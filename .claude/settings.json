@@ -1,0 +1,20 @@
+{
+  "$schema": "https://docs.anthropic.com/en/docs/claude-code/settings-schema.json",
+
+  "_comment_purpose": "Settings for Claude Code in the Nitrox project. This file is committed to the repo and applies to all contributors. Personal preferences go in CLAUDE.local.md (gitignored), not here.",
+
+  "autoMemoryEnabled": true,
+
+  "_comment_excludes": "Don't load CLAUDE.md files from build artifacts or vendored code.",
+  "claudeMdExcludes": [
+    "**/target/**",
+    "**/node_modules/**",
+    "kernel/vendor/**"
+  ],
+
+  "_comment_commands": "Project-specific custom commands available via /command-name in Claude Code sessions. Add custom commands as files in .claude/commands/ if needed.",
+
+  "_comment_hooks": "Reserved for future use. Hooks like InstructionsLoaded can be useful for debugging which CLAUDE.md files are being loaded; uncomment when needed.",
+
+  "_comment_subagents": "Subagent configurations go in .claude/subagents/ if used. Not currently configured."
+}
