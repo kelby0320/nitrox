@@ -1,0 +1,9 @@
+# Top-level cargo aliases.
+#
+# `cargo xtask <cmd>` runs the build orchestrator in tools/xtask. The
+# `--manifest-path` form lets the alias work from anywhere in the repo
+# without depending on a workspace-wide membership relationship with the
+# kernel (which has a different target).
+
+[alias]
+xtask = "run --release --manifest-path tools/Cargo.toml -p xtask --"

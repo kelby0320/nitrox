@@ -1,0 +1,19 @@
+# Per-package Cargo configuration for the Nitrox kernel.
+#
+# Default target is the built-in freestanding x86_64-unknown-none triple.
+# That target spec already implies soft-float, no MMX/SSE, no red zone — so
+# we don't restate those here. The linker script is wired up via build.rs
+# because rust-lld runs from the target directory.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    # Higher-half kernel: code model "kernel" generates relocations valid
+    # only when the executable sits in the top 2 GiB.
+    "-C", "code-model=kernel",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]
