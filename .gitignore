@@ -1,0 +1,15 @@
+# Build artifacts
+target/
+**/target/
+
+# xtask-managed cache: fetched Limine binaries, assembled disk image.
+tools/build-cache/
+
+# Editor / OS noise
+*.swp
+*.swo
+.DS_Store
+
+# Cargo lockfiles in the kernel are checked in; lockfiles in `tools/` are
+# not — host tooling can drift.
+/tools/Cargo.lock

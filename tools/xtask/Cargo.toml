@@ -1,0 +1,11 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2024"
+description = "Nitrox build orchestrator — kernel builds, Limine fetch, disk image, QEMU."
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]

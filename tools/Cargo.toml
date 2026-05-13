@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["xtask"]
+
+[profile.release]
+opt-level = 1
+debug = true

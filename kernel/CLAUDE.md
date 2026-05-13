@@ -5,15 +5,17 @@ Kernel workspace constraints. Loaded when Claude Code reads files under `kernel/
 ## Build environment
 
 - **`#![no_std]`** — no Rust standard library
-- **`#![no_main]`** — entry point is in `arch/<arch>/boot.asm`, not `main.rs`
+- **`#![no_main]`** — the ELF entry point (currently `_start` in `main.rs`, eventually an arch-specific stub) is the kernel's first instruction; there is no Rust `main`.
 - **No `alloc` crate at startup.** `KBox`, `KVec`, etc., become available only after the kernel allocator is initialized in early boot (see `kernel/src/main.rs` initialization sequence). Code in the early-init path cannot allocate; later code can.
-- **Custom target**: `x86_64-unknown-none.json` (and aarch64 equivalent). `cargo build-std` compiles `core` and `compiler_builtins` from source.
+- **Target**: the built-in `x86_64-unknown-none` rustc target. It already implies soft-float, no MMX/SSE, and no red zone — exactly the semantics the kernel needs. Staying on a built-in target keeps us on stable Rust without `-Z build-std`, which is nightly-only. If we ever need a feature the built-in spec doesn't expose, we switch to a custom JSON at that point — but not before. The aarch64 equivalent is `aarch64-unknown-none`. (Decision recorded in `docs/history/decision-log.md` 2026-05-13.)
 - **`panic = "abort"`** — no stack unwinding in the kernel.
-- **`-mno-sse -mno-mmx -msoft-float`** in target JSON. The kernel does not use FPU; user FPU state is saved/restored on context switch.
+- The target already disables MMX/SSE and forces soft-float; the kernel does not use FPU. User FPU state is saved/restored on context switch.
 
 ## No external crates
 
 The kernel uses no third-party Rust crates. All data structures (`KVec`, `KString`, intrusive linked lists, red-black trees, spin locks, atomics-based queues) are in `kernel/src/libkern/` or equivalent. Don't add `serde`, `bytemuck`, `bitflags` (we use a hand-rolled bitflag pattern), or any other ecosystem crate.
+
+This applies to bootloader integration too: the Limine boot protocol bindings are hand-rolled `#[repr(C)]` types in `kernel/src/limine.rs`, not the `limine` crate from crates.io. Pin the protocol revision in source and re-validate against `limine-bootloader/limine-protocol` when bumping it.
 
 The one planned exception is ACPICA via FFI in Phase 2 of ACPI support. Phase 2 is not yet active. See `docs/rationale/why-phased-acpi.md`. If the time comes, the integration is a documented exception, not a general retreat from the no-external-crates rule.
 
