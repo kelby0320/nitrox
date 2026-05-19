@@ -374,3 +374,107 @@ fn format_cmd(cmd: &Command) -> String {
     s
 }
 
+// --- Tests --------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static TMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    /// Per-test unique tmp dir. We avoid `tempfile` to keep xtask
+    /// dependency-free, so we have to clean up manually.
+    struct TmpDir(PathBuf);
+
+    impl TmpDir {
+        fn new(tag: &str) -> Self {
+            let n = TMP_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let path = env::temp_dir().join(format!(
+                "nitrox-xtask-{}-{}-{}",
+                tag,
+                std::process::id(),
+                n
+            ));
+            if path.exists() {
+                fs::remove_dir_all(&path).expect("clear stale tmp");
+            }
+            fs::create_dir_all(&path).expect("create tmp");
+            Self(path)
+        }
+        fn path(&self) -> &Path {
+            &self.0
+        }
+    }
+
+    impl Drop for TmpDir {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn touch(p: &Path) {
+        if let Some(parent) = p.parent() {
+            fs::create_dir_all(parent).expect("mkdir -p");
+        }
+        fs::write(p, b"").expect("touch");
+    }
+
+    #[test]
+    fn walk_for_finds_nested_file() {
+        let tmp = TmpDir::new("walk-nested");
+        touch(&tmp.path().join("a/b/c/target.bin"));
+        let found = walk_for(tmp.path(), "target.bin").unwrap();
+        let found = found.expect("walk_for should locate target.bin");
+        assert_eq!(found.file_name().unwrap(), "target.bin");
+    }
+
+    #[test]
+    fn walk_for_returns_none_when_missing() {
+        let tmp = TmpDir::new("walk-missing");
+        fs::create_dir_all(tmp.path().join("a")).unwrap();
+        assert!(walk_for(tmp.path(), "nope.efi").unwrap().is_none());
+    }
+
+    #[test]
+    fn find_bootx64_uses_known_location() {
+        let tmp = TmpDir::new("bootx64-known");
+        // Limine v12 layout: efi/x86_64/BOOTX64.EFI
+        let expected = tmp.path().join("efi/x86_64/BOOTX64.EFI");
+        touch(&expected);
+        // Decoy that should be ignored because the known location wins.
+        touch(&tmp.path().join("somewhere/else/BOOTX64.EFI"));
+        let found = find_bootx64(tmp.path()).unwrap();
+        assert_eq!(found, expected);
+    }
+
+    #[test]
+    fn find_bootx64_falls_back_to_recursive_scan() {
+        let tmp = TmpDir::new("bootx64-fallback");
+        let weird = tmp.path().join("unexpected/depth/BOOTX64.EFI");
+        touch(&weird);
+        let found = find_bootx64(tmp.path()).unwrap();
+        assert!(found.ends_with("BOOTX64.EFI"));
+    }
+
+    #[test]
+    fn find_bootx64_errors_when_absent() {
+        let tmp = TmpDir::new("bootx64-absent");
+        fs::create_dir_all(tmp.path().join("efi")).unwrap();
+        assert!(find_bootx64(tmp.path()).is_err());
+    }
+
+    #[test]
+    fn format_cmd_includes_program_and_args() {
+        let mut cmd = Command::new("echo");
+        cmd.arg("hello").arg("world");
+        assert_eq!(format_cmd(&cmd), "echo hello world");
+    }
+
+    #[test]
+    fn format_cmd_handles_no_args() {
+        let cmd = Command::new("true");
+        assert_eq!(format_cmd(&cmd), "true");
+    }
+}
+

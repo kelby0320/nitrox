@@ -114,6 +114,18 @@ These will eventually be done, but aren't in initial scope. Each entry documents
 
 **NUMA-aware scheduling and memory allocation.** Architecture does not preclude NUMA but does not exploit topology. Single buddy allocator zones, scheduler treats all CPUs as uniform, work stealing ignores topology. Trigger: NUMA hardware where the lack of awareness is producing measurable problems.
 
+### Testing and CI
+
+**Kernel host-side unit tests.** Phase 0 ships without host-side tests for kernel code. The kernel crate is `#![no_std]` / `#![no_main]` against `x86_64-unknown-none` with `panic = "abort"`; making it host-testable requires splitting into `lib + bin` with conditional compilation. The current Phase 0 kernel has roughly thirty lines of testable arithmetic (`pick_scale`, `text_width`, `Rgb::pack`) that will be replaced when the PSF loader and a proper console land on top of an allocator. Trigger: Phase 1 lands code with real, non-throwaway host-testable logic (handle table operations, namespace resolution, ABI encoding/decoding — all called out in `kernel/CLAUDE.md` as candidates).
+
+**`xtask test` subcommand.** The convention is that `cargo xtask test` runs host-side tests for the OS we are building. With no host-testable kernel/userspace code in Phase 0, a stub subcommand would be ceremony. Trigger: same as above — when there is something to run, the subcommand lands alongside it.
+
+**`xtask test-qemu` integration harness.** A QEMU integration test today would amount to a single "did the kernel reach the end of `kernel_main`?" smoke via `isa-debug-exit`. `xtask qemu` already proves that interactively, and there is no IDT, memory-map handling, allocator, IPC, or scheduler code yet to actually regress. Trigger: Phase 1 introduces a milestone past the Limine handoff that benefits from automated assertion (e.g., "allocator initialised", "first userspace process spawned").
+
+**Image assembly and QEMU smoke in CI.** Phase 0 CI runs `cargo xtask build` only. Adding `cargo xtask image` would exercise the sgdisk + mtools path; adding a QEMU smoke run would exercise the boot path. Both are deferred until there is meaningful regression surface beyond the build itself. Trigger: Phase 1 boot path complexity warrants it.
+
+**`libkern` mock-syscall test mode.** `userspace/libkern/CLAUDE.md` describes a feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
+
 ### Auditing and observability
 
 **Comprehensive systemwide tracing infrastructure (DTrace/eBPF equivalent).** Per-CPU ring buffers for kernel tracing exist in concept. A full programmable tracing facility (DTrace probes, eBPF-style filters, etc.) is out of scope initially. Trigger: deep performance analysis needs that exceed what `kprintln!` and basic tracing handles.
