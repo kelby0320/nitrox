@@ -4,6 +4,10 @@ version = "0.1.0"
 edition = "2024"
 description = "Nitrox kernel — bare-metal x86_64 entry, Limine-loaded."
 
+[lib]
+name = "nitrox_kernel"
+path = "src/lib.rs"
+
 [[bin]]
 name = "nitrox-kernel"
 path = "src/main.rs"

@@ -5,6 +5,7 @@
 //!   image           build kernel + assemble a UEFI-bootable GPT/FAT32 image
 //!   qemu            build + launch QEMU with OVMF
 //!   qemu-debug      build + launch QEMU paused for GDB on :1234
+//!   test            host-side unit tests (kernel lib + tools workspace)
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
@@ -38,6 +39,7 @@ fn main() -> ExitCode {
         Some("image") => cmd_image(),
         Some("qemu") => cmd_qemu(false, &rest),
         Some("qemu-debug") => cmd_qemu(true, &rest),
+        Some("test") => cmd_test(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -67,6 +69,7 @@ fn print_help() {
            image         build + assemble a UEFI-bootable disk image\n  \
            qemu          build + launch QEMU with OVMF\n  \
            qemu-debug    build + launch QEMU paused for GDB on :1234\n  \
+           test          host-side unit tests (kernel lib + tools)\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
            help          show this message\n\
@@ -211,6 +214,53 @@ fn cmd_clean() -> R<()> {
         println!("xtask: removed {}", cache.display());
     }
     Ok(())
+}
+
+fn cmd_test() -> R<()> {
+    // Tools workspace tests (xtask itself, image-builder helpers, etc.).
+    let tools_manifest = repo_root().join("tools").join("Cargo.toml");
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("--manifest-path")
+        .arg(&tools_manifest))?;
+
+    // Kernel host tests. The kernel's `.cargo/config.toml` pins the
+    // build target to `x86_64-unknown-none`, which can't link the
+    // standard test harness, so we force the host triple here. `--lib`
+    // skips the `[[bin]]` (it's `#![no_main]`, unbuildable on host).
+    let host = host_triple()?;
+    let kernel_dir = repo_root().join("kernel");
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&kernel_dir))?;
+    Ok(())
+}
+
+/// Return the host's target triple by parsing `rustc -vV` output.
+fn host_triple() -> R<String> {
+    let out = Command::new("rustc").arg("-vV").output()?;
+    if !out.status.success() {
+        return Err(format!("rustc -vV exited {}", out.status).into());
+    }
+    let text = String::from_utf8(out.stdout)?;
+    parse_host_from_rustc_vv(&text)
+        .ok_or_else(|| "rustc -vV did not contain a `host:` line".into())
+}
+
+/// Find the `host:` line in `rustc -vV` output and return the triple.
+fn parse_host_from_rustc_vv(s: &str) -> Option<String> {
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("host:") {
+            let triple = rest.trim();
+            if !triple.is_empty() {
+                return Some(triple.to_string());
+            }
+        }
+    }
+    None
 }
 
 // --- Image assembly -----------------------------------------------------
@@ -475,6 +525,38 @@ mod tests {
     fn format_cmd_handles_no_args() {
         let cmd = Command::new("true");
         assert_eq!(format_cmd(&cmd), "true");
+    }
+
+    #[test]
+    fn parse_host_extracts_linux_triple() {
+        let sample = "\
+rustc 1.95.0 (59807616e 2026-04-14)
+binary: rustc
+commit-hash: 59807616e1fa2540724bfbac14d7976d7e4a3860
+commit-date: 2026-04-14
+host: x86_64-unknown-linux-gnu
+release: 1.95.0
+LLVM version: 22.1.2
+";
+        assert_eq!(
+            parse_host_from_rustc_vv(sample).as_deref(),
+            Some("x86_64-unknown-linux-gnu")
+        );
+    }
+
+    #[test]
+    fn parse_host_extracts_macos_triple() {
+        let sample = "rustc 1.95.0\nhost: aarch64-apple-darwin\n";
+        assert_eq!(
+            parse_host_from_rustc_vv(sample).as_deref(),
+            Some("aarch64-apple-darwin")
+        );
+    }
+
+    #[test]
+    fn parse_host_returns_none_when_absent() {
+        let sample = "rustc 1.95.0\nrelease: 1.95.0\n";
+        assert!(parse_host_from_rustc_vv(sample).is_none());
     }
 }
 

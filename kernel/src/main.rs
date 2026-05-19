@@ -13,15 +13,11 @@
 #![no_std]
 #![no_main]
 
-mod arch;
-mod font;
-mod framebuffer;
-mod limine;
-
 use core::panic::PanicInfo;
 
-use crate::framebuffer::{FbWriter, Rgb};
-use crate::limine::{
+use nitrox_kernel::arch;
+use nitrox_kernel::framebuffer::{FbWriter, Rgb};
+use nitrox_kernel::limine::{
     BaseRevision, FramebufferRequest, RequestsEndMarker, RequestsStartMarker,
 };
 

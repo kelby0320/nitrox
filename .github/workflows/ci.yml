@@ -43,8 +43,7 @@ jobs:
       - name: cargo xtask build
         run: cargo xtask build
 
-      # Host-side tests for xtask itself. There are no kernel or
-      # userspace host tests yet; Phase 1 adds an `xtask test`
-      # subcommand once there is something to run.
-      - name: cargo test (tools)
-        run: cargo test --manifest-path tools/Cargo.toml
+      # Host-side tests: kernel lib (compiled against the host triple via
+      # an internal override in xtask) plus the tools workspace.
+      - name: cargo xtask test
+        run: cargo xtask test
