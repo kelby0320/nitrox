@@ -82,3 +82,53 @@ What's deferred to Phase 1+:
 - Custom JSON target if we need anything the built-in doesn't expose
 - Replacement of the hand-coded font with a PSF loader once an allocator
   exists
+
+---
+
+## 2026-05-19 — Phase 0 CI and host-test scope
+
+Added GitHub Actions CI plus an opening set of host-side unit tests
+under `tools/xtask`. Scope was deliberately narrowed after auditing the
+Phase 0 codebase for what is actually testable today.
+
+What's in the build:
+
+- `.github/workflows/ci.yml` — runs on pushes and PRs against `main`.
+  One job: `rustup` stable + `rustup target add x86_64-unknown-none`,
+  cached cargo registry/build outputs, then `cargo xtask build`
+  followed by `cargo test --manifest-path tools/Cargo.toml`.
+- `tools/xtask/src/main.rs` `#[cfg(test)]` module — covers
+  `walk_for`, the three branches of `find_bootx64` (known location,
+  recursive fallback, error path), and `format_cmd`. Uses a small
+  `TmpDir` RAII helper rather than pulling in `tempfile`, to keep
+  xtask's "no external crates" stance.
+
+Decisions worth recording:
+
+- **No `xtask test` subcommand yet.** The convention from
+  `kernel/CLAUDE.md` is that `cargo xtask test` runs host-side unit
+  tests for the OS we are building (kernel + userspace where the code
+  can run on the host). In Phase 0 there is no such code — the kernel
+  is entirely bare-metal, and `userspace/init` and `userspace/libkern`
+  are `cargo new` placeholders. Adding a stub subcommand that runs
+  nothing is ceremony; Phase 1 adds the real subcommand once there is
+  something to run. xtask's own tests are invoked via plain
+  `cargo test --manifest-path tools/Cargo.toml` from CI, treating
+  xtask as a normal host crate rather than as part of the OS-under-test.
+- **CI builds, but does not assemble images or run QEMU.** Build
+  catches the regressions worth catching today: kernel target spec,
+  `code-model=kernel` rustflags, linker script wiring, `build.rs` path
+  emission. Image assembly (sgdisk + mtools) and the eventual QEMU
+  smoke test are deferred to Phase 1 CI, by which point there will be
+  something past `kernel_main` for a smoke test to actually assert on.
+- **Kernel host unit tests deferred to Phase 1.** The Phase 0 kernel's
+  testable surface is roughly thirty lines of arithmetic helpers
+  (`pick_scale`, `text_width`, `text_height`, the `Rgb::pack` shifts)
+  that will be replaced when the PSF loader and a real console land on
+  top of an allocator. Splitting the kernel crate into `lib + bin`
+  with conditional `#![no_main]` to expose those helpers to host
+  `cargo test` is real surgery for negative net value at this scale.
+- **Userspace placeholder test left alone.** `userspace/libkern`'s
+  `pub fn add` + `it_works` test is the `cargo new` boilerplate. It
+  is not run by CI (CI only invokes the `tools/` workspace) and will
+  be deleted wholesale when libkern is rewritten in Phase 1.
