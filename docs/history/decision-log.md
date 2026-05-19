@@ -132,3 +132,96 @@ Decisions worth recording:
   `pub fn add` + `it_works` test is the `cargo new` boilerplate. It
   is not run by CI (CI only invokes the `tools/` workspace) and will
   be deleted wholesale when libkern is rewritten in Phase 1.
+
+---
+
+## 2026-05-19 — Phase 1, slice 1: physical-memory buddy allocator
+
+First Phase 1 slice. Implements `kernel/src/mm/buddy.rs`: a single
+`BuddyAllocator` covering every Limine `Usable` region above 1 MiB,
+backed by intrusive free-list pointers stored in each free frame's first
+8 bytes and a coalesce bitmap carved out of physical memory at init.
+Orders 0..=10 (4 KiB to 4 MiB blocks). Host-tested. Boot integration
+deferred to the next slice (slab + heap), so the new memmap/HHDM Limine
+bindings are present but their request statics are not yet declared in
+`main.rs`.
+
+What's in the build:
+
+- `kernel/src/mm/{mod.rs,buddy.rs}` — `PhysAddr`, `PAGE_SIZE`/`PAGE_SHIFT`,
+  the buddy allocator and its host-side `#[cfg(test)]` suite.
+- `kernel/src/limine.rs` — extended with `MemoryMapRequest`/`Response`
+  /`Entry` (with `MEMMAP_USABLE` and the other kind constants) and
+  `HhdmRequest`/`Response`.
+- `kernel/src/lib.rs` + `[lib]` in `kernel/Cargo.toml` — the kernel
+  crate now exposes a lib alongside the `nitrox-kernel` bin so
+  `cargo test` can compile kernel modules against the host's std.
+  `main.rs` lost its `mod` declarations and imports from
+  `nitrox_kernel::*`.
+- `kernel/build.rs` — only emits the freestanding linker script when
+  building for `x86_64-unknown-none`; host test binaries take the
+  std-linked path.
+- `tools/xtask` — new `test` subcommand runs the tools workspace's
+  tests followed by `cargo test --lib --target $host` inside `kernel/`
+  to override the kernel's pinned target. Adds a `host_triple` helper
+  that parses `rustc -vV` (tested host-side alongside the existing
+  helpers).
+- `.github/workflows/ci.yml` — single test step is now
+  `cargo xtask test` (replacing the previous tools-workspace-only run).
+
+Decisions worth recording:
+
+- **Kernel split into `lib + bin`.** Supersedes the 2026-05-19 Phase 0
+  decision to defer this. The buddy allocator has substantive host-
+  testable algorithmic content (coalesce bitmap math, free-list
+  splicing, split/coalesce paths), enough that the cost-benefit
+  trade-off inverts. Future testable kernel code (handle table,
+  namespace resolution, ABI codecs) inherits the same infrastructure.
+  The lib uses `#![cfg_attr(not(test), no_std)]`; the bin keeps
+  `#![no_std]` + `#![no_main]` and imports modules from the lib.
+- **Single flat allocator, not zoned.** The architecture overview's
+  DMA / Normal zone split is staged for later; a `// TODO: zone split`
+  comment in `buddy.rs` marks the insertion point. ISA-DMA-bound
+  allocations will need that, but Phase 1 has no ISA-DMA consumers.
+- **Skip the first 1 MiB of physical memory.** The bitmap and the
+  free-frame walk both refuse frames below `0x10_0000`. Low memory
+  holds legacy DMA buffers, the BIOS data area under UEFI, and the
+  AP bring-up trampoline that Phase 1.5+ will place there. 256 frames
+  is a cheap reservation; allocating-and-freeing into low memory
+  invites bugs that are tedious to debug.
+- **`BootloaderReclaimable` left alone.** The kernel still runs on
+  Limine's 64 KiB stack and reads from bootloader-reclaimable
+  framebuffer descriptors. Reclamation arrives once the kernel owns
+  its stack; tracked here for the next slice.
+- **`base_frame` rounded down to `2^(MAX_ORDER+1)`-frame alignment.**
+  The bit-index formula `(frame - base_frame) >> (order + 1)` assumes
+  `base_frame` aligns with the natural buddy-pair structure at every
+  order. Misaligned bases bucket non-buddies into the same pair and
+  corrupt coalescing (host tests caught this on the first run with
+  arbitrary `Vec<u8>` addresses). Rounding down introduces "phantom"
+  frames below the usable range that have bitmap bits but are never
+  fed in — they stay marked allocated and out of reach. The overhead
+  is at most ~2047 frames (8 MiB) per allocator and only one allocator
+  instance exists.
+- **Coalesce-bitmap sentinel = 0 in the free-list next slot.** Frame 0
+  never enters the allocator (covered by the 1 MiB skip), so `0` is
+  a safe "end of list" marker that needs no extra null check.
+- **Memmap/HHDM request statics deferred.** The bindings compile, but
+  `main.rs` does not declare static instances yet. Wiring them up
+  alongside `BuddyAllocator::new` belongs in the slab/heap slice; doing
+  it here would grow the diff without adding observable behaviour at
+  this scale (no allocator consumer exists yet).
+- **`cargo xtask test` subcommand.** Implements the convention
+  `kernel/CLAUDE.md` already documents (`run via cargo xtask test`).
+  CI now invokes it instead of `cargo test --manifest-path
+  tools/Cargo.toml` directly. The kernel's `.cargo/config.toml` pins
+  the target to `x86_64-unknown-none`, so xtask forces the host
+  triple via `--target` — derived at runtime from `rustc -vV` rather
+  than hard-coded.
+
+Verification:
+
+- `cargo xtask build` succeeds: kernel ELF still links against the
+  freestanding target with the higher-half linker script.
+- `cargo xtask test` runs ten host tests in `tools/xtask` and six in
+  `nitrox-kernel`'s lib; all pass.

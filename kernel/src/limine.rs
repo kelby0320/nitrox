@@ -139,3 +139,104 @@ pub struct Framebuffer {
     pub mode_count: u64,
     pub modes: *mut *mut u8,
 }
+
+// --- Memory map request --------------------------------------------------
+//
+// Limine populates a list of physical-memory ranges with type tags
+// (Usable, Reserved, ACPI Reclaimable, etc.). The buddy allocator consumes
+// only `Usable` entries; others are passed through untouched.
+
+const MEMMAP_ID_2: u64 = 0x67cf3d9d378a806f;
+const MEMMAP_ID_3: u64 = 0xe304acdfc50c3c62;
+
+/// Usable RAM — free for the kernel to manage.
+pub const MEMMAP_USABLE: u64 = 0;
+/// Firmware-reserved; never claim.
+pub const MEMMAP_RESERVED: u64 = 1;
+/// ACPI tables that may be reclaimed once parsing is complete.
+pub const MEMMAP_ACPI_RECLAIMABLE: u64 = 2;
+/// ACPI non-volatile storage; never claim.
+pub const MEMMAP_ACPI_NVS: u64 = 3;
+/// Hardware flagged as defective; never claim.
+pub const MEMMAP_BAD_MEMORY: u64 = 4;
+/// Bootloader's working memory; reclaimable once we own the boot stack.
+pub const MEMMAP_BOOTLOADER_RECLAIMABLE: u64 = 5;
+/// Memory occupied by the kernel ELF and any loaded modules.
+pub const MEMMAP_KERNEL_AND_MODULES: u64 = 6;
+/// Linear framebuffer backing store.
+pub const MEMMAP_FRAMEBUFFER: u64 = 7;
+
+#[repr(C)]
+pub struct MemoryMapRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut MemoryMapResponse,
+}
+
+// SAFETY: identical reasoning to `FramebufferRequest` — the request lives
+// in a `static`, is written exactly once by Limine before `_start`, and is
+// thereafter read by single-threaded boot code.
+unsafe impl Sync for MemoryMapRequest {}
+
+impl MemoryMapRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MEMMAP_ID_2, MEMMAP_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct MemoryMapResponse {
+    pub revision: u64,
+    pub entry_count: u64,
+    /// Pointer to an array of `entry_count` `*mut MemoryMapEntry`.
+    pub entries: *mut *mut MemoryMapEntry,
+}
+
+#[repr(C)]
+pub struct MemoryMapEntry {
+    pub base: u64,
+    pub length: u64,
+    pub kind: u64,
+}
+
+// --- Higher-Half Direct Map (HHDM) request -------------------------------
+//
+// Limine maps all of physical memory at a fixed offset in the higher half
+// (typically 0xffff800000000000). The kernel reaches a physical address `p`
+// by reading `(p + hhdm_offset) as *mut _`. The buddy allocator uses this
+// to access the first 8 bytes of each free frame (its intrusive next
+// pointer) and to zero the coalesce bitmap during init.
+
+const HHDM_ID_2: u64 = 0x48dcf1cb8ad2b852;
+const HHDM_ID_3: u64 = 0x63984e959a98244b;
+
+#[repr(C)]
+pub struct HhdmRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut HhdmResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other
+// requests in this file.
+unsafe impl Sync for HhdmRequest {}
+
+impl HhdmRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, HHDM_ID_2, HHDM_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct HhdmResponse {
+    pub revision: u64,
+    pub offset: u64,
+}
