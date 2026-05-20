@@ -10,6 +10,7 @@ tools/build-cache/
 *.swo
 .DS_Store
 
-# Cargo lockfiles in the kernel are checked in; lockfiles in `tools/` are
-# not — host tooling can drift.
+# Cargo lockfiles in the kernel and userspace workspaces are checked in
+# (they produce the OS artifacts we ship). The `tools/` lockfile is not
+# — host tooling can drift.
 /tools/Cargo.lock

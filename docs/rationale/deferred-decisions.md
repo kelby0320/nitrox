@@ -114,6 +114,16 @@ These will eventually be done, but aren't in initial scope. Each entry documents
 
 **NUMA-aware scheduling and memory allocation.** Architecture does not preclude NUMA but does not exploit topology. Single buddy allocator zones, scheduler treats all CPUs as uniform, work stealing ignores topology. Trigger: NUMA hardware where the lack of awareness is producing measurable problems.
 
+**Per-CPU slab caching.** Phase 1's slab allocator uses a single global spinlock per cache. SLUB's per-CPU optimisation (a `current_slab` pointer per CPU, with the cache lock taken only on slow paths) is structurally compatible with the existing state machine but requires per-CPU infrastructure that doesn't exist yet. Trigger: SMP bring-up in Phase 3 introduces per-CPU areas; the slab fast path migrates onto them at that point.
+
+**Empty-slab reclamation back to the buddy.** Once a slab cache grows by one page, that page stays with the cache forever. Production kernels reclaim wholly-empty slabs after a watermark; Nitrox doesn't yet. Trigger: long-running workloads where slab churn produces visible memory bloat, or memory-pressure handling (the OOM daemon) needs a hook to drain caches.
+
+**Alignment greater than `SLAB_SIZE` (4 KiB) in `kmalloc`.** Today `kmalloc(_, align)` for `align > SLAB_SIZE` returns null. The slab's descriptor-at-byte-0 trick relies on the user pointer staying in the first page of the buddy block; alignments above 4 KiB push the user pointer into later pages and break the recovery. Trigger: DMA buffer allocation in Phase 2 needs page-multiple alignments and is the natural client for a real answer here (likely a separate `dma_alloc` path that maintains its own table, not a kmalloc extension).
+
+**DMA / Normal zone split in the buddy.** The buddy treats every Usable frame above 1 MiB as a single pool. ISA-DMA (below 16 MiB) has no fast path. Trigger: a driver that needs ISA-DMA buffers (none yet). See `TODO:` comment in `kernel/src/mm/buddy.rs`.
+
+**Debug-build lock-ordering enforcement.** `kernel/CLAUDE.md` documents that debug builds will track acquisition order and panic on violations. The mechanism doesn't yet exist; the only lock-ordering enforcement today is code review and `kernel/docs/lock-ordering.md`. Trigger: enough locks exist that the cost of building the rank-tracker outweighs the cost of a missed bug.
+
 ### Testing and CI
 
 **Kernel host-side unit tests.** Phase 0 ships without host-side tests for kernel code. The kernel crate is `#![no_std]` / `#![no_main]` against `x86_64-unknown-none` with `panic = "abort"`; making it host-testable requires splitting into `lib + bin` with conditional compilation. The current Phase 0 kernel has roughly thirty lines of testable arithmetic (`pick_scale`, `text_width`, `Rgb::pack`) that will be replaced when the PSF loader and a proper console land on top of an allocator. Trigger: Phase 1 lands code with real, non-throwaway host-testable logic (handle table operations, namespace resolution, ABI encoding/decoding — all called out in `kernel/CLAUDE.md` as candidates).

@@ -225,3 +225,127 @@ Verification:
   freestanding target with the higher-half linker script.
 - `cargo xtask test` runs ten host tests in `tools/xtask` and six in
   `nitrox-kernel`'s lib; all pass.
+
+---
+
+## 2026-05-19 — Phase 1, slice 2: slab allocator and global-allocator wiring
+
+Second Phase 1 slice. Wires the buddy allocator into boot, builds a
+SLUB-inspired slab allocator on top, and registers a `#[global_allocator]`
+so `extern crate alloc` is usable from kernel code from here onward. Also
+adds the kernel's own `SpinLock` primitive (a prerequisite, not optional)
+and creates `kernel/docs/lock-ordering.md`, which the kernel CLAUDE.md
+already referenced.
+
+What's in the build:
+
+- `kernel/src/libkern/{mod.rs,spinlock.rs}` — kernel-internal primitives
+  module. `SpinLock<T>` / `SpinLockGuard<'_, T>` are test-and-set
+  (`AtomicBool` + `UnsafeCell<T>`) with `const fn new`. No IRQ masking
+  (Phase 1 has interrupts disabled throughout; an `IrqSpinLock` variant
+  will land in the IDT slice).
+- `kernel/src/mm/heap.rs` — buddy facade. Owns
+  `BUDDY: SpinLock<Option<BuddyAllocator>>` and `HHDM_OFFSET: AtomicU64`,
+  populated by `init_buddy` at boot. Exposes `buddy_alloc` /
+  `buddy_free` / `hhdm_offset` plus a small `BuddyPager` trait that the
+  slab module uses (production impl `HeapBuddy`; tests inject a
+  `LocalBuddy` wrapping a per-test `BuddyAllocator`).
+- `kernel/src/mm/slab.rs` — the slab. `SlabDescriptor` at byte 0 of each
+  4 KiB slab page; embedded-freelist allocation; intrusive partial/full
+  lists; O(1) free via `(ptr & SLAB_MASK) as *mut SlabDescriptor`. Seven
+  size buckets (32..2048 in `×2` steps); requests larger than 2048 B
+  bypass to the buddy and carry an `owner = null` sentinel descriptor.
+  Exports `kmalloc`/`kfree`/`kzalloc` plus a `KernelAllocator` unit
+  struct implementing `core::alloc::GlobalAlloc`.
+- `kernel/src/main.rs` — declares `MEMMAP_REQUEST` and `HHDM_REQUEST`
+  statics next to the existing framebuffer one; registers
+  `#[global_allocator] static ALLOCATOR: mm::slab::KernelAllocator`;
+  factors out `init_memory()` to extract the Limine responses, call
+  `heap::init_buddy`, then `slab::slab_init`. Boot screen text updates
+  to `PHASE 1: ALLOCATORS UP`.
+- `kernel/docs/lock-ordering.md` — first version. Documents ranks 1..6,
+  with slab as rank 6a and buddy as rank 6b. Calls out the slab → buddy
+  nesting as the only allowed allocator-on-allocator pattern.
+- `docs/architecture/memory-management.md` — first version. Three-layer
+  overview, slab geometry / large-alloc routing / init order /
+  locking / Phase 1 limitations.
+- `docs/rationale/why-slub-not-buddy-only.md` — rationale doc.
+
+Decisions worth recording:
+
+- **Plain spin lock, not IRQ-saving.** Interrupts are never enabled in
+  Phase 1 (no IDT, PIC, or APIC). The `SpinLock` does not mask
+  interrupts. When the IDT slice arrives, an `IrqSpinLock` variant will
+  be added and call sites audited; allocator locks are likely
+  candidates. Today's `SpinLock` becomes the "no-IRQ-needed" choice
+  rather than the only choice.
+- **Slab returns HHDM-mapped kernel-virtual pointers, not raw `PhysAddr`.**
+  Lets `kfree` recover the `SlabDescriptor` via `ptr & !0xFFF` directly,
+  with no per-allocation external table. Costs us the ability to return
+  a raw `PhysAddr` from `kmalloc`, which no kmalloc consumer wants
+  anyway.
+- **Untyped `SlabCache`, not `SlabCache<T>`.** The seven kmalloc buckets
+  live in a single `[SlabCache; 7]`; that's not possible with a generic
+  parameter. A typed `KCache<T>` wrapper for object pools can sit on
+  top of the same machinery later.
+- **Single global lock per cache, no per-CPU fast path yet.** Phase 1
+  has no SMP and no preemption. The cost of an uncontested
+  `compare_exchange_weak` on an `AtomicBool` is negligible. Per-CPU
+  caching is the natural Phase 3 (SMP) follow-up; the existing
+  alloc/free state machine becomes the slow path then, unchanged.
+- **Slab → buddy is the sanctioned allocator-on-allocator nesting.**
+  Slab's `grow_locked` holds the cache lock (rank 6a) across a
+  `buddy_alloc` call (rank 6b). Buddy never recurses into slab, so the
+  cycle is impossible. Documented in `kernel/docs/lock-ordering.md`.
+- **Large allocations route via an `owner = null` sentinel.** Requests
+  larger than 2048 B go directly to the buddy; a stub `SlabDescriptor`
+  at byte 0 of the buddy block stores the total block size in
+  `obj_size` for `large_free` to recover the order. Routing is O(1) and
+  requires no external state. Alternative — a global slab-descriptor
+  registry — was rejected because it would add a synchronisation point
+  on every alloc and free.
+- **`KernelAllocator` panics loudly if called before `slab_init`.** A
+  silent "not ready" mode would mask premature-use bugs in any code
+  that happens to allocate before `init_memory` runs. With `panic` =
+  `abort`, the kernel halts cleanly and the framebuffer never displays
+  the boot screen, which is the right tripwire.
+- **`obj_offset` rounded up from `size_of::<SlabDescriptor>()` to cache
+  alignment, asserted at init.** Three asserts: header fits, alignment
+  is honoured, at least one object per slab. Each catches a different
+  geometry mistake before any allocation runs.
+- **Buddy facade in `mm/heap.rs`, separate from `mm/slab.rs`.** The
+  buddy is also the source of pages for the page-table and VMM layers
+  that come next; routing those callers through `slab::*` would couple
+  unrelated subsystems. Keeping the facade in `heap.rs` keeps slab as
+  one client among future others.
+- **Test isolation via `BuddyPager` trait + `LocalBuddy`.** Slab's
+  hot paths take `&P: BuddyPager` so tests build per-test buddies
+  without touching the global `BUDDY` / `SLAB_CACHES` statics. Slight
+  cost: production code dispatches through a trait method (one indirect
+  call inside `grow_locked` only).
+
+Verification:
+
+- `cargo xtask test` — 23 host tests pass: 4 spinlock + 1 heap +
+  12 slab + 6 buddy (existing).
+- `cargo xtask build` — kernel ELF builds clean for the
+  `x86_64-unknown-none` target.
+- `cargo xtask qemu` — boot reaches `kernel_main`, allocator init
+  runs without panicking, and the boot screen renders
+  "PHASE 1: ALLOCATORS UP". (Adding an `extern crate alloc` smoke
+  test in `main.rs` was considered but not landed — the host tests
+  cover the `kmalloc`/`kfree` paths the `GlobalAlloc` impl forwards
+  to, and the boot-screen render is itself evidence that init
+  succeeded.)
+
+Deferred:
+
+- `IrqSpinLock` variant — IDT slice.
+- Per-CPU slab caching — SMP slice (Phase 3).
+- Empty-slab reclamation back to the buddy — no trigger yet.
+- Alignment greater than `SLAB_SIZE` — Phase 2 (DMA buffers).
+- DMA / Normal zone split in the buddy — already TODO in
+  `mm/buddy.rs`.
+- Debug-build lock-ordering checker — code review enforces today.
+
+All filed in `docs/rationale/deferred-decisions.md`.
