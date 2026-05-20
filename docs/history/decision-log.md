@@ -349,3 +349,100 @@ Deferred:
 - Debug-build lock-ordering checker — code review enforces today.
 
 All filed in `docs/rationale/deferred-decisions.md`.
+
+---
+
+## 2026-05-20 — Phase 1, slice 3: drop the `alloc` crate; `libkern` heap containers
+
+Third Phase 1 slice. Reverses part of slice 2: the kernel no longer
+registers a `#[global_allocator]` and will not use the `alloc` crate.
+In its place, `kernel/src/libkern/` gains the first hand-rolled,
+fallible heap containers — `KBox`, `KVec`, `KString` — that the rest of
+the kernel will build on. Supersedes the slice-2 decision
+"**registers a `#[global_allocator]`** so `extern crate alloc` is
+usable from kernel code from here onward."
+
+What's in the build:
+
+- `kernel/src/libkern/` — new `kbox.rs`, `kvec.rs`, `kstring.rs`
+  modules, plus an `AllocError` type in `mod.rs`. `KBox<T>` is a
+  fallible owned heap pointer; `KVec<T>` a fallible growable array;
+  `KString` a fallible UTF-8 string wrapping `KVec<u8>`. All three
+  call `mm::slab::{kmalloc, kfree}` directly. A `kformat!` macro
+  (`core::fmt::Write` on `KString`) gives `format!`-style output that
+  returns `Result<KString, AllocError>` instead of aborting.
+- `kernel/src/main.rs` — the `#[global_allocator] static ALLOCATOR`
+  is removed.
+- `kernel/src/mm/slab.rs` — `KernelAllocator` and its
+  `core::alloc::GlobalAlloc` impl are removed. `kmalloc` / `kzalloc` /
+  `kfree` remain as the slab's public surface; doc comments updated.
+- `kernel/src/mm/test_support.rs` — `#[cfg(test)]` helper that boots
+  the global `BUDDY` / `SLAB_CACHES` statics against a leaked host
+  buffer (via `std::sync::Once`), so the `libkern` containers can be
+  host-tested through the real `kmalloc` / `kfree` path.
+- `docs/architecture/memory-management.md` — initialisation-order
+  section updated to drop the `extern crate alloc` claim.
+
+Decisions worth recording:
+
+- **No `#[global_allocator]`; no `alloc` crate.** `alloc`'s every
+  type (`Box::new`, `Vec::push`, `BTreeMap::insert`, …) aborts the
+  process on allocation failure. A kernel must propagate OOM as a
+  `Result`. On stable Rust — which the project is committed to — there
+  is no fallible `Box::new` and no fallible `BTreeMap::insert` at all,
+  so `alloc` cannot meet the kernel's allocation contract. The kernel
+  CLAUDE.md already named `KBox` / `KVec` / `KString` as the kernel's
+  containers; enabling `alloc` was the deviation, and slice 2's
+  registration is now reverted.
+- **The registration is *removed*, not merely left unused.** With no
+  registered global allocator, a future `extern crate alloc` plus any
+  allocating type fails to *link* ("no global memory allocator
+  found"). That is linker-enforced discipline, strictly stronger than
+  a clippy lint or a code-review rule — consistent with the project's
+  preference (e.g. typestate over const-generics) for letting the
+  toolchain enforce invariants.
+- **`KBox` / `KVec` bypass `GlobalAlloc` entirely.** They call
+  `kmalloc` / `kfree` as plain functions. `kfree` recovers the size
+  class from the slab descriptor, so the containers store no `Layout`
+  and `Drop` is just `kfree(ptr)`. There is no `krealloc`, so `KVec`
+  growth is allocate-copy-free; fixed slab size classes preclude
+  in-place growth regardless.
+- **Zero-sized types never touch the allocator.** `KBox<T>` /
+  `KVec<T>` for a ZST use `NonNull::dangling()` and never call
+  `kmalloc` / `kfree`, mirroring `core`/`std` practice. This is also
+  why `kfree`'s ZST-sentinel hazard (noted in slab.rs) is safe: the
+  containers never hand a ZST pointer to `kfree`.
+- **`KBox::try_new` aborts, not `Err`s, if called before
+  `slab_init`.** That path is a use-before-init bug, not an
+  out-of-memory condition; `kmalloc`'s existing pre-init panic (slice
+  2) is the right tripwire and is left in place. The container docs
+  state this explicitly.
+- **Deferred the intrusive list, red-black tree, and `KArc`.** The
+  implementation plan grouped six structures into one memory-
+  foundation item. Only `KBox` / `KVec` / `KString` are built now:
+  they have zero design risk and a consumer within one or two slices.
+  The other three are scheduled just-in-time, because each one's API
+  is defined by a consumer that does not exist yet — the intrusive
+  list by the scheduler run queue / wait queues; the tree by the VMA
+  manager (which needs the *interval-augmented* variant, so a plain
+  `RbTree` would be built twice or wrong); `KArc` / `ObjectRef` by
+  `KObjectHeader` and the seqlock protocol. Building them speculatively
+  now would be guessing. The plan's grouping is annotated inline.
+- **`mm::test_support` drives the *global* allocator for tests.** The
+  buddy and slab test suites use *local* allocators (`FakeMem` +
+  `LocalBuddy`) to stay hermetic. The `libkern` containers have no
+  allocator-injection seam — they call the global `kmalloc` / `kfree`
+  by design — so their host tests need the real statics live. A
+  `Once`-guarded init against a leaked 16 MiB host buffer provides
+  that; the slab/buddy locks make sharing it across parallel tests
+  sound. An allocator-injection seam on `KBox` / `KVec` was rejected:
+  it would complicate every signature to serve tests only, and the
+  whole point of these types is that they are *not* generic over an
+  allocator.
+
+Verification:
+
+- `cargo xtask test` — host tests pass, including the new `libkern`
+  suites (`KBox`, `KVec`, `KString`).
+- `cargo xtask build` — kernel ELF builds clean for the
+  `x86_64-unknown-none` target with no `#[global_allocator]`.

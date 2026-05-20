@@ -65,15 +65,6 @@ static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
 #[unsafe(link_section = ".limine_requests_end")]
 static REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 
-// --- Global allocator ---------------------------------------------------
-//
-// The slab allocator backs `core::alloc::GlobalAlloc` for the kernel.
-// Until `mm::slab::slab_init()` runs, any allocation through this
-// instance panics loudly — there is no silent "not ready" state.
-
-#[global_allocator]
-static ALLOCATOR: mm::slab::KernelAllocator = mm::slab::KernelAllocator::new();
-
 // --- Entry point --------------------------------------------------------
 
 /// ELF entry point. Limine jumps here after setting up long mode, paging,
