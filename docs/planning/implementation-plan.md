@@ -79,12 +79,27 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   - Uses Limine's HHDM for physical-to-virtual translation
   - Host-testable: write the buddy logic with mocked free lists; run in `cargo test`
 - [x] SLUB-inspired slab allocator on top of buddy
-  - Also wires the buddy allocator into the boot path and registers the
-    slab as `#[global_allocator]`. `extern crate alloc` is now usable
-    kernel-wide. See `docs/architecture/memory-management.md`.
-- [ ] `KBox<T>` and `KVec<T>` in kernel's `libkern` module/crate
-- [ ] Other kernel data structures: `KString`, intrusive linked list, red-black tree
-- [ ] `Arc`-equivalent for refcounted kernel object references (`KArc<T>` or similar — name TBD)
+  - Wires the buddy allocator into the boot path. Exposes `kmalloc` /
+    `kfree` / `kzalloc`. See `docs/architecture/memory-management.md`.
+  - Note: 2026-05-20 — the slab originally also registered a
+    `#[global_allocator]` to enable `extern crate alloc`. That was
+    removed: kernel code uses the fallible `libkern` containers, not
+    `alloc`. See the decision log entry of 2026-05-20.
+- [x] `KBox<T>` and `KVec<T>` in kernel's `libkern` module
+- [x] `KString` + `core::fmt::Write` + `kformat!` in `libkern`
+- [ ] Intrusive linked list — deferred to the scheduler / wait-queue
+  slice, where its first real consumer lands
+- [ ] Red-black / interval tree — deferred to the VMA slice; build the
+  interval-augmented variant directly against the VMA manager's needs
+- [ ] `Arc`-equivalent for refcounted kernel object references
+  (`KArc` / `ObjectRef`) — deferred to the kernel-object-infrastructure
+  slice; its shape depends on `KObjectHeader` + the seqlock protocol
+  - Note: 2026-05-20 — the original three lines grouped six structures
+    into the memory foundation. Reordered to a just-in-time schedule:
+    `KBox` / `KVec` / `KString` now (zero design risk, needed within
+    1–2 slices); the intrusive list, tree, and `KArc` when their first
+    consumer lands, since each one's API is defined by a consumer that
+    does not exist yet. See the decision log entry of 2026-05-20.
 
 #### Address spaces and paging
 

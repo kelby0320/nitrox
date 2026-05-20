@@ -117,12 +117,17 @@ The single owner of the buddy allocator. Three responsibilities:
 2. `kernel_main` checks the base-revision marker.
 3. `init_memory` reads `MEMMAP_REQUEST.response` and `HHDM_REQUEST.response`,
    then calls `heap::init_buddy(memmap, hhdm_offset)` followed by `slab::slab_init()`.
-4. From here on, `extern crate alloc` is usable from any kernel code:
-   `Box`, `Vec`, `Arc` all route through `KernelAllocator` and back to
-   the slab.
+4. From here on `kmalloc` / `kfree` work, and with them the fallible
+   `libkern` containers (`KBox`, `KVec`, `KString`).
 
 Calling `kmalloc` / `kfree` before `slab_init` panics with a clear
 message — there is no silent "not ready" mode.
+
+The kernel registers no `#[global_allocator]` and does not use the
+`alloc` crate: every `alloc` type aborts on allocation failure, which
+the kernel cannot tolerate. `KBox` / `KVec` / `KString` call `kmalloc` /
+`kfree` directly and surface exhaustion as `AllocError`. See the
+decision log entry of 2026-05-20.
 
 ## Locking
 

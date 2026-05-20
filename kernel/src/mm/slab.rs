@@ -2,8 +2,11 @@
 //!
 //! Layer 2 of the three-layer memory management design (per
 //! `docs/architecture/memory-management.md`). Sits between the buddy
-//! allocator (which hands out page frames) and the kernel `GlobalAlloc`
-//! impl that backs `extern crate alloc`'s `Box`/`Vec`.
+//! allocator (which hands out page frames) and `libkern`'s heap
+//! containers (`KBox`, `KVec`, `KString`), which call [`kmalloc`] /
+//! [`kfree`] directly. The kernel registers no `#[global_allocator]`
+//! and does not use the `alloc` crate — see the decision log entry of
+//! 2026-05-20.
 //!
 //! ## Geometry
 //!
@@ -41,7 +44,6 @@
 //! lock across a `buddy.alloc()` call, and that is the only allocator-
 //! to-allocator nesting permitted.
 
-use core::alloc::{GlobalAlloc, Layout};
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 
@@ -350,9 +352,9 @@ static SLAB_CACHES: [SlabCache; 7] = [
     SlabCache::new(),
 ];
 
-/// Flag inspected by the `GlobalAlloc` impl so a too-early allocation
-/// (before [`slab_init`]) panics loudly rather than silently corrupting
-/// the heap.
+/// Flag inspected by [`kmalloc`] so a too-early allocation (before
+/// [`slab_init`]) panics loudly rather than silently corrupting the
+/// heap.
 static SLAB_INITIALISED: AtomicBool = AtomicBool::new(false);
 
 /// Initialise the seven size-bucket caches. Call exactly once during
@@ -439,9 +441,10 @@ pub fn kfree(ptr: *mut u8) {
     // either a slab descriptor with non-null `owner`, or a large-alloc
     // descriptor with null `owner`. The ZST sentinel is not a valid
     // pointer into our pages and would mask to some garbage page; for
-    // safety the caller must not free a ZST allocation. (Rust's
-    // `GlobalAlloc` contract forbids `dealloc(ptr, layout)` when
-    // `layout.size() == 0`, so this is enforced upstream.)
+    // safety the caller must not free a ZST allocation. The `libkern`
+    // containers uphold this: `KBox` / `KVec` represent zero-sized types
+    // with a dangling pointer and never route them through `kmalloc` /
+    // `kfree`.
     let owner = unsafe { (*desc).owner };
     if owner.is_null() {
         large_free(ptr, &HeapBuddy);
@@ -499,31 +502,6 @@ fn large_free<P: BuddyPager>(ptr: *mut u8, pager: &P) {
     let order = BuddyAllocator::order_for_size(total);
     let phys = PhysAddr::new((page0 as u64).wrapping_sub(pager.hhdm_offset()));
     pager.free(phys, order);
-}
-
-/// Unit struct exported so a `#[global_allocator]` `static` can be
-/// declared in `main.rs`. The slab is the kernel's `core::alloc::GlobalAlloc`.
-pub struct KernelAllocator;
-
-impl KernelAllocator {
-    pub const fn new() -> Self {
-        Self
-    }
-}
-
-// SAFETY: all the storage `kmalloc` hands out is properly aligned per
-// the requested layout and is owned by the caller until `kfree` runs;
-// no two outstanding allocations overlap.
-unsafe impl GlobalAlloc for KernelAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        kmalloc(layout.size(), layout.align())
-    }
-    unsafe fn dealloc(&self, ptr: *mut u8, _layout: Layout) {
-        kfree(ptr);
-    }
-    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
-        kzalloc(layout.size(), layout.align())
-    }
 }
 
 #[inline]
