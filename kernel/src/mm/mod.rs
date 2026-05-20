@@ -8,6 +8,8 @@
 //! consume.
 
 pub mod buddy;
+pub mod heap;
+pub mod slab;
 
 /// Page size in bytes. The kernel uses 4 KiB pages on x86_64; large pages
 /// are an optimisation handled inside the VMM, not a different unit of

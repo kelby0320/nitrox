@@ -1,14 +1,17 @@
-//! Nitrox kernel — Phase 0 entry point.
+//! Nitrox kernel entry point.
 //!
 //! Boot path:
 //!   1. UEFI firmware loads Limine from the ESP.
 //!   2. Limine parses our ELF, locates our request statics (the
 //!      `.limine_requests` bracket below), sets up long mode + paging +
 //!      a framebuffer, and jumps to [`_start`].
-//!   3. We verify the bootloader honoured base revision 6, fetch the
-//!      framebuffer response, render a boot message, and halt forever.
+//!   3. We verify the bootloader honoured base revision 6, bring up the
+//!      buddy and slab allocators from Limine's memory map and HHDM,
+//!      then render the boot screen.
 //!
-//! No allocator, no IDT, no userspace yet — Phase 1 adds those.
+//! After `kernel_main` returns, [`_start`] enters [`arch::halt_loop`]
+//! forever. The kernel does no further work in this slice; Phase 1's
+//! remaining items (IDT, scheduler, syscalls, userspace) land next.
 
 #![no_std]
 #![no_main]
@@ -18,8 +21,10 @@ use core::panic::PanicInfo;
 use nitrox_kernel::arch;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::limine::{
-    BaseRevision, FramebufferRequest, RequestsEndMarker, RequestsStartMarker,
+    BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
+    RequestsStartMarker,
 };
+use nitrox_kernel::mm;
 
 // --- Limine request statics ---------------------------------------------
 //
@@ -37,6 +42,21 @@ static BASE_REVISION: BaseRevision = BaseRevision::new(6);
 #[unsafe(link_section = ".limine_requests")]
 static mut FRAMEBUFFER_REQUEST: FramebufferRequest = FramebufferRequest::new();
 
+// `static mut`, not `static`: Limine writes to the `response` field
+// after the kernel is loaded but before `_start` runs. With a plain
+// `static`, rustc is allowed to constant-fold reads against the
+// const-initialised null and never observe Limine's write — which
+// silently breaks `init_memory`. The `static mut` here mirrors
+// `FRAMEBUFFER_REQUEST` above; `BASE_REVISION` gets away without it
+// because its `supported()` reads via `ptr::read_volatile`.
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
+
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
 static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
@@ -44,6 +64,15 @@ static REQUESTS_START: RequestsStartMarker = RequestsStartMarker::new();
 #[used]
 #[unsafe(link_section = ".limine_requests_end")]
 static REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
+
+// --- Global allocator ---------------------------------------------------
+//
+// The slab allocator backs `core::alloc::GlobalAlloc` for the kernel.
+// Until `mm::slab::slab_init()` runs, any allocation through this
+// instance panics loudly — there is no silent "not ready" state.
+
+#[global_allocator]
+static ALLOCATOR: mm::slab::KernelAllocator = mm::slab::KernelAllocator::new();
 
 // --- Entry point --------------------------------------------------------
 
@@ -60,6 +89,15 @@ fn kernel_main() {
     if !BASE_REVISION.supported() {
         // Limine refused our protocol revision. No framebuffer is safe to
         // touch in this state — just halt.
+        return;
+    }
+
+    // Bring up the physical-memory buddy allocator and the slab on top
+    // of it before any other code runs. Returns false if Limine didn't
+    // populate one of the required responses; in that case we have no
+    // way to manage memory and there's nothing useful we can do, so we
+    // fall through to halt.
+    if !init_memory() {
         return;
     }
 
@@ -95,6 +133,36 @@ fn kernel_main() {
     };
 
     draw_nitrox_band(&mut writer);
+}
+
+/// Bring up the buddy allocator and the slab on top of it. Returns false
+/// if Limine didn't populate either of the requests we depend on.
+fn init_memory() -> bool {
+    // SAFETY: `MEMMAP_REQUEST` and `HHDM_REQUEST` live in
+    // `.limine_requests*`. Limine writes the response pointer into each
+    // before jumping to `_start`. Reading through a raw-pointer copy
+    // avoids the optimiser caching the pre-Limine null.
+    let memmap_resp = unsafe { (&raw const MEMMAP_REQUEST).read().response };
+    if memmap_resp.is_null() {
+        return false;
+    }
+    let hhdm_resp = unsafe { (&raw const HHDM_REQUEST).read().response };
+    if hhdm_resp.is_null() {
+        return false;
+    }
+    // SAFETY: Each non-null response pointer guarantees Limine populated
+    // a valid response of the corresponding type. The responses live in
+    // bootloader-reclaimable memory which we have not yet reclaimed.
+    let memmap = unsafe { &*memmap_resp };
+    let hhdm_offset = unsafe { (*hhdm_resp).offset };
+    // SAFETY: `memmap` is a live Limine response and `hhdm_offset` is
+    // the bootloader's HHDM base — together they satisfy the contract
+    // of `BuddyAllocator::new` (see `kernel/src/mm/buddy.rs`).
+    unsafe {
+        mm::heap::init_buddy(memmap, hhdm_offset);
+    }
+    mm::slab::slab_init();
+    true
 }
 
 /// Render the boot screen as a scuba Nitrox tank decal: a yellow band
@@ -135,7 +203,7 @@ fn draw_nitrox_band(writer: &mut FbWriter) {
 
     // Phase indicator below the band, slightly dimmer so the eye reads
     // the tank decal first.
-    let status = b"PHASE 0: BOOT OK";
+    let status = b"PHASE 1: ALLOCATORS UP";
     let status_scale = 2;
     let status_w = FbWriter::text_width(status, status_scale);
     let status_x = (width - status_w) / 2;
