@@ -99,7 +99,7 @@ struct HandleEntry {
 }
 ```
 
-Total size: 64 bytes (one cache line on amd64). The 64-byte alignment is enforced.
+Total size: 64 bytes (one cache line on x86_64). The 64-byte alignment is enforced.
 
 ## Validation algorithm
 
@@ -207,7 +207,7 @@ Generic rights (`DUPLICATE`, `TRANSFER`, `INSPECT`, `WAIT`) are valid on any han
 
 ## Endianness
 
-All multi-byte integers in handle table entries and the `RawHandle` value are little-endian on amd64 (native). On aarch64, native little-endian is also assumed; big-endian variants are out of scope.
+All multi-byte integers in handle table entries and the `RawHandle` value are little-endian on x86_64 (native). On aarch64, native little-endian is also assumed; big-endian variants are out of scope.
 
 ## Where to read more
 

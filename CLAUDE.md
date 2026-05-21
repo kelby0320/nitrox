@@ -4,7 +4,7 @@ Project-level instructions for Claude Code working on Nitrox.
 
 ## What this project is
 
-Nitrox is a hobby operating system written in Rust. Successor to Latte (kelby0320/latte, an earlier Unix-like OS in C). Targets amd64 UEFI primarily; aarch64 designed in via the architecture abstraction layer but not yet implemented. The system architecture rejects POSIX, Unix signals, ambient authority, and synchronous syscalls; it preserves Unix's composable pipelines, everything-as-a-resource philosophy, and powerful shell environment, on a foundation of capability-based access control plus per-process namespaces.
+Nitrox is a hobby operating system written in Rust. Successor to Latte (kelby0320/latte, an earlier Unix-like OS in C). Targets x86_64 UEFI primarily; aarch64 designed in via the architecture abstraction layer but not yet implemented. The system architecture rejects POSIX, Unix signals, ambient authority, and synchronous syscalls; it preserves Unix's composable pipelines, everything-as-a-resource philosophy, and powerful shell environment, on a foundation of capability-based access control plus per-process namespaces.
 
 For the full architecture: read `docs/architecture/overview.md` first. For specific decisions and their rationale: `docs/rationale/`. For exact contracts (ABIs, formats): `docs/spec/`.
 
@@ -24,7 +24,7 @@ These shape every decision; deviation requires explicit discussion:
 - **Rust throughout.** Kernel, userspace services, and runtime libraries.
 - **Stable Rust only.** No nightly features. The `Handle<T, M>` design uses typestate markers rather than const-generic bitflags specifically to stay on stable.
 - **NASM** for the small amount of unavoidable assembly: kernel entry stub, context switch, user-memory copy routines.
-- **Cargo + cargo xtask** for builds. The `xtask` workspace provides higher-level commands (`xtask qemu`, `xtask build-initramfs`, etc.).
+- **Cargo + cargo xtask** for builds. The `xtask` workspace provides higher-level commands (`xtask qemu`, `xtask image`, etc.).
 - **Limine** as the bootloader.
 
 ## Build commands
@@ -32,12 +32,16 @@ These shape every decision; deviation requires explicit discussion:
 Standard development loop:
 
 ```
-cargo xtask build          # build kernel + userspace, assemble disk image
-cargo xtask qemu           # build and launch under QEMU
-cargo xtask qemu-debug     # launch QEMU with GDB stub enabled
+cargo xtask build          # build the kernel ELF
+cargo xtask image          # build + assemble the UEFI-bootable disk image
+cargo xtask qemu           # build, assemble the image, and launch under QEMU
+cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
 cargo xtask test           # host-side unit tests
-cargo xtask test-qemu      # integration tests in QEMU with isa-debug-exit
 ```
+
+`cargo xtask test-qemu` (QEMU integration tests via the `isa-debug-exit`
+device) is planned but not yet implemented — see
+`docs/rationale/deferred-decisions.md`.
 
 Don't run kernel code on the host. Don't run `cargo build` directly in the kernel workspace without the custom target — it will fail.
 
@@ -109,4 +113,4 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phase 0 (foundation) work is the current focus. See `docs/history/decision-log.md` for current implementation phase.
+Phase 1 (kernel substrate) is the current focus; Phase 0 (foundation) is complete. See `docs/history/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

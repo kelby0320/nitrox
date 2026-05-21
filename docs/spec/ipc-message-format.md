@@ -13,7 +13,7 @@ This document specifies the on-wire format of IPC messages — `IpcMsg` and its 
 | `IPC_HANDLE_MAX` | 8 | Maximum transferable handles per message |
 | `IPC_HEADER_SIZE` | 24 | Size of `IpcMsgHeader` in bytes |
 
-`IPC_MSG_SIZE = IPC_HEADER_SIZE + IPC_PAYLOAD_SIZE + (IPC_HANDLE_MAX × 8) - alignment_padding`. The alignment is deliberate: `IpcMsg` is one page on amd64.
+`IPC_MSG_SIZE = IPC_HEADER_SIZE + IPC_PAYLOAD_SIZE + (IPC_HANDLE_MAX × 8) - alignment_padding`. The alignment is deliberate: `IpcMsg` is one page on x86_64.
 
 ## IpcMsg layout
 
@@ -186,7 +186,7 @@ The IPC channel itself is **not** a bulk data transport. It carries control mess
 
 ## Endianness and alignment
 
-All multi-byte fields are little-endian (native on amd64 and aarch64). The `IpcMsg` is page-aligned; field alignments follow standard `#[repr(C)]` rules. No packing.
+All multi-byte fields are little-endian (native on x86_64 and aarch64). The `IpcMsg` is page-aligned; field alignments follow standard `#[repr(C)]` rules. No packing.
 
 ## Where to read more
 

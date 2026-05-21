@@ -251,7 +251,7 @@ The recipient ABI version is recorded at process spawn time based on the linked 
 
 ## Endianness
 
-All multi-byte fields are little-endian on amd64 (native) and aarch64 (native little-endian assumed).
+All multi-byte fields are little-endian on x86_64 (native) and aarch64 (native little-endian assumed).
 
 ## Field alignment and packing
 

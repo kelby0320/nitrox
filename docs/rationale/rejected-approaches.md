@@ -86,7 +86,7 @@ Entries are organized roughly by subsystem.
 
 ## Lazy FPU save (TS-bit trickery)
 
-**Approach:** Mark the FPU as inactive on context switch via the TS bit on amd64. The first FPU instruction in the new thread traps; the trap handler saves the previous thread's FPU state and restores the new one. Threads that never touch FPU save no state.
+**Approach:** Mark the FPU as inactive on context switch via the TS bit on x86_64. The first FPU instruction in the new thread traps; the trap handler saves the previous thread's FPU state and restores the new one. Threads that never touch FPU save no state.
 
 **Why considered:** Smaller context switch cost for threads that don't use SSE/AVX. Historically common; Linux did this for years.
 
