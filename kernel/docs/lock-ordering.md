@@ -2,7 +2,7 @@
 
 This document records the rank ordering for every long-lived lock in the
 Nitrox kernel. Acquisition must follow the order from rank 1 down to
-rank 6; taking a lock at rank N while holding any lock at rank M < N
+rank 7; taking a lock at rank N while holding any lock at rank M < N
 inverts the order and risks deadlock. The kernel's CLAUDE.md references
 this document; the architecture overview alludes to the ranking but does
 not enumerate it.
@@ -22,6 +22,7 @@ enforced by code review.
 | 5    | IPC channel                                  | not yet present                          |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
+| 7    | Serial port (`SERIAL`)                       | live as of Phase 1 slice 4 (diagnostics) |
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
@@ -53,19 +54,39 @@ ordering remains slab → buddy and the lower lock cannot block waiting
 for the upper. If a future change makes the buddy depend on the slab,
 that closes the cycle and must be rejected at design review.
 
+## The serial lock is a leaf
+
+`SERIAL` (`kernel/src/arch/x86_64/serial.rs`) guards the COM1 UART. It is
+a leaf at rank 7: `write_byte` does nothing but poll an I/O port and emit
+a byte — it allocates nothing, calls into no other subsystem, and takes
+no other lock. It may therefore be acquired while holding any
+higher-ranked lock, and nothing is ever acquired while holding it.
+
+The panic handler and the CPU exception handlers do **not** take this
+lock. They write through `serial::emergency_writer()`, an unsynchronised
+path that drives the UART directly. `SpinLock` cannot be force-unlocked,
+so a handler that tried to lock `SERIAL` after a fault that struck while
+the lock was held would deadlock. Bypassing the lock is sound only
+because Phase 1 is single-CPU with interrupts masked: at fault time no
+other context can be driving the UART. This must be revisited at SMP.
+
 ## Interrupt semantics
 
-The Phase 1 `SpinLock` (`kernel/src/libkern/spinlock.rs`) does **not**
-mask interrupts. Phase 1 runs with interrupts disabled throughout — no
-IDT, PIC, or APIC has been brought up — so masking is unnecessary today.
+The `SpinLock` (`kernel/src/libkern/spinlock.rs`) does **not** mask
+interrupts. As of the Phase 1 diagnostics slice an IDT is installed, but
+it handles only CPU exceptions — non-maskable faults — and the kernel
+still never executes `sti`, so no hardware IRQ ever fires. The exception
+handlers take no lock at all (they use the unsynchronised emergency
+serial path described above and then halt), so there is still exactly
+one lock-taking execution context and masking remains unnecessary.
 
-When interrupts are enabled (the upcoming IDT slice), every spin lock
-that protects data touched by an IRQ handler must switch to an
-`IrqSpinLock` variant that saves and restores `RFLAGS` on lock/unlock.
-The audit will visit each call site and decide; both allocator locks
-(6a and 6b) are likely candidates because allocations from IRQ context
-are forbidden but the locks themselves may be observed during shutdown
-paths that race with interrupts.
+When hardware interrupts are eventually enabled (a later slice, with
+PIC/APIC bring-up), every spin lock that protects data touched by an IRQ
+handler must switch to an `IrqSpinLock` variant that saves and restores
+`RFLAGS` on lock/unlock. The audit will visit each call site and decide;
+both allocator locks (6a and 6b) are likely candidates because
+allocations from IRQ context are forbidden but the locks themselves may
+be observed during shutdown paths that race with interrupts.
 
 Until that variant exists: no IRQ handler may take any `SpinLock`.
 

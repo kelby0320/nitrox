@@ -6,12 +6,13 @@
 //!      `.limine_requests` bracket below), sets up long mode + paging +
 //!      a framebuffer, and jumps to [`_start`].
 //!   3. We verify the bootloader honoured base revision 6, bring up the
+//!      serial console, install the kernel's GDT/TSS/IDT, bring up the
 //!      buddy and slab allocators from Limine's memory map and HHDM,
 //!      then render the boot screen.
 //!
 //! After `kernel_main` returns, [`_start`] enters [`arch::halt_loop`]
 //! forever. The kernel does no further work in this slice; Phase 1's
-//! remaining items (IDT, scheduler, syscalls, userspace) land next.
+//! remaining items (paging, scheduler, syscalls, userspace) land next.
 
 #![no_std]
 #![no_main]
@@ -20,6 +21,7 @@ use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
+use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
     BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
     RequestsStartMarker,
@@ -83,14 +85,29 @@ fn kernel_main() {
         return;
     }
 
-    // Bring up the physical-memory buddy allocator and the slab on top
-    // of it before any other code runs. Returns false if Limine didn't
-    // populate one of the required responses; in that case we have no
-    // way to manage memory and there's nothing useful we can do, so we
-    // fall through to halt.
+    // Serial first: it touches only fixed I/O ports — no dependency on
+    // the allocator or the IDT — so every step after this can report its
+    // progress, and its failures, to the console.
+    arch::serial::init();
+    kprintln!("Nitrox kernel — diagnostics online");
+
+    // Install the kernel's own GDT + TSS, then the IDT. The IDT's gates
+    // reference the kernel code selector that only becomes ours once our
+    // GDT is loaded, and the double-fault gate needs the TSS's IST stack.
+    arch::gdt::init();
+    arch::idt::init();
+    kprintln!("CPU tables installed (GDT/TSS/IDT)");
+
+    // Bring up the physical-memory buddy allocator and the slab on top of
+    // it. This is the first code that walks Limine's structures and pokes
+    // the allocator — the first place a bug can fault — so the IDT is
+    // live before we reach it. Returns false if Limine didn't populate a
+    // required response, in which case there is nothing useful to do.
     if !init_memory() {
+        kprintln!("init_memory failed — halting");
         return;
     }
+    kprintln!("allocators up");
 
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
     // jumping to `_start`. We are the sole reader; no other thread exists.
@@ -223,9 +240,18 @@ fn pick_scale(text: &[u8], max_w: usize, max_h: usize) -> usize {
 }
 
 #[panic_handler]
-fn panic(_info: &PanicInfo) -> ! {
-    // Phase 0 has no logging surface beyond the framebuffer, which we may
-    // not own at panic time. Halt and let a hardware-debug session pick
-    // it up.
-    arch::halt_loop();
+fn panic(info: &PanicInfo) -> ! {
+    use core::fmt::Write;
+
+    // Use the unsynchronised emergency serial path, not `kprintln!`: a
+    // panic can occur while `SERIAL`'s lock is held, and re-locking would
+    // deadlock. Bypassing the lock is sound under Phase 1's single-CPU,
+    // interrupts-masked model — no other context can be driving COM1.
+    let mut w = arch::serial::emergency_writer();
+    let _ = writeln!(w, "\n*** KERNEL PANIC ***");
+    if let Some(loc) = info.location() {
+        let _ = writeln!(w, "  at {}:{}:{}", loc.file(), loc.line(), loc.column());
+    }
+    let _ = writeln!(w, "  {}", info.message());
+    arch::halt_loop()
 }

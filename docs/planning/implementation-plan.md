@@ -126,26 +126,36 @@ work debuggable. Until it lands, `panic!`/`expect()` halt silently and a
 CPU fault triple-faults with no output. Serial and a dump-and-halt IDT
 are one unit; both belong before the first paging code.
 
-- [ ] Port I/O wrappers (`inb`/`outb`/`inw`/`outw`/`inl`/`outl`) in
-  `kernel/src/arch/x86_64/` — first hardware-register surface; per
-  `kernel/CLAUDE.md`, all port I/O lives in the arch layer
-- [ ] Polled 16550 UART driver on COM1 in `kernel/src/arch/x86_64/serial.rs`
+- [x] Port I/O wrappers (`inb`/`outb`/`inw`/`outw`/`inl`/`outl`) plus a
+  `read_cr2` in `kernel/src/arch/x86_64/regs.rs` — per `kernel/CLAUDE.md`,
+  hardware-register access lives in the arch layer's `regs.rs`
+- [x] Polled 16550 UART driver on COM1 in `kernel/src/arch/x86_64/serial.rs`
   - `init` + `write_byte`, no interrupts, no allocation
   - Behind a `SpinLock`; usable before paging and inside the panic handler
-- [ ] `kprint!` / `kprintln!` macros over a `core::fmt::Write` serial sink
+- [x] `kprint!` / `kprintln!` macros over a `core::fmt::Write` serial sink
   - Single sink for now; the multi-sink logging service is Phase 3 — do
     not pre-build it
-- [ ] Rewrite `#[panic_handler]` to dump `PanicInfo` (location + message)
+- [x] Rewrite `#[panic_handler]` to dump `PanicInfo` (location + message)
   to serial before halting
-- [ ] Minimal IDT with dump-and-halt handlers for `#UD`, `#GP`, `#PF`, `#DF`
+- [x] Minimal IDT with dump-and-halt handlers for CPU exceptions
   - Dumps vector, error code, `CR2`, and key registers to serial
-  - IST with a dedicated double-fault stack
+  - IST with a dedicated double-fault stack; the kernel's own GDT + TSS
+    were added with it (the IST needs a TSS, the TSS needs a descriptor
+    in a GDT the kernel owns)
   - IRQs stay masked (no DPCs yet), so `SpinLock` is still sufficient;
     `IrqSpinLock` arrives with the later interrupt-controller work
   - Dump-and-halt only; the exception-table-consulting `#PF` handler is
     a later item under "User memory access"
-- [ ] Host-test the UART register-sequence logic and the `kprintln!`
-  formatting path where they do not need the kernel runtime
+  - Note: 2026-05-20 — handlers cover all 32 CPU exception vectors
+    (0–31), not just `#UD`/`#GP`/`#PF`/`#DF`: a uniform 32-stub macro is
+    no more work and gives complete coverage. Stubs are naked Rust
+    functions (`#[unsafe(naked)]` + `naked_asm!`), the `x86-interrupt`
+    ABI being nightly-only.
+- [x] Host-test the descriptor-encoding arithmetic (`IdtEntry::set_handler`,
+  the TSS descriptor encoder)
+  - Note: 2026-05-20 — the UART register sequence and the `kprintln!`
+    formatting path were judged low-value to host-test (a fixed `outb`
+    list; `core::fmt`'s own code) and are verified on target instead.
 
 Done when: `xtask qemu` shows a kernel banner and boot progress on the
 serial console, a deliberate `panic!` prints file/line/message, and a
