@@ -1,4 +1,9 @@
-//! x86_64-specific primitives for Phase 0.
+//! x86_64-specific primitives.
+
+pub mod gdt;
+pub mod idt;
+pub mod regs;
+pub mod serial;
 
 use core::arch::asm;
 
