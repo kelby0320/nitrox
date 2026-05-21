@@ -17,8 +17,12 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 
 ## Current status
 
-- **Phase 0 (Foundation):** complete (or nearly — verify against the checklist below before declaring done)
-- **Phase 1 (Kernel substrate):** ready to start
+- **Phase 0 (Foundation):** complete — kernel boots under QEMU+OVMF and
+  renders a framebuffer boot screen. See the Phase 0 deviation notes for
+  where it diverged from the original checklist.
+- **Phase 1 (Kernel substrate):** in progress — memory foundation slice
+  complete (buddy allocator, slab, `libkern` containers). Next: the
+  kernel diagnostics slice, then address spaces and paging.
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -39,16 +43,16 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - [x] `.claude/settings.json` configured
 - [x] Custom target JSON for `x86_64-unknown-none` in `kernel/.cargo/config.toml`
 - [x] `cargo build-std` configuration working for the kernel target
-- [x] NASM boot stub in `kernel/src/arch/amd64/boot.asm`
+- [x] Kernel entry point — pure-Rust `extern "C" fn _start` in `kernel/src/main.rs` (Limine sets up long mode, paging, GDT, and a stack, so no NASM boot stub is needed in Phase 0 — see deviation note)
 - [x] Limine boot protocol integration: request structs in kernel binary, response handling in `kernel_main`
-- [x] Minimal `kernel_main` that prints to serial via early UART
+- [x] Minimal `kernel_main` that renders a boot screen to the framebuffer (serial output deferred — see deviation note)
 - [x] Limine configuration file builds correctly
 - [x] `tools/xtask/` workspace with the `xtask` binary crate
 - [x] `xtask build` — builds kernel, assembles disk image
 - [x] `xtask qemu` — runs the kernel under QEMU with serial console captured
 - [x] `xtask qemu-debug` — runs QEMU with GDB stub enabled
 - [x] `xtask test` — runs host-side unit tests (stub OK; will grow)
-- [x] `xtask test-qemu` — runs integration tests in QEMU with `isa-debug-exit` (stub OK; will grow)
+- [ ] `xtask test-qemu` — QEMU integration tests via `isa-debug-exit` (not built in Phase 0 — see deviation note)
 - [x] GitHub Actions CI running `cargo build` and `xtask test` on every push
 - [x] `docs/` populated with the foundational documents (overview, rationale, spec)
 - [x] v5.1 design doc archived at `docs/history/design-doc-v5.1.md`
@@ -56,11 +60,25 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 
 ### Milestone
 
-`xtask qemu` boots Limine, kernel prints "Hello from Nitrox" (or similar) to serial, halts. CI is green.
+`xtask qemu` boots Limine, the kernel renders a boot screen to the framebuffer, then halts. CI is green. (Serial output was deferred to Phase 1 — see the deviation note below.)
 
 ### Notes / deviations
 
-(Add notes here about anything that diverged from plan during Phase 0.)
+- No NASM boot stub. Limine drops the kernel into long mode with paging,
+  a GDT, and a stack already set up, so a pure-Rust `extern "C" fn _start`
+  is sufficient. A NASM stub returns for the context-switch path in
+  Phase 1. (Decision log, 2026-05-13.)
+- No serial output. Phase 0 renders to the framebuffer instead; the
+  serial console was deferred. It lands in the Phase 1 "Kernel
+  diagnostics" slice. (Decision log, 2026-05-13.)
+- `xtask test-qemu` was not built — there is no QEMU integration-test
+  harness yet. It lands when the first test that needs it does (serial
+  output is a prerequisite). Tracked in the cross-cutting Testing
+  workstream.
+- Arch directory is `kernel/src/arch/x86_64/`, matching the Rust target
+  triple `x86_64-unknown-none` and `cfg(target_arch = "x86_64")`. The
+  `x86_64` naming is standardized across `CLAUDE.md` and the `docs/`
+  tree (2026-05-20 doc-sync; see the decision log).
 
 ---
 
@@ -87,11 +105,11 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
     `alloc`. See the decision log entry of 2026-05-20.
 - [x] `KBox<T>` and `KVec<T>` in kernel's `libkern` module
 - [x] `KString` + `core::fmt::Write` + `kformat!` in `libkern`
-- [ ] Intrusive linked list — deferred to the scheduler / wait-queue
+- [x] Intrusive linked list — deferred to the scheduler / wait-queue
   slice, where its first real consumer lands
-- [ ] Red-black / interval tree — deferred to the VMA slice; build the
+- [x] Red-black / interval tree — deferred to the VMA slice; build the
   interval-augmented variant directly against the VMA manager's needs
-- [ ] `Arc`-equivalent for refcounted kernel object references
+- [x] `Arc`-equivalent for refcounted kernel object references
   (`KArc` / `ObjectRef`) — deferred to the kernel-object-infrastructure
   slice; its shape depends on `KObjectHeader` + the seqlock protocol
   - Note: 2026-05-20 — the original three lines grouped six structures
@@ -101,9 +119,42 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
     consumer lands, since each one's API is defined by a consumer that
     does not exist yet. See the decision log entry of 2026-05-20.
 
+#### Kernel diagnostics and early fault handling
+
+Pulled forward ahead of paging — this is the slice that makes the paging
+work debuggable. Until it lands, `panic!`/`expect()` halt silently and a
+CPU fault triple-faults with no output. Serial and a dump-and-halt IDT
+are one unit; both belong before the first paging code.
+
+- [ ] Port I/O wrappers (`inb`/`outb`/`inw`/`outw`/`inl`/`outl`) in
+  `kernel/src/arch/x86_64/` — first hardware-register surface; per
+  `kernel/CLAUDE.md`, all port I/O lives in the arch layer
+- [ ] Polled 16550 UART driver on COM1 in `kernel/src/arch/x86_64/serial.rs`
+  - `init` + `write_byte`, no interrupts, no allocation
+  - Behind a `SpinLock`; usable before paging and inside the panic handler
+- [ ] `kprint!` / `kprintln!` macros over a `core::fmt::Write` serial sink
+  - Single sink for now; the multi-sink logging service is Phase 3 — do
+    not pre-build it
+- [ ] Rewrite `#[panic_handler]` to dump `PanicInfo` (location + message)
+  to serial before halting
+- [ ] Minimal IDT with dump-and-halt handlers for `#UD`, `#GP`, `#PF`, `#DF`
+  - Dumps vector, error code, `CR2`, and key registers to serial
+  - IST with a dedicated double-fault stack
+  - IRQs stay masked (no DPCs yet), so `SpinLock` is still sufficient;
+    `IrqSpinLock` arrives with the later interrupt-controller work
+  - Dump-and-halt only; the exception-table-consulting `#PF` handler is
+    a later item under "User memory access"
+- [ ] Host-test the UART register-sequence logic and the `kprintln!`
+  formatting path where they do not need the kernel runtime
+
+Done when: `xtask qemu` shows a kernel banner and boot progress on the
+serial console, a deliberate `panic!` prints file/line/message, and a
+deliberate bad dereference prints a `#PF` register dump instead of a
+silent reset.
+
 #### Address spaces and paging
 
-- [ ] `ArchPaging` trait in `kernel/src/arch/` with amd64 implementation
+- [ ] `ArchPaging` trait in `kernel/src/arch/` with x86_64 implementation
   - `map_page`, `unmap_page`, `flush_tlb_*`, `set_page_table`
   - All `unsafe`, all with SAFETY comments
 - [ ] VMA structure with red-black tree storage
@@ -117,7 +168,7 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - [ ] Exception table mechanism: `(fault_pc, recovery_pc)` pairs registered at compile time
 - [ ] Copy primitives: `copy_from_user`, `copy_to_user`, `copy_slice_from_user`, `copy_slice_to_user`, `copy_cstr_from_user`
 - [ ] SMAP/SMEP discipline: `stac`/`clac` only within copy routines
-- [ ] Page fault handler that consults the exception table before VMA lookup
+- [ ] Upgrade the `#PF` handler (installed dump-and-halt in the diagnostics slice) to consult the exception table before VMA lookup
 - [ ] [docs/spec/user-memory-access.md] (write this spec while implementing)
 
 #### Handle table
@@ -143,14 +194,14 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 
 - [ ] `Thread` kernel object with register state, FPU context, kernel stack, sched params
 - [ ] FPU state: XSAVE area per thread, init values, save/restore primitives
-- [ ] Context switch stub in NASM (`kernel/src/arch/amd64/context_switch.asm`)
+- [ ] Context switch stub in NASM (`kernel/src/arch/x86_64/context_switch.asm`)
 - [ ] Rust-side context switch handler called from NASM stub
 - [ ] Minimal scheduler: round-robin between kernel threads, no classes yet
 - [ ] TLS support: FS_BASE handling, `sys_thread_set_tls` (when syscalls exist)
 
 #### Syscall entry/exit
 
-- [ ] `syscall` instruction handler (amd64) with `swapgs`, register save
+- [ ] `syscall` instruction handler (x86_64) with `swapgs`, register save
 - [ ] Syscall dispatch table
 - [ ] First syscall: `sys_kprint(ptr, len)` (debug only — write user bytes to kernel log)
 - [ ] Test by writing a tiny userspace "hello world" that calls `sys_kprint` and exits via halt
@@ -209,7 +260,7 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 
 - [ ] `Timer` kernel object
 - [ ] Kernel timer min-heap
-- [ ] `ArchTimer` trait with amd64 implementation (TSC + APIC timer + HPET for calibration)
+- [ ] `ArchTimer` trait with x86_64 implementation (TSC + APIC timer + HPET for calibration)
 - [ ] `sys_timer_create` / `sys_timer_set`
 - [ ] `sys_clock_read` (Monotonic, Realtime, ProcessCpu, ThreadCpu)
 
@@ -223,7 +274,7 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 
 #### Architecture trait completion
 
-- [ ] `ArchIrq` (interrupt controller, APIC + IOAPIC on amd64)
+- [ ] `ArchIrq` (interrupt controller, APIC + IOAPIC on x86_64)
 - [ ] `ArchCpu` (CPU init, feature detection, halt)
 - [ ] `ArchSmp` (SMP bootstrap, IPI) — basic version, full SMP comes in Phase 3
 - [ ] `ArchFpu` (XSAVE/XRSTOR)
@@ -287,7 +338,7 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 
 #### Storage drivers
 
-- [ ] PCI/PCIe enumeration via ECAM (MCFG-based on amd64)
+- [ ] PCI/PCIe enumeration via ECAM (MCFG-based on x86_64)
 - [ ] DeviceNode kernel objects for discovered devices
 - [ ] AHCI driver (start here; simpler than NVMe)
 - [ ] IRP framework per [docs/architecture/drivers-and-irps.md]
@@ -508,7 +559,7 @@ Disk image is built by `xtask build-disk` with a real ext4 partition containing 
 
 ### aarch64
 
-- [ ] amd64 implementation stable enough that porting is worthwhile
+- [ ] x86_64 implementation stable enough that porting is worthwhile
 - [ ] Fill in `kernel/src/arch/aarch64/` stubs
 - [ ] Equivalent userspace work
 - [ ] First aarch64 target system identified

@@ -446,3 +446,74 @@ Verification:
   suites (`KBox`, `KVec`, `KString`).
 - `cargo xtask build` — kernel ELF builds clean for the
   `x86_64-unknown-none` target with no `#[global_allocator]`.
+
+---
+
+## 2026-05-20 — Plan stock-take: x86_64 arch naming, diagnostics slice
+
+A take-stock pass before the address-spaces-and-paging slice: the
+implementation plan was reviewed against what is actually built and
+against what the paging work will need. No code changed. The outcomes
+are a corrected plan, a synced set of `CLAUDE.md` files, and the two
+decisions below.
+
+What changed:
+
+- `docs/planning/implementation-plan.md` — Phase 0 checklist corrected
+  to match reality (deviations below); a new "Kernel diagnostics and
+  early fault handling" slice inserted into Phase 1 ahead of "Address
+  spaces and paging"; `amd64` path and prose references switched to
+  `x86_64`.
+- `CLAUDE.md` (root) and `kernel/CLAUDE.md` — doc-sync: `amd64` prose,
+  the stale `xtask` command list, and the `test-qemu` /
+  `tests/qemu-tests/` references brought in line with reality.
+- `docs/spec/`, `docs/architecture/`, `docs/rationale/` — `amd64` prose
+  references swept to `x86_64` (8 files). `docs/history/` left
+  untouched.
+
+Decisions worth recording:
+
+- **Architecture directory is `x86_64`, not `amd64`.** `amd64` is the
+  standard name in the OS-distribution world (Debian, the BSDs, Go's
+  `GOARCH`); `x86_64` is the standard name in the toolchain world (the
+  `x86_64-unknown-none` target triple, `cfg(target_arch = "x86_64")`,
+  LLVM triples, `uname -m`). The toolchain name wins because Rust bakes
+  it into the source irrevocably: a directory named `arch/amd64/` would
+  sit behind a `cfg(target_arch = "x86_64")` gate — a permanent spelling
+  mismatch at the exact site that selects it. `x86_64` also pairs
+  consistently with `aarch64`, already the Rust name for the other
+  architecture. Scope: this governs source identifiers — the
+  `kernel/src/arch/x86_64/` directory, `cfg` gates, the target triple.
+  Prose in `docs/spec/`, `docs/architecture/`, and `docs/rationale/`
+  also used "amd64" as the architecture's common name; all such
+  references were swept to `x86_64`. Two things were deliberately left:
+  the proper noun "System V AMD64 ABI" in `docs/spec/syscall-abi.md`
+  (the external specification's actual name), and `docs/history/` (the
+  decision log is append-only; `os-design-v5.1.md` is an archived
+  snapshot).
+
+- **A "kernel diagnostics" slice is pulled in ahead of paging.** Paging
+  is the most fault-prone subsystem in a kernel, and the kernel today
+  has no observable output: `panic!` / `expect()` halt silently (the
+  panic handler has no logging surface), and with no IDT a CPU fault
+  triple-faults with zero diagnostics. A small slice — polled COM1
+  serial, `kprintln!`, a `PanicInfo`-dumping panic handler, and a
+  minimal dump-and-halt IDT for `#UD` / `#GP` / `#PF` / `#DF` — makes
+  the paging work debuggable at low cost. Serial and the dump-and-halt
+  IDT are one unit: a fault handler with nowhere to print is useless.
+  The real exception-table-consulting `#PF` handler stays later, under
+  "User memory access" — the diagnostics slice only installs the
+  dump-and-halt version.
+
+Plan-vs-reality deviations corrected. The Phase 0 checklist had items
+checked off that were never built, or built differently:
+
+- No NASM boot stub was written; the entry point is a pure-Rust
+  `extern "C" fn _start`. The 2026-05-13 entry already records this —
+  the plan checklist simply disagreed with it.
+- No serial output exists; Phase 0 renders to the framebuffer. Serial
+  was deferred (2026-05-13 entry) and now has a home in the diagnostics
+  slice.
+- `xtask test-qemu` was never built — there is no QEMU integration-test
+  harness. It remains a deferred item
+  (`docs/rationale/deferred-decisions.md`).

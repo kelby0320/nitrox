@@ -6,7 +6,7 @@ For specific details: where this document says "the handle table is segmented," 
 
 ## What Nitrox is
 
-Nitrox is a from-scratch operating system targeting amd64 (UEFI only) with aarch64 designed in from the start. It is the successor to Latte, an earlier Unix-like hobby OS written in C. Nitrox is more ambitious: rather than reimplementing Unix in a new language, it is an attempt at a coherent modern design that learns from Unix without copying its mistakes.
+Nitrox is a from-scratch operating system targeting x86_64 (UEFI only) with aarch64 designed in from the start. It is the successor to Latte, an earlier Unix-like hobby OS written in C. Nitrox is more ambitious: rather than reimplementing Unix in a new language, it is an attempt at a coherent modern design that learns from Unix without copying its mistakes.
 
 The design takes the things Unix got right — composable pipelines, treating system state as named resources, a powerful shell environment — and rebuilds them on a foundation that doesn't carry Unix's weaker patterns: signals, synchronous syscalls, a global VFS tree, ambient authority through UID/GID, and the cluster of compatibility constraints that come with POSIX. The result is closer in spirit to Plan 9, Fuchsia, and the seL4 capability literature than to Linux or BSD, while remaining a system designed to be used rather than a research artifact.
 
@@ -55,7 +55,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │   Tier 1 drivers: PCI, AHCI/NVMe, GPT, console                  │
 │   In-kernel resource servers: /proc, /dev, /initramfs, ...      │
 │                                                                 │
-│   Architecture abstraction layer: amd64 (initial), aarch64      │
+│   Architecture abstraction layer: x86_64 (initial), aarch64     │
 └─────────────────────────────────────────────────────────────────┘
                                      │
 ┌────────────────────────────────────┴────────────────────────────┐

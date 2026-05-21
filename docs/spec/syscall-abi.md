@@ -6,7 +6,7 @@ This document specifies the Nitrox syscall interface: calling convention, return
 
 ## Calling convention
 
-### amd64
+### x86_64
 
 Syscall entry uses the `syscall` instruction. Register conventions follow System V AMD64 ABI for the C-equivalent function call, with the syscall number in `RAX`:
 
@@ -175,7 +175,7 @@ Exits the calling process (terminates all its threads). Does not return.
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize
 ```
-Sets the calling thread's TLS base register (FS_BASE on amd64, TPIDR_EL0 on aarch64).
+Sets the calling thread's TLS base register (FS_BASE on x86_64, TPIDR_EL0 on aarch64).
 
 ```rust
 fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: CpuMask) -> isize

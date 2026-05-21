@@ -217,7 +217,7 @@ The terminator is not optional but may be delivered out-of-band in some cases (e
 
 ## Endianness
 
-All multi-byte integers are little-endian (native on amd64 and aarch64).
+All multi-byte integers are little-endian (native on x86_64 and aarch64).
 
 ## Versioning
 
