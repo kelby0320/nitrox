@@ -109,6 +109,9 @@ fn kernel_main() {
     }
     kprintln!("allocators up");
 
+    // Smoke-test the new paging arch layer against Limine's live tables.
+    paging_smoke_test();
+
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
     // jumping to `_start`. We are the sole reader; no other thread exists.
     let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
@@ -171,6 +174,39 @@ fn init_memory() -> bool {
     }
     mm::slab::slab_init();
     true
+}
+
+/// Smoke-test the paging arch layer: enable the no-execute extension,
+/// then walk Limine's live page tables with [`arch::translate`] to
+/// confirm the kernel's table-walk agrees with the hardware.
+///
+/// Read-only — it never installs or switches a mapping. The first item
+/// of the "Address Spaces and Paging" slice has no boot-path caller of
+/// its own; this exercises the new code against a real address space and
+/// a real HHDM offset (host tests run with an HHDM offset of 0). See
+/// `docs/planning/implementation-plan.md`.
+fn paging_smoke_test() {
+    arch::ensure_nxe();
+
+    // Limine's top-level page table is whatever the CPU runs on now.
+    let root = arch::active_root();
+
+    // This function's own code is certainly mapped; resolve its address.
+    let probe = mm::VirtAddr::new(paging_smoke_test as fn() as usize as u64);
+    // SAFETY: `root` is the live top-level page table the CPU is using,
+    // reachable through the HHDM. `translate` only reads page-table
+    // memory — it installs and switches nothing.
+    match unsafe { arch::translate(root, probe) } {
+        Some(phys) => kprintln!(
+            "paging: NX enabled; translate {:#x} -> {:#x}",
+            probe.as_u64(),
+            phys.as_u64()
+        ),
+        None => kprintln!(
+            "paging: translate {:#x} -> UNMAPPED — walk disagrees with hardware",
+            probe.as_u64()
+        ),
+    }
 }
 
 /// Render the boot screen as a scuba Nitrox tank decal: a yellow band

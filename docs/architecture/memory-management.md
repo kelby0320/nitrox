@@ -14,8 +14,11 @@ the single global `BuddyAllocator` and exposes `buddy_alloc` /
 this facade through a small `BuddyPager` trait so tests can inject a
 local buddy without touching the global statics.
 
-Phase 1 implements layers 1 and 2; layer 3 lands in the next slice
-alongside paging.
+Phase 1 implements layers 1 and 2 in full. Layer 3 — the VMM — is in
+progress: the arch-level page-table primitive it sits on now exists (see
+[Arch paging layer](#arch-paging-layer)), and the VMM proper
+(`mm/vmm.rs`, the VMA tree, address-space construction) lands across the
+rest of the address-spaces-and-paging slice.
 
 ## Buddy allocator
 
@@ -128,6 +131,33 @@ The kernel registers no `#[global_allocator]` and does not use the
 the kernel cannot tolerate. `KBox` / `KVec` / `KString` call `kmalloc` /
 `kfree` directly and surface exhaustion as `AllocError`. See the
 decision log entry of 2026-05-20.
+
+## Arch paging layer
+
+The VMM (layer 3) does not touch hardware page tables directly — it goes
+through `ArchPaging`, the kernel's first cross-architecture trait
+(`kernel/src/arch/paging.rs`). The trait abstracts the operations whose
+implementation genuinely differs between x86_64 and aarch64; the active
+architecture's implementation is re-exported as `arch::Paging`.
+
+- **Surface:** `map_page`, `unmap_page`, `flush_tlb_page`,
+  `flush_tlb_all`, `set_page_table` — all `unsafe`. `map_page` /
+  `unmap_page` install and remove a 4 KiB leaf and allocate intermediate
+  tables from the buddy on demand; neither flushes the TLB, so the
+  caller batches one flush over many changes. `unmap_page` returns the
+  freed `PhysAddr` for the VMM to reclaim.
+- **Permissions:** the arch-neutral `PageFlags` (writable, user,
+  no-execute, global, cache attributes) is translated to page-table-entry
+  bits by each architecture's implementation.
+- **x86_64:** `kernel/src/arch/x86_64/paging.rs` — 4-level (48-bit)
+  paging, 4 KiB leaves only. `translate` additionally understands 2 MiB
+  and 1 GiB pages so it is correct against the bootloader's live tables.
+  The kernel enables `EFER.NXE` at boot so `NO_EXECUTE` is usable.
+
+Page tables are reached through the higher-half direct map: a table at
+physical `p` is addressed at `p + hhdm_offset()`. Out of scope today:
+reclaiming intermediate tables on unmap, range TLB flush, and cross-CPU
+shootdown — all filed in `docs/rationale/deferred-decisions.md`.
 
 ## Locking
 

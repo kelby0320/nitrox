@@ -54,6 +54,17 @@ ordering remains slab → buddy and the lower lock cannot block waiting
 for the upper. If a future change makes the buddy depend on the slab,
 that closes the cycle and must be rejected at design review.
 
+## Paging allocates page-table frames from the buddy
+
+`ArchPaging::map_page` (`kernel/src/arch/x86_64/paging.rs`) calls
+`buddy_alloc` to obtain frames for intermediate page tables. The paging
+layer holds no lock of its own — the page-table root is passed in by the
+caller — so it introduces no new rank and no new nesting. It does
+acquire rank 6b transitively: `map_page` must not be called while
+holding the rank-7 `SERIAL` lock. The future VMM will call `map_page`
+while holding the rank-4 VMA-tree lock, which is correctly ordered (rank
+4 is above rank 6b).
+
 ## The serial lock is a leaf
 
 `SERIAL` (`kernel/src/arch/x86_64/serial.rs`) guards the COM1 UART. It is

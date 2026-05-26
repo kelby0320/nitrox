@@ -1,10 +1,13 @@
-//! Raw x86_64 hardware-register access: I/O ports and control registers.
+//! Raw x86_64 hardware-register access: I/O ports, control registers,
+//! and model-specific registers.
 //!
 //! Per `kernel/CLAUDE.md`, port I/O and hardware-register reads/writes
 //! live behind wrapper functions in this module rather than as `asm!`
 //! calls scattered through the codebase. The diagnostics slice needs the
 //! port primitives (the 16550 UART speaks port I/O) and a `CR2` read (the
-//! page-fault handler reports the faulting linear address from it).
+//! page-fault handler reports the faulting linear address from it). The
+//! paging slice adds `CR3` access, `invlpg`, and MSR read/write — the
+//! page-table root, single-page TLB invalidation, and `EFER.NXE`.
 
 use core::arch::asm;
 
@@ -112,4 +115,96 @@ pub fn read_cr2() -> u64 {
              options(nomem, nostack, preserves_flags));
     }
     val
+}
+
+/// Read control register `CR3` — the physical base of the active
+/// top-level page table in bits 51:12, plus its low control flags.
+///
+/// Safe: reading `CR3` has no side effects and is always valid in ring 0.
+#[inline]
+pub fn read_cr3() -> u64 {
+    let val: u64;
+    // SAFETY: `mov reg, cr3` reads CR3 into a general register. It has no
+    // side effects, touches no normal memory, and leaves flags untouched.
+    unsafe {
+        asm!("mov {}, cr3", out(reg) val,
+             options(nomem, nostack, preserves_flags));
+    }
+    val
+}
+
+/// Load control register `CR3`, switching the active page-table root.
+/// Writing `CR3` also flushes every non-global TLB entry.
+///
+/// # Safety
+/// `value` must hold the physical base of a fully-formed top-level page
+/// table (see [`crate::arch::paging::ArchPaging::set_page_table`]).
+/// Loading an incomplete table triple-faults the CPU instantly.
+#[inline]
+pub unsafe fn write_cr3(value: u64) {
+    // SAFETY: `mov cr3, reg` installs `value` as the page-table root; the
+    // caller guarantees it names a valid table. The instruction touches
+    // no arithmetic flags. `nomem` is omitted: the write changes how
+    // every subsequent memory access is translated.
+    unsafe {
+        asm!("mov cr3, {}", in(reg) value,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// Invalidate the TLB entry for the page containing linear address
+/// `virt` on the current CPU.
+///
+/// # Safety
+/// `invlpg` is valid only in ring 0, which is the only ring the kernel
+/// runs in. The caller should already have updated the page tables so
+/// the invalidation reflects a real change.
+#[inline]
+pub unsafe fn invlpg(virt: u64) {
+    // SAFETY: `invlpg [mem]` invalidates the TLB entry for the addressed
+    // page; it is a ring-0 instruction with no flag effects. `nomem` is
+    // omitted because it has memory-ordering semantics over the page
+    // tables; the operand is consumed as an address, not dereferenced.
+    unsafe {
+        asm!("invlpg [{}]", in(reg) virt,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// Read model-specific register `msr`.
+///
+/// # Safety
+/// `rdmsr` is a ring-0 instruction and `#GP`s on an MSR index the CPU
+/// does not implement. The caller must pass a valid index.
+#[inline]
+pub unsafe fn rdmsr(msr: u32) -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: `rdmsr` reads the MSR named by `ecx` into `edx:eax`. The
+    // caller guarantees `msr` is implemented. It touches no normal
+    // memory and no arithmetic flags.
+    unsafe {
+        asm!("rdmsr", in("ecx") msr, out("eax") low, out("edx") high,
+             options(nomem, nostack, preserves_flags));
+    }
+    ((high as u64) << 32) | (low as u64)
+}
+
+/// Write `value` to model-specific register `msr`.
+///
+/// # Safety
+/// `wrmsr` is a ring-0 instruction that can change fundamental CPU state
+/// (paging mode, NX-enable, the `syscall` target). The caller must pass
+/// a valid index and a value that is sound for the running kernel.
+#[inline]
+pub unsafe fn wrmsr(msr: u32, value: u64) {
+    let low = value as u32;
+    let high = (value >> 32) as u32;
+    // SAFETY: `wrmsr` writes `edx:eax` to the MSR named by `ecx`. The
+    // caller upholds the index/value contract. No arithmetic flags are
+    // touched.
+    unsafe {
+        asm!("wrmsr", in("ecx") msr, in("eax") low, in("edx") high,
+             options(nomem, nostack, preserves_flags));
+    }
 }

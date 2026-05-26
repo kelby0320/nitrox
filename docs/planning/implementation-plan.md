@@ -164,7 +164,7 @@ silent reset.
 
 #### Address spaces and paging
 
-- [ ] `ArchPaging` trait in `kernel/src/arch/` with x86_64 implementation
+- [x] `ArchPaging` trait in `kernel/src/arch/` with x86_64 implementation
   - `map_page`, `unmap_page`, `flush_tlb_*`, `set_page_table`
   - All `unsafe`, all with SAFETY comments
 - [ ] VMA structure with red-black tree storage

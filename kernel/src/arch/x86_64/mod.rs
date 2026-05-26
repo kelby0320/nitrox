@@ -2,6 +2,7 @@
 
 pub mod gdt;
 pub mod idt;
+pub mod paging;
 pub mod regs;
 pub mod serial;
 

@@ -611,3 +611,87 @@ Verification:
   `0x0e`, the correct `CR2`, and `cs=0x0008` / `ss=0x0010` — confirming
   the IDT, the error-code normalisation, the `ExceptionFrame` layout, and
   the GDT/segment reload all work.
+
+---
+
+## 2026-05-22 — Phase 1, slice 5 (item 1): `ArchPaging` trait and x86_64 implementation
+
+The first item of the "Address Spaces and Paging" slice: the raw
+arch-level page-table primitive that the later items of the slice (the
+VMA tree, address-space construction, higher-half sharing, kernel
+stacks) will build on. No VMM yet — this slice item delivers `map_page`
+/ `unmap_page` / `flush_tlb_*` / `set_page_table` and nothing above them.
+
+What's in the build:
+
+- `kernel/src/arch/paging.rs` — new, architecture-neutral: the
+  `ArchPaging` trait, `PageFlags` (hand-rolled bitflags), and the
+  `MapError` / `UnmapError` enums.
+- `kernel/src/arch/x86_64/paging.rs` — new: `X86Paging` (the
+  `ArchPaging` impl), the `Pte` newtype and bit constants, the
+  9-9-9-9-12 index split, the 4-level table walk, `translate`,
+  `active_root`, and `ensure_nxe`. Host-tested.
+- `kernel/src/arch/x86_64/regs.rs` — `read_cr3` / `write_cr3` /
+  `invlpg` / `rdmsr` / `wrmsr` added alongside the existing port-I/O
+  and `read_cr2` wrappers.
+- `kernel/src/mm/mod.rs` — `VirtAddr` newtype (mirrors `PhysAddr`),
+  with `is_canonical`.
+- `kernel/src/arch/{mod.rs,x86_64/mod.rs}` — register the modules;
+  `arch` re-exports `X86Paging as Paging` plus `translate` /
+  `active_root` / `ensure_nxe`.
+- `kernel/src/main.rs` — a read-only paging smoke test in
+  `kernel_main`: enable NX, then `translate` the kernel's own code
+  address against Limine's live tables.
+
+Decisions worth recording:
+
+- **`ArchPaging` is the first arch *trait*; `gdt`/`idt`/`regs`/`serial`
+  remain cfg-gated free-function modules.** GDT/IDT are x86-only
+  concepts with no aarch64 analogue, so they need no cross-arch
+  contract. Paging does: aarch64's translation-table format genuinely
+  differs, and the VMM (later this slice) must be written against an
+  abstraction, not against x86 PTEs. The trait *is* that contract.
+- **ZST + associated functions, not `&self` / `&mut self`.** The v5.1
+  design doc sketched paging methods on `&mut self`, implying per-CPU
+  or per-address-space arch state. There is none: the page-table root
+  is an explicit `PhysAddr` argument to every method, so the same code
+  maps into any address space. `X86Paging` is a unit struct.
+- **`map_page` / `unmap_page` do not flush the TLB; the caller does.**
+  Flushing is exposed separately (`flush_tlb_page` / `flush_tlb_all`).
+  This keeps the map/unmap paths free of privileged instructions — so
+  they are fully host-testable — and lets a future bulk mapper amortise
+  one flush over many entries.
+- **`map_page` returns `AlreadyMapped` on a present leaf; never
+  silently replaces.** Remap semantics belong to the VMM, which will
+  own the policy. `unmap_page` returns the freed `PhysAddr` so the VMM
+  can reclaim or refcount the frame.
+- **`EFER.NXE` is enabled by the kernel (`ensure_nxe`).** A PTE with
+  the NX bit faults as a reserved-bit violation unless `EFER.NXE` is
+  set, and Limine does not guarantee it. Enabling it now keeps
+  `PageFlags::NO_EXECUTE` honest — the VMA slice will want W^X
+  immediately. `rdmsr` / `wrmsr` wrappers were added to `regs.rs` for
+  this; they are general MSR primitives, not EFER-specific.
+- **`translate` understands huge pages; `map_page` / `unmap_page` do
+  not.** This module only ever creates 4 KiB leaves, so the map/unmap
+  walks assume no `PS` bit. `translate`, however, is run against
+  Limine's live tables — which may use 2 MiB or 1 GiB pages — so it
+  checks the `PS` bit at the PDPT and PD levels. `translate` is `pub`
+  (not `pub(crate)`): the boot smoke test lives in the `main.rs` binary
+  crate, which is separate from the library crate.
+- **Intermediate page-table frames are not reclaimed on `unmap_page`.**
+  Tracking emptiness needs a per-table populated-entry count or a
+  512-slot scan per unmap. Deferred — see
+  `docs/rationale/deferred-decisions.md`. Phase 1 has a single address
+  space; the leak is negligible.
+
+Verification:
+
+- `cargo xtask test` — host tests pass, including 11 new
+  `arch::x86_64::paging` cases (index split, flag/PTE encode-decode,
+  map→translate→unmap round-trips, already-mapped / not-mapped errors,
+  misaligned / non-canonical rejection, multi-level table allocation)
+  and 3 `VirtAddr` cases.
+- `cargo xtask build` — kernel ELF builds clean for `x86_64-unknown-none`.
+- `cargo xtask qemu` — boot reaches the smoke test, which prints
+  `paging: NX enabled; translate <virt> -> <phys>` and continues to
+  the boot screen.
