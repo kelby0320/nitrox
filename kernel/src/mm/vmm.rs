@@ -185,6 +185,16 @@ enum RbColor {
     Black,
 }
 
+/// `true` if `node` is a real, red node. The delete fixup needs to
+/// treat `None` (a missing leaf) as black per the RB-tree convention;
+/// this helper makes that the natural single-expression check.
+fn is_red(node: Option<NonNull<Vma>>) -> bool {
+    // SAFETY: when `Some`, the link pointer references a live tree
+    // node by the invariants documented on `VmaTree`.
+    node.map(|n| unsafe { n.as_ref().link.color } == RbColor::Red)
+        .unwrap_or(false)
+}
+
 /// Intrusive red-black-tree link embedded in every [`Vma`].
 ///
 /// Raw pointers because the tree forms cycles — every non-root node's
@@ -400,6 +410,288 @@ impl VmaTree {
             }
         }
         None
+    }
+
+    /// Find and remove the `Vma` whose range contains `addr`, returning
+    /// the owning [`KBox`] so the caller may inspect, drop, or reinsert
+    /// a modified version. Returns `None` if no VMA covers `addr`; the
+    /// tree is unchanged in that case.
+    ///
+    /// The deletion is BST-delete with successor swap when the target
+    /// has two children, followed by an RB delete-fixup when a black
+    /// node was structurally removed (restores the equal-black-height
+    /// property). Interval augmentation is refreshed along the affected
+    /// path before the fixup runs.
+    pub fn remove_covering(&mut self, addr: VirtAddr) -> Option<KBox<Vma>> {
+        // Locate the target node (z) via the same BST walk as
+        // find_covering. Working with a raw pointer (rather than a
+        // borrow) lets us mutate the tree afterwards.
+        let mut current = self.root;
+        let z = loop {
+            let n = current?;
+            // SAFETY: live link.
+            let v = unsafe { n.as_ref() };
+            if v.range.contains(addr) {
+                break n;
+            } else if addr < v.range.start() {
+                current = v.link.left;
+            } else {
+                current = v.link.right;
+            }
+        };
+
+        // SAFETY: every link pointer touched below addresses a live
+        // tree node (root, ancestor, child, or successor reached via
+        // the standard CLRS traversal). The successor `y` is leftmost
+        // in `z`'s right subtree so its `.left` is necessarily `None`.
+        // Each structural mutation maintains the tree invariants
+        // declared at the type level.
+        let (x, x_parent, x_is_left, y_original_color) = unsafe {
+            let zp = z.as_ptr();
+            let z_left = (*zp).link.left;
+            let z_right = (*zp).link.right;
+
+            if z_left.is_none() {
+                // 0 or 1 (right) child: x = z.right takes z's spot.
+                let x = z_right;
+                let x_parent = (*zp).link.parent;
+                let x_is_left = matches!(
+                    x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)),
+                    Some(true),
+                );
+                self.transplant(z, x);
+                (x, x_parent, x_is_left, (*zp).link.color)
+            } else if z_right.is_none() {
+                // 1 (left) child: x = z.left takes z's spot.
+                let x = z_left;
+                let x_parent = (*zp).link.parent;
+                let x_is_left = matches!(
+                    x_parent.map(|p| (*p.as_ptr()).link.left == Some(z)),
+                    Some(true),
+                );
+                self.transplant(z, x);
+                (x, x_parent, x_is_left, (*zp).link.color)
+            } else {
+                // Two children: in-order successor y = leftmost of
+                // z.right. y has no left child by construction.
+                let mut y = z_right.unwrap();
+                while let Some(yl) = (*y.as_ptr()).link.left {
+                    y = yl;
+                }
+                let yp = y.as_ptr();
+                let y_original_color = (*yp).link.color;
+                let x = (*yp).link.right;
+                let (x_parent, x_is_left);
+                if (*yp).link.parent == Some(z) {
+                    // y is z's direct right child. x stays as y.right;
+                    // y rises to z's spot. After fixup, x_parent is y.
+                    x_parent = Some(y);
+                    x_is_left = false;
+                } else {
+                    // y is deeper. Transplant x for y first, then move
+                    // y up to z's spot inheriting z's right subtree.
+                    let yp_parent = (*yp).link.parent.unwrap();
+                    x_parent = Some(yp_parent);
+                    x_is_left = true; // y was leftmost, so y was its parent's left child.
+                    self.transplant(y, x);
+                    (*yp).link.right = z_right;
+                    let zr = z_right.unwrap();
+                    (*zr.as_ptr()).link.parent = Some(y);
+                }
+                // Move y to z's slot. y inherits z's left subtree and
+                // z's color (so the only colour that "vanished" is y's
+                // own original colour, captured above).
+                self.transplant(z, Some(y));
+                (*yp).link.left = z_left;
+                let zl = z_left.unwrap();
+                (*zl.as_ptr()).link.parent = Some(y);
+                (*yp).link.color = (*zp).link.color;
+                (x, x_parent, x_is_left, y_original_color)
+            }
+        };
+
+        // Augmentation: the structural change altered subtree contents
+        // on the path from x_parent up to root. One walk fixes them all.
+        self.update_max_end_up_from(x_parent);
+
+        // RB-fixup only when we removed a black node (paths through the
+        // removed position now have one fewer black, which the fixup
+        // either absorbs or rotates away).
+        if y_original_color == RbColor::Black {
+            self.delete_fixup(x, x_parent, x_is_left);
+        }
+
+        // Detach z's link state so the returned box looks fresh. Then
+        // reconstitute the owning KBox and return it.
+        // SAFETY: z came from KBox::into_raw in `insert`, has been
+        // structurally removed from the tree, and is no longer reached
+        // by any link pointer.
+        unsafe {
+            let zp = z.as_ptr();
+            (*zp).link = RbLink::new((*zp).range.end());
+            self.len -= 1;
+            Some(KBox::from_raw(z))
+        }
+    }
+
+    /// Replace `u`'s slot in its parent (or the root) with `v`, and
+    /// update `v`'s parent pointer. `u`'s own parent pointer is not
+    /// cleared — the caller either reuses `u` (the successor-swap
+    /// path) or discards `u` afterwards.
+    ///
+    /// # Safety
+    /// `u` is a live tree node; `v` is `None` or a live tree node.
+    unsafe fn transplant(&mut self, u: NonNull<Vma>, v: Option<NonNull<Vma>>) {
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            let up = u.as_ptr();
+            match (*up).link.parent {
+                None => self.root = v,
+                Some(parent) => {
+                    let pp = parent.as_ptr();
+                    if (*pp).link.left == Some(u) {
+                        (*pp).link.left = v;
+                    } else {
+                        (*pp).link.right = v;
+                    }
+                }
+            }
+            if let Some(vv) = v {
+                (*vv.as_ptr()).link.parent = (*up).link.parent;
+            }
+        }
+    }
+
+    /// Restore the equal-black-height property after structurally
+    /// removing a black node. `x` (possibly `None`) replaced the
+    /// removed node at the spot that lost a black; `x_parent` is its
+    /// parent (or `None` if `x` is the root); `x_is_left` says which
+    /// side of `x_parent` `x` sits on, only consulted on the first
+    /// iteration since `x` may be `None`.
+    ///
+    /// Four CLRS-textbook cases, mirrored for left vs. right. The
+    /// loop terminates because every iteration either rotates +
+    /// recolours to a configuration that locally absorbs the missing
+    /// black (cases 1/3/4 → break), or moves the "doubly-black" mark
+    /// one level up (case 2). When the mark reaches a red node or the
+    /// root, it is absorbed.
+    fn delete_fixup(
+        &mut self,
+        mut x: Option<NonNull<Vma>>,
+        mut x_parent: Option<NonNull<Vma>>,
+        mut x_is_left: bool,
+    ) {
+        // SAFETY of the loop body: every link pointer dereferenced is
+        // either `x_parent`, `x_parent`'s sibling, or those siblings'
+        // children — all of which are live tree nodes. The fixup
+        // invariant guarantees the sibling `w` exists (a black `None`
+        // x has a non-`None` sibling, else the parent's black-height
+        // would already differ before our removal).
+        unsafe {
+            loop {
+                let Some(parent) = x_parent else { break };
+                if matches!(x, Some(n) if n.as_ref().link.color == RbColor::Red) {
+                    break;
+                }
+
+                let pp = parent.as_ptr();
+                if x_is_left {
+                    let mut w = (*pp).link.right.expect("delete fixup: sibling must exist");
+                    let wp = w.as_ptr();
+                    if (*wp).link.color == RbColor::Red {
+                        // Case 1: red sibling. Rotate parent left and
+                        // swap colours; new sibling is one of w's
+                        // children, which is black.
+                        (*wp).link.color = RbColor::Black;
+                        (*pp).link.color = RbColor::Red;
+                        self.rotate_left(parent);
+                        w = (*pp).link.right.expect("rotation must leave new sibling");
+                    }
+                    let wpp = w.as_ptr();
+                    let w_left_black = !is_red((*wpp).link.left);
+                    let w_right_black = !is_red((*wpp).link.right);
+                    if w_left_black && w_right_black {
+                        // Case 2: black sibling with two black
+                        // children — recolour sibling red and push the
+                        // missing-black mark up to the parent.
+                        (*wpp).link.color = RbColor::Red;
+                        x = x_parent;
+                        x_parent = (*pp).link.parent;
+                        if let Some(new_parent) = x_parent {
+                            x_is_left =
+                                (*new_parent.as_ptr()).link.left == x;
+                        }
+                    } else {
+                        if w_right_black {
+                            // Case 3: outer (right) nephew black, inner
+                            // (left) red — rotate sibling right so the
+                            // outer nephew becomes red.
+                            if let Some(wl) = (*wpp).link.left {
+                                (*wl.as_ptr()).link.color = RbColor::Black;
+                            }
+                            (*wpp).link.color = RbColor::Red;
+                            self.rotate_right(w);
+                            w = (*pp).link.right.expect("rotation leaves sibling");
+                        }
+                        // Case 4: outer nephew red — rotate parent and
+                        // recolour to absorb the missing black.
+                        let wpp = w.as_ptr();
+                        (*wpp).link.color = (*pp).link.color;
+                        (*pp).link.color = RbColor::Black;
+                        if let Some(wr) = (*wpp).link.right {
+                            (*wr.as_ptr()).link.color = RbColor::Black;
+                        }
+                        self.rotate_left(parent);
+                        break;
+                    }
+                } else {
+                    // Mirror: x is its parent's right child.
+                    let mut w = (*pp).link.left.expect("delete fixup: sibling must exist");
+                    let wp = w.as_ptr();
+                    if (*wp).link.color == RbColor::Red {
+                        (*wp).link.color = RbColor::Black;
+                        (*pp).link.color = RbColor::Red;
+                        self.rotate_right(parent);
+                        w = (*pp).link.left.expect("rotation must leave new sibling");
+                    }
+                    let wpp = w.as_ptr();
+                    let w_right_black = !is_red((*wpp).link.right);
+                    let w_left_black = !is_red((*wpp).link.left);
+                    if w_right_black && w_left_black {
+                        (*wpp).link.color = RbColor::Red;
+                        x = x_parent;
+                        x_parent = (*pp).link.parent;
+                        if let Some(new_parent) = x_parent {
+                            x_is_left =
+                                (*new_parent.as_ptr()).link.left == x;
+                        }
+                    } else {
+                        if w_left_black {
+                            if let Some(wr) = (*wpp).link.right {
+                                (*wr.as_ptr()).link.color = RbColor::Black;
+                            }
+                            (*wpp).link.color = RbColor::Red;
+                            self.rotate_left(w);
+                            w = (*pp).link.left.expect("rotation leaves sibling");
+                        }
+                        let wpp = w.as_ptr();
+                        (*wpp).link.color = (*pp).link.color;
+                        (*pp).link.color = RbColor::Black;
+                        if let Some(wl) = (*wpp).link.left {
+                            (*wl.as_ptr()).link.color = RbColor::Black;
+                        }
+                        self.rotate_right(parent);
+                        break;
+                    }
+                }
+            }
+            // Absorb any remaining missing-black into x by colouring it
+            // black. If `x` is `None`, the missing-black is at the root
+            // and disappears with nothing to absorb.
+            if let Some(n) = x {
+                (*n.as_ptr()).link.color = RbColor::Black;
+            }
+        }
     }
 
     // ----- Internals -----
@@ -1017,6 +1309,134 @@ mod tests {
             assert!(tree.find_covering(va(start + PAGE)).is_some());
             assert!(tree.find_covering(va(start + PAGE * 2)).is_none()); // exclusive end
         }
+    }
+
+    #[test]
+    fn remove_on_empty_returns_none() {
+        let mut tree = VmaTree::new();
+        assert!(tree.remove_covering(va(PAGE)).is_none());
+        assert!(tree.is_empty());
+        verify(&tree);
+    }
+
+    #[test]
+    fn remove_missing_returns_none_and_leaves_tree_unchanged() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
+        // Address before, after, and exactly at the exclusive end.
+        assert!(tree.remove_covering(va(PAGE)).is_none());
+        assert!(tree.remove_covering(va(PAGE * 16)).is_none());
+        assert!(tree.remove_covering(va(PAGE * 8)).is_none()); // half-open
+        assert_eq!(tree.len(), 1);
+        verify(&tree);
+    }
+
+    #[test]
+    fn single_node_remove_leaves_empty_tree() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
+        let removed = tree.remove_covering(va(PAGE * 6)).expect("must be there");
+        assert_eq!(removed.range, range(PAGE * 4, PAGE * 8));
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+        verify(&tree);
+    }
+
+    #[test]
+    fn removing_all_in_insertion_order_maintains_invariants() {
+        // Insert ascending, then remove ascending. Each remove pulls a
+        // leaf-or-near-leaf (after early rebalancing); collectively
+        // they exercise root removal once the rest of the tree is gone.
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        let n: u64 = 64;
+        for i in 0..n {
+            let start = (i * 2) * PAGE;
+            insert_or_panic(&mut tree, range(start, start + PAGE));
+        }
+        verify(&tree);
+        for i in 0..n {
+            let start = (i * 2) * PAGE;
+            let removed = tree.remove_covering(va(start)).expect("must be there");
+            assert_eq!(removed.range.start(), va(start));
+            verify(&tree);
+        }
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn removing_all_in_reverse_order_maintains_invariants() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        let n: u64 = 64;
+        for i in 0..n {
+            let start = (i * 2) * PAGE;
+            insert_or_panic(&mut tree, range(start, start + PAGE));
+        }
+        for i in (0..n).rev() {
+            let start = (i * 2) * PAGE;
+            let removed = tree.remove_covering(va(start)).expect("must be there");
+            assert_eq!(removed.range.start(), va(start));
+            verify(&tree);
+        }
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn shuffled_insert_then_shuffled_remove_maintains_invariants() {
+        // The torture test: 200 ranges inserted in shuffled order and
+        // then removed in a *different* shuffled order, with full
+        // invariant verification after every single operation. This is
+        // the most-exercised path for the delete fixup's case mix.
+        init_global_heap();
+        let n: usize = 200;
+        let mut insert_order: [usize; 200] = core::array::from_fn(|i| i);
+        let mut remove_order: [usize; 200] = core::array::from_fn(|i| i);
+
+        fn shuffle(arr: &mut [usize], mut lcg: u64) {
+            for i in (1..arr.len()).rev() {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                let j = (lcg as usize) % (i + 1);
+                arr.swap(i, j);
+            }
+        }
+        shuffle(&mut insert_order, 0xDEAD_BEEF_CAFE_F00D);
+        shuffle(&mut remove_order, 0xFACE_FEED_5EA1_0DDD);
+
+        let mut tree = VmaTree::new();
+        for &idx in insert_order.iter() {
+            let start = (idx as u64 * 4) * PAGE;
+            insert_or_panic(&mut tree, range(start, start + PAGE * 2));
+            verify(&tree);
+        }
+        assert_eq!(tree.len(), n);
+
+        for (count, &idx) in remove_order.iter().enumerate() {
+            let start = (idx as u64 * 4) * PAGE;
+            let removed = tree
+                .remove_covering(va(start + PAGE))
+                .expect("must find every inserted range");
+            assert_eq!(removed.range.start(), va(start));
+            verify(&tree);
+            assert_eq!(tree.len(), n - count - 1);
+        }
+        assert!(tree.is_empty());
+    }
+
+    #[test]
+    fn find_no_longer_finds_removed_range() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
+        insert_or_panic(&mut tree, range(PAGE * 12, PAGE * 16));
+        assert!(tree.find_covering(va(PAGE * 6)).is_some());
+        let _ = tree.remove_covering(va(PAGE * 6)).unwrap();
+        assert!(tree.find_covering(va(PAGE * 6)).is_none());
+        assert!(tree.find_covering(va(PAGE * 14)).is_some()); // other range still present
     }
 
     #[test]

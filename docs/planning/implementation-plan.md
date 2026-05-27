@@ -188,8 +188,13 @@ silent reset.
     exercised on every insert across ascending, descending, and
     shuffled-insert sequences (200 randomised inserts, full invariant
     check after each); overlap rejection across all shapes
-  - [ ] `VmaTree::remove`, `find_first_overlapping(range)` + overlap
-    iterator, in-order iterator
+  - [x] `VmaTree::remove_covering(addr)`: BST-delete with in-order
+    successor swap when the target has two children; CLRS-textbook
+    delete-fixup with all four cases (mirrored), tested against
+    shuffled-insert + shuffled-remove sequences with full invariant
+    verification after every operation
+  - [ ] `find_first_overlapping(range)` + overlap iterator, in-order
+    iterator
   - [ ] Update [docs/architecture/memory-management.md] to point at
     `mm/vmm.rs` and drop the "not yet" annotation in the layer table
 - [ ] Address space construction from an ELF image
