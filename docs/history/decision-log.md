@@ -611,3 +611,620 @@ Verification:
   `0x0e`, the correct `CR2`, and `cs=0x0008` / `ss=0x0010` — confirming
   the IDT, the error-code normalisation, the `ExceptionFrame` layout, and
   the GDT/segment reload all work.
+
+---
+
+## 2026-05-22 — Phase 1, slice 5 (item 1): `ArchPaging` trait and x86_64 implementation
+
+The first item of the "Address Spaces and Paging" slice: the raw
+arch-level page-table primitive that the later items of the slice (the
+VMA tree, address-space construction, higher-half sharing, kernel
+stacks) will build on. No VMM yet — this slice item delivers `map_page`
+/ `unmap_page` / `flush_tlb_*` / `set_page_table` and nothing above them.
+
+What's in the build:
+
+- `kernel/src/arch/paging.rs` — new, architecture-neutral: the
+  `ArchPaging` trait, `PageFlags` (hand-rolled bitflags), and the
+  `MapError` / `UnmapError` enums.
+- `kernel/src/arch/x86_64/paging.rs` — new: `X86Paging` (the
+  `ArchPaging` impl), the `Pte` newtype and bit constants, the
+  9-9-9-9-12 index split, the 4-level table walk, `translate`,
+  `active_root`, and `ensure_nxe`. Host-tested.
+- `kernel/src/arch/x86_64/regs.rs` — `read_cr3` / `write_cr3` /
+  `invlpg` / `rdmsr` / `wrmsr` added alongside the existing port-I/O
+  and `read_cr2` wrappers.
+- `kernel/src/mm/mod.rs` — `VirtAddr` newtype (mirrors `PhysAddr`),
+  with `is_canonical`.
+- `kernel/src/arch/{mod.rs,x86_64/mod.rs}` — register the modules;
+  `arch` re-exports `X86Paging as Paging` plus `translate` /
+  `active_root` / `ensure_nxe`.
+- `kernel/src/main.rs` — a read-only paging smoke test in
+  `kernel_main`: enable NX, then `translate` the kernel's own code
+  address against Limine's live tables.
+
+Decisions worth recording:
+
+- **`ArchPaging` is the first arch *trait*; `gdt`/`idt`/`regs`/`serial`
+  remain cfg-gated free-function modules.** GDT/IDT are x86-only
+  concepts with no aarch64 analogue, so they need no cross-arch
+  contract. Paging does: aarch64's translation-table format genuinely
+  differs, and the VMM (later this slice) must be written against an
+  abstraction, not against x86 PTEs. The trait *is* that contract.
+- **ZST + associated functions, not `&self` / `&mut self`.** The v5.1
+  design doc sketched paging methods on `&mut self`, implying per-CPU
+  or per-address-space arch state. There is none: the page-table root
+  is an explicit `PhysAddr` argument to every method, so the same code
+  maps into any address space. `X86Paging` is a unit struct.
+- **`map_page` / `unmap_page` do not flush the TLB; the caller does.**
+  Flushing is exposed separately (`flush_tlb_page` / `flush_tlb_all`).
+  This keeps the map/unmap paths free of privileged instructions — so
+  they are fully host-testable — and lets a future bulk mapper amortise
+  one flush over many entries.
+- **`map_page` returns `AlreadyMapped` on a present leaf; never
+  silently replaces.** Remap semantics belong to the VMM, which will
+  own the policy. `unmap_page` returns the freed `PhysAddr` so the VMM
+  can reclaim or refcount the frame.
+- **`EFER.NXE` is enabled by the kernel (`ensure_nxe`).** A PTE with
+  the NX bit faults as a reserved-bit violation unless `EFER.NXE` is
+  set, and Limine does not guarantee it. Enabling it now keeps
+  `PageFlags::NO_EXECUTE` honest — the VMA slice will want W^X
+  immediately. `rdmsr` / `wrmsr` wrappers were added to `regs.rs` for
+  this; they are general MSR primitives, not EFER-specific.
+- **`translate` understands huge pages; `map_page` / `unmap_page` do
+  not.** This module only ever creates 4 KiB leaves, so the map/unmap
+  walks assume no `PS` bit. `translate`, however, is run against
+  Limine's live tables — which may use 2 MiB or 1 GiB pages — so it
+  checks the `PS` bit at the PDPT and PD levels. `translate` is `pub`
+  (not `pub(crate)`): the boot smoke test lives in the `main.rs` binary
+  crate, which is separate from the library crate.
+- **Intermediate page-table frames are not reclaimed on `unmap_page`.**
+  Tracking emptiness needs a per-table populated-entry count or a
+  512-slot scan per unmap. Deferred — see
+  `docs/rationale/deferred-decisions.md`. Phase 1 has a single address
+  space; the leak is negligible.
+
+Verification:
+
+- `cargo xtask test` — host tests pass, including 11 new
+  `arch::x86_64::paging` cases (index split, flag/PTE encode-decode,
+  map→translate→unmap round-trips, already-mapped / not-mapped errors,
+  misaligned / non-canonical rejection, multi-level table allocation)
+  and 3 `VirtAddr` cases.
+- `cargo xtask build` — kernel ELF builds clean for `x86_64-unknown-none`.
+- `cargo xtask qemu` — boot reaches the smoke test, which prints
+  `paging: NX enabled; translate <virt> -> <phys>` and continues to
+  the boot screen.
+
+## 2026-05-27 — Phase 1, slice 5 (item 2): VMA tree (interval-augmented intrusive RB-tree)
+
+The second item of the "Address Spaces and Paging" slice: the per-process
+data structure that the rest of the VMM will manipulate. No address-space
+owner yet, no page-table integration yet — this item delivers the leaf
+data types (`VAddrRange`, `Protection`, `MappingKind`, `Vma`) and the
+`VmaTree` itself (insert, remove, point lookup, overlap iteration).
+
+What's in the build:
+
+- `kernel/src/mm/vmm.rs` — new: the leaf types, `RbColor` / `RbLink`
+  (private), `VmaTree` with `insert` / `remove_covering` / `find_covering`
+  / `find_first_overlapping` / `iter` / `iter_overlapping`, an iterative
+  post-order `Drop`, and 30+ host-side tests including 200-element
+  shuffled-insert + shuffled-remove torture tests with full BST + RB +
+  augmentation invariant verification after every operation.
+- `kernel/src/libkern/kbox.rs` — `into_raw` / `from_raw` for intrusive
+  ownership transfer; `Debug` forwarded to the contained `T`.
+- `kernel/src/mm/mod.rs` — registers `mod vmm`.
+- `docs/architecture/memory-management.md` — drops the "(not yet)" on
+  the VMM row, rewrites the intro paragraph, adds a `## VMA tree`
+  section, adds the `AddressSpace`-not-yet Phase 1 limitation.
+
+Decisions worth recording:
+
+- **Tree built tailored to `Vma`, not as a generic container in
+  `libkern`.** The `RbLink` is embedded directly in `Vma`; the tree
+  operations consume `Vma` fields by name. A generic `RbTree<T>` would
+  have to abstract the key extraction and the interval augmentation
+  through trait dispatch, paying complexity for a single consumer. The
+  only other RB-tree consumer on the horizon (the namespace binding
+  tree) is keyed by path components, not address intervals, so it
+  wouldn't share an implementation anyway. Revisit if a third consumer
+  appears.
+- **Iterative RB-tree operations, not recursive.** Insert/delete fixup
+  walks *up* the tree from the inserted/deleted node, which is iterative
+  with parent pointers regardless of style. Search and in-order
+  traversal are iterative trivially. Removes kernel-stack-depth as a
+  real concern. Matches Linux's `lib/rbtree.c`.
+- **`KBox<Vma>` ownership, not a per-address-space arena.** VMAs come
+  and go constantly during a process's life (every `mprotect` boundary
+  crossing splits a VMA), so an arena either needs an internal free-list
+  (which is just the slab again) or fragments. The slab cache gives
+  good locality and O(1) alloc/free without the fragmentation. Matches
+  Linux's `vm_area_cachep`. `KBox::into_raw` / `from_raw` thread the
+  allocation through the tree's intrusive links.
+- **`Protection` is narrower than `arch::paging::PageFlags`.** A VMA
+  carries WRITE / EXEC / USER only; `GLOBAL` and the cache-attribute
+  bits are per-PTE policy decided at install time (driver MMIO,
+  framebuffer), not a property of the address range. The VMM will
+  translate `Protection` to `PageFlags` when populating leaves.
+  `Protection::empty()` is kernel-only / read-only / non-executable —
+  the inverse of `PageFlags::empty()`, which is executable by default
+  because `NO_EXECUTE` is opt-in at the hardware level. The VMM
+  presents the safer logical default; the translation inverts it.
+- **`MappingKind` ships with `Anonymous` only.** `FileBacked(Handle)`
+  needs the handle table; `Device(PhysAddr)` needs the driver MMIO
+  mapper. Both arrive with their consumers. The enum is open to
+  extension and adding a variant only touches the call sites that
+  need to act on the new backing kind.
+- **Interval augmentation maintained, not consumed.** `subtree_max_end`
+  is updated on every structural mutation (insert path walk, rotations,
+  remove path walk) but no query reads it today: the leftmost-overlap
+  query is already O(log n) without it, and `iter_overlapping` is just
+  in-order successor advance terminated at the query end. The
+  augmentation pays off for future disjoint-range stabbing queries
+  where subtree pruning lets the walk skip whole branches.
+- **`Vma` is `!Send` / `!Sync` by composition.** Holding `NonNull` in
+  the link field demotes the type's auto-traits. This is intentional —
+  a `Vma` in a tree is bound to its `AddressSpace`'s lock. The
+  `AddressSpace` will carry `unsafe impl Send` when it lands, with a
+  SAFETY comment pointing at the lock.
+- **`insert` rejects overlap rather than splitting / merging /
+  replacing.** The VMM's `mprotect`-style operations (split a VMA on a
+  protection-change boundary; merge adjacent compatible VMAs) belong at
+  a higher layer than the tree; the tree's invariant is just "no
+  overlap." Returning the rejected `KBox<Vma>` back to the caller keeps
+  ownership clean and lets the higher layer decide what to do.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (99 total, +24 in `mm::vmm`):
+  range arithmetic and protection bitflag operations; insert
+  invariants under ascending / descending / 200-element shuffled
+  sequences with full BST + RB + augmentation verification after every
+  insert; overlap rejection across identical / starts-inside /
+  ends-inside / nested-both-ways shapes; adjacent-range acceptance;
+  remove invariants under ascending / descending / 200-element
+  shuffled removes (different shuffle seeds) with full verification
+  after every remove; iterator correctness on empty, single-node, and
+  multi-node trees, post-remove queries, and full-tree-coverage
+  comparison between `iter` and `iter_overlapping`; iterative `Drop`
+  across repeated 256-node tree teardowns.
+- `cargo xtask build` — kernel ELF builds clean for `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 3): `AddressSpace` skeleton
+
+The third item of the "Address Spaces and Paging" slice: pair the VMA
+tree with a page-table root so VMA mutations actually update hardware
+translations. No higher-half kernel mapping yet (the next item) and no
+ELF loader yet (the item after) — this lands the bridge layer that
+both later items consume.
+
+What's in the build:
+
+- `kernel/src/mm/addr_space.rs` — new: `AddressSpace` (a
+  `SpinLock<Inner>` wrapping `VmaTree` + PML4 `PhysAddr`), `new`,
+  `map_vma`, `unmap_covering`, `root`, `is_empty`, `len`, `Drop`,
+  the `MapError` enum, plus private `free_vma_pages` /
+  `rollback_partial_map` / `protection_to_page_flags` helpers and 8
+  host-side tests.
+- `kernel/src/mm/mod.rs` — registers `mod addr_space`.
+- `docs/architecture/memory-management.md` — new `## AddressSpace`
+  section; updates Phase 1 limitations from "no AddressSpace yet" to
+  the more specific "exists but no kernel-half mapping / no TLB flush
+  / no ELF loader."
+- `kernel/docs/lock-ordering.md` — rank 4 (kernel-object internal
+  locks) flips from "not yet present" to "live as of Phase 1 slice 5
+  (item 3): AddressSpace."
+
+Decisions worth recording:
+
+- **`SpinLock<Inner>` wrapping, not flat fields + separate lock.**
+  Linux's `mm_struct` keeps fields directly addressable and uses
+  `mmap_lock` as a separate semaphore — that's what C allows. In
+  Rust, wrapping the inner state in `SpinLock<Inner>` makes "field
+  access requires the lock" a type-system guarantee, not a code-review
+  convention. There is no way to read or modify `vma_tree` or `root`
+  without going through `lock()`.
+- **Eager per-page anonymous allocation.** `map_vma` allocates and
+  zeros one frame per page up front. Lazy on-fault allocation is the
+  real-OS pattern (Linux only commits frames when the page is first
+  touched), but it requires a page-fault handler that can service VMA
+  faults — the current `#PF` handler is the dump-and-halt one from
+  the diagnostics slice. Eager works today and the switch to lazy is
+  a local change to `map_vma` plus PF-handler upgrade when that lands.
+- **Per-page allocate-and-install in lockstep, with rollback on
+  failure.** The alternative was pre-allocate-then-commit using a
+  temporary `KVec<PhysAddr>` to stage frames. Rejected: a 100 MiB
+  anonymous mapping would need a 25,600-entry temporary vector. The
+  lockstep loop walks the same number of pages but never holds more
+  than one allocated-but-uninstalled frame at a time. Rollback walks
+  back through the installed range uninstalling and freeing —
+  symmetric work, no extra storage.
+- **Frame ownership tracked by the page tables themselves.** No
+  per-VMA list of owned `PhysAddr`s.
+  `ArchPaging::unmap_page(root, virt)` already returns the
+  `PhysAddr` it freed; `unmap_covering` and `Drop` hand each one
+  straight to `buddy_free`. Adding a per-VMA frame list would
+  duplicate state. For `MappingKind::Anonymous` we always free the
+  returned frame; the call site will branch on backing kind when
+  `FileBacked` (page cache owns the frame) and `Device` (kernel never
+  allocated it) arrive.
+- **`unreachable!()` for `ArchPaging` errors that pre-validation
+  makes impossible.** `map_page` can return `AlreadyMapped` (we held
+  the AS lock and pre-checked tree overlap) and `Misaligned`
+  (VAddrRange enforces page alignment; our per-page address is
+  `start + i*PAGE_SIZE`). Both would indicate kernel-internal
+  invariant violations. Per `kernel/CLAUDE.md`'s
+  "`panic!()` outside of explicitly-unrecoverable error paths"
+  carve-out, panicking is the correct response.
+- **`Drop` drains the tree leftmost-first via `iter().next() +
+  remove_covering`** rather than a dedicated `pop_first` on
+  `VmaTree`. The iter borrow is scoped to a block that ends before
+  the mutating call, so the borrow checker accepts it without
+  ceremony. Adding `pop_first` for one consumer would be premature;
+  revisit if a second consumer appears.
+- **Higher-half kernel mapping deferred to its own sub-item.** A
+  fresh AS has an all-zero PML4: switching to it would triple-fault
+  because the running kernel's code wouldn't be mapped. We could
+  have built the kernel-half template inheritance into `new()`, but
+  it needs the kernel image's actual PML4 entries (which depend on
+  what Limine handed us) and is a distinct architectural concern.
+  Keeping it separate gives that work its own design-and-test cycle.
+- **No TLB flushing.** No CPU has any `AddressSpace` loaded today;
+  there is nothing in the TLB to invalidate. The scheduler will
+  introduce `set_active` and inherit responsibility for flush
+  policy.
+- **ELF loader split per the universal kernel/userspace boundary.**
+  Linux / Windows / macOS all draw the same line: the kernel handles
+  parsing the executable header, mapping LOAD segments, setting up
+  the initial stack, and (when present) loading the dynamic linker
+  interpreter. Symbol resolution and library loading run in
+  userspace via `ld.so` / NTDLL / dyld. We will follow this split.
+  This sub-item lands the AS skeleton; the next sub-item adds the
+  kernel-half mapping; the sub-item after lands the in-kernel ELF
+  loader for static binaries. PT_INTERP + a userspace dynamic linker
+  come later when a binary actually needs them — init and the early
+  userspace will be statically linked.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (107 total, +8 in
+  `mm::addr_space`): `new` builds a real empty AS with a
+  page-aligned PML4; single-page `map_vma` installs a PTE that
+  `translate` finds; multi-page `map_vma` installs every PTE in the
+  range and nothing outside it; `unmap_covering` returns the box
+  and removes every PTE; overlap is rejected with the original
+  mapping untouched and the rejected box returned; kernel-half
+  ranges are rejected; `unmap_covering` returns `None` on a miss;
+  `Drop` cleanly tears down repeated populated address spaces
+  without exhausting the 16 MiB host heap.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 4): in-kernel ELF loader (static binaries)
+
+The fourth item of the "Address Spaces and Paging" slice: take a
+static ELF64 binary as a `&[u8]` and populate an `AddressSpace` with
+its LOAD segments + an initial stack VMA. Closes out "Address space
+construction from an ELF image" as a parent item.
+
+What's in the build:
+
+- `kernel/src/mm/elf.rs` — new: hand-rolled ELF64 parser (`Ehdr` /
+  `Phdr` reader functions using `u{16,32,64}::from_le_bytes`),
+  `load_elf(asp, bytes)`, `EntryInfo`, `ElfLoadError`,
+  `map_load_segment` helper, plus a `STACK_TOP` / `STACK_SIZE`
+  pair and 12 host-side tests including a Vec-based test ELF
+  builder.
+- `kernel/src/mm/mod.rs` — registers `mod elf`.
+- `docs/architecture/memory-management.md` — adds `## ELF loader`
+  section; updates Phase 1 limitations to reflect "loader exists,
+  static-only / no argv setup."
+- `docs/planning/implementation-plan.md` — checks off both the
+  ELF-loader sub-item and the parent "Address space construction
+  from an ELF image."
+
+Decisions worth recording:
+
+- **Universal kernel/userspace ELF loader split.** Linux
+  (`binfmt_elf` → `ld.so`), Windows (kernel loader → NTDLL), and
+  macOS (kernel → `dyld`) all draw the line at the same place: the
+  kernel handles parsing the executable header, mapping LOAD
+  segments, setting up the initial stack, and (when present)
+  loading the dynamic linker interpreter. Symbol resolution,
+  library loading, and relocation run entirely in userspace. We
+  follow the same split. PT_INTERP support and a userspace dynamic
+  linker arrive when a binary actually needs them — init and the
+  early Nitrox userspace will be statically linked, same as Linux's
+  early userspace historically was.
+- **Static binaries only in this commit.** Both `ET_DYN` (PIE) and
+  `PT_INTERP` (dynamic) are rejected. PIE handling needs base
+  randomization — a separate sub-item. The dynamic-linker
+  interpreter cannot be loaded without a userspace `ld.so`
+  equivalent — also separate. Restricting to `ET_EXEC` gets us
+  what init needs without preempting either future design call.
+- **Hand-rolled parser, not `goblin` or `xmas-elf`.** Per
+  `kernel/CLAUDE.md`'s no-external-crates rule, the ELF parser is
+  hand-rolled. The footprint is small (validate `e_ident`, read
+  ~20 fields total across `Ehdr` and `Phdr`); a crate dependency
+  would be heavier-weight than the parser itself.
+- **`load_elf(asp, bytes)` as a free function, not
+  `AddressSpace::from_elf(bytes)`.** The function composes (build
+  AS via `AddressSpace::new`, then populate via `load_elf`) rather
+  than baking ELF knowledge into the AS constructor. The AS type
+  stays format-agnostic; future loaders (PE for testing? raw
+  blobs?) can sit alongside `load_elf` in `mm/elf.rs` or its
+  successors without rippling into `addr_space.rs`.
+- **Bytes copied via the HHDM, not via `UserPtr` copy primitives.**
+  The frames we're writing into are freshly-allocated kernel-owned
+  memory; the `UserPtr` discipline (which exists for a different
+  reason — protecting against bad user pointers during syscalls)
+  doesn't apply yet. HHDM access is the natural way: `translate`
+  the just-mapped virtual address to find the physical frame, then
+  write through `phys + hhdm_offset()`.
+- **Page-by-page copy loop, not bulk-copy-then-fixup.** Each
+  iteration covers `min(remaining_in_page, remaining_in_file)`
+  bytes starting at the current `va` / `file_off` pair. The
+  alternative (compute every (virt, phys, len) triplet up front,
+  then bulk-copy) needs a temporary vector. The per-page loop
+  works in fixed memory and is no slower for the volumes Phase 1
+  cares about.
+- **No partial-load rollback.** A segment failing mid-load leaves
+  the AS in a partial state. The caller drops the AS;
+  `AddressSpace::Drop` cleans up. The alternative — walking back
+  through already-installed segments to unmap them — adds
+  significant code for a path that's only exercised on malformed
+  ELFs or true OOM. Both are rare and the cleanup-by-Drop strategy
+  is already correct.
+- **No argv / envp / auxv on the stack.** Nitrox passes argv and
+  env as typed structural values rather than C strings (per the
+  v5.1 design doc). The handoff format is defined by the userspace
+  runtime, which doesn't exist yet — the "first userspace process"
+  milestone is where the format gets decided. Until then,
+  `load_elf` just maps an empty 16 KiB stack at a known address.
+- **Fixed stack placement at `STACK_TOP = 0x7FFF_FFFF_0000`.**
+  Picked to be page-aligned, canonical, and well below
+  `USER_VIRT_END`. ASLR for the stack is a future hardening pass,
+  alongside the kernel-image and mmap-arena ASLR slots.
+- **`map_load_segment` reports overlap-or-canonical-failure
+  uniformly**, even though `MapError` from `map_vma` distinguishes
+  them. From the loader's perspective, both are "this ELF places a
+  segment somewhere it can't go" — the user (the developer who
+  built the binary) cares whether the binary is malformed, not
+  about the internal subdivision. The granular `MapError` stays
+  available for future callers that want it.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (119 total, +12 in
+  `mm::elf`): truncated input, bad magic, wrong class / data /
+  version / machine / type, `PT_INTERP` present, single-page
+  LOAD segment maps and copies bytes (with BSS verified zero),
+  non-zero in-page offset segment, multi-page segment span,
+  alignment violation, kernel-half segment range, overlapping
+  segments, stack VMA at the right address and zero-initialised.
+  Tests use a Vec-based `ElfBuilder` to construct minimal valid
+  ELFs in-memory; no external binaries needed.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 5): higher-half kernel mapping shared across address spaces
+
+Until now, `AddressSpace::new()` produced an all-zero PML4 —
+"installable but not loadable." Switching `CR3` to it would
+triple-fault the moment the kernel tried to fetch its next
+instruction. This item closes that gap, making every freshly-
+constructed AS share the boot kernel's higher-half mappings.
+
+What's in the build:
+
+- `kernel/src/arch/paging.rs` — new `unsafe fn
+  inherit_kernel_mappings(root)` on the `ArchPaging` trait, with
+  the contract: callers pass a writable top-level page table they
+  own; the impl populates whatever kernel-half mappings the active
+  architecture's process ASes need to inherit.
+- `kernel/src/arch/x86_64/paging.rs` — new private
+  `KERNEL_TEMPLATE: SpinLock<Option<[u64; 256]>>`, public
+  `init_kernel_template(boot_root)` that snapshots PML4 entries
+  256..512 into it via private `read_kernel_half_entries`, and
+  the `inherit_kernel_mappings` impl that copies them into a
+  fresh PML4 via private `write_kernel_half_entries`. The two
+  helpers carry the unsafe work; the trait method is a thin
+  template + write wrapper.
+- `kernel/src/arch/mod.rs` — re-exports `init_kernel_template`
+  alongside the existing `active_root` / `ensure_nxe` / `translate`.
+- `kernel/src/mm/addr_space.rs` — `AddressSpace::new` calls
+  `Paging::inherit_kernel_mappings(root)` after zeroing the new
+  PML4. The doc on `new` is updated to remove the "installable but
+  not loadable" caveat.
+- `kernel/src/main.rs` — boot path gains a `paging_init()` step
+  that runs `ensure_nxe` and `init_kernel_template(active_root())`
+  before the existing translate smoke test.
+- `kernel/src/mm/test_support.rs` — `init_global_heap` now also
+  initialises the template from an all-zero fake PML4 so the
+  existing `AddressSpace` tests' `inherit_kernel_mappings` call
+  doesn't panic.
+- `kernel/docs/lock-ordering.md` — `KERNEL_TEMPLATE` slots in at
+  rank 6c, alongside the allocator locks; documented as a
+  no-nest leaf taken only at boot and at AS construction.
+- `docs/architecture/memory-management.md` — new
+  `## Kernel-half PML4 sharing` section describing the
+  template-and-copy mechanism, the shared-intermediate-tables
+  consequence, and the "PML4 entries for the kernel half are
+  immutable post-boot" rule.
+
+Decisions worth recording:
+
+- **Template-and-copy at AS construction, not
+  shared-PML4-by-reference.** Each AS owns its own PML4 frame
+  (so CR3 holds a per-AS value, which is required for any
+  future ASID tagging and for cleanliness). What's shared are
+  the *entries* (and through them the intermediate tables they
+  point at). The alternative — a single shared PML4 with
+  per-AS PML4 entries swapped in on CR3 load — would require
+  modifying global state on every context switch, which is
+  worse on every axis.
+- **Snapshot at boot, not "always read live."** The kernel's
+  higher-half PML4 entries are populated by Limine before
+  `_start` runs and never change post-boot (per the
+  "kernel-half PML4 entries are immutable post-boot" rule
+  this item establishes). A static snapshot avoids paying the
+  CR3-read-and-walk cost per `AddressSpace::new`, and makes
+  the source of truth explicit. If a future change really
+  needs the kernel half to grow new PML4 entries at runtime,
+  it has to also visit every AS — the design wants that to
+  be obviously expensive.
+- **`SpinLock<Option<[u64; 256]>>` over `Once`-style init.**
+  The `Once` pattern matches the buddy/slab init style, but
+  the kernel-half template benefits from being re-initialisable
+  in tests (the `init_global_heap` helper writes a zero
+  template; a future on-target ASLR-style rebuild might want
+  to re-snapshot). `SpinLock<Option<...>>` allows that without
+  adding a test-only escape hatch.
+- **`init_kernel_template` is `unsafe`.** It reads through
+  HHDM into a raw `u64` array; the `boot_root` argument
+  carries the unsafe invariants (real PML4, page-aligned,
+  HHDM-reachable). Marking it `unsafe` shifts those to the
+  caller — `paging_init` in `main.rs`, where the invariants
+  obviously hold given `arch::active_root()` returns the
+  live CR3.
+- **Rank 6c for `KERNEL_TEMPLATE`, alongside the allocators.**
+  The lock is a leaf: held briefly, no nesting, no other lock
+  acquired while inside it. Could have been a fresh rank, but
+  grouping with the other constant-time leaves (6a, 6b) makes
+  the lock-ordering table easier to reason about.
+- **No `inherit_kernel_mappings` on aarch64 (when implemented):
+  no-op.** TTBR0/TTBR1 split keeps the kernel half in a
+  separate translation register that process ASes never touch.
+  Putting the responsibility on `ArchPaging` rather than baking
+  the x86_64 mechanism into `AddressSpace::new` keeps the
+  arch-neutral caller unchanged.
+- **Test the read/write helpers, not the global template.**
+  Host tests for `read_kernel_half_entries` and
+  `write_kernel_half_entries` exercise the byte-shuffling
+  against fake PML4 frames with marker patterns. The trait
+  method that reads the global template is implicitly tested
+  by every existing `AddressSpace` test (which now calls
+  `inherit_kernel_mappings` against `test_support`'s zeroed
+  template and would panic on a use-before-init bug).
+
+Verification:
+
+- `cargo xtask test` — host tests pass (122 total, +3 in
+  `arch::x86_64::paging::tests`): `read_kernel_half_entries`
+  captures only the kernel half; `write_kernel_half_entries`
+  preserves the user half and writes the kernel half;
+  read-then-write round-trips. Every existing AS test still
+  passes (the `inherit_kernel_mappings` call against
+  `test_support`'s zeroed template is a no-op for tests that
+  don't validate kernel-half entries).
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 6): kernel vmap + per-thread kernel stack
+
+The sixth item closes out the address-spaces-and-paging slice. It
+lands the first kernel-half post-boot allocator (a bump-pointer vmap)
+and its first consumer (`KernelStack`), exercising end-to-end the
+shared-PDPT machinery that item 5 set up.
+
+What's in the build:
+
+- `kernel/src/arch/paging.rs` — new `unsafe fn
+  ensure_kernel_intermediate(root, virt) -> Result<(), MapError>`
+  on `ArchPaging`. The contract: pre-allocate whatever top-level
+  kernel-half intermediate page tables are needed so post-boot
+  leaf installs at `virt` propagate to every AS via the captured
+  template. On x86_64 (4-level paging) this allocates a PDPT under
+  the PML4 entry covering `virt`; on aarch64 (split TTBR) this
+  will be a no-op.
+- `kernel/src/arch/x86_64/paging.rs` — `ensure_kernel_intermediate`
+  impl uses `pml4_index(virt)`, `alloc_page_table`, and
+  `Pte::new_table`. Idempotent: returns `Ok` if the entry is
+  already present.
+- `kernel/src/mm/kvmap.rs` — new module. `KERNEL_VMAP_START` /
+  `KERNEL_VMAP_END` constants per the architecture overview
+  (16 TiB at `0xFFFF_C000_0000_0000`). `VMAP_NEXT: SpinLock<u64>`
+  bump cursor (lock rank 6d, leaf). `vmap_alloc_pages(n)` returns
+  a page-aligned virtual address and advances the cursor.
+  `init()` calls `Paging::ensure_kernel_intermediate` for the
+  vmap start so the captured template includes the PDPT.
+- `kernel/src/mm/kstack.rs` — new module. `KernelStack` carries
+  the stack top, base, backing frames, and the install root.
+  `KernelStack::new(root)` reserves `KERNEL_STACK_PAGES + 1`
+  vmap pages (one guard + N stack), allocates frames, installs
+  PTEs writable / NX / kernel-only. Drop unmaps and frees.
+  `KERNEL_STACK_PAGES = 4` (16 KiB).
+- `kernel/src/mm/mod.rs` — registers `mod kstack` and `mod kvmap`.
+- `kernel/src/main.rs` — `paging_init` now does `ensure_nxe` →
+  `kvmap::init` → `init_kernel_template`. The ordering is
+  load-bearing: `kvmap::init` modifies the live PML4 in ways the
+  template snapshot must capture.
+- `kernel/docs/lock-ordering.md` — adds rank 6d for `VMAP_NEXT`
+  and a leaf-no-nest note.
+- `docs/architecture/memory-management.md` — new `## Kernel vmap
+  and per-thread kernel stacks` section; Phase 1 limitations
+  updated.
+
+Decisions worth recording:
+
+- **Bump-pointer allocator, no freelist.** The vmap region is
+  16 TiB. Each kernel stack consumes 5 pages = 20 KiB of vmap
+  (the bump never reclaims). To run out we'd need ~800 million
+  stack allocations. The freelist isn't worth the complexity for
+  Phase 1. If kernel stacks ever churn heavily (they shouldn't —
+  a stack lives as long as its thread), a freelist is a local
+  addition to `kvmap.rs` only.
+- **Pre-allocate only one PDPT, not the full 16 TiB of PDPTs.**
+  32 PDPTs covering the whole vmap region would cost 128 KiB at
+  boot. One PDPT covers 512 GiB — well past anything Phase 1
+  will use. The cost is "if vmap ever crosses 512 GiB we have to
+  add the next PDPT at boot." That's enforced by the
+  immutable-post-boot rule from item 5: late additions are
+  impossible without visiting every AS.
+- **`ensure_kernel_intermediate` is on `ArchPaging`, not a free
+  function.** The concept ("pre-allocate the top-level
+  kernel-half intermediate tables") generalises across
+  architectures even though the implementation differs (PDPT on
+  x86_64, no-op on aarch64). Putting it on the trait keeps
+  arch-neutral callers (`kvmap::init`) unchanged across ports.
+- **`KernelStack::new` takes `root` explicitly.** Because the
+  shared PDPT means any AS can be used as the install target
+  with the same observable result, we could plausibly default to
+  `active_root()`. But making it explicit (a) keeps the function
+  testable host-side (tests pass a test AS's root, not a real
+  CR3 value), (b) documents that this stack is associated with a
+  specific AS for `Drop`'s benefit, and (c) avoids hiding the
+  arch::active_root dependency.
+- **Guard page at the **bottom** of the stack region.** Stacks
+  grow down on x86_64; overflow happens at low addresses.
+  Placing the guard one page below `base` (the lowest mapped
+  byte) catches it. Some kernels (notably FreeBSD) also have a
+  guard above the top for "underflow" detection, but that's
+  pointless for normal stack use — there's no way to underflow a
+  stack you allocated.
+- **`PageFlags::WRITABLE | PageFlags::NO_EXECUTE` only.** Kernel
+  stacks need W (we write to them) and NX (no instruction fetch).
+  USER is deliberately absent — these are kernel-only. GLOBAL
+  could be set in principle (kernel-only mappings persist across
+  CR3 reloads), but Phase 1 doesn't have a global-bit story yet;
+  leaving it absent matches every other kernel mapping the
+  template captures from Limine. Revisit during the Phase 3
+  global-bit / PCID hardening pass.
+- **No production consumer yet.** Threading lands in a later
+  slice. `KernelStack` is built now because the kvmap allocator
+  + guard-page primitive belong with the memory subsystem; the
+  first consumer is incidentally a stack, but per-CPU data and
+  driver MMIO will use the same vmap allocator when they arrive.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (130 total, +8 in the new
+  modules): kvmap allocations are page-aligned, in the vmap
+  region, and monotonically increasing; `KernelStack::new`
+  installs the stack pages and leaves the guard unmapped (verified
+  via `translate`); `top = base + KERNEL_STACK_BYTES`; the guard
+  is exactly one page below `base`; multiple stacks have disjoint
+  ranges; `Drop` unmaps the stack pages.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.

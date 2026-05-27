@@ -6,7 +6,7 @@ Three layers, each owning a single concern:
 |--------|---------------------------------------|----------------------------------------|
 | Buddy  | `kernel/src/mm/buddy.rs`              | Physical page frames                   |
 | Slab   | `kernel/src/mm/slab.rs`               | Sub-page kernel-object allocation      |
-| VMM    | `kernel/src/mm/vmm.rs` (not yet)      | Per-process address spaces, VMAs       |
+| VMM    | `kernel/src/mm/vmm.rs`                | Per-process address spaces, VMAs       |
 
 The boot facade in `kernel/src/mm/heap.rs` glues layers 1 and 2: it owns
 the single global `BuddyAllocator` and exposes `buddy_alloc` /
@@ -14,8 +14,13 @@ the single global `BuddyAllocator` and exposes `buddy_alloc` /
 this facade through a small `BuddyPager` trait so tests can inject a
 local buddy without touching the global statics.
 
-Phase 1 implements layers 1 and 2; layer 3 lands in the next slice
-alongside paging.
+Phase 1 implements layers 1 and 2 in full. Layer 3 — the VMM — is being
+built up incrementally. In today: the arch-level page-table primitive
+(see [Arch paging layer](#arch-paging-layer)) and the [VMA tree](#vma-tree)
+that stores per-address-space mappings. Still ahead: the `AddressSpace`
+owner that pairs the VMA tree with a page-table root under one lock, the
+page-table integration that turns VMA mutations into PTE installs and
+removals, and the `mprotect`-style split / merge operations.
 
 ## Buddy allocator
 
@@ -129,6 +134,262 @@ the kernel cannot tolerate. `KBox` / `KVec` / `KString` call `kmalloc` /
 `kfree` directly and surface exhaustion as `AllocError`. See the
 decision log entry of 2026-05-20.
 
+## Arch paging layer
+
+The VMM (layer 3) does not touch hardware page tables directly — it goes
+through `ArchPaging`, the kernel's first cross-architecture trait
+(`kernel/src/arch/paging.rs`). The trait abstracts the operations whose
+implementation genuinely differs between x86_64 and aarch64; the active
+architecture's implementation is re-exported as `arch::Paging`.
+
+- **Surface:** `map_page`, `unmap_page`, `flush_tlb_page`,
+  `flush_tlb_all`, `set_page_table` — all `unsafe`. `map_page` /
+  `unmap_page` install and remove a 4 KiB leaf and allocate intermediate
+  tables from the buddy on demand; neither flushes the TLB, so the
+  caller batches one flush over many changes. `unmap_page` returns the
+  freed `PhysAddr` for the VMM to reclaim.
+- **Permissions:** the arch-neutral `PageFlags` (writable, user,
+  no-execute, global, cache attributes) is translated to page-table-entry
+  bits by each architecture's implementation.
+- **x86_64:** `kernel/src/arch/x86_64/paging.rs` — 4-level (48-bit)
+  paging, 4 KiB leaves only. `translate` additionally understands 2 MiB
+  and 1 GiB pages so it is correct against the bootloader's live tables.
+  The kernel enables `EFER.NXE` at boot so `NO_EXECUTE` is usable.
+
+Page tables are reached through the higher-half direct map: a table at
+physical `p` is addressed at `p + hhdm_offset()`. Out of scope today:
+reclaiming intermediate tables on unmap, range TLB flush, and cross-CPU
+shootdown — all filed in `docs/rationale/deferred-decisions.md`.
+
+## VMA tree
+
+[`mm/vmm.rs`](../../kernel/src/mm/vmm.rs) holds the leaf data types
+(`VAddrRange`, `Protection`, `MappingKind`, `Vma`) and `VmaTree` — an
+interval-augmented intrusive red-black tree of `Vma`s, keyed on
+`range.start`.
+
+- **Intrusive linkage.** The `RbLink` (parent / left / right / colour
+  / `subtree_max_end`) lives as a private field on `Vma`. The tree
+  owns the boxed VMAs through `KBox<Vma>`: insert takes a box, remove
+  returns one. Slab-backed allocation matches Linux's `vm_area_cachep`
+  — every VMA goes through `kmalloc`, no per-address-space arena. The
+  arena alternative was considered and rejected; see the decision log
+  entry of 2026-05-27.
+- **Interval augmentation.** Each node carries `subtree_max_end`, the
+  maximum `range.end` over its subtree. It is maintained on every
+  structural mutation (insert, remove, rotation). Today's queries are
+  already O(log n) without consuming it; the augmentation is in place
+  for future disjoint-range stabbing queries that need subtree
+  pruning to skip whole branches.
+- **`Protection` is narrower than `arch::paging::PageFlags`.** A VMA
+  carries WRITE / EXEC / USER only; `GLOBAL` and cache-attribute bits
+  are per-PTE policy decided at install time, not a property of the
+  address range. The VMM will translate `Protection` into `PageFlags`
+  when it actually populates a leaf. `Protection::empty()` is the safe
+  default (kernel-only, read-only, non-executable), the inverse of
+  `PageFlags::empty()`'s hardware-friendly default.
+- **Queries.** `find_covering(addr)` for point lookup, `iter()` for
+  full in-order traversal, `find_first_overlapping(range)` for the
+  leftmost overlapping VMA, and `iter_overlapping(range)` for the
+  contiguous overlap run. Iterators advance through parent pointers
+  for the in-order successor — no allocation, no recursion.
+- **Operations.** `insert` rejects any overlap with an existing VMA
+  and returns the box back to the caller. `remove_covering(addr)`
+  unlinks the VMA containing `addr` and returns the box. Both
+  fixups follow CLRS, iterative throughout (parent pointers make
+  recursion unnecessary; see the 2026-05-27 deviation note).
+- **Send / Sync.** `Vma` is non-`Send` / non-`Sync` because the link
+  field holds `NonNull` pointers. That's intentional: a `Vma` in a
+  tree is bound to its address-space lock. The `AddressSpace` will
+  carry the `unsafe impl Send` when it lands, with a SAFETY comment
+  pointing at the lock.
+
+## AddressSpace
+
+[`mm/addr_space.rs`](../../kernel/src/mm/addr_space.rs) pairs the VMA
+tree with a top-level page-table root under a single
+`SpinLock<Inner>` (rank 4 per
+[kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)).
+It is the bridge between the VMM's bookkeeping (the tree) and the
+hardware MMU's actual translations (the page tables): `map_vma`
+updates both atomically; `unmap_covering` does the inverse.
+
+- **Construction.** `new()` allocates a fresh 4 KiB PML4 frame from
+  the buddy, zeros every entry, then calls
+  `ArchPaging::inherit_kernel_mappings` to populate the kernel half
+  from a boot-captured template (see
+  [Kernel-half PML4 sharing](#kernel-half-pml4-sharing) below). The
+  resulting AS is loadable: switching `CR3` to its root preserves
+  every higher-half mapping the running kernel relies on (its own
+  code, the kernel stack, the HHDM, the framebuffer).
+- **`map_vma(KBox<Vma>)`.** Validates the range (canonical, within
+  `[0, USER_VIRT_END)`), pre-checks tree overlap, then walks the
+  range one page at a time: allocate a frame, zero it through the
+  HHDM, install the PTE via `ArchPaging::map_page`. On failure
+  mid-walk, the partial install is rolled back (every installed PTE
+  uninstalled, every allocated frame freed) and the box returned to
+  the caller with a `MapError`. The whole sequence runs under the AS
+  lock so the tree and the page tables can never disagree about
+  what's mapped.
+- **Eager anonymous allocation.** One frame per page is allocated at
+  `map_vma` time; on-demand allocation via the page-fault handler
+  would be the real-OS pattern but needs an upgraded `#PF` handler
+  (today's is dump-and-halt). The switch lands when the PF handler
+  does.
+- **Frame ownership lives in the page tables.** No per-VMA list of
+  owned physical frames: `ArchPaging::unmap_page` returns the
+  `PhysAddr` it freed, which `unmap_covering` and `Drop` hand straight
+  to `buddy_free`. For `MappingKind::Anonymous` the frame is freed;
+  the dispatch will branch on backing kind when `FileBacked` /
+  `Device` arrive (file-backed pages belong to the page cache, device
+  pages were never allocated by the kernel).
+- **`Drop` drains the tree leftmost-first**, uninstalls every PTE,
+  frees every leaf frame, then frees the PML4. Intermediate
+  page-table frames (PDPT / PD / PT) leak per the deferred decision
+  documented for `ArchPaging::unmap_page` — for a single Phase 1 AS
+  the cost is negligible.
+- **No TLB flushing.** No `AddressSpace` is ever loaded onto a CPU
+  today; the TLB never holds entries for the new mappings. When the
+  scheduler arrives it will own the `set_active` entry point and
+  the flush policy that comes with it.
+
+## Kernel-half PML4 sharing
+
+Every process address space shares the boot kernel's higher-half
+mappings — kernel code, kernel stack, HHDM, framebuffer, future
+kernel-vmap allocations. Without that sharing, switching `CR3` to a
+process AS would unmap the executing kernel and triple-fault.
+
+The mechanism is template-and-copy:
+
+1. **Boot capture.** At boot,
+   [`arch::init_kernel_template`](../../kernel/src/arch/x86_64/paging.rs)
+   reads Limine's live PML4 (via `arch::active_root`) and copies
+   entries 256..512 — the canonical kernel-half — into a static
+   `SpinLock<Option<[u64; 256]>>`. Must run after `init_memory` (the
+   HHDM is required to reach the PML4 frame) and before any
+   `AddressSpace::new`.
+2. **AS inheritance.** `AddressSpace::new` allocates a fresh PML4,
+   zeros it, then calls
+   `ArchPaging::inherit_kernel_mappings(root)`. On x86_64 this
+   copies the template's 256 entries into the new PML4's kernel
+   half. The user half (entries 0..256) stays zero.
+3. **Shared intermediate tables.** The copied entries are PML4
+   slots, which point at PDPTs — and through those at PDs and
+   PTs. All address spaces hold the *same* `PhysAddr` values in
+   their kernel-half PML4 slots, so they reach the *same*
+   intermediate tables. Modifications at the leaf level (a future
+   kernel-vmap allocation, for instance) become visible to every
+   AS without a cross-AS update step or a TLB shootdown of any
+   kind beyond the local invalidation.
+
+The rule that follows: **PML4 entries for the kernel half are
+immutable post-boot**. The intermediate tables they point at can
+grow leaves freely; the top-level entries cannot change without
+visiting every AS to update its template-copy. Linux preallocates
+intermediate tables for the kernel-vmap region for the same
+reason; we will do the same when the vmap allocator lands (the
+next sub-item).
+
+On a future aarch64 port, `inherit_kernel_mappings` is a no-op:
+the TTBR0/TTBR1 split makes the kernel half live in a separate
+translation register that process address spaces don't manage.
+The arch-neutral caller (`AddressSpace::new`) is unchanged.
+
+## Kernel vmap and per-thread kernel stacks
+
+Kernel-half regions allocated post-boot — kernel stacks today, future
+per-CPU data and driver MMIO — live in the kernel vmap region
+(`0xFFFF_C000_0000_0000..0xFFFF_D000_0000_0000`, 16 TiB per the
+[architecture overview](overview.md)). Two pieces split the work:
+
+[`mm/kvmap.rs`](../../kernel/src/mm/kvmap.rs) is a bump-pointer
+allocator that hands out virtual address ranges in the vmap region.
+`vmap_alloc_pages(n)` returns a page-aligned virtual address and
+advances the cursor; no freelist. 16 TiB is enough that the lack of
+reuse doesn't matter for Phase 1.
+
+`mm::kvmap::init` runs at boot **before** `init_kernel_template`. It
+calls `ArchPaging::ensure_kernel_intermediate` to pre-allocate the
+PDPT under the PML4 entry covering the vmap region (one PDPT covers
+512 GiB — well past anything Phase 1 will use). The
+[shared-kernel-half rule](#kernel-half-pml4-sharing) does the rest:
+the captured template includes the PDPT pointer, every future AS
+inherits it, and post-boot leaf installs into vmap modify the shared
+sub-tree visible to every AS without any cross-AS coordination.
+
+[`mm/kstack.rs`](../../kernel/src/mm/kstack.rs) is the first
+consumer. `KernelStack::new(root)` reserves `KERNEL_STACK_PAGES + 1`
+virtual pages in vmap (16 KiB stack + 1 guard page), allocates frames
+for the top `KERNEL_STACK_PAGES`, installs them writable / NX /
+kernel-only via `ArchPaging::map_page`. The bottom page is the guard
+— deliberately left absent so a stack-overflow write to it
+page-faults rather than silently corrupting whatever sits below.
+
+- **`root` is which AS to install through.** Because the PDPT is
+  shared across every AS, the PTEs end up visible to all of them
+  regardless of which `root` is passed; the parameter is stored so
+  `Drop` can clear the PTEs symmetrically and to make the
+  ownership explicit.
+- **Drop reclaims frames but not vmap.** The bump allocator has no
+  freelist, so the virtual range of a freed stack stays reserved.
+  Phase 1 kernel stacks are constructed once per thread and freed
+  at thread exit; churn is negligible. A vmap freelist is a local
+  addition if that ever changes.
+- **No production consumer today.** Threading lands in a later
+  slice; `KernelStack` is built now because the underlying
+  infrastructure (the vmap allocator + the guard-page discipline)
+  belongs with the memory subsystem rather than dragging into the
+  threading slice.
+
+`VMAP_NEXT` sits at lock rank 6d alongside the allocator leaves.
+
+## ELF loader
+
+[`mm/elf.rs`](../../kernel/src/mm/elf.rs) populates a fresh
+`AddressSpace` from a static ELF64 binary.
+`load_elf(asp, bytes) -> Result<EntryInfo, ElfLoadError>` parses the
+header (hand-rolled `repr(C)`-free reader; no external crates),
+walks the program headers, and for each `PT_LOAD` segment allocates
+a page-aligned VMA covering `[align_down(p_vaddr), align_up(p_vaddr
++ p_memsz))`, then copies file bytes `p_offset..p_offset + p_filesz`
+into the newly-allocated frames via the HHDM. BSS (the `p_memsz -
+p_filesz` tail) comes for free from `map_vma`'s zero-init step.
+After segments, an initial 4-page stack VMA is installed at the
+host architecture's `arch::abi::DEFAULT_USER_STACK_TOP` (on x86_64,
+`0x7FFF_FFFF_0000`); the returned [`EntryInfo`] carries the entry
+point and stack top for whatever launches the user thread later.
+
+The loader itself is architecture-neutral: it lives outside
+`kernel/src/arch/` and consults [`arch::abi`](../../kernel/src/arch/x86_64/abi.rs)
+for the three values that vary across machines — the expected
+`e_machine`, the user-half upper bound, and the default stack
+placement. An aarch64 port supplies its own `abi.rs`; this file is
+unchanged.
+
+- **Static binaries only.** `ET_DYN` is rejected pending PIE
+  base-address randomization. `PT_INTERP` is rejected: dynamic
+  linking is a userspace concern matching the universal
+  kernel/userspace boundary used by Linux (`binfmt_elf` →
+  `ld.so`), Windows (kernel loader → NTDLL), and macOS (kernel
+  Mach-O → `dyld`). A future Nitrox `ld.so` equivalent will live
+  in userspace and use normal syscalls to map shared libraries.
+- **`p_vaddr % PAGE == p_offset % PAGE`** is enforced (the ELF spec
+  requires it); without it the file bytes couldn't be laid into the
+  VMA contiguously through HHDM.
+- **Protection mapping.** `PF_X` → `Protection::EXEC`, `PF_W` →
+  `Protection::WRITE`. Every loaded segment gets `Protection::USER`.
+  `PF_R` is implicit: every architecture Nitrox targets makes a
+  present mapping readable.
+- **No argv / envp / auxv on the stack.** Nitrox passes argv / env
+  as typed structural values; the handoff format belongs to "first
+  userspace process" where the userspace runtime defines it. The
+  stack VMA today is just 16 KiB of writable, zero-initialised
+  memory at a known address.
+- **No partial-load rollback.** A segment failure mid-load leaves
+  the address space in a partial state; the caller drops it,
+  which `AddressSpace::Drop` cleans up.
+
 ## Locking
 
 Both allocator locks sit at rank 6 (see [kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)):
@@ -158,3 +419,24 @@ allocator locks are likely candidates.
 - No DMA / Normal zone split in the buddy (see TODO in `buddy.rs`).
 - No allocator-rank-checker in debug builds (still on the to-do list
   in CLAUDE.md).
+- No TLB flushing on map / unmap. No AS is "active" today, so the
+  TLB doesn't cache its entries. The scheduler will own flushing
+  once `AddressSpace::set_active` exists.
+- Kernel vmap PDPT pre-allocation covers only the first 512 GiB of
+  the 16 TiB vmap region. If a future allocation crosses that
+  boundary, the additional PDPTs must be added to the live PML4
+  *before* `init_kernel_template` snapshot — i.e., at boot. The
+  immutable-post-boot rule for kernel-half PML4 entries makes
+  late additions impossible without visiting every AS.
+- Kernel vmap allocator has no freelist; `KernelStack::Drop`
+  reclaims frames but leaks the vmap region. Negligible at Phase 1
+  churn; revisit if it ever isn't.
+- `KernelStack` has no production consumer yet — threading lands
+  in a later slice.
+- ELF loader handles **static** binaries only: `ET_DYN` (PIE) and
+  `PT_INTERP` (dynamic linking) are rejected. PIE needs base
+  randomization; dynamic linking needs a userspace `ld.so`
+  equivalent. Both arrive later.
+- ELF loader does **not** set up argv / envp / auxv on the stack
+  yet — the handoff format is defined by the userspace runtime and
+  belongs to the "first userspace process" milestone.

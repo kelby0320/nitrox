@@ -18,10 +18,12 @@ enforced by code review.
 | 1    | Scheduler runqueue                           | not yet present                          |
 | 2    | Wait queue                                   | not yet present                          |
 | 3    | Handle-table segment allocation              | not yet present                          |
-| 4    | Kernel-object internal locks (VMA tree, etc.)| not yet present                          |
+| 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
 | 5    | IPC channel                                  | not yet present                          |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
+| 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
+| 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`)                       | live as of Phase 1 slice 4 (diagnostics) |
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
@@ -53,6 +55,44 @@ When SMP arrives (Phase 3), the nesting still works because the rank
 ordering remains slab → buddy and the lower lock cannot block waiting
 for the upper. If a future change makes the buddy depend on the slab,
 that closes the cycle and must be rejected at design review.
+
+## Kernel vmap bump pointer is a leaf
+
+`VMAP_NEXT` (`kernel/src/mm/kvmap.rs`) is a `SpinLock<u64>` holding
+the next free virtual address in the kernel vmap region. Acquired
+briefly per allocation in `vmap_alloc_pages`; no other lock is taken
+inside, no other lock is held outside it during the acquire. Rank 6d
+keeps it grouped with the other constant-time leaves; like them, it
+may be acquired while holding any lock at rank 1–5.
+
+## Kernel-half PML4 template is a leaf
+
+`KERNEL_TEMPLATE` (`kernel/src/arch/x86_64/paging.rs`) is a
+`SpinLock<Option<[u64; 256]>>` holding the kernel-half PML4 entries
+captured at boot. It is acquired in exactly two places:
+
+- `init_kernel_template(boot_root)` at boot, with no other lock held.
+- `X86Paging::inherit_kernel_mappings(root)` inside
+  `AddressSpace::new` — at the point of acquisition, the freshly
+  allocated PML4 frame is the only AS-related state; `new` has not
+  yet wrapped it in its own `SpinLock<Inner>`, so the rank-4
+  `AddressSpace` lock is not held.
+
+It nests with nothing and never recurses. Rank 6c keeps it grouped
+with the other constant-time leaf-style locks (the allocators);
+calling `inherit_kernel_mappings` while holding any lock at rank
+1–5 is allowed and expected.
+
+## Paging allocates page-table frames from the buddy
+
+`ArchPaging::map_page` (`kernel/src/arch/x86_64/paging.rs`) calls
+`buddy_alloc` to obtain frames for intermediate page tables. The paging
+layer holds no lock of its own — the page-table root is passed in by the
+caller — so it introduces no new rank and no new nesting. It does
+acquire rank 6b transitively: `map_page` must not be called while
+holding the rank-7 `SERIAL` lock. The future VMM will call `map_page`
+while holding the rank-4 VMA-tree lock, which is correctly ordered (rank
+4 is above rank 6b).
 
 ## The serial lock is a leaf
 

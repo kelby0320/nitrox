@@ -20,9 +20,17 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - **Phase 0 (Foundation):** complete — kernel boots under QEMU+OVMF and
   renders a framebuffer boot screen. See the Phase 0 deviation notes for
   where it diverged from the original checklist.
-- **Phase 1 (Kernel substrate):** in progress — memory foundation slice
-  complete (buddy allocator, slab, `libkern` containers). Next: the
-  kernel diagnostics slice, then address spaces and paging.
+- **Phase 1 (Kernel substrate):** in progress — the
+  address-spaces-and-paging slice is complete. Memory foundation
+  (buddy / slab / `libkern` containers), kernel diagnostics (serial,
+  GDT/TSS/IDT, fault dumps), the `ArchPaging` trait + x86_64 4-level
+  page-table primitive, the VMA tree (interval-augmented intrusive
+  RB-tree), `AddressSpace` (VMA tree + page-table root + lock under
+  one `SpinLock<Inner>`), the static ELF loader, the shared
+  higher-half kernel mapping across address spaces, and per-thread
+  kernel stacks with guard pages are all in. Next: user memory access
+  discipline (`UserPtr<T>`, exception-table copy primitives, SMAP),
+  then the handle table.
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -164,13 +172,92 @@ silent reset.
 
 #### Address spaces and paging
 
-- [ ] `ArchPaging` trait in `kernel/src/arch/` with x86_64 implementation
+- [x] `ArchPaging` trait in `kernel/src/arch/` with x86_64 implementation
   - `map_page`, `unmap_page`, `flush_tlb_*`, `set_page_table`
   - All `unsafe`, all with SAFETY comments
-- [ ] VMA structure with red-black tree storage
-- [ ] Address space construction from an ELF image
-- [ ] Higher-half kernel mapping shared across all address spaces
-- [ ] Per-thread kernel stack with guard page
+- [x] VMA structure with red-black tree storage
+  - [x] `Vma` struct + `VAddrRange`, `Protection`, `MappingKind` types in
+    `kernel/src/mm/vmm.rs`. `MappingKind` starts as `Anonymous`-only;
+    `FileBacked` / `Device` variants land with their consumers.
+    `Protection` is a narrower abstraction than `arch::PageFlags` (WRITE
+    / EXEC / USER), translated to `PageFlags` at PTE-install time
+  - [x] Intrusive RB-tree node embedded in `Vma`: parent / left / right
+    / colour, plus `subtree_max_end` for interval augmentation
+  - [x] RB-tree insert with overlap detection, CLRS-textbook fixup
+    (rotations + recolour), augmentation maintenance on every structural
+    mutation. Remove lands with the next sub-item
+  - [x] Point lookup `VmaTree::find_covering(addr)` — plain BST walk;
+    interval augmentation isn't needed for point queries
+  - [x] Ownership: `VmaTree` owns `KBox<Vma>` (insert takes a box,
+    returns it back on overlap rejection). `KBox::into_raw` /
+    `from_raw` added for intrusive ownership. Iterative post-order
+    `Drop` via parent pointers, no allocation
+  - [x] Host-side tests: BST + RB + augmentation invariant checkers
+    exercised on every insert across ascending, descending, and
+    shuffled-insert sequences (200 randomised inserts, full invariant
+    check after each); overlap rejection across all shapes
+  - [x] `VmaTree::remove_covering(addr)`: BST-delete with in-order
+    successor swap when the target has two children; CLRS-textbook
+    delete-fixup with all four cases (mirrored), tested against
+    shuffled-insert + shuffled-remove sequences with full invariant
+    verification after every operation
+  - [x] `find_first_overlapping(range)` — O(log n) leftmost-overlap
+    BST walk; `iter_overlapping(range)` — in-order iterator over the
+    contiguous overlap run with parent-pointer successor advance;
+    `iter()` — full in-order iterator. Augmentation maintained but
+    not consumed by these queries (leftmost-overlap is already
+    O(log n) without it; pruning matters for future disjoint-range
+    queries)
+  - [x] Update [docs/architecture/memory-management.md] to point at
+    `mm/vmm.rs` and drop the "not yet" annotation in the layer table.
+    Added a `## VMA tree` section describing structure, augmentation,
+    queries, and the Send/Sync story; added a Phase 1 limitation
+    noting the missing `AddressSpace` owner
+- [x] Address space construction from an ELF image
+  - [x] `AddressSpace` skeleton in `kernel/src/mm/addr_space.rs`:
+    `VmaTree` + page-table root paired under a single `SpinLock<Inner>`
+    (rank 4). `new()` allocates and zeroes a fresh PML4 frame.
+    `map_vma(KBox<Vma>)` validates the range (canonical + user-half),
+    pre-checks tree overlap, then allocates+zeros+installs one frame
+    per page in lockstep (with full rollback on failure), and commits
+    the VMA to the tree. `unmap_covering(addr)` is the inverse. `Drop`
+    drains the tree, uninstalls every PTE, frees leaf frames, frees
+    the PML4. No TLB flush yet (no AS is "active" until the scheduler
+    lands); no higher-half kernel mapping yet (the next sub-item)
+  - [x] In-kernel ELF loader for **static** binaries:
+    `mm::elf::load_elf(asp, bytes) -> Result<EntryInfo, ElfLoadError>`.
+    Hand-rolled ELF64 parser (no external crates), validates header
+    (magic / class / data / version / machine / type), walks program
+    headers, allocates a VMA + zeroed frames + copies file bytes for
+    each PT_LOAD, rejects PT_INTERP (dynamic linking is a userspace
+    `ld.so` concern). Sets up an initial 4-page stack VMA at a fixed
+    top-of-user-space address; returns the entry point and stack top.
+    argv / envp / auxv stack-area setup deferred to "first userspace
+    process" where the userspace runtime defines the handoff format
+- [x] Higher-half kernel mapping shared across all address spaces:
+  `ArchPaging::inherit_kernel_mappings(root)` populates a fresh PML4's
+  kernel half from a boot-captured template. x86_64 impl copies entries
+  256..512 from a `SpinLock<Option<[u64; 256]>>` snapshot of Limine's
+  PML4 (captured by `init_kernel_template(active_root())` at boot,
+  before any AS construction). aarch64 (when implemented) will be a
+  no-op given TTBR0/TTBR1 split. `AddressSpace::new()` calls it after
+  zeroing the freshly-allocated PML4. The intermediate PDPTs the
+  template points at are now shared across every AS, so future
+  kernel-vmap allocations propagate to every AS automatically
+- [x] Per-thread kernel stack with guard page:
+  `mm::kvmap` is a bump-pointer kernel-vmap allocator hands out
+  virtual address ranges in `0xFFFF_C000_0000_0000..0xFFFF_D000_0000_0000`
+  (16 TiB). `mm::kvmap::init` runs at boot before
+  `init_kernel_template` and calls
+  `ArchPaging::ensure_kernel_intermediate` to pre-allocate the
+  vmap PDPT, so the captured template includes it and every AS
+  inherits the shared sub-tree. `mm::kstack::KernelStack::new(root)`
+  reserves `KERNEL_STACK_PAGES + 1` vmap pages, allocates frames
+  for the top N (writable / NX / kernel-only), leaves the bottom
+  page as an unmapped guard. Drop unmaps the PTEs and frees the
+  frames; the vmap region itself is not reclaimed (no freelist —
+  fine for Phase 1's churn rate). No production consumer yet —
+  threading consumes when it lands
 
 #### User memory access discipline
 
@@ -296,7 +383,18 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 
 ### Notes / deviations
 
-(Add notes here.)
+- 2026-05-27 — VMA tree design call: RB-tree operations are iterative
+  rather than recursive. With parent pointers (required for an intrusive
+  tree anyway), insert/delete rebalancing walks up the tree naturally;
+  search and in-order iteration become iterative trivially. Removes a
+  kernel-stack-depth concern as a real tradeoff. Matches Linux
+  (`lib/rbtree.c`).
+- 2026-05-27 — VMA tree design call: `KBox<Vma>` over a per-address-space
+  arena. VMAs come and go constantly (every `mprotect` boundary-cross
+  splits a VMA), so an arena either needs an internal free-list (which
+  is just the slab again) or fragments. Slab-backed allocation matches
+  Linux's `vm_area_cachep` model. Revisit if profiling ever shows the
+  slab is a bottleneck — the change is local to `VmaTree`.
 
 ---
 

@@ -57,6 +57,31 @@ impl<T> KBox<T> {
         unsafe { ptr::write(ptr.as_ptr(), val) };
         Ok(KBox { ptr })
     }
+
+    /// Consume the box and yield its raw pointer, suppressing the
+    /// destructor. The caller takes ownership of the allocation and is
+    /// responsible for reconstituting it via [`KBox::from_raw`] (or
+    /// freeing the storage directly).
+    ///
+    /// Used by intrusive containers that thread the allocation through
+    /// raw pointers in their links and reconstruct the box on removal.
+    pub fn into_raw(boxed: Self) -> NonNull<T> {
+        let ptr = boxed.ptr;
+        mem::forget(boxed);
+        ptr
+    }
+
+    /// Reconstruct a box from a raw pointer previously yielded by
+    /// [`KBox::into_raw`]. The reconstructed box owns the allocation as
+    /// if it had been returned by `try_new`.
+    ///
+    /// # Safety
+    /// `ptr` must have come from a prior [`KBox::into_raw`] for a `T`
+    /// of the same type, and must not have been reconstructed already.
+    /// The pointee must still be initialised and not aliased.
+    pub unsafe fn from_raw(ptr: NonNull<T>) -> Self {
+        Self { ptr }
+    }
 }
 
 impl<T> Deref for KBox<T> {
@@ -74,6 +99,12 @@ impl<T> DerefMut for KBox<T> {
         // SAFETY: the box owns an initialised `T`; `&mut self` proves no
         // other reference to it is live.
         unsafe { self.ptr.as_mut() }
+    }
+}
+
+impl<T: core::fmt::Debug> core::fmt::Debug for KBox<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        (**self).fmt(f)
     }
 }
 
@@ -150,6 +181,21 @@ mod tests {
         {
             let _b = KBox::try_new(ZstDrop(&count)).unwrap();
         }
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn into_raw_then_from_raw_round_trips_without_double_free() {
+        init_global_heap();
+        let count = AtomicUsize::new(0);
+        let raw = KBox::into_raw(KBox::try_new(DropFlag(&count)).unwrap());
+        // `into_raw` must suppress the destructor — no drop yet.
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        // SAFETY: `raw` came from the matching `into_raw` above and
+        // has not been reconstructed yet.
+        let _restored = unsafe { KBox::from_raw(raw) };
+        assert_eq!(count.load(Ordering::SeqCst), 0);
+        drop(_restored);
         assert_eq!(count.load(Ordering::SeqCst), 1);
     }
 

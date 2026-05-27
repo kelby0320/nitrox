@@ -122,6 +122,10 @@ These will eventually be done, but aren't in initial scope. Each entry documents
 
 **DMA / Normal zone split in the buddy.** The buddy treats every Usable frame above 1 MiB as a single pool. ISA-DMA (below 16 MiB) has no fast path. Trigger: a driver that needs ISA-DMA buffers (none yet). See `TODO:` comment in `kernel/src/mm/buddy.rs`.
 
+**Reclaiming empty intermediate page tables on unmap.** `ArchPaging::unmap_page` clears the leaf entry but leaves the PDPT/PD/PT frames it walked through allocated, even when an unmap empties one. Reclaiming them needs a per-table populated-entry count (or a 512-slot scan on every unmap). Phase 1 runs a single address space with little mapping churn, so the leak is negligible. See the `TODO:` comment in `kernel/src/arch/x86_64/paging.rs`. Trigger: address-space teardown (process exit) or `munmap`-heavy workloads make the retained tables a measurable cost.
+
+**Range TLB invalidation and cross-CPU shootdown.** `ArchPaging` exposes `flush_tlb_page` (one page) and `flush_tlb_all` (a CR3 reload). There is no range flush — a bulk unmapper issues one `flush_tlb_page` per page — and no cross-CPU shootdown IPI. Phase 1 is single-CPU, so a local flush is a complete flush. Trigger: SMP bring-up (Phase 3) makes a stale TLB entry on another CPU a correctness bug; a `flush_tlb_range` and a `send_shootdown_ipi` land with the per-CPU and IPI infrastructure.
+
 **Debug-build lock-ordering enforcement.** `kernel/CLAUDE.md` documents that debug builds will track acquisition order and panic on violations. The mechanism doesn't yet exist; the only lock-ordering enforcement today is code review and `kernel/docs/lock-ordering.md`. Trigger: enough locks exist that the cost of building the rank-tracker outweighs the cost of a missed bug.
 
 ### Testing and CI
