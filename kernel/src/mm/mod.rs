@@ -14,6 +14,7 @@ pub mod heap;
 pub mod kstack;
 pub mod kvmap;
 pub mod slab;
+pub mod user_access;
 pub mod vmm;
 
 #[cfg(test)]

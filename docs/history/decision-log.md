@@ -1228,3 +1228,124 @@ Verification:
   ranges; `Drop` unmaps the stack pages.
 - `cargo xtask build` — kernel ELF builds clean for
   `x86_64-unknown-none`.
+
+---
+
+## 2026-05-27 — Phase 1, slice 6 (item 1): user-access exception table + `#PF` recovery
+
+First commit of the user-memory-access-discipline slice. Lands the
+plumbing the copy primitives will hang off of in slice 2: a linker
+section that holds `(fault_pc, recovery_pc)` pairs, a lookup function
+that walks it, and a `#PF` handler that consults the table and
+`iretq`s to the recovery PC on a match. Nothing registers entries
+yet — the copy primitives are slice 2 — so the section is empty in
+this commit. The handler still dump-and-halts on a miss, matching
+the diagnostics IDT's behaviour for every other vector.
+
+What's in the build:
+
+- `kernel/linker.ld` — new `.user_access_table` output section in
+  the rodata segment, bracketed by `__start_user_access_table` and
+  `__stop_user_access_table`. `ALIGN(8)` matches the `u64`-pair
+  entry layout. `KEEP` because nothing in Rust source refers to
+  the entries by name — they're indirectly reachable only through
+  the start/stop symbols, so `--gc-sections` would otherwise drop
+  them. Empty section is well-defined: `start == stop` means "no
+  recovery sites registered."
+- `kernel/src/mm/user_access.rs` — new module. `ExtableEntry`
+  (`#[repr(C)]`, two `u64`s) is the layout slice 2's inline asm
+  will emit with `.quad` directives. `lookup_recovery(fault_pc)
+  -> Option<u64>` walks the bracketed slice linearly and returns
+  the recovery PC on match. A small `lookup_recovery_in(table,
+  fault_pc)` helper takes an explicit slice so the lookup is
+  host-testable without the linker symbols (`cfg(test)` returns
+  an empty table).
+- `kernel/src/mm/mod.rs` — registers `mod user_access`.
+- `kernel/src/arch/x86_64/idt.rs` — splits vector 14 (`#PF`) off
+  the common `exception_stub!` macro. The macro stubs end in
+  `ud2` because their dispatcher is `-> !`; the new `vec14` stub
+  ends in `iretq` because `pf_dispatch` is allowed to return.
+  Stub flow: push vector + 15 GPRs (the CPU pushed the error
+  code), `call pf_dispatch`, on return pop everything and
+  `iretq` to the patched RIP. `pf_dispatch` reads the saved RIP,
+  calls `lookup_recovery`, writes the recovery PC back to
+  `frame.rip` and returns on match, or falls through to a
+  factored-out `dump_and_halt(&ExceptionFrame) -> !`
+  (previously the body of `exception_dispatch`) on miss.
+
+Decisions worth recording:
+
+- **Absolute 64-bit PCs in entries, not 32-bit relative offsets.**
+  Linux uses relative offsets to be KASLR-friendly. Nitrox has no
+  KASLR and isn't planning any in Phase 1. The per-entry cost
+  difference (16 vs 8 bytes) is negligible at the entry counts
+  we expect (one per copy primitive, ~5 in total for slice 2),
+  and absolute PCs simplify both the asm emitter and the lookup.
+  Revisit if KASLR ever lands.
+- **Linear scan over sorted-table + binary search.** Lookup runs
+  only on the rare (faulting) path. The full table from slice 2
+  fits well inside a single cacheline. A linear scan with no
+  sorting requirement also keeps the asm-side `.pushsection`
+  emitter trivial — no need to maintain ordering across
+  translation units. Revisit if Phase 2 ever pushes the count
+  past a few dozen.
+- **`pf_dispatch` returns; the fatal path calls `dump_and_halt`
+  itself.** Two alternatives were considered: (a) make
+  `pf_dispatch` return an enum (`Recovered`/`Fatal`) and have the
+  stub branch on it, and (b) make `pf_dispatch` always return
+  and let the stub conditionally `iretq` vs `ud2`. (a) needs a
+  second register output from the stub; (b) needs a branch in
+  asm. The chosen path keeps the stub straight-line and pushes
+  the conditional into Rust where it belongs. The trade-off is
+  the dispatcher has two effective return modes — return normally
+  on recovery, or never return — which is exactly what `-> ()`
+  vs `-> !` already encodes, applied at the call boundary inside
+  the function rather than at the function signature.
+- **Vector 14 is hand-written, not added to the macro.** The
+  macro's contract is "uniform stub, `ud2` at the end, dispatcher
+  is `-> !`." Generalising the macro to support both ending
+  shapes would mean either a second macro arm or a runtime branch
+  in every stub — both worse than the duplication of one
+  hand-written stub. The duplication is bounded by `#PF` being
+  the only recoverable CPU exception (everything else really is
+  fatal in Phase 1).
+- **The "VMA lookup" branch the plan mentions is not in this
+  commit.** Today there's no concept of an active address space:
+  the kernel still runs on Limine's tables, and the scheduler
+  that will own `set_active` hasn't landed. Until it does, a
+  `#PF` whose RIP is not in the exception table is either a
+  kernel bug (today's behaviour: dump-and-halt is correct) or a
+  user-space fault that can't be delivered anywhere meaningful
+  (no process, no notification channel). When the scheduler
+  arrives, `pf_dispatch` will grow a second decision step
+  between "exception-table lookup" and `dump_and_halt`. Noted
+  as a follow-up in the slice-2 wrap-up.
+- **Host-tested via a sliced-out pure function.** The real
+  `lookup_recovery` reads the linker symbols, which don't exist
+  under `cargo test`. Factoring out `lookup_recovery_in(table,
+  fault_pc)` and providing a `cfg(test)` empty-table shim for
+  the wrapper keeps every interesting case (empty / single hit
+  / multiple entries / duplicate fault_pc) host-testable, and
+  the layout-assertions test pins down the asm contract
+  (`offset_of!(fault_pc) == 0`, `offset_of!(recovery_pc) == 8`,
+  `size_of == 16`, `align_of == 8`) so slice 2's `.quad` writes
+  can't drift away from the Rust struct.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (136 total, +6 in
+  `mm::user_access`): empty table, single-entry hit/miss,
+  multi-entry recovery routing, duplicate-fault-pc determinism,
+  the host-build empty-table shim, and the layout-contract
+  assertions.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
+- `readelf -S` + `nm` confirm the `.user_access_table` section
+  exists in the kernel ELF with size 0 and that
+  `__start_user_access_table == __stop_user_access_table` —
+  the well-defined "no entries yet" state.
+- Boot under QEMU+OVMF reaches the existing diagnostics
+  milestones ("diagnostics online", "CPU tables installed",
+  "allocators up", paging smoke-test passes) — the IDT install
+  picks up the new vec14 stub without disturbing the existing
+  boot path.

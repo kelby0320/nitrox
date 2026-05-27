@@ -1,13 +1,18 @@
 //! Minimal Interrupt Descriptor Table: dump-and-halt handlers for the 32
-//! CPU exception vectors.
+//! CPU exception vectors, with a recovery path for `#PF`.
 //!
-//! This is a *diagnostics* IDT, not a full interrupt subsystem. Every
-//! exception vector (0-31) gets a handler that prints the faulting state
-//! to the serial console and halts. There is no recovery, no
-//! exception-table consultation, and no `iret` — that is the job of the
-//! later "user memory access" slice. Hardware IRQs are not handled at
-//! all: the kernel never executes `sti` in Phase 1, so only non-maskable
-//! CPU exceptions can fire.
+//! Every exception vector (0-31) gets a handler that prints the faulting
+//! state to the serial console and halts. Hardware IRQs are not handled
+//! at all: the kernel never executes `sti` in Phase 1, so only
+//! non-maskable CPU exceptions can fire.
+//!
+//! `#PF` (vector 14) is the one exception with a recovery path: the
+//! handler consults the user-memory-access exception table (see
+//! [`crate::mm::user_access`]) and, on a match, patches the saved RIP
+//! to the registered recovery PC and `iretq`s back to it. The first
+//! consumer — the copy primitives in slice 2 — uses this to turn a
+//! fault during a user-memory copy into a [`Result::Err`] instead of
+//! a kernel halt. Faults that miss the table still dump-and-halt.
 //!
 //! ## Handler entry: naked stubs
 //!
@@ -20,6 +25,12 @@
 //! 2. pushes the vector number and all 15 general-purpose registers,
 //!    building an [`ExceptionFrame`] on the stack;
 //! 3. calls [`exception_dispatch`] with a pointer to that frame.
+//!
+//! Vector 14 is built by hand ([`vec14`]) rather than from the macro:
+//! its dispatcher is allowed to return when the fault is recoverable,
+//! and the stub then unwinds the GPRs / vector / error code and
+//! `iretq`s to the patched RIP. The other 31 stubs follow the macro
+//! and end in `ud2` — their dispatcher is `-> !` and must not return.
 //!
 //! `#DF` runs on IST1 (a dedicated stack set up in `gdt.rs`) so it can
 //! report even after a stack overflow.
@@ -173,7 +184,8 @@ exception_stub!(err, vec10, 10);
 exception_stub!(err, vec11, 11);
 exception_stub!(err, vec12, 12);
 exception_stub!(err, vec13, 13);
-exception_stub!(err, vec14, 14);
+// vec14 (#PF) is built by hand below — its dispatcher returns on a
+// recoverable fault, so the stub must `iretq` rather than `ud2`.
 exception_stub!(noerr, vec15, 15);
 exception_stub!(noerr, vec16, 16);
 exception_stub!(err, vec17, 17);
@@ -191,6 +203,76 @@ exception_stub!(noerr, vec28, 28);
 exception_stub!(err, vec29, 29);
 exception_stub!(err, vec30, 30);
 exception_stub!(noerr, vec31, 31);
+
+// --- #PF stub (vector 14) -----------------------------------------------
+//
+// Differs from the macro stubs in two places: (a) the CPU pushed an
+// error code so we don't push a dummy zero, and (b) on a recoverable
+// fault the dispatcher returns instead of halting, so the stub must
+// unwind the GPRs / vector / error code and `iretq` to the patched
+// RIP. Fatal faults are handled inside the dispatcher (it calls
+// `dump_and_halt`, which is `-> !`), so the post-`call` instructions
+// run only on the recovery path.
+
+/// `#PF` (vector 14) entry stub. See the module doc for the recovery
+/// contract.
+#[unsafe(naked)]
+extern "C" fn vec14() -> ! {
+    ::core::arch::naked_asm!(
+        // The CPU pushed a #PF error code; push the vector and the 15
+        // GPRs to build a full `ExceptionFrame` on the stack, then pass
+        // its address to the dispatcher.
+        concat!(
+            "push 14\n",
+            "push rax\npush rbx\npush rcx\npush rdx\n",
+            "push rsi\npush rdi\npush rbp\n",
+            "push r8\npush r9\npush r10\npush r11\n",
+            "push r12\npush r13\npush r14\npush r15\n",
+            "mov rdi, rsp\n",
+        ),
+        "call {dispatch}",
+        // Recovery path: the dispatcher patched `frame.rip` and
+        // returned. Pop the GPRs, drop the vector + error-code slots
+        // (16 bytes), and `iretq` to the patched RIP. The CPU-pushed
+        // RIP/CS/RFLAGS/RSP/SS are popped by `iretq` itself.
+        concat!(
+            "pop r15\npop r14\npop r13\npop r12\n",
+            "pop r11\npop r10\npop r9\npop r8\n",
+            "pop rbp\npop rdi\npop rsi\n",
+            "pop rdx\npop rcx\npop rbx\npop rax\n",
+            "add rsp, 16\n",
+            "iretq\n",
+        ),
+        dispatch = sym pf_dispatch,
+    );
+}
+
+/// `#PF` dispatcher. Looks up the faulting RIP in the user-access
+/// exception table; on a match, patches `frame.rip` to the recovery PC
+/// and returns so the stub can `iretq` to it. On a miss, calls
+/// [`dump_and_halt`] which never returns.
+///
+/// `*mut ExceptionFrame` rather than `*const` because the recovery
+/// path writes back the new RIP in place. The frame lives on the
+/// current stack (the stub built it with `push`es), and only this
+/// thread can be using that stack region.
+///
+/// Reached only from [`vec14`] via `call`; `extern "C"` matches the
+/// stub's `mov rdi, rsp` argument pass.
+extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
+    // SAFETY: the naked stub built a complete `ExceptionFrame` at the
+    // stack top and passed its address in RDI. It is valid, 8-byte
+    // aligned, and not aliased for the duration of this call.
+    let f = unsafe { &mut *frame };
+    debug_assert_eq!(f.vector, 14);
+
+    if let Some(recovery) = crate::mm::user_access::lookup_recovery(f.rip) {
+        f.rip = recovery;
+        return;
+    }
+
+    dump_and_halt(f);
+}
 
 /// Entry stubs for CPU exception vectors 0-31, indexed by vector number.
 const STUBS: [extern "C" fn() -> !; 32] = [
@@ -228,8 +310,8 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
-/// Common handler for every CPU exception. Dumps the faulting state to
-/// the serial console and halts — Phase 1 has no recovery path.
+/// Common handler for every CPU exception except `#PF`. Hands the
+/// frame to [`dump_and_halt`], which never returns.
 ///
 /// Reached only from a naked stub via `call`; `extern "C"` matches the
 /// stub's `mov rdi, rsp` argument pass.
@@ -238,7 +320,13 @@ extern "C" fn exception_dispatch(frame: *const ExceptionFrame) -> ! {
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
     let f = unsafe { &*frame };
+    dump_and_halt(f);
+}
 
+/// Dump the faulting state to the serial console and halt. Shared
+/// between [`exception_dispatch`] (always) and [`pf_dispatch`] (only on
+/// faults that miss the user-access exception table).
+fn dump_and_halt(f: &ExceptionFrame) -> ! {
     // The emergency writer bypasses `SERIAL`'s lock: the fault may have
     // occurred while that lock was held. Sound under Phase 1's
     // single-CPU, interrupts-masked model.
