@@ -374,7 +374,6 @@ mod tests {
     // ----- Test ELF builder -----
 
     struct ElfBuilder {
-        bytes: Vec<u8>,
         segments: Vec<TestSegment>,
         e_type: u16,
         e_machine: u16,
@@ -395,7 +394,6 @@ mod tests {
     impl ElfBuilder {
         fn new() -> Self {
             Self {
-                bytes: Vec::new(),
                 segments: Vec::new(),
                 e_type: E_TYPE_EXEC,
                 e_machine: E_MACHINE,
