@@ -13,6 +13,8 @@
 //! tree operations, and the `AddressSpace` owner land in the following
 //! sub-items.
 
+use core::ptr::NonNull;
+
 use crate::mm::{PAGE_SIZE, VirtAddr};
 
 /// A half-open range of virtual addresses, `[start, end)`.
@@ -173,20 +175,83 @@ pub enum MappingKind {
     Anonymous,
 }
 
+/// Red-black tree node colour for the intrusive link in [`Vma`].
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+#[allow(dead_code)] // `Black` is recoloured-to in the insert fixup — next sub-item.
+enum RbColor {
+    Red,
+    Black,
+}
+
+/// Intrusive red-black-tree link embedded in every [`Vma`].
+///
+/// Raw pointers because the tree forms cycles — every non-root node's
+/// parent slot points back through the parent's child slot at the same
+/// node — which Rust's borrow checker correctly refuses to express with
+/// references. The pointers are non-aliasing in the safe sense: every
+/// `Vma` is reached through exactly one tree node. Expressing that as
+/// `&mut Vma` is still impossible because a tree walk needs the parent
+/// reference live while it visits a child, and the parent's child slot
+/// aliases the child reference.
+///
+/// `NonNull` rather than `*mut Vma` for the nullable-but-aligned shape
+/// (`Option<NonNull<Vma>>` is one machine word with a niche-optimised
+/// `None`) and the soundness invariant that a non-`None` link is never
+/// dangling-by-construction.
+///
+/// The link is private to `mm::vmm`; callers outside this module neither
+/// see nor construct one. It carries no methods today — accessors and
+/// the structural mutators arrive with the tree operations.
+#[derive(Debug)]
+#[allow(dead_code)] // fields are read by the tree operations — next sub-item.
+struct RbLink {
+    parent: Option<NonNull<Vma>>,
+    left: Option<NonNull<Vma>>,
+    right: Option<NonNull<Vma>>,
+    color: RbColor,
+    /// The largest `range.end` in the subtree rooted at this node — the
+    /// interval-tree augmentation. Maintained on every structural
+    /// mutation by the tree operations.
+    subtree_max_end: VirtAddr,
+}
+
+impl RbLink {
+    /// Construct a link for a freshly-allocated `Vma` whose own range
+    /// ends at `end`. New nodes are red — the standard RB-tree insertion
+    /// convention; the insert fixup recolours as needed.
+    const fn new(end: VirtAddr) -> Self {
+        Self {
+            parent: None,
+            left: None,
+            right: None,
+            color: RbColor::Red,
+            subtree_max_end: end,
+        }
+    }
+}
+
 /// A virtual memory area: a contiguous virtual address range with
 /// uniform protection and a single backing kind.
 ///
 /// The smallest unit the VMM tracks. An address space is a tree of
-/// non-overlapping `Vma`s (the tree machinery lands in the next
-/// sub-item). `mprotect`-style operations that change protection on
-/// only a sub-range, and merges of adjacent compatible VMAs, are tree
-/// operations rather than field mutations: a `Vma` is conceptually
-/// immutable once installed.
-#[derive(Clone, Debug)]
+/// non-overlapping `Vma`s. `mprotect`-style operations that change
+/// protection on only a sub-range, and merges of adjacent compatible
+/// VMAs, are tree operations rather than field mutations: a `Vma` is
+/// conceptually immutable once installed.
+///
+/// Once a `Vma` has been wired into a tree, its address must not change
+/// — the intrusive links of its parent and children hold raw pointers
+/// at it. Storing `Vma`s in `KBox` (and never moving the box) satisfies
+/// this. The non-`Send` / non-`Sync` status that follows from the link
+/// field is intentional: synchronisation is provided by the owning
+/// `AddressSpace`'s lock, not by `Vma` itself.
+#[derive(Debug)]
 pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
     pub mapping: MappingKind,
+    #[allow(dead_code)] // read by the tree operations — next sub-item.
+    link: RbLink,
 }
 
 impl Vma {
@@ -195,6 +260,7 @@ impl Vma {
             range,
             prot,
             mapping,
+            link: RbLink::new(range.end()),
         }
     }
 }
@@ -301,6 +367,17 @@ mod tests {
         assert!(!Protection::empty().contains(Protection::WRITE));
         assert!(!Protection::empty().contains(Protection::EXEC));
         assert!(!Protection::empty().contains(Protection::USER));
+    }
+
+    #[test]
+    fn vma_new_initializes_link_unlinked_red_with_self_max() {
+        let r = range(PAGE, PAGE * 4);
+        let v = Vma::new(r, Protection::empty(), MappingKind::Anonymous);
+        assert!(v.link.parent.is_none());
+        assert!(v.link.left.is_none());
+        assert!(v.link.right.is_none());
+        assert_eq!(v.link.color, RbColor::Red);
+        assert_eq!(v.link.subtree_max_end, r.end());
     }
 
     #[test]
