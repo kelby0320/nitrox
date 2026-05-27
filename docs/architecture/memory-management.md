@@ -6,7 +6,7 @@ Three layers, each owning a single concern:
 |--------|---------------------------------------|----------------------------------------|
 | Buddy  | `kernel/src/mm/buddy.rs`              | Physical page frames                   |
 | Slab   | `kernel/src/mm/slab.rs`               | Sub-page kernel-object allocation      |
-| VMM    | `kernel/src/mm/vmm.rs` (not yet)      | Per-process address spaces, VMAs       |
+| VMM    | `kernel/src/mm/vmm.rs`                | Per-process address spaces, VMAs       |
 
 The boot facade in `kernel/src/mm/heap.rs` glues layers 1 and 2: it owns
 the single global `BuddyAllocator` and exposes `buddy_alloc` /
@@ -14,11 +14,13 @@ the single global `BuddyAllocator` and exposes `buddy_alloc` /
 this facade through a small `BuddyPager` trait so tests can inject a
 local buddy without touching the global statics.
 
-Phase 1 implements layers 1 and 2 in full. Layer 3 — the VMM — is in
-progress: the arch-level page-table primitive it sits on now exists (see
-[Arch paging layer](#arch-paging-layer)), and the VMM proper
-(`mm/vmm.rs`, the VMA tree, address-space construction) lands across the
-rest of the address-spaces-and-paging slice.
+Phase 1 implements layers 1 and 2 in full. Layer 3 — the VMM — is being
+built up incrementally. In today: the arch-level page-table primitive
+(see [Arch paging layer](#arch-paging-layer)) and the [VMA tree](#vma-tree)
+that stores per-address-space mappings. Still ahead: the `AddressSpace`
+owner that pairs the VMA tree with a page-table root under one lock, the
+page-table integration that turns VMA mutations into PTE installs and
+removals, and the `mprotect`-style split / merge operations.
 
 ## Buddy allocator
 
@@ -159,6 +161,49 @@ physical `p` is addressed at `p + hhdm_offset()`. Out of scope today:
 reclaiming intermediate tables on unmap, range TLB flush, and cross-CPU
 shootdown — all filed in `docs/rationale/deferred-decisions.md`.
 
+## VMA tree
+
+[`mm/vmm.rs`](../../kernel/src/mm/vmm.rs) holds the leaf data types
+(`VAddrRange`, `Protection`, `MappingKind`, `Vma`) and `VmaTree` — an
+interval-augmented intrusive red-black tree of `Vma`s, keyed on
+`range.start`.
+
+- **Intrusive linkage.** The `RbLink` (parent / left / right / colour
+  / `subtree_max_end`) lives as a private field on `Vma`. The tree
+  owns the boxed VMAs through `KBox<Vma>`: insert takes a box, remove
+  returns one. Slab-backed allocation matches Linux's `vm_area_cachep`
+  — every VMA goes through `kmalloc`, no per-address-space arena. The
+  arena alternative was considered and rejected; see the decision log
+  entry of 2026-05-27.
+- **Interval augmentation.** Each node carries `subtree_max_end`, the
+  maximum `range.end` over its subtree. It is maintained on every
+  structural mutation (insert, remove, rotation). Today's queries are
+  already O(log n) without consuming it; the augmentation is in place
+  for future disjoint-range stabbing queries that need subtree
+  pruning to skip whole branches.
+- **`Protection` is narrower than `arch::paging::PageFlags`.** A VMA
+  carries WRITE / EXEC / USER only; `GLOBAL` and cache-attribute bits
+  are per-PTE policy decided at install time, not a property of the
+  address range. The VMM will translate `Protection` into `PageFlags`
+  when it actually populates a leaf. `Protection::empty()` is the safe
+  default (kernel-only, read-only, non-executable), the inverse of
+  `PageFlags::empty()`'s hardware-friendly default.
+- **Queries.** `find_covering(addr)` for point lookup, `iter()` for
+  full in-order traversal, `find_first_overlapping(range)` for the
+  leftmost overlapping VMA, and `iter_overlapping(range)` for the
+  contiguous overlap run. Iterators advance through parent pointers
+  for the in-order successor — no allocation, no recursion.
+- **Operations.** `insert` rejects any overlap with an existing VMA
+  and returns the box back to the caller. `remove_covering(addr)`
+  unlinks the VMA containing `addr` and returns the box. Both
+  fixups follow CLRS, iterative throughout (parent pointers make
+  recursion unnecessary; see the 2026-05-27 deviation note).
+- **Send / Sync.** `Vma` is non-`Send` / non-`Sync` because the link
+  field holds `NonNull` pointers. That's intentional: a `Vma` in a
+  tree is bound to its address-space lock. The `AddressSpace` will
+  carry the `unsafe impl Send` when it lands, with a SAFETY comment
+  pointing at the lock.
+
 ## Locking
 
 Both allocator locks sit at rank 6 (see [kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)):
@@ -188,3 +233,7 @@ allocator locks are likely candidates.
 - No DMA / Normal zone split in the buddy (see TODO in `buddy.rs`).
 - No allocator-rank-checker in debug builds (still on the to-do list
   in CLAUDE.md).
+- No `AddressSpace` yet. The VMA tree is fully functional in
+  isolation but isn't driving any real mappings — inserting or
+  removing a `Vma` doesn't touch page tables today. The integration
+  lands with the `AddressSpace` owner in a following sub-item.

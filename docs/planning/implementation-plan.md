@@ -20,9 +20,14 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - **Phase 0 (Foundation):** complete — kernel boots under QEMU+OVMF and
   renders a framebuffer boot screen. See the Phase 0 deviation notes for
   where it diverged from the original checklist.
-- **Phase 1 (Kernel substrate):** in progress — memory foundation slice
-  complete (buddy allocator, slab, `libkern` containers). Next: the
-  kernel diagnostics slice, then address spaces and paging.
+- **Phase 1 (Kernel substrate):** in progress — memory foundation
+  (buddy / slab / `libkern` containers), kernel diagnostics (serial,
+  GDT/TSS/IDT, fault dumps), the `ArchPaging` trait + x86_64 4-level
+  page-table primitive, and the VMA tree (interval-augmented intrusive
+  RB-tree with insert / remove / point lookup / overlap iteration) are
+  all complete. Next within the address-spaces-and-paging slice: the
+  `AddressSpace` owner that pairs the VMA tree with a page-table root
+  under one lock, then address-space construction from an ELF image.
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -167,7 +172,7 @@ silent reset.
 - [x] `ArchPaging` trait in `kernel/src/arch/` with x86_64 implementation
   - `map_page`, `unmap_page`, `flush_tlb_*`, `set_page_table`
   - All `unsafe`, all with SAFETY comments
-- [ ] VMA structure with red-black tree storage
+- [x] VMA structure with red-black tree storage
   - [x] `Vma` struct + `VAddrRange`, `Protection`, `MappingKind` types in
     `kernel/src/mm/vmm.rs`. `MappingKind` starts as `Anonymous`-only;
     `FileBacked` / `Device` variants land with their consumers.
@@ -200,8 +205,11 @@ silent reset.
     not consumed by these queries (leftmost-overlap is already
     O(log n) without it; pruning matters for future disjoint-range
     queries)
-  - [ ] Update [docs/architecture/memory-management.md] to point at
-    `mm/vmm.rs` and drop the "not yet" annotation in the layer table
+  - [x] Update [docs/architecture/memory-management.md] to point at
+    `mm/vmm.rs` and drop the "not yet" annotation in the layer table.
+    Added a `## VMA tree` section describing structure, augmentation,
+    queries, and the Send/Sync story; added a Phase 1 limitation
+    noting the missing `AddressSpace` owner
 - [ ] Address space construction from an ELF image
 - [ ] Higher-half kernel mapping shared across all address spaces
 - [ ] Per-thread kernel stack with guard page

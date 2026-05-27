@@ -695,3 +695,98 @@ Verification:
 - `cargo xtask qemu` — boot reaches the smoke test, which prints
   `paging: NX enabled; translate <virt> -> <phys>` and continues to
   the boot screen.
+
+## 2026-05-27 — Phase 1, slice 5 (item 2): VMA tree (interval-augmented intrusive RB-tree)
+
+The second item of the "Address Spaces and Paging" slice: the per-process
+data structure that the rest of the VMM will manipulate. No address-space
+owner yet, no page-table integration yet — this item delivers the leaf
+data types (`VAddrRange`, `Protection`, `MappingKind`, `Vma`) and the
+`VmaTree` itself (insert, remove, point lookup, overlap iteration).
+
+What's in the build:
+
+- `kernel/src/mm/vmm.rs` — new: the leaf types, `RbColor` / `RbLink`
+  (private), `VmaTree` with `insert` / `remove_covering` / `find_covering`
+  / `find_first_overlapping` / `iter` / `iter_overlapping`, an iterative
+  post-order `Drop`, and 30+ host-side tests including 200-element
+  shuffled-insert + shuffled-remove torture tests with full BST + RB +
+  augmentation invariant verification after every operation.
+- `kernel/src/libkern/kbox.rs` — `into_raw` / `from_raw` for intrusive
+  ownership transfer; `Debug` forwarded to the contained `T`.
+- `kernel/src/mm/mod.rs` — registers `mod vmm`.
+- `docs/architecture/memory-management.md` — drops the "(not yet)" on
+  the VMM row, rewrites the intro paragraph, adds a `## VMA tree`
+  section, adds the `AddressSpace`-not-yet Phase 1 limitation.
+
+Decisions worth recording:
+
+- **Tree built tailored to `Vma`, not as a generic container in
+  `libkern`.** The `RbLink` is embedded directly in `Vma`; the tree
+  operations consume `Vma` fields by name. A generic `RbTree<T>` would
+  have to abstract the key extraction and the interval augmentation
+  through trait dispatch, paying complexity for a single consumer. The
+  only other RB-tree consumer on the horizon (the namespace binding
+  tree) is keyed by path components, not address intervals, so it
+  wouldn't share an implementation anyway. Revisit if a third consumer
+  appears.
+- **Iterative RB-tree operations, not recursive.** Insert/delete fixup
+  walks *up* the tree from the inserted/deleted node, which is iterative
+  with parent pointers regardless of style. Search and in-order
+  traversal are iterative trivially. Removes kernel-stack-depth as a
+  real concern. Matches Linux's `lib/rbtree.c`.
+- **`KBox<Vma>` ownership, not a per-address-space arena.** VMAs come
+  and go constantly during a process's life (every `mprotect` boundary
+  crossing splits a VMA), so an arena either needs an internal free-list
+  (which is just the slab again) or fragments. The slab cache gives
+  good locality and O(1) alloc/free without the fragmentation. Matches
+  Linux's `vm_area_cachep`. `KBox::into_raw` / `from_raw` thread the
+  allocation through the tree's intrusive links.
+- **`Protection` is narrower than `arch::paging::PageFlags`.** A VMA
+  carries WRITE / EXEC / USER only; `GLOBAL` and the cache-attribute
+  bits are per-PTE policy decided at install time (driver MMIO,
+  framebuffer), not a property of the address range. The VMM will
+  translate `Protection` to `PageFlags` when populating leaves.
+  `Protection::empty()` is kernel-only / read-only / non-executable —
+  the inverse of `PageFlags::empty()`, which is executable by default
+  because `NO_EXECUTE` is opt-in at the hardware level. The VMM
+  presents the safer logical default; the translation inverts it.
+- **`MappingKind` ships with `Anonymous` only.** `FileBacked(Handle)`
+  needs the handle table; `Device(PhysAddr)` needs the driver MMIO
+  mapper. Both arrive with their consumers. The enum is open to
+  extension and adding a variant only touches the call sites that
+  need to act on the new backing kind.
+- **Interval augmentation maintained, not consumed.** `subtree_max_end`
+  is updated on every structural mutation (insert path walk, rotations,
+  remove path walk) but no query reads it today: the leftmost-overlap
+  query is already O(log n) without it, and `iter_overlapping` is just
+  in-order successor advance terminated at the query end. The
+  augmentation pays off for future disjoint-range stabbing queries
+  where subtree pruning lets the walk skip whole branches.
+- **`Vma` is `!Send` / `!Sync` by composition.** Holding `NonNull` in
+  the link field demotes the type's auto-traits. This is intentional —
+  a `Vma` in a tree is bound to its `AddressSpace`'s lock. The
+  `AddressSpace` will carry `unsafe impl Send` when it lands, with a
+  SAFETY comment pointing at the lock.
+- **`insert` rejects overlap rather than splitting / merging /
+  replacing.** The VMM's `mprotect`-style operations (split a VMA on a
+  protection-change boundary; merge adjacent compatible VMAs) belong at
+  a higher layer than the tree; the tree's invariant is just "no
+  overlap." Returning the rejected `KBox<Vma>` back to the caller keeps
+  ownership clean and lets the higher layer decide what to do.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (99 total, +24 in `mm::vmm`):
+  range arithmetic and protection bitflag operations; insert
+  invariants under ascending / descending / 200-element shuffled
+  sequences with full BST + RB + augmentation verification after every
+  insert; overlap rejection across identical / starts-inside /
+  ends-inside / nested-both-ways shapes; adjacent-range acceptance;
+  remove invariants under ascending / descending / 200-element
+  shuffled removes (different shuffle seeds) with full verification
+  after every remove; iterator correctness on empty, single-node, and
+  multi-node trees, post-remove queries, and full-tree-coverage
+  comparison between `iter` and `iter_overlapping`; iterative `Drop`
+  across repeated 256-node tree teardowns.
+- `cargo xtask build` — kernel ELF builds clean for `x86_64-unknown-none`.
