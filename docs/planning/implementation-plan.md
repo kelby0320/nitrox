@@ -231,7 +231,16 @@ silent reset.
     top-of-user-space address; returns the entry point and stack top.
     argv / envp / auxv stack-area setup deferred to "first userspace
     process" where the userspace runtime defines the handoff format
-- [ ] Higher-half kernel mapping shared across all address spaces
+- [x] Higher-half kernel mapping shared across all address spaces:
+  `ArchPaging::inherit_kernel_mappings(root)` populates a fresh PML4's
+  kernel half from a boot-captured template. x86_64 impl copies entries
+  256..512 from a `SpinLock<Option<[u64; 256]>>` snapshot of Limine's
+  PML4 (captured by `init_kernel_template(active_root())` at boot,
+  before any AS construction). aarch64 (when implemented) will be a
+  no-op given TTBR0/TTBR1 split. `AddressSpace::new()` calls it after
+  zeroing the freshly-allocated PML4. The intermediate PDPTs the
+  template points at are now shared across every AS, so future
+  kernel-vmap allocations propagate to every AS automatically
 - [ ] Per-thread kernel stack with guard page
 
 #### User memory access discipline

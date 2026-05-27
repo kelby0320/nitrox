@@ -18,7 +18,8 @@
 
 use crate::arch::paging::{ArchPaging, MapError, PageFlags, UnmapError};
 use crate::arch::x86_64::regs;
-use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
+use crate::libkern::SpinLock;
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 
 /// Entries per page table at every level. A 4 KiB frame of 8-byte entries.
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -307,6 +308,94 @@ pub fn ensure_nxe() {
     }
 }
 
+// --- Kernel-half PML4 template ------------------------------------------
+//
+// On 4-level x86_64 paging the kernel half spans PML4 entries 256..512
+// (canonical addresses `0xFFFF_8000_0000_0000` and up). Every process
+// address space must see the same kernel-half mappings as the boot
+// address space — otherwise switching CR3 to it would unmap the
+// currently-executing kernel code, stack, and HHDM. We achieve this by
+// snapshotting the kernel-half PML4 entries at boot and copying them
+// into every new top-level table at construction time. The entries
+// point at intermediate page tables (PDPTs) which are then shared
+// across all address spaces, so modifications at the leaf level
+// (future kernel-vmap allocations, for example) propagate to every AS
+// automatically.
+
+/// First PML4 entry that belongs to the kernel half on 4-level paging.
+const KERNEL_PML4_BASE: usize = 256;
+/// Number of PML4 entries in the kernel half.
+const KERNEL_PML4_COUNT: usize = PAGE_TABLE_ENTRIES - KERNEL_PML4_BASE;
+
+/// Captured kernel-half PML4 entries used by
+/// [`X86Paging::inherit_kernel_mappings`]. `None` until
+/// [`init_kernel_template`] runs at boot.
+///
+/// Stored as raw `u64` PML4 entries: the entries themselves are
+/// inert data (they only become live page-table references when
+/// the array is copied into a PML4 frame and that frame is loaded
+/// into `CR3`).
+static KERNEL_TEMPLATE: SpinLock<Option<[u64; KERNEL_PML4_COUNT]>> = SpinLock::new(None);
+
+/// Snapshot the kernel-half PML4 entries from the live page table at
+/// `boot_root` and store them for [`X86Paging::inherit_kernel_mappings`]
+/// to copy into future address spaces.
+///
+/// Called once at boot, after the buddy/HHDM are up and before any
+/// `AddressSpace::new`. Repeated calls overwrite the template — harmless
+/// at boot (idempotent given the boot tables don't change), and useful
+/// in tests that need to inject a specific template.
+///
+/// # Safety
+/// `boot_root` must be the physical base of a valid PML4 reachable
+/// through the HHDM. The entries at indices `256..512` are read but
+/// not modified.
+pub unsafe fn init_kernel_template(boot_root: PhysAddr) {
+    // SAFETY: forwarded from this function's contract — `boot_root`
+    // points at a live PML4 reachable via HHDM.
+    let entries = unsafe { read_kernel_half_entries(boot_root) };
+    *KERNEL_TEMPLATE.lock() = Some(entries);
+}
+
+/// Read entries `256..512` from the PML4 at `root` into a fresh array.
+///
+/// # Safety
+/// `root` must be the physical base of a valid PML4 reachable through
+/// the HHDM.
+unsafe fn read_kernel_half_entries(root: PhysAddr) -> [u64; KERNEL_PML4_COUNT] {
+    // SAFETY: forwarded from this function's contract; we read 256
+    // 8-byte entries from a 512-entry page-aligned table.
+    unsafe {
+        let pml4 = (root.as_u64() + heap::hhdm_offset()) as *const u64;
+        let mut out = [0u64; KERNEL_PML4_COUNT];
+        let mut i = 0;
+        while i < KERNEL_PML4_COUNT {
+            out[i] = *pml4.add(KERNEL_PML4_BASE + i);
+            i += 1;
+        }
+        out
+    }
+}
+
+/// Write `entries` into the kernel-half slots of the PML4 at `root`.
+/// Entries `0..256` (the user half) are left untouched.
+///
+/// # Safety
+/// `root` must be the physical base of a writable PML4 reachable
+/// through the HHDM and owned by the caller.
+unsafe fn write_kernel_half_entries(root: PhysAddr, entries: &[u64; KERNEL_PML4_COUNT]) {
+    // SAFETY: forwarded from this function's contract; we write 256
+    // entries into a 512-entry page-aligned table.
+    unsafe {
+        let pml4 = (root.as_u64() + heap::hhdm_offset()) as *mut u64;
+        let mut i = 0;
+        while i < KERNEL_PML4_COUNT {
+            *pml4.add(KERNEL_PML4_BASE + i) = entries[i];
+            i += 1;
+        }
+    }
+}
+
 // --- ArchPaging implementation ------------------------------------------
 
 /// The x86_64 implementation of [`ArchPaging`].
@@ -392,6 +481,20 @@ impl ArchPaging for X86Paging {
         // PCD/PWT control bits are carried into CR3.
         unsafe {
             regs::write_cr3(root.as_u64());
+        }
+    }
+
+    unsafe fn inherit_kernel_mappings(root: PhysAddr) {
+        let template = KERNEL_TEMPLATE.lock();
+        let entries = template
+            .as_ref()
+            .expect("inherit_kernel_mappings called before init_kernel_template");
+        // SAFETY: forwarded from `ArchPaging::inherit_kernel_mappings` —
+        // `root` is a writable PML4 owned by the caller, reachable via
+        // HHDM. We touch only entries 256..512 (the kernel half);
+        // entries 0..256 (the user half) are preserved.
+        unsafe {
+            write_kernel_half_entries(root, entries);
         }
     }
 }
@@ -569,6 +672,118 @@ mod tests {
                 X86Paging::map_page(root, v, phys, PageFlags::WRITABLE).unwrap();
                 assert_eq!(translate(root, v), Some(phys));
             }
+        }
+    }
+
+    // ----- Kernel-half PML4 template -----
+
+    /// Fill a freshly-allocated PML4 frame with `value` in every entry,
+    /// returning its physical base.
+    fn fill_pml4(value: u64) -> PhysAddr {
+        let frame = alloc_page_table().unwrap();
+        // SAFETY: just allocated, page-aligned, HHDM-reachable; we write
+        // exactly the 512 entries the frame holds.
+        unsafe {
+            let pml4 = (frame.as_u64() + heap::hhdm_offset()) as *mut u64;
+            for i in 0..PAGE_TABLE_ENTRIES {
+                *pml4.add(i) = value.wrapping_add(i as u64);
+            }
+        }
+        frame
+    }
+
+    /// Read all 512 entries from a PML4 frame.
+    fn read_all_entries(frame: PhysAddr) -> [u64; PAGE_TABLE_ENTRIES] {
+        let mut out = [0u64; PAGE_TABLE_ENTRIES];
+        // SAFETY: PML4 is page-aligned and HHDM-reachable.
+        unsafe {
+            let pml4 = (frame.as_u64() + heap::hhdm_offset()) as *const u64;
+            for i in 0..PAGE_TABLE_ENTRIES {
+                out[i] = *pml4.add(i);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn read_kernel_half_entries_captures_only_kernel_half() {
+        init_global_heap();
+        // Base of 0xDEAD_0000_0000_0000 + index gives a distinct value
+        // per entry across both halves.
+        let source = fill_pml4(0xDEAD_0000_0000_0000);
+
+        // SAFETY: `source` was just constructed and is HHDM-reachable.
+        let captured = unsafe { read_kernel_half_entries(source) };
+
+        for i in 0..KERNEL_PML4_COUNT {
+            let expected = 0xDEAD_0000_0000_0000u64
+                .wrapping_add((KERNEL_PML4_BASE + i) as u64);
+            assert_eq!(
+                captured[i], expected,
+                "kernel entry {i} (PML4 slot {}): expected {expected:#x}, got {:#x}",
+                KERNEL_PML4_BASE + i,
+                captured[i]
+            );
+        }
+    }
+
+    #[test]
+    fn write_kernel_half_entries_preserves_user_half() {
+        init_global_heap();
+        // Target PML4 prepopulated with a user-half-marker pattern so we
+        // can verify the write doesn't touch entries 0..256.
+        let target = fill_pml4(0xC0DE_0000_0000_0000);
+        let entries: [u64; KERNEL_PML4_COUNT] =
+            core::array::from_fn(|i| 0xBEEF_0000_0000_0000u64.wrapping_add(i as u64));
+
+        // SAFETY: `target` is page-aligned and HHDM-reachable.
+        unsafe { write_kernel_half_entries(target, &entries) };
+
+        let after = read_all_entries(target);
+        for i in 0..KERNEL_PML4_BASE {
+            // User-half entries untouched: they still match the original
+            // `fill_pml4` pattern.
+            let expected = 0xC0DE_0000_0000_0000u64.wrapping_add(i as u64);
+            assert_eq!(after[i], expected, "user-half entry {i} was modified");
+        }
+        for i in 0..KERNEL_PML4_COUNT {
+            assert_eq!(
+                after[KERNEL_PML4_BASE + i],
+                entries[i],
+                "kernel-half entry {i} was not written"
+            );
+        }
+    }
+
+    #[test]
+    fn read_then_write_round_trips_the_kernel_half() {
+        init_global_heap();
+        let source = fill_pml4(0xFEED_0000_0000_0000);
+        // SAFETY: see fill_pml4.
+        let captured = unsafe { read_kernel_half_entries(source) };
+
+        let target = alloc_page_table().unwrap();
+        // Zero the target so any leak through from `alloc_page_table` is
+        // a clear bug.
+        // SAFETY: just allocated, page-aligned, HHDM-reachable.
+        unsafe {
+            let pml4 = (target.as_u64() + heap::hhdm_offset()) as *mut u8;
+            core::ptr::write_bytes(pml4, 0, PAGE_SIZE);
+            write_kernel_half_entries(target, &captured);
+        }
+
+        let after = read_all_entries(target);
+        for i in 0..KERNEL_PML4_BASE {
+            assert_eq!(after[i], 0, "user half not zero at entry {i}");
+        }
+        for i in 0..KERNEL_PML4_COUNT {
+            let expected = 0xFEED_0000_0000_0000u64
+                .wrapping_add((KERNEL_PML4_BASE + i) as u64);
+            assert_eq!(
+                after[KERNEL_PML4_BASE + i],
+                expected,
+                "round-trip mismatch at kernel entry {i}"
+            );
         }
     }
 }

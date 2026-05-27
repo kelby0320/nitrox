@@ -22,6 +22,7 @@ enforced by code review.
 | 5    | IPC channel                                  | not yet present                          |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
+| 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
 | 7    | Serial port (`SERIAL`)                       | live as of Phase 1 slice 4 (diagnostics) |
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
@@ -53,6 +54,24 @@ When SMP arrives (Phase 3), the nesting still works because the rank
 ordering remains slab → buddy and the lower lock cannot block waiting
 for the upper. If a future change makes the buddy depend on the slab,
 that closes the cycle and must be rejected at design review.
+
+## Kernel-half PML4 template is a leaf
+
+`KERNEL_TEMPLATE` (`kernel/src/arch/x86_64/paging.rs`) is a
+`SpinLock<Option<[u64; 256]>>` holding the kernel-half PML4 entries
+captured at boot. It is acquired in exactly two places:
+
+- `init_kernel_template(boot_root)` at boot, with no other lock held.
+- `X86Paging::inherit_kernel_mappings(root)` inside
+  `AddressSpace::new` — at the point of acquisition, the freshly
+  allocated PML4 frame is the only AS-related state; `new` has not
+  yet wrapped it in its own `SpinLock<Inner>`, so the rank-4
+  `AddressSpace` lock is not held.
+
+It nests with nothing and never recurses. Rank 6c keeps it grouped
+with the other constant-time leaf-style locks (the allocators);
+calling `inherit_kernel_mappings` while holding any lock at rank
+1–5 is allowed and expected.
 
 ## Paging allocates page-table frames from the buddy
 

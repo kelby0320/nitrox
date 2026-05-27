@@ -1007,3 +1007,116 @@ Verification:
   ELFs in-memory; no external binaries needed.
 - `cargo xtask build` — kernel ELF builds clean for
   `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 5): higher-half kernel mapping shared across address spaces
+
+Until now, `AddressSpace::new()` produced an all-zero PML4 —
+"installable but not loadable." Switching `CR3` to it would
+triple-fault the moment the kernel tried to fetch its next
+instruction. This item closes that gap, making every freshly-
+constructed AS share the boot kernel's higher-half mappings.
+
+What's in the build:
+
+- `kernel/src/arch/paging.rs` — new `unsafe fn
+  inherit_kernel_mappings(root)` on the `ArchPaging` trait, with
+  the contract: callers pass a writable top-level page table they
+  own; the impl populates whatever kernel-half mappings the active
+  architecture's process ASes need to inherit.
+- `kernel/src/arch/x86_64/paging.rs` — new private
+  `KERNEL_TEMPLATE: SpinLock<Option<[u64; 256]>>`, public
+  `init_kernel_template(boot_root)` that snapshots PML4 entries
+  256..512 into it via private `read_kernel_half_entries`, and
+  the `inherit_kernel_mappings` impl that copies them into a
+  fresh PML4 via private `write_kernel_half_entries`. The two
+  helpers carry the unsafe work; the trait method is a thin
+  template + write wrapper.
+- `kernel/src/arch/mod.rs` — re-exports `init_kernel_template`
+  alongside the existing `active_root` / `ensure_nxe` / `translate`.
+- `kernel/src/mm/addr_space.rs` — `AddressSpace::new` calls
+  `Paging::inherit_kernel_mappings(root)` after zeroing the new
+  PML4. The doc on `new` is updated to remove the "installable but
+  not loadable" caveat.
+- `kernel/src/main.rs` — boot path gains a `paging_init()` step
+  that runs `ensure_nxe` and `init_kernel_template(active_root())`
+  before the existing translate smoke test.
+- `kernel/src/mm/test_support.rs` — `init_global_heap` now also
+  initialises the template from an all-zero fake PML4 so the
+  existing `AddressSpace` tests' `inherit_kernel_mappings` call
+  doesn't panic.
+- `kernel/docs/lock-ordering.md` — `KERNEL_TEMPLATE` slots in at
+  rank 6c, alongside the allocator locks; documented as a
+  no-nest leaf taken only at boot and at AS construction.
+- `docs/architecture/memory-management.md` — new
+  `## Kernel-half PML4 sharing` section describing the
+  template-and-copy mechanism, the shared-intermediate-tables
+  consequence, and the "PML4 entries for the kernel half are
+  immutable post-boot" rule.
+
+Decisions worth recording:
+
+- **Template-and-copy at AS construction, not
+  shared-PML4-by-reference.** Each AS owns its own PML4 frame
+  (so CR3 holds a per-AS value, which is required for any
+  future ASID tagging and for cleanliness). What's shared are
+  the *entries* (and through them the intermediate tables they
+  point at). The alternative — a single shared PML4 with
+  per-AS PML4 entries swapped in on CR3 load — would require
+  modifying global state on every context switch, which is
+  worse on every axis.
+- **Snapshot at boot, not "always read live."** The kernel's
+  higher-half PML4 entries are populated by Limine before
+  `_start` runs and never change post-boot (per the
+  "kernel-half PML4 entries are immutable post-boot" rule
+  this item establishes). A static snapshot avoids paying the
+  CR3-read-and-walk cost per `AddressSpace::new`, and makes
+  the source of truth explicit. If a future change really
+  needs the kernel half to grow new PML4 entries at runtime,
+  it has to also visit every AS — the design wants that to
+  be obviously expensive.
+- **`SpinLock<Option<[u64; 256]>>` over `Once`-style init.**
+  The `Once` pattern matches the buddy/slab init style, but
+  the kernel-half template benefits from being re-initialisable
+  in tests (the `init_global_heap` helper writes a zero
+  template; a future on-target ASLR-style rebuild might want
+  to re-snapshot). `SpinLock<Option<...>>` allows that without
+  adding a test-only escape hatch.
+- **`init_kernel_template` is `unsafe`.** It reads through
+  HHDM into a raw `u64` array; the `boot_root` argument
+  carries the unsafe invariants (real PML4, page-aligned,
+  HHDM-reachable). Marking it `unsafe` shifts those to the
+  caller — `paging_init` in `main.rs`, where the invariants
+  obviously hold given `arch::active_root()` returns the
+  live CR3.
+- **Rank 6c for `KERNEL_TEMPLATE`, alongside the allocators.**
+  The lock is a leaf: held briefly, no nesting, no other lock
+  acquired while inside it. Could have been a fresh rank, but
+  grouping with the other constant-time leaves (6a, 6b) makes
+  the lock-ordering table easier to reason about.
+- **No `inherit_kernel_mappings` on aarch64 (when implemented):
+  no-op.** TTBR0/TTBR1 split keeps the kernel half in a
+  separate translation register that process ASes never touch.
+  Putting the responsibility on `ArchPaging` rather than baking
+  the x86_64 mechanism into `AddressSpace::new` keeps the
+  arch-neutral caller unchanged.
+- **Test the read/write helpers, not the global template.**
+  Host tests for `read_kernel_half_entries` and
+  `write_kernel_half_entries` exercise the byte-shuffling
+  against fake PML4 frames with marker patterns. The trait
+  method that reads the global template is implicitly tested
+  by every existing `AddressSpace` test (which now calls
+  `inherit_kernel_mappings` against `test_support`'s zeroed
+  template and would panic on a use-before-init bug).
+
+Verification:
+
+- `cargo xtask test` — host tests pass (122 total, +3 in
+  `arch::x86_64::paging::tests`): `read_kernel_half_entries`
+  captures only the kernel half; `write_kernel_half_entries`
+  preserves the user half and writes the kernel half;
+  read-then-write round-trips. Every existing AS test still
+  passes (the `inherit_kernel_mappings` call against
+  `test_support`'s zeroed template is a no-op for tests that
+  don't validate kernel-half entries).
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.

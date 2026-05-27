@@ -169,4 +169,23 @@ pub trait ArchPaging {
     /// the current stack, and the higher-half direct map. Loading an
     /// incomplete table triple-faults the CPU instantly.
     unsafe fn set_page_table(root: PhysAddr);
+
+    /// Populate the kernel-half mappings of a freshly-allocated top-level
+    /// page table `root` from a previously-captured boot template, so
+    /// that switching to `root` does not lose the currently-executing
+    /// kernel code, stack, or higher-half direct map.
+    ///
+    /// On x86_64 this copies PML4 entries 256..512 from the template
+    /// captured by [`init_kernel_template`](crate::arch::init_kernel_template).
+    /// On aarch64 (when implemented) this is a no-op: the TTBR0/TTBR1
+    /// split keeps the kernel half in a separate translation register
+    /// that process address spaces don't manage.
+    ///
+    /// # Safety
+    /// - `root` must be the physical base of a top-level page table that
+    ///   the caller owns and that no other CPU has loaded.
+    /// - The kernel template must already have been initialised by a
+    ///   call to `init_kernel_template`; otherwise the call panics with
+    ///   a use-before-init message.
+    unsafe fn inherit_kernel_mappings(root: PhysAddr);
 }

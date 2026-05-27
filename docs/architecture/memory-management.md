@@ -215,11 +215,13 @@ hardware MMU's actual translations (the page tables): `map_vma`
 updates both atomically; `unmap_covering` does the inverse.
 
 - **Construction.** `new()` allocates a fresh 4 KiB PML4 frame from
-  the buddy and zeros every entry. The fresh address space has empty
-  user space and **no kernel-half mapping** — switching `CR3` to its
-  root would triple-fault immediately. The next sub-item in the slice
-  (shared higher-half kernel mapping) closes that gap; until then
-  `AddressSpace` is "installable but not loadable."
+  the buddy, zeros every entry, then calls
+  `ArchPaging::inherit_kernel_mappings` to populate the kernel half
+  from a boot-captured template (see
+  [Kernel-half PML4 sharing](#kernel-half-pml4-sharing) below). The
+  resulting AS is loadable: switching `CR3` to its root preserves
+  every higher-half mapping the running kernel relies on (its own
+  code, the kernel stack, the HHDM, the framebuffer).
 - **`map_vma(KBox<Vma>)`.** Validates the range (canonical, within
   `[0, USER_VIRT_END)`), pre-checks tree overlap, then walks the
   range one page at a time: allocate a frame, zero it through the
@@ -250,6 +252,49 @@ updates both atomically; `unmap_covering` does the inverse.
   today; the TLB never holds entries for the new mappings. When the
   scheduler arrives it will own the `set_active` entry point and
   the flush policy that comes with it.
+
+## Kernel-half PML4 sharing
+
+Every process address space shares the boot kernel's higher-half
+mappings — kernel code, kernel stack, HHDM, framebuffer, future
+kernel-vmap allocations. Without that sharing, switching `CR3` to a
+process AS would unmap the executing kernel and triple-fault.
+
+The mechanism is template-and-copy:
+
+1. **Boot capture.** At boot,
+   [`arch::init_kernel_template`](../../kernel/src/arch/x86_64/paging.rs)
+   reads Limine's live PML4 (via `arch::active_root`) and copies
+   entries 256..512 — the canonical kernel-half — into a static
+   `SpinLock<Option<[u64; 256]>>`. Must run after `init_memory` (the
+   HHDM is required to reach the PML4 frame) and before any
+   `AddressSpace::new`.
+2. **AS inheritance.** `AddressSpace::new` allocates a fresh PML4,
+   zeros it, then calls
+   `ArchPaging::inherit_kernel_mappings(root)`. On x86_64 this
+   copies the template's 256 entries into the new PML4's kernel
+   half. The user half (entries 0..256) stays zero.
+3. **Shared intermediate tables.** The copied entries are PML4
+   slots, which point at PDPTs — and through those at PDs and
+   PTs. All address spaces hold the *same* `PhysAddr` values in
+   their kernel-half PML4 slots, so they reach the *same*
+   intermediate tables. Modifications at the leaf level (a future
+   kernel-vmap allocation, for instance) become visible to every
+   AS without a cross-AS update step or a TLB shootdown of any
+   kind beyond the local invalidation.
+
+The rule that follows: **PML4 entries for the kernel half are
+immutable post-boot**. The intermediate tables they point at can
+grow leaves freely; the top-level entries cannot change without
+visiting every AS to update its template-copy. Linux preallocates
+intermediate tables for the kernel-vmap region for the same
+reason; we will do the same when the vmap allocator lands (the
+next sub-item).
+
+On a future aarch64 port, `inherit_kernel_mappings` is a no-op:
+the TTBR0/TTBR1 split makes the kernel half live in a separate
+translation register that process address spaces don't manage.
+The arch-neutral caller (`AddressSpace::new`) is unchanged.
 
 ## ELF loader
 
@@ -326,12 +371,17 @@ allocator locks are likely candidates.
 - No DMA / Normal zone split in the buddy (see TODO in `buddy.rs`).
 - No allocator-rank-checker in debug builds (still on the to-do list
   in CLAUDE.md).
-- `AddressSpace` exists but has no higher-half kernel mapping —
-  switching `CR3` to a fresh AS would triple-fault. Lands with the
-  next sub-item (shared higher-half kernel mapping).
 - No TLB flushing on map / unmap. No AS is "active" today, so the
   TLB doesn't cache its entries. The scheduler will own flushing
   once `AddressSpace::set_active` exists.
+- No kernel-vmap allocator yet, and no preallocation of
+  intermediate page tables for the kernel-vmap region. The
+  kernel-half template currently inherits whatever Limine left in
+  the higher half; future kernel-half allocations (per-thread
+  kernel stacks, per-CPU data, driver MMIO) need a vmap allocator
+  plus the preallocated PDPTs/PDs that make leaf modifications
+  visible to every AS. Lands with the next sub-item (per-thread
+  kernel stack with guard page).
 - ELF loader handles **static** binaries only: `ET_DYN` (PIE) and
   `PT_INTERP` (dynamic linking) are rejected. PIE needs base
   randomization; dynamic linking needs a userspace `ld.so`

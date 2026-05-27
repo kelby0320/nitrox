@@ -109,7 +109,11 @@ fn kernel_main() {
     }
     kprintln!("allocators up");
 
-    // Smoke-test the new paging arch layer against Limine's live tables.
+    // One-time paging setup, then a smoke test against Limine's live
+    // tables. `paging_init` enables NX and captures the kernel-half
+    // PML4 template every future `AddressSpace::new` will inherit
+    // from; it must run before any AS is constructed.
+    paging_init();
     paging_smoke_test();
 
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
@@ -176,18 +180,31 @@ fn init_memory() -> bool {
     true
 }
 
-/// Smoke-test the paging arch layer: enable the no-execute extension,
-/// then walk Limine's live page tables with [`arch::translate`] to
-/// confirm the kernel's table-walk agrees with the hardware.
-///
-/// Read-only — it never installs or switches a mapping. The first item
-/// of the "Address Spaces and Paging" slice has no boot-path caller of
-/// its own; this exercises the new code against a real address space and
-/// a real HHDM offset (host tests run with an HHDM offset of 0). See
-/// `docs/planning/implementation-plan.md`.
-fn paging_smoke_test() {
+/// One-time paging setup that must run before any `AddressSpace::new`:
+/// enable the no-execute paging extension (so `PageFlags::NO_EXECUTE` is
+/// honoured rather than faulting as a reserved-bit violation), then
+/// capture the kernel-half PML4 entries from Limine's live tables into
+/// the boot template every new address space inherits.
+fn paging_init() {
     arch::ensure_nxe();
+    // SAFETY: `active_root()` returns the live PML4 the CPU is using,
+    // which Limine populated and which is reachable through the HHDM.
+    // The template-init reads the top 256 entries without mutating
+    // anything; calling it before `AddressSpace::new` satisfies the
+    // ordering contract.
+    unsafe {
+        arch::init_kernel_template(arch::active_root());
+    }
+}
 
+/// Smoke-test the paging arch layer: walk Limine's live page tables
+/// with [`arch::translate`] to confirm the kernel's table-walk agrees
+/// with the hardware.
+///
+/// Read-only — it never installs or switches a mapping. Exercises the
+/// real address space and real HHDM offset (host tests run with an
+/// HHDM offset of 0).
+fn paging_smoke_test() {
     // Limine's top-level page table is whatever the CPU runs on now.
     let root = arch::active_root();
 

@@ -89,17 +89,24 @@ struct Inner {
 }
 
 impl AddressSpace {
-    /// Build an empty address space: allocate a fresh PML4 frame, zero
-    /// it (all entries absent), and pair it with an empty VMA tree.
-    /// Returns [`AllocError`] if the PML4 frame allocation fails.
+    /// Build an empty (user-half) address space sharing the boot
+    /// kernel's higher-half mappings: allocate a fresh PML4 frame, zero
+    /// it, inherit the kernel-half entries from the boot template
+    /// (`ArchPaging::inherit_kernel_mappings`), and pair it with an
+    /// empty VMA tree. Returns [`AllocError`] if the PML4 frame
+    /// allocation fails; panics if called before
+    /// `arch::init_kernel_template`.
     pub fn new() -> Result<Self, AllocError> {
         let root = heap::buddy_alloc(0).ok_or(AllocError)?;
         // SAFETY: the frame was just returned by the buddy and is not
         // aliased; HHDM access is the standard way to reach a fresh
-        // physical frame. Zeroing it makes every PML4 entry absent.
+        // physical frame. Zeroing it makes every PML4 entry absent;
+        // `inherit_kernel_mappings` then refills the kernel half so
+        // the AS is loadable without losing kernel code, stack, or HHDM.
         unsafe {
             let virt = (root.as_u64() + heap::hhdm_offset()) as *mut u8;
             ptr::write_bytes(virt, 0, PAGE_SIZE);
+            Paging::inherit_kernel_mappings(root);
         }
         Ok(AddressSpace {
             inner: SpinLock::new(Inner {

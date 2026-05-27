@@ -14,8 +14,9 @@
 
 use std::sync::Once;
 
+use crate::arch::init_kernel_template;
 use crate::limine::{MEMMAP_USABLE, MemoryMapEntry, MemoryMapResponse};
-use crate::mm::{PAGE_SIZE, heap, slab};
+use crate::mm::{PAGE_SIZE, PhysAddr, heap, slab};
 
 static HEAP_INIT: Once = Once::new();
 
@@ -62,5 +63,22 @@ pub fn init_global_heap() {
         // virtual addresses. This satisfies `init_buddy`'s contract.
         unsafe { heap::init_buddy(response, 0) };
         slab::slab_init();
+
+        // Initialise the kernel-half PML4 template from a fresh,
+        // all-zero frame: tests don't exercise kernel-half mappings,
+        // they just need `AddressSpace::new()`'s
+        // `inherit_kernel_mappings` call not to panic. The 8 KiB
+        // leaked allocation gives us a page-aligned base regardless
+        // of what the host allocator returned for `vec`.
+        let template_backing: &'static mut [u8] =
+            vec![0u8; 2 * PAGE_SIZE].leak();
+        let raw = template_backing.as_mut_ptr() as usize;
+        let aligned = (raw + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        // SAFETY: `aligned` points at a leaked, zeroed, page-aligned
+        // 4 KiB region. Under the test HHDM offset of 0, the
+        // physical address equals the host virtual address, so
+        // `init_kernel_template` can read 256 entries from it
+        // through HHDM (which is a no-op offset).
+        unsafe { init_kernel_template(PhysAddr::new(aligned as u64)) };
     });
 }
