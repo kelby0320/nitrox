@@ -204,6 +204,53 @@ interval-augmented intrusive red-black tree of `Vma`s, keyed on
   carry the `unsafe impl Send` when it lands, with a SAFETY comment
   pointing at the lock.
 
+## AddressSpace
+
+[`mm/addr_space.rs`](../../kernel/src/mm/addr_space.rs) pairs the VMA
+tree with a top-level page-table root under a single
+`SpinLock<Inner>` (rank 4 per
+[kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)).
+It is the bridge between the VMM's bookkeeping (the tree) and the
+hardware MMU's actual translations (the page tables): `map_vma`
+updates both atomically; `unmap_covering` does the inverse.
+
+- **Construction.** `new()` allocates a fresh 4 KiB PML4 frame from
+  the buddy and zeros every entry. The fresh address space has empty
+  user space and **no kernel-half mapping** — switching `CR3` to its
+  root would triple-fault immediately. The next sub-item in the slice
+  (shared higher-half kernel mapping) closes that gap; until then
+  `AddressSpace` is "installable but not loadable."
+- **`map_vma(KBox<Vma>)`.** Validates the range (canonical, within
+  `[0, USER_VIRT_END)`), pre-checks tree overlap, then walks the
+  range one page at a time: allocate a frame, zero it through the
+  HHDM, install the PTE via `ArchPaging::map_page`. On failure
+  mid-walk, the partial install is rolled back (every installed PTE
+  uninstalled, every allocated frame freed) and the box returned to
+  the caller with a `MapError`. The whole sequence runs under the AS
+  lock so the tree and the page tables can never disagree about
+  what's mapped.
+- **Eager anonymous allocation.** One frame per page is allocated at
+  `map_vma` time; on-demand allocation via the page-fault handler
+  would be the real-OS pattern but needs an upgraded `#PF` handler
+  (today's is dump-and-halt). The switch lands when the PF handler
+  does.
+- **Frame ownership lives in the page tables.** No per-VMA list of
+  owned physical frames: `ArchPaging::unmap_page` returns the
+  `PhysAddr` it freed, which `unmap_covering` and `Drop` hand straight
+  to `buddy_free`. For `MappingKind::Anonymous` the frame is freed;
+  the dispatch will branch on backing kind when `FileBacked` /
+  `Device` arrive (file-backed pages belong to the page cache, device
+  pages were never allocated by the kernel).
+- **`Drop` drains the tree leftmost-first**, uninstalls every PTE,
+  frees every leaf frame, then frees the PML4. Intermediate
+  page-table frames (PDPT / PD / PT) leak per the deferred decision
+  documented for `ArchPaging::unmap_page` — for a single Phase 1 AS
+  the cost is negligible.
+- **No TLB flushing.** No `AddressSpace` is ever loaded onto a CPU
+  today; the TLB never holds entries for the new mappings. When the
+  scheduler arrives it will own the `set_active` entry point and
+  the flush policy that comes with it.
+
 ## Locking
 
 Both allocator locks sit at rank 6 (see [kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)):
@@ -233,7 +280,11 @@ allocator locks are likely candidates.
 - No DMA / Normal zone split in the buddy (see TODO in `buddy.rs`).
 - No allocator-rank-checker in debug builds (still on the to-do list
   in CLAUDE.md).
-- No `AddressSpace` yet. The VMA tree is fully functional in
-  isolation but isn't driving any real mappings — inserting or
-  removing a `Vma` doesn't touch page tables today. The integration
-  lands with the `AddressSpace` owner in a following sub-item.
+- `AddressSpace` exists but has no higher-half kernel mapping —
+  switching `CR3` to a fresh AS would triple-fault. Lands with the
+  next sub-item (shared higher-half kernel mapping).
+- No TLB flushing on map / unmap. No AS is "active" today, so the
+  TLB doesn't cache its entries. The scheduler will own flushing
+  once `AddressSpace::set_active` exists.
+- No ELF loader yet. `AddressSpace::from_elf(bytes)` for static
+  binaries is the next item after the kernel-half mapping.

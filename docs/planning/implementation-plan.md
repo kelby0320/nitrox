@@ -211,6 +211,24 @@ silent reset.
     queries, and the Send/Sync story; added a Phase 1 limitation
     noting the missing `AddressSpace` owner
 - [ ] Address space construction from an ELF image
+  - [x] `AddressSpace` skeleton in `kernel/src/mm/addr_space.rs`:
+    `VmaTree` + page-table root paired under a single `SpinLock<Inner>`
+    (rank 4). `new()` allocates and zeroes a fresh PML4 frame.
+    `map_vma(KBox<Vma>)` validates the range (canonical + user-half),
+    pre-checks tree overlap, then allocates+zeros+installs one frame
+    per page in lockstep (with full rollback on failure), and commits
+    the VMA to the tree. `unmap_covering(addr)` is the inverse. `Drop`
+    drains the tree, uninstalls every PTE, frees leaf frames, frees
+    the PML4. No TLB flush yet (no AS is "active" until the scheduler
+    lands); no higher-half kernel mapping yet (the next sub-item)
+  - [ ] In-kernel ELF loader for **static** binaries:
+    `AddressSpace::from_elf(bytes)`. Validates the ELF header, walks
+    program headers, allocates a VMA + frames + copies bytes for each
+    PT_LOAD, sets up an initial stack VMA. PT_INTERP and dynamic
+    linking are deferred to a userspace `ld.so` equivalent (matches the
+    Linux / Windows / macOS split: kernel does the irreducible "create
+    AS, load initial image"; userspace does symbol resolution and
+    library loading)
 - [ ] Higher-half kernel mapping shared across all address spaces
 - [ ] Per-thread kernel stack with guard page
 

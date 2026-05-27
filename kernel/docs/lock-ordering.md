@@ -18,7 +18,7 @@ enforced by code review.
 | 1    | Scheduler runqueue                           | not yet present                          |
 | 2    | Wait queue                                   | not yet present                          |
 | 3    | Handle-table segment allocation              | not yet present                          |
-| 4    | Kernel-object internal locks (VMA tree, etc.)| not yet present                          |
+| 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
 | 5    | IPC channel                                  | not yet present                          |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |

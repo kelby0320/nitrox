@@ -790,3 +790,113 @@ Verification:
   comparison between `iter` and `iter_overlapping`; iterative `Drop`
   across repeated 256-node tree teardowns.
 - `cargo xtask build` — kernel ELF builds clean for `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 3): `AddressSpace` skeleton
+
+The third item of the "Address Spaces and Paging" slice: pair the VMA
+tree with a page-table root so VMA mutations actually update hardware
+translations. No higher-half kernel mapping yet (the next item) and no
+ELF loader yet (the item after) — this lands the bridge layer that
+both later items consume.
+
+What's in the build:
+
+- `kernel/src/mm/addr_space.rs` — new: `AddressSpace` (a
+  `SpinLock<Inner>` wrapping `VmaTree` + PML4 `PhysAddr`), `new`,
+  `map_vma`, `unmap_covering`, `root`, `is_empty`, `len`, `Drop`,
+  the `MapError` enum, plus private `free_vma_pages` /
+  `rollback_partial_map` / `protection_to_page_flags` helpers and 8
+  host-side tests.
+- `kernel/src/mm/mod.rs` — registers `mod addr_space`.
+- `docs/architecture/memory-management.md` — new `## AddressSpace`
+  section; updates Phase 1 limitations from "no AddressSpace yet" to
+  the more specific "exists but no kernel-half mapping / no TLB flush
+  / no ELF loader."
+- `kernel/docs/lock-ordering.md` — rank 4 (kernel-object internal
+  locks) flips from "not yet present" to "live as of Phase 1 slice 5
+  (item 3): AddressSpace."
+
+Decisions worth recording:
+
+- **`SpinLock<Inner>` wrapping, not flat fields + separate lock.**
+  Linux's `mm_struct` keeps fields directly addressable and uses
+  `mmap_lock` as a separate semaphore — that's what C allows. In
+  Rust, wrapping the inner state in `SpinLock<Inner>` makes "field
+  access requires the lock" a type-system guarantee, not a code-review
+  convention. There is no way to read or modify `vma_tree` or `root`
+  without going through `lock()`.
+- **Eager per-page anonymous allocation.** `map_vma` allocates and
+  zeros one frame per page up front. Lazy on-fault allocation is the
+  real-OS pattern (Linux only commits frames when the page is first
+  touched), but it requires a page-fault handler that can service VMA
+  faults — the current `#PF` handler is the dump-and-halt one from
+  the diagnostics slice. Eager works today and the switch to lazy is
+  a local change to `map_vma` plus PF-handler upgrade when that lands.
+- **Per-page allocate-and-install in lockstep, with rollback on
+  failure.** The alternative was pre-allocate-then-commit using a
+  temporary `KVec<PhysAddr>` to stage frames. Rejected: a 100 MiB
+  anonymous mapping would need a 25,600-entry temporary vector. The
+  lockstep loop walks the same number of pages but never holds more
+  than one allocated-but-uninstalled frame at a time. Rollback walks
+  back through the installed range uninstalling and freeing —
+  symmetric work, no extra storage.
+- **Frame ownership tracked by the page tables themselves.** No
+  per-VMA list of owned `PhysAddr`s.
+  `ArchPaging::unmap_page(root, virt)` already returns the
+  `PhysAddr` it freed; `unmap_covering` and `Drop` hand each one
+  straight to `buddy_free`. Adding a per-VMA frame list would
+  duplicate state. For `MappingKind::Anonymous` we always free the
+  returned frame; the call site will branch on backing kind when
+  `FileBacked` (page cache owns the frame) and `Device` (kernel never
+  allocated it) arrive.
+- **`unreachable!()` for `ArchPaging` errors that pre-validation
+  makes impossible.** `map_page` can return `AlreadyMapped` (we held
+  the AS lock and pre-checked tree overlap) and `Misaligned`
+  (VAddrRange enforces page alignment; our per-page address is
+  `start + i*PAGE_SIZE`). Both would indicate kernel-internal
+  invariant violations. Per `kernel/CLAUDE.md`'s
+  "`panic!()` outside of explicitly-unrecoverable error paths"
+  carve-out, panicking is the correct response.
+- **`Drop` drains the tree leftmost-first via `iter().next() +
+  remove_covering`** rather than a dedicated `pop_first` on
+  `VmaTree`. The iter borrow is scoped to a block that ends before
+  the mutating call, so the borrow checker accepts it without
+  ceremony. Adding `pop_first` for one consumer would be premature;
+  revisit if a second consumer appears.
+- **Higher-half kernel mapping deferred to its own sub-item.** A
+  fresh AS has an all-zero PML4: switching to it would triple-fault
+  because the running kernel's code wouldn't be mapped. We could
+  have built the kernel-half template inheritance into `new()`, but
+  it needs the kernel image's actual PML4 entries (which depend on
+  what Limine handed us) and is a distinct architectural concern.
+  Keeping it separate gives that work its own design-and-test cycle.
+- **No TLB flushing.** No CPU has any `AddressSpace` loaded today;
+  there is nothing in the TLB to invalidate. The scheduler will
+  introduce `set_active` and inherit responsibility for flush
+  policy.
+- **ELF loader split per the universal kernel/userspace boundary.**
+  Linux / Windows / macOS all draw the same line: the kernel handles
+  parsing the executable header, mapping LOAD segments, setting up
+  the initial stack, and (when present) loading the dynamic linker
+  interpreter. Symbol resolution and library loading run in
+  userspace via `ld.so` / NTDLL / dyld. We will follow this split.
+  This sub-item lands the AS skeleton; the next sub-item adds the
+  kernel-half mapping; the sub-item after lands the in-kernel ELF
+  loader for static binaries. PT_INTERP + a userspace dynamic linker
+  come later when a binary actually needs them — init and the early
+  userspace will be statically linked.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (107 total, +8 in
+  `mm::addr_space`): `new` builds a real empty AS with a
+  page-aligned PML4; single-page `map_vma` installs a PTE that
+  `translate` finds; multi-page `map_vma` installs every PTE in the
+  range and nothing outside it; `unmap_covering` returns the box
+  and removes every PTE; overlap is rejected with the original
+  mapping untouched and the rejected box returned; kernel-half
+  ranges are rejected; `unmap_covering` returns `None` on a miss;
+  `Drop` cleanly tears down repeated populated address spaces
+  without exhausting the 16 MiB host heap.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.

@@ -7,6 +7,7 @@
 //! holds the buddy allocator and the common types both upper layers
 //! consume.
 
+pub mod addr_space;
 pub mod buddy;
 pub mod heap;
 pub mod slab;
