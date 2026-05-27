@@ -168,25 +168,28 @@ silent reset.
   - `map_page`, `unmap_page`, `flush_tlb_*`, `set_page_table`
   - All `unsafe`, all with SAFETY comments
 - [ ] VMA structure with red-black tree storage
-  - [ ] `Vma` struct + `VAddrRange`, `Protection`, `MappingKind` types in
+  - [x] `Vma` struct + `VAddrRange`, `Protection`, `MappingKind` types in
     `kernel/src/mm/vmm.rs`. `MappingKind` starts as `Anonymous`-only;
     `FileBacked` / `Device` variants land with their consumers.
     `Protection` is a narrower abstraction than `arch::PageFlags` (WRITE
     / EXEC / USER), translated to `PageFlags` at PTE-install time
-  - [ ] Intrusive RB-tree node embedded in `Vma`: parent / left / right
+  - [x] Intrusive RB-tree node embedded in `Vma`: parent / left / right
     / colour, plus `subtree_max_end` for interval augmentation
-  - [ ] RB-tree operations: insert, remove, rotations, recolour — all
-    iterative (parent pointers make recursion unnecessary), augmentation
-    maintained on every structural mutation
-  - [ ] Lookup primitives the VMM will call: `find_covering(addr)`,
-    `find_first_overlapping(range)` + overlap iterator, in-order iterator
-  - [ ] Ownership model: `VmaTree` owns `KBox<Vma>` (insert takes a box,
-    remove returns one). Slab-backed, matching Linux's `vm_area_cachep`.
-    Arena allocation considered and rejected — see deviation note
-  - [ ] Host-side tests: RB-tree invariants (root black, no red-red,
-    equal black-heights); augmentation invariant; randomised
-    insert/remove against a sorted-`KVec` oracle; overlap queries on
-    hand-crafted layouts
+  - [x] RB-tree insert with overlap detection, CLRS-textbook fixup
+    (rotations + recolour), augmentation maintenance on every structural
+    mutation. Remove lands with the next sub-item
+  - [x] Point lookup `VmaTree::find_covering(addr)` — plain BST walk;
+    interval augmentation isn't needed for point queries
+  - [x] Ownership: `VmaTree` owns `KBox<Vma>` (insert takes a box,
+    returns it back on overlap rejection). `KBox::into_raw` /
+    `from_raw` added for intrusive ownership. Iterative post-order
+    `Drop` via parent pointers, no allocation
+  - [x] Host-side tests: BST + RB + augmentation invariant checkers
+    exercised on every insert across ascending, descending, and
+    shuffled-insert sequences (200 randomised inserts, full invariant
+    check after each); overlap rejection across all shapes
+  - [ ] `VmaTree::remove`, `find_first_overlapping(range)` + overlap
+    iterator, in-order iterator
   - [ ] Update [docs/architecture/memory-management.md] to point at
     `mm/vmm.rs` and drop the "not yet" annotation in the layer table
 - [ ] Address space construction from an ELF image

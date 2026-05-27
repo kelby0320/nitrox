@@ -9,12 +9,15 @@
 //!
 //! This file lands the address-spaces-and-paging slice incrementally.
 //! Today it holds the leaf data types ([`VAddrRange`], [`Protection`],
-//! [`MappingKind`], [`Vma`]). The intrusive red-black-tree node, the
-//! tree operations, and the `AddressSpace` owner land in the following
-//! sub-items.
+//! [`MappingKind`], [`Vma`]) and the [`VmaTree`] — an intrusive
+//! interval-augmented red-black tree of `Vma`s with overlap-detecting
+//! insert, point lookup, and iterative teardown. Range-overlap
+//! iteration, removal, and the `AddressSpace` owner land in the
+//! following sub-items.
 
 use core::ptr::NonNull;
 
+use crate::libkern::KBox;
 use crate::mm::{PAGE_SIZE, VirtAddr};
 
 /// A half-open range of virtual addresses, `[start, end)`.
@@ -177,7 +180,6 @@ pub enum MappingKind {
 
 /// Red-black tree node colour for the intrusive link in [`Vma`].
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-#[allow(dead_code)] // `Black` is recoloured-to in the insert fixup — next sub-item.
 enum RbColor {
     Red,
     Black,
@@ -203,7 +205,6 @@ enum RbColor {
 /// see nor construct one. It carries no methods today — accessors and
 /// the structural mutators arrive with the tree operations.
 #[derive(Debug)]
-#[allow(dead_code)] // fields are read by the tree operations — next sub-item.
 struct RbLink {
     parent: Option<NonNull<Vma>>,
     left: Option<NonNull<Vma>>,
@@ -250,7 +251,6 @@ pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
     pub mapping: MappingKind,
-    #[allow(dead_code)] // read by the tree operations — next sub-item.
     link: RbLink,
 }
 
@@ -265,9 +265,397 @@ impl Vma {
     }
 }
 
+/// An interval-augmented red-black tree of [`Vma`]s, keyed on
+/// `range.start`.
+///
+/// The tree owns the boxed `Vma`s it stores. Insertion takes a
+/// [`KBox<Vma>`] and consumes it on success; on overlap it returns the
+/// box back so the caller decides what to do. Removal (next sub-item)
+/// returns the box. On drop the tree iteratively frees every node
+/// without allocating.
+///
+/// ## Invariants
+///
+/// 1. **BST ordering by `range.start`.** Sub-trees are uniquely ordered
+///    because no two stored `Vma`s overlap, so no two share a start.
+/// 2. **Red-black properties.** Root is black; no red node has a red
+///    parent; every root-to-leaf path crosses the same number of black
+///    nodes.
+/// 3. **Interval augmentation.** Each node's `subtree_max_end` equals
+///    the maximum `range.end` over all `Vma`s in its subtree.
+/// 4. **Non-overlap.** Inserts that would create an overlap with an
+///    existing VMA are rejected.
+///
+/// All link pointers (`parent`, `left`, `right`) refer to live `Vma`s
+/// owned by this tree, or are `None`. The `Vma` at the address held in
+/// any link is live until either the tree drops or the node is removed
+/// — both events run through the tree, so external code cannot
+/// invalidate them.
+pub struct VmaTree {
+    root: Option<NonNull<Vma>>,
+    len: usize,
+}
+
+impl VmaTree {
+    pub const fn new() -> Self {
+        Self { root: None, len: 0 }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.root.is_none()
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Insert `boxed` into the tree.
+    ///
+    /// On success the tree takes ownership of the box. On overlap with
+    /// an existing VMA the box is returned untouched so the caller can
+    /// drop it, modify it, or retry with a different range. The
+    /// rejection is decided by walking the BST: if the new range
+    /// overlaps any VMA in the tree it necessarily overlaps one on the
+    /// insertion path, so a single walk catches every conflict (proof
+    /// in the architecture doc).
+    pub fn insert(&mut self, boxed: KBox<Vma>) -> Result<(), KBox<Vma>> {
+        // Find the parent slot via a BST walk, checking for overlap at
+        // every visited node. `parent` ends up at the future leaf's
+        // parent; `parent_left` records which side to hook into.
+        let new_range = boxed.range;
+        let mut parent: Option<NonNull<Vma>> = None;
+        let mut parent_left = false;
+        let mut current = self.root;
+        while let Some(node) = current {
+            // SAFETY: `node` is a tree-link pointer, valid for the tree's
+            // lifetime per the type invariants above.
+            let v = unsafe { node.as_ref() };
+            if new_range.overlaps(v.range) {
+                return Err(boxed);
+            }
+            parent = Some(node);
+            if new_range.start() < v.range.start() {
+                parent_left = true;
+                current = v.link.left;
+            } else {
+                parent_left = false;
+                current = v.link.right;
+            }
+        }
+
+        // Hook the new node in. KBox::into_raw consumes the box and
+        // hands ownership to the tree; from here on the tree is
+        // responsible for freeing it.
+        let new_node = KBox::into_raw(boxed);
+        // SAFETY: `new_node` is the just-allocated node, no other reference
+        // exists; we initialise its link to point at its parent.
+        unsafe {
+            let n = new_node.as_ptr();
+            (*n).link.parent = parent;
+            (*n).link.left = None;
+            (*n).link.right = None;
+            (*n).link.color = RbColor::Red;
+            (*n).link.subtree_max_end = (*n).range.end();
+        }
+        match parent {
+            None => self.root = Some(new_node),
+            Some(p) => unsafe {
+                // SAFETY: `p` is a live tree node by the walk invariants.
+                let pr = p.as_ptr();
+                if parent_left {
+                    (*pr).link.left = Some(new_node);
+                } else {
+                    (*pr).link.right = Some(new_node);
+                }
+            },
+        }
+        self.len += 1;
+
+        // Update interval augmentation up the path. This is independent
+        // of RB fixup: the set of nodes in each ancestor's subtree
+        // changed, so each ancestor's subtree_max_end may have grown.
+        self.update_max_end_up_from(parent);
+
+        // RB fixup: restore the no-red-red property. Rotations inside
+        // the fixup separately maintain augmentation on the rotated
+        // nodes (see `rotate_left` / `rotate_right`).
+        self.insert_fixup(new_node);
+        Ok(())
+    }
+
+    /// Find the `Vma` whose range contains `addr`, if any. The interval
+    /// augmentation isn't needed for a point query — a plain BST walk
+    /// is O(log n).
+    pub fn find_covering(&self, addr: VirtAddr) -> Option<&Vma> {
+        let mut current = self.root;
+        while let Some(node) = current {
+            // SAFETY: link pointer; live by the type invariants.
+            let v = unsafe { node.as_ref() };
+            if v.range.contains(addr) {
+                return Some(v);
+            } else if addr < v.range.start() {
+                current = v.link.left;
+            } else {
+                current = v.link.right;
+            }
+        }
+        None
+    }
+
+    // ----- Internals -----
+
+    /// Recompute the `subtree_max_end` for the single node `n` from its
+    /// own range end and its children's `subtree_max_end`.
+    ///
+    /// # Safety
+    /// `n` is a live tree node; its child links (which we read) are
+    /// either `None` or themselves live nodes per the tree invariants.
+    unsafe fn recompute_max_end(n: NonNull<Vma>) {
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            let v = n.as_ptr();
+            let mut m = (*v).range.end();
+            if let Some(l) = (*v).link.left {
+                let lm = l.as_ref().link.subtree_max_end;
+                if lm > m {
+                    m = lm;
+                }
+            }
+            if let Some(r) = (*v).link.right {
+                let rm = r.as_ref().link.subtree_max_end;
+                if rm > m {
+                    m = rm;
+                }
+            }
+            (*v).link.subtree_max_end = m;
+        }
+    }
+
+    /// Walk from `start` up to the root, recomputing each ancestor's
+    /// `subtree_max_end`.
+    fn update_max_end_up_from(&mut self, start: Option<NonNull<Vma>>) {
+        let mut cur = start;
+        while let Some(n) = cur {
+            // SAFETY: tree-link pointer, live by invariants.
+            unsafe {
+                Self::recompute_max_end(n);
+                cur = n.as_ref().link.parent;
+            }
+        }
+    }
+
+    /// Rotate left at `x`: x's right child y becomes the parent, x
+    /// becomes y's left child. The set of nodes in the subtree is
+    /// unchanged, so y inherits x's old `subtree_max_end`; x's gets
+    /// recomputed because its children changed.
+    ///
+    /// # Safety
+    /// `x` is a live tree node with a non-`None` right child. Every
+    /// link the rotation touches (the right child, its left subtree,
+    /// `x`'s parent) is therefore live or `None`.
+    unsafe fn rotate_left(&mut self, x: NonNull<Vma>) {
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            let xp = x.as_ptr();
+            let y = (*xp)
+                .link
+                .right
+                .expect("rotate_left precondition: right child");
+            let yp = y.as_ptr();
+
+            // y's left subtree becomes x's right subtree.
+            (*xp).link.right = (*yp).link.left;
+            if let Some(yl) = (*yp).link.left {
+                (*yl.as_ptr()).link.parent = Some(x);
+            }
+
+            // y takes x's slot in the parent.
+            (*yp).link.parent = (*xp).link.parent;
+            match (*xp).link.parent {
+                None => self.root = Some(y),
+                Some(xparent) => {
+                    let p = xparent.as_ptr();
+                    if (*p).link.left == Some(x) {
+                        (*p).link.left = Some(y);
+                    } else {
+                        (*p).link.right = Some(y);
+                    }
+                }
+            }
+
+            // x becomes y's left child.
+            (*yp).link.left = Some(x);
+            (*xp).link.parent = Some(y);
+
+            // Augmentation: x first (its children changed), then y.
+            Self::recompute_max_end(x);
+            Self::recompute_max_end(y);
+        }
+    }
+
+    /// Rotate right at `y`: mirror of [`rotate_left`].
+    ///
+    /// # Safety
+    /// `y` is a live tree node with a non-`None` left child.
+    unsafe fn rotate_right(&mut self, y: NonNull<Vma>) {
+        // SAFETY: forwarded from this function's contract.
+        unsafe {
+            let yp = y.as_ptr();
+            let x = (*yp)
+                .link
+                .left
+                .expect("rotate_right precondition: left child");
+            let xp = x.as_ptr();
+
+            (*yp).link.left = (*xp).link.right;
+            if let Some(xr) = (*xp).link.right {
+                (*xr.as_ptr()).link.parent = Some(y);
+            }
+
+            (*xp).link.parent = (*yp).link.parent;
+            match (*yp).link.parent {
+                None => self.root = Some(x),
+                Some(yparent) => {
+                    let p = yparent.as_ptr();
+                    if (*p).link.right == Some(y) {
+                        (*p).link.right = Some(x);
+                    } else {
+                        (*p).link.left = Some(x);
+                    }
+                }
+            }
+
+            (*xp).link.right = Some(y);
+            (*yp).link.parent = Some(x);
+
+            Self::recompute_max_end(y);
+            Self::recompute_max_end(x);
+        }
+    }
+
+    /// Restore the no-red-red property after inserting `z` as a red
+    /// leaf. CLRS-textbook fixup: while `z`'s parent is red, look at
+    /// `z`'s uncle and either recolour (red uncle) or rotate (black
+    /// uncle), mirrored for left vs. right parent.
+    fn insert_fixup(&mut self, z: NonNull<Vma>) {
+        let mut z = z;
+        // SAFETY of the loop body: every pointer dereferenced is either
+        // `z` itself or reached through `z`'s `parent` / grandparent /
+        // uncle chain. Each is a live tree node — `z` because we just
+        // inserted it, the rest because they exist as ancestors. The
+        // loop condition guarantees `z.parent` is `Some(_)` and red;
+        // since the root is always black on entry (invariant), a red
+        // parent implies a grandparent exists.
+        unsafe {
+            while let Some(zparent) = z.as_ref().link.parent {
+                if zparent.as_ref().link.color != RbColor::Red {
+                    break;
+                }
+                let zgp = zparent
+                    .as_ref()
+                    .link
+                    .parent
+                    .expect("red parent implies grandparent exists");
+                let gpp = zgp.as_ptr();
+                if (*gpp).link.left == Some(zparent) {
+                    let uncle = (*gpp).link.right;
+                    if matches!(uncle.map(|u| u.as_ref().link.color), Some(RbColor::Red)) {
+                        // Case 1 (left): red uncle — recolour, push up.
+                        (*zparent.as_ptr()).link.color = RbColor::Black;
+                        (*uncle.unwrap().as_ptr()).link.color = RbColor::Black;
+                        (*gpp).link.color = RbColor::Red;
+                        z = zgp;
+                    } else {
+                        if (*zparent.as_ptr()).link.right == Some(z) {
+                            // Case 2 (left): rotate parent left, then fall through.
+                            z = zparent;
+                            self.rotate_left(z);
+                        }
+                        // Case 3 (left): recolour and rotate grandparent right.
+                        let zp_after = z.as_ref().link.parent.unwrap();
+                        (*zp_after.as_ptr()).link.color = RbColor::Black;
+                        (*gpp).link.color = RbColor::Red;
+                        self.rotate_right(zgp);
+                    }
+                } else {
+                    let uncle = (*gpp).link.left;
+                    if matches!(uncle.map(|u| u.as_ref().link.color), Some(RbColor::Red)) {
+                        // Case 1 (right, mirror).
+                        (*zparent.as_ptr()).link.color = RbColor::Black;
+                        (*uncle.unwrap().as_ptr()).link.color = RbColor::Black;
+                        (*gpp).link.color = RbColor::Red;
+                        z = zgp;
+                    } else {
+                        if (*zparent.as_ptr()).link.left == Some(z) {
+                            z = zparent;
+                            self.rotate_right(z);
+                        }
+                        let zp_after = z.as_ref().link.parent.unwrap();
+                        (*zp_after.as_ptr()).link.color = RbColor::Black;
+                        (*gpp).link.color = RbColor::Red;
+                        self.rotate_left(zgp);
+                    }
+                }
+            }
+            // Recolour the root black. The fixup may have left a red
+            // root in the case-1 recursion path.
+            if let Some(root) = self.root {
+                (*root.as_ptr()).link.color = RbColor::Black;
+            }
+        }
+    }
+}
+
+impl Default for VmaTree {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for VmaTree {
+    /// Iterative post-order teardown using parent pointers. Each leaf
+    /// is freed and its parent's pointing slot cleared, so the next
+    /// iteration finds a new leaf one level up. O(n), no allocation.
+    fn drop(&mut self) {
+        let mut current = self.root;
+        while let Some(n) = current {
+            // SAFETY: tree-link pointer to a live, owned node.
+            let next = unsafe {
+                let np = n.as_ptr();
+                if let Some(l) = (*np).link.left {
+                    Some(l)
+                } else if let Some(r) = (*np).link.right {
+                    Some(r)
+                } else {
+                    // Leaf: clear the parent's slot and free.
+                    let parent = (*np).link.parent;
+                    if let Some(p) = parent {
+                        let pp = p.as_ptr();
+                        if (*pp).link.left == Some(n) {
+                            (*pp).link.left = None;
+                        } else {
+                            (*pp).link.right = None;
+                        }
+                    }
+                    // SAFETY: `n` came from `KBox::into_raw` in `insert`,
+                    // has not been reconstructed yet, and is no longer
+                    // referenced from the tree (we just cleared the
+                    // parent slot, and it has no children).
+                    drop(KBox::from_raw(n));
+                    parent
+                }
+            };
+            current = next;
+        }
+        self.root = None;
+        self.len = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::mm::test_support::init_global_heap;
 
     const PAGE: u64 = PAGE_SIZE as u64;
 
@@ -277,6 +665,117 @@ mod tests {
 
     fn range(start: u64, end: u64) -> VAddrRange {
         VAddrRange::new(va(start), va(end)).expect("test range must be valid")
+    }
+
+    fn anon_box(r: VAddrRange) -> KBox<Vma> {
+        KBox::try_new(Vma::new(r, Protection::empty(), MappingKind::Anonymous))
+            .expect("test heap exhausted")
+    }
+
+    fn insert_or_panic(tree: &mut VmaTree, r: VAddrRange) {
+        tree.insert(anon_box(r)).expect("test insert must succeed");
+    }
+
+    // ----- Invariant checkers -----
+
+    /// Walk the subtree rooted at `node` and verify:
+    /// - BST ordering by `range.start` (and consequently no overlaps,
+    ///   since we also reject overlapping inserts up front).
+    /// - Interval-augmentation invariant: `subtree_max_end` at every
+    ///   node equals the true maximum `range.end` over the subtree.
+    ///
+    /// Returns the actual maximum `range.end` of the subtree, panics
+    /// with a descriptive message on any violation.
+    fn check_bst_and_augmentation(node: Option<NonNull<Vma>>) -> VirtAddr {
+        let Some(n) = node else {
+            return VirtAddr::new(0);
+        };
+        // SAFETY: link pointer; live as long as the tree is.
+        let v = unsafe { n.as_ref() };
+        let mut max_end = v.range.end();
+        if let Some(l) = v.link.left {
+            let l_max_end = check_bst_and_augmentation(Some(l));
+            // SAFETY: live link.
+            let lv = unsafe { l.as_ref() };
+            assert!(
+                lv.range.start() < v.range.start(),
+                "BST violation: left child start {:?} not < node start {:?}",
+                lv.range.start(),
+                v.range.start()
+            );
+            if l_max_end > max_end {
+                max_end = l_max_end;
+            }
+        }
+        if let Some(r) = v.link.right {
+            let r_max_end = check_bst_and_augmentation(Some(r));
+            // SAFETY: live link.
+            let rv = unsafe { r.as_ref() };
+            assert!(
+                rv.range.start() > v.range.start(),
+                "BST violation: right child start {:?} not > node start {:?}",
+                rv.range.start(),
+                v.range.start()
+            );
+            if r_max_end > max_end {
+                max_end = r_max_end;
+            }
+        }
+        assert_eq!(
+            v.link.subtree_max_end, max_end,
+            "augmentation violation at node starting {:?}",
+            v.range.start()
+        );
+        max_end
+    }
+
+    /// Walk the subtree rooted at `node` and verify the red-black
+    /// properties: no red node has a red parent, every root-to-leaf
+    /// path crosses the same number of black nodes. Returns the
+    /// black-height (counting black nodes on any path from `node` down
+    /// to a `None` leaf, exclusive of `node`).
+    fn check_rb(node: Option<NonNull<Vma>>, parent_color: RbColor) -> usize {
+        let Some(n) = node else {
+            return 0;
+        };
+        // SAFETY: live link.
+        let v = unsafe { n.as_ref() };
+        if v.link.color == RbColor::Red {
+            assert_ne!(
+                parent_color,
+                RbColor::Red,
+                "red-red violation at node starting {:?}",
+                v.range.start()
+            );
+        }
+        let lbh = check_rb(v.link.left, v.link.color);
+        let rbh = check_rb(v.link.right, v.link.color);
+        assert_eq!(
+            lbh, rbh,
+            "black-height mismatch at node starting {:?}: left={lbh}, right={rbh}",
+            v.range.start()
+        );
+        lbh + match v.link.color {
+            RbColor::Black => 1,
+            RbColor::Red => 0,
+        }
+    }
+
+    fn verify(tree: &VmaTree) {
+        check_bst_and_augmentation(tree.root);
+        if let Some(root) = tree.root {
+            // SAFETY: live link.
+            let rc = unsafe { root.as_ref().link.color };
+            assert_eq!(rc, RbColor::Black, "root must be black");
+        }
+        check_rb(tree.root, RbColor::Black);
+    }
+
+    fn count_nodes(node: Option<NonNull<Vma>>) -> usize {
+        let Some(n) = node else { return 0 };
+        // SAFETY: live link.
+        let v = unsafe { n.as_ref() };
+        1 + count_nodes(v.link.left) + count_nodes(v.link.right)
     }
 
     #[test]
@@ -390,5 +889,152 @@ mod tests {
         assert!(rw_user.contains(rw_user));
         // Empty is contained in everything.
         assert!(rw_user.contains(Protection::empty()));
+    }
+
+    // ----- VmaTree -----
+
+    #[test]
+    fn empty_tree_is_valid() {
+        let tree = VmaTree::new();
+        assert!(tree.is_empty());
+        assert_eq!(tree.len(), 0);
+        verify(&tree);
+        assert!(tree.find_covering(va(PAGE)).is_none());
+    }
+
+    #[test]
+    fn single_insert_finds_and_misses_correctly() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
+        assert_eq!(tree.len(), 1);
+        verify(&tree);
+
+        assert!(tree.find_covering(va(PAGE * 4)).is_some());
+        assert!(tree.find_covering(va(PAGE * 6)).is_some());
+        assert!(tree.find_covering(va(PAGE * 8 - 1)).is_some());
+        assert!(tree.find_covering(va(PAGE * 8)).is_none()); // half-open
+        assert!(tree.find_covering(va(PAGE * 3)).is_none());
+    }
+
+    #[test]
+    fn insert_rejects_overlap_in_every_shape() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
+
+        // Identical range.
+        assert!(tree.insert(anon_box(range(PAGE * 4, PAGE * 8))).is_err());
+        // Starts inside.
+        assert!(tree.insert(anon_box(range(PAGE * 6, PAGE * 10))).is_err());
+        // Ends inside.
+        assert!(tree.insert(anon_box(range(PAGE * 2, PAGE * 6))).is_err());
+        // Strictly nested inside existing.
+        assert!(tree.insert(anon_box(range(PAGE * 5, PAGE * 7))).is_err());
+        // Existing nested inside new.
+        assert!(tree.insert(anon_box(range(PAGE * 2, PAGE * 10))).is_err());
+
+        // Tree unchanged after every rejection.
+        assert_eq!(tree.len(), 1);
+        verify(&tree);
+    }
+
+    #[test]
+    fn adjacent_ranges_do_not_overlap() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        // Touching at PAGE*8 — half-open semantics: no overlap.
+        insert_or_panic(&mut tree, range(PAGE * 4, PAGE * 8));
+        insert_or_panic(&mut tree, range(PAGE * 8, PAGE * 12));
+        insert_or_panic(&mut tree, range(0, PAGE * 4));
+        assert_eq!(tree.len(), 3);
+        verify(&tree);
+    }
+
+    #[test]
+    fn ascending_inserts_balance_and_keep_invariants() {
+        // Pure ascending order is the degenerate input for an unbalanced
+        // BST: it builds a right-leaning list. RB fixup must rebalance
+        // it. Verify the invariants after every insert.
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        let n: u64 = 64;
+        for i in 0..n {
+            let start = (i * 2) * PAGE;
+            insert_or_panic(&mut tree, range(start, start + PAGE));
+            verify(&tree);
+            assert_eq!(tree.len() as u64, i + 1);
+        }
+        assert_eq!(count_nodes(tree.root) as u64, n);
+    }
+
+    #[test]
+    fn descending_inserts_balance_and_keep_invariants() {
+        // Mirror of ascending: pure descending builds a left-leaning
+        // list without rebalancing.
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        let n: u64 = 64;
+        for i in (0..n).rev() {
+            let start = (i * 2) * PAGE;
+            insert_or_panic(&mut tree, range(start, start + PAGE));
+            verify(&tree);
+        }
+        assert_eq!(count_nodes(tree.root) as u64, n);
+    }
+
+    #[test]
+    fn shuffled_inserts_maintain_invariants_throughout() {
+        // Generate a sequence of non-overlapping ranges, shuffle the
+        // insertion order with a fixed-seed LCG (deterministic for
+        // reproducibility), and verify after each insert.
+        init_global_heap();
+        let n: usize = 200;
+        let mut order: [usize; 200] = core::array::from_fn(|i| i);
+
+        // Fisher-Yates with the LCG.
+        let mut lcg: u64 = 0xDEAD_BEEF_CAFE_F00D;
+        for i in (1..n).rev() {
+            lcg = lcg
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            let j = (lcg as usize) % (i + 1);
+            order.swap(i, j);
+        }
+
+        let mut tree = VmaTree::new();
+        for (count, &idx) in order.iter().enumerate() {
+            let start = (idx as u64 * 4) * PAGE;
+            insert_or_panic(&mut tree, range(start, start + PAGE * 2));
+            verify(&tree);
+            assert_eq!(tree.len(), count + 1);
+        }
+
+        // Lookups across the resulting tree.
+        for &idx in order.iter() {
+            let start = (idx as u64 * 4) * PAGE;
+            assert!(tree.find_covering(va(start)).is_some());
+            assert!(tree.find_covering(va(start + PAGE)).is_some());
+            assert!(tree.find_covering(va(start + PAGE * 2)).is_none()); // exclusive end
+        }
+    }
+
+    #[test]
+    fn drop_releases_every_owned_box() {
+        // Indirect verification: drop a large tree, then allocate the
+        // same number of fresh Vmas. With a leak, this would gradually
+        // exhaust the 16 MiB host heap across the test run. The hard
+        // verification of "every box drops exactly once" lives in
+        // KBox's own tests; this confirms the tree threads boxes
+        // through KBox::from_raw on teardown.
+        init_global_heap();
+        for _ in 0..4 {
+            let mut tree = VmaTree::new();
+            for i in 0..256u64 {
+                insert_or_panic(&mut tree, range(i * 2 * PAGE, (i * 2 + 1) * PAGE));
+            }
+            verify(&tree);
+            // Tree drops here.
+        }
     }
 }
