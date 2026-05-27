@@ -10,6 +10,7 @@
 pub mod buddy;
 pub mod heap;
 pub mod slab;
+pub mod vmm;
 
 #[cfg(test)]
 pub(crate) mod test_support;

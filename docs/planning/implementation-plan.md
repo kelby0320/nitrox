@@ -168,6 +168,27 @@ silent reset.
   - `map_page`, `unmap_page`, `flush_tlb_*`, `set_page_table`
   - All `unsafe`, all with SAFETY comments
 - [ ] VMA structure with red-black tree storage
+  - [ ] `Vma` struct + `VAddrRange`, `Protection`, `MappingKind` types in
+    `kernel/src/mm/vmm.rs`. `MappingKind` starts as `Anonymous`-only;
+    `FileBacked` / `Device` variants land with their consumers.
+    `Protection` is a narrower abstraction than `arch::PageFlags` (WRITE
+    / EXEC / USER), translated to `PageFlags` at PTE-install time
+  - [ ] Intrusive RB-tree node embedded in `Vma`: parent / left / right
+    / colour, plus `subtree_max_end` for interval augmentation
+  - [ ] RB-tree operations: insert, remove, rotations, recolour — all
+    iterative (parent pointers make recursion unnecessary), augmentation
+    maintained on every structural mutation
+  - [ ] Lookup primitives the VMM will call: `find_covering(addr)`,
+    `find_first_overlapping(range)` + overlap iterator, in-order iterator
+  - [ ] Ownership model: `VmaTree` owns `KBox<Vma>` (insert takes a box,
+    remove returns one). Slab-backed, matching Linux's `vm_area_cachep`.
+    Arena allocation considered and rejected — see deviation note
+  - [ ] Host-side tests: RB-tree invariants (root black, no red-red,
+    equal black-heights); augmentation invariant; randomised
+    insert/remove against a sorted-`KVec` oracle; overlap queries on
+    hand-crafted layouts
+  - [ ] Update [docs/architecture/memory-management.md] to point at
+    `mm/vmm.rs` and drop the "not yet" annotation in the layer table
 - [ ] Address space construction from an ELF image
 - [ ] Higher-half kernel mapping shared across all address spaces
 - [ ] Per-thread kernel stack with guard page
@@ -296,7 +317,18 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 
 ### Notes / deviations
 
-(Add notes here.)
+- 2026-05-27 — VMA tree design call: RB-tree operations are iterative
+  rather than recursive. With parent pointers (required for an intrusive
+  tree anyway), insert/delete rebalancing walks up the tree naturally;
+  search and in-order iteration become iterative trivially. Removes a
+  kernel-stack-depth concern as a real tradeoff. Matches Linux
+  (`lib/rbtree.c`).
+- 2026-05-27 — VMA tree design call: `KBox<Vma>` over a per-address-space
+  arena. VMAs come and go constantly (every `mprotect` boundary-cross
+  splits a VMA), so an arena either needs an internal free-list (which
+  is just the slab again) or fragments. Slab-backed allocation matches
+  Linux's `vm_area_cachep` model. Revisit if profiling ever shows the
+  slab is a bottleneck — the change is local to `VmaTree`.
 
 ---
 
