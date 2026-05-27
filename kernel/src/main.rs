@@ -182,8 +182,9 @@ fn init_memory() -> bool {
 
 /// One-time paging setup that must run before any `AddressSpace::new`:
 ///
-/// 1. Enable the no-execute paging extension (so `PageFlags::NO_EXECUTE`
-///    is honoured rather than faulting as a reserved-bit violation).
+/// 1. Enable every CPU memory-protection feature the kernel depends
+///    on. On x86_64: NX paging extension, SMEP, SMAP. The arch impl
+///    panics if any required feature is missing from the running CPU.
 /// 2. Pre-allocate the kernel-vmap region's intermediate page tables
 ///    in the live PML4, so the next step's snapshot captures them and
 ///    every future AS inherits the shared sub-tree.
@@ -195,7 +196,8 @@ fn init_memory() -> bool {
 /// half post-call. See the "Kernel-half PML4 sharing" section in
 /// `docs/architecture/memory-management.md`.
 fn paging_init() {
-    arch::ensure_nxe();
+    arch::init_protections();
+    kprintln!("memory protections enabled");
     // SAFETY: HHDM is up (init_memory ran first) and the buddy
     // allocator is live; no AS exists yet whose captured template
     // could disagree with the new PML4 entries.

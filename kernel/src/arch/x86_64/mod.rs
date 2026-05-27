@@ -6,6 +6,7 @@ pub mod idt;
 pub mod paging;
 pub mod regs;
 pub mod serial;
+pub mod user_access;
 
 use core::arch::asm;
 
