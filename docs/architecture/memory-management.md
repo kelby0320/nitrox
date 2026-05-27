@@ -408,6 +408,48 @@ interrupts disabled, so the lock is sound today. The IDT slice will
 introduce an `IrqSpinLock` variant for locks that must mask interrupts;
 allocator locks are likely candidates.
 
+## User memory access
+
+The user-memory-access subsystem is the single sanctioned interface
+for the kernel to read or write user memory. It is split in two:
+[`mm/user_access.rs`](../../kernel/src/mm/user_access.rs) holds the
+arch-neutral types, validation, and public API;
+[`arch/x86_64/user_access.rs`](../../kernel/src/arch/x86_64/user_access.rs)
+holds the inline-asm raw copies and the `.user_access_table` entry
+emission. The exact contract — pointer types, copy primitive
+signatures, exception table format, SMAP/SMEP discipline — lives in
+[`docs/spec/user-memory-access.md`](../spec/user-memory-access.md);
+this section sketches how the subsystem fits into the wider memory
+management story.
+
+- **Opaque pointer types.** `UserPtr<T>` / `UserMutPtr<T>` wrap a
+  validated user-half virtual address. There is no `Deref`, no
+  public `as_ptr`, and the raw `u64` is crate-private. Construction
+  rejects addresses in the kernel half (`addr >= USER_VIRT_END`) and
+  misalignments for `T`. Everything outside this module that needs
+  to touch user memory does so through the five copy primitives.
+- **Five copy primitives.** `copy_from_user<T: Copy>`,
+  `copy_to_user<T: Copy>`, `copy_slice_from_user`,
+  `copy_slice_to_user`, `copy_cstr_from_user`. All return
+  `Result<_, UserAccessError>`. The slice variants use `rep movsb`
+  under `stac` / `clac`; the cstr variant uses a byte-at-a-time
+  `lodsb` / `stosb` loop, also under SMAP discipline.
+- **Exception table.** Each copy primitive's inline asm registers
+  a `(fault_pc, recovery_pc)` pair in the `.user_access_table`
+  rodata section (bracketed by linker symbols). The `#PF` handler
+  ([`arch::idt::pf_dispatch`](../../kernel/src/arch/x86_64/idt.rs))
+  consults the table on every fault: on match it patches the saved
+  RIP to the recovery PC and `iretq`s; on miss it dump-and-halts.
+  The recovery code closes the SMAP window and signals failure to
+  the Rust wrapper.
+- **User-access protections enabled at boot.**
+  [`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs)
+  runs in `paging_init`. On x86_64 it enables NX, SMEP, and SMAP
+  (panicking if any are absent); a future aarch64 port will use
+  the same entry point to configure PAN / PXN. Phase 1
+  hard-requires the protections — the dev loop runs QEMU with
+  `-cpu qemu64,+smap,+smep` so TCG exposes them.
+
 ## Phase 1 limitations
 
 - No per-CPU caching in the slab. The single global lock per cache is

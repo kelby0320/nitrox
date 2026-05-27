@@ -143,6 +143,15 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.arg("-M")
         .arg("q35")
+        // CPU model = "the features the kernel actually requires,
+        // nothing more". Base `qemu64` brings long mode, NX, and basic
+        // SSE; the `+smap,+smep` opt-ins give us the user-access
+        // protections `arch::init_protections` asserts on. Future
+        // slices add features here as they need them (the
+        // `ArchTimer` slice will want `+tsc-deadline`, `ArchIrq` will
+        // want `+x2apic`, etc.). See the slice-2 decision log entry.
+        .arg("-cpu")
+        .arg("qemu64,+smap,+smep")
         .arg("-m")
         .arg("256M")
         .arg("-drive")

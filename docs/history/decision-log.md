@@ -1228,3 +1228,336 @@ Verification:
   ranges; `Drop` unmaps the stack pages.
 - `cargo xtask build` — kernel ELF builds clean for
   `x86_64-unknown-none`.
+
+---
+
+## 2026-05-27 — Phase 1, slice 6 (item 1): user-access exception table + `#PF` recovery
+
+First commit of the user-memory-access-discipline slice. Lands the
+plumbing the copy primitives will hang off of in slice 2: a linker
+section that holds `(fault_pc, recovery_pc)` pairs, a lookup function
+that walks it, and a `#PF` handler that consults the table and
+`iretq`s to the recovery PC on a match. Nothing registers entries
+yet — the copy primitives are slice 2 — so the section is empty in
+this commit. The handler still dump-and-halts on a miss, matching
+the diagnostics IDT's behaviour for every other vector.
+
+What's in the build:
+
+- `kernel/linker.ld` — new `.user_access_table` output section in
+  the rodata segment, bracketed by `__start_user_access_table` and
+  `__stop_user_access_table`. `ALIGN(8)` matches the `u64`-pair
+  entry layout. `KEEP` because nothing in Rust source refers to
+  the entries by name — they're indirectly reachable only through
+  the start/stop symbols, so `--gc-sections` would otherwise drop
+  them. Empty section is well-defined: `start == stop` means "no
+  recovery sites registered."
+- `kernel/src/mm/user_access.rs` — new module. `ExtableEntry`
+  (`#[repr(C)]`, two `u64`s) is the layout slice 2's inline asm
+  will emit with `.quad` directives. `lookup_recovery(fault_pc)
+  -> Option<u64>` walks the bracketed slice linearly and returns
+  the recovery PC on match. A small `lookup_recovery_in(table,
+  fault_pc)` helper takes an explicit slice so the lookup is
+  host-testable without the linker symbols (`cfg(test)` returns
+  an empty table).
+- `kernel/src/mm/mod.rs` — registers `mod user_access`.
+- `kernel/src/arch/x86_64/idt.rs` — splits vector 14 (`#PF`) off
+  the common `exception_stub!` macro. The macro stubs end in
+  `ud2` because their dispatcher is `-> !`; the new `vec14` stub
+  ends in `iretq` because `pf_dispatch` is allowed to return.
+  Stub flow: push vector + 15 GPRs (the CPU pushed the error
+  code), `call pf_dispatch`, on return pop everything and
+  `iretq` to the patched RIP. `pf_dispatch` reads the saved RIP,
+  calls `lookup_recovery`, writes the recovery PC back to
+  `frame.rip` and returns on match, or falls through to a
+  factored-out `dump_and_halt(&ExceptionFrame) -> !`
+  (previously the body of `exception_dispatch`) on miss.
+
+Decisions worth recording:
+
+- **Absolute 64-bit PCs in entries, not 32-bit relative offsets.**
+  Linux uses relative offsets to be KASLR-friendly. Nitrox has no
+  KASLR and isn't planning any in Phase 1. The per-entry cost
+  difference (16 vs 8 bytes) is negligible at the entry counts
+  we expect (one per copy primitive, ~5 in total for slice 2),
+  and absolute PCs simplify both the asm emitter and the lookup.
+  Revisit if KASLR ever lands.
+- **Linear scan over sorted-table + binary search.** Lookup runs
+  only on the rare (faulting) path. The full table from slice 2
+  fits well inside a single cacheline. A linear scan with no
+  sorting requirement also keeps the asm-side `.pushsection`
+  emitter trivial — no need to maintain ordering across
+  translation units. Revisit if Phase 2 ever pushes the count
+  past a few dozen.
+- **`pf_dispatch` returns; the fatal path calls `dump_and_halt`
+  itself.** Two alternatives were considered: (a) make
+  `pf_dispatch` return an enum (`Recovered`/`Fatal`) and have the
+  stub branch on it, and (b) make `pf_dispatch` always return
+  and let the stub conditionally `iretq` vs `ud2`. (a) needs a
+  second register output from the stub; (b) needs a branch in
+  asm. The chosen path keeps the stub straight-line and pushes
+  the conditional into Rust where it belongs. The trade-off is
+  the dispatcher has two effective return modes — return normally
+  on recovery, or never return — which is exactly what `-> ()`
+  vs `-> !` already encodes, applied at the call boundary inside
+  the function rather than at the function signature.
+- **Vector 14 is hand-written, not added to the macro.** The
+  macro's contract is "uniform stub, `ud2` at the end, dispatcher
+  is `-> !`." Generalising the macro to support both ending
+  shapes would mean either a second macro arm or a runtime branch
+  in every stub — both worse than the duplication of one
+  hand-written stub. The duplication is bounded by `#PF` being
+  the only recoverable CPU exception (everything else really is
+  fatal in Phase 1).
+- **The "VMA lookup" branch the plan mentions is not in this
+  commit.** Today there's no concept of an active address space:
+  the kernel still runs on Limine's tables, and the scheduler
+  that will own `set_active` hasn't landed. Until it does, a
+  `#PF` whose RIP is not in the exception table is either a
+  kernel bug (today's behaviour: dump-and-halt is correct) or a
+  user-space fault that can't be delivered anywhere meaningful
+  (no process, no notification channel). When the scheduler
+  arrives, `pf_dispatch` will grow a second decision step
+  between "exception-table lookup" and `dump_and_halt`. Noted
+  as a follow-up in the slice-2 wrap-up.
+- **Host-tested via a sliced-out pure function.** The real
+  `lookup_recovery` reads the linker symbols, which don't exist
+  under `cargo test`. Factoring out `lookup_recovery_in(table,
+  fault_pc)` and providing a `cfg(test)` empty-table shim for
+  the wrapper keeps every interesting case (empty / single hit
+  / multiple entries / duplicate fault_pc) host-testable, and
+  the layout-assertions test pins down the asm contract
+  (`offset_of!(fault_pc) == 0`, `offset_of!(recovery_pc) == 8`,
+  `size_of == 16`, `align_of == 8`) so slice 2's `.quad` writes
+  can't drift away from the Rust struct.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (136 total, +6 in
+  `mm::user_access`): empty table, single-entry hit/miss,
+  multi-entry recovery routing, duplicate-fault-pc determinism,
+  the host-build empty-table shim, and the layout-contract
+  assertions.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
+- `readelf -S` + `nm` confirm the `.user_access_table` section
+  exists in the kernel ELF with size 0 and that
+  `__start_user_access_table == __stop_user_access_table` —
+  the well-defined "no entries yet" state.
+- Boot under QEMU+OVMF reaches the existing diagnostics
+  milestones ("diagnostics online", "CPU tables installed",
+  "allocators up", paging smoke-test passes) — the IDT install
+  picks up the new vec14 stub without disturbing the existing
+  boot path.
+
+---
+
+## 2026-05-27 — Phase 1, slice 6 (items 2-4): UserPtr + copy primitives + SMAP/SMEP
+
+Second commit of the user-memory-access-discipline slice. Lands what
+slice 1's exception table existed to support: the opaque user-pointer
+types, the five copy primitives, and the boot-time SMAP/SMEP enable.
+Closes out the entire user-memory-access section of the implementation
+plan (items 1, 3, 4, plus the slice-1 items 2 and 5).
+
+What's in the build:
+
+- `kernel/src/arch/x86_64/regs.rs` — new `read_cr4` / `write_cr4`
+  and `cpuid(leaf, subleaf)`. The cpuid impl avoids LLVM's
+  rbx-as-operand restriction by routing the EBX result through a
+  swap register (`xchg rbx, {tmp:r}` before/after the cpuid).
+  `stac` and `clac` are deliberately *not* exposed as Rust-visible
+  wrappers — they live only inside the inline asm of
+  `arch::user_access`, where the "only inside copy primitives"
+  SMAP discipline is structurally enforced.
+- `kernel/src/arch/x86_64/paging.rs` — new `ensure_smap_smep`.
+  Reads CPUID 7.0:EBX, panics if either feature bit (7 = SMEP,
+  20 = SMAP) is missing, otherwise ORs `CR4.SMEP | CR4.SMAP` and
+  writes CR4 back. Bundled with `ensure_nxe` under the new
+  arch-neutral `arch::init_protections()` entry point so
+  `main.rs::paging_init` calls a single function rather than
+  touching x86 feature names directly. `ensure_nxe` and
+  `ensure_smap_smep` are now `pub(crate)`; only
+  `init_protections` is re-exported through `arch::`.
+- `kernel/src/mm/user_access.rs` — the arch-neutral half.
+  - `UserPtr<T>` / `UserMutPtr<T>`: `#[repr(transparent)]` over a
+    `u64` with `PhantomData<*const T>` / `PhantomData<*mut T>` for
+    type tagging. `new(addr)` validates user-half (`addr <
+    USER_VIRT_END`) and alignment for `T`. The held `u64` is
+    `pub(crate)` only — outside this module there is no way to
+    read a user address.
+  - `UserAccessError`: `BadAddress`, `Misaligned`, `Fault`,
+    `NoTerminator`.
+  - Five public copy primitives: `copy_from_user<T: Copy>`,
+    `copy_to_user<T: Copy>`, `copy_slice_from_user`,
+    `copy_slice_to_user`, `copy_cstr_from_user`. Each runs
+    validate-range → dispatch into `arch::user_access::*` →
+    map the arch signal into `Result<_, UserAccessError>`.
+- `kernel/src/arch/x86_64/user_access.rs` — the x86_64 arch half.
+  - `pub(crate) unsafe fn copy_bytes_raw(dst, src, len) -> bool`
+    (true = faulted). Inline asm with `stac` / `rep movsb` /
+    `clac`. Exception-table entry emitted via `.pushsection
+    .user_access_table` registers the `rep movsb` PC as the
+    fault site and a recovery label as the resume PC.
+  - `pub(crate) enum CstrCopyOutcome { Ok(usize), Fault, NoTerminator }`
+    and `pub(crate) unsafe fn copy_cstr_raw(...) -> CstrCopyOutcome`.
+    The asm uses a `lodsb`/`stosb` byte loop with `lodsb` as the
+    single registered fault site.
+  - Host-test stubs: under `cfg(test)` both raw primitives fall
+    back to `core::ptr::copy_nonoverlapping` (and a byte loop for
+    cstr) so the mm-layer validation tests exercise the full
+    wrapper plumbing without privileged instructions.
+- `kernel/src/arch/mod.rs` — re-export `ensure_smap_smep`
+  alongside the existing `ensure_nxe`.
+- `kernel/src/main.rs` — `paging_init` calls
+  `arch::init_protections()` and logs the arch-neutral
+  `"memory protections enabled"`. Updated the fn-level doc to
+  describe the abstraction.
+- `tools/xtask/src/main.rs` — QEMU command bumped to
+  `-cpu qemu64,+smap,+smep`. Default `qemu64` (no opt-ins) lacks
+  SMAP, so `arch::init_protections` would panic at boot; the
+  `+smap,+smep` flags add the two features the kernel actually
+  requires today. Named CPU models like `Haswell-v4` or
+  `Broadwell-v4` were considered but rejected: TCG silently
+  drops five features they advertise (PCID, x2APIC, TSC-deadline,
+  INVPCID, SPEC-CTRL), generating a noisy warning on every
+  boot. See the "minimal CPU model" decision below for the
+  underlying principle.
+- `docs/spec/user-memory-access.md` — new spec doc covering the
+  contract for `UserPtr` types, copy primitives (signatures and
+  partial-completion semantics), exception table layout /
+  encoding / registration / lookup, SMAP/SMEP discipline, and
+  aarch64 portability notes.
+
+Decisions worth recording:
+
+- **`UserPtr::new` returns `Result`, not `Option`.** A misaligned
+  address and an out-of-range address are different syscall
+  failures (`BadAddress` vs `Misaligned`). Squashing both into
+  `None` would lose information that the syscall layer wants to
+  forward to the user. The slight verbosity at construction
+  sites is fine; both errors stay in the same `UserAccessError`
+  type the copy primitives already return.
+- **Tags are `PhantomData<*const T>` / `PhantomData<*mut T>`, not
+  `PhantomData<T>`.** Auto-trait inference would otherwise make
+  `UserPtr<T>` `Send`/`Sync` whenever `T` is, which is more
+  permissive than warranted for a kernel-side handle to an
+  unverified user address. Callers that need to ferry a
+  `UserPtr<T>` across threads must opt in explicitly.
+- **The held `u64` is `pub(crate)` only.** Public `as_ptr` /
+  `into_raw` methods would let any kernel code dereference user
+  memory through ordinary pointer ops, bypassing the SMAP
+  window. The discipline that this is the *only* path to user
+  bytes lives in `kernel/CLAUDE.md` and is enforced by code
+  review; making the field private is a real type-level
+  constraint that backs it up.
+- **Hard SMAP/SMEP requirement, panic on missing.** Two
+  alternatives were rejected: (a) detect at boot and disable
+  enforcement on older hardware (each copy primitive gets a
+  runtime branch around `stac` / `clac`), and (b) #UD silently
+  in the copy primitive (the asm always emits `stac`, the
+  panic surfaces only on the first call). (a) trades simplicity
+  for hardware support we don't currently care about; (b) gives
+  a worse failure mode (cryptic #UD instead of a clear panic at
+  boot). The hard requirement is the cleanest choice for a
+  Phase 1 OS targeting modern hardware (SMAP shipped on client
+  Broadwell and server Haswell-EP, both 2014). Revisit if we
+  ever care about pre-Broadwell client CPUs.
+- **`-cpu qemu64,+smap,+smep` — minimal CPU model.** Three
+  candidates were on the table:
+  1. `qemu64,+smap,+smep` — the chosen form. Carries long mode,
+     NX, basic SSE; the opt-ins add exactly the user-access
+     protections the kernel requires. No TCG warnings.
+  2. `Haswell-v4,+smap,+smep` (or `Broadwell-v4,...`) — a
+     "realistic" CPU model. Same kernel-visible CPUID modulo
+     the dropped features, but emits five "TCG doesn't support
+     requested feature" warnings on every boot. The dropped
+     features (PCID, x2APIC, TSC-deadline, INVPCID, SPEC-CTRL)
+     are things we will want eventually but don't use today.
+  3. `max` — "every feature TCG implements". Warning-free
+     too, but commits us to "whatever QEMU version X happens
+     to expose" — a future TCG improvement could give the
+     kernel an implicit feature dependency we didn't intend.
+  
+  The principle: the xtask command should be a self-
+  documenting record of "these are the CPU features the
+  kernel currently requires". As future slices add
+  dependencies, the command grows by one flag at a time
+  (`ArchTimer` will add `+tsc-deadline`, `ArchIrq` will add
+  `+x2apic`, etc.) and the commit message explains why.
+  This matches the same minimalist discipline the kernel
+  applies elsewhere — fallible `KBox` over `alloc::Box`,
+  hand-rolled bitflags over the `bitflags` crate, depend on
+  what you use and nothing more.
+- **`arch::init_protections()` bundles NX + SMEP + SMAP behind
+  one arch-neutral entry point.** `main.rs` previously called
+  `arch::ensure_nxe()` and `arch::ensure_smap_smep()` directly,
+  leaking x86 feature names into the boot path. The wrapper
+  hides those names; an aarch64 port's `init_protections`
+  will configure `SCTLR_EL1.SPAN` and check `FEAT_PAN`
+  instead, with no change to `main.rs`. Cost: one trivial
+  function in `arch::x86_64::paging`. Spec doc reworded along
+  the same axis ("user-access window" / "user-access
+  protection" instead of "SMAP window" / "SMAP / SMEP" in
+  generic discussion; the per-arch instructions appear as
+  concrete realisations).
+- **Inline asm bodies live in `arch/x86_64/user_access.rs`, not
+  in `mm/user_access.rs` and not behind a trait.** The mm layer
+  is fully arch-neutral; everything x86-specific (`stac`,
+  `clac`, `rep movsb`, `lodsb`, the `.pushsection` exception-
+  table emission) sits behind the arch boundary. When aarch64
+  lands, its raw primitives drop into
+  `arch/aarch64/user_access.rs` with the same `copy_bytes_raw`
+  / `copy_cstr_raw` shapes and the mm-layer wrappers are
+  unchanged. An `ArchUserAccess` trait would add indirection
+  without paying back portability today; once two arches exist
+  the trait is a small local refactor.
+- **Arch primitives return simple signals (`bool` / `CstrCopyOutcome`),
+  not `Result<(), UserAccessError>`.** Keeping `UserAccessError`
+  in the mm layer means the arch layer has zero upward
+  dependencies. The mm-layer wrappers do the `bool → Result`
+  / `CstrCopyOutcome → Result<&[u8], _>` translation — a handful
+  of lines per primitive, trivial to read.
+- **Linear scan in `lookup_recovery`, single-entry per primitive.**
+  `rep movsb` is one architectural instruction with one fault
+  PC, so one exception-table entry per copy primitive suffices.
+  The cstr variant's `lodsb`/`stosb` loop has a single
+  user-side fault instruction (`lodsb`) — `stosb` writes
+  kernel memory which can't fault in well-formed code, so it
+  doesn't need its own entry.
+- **`copy_cstr_from_user` returns the slice including the NUL.**
+  Linux's `strncpy_from_user` returns the length excluding the
+  NUL. Either is a valid convention; including the NUL keeps
+  the slice "what was actually written into `dst`" which is
+  what callers usually want — `&dst[..k-1]` for the body is
+  cheap, and the caller never wonders whether the buffer is
+  NUL-terminated.
+- **Zero-length copy is `Ok` even at `addr == USER_VIRT_END`.**
+  A zero-length range accesses no bytes; it is vacuously valid.
+  The bounds check (`addr + len <= USER_VIRT_END`) accepts the
+  boundary case because there's no byte at `USER_VIRT_END` for
+  it to violate. `UserPtr::new` rejects `addr == USER_VIRT_END`
+  for non-zero T sizes; for `UserPtr<u8>` with subsequent
+  zero-length copies, the access is genuinely empty.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (152 total, +16 over
+  slice 1): `UserPtr` / `UserMutPtr` construction validation
+  (user-half rejection, alignment rejection, larger-alignment
+  types), `validate_user_range` (boundary handling, overflow,
+  zero-length acceptance), and the host stubs round-tripping
+  bytes / cstring data through the wrappers.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
+- `readelf -S` + `objdump -s` confirm the
+  `.user_access_table` section is now 80 bytes (5 × 16-byte
+  entries — one per public copy primitive that the compiler
+  monomorphises through the arch raw functions). The recorded
+  `fault_pc` and `recovery_pc` values match the `.text` ranges
+  of the arch primitives via `nm`.
+- Boot under QEMU+OVMF with `-cpu qemu64,+smap,+smep`
+  reaches the new diagnostic line "memory protections enabled"
+  and continues past it through the paging smoke test —
+  `init_protections` accepts the CPU model and the CR4 write
+  completed without taking the kernel down. No TCG warnings.

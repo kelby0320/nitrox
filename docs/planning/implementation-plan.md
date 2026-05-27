@@ -21,16 +21,17 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   renders a framebuffer boot screen. See the Phase 0 deviation notes for
   where it diverged from the original checklist.
 - **Phase 1 (Kernel substrate):** in progress — the
-  address-spaces-and-paging slice is complete. Memory foundation
-  (buddy / slab / `libkern` containers), kernel diagnostics (serial,
-  GDT/TSS/IDT, fault dumps), the `ArchPaging` trait + x86_64 4-level
-  page-table primitive, the VMA tree (interval-augmented intrusive
-  RB-tree), `AddressSpace` (VMA tree + page-table root + lock under
-  one `SpinLock<Inner>`), the static ELF loader, the shared
-  higher-half kernel mapping across address spaces, and per-thread
-  kernel stacks with guard pages are all in. Next: user memory access
-  discipline (`UserPtr<T>`, exception-table copy primitives, SMAP),
-  then the handle table.
+  address-spaces-and-paging and user-memory-access slices are
+  complete. Memory foundation (buddy / slab / `libkern` containers),
+  kernel diagnostics (serial, GDT/TSS/IDT, fault dumps), the
+  `ArchPaging` trait + x86_64 4-level page-table primitive, the VMA
+  tree (interval-augmented intrusive RB-tree), `AddressSpace` (VMA
+  tree + page-table root + lock under one `SpinLock<Inner>`), the
+  static ELF loader, the shared higher-half kernel mapping across
+  address spaces, per-thread kernel stacks with guard pages, and the
+  user-memory-access discipline (`UserPtr<T>`/`UserMutPtr<T>`,
+  exception table + `#PF` recovery, five copy primitives, boot-time
+  SMAP/SMEP enable) are all in. Next: the handle table.
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -261,12 +262,13 @@ silent reset.
 
 #### User memory access discipline
 
-- [ ] `UserPtr<T>` and `UserMutPtr<T>` opaque wrapper types
-- [ ] Exception table mechanism: `(fault_pc, recovery_pc)` pairs registered at compile time
-- [ ] Copy primitives: `copy_from_user`, `copy_to_user`, `copy_slice_from_user`, `copy_slice_to_user`, `copy_cstr_from_user`
-- [ ] SMAP/SMEP discipline: `stac`/`clac` only within copy routines
-- [ ] Upgrade the `#PF` handler (installed dump-and-halt in the diagnostics slice) to consult the exception table before VMA lookup
-- [ ] [docs/spec/user-memory-access.md] (write this spec while implementing)
+- [x] `UserPtr<T>` and `UserMutPtr<T>` opaque wrapper types
+- [x] Exception table mechanism: `(fault_pc, recovery_pc)` pairs registered at compile time
+- [x] Copy primitives: `copy_from_user`, `copy_to_user`, `copy_slice_from_user`, `copy_slice_to_user`, `copy_cstr_from_user`
+- [x] SMAP/SMEP discipline: `stac`/`clac` only within copy routines
+- [x] Upgrade the `#PF` handler (installed dump-and-halt in the diagnostics slice) to consult the exception table before VMA lookup
+  - Note: the VMA-lookup branch is deferred until the scheduler lands (no active address space exists yet, so a fault that misses the exception table is necessarily a kernel bug). The exception-table consultation is in place; `pf_dispatch` will grow a second decision step when the scheduler arrives.
+- [x] [docs/spec/user-memory-access.md] (write this spec while implementing)
 
 #### Handle table
 

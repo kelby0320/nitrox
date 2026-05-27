@@ -117,6 +117,87 @@ pub fn read_cr2() -> u64 {
     val
 }
 
+/// Read control register `CR4` — the bag of feature-enable bits for
+/// paging extensions, user-access protections, and others.
+///
+/// Safe: reading `CR4` has no side effects and is always valid in ring 0.
+#[inline]
+pub fn read_cr4() -> u64 {
+    let val: u64;
+    // SAFETY: `mov reg, cr4` reads CR4 into a general register. No
+    // memory side effects, no flag changes.
+    unsafe {
+        asm!("mov {}, cr4", out(reg) val,
+             options(nomem, nostack, preserves_flags));
+    }
+    val
+}
+
+/// Write control register `CR4`.
+///
+/// # Safety
+/// CR4 controls fundamental CPU features (paging extensions,
+/// user-access protections, performance counters, virtualisation
+/// gates). Clearing a bit that the running kernel depends on
+/// (e.g. PAE, PSE) is undefined; setting a bit whose feature the
+/// CPU does not implement `#GP`s. The caller must ensure both.
+#[inline]
+pub unsafe fn write_cr4(value: u64) {
+    // SAFETY: `mov cr4, reg` installs the new control bits. The
+    // caller upholds the feature-bit contract. `nomem` is omitted
+    // because flipping CR4 bits changes how subsequent accesses are
+    // interpreted.
+    unsafe {
+        asm!("mov cr4, {}", in(reg) value,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// Execute `cpuid` with `leaf` in `EAX` and `subleaf` in `ECX`,
+/// returning `(eax, ebx, ecx, edx)`.
+///
+/// Safe in ring 0: `cpuid` has no memory side effects and touches no
+/// arithmetic flags. The leaf must be one the CPU actually
+/// implements; querying an unsupported leaf yields zeros rather than
+/// faulting (this is the architectural contract since the original
+/// Pentium).
+#[inline]
+pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
+    let eax: u32;
+    let ebx: u32;
+    let ecx: u32;
+    let edx: u32;
+    // SAFETY: `cpuid` reads `eax`/`ecx` for input and writes
+    // `eax`/`ebx`/`ecx`/`edx` for output. No memory side effects, no
+    // flag changes. LLVM reserves `rbx` for its own use and refuses
+    // to accept it as a register operand, so we route the cpuid
+    // result through a different register via `xchg`: save the
+    // kernel's rbx into `tmp`, run cpuid (clobbers rbx with the
+    // result), swap again so `tmp` holds the result and rbx is
+    // restored. The compiler then reads `tmp` as `ebx`.
+    unsafe {
+        asm!(
+            "xchg rbx, {tmp:r}",
+            "cpuid",
+            "xchg rbx, {tmp:r}",
+            tmp = lateout(reg) ebx,
+            inout("eax") leaf => eax,
+            inout("ecx") subleaf => ecx,
+            lateout("edx") edx,
+            options(nomem, nostack, preserves_flags),
+        );
+    }
+    (eax, ebx, ecx, edx)
+}
+
+// `stac` and `clac` are deliberately not Rust-visible wrappers. They
+// would be `unsafe fn` callable from anywhere in the kernel, which
+// breaks the project's "only inside copy primitives" SMAP discipline
+// (kernel/CLAUDE.md). The instructions are emitted directly inside
+// the copy primitives' inline asm in `arch::x86_64::user_access`,
+// where they are bracketed by the exception-table window and never
+// outlive it.
+
 /// Read control register `CR3` — the physical base of the active
 /// top-level page table in bits 51:12, plus its low control flags.
 ///

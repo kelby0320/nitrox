@@ -41,6 +41,19 @@ SECTIONS
         *(.rodata .rodata.*)
     } :rodata
 
+    /* User-memory-access exception table: 16-byte (fault_pc, recovery_pc)
+     * entries emitted from inline asm in copy primitives. The bracketing
+     * symbols give a (start, stop) pair the #PF handler walks; KEEP keeps
+     * the entries even though no Rust code references them by name. The
+     * section may be empty (no entries registered yet) — start == stop is
+     * the well-defined "no recovery sites" case. */
+    . = ALIGN(8);
+    .user_access_table : {
+        __start_user_access_table = .;
+        KEEP(*(.user_access_table .user_access_table.*))
+        __stop_user_access_table = .;
+    } :rodata
+
     . = ALIGN(CONSTANT(MAXPAGESIZE));
     .data : {
         *(.data .data.*)
