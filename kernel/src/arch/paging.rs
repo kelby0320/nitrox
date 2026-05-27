@@ -188,4 +188,31 @@ pub trait ArchPaging {
     ///   call to `init_kernel_template`; otherwise the call panics with
     ///   a use-before-init message.
     unsafe fn inherit_kernel_mappings(root: PhysAddr);
+
+    /// Pre-allocate the top-level kernel-half intermediate page tables
+    /// for the region containing `virt`, so post-boot leaf
+    /// modifications at this address are visible to every address
+    /// space via the shared kernel template.
+    ///
+    /// On x86_64 (4-level paging) this allocates a PDPT under the PML4
+    /// entry covering `virt` if absent; idempotent if already present.
+    /// On aarch64 (split TTBR) this is a no-op — kernel-half tables
+    /// live under TTBR1 and aren't managed per AS.
+    ///
+    /// Must be called for every kernel-half region whose leaves will
+    /// be installed post-boot (the kernel vmap, future per-CPU data,
+    /// driver MMIO mapper) **before** [`init_kernel_template`](crate::arch::init_kernel_template)
+    /// snapshots the live PML4. After that snapshot, top-level
+    /// entries for the kernel half are immutable; see
+    /// `docs/architecture/memory-management.md`.
+    ///
+    /// # Safety
+    /// `root` must be a valid top-level page table reachable through
+    /// the HHDM that the caller is permitted to mutate. Returns
+    /// [`MapError::OutOfMemory`] if the intermediate frame cannot be
+    /// allocated.
+    unsafe fn ensure_kernel_intermediate(
+        root: PhysAddr,
+        virt: VirtAddr,
+    ) -> Result<(), MapError>;
 }

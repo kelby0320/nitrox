@@ -181,18 +181,26 @@ fn init_memory() -> bool {
 }
 
 /// One-time paging setup that must run before any `AddressSpace::new`:
-/// enable the no-execute paging extension (so `PageFlags::NO_EXECUTE` is
-/// honoured rather than faulting as a reserved-bit violation), then
-/// capture the kernel-half PML4 entries from Limine's live tables into
-/// the boot template every new address space inherits.
+///
+/// 1. Enable the no-execute paging extension (so `PageFlags::NO_EXECUTE`
+///    is honoured rather than faulting as a reserved-bit violation).
+/// 2. Pre-allocate the kernel-vmap region's intermediate page tables
+///    in the live PML4, so the next step's snapshot captures them and
+///    every future AS inherits the shared sub-tree.
+/// 3. Capture the kernel-half PML4 entries from Limine's live tables
+///    into the boot template every new address space inherits.
+///
+/// The ordering matters: `kvmap::init` modifies the live PML4 in ways
+/// the template must see; the template snapshot freezes the kernel
+/// half post-call. See the "Kernel-half PML4 sharing" section in
+/// `docs/architecture/memory-management.md`.
 fn paging_init() {
     arch::ensure_nxe();
-    // SAFETY: `active_root()` returns the live PML4 the CPU is using,
-    // which Limine populated and which is reachable through the HHDM.
-    // The template-init reads the top 256 entries without mutating
-    // anything; calling it before `AddressSpace::new` satisfies the
-    // ordering contract.
+    // SAFETY: HHDM is up (init_memory ran first) and the buddy
+    // allocator is live; no AS exists yet whose captured template
+    // could disagree with the new PML4 entries.
     unsafe {
+        mm::kvmap::init();
         arch::init_kernel_template(arch::active_root());
     }
 }

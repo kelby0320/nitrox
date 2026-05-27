@@ -23,6 +23,7 @@ enforced by code review.
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
+| 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`)                       | live as of Phase 1 slice 4 (diagnostics) |
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
@@ -54,6 +55,15 @@ When SMP arrives (Phase 3), the nesting still works because the rank
 ordering remains slab → buddy and the lower lock cannot block waiting
 for the upper. If a future change makes the buddy depend on the slab,
 that closes the cycle and must be rejected at design review.
+
+## Kernel vmap bump pointer is a leaf
+
+`VMAP_NEXT` (`kernel/src/mm/kvmap.rs`) is a `SpinLock<u64>` holding
+the next free virtual address in the kernel vmap region. Acquired
+briefly per allocation in `vmap_alloc_pages`; no other lock is taken
+inside, no other lock is held outside it during the acquire. Rank 6d
+keeps it grouped with the other constant-time leaves; like them, it
+may be acquired while holding any lock at rank 1–5.
 
 ## Kernel-half PML4 template is a leaf
 

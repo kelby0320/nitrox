@@ -20,14 +20,17 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - **Phase 0 (Foundation):** complete — kernel boots under QEMU+OVMF and
   renders a framebuffer boot screen. See the Phase 0 deviation notes for
   where it diverged from the original checklist.
-- **Phase 1 (Kernel substrate):** in progress — memory foundation
+- **Phase 1 (Kernel substrate):** in progress — the
+  address-spaces-and-paging slice is complete. Memory foundation
   (buddy / slab / `libkern` containers), kernel diagnostics (serial,
   GDT/TSS/IDT, fault dumps), the `ArchPaging` trait + x86_64 4-level
-  page-table primitive, and the VMA tree (interval-augmented intrusive
-  RB-tree with insert / remove / point lookup / overlap iteration) are
-  all complete. Next within the address-spaces-and-paging slice: the
-  `AddressSpace` owner that pairs the VMA tree with a page-table root
-  under one lock, then address-space construction from an ELF image.
+  page-table primitive, the VMA tree (interval-augmented intrusive
+  RB-tree), `AddressSpace` (VMA tree + page-table root + lock under
+  one `SpinLock<Inner>`), the static ELF loader, the shared
+  higher-half kernel mapping across address spaces, and per-thread
+  kernel stacks with guard pages are all in. Next: user memory access
+  discipline (`UserPtr<T>`, exception-table copy primitives, SMAP),
+  then the handle table.
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -241,7 +244,20 @@ silent reset.
   zeroing the freshly-allocated PML4. The intermediate PDPTs the
   template points at are now shared across every AS, so future
   kernel-vmap allocations propagate to every AS automatically
-- [ ] Per-thread kernel stack with guard page
+- [x] Per-thread kernel stack with guard page:
+  `mm::kvmap` is a bump-pointer kernel-vmap allocator hands out
+  virtual address ranges in `0xFFFF_C000_0000_0000..0xFFFF_D000_0000_0000`
+  (16 TiB). `mm::kvmap::init` runs at boot before
+  `init_kernel_template` and calls
+  `ArchPaging::ensure_kernel_intermediate` to pre-allocate the
+  vmap PDPT, so the captured template includes it and every AS
+  inherits the shared sub-tree. `mm::kstack::KernelStack::new(root)`
+  reserves `KERNEL_STACK_PAGES + 1` vmap pages, allocates frames
+  for the top N (writable / NX / kernel-only), leaves the bottom
+  page as an unmapped guard. Drop unmaps the PTEs and frees the
+  frames; the vmap region itself is not reclaimed (no freelist —
+  fine for Phase 1's churn rate). No production consumer yet —
+  threading consumes when it lands
 
 #### User memory access discipline
 

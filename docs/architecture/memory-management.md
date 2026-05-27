@@ -296,6 +296,54 @@ the TTBR0/TTBR1 split makes the kernel half live in a separate
 translation register that process address spaces don't manage.
 The arch-neutral caller (`AddressSpace::new`) is unchanged.
 
+## Kernel vmap and per-thread kernel stacks
+
+Kernel-half regions allocated post-boot — kernel stacks today, future
+per-CPU data and driver MMIO — live in the kernel vmap region
+(`0xFFFF_C000_0000_0000..0xFFFF_D000_0000_0000`, 16 TiB per the
+[architecture overview](overview.md)). Two pieces split the work:
+
+[`mm/kvmap.rs`](../../kernel/src/mm/kvmap.rs) is a bump-pointer
+allocator that hands out virtual address ranges in the vmap region.
+`vmap_alloc_pages(n)` returns a page-aligned virtual address and
+advances the cursor; no freelist. 16 TiB is enough that the lack of
+reuse doesn't matter for Phase 1.
+
+`mm::kvmap::init` runs at boot **before** `init_kernel_template`. It
+calls `ArchPaging::ensure_kernel_intermediate` to pre-allocate the
+PDPT under the PML4 entry covering the vmap region (one PDPT covers
+512 GiB — well past anything Phase 1 will use). The
+[shared-kernel-half rule](#kernel-half-pml4-sharing) does the rest:
+the captured template includes the PDPT pointer, every future AS
+inherits it, and post-boot leaf installs into vmap modify the shared
+sub-tree visible to every AS without any cross-AS coordination.
+
+[`mm/kstack.rs`](../../kernel/src/mm/kstack.rs) is the first
+consumer. `KernelStack::new(root)` reserves `KERNEL_STACK_PAGES + 1`
+virtual pages in vmap (16 KiB stack + 1 guard page), allocates frames
+for the top `KERNEL_STACK_PAGES`, installs them writable / NX /
+kernel-only via `ArchPaging::map_page`. The bottom page is the guard
+— deliberately left absent so a stack-overflow write to it
+page-faults rather than silently corrupting whatever sits below.
+
+- **`root` is which AS to install through.** Because the PDPT is
+  shared across every AS, the PTEs end up visible to all of them
+  regardless of which `root` is passed; the parameter is stored so
+  `Drop` can clear the PTEs symmetrically and to make the
+  ownership explicit.
+- **Drop reclaims frames but not vmap.** The bump allocator has no
+  freelist, so the virtual range of a freed stack stays reserved.
+  Phase 1 kernel stacks are constructed once per thread and freed
+  at thread exit; churn is negligible. A vmap freelist is a local
+  addition if that ever changes.
+- **No production consumer today.** Threading lands in a later
+  slice; `KernelStack` is built now because the underlying
+  infrastructure (the vmap allocator + the guard-page discipline)
+  belongs with the memory subsystem rather than dragging into the
+  threading slice.
+
+`VMAP_NEXT` sits at lock rank 6d alongside the allocator leaves.
+
 ## ELF loader
 
 [`mm/elf.rs`](../../kernel/src/mm/elf.rs) populates a fresh
@@ -374,14 +422,17 @@ allocator locks are likely candidates.
 - No TLB flushing on map / unmap. No AS is "active" today, so the
   TLB doesn't cache its entries. The scheduler will own flushing
   once `AddressSpace::set_active` exists.
-- No kernel-vmap allocator yet, and no preallocation of
-  intermediate page tables for the kernel-vmap region. The
-  kernel-half template currently inherits whatever Limine left in
-  the higher half; future kernel-half allocations (per-thread
-  kernel stacks, per-CPU data, driver MMIO) need a vmap allocator
-  plus the preallocated PDPTs/PDs that make leaf modifications
-  visible to every AS. Lands with the next sub-item (per-thread
-  kernel stack with guard page).
+- Kernel vmap PDPT pre-allocation covers only the first 512 GiB of
+  the 16 TiB vmap region. If a future allocation crosses that
+  boundary, the additional PDPTs must be added to the live PML4
+  *before* `init_kernel_template` snapshot — i.e., at boot. The
+  immutable-post-boot rule for kernel-half PML4 entries makes
+  late additions impossible without visiting every AS.
+- Kernel vmap allocator has no freelist; `KernelStack::Drop`
+  reclaims frames but leaks the vmap region. Negligible at Phase 1
+  churn; revisit if it ever isn't.
+- `KernelStack` has no production consumer yet — threading lands
+  in a later slice.
 - ELF loader handles **static** binaries only: `ET_DYN` (PIE) and
   `PT_INTERP` (dynamic linking) are rejected. PIE needs base
   randomization; dynamic linking needs a userspace `ld.so`

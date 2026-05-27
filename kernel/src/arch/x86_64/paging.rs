@@ -497,6 +497,25 @@ impl ArchPaging for X86Paging {
             write_kernel_half_entries(root, entries);
         }
     }
+
+    unsafe fn ensure_kernel_intermediate(
+        root: PhysAddr,
+        virt: VirtAddr,
+    ) -> Result<(), MapError> {
+        let index = pml4_index(virt);
+        // SAFETY: forwarded from `ArchPaging::ensure_kernel_intermediate` —
+        // `root` is a valid PML4 reachable through HHDM.
+        unsafe {
+            let pml4 = table_ptr(root);
+            let entry = *pml4.add(index);
+            if entry.is_present() {
+                return Ok(());
+            }
+            let new_pdpt = alloc_page_table().ok_or(MapError::OutOfMemory)?;
+            *pml4.add(index) = Pte::new_table(new_pdpt);
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]

@@ -1120,3 +1120,111 @@ Verification:
   don't validate kernel-half entries).
 - `cargo xtask build` — kernel ELF builds clean for
   `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 6): kernel vmap + per-thread kernel stack
+
+The sixth item closes out the address-spaces-and-paging slice. It
+lands the first kernel-half post-boot allocator (a bump-pointer vmap)
+and its first consumer (`KernelStack`), exercising end-to-end the
+shared-PDPT machinery that item 5 set up.
+
+What's in the build:
+
+- `kernel/src/arch/paging.rs` — new `unsafe fn
+  ensure_kernel_intermediate(root, virt) -> Result<(), MapError>`
+  on `ArchPaging`. The contract: pre-allocate whatever top-level
+  kernel-half intermediate page tables are needed so post-boot
+  leaf installs at `virt` propagate to every AS via the captured
+  template. On x86_64 (4-level paging) this allocates a PDPT under
+  the PML4 entry covering `virt`; on aarch64 (split TTBR) this
+  will be a no-op.
+- `kernel/src/arch/x86_64/paging.rs` — `ensure_kernel_intermediate`
+  impl uses `pml4_index(virt)`, `alloc_page_table`, and
+  `Pte::new_table`. Idempotent: returns `Ok` if the entry is
+  already present.
+- `kernel/src/mm/kvmap.rs` — new module. `KERNEL_VMAP_START` /
+  `KERNEL_VMAP_END` constants per the architecture overview
+  (16 TiB at `0xFFFF_C000_0000_0000`). `VMAP_NEXT: SpinLock<u64>`
+  bump cursor (lock rank 6d, leaf). `vmap_alloc_pages(n)` returns
+  a page-aligned virtual address and advances the cursor.
+  `init()` calls `Paging::ensure_kernel_intermediate` for the
+  vmap start so the captured template includes the PDPT.
+- `kernel/src/mm/kstack.rs` — new module. `KernelStack` carries
+  the stack top, base, backing frames, and the install root.
+  `KernelStack::new(root)` reserves `KERNEL_STACK_PAGES + 1`
+  vmap pages (one guard + N stack), allocates frames, installs
+  PTEs writable / NX / kernel-only. Drop unmaps and frees.
+  `KERNEL_STACK_PAGES = 4` (16 KiB).
+- `kernel/src/mm/mod.rs` — registers `mod kstack` and `mod kvmap`.
+- `kernel/src/main.rs` — `paging_init` now does `ensure_nxe` →
+  `kvmap::init` → `init_kernel_template`. The ordering is
+  load-bearing: `kvmap::init` modifies the live PML4 in ways the
+  template snapshot must capture.
+- `kernel/docs/lock-ordering.md` — adds rank 6d for `VMAP_NEXT`
+  and a leaf-no-nest note.
+- `docs/architecture/memory-management.md` — new `## Kernel vmap
+  and per-thread kernel stacks` section; Phase 1 limitations
+  updated.
+
+Decisions worth recording:
+
+- **Bump-pointer allocator, no freelist.** The vmap region is
+  16 TiB. Each kernel stack consumes 5 pages = 20 KiB of vmap
+  (the bump never reclaims). To run out we'd need ~800 million
+  stack allocations. The freelist isn't worth the complexity for
+  Phase 1. If kernel stacks ever churn heavily (they shouldn't —
+  a stack lives as long as its thread), a freelist is a local
+  addition to `kvmap.rs` only.
+- **Pre-allocate only one PDPT, not the full 16 TiB of PDPTs.**
+  32 PDPTs covering the whole vmap region would cost 128 KiB at
+  boot. One PDPT covers 512 GiB — well past anything Phase 1
+  will use. The cost is "if vmap ever crosses 512 GiB we have to
+  add the next PDPT at boot." That's enforced by the
+  immutable-post-boot rule from item 5: late additions are
+  impossible without visiting every AS.
+- **`ensure_kernel_intermediate` is on `ArchPaging`, not a free
+  function.** The concept ("pre-allocate the top-level
+  kernel-half intermediate tables") generalises across
+  architectures even though the implementation differs (PDPT on
+  x86_64, no-op on aarch64). Putting it on the trait keeps
+  arch-neutral callers (`kvmap::init`) unchanged across ports.
+- **`KernelStack::new` takes `root` explicitly.** Because the
+  shared PDPT means any AS can be used as the install target
+  with the same observable result, we could plausibly default to
+  `active_root()`. But making it explicit (a) keeps the function
+  testable host-side (tests pass a test AS's root, not a real
+  CR3 value), (b) documents that this stack is associated with a
+  specific AS for `Drop`'s benefit, and (c) avoids hiding the
+  arch::active_root dependency.
+- **Guard page at the **bottom** of the stack region.** Stacks
+  grow down on x86_64; overflow happens at low addresses.
+  Placing the guard one page below `base` (the lowest mapped
+  byte) catches it. Some kernels (notably FreeBSD) also have a
+  guard above the top for "underflow" detection, but that's
+  pointless for normal stack use — there's no way to underflow a
+  stack you allocated.
+- **`PageFlags::WRITABLE | PageFlags::NO_EXECUTE` only.** Kernel
+  stacks need W (we write to them) and NX (no instruction fetch).
+  USER is deliberately absent — these are kernel-only. GLOBAL
+  could be set in principle (kernel-only mappings persist across
+  CR3 reloads), but Phase 1 doesn't have a global-bit story yet;
+  leaving it absent matches every other kernel mapping the
+  template captures from Limine. Revisit during the Phase 3
+  global-bit / PCID hardening pass.
+- **No production consumer yet.** Threading lands in a later
+  slice. `KernelStack` is built now because the kvmap allocator
+  + guard-page primitive belong with the memory subsystem; the
+  first consumer is incidentally a stack, but per-CPU data and
+  driver MMIO will use the same vmap allocator when they arrive.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (130 total, +8 in the new
+  modules): kvmap allocations are page-aligned, in the vmap
+  region, and monotonically increasing; `KernelStack::new`
+  installs the stack pages and leaves the guard unmapped (verified
+  via `translate`); `top = base + KERNEL_STACK_BYTES`; the guard
+  is exactly one page below `base`; multiple stacks have disjoint
+  ranges; `Drop` unmaps the stack pages.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.
