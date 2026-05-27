@@ -412,6 +412,68 @@ impl VmaTree {
         None
     }
 
+    /// Find the lowest-start `Vma` that overlaps `query`, if any.
+    ///
+    /// O(log n) plain BST walk, no backtracking, no augmentation
+    /// consumed. At each node:
+    /// - If `node.start >= query.end`, the node and its right subtree
+    ///   lie entirely after the query — descend left.
+    /// - Otherwise, if `node.range` overlaps `query`, record it as the
+    ///   best candidate so far and descend left to look for an earlier
+    ///   one (`best` is overwritten only by smaller `start`s).
+    /// - Otherwise (`node.end <= query.start`, node entirely before
+    ///   query), descend right.
+    ///
+    /// The `subtree_max_end` augmentation is maintained by the tree
+    /// but not consulted here: the leftmost-overlap query is already
+    /// O(log n) without it. Augmentation pays off for disjoint-range
+    /// stabbing queries (a later sub-item) where subtree pruning
+    /// avoids visiting entire branches.
+    pub fn find_first_overlapping(&self, query: VAddrRange) -> Option<&Vma> {
+        let mut current = self.root;
+        let mut best: Option<NonNull<Vma>> = None;
+        while let Some(node) = current {
+            // SAFETY: live link.
+            let v = unsafe { node.as_ref() };
+            if v.range.start() >= query.end() {
+                current = v.link.left;
+            } else if v.range.overlaps(query) {
+                best = Some(node);
+                current = v.link.left;
+            } else {
+                current = v.link.right;
+            }
+        }
+        // SAFETY: live link, lifetime tied to `&self`.
+        best.map(|n| unsafe { n.as_ref() })
+    }
+
+    /// In-order iterator over every `Vma` in the tree, by ascending
+    /// `range.start`.
+    pub fn iter(&self) -> Iter<'_> {
+        Iter {
+            cur: leftmost_of(self.root),
+            _tree: core::marker::PhantomData,
+        }
+    }
+
+    /// In-order iterator over every `Vma` whose range overlaps `query`,
+    /// yielded by ascending `range.start`.
+    ///
+    /// Overlapping VMAs are necessarily contiguous in the in-order
+    /// sequence: if `A` and `B` both overlap `query` and `A` precedes
+    /// `B`, any `C` strictly between them has `C.start >= A.end >
+    /// query.start`, so `C.start < query.end` would also overlap. The
+    /// iterator therefore terminates at the first node with `start >=
+    /// query.end` — no further candidates can exist.
+    pub fn iter_overlapping(&self, query: VAddrRange) -> OverlapIter<'_> {
+        OverlapIter {
+            cur: self.find_first_overlapping(query).map(NonNull::from),
+            end: query.end(),
+            _tree: core::marker::PhantomData,
+        }
+    }
+
     /// Find and remove the `Vma` whose range contains `addr`, returning
     /// the owning [`KBox`] so the caller may inspect, drop, or reinsert
     /// a modified version. Returns `None` if no VMA covers `addr`; the
@@ -901,6 +963,88 @@ impl VmaTree {
 impl Default for VmaTree {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+/// Walk left from `start` to the leftmost descendant in its subtree.
+/// Returns `start` itself if it has no left child, or `None` if `start`
+/// is itself `None`.
+fn leftmost_of(start: Option<NonNull<Vma>>) -> Option<NonNull<Vma>> {
+    let mut cur = start?;
+    // SAFETY: link pointers refer to live tree nodes by invariants.
+    unsafe {
+        while let Some(l) = cur.as_ref().link.left {
+            cur = l;
+        }
+    }
+    Some(cur)
+}
+
+/// In-order successor of `node` in the tree it sits in: the next-larger
+/// node by `range.start`. Walks the right subtree's leftmost path if
+/// `node` has a right child; otherwise climbs via parent pointers until
+/// arriving from a left child. Returns `None` if `node` is the
+/// rightmost in the tree.
+fn successor(node: NonNull<Vma>) -> Option<NonNull<Vma>> {
+    // SAFETY: link pointers refer to live tree nodes by invariants.
+    unsafe {
+        if let Some(r) = node.as_ref().link.right {
+            return leftmost_of(Some(r));
+        }
+        let mut child = node;
+        let mut parent = child.as_ref().link.parent;
+        while let Some(p) = parent {
+            if p.as_ref().link.left == Some(child) {
+                return Some(p);
+            }
+            child = p;
+            parent = p.as_ref().link.parent;
+        }
+        None
+    }
+}
+
+/// In-order iterator over every `Vma` in a [`VmaTree`], yielded by
+/// ascending `range.start`.
+pub struct Iter<'a> {
+    cur: Option<NonNull<Vma>>,
+    _tree: core::marker::PhantomData<&'a VmaTree>,
+}
+
+impl<'a> Iterator for Iter<'a> {
+    type Item = &'a Vma;
+
+    fn next(&mut self) -> Option<&'a Vma> {
+        let n = self.cur?;
+        self.cur = successor(n);
+        // SAFETY: link pointer; live as long as the borrowed tree is.
+        Some(unsafe { n.as_ref() })
+    }
+}
+
+/// In-order iterator over every `Vma` in a [`VmaTree`] that overlaps a
+/// query range, yielded by ascending `range.start`. Terminates at the
+/// first node whose `range.start >= query.end` — past that point no
+/// further overlap is possible (proof on [`VmaTree::iter_overlapping`]).
+pub struct OverlapIter<'a> {
+    cur: Option<NonNull<Vma>>,
+    end: VirtAddr,
+    _tree: core::marker::PhantomData<&'a VmaTree>,
+}
+
+impl<'a> Iterator for OverlapIter<'a> {
+    type Item = &'a Vma;
+
+    fn next(&mut self) -> Option<&'a Vma> {
+        let n = self.cur?;
+        // SAFETY: link pointer; live as long as the borrowed tree is.
+        let v = unsafe { n.as_ref() };
+        if v.range.start() >= self.end {
+            self.cur = None;
+            return None;
+        }
+        self.cur = successor(n);
+        Some(v)
     }
 }
 
@@ -1437,6 +1581,170 @@ mod tests {
         let _ = tree.remove_covering(va(PAGE * 6)).unwrap();
         assert!(tree.find_covering(va(PAGE * 6)).is_none());
         assert!(tree.find_covering(va(PAGE * 14)).is_some()); // other range still present
+    }
+
+    // ----- Iteration -----
+
+    #[test]
+    fn iter_on_empty_tree_yields_nothing() {
+        let tree = VmaTree::new();
+        assert_eq!(tree.iter().count(), 0);
+        assert_eq!(
+            tree.iter_overlapping(range(0, PAGE * 16)).count(),
+            0
+        );
+    }
+
+    #[test]
+    fn iter_yields_every_vma_in_ascending_order() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        // Insert in a non-sorted order so the tree isn't trivially linear.
+        let starts: [u64; 5] = [40, 10, 30, 0, 20];
+        for s in starts.iter() {
+            insert_or_panic(&mut tree, range(s * PAGE, (s + 4) * PAGE));
+        }
+        let collected: [VirtAddr; 5] = {
+            let mut arr = [va(0); 5];
+            for (i, v) in tree.iter().enumerate() {
+                arr[i] = v.range.start();
+            }
+            arr
+        };
+        assert_eq!(
+            collected,
+            [va(0), va(10 * PAGE), va(20 * PAGE), va(30 * PAGE), va(40 * PAGE)]
+        );
+    }
+
+    #[test]
+    fn find_first_overlapping_returns_leftmost_when_multiple_overlap() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        // Three non-overlapping VMAs at offsets 10, 20, 30 (each
+        // PAGE*2 wide: ends at 12, 22, 32). A query covering 11..21
+        // overlaps the 10 VMA (at 11..12) and the 20 VMA (at 20..21);
+        // the leftmost must be at 10.
+        for s in [10u64, 20, 30] {
+            insert_or_panic(&mut tree, range(s * PAGE, (s + 2) * PAGE));
+        }
+        let q = range(11 * PAGE, 21 * PAGE);
+        let first = tree.find_first_overlapping(q).expect("must overlap");
+        assert_eq!(first.range.start(), va(10 * PAGE));
+    }
+
+    #[test]
+    fn find_first_overlapping_returns_none_when_disjoint() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(10 * PAGE, 12 * PAGE));
+        insert_or_panic(&mut tree, range(20 * PAGE, 22 * PAGE));
+        // Before all VMAs.
+        assert!(tree.find_first_overlapping(range(0, 8 * PAGE)).is_none());
+        // In a gap.
+        assert!(
+            tree.find_first_overlapping(range(14 * PAGE, 18 * PAGE))
+                .is_none()
+        );
+        // After all VMAs.
+        assert!(
+            tree.find_first_overlapping(range(30 * PAGE, 40 * PAGE))
+                .is_none()
+        );
+        // Exactly adjacent (half-open): no overlap.
+        assert!(
+            tree.find_first_overlapping(range(12 * PAGE, 14 * PAGE))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn iter_overlapping_yields_contiguous_run_in_order() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        // Five VMAs at starts 0, 10, 20, 30, 40 (PAGE*4 each: ends at
+        // 4, 14, 24, 34, 44). A query covering 12..32 overlaps the 10
+        // VMA (12..14), all of 20 (20..24), and 30 (30..32) — but not
+        // the 0 or 40 VMA.
+        for s in [0u64, 10, 20, 30, 40] {
+            insert_or_panic(&mut tree, range(s * PAGE, (s + 4) * PAGE));
+        }
+        let q = range(12 * PAGE, 32 * PAGE);
+        let mut got = [va(0); 3];
+        let mut n = 0;
+        for v in tree.iter_overlapping(q) {
+            got[n] = v.range.start();
+            n += 1;
+        }
+        assert_eq!(n, 3);
+        assert_eq!(
+            got,
+            [va(10 * PAGE), va(20 * PAGE), va(30 * PAGE)]
+        );
+    }
+
+    #[test]
+    fn iter_overlapping_single_hit_nested_inside_one_vma() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        insert_or_panic(&mut tree, range(0, PAGE * 16));
+        // A query entirely inside the lone VMA yields just that VMA.
+        let mut hits = 0;
+        for v in tree.iter_overlapping(range(PAGE * 4, PAGE * 8)) {
+            assert_eq!(v.range, range(0, PAGE * 16));
+            hits += 1;
+        }
+        assert_eq!(hits, 1);
+    }
+
+    #[test]
+    fn iter_overlapping_covering_the_entire_tree_matches_iter() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        for s in [5u64, 50, 25, 75, 100, 10, 60] {
+            insert_or_panic(&mut tree, range(s * PAGE, (s + 2) * PAGE));
+        }
+        // A query covering the full extent of every VMA should yield
+        // the same sequence as `iter()`.
+        let big = range(0, 200 * PAGE);
+        let from_iter: [VirtAddr; 7] = {
+            let mut arr = [va(0); 7];
+            for (i, v) in tree.iter().enumerate() {
+                arr[i] = v.range.start();
+            }
+            arr
+        };
+        let from_overlap: [VirtAddr; 7] = {
+            let mut arr = [va(0); 7];
+            for (i, v) in tree.iter_overlapping(big).enumerate() {
+                arr[i] = v.range.start();
+            }
+            arr
+        };
+        assert_eq!(from_iter, from_overlap);
+    }
+
+    #[test]
+    fn iter_overlapping_after_removes_skips_removed_ranges() {
+        init_global_heap();
+        let mut tree = VmaTree::new();
+        for s in [10u64, 20, 30, 40, 50] {
+            insert_or_panic(&mut tree, range(s * PAGE, (s + 2) * PAGE));
+        }
+        // Remove the middle one.
+        let _ = tree.remove_covering(va(30 * PAGE)).expect("present");
+        verify(&tree);
+        // A query spanning what was 25..45 should now yield only 40
+        // (the 30 VMA is gone; 20 ends at 22; 50 starts at 50).
+        let q = range(25 * PAGE, 45 * PAGE);
+        let mut hits = [va(0); 4];
+        let mut n = 0;
+        for v in tree.iter_overlapping(q) {
+            hits[n] = v.range.start();
+            n += 1;
+        }
+        assert_eq!(n, 1);
+        assert_eq!(hits[0], va(40 * PAGE));
     }
 
     #[test]

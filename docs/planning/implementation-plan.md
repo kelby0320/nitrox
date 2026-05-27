@@ -193,8 +193,13 @@ silent reset.
     delete-fixup with all four cases (mirrored), tested against
     shuffled-insert + shuffled-remove sequences with full invariant
     verification after every operation
-  - [ ] `find_first_overlapping(range)` + overlap iterator, in-order
-    iterator
+  - [x] `find_first_overlapping(range)` — O(log n) leftmost-overlap
+    BST walk; `iter_overlapping(range)` — in-order iterator over the
+    contiguous overlap run with parent-pointer successor advance;
+    `iter()` — full in-order iterator. Augmentation maintained but
+    not consumed by these queries (leftmost-overlap is already
+    O(log n) without it; pruning matters for future disjoint-range
+    queries)
   - [ ] Update [docs/architecture/memory-management.md] to point at
     `mm/vmm.rs` and drop the "not yet" annotation in the layer table
 - [ ] Address space construction from an ELF image
