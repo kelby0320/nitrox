@@ -46,16 +46,11 @@
 use core::ptr;
 
 use crate::arch::Paging;
+use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::{AllocError, KBox, SpinLock};
 use crate::mm::vmm::{MappingKind, Protection, Vma, VmaTree};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
-
-/// First non-canonical address — and therefore the exclusive upper
-/// bound of the user half on 4-level paging. Anything at or above this
-/// either falls in the canonical hole or is in the kernel half; both
-/// are off-limits to `map_vma`.
-pub const USER_VIRT_END: u64 = 0x0000_8000_0000_0000;
 
 /// Why [`AddressSpace::map_vma`] could not install a mapping.
 ///

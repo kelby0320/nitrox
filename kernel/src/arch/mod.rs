@@ -16,7 +16,7 @@ pub mod paging;
 pub mod x86_64;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{gdt, halt_loop, idt, serial};
+pub use x86_64::{abi, gdt, halt_loop, idt, serial};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{X86Paging as Paging, active_root, ensure_nxe, translate};

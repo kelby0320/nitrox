@@ -262,10 +262,17 @@ a page-aligned VMA covering `[align_down(p_vaddr), align_up(p_vaddr
 + p_memsz))`, then copies file bytes `p_offset..p_offset + p_filesz`
 into the newly-allocated frames via the HHDM. BSS (the `p_memsz -
 p_filesz` tail) comes for free from `map_vma`'s zero-init step.
-After segments, an initial 4-page stack VMA is installed at a fixed
-top-of-user-space address (`STACK_TOP = 0x7FFF_FFFF_0000`); the
-returned [`EntryInfo`] carries the entry point and stack top for
-whatever launches the user thread later.
+After segments, an initial 4-page stack VMA is installed at the
+host architecture's `arch::abi::DEFAULT_USER_STACK_TOP` (on x86_64,
+`0x7FFF_FFFF_0000`); the returned [`EntryInfo`] carries the entry
+point and stack top for whatever launches the user thread later.
+
+The loader itself is architecture-neutral: it lives outside
+`kernel/src/arch/` and consults [`arch::abi`](../../kernel/src/arch/x86_64/abi.rs)
+for the three values that vary across machines — the expected
+`e_machine`, the user-half upper bound, and the default stack
+placement. An aarch64 port supplies its own `abi.rs`; this file is
+unchanged.
 
 - **Static binaries only.** `ET_DYN` is rejected pending PIE
   base-address randomization. `PT_INTERP` is rejected: dynamic
@@ -279,7 +286,8 @@ whatever launches the user thread later.
   VMA contiguously through HHDM.
 - **Protection mapping.** `PF_X` → `Protection::EXEC`, `PF_W` →
   `Protection::WRITE`. Every loaded segment gets `Protection::USER`.
-  `PF_R` is implicit: every present mapping is readable on x86_64.
+  `PF_R` is implicit: every architecture Nitrox targets makes a
+  present mapping readable.
 - **No argv / envp / auxv on the stack.** Nitrox passes argv / env
   as typed structural values; the handoff format belongs to "first
   userspace process" where the userspace runtime defines it. The

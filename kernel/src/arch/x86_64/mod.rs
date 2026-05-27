@@ -1,5 +1,6 @@
 //! x86_64-specific primitives.
 
+pub mod abi;
 pub mod gdt;
 pub mod idt;
 pub mod paging;

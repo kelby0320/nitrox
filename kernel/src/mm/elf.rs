@@ -1,4 +1,4 @@
-//! In-kernel ELF64 loader for static x86_64 binaries.
+//! In-kernel ELF64 loader for static binaries.
 //!
 //! Populates a fresh [`AddressSpace`] from an ELF byte slice: parses
 //! the header, walks the program headers, allocates a VMA for each
@@ -9,14 +9,23 @@
 //! top, ready to hand to whatever launches the process (when threading
 //! and syscall entry exist).
 //!
+//! Architecture-neutral: the only arch-specific values are pulled
+//! from [`crate::arch::abi`] — the ELF `e_machine` for the host
+//! architecture, the user-half upper bound, and the default user
+//! stack placement. The aarch64 port supplies its own values; this
+//! file is unchanged.
+//!
 //! ## Scope today
 //!
-//! - **Static x86_64 ELF64 little-endian only.** `ET_DYN` is rejected
-//!   (PIE handling needs base randomization, which is a separate
-//!   sub-item). `PT_INTERP` is rejected: dynamic linking is a userspace
-//!   concern handled by a future `ld.so`-equivalent, matching the
-//!   universal kernel/userspace boundary (Linux `binfmt_elf` /
-//!   Windows NTDLL / macOS dyld).
+//! - **Static ELF64 little-endian only**, machine matching the host
+//!   architecture. `ET_DYN` is rejected (PIE handling needs base
+//!   randomization, which is a separate sub-item). `PT_INTERP` is
+//!   rejected: dynamic linking is a userspace concern handled by a
+//!   future `ld.so`-equivalent, matching the universal
+//!   kernel/userspace boundary (Linux `binfmt_elf` / Windows NTDLL /
+//!   macOS dyld). Little-endian only is a Nitrox-wide convention
+//!   (the project doesn't target BE configurations even where the
+//!   architecture allows them).
 //! - **No argv / envp / auxv setup on the stack.** Nitrox passes
 //!   argv/env as typed structural values rather than C strings; the
 //!   handoff format belongs to the "first userspace process"
@@ -34,14 +43,18 @@
 //! initramfs subsystem arrives (Phase 2) the same loader will accept
 //! bytes read from CPIO.
 
+use crate::arch::abi::{
+    DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE,
+    USER_VIRT_END,
+};
 use crate::arch::translate;
 use crate::libkern::KBox;
-use crate::mm::addr_space::{AddressSpace, MapError, USER_VIRT_END};
+use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::heap;
 use crate::mm::vmm::{MappingKind, Protection, VAddrRange, Vma};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 
-// ----- ELF64 constants -----
+// ----- ELF64 constants (arch-neutral; spec values) -----
 
 const ELF_MAGIC: [u8; 4] = [0x7F, b'E', b'L', b'F'];
 const EI_CLASS_64: u8 = 2;
@@ -49,29 +62,18 @@ const EI_DATA_LSB: u8 = 1;
 const EI_VERSION_CURRENT: u8 = 1;
 
 const E_TYPE_EXEC: u16 = 2;
-const E_MACHINE_X86_64: u16 = 62;
 
 const PT_LOAD: u32 = 1;
 const PT_INTERP: u32 = 3;
 
 const PF_X: u32 = 1 << 0;
 const PF_W: u32 = 1 << 1;
-// PF_R is implicit: every present mapping is readable on x86_64.
+// PF_R is implicit: every architecture Nitrox targets makes a present
+// mapping readable (x86_64 has no separate read bit; aarch64's AP
+// encoding always permits read at the corresponding EL).
 
 const ELF64_EHDR_SIZE: usize = 64;
 const ELF64_PHDR_SIZE: usize = 56;
-
-// ----- Stack placement -----
-
-/// Top-of-user-space address of the initial user stack VMA. The stack
-/// VMA covers `[STACK_TOP - STACK_SIZE, STACK_TOP)` and is the value
-/// returned in [`EntryInfo::stack_top`]. Picked to be page-aligned,
-/// canonical, and well below `USER_VIRT_END`.
-pub const STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
-/// Default initial user stack size (4 pages). The first userspace
-/// process can grow it later via an explicit `sys_memory_map` once
-/// syscalls exist; today this is the only stack a process gets.
-pub const STACK_SIZE: u64 = 4 * (PAGE_SIZE as u64);
 
 // ----- Public API -----
 
@@ -85,7 +87,9 @@ pub enum ElfLoadError {
     Not64Bit,
     NotLittleEndian,
     NotCurrentVersion,
-    NotX86_64,
+    /// `e_machine` did not match the host architecture's
+    /// [`crate::arch::abi::E_MACHINE`].
+    WrongMachine,
     /// `e_type` was not `ET_EXEC`. `ET_DYN` (PIE) is rejected until
     /// base-address randomization lands.
     NotExecutable,
@@ -205,8 +209,8 @@ fn parse_ehdr(bytes: &[u8]) -> Result<Ehdr, ElfLoadError> {
     let e_phoff = read_u64(bytes, 32)?;
     let e_phentsize = read_u16(bytes, 54)?;
     let e_phnum = read_u16(bytes, 56)?;
-    if e_machine != E_MACHINE_X86_64 {
-        return Err(ElfLoadError::NotX86_64);
+    if e_machine != E_MACHINE {
+        return Err(ElfLoadError::WrongMachine);
     }
     if e_type != E_TYPE_EXEC {
         return Err(ElfLoadError::NotExecutable);
@@ -394,7 +398,7 @@ mod tests {
                 bytes: Vec::new(),
                 segments: Vec::new(),
                 e_type: E_TYPE_EXEC,
-                e_machine: E_MACHINE_X86_64,
+                e_machine: E_MACHINE,
                 e_class: EI_CLASS_64,
                 e_data: EI_DATA_LSB,
                 e_version: EI_VERSION_CURRENT,
@@ -546,8 +550,11 @@ mod tests {
     fn wrong_machine_or_type_rejected() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        let bytes = ElfBuilder::new().machine(0x3E + 1).build();
-        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::NotX86_64));
+        // Any value that differs from the host's E_MACHINE rejects.
+        let bytes = ElfBuilder::new()
+            .machine(E_MACHINE.wrapping_add(1))
+            .build();
+        assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::WrongMachine));
         let bytes = ElfBuilder::new().e_type(3).build(); // ET_DYN
         assert_eq!(load_elf(&asp, &bytes), Err(ElfLoadError::NotExecutable));
     }
