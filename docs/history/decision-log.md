@@ -900,3 +900,110 @@ Verification:
   without exhausting the 16 MiB host heap.
 - `cargo xtask build` — kernel ELF builds clean for
   `x86_64-unknown-none`.
+
+## 2026-05-27 — Phase 1, slice 5 (item 4): in-kernel ELF loader (static binaries)
+
+The fourth item of the "Address Spaces and Paging" slice: take a
+static ELF64 binary as a `&[u8]` and populate an `AddressSpace` with
+its LOAD segments + an initial stack VMA. Closes out "Address space
+construction from an ELF image" as a parent item.
+
+What's in the build:
+
+- `kernel/src/mm/elf.rs` — new: hand-rolled ELF64 parser (`Ehdr` /
+  `Phdr` reader functions using `u{16,32,64}::from_le_bytes`),
+  `load_elf(asp, bytes)`, `EntryInfo`, `ElfLoadError`,
+  `map_load_segment` helper, plus a `STACK_TOP` / `STACK_SIZE`
+  pair and 12 host-side tests including a Vec-based test ELF
+  builder.
+- `kernel/src/mm/mod.rs` — registers `mod elf`.
+- `docs/architecture/memory-management.md` — adds `## ELF loader`
+  section; updates Phase 1 limitations to reflect "loader exists,
+  static-only / no argv setup."
+- `docs/planning/implementation-plan.md` — checks off both the
+  ELF-loader sub-item and the parent "Address space construction
+  from an ELF image."
+
+Decisions worth recording:
+
+- **Universal kernel/userspace ELF loader split.** Linux
+  (`binfmt_elf` → `ld.so`), Windows (kernel loader → NTDLL), and
+  macOS (kernel → `dyld`) all draw the line at the same place: the
+  kernel handles parsing the executable header, mapping LOAD
+  segments, setting up the initial stack, and (when present)
+  loading the dynamic linker interpreter. Symbol resolution,
+  library loading, and relocation run entirely in userspace. We
+  follow the same split. PT_INTERP support and a userspace dynamic
+  linker arrive when a binary actually needs them — init and the
+  early Nitrox userspace will be statically linked, same as Linux's
+  early userspace historically was.
+- **Static binaries only in this commit.** Both `ET_DYN` (PIE) and
+  `PT_INTERP` (dynamic) are rejected. PIE handling needs base
+  randomization — a separate sub-item. The dynamic-linker
+  interpreter cannot be loaded without a userspace `ld.so`
+  equivalent — also separate. Restricting to `ET_EXEC` gets us
+  what init needs without preempting either future design call.
+- **Hand-rolled parser, not `goblin` or `xmas-elf`.** Per
+  `kernel/CLAUDE.md`'s no-external-crates rule, the ELF parser is
+  hand-rolled. The footprint is small (validate `e_ident`, read
+  ~20 fields total across `Ehdr` and `Phdr`); a crate dependency
+  would be heavier-weight than the parser itself.
+- **`load_elf(asp, bytes)` as a free function, not
+  `AddressSpace::from_elf(bytes)`.** The function composes (build
+  AS via `AddressSpace::new`, then populate via `load_elf`) rather
+  than baking ELF knowledge into the AS constructor. The AS type
+  stays format-agnostic; future loaders (PE for testing? raw
+  blobs?) can sit alongside `load_elf` in `mm/elf.rs` or its
+  successors without rippling into `addr_space.rs`.
+- **Bytes copied via the HHDM, not via `UserPtr` copy primitives.**
+  The frames we're writing into are freshly-allocated kernel-owned
+  memory; the `UserPtr` discipline (which exists for a different
+  reason — protecting against bad user pointers during syscalls)
+  doesn't apply yet. HHDM access is the natural way: `translate`
+  the just-mapped virtual address to find the physical frame, then
+  write through `phys + hhdm_offset()`.
+- **Page-by-page copy loop, not bulk-copy-then-fixup.** Each
+  iteration covers `min(remaining_in_page, remaining_in_file)`
+  bytes starting at the current `va` / `file_off` pair. The
+  alternative (compute every (virt, phys, len) triplet up front,
+  then bulk-copy) needs a temporary vector. The per-page loop
+  works in fixed memory and is no slower for the volumes Phase 1
+  cares about.
+- **No partial-load rollback.** A segment failing mid-load leaves
+  the AS in a partial state. The caller drops the AS;
+  `AddressSpace::Drop` cleans up. The alternative — walking back
+  through already-installed segments to unmap them — adds
+  significant code for a path that's only exercised on malformed
+  ELFs or true OOM. Both are rare and the cleanup-by-Drop strategy
+  is already correct.
+- **No argv / envp / auxv on the stack.** Nitrox passes argv and
+  env as typed structural values rather than C strings (per the
+  v5.1 design doc). The handoff format is defined by the userspace
+  runtime, which doesn't exist yet — the "first userspace process"
+  milestone is where the format gets decided. Until then,
+  `load_elf` just maps an empty 16 KiB stack at a known address.
+- **Fixed stack placement at `STACK_TOP = 0x7FFF_FFFF_0000`.**
+  Picked to be page-aligned, canonical, and well below
+  `USER_VIRT_END`. ASLR for the stack is a future hardening pass,
+  alongside the kernel-image and mmap-arena ASLR slots.
+- **`map_load_segment` reports overlap-or-canonical-failure
+  uniformly**, even though `MapError` from `map_vma` distinguishes
+  them. From the loader's perspective, both are "this ELF places a
+  segment somewhere it can't go" — the user (the developer who
+  built the binary) cares whether the binary is malformed, not
+  about the internal subdivision. The granular `MapError` stays
+  available for future callers that want it.
+
+Verification:
+
+- `cargo xtask test` — host tests pass (119 total, +12 in
+  `mm::elf`): truncated input, bad magic, wrong class / data /
+  version / machine / type, `PT_INTERP` present, single-page
+  LOAD segment maps and copies bytes (with BSS verified zero),
+  non-zero in-page offset segment, multi-page segment span,
+  alignment violation, kernel-half segment range, overlapping
+  segments, stack VMA at the right address and zero-initialised.
+  Tests use a Vec-based `ElfBuilder` to construct minimal valid
+  ELFs in-memory; no external binaries needed.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`.

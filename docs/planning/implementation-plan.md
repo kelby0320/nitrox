@@ -210,7 +210,7 @@ silent reset.
     Added a `## VMA tree` section describing structure, augmentation,
     queries, and the Send/Sync story; added a Phase 1 limitation
     noting the missing `AddressSpace` owner
-- [ ] Address space construction from an ELF image
+- [x] Address space construction from an ELF image
   - [x] `AddressSpace` skeleton in `kernel/src/mm/addr_space.rs`:
     `VmaTree` + page-table root paired under a single `SpinLock<Inner>`
     (rank 4). `new()` allocates and zeroes a fresh PML4 frame.
@@ -221,14 +221,16 @@ silent reset.
     drains the tree, uninstalls every PTE, frees leaf frames, frees
     the PML4. No TLB flush yet (no AS is "active" until the scheduler
     lands); no higher-half kernel mapping yet (the next sub-item)
-  - [ ] In-kernel ELF loader for **static** binaries:
-    `AddressSpace::from_elf(bytes)`. Validates the ELF header, walks
-    program headers, allocates a VMA + frames + copies bytes for each
-    PT_LOAD, sets up an initial stack VMA. PT_INTERP and dynamic
-    linking are deferred to a userspace `ld.so` equivalent (matches the
-    Linux / Windows / macOS split: kernel does the irreducible "create
-    AS, load initial image"; userspace does symbol resolution and
-    library loading)
+  - [x] In-kernel ELF loader for **static** binaries:
+    `mm::elf::load_elf(asp, bytes) -> Result<EntryInfo, ElfLoadError>`.
+    Hand-rolled ELF64 parser (no external crates), validates header
+    (magic / class / data / version / machine / type), walks program
+    headers, allocates a VMA + zeroed frames + copies file bytes for
+    each PT_LOAD, rejects PT_INTERP (dynamic linking is a userspace
+    `ld.so` concern). Sets up an initial 4-page stack VMA at a fixed
+    top-of-user-space address; returns the entry point and stack top.
+    argv / envp / auxv stack-area setup deferred to "first userspace
+    process" where the userspace runtime defines the handoff format
 - [ ] Higher-half kernel mapping shared across all address spaces
 - [ ] Per-thread kernel stack with guard page
 

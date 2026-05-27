@@ -251,6 +251,44 @@ updates both atomically; `unmap_covering` does the inverse.
   scheduler arrives it will own the `set_active` entry point and
   the flush policy that comes with it.
 
+## ELF loader
+
+[`mm/elf.rs`](../../kernel/src/mm/elf.rs) populates a fresh
+`AddressSpace` from a static ELF64 binary.
+`load_elf(asp, bytes) -> Result<EntryInfo, ElfLoadError>` parses the
+header (hand-rolled `repr(C)`-free reader; no external crates),
+walks the program headers, and for each `PT_LOAD` segment allocates
+a page-aligned VMA covering `[align_down(p_vaddr), align_up(p_vaddr
++ p_memsz))`, then copies file bytes `p_offset..p_offset + p_filesz`
+into the newly-allocated frames via the HHDM. BSS (the `p_memsz -
+p_filesz` tail) comes for free from `map_vma`'s zero-init step.
+After segments, an initial 4-page stack VMA is installed at a fixed
+top-of-user-space address (`STACK_TOP = 0x7FFF_FFFF_0000`); the
+returned [`EntryInfo`] carries the entry point and stack top for
+whatever launches the user thread later.
+
+- **Static binaries only.** `ET_DYN` is rejected pending PIE
+  base-address randomization. `PT_INTERP` is rejected: dynamic
+  linking is a userspace concern matching the universal
+  kernel/userspace boundary used by Linux (`binfmt_elf` →
+  `ld.so`), Windows (kernel loader → NTDLL), and macOS (kernel
+  Mach-O → `dyld`). A future Nitrox `ld.so` equivalent will live
+  in userspace and use normal syscalls to map shared libraries.
+- **`p_vaddr % PAGE == p_offset % PAGE`** is enforced (the ELF spec
+  requires it); without it the file bytes couldn't be laid into the
+  VMA contiguously through HHDM.
+- **Protection mapping.** `PF_X` → `Protection::EXEC`, `PF_W` →
+  `Protection::WRITE`. Every loaded segment gets `Protection::USER`.
+  `PF_R` is implicit: every present mapping is readable on x86_64.
+- **No argv / envp / auxv on the stack.** Nitrox passes argv / env
+  as typed structural values; the handoff format belongs to "first
+  userspace process" where the userspace runtime defines it. The
+  stack VMA today is just 16 KiB of writable, zero-initialised
+  memory at a known address.
+- **No partial-load rollback.** A segment failure mid-load leaves
+  the address space in a partial state; the caller drops it,
+  which `AddressSpace::Drop` cleans up.
+
 ## Locking
 
 Both allocator locks sit at rank 6 (see [kernel/docs/lock-ordering.md](../../kernel/docs/lock-ordering.md)):
@@ -286,5 +324,10 @@ allocator locks are likely candidates.
 - No TLB flushing on map / unmap. No AS is "active" today, so the
   TLB doesn't cache its entries. The scheduler will own flushing
   once `AddressSpace::set_active` exists.
-- No ELF loader yet. `AddressSpace::from_elf(bytes)` for static
-  binaries is the next item after the kernel-half mapping.
+- ELF loader handles **static** binaries only: `ET_DYN` (PIE) and
+  `PT_INTERP` (dynamic linking) are rejected. PIE needs base
+  randomization; dynamic linking needs a userspace `ld.so`
+  equivalent. Both arrive later.
+- ELF loader does **not** set up argv / envp / auxv on the stack
+  yet — the handoff format is defined by the userspace runtime and
+  belongs to the "first userspace process" milestone.
