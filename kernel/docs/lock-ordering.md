@@ -17,7 +17,7 @@ enforced by code review.
 |------|----------------------------------------------|------------------------------------------|
 | 1    | Scheduler runqueue                           | not yet present                          |
 | 2    | Wait queue                                   | not yet present                          |
-| 3    | Handle-table segment allocation              | not yet present                          |
+| 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
 | 5    | IPC channel                                  | not yet present                          |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
@@ -29,6 +29,34 @@ enforced by code review.
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
 either order — with one exception, called out below.
+
+## Handle-table segment growth releases rank 3 before rank 6
+
+`HandleTable::grow_one` (`kernel/src/handle/table.rs`) needs to call
+the slab/buddy allocators — segments are 256 KiB plus a 16 KiB
+scratch shuffle buffer, both routed through `kmalloc` and thence
+through the buddy at order 6 and order 2 respectively. Rank 3 cannot
+be held across those calls (the rule is rank N may not be held while
+acquiring rank M < N is permitted, but acquiring rank 6 while
+holding rank 3 inverts the ranking when the allocator wakes up
+ranks 6a/6b internally).
+
+The sequence is therefore:
+
+1. Take the rank-3 lock; snapshot the next segment id to grow and
+   the PRNG seed to use; release the lock.
+2. Without any handle-table lock, call
+   `segment::try_alloc_initialised(seed)`, which acquires the slab/
+   buddy locks at rank 6.
+3. Reacquire the rank-3 lock and either publish the new segment into
+   the directory or, on a race, free the spare and return — the
+   caller's outer retry loop will observe the racer's segment on
+   the next pass.
+
+Phase 1 is single-CPU so step-3 races are impossible; they are
+documented because the same mechanism must work under SMP, where two
+CPUs may simultaneously decide to grow the same segment id and one
+will lose.
 
 ## Allocator nesting: slab → buddy is permitted
 

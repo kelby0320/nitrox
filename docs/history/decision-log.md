@@ -1561,3 +1561,138 @@ Verification:
   and continues past it through the paging smoke test —
   `init_protections` accepts the CPU model and the CR4 write
   completed without taking the kernel down. No TCG warnings.
+
+## 2026-05-28 — Phase 1, slice 7: handle table
+
+Phase 1's handle-table slice is in. The handle layer is the
+capability-lookup substrate every later syscall will route
+through; the kernel-object layer (`KObjectHeader`, `Process`,
+`Thread`) that lives behind the entries is the next slice.
+
+Scope landed:
+
+- `kernel/src/libkern/handle.rs` — `RawHandle`, `Rights`,
+  `KObjectType` value types per `docs/spec/handle-encoding.md`.
+  Pure `const fn` API, no allocator dependency, ready to be
+  mirrored to userspace later.
+- `kernel/src/handle/` — `HandleTable` with the segmented
+  storage, lock-free directory + per-entry seqlocks,
+  Fisher-Yates-shuffled freelists, RCU-style deferred
+  reclamation, and owner-PID enforcement on every lookup. Public
+  API: `try_new`, `allocate`, `lookup`, `close`, `restrict`,
+  `duplicate`, `stat`, `quiesce`. 12-step validation algorithm
+  implemented in `HandleTable::lookup` matches the spec
+  step-for-step.
+- `docs/architecture/handle-system.md` — implementation
+  overview (referenced from `kernel/CLAUDE.md` and the spec but
+  previously missing; now written alongside the
+  implementation, same pattern as `user-memory-access.md`).
+- `kernel/docs/lock-ordering.md` — rank 3 ("Handle-table
+  segment allocation") marked live. New section documents the
+  drop-rank-3 → take-rank-6 → reacquire-rank-3 segment-grow
+  protocol; this is the only path in the kernel that legitimately
+  crosses the boundary.
+- `docs/planning/implementation-plan.md` — handle-table
+  checklist ticked through; current-status prose updated to
+  point at the next slice (kernel-object substrate).
+
+Decisions worth recording:
+
+- **Handles live in their own module, not under `object/`.**
+  Handles point at kernel objects but are not kernel objects
+  themselves; the handle table is the capability lookup layer.
+  Co-locating with the future `KObjectHeader` would muddy that
+  distinction. `kernel/src/handle/` is the home; the
+  kernel-object substrate gets its own sibling module in the
+  next slice.
+- **All metadata fields atomic, seqlock on top.** The spec
+  describes the entry fields as plain integers under a seqlock.
+  We use atomics for every field (`AtomicU32`, `AtomicU64`,
+  `AtomicPtr`) and keep the seqlock for *snapshot atomicity
+  across multiple fields*. Cost on x86_64: zero (atomic load of
+  aligned data is a single `mov`). Benefit: zero `unsafe` in
+  the seqlock writer body; the only pointer-through-reference
+  writes that remain are in the segment initialiser, which is
+  bounded and fully audited.
+- **Per-entry `AtomicPtr<()>` `object` field is separate from
+  the seqlock-guarded metadata.** Lookup step 6 ("is the
+  object non-null?") becomes a single `Acquire` load outside
+  the seqlock retry loop, paying for itself by skipping the
+  whole snapshot dance for the (very common) closed-handle
+  case.
+- **`ObjectRef::try_acquire` is a free-function seam, not a
+  trait or fn-ptr per entry.** `kernel/CLAUDE.md` requires
+  kernel-object dispatch via `match KObjectType` rather than
+  `dyn Trait` to keep `HandleEntry::object` 8 bytes (not 16).
+  This slice ships `handle::try_acquire_refcount(*mut (),
+  KObjectType) -> bool` and `release_refcount(...)` as no-op
+  stubs; the next slice rewrites them to dispatch on
+  `KObjectType` and bump `KObjectHeader::refcount`. The
+  handle-table code itself never changes — the rewrite is
+  mechanical, contained to two free functions.
+- **Per-segment metadata lives in `Inner`, not inline in
+  `SegmentEntries`.** Inlining would make a segment 256 KiB +
+  8 bytes, which the buddy would round up to a 512 KiB
+  allocation — half wasted per segment, 64 MiB across a full
+  256-segment table. The metadata array is 256 × 8 = 2 KiB
+  inline in `Inner`, paid once per table.
+- **Defer ring capacity 256, fixed at construction.** Allocates
+  the backing `KVec<Option<DeferredClose>>` once in `try_new`
+  so `close` never calls `kmalloc` under the rank-3 lock (per
+  `kernel/CLAUDE.md` § "Forbidden patterns"). On overflow,
+  `close` forces an extra `drain_expired` and retries; in
+  Phase 1's single-CPU world that always frees because the
+  only context that could be in-flight at the snapshot epoch
+  is the closing thread itself, which is by construction
+  quiescent at the close-syscall boundary.
+- **`GraceTracker` keyed by an opaque `current_ctx_id()` shim.**
+  Phase 1 (single CPU, no preemption, no `Process`) returns
+  0; SMP will return `arch::cpu_id()`; the `Process` slice
+  will return `Process::current().ctx_id()`. The mechanism
+  doesn't care; replacing the shim is a one-function change
+  that doesn't touch the rest of the handle module.
+- **PRNG is xorshift64 seeded by the caller.** Production code
+  will seed from `RDTSC` at boot; the entropy slice will
+  re-seed from `RDRAND/RDSEED` once it lands. Seed quality
+  affects only the visible distribution of slot indices —
+  never correctness or safety, both of which rely on the
+  owner-PID check and 32-bit generation counter.
+- **`ClosedObject` wrapper for `close`'s return.** Rust 2021+
+  disjoint-closure-captures infers the *field*, not the whole
+  struct, when a closure references `tok.0`. With a bare
+  `*mut ()` return from `close`, the `Result<*mut (),
+  HandleError>` produced inside a closure was enough to mark
+  the closure `!Send` because `*mut ()` is `!Send`. Wrapping
+  the pointer in `ClosedObject` (with `unsafe impl Send`)
+  keeps the API ergonomic and the multi-thread tests
+  compiling. Same applied to `LookupOk` for the same reason.
+
+Verification:
+
+- `cargo xtask test` — 223 tests pass (+~70 over the prior
+  slice). New tests cover: `RawHandle` encode/decode at field
+  corners, `Rights` subset semantics, `HandleEntry` exact 64-
+  byte layout, `Xorshift64` distribution, `Segment` Fisher-
+  Yates freelist invariants, `GraceTracker` quiesce-and-
+  release flow, type-rights compatibility matrix (every type),
+  `HandleTable` allocate/lookup round-trip across rights and
+  pids, close + reallocate generation bump, generation wrap
+  at `u32::MAX`, segment grow at the 4097th handle, restrict
+  cannot amplify, duplicate intersects rights and requires
+  `DUPLICATE`, the `FAIL_NEXT_ACQUIRE` step-7 failure branch,
+  freelist-length-matches-`free_count` invariant, an 8-thread
+  cross-pid isolation stress test, and a torn-read torture
+  test (one churning writer, four spinning readers, sentinel
+  metadata tuple, 50 ms run — no internally-inconsistent
+  snapshot ever observed).
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`. The handle module compiles `no_std`,
+  no external crates, only `libkern` primitives.
+- Compile-time `const _ = assert!` in `kernel/src/handle/entry.rs`
+  pins `HandleEntry` at exactly 64 bytes / 64-byte alignment;
+  any future field reorder that drifts this fails the build.
+- No QEMU integration test for this slice: handle table is
+  pure logic with no hardware dependency. The substrate-works
+  milestone (first userspace process via `sys_kprint`) several
+  slices later will exercise the handle table end-to-end at
+  that point.

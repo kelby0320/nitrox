@@ -31,7 +31,12 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   address spaces, per-thread kernel stacks with guard pages, and the
   user-memory-access discipline (`UserPtr<T>`/`UserMutPtr<T>`,
   exception table + `#PF` recovery, five copy primitives, boot-time
-  SMAP/SMEP enable) are all in. Next: the handle table.
+  SMAP/SMEP enable), and the handle-table slice (segmented table,
+  per-entry seqlocks, lock-free lookup, shuffled freelist allocation,
+  RCU-style deferred reclamation, owner-PID enforcement, ~30 host
+  unit tests including multi-thread torn-read torture) are all in.
+  Next: the kernel-object substrate (`KObjectHeader`, `ObjectRef`,
+  the first concrete `Process` and `Thread` types).
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -272,14 +277,16 @@ silent reset.
 
 #### Handle table
 
-- [ ] Segmented handle table per [docs/spec/handle-encoding.md]
-- [ ] `HandleEntry` with seqlocks
-- [ ] Lookup path (lock-free common case)
-- [ ] Allocation with randomized slot allocation (shuffled free list)
-- [ ] Close with deferred reclamation
-- [ ] Per-process quiescent state counter for RCU-style grace periods
-- [ ] Owner-PID enforcement on every lookup
-- [ ] Host-testable: build the handle table standalone, hammer it from threads, verify invariants
+- [x] Segmented handle table per [docs/spec/handle-encoding.md]
+- [x] `HandleEntry` with seqlocks
+- [x] Lookup path (lock-free common case)
+- [x] Allocation with randomized slot allocation (shuffled free list)
+- [x] Close with deferred reclamation
+- [x] Per-process quiescent state counter for RCU-style grace periods
+  - Implemented as a generic `GraceTracker` keyed by `current_ctx_id()`. In Phase 1 (single CPU, no preemption, no `Process`) every operation runs in context 0; the shim is replaced wholesale when SMP or `Process` lands. See `docs/architecture/handle-system.md` § "Grace tracking".
+- [x] Owner-PID enforcement on every lookup
+- [x] Host-testable: build the handle table standalone, hammer it from threads, verify invariants
+  - 8-thread allocate/lookup/close stress preserves cross-pid isolation; multi-thread torn-read torture proves the seqlock never returns inconsistent snapshots. See `kernel/src/handle/table.rs` `#[cfg(test)] mod tests`.
 
 #### Kernel object infrastructure
 
@@ -288,6 +295,17 @@ silent reset.
 - [ ] Match-dispatch pattern for type-specific operations
 - [ ] `ObjectRef` RAII refcount holder with try_acquire seqlock interaction
 - [ ] First kernel objects: `Process`, `Thread` (no other types yet)
+- [ ] **Close `HandleTable::duplicate` TOCTOU.** The handle-table slice's
+  `duplicate` calls `lookup` then `allocate`. With Phase 1's no-op
+  refcount stubs that's a TOCTOU: a concurrent `close` between the
+  two calls can drop the object's last refcount, leaving the new
+  handle pointing at freed memory. When `ObjectRef::try_acquire`
+  bumps the real `KObjectHeader::refcount` (and `lookup` returns an
+  `ObjectRef` rather than a bare `*mut ()`), the refcount held by the
+  outstanding `ObjectRef` keeps the object alive across the gap and
+  the duplicate's allocate bumps the refcount again before the
+  caller's `ObjectRef` drops. Verify the duplicate path explicitly in
+  a new multi-thread test once `KObjectHeader` exists.
 
 #### Threading and context switch
 
