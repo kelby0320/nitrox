@@ -15,6 +15,7 @@
 pub mod arch;
 pub mod font;
 pub mod framebuffer;
+pub mod handle;
 pub mod libkern;
 pub mod limine;
 pub mod mm;
