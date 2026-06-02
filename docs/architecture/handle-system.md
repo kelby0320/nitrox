@@ -30,8 +30,9 @@ A handle is *not* a kernel object itself. The handle table is the
 **capability lookup layer**: handles point at kernel objects, but
 they have no per-instance data of their own beyond what is stored in
 the table entry. The kernel-object substrate (`KObjectHeader`,
-`ObjectRef`, the per-type structs) lives in its own module and is
-introduced in the slice that follows this one.
+`ObjectRef`, the per-type structs) lives in its own module,
+`kernel/src/object/` — see [`crate::object`] and
+`docs/architecture/overview.md` § "Kernel objects".
 
 ## Module layout
 
@@ -186,14 +187,22 @@ algorithm" step-for-step.
 Every error path that has already incremented the refcount releases
 it before returning.
 
-### ObjectRef seam (Phase 1 stub)
+### ObjectRef seam
 
-Step 8 calls `try_acquire_refcount(*mut (), KObjectType) -> bool` and
-errors paths call `release_refcount(*mut (), KObjectType)`. In Phase
-1 these are no-ops (a `#[cfg(test)] FAIL_NEXT_ACQUIRE` flag exercises
-the error branch). The next slice rewrites them to dispatch on
-`KObjectType` and bump a `KObjectHeader::refcount`; the handle table
-itself does not change.
+Step 8 calls `try_acquire_refcount(*mut (), KObjectType) -> bool`, which
+reads the `KObjectHeader` at offset 0 of the object pointer and bumps
+its refcount with `Arc`-upgrade semantics (failing if the count was
+already zero — the object is being torn down). Error/retry paths call
+`release_refcount(*mut (), KObjectType)`, which drops the reference and
+runs the object's destructor (dispatched on `KObjectType`) if it was the
+last. On success, step 13 wraps the acquired reference in an `ObjectRef`
+(the RAII holder in `kernel/src/object/`); `lookup` returns
+`LookupOk { object: ObjectRef, rights }` and dropping the `LookupOk`
+releases the reference. A `#[cfg(test)] FAIL_NEXT_ACQUIRE` flag still
+forces the step-8 failure branch deterministically. See
+[`docs/spec/abi-version-hash.md`](../spec/abi-version-hash.md) for the
+`KObjectHeader` layout and `kernel/src/object/header.rs` for the
+ownership model.
 
 ## Close + deferred reclamation
 
@@ -210,11 +219,19 @@ close(handle, caller_pid) -> ClosedObject
 4. `drain_expired()`. Then push the new `DeferredClose { handle,
    epoch: deferred_epoch }` onto the ring.
 
-The returned `ClosedObject` carries the previous object pointer so
-the next slice's refcount-decrement runs after close returns. The
-wrapper type makes `Result<ClosedObject, _>` Send-able for closures
-that span thread boundaries; bare `*mut ()` is `!Send` and would
-poison any closure that touched it.
+The returned `ClosedObject(*mut (), KObjectType)` carries the previous
+object pointer **and its type**, transferring the handle's one
+reference to the caller; `close` itself does **not** decrement. The
+caller releases it via `ObjectRef::from_raw(ptr, ty)` + drop after
+`close` returns. Keeping the decrement out of `close` keeps object
+destruction (which calls `kfree`, a rank-6 allocator lock) off the
+rank-3 handle-table lock, and makes a racing `lookup` safe: the slot's
+reference is conceptually live until the caller takes it, so a
+concurrent `try_acquire` always observes a positive count (pins the
+object) or zero (object dying). The wrapper type makes
+`Result<ClosedObject, _>` Send-able for closures that span thread
+boundaries; bare `*mut ()` is `!Send` and would poison any closure
+that touched it.
 
 ### Why deferred reclamation
 
@@ -307,18 +324,6 @@ slice wires it up.
 
 ## Phase 1 limitations
 
-- `try_acquire_refcount` / `release_refcount` are no-ops. Real
-  refcounting lands with `KObjectHeader`.
-- **`duplicate` carries a TOCTOU until the refcount lands.** It
-  calls `lookup` then `allocate`; with no-op refcount stubs, a
-  concurrent `close` between the two can drop the object's last
-  reference and the new handle ends up pointing at freed memory.
-  When `ObjectRef::try_acquire` becomes real (next slice) and
-  `lookup` returns an `ObjectRef` that holds a refcount across the
-  gap, the duplicate's allocate will bump the count before the
-  outstanding `ObjectRef` drops, closing the window. Tracked as a
-  checklist item under "Kernel object infrastructure" in
-  `docs/planning/implementation-plan.md`.
 - `current_ctx_id()` returns 0 in production builds. SMP / Process
   will plug in real ids.
 - The PRNG seed comes from a caller-supplied `u64`. Production code

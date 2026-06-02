@@ -608,6 +608,29 @@ mod tests {
     }
 
     #[test]
+    fn copy_cstr_maps_fault_outcome_to_fault_error() {
+        // The host stub never #PFs on its own, so force the step that the
+        // real asm body reaches on a user-side fault and confirm
+        // `copy_cstr_from_user` maps `CstrCopyOutcome::Fault` to
+        // `UserAccessError::Fault`.
+        let src_data: [u8; 8] = *b"hello\0XX";
+        let src = UserPtr::<u8> {
+            addr: src_data.as_ptr() as u64,
+            _phantom: PhantomData,
+        };
+        let mut dst = [0u8; 16];
+        if src.addr < USER_VIRT_END
+            && src.addr.checked_add(dst.len() as u64).map_or(true, |e| e <= USER_VIRT_END)
+        {
+            crate::arch::user_access::FAIL_NEXT_CSTR_COPY.with(|f| f.set(true));
+            assert_eq!(
+                copy_cstr_from_user(&mut dst, src),
+                Err(UserAccessError::Fault),
+            );
+        }
+    }
+
+    #[test]
     fn copy_cstr_host_stub_no_terminator() {
         let src_data: [u8; 8] = *b"abcdefgh"; // no NUL
         let src = UserPtr::<u8> {

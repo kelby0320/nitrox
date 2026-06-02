@@ -34,9 +34,15 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   SMAP/SMEP enable), and the handle-table slice (segmented table,
   per-entry seqlocks, lock-free lookup, shuffled freelist allocation,
   RCU-style deferred reclamation, owner-PID enforcement, ~30 host
-  unit tests including multi-thread torn-read torture) are all in.
-  Next: the kernel-object substrate (`KObjectHeader`, `ObjectRef`,
-  the first concrete `Process` and `Thread` types).
+  unit tests including multi-thread torn-read torture), and the
+  kernel-object substrate (`KObjectHeader` + atomic refcount,
+  `ObjectRef` RAII holder with `match`-on-`KObjectType` destructor
+  dispatch, the first concrete `Process` and `Thread` types, the real
+  `try_acquire_refcount`/`release_refcount` seam closing the
+  `duplicate` TOCTOU, plus a multi-thread duplicate-vs-close torture
+  test) are all in. Next: threading and the context switch (`Thread`
+  register/FPU state, NASM context switch, the minimal round-robin
+  scheduler).
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -124,8 +130,9 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - [x] Red-black / interval tree — deferred to the VMA slice; build the
   interval-augmented variant directly against the VMA manager's needs
 - [x] `Arc`-equivalent for refcounted kernel object references
-  (`KArc` / `ObjectRef`) — deferred to the kernel-object-infrastructure
-  slice; its shape depends on `KObjectHeader` + the seqlock protocol
+  (`ObjectRef`) — landed in the kernel-object-infrastructure slice as
+  an RAII holder over `KObjectHeader`'s atomic refcount, in
+  `kernel/src/object/header.rs`
   - Note: 2026-05-20 — the original three lines grouped six structures
     into the memory foundation. Reordered to a just-in-time schedule:
     `KBox` / `KVec` / `KString` now (zero design risk, needed within
@@ -290,22 +297,40 @@ silent reset.
 
 #### Kernel object infrastructure
 
-- [ ] `KObjectHeader` with refcount and type tag
-- [ ] `KObjectType` enum
-- [ ] Match-dispatch pattern for type-specific operations
-- [ ] `ObjectRef` RAII refcount holder with try_acquire seqlock interaction
-- [ ] First kernel objects: `Process`, `Thread` (no other types yet)
-- [ ] **Close `HandleTable::duplicate` TOCTOU.** The handle-table slice's
-  `duplicate` calls `lookup` then `allocate`. With Phase 1's no-op
-  refcount stubs that's a TOCTOU: a concurrent `close` between the
-  two calls can drop the object's last refcount, leaving the new
-  handle pointing at freed memory. When `ObjectRef::try_acquire`
-  bumps the real `KObjectHeader::refcount` (and `lookup` returns an
-  `ObjectRef` rather than a bare `*mut ()`), the refcount held by the
-  outstanding `ObjectRef` keeps the object alive across the gap and
-  the duplicate's allocate bumps the refcount again before the
-  caller's `ObjectRef` drops. Verify the duplicate path explicitly in
-  a new multi-thread test once `KObjectHeader` exists.
+- [x] `KObjectHeader` with refcount and type tag
+  - `#[repr(C)]` `{ refcount: AtomicUsize, object_type: KObjectType }`
+    in `kernel/src/object/header.rs`; ABI-critical (see
+    `docs/spec/abi-version-hash.md`). `Arc`-discipline orderings:
+    `Relaxed` increments, `Release` decrement, `Acquire` fence on the
+    last release, fail-at-zero `try_acquire`, and a `MAX_REFCOUNT`
+    overflow guard.
+- [x] `KObjectType` enum
+  - Already declared in `kernel/src/libkern/handle.rs` (`#[repr(u32)]`,
+    the v5.1 `repr(u16)` is superseded by source); reused as the
+    header's type tag.
+- [x] Match-dispatch pattern for type-specific operations
+  - `dispatch_destroy` runs the concrete destructor via `match` on
+    `KObjectType` (not `dyn`), reconstituting the owning `KBox`.
+- [x] `ObjectRef` RAII refcount holder with try_acquire seqlock interaction
+  - `lookup` step 7 acquires via the header and step 12 wraps it in an
+    `ObjectRef`; `LookupOk { object: ObjectRef, rights }`. `into_raw` /
+    `from_raw` transfer references for `duplicate` and `close`.
+- [x] First kernel objects: `Process`, `Thread` (no other types yet)
+  - Minimal: header + identity fields (`Process` also carries a
+    self-check `magic` sentinel used by the torture tests). Register/FPU
+    state, address space, sched params, and the Process↔Thread graph
+    arrive with the threading / process-management slices.
+- [x] **Close `HandleTable::duplicate` TOCTOU.** Closed: `lookup` returns
+  an `ObjectRef` holding a reference across the `lookup`→`allocate` gap,
+  which `duplicate` transfers straight into the new handle via
+  `into_raw` (no decrement in the gap); a concurrent `close` can drop at
+  most the source handle's reference, never the object's last one.
+  `allocate` adopts the caller-transferred reference without bumping;
+  on `allocate` failure `duplicate` reclaims and releases it. `close`
+  transfers (does not decrement) the handle's reference to the returned
+  `ClosedObject(*mut (), KObjectType)`. Verified by
+  `concurrent_duplicate_vs_close_toctou_torture` and the per-operation
+  refcount-accounting tests in `kernel/src/handle/table.rs`.
 
 #### Threading and context switch
 

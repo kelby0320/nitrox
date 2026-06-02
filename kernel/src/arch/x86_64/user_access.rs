@@ -194,11 +194,27 @@ pub(crate) unsafe fn copy_cstr_raw(
 }
 
 #[cfg(test)]
+std::thread_local! {
+    /// One-shot **per-thread** flag the suite can set to force the next
+    /// [`copy_cstr_raw`] host-stub call on the same thread to report a
+    /// [`CstrCopyOutcome::Fault`], exercising the `#PF` mapping path that
+    /// the real asm body produces only on a genuine user-side fault.
+    ///
+    /// Per-thread (rather than process-global) so concurrent tests do
+    /// not consume each other's flag — cargo runs unit tests in parallel.
+    pub(crate) static FAIL_NEXT_CSTR_COPY: core::cell::Cell<bool> =
+        const { core::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
 pub(crate) unsafe fn copy_cstr_raw(
     dst: *mut u8,
     src: *const u8,
     max_len: usize,
 ) -> CstrCopyOutcome {
+    if FAIL_NEXT_CSTR_COPY.with(|f| f.replace(false)) {
+        return CstrCopyOutcome::Fault;
+    }
     // Host stub: byte-by-byte copy until NUL or max_len.
     // SAFETY: forwarded; host tests use ordinary in-process buffers.
     let src_slice = unsafe { core::slice::from_raw_parts(src, max_len) };

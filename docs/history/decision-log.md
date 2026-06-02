@@ -1696,3 +1696,83 @@ Verification:
   milestone (first userspace process via `sys_kprint`) several
   slices later will exercise the handle table end-to-end at
   that point.
+
+---
+
+## 2026-05-28 — Phase 1, slice 8: kernel object infrastructure
+
+The kernel-object substrate that handle entries point at: a new
+`kernel/src/object/` module with `KObjectHeader` (atomic refcount +
+type tag), the `ObjectRef` RAII reference holder, `match`-on-
+`KObjectType` destructor dispatch, and the first two concrete object
+types `Process` and `Thread`. This also rewires the handle-table
+slice's no-op refcount seam to real refcounting, closing the
+`HandleTable::duplicate` TOCTOU.
+
+Decisions worth recording:
+
+- **Refcount ownership model: one ref per live handle, one per
+  `ObjectRef`.** The invariant is `refcount == (live handles to O) +
+  (live ObjectRefs to O)`; it reaches zero exactly once, firing exactly
+  one destroy. `KObjectHeader::new` starts at 1 (the creating handle's
+  reference). `allocate` is refcount-agnostic — it *adopts* one
+  caller-supplied reference rather than bumping, so the create path
+  (`KBox::into_raw` → `allocate`) and the duplicate path (lookup's
+  `ObjectRef::into_raw` → `allocate`) are symmetric.
+
+- **`lookup` returns an `ObjectRef`, not a bare `*mut ()`.** Step 7
+  bumps the header refcount (`Arc`-upgrade semantics, fail-at-zero);
+  step 12 wraps it in an `ObjectRef` that releases on drop. This is what
+  closes the `duplicate` TOCTOU: the `ObjectRef` pins the object across
+  the `lookup`→`allocate` gap, so a concurrent `close` can drop at most
+  the source handle's reference, never the last one. `duplicate`
+  transfers that reference straight into the new handle via `into_raw`
+  (no decrement in the gap); on `allocate` failure it reclaims via
+  `from_raw` + drop. Verified by a multi-thread duplicate-vs-close
+  torture test and per-operation refcount-accounting tests.
+
+- **`close` transfers the reference; it does not decrement.** It nulls
+  the slot under the seqlock and returns `ClosedObject(*mut (),
+  KObjectType)`; the caller reconstructs an `ObjectRef` and drops it to
+  release. Keeping the decrement (and therefore the destructor, which
+  calls `kfree` under a rank-6 lock) out of `close` keeps it off the
+  rank-3 handle-table lock, and makes a racing `lookup` SMP-safe: the
+  slot's reference is conceptually live until the caller takes it, so a
+  concurrent `try_acquire` sees a positive count (pins) or zero (dying).
+  This is the same soundness argument as `Arc`/`Weak::upgrade`, with the
+  header's `refcount` atomic as the synchronization object.
+
+- **Destructor dispatch by `match`, not `dyn`.** Because every kernel
+  object is `#[repr(C)]` with `KObjectHeader` first, a type-erased
+  `*mut ()` reads the header at offset 0 for refcount ops without
+  knowing the concrete type; only destruction needs the type, dispatched
+  through `match KObjectType` (per `kernel/CLAUDE.md`). Reconstitutes the
+  owning `KBox<T>` and drops it.
+
+- **`Process` / `Thread` kept minimal.** Header + identity fields only
+  (`Process` also carries a `magic` self-check sentinel for the torture
+  tests). No register/FPU state, address space, sched params, or
+  Process↔Thread graph — those land with the threading and
+  process-management slices, per the "no for-now fields" rule. Rather
+  than give them artificial heap-owning fields, destructor-dispatch
+  correctness is verified by a `#[cfg(test)]` per-type counter probe in
+  `object::header`.
+
+- **ABI hash impact.** `KObjectHeader` is an ABI-critical type
+  (`docs/spec/abi-version-hash.md` § "KObjectHeader layout"): `#[repr(C)]`,
+  `AtomicUsize` (8) + `KObjectType`/`repr(u32)` (4) + 4 pad = 16 bytes.
+  Introducing it changes the kernel ABI version hash; noted here and in
+  the commit message.
+
+Verification:
+
+- `cargo xtask test` — 237 host tests pass, including the reworked
+  handle-table tests (now using real `Process`/`Thread` objects),
+  per-operation refcount-accounting tests, destructor-dispatch tests,
+  the `ObjectRef`/`KObjectHeader` unit tests (acquire/release, clone,
+  `into_raw`/`from_raw`, fail-at-zero, overflow-guard panic), and
+  `concurrent_duplicate_vs_close_toctou_torture`. The concurrency
+  torture tests also pass repeatedly under `--release`.
+- `cargo xtask build` — kernel ELF builds clean for
+  `x86_64-unknown-none`; the `object` module is `no_std`, no external
+  crates, only `libkern` primitives.
