@@ -254,8 +254,8 @@ fn run_user_demo() {
     // Arm the syscall MSRs + per-CPU syscall stack. RSP0 covers a ring-3
     // fault; the per-CPU kstack is what the `syscall` stub itself loads.
     let stack_top = (&raw const SYSCALL_STACK as u64) + (16 * 1024);
-    arch::syscall::init(stack_top);
-    arch::gdt::set_kernel_stack(stack_top);
+    arch::init_syscalls(stack_top);
+    arch::set_kernel_stack(stack_top);
     kprintln!("syscall fast-path armed");
 
     let aspace = match mm::addr_space::AddressSpace::new() {

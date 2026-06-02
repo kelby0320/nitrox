@@ -40,6 +40,7 @@ fn main() -> ExitCode {
         Some("qemu") => cmd_qemu(false, &rest),
         Some("qemu-debug") => cmd_qemu(true, &rest),
         Some("test") => cmd_test(),
+        Some("check-arch") => cmd_check_arch(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -70,6 +71,7 @@ fn print_help() {
            qemu          build + launch QEMU with OVMF\n  \
            qemu-debug    build + launch QEMU paused for GDB on :1234\n  \
            test          host-side unit tests (kernel lib + tools)\n  \
+           check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
            help          show this message\n\
@@ -245,6 +247,63 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&kernel_dir))?;
+    Ok(())
+}
+
+/// Enforce the architecture-abstraction boundary: kernel code outside
+/// `kernel/src/arch/` must reach the arch layer only through the neutral
+/// `crate::arch` interface, never `arch::x86_64::…` internals. The private
+/// `mod x86_64` already makes such a path a compile error; this lint is the
+/// regression net for comments, doc-links, and future re-export slips that
+/// the compiler can't catch. See `docs/conventions/arch-boundary.md`.
+fn cmd_check_arch() -> R<()> {
+    let kernel_src = repo_root().join("kernel").join("src");
+    let arch_dir = kernel_src.join("arch");
+    let mut violations: Vec<String> = Vec::new();
+
+    visit_rs_files(&kernel_src, &mut |path| {
+        // The arch implementation legitimately names its own internals.
+        if path.starts_with(&arch_dir) {
+            return Ok(());
+        }
+        let text = fs::read_to_string(path)?;
+        for (i, line) in text.lines().enumerate() {
+            // Ignore comment/doc text — only real code is a boundary break.
+            let code = line.split("//").next().unwrap_or("");
+            if code.contains("arch::x86_64") || code.contains("arch::aarch64") {
+                violations.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+            }
+        }
+        Ok(())
+    })?;
+
+    if violations.is_empty() {
+        println!("check-arch: no arch-internal references outside kernel/src/arch ✓");
+        Ok(())
+    } else {
+        let mut msg = String::from(
+            "arch boundary violated — use the neutral `crate::arch` interface, \
+             not arch-internal modules:\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        Err(msg.into())
+    }
+}
+
+/// Recursively visit every `.rs` file under `dir`, calling `f` on each.
+fn visit_rs_files(dir: &Path, f: &mut dyn FnMut(&Path) -> R<()>) -> R<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            visit_rs_files(&path, f)?;
+        } else if path.extension().map_or(false, |e| e == "rs") {
+            f(&path)?;
+        }
+    }
     Ok(())
 }
 

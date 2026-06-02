@@ -37,6 +37,12 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-cargo-
 
+      # Enforce the architecture-abstraction boundary: kernel code outside
+      # arch/ must not reference arch internals. See
+      # docs/conventions/arch-boundary.md.
+      - name: cargo xtask check-arch
+        run: cargo xtask check-arch
+
       # Builds the kernel ELF for x86_64-unknown-none. Image assembly
       # (sgdisk + mtools) and QEMU are intentionally not exercised here —
       # those are integration concerns deferred to Phase 1 CI.

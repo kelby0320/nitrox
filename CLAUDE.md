@@ -98,6 +98,11 @@ Things that should not appear in code, period:
 - Code that assumes a UID/GID model
 - Direct `panic!()` in init or eshell — these are critical-path
 - Adding "for now" code without a TODO and a tracking entry
+- Referencing architecture internals (`arch::x86_64::*`, future
+  `arch::aarch64::*`) from kernel code outside `kernel/src/arch/` — go
+  through the neutral `crate::arch` interface. Enforced by a private arch
+  submodule and `cargo xtask check-arch`. See
+  `docs/conventions/arch-boundary.md`.
 
 If you find yourself writing one of these, stop and ask.
 

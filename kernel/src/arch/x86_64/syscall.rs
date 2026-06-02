@@ -26,6 +26,7 @@ use core::arch::naked_asm;
 use core::mem::offset_of;
 
 use super::{gdt, regs};
+use crate::syscall::table;
 
 // --- MSRs -----------------------------------------------------------------
 
@@ -100,11 +101,66 @@ pub fn init(kstack_top: u64) {
     }
 }
 
+// --- Register frame + dispatch --------------------------------------------
+
+/// The x86_64 register snapshot the entry stub builds on the kernel stack
+/// and hands to [`syscall_dispatch`].
+///
+/// `#[repr(C)]`; the field order is **lowest address first** and must mirror
+/// the stub's push order exactly (the `r15` field is what the stub pushes
+/// last, so it lies at the lowest address — where RSP points when the
+/// dispatcher is called). The `offset_of!` assertions pin the layout the
+/// stub's `mov [rsp + …]` depends on.
+///
+/// `rcx` holds the user RIP and `r11` the user RFLAGS — the values `sysretq`
+/// consumes — so the stub saves and restores them across the dispatch call
+/// even though no handler reads them. This is x86-specific, so it lives in
+/// the arch layer; the neutral syscall layer only sees `(number, args) ->
+/// isize` via [`table::dispatch`].
+#[repr(C)]
+struct SyscallFrame {
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbp: u64,
+    rbx: u64,
+    r11: u64, // user RFLAGS
+    r10: u64, // arg4
+    r9: u64,  // arg6
+    r8: u64,  // arg5
+    rdx: u64, // arg3
+    rsi: u64, // arg2
+    rdi: u64, // arg1
+    rcx: u64, // user RIP
+    rax: u64, // syscall number in / return value out
+    user_rsp: u64,
+}
+
+const _: () = assert!(core::mem::size_of::<SyscallFrame>() == 16 * 8);
+const _: () = assert!(offset_of!(SyscallFrame, r15) == 0);
+const _: () = assert!(offset_of!(SyscallFrame, rax) == 14 * 8);
+const _: () = assert!(offset_of!(SyscallFrame, user_rsp) == 15 * 8);
+
+/// Reached from [`syscall_entry`] via `call` with `rdi = &mut frame`. Unpacks
+/// the x86 register frame into the neutral `(number, args)` form and routes
+/// it through [`table::dispatch`]; the returned `isize` goes back in RAX and
+/// the stub stores it into the frame's `rax` slot before `sysretq`.
+///
+/// # Safety
+/// `frame` must point at a fully-initialised [`SyscallFrame`] on the current
+/// kernel stack — exactly what the entry stub builds.
+unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
+    // SAFETY: the stub built a complete frame at the kernel stack top and
+    // passed its address; valid, aligned, and unaliased for this call.
+    let f = unsafe { &mut *frame };
+    table::dispatch(f.rax, f.rdi, f.rsi, f.rdx, f.r10, f.r8, f.r9)
+}
+
 // --- Entry stub -----------------------------------------------------------
 
 /// The `syscall` entry point (the `IA32_LSTAR` target). Builds a
-/// [`SyscallFrame`](crate::syscall::SyscallFrame) and calls
-/// [`syscall_dispatch`](crate::syscall::syscall_dispatch), then `sysretq`s.
+/// [`SyscallFrame`] and calls [`syscall_dispatch`], then `sysretq`s.
 #[unsafe(naked)]
 extern "C" fn syscall_entry() -> ! {
     // SAFETY: naked — every register/stack effect is explicit. On entry
@@ -166,8 +222,8 @@ extern "C" fn syscall_entry() -> ! {
         "sysretq",
         scratch  = const OFF_SCRATCH,
         kstack   = const OFF_KSTACK,
-        rax_off  = const offset_of!(crate::syscall::SyscallFrame, rax),
-        dispatch = sym crate::syscall::syscall_dispatch,
+        rax_off  = const offset_of!(SyscallFrame, rax),
+        dispatch = sym syscall_dispatch,
     );
 }
 

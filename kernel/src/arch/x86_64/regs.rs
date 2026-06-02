@@ -43,62 +43,10 @@ pub unsafe fn inb(port: u16) -> u8 {
     val
 }
 
-/// Write a 16-bit word to I/O port `port`.
-///
-/// # Safety
-/// See [`outb`] — the caller must own `port`.
-#[inline]
-pub unsafe fn outw(port: u16, val: u16) {
-    // SAFETY: `out dx, ax` writes `ax` to the I/O port named by `dx`. As
-    // for `outb`, the caller upholds the device-level contract.
-    unsafe {
-        asm!("out dx, ax", in("dx") port, in("ax") val,
-             options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// Read a 16-bit word from I/O port `port`.
-///
-/// # Safety
-/// See [`outb`] — the caller must own `port`.
-#[inline]
-pub unsafe fn inw(port: u16) -> u16 {
-    let val: u16;
-    // SAFETY: `in ax, dx` reads the I/O port named by `dx` into `ax`.
-    unsafe {
-        asm!("in ax, dx", out("ax") val, in("dx") port,
-             options(nomem, nostack, preserves_flags));
-    }
-    val
-}
-
-/// Write a 32-bit doubleword to I/O port `port`.
-///
-/// # Safety
-/// See [`outb`] — the caller must own `port`.
-#[inline]
-pub unsafe fn outl(port: u16, val: u32) {
-    // SAFETY: `out dx, eax` writes `eax` to the I/O port named by `dx`.
-    unsafe {
-        asm!("out dx, eax", in("dx") port, in("eax") val,
-             options(nomem, nostack, preserves_flags));
-    }
-}
-
-/// Read a 32-bit doubleword from I/O port `port`.
-///
-/// # Safety
-/// See [`outb`] — the caller must own `port`.
-#[inline]
-pub unsafe fn inl(port: u16) -> u32 {
-    let val: u32;
-    // SAFETY: `in eax, dx` reads the I/O port named by `dx` into `eax`.
-    unsafe {
-        asm!("in eax, dx", out("eax") val, in("dx") port,
-             options(nomem, nostack, preserves_flags));
-    }
-    val
-}
+// Word (16-bit) and doubleword (32-bit) port I/O (`outw`/`inw`/`outl`/`inl`)
+// were removed when the arch boundary was made private: only the byte
+// variants are used today (the 16550 serial driver). Re-add the wider
+// variants here when a device driver needs them.
 
 /// Read control register `CR2` — the linear address of the most recent
 /// page fault.

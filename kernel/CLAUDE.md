@@ -86,6 +86,11 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
 - Holding a spinlock across a function call that might allocate or block.
 - Manual `Box::leak` patterns. If you need a `'static` reference, the design is wrong.
 - Direct hardware port I/O outside the arch layer.
+- Referencing architecture internals (`arch::x86_64::*`) from code outside
+  `kernel/src/arch/`. The `x86_64` submodule is private; reach the arch
+  layer only through the neutral `crate::arch` interface, and don't surface
+  arch jargon (`gdt`, `cr3`, MSR names, …) in neutral names. Enforced by
+  `cargo xtask check-arch`. See `docs/conventions/arch-boundary.md`.
 
 ## Useful pointers
 
