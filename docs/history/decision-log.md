@@ -1776,3 +1776,135 @@ Verification:
 - `cargo xtask build` — kernel ELF builds clean for
   `x86_64-unknown-none`; the `object` module is `no_std`, no external
   crates, only `libkern` primitives.
+
+## 2026-05-29 — Phase 1, slice 9: threading and context switch
+
+Makes the kernel multi-threaded (cooperatively). The `Thread` object gains
+its saved kernel register state, owned kernel stack, lifecycle state, and
+entry point; a Rust-emitted context switch performs the swap; and a minimal
+round-robin scheduler (`kernel/src/sched.rs`) runs kernel threads,
+demonstrated by a boot-time worker round-robin on the serial console.
+
+Decisions worth recording:
+
+- **Context switch emitted from Rust (`#[unsafe(naked)]` + `naked_asm!`),
+  not NASM.** This supersedes the NASM mention in `CLAUDE.md` and the
+  `context_switch.asm` checklist item in the implementation plan.
+  Rationale: (a) every other piece of kernel assembly is already
+  Rust-emitted (`idt.rs` naked exception stubs, `gdt.rs`, `regs.rs`,
+  `user_access.rs`); (b) the build has no assembler integration and adding
+  one for a single ~15-instruction function is unjustified; (c) the
+  scheduler reaches the saved context through typed Rust accessors on the
+  arch layer rather than the hand-maintained numeric offset a separate
+  `.asm` file would require; (d) a cooperative switch
+  needs no FPU/CR3/RFLAGS handling in Phase 1, so it is short and
+  auditable inline. Continues the same reasoning that kept the boot stub
+  and exception stubs in Rust (2026-05-13, 2026-05-20).
+
+- **Cooperative, not preemptive.** Phase 1 runs single-CPU with interrupts
+  masked everywhere (IF=0, no timer/APIC). A thread runs until it calls
+  `yield_now`/`exit`. The switch is the standard xv6/Linux `swtch`: park
+  the six callee-saved registers on the outgoing stack, save RSP into the
+  outgoing thread, load the incoming RSP, restore, `ret`. Caller-saved
+  registers and RFLAGS are not saved — they are caller-clobbered across
+  any `call` by the SysV ABI, and there is no interrupt state to preserve.
+  The future preemptive path (timer IRQ) is a separate entry that saves a
+  full interrupt frame; it does not go through `context_switch`.
+
+- **New threads bootstrap via a fabricated frame + trampoline.** A
+  never-run thread's stack top is hand-built so the first switch-in pops
+  six zeroed callee-saved slots and `ret`s into a naked `thread_trampoline`
+  (which re-aligns and `call`s `thread_enter`); `thread_enter` reads the
+  now-current thread's entry/arg and runs it, then calls `exit`. The boot
+  context is adopted as the first thread with no fabricated frame — its
+  saved stack pointer is written by the first switch-out before it is ever read.
+
+- **Run-queue lock (rank 1) is never held across the switch.** Dropped
+  before every `context_switch`, re-acquired fresh on resume; allocation
+  and stack reclamation (an exited thread parks itself in `reap` for the
+  next scheduler entry to drop) happen outside it. See
+  `kernel/docs/lock-ordering.md`.
+
+- **`Thread` field mutation discipline.** `arch`/`state`/`entry`/`arg` are
+  mutated through a shared `ObjectRef` via raw-pointer field accessors that
+  never form a `&mut Thread` (which would alias the atomically-accessed
+  header); sound because single-CPU + only-under-the-runqueue-lock
+  serialises all access. No atomics added this slice.
+
+- **FPU/XSAVE and TLS deferred.** The kernel is soft-float and never uses
+  the FPU, and userspace (the first real FPU/TLS user) is two slices away,
+  so eager XSAVE and `fs_base`/`sys_thread_set_tls` land with the
+  first-userspace-thread slice rather than here.
+
+- **ABI hash impact: none.** `KObjectHeader` is unchanged and stays first;
+  the new `Thread` fields are internal and not part of the ABI hash
+  (`Thread`'s layout never crosses to userspace).
+
+Verification:
+
+- `cargo xtask test` — 252 host tests pass (+14): `KVec::remove`
+  FIFO/no-double-drop, the fabricated-frame arithmetic and layout,
+  `Thread` constructor/state/saved-sp accessors, and scheduler
+  data-structure tests (round-robin dequeue, queue-drop releases each
+  thread's reference exactly once via the destructor probe). The real
+  `context_switch`/trampoline are not host-tested — they manipulate live
+  registers/stacks and are validated under QEMU.
+- `cargo xtask build` — kernel ELF builds clean, no warnings.
+- `cargo xtask qemu` — serial shows three workers interleaving round-robin
+  across three rounds, each exiting cleanly, then `boot thread halting` —
+  proving switch-in, rotation, cooperative yield, clean exit, and stack
+  reclamation without UAF (the boot thread resumes and runs to the final
+  line). Integration coverage is the serial trace until `xtask test-qemu`
+  exists.
+
+## 2026-05-29 — Scheduler evolution: cooperative → preemptive (single-CPU) → SMP
+
+Recording the staged plan for the scheduler so the steps are explicit
+rather than folded into a single "scheduler matures" item.
+
+The scheduler ships cooperative and single-CPU (slice 9). It must become
+preemptive, and eventually multi-CPU. **Preemption and multiple CPUs are
+separate concerns and are staged separately:**
+
+1. **Cooperative, single-CPU** — current. A thread runs until it yields or
+   exits; correct under Phase 1's interrupts-masked model.
+2. **Preemptive, single-CPU** — a new Phase 1 slice (added to
+   `docs/planning/implementation-plan.md`), sequenced *after* Timers/clocks
+   and `ArchIrq`/APIC because preemption's prerequisites are a periodic
+   timer interrupt and an enabled interrupt controller. It introduces the
+   `IrqSpinLock` (the `cli`/save-`RFLAGS` variant `spinlock.rs` already
+   anticipates), flips the kernel to `IF=1`, and adds a timer-IRQ-driven
+   switch path that saves the full interrupt frame and returns via `iretq`.
+3. **SMP, multi-CPU** — stays in Phase 3 (per-CPU runqueues, work stealing,
+   per-CPU `current` via GS-based per-CPU data, per-CPU APIC timers).
+
+Decisions worth recording:
+
+- **The cooperative `context_switch` is retained, not replaced.**
+  Preemption *adds* a second switch path (entered from the timer IRQ, full
+  register frame, `iretq` return); voluntary yield/blocking continues to
+  use the cooperative naked `context_switch`. Two paths, one `Thread`
+  representation.
+
+- **Preemption before SMP, deliberately.** Getting preemption correct on
+  one CPU (IRQ-safe locking, quantum, idle thread, the full-frame switch)
+  is a self-contained problem; doing it before adding CPUs avoids debugging
+  preemption and cross-CPU races simultaneously. The single-CPU
+  interrupts-masked model is the thing being retired in step 2; SMP in
+  step 3 is then "more of the same, per CPU."
+
+- **Today's global `SCHED`/`current` are explicit single-CPU stand-ins.**
+  Step 3 refactors `SchedState` into per-CPU instances, `current` into
+  per-CPU data, and points `current_ctx_id()` (the handle-table grace
+  shim, currently constant 0) at `arch::cpu_id()`. The cooperative switch
+  and the `Thread` layout do not change for that — confirmation the
+  current factoring is sound.
+
+- **FPU/XSAVE wiring lands with preemption-era work, into both paths.**
+  Eager save/restore (deferred from slice 9, arriving with `ArchFpu`) must
+  be added to both the cooperative and the preemptive switch once userspace
+  threads can touch the FPU.
+
+No code in this entry — it records the staging only. The preemptive-
+scheduling slice is tracked in `docs/planning/implementation-plan.md`
+under Phase 1.

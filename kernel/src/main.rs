@@ -27,6 +27,7 @@ use nitrox_kernel::limine::{
     RequestsStartMarker,
 };
 use nitrox_kernel::mm;
+use nitrox_kernel::sched;
 
 // --- Limine request statics ---------------------------------------------
 //
@@ -116,6 +117,12 @@ fn kernel_main() {
     paging_init();
     paging_smoke_test();
 
+    // Bring up the cooperative scheduler and run a few kernel threads to
+    // prove the context switch end-to-end: each worker prints and yields
+    // round-robin, then exits; the boot thread drains the queue and
+    // returns here. See `docs/architecture/overview.md` § Scheduling.
+    run_scheduler_demo();
+
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
     // jumping to `_start`. We are the sole reader; no other thread exists.
     let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
@@ -148,6 +155,42 @@ fn kernel_main() {
     };
 
     draw_nitrox_band(&mut writer);
+}
+
+/// A demo kernel thread: print a few rounds, yielding cooperatively
+/// between each, then return (the trampoline calls [`sched::exit`]).
+extern "C" fn demo_worker(arg: usize) {
+    for round in 0..3 {
+        kprintln!("worker {} round {}", arg, round);
+        sched::yield_now();
+    }
+    kprintln!("worker {} exiting", arg);
+}
+
+/// Initialise the scheduler, spawn three demo workers, and drain them
+/// cooperatively from the boot thread. Proves switch-in, round-robin
+/// rotation, cooperative yield, clean exit, and stack reclamation. The
+/// boot thread returns here once the run queue is empty.
+fn run_scheduler_demo() {
+    if sched::init().is_err() {
+        kprintln!("sched: init failed — skipping demo");
+        return;
+    }
+    for id in 1..=3 {
+        if sched::spawn(demo_worker, id).is_err() {
+            kprintln!("sched: spawn {} failed", id);
+        }
+    }
+    // Cooperatively run every ready thread to completion, reclaiming each
+    // exited thread's stack between turns.
+    loop {
+        sched::reap_pending();
+        if sched::ready_is_empty() {
+            break;
+        }
+        sched::yield_now();
+    }
+    kprintln!("sched: all workers done; boot thread halting");
 }
 
 /// Bring up the buddy allocator and the slab on top of it. Returns false

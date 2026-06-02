@@ -40,9 +40,13 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   dispatch, the first concrete `Process` and `Thread` types, the real
   `try_acquire_refcount`/`release_refcount` seam closing the
   `duplicate` TOCTOU, plus a multi-thread duplicate-vs-close torture
-  test) are all in. Next: threading and the context switch (`Thread`
-  register/FPU state, NASM context switch, the minimal round-robin
-  scheduler).
+  test) are all in. Threading and the context switch are also in: the
+  `Thread` object carries its saved kernel register state, kernel stack,
+  lifecycle state and entry point; a Rust-emitted `#[unsafe(naked)]`
+  `context_switch` performs the cooperative switch; and a minimal
+  round-robin scheduler runs kernel threads (demonstrated by the boot-time
+  worker round-robin on the serial console). Next: syscall entry/exit
+  (`syscall` handler, dispatch table, `sys_kprint`).
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -84,10 +88,12 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 
 ### Notes / deviations
 
-- No NASM boot stub. Limine drops the kernel into long mode with paging,
+- No NASM anywhere. Limine drops the kernel into long mode with paging,
   a GDT, and a stack already set up, so a pure-Rust `extern "C" fn _start`
-  is sufficient. A NASM stub returns for the context-switch path in
-  Phase 1. (Decision log, 2026-05-13.)
+  is sufficient. The context switch, originally slated for NASM, also
+  landed as Rust-emitted `naked_asm!` — consistent with every other piece
+  of kernel assembly and free of any assembler in the build. (Decision
+  log, 2026-05-13 and 2026-05-29.)
 - No serial output. Phase 0 renders to the framebuffer instead; the
   serial console was deferred. It lands in the Phase 1 "Kernel
   diagnostics" slice. (Decision log, 2026-05-13.)
@@ -334,12 +340,26 @@ silent reset.
 
 #### Threading and context switch
 
-- [ ] `Thread` kernel object with register state, FPU context, kernel stack, sched params
+- [x] `Thread` kernel object with saved register state (saved stack
+      pointer; the per-arch representation stays inside the arch layer), kernel
+      stack, lifecycle state, and entry point (`kernel/src/object/thread.rs`).
+      Sched params are round-robin-implicit; no priority/class yet.
 - [ ] FPU state: XSAVE area per thread, init values, save/restore primitives
-- [ ] Context switch stub in NASM (`kernel/src/arch/x86_64/context_switch.asm`)
-- [ ] Rust-side context switch handler called from NASM stub
-- [ ] Minimal scheduler: round-robin between kernel threads, no classes yet
-- [ ] TLS support: FS_BASE handling, `sys_thread_set_tls` (when syscalls exist)
+      — **deferred** to the first-userspace-thread slice. The kernel is
+      soft-float and never touches the FPU, so eager XSAVE has nothing to
+      preserve between kernel threads and cannot be exercised until
+      userspace exists.
+- [x] Context switch emitted from Rust as a `#[unsafe(naked)]`
+      `context_switch` (`kernel/src/arch/x86_64/context.rs`), **not** NASM —
+      consistent with the kernel's existing Rust-emitted asm and free of an
+      assembler in the build. (Decision log, 2026-05-29.)
+- [x] New-thread bootstrap: fabricated initial frame + naked
+      `thread_trampoline` → `thread_enter` runs the body.
+- [x] Minimal cooperative scheduler: round-robin between kernel threads,
+      no classes yet (`kernel/src/sched.rs`); boot-time worker demo proves
+      it on the serial console.
+- [ ] TLS support: FS_BASE handling, `sys_thread_set_tls` — **deferred**
+      until syscalls and userspace exist (FS_BASE is unused in ring 0).
 
 #### Syscall entry/exit
 
@@ -421,6 +441,40 @@ silent reset.
 - [ ] `ArchSmp` (SMP bootstrap, IPI) — basic version, full SMP comes in Phase 3
 - [ ] `ArchFpu` (XSAVE/XRSTOR)
 - [ ] `ArchUserAccess` (SMAP/PAN window management)
+
+#### Preemptive scheduling (single-CPU)
+
+Switches the cooperative scheduler (the threading slice) to a preemptive
+one, still on a single CPU. Sequenced here because it depends on a periodic
+timer (Timers and clocks) and an enabled interrupt controller (`ArchIrq`).
+This is deliberately separate from SMP: get preemption correct on one CPU
+first; multiple CPUs come in Phase 3. (Decision log, 2026-05-29.)
+
+- [ ] `IrqSpinLock` — the `cli` + save/restore-`RFLAGS` lock variant
+      `kernel/src/libkern/spinlock.rs` already anticipates. Audit every
+      existing `SpinLock` site reachable from IRQ context (the runqueue
+      lock becomes an `IrqSpinLock`).
+- [ ] Enable interrupts (`IF=1`) — the model-wide flip from Phase 1's
+      "interrupts masked everywhere"; re-audit all lock sites against the
+      new IRQ-reentrancy.
+- [ ] Preemptive switch path — a timer-IRQ-driven switch distinct from the
+      cooperative `context_switch`. The IRQ stub saves the full register
+      frame (as the exception stubs do); the switch swaps at the
+      interrupt-frame level and returns via `iretq`. The cooperative
+      voluntary-yield/`exit` path is retained, not replaced.
+- [ ] Timer-tick reschedule: per-thread quantum/time-slice; on expiry the
+      tick requests a reschedule. Round-robin still (no classes yet).
+- [ ] Idle thread: per-CPU placeholder that `hlt`s when the runqueue is
+      empty.
+- [ ] Wire eager FPU save/restore (`ArchFpu`) into **both** switch paths
+      once userspace threads can touch the FPU.
+
+Note: the threading slice's global `SCHED`/`current` are explicit
+single-CPU stand-ins. Phase 3 SMP refactors `SchedState` into per-CPU
+instances, `current` into GS-based per-CPU data, and points
+`current_ctx_id()` (the handle-table grace shim, currently constant 0) at
+`arch::cpu_id()`. The cooperative switch and `Thread` layout are unchanged
+by that refactor.
 
 ### Milestone
 

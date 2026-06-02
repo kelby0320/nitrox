@@ -15,7 +15,7 @@ enforced by code review.
 
 | Rank | Lock                                         | Status                                   |
 |------|----------------------------------------------|------------------------------------------|
-| 1    | Scheduler runqueue                           | not yet present                          |
+| 1    | Scheduler runqueue (`SCHED`)                 | live as of Phase 1 slice 9 (scheduler)   |
 | 2    | Wait queue                                   | not yet present                          |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
@@ -29,6 +29,39 @@ enforced by code review.
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
 either order — with one exception, called out below.
+
+## Scheduler runqueue lock is dropped before every context switch
+
+`SCHED` (`kernel/src/sched.rs`) is the rank-1 runqueue lock. The cardinal
+rule: **the lock is released before every
+`context_switch` and re-acquired fresh on resume — it is never held across
+a stack switch.** `yield_now`/`exit` acquire it, mutate the queue and the
+current-thread pointer, capture the `(prev_sp_slot, next_sp)` pair, drop
+the guard, and only then call the switch. Every point a thread *resumes*
+at (the instruction after `context_switch`, and `thread_enter` for a
+freshly scheduled thread) therefore runs with the lock not held.
+
+If the lock were carried across the switch, the *resumed* thread — which
+parked at its own `context_switch` call site, lock-free — would eventually
+drop a guard it never acquired, releasing a lock another thread still
+believes it holds. Single-CPU / IF=0 / no-preemption makes the brief
+window between publishing the next thread and executing the register
+switch safe: nothing else can run.
+
+Two corollaries:
+
+- **No allocation under rank 1.** `init` installs a pre-reserved run
+  queue (built outside the lock), and `spawn` does all heavy work
+  (`KernelStack::new`, `Thread` allocation, frame fabrication) before the
+  brief enqueue lock; the enqueue itself stays within the reserve
+  (debug-asserted). This keeps the otherwise-legal rank-1 → rank-6
+  descent out of the hot path entirely.
+- **Reaping runs outside rank 1.** An exited thread cannot free its own
+  kernel stack (it is still running on it), so `exit` parks itself in
+  `reap`; the next scheduler entry's `reap_pending` `take`s it under the
+  lock and drops it *after* releasing — `KernelStack`'s `Drop` unmaps and
+  returns frames to the buddy (rank 6), which must not happen under
+  rank 1.
 
 ## Handle-table segment growth releases rank 3 before rank 6
 
