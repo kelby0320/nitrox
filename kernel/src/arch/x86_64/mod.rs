@@ -24,6 +24,20 @@ pub fn init_cpu_tables() {
     idt::init();
 }
 
+/// Set the kernel stack the CPU loads on a ring3→ring0 trap (the neutral
+/// name for `TSS.RSP0`). Wraps the GDT/TSS-specific setter so callers
+/// outside `arch/` never name `gdt`.
+pub fn set_kernel_stack(top: u64) {
+    gdt::set_kernel_stack(top);
+}
+
+/// Program the syscall fast-path (the neutral name for the x86 `syscall`
+/// MSR + per-CPU stack setup). `stack_top` is the kernel stack the entry
+/// path switches to. Wraps the x86 `syscall::init`.
+pub fn init_syscalls(stack_top: u64) {
+    syscall::init(stack_top);
+}
+
 /// Park the CPU forever. Disables interrupts and `hlt`s in a loop so a
 /// spurious wake-up cannot restart execution. This is the only sanctioned
 /// way to exit the kernel's top-level entry point in Phase 0.

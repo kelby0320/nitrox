@@ -31,7 +31,7 @@
 //! 3. **Fault recovery.** Each raw arch primitive registers a
 //!    `(fault_pc, recovery_pc)` pair in the `.user_access_table`
 //!    section. On a `#PF` whose RIP matches a registered fault site,
-//!    the [`#PF` handler](crate::arch::x86_64::idt) patches RIP to the
+//!    the arch layer's `#PF` handler patches RIP to the
 //!    recovery PC, which closes the protection window and signals
 //!    failure. A user-side fault turns into
 //!    [`UserAccessError::Fault`], not a kernel halt.

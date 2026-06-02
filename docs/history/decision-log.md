@@ -1979,3 +1979,58 @@ Verification:
   `hello, ring3` (printed by `sys_kprint` from ring 3), then `user demo:
   returned from ring 3 (status 0)` — proving entry, dispatch, the SMAP user
   copy, `sysretq`, and the debug-exit round trip.
+
+## 2026-05-29 — Arch-abstraction boundary made enforceable
+
+Architecture-specific names had leaked into kernel code repeatedly
+(`arch::gdt::init`, `arch::idt::init`, `arch::gdt::set_kernel_stack`,
+`arch::syscall::init`, and an x86 register `SyscallFrame` in the neutral
+`crate::syscall`). `arch::x86_64` was a `pub mod`, so nothing prevented it.
+This change makes the boundary compiler-enforced and adds a lint + a
+documented convention (`docs/conventions/arch-boundary.md`).
+
+Decisions:
+
+- **Private arch submodule (compiler-enforced).** `arch/mod.rs` now declares
+  `mod x86_64;` (private). `crate::arch::x86_64::…` no longer resolves
+  outside `arch/` — a hard compile error. The neutral surface is whatever
+  `arch/mod.rs` re-exports; re-exporting from a private module is allowed.
+  This achieves the "impossible to import arch internals" goal **without a
+  separate crate**.
+
+- **Separate-crate option considered and deferred.** A `kernel-arch` crate
+  would give a crate-level privacy boundary, but requires first extracting
+  shared types (`PhysAddr`/`VirtAddr`/`KBox`/`SpinLock`) into a base crate to
+  break the kernel↔arch dependency cycle. Overkill while single-arch; the
+  private-module boundary is sufficient. Revisit if/when aarch64 lands.
+
+- **Curated neutral re-exports; jargon wrapped.** Dropped the x86-jargon
+  module re-exports (`gdt`, `syscall`). Added neutral free-function wrappers
+  `arch::set_kernel_stack` (was `arch::gdt::set_kernel_stack`) and
+  `arch::init_syscalls` (was `arch::syscall::init`) in `arch/x86_64/mod.rs`.
+  Kept the already-neutral module names `arch::abi`, `arch::user_access`,
+  `arch::serial`. **Scope: identifiers/paths only** — x86 terms in *comments*
+  (PML4/CR3/RSP) are left as-is; they describe the concrete impl.
+
+- **`SyscallFrame` moved into the arch layer.** The x86 register snapshot
+  (r15…rax) and its frame-unpacking `syscall_dispatch` moved from the neutral
+  `kernel/src/syscall/mod.rs` into `kernel/src/arch/x86_64/syscall.rs`; the
+  dispatcher calls the neutral `syscall::table::dispatch(nr, args)`. The
+  neutral syscall module now sees only `(number, args) -> isize`.
+
+- **`cargo xtask check-arch` lint.** Walks `kernel/src/` (skipping `arch/`),
+  fails on any non-comment line naming `arch::x86_64` / `arch::aarch64`.
+  Wired into CI before build/test. Regression net for comments/doc-links the
+  compiler can't catch. Verified it fails on an injected leak and ignores the
+  same text in a comment.
+
+- **Dead code surfaced by the boundary.** Making `x86_64` private revealed
+  that the word/dword port-I/O helpers (`outw`/`inw`/`outl`/`inl`) were
+  unused — they had been "live" only via the leaky public path. Removed them
+  (only the byte variants `outb`/`inb`, used by the serial driver, remain);
+  trivially re-added when a device driver needs wider port I/O.
+
+Verification: `cargo xtask check-arch` passes (and fails on an injected
+leak); `cargo xtask build` clean, no warnings; `cargo xtask test` 260 pass;
+`cargo xtask qemu` ring-3 trace unchanged — the `SyscallFrame` move and
+neutral wrappers did not change behaviour.
