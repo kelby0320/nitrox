@@ -41,7 +41,7 @@ This follows Linux's aarch64 convention.
 
 All syscalls return a single `isize` value:
 
-- **Negative values** are `KError` discriminants. See [error-codes reference](../reference/error-codes.md) for the complete list.
+- **Negative values** are `KError` discriminants. See the `KError` enum in `kernel/src/syscall/error.rs` (the canonical source until a `docs/reference/error-codes.md` catalogue is written) for the complete list.
 - **Non-negative values** are operation-specific. Common patterns: a count of bytes transferred, a handle value, or `0` for "success with no value."
 
 Userspace code typically wraps this as `Result<NonNegative, KError>`:
@@ -67,6 +67,13 @@ Page faults during user memory access are recovered via the exception table; the
 ## Syscall numbering
 
 Syscall numbers are not yet stabilized. The current convention is sequential allocation in `kernel/src/syscall/table.rs`, with stable assignments to be made before the v1.0 ABI freeze. Userspace code should reference syscalls by name through `libkern`, not by number.
+
+### Debug syscalls (not ABI-stable)
+
+A small set of **debug-only** syscalls exists to bootstrap and exercise the kernel before the stable syscall surface lands. They occupy a deliberately high, non-stable number range (`0xFFFF_0000+`) so they never shadow the stable sequential numbers, and they are **excluded from the v1.0 ABI freeze** — they may change or be removed without notice.
+
+- `sys_debug_kprint(ptr: UserPtr<u8>, len: usize) -> isize` (`0xFFFF_0000`) — copy `len` user bytes (bounded) and write them to the kernel serial log; returns the byte count. The non-async exception to the async-first rule (it completes immediately).
+- `sys_debug_exit(status: i32) -> !` (`0xFFFF_0001`) — used only by the throwaway ring-3 bootstrap harness to return control to the kernel; removed when the first real userspace process lands.
 
 ## The complete syscall set
 
@@ -327,6 +334,6 @@ After v1.0, syscall numbers and the existing signatures become a stability commi
 - [Handle encoding](handle-encoding.md)
 - [IPC message format](ipc-message-format.md)
 - [Notification format](notification-format.md)
-- [Error codes reference](../reference/error-codes.md)
+- `kernel/src/syscall/error.rs` — the `KError` enum (canonical error-code source)
 - [Process spawn args](process-spawn-args.md)
 - [Why async-first syscalls](../rationale/why-async-syscalls.md)

@@ -21,3 +21,4 @@ pub mod limine;
 pub mod mm;
 pub mod object;
 pub mod sched;
+pub mod syscall;

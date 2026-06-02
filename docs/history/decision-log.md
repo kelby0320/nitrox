@@ -1908,3 +1908,74 @@ Decisions worth recording:
 No code in this entry — it records the staging only. The preemptive-
 scheduling slice is tracked in `docs/planning/implementation-plan.md`
 under Phase 1.
+
+## 2026-05-29 — Phase 1, slice 10: syscall entry/exit (+ first ring-3 code)
+
+The x86_64 `syscall`/`sysretq` fast path, a dispatcher + table, the first
+syscall `sys_kprint`, and a throwaway ring-3 bootstrap that runs the
+project's first userspace code. New `kernel/src/syscall/{mod,table,error}.rs`
+and `kernel/src/arch/x86_64/syscall.rs`; GDT and boot wiring updated.
+
+Decisions worth recording:
+
+- **Assembly is Rust-emitted (naked), not NASM** — same as the context
+  switch (prior 2026-05-29 entry). The `syscall_entry` stub, `enter_user`,
+  and `syscall_debug_exit` are `#[unsafe(naked)] + naked_asm!`, coupled to
+  `SyscallFrame`/`CpuLocal` via `offset_of!`.
+
+- **GDT reordered for the SYSRET selector constraint.** `sysretq` forces
+  `CS = STAR[63:48]+16`, `SS = STAR[63:48]+8` (RPL 3), so the GDT now runs
+  null, kernel code (0x08), kernel data (0x10), **user data (0x18)**, **user
+  code (0x20)**, TSS (**moved 0x18 → 0x28**); `GDT_LEN = 7`. `STAR =
+  (0x10<<48)|(0x08<<32)`. **ABI-hash impact: none** — GDT selector values
+  are not in the kernel ABI version hash.
+
+- **Per-CPU `CpuLocal` + `swapgs` introduced.** `syscall` doesn't switch
+  RSP, so the stub `swapgs`es to a per-CPU block (via `IA32_KERNEL_GS_BASE`)
+  to find the kernel stack. Phase 1 has a single global `CPU0`. GS model:
+  ring 0 runs with `GS_BASE = 0`, `KERNEL_GS_BASE = &CPU0`; the swapgs pair
+  brackets the entry window. Nothing else in the kernel uses `gs:`. The
+  pre-`swapgs` entry-window #PF/NMI hazard is **accepted** for single-CPU /
+  no-IRQ (interrupts masked; the NMI handler uses no `gs:`); the paranoid
+  fix (GS-base sign check / IST) is deferred to the IRQ/SMP slice. This is
+  the first per-CPU data — the SMP foundation the handle-table grace shim
+  (`current_ctx_id`) anticipated.
+
+- **`sysretq` register discipline.** RCX (user RIP) and R11 (user RFLAGS)
+  are saved in `SyscallFrame` and preserved across the dispatch `call`;
+  caller-saved scratch (RDX/RSI/RDI/R8–R10) is zeroed before `sysretq` to
+  avoid leaking kernel values to ring 3; user FS_BASE is never touched.
+
+- **`KError` is `#[repr(i32)]`** in `kernel/src/syscall/error.rs`,
+  discriminants per `os-design-v5.1`. Syscalls return `isize` (negative =
+  `KError`, non-negative = success). **ABI-hash impact: none** yet — `KError`
+  does not cross an `export!` boundary; when userspace `libkern` mirrors it,
+  the discriminants become an ABI commitment.
+
+- **Debug syscalls in a high, non-stable range.** `SYS_DEBUG_KPRINT =
+  0xFFFF_0000`, `SYS_DEBUG_EXIT = 0xFFFF_0001` — excluded from the v1.0 ABI
+  freeze, kept out of the stable sequential (`0..`) space, and removable
+  with the throwaway harness.
+
+- **Throwaway ring-3 round-trip harness.** `enter_user` saves a kernel
+  resume point, switches CR3 to a user `AddressSpace`, and `iretq`s to a
+  hand-assembled blob; `sys_debug_exit` restores the resume point (with a
+  manual `swapgs` rebalance, since it skips `sysretq`) and returns into the
+  kernel, which restores the boot CR3 before dropping the user AS and
+  continues to the framebuffer. Chosen over a halt-on-exit so the demo
+  proves a full user→kernel→exit→kernel cycle and pre-stages the scheduler
+  return path. Replaced next slice by the ELF `Process` + user thread.
+
+Verification:
+
+- `cargo xtask test` — 260 host tests pass (+8): `KError`/`encode`
+  round-trips, `UserAccessError→KError`, `table::dispatch` pure paths
+  (unknown→Unsupported, `len==0`→0, `len>max`→TooLarge), GDT user-descriptor
+  + STAR-derivation encodings, `offset_of!` asserts on `SyscallFrame`/
+  `CpuLocal`. The `syscall`/`iretq`/`sysretq`/`swapgs` round trip is not
+  host-testable.
+- `cargo xtask build` — kernel ELF builds clean, no warnings.
+- `cargo xtask qemu` — serial shows `syscall fast-path armed`, then
+  `hello, ring3` (printed by `sys_kprint` from ring 3), then `user demo:
+  returned from ring 3 (status 0)` — proving entry, dispatch, the SMAP user
+  copy, `sysretq`, and the debug-exit round trip.

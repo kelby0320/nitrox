@@ -28,6 +28,7 @@ use nitrox_kernel::limine::{
 };
 use nitrox_kernel::mm;
 use nitrox_kernel::sched;
+use nitrox_kernel::syscall::table::{SYS_DEBUG_EXIT, SYS_DEBUG_KPRINT};
 
 // --- Limine request statics ---------------------------------------------
 //
@@ -92,11 +93,10 @@ fn kernel_main() {
     arch::serial::init();
     kprintln!("Nitrox kernel — diagnostics online");
 
-    // Install the kernel's own GDT + TSS, then the IDT. The IDT's gates
-    // reference the kernel code selector that only becomes ours once our
-    // GDT is loaded, and the double-fault gate needs the TSS's IST stack.
-    arch::gdt::init();
-    arch::idt::init();
+    // Install the architecture's CPU control tables (on x86_64: GDT + TSS,
+    // then IDT). The ordering dependency between them lives in the arch
+    // layer, not here.
+    arch::init_cpu_tables();
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
 
     // Bring up the physical-memory buddy allocator and the slab on top of
@@ -122,6 +122,11 @@ fn kernel_main() {
     // round-robin, then exits; the boot thread drains the queue and
     // returns here. See `docs/architecture/overview.md` § Scheduling.
     run_scheduler_demo();
+
+    // Arm the syscall fast path and prove it end-to-end by dropping to
+    // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
+    // (Throwaway harness — replaced next slice by an ELF-loaded process.)
+    run_user_demo();
 
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
     // jumping to `_start`. We are the sole reader; no other thread exists.
@@ -191,6 +196,144 @@ fn run_scheduler_demo() {
         sched::yield_now();
     }
     kprintln!("sched: all workers done; boot thread halting");
+}
+
+// --- Throwaway ring-3 syscall demo --------------------------------------
+//
+// This is the project's first userspace code: a hand-assembled blob mapped
+// into a user address space and entered via `iretq`. It calls `sys_kprint`
+// then `sys_debug_exit`, which returns control to the kernel. The whole
+// harness (this function + `arch::enter_user`/`syscall_debug_exit`) is
+// replaced next slice by an ELF-loaded `Process` + scheduler-driven thread.
+
+/// 16-aligned static kernel stack the syscall entry stub switches to. Lives
+/// in `.bss` (kernel half), so it is mapped in every address space.
+#[repr(C, align(16))]
+struct SyscallStack([u8; 16 * 1024]);
+static mut SYSCALL_STACK: SyscallStack = SyscallStack([0; 16 * 1024]);
+
+/// User virtual addresses for the demo blob. Canonical, page-aligned, and
+/// well below `USER_VIRT_END`.
+const USER_CODE_VA: u64 = 0x1_0000;
+const USER_STACK_BASE: u64 = 0x2_0000;
+const USER_STACK_TOP: u64 = 0x2_4000;
+/// Offset of the message string within the code page.
+const USER_STR_OFF: u64 = 0x40;
+
+/// Emit the ring-3 blob into `buf`, returning its length. The blob runs:
+/// `sys_kprint(STR_VA, len)` then `sys_debug_exit(0)`.
+fn build_user_blob(buf: &mut [u8], str_va: u64, str_len: u64) -> usize {
+    let mut n = 0usize;
+    let mut emit = |bytes: &[u8]| {
+        buf[n..n + bytes.len()].copy_from_slice(bytes);
+        n += bytes.len();
+    };
+    emit(&[0x48, 0xB8]); // mov rax, imm64
+    emit(&SYS_DEBUG_KPRINT.to_le_bytes());
+    emit(&[0x48, 0xBF]); // mov rdi, imm64
+    emit(&str_va.to_le_bytes());
+    emit(&[0x48, 0xBE]); // mov rsi, imm64
+    emit(&str_len.to_le_bytes());
+    emit(&[0x0F, 0x05]); // syscall
+    emit(&[0x48, 0xB8]); // mov rax, imm64
+    emit(&SYS_DEBUG_EXIT.to_le_bytes());
+    emit(&[0x31, 0xFF]); // xor edi, edi
+    emit(&[0x0F, 0x05]); // syscall
+    emit(&[0xEB, 0xFE]); // jmp $  (safety: should never be reached)
+    n
+}
+
+/// Build a user address space, install the blob, enter ring 3, and report
+/// the status it exits with. See the module comment above.
+fn run_user_demo() {
+    use mm::vmm::{MappingKind, Protection, VAddrRange, Vma};
+    use mm::{PAGE_SIZE, PhysAddr, VirtAddr};
+    use nitrox_kernel::arch::paging::ArchPaging;
+    use nitrox_kernel::libkern::KBox;
+
+    // Arm the syscall MSRs + per-CPU syscall stack. RSP0 covers a ring-3
+    // fault; the per-CPU kstack is what the `syscall` stub itself loads.
+    let stack_top = (&raw const SYSCALL_STACK as u64) + (16 * 1024);
+    arch::syscall::init(stack_top);
+    arch::gdt::set_kernel_stack(stack_top);
+    kprintln!("syscall fast-path armed");
+
+    let aspace = match mm::addr_space::AddressSpace::new() {
+        Ok(a) => a,
+        Err(_) => {
+            kprintln!("user demo: address space alloc failed");
+            return;
+        }
+    };
+
+    // Map a USER|EXEC code+string page and a USER|WRITE stack.
+    let code_range = VAddrRange::new(
+        VirtAddr::new(USER_CODE_VA),
+        VirtAddr::new(USER_CODE_VA + PAGE_SIZE as u64),
+    )
+    .expect("code range valid");
+    let stack_range = VAddrRange::new(
+        VirtAddr::new(USER_STACK_BASE),
+        VirtAddr::new(USER_STACK_TOP),
+    )
+    .expect("stack range valid");
+
+    let code_vma = KBox::try_new(Vma::new(
+        code_range,
+        Protection::USER | Protection::EXEC,
+        MappingKind::Anonymous,
+    ))
+    .expect("vma box");
+    let stack_vma = KBox::try_new(Vma::new(
+        stack_range,
+        Protection::USER | Protection::WRITE,
+        MappingKind::Anonymous,
+    ))
+    .expect("vma box");
+
+    if aspace.map_vma(code_vma).is_err() || aspace.map_vma(stack_vma).is_err() {
+        kprintln!("user demo: mapping failed");
+        return;
+    }
+
+    // Write the blob + string into the code frame via the HHDM (the user
+    // PTE is read-execute; the kernel reaches the physical frame through
+    // its own HHDM mapping).
+    let msg = b"hello, ring3\n";
+    let root = aspace.root();
+    // SAFETY: `translate` is a read-only walk of the AS we just populated;
+    // the code page is mapped, so the phys frame exists and is HHDM-
+    // reachable; we own the fresh frame and write within its bounds.
+    let code_phys = unsafe { arch::translate(root, VirtAddr::new(USER_CODE_VA)) }
+        .expect("code page mapped");
+    let mut blob = [0u8; 64];
+    let blob_len = build_user_blob(&mut blob, USER_CODE_VA + USER_STR_OFF, msg.len() as u64);
+    // SAFETY: `code_phys + hhdm_offset` addresses the 4 KiB code frame; the
+    // blob (<64 B) and the string (at +0x40) fit within the page and do not
+    // overlap.
+    unsafe {
+        let kva = (code_phys.as_u64() + mm::heap::hhdm_offset()) as *mut u8;
+        core::ptr::copy_nonoverlapping(blob.as_ptr(), kva, blob_len);
+        core::ptr::copy_nonoverlapping(msg.as_ptr(), kva.add(USER_STR_OFF as usize), msg.len());
+    }
+
+    // Capture the kernel's page-table root so we can restore it before the
+    // user address space is dropped (its `Drop` frees the live PML4).
+    let boot_root: PhysAddr = arch::active_root();
+
+    // Drop to ring 3. Returns when the blob calls sys_debug_exit.
+    // SAFETY: the AS has the kernel half inherited (current stack stays
+    // mapped); the entry/stack VAs are mapped exec/writable; syscall::init
+    // ran above. The harness restores callee-saved state on return.
+    let status = unsafe { arch::enter_user(USER_CODE_VA, USER_STACK_TOP, root.as_u64()) };
+
+    // Back on the user CR3 but the kernel half is shared, so this is safe;
+    // restore the boot root before dropping the user AS.
+    // SAFETY: `boot_root` is the kernel's original, fully-formed PML4.
+    unsafe { nitrox_kernel::arch::Paging::set_page_table(boot_root) };
+    drop(aspace);
+
+    kprintln!("user demo: returned from ring 3 (status {})", status);
 }
 
 /// Bring up the buddy allocator and the slab on top of it. Returns false

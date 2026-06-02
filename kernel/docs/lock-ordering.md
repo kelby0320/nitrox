@@ -171,6 +171,13 @@ the lock was held would deadlock. Bypassing the lock is sound only
 because Phase 1 is single-CPU with interrupts masked: at fault time no
 other context can be driving the UART. This must be revisited at SMP.
 
+The syscall path (`sys_kprint`) takes only `SERIAL`, at rank 7, and holds
+**no** lock across the user-memory copy: `copy_slice_from_user` runs its
+SMAP window (`stac`/`clac`) and exception-table fault recovery before the
+serial lock is acquired. So a faulting user buffer unwinds to a `KError`
+without any lock held, and the serial write that follows is a clean leaf
+acquisition.
+
 ## Interrupt semantics
 
 The `SpinLock` (`kernel/src/libkern/spinlock.rs`) does **not** mask

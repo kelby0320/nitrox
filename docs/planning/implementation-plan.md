@@ -45,8 +45,13 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   lifecycle state and entry point; a Rust-emitted `#[unsafe(naked)]`
   `context_switch` performs the cooperative switch; and a minimal
   round-robin scheduler runs kernel threads (demonstrated by the boot-time
-  worker round-robin on the serial console). Next: syscall entry/exit
-  (`syscall` handler, dispatch table, `sys_kprint`).
+  worker round-robin on the serial console). Syscall entry/exit is also in:
+  the `syscall`/`sysretq` fast path (MSR setup, per-CPU `swapgs` block, the
+  naked entry stub + `SyscallFrame`), a `match`-dispatch table with `KError`
+  encoding, and `sys_kprint` — proven by a throwaway hand-assembled ring-3
+  blob that prints from userspace and round-trips back. Next: the first
+  userspace process (ELF-loaded `Process` + scheduler-driven user thread,
+  replacing the throwaway ring-3 harness).
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -363,15 +368,31 @@ silent reset.
 
 #### Syscall entry/exit
 
-- [ ] `syscall` instruction handler (x86_64) with `swapgs`, register save
-- [ ] Syscall dispatch table
-- [ ] First syscall: `sys_kprint(ptr, len)` (debug only — write user bytes to kernel log)
-- [ ] Test by writing a tiny userspace "hello world" that calls `sys_kprint` and exits via halt
+- [x] `syscall` instruction handler (x86_64) with `swapgs`, register save
+      (`kernel/src/arch/x86_64/syscall.rs`): MSR setup (EFER.SCE, STAR,
+      LSTAR, SFMASK, KERNEL_GS_BASE), per-CPU `CpuLocal`, the naked
+      `syscall_entry` stub building a `SyscallFrame`, and `sysretq`. GDT
+      reordered for the SYSRET selector constraint (user data 0x18, user
+      code 0x20, TSS → 0x28).
+- [x] Syscall dispatch table (`kernel/src/syscall/{mod,table,error}.rs`):
+      `match`-on-number dispatch, `KError` (`#[repr(i32)]`) + `isize`
+      encoding.
+- [x] First syscall: `sys_kprint(ptr, len)` (debug only — copy a user
+      buffer in via the SMAP-safe primitive, write to serial).
+- [x] Tested by a throwaway hand-assembled ring-3 blob (`run_user_demo` in
+      `main.rs` + `arch::enter_user`/`syscall_debug_exit`) that calls
+      `sys_kprint` then a debug-exit syscall which round-trips back to the
+      kernel. Serial shows `hello, ring3` from ring 3. **This harness is
+      throwaway** — the next slice replaces it with a real ELF-loaded
+      process and a scheduler-driven user thread.
 
 #### First userspace process
 
 - [ ] Construct a `Process` with `AddressSpace` from a hardcoded ELF image
-- [ ] Start its main thread
+      (replacing the throwaway `run_user_demo` ring-3 harness)
+- [ ] Start its main thread via the scheduler (extend the thread/context
+      path to launch a user thread into ring 3, reusing this slice's
+      `iretq`/per-CPU-stack groundwork)
 - [ ] Verify it runs, calls `sys_kprint`, output appears on serial
 - [ ] **This is the substrate-works milestone**
 
