@@ -29,19 +29,26 @@
 //! the lock is *not* taken; the grace tracker uses its own atomics.
 //! See [`grace`].
 //!
-//! ## ObjectRef seam (Phase 1, this slice)
+//! ## ObjectRef seam
 //!
-//! Step 7 of the spec's validation algorithm calls
-//! `ObjectRef::try_acquire` to bump the target kernel object's
-//! refcount. `KObjectHeader` lands in the next slice; until then,
-//! [`try_acquire_refcount`] and [`release_refcount`] are stubs that
-//! unconditionally succeed (a test-only override flag forces failure
-//! so the error path is still exercised). When the next slice arrives
-//! it rewrites these two free functions to dispatch on
-//! [`KObjectType`](crate::libkern::handle::KObjectType) and bump
-//! `KObjectHeader::refcount`; the handle table itself never changes.
+//! Step 7 of the spec's validation algorithm bumps the target kernel
+//! object's refcount; [`try_acquire_refcount`] reads the
+//! [`KObjectHeader`](crate::object::KObjectHeader) at offset 0 of the
+//! type-erased object pointer and calls
+//! [`KObjectHeader::try_acquire`](crate::object::KObjectHeader::try_acquire)
+//! (`Arc`-upgrade semantics — fails if the count was already zero). On
+//! the lookup success path the bumped reference is adopted into an
+//! [`ObjectRef`](crate::object::ObjectRef) at step 12; on the retry and
+//! error paths [`release_refcount`] drops it (running the object's
+//! destructor if it was the last). A test-only override flag
+//! ([`FAIL_NEXT_ACQUIRE`]) forces the step-7 failure branch
+//! deterministically, since racing a real count-to-zero is not
+//! reproducible. The handle-table body is unchanged from the stub era:
+//! the two free functions kept the same signatures.
 
 use crate::libkern::handle::KObjectType;
+use crate::object::ObjectRef;
+use crate::object::header::KObjectHeader;
 
 pub(crate) mod entry;
 pub(crate) mod grace;
@@ -72,19 +79,18 @@ const _: () = assert!(DIRECTORY_LEN <= (1 << 12));
 
 // --- ObjectRef seam (Phase 1 stub) ----------------------------------
 
-/// In test builds, a one-shot **per-thread** flag the suite can set
-/// to force the next [`try_acquire_refcount`] call on the same
-/// thread to fail. Lets tests exercise the step-7 failure branch
-/// without a real `KObjectHeader`.
-///
-/// Per-thread (rather than process-global) so that one test setting
-/// the flag does not poison concurrent lookups on other threads —
-/// cargo runs unit tests in parallel by default, and a global flag
-/// would cause cross-test interference (a stress-test thread's
-/// lookup would consume a flag the dedicated test set, and vice
-/// versa).
 #[cfg(test)]
 std::thread_local! {
+    /// One-shot **per-thread** flag the suite can set to force the next
+    /// [`try_acquire_refcount`] call on the same thread to fail, so tests
+    /// can exercise the step-7 failure branch deterministically (racing a
+    /// real refcount-to-zero is not reproducible).
+    ///
+    /// Per-thread (rather than process-global) so that one test setting
+    /// the flag does not poison concurrent lookups on other threads —
+    /// cargo runs unit tests in parallel by default, and a global flag
+    /// would cause cross-test interference (a stress-test thread's lookup
+    /// would consume a flag the dedicated test set, and vice versa).
     pub(crate) static FAIL_NEXT_ACQUIRE: core::cell::Cell<bool> =
         const { core::cell::Cell::new(false) };
 }
@@ -94,26 +100,36 @@ std::thread_local! {
 /// refcount was already zero (the object is being torn down) and
 /// the lookup should fall through to `InvalidHandle`.
 ///
-/// Phase 1 stub: unconditionally returns `true` (and consults
-/// [`FAIL_NEXT_ACQUIRE`] under `cfg(test)`). The next slice rewrites
-/// this to dispatch on `_ty` and bump
-/// `KObjectHeader::refcount`. The handle table's lookup path is
-/// shaped against this signature so the swap is mechanical.
-pub(crate) fn try_acquire_refcount(_obj: *mut (), _ty: KObjectType) -> bool {
+/// Reads the [`KObjectHeader`] at offset 0 of `obj` and calls
+/// [`KObjectHeader::try_acquire`]. Under `cfg(test)` a one-shot
+/// [`FAIL_NEXT_ACQUIRE`] flag forces the failure branch.
+pub(crate) fn try_acquire_refcount(obj: *mut (), _ty: KObjectType) -> bool {
     #[cfg(test)]
     {
         if FAIL_NEXT_ACQUIRE.with(|f| f.replace(false)) {
             return false;
         }
     }
-    true
+    // SAFETY: `obj` was observed non-null in a live handle entry under a
+    // grace read-guard (lookup step 6 precedes step 7), so it addresses a
+    // live kernel object whose first `#[repr(C)]` field is a
+    // `KObjectHeader`. We only touch the atomic refcount.
+    let header = unsafe { &*(obj as *const KObjectHeader) };
+    header.try_acquire()
 }
 
 /// Release a refcount previously acquired with [`try_acquire_refcount`].
-/// Phase 1 stub: no-op. Rewritten alongside `try_acquire_refcount` in
-/// the next slice.
-pub(crate) fn release_refcount(_obj: *mut (), _ty: KObjectType) {
-    // No-op until KObjectHeader exists.
+/// Runs the object's destructor if this was the last reference.
+///
+/// Implemented by adopting the reference into a transient [`ObjectRef`]
+/// and dropping it, which performs the `Release` decrement, the
+/// `Acquire` fence, and the type-dispatched destroy in one place.
+pub(crate) fn release_refcount(obj: *mut (), ty: KObjectType) {
+    // SAFETY: `obj` owns exactly the reference acquired by the matching
+    // `try_acquire_refcount` on the lookup retry/error path; adopting it
+    // into an `ObjectRef` and dropping it accounts for that one
+    // reference exactly once.
+    drop(unsafe { ObjectRef::from_raw(obj, ty) });
 }
 
 /// Return the calling context's id for the [`grace::GraceTracker`].
