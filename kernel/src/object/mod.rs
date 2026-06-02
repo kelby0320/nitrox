@@ -26,4 +26,4 @@ pub mod thread;
 
 pub use header::{KObjectHeader, ObjectRef};
 pub use process::Process;
-pub use thread::Thread;
+pub use thread::{Thread, ThreadEntry, ThreadState};

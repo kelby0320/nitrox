@@ -19,6 +19,11 @@ pub mod x86_64;
 pub use x86_64::{abi, gdt, halt_loop, idt, serial, user_access};
 
 #[cfg(target_arch = "x86_64")]
+pub use x86_64::context::{
+    ArchThreadContext, context_switch, fabricate_frame, thread_trampoline,
+};
+
+#[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{
     X86Paging as Paging, active_root, init_kernel_template, init_protections, translate,
 };

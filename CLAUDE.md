@@ -23,7 +23,7 @@ These shape every decision; deviation requires explicit discussion:
 
 - **Rust throughout.** Kernel, userspace services, and runtime libraries.
 - **Stable Rust only.** No nightly features. The `Handle<T, M>` design uses typestate markers rather than const-generic bitflags specifically to stay on stable.
-- **NASM** for the small amount of unavoidable assembly: kernel entry stub, context switch, user-memory copy routines.
+- **Assembly is emitted from Rust**, not NASM: `core::arch::asm!`, `global_asm!`, and `#[unsafe(naked)]` + `naked_asm!` (all stable since Rust 1.88). The exception entry stubs, the GDT/TSS load, the user-memory copy routines, and the thread context switch are all in-tree Rust asm. There is no assembler in the build — `build.rs` only passes the linker script. (Earlier drafts reserved NASM for the entry stub and context switch; both turned out cleaner as Rust-emitted asm — see `docs/history/decision-log.md` 2026-05-13 and 2026-05-29 — so NASM is not used. Re-evaluate only if a routine genuinely cannot be expressed via `asm!`/`naked_asm!`.)
 - **Cargo + cargo xtask** for builds. The `xtask` workspace provides higher-level commands (`xtask qemu`, `xtask image`, etc.).
 - **Limine** as the bootloader.
 

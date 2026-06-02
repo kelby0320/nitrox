@@ -20,3 +20,4 @@ pub mod libkern;
 pub mod limine;
 pub mod mm;
 pub mod object;
+pub mod sched;

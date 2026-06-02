@@ -91,6 +91,29 @@ impl<T> KVec<T> {
         Some(unsafe { ptr::read(self.ptr.as_ptr().add(self.len)) })
     }
 
+    /// Remove and return the element at `index`, shifting every later
+    /// element down by one. `O(len - index)`. Panics if `index >= len`.
+    ///
+    /// This is the front-dequeue the scheduler's round-robin run queue
+    /// needs (`remove(0)`); it never reallocates, so it is safe to call
+    /// while holding a lock that forbids allocation.
+    pub fn remove(&mut self, index: usize) -> T {
+        assert!(index < self.len, "KVec::remove index out of bounds");
+        // SAFETY: `index < len`, so the slot is initialised; `read` moves
+        // it out. The `copy` shifts the `len - index - 1` trailing elements
+        // down by one over the now-vacated slot (overlapping ranges, hence
+        // `copy` not `copy_nonoverlapping`); decrementing `len` then drops
+        // the duplicated last slot from the live range without re-dropping.
+        unsafe {
+            let base = self.ptr.as_ptr();
+            let hole = base.add(index);
+            let val = ptr::read(hole);
+            ptr::copy(hole.add(1), hole, self.len - index - 1);
+            self.len -= 1;
+            val
+        }
+    }
+
     /// Ensure room for at least `additional` further elements so the
     /// next inserts will not reallocate.
     pub fn try_reserve(&mut self, additional: usize) -> Result<(), AllocError> {
@@ -285,6 +308,45 @@ mod tests {
         assert_eq!(v.len(), 800);
         assert_eq!(v[0], 0);
         assert_eq!(v[799], 799);
+    }
+
+    #[test]
+    fn remove_front_is_fifo_and_shifts_down() {
+        init_global_heap();
+        let mut v = KVec::new();
+        for i in 0..5u32 {
+            v.try_push(i).unwrap();
+        }
+        // Round-robin dequeue from the front preserves order.
+        assert_eq!(v.remove(0), 0);
+        assert_eq!(v.remove(0), 1);
+        assert_eq!(&v[..], &[2, 3, 4]);
+        // Removing from the middle shifts the tail down.
+        assert_eq!(v.remove(1), 3);
+        assert_eq!(&v[..], &[2, 4]);
+        // Removing the last element empties it.
+        assert_eq!(v.remove(1), 4);
+        assert_eq!(v.remove(0), 2);
+        assert!(v.is_empty());
+    }
+
+    #[test]
+    fn remove_runs_no_destructor_on_shifted_elements() {
+        init_global_heap();
+        let count = AtomicUsize::new(0);
+        let mut v = KVec::new();
+        for _ in 0..4 {
+            v.try_push(DropFlag(&count)).unwrap();
+        }
+        // Removing returns ownership of exactly one element; dropping the
+        // returned value runs exactly one destructor, and the three shifted
+        // survivors are not dropped by the shift.
+        let taken = v.remove(0);
+        drop(taken);
+        assert_eq!(count.load(Ordering::SeqCst), 1);
+        assert_eq!(v.len(), 3);
+        drop(v);
+        assert_eq!(count.load(Ordering::SeqCst), 4, "no double-drop on shift");
     }
 
     #[test]
