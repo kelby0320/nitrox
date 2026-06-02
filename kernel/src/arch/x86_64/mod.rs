@@ -7,9 +7,22 @@ pub mod idt;
 pub mod paging;
 pub mod regs;
 pub mod serial;
+pub mod syscall;
 pub mod user_access;
 
 use core::arch::asm;
+
+/// Install the architecture's CPU control tables, early in boot.
+///
+/// On x86_64 this is the GDT (with its TSS) followed by the IDT. The order
+/// is fixed here, not exposed to the caller: the IDT's gates reference the
+/// kernel code selector the GDT installs, and the double-fault gate needs
+/// the TSS's IST stack. The arch-neutral entry point — `main` calls this
+/// rather than the per-table `gdt`/`idt` initialisers.
+pub fn init_cpu_tables() {
+    gdt::init();
+    idt::init();
+}
 
 /// Park the CPU forever. Disables interrupts and `hlt`s in a loop so a
 /// spurious wake-up cannot restart execution. This is the only sanctioned

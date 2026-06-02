@@ -20,16 +20,39 @@ use core::arch::asm;
 pub const KERNEL_CODE_SELECTOR: u16 = 0x08;
 /// Selector for the kernel data segment (GDT index 2).
 const KERNEL_DATA_SELECTOR: u16 = 0x10;
-/// Selector for the TSS descriptor (GDT index 3, spanning indices 3-4).
-const TSS_SELECTOR: u16 = 0x18;
+/// Selector for the ring-3 data segment (GDT index 3), with RPL 3. Loaded
+/// into SS by `sysretq` (and pushed as SS in the ring-3 `iretq` frame).
+pub const USER_DATA_SELECTOR: u16 = 0x18 | 3;
+/// Selector for the ring-3 64-bit code segment (GDT index 4), with RPL 3.
+/// Loaded into CS by `sysretq` (and pushed as CS in the `iretq` frame).
+pub const USER_CODE_SELECTOR: u16 = 0x20 | 3;
+/// Selector for the TSS descriptor (GDT index 5, spanning indices 5-6).
+const TSS_SELECTOR: u16 = 0x28;
 
 /// 64-bit kernel code descriptor: present, DPL 0, executable, long-mode.
 const KERNEL_CODE: u64 = 0x00AF_9A00_0000_FFFF;
 /// Kernel data descriptor: present, DPL 0, writable.
 const KERNEL_DATA: u64 = 0x00CF_9200_0000_FFFF;
+/// Ring-3 data descriptor: kernel data with DPL 3 (access `0x92 | 0x60 =
+/// 0xF2`).
+const USER_DATA: u64 = 0x00CF_F200_0000_FFFF;
+/// Ring-3 64-bit code descriptor: kernel code with DPL 3 (access `0x9A |
+/// 0x60 = 0xFA`).
+const USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 
-/// GDT slot count: null + code + data + TSS descriptor (two slots).
-const GDT_LEN: usize = 5;
+/// The `IA32_STAR` value for `syscall`/`sysretq`.
+///
+/// - `STAR[47:32]` (the `syscall` base) = `0x08`: `syscall` loads
+///   `CS = 0x08` (kernel code) and `SS = 0x08 + 8 = 0x10` (kernel data).
+/// - `STAR[63:48]` (the `sysret` base) = `0x10`: `sysretq` loads
+///   `SS = 0x10 + 8 = 0x18` and `CS = 0x10 + 16 = 0x20` (each with RPL
+///   forced to 3, giving `0x1B` / `0x23`). This is *why* the GDT places
+///   user data at `0x18` and user code at `0x20`, in that order.
+pub const STAR_VALUE: u64 = (0x0010u64 << 48) | (0x0008u64 << 32);
+
+/// GDT slot count: null + kernel code + kernel data + user data + user
+/// code + TSS descriptor (two slots).
+const GDT_LEN: usize = 7;
 
 /// Size of the per-CPU double-fault IST stack.
 const DF_STACK_SIZE: usize = 16 * 1024;
@@ -129,7 +152,17 @@ pub fn init() {
     // 2. Build the GDT with a TSS descriptor for the TSS just written.
     let tss_addr = &raw const TSS as usize as u64;
     let tss_desc = tss_descriptor(tss_addr, (size_of::<Tss>() - 1) as u32);
-    let gdt: [u64; GDT_LEN] = [0, KERNEL_CODE, KERNEL_DATA, tss_desc[0], tss_desc[1]];
+    // Order is fixed by `sysretq`: user data (0x18) then user code (0x20),
+    // with the TSS pushed to 0x28. See `STAR_VALUE`.
+    let gdt: [u64; GDT_LEN] = [
+        0,
+        KERNEL_CODE, // 0x08
+        KERNEL_DATA, // 0x10
+        USER_DATA,   // 0x18
+        USER_CODE,   // 0x20
+        tss_desc[0], // 0x28 (low)
+        tss_desc[1], // 0x28 (high)
+    ];
     // SAFETY: as above — `GDT` is an exclusively-owned 'static with no
     // outstanding reference.
     unsafe {
@@ -206,6 +239,23 @@ unsafe fn load_tss() {
     }
 }
 
+/// Set `TSS.RSP0` — the stack the CPU loads when an interrupt or exception
+/// is taken while running in ring 3. Must be set before any ring-3 entry.
+///
+/// Note: the `syscall` instruction does *not* consult RSP0 (it doesn't
+/// switch stacks at all — the syscall entry stub loads the kernel stack
+/// itself via the per-CPU block); RSP0 covers a fault/IRQ taken in ring 3.
+pub fn set_kernel_stack(top: u64) {
+    // SAFETY: single-CPU boot; `TSS` is exclusively owned by this module
+    // with no outstanding reference. `rsp[0]` is a `u64` at a 4-aligned
+    // offset in a `#[repr(C, packed)]` TSS, so write it unaligned to avoid
+    // forming a misaligned reference.
+    unsafe {
+        let rsp0 = &raw mut (*(&raw mut TSS)).rsp[0];
+        rsp0.write_unaligned(top);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -228,5 +278,28 @@ mod tests {
         let [low, high] = tss_descriptor(0, 0);
         assert_eq!(low, 0x89_u64 << 40);
         assert_eq!(high, 0);
+    }
+
+    #[test]
+    fn user_descriptors_are_kernel_descriptors_with_dpl3() {
+        // Same base/limit/flags as the kernel descriptors, access byte
+        // raised to DPL 3 (the `0x60` DPL bits).
+        assert_eq!(USER_CODE, KERNEL_CODE | (0x60 << 40), "user code = kcode|DPL3");
+        assert_eq!(USER_DATA, KERNEL_DATA | (0x60 << 40), "user data = kdata|DPL3");
+        assert_eq!((USER_CODE >> 40) & 0xFF, 0xFA, "user code access byte");
+        assert_eq!((USER_DATA >> 40) & 0xFF, 0xF2, "user data access byte");
+    }
+
+    #[test]
+    fn star_value_yields_the_sysret_and_syscall_selectors() {
+        let sysret_base = STAR_VALUE >> 48;
+        let syscall_base = (STAR_VALUE >> 32) & 0xFFFF;
+        // syscall: CS = base, SS = base + 8 → kernel code / kernel data.
+        assert_eq!(syscall_base, KERNEL_CODE_SELECTOR as u64);
+        assert_eq!(syscall_base + 8, KERNEL_DATA_SELECTOR as u64);
+        // sysretq: SS = base + 8, CS = base + 16 → user data / user code
+        // (RPL stripped; the hardware forces RPL 3 on load).
+        assert_eq!(sysret_base + 8, (USER_DATA_SELECTOR & !3) as u64);
+        assert_eq!(sysret_base + 16, (USER_CODE_SELECTOR & !3) as u64);
     }
 }

@@ -16,7 +16,10 @@ pub mod paging;
 pub mod x86_64;
 
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{abi, gdt, halt_loop, idt, serial, user_access};
+pub use x86_64::{abi, gdt, halt_loop, init_cpu_tables, serial, syscall, user_access};
+
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::syscall::{enter_user, syscall_debug_exit};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{
