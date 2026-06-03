@@ -13,9 +13,11 @@ use crate::mm::user_access::{UserPtr, copy_slice_from_user};
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
-/// Debug: leave ring 3 and return control to the kernel bootstrap. Not
-/// ABI-stable; see [`crate::arch`]'s throwaway ring-3 harness.
-pub const SYS_DEBUG_EXIT: u64 = 0xFFFF_0001;
+/// Terminate the calling (single-threaded) process. Routes to the
+/// scheduler's thread exit; the dying thread's last `Process` reference is
+/// released on reap, freeing its address space. Debug number for now
+/// (status plumbing / multi-thread teardown land with later slices).
+pub const SYS_PROCESS_EXIT: u64 = 0xFFFF_0001;
 
 /// Largest buffer `sys_kprint` will copy in one call. Bounds the on-stack
 /// kernel buffer; well under `MAX_USER_COPY_SIZE`.
@@ -27,10 +29,19 @@ const KPRINT_MAX: usize = 4096;
 pub fn dispatch(nr: u64, a0: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> isize {
     match nr {
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
-        // Diverges: returns to the kernel bootstrap, never back to dispatch.
-        SYS_DEBUG_EXIT => crate::arch::syscall_debug_exit(a0 as i32),
+        // Diverges into the scheduler; never returns to dispatch/sysret.
+        SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
         _ => KError::Unsupported.as_isize(),
     }
+}
+
+/// `sys_process_exit(status)` — terminate the calling process. This slice's
+/// processes are single-threaded, so process exit is the current thread's
+/// exit: hand off to the scheduler, which switches to another thread and
+/// (on the next scheduler entry) reaps this one — releasing its last
+/// `Process` reference and freeing the address space. Never returns.
+fn sys_process_exit(_status: i32) -> ! {
+    crate::sched::exit()
 }
 
 /// `sys_kprint(ptr, len)` — copy `len` bytes from the user buffer at `ptr`

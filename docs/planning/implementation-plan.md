@@ -48,10 +48,12 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   worker round-robin on the serial console). Syscall entry/exit is also in:
   the `syscall`/`sysretq` fast path (MSR setup, per-CPU `swapgs` block, the
   naked entry stub + `SyscallFrame`), a `match`-dispatch table with `KError`
-  encoding, and `sys_kprint` — proven by a throwaway hand-assembled ring-3
-  blob that prints from userspace and round-trips back. Next: the first
-  userspace process (ELF-loaded `Process` + scheduler-driven user thread,
-  replacing the throwaway ring-3 harness).
+  encoding, and `sys_kprint`. The **first userspace process** is also in — the
+  **substrate-works milestone**: an embedded `ET_EXEC` (`userspace/hello`) is
+  loaded into an `AddressSpace`, wrapped in a `Process`, and run as a
+  scheduler-driven user thread that prints from ring 3 and exits via
+  `sys_process_exit`; the scheduler now manages per-thread CR3. Next:
+  fleshing out the real syscall surface (handle ops, memory objects, IPC).
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -388,13 +390,23 @@ silent reset.
 
 #### First userspace process
 
-- [ ] Construct a `Process` with `AddressSpace` from a hardcoded ELF image
-      (replacing the throwaway `run_user_demo` ring-3 harness)
-- [ ] Start its main thread via the scheduler (extend the thread/context
-      path to launch a user thread into ring 3, reusing this slice's
-      `iretq`/per-CPU-stack groundwork)
-- [ ] Verify it runs, calls `sys_kprint`, output appears on serial
-- [ ] **This is the substrate-works milestone**
+- [x] Construct a `Process` with `AddressSpace` from a hardcoded ELF image:
+      the embedded `userspace/hello` ELF (static, non-PIE `ET_EXEC`, built by
+      `cargo xtask` before the kernel and `include_bytes!`d) is loaded by
+      `mm::elf::load_elf` into a fresh `AddressSpace`, wrapped in
+      `Process::try_new_user` (the `Process` now owns its address space).
+- [x] Start its main thread via the scheduler: `Thread::try_new_user` +
+      `sched::spawn_user`; on first run `thread_enter` descends to ring 3 via
+      the neutral `arch::enter_user`. The scheduler now loads each thread's
+      page-table root on switch-in (kernel/boot root or the process root),
+      which also restores the boot root before a dying user thread's address
+      space is reaped. Per-thread `TSS.RSP0` + per-CPU syscall stack are set
+      on descent. The throwaway `run_user_demo`/`enter_user(cr3)`/
+      `syscall_debug_exit` harness is removed.
+- [x] Verified: `cargo xtask qemu` serial shows `hello from ring 3 (pid 1)`
+      (printed by `sys_kprint` from ring 3), then the process exits via
+      `sys_process_exit` → `sched::exit` and the boot thread resumes.
+- [x] **This is the substrate-works milestone** — reached.
 
 #### Handle operation syscalls
 

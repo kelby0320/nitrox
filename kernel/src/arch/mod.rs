@@ -30,19 +30,19 @@ pub mod paging;
 mod x86_64;
 
 // Neutral modules and free functions (defined at the x86_64 root). The
-// `set_kernel_stack` / `init_syscalls` wrappers give neutral names to the
-// GDT / syscall-MSR entry points.
+// `set_kernel_stack` gives a neutral name to the GDT/TSS RSP0 setter.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{
-    abi, halt_loop, init_cpu_tables, init_syscalls, serial, set_kernel_stack, user_access,
+    abi, halt_loop, init_cpu_tables, serial, set_kernel_stack, user_access,
 };
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, thread_trampoline};
 
-// Throwaway ring-3 bootstrap (removed with the first real userspace process).
+// Syscall fast-path: arm it once at boot, set the per-thread kernel stack on
+// switch-in, and descend to ring 3 from a scheduled user thread.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::syscall::{enter_user, syscall_debug_exit};
+pub use x86_64::syscall::{enter_user, init_syscall_entry, set_syscall_kernel_stack};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::{

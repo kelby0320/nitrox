@@ -55,36 +55,32 @@ pub struct CpuLocal {
     /// `gs:[0]` — scratch the entry stub stashes the user RSP into.
     rsp_scratch: u64,
     /// `gs:[8]` — top of the kernel syscall stack, loaded into RSP on entry.
+    /// Set per-thread by [`set_syscall_kernel_stack`] when a user thread is
+    /// about to run, so syscalls from ring 3 land on that thread's stack.
     kstack_top: u64,
-    /// `gs:[16]` — kernel resume RSP for the [`enter_user`] round trip.
-    resume_rsp: u64,
 }
 
 static mut CPU0: CpuLocal = CpuLocal {
     rsp_scratch: 0,
     kstack_top: 0,
-    resume_rsp: 0,
 };
 
 const OFF_SCRATCH: usize = offset_of!(CpuLocal, rsp_scratch);
 const OFF_KSTACK: usize = offset_of!(CpuLocal, kstack_top);
-const OFF_RESUME: usize = offset_of!(CpuLocal, resume_rsp);
-const _: () = assert!(OFF_SCRATCH == 0 && OFF_KSTACK == 8 && OFF_RESUME == 16);
+const _: () = assert!(OFF_SCRATCH == 0 && OFF_KSTACK == 8);
 
 // --- Initialisation -------------------------------------------------------
 
-/// Program the syscall MSRs and the per-CPU syscall stack. Must run after
-/// `gdt::init` (STAR's selectors must already be in the loaded GDT before
-/// the first `syscall`) and after paging (EFER fully formed), and before
-/// any ring-3 entry. `kstack_top` is the (16-aligned) top of the kernel
-/// stack the entry stub switches to.
-pub fn init(kstack_top: u64) {
-    // SAFETY: single-CPU boot; `CPU0` is exclusively owned with no
-    // outstanding reference. `kstack_top` is written before it can be read
-    // by any `syscall`.
-    unsafe {
-        (&raw mut (*(&raw mut CPU0)).kstack_top).write(kstack_top);
-    }
+/// Arm the architecture's syscall fast-path entry, once at boot. Must run
+/// after `gdt::init` (STAR's selectors must already be in the loaded GDT
+/// before the first `syscall`) and after paging (EFER fully formed), and
+/// before any ring-3 entry.
+///
+/// The per-CPU kernel stack the entry stub switches to is **not** set here —
+/// it is per-thread (see [`set_syscall_kernel_stack`]). (On x86_64 this
+/// programs the `EFER.SCE`/`STAR`/`LSTAR`/`SFMASK`/`KERNEL_GS_BASE` MSRs;
+/// that is the architecture's implementation detail.)
+pub fn init_syscall_entry() {
     let cpu0_addr = &raw const CPU0 as u64;
     let star = gdt::STAR_VALUE;
     let lstar = syscall_entry as *const () as u64;
@@ -98,6 +94,19 @@ pub fn init(kstack_top: u64) {
         regs::wrmsr(MSR_SFMASK, SFMASK_VALUE);
         let efer = regs::rdmsr(MSR_EFER);
         regs::wrmsr(MSR_EFER, efer | EFER_SCE);
+    }
+}
+
+/// Set the per-CPU kernel stack the `syscall` entry stub switches to. The
+/// scheduler/`thread_enter` calls this with the running user thread's kernel
+/// stack top before descending to ring 3, so a syscall lands on the right
+/// stack.
+pub fn set_syscall_kernel_stack(top: u64) {
+    // SAFETY: single-CPU; `CPU0` is exclusively owned. We're in ring 0 about
+    // to descend to ring 3, so no `syscall` can be reading `kstack_top`
+    // concurrently.
+    unsafe {
+        (&raw mut (*(&raw mut CPU0)).kstack_top).write(top);
     }
 }
 
@@ -227,75 +236,51 @@ extern "C" fn syscall_entry() -> ! {
     );
 }
 
-// --- Throwaway ring-3 bootstrap -------------------------------------------
+// --- Ring-3 descent -------------------------------------------------------
 
-/// Enter ring 3 at `entry` with user stack `user_sp`, in the address space
-/// rooted at `cr3_phys`. Returns (with the user's exit status in the low 32
-/// bits) when the ring-3 code invokes the `SYS_DEBUG_EXIT` syscall, which
-/// routes to [`syscall_debug_exit`].
+/// Descend to ring 3 at `entry` with user stack `user_sp`. Never returns:
+/// the only way back to ring 0 is via the `syscall` entry stub (or a trap).
 ///
-/// THROWAWAY test scaffold — replaced next slice by the ELF `Process` +
-/// scheduler-driven user thread.
+/// Called from `thread_enter` on a user thread's first run. The page-table
+/// root (CR3) is already the process address space (loaded by the scheduler
+/// on switch-in); `TSS.RSP0` and the per-CPU syscall stack already point at
+/// this thread's kernel stack (set by `thread_enter`). We build an `iretq`
+/// frame and go. No `swapgs`: ring 0 runs with `GS_BASE = 0` and
+/// `KERNEL_GS_BASE = &CPU0`, and the user's first `syscall` swaps it in.
 ///
 /// # Safety
-/// `cr3_phys` must be a fully-formed PML4 (with the kernel half inherited,
-/// so the current kernel stack stays mapped); `entry`/`user_sp` must be
-/// canonical user addresses mapped executable / writable respectively;
-/// [`init`] must have run.
+/// `entry`/`user_sp` must be canonical user addresses mapped executable /
+/// writable in the active address space; [`init_syscall_entry`] must have
+/// run; the active CR3 must be the process address space.
 #[unsafe(naked)]
-pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, cr3_phys: u64) -> i32 {
-    // SAFETY: naked. SysV: rdi=entry, rsi=user_sp, rdx=cr3_phys. We save
-    // callee-saved registers and the kernel resume RSP into CPU0 (by
-    // absolute address — GS_BASE is 0 in ring 0 here), switch CR3, build an
-    // `iretq` frame, and drop to ring 3. `syscall_debug_exit` restores the
-    // resume RSP and returns into this function's caller.
+pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64) -> ! {
+    // SAFETY: naked. SysV: rdi=entry, rsi=user_sp. Build the iretq frame
+    // (CPU pops RIP, CS, RFLAGS, RSP, SS) and drop to ring 3, zeroing every
+    // GPR first so no kernel value leaks to userspace.
     naked_asm!(
-        "push rbp",
-        "push rbx",
-        "push r12",
-        "push r13",
-        "push r14",
-        "push r15",
-        "lea rax, [rip + {cpu0}]",
-        "mov [rax + {resume}], rsp", // CPU0.resume_rsp = kernel RSP
-        "mov cr3, rdx",              // switch to the user address space
-        // Build the iretq frame (CPU pops RIP, CS, RFLAGS, RSP, SS).
         "push {user_ss}",           // SS
         "push rsi",                 // RSP = user_sp
         "push {rflags}",            // RFLAGS (IF=0; bit1 reserved=1)
         "push {user_cs}",           // CS
         "push rdi",                 // RIP = entry
+        "xor eax, eax",
+        "xor ebx, ebx",
+        "xor ecx, ecx",
+        "xor edx, edx",
+        "xor esi, esi",
+        "xor edi, edi",
+        "xor ebp, ebp",
+        "xor r8d, r8d",
+        "xor r9d, r9d",
+        "xor r10d, r10d",
+        "xor r11d, r11d",
+        "xor r12d, r12d",
+        "xor r13d, r13d",
+        "xor r14d, r14d",
+        "xor r15d, r15d",
         "iretq",
-        cpu0    = sym CPU0,
-        resume  = const OFF_RESUME,
         user_ss = const gdt::USER_DATA_SELECTOR as u64,
         user_cs = const gdt::USER_CODE_SELECTOR as u64,
         rflags  = const 0x2u64,
-    );
-}
-
-/// Handle `SYS_DEBUG_EXIT`: leave ring 3 and return into [`enter_user`]'s
-/// caller, carrying `status`. Reached from inside [`syscall_entry`] (so
-/// `GS_BASE = &CPU0`); we abandon the `sysretq` path, so we `swapgs` by
-/// hand to restore the kernel-normal GS before resuming. Never returns to
-/// the dispatcher. THROWAWAY.
-#[unsafe(naked)]
-pub extern "C" fn syscall_debug_exit(status: i32) -> ! {
-    // SAFETY: naked. `enter_user` stashed a valid resume RSP in CPU0; we
-    // are on the syscall kernel stack inside the dispatch call chain. We
-    // switch back to `enter_user`'s stack, rebalance GS, restore its
-    // callee-saved registers, and `ret` to its caller with `status` in EAX.
-    naked_asm!(
-        "mov eax, edi",            // return status
-        "mov rsp, gs:[{resume}]",  // restore enter_user's kernel RSP
-        "swapgs",                  // back to GS_BASE = 0 (kernel-normal)
-        "pop r15",
-        "pop r14",
-        "pop r13",
-        "pop r12",
-        "pop rbx",
-        "pop rbp",
-        "ret",
-        resume = const OFF_RESUME,
     );
 }

@@ -120,6 +120,11 @@ fn limine_conf() -> PathBuf {
 // --- Subcommands --------------------------------------------------------
 
 fn cmd_build() -> R<()> {
+    // Build the first userspace program BEFORE the kernel: the kernel embeds
+    // its ELF via `include_bytes!`, so the artifact must exist at kernel
+    // compile time.
+    cmd_build_hello()?;
+
     let kernel_dir = repo_root().join("kernel");
     run(Command::new("cargo").arg("build").current_dir(&kernel_dir))?;
     let elf = kernel_elf();
@@ -127,6 +132,32 @@ fn cmd_build() -> R<()> {
         return Err(format!("kernel ELF missing after build: {}", elf.display()).into());
     }
     println!("xtask: built kernel ELF at {}", elf.display());
+    Ok(())
+}
+
+/// Path to the built `hello` userspace ELF (release; the kernel embeds this).
+fn hello_elf() -> PathBuf {
+    repo_root()
+        .join("userspace/target/x86_64-unknown-none/release/hello")
+}
+
+/// Build the `hello` userspace program as a static `ET_EXEC` for the bare
+/// target. Run from `userspace/hello` so that crate's `.cargo/config.toml`
+/// (target + non-PIE/static rustflags) applies without affecting the other
+/// userspace members.
+fn cmd_build_hello() -> R<()> {
+    let hello_dir = repo_root().join("userspace").join("hello");
+    run(Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg("x86_64-unknown-none")
+        .current_dir(&hello_dir))?;
+    let elf = hello_elf();
+    if !elf.exists() {
+        return Err(format!("hello ELF missing after build: {}", elf.display()).into());
+    }
+    println!("xtask: built hello ELF at {}", elf.display());
     Ok(())
 }
 
@@ -219,6 +250,8 @@ fn cmd_fetch_limine() -> R<PathBuf> {
 fn cmd_clean() -> R<()> {
     let kernel_dir = repo_root().join("kernel");
     run(Command::new("cargo").arg("clean").current_dir(&kernel_dir))?;
+    let userspace_dir = repo_root().join("userspace");
+    run(Command::new("cargo").arg("clean").current_dir(&userspace_dir))?;
     let cache = build_cache();
     if cache.exists() {
         fs::remove_dir_all(&cache)?;
