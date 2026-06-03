@@ -2034,3 +2034,74 @@ Verification: `cargo xtask check-arch` passes (and fails on an injected
 leak); `cargo xtask build` clean, no warnings; `cargo xtask test` 260 pass;
 `cargo xtask qemu` ring-3 trace unchanged — the `SyscallFrame` move and
 neutral wrappers did not change behaviour.
+
+## 2026-05-29 — Phase 1, slice 11: first userspace process (substrate-works)
+
+The Phase-1 milestone: an ELF-loaded process runs in ring 3, calls
+`sys_kprint`, and exits — via the real scheduler, replacing the throwaway
+ring-3 harness. New `userspace/hello` crate; `Process` owns an
+`AddressSpace`; `Thread` gains user-thread launch; the scheduler manages
+per-thread CR3.
+
+Decisions worth recording:
+
+- **First program is a throwaway `userspace/hello` crate**, not `init`. A
+  minimal `#![no_std] #![no_main]` raw-syscall program (kprint + exit). It is
+  the proof of substrate; the real `init` (PID 1, loaded from initramfs)
+  comes later. Built as a **static, non-PIE `ET_EXEC`** at a low VA
+  (`relocation-model=static` + `-no-pie` + `code-model=small` + a
+  `user.ld`/`build.rs`): the kernel ELF loader rejects PIE/`ET_DYN` and
+  dynamic interpreters. `xtask` builds it **before** the kernel; the kernel
+  `include_bytes!`s the result (`kernel/build.rs` adds `rerun-if-changed`).
+
+- **`Process` owns an optional `AddressSpace`.** `try_new(pid)` keeps making
+  an AS-less process (used by the many handle-table/torture-test kernel
+  objects — forcing a PML4 per `Process` there would churn the test heap);
+  `try_new_user(pid, address_space)` builds a userspace one. `Drop` frees the
+  AS automatically via `dispatch_destroy`. (Deviation from the plan's
+  non-optional field, for the test-heap reason.)
+
+- **User threads launch through the existing thread/scheduler path.** A
+  `Thread` gains a `user_entry: Option<(entry, user_sp)>`, an owning
+  `Option<ObjectRef>` to its `Process`, and an `addr_space_root:
+  Option<PhysAddr>` (`None` = kernel/boot root). On first run `thread_enter`
+  branches: a user thread sets `TSS.RSP0` + the per-CPU syscall stack to its
+  own kernel stack and descends via `arch::enter_user(entry, user_sp) -> !`
+  (iretq). No refcount cycle: the `Thread` holds the `Process`, not vice
+  versa, so reaping the thread frees the process + AS.
+
+- **Scheduler manages CR3 (the linchpin).** On every switch-in the scheduler
+  loads the incoming thread's page-table root (process root for a user
+  thread, the boot root cached at `init` for kernel threads) before
+  `context_switch`. Safe because all kernel stacks live in the shared kernel
+  half, mapped identically across roots. This both runs user threads in
+  their AS and **restores the boot root before a dying user thread is
+  reaped** — its `AddressSpace::Drop` frees the PML4 CR3 would otherwise
+  reference. Reaping runs on the boot thread (next scheduler entry), never on
+  the dying stack.
+
+- **`SYS_DEBUG_EXIT` repurposed to `sys_process_exit`** (same `0xFFFF_0001`
+  debug number): the handler calls `sched::exit()`. The throwaway
+  `enter_user(cr3)` / `syscall_debug_exit` / `CpuLocal.resume_rsp` are
+  removed; `init(kstack_top)` split into `init_syscall_entry()` (boot) +
+  `set_syscall_kernel_stack(top)` (per-thread). New arch ops are exposed via
+  neutral `crate::arch` names (`enter_user`, `init_syscall_entry`,
+  `set_syscall_kernel_stack`, reused `Paging::set_page_table`); `check-arch`
+  stays green.
+
+- **Host-test limits.** `Thread::try_new_user` (like `try_new_runnable`) calls
+  `fabricate_frame`, which writes to a kernel-vmap virtual stack top that is
+  not real host memory — so it is QEMU-only. The host tests build the
+  user-thread fixtures with no kernel stack (the test module names the
+  private fields) to exercise the bookkeeping + the no-cycle refcount
+  property; the ring-3 run itself is validated by the QEMU serial trace.
+
+- **ABI-hash impact: none** (no `KObjectHeader`/export/discriminant changes;
+  `Process`/`Thread` internal layout is not in the hash).
+
+Verification: `cargo xtask check-arch` ✓; `cargo xtask build` clean (builds
+`hello` as `ET_EXEC` then the kernel); `cargo xtask test` 265 pass (+5:
+`Process` with-AS construction/teardown, user-thread bookkeeping, the
+Thread→Process no-cycle release); `cargo xtask qemu` serial shows
+`hello from ring 3 (pid 1)` then `init: user process exited; boot thread
+resuming`. `readelf -h userspace/target/.../hello` → `Type: EXEC`.

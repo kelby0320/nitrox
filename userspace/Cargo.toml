@@ -1,3 +1,12 @@
 [workspace]
 resolver = "3"
-members = ["init","libkern"]
+members = ["init","libkern","hello"]
+
+# `hello` is a freestanding no_std bin with no unwinder; abort on panic.
+# Harmless for the std `init`/`libkern` members (xtask never builds them for
+# the bare target).
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"

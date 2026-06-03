@@ -27,15 +27,37 @@
 //! locks via [`KernelStack`](crate::mm)'s `Drop`) likewise runs outside
 //! the rank-1 lock.
 
-use crate::arch::context_switch;
+use core::sync::atomic::{AtomicU64, Ordering};
+
+use crate::arch::paging::ArchPaging;
+use crate::arch::{Paging, context_switch};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
+use crate::mm::PhysAddr;
 use crate::object::{ObjectRef, Thread, ThreadEntry, ThreadState};
 
 /// Run-queue capacity reserved once at [`init`]. Phase 1 runs a handful of
 /// kernel threads; enqueueing beyond this is a logic error (debug-asserted)
 /// rather than an allocation under the rank-1 lock.
 const READY_RESERVE: usize = 16;
+
+/// The kernel/boot page-table root, captured once at [`init`]. Threads with
+/// no per-process address space (`addr_space_root == None`) run on this root;
+/// the scheduler loads it on switch-in so a dying user thread's address space
+/// can be freed safely (CR3 is the boot root before the reap).
+static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
+
+/// The page-table root a thread should run under: its own process root if it
+/// has one, else the boot root. Caller holds the run-queue lock.
+///
+/// # Safety
+/// `obj` is a live, pinned `Thread`.
+unsafe fn resolve_root(obj: *mut ()) -> PhysAddr {
+    match unsafe { Thread::addr_space_root(obj) } {
+        Some(root) => root,
+        None => PhysAddr::new(BOOT_ROOT.load(Ordering::Relaxed)),
+    }
+}
 
 /// Scheduler state behind the rank-1 run-queue lock.
 struct SchedState {
@@ -73,6 +95,11 @@ fn into_objref(t: KBox<Thread>) -> ObjectRef {
 /// save into. Must run once, after the allocators and paging are up and
 /// before any [`spawn`]/[`yield_now`].
 pub fn init() -> Result<(), AllocError> {
+    // Cache the kernel/boot page-table root for the CR3 hook (see
+    // `resolve_root`). `active_root` reads CR3 — a ring-0 op only reached at
+    // real boot, never in host tests (which never call `init`).
+    BOOT_ROOT.store(crate::arch::active_root().as_u64(), Ordering::Relaxed);
+
     // Build the pre-reserved run queue OUTSIDE the lock (the only growth).
     let mut ready: KVec<ObjectRef> = KVec::new();
     ready.try_reserve(READY_RESERVE)?;
@@ -119,6 +146,36 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
     Err(AllocError)
 }
 
+/// Create a **user** thread for `process` that descends to ring 3 at
+/// `entry` with stack `user_sp`, and enqueue it. Returns its thread id. The
+/// `process` reference is moved into the thread (keeping its address space
+/// alive). The kernel stack + frame fabrication happen before the (brief)
+/// enqueue lock.
+pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64) -> Result<u32, AllocError> {
+    let tid = {
+        let mut g = SCHED.lock();
+        let t = g.next_tid;
+        g.next_tid = g.next_tid.wrapping_add(1);
+        t
+    };
+    // Heavy work outside the lock (consumes `process` on success).
+    let thread = Thread::try_new_user(tid, process, entry, user_sp)?;
+    let r = into_objref(thread);
+
+    {
+        let mut g = SCHED.lock();
+        if g.ready.len() < g.ready.capacity() {
+            g.ready
+                .try_push(r)
+                .expect("push within reserved capacity is infallible");
+            return Ok(tid);
+        }
+    }
+    // Over capacity: `r` drops here (lock released) — releasing the thread's
+    // last reference, freeing its kernel stack, and releasing the Process.
+    Err(AllocError)
+}
+
 /// Cooperatively yield to the next ready thread, round-robin. Returns
 /// immediately (still current) if no other thread is ready. Resumes here,
 /// lock-free, when this thread is scheduled again.
@@ -126,7 +183,7 @@ pub fn yield_now() {
     // Reclaim any previously-exited thread's stack first (outside the lock).
     reap_pending();
 
-    let switch: Option<(*mut u64, u64)> = {
+    let switch: Option<(*mut u64, u64, PhysAddr)> = {
         let mut g = SCHED.lock();
         match dequeue_front(&mut g) {
             None => None, // nothing else ready — keep running
@@ -143,19 +200,27 @@ pub fn yield_now() {
                 }
                 let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
                 let next_sp = unsafe { Thread::saved_sp(next_obj) };
+                let next_root = unsafe { resolve_root(next_obj) };
                 debug_assert!(g.ready.len() < g.ready.capacity());
                 // Re-enqueue prev at the tail, then install next as current.
                 g.ready
                     .try_push(prev)
                     .expect("run queue within reserve");
                 g.current = Some(next);
-                Some((prev_slot, next_sp))
+                Some((prev_slot, next_sp, next_root))
             }
         }
         // Guard dropped here — lock released before the switch.
     };
 
-    if let Some((prev_slot, next_sp)) = switch {
+    if let Some((prev_slot, next_sp, next_root)) = switch {
+        // Make the incoming thread's address space active before swapping
+        // stacks. Safe to switch CR3 here: every kernel stack (incl. both
+        // threads' and this code) lives in the shared kernel half, mapped
+        // identically in every address space.
+        // SAFETY: `next_root` is a fully-formed PML4 (boot root or a process
+        // root with the kernel half inherited).
+        unsafe { Paging::set_page_table(next_root) };
         // SAFETY: the lock is released; `prev_slot` points into the prev
         // thread (pinned in `ready`) and `next_sp` is the saved RSP of the
         // now-current thread (pinned in `current`). Single-CPU: no other
@@ -173,7 +238,7 @@ pub fn exit() -> ! {
     // Reclaim any earlier exited thread first, so `reap` is free for us.
     reap_pending();
 
-    let switch: Option<(*mut u64, u64)> = {
+    let switch: Option<(*mut u64, u64, PhysAddr)> = {
         let mut g = SCHED.lock();
         let me = g.current.take().expect("current set");
         let me_obj = me.as_ptr();
@@ -191,15 +256,24 @@ pub fn exit() -> ! {
                 // SAFETY: next is pinned, becoming current; lock held.
                 unsafe { Thread::set_state(next_obj, ThreadState::Running) };
                 let next_sp = unsafe { Thread::saved_sp(next_obj) };
+                let next_root = unsafe { resolve_root(next_obj) };
                 g.current = Some(next);
-                Some((me_slot, next_sp))
+                Some((me_slot, next_sp, next_root))
             }
             None => None,
         }
     };
 
     match switch {
-        Some((me_slot, next_sp)) => {
+        Some((me_slot, next_sp, next_root)) => {
+            // Load the incoming thread's root BEFORE switching away. When a
+            // user thread exits, `next_root` is the boot root, so CR3 is
+            // restored to the kernel table before this (parked-in-`reap`)
+            // thread is reaped — its `AddressSpace::Drop` frees the PML4 CR3
+            // would otherwise still reference.
+            // SAFETY: `next_root` is a fully-formed PML4; all kernel stacks
+            // are mapped identically across roots.
+            unsafe { Paging::set_page_table(next_root) };
             // SAFETY: lock released. We switch away from this stack forever;
             // `me_slot` (our own, now-Exited thread, pinned in `reap`) is
             // written by the switch and never read again. `next_sp` is the
@@ -258,9 +332,42 @@ fn current_entry() -> (ThreadEntry, usize) {
 /// Reached with the run-queue lock **not** held (the switching thread
 /// released it before [`context_switch`]).
 pub(crate) extern "C" fn thread_enter() -> ! {
-    let (entry, arg) = current_entry();
-    entry(arg);
-    exit();
+    // Capture (under the lock) whether the current thread descends to ring 3
+    // and, if so, its descent params + kernel-stack top.
+    let descent: Option<(u64, u64, u64)> = {
+        let g = SCHED.lock();
+        let cur = g.current.as_ref().expect("current set when a thread runs");
+        let obj = cur.as_ptr();
+        // SAFETY: `current` is pinned alive and we hold the lock.
+        match unsafe { Thread::user_entry(obj) } {
+            Some((entry, user_sp)) => {
+                let ktop = unsafe { Thread::kstack_top(obj) }
+                    .expect("a user thread has a kernel stack");
+                Some((entry, user_sp, ktop))
+            }
+            None => None,
+        }
+    };
+
+    match descent {
+        Some((entry, user_sp, ktop)) => {
+            // Point the ring0 trap stack (TSS.RSP0) and the per-CPU syscall
+            // stack at THIS thread's kernel stack before dropping to ring 3,
+            // so syscalls/traps from ring 3 land on it. CR3 is already the
+            // process address space (loaded by the scheduler on switch-in).
+            crate::arch::set_kernel_stack(ktop);
+            crate::arch::set_syscall_kernel_stack(ktop);
+            // SAFETY: `entry`/`user_sp` are canonical user VAs mapped X / W
+            // in the active address space; the syscall fast-path is armed.
+            unsafe { crate::arch::enter_user(entry, user_sp) }
+        }
+        None => {
+            // Kernel thread: run the body in ring 0, then exit cleanly.
+            let (entry, arg) = current_entry();
+            entry(arg);
+            exit();
+        }
+    }
 }
 
 #[cfg(test)]
