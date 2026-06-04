@@ -408,7 +408,27 @@ silent reset.
       `sys_process_exit` → `sched::exit` and the boot thread resumes.
 - [x] **This is the substrate-works milestone** — reached.
 
+> **2026-06-04 re-sequencing.** The remaining Phase 1 slices were reordered
+> so the IRQ/timer/preemption **infrastructure** precedes the **blocking**
+> subsystems that depend on it. The async-first model makes `sys_wait` the
+> one blocking primitive, and wait queues / blocking IPC / notification
+> (exception) delivery all funnel through it — they need timers (deadlines),
+> an interrupt controller (IRQ-driven wakeup), and a `Blocked` thread state,
+> all of which used to be ordered *after* them. New order:
+> handle ops → memory objects → arch traits → timers → preemptive scheduling
+> → wait queues → notifications → IPC → other syscalls. See the decision log.
+
 #### Handle operation syscalls
+
+Synchronous; no blocking dependencies. Builds on the existing **global**
+handle table — a single globally-numbered segmented table with a per-entry
+`owner_pid` checked on every lookup (per-process tables are explicitly
+rejected; transfer would otherwise be a two-table operation — see
+`docs/rationale/rejected-approaches.md`). What this slice needs: the syscall
+dispatcher resolves the **calling process's pid** (current thread →
+`owner_pid`) to pass as `caller_pid` to `lookup`/`close`/`restrict`/`stat`/
+`duplicate`, and the `HandleEntry::next_owned` owned-handle list (field
+exists, currently unused) is wired up on the process for release-at-exit.
 
 - [ ] `sys_handle_close`
 - [ ] `sys_handle_duplicate`
@@ -417,71 +437,49 @@ silent reset.
 
 #### Memory objects
 
+Synchronous; no blocking dependencies.
+
 - [ ] `MemoryObject` kernel object
 - [ ] `sys_memory_create`
 - [ ] `sys_memory_map` / `sys_memory_unmap`
 - [ ] Userspace can allocate memory now
 
-#### IPC
+#### Architecture trait completion
 
-- [ ] `IpcChannel` kernel object per [docs/spec/ipc-message-format.md]
-- [ ] Per-channel queue with configurable depth, slot pool allocation
-- [ ] `sys_channel_create`
-- [ ] `sys_channel_send` with Block / NoBlock / BlockBounded modes
-- [ ] `sys_channel_recv`
-- [ ] Handle transfer mechanics during send (move and duplicate paths)
-- [ ] Dead-peer handling (`PeerClosed` notification, send/recv errors)
+Moved ahead of the blocking subsystems: the IRQ controller and CPU/FPU
+primitives are prerequisites for timers, preemptive scheduling, and
+therefore wait queues / blocking IPC / notifications.
 
-#### Notifications
-
-- [ ] `NotificationChannel` kernel object per [docs/spec/notification-format.md]
-- [ ] Bounded queue (default 64 entries) in kernel memory
-- [ ] Notification enum with sparse category-based discriminants
-- [ ] `sys_notif_recv`
-- [ ] First notification variants: `ChildExited`, `SegFault`, `PeerClosed`
-- [ ] Exception delivery path: thread fault → suspend → notification
-- [ ] `sys_exception_resume` with Disposition enum
-- [ ] Overflow handling (exception-priority eviction)
-
-#### Wait queues
-
-- [ ] `WaitQueue` with intrusive linked list per object
-- [ ] `WaitNode` pre-allocated array on `Thread`
-- [ ] `sys_wait` with multi-handle support and deadline
-- [ ] DPC integration for wakeup (DPCs queued from IRQ context; wake threads via wait queue)
-- [ ] Unified wait works across `PendingOperation`, `IpcChannel`, `Timer`, `NotificationChannel`, `Process`
+- [ ] `ArchIrq` — **local APIC only** for Phase 1: discovered via the
+      `IA32_APIC_BASE` MSR (no ACPI), LAPIC configured for the timer
+      interrupt. IOAPIC enumeration + external-device IRQ routing need ACPI
+      (MADT) and are deferred to Phase 2; Phase 1 has no IRQ-driven devices
+      (the UART is polled).
+- [ ] `ArchCpu` (CPU init, feature detection, halt)
+- [ ] `ArchFpu` (XSAVE/XRSTOR) — wired into the context switch once userspace
+      threads can touch the FPU
+- [ ] `ArchUserAccess` (SMAP/PAN window management) — formalises the existing
+      copy-primitive SMAP discipline
+- [ ] `ArchSmp` (SMP bootstrap, IPI) — stubbed in Phase 1; full SMP is Phase 3
 
 #### Timers and clocks
 
 - [ ] `Timer` kernel object
 - [ ] Kernel timer min-heap
-- [ ] `ArchTimer` trait with x86_64 implementation (TSC + APIC timer + HPET for calibration)
+- [ ] `ArchTimer` trait with x86_64 implementation: **LAPIC timer + TSC,
+      calibrated against the legacy PIT** (no ACPI). HPET (which needs ACPI
+      to locate) is deferred to Phase 2.
 - [ ] `sys_timer_create` / `sys_timer_set`
 - [ ] `sys_clock_read` (Monotonic, Realtime, ProcessCpu, ThreadCpu)
-
-#### Other syscalls
-
-- [ ] `sys_process_spawn` per [docs/spec/syscall-abi.md]
-- [ ] `sys_process_exit`, `sys_thread_exit`
-- [ ] `sys_thread_create`
-- [ ] `sys_thread_set_affinity`
-- [ ] `sys_thread_get_registers`
-
-#### Architecture trait completion
-
-- [ ] `ArchIrq` (interrupt controller, APIC + IOAPIC on x86_64)
-- [ ] `ArchCpu` (CPU init, feature detection, halt)
-- [ ] `ArchSmp` (SMP bootstrap, IPI) — basic version, full SMP comes in Phase 3
-- [ ] `ArchFpu` (XSAVE/XRSTOR)
-- [ ] `ArchUserAccess` (SMAP/PAN window management)
 
 #### Preemptive scheduling (single-CPU)
 
 Switches the cooperative scheduler (the threading slice) to a preemptive
-one, still on a single CPU. Sequenced here because it depends on a periodic
-timer (Timers and clocks) and an enabled interrupt controller (`ArchIrq`).
-This is deliberately separate from SMP: get preemption correct on one CPU
-first; multiple CPUs come in Phase 3. (Decision log, 2026-05-29.)
+one, still on a single CPU. Depends on a periodic timer (Timers and clocks)
+and an enabled interrupt controller (`ArchIrq`). Deliberately separate from
+SMP: get preemption correct on one CPU first; multiple CPUs come in Phase 3.
+This slice also introduces the `Blocked` thread state + block/unblock that
+**wait queues** build on. (Decision log, 2026-05-29; re-sequenced 2026-06-04.)
 
 - [ ] `IrqSpinLock` — the `cli` + save/restore-`RFLAGS` lock variant
       `kernel/src/libkern/spinlock.rs` already anticipates. Audit every
@@ -495,6 +493,8 @@ first; multiple CPUs come in Phase 3. (Decision log, 2026-05-29.)
       frame (as the exception stubs do); the switch swaps at the
       interrupt-frame level and returns via `iretq`. The cooperative
       voluntary-yield/`exit` path is retained, not replaced.
+- [ ] `Blocked` thread state + block/unblock scheduler operations — the
+      descheduling primitive wait queues consume.
 - [ ] Timer-tick reschedule: per-thread quantum/time-slice; on expiry the
       tick requests a reschedule. Round-robin still (no classes yet).
 - [ ] Idle thread: per-CPU placeholder that `hlt`s when the runqueue is
@@ -508,6 +508,55 @@ instances, `current` into GS-based per-CPU data, and points
 `current_ctx_id()` (the handle-table grace shim, currently constant 0) at
 `arch::cpu_id()`. The cooperative switch and `Thread` layout are unchanged
 by that refactor.
+
+#### Wait queues
+
+With the IRQ-driven scheduler, timers, and the `Blocked` state in place,
+`sys_wait` (the unified blocking primitive) and per-object wait queues land.
+
+- [ ] `WaitQueue` with intrusive linked list per object
+- [ ] `WaitNode` pre-allocated array on `Thread`
+- [ ] `sys_wait` with multi-handle support and deadline (deadline uses the
+      timer min-heap; wakeup via DPC from the timer IRQ)
+- [ ] DPC integration for wakeup (DPCs queued from IRQ context; wake threads via wait queue)
+- [ ] Unified wait works across `PendingOperation`, `IpcChannel`, `Timer`, `NotificationChannel`, `Process`
+
+#### Notifications
+
+Ordered before IPC so IPC's dead-peer path has its `PeerClosed` variant; the
+exception-delivery path uses the wait-queue blocking primitive above.
+
+- [ ] `NotificationChannel` kernel object per [docs/spec/notification-format.md]
+- [ ] Bounded queue (default 64 entries) in kernel memory
+- [ ] Notification enum with sparse category-based discriminants
+- [ ] `sys_notif_recv`
+- [ ] First notification variants: `ChildExited`, `SegFault`, `PeerClosed`
+- [ ] Exception delivery path: thread fault → suspend → notification
+- [ ] `sys_exception_resume` with Disposition enum
+- [ ] Overflow handling (exception-priority eviction)
+
+#### IPC
+
+- [ ] `IpcChannel` kernel object per [docs/spec/ipc-message-format.md]
+- [ ] Per-channel queue with configurable depth, slot pool allocation
+- [ ] `sys_channel_create`
+- [ ] `sys_channel_send` with Block / NoBlock / BlockBounded modes (Block /
+      BlockBounded use wait queues + timers)
+- [ ] `sys_channel_recv`
+- [ ] Handle transfer mechanics during send (move and duplicate paths)
+- [ ] Dead-peer handling (`PeerClosed` notification, send/recv errors)
+
+#### Other syscalls
+
+- [ ] `sys_process_spawn` per [docs/spec/syscall-abi.md] (allocates the
+      child's initial handles in the global table tagged with the child's
+      `owner_pid`, and uses IPC for passing channel endpoints)
+- [ ] `sys_process_exit`, `sys_thread_exit` — real versions: exit status →
+      parent's `ChildExited` notification, replacing the debug
+      `sys_process_exit`
+- [ ] `sys_thread_create`
+- [ ] `sys_thread_set_affinity` (a no-op until SMP; Phase 3)
+- [ ] `sys_thread_get_registers`
 
 ### Milestone
 
