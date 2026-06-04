@@ -116,6 +116,15 @@ fn kernel_main() {
     paging_init();
     paging_smoke_test();
 
+    // Bring up the single global handle table. It eagerly allocates its
+    // first segment, so the heap must be up (it is — `init_memory` ran); it
+    // must be live before any userspace can issue a handle syscall.
+    if nitrox_kernel::handle::global::init().is_err() {
+        kprintln!("global handle table init failed — halting");
+        return;
+    }
+    kprintln!("global handle table up");
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and

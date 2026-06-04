@@ -51,6 +51,7 @@ use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 
 pub(crate) mod entry;
+pub mod global;
 pub(crate) mod grace;
 pub(crate) mod prng;
 pub(crate) mod segment;

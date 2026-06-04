@@ -68,6 +68,17 @@ Page faults during user memory access are recovered via the exception table; the
 
 Syscall numbers are not yet stabilized. The current convention is sequential allocation in `kernel/src/syscall/table.rs`, with stable assignments to be made before the v1.0 ABI freeze. Userspace code should reference syscalls by name through `libkern`, not by number.
 
+The first stable numbers, allocated sequentially from `0`, are the handle operations:
+
+| Number | Syscall |
+|---|---|
+| `0` | `sys_handle_close` |
+| `1` | `sys_handle_duplicate` |
+| `2` | `sys_handle_restrict` |
+| `3` | `sys_handle_stat` |
+
+Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
+
 ### Debug syscalls (not ABI-stable)
 
 A small set of **debug-only** syscalls exists to bootstrap and exercise the kernel before the stable syscall surface lands. They occupy a deliberately high, non-stable number range (`0xFFFF_0000+`) so they never shadow the stable sequential numbers, and they are **excluded from the v1.0 ABI freeze** — they may change or be removed without notice.
@@ -87,7 +98,7 @@ Releases the calling process's reference to the handle. After this returns, the 
 ```rust
 fn sys_handle_restrict(h: RawHandle, new_rights: Rights) -> isize
 ```
-Consumes `h`, returns a new handle with rights = `h.rights & new_rights`. Cannot amplify rights. Does not require `DUPLICATE` (this is self-attenuation).
+Attenuates `h`'s rights **in place** to `h.rights & new_rights`; `h` keeps the same value and remains valid. Cannot amplify rights. Requires no right (this is self-attenuation). Returns `0`.
 
 ```rust
 fn sys_handle_duplicate(h: RawHandle, new_rights: Rights) -> isize
@@ -97,7 +108,20 @@ Returns a new handle referring to the same kernel object, with rights = `h.right
 ```rust
 fn sys_handle_stat(h: RawHandle, out: UserMutPtr<HandleInfo>) -> isize
 ```
-Writes metadata about `h` (object type, rights, generation) to `*out`. Requires `INSPECT` right on `h`.
+Writes metadata about `h` to `*out`. Requires `INSPECT` right on `h`. Returns `0`.
+
+`HandleInfo` is a fixed `#[repr(C)]` record (16 bytes, 8-byte aligned, no interior padding):
+
+```rust
+#[repr(C)]
+pub struct HandleInfo {
+    pub rights: u64,       // offset 0  — Rights::bits()
+    pub object_type: u32,  // offset 8  — KObjectType discriminant
+    pub generation: u32,   // offset 12 — handle generation counter
+}
+```
+
+`owner_pid` is intentionally not reported: a process can only `stat` handles it owns (the table enforces `owner_pid == caller`), so it would always equal the caller's pid.
 
 ### I/O Core
 

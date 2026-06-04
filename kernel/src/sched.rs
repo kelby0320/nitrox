@@ -324,6 +324,23 @@ fn current_entry() -> (ThreadEntry, usize) {
     unsafe { Thread::entry_and_arg(cur.as_ptr()) }
 }
 
+/// The pid of the process that owns the currently running thread.
+///
+/// Valid during a syscall: the current thread is the calling user thread, so
+/// this is the `caller_pid` the handle table's `lookup`/`close`/`restrict`/
+/// `stat`/`duplicate` need. Takes only the rank-1 run-queue lock and releases
+/// it before returning — handle syscalls call this **first**, then take the
+/// rank-3 handle-table lock, never nesting the two.
+pub fn current_owner_pid() -> u32 {
+    let g = SCHED.lock();
+    let cur = g.current.as_ref().expect("current set when a thread runs");
+    // SAFETY: `current` is pinned alive (it holds a refcount on the `Thread`)
+    // and we hold the run-queue lock, which — single-CPU — serialises all
+    // access to the `Thread`. Forming a shared `&Thread` to read `owner_pid`
+    // is sound; no `&mut` is taken anywhere under this lock.
+    unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.owner_pid()
+}
+
 /// Rust entry reached from
 /// [`thread_trampoline`](crate::arch::thread_trampoline) the first time a
 /// thread is scheduled. Runs the thread body, then exits cleanly if it
