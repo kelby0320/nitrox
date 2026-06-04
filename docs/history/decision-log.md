@@ -2105,3 +2105,49 @@ Verification: `cargo xtask check-arch` ✓; `cargo xtask build` clean (builds
 Thread→Process no-cycle release); `cargo xtask qemu` serial shows
 `hello from ring 3 (pid 1)` then `init: user process exited; boot thread
 resuming`. `readelf -h userspace/target/.../hello` → `Type: EXEC`.
+
+## 2026-06-04 — Phase 1 re-sequencing: infrastructure before blocking subsystems
+
+Reordered the remaining Phase 1 slices in `docs/planning/implementation-plan.md`
+after noticing wait queues were ordered before the timers they depend on —
+and that the same inversion ran through the whole blocking cluster.
+
+The problem: the async-first model makes `sys_wait` the one blocking
+primitive, and **wait queues**, **blocking IPC** (`Block`/`BlockBounded`
+send), and **notification/exception delivery** all funnel through it. Those
+need: a periodic **timer** (deadlines, `Timer` as a waitable), an
+**interrupt controller** (IRQ-driven / DPC wakeup), and a **`Blocked` thread
+state** (descheduling). All three were ordered *after* the subsystems that
+consume them (arch traits + timers were last; preemptive scheduling, which
+brings `IF=1`/`IrqSpinLock`/the `Blocked` state, was dead last).
+
+Decision: move the infrastructure ahead of the blocking cluster. New order
+for the remaining slices: handle ops → memory objects → **architecture trait
+completion → timers → preemptive scheduling** → wait queues → notifications →
+IPC → other syscalls. Handle ops and memory objects stay first (synchronous,
+no blocking deps); notifications precede IPC so IPC's dead-peer path has its
+`PeerClosed` variant; `process_spawn`/real exit go last (they need IPC
+handle-passing and `ChildExited`). The handle table stays **global** (a
+single globally-numbered table with per-entry `owner_pid`; per-process
+tables are explicitly rejected — `docs/rationale/rejected-approaches.md`);
+the handle-ops slice only adds caller-pid resolution in the dispatcher and
+wires the `next_owned` owned-handle list for release-at-exit. The Phase 1
+milestone is unchanged.
+
+- **`Blocked` state placement.** The `Blocked` thread state + block/unblock
+  belong with the preemptive-scheduling slice (it already overhauls the
+  scheduler and enables IRQs); wait queues consume them. Pure cooperative
+  cross-thread wake (IPC, process-exit) doesn't strictly need preemption,
+  but `sys_wait` deadlines need the timer IRQ, so bundling the IRQ-enable +
+  `IrqSpinLock` + reschedule machinery before wait queues is the clean split.
+
+- **ArchIrq/Timers scoped to the local APIC for Phase 1 (no ACPI).** Full
+  APIC/IOAPIC/HPET enumeration needs ACPI (MADT), which is Phase 2. Phase 1
+  only needs a timer interrupt, so `ArchIrq`/`ArchTimer` use the **local
+  APIC** (discovered via the `IA32_APIC_BASE` MSR) + **LAPIC timer + TSC,
+  PIT-calibrated** — no ACPI. IOAPIC + external-device IRQ routing + HPET are
+  deferred to Phase 2 (Phase 1 has no IRQ-driven devices; the UART is
+  polled). Recorded in the affected plan slices.
+
+Planning-only change; no code. The plan's existing 2026-05-29 preemptive-
+scheduling note is updated to reflect the new position.
