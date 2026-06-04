@@ -328,12 +328,18 @@ slice wires it up.
   will plug in real ids.
 - The PRNG seed comes from a caller-supplied `u64`. Production code
   will seed from `RDTSC`; the entropy slice swaps to `RDRAND/RDSEED`.
-- `next_owned` field exists; the list it threads is not built.
+- `next_owned` field exists; the list it threads is not built. The
+  owned-handle list (release-at-exit) is wired up in the `Process`
+  slice, not the handle-syscalls slice.
 - No per-process quota enforcement. The spec's "soft cap" of 65,536
   handles per process is unenforced until `Process` exists.
-- `sys_handle_close`, `sys_handle_restrict`, `sys_handle_duplicate`,
-  `sys_handle_stat` are not yet exposed — the syscall surface itself
-  is later in Phase 1.
+- `sys_handle_close`, `sys_handle_duplicate`, `sys_handle_restrict`,
+  `sys_handle_stat` **are** now exposed (stable syscall numbers 0–3),
+  backed by a single global `HandleTable` instance
+  (`kernel/src/handle/global.rs`); the dispatcher resolves the caller's
+  pid via `sched::current_owner_pid`. They are first exercised from ring 3
+  in the Memory objects slice (userspace's first handle is minted by
+  `sys_memory_create`).
 
 ## Invariants exercised by host tests
 

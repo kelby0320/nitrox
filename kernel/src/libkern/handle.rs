@@ -273,6 +273,47 @@ impl KObjectType {
     }
 }
 
+/// User-visible handle metadata, written by `sys_handle_stat`.
+///
+/// `#[repr(C)]` boundary type (`docs/spec/syscall-abi.md`). Field order is
+/// chosen so the `u64` sits first (no leading pad) and the two `u32`s pack
+/// into the trailing 8 bytes — total 16 bytes, 8-byte aligned, no interior
+/// padding (asserted below). `owner_pid` is intentionally omitted: a process
+/// can only stat handles it owns (the table's lookup enforces
+/// `owner_pid == caller`), so reporting it back is redundant.
+///
+/// Not part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`
+/// lists the hashed types; `HandleInfo` is not among them).
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct HandleInfo {
+    /// The handle's current rights bitmask (`Rights::bits()`).
+    pub rights: u64,
+    /// The referenced object's [`KObjectType`] discriminant (`as u32`).
+    pub object_type: u32,
+    /// The handle's generation counter (bits 63:32 of the [`RawHandle`]).
+    pub generation: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<HandleInfo>() == 16);
+const _: () = assert!(core::mem::align_of::<HandleInfo>() == 8);
+const _: () = assert!(core::mem::offset_of!(HandleInfo, rights) == 0);
+const _: () = assert!(core::mem::offset_of!(HandleInfo, object_type) == 8);
+const _: () = assert!(core::mem::offset_of!(HandleInfo, generation) == 12);
+
+impl HandleInfo {
+    /// Build the user-facing info from a handle's metadata snapshot. Takes
+    /// primitives (not the table's `HandleStat`) so this type keeps its
+    /// no-allocator, no-table dependency and can be shared with userspace.
+    pub const fn from_stat(object_type: KObjectType, rights: Rights, generation: u32) -> Self {
+        Self {
+            rights: rights.bits(),
+            object_type: object_type as u32,
+            generation,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -391,5 +432,26 @@ mod tests {
     fn kobject_type_is_four_bytes() {
         assert_eq!(core::mem::size_of::<KObjectType>(), 4);
         assert_eq!(core::mem::align_of::<KObjectType>(), 4);
+    }
+
+    // --- HandleInfo ---------------------------------------------------
+
+    #[test]
+    fn handle_info_from_stat_maps_fields() {
+        let rights = Rights::DUPLICATE | Rights::INSPECT | Rights::SIGNAL;
+        let info = HandleInfo::from_stat(KObjectType::Process, rights, 0xDEAD_BEEF);
+        assert_eq!(info.rights, rights.bits());
+        assert_eq!(info.object_type, KObjectType::Process as u32);
+        assert_eq!(info.generation, 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn handle_info_layout_is_stable() {
+        // Mirrors the compile-time asserts; documents the wire layout.
+        assert_eq!(core::mem::size_of::<HandleInfo>(), 16);
+        assert_eq!(core::mem::align_of::<HandleInfo>(), 8);
+        assert_eq!(core::mem::offset_of!(HandleInfo, rights), 0);
+        assert_eq!(core::mem::offset_of!(HandleInfo, object_type), 8);
+        assert_eq!(core::mem::offset_of!(HandleInfo, generation), 12);
     }
 }

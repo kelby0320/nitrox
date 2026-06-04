@@ -424,25 +424,48 @@ Synchronous; no blocking dependencies. Builds on the existing **global**
 handle table — a single globally-numbered segmented table with a per-entry
 `owner_pid` checked on every lookup (per-process tables are explicitly
 rejected; transfer would otherwise be a two-table operation — see
-`docs/rationale/rejected-approaches.md`). What this slice needs: the syscall
-dispatcher resolves the **calling process's pid** (current thread →
-`owner_pid`) to pass as `caller_pid` to `lookup`/`close`/`restrict`/`stat`/
-`duplicate`, and the `HandleEntry::next_owned` owned-handle list (field
-exists, currently unused) is wired up on the process for release-at-exit.
+`docs/rationale/rejected-approaches.md`). What this slice added: a single
+global `HandleTable` instance (once-init cell, `kernel/src/handle/global.rs`),
+the dispatcher resolving the **calling process's pid** (current thread →
+`owner_pid`, via `sched::current_owner_pid`) as `caller_pid`, the four
+handlers, and the `HandleInfo` `#[repr(C)]` boundary type.
 
-- [ ] `sys_handle_close`
-- [ ] `sys_handle_duplicate`
-- [ ] `sys_handle_restrict`
-- [ ] `sys_handle_stat`
+> **`next_owned` deferred.** Wiring the `HandleEntry::next_owned` owned-handle
+> list for release-at-exit (mentioned in the 2026-06-04 re-sequencing note) is
+> **moved to the Process slice** — it needs a `Process` list-head field and an
+> exit-path walk (process-lifecycle work). The field stays `RawHandle::NULL`
+> until then. (Decision log, 2026-06-04 slice-12.)
+
+> **Sequencing.** This slice's deliverable is "the operations exist and are
+> correct" (host-tested), not a userspace-capability milestone. Userspace
+> obtains its first handle by *creating* an object (`sys_memory_create`, next
+> slice), not by bootstrap delivery — so the **Memory objects** slice is where
+> these syscalls first run in ring 3. Inter-process handle delivery
+> (`SpawnArgs.handles`) stays in "Other syscalls".
+
+- [x] `sys_handle_close`
+- [x] `sys_handle_duplicate`
+- [x] `sys_handle_restrict`
+- [x] `sys_handle_stat`
 
 #### Memory objects
 
-Synchronous; no blocking dependencies.
+Synchronous; no blocking dependencies. First slice with a real
+"userspace can do X" milestone — `sys_memory_create` mints a `MemoryObject`
+**and its handle** (tagged with the caller's pid) and returns it, so this is
+also where the handle syscalls first run end-to-end in ring 3.
 
+- [ ] `current_process()` → `AddressSpace` resolution (current thread →
+      `Process`; the small shared primitive, on top of the handle-ops slice's
+      `sched::current_owner_pid`). `sys_memory_map` maps into it.
 - [ ] `MemoryObject` kernel object
-- [ ] `sys_memory_create`
+- [ ] `sys_memory_create` (allocates the object + a handle in the global table)
 - [ ] `sys_memory_map` / `sys_memory_unmap`
 - [ ] Userspace can allocate memory now
+- [ ] Handle-ops ring-3 exercise: `hello` (or successor) calls
+      `sys_memory_create` then `sys_handle_stat`/`duplicate`/`restrict`/`close`
+      on the returned handle — the end-to-end proof deferred from the handle-ops
+      slice.
 
 #### Architecture trait completion
 

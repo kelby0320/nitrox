@@ -2151,3 +2151,81 @@ milestone is unchanged.
 
 Planning-only change; no code. The plan's existing 2026-05-29 preemptive-
 scheduling note is updated to reflect the new position.
+
+---
+
+## 2026-06-04 — Phase 1, slice 12: handle operation syscalls
+
+The four handle operations — `sys_handle_close`, `sys_handle_duplicate`,
+`sys_handle_restrict`, `sys_handle_stat` — are now reachable from userspace,
+backed by the existing **global** handle table. The table's operations already
+existed and were tested; this slice added the plumbing: a single global table
+instance, caller-pid resolution, the four handlers, and the `HandleInfo`
+boundary type. (`kernel/src/{handle/global.rs, syscall/table.rs,
+sched.rs::current_owner_pid, libkern/handle.rs::HandleInfo, main.rs}`.)
+
+Decisions worth recording:
+
+- **First stable syscalls.** These are the first syscalls on the stable,
+  sequential-from-`0` ABI numbers (`close=0, duplicate=1, restrict=2,
+  stat=3`); the debug syscalls stay in their high `0xFFFF_0000+` range.
+  Syscall numbers are not part of the kernel ABI version hash.
+
+- **Global-table singleton without `Box::leak` or a coarse lock.** The one
+  `HandleTable` lives inline in a once-init cell (`handle::global` — an
+  `AtomicU8` state + `UnsafeCell<MaybeUninit<HandleTable>>`, published
+  `Release`/read `Acquire`), initialised in boot after the heap is up and
+  before userspace. `Box::leak` is forbidden (`kernel/CLAUDE.md`), and wrapping
+  the table in a `SpinLock` would serialise its lock-free seqlock lookups — so
+  neither was used. The table hands out `&'static HandleTable`; its own `&self`
+  methods provide all interior synchronisation.
+
+- **`restrict` is in-place (spec correction).** `docs/spec/syscall-abi.md`
+  previously described `sys_handle_restrict` as "consumes `h`, returns a new
+  handle." The implementation (`HandleTable::restrict`) attenuates rights **in
+  place** and returns `0`; `h` keeps its value. Source wins
+  (`CLAUDE.md` § Status); the spec was corrected to match.
+
+- **`NotOwner → InvalidHandle` for capability hygiene.** The handler error map
+  collapses the table's precise `NotOwner` to `InvalidHandle` so a handle owned
+  by another process is indistinguishable from one that never existed — a
+  caller cannot probe other processes' handle existence by error code. The
+  table itself keeps `NotOwner` for telemetry.
+
+- **`next_owned` release-at-exit deferred to the Process slice.** The
+  2026-06-04 re-sequencing entry above said this slice would wire the
+  `HandleEntry::next_owned` owned-handle list; that is **superseded** — it
+  needs a `Process` list-head field and an exit-path walk, which are
+  process-lifecycle work. The field stays `RawHandle::NULL` (written on
+  allocate, ignored on close) until the Process/`sys_process_spawn` slice. The
+  one bounded consequence: any handle pid 1 holds at exit keeps its object
+  refcounted until then — none are minted this slice.
+
+- **Sequencing: userspace's first handle is minted by object creation.** The
+  handle ops' deliverable is "the operations exist and are correct"
+  (host-tested), not a userspace-capability milestone. Userspace obtains its
+  first handle by *creating* an object (`sys_memory_create`, next slice), not
+  by bootstrap delivery — so the memory slice is where these syscalls first run
+  in ring 3 (create → stat/duplicate/restrict/close a real memory handle).
+  Inter-process handle delivery (`SpawnArgs.handles`) stays in the final
+  "other syscalls" slice, which depends on handle ops + IPC + notifications and
+  so cannot move earlier. No re-ordering was needed; no throwaway
+  bootstrap-handle code was added (so no arch `enter_user` change).
+
+- **Known ABI tension (not fixed).** `sys_handle_duplicate` returns the new
+  handle's bits as `isize`. A handle's top bit is the high bit of the 32-bit
+  generation counter; after ~2³¹ reuses of one slot it would set the sign bit
+  and userspace would misread a valid handle as a `KError`. Unreachable in
+  Phase 1 (and `encode`'s `debug_assert!(v >= 0)` would catch it), but the
+  "non-negative = value, negative = error" return convention is in tension with
+  a full 64-bit handle. To resolve before v1.0 (e.g. cap generation to 31 bits,
+  or change the handle-returning convention).
+
+**ABI-hash impact: none.** `KError`, `KObjectType`, `Rights` bit positions,
+and `KObjectHeader` are unchanged; `HandleInfo` is a new boundary type but is
+not among the hashed types; syscall numbers are not a hash input.
+
+Verified: `cargo xtask check-arch` clean, `build` clean, `test` (278 host
+tests, incl. 13 new handle-syscall/`HandleInfo` tests) green, and `qemu` boots
+through `global handle table up` to `hello from ring 3 (pid 1)` with no
+regressions.
