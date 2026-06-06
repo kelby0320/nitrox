@@ -85,6 +85,15 @@ impl Process {
     pub fn address_space_root(&self) -> Option<PhysAddr> {
         self.address_space.as_ref().map(|a| a.root())
     }
+
+    /// This process's address space, if it has one. Lets a syscall reach the
+    /// interior-mutable [`AddressSpace`] through an [`ObjectRef`] (e.g. to
+    /// map a memory object) without taking ownership.
+    ///
+    /// [`ObjectRef`]: crate::object::ObjectRef
+    pub fn address_space(&self) -> Option<&AddressSpace> {
+        self.address_space.as_ref()
+    }
 }
 
 #[cfg(test)]

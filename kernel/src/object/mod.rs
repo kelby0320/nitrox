@@ -21,9 +21,11 @@
 //! behind their respective Phase 1 slices.
 
 pub mod header;
+pub mod memory_object;
 pub mod process;
 pub mod thread;
 
 pub use header::{KObjectHeader, ObjectRef};
+pub use memory_object::MemoryObject;
 pub use process::Process;
 pub use thread::{Thread, ThreadEntry, ThreadState};

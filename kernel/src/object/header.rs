@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
-use crate::object::{Process, Thread};
+use crate::object::{MemoryObject, Process, Thread};
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
 /// references — a catastrophic bug, not a recoverable condition — so we
@@ -267,6 +267,15 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::Thread);
         }
+        KObjectType::MemoryObject => {
+            // SAFETY: last ref to a `MemoryObject` produced by KBox::into_raw.
+            // Dropping the box runs `MemoryObject::Drop`, freeing its frames.
+            drop(unsafe {
+                KBox::<MemoryObject>::from_raw(NonNull::new_unchecked(ptr as *mut MemoryObject))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::MemoryObject);
+        }
         // No other kernel object types are implemented this slice; they
         // land behind their respective Phase 1 slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -288,12 +297,16 @@ pub(crate) mod test_probe {
     std::thread_local! {
         static PROCESS_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static THREAD_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static MEMORY_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
         match ty {
             KObjectType::Process => PROCESS_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::Thread => THREAD_DESTROYS.with(|c| c.set(c.get() + 1)),
+            KObjectType::MemoryObject => {
+                MEMORY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1))
+            }
             _ => {}
         }
     }
@@ -306,9 +319,14 @@ pub(crate) mod test_probe {
         THREAD_DESTROYS.with(Cell::get)
     }
 
+    pub(crate) fn memory_object_destroys() -> usize {
+        MEMORY_OBJECT_DESTROYS.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PROCESS_DESTROYS.with(|c| c.set(0));
         THREAD_DESTROYS.with(|c| c.set(0));
+        MEMORY_OBJECT_DESTROYS.with(|c| c.set(0));
     }
 }
 

@@ -14,13 +14,95 @@ the single global `BuddyAllocator` and exposes `buddy_alloc` /
 this facade through a small `BuddyPager` trait so tests can inject a
 local buddy without touching the global statics.
 
-Phase 1 implements layers 1 and 2 in full. Layer 3 — the VMM — is being
-built up incrementally. In today: the arch-level page-table primitive
-(see [Arch paging layer](#arch-paging-layer)) and the [VMA tree](#vma-tree)
-that stores per-address-space mappings. Still ahead: the `AddressSpace`
-owner that pairs the VMA tree with a page-table root under one lock, the
-page-table integration that turns VMA mutations into PTE installs and
-removals, and the `mprotect`-style split / merge operations.
+These three are the core, but the full picture spans more: the
+[arch paging layer](#arch-paging-layer) (the hardware MMU primitive), the
+[`AddressSpace`](#addressspace) owner that pairs a VMA tree with a page-table
+root, the [`MemoryObject`](#memoryobject) kernel object that owns user-mappable
+memory, and the handle/syscall surface that lets userspace ask for it. The
+next section traces how they fit together end to end; the rest of the document
+details each layer in turn.
+
+Phase 1 implements all of the above. Still ahead within the VMM: lazy
+on-fault allocation (needs a real `#PF` handler), `mprotect`-style
+split / merge, and copy-on-write.
+
+## How an allocation flows (overview)
+
+Two distinct paths share the same foundation. Keep them separate in your head:
+
+- **Kernel-internal allocation** — `KBox` / `KVec` / `KString` → `slab`
+  ([kmalloc/kfree](#slab-allocator)) → `buddy`. For kernel data structures.
+- **User memory** — `sys_memory_create` → `MemoryObject` → `buddy` (frames),
+  then `sys_memory_map` → `AddressSpace` → arch paging → user PTEs. This is the
+  path below.
+
+```
+                 ┌─────────────────────────────────────────────┐
+   ring 3        │  userspace:  sys_memory_create / _map / _unmap│
+                 └───────────────────────┬─────────────────────┘
+ ── syscall ─────────────────────────────┼───────────────────────
+                 ┌───────────────────────▼─────────────────────┐
+   dispatch      │  syscall/table.rs  (handlers)                │
+                 └──┬───────────────┬──────────────────┬───────┘
+            ┌───────▼──────┐ ┌──────▼───────┐  ┌───────▼────────┐
+  objects   │ handle table │ │  scheduler   │  │ kernel objects │
+            │  handle/     │ │  sched.rs    │  │ object/        │
+            │ h→obj,rights,│ │ current_*()  │  │ MemoryObject,  │
+            │  owner_pid   │ │              │  │ Process,Thread │
+            └──────────────┘ └──────────────┘  └───────┬────────┘
+                                                        │ owns frames
+            ┌───────────────────────────────────────────▼─────────┐
+  VMM       │  AddressSpace = VmaTree (what's mapped) + PML4 root   │
+            │  mm/addr_space.rs                                     │
+            └───────────┬───────────────────────────┬──────────────┘
+                        │ bookkeeping               │ hardware
+            ┌───────────▼──────────┐   ┌────────────▼──────────────┐
+            │  VmaTree / Vma       │   │  arch paging (ArchPaging)  │
+            │  mm/vmm.rs           │   │  map_page / unmap_page /…  │
+            └──────────────────────┘   └────────────┬──────────────┘
+            ┌──────────────────────┐   ┌────────────▼──────────────┐
+  base      │  slab: kmalloc/kfree │──▶│  buddy: buddy_alloc/free   │
+            │  mm/slab.rs          │   │  mm/buddy.rs  (PhysAddr)   │
+            └──────────────────────┘   └────────────┬──────────────┘
+              HHDM (phys+offset ⇒ kernel-virtual view of any frame)
+            ┌───────────────────────────────────────▼──────────────┐
+            │  Physical RAM (from Limine's memory map)               │
+            └───────────────────────────────────────────────────────┘
+```
+
+**Where `MemoryObject` fits.** It is the *owner* of user-mappable physical
+memory, sitting as a kernel object between the buddy allocator and the address
+space. It pulls frames straight from the buddy (zeroed via the HHDM), is
+reference-counted and reachable by a handle, and — crucially — *owns* those
+frames. Mapping it installs PTEs that point at its frames; unmap removes the
+PTEs but never frees them. That is the difference from an anonymous `map_vma`
+mapping, whose frames belong to the *mapping* (one mapping = its own memory):
+a `MemoryObject`'s frames belong to the *object*, so mapping it twice aliases
+the same physical memory — the property that makes it shareable. See
+[MemoryObject](#memoryobject).
+
+**Trace — `sys_memory_create(size, 0)`:** validate flags/size →
+`MemoryObject::try_new` (`buddy_alloc(0)` × N pages, zero each via HHDM, store
+in a slab-backed `KVec<PhysAddr>`; refcount 1) → `handle table allocate(pid,
+obj, MemoryObject, full_rights)` → return the handle to userspace.
+
+**Trace — `sys_memory_map(h, 0, size, rights)`:** resolve the caller's
+`AddressSpace` (`sched::current_process`) → handle-table `lookup` (checks owner
++ that the handle carries the requested `MAP_*` rights; pins the object) →
+`find_free_range` picks a virtual range → `AddressSpace::map_object` installs a
+PTE per page pointing at `obj.frames()[i]` and records an `Object` VMA holding
+an `ObjectRef` → `flush_tlb_all` (the AS is active) → return the base address.
+A subsequent user dereference is pure MMU: the process PML4 walk hits the
+installed PTE, no kernel involvement.
+
+**Trace — teardown:** `sys_memory_unmap(addr)` removes the VMA + PTEs (frames
+untouched) and drops the VMA's `ObjectRef`; `sys_handle_close` (or process
+exit) drops the handle's. When the last reference goes, `dispatch_destroy` runs
+`MemoryObject::Drop`, returning every frame to the buddy.
+
+**Boot order** (`kernel/src/main.rs`): Limine memory map → buddy + slab
+(`init_memory`) → kernel-half paging template (`paging_init`, inherited by
+every new `AddressSpace`) → global handle table → first userspace process.
 
 ## Buddy allocator
 
@@ -231,27 +313,65 @@ updates both atomically; `unmap_covering` does the inverse.
   the caller with a `MapError`. The whole sequence runs under the AS
   lock so the tree and the page tables can never disagree about
   what's mapped.
+- **`map_object(range, prot, ObjectRef)`.** The sibling path for a
+  `MemoryObject` (see below). It allocates and zeroes **nothing** — it
+  installs PTEs pointing at the object's own, pre-allocated frames and
+  records a `MappingKind::Object` VMA that holds the `ObjectRef`. The
+  `ObjectRef` (the only fallible thing before it is consumed is the VMA
+  box, allocated before the lock) is handed back in the error tuple on
+  any failure. Mapping the same object at two ranges installs PTEs to the
+  same frames, so the two mappings alias.
 - **Eager anonymous allocation.** One frame per page is allocated at
   `map_vma` time; on-demand allocation via the page-fault handler
   would be the real-OS pattern but needs an upgraded `#PF` handler
   (today's is dump-and-halt). The switch lands when the PF handler
   does.
-- **Frame ownership lives in the page tables.** No per-VMA list of
-  owned physical frames: `ArchPaging::unmap_page` returns the
-  `PhysAddr` it freed, which `unmap_covering` and `Drop` hand straight
-  to `buddy_free`. For `MappingKind::Anonymous` the frame is freed;
-  the dispatch will branch on backing kind when `FileBacked` /
-  `Device` arrive (file-backed pages belong to the page cache, device
-  pages were never allocated by the kernel).
+- **Frame ownership depends on the backing kind.**
+  `ArchPaging::unmap_page` returns the `PhysAddr` it cleared;
+  `unmap_covering` and `Drop` branch on `Vma.mapping`: for
+  `MappingKind::Anonymous` the frame was owned by the mapping and is
+  handed to `buddy_free`; for `MappingKind::Object` the frame is owned by
+  the `MemoryObject` (kept alive by `Vma.object`) and is **not** freed —
+  the object frees its frames when its last reference drops. `FileBacked`
+  / `Device` (Phase 2) add further arms (page-cache pages, never-kernel-
+  allocated device pages).
 - **`Drop` drains the tree leftmost-first**, uninstalls every PTE,
   frees every leaf frame, then frees the PML4. Intermediate
   page-table frames (PDPT / PD / PT) leak per the deferred decision
   documented for `ArchPaging::unmap_page` — for a single Phase 1 AS
   the cost is negligible.
-- **No TLB flushing.** No `AddressSpace` is ever loaded onto a CPU
-  today; the TLB never holds entries for the new mappings. When the
-  scheduler arrives it will own the `set_active` entry point and
-  the flush policy that comes with it.
+- **TLB flushing is the caller's job.** The `AddressSpace` methods
+  install/uninstall PTEs but issue no TLB invalidation or other
+  privileged instruction (which keeps them host-testable against a real
+  PML4 via `translate`). A caller that mutates the **active** address
+  space — the memory syscalls, which operate on the current process's AS
+  — flushes afterward (`sys_memory_map`/`unmap` call `Paging::
+  flush_tlb_all()` once on success; single-CPU Phase 1). Range flushes
+  and cross-CPU shootdown are deferred to SMP (Phase 3).
+
+## MemoryObject
+
+A `MemoryObject` (`kernel/src/object/memory_object.rs`) is the kernel object
+behind `sys_memory_create`: anonymous, zero-filled memory a process can map.
+Unlike an anonymous `Vma` (whose frames are owned by the mapping), a
+`MemoryObject` **owns its physical frames** — a `KVec<PhysAddr>`, one per
+page, allocated and zeroed at creation and freed in its `Drop`. `map_object`
+points a process's PTEs at those frames and keeps the object alive for the
+mapping's lifetime via an `ObjectRef` in the `Vma`. This is what makes the
+object shareable: two mappings (eventually, in two processes) of the same
+object address the same physical memory, and the frames outlive any individual
+mapping. Phase 1 is eager and anonymous-only; copy-on-write and file-backing
+are later work.
+
+Because creation is eager, `sys_memory_create` caps object size at
+`MemoryObject::MAX_SIZE` (16 MiB) — a denial-of-service guard against one
+syscall committing all of physical RAM in an unpreemptable allocate-and-zero
+loop, **not** a designed ceiling. The cap goes away once backing is
+demand-paged (reserve cheaply, fault frames in on first touch) and per-process
+memory quotas exist — the same way Linux (`mmap`/`memfd`) and Windows (section
+objects) avoid any per-allocation byte limit. See
+`docs/rationale/deferred-decisions.md` § "Lazy (demand-paged) MemoryObject
+backing".
 
 ## Kernel-half PML4 sharing
 

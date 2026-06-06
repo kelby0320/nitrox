@@ -9,11 +9,18 @@
 //! exercise the entry/exit path before real syscalls land.
 
 use super::error::{KError, SysResult, encode, from_user_access};
+use crate::arch::Paging;
+use crate::arch::abi::USER_VIRT_END;
+use crate::arch::paging::ArchPaging;
 use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable};
-use crate::libkern::handle::{HandleInfo, RawHandle, Rights};
+use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
+use crate::libkern::{KBox, MemFlags};
+use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::user_access::{UserMutPtr, UserPtr, copy_slice_from_user, copy_to_user};
-use crate::object::ObjectRef;
+use crate::mm::vmm::{Protection, VAddrRange};
+use crate::mm::{PAGE_SIZE, VirtAddr};
+use crate::object::{MemoryObject, ObjectRef, Process};
 
 // --- Stable ABI syscall numbers -----------------------------------------
 //
@@ -29,6 +36,12 @@ pub const SYS_HANDLE_DUPLICATE: u64 = 1;
 pub const SYS_HANDLE_RESTRICT: u64 = 2;
 /// `sys_handle_stat` — write a handle's metadata to user memory.
 pub const SYS_HANDLE_STAT: u64 = 3;
+/// `sys_memory_create` — allocate a `MemoryObject`, return its handle.
+pub const SYS_MEMORY_CREATE: u64 = 4;
+/// `sys_memory_map` — map a `MemoryObject` into the caller's address space.
+pub const SYS_MEMORY_MAP: u64 = 5;
+/// `sys_memory_unmap` — unmap a region of the caller's address space.
+pub const SYS_MEMORY_UNMAP: u64 = 6;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -45,7 +58,7 @@ const KPRINT_MAX: usize = 4096;
 /// Route a decoded syscall to its handler. `nr` is the number (from RAX);
 /// `a0..a5` are the six argument registers (RDI, RSI, RDX, R10, R8, R9).
 /// Returns the `isize` the ABI hands back in RAX.
-pub fn dispatch(nr: u64, a0: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u64) -> isize {
+pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> isize {
     // No explicit grace `quiesce` is needed on this dispatch path: every
     // handle syscall below routes through a `HandleTable` method that takes
     // and drops a read guard, which marks the calling context (ctx 0 in
@@ -57,6 +70,9 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, _a2: u64, _a3: u64, _a4: u64, _a5: u6
         SYS_HANDLE_DUPLICATE => encode(sys_handle_duplicate(a0, a1)),
         SYS_HANDLE_RESTRICT => encode(sys_handle_restrict(a0, a1)),
         SYS_HANDLE_STAT => encode(sys_handle_stat(a0, a1)),
+        SYS_MEMORY_CREATE => encode(sys_memory_create(a0, a1)),
+        SYS_MEMORY_MAP => encode(sys_memory_map(a0, a1, a2, a3)),
+        SYS_MEMORY_UNMAP => encode(sys_memory_unmap(a0, a1)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Diverges into the scheduler; never returns to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -213,6 +229,175 @@ pub fn sys_handle_stat(h: u64, out: u64) -> SysResult {
     let info = stat_on(global::get(), RawHandle(h), pid)?;
     copy_to_user(uptr, &info).map_err(from_user_access)?;
     Ok(0)
+}
+
+// --- Memory object syscalls ---------------------------------------------
+
+/// Rights minted on a fresh `MemoryObject` handle: the full map band plus the
+/// generic rights that let the owner duplicate, inspect, and transfer it.
+///
+/// Principal `READ`/`WRITE`/`EXECUTE` are deliberately excluded — only the
+/// `MAP_*` band is valid on a `MemoryObject` (see `handle/type_rights.rs`), so
+/// including them would make `allocate` reject the set as `BadRights`.
+fn full_mem_rights() -> Rights {
+    Rights::MAP_READ
+        | Rights::MAP_WRITE
+        | Rights::MAP_EXEC
+        | Rights::DUPLICATE
+        | Rights::INSPECT
+        | Rights::TRANSFER
+}
+
+/// Map an [`AddressSpace`] mapping failure into the syscall error space.
+fn map_mem_map_err(e: MapError) -> KError {
+    match e {
+        MapError::Overlap | MapError::NotCanonical | MapError::NotUserHalf => {
+            KError::InvalidArgument
+        }
+        MapError::OutOfMemory => KError::OutOfMemory,
+    }
+}
+
+/// Round `n` up to a whole number of pages, saturating rather than wrapping
+/// (a near-`u64::MAX` request rounds to a huge value the size checks reject).
+fn round_up_page(n: u64) -> u64 {
+    n.saturating_add(PAGE_SIZE as u64 - 1) & !(PAGE_SIZE as u64 - 1)
+}
+
+/// Borrow the calling process's address space through its `ObjectRef`. The
+/// returned reference is tied to `proc_ref`, which the caller holds for the
+/// syscall's duration (keeping the process and its address space alive).
+fn current_address_space(proc_ref: &ObjectRef) -> Option<&AddressSpace> {
+    debug_assert_eq!(proc_ref.object_type(), KObjectType::Process);
+    // SAFETY: `proc_ref` references a live `Process` (its `KObjectHeader` is at
+    // offset 0), pinned by the current user thread for the syscall's duration.
+    // The returned borrow is tied to `proc_ref`'s lifetime.
+    let proc: &Process = unsafe { &*(proc_ref.as_ptr() as *const Process) };
+    proc.address_space()
+}
+
+/// `sys_memory_create(size, flags)` — allocate a zero-filled `MemoryObject` of
+/// `size` bytes (rounded up to a page) and return a handle to it (full rights).
+/// `flags` must be a valid [`MemFlags`] (no flags defined yet → must be 0).
+pub fn sys_memory_create(size: u64, flags: u64) -> SysResult {
+    if MemFlags::from_bits(flags).is_none() {
+        return Err(KError::InvalidArgument);
+    }
+    if size == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    if size as usize > MemoryObject::MAX_SIZE {
+        return Err(KError::TooLarge);
+    }
+    let obj = MemoryObject::try_new(size as usize).map_err(|_| KError::OutOfMemory)?;
+    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
+    let pid = crate::sched::current_owner_pid();
+    match global::get().allocate(pid, ptr, KObjectType::MemoryObject, full_mem_rights()) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // `allocate` did not adopt the creation reference; reclaim and drop
+            // it (running `MemoryObject::Drop`, freeing the frames). Done
+            // outside the table call so teardown isn't nested under rank-3.
+            // SAFETY: `ptr` carries the single outstanding creation reference.
+            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::MemoryObject) });
+            Err(map_handle_err(e))
+        }
+    }
+}
+
+/// `sys_memory_map(obj, hint, size, rights)` — map `obj`'s frames into the
+/// calling process's address space with `rights` (a subset of the `MAP_*`
+/// band). `hint == 0` picks any free range; otherwise `hint` is the requested
+/// (page-aligned) base. Returns the mapped base virtual address.
+pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResult {
+    let req = Rights::from_bits_truncate(rights);
+    // Require the handle to actually carry the MAP_* bits being installed — a
+    // lookup with `required` rejects amplification (e.g. mapping writable
+    // without `MAP_WRITE`) as `NoAccess`.
+    let required = req & (Rights::MAP_READ | Rights::MAP_WRITE | Rights::MAP_EXEC);
+
+    let pid = crate::sched::current_owner_pid();
+    let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
+    let asp = current_address_space(&proc_ref).ok_or(KError::KernelError)?;
+
+    let ok = global::get()
+        .lookup(RawHandle(obj_h), pid, required)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::MemoryObject {
+        return Err(KError::InvalidArgument);
+    }
+    // SAFETY: `object_type` confirms a live `MemoryObject`; `lookup` pinned it.
+    // The borrow is from a raw pointer, so it does not block moving `ok.object`
+    // into `map_object` below (it is unused after `size()` is read).
+    let mobj = unsafe { &*(ok.object.as_ptr() as *const MemoryObject) };
+
+    let size = round_up_page(size);
+    if size == 0 || size as usize > mobj.size() {
+        return Err(KError::InvalidArgument);
+    }
+
+    let range = if hint == 0 {
+        asp.find_free_range(size).ok_or(KError::OutOfMemory)?
+    } else {
+        let start = VirtAddr::new(hint);
+        if !start.is_page_aligned() {
+            return Err(KError::InvalidArgument);
+        }
+        let end = hint.checked_add(size).ok_or(KError::InvalidArgument)?;
+        if end > USER_VIRT_END {
+            return Err(KError::InvalidArgument);
+        }
+        VAddrRange::new(start, VirtAddr::new(end)).ok_or(KError::InvalidArgument)?
+    };
+
+    // Build the protection from the requested rights. USER is always set; the
+    // bits can never exceed the handle's (lookup confirmed `required` ⊆ rights).
+    let mut prot = Protection::USER;
+    if req.contains(Rights::MAP_WRITE) {
+        prot = prot | Protection::WRITE;
+    }
+    if req.contains(Rights::MAP_EXEC) {
+        prot = prot | Protection::EXEC;
+    }
+
+    // Move the looked-up reference into the mapping. `map_object` installs only
+    // `range.pages()` PTEs; `size <= obj.size()` guarantees enough frames.
+    match asp.map_object(range, prot, ok.object) {
+        Ok(()) => {
+            // The calling process's AS is active; make the new PTEs visible.
+            // SAFETY: ring-0 TLB flush; reloads the active root with itself.
+            unsafe { Paging::flush_tlb_all() };
+            Ok(range.start().as_u64() as isize)
+        }
+        Err((returned, e)) => {
+            drop(returned);
+            Err(map_mem_map_err(e))
+        }
+    }
+}
+
+/// `sys_memory_unmap(addr, size)` — unmap the region at `addr` from the
+/// calling process's address space. Phase 1 unmaps the **whole** VMA covering
+/// `addr` (the `size` argument is not yet honored for partial/split unmaps —
+/// TODO(mm)). Returns 0, or `InvalidArgument` if nothing is mapped at `addr`.
+pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
+    let va = VirtAddr::new(addr);
+    if !va.is_page_aligned() || addr >= USER_VIRT_END {
+        return Err(KError::InvalidArgument);
+    }
+    let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
+    let asp = current_address_space(&proc_ref).ok_or(KError::KernelError)?;
+    match asp.unmap_covering(va) {
+        Some(_vma) => {
+            // `_vma` drops here, releasing its object reference (for object
+            // mappings) or freeing its anonymous frames. The AS is active;
+            // flush the removed PTEs.
+            // SAFETY: ring-0 TLB flush; reloads the active root with itself.
+            unsafe { Paging::flush_tlb_all() };
+            Ok(0)
+        }
+        None => Err(KError::InvalidArgument),
+    }
 }
 
 #[cfg(test)]
@@ -405,5 +590,49 @@ mod tests {
             .unwrap();
         assert_eq!(stat_on(&t, h, 2), Err(KError::InvalidHandle));
         close_on(&t, h, 1).unwrap();
+    }
+
+    // --- Memory syscall helpers --------------------------------------
+    //
+    // The create/map/unmap handlers themselves depend on `global::get()` and
+    // the current thread, so they are exercised end-to-end under QEMU; the
+    // mapping mechanics are host-tested in `mm::addr_space` (map_object
+    // aliasing) and `object::memory_object` (create/zero/drop). Here we cover
+    // the pure helpers.
+
+    #[test]
+    fn round_up_page_rounds_and_saturates() {
+        assert_eq!(round_up_page(0), 0);
+        assert_eq!(round_up_page(1), PAGE_SIZE as u64);
+        assert_eq!(round_up_page(PAGE_SIZE as u64), PAGE_SIZE as u64);
+        assert_eq!(round_up_page(PAGE_SIZE as u64 + 1), 2 * PAGE_SIZE as u64);
+        // Near u64::MAX it saturates (no wrap/panic) to a huge, page-aligned
+        // value the size checks reject.
+        let big = round_up_page(u64::MAX);
+        assert_eq!(big & (PAGE_SIZE as u64 - 1), 0);
+    }
+
+    #[test]
+    fn map_mem_map_err_mapping() {
+        assert_eq!(map_mem_map_err(MapError::Overlap), KError::InvalidArgument);
+        assert_eq!(map_mem_map_err(MapError::NotCanonical), KError::InvalidArgument);
+        assert_eq!(map_mem_map_err(MapError::NotUserHalf), KError::InvalidArgument);
+        assert_eq!(map_mem_map_err(MapError::OutOfMemory), KError::OutOfMemory);
+    }
+
+    #[test]
+    fn full_mem_rights_are_allocatable_on_a_memory_object() {
+        // The minted rights must be accepted by the handle table for a
+        // MemoryObject (no principal bits outside the MAP_* band).
+        init_global_heap();
+        let t = HandleTable::try_new(0xFEED_FACE_CAFE_BEEF).unwrap();
+        let m = crate::object::MemoryObject::try_new(PAGE_SIZE).unwrap();
+        let ptr = KBox::into_raw(m).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, ptr, KObjectType::MemoryObject, full_mem_rights())
+            .expect("full_mem_rights must be valid for a MemoryObject");
+        // Clean up: close releases the handle's ref, freeing the object.
+        let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 }

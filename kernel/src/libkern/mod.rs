@@ -21,10 +21,12 @@ pub mod handle;
 pub mod kbox;
 pub mod kstring;
 pub mod kvec;
+pub mod memory;
 pub mod spinlock;
 
 pub use handle::{KObjectType, RawHandle, Rights};
 pub use kbox::KBox;
+pub use memory::MemFlags;
 pub use kstring::KString;
 pub use kvec::KVec;
 pub use spinlock::{SpinLock, SpinLockGuard};
