@@ -218,15 +218,16 @@ extern "C" fn syscall_entry() -> ! {
         "pop rcx",                  // user RIP for sysretq
         "pop rax",                  // return value
         "pop rsp",                  // restore user RSP
-        // Zero caller-saved scratch we don't deliberately return, so no
-        // kernel value leaks to ring 3. RAX (return), RCX (RIP), R11
-        // (RFLAGS) are intended; RBX/RBP/R12-R15 hold the user's values.
-        "xor edx, edx",
-        "xor esi, esi",
-        "xor edi, edi",
-        "xor r8d, r8d",
-        "xor r9d, r9d",
-        "xor r10d, r10d",
+        // Every GPR has now been restored to the user's own saved value
+        // (the pops above), except RAX (return value), RCX (user RIP), and
+        // R11 (user RFLAGS) which `sysretq` consumes. Nothing kernel-private
+        // is left in any register, so no scrubbing is needed — and the ABI
+        // contract that all GPRs but RCX/R11/RAX are preserved across a
+        // syscall (`docs/spec/syscall-abi.md`) holds. (An earlier version
+        // zeroed RDX/RSI/RDI/R8/R9/R10 here; that destroyed the user's own
+        // restored argument registers and broke multi-syscall callers, while
+        // leaking nothing — the popped values are the user's, not kernel
+        // scratch. Removed; see the decision log.)
         "swapgs",
         "sysretq",
         scratch  = const OFF_SCRATCH,

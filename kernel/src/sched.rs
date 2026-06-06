@@ -341,6 +341,23 @@ pub fn current_owner_pid() -> u32 {
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.owner_pid()
 }
 
+/// The [`Process`](crate::object::Process) owning the currently running
+/// thread, if it has one (`None` for kernel/boot threads). Valid during a
+/// syscall: the current thread is the calling user thread, so this is the
+/// process whose address space and handles the call operates on. Takes only
+/// the rank-1 run-queue lock; the returned [`ObjectRef`](crate::object::ObjectRef)
+/// is cloned under the lock and outlives it. Handle/memory syscalls call this
+/// first, then take lower-rank locks (handle-table rank-3, AS rank-4), never
+/// nesting upward.
+pub fn current_process() -> Option<ObjectRef> {
+    let g = SCHED.lock();
+    let cur = g.current.as_ref().expect("current set when a thread runs");
+    // SAFETY: as `current_owner_pid` — `current` is pinned and the run-queue
+    // lock serialises Thread access; `process_ref` clones the stored
+    // `ObjectRef` (bumping the process refcount) under the lock.
+    unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.process_ref()
+}
+
 /// Rust entry reached from
 /// [`thread_trampoline`](crate::arch::thread_trampoline) the first time a
 /// thread is scheduled. Runs the thread body, then exits cleanly if it

@@ -2229,3 +2229,85 @@ Verified: `cargo xtask check-arch` clean, `build` clean, `test` (278 host
 tests, incl. 13 new handle-syscall/`HandleInfo` tests) green, and `qemu` boots
 through `global handle table up` to `hello from ring 3 (pid 1)` with no
 regressions.
+
+---
+
+## 2026-06-05 — Phase 1, slice 13: memory objects
+
+The first kernel object userspace can *create*: `MemoryObject` plus
+`sys_memory_create` (4) / `sys_memory_map` (5) / `sys_memory_unmap` (6). This
+reaches the "userspace can allocate memory now" milestone and is where the
+handle-operation syscalls (0–3) first run end-to-end in ring 3 — `hello` now
+creates a memory object, maps it, round-trips a byte through the mapped page,
+then `stat`/`duplicate`/`restrict`/`close`es the handle. (`kernel/src/object/
+memory_object.rs`, `libkern/memory.rs`, `mm/{vmm,addr_space}.rs`,
+`syscall/table.rs`, `sched.rs`, `object/{process,thread}.rs`, `userspace/hello`.)
+
+Decisions worth recording:
+
+- **A `MemoryObject` owns its frames.** `create` eagerly allocates + zeroes the
+  object's physical frames (a `KVec<PhysAddr>`); the object owns them and frees
+  them on its last-ref drop. `map` installs PTEs pointing at *those* frames
+  (`AddressSpace::map_object`) and records a `Vma` holding an `ObjectRef`;
+  `unmap` removes the PTEs but never frees the frames. So mapping the same
+  object twice — or, once a second process exists, in two address spaces —
+  aliases the same physical memory. The alternative (anonymous per-mapping
+  frames, reusing `map_vma`) was rejected: it would make the handle a mere
+  "give me fresh memory" token with no real sharing, requiring rework when
+  `sys_process_spawn`/IPC arrive.
+
+- **Per-frame buddy allocation, not one contiguous block.** The buddy caps at
+  `MAX_ORDER` (4 MiB) and contiguous allocation rounds to powers of two;
+  per-frame (`buddy_alloc(0)` × npages) supports the 16 MiB `MAX_SIZE` and a
+  fragmented heap. The map/unmap loops index `frames[i]` per page.
+
+- **`MappingKind::Object` + a `Vma.object` field.** The owning `ObjectRef` lives
+  in a new `Vma.object: Option<ObjectRef>` rather than inside `MappingKind`, so
+  the enum stays `Copy`/`Eq`. `free_vma_pages` branches on the kind: anonymous
+  frees frames, object does not (the `Vma`'s `ObjectRef` drop releases them via
+  the object). `unmap_covering` and the address-space `Drop` are thus correct
+  for both kinds with no separate unmap path.
+
+- **`find_free_range` + an mmap window.** `hint == 0` ("anywhere") scans the VMA
+  tree for the first gap in `[MMAP_BASE = 0x1_0000_0000, DEFAULT_USER_STACK_TOP
+  − stack)`, above the ELF image and below the stack.
+
+- **`current_process()` resolution.** A small `sched::current_process()` (clones
+  the current thread's `Process` `ObjectRef`) + `Process::address_space()` lets
+  the map/unmap handlers reach the calling process's interior-mutable
+  `AddressSpace`. This is the shared primitive the sequencing note in the
+  handle-ops slice anticipated.
+
+- **TLB flush in the handlers, not the AS layer.** `map_object`/`free_vma_pages`
+  issue no privileged instructions (so they stay host-testable against a real
+  PML4 via `translate`); the syscall handlers `flush_tlb_all()` after a
+  successful map/unmap, since the calling process's address space is active.
+
+- **Syscall-ABI fix: preserve the argument registers across `syscall`.** The
+  x86_64 entry stub previously zeroed `RDX`/`RSI`/`RDI`/`R8`/`R9`/`R10` just
+  before `sysretq`. Those had already been restored to the user's own saved
+  values by the preceding pops, so the zeroing leaked nothing — but it
+  destroyed the caller's registers and broke any userspace code making
+  sequential syscalls with register reuse (it surfaced as garbage once `hello`
+  issued many calls). It also violated the documented contract
+  (`docs/spec/syscall-abi.md`: "the kernel saves and restores all other
+  general-purpose registers"). Removed the zeroing; every GPR handed to ring 3
+  is now the user's own saved value or an intended return (`RAX`/`RCX`/`R11`).
+  Userspace syscall wrappers need only declare `RCX`/`R11` clobbered.
+
+- **`MemFlags` reserved.** `#[repr(transparent)] u64`; no flags defined yet, and
+  `create` rejects any unknown bit (`from_bits` → `InvalidArgument`) so the slot
+  stays forward-compatible.
+
+- **`unmap` ignores `size` (Phase 1).** It unmaps the whole VMA covering `addr`;
+  partial/splitting unmap is a TODO. Documented in the spec.
+
+**ABI-hash impact: none.** `KObjectType::MemoryObject = 4` discriminant is
+unchanged; `MemFlags` and `Vma` are not hashed types; syscall numbers and the
+syscall register convention are not hash inputs.
+
+Verified: `cargo xtask check-arch` clean; `build` clean; `test` (292 host
+tests, incl. new `MemoryObject`/`MemFlags`/`find_free_range`/`map_object`
+aliasing/`round_up_page` tests) green; `qemu` boots through `global handle
+table up` → `hello from ring 3 (pid 1)` → `memory: roundtrip ok` →
+`handle-ops ok` → `memory: unmap ok` with no regressions.

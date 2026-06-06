@@ -19,6 +19,7 @@ use core::ptr::NonNull;
 
 use crate::libkern::KBox;
 use crate::mm::{PAGE_SIZE, VirtAddr};
+use crate::object::ObjectRef;
 
 /// A half-open range of virtual addresses, `[start, end)`.
 ///
@@ -166,16 +167,24 @@ impl core::ops::BitOr for Protection {
 
 /// What backs a [`Vma`]'s pages.
 ///
-/// Only `Anonymous` is defined today. `FileBacked(Handle)` lands with
-/// the page-cache and fs-server integration in Phase 2; `Device(PhysAddr)`
-/// lands with the driver MMIO mapper. The enum is open to extension:
-/// adding a variant only touches the call sites that need to act on the
-/// new backing kind.
+/// `FileBacked(Handle)` lands with the page-cache and fs-server integration
+/// in Phase 2; `Device(PhysAddr)` lands with the driver MMIO mapper. The enum
+/// is a `Copy` marker — the per-mapping owning reference for [`Object`] lives
+/// in [`Vma::object`], not here, so the enum stays `Copy`/`Eq`. Adding a
+/// variant only touches the call sites that need to act on the new backing
+/// kind (notably the `match` in `AddressSpace::free_vma_pages`).
+///
+/// [`Object`]: MappingKind::Object
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MappingKind {
-    /// Zero-initialised on first touch; backed by anonymous physical
-    /// frames allocated lazily through the buddy.
+    /// Zero-initialised; backed by anonymous physical frames owned by the
+    /// VMA itself (allocated at map time, freed on unmap).
     Anonymous,
+    /// Backed by a [`MemoryObject`](crate::object::MemoryObject)'s own,
+    /// pre-allocated frames. The owning [`ObjectRef`] is held in
+    /// [`Vma::object`]; the frames are freed by the object on its last-ref
+    /// drop, **not** by unmap.
+    Object,
 }
 
 /// Red-black tree node colour for the intrusive link in [`Vma`].
@@ -261,6 +270,12 @@ pub struct Vma {
     pub range: VAddrRange,
     pub prot: Protection,
     pub mapping: MappingKind,
+    /// `Some(_)` iff `mapping == MappingKind::Object`: the owning reference to
+    /// the backing [`MemoryObject`](crate::object::MemoryObject), held so its
+    /// frames outlive this mapping. Dropped when the VMA is freed (unmap or
+    /// address-space teardown), releasing one object reference. `None` for
+    /// anonymous mappings.
+    pub object: Option<ObjectRef>,
     link: RbLink,
 }
 
@@ -270,6 +285,19 @@ impl Vma {
             range,
             prot,
             mapping,
+            object: None,
+            link: RbLink::new(range.end()),
+        }
+    }
+
+    /// Construct an object-backed VMA holding `object` alive for its lifetime.
+    /// Not `const` because it stores a (non-`const`) [`ObjectRef`].
+    pub fn new_object(range: VAddrRange, prot: Protection, object: ObjectRef) -> Self {
+        Self {
+            range,
+            prot,
+            mapping: MappingKind::Object,
+            object: Some(object),
             link: RbLink::new(range.end()),
         }
     }
@@ -446,6 +474,46 @@ impl VmaTree {
         }
         // SAFETY: live link, lifetime tied to `&self`.
         best.map(|n| unsafe { n.as_ref() })
+    }
+
+    /// Find the lowest page-aligned gap of `size` bytes within `[min, max)`
+    /// not covered by any existing VMA, for `sys_memory_map(hint = 0)`.
+    ///
+    /// O(n) scan of the VMAs in ascending order (the common Phase 1 case has
+    /// a handful of mappings). Returns `None` if no gap fits. The produced
+    /// range is page-aligned: the cursor starts at `min` (a page-aligned
+    /// base) and only ever advances to a VMA's `range.end()`, which the
+    /// [`VAddrRange`] invariant keeps page-aligned.
+    pub fn find_free_range(
+        &self,
+        min: VirtAddr,
+        max: VirtAddr,
+        size: u64,
+    ) -> Option<VAddrRange> {
+        let max = max.as_u64();
+        let mut cursor = min.as_u64();
+        for v in self.iter() {
+            let s = v.range.start().as_u64();
+            let e = v.range.end().as_u64();
+            if e <= cursor {
+                // Entirely behind the cursor; skip.
+                continue;
+            }
+            // The gap [cursor, s) precedes this VMA. Does `size` fit in it?
+            if s >= cursor.saturating_add(size) {
+                break;
+            }
+            // Overlaps the cursor — jump past it and keep looking.
+            cursor = e;
+            if cursor.saturating_add(size) > max {
+                return None;
+            }
+        }
+        if cursor.saturating_add(size) <= max {
+            VAddrRange::new(VirtAddr::new(cursor), VirtAddr::new(cursor + size))
+        } else {
+            None
+        }
     }
 
     /// In-order iterator over every `Vma` in the tree, by ascending

@@ -233,6 +233,14 @@ impl Thread {
         self.owner_pid
     }
 
+    /// Clone the owning [`Process`](crate::object::Process) reference, if this
+    /// is a user thread. Bumps the process refcount; `None` for kernel/boot
+    /// threads. Used by [`sched::current_process`](crate::sched::current_process)
+    /// to reach the calling process's address space from a syscall.
+    pub fn process_ref(&self) -> Option<ObjectRef> {
+        self.process.clone()
+    }
+
     // --- Scheduler-only field accessors --------------------------------
     //
     // Each takes the type-erased object pointer (`ObjectRef::as_ptr()`) and

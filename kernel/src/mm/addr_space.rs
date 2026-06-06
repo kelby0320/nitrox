@@ -46,11 +46,23 @@
 use core::ptr;
 
 use crate::arch::Paging;
-use crate::arch::abi::USER_VIRT_END;
+use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_VIRT_END};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
+use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, SpinLock};
-use crate::mm::vmm::{MappingKind, Protection, Vma, VmaTree};
+use crate::mm::vmm::{MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
+use crate::object::{MemoryObject, ObjectRef};
+
+/// Base of the `hint == 0` ("anywhere") mapping window for
+/// [`AddressSpace::find_free_range`]: above the ELF image (loaded at
+/// `0x40_0000`) and well below the default user stack. See `arch::abi`.
+const MMAP_BASE: u64 = 0x1_0000_0000;
+
+/// Exclusive upper bound of the mapping window — kept below the default user
+/// stack region so an "anywhere" mapping can never collide with the stack the
+/// ELF loader installs near [`DEFAULT_USER_STACK_TOP`].
+const MMAP_MAX: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE;
 
 /// Why [`AddressSpace::map_vma`] could not install a mapping.
 ///
@@ -223,6 +235,116 @@ impl AddressSpace {
         }
     }
 
+    /// Map a [`MemoryObject`]'s **own** frames over `range`, holding `object`
+    /// alive for the mapping's lifetime. Unlike [`map_vma`](Self::map_vma)
+    /// this allocates and zeroes **nothing** — it installs PTEs pointing at
+    /// the object's pre-allocated frames — so mapping the same object twice
+    /// aliases the same physical memory. The recorded VMA owns `object`; the
+    /// frames are freed by the object on its last-ref drop, not by unmap.
+    ///
+    /// `object` must reference a [`MemoryObject`] with at least
+    /// `range.pages()` frames (the syscall layer checks `size <= obj.size`).
+    /// On any failure the `object` reference is handed back in the error
+    /// tuple so the caller can drop it.
+    pub fn map_object(
+        &self,
+        range: VAddrRange,
+        prot: Protection,
+        object: ObjectRef,
+    ) -> Result<(), (ObjectRef, MapError)> {
+        // Canonicality / user-half checks (as map_vma), before consuming
+        // anything — `object` is returned untouched on rejection.
+        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
+        if !range.start().is_canonical() || !last_byte.is_canonical() {
+            return Err((object, MapError::NotCanonical));
+        }
+        if range.end().as_u64() > USER_VIRT_END {
+            return Err((object, MapError::NotUserHalf));
+        }
+
+        // Read the backing frames through the live object. The slice is
+        // derived from a raw pointer, so its lifetime is not tied to
+        // `object`'s ownership — we may move `object` into the VMA later
+        // while still holding `frames` for the install loop.
+        debug_assert_eq!(object.object_type(), KObjectType::MemoryObject);
+        // SAFETY: `object` holds a reference to a live `MemoryObject` (its
+        // header is at offset 0); we only read its frame list.
+        let mobj = unsafe { &*(object.as_ptr() as *const MemoryObject) };
+        let frames = mobj.frames();
+        let npages = range.pages();
+        debug_assert!(frames.len() as u64 >= npages, "object too small for range");
+
+        // Build the VMA box (with no object yet) BEFORE taking the lock — the
+        // no-alloc-under-spinlock rule. This is the only fallible step that
+        // happens before `object` is consumed, so its failure path can still
+        // return `object`.
+        let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::Object)) {
+            Ok(b) => b,
+            Err(_) => return Err((object, MapError::OutOfMemory)),
+        };
+
+        let mut guard = self.inner.lock();
+
+        if guard.vma_tree.find_first_overlapping(range).is_some() {
+            return Err((object, MapError::Overlap));
+        }
+
+        let flags = protection_to_page_flags(prot);
+        let root = guard.root;
+        let mut installed: u64 = 0;
+
+        for i in 0..npages {
+            let virt = VirtAddr::new(range.start().as_u64() + i * (PAGE_SIZE as u64));
+            // SAFETY: `root` is this AS's PML4; `frames[i]` is owned by the
+            // `MemoryObject` the VMA will keep alive; `virt` is in the
+            // validated canonical user-half range. Aliasing a frame already
+            // mapped elsewhere is intended (shared memory). No frame is
+            // allocated or zeroed here — the object owns them.
+            match unsafe { Paging::map_page(root, virt, frames[i as usize], flags) } {
+                Ok(()) => installed += 1,
+                Err(ArchMapError::OutOfMemory) => {
+                    rollback_object_map(root, range.start(), installed);
+                    return Err((object, MapError::OutOfMemory));
+                }
+                Err(ArchMapError::AlreadyMapped) => {
+                    // Impossible: overlap was pre-checked under the lock.
+                    unreachable!(
+                        "ArchPaging::map_page returned AlreadyMapped after VmaTree overlap pre-check"
+                    );
+                }
+                Err(ArchMapError::Misaligned) => {
+                    // Impossible: VAddrRange enforces page alignment.
+                    unreachable!(
+                        "ArchPaging::map_page returned Misaligned for a page-aligned per-page address"
+                    );
+                }
+            }
+        }
+
+        // PTEs are in; now move `object` into the VMA and commit to the tree.
+        boxed.object = Some(object);
+        match guard.vma_tree.insert(boxed) {
+            Ok(()) => Ok(()),
+            Err(mut b) => {
+                rollback_object_map(root, range.start(), installed);
+                let object = b
+                    .object
+                    .take()
+                    .expect("object-backed VMA carries its ObjectRef");
+                Err((object, MapError::Overlap))
+            }
+        }
+    }
+
+    /// Find the lowest free virtual range of `size` bytes in the "anywhere"
+    /// mapping window (`[MMAP_BASE, MMAP_MAX)`), for `sys_memory_map(hint=0)`.
+    pub fn find_free_range(&self, size: u64) -> Option<VAddrRange> {
+        let guard = self.inner.lock();
+        guard
+            .vma_tree
+            .find_free_range(VirtAddr::new(MMAP_BASE), VirtAddr::new(MMAP_MAX), size)
+    }
+
     /// Remove the VMA covering `addr`: drop it from the tree, then walk
     /// its range uninstalling every PTE and freeing the backing frame
     /// (for anonymous mappings). Returns the VMA box, or `None` if no
@@ -275,6 +397,11 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
         if let Ok(phys) = r {
             match vma.mapping {
                 MappingKind::Anonymous => heap::buddy_free(phys, 0),
+                // Object-backed: the frames are owned by the `MemoryObject`
+                // (held alive by `vma.object`). They are freed by the object
+                // on its last-ref drop — which includes this VMA's `object`
+                // reference being released when `vma` drops — never here.
+                MappingKind::Object => {}
             }
         }
     }
@@ -292,6 +419,20 @@ fn rollback_partial_map(root: PhysAddr, start: VirtAddr, installed: u64) {
         if let Ok(phys) = r {
             heap::buddy_free(phys, 0);
         }
+    }
+}
+
+/// Roll back a partial [`map_object`](AddressSpace::map_object): uninstall the
+/// `installed` PTEs starting at `start`. Like [`rollback_partial_map`] but
+/// **does not free the frames** — they belong to the `MemoryObject`, not the
+/// mapping.
+fn rollback_object_map(root: PhysAddr, start: VirtAddr, installed: u64) {
+    for i in 0..installed {
+        let virt = VirtAddr::new(start.as_u64() + i * (PAGE_SIZE as u64));
+        // SAFETY: we successfully installed exactly these `installed` pages in
+        // `map_object` immediately before this call. The returned phys is the
+        // object's frame, which the object still owns — discard it.
+        let _ = unsafe { Paging::unmap_page(root, virt) };
     }
 }
 
@@ -487,5 +628,97 @@ mod tests {
             }
             // Drop runs at end of iteration.
         }
+    }
+
+    // --- Object-backed mappings --------------------------------------
+
+    use crate::object::header::test_probe;
+
+    /// Adopt a `MemoryObject`'s creation reference into an `ObjectRef`.
+    fn into_obj(m: KBox<MemoryObject>) -> ObjectRef {
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(KBox::into_raw(m).as_ptr() as *mut (), KObjectType::MemoryObject)
+        }
+    }
+
+    fn uprot() -> Protection {
+        Protection::WRITE | Protection::USER
+    }
+
+    #[test]
+    fn map_object_points_ptes_at_object_frames() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let m = MemoryObject::try_new(PAGE as usize * 3).unwrap();
+        let frames = [m.frames()[0], m.frames()[1], m.frames()[2]];
+        let obj = into_obj(m);
+
+        asp.map_object(range(PAGE * 4, PAGE * 7), uprot(), obj)
+            .expect("map_object must succeed");
+
+        // Each mapped page translates to the object's own frame — not a
+        // freshly allocated one (this is what makes the object shareable).
+        for i in 0..3u64 {
+            let phys = unsafe { translate(asp.root(), va(PAGE * (4 + i))) }
+                .expect("page must be mapped");
+            assert_eq!(phys, frames[i as usize], "page {i} not pointing at object frame");
+        }
+        assert_eq!(asp.len(), 1);
+    }
+
+    #[test]
+    fn map_object_twice_aliases_same_frame() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let m = MemoryObject::try_new(PAGE as usize).unwrap();
+        let frame0 = m.frames()[0];
+        let obj = into_obj(m);
+        let obj2 = obj.clone(); // second mapping needs its own reference
+
+        asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
+        asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), obj2).unwrap();
+
+        let p1 = unsafe { translate(asp.root(), va(PAGE * 4)) }.unwrap();
+        let p2 = unsafe { translate(asp.root(), va(PAGE * 8)) }.unwrap();
+        assert_eq!(p1, frame0);
+        assert_eq!(p2, frame0);
+        assert_eq!(p1, p2, "two mappings of one object must alias the same frame");
+    }
+
+    #[test]
+    fn unmap_object_mapping_does_not_free_the_objects_frames() {
+        init_global_heap();
+        test_probe::reset();
+        let asp = AddressSpace::new().unwrap();
+        let m = MemoryObject::try_new(PAGE as usize).unwrap();
+        let obj = into_obj(m);
+        // Hold an extra reference so unmapping (which drops the VMA's ref)
+        // does not destroy the object — then we can prove it survived.
+        let keep = obj.clone();
+
+        asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
+        let removed = asp
+            .unmap_covering(va(PAGE * 4))
+            .expect("unmap must find the covering vma");
+        // PTE is gone.
+        assert!(unsafe { translate(asp.root(), va(PAGE * 4)) }.is_none());
+        // Dropping the removed VMA releases its object reference, but `keep`
+        // still holds one — the object (and its frames) must NOT be freed.
+        drop(removed);
+        assert_eq!(test_probe::memory_object_destroys(), 0, "unmap freed shared frames");
+        // The last reference now drops: object destroyed, frames freed.
+        drop(keep);
+        assert_eq!(test_probe::memory_object_destroys(), 1);
+    }
+
+    #[test]
+    fn find_free_range_picks_a_gap_in_the_mmap_window() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        // An empty AS yields the window base.
+        let r = asp.find_free_range(PAGE).expect("empty AS has room");
+        assert_eq!(r.start().as_u64(), MMAP_BASE);
+        assert_eq!(r.len(), PAGE);
     }
 }

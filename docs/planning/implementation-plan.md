@@ -455,17 +455,23 @@ Synchronous; no blocking dependencies. First slice with a real
 **and its handle** (tagged with the caller's pid) and returns it, so this is
 also where the handle syscalls first run end-to-end in ring 3.
 
-- [ ] `current_process()` → `AddressSpace` resolution (current thread →
+- [x] `current_process()` → `AddressSpace` resolution (current thread →
       `Process`; the small shared primitive, on top of the handle-ops slice's
       `sched::current_owner_pid`). `sys_memory_map` maps into it.
-- [ ] `MemoryObject` kernel object
-- [ ] `sys_memory_create` (allocates the object + a handle in the global table)
-- [ ] `sys_memory_map` / `sys_memory_unmap`
-- [ ] Userspace can allocate memory now
-- [ ] Handle-ops ring-3 exercise: `hello` (or successor) calls
-      `sys_memory_create` then `sys_handle_stat`/`duplicate`/`restrict`/`close`
-      on the returned handle — the end-to-end proof deferred from the handle-ops
-      slice.
+- [x] `MemoryObject` kernel object — **owns its frames** (eager alloc + zero;
+      freed on last-ref drop); mapped via `AddressSpace::map_object` (a
+      `MappingKind::Object` VMA holding an `ObjectRef`), so double-map aliases.
+- [x] `sys_memory_create` (allocates the object + a handle in the global table)
+- [x] `sys_memory_map` / `sys_memory_unmap` (numbers 5/6; `unmap` whole-VMA in
+      Phase 1, `size` not yet honored)
+- [x] Userspace can allocate memory now
+- [x] Handle-ops ring-3 exercise: `hello` calls `sys_memory_create` →
+      `sys_memory_map`, round-trips a byte through the mapped page, then
+      `sys_handle_stat`/`duplicate`/`restrict`/`close` on the handle — the
+      end-to-end proof deferred from the handle-ops slice.
+- [x] Fixed a syscall-ABI bug surfaced by the ring-3 exercise: the entry stub
+      no longer zeroes the argument registers on `sysretq` (it preserves all
+      GPRs but `RAX`/`RCX`/`R11`, per the spec). See the decision log.
 
 #### Architecture trait completion
 

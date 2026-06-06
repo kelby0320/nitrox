@@ -22,7 +22,7 @@ Syscall entry uses the `syscall` instruction. Register conventions follow System
 
 Syscalls take at most 6 arguments. Calls requiring more pass a pointer to a struct containing the additional fields.
 
-`RCX` and `R11` are clobbered by the `syscall` instruction (saved RIP and RFLAGS respectively). The kernel saves and restores all other general-purpose registers.
+`RCX` and `R11` are clobbered by the `syscall` instruction (saved RIP and RFLAGS respectively). The kernel saves and restores **all** other general-purpose registers (including the argument registers `RDI`/`RSI`/`RDX`/`R10`/`R8`/`R9`), so apart from `RAX` (the return value) and the `syscall`-clobbered `RCX`/`R11`, every register a caller holds across a `syscall` is preserved. (Userspace syscall wrappers therefore need only declare `RCX`/`R11` clobbered and `RAX` as the result.)
 
 The kernel preserves the user thread's FS_BASE across syscall entry/exit. The kernel uses `swapgs` to swap GS_BASE for per-CPU kernel data.
 
@@ -76,6 +76,9 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `1` | `sys_handle_duplicate` |
 | `2` | `sys_handle_restrict` |
 | `3` | `sys_handle_stat` |
+| `4` | `sys_memory_create` |
+| `5` | `sys_memory_map` |
+| `6` | `sys_memory_unmap` |
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -233,7 +236,7 @@ Extends the deadline before the kernel auto-terminates a suspended thread. Used 
 ```rust
 fn sys_memory_create(size: usize, flags: MemFlags) -> isize
 ```
-Allocates a `MemoryObject` of `size` bytes (rounded up to page size). Returns a handle.
+Allocates a `MemoryObject` of `size` bytes (rounded up to page size), zero-filled, owned by the calling process; the object owns its physical frames for its lifetime. Returns a handle with full rights (`MAP_READ | MAP_WRITE | MAP_EXEC | DUPLICATE | INSPECT | TRANSFER`). `MemFlags` is a reserved `#[repr(transparent)]` bitflags `u64`; **no flags are defined yet, so `flags` must be `0`** — any set bit returns `InvalidArgument`. `size` of `0` returns `InvalidArgument`; `size` above the Phase 1 cap (16 MiB) returns `TooLarge`.
 
 ```rust
 fn sys_memory_map(
@@ -243,12 +246,12 @@ fn sys_memory_map(
     rights: Rights,
 ) -> isize
 ```
-Maps `obj` into the calling process's address space. `hint` is an advisory address (`0` for "anywhere"). `rights` must be ⊆ `obj`'s rights. Returns the mapped virtual address.
+Maps `obj`'s frames into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window). `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), else `NoAccess`. `size` is rounded up to a page and must be ≤ the object's size. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
 
 ```rust
 fn sys_memory_unmap(addr: usize, size: usize) -> isize
 ```
-Unmaps the region `[addr, addr+size)`.
+Unmaps the mapping at `addr`. **Phase 1 unmaps the whole VMA covering `addr`; the `size` argument is not yet honored** (partial/splitting unmap is a later refinement — see the kernel TODO). Returns `0`, or `InvalidArgument` if nothing is mapped at `addr`. For an object-backed mapping the object's frames are *not* freed — they are released when the object's last handle/mapping is dropped.
 
 ### IPC
 
