@@ -28,8 +28,8 @@
 //!    is visible to every AS — no shootdown step, no per-AS
 //!    coordination.
 
+use crate::arch::Paging;
 use crate::arch::paging::ArchPaging;
-use crate::arch::{Paging, active_root};
 use crate::libkern::{AllocError, SpinLock};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 
@@ -63,7 +63,7 @@ static VMAP_NEXT: SpinLock<u64> = SpinLock::new(KERNEL_VMAP_START);
 /// (must influence the snapshot). The single CPU running boot code
 /// is the only mutator of the live PML4 at this point.
 pub unsafe fn init() {
-    let root = active_root();
+    let root = Paging::active_root();
     // SAFETY: forwarded from this function's contract. Allocating a
     // PDPT under the PML4 entry covering KERNEL_VMAP_START is sound
     // because (a) no AS has been built yet, so there is no captured

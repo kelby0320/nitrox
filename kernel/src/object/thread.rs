@@ -22,6 +22,7 @@
 
 use crate::arch::{ArchThreadContext, fabricate_frame, thread_trampoline};
 use crate::libkern::handle::KObjectType;
+use crate::arch::paging::ArchPaging;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
 use crate::mm::kstack::KernelStack;
@@ -152,7 +153,7 @@ impl Thread {
     ) -> Result<KBox<Self>, AllocError> {
         // Kernel threads share the active (boot) PML4; the stack maps into
         // the shared kernel vmap, visible from every address space.
-        let stack = KernelStack::new(crate::arch::active_root())?;
+        let stack = KernelStack::new(crate::arch::Paging::active_root())?;
         let top = stack.top().as_u64();
         // SAFETY: a freshly allocated `KernelStack` has its top
         // `KERNEL_STACK_PAGES` pages mapped writable in the shared kernel

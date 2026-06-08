@@ -47,7 +47,8 @@ use crate::arch::abi::{
     DEFAULT_USER_STACK_SIZE as STACK_SIZE, DEFAULT_USER_STACK_TOP as STACK_TOP, E_MACHINE,
     USER_VIRT_END,
 };
-use crate::arch::translate;
+use crate::arch::Paging;
+use crate::arch::paging::ArchPaging;
 use crate::libkern::KBox;
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::heap;
@@ -347,7 +348,7 @@ fn map_load_segment(
         // we just mapped (validated `aligned_start..aligned_end`
         // covers `[p_vaddr, p_vaddr + p_memsz)`), so translate must
         // succeed.
-        let phys = unsafe { translate(root, VirtAddr::new(va)) }
+        let phys = unsafe { Paging::translate(root, VirtAddr::new(va)) }
             .expect("just-mapped virtual address must translate");
 
         // SAFETY: `phys` is a freshly-allocated frame owned by `asp`;
@@ -509,7 +510,7 @@ mod tests {
     }
 
     fn read_user_byte(asp: &AddressSpace, virt: VirtAddr) -> u8 {
-        let phys = unsafe { translate(asp.root(), virt) }
+        let phys = unsafe { Paging::translate(asp.root(), virt) }
             .expect("address must be mapped for the test to read it");
         unsafe { *((phys.as_u64() + heap::hhdm_offset()) as *const u8) }
     }

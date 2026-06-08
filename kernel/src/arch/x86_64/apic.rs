@@ -18,7 +18,7 @@ use crate::arch::irq::{ArchIrq, SPURIOUS_VECTOR};
 use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::arch::x86_64::cpu::X86Cpu;
 use crate::arch::x86_64::regs;
-use crate::arch::{Paging, active_root};
+use crate::arch::Paging;
 use crate::libkern::AllocError;
 use crate::mm::{PAGE_SIZE, PhysAddr, kvmap};
 
@@ -97,7 +97,7 @@ impl ArchIrq for XApic {
         // the LAPIC's MMIO frame from the MSR; mapping into the boot root is
         // visible from every address space (shared kernel-half PDPTs). Any
         // failure is an out-of-memory condition for the intermediate tables.
-        unsafe { Paging::map_page(active_root(), va, phys, flags) }.map_err(|_| AllocError)?;
+        unsafe { Paging::map_page(Paging::active_root(), va, phys, flags) }.map_err(|_| AllocError)?;
         debug_assert!(PAGE_SIZE >= 0x400, "LAPIC register file fits in one page");
         LAPIC_BASE.store(va.as_u64(), Ordering::Relaxed);
 

@@ -84,19 +84,20 @@ Keep **free functions / plain modules** for:
 - **Stateful singletons** — `serial` (a `SERIAL` lock + log macros).
 - **Pure data** — `abi` (constants).
 
-> **Normalization in progress.** Some legacy free functions pre-date this rule
-> and still sit beside the trait they belong to — the paging companions
-> (`translate`, `active_root`, `init_kernel_template`) and the CPU boot fns
-> (`init_cpu_tables`, `init_protections`, `set_kernel_stack`, `halt_loop`). The
-> "Arch boundary normalization" slice folds them into `ArchPaging`/`ArchCpu`.
-> New arch surface should follow the rule above from the start.
-
 ## Examples
 
 ```rust
-// OK — neutral interface:
-use crate::arch::{halt_loop, init_cpu_tables, set_kernel_stack};
-crate::arch::active_root();
+// OK — neutral interface. Behavioural subsystems are trait methods reached
+// through the re-exported alias (the trait must be in scope to call them):
+use crate::arch::{Cpu, Paging};
+use crate::arch::cpu::ArchCpu;
+use crate::arch::paging::ArchPaging;
+Cpu::init_tables();
+Cpu::halt_loop();
+let root = Paging::active_root();
+
+// OK — neutral data/singleton modules:
+use crate::arch::{abi, serial};
 
 // COMPILE ERROR — module `x86_64` is private:
 use crate::arch::x86_64::gdt;

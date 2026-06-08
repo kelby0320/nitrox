@@ -14,7 +14,8 @@
 
 use std::sync::Once;
 
-use crate::arch::init_kernel_template;
+use crate::arch::Paging;
+use crate::arch::paging::ArchPaging;
 use crate::limine::{MEMMAP_USABLE, MemoryMapEntry, MemoryMapResponse};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap, slab};
 
@@ -79,6 +80,6 @@ pub fn init_global_heap() {
         // physical address equals the host virtual address, so
         // `init_kernel_template` can read 256 entries from it
         // through HHDM (which is a no-op offset).
-        unsafe { init_kernel_template(PhysAddr::new(aligned as u64)) };
+        unsafe { Paging::init_kernel_template(PhysAddr::new(aligned as u64)) };
     });
 }

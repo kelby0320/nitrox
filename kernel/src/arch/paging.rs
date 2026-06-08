@@ -94,10 +94,11 @@ pub enum UnmapError {
 
 /// Architecture page-table operations.
 ///
-/// Every method is `unsafe`: they install, remove, or switch hardware
+/// Most methods are `unsafe`: they install, remove, or switch hardware
 /// address translations and mutate live MMU state the running kernel
-/// depends on. The implementation for the active architecture is
-/// re-exported as `crate::arch::Paging`.
+/// depends on. The read-only [`active_root`](ArchPaging::active_root) is the
+/// exception (a side-effect-free `CR3` read). The implementation for the
+/// active architecture is re-exported as `crate::arch::Paging`.
 ///
 /// Neither [`map_page`](ArchPaging::map_page) nor
 /// [`unmap_page`](ArchPaging::unmap_page) flushes the TLB; the caller
@@ -176,7 +177,7 @@ pub trait ArchPaging {
     /// kernel code, stack, or higher-half direct map.
     ///
     /// On x86_64 this copies PML4 entries 256..512 from the template
-    /// captured by [`init_kernel_template`](crate::arch::init_kernel_template).
+    /// captured by [`init_kernel_template`](ArchPaging::init_kernel_template).
     /// On aarch64 (when implemented) this is a no-op: the TTBR0/TTBR1
     /// split keeps the kernel half in a separate translation register
     /// that process address spaces don't manage.
@@ -201,7 +202,7 @@ pub trait ArchPaging {
     ///
     /// Must be called for every kernel-half region whose leaves will
     /// be installed post-boot (the kernel vmap, future per-CPU data,
-    /// driver MMIO mapper) **before** [`init_kernel_template`](crate::arch::init_kernel_template)
+    /// driver MMIO mapper) **before** [`init_kernel_template`](ArchPaging::init_kernel_template)
     /// snapshots the live PML4. After that snapshot, top-level
     /// entries for the kernel half are immutable; see
     /// `docs/architecture/memory-management.md`.
@@ -215,4 +216,31 @@ pub trait ArchPaging {
         root: PhysAddr,
         virt: VirtAddr,
     ) -> Result<(), MapError>;
+
+    /// Software-walk the page-table tree rooted at `root` and return the
+    /// physical address `virt` maps to, or `None` if it is not mapped (or
+    /// not canonical). Read-only; does not touch the active MMU.
+    ///
+    /// # Safety
+    /// `root` must be the physical base of a valid top-level page table
+    /// reachable through the higher-half direct map.
+    unsafe fn translate(root: PhysAddr, virt: VirtAddr) -> Option<PhysAddr>;
+
+    /// The physical base of the page table the current CPU is using (the
+    /// address field of the architecture's page-table-root register).
+    /// Read-only.
+    fn active_root() -> PhysAddr;
+
+    /// Capture the kernel-half mappings of the currently-active top-level
+    /// page table `boot_root` into a template that
+    /// [`inherit_kernel_mappings`](ArchPaging::inherit_kernel_mappings) later
+    /// copies into every freshly-allocated address space. Runs once at boot,
+    /// after all post-boot kernel-half intermediates are pre-allocated (see
+    /// [`ensure_kernel_intermediate`](ArchPaging::ensure_kernel_intermediate)).
+    ///
+    /// # Safety
+    /// `boot_root` must be the live top-level page table reachable through
+    /// the HHDM; call exactly once during boot before any address space is
+    /// constructed.
+    unsafe fn init_kernel_template(boot_root: PhysAddr);
 }

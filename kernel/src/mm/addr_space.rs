@@ -457,7 +457,8 @@ fn protection_to_page_flags(prot: Protection) -> PageFlags {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::translate;
+    use crate::arch::Paging;
+    use crate::arch::paging::ArchPaging;
     use crate::mm::test_support::init_global_heap;
     use crate::mm::vmm::VAddrRange;
 
@@ -498,10 +499,10 @@ mod tests {
 
         // SAFETY: translate is read-only against the live tables we
         // just populated. The root is owned by `asp`.
-        let phys = unsafe { translate(asp.root(), va(PAGE * 4)) };
+        let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) };
         assert!(phys.is_some());
         // Address just past the page should be unmapped.
-        let beyond = unsafe { translate(asp.root(), va(PAGE * 5)) };
+        let beyond = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) };
         assert!(beyond.is_none());
         assert_eq!(asp.len(), 1);
     }
@@ -517,11 +518,11 @@ mod tests {
         // Each page in the range is mapped; the addresses immediately
         // before and after are not.
         for i in 8..16 {
-            let p = unsafe { translate(asp.root(), va(PAGE * i)) };
+            let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
             assert!(p.is_some(), "page {i} not mapped");
         }
-        let before = unsafe { translate(asp.root(), va(PAGE * 7)) };
-        let after = unsafe { translate(asp.root(), va(PAGE * 16)) };
+        let before = unsafe { Paging::translate(asp.root(), va(PAGE * 7)) };
+        let after = unsafe { Paging::translate(asp.root(), va(PAGE * 16)) };
         assert!(before.is_none());
         assert!(after.is_none());
     }
@@ -541,7 +542,7 @@ mod tests {
         assert!(asp.is_empty());
 
         for i in 4..8 {
-            let p = unsafe { translate(asp.root(), va(PAGE * i)) };
+            let p = unsafe { Paging::translate(asp.root(), va(PAGE * i)) };
             assert!(p.is_none(), "page {i} still mapped after unmap");
         }
     }
@@ -567,9 +568,9 @@ mod tests {
         assert_eq!(err.0.range, range(PAGE * 6, PAGE * 10));
 
         // The original mapping must be untouched.
-        assert!(unsafe { translate(asp.root(), va(PAGE * 4)) }.is_some());
+        assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_some());
         // The rejected range's pages must NOT have been installed.
-        assert!(unsafe { translate(asp.root(), va(PAGE * 9)) }.is_none());
+        assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 9)) }.is_none());
         assert_eq!(asp.len(), 1);
     }
 
@@ -660,7 +661,7 @@ mod tests {
         // Each mapped page translates to the object's own frame — not a
         // freshly allocated one (this is what makes the object shareable).
         for i in 0..3u64 {
-            let phys = unsafe { translate(asp.root(), va(PAGE * (4 + i))) }
+            let phys = unsafe { Paging::translate(asp.root(), va(PAGE * (4 + i))) }
                 .expect("page must be mapped");
             assert_eq!(phys, frames[i as usize], "page {i} not pointing at object frame");
         }
@@ -679,8 +680,8 @@ mod tests {
         asp.map_object(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
         asp.map_object(range(PAGE * 8, PAGE * 9), uprot(), obj2).unwrap();
 
-        let p1 = unsafe { translate(asp.root(), va(PAGE * 4)) }.unwrap();
-        let p2 = unsafe { translate(asp.root(), va(PAGE * 8)) }.unwrap();
+        let p1 = unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.unwrap();
+        let p2 = unsafe { Paging::translate(asp.root(), va(PAGE * 8)) }.unwrap();
         assert_eq!(p1, frame0);
         assert_eq!(p2, frame0);
         assert_eq!(p1, p2, "two mappings of one object must alias the same frame");
@@ -702,7 +703,7 @@ mod tests {
             .unmap_covering(va(PAGE * 4))
             .expect("unmap must find the covering vma");
         // PTE is gone.
-        assert!(unsafe { translate(asp.root(), va(PAGE * 4)) }.is_none());
+        assert!(unsafe { Paging::translate(asp.root(), va(PAGE * 4)) }.is_none());
         // Dropping the removed VMA releases its object reference, but `keep`
         // still holds one — the object (and its frames) must NOT be freed.
         drop(removed);

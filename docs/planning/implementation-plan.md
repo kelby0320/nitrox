@@ -509,8 +509,10 @@ the paging companions (`translate`, `active_root`, `init_kernel_template`) into
 `abi` data as free fns/modules. Re-points callers in `sched`/`mm`/`main`. See
 `docs/conventions/arch-boundary.md`.
 
-- [ ] Fold paging-companion free fns into `ArchPaging`
-- [ ] Gather CPU boot free fns into `ArchCpu`
+- [x] Fold paging-companion free fns into `ArchPaging`
+      (`translate`/`active_root`/`init_kernel_template`)
+- [x] Gather CPU boot free fns into `ArchCpu` (`init_tables`/`init_protections`/
+      `set_kernel_stack`/`halt_loop`)
 
 #### Timers and clocks
 
