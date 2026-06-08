@@ -29,8 +29,9 @@
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
+use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
-use crate::arch::{Paging, context_switch};
+use crate::arch::{Cpu, Paging, context_switch};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::PhysAddr;
@@ -98,7 +99,7 @@ pub fn init() -> Result<(), AllocError> {
     // Cache the kernel/boot page-table root for the CR3 hook (see
     // `resolve_root`). `active_root` reads CR3 — a ring-0 op only reached at
     // real boot, never in host tests (which never call `init`).
-    BOOT_ROOT.store(crate::arch::active_root().as_u64(), Ordering::Relaxed);
+    BOOT_ROOT.store(Paging::active_root().as_u64(), Ordering::Relaxed);
 
     // Build the pre-reserved run queue OUTSIDE the lock (the only growth).
     let mut ready: KVec<ObjectRef> = KVec::new();
@@ -285,7 +286,7 @@ pub fn exit() -> ! {
         // is nothing to switch to. Halt — a defensive tripwire; in the
         // Phase 1 demo the boot thread is always queued when a worker
         // exits, so this branch is not reached.
-        None => crate::arch::halt_loop(),
+        None => Cpu::halt_loop(),
     }
 }
 
@@ -389,7 +390,7 @@ pub(crate) extern "C" fn thread_enter() -> ! {
             // stack at THIS thread's kernel stack before dropping to ring 3,
             // so syscalls/traps from ring 3 land on it. CR3 is already the
             // process address space (loaded by the scheduler on switch-in).
-            crate::arch::set_kernel_stack(ktop);
+            Cpu::set_kernel_stack(ktop);
             crate::arch::set_syscall_kernel_stack(ktop);
             // SAFETY: `entry`/`user_sp` are canonical user VAs mapped X / W
             // in the active address space; the syscall fast-path is armed.

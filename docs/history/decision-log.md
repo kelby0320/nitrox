@@ -2378,3 +2378,39 @@ no `arch::x86_64` path in `mm/`); `build` clean; `test` (293 host tests, incl.
 the new `ArchSmp` stub test) green; `qemu` boots through `local APIC up (xAPIC,
 id 0)` and the hello ring-3 flow (`memory: roundtrip ok` → `handle-ops ok` →
 `memory: unmap ok`) with no regressions.
+
+---
+
+## 2026-06-08 — Phase 1, slice 15: arch boundary normalization
+
+Pure, behaviour-preserving refactor applying the arch-boundary convention (set
+in slice 14) to the legacy free functions that pre-dated it. The neutral
+`crate::arch` surface now exposes paging and CPU operations uniformly as
+trait methods, matching `ArchPaging::map_page`.
+
+- **Paging companions → `ArchPaging`.** `translate`, `active_root`, and
+  `init_kernel_template` move from free functions in `arch/x86_64/paging.rs`
+  into the `impl ArchPaging for X86Paging` block (their bodies use the
+  module-private table-walk helpers, so they stay in that file). Reached as
+  `Paging::translate` / `Paging::active_root` / `Paging::init_kernel_template`.
+- **CPU control → `ArchCpu`.** `init_cpu_tables` (→ `Cpu::init_tables`, dropping
+  the redundant `cpu_` under `Cpu::`), `set_kernel_stack`, `halt_loop`, and
+  `init_protections` become `ArchCpu` methods in `arch/x86_64/cpu.rs`. The NX/
+  SMAP/SMEP helpers (`ensure_nxe`, `ensure_smap_smep`) and their EFER/CR4/CPUID
+  consts move from `paging.rs` to `cpu.rs` (they are CPU-feature enables, used
+  only by `init_protections`).
+- **`arch/mod.rs`** drops the folded free-fn re-exports; the neutral surface for
+  these ops is now the `Paging`/`Cpu` aliases. Callers across `main`/`sched`/
+  `thread`/`mm`/in-arch import the trait and use the method form.
+
+Unchanged, per the convention: naked-asm entry/switch glue (`context_switch`,
+`enter_user`, syscall entry), the `serial` singleton, and `abi` data stay free
+fns/modules. No logic changes anywhere.
+
+**ABI-hash impact: none** — internal arch surface only; no `export!` symbols or
+hashed type layouts/discriminants change.
+
+Verified: `cargo xtask check-arch` clean; `build` clean; `test` (293 host tests,
+now exercising `Paging::translate`/`active_root` through the trait) green; `qemu`
+boot trace byte-for-byte identical (`local APIC up (xAPIC, id 0)` → hello ring-3
+`memory: roundtrip ok` → `handle-ops ok` → `memory: unmap ok`).

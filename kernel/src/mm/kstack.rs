@@ -168,7 +168,8 @@ impl Drop for KernelStack {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::arch::translate;
+    use crate::arch::Paging;
+    use crate::arch::paging::ArchPaging;
     use crate::mm::addr_space::AddressSpace;
     use crate::mm::test_support::init_global_heap;
 
@@ -182,16 +183,16 @@ mod tests {
         for i in 0..KERNEL_STACK_PAGES as u64 {
             let v = VirtAddr::new(stack.base.as_u64() + i * PAGE_SIZE as u64);
             // SAFETY: read-only walk against the AS we just mapped into.
-            let p = unsafe { translate(asp.root(), v) };
+            let p = unsafe { Paging::translate(asp.root(), v) };
             assert!(p.is_some(), "stack page {i} not mapped");
         }
         // The guard page must NOT be mapped.
         // SAFETY: read-only walk.
-        let guard = unsafe { translate(asp.root(), stack.guard_page()) };
+        let guard = unsafe { Paging::translate(asp.root(), stack.guard_page()) };
         assert!(guard.is_none(), "guard page must be unmapped");
         // The page at `top` is past the stack and also unmapped.
         // SAFETY: read-only walk.
-        let above = unsafe { translate(asp.root(), stack.top) };
+        let above = unsafe { Paging::translate(asp.root(), stack.top) };
         assert!(above.is_none(), "page at top should be unmapped");
     }
 
@@ -247,14 +248,14 @@ mod tests {
             let stack = KernelStack::new(asp.root()).unwrap();
             // SAFETY: read-only walk.
             assert!(
-                unsafe { translate(asp.root(), stack.base) }.is_some(),
+                unsafe { Paging::translate(asp.root(), stack.base) }.is_some(),
                 "stack base must be mapped before drop"
             );
             stack.base
         }; // stack dropped here
         // SAFETY: read-only walk against the now-cleared mapping.
         assert!(
-            unsafe { translate(asp.root(), base) }.is_none(),
+            unsafe { Paging::translate(asp.root(), base) }.is_none(),
             "stack base must be unmapped after drop"
         );
     }

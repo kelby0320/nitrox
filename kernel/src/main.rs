@@ -10,7 +10,7 @@
 //!      buddy and slab allocators from Limine's memory map and HHDM,
 //!      then render the boot screen.
 //!
-//! After `kernel_main` returns, [`_start`] enters [`arch::halt_loop`]
+//! After `kernel_main` returns, [`_start`] enters [`arch::Cpu::halt_loop`]
 //! forever. The kernel does no further work in this slice; Phase 1's
 //! remaining items (paging, scheduler, syscalls, userspace) land next.
 
@@ -20,6 +20,8 @@
 use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
+use nitrox_kernel::arch::cpu::ArchCpu;
+use nitrox_kernel::arch::paging::ArchPaging;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
@@ -76,7 +78,7 @@ static REQUESTS_END: RequestsEndMarker = RequestsEndMarker::new();
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
     kernel_main();
-    arch::halt_loop();
+    arch::Cpu::halt_loop();
 }
 
 fn kernel_main() {
@@ -95,7 +97,7 @@ fn kernel_main() {
     // Install the architecture's CPU control tables (on x86_64: GDT + TSS,
     // then IDT). The ordering dependency between them lives in the arch
     // layer, not here.
-    arch::init_cpu_tables();
+    arch::Cpu::init_tables();
     kprintln!("CPU tables installed (GDT/TSS/IDT)");
 
     // Bring up the physical-memory buddy allocator and the slab on top of
@@ -346,14 +348,14 @@ fn init_memory() -> bool {
 /// half post-call. See the "Kernel-half PML4 sharing" section in
 /// `docs/architecture/memory-management.md`.
 fn paging_init() {
-    arch::init_protections();
+    arch::Cpu::init_protections();
     kprintln!("memory protections enabled");
     // SAFETY: HHDM is up (init_memory ran first) and the buddy
     // allocator is live; no AS exists yet whose captured template
     // could disagree with the new PML4 entries.
     unsafe {
         mm::kvmap::init();
-        arch::init_kernel_template(arch::active_root());
+        arch::Paging::init_kernel_template(arch::Paging::active_root());
     }
 }
 
@@ -366,14 +368,14 @@ fn paging_init() {
 /// HHDM offset of 0).
 fn paging_smoke_test() {
     // Limine's top-level page table is whatever the CPU runs on now.
-    let root = arch::active_root();
+    let root = arch::Paging::active_root();
 
     // This function's own code is certainly mapped; resolve its address.
     let probe = mm::VirtAddr::new(paging_smoke_test as fn() as usize as u64);
     // SAFETY: `root` is the live top-level page table the CPU is using,
     // reachable through the HHDM. `translate` only reads page-table
     // memory — it installs and switches nothing.
-    match unsafe { arch::translate(root, probe) } {
+    match unsafe { arch::Paging::translate(root, probe) } {
         Some(phys) => kprintln!(
             "paging: NX enabled; translate {:#x} -> {:#x}",
             probe.as_u64(),
@@ -466,5 +468,5 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = writeln!(w, "  at {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
     let _ = writeln!(w, "  {}", info.message());
-    arch::halt_loop()
+    arch::Cpu::halt_loop()
 }

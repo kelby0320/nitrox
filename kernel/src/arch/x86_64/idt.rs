@@ -38,7 +38,8 @@
 use core::arch::asm;
 use core::fmt::Write;
 
-use crate::arch::halt_loop;
+use crate::arch::Cpu;
+use crate::arch::cpu::ArchCpu;
 use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
 use crate::arch::x86_64::regs;
 use crate::arch::x86_64::serial;
@@ -352,7 +353,7 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "  r15 {:#018x}", f.r15);
     let _ = writeln!(w, "halting.");
 
-    halt_loop()
+    Cpu::halt_loop()
 }
 
 /// Build and load the IDT. Call once, early in boot, after
