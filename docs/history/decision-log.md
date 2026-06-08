@@ -2311,3 +2311,70 @@ tests, incl. new `MemoryObject`/`MemFlags`/`find_free_range`/`map_object`
 aliasing/`round_up_page` tests) green; `qemu` boots through `global handle
 table up` → `hello from ring 3 (pid 1)` → `memory: roundtrip ok` →
 `handle-ops ok` → `memory: unmap ok` with no regressions.
+
+---
+
+## 2026-06-08 — Phase 1, slice 14: architecture trait completion
+
+Added four architecture traits the timer/preemption infrastructure depends on,
+mirroring the `ArchPaging` pattern (neutral trait module `kernel/src/arch/
+<name>.rs`, x86_64 `X86<Name>` impl, neutral re-export in `arch/mod.rs`):
+`ArchIrq` (local interrupt controller), `ArchCpu` (feature detection + halt),
+`ArchUserAccess` (the SMAP copy discipline as a trait), and `ArchSmp` (a
+single-CPU stub). Interrupts stay masked (IF=0) for the whole slice — the LAPIC
+is brought up but armed with no source and no IDT IRQ handler.
+
+Decisions worth recording:
+
+- **xAPIC (MMIO), not x2APIC.** The plan first chose x2APIC (MSR-based) for its
+  simplicity (no MMIO/uncached mapping). That turned out to be **unusable in
+  the project's dev loop**: QEMU under TCG does not emulate x2APIC at all
+  (`warning: TCG doesn't support requested feature: CPUID.01H:ECX.x2apic`), and
+  the kernel deliberately keeps the QEMU dev loop on TCG (no `/dev/kvm`
+  dependency for CI/sandboxes). So `ArchIrq` uses the legacy **xAPIC** MMIO
+  controller, which TCG fully supports: read `IA32_APIC_BASE` for the register
+  page's physical base, ensure the global-enable bit, map that page uncached
+  (`PageFlags::NO_CACHE`) into the shared kernel vmap (`kvmap::vmap_alloc_pages`
+  + `Paging::map_page`), and access registers (SVR `0xF0` / EOI `0xB0` / ID
+  `0x20` / TPR `0x80`) by volatile MMIO. Still no ACPI/MADT — the controller is
+  found from the MSR. (Lesson: validate emulator feature support before picking
+  the "simpler" hardware path.)
+
+- **`ArchFpu` deferred** to the preemptive-scheduling slice, alongside its only
+  consumer — FPU save/restore in the context switch. Phase-1 userspace is
+  soft-float with one user thread, so nothing uses the FPU yet.
+
+- **Refined arch-boundary convention.** A *trait* for each behavioural
+  subsystem with genuinely divergent per-arch logic and a neutral consumer
+  (paging, cpu, irq, user-access, smp; future timer, fpu); *free functions /
+  modules* for naked-asm entry/switch glue (`context_switch`, `enter_user`, the
+  syscall entry), stateful singletons (`serial`), and pure data (`abi`). This
+  resolves the question of whether everything should be a trait: no — wrapping
+  naked stubs and singletons in all-static "namespace traits" is ceremony
+  without payoff. `ArchUserAccess` became a trait under this rule (SMAP-vs-PAN
+  is divergent, with a neutral consumer in `mm::user_access`); the SMAP asm +
+  exception table are unchanged — only the call surface is formalised.
+
+- **Arch-boundary normalization deferred to its own slice.** The existing
+  paging-companion free fns (`translate`/`active_root`/`init_kernel_template`)
+  and CPU free fns (`init_cpu_tables`/`init_protections`/`set_kernel_stack`/
+  `halt_loop`) are *not* folded into `ArchPaging`/`ArchCpu` here — that churny,
+  behaviour-preserving refactor of `sched`/`mm`/`main` callers is a dedicated
+  "Arch boundary normalization" slice (added to the plan). `ArchCpu` ships
+  additive-only this slice (`has_apic`, `halt`). A temporary, tracked split of
+  "cpu"/"paging" surface across a trait and free fns is accepted until then.
+
+- **`ArchSmp` is a single-CPU stub** (`cpu_count()==1`, `current_cpu()==0`,
+  `send_ipi` → `unimplemented!`). It is *not* wired into
+  `handle::current_ctx_id()` or the syscall `CpuLocal` — those stay Phase-3.
+
+**ABI-hash impact: none** — all four traits are internal arch surface; no
+`export!` symbols or hashed type layouts/discriminants change. (`CstrCopyOutcome`
+was widened from `pub(crate)` to `pub` so the neutral `ArchUserAccess` trait can
+name it; it is not a hashed type.)
+
+Verified: `cargo xtask check-arch` clean (incl. the `ArchUserAccess` refactor —
+no `arch::x86_64` path in `mm/`); `build` clean; `test` (293 host tests, incl.
+the new `ArchSmp` stub test) green; `qemu` boots through `local APIC up (xAPIC,
+id 0)` and the hello ring-3 flow (`memory: roundtrip ok` → `handle-ops ok` →
+`memory: unmap ok`) with no regressions.

@@ -179,10 +179,12 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
         // CPU model = "the features the kernel actually requires,
         // nothing more". Base `qemu64` brings long mode, NX, and basic
         // SSE; the `+smap,+smep` opt-ins give us the user-access
-        // protections `arch::init_protections` asserts on. Future
-        // slices add features here as they need them (the
-        // `ArchTimer` slice will want `+tsc-deadline`, `ArchIrq` will
-        // want `+x2apic`, etc.). See the slice-2 decision log entry.
+        // protections `arch::init_protections` asserts on. The local
+        // APIC is brought up in **xAPIC** (MMIO) mode — the on-chip APIC
+        // (CPUID.01H:EDX.9) is present in `qemu64` by default, and TCG does
+        // not emulate x2APIC, so no extra CPU flag is needed. Future slices
+        // add features as they need them (the `ArchTimer` slice will want
+        // `+tsc-deadline`, etc.). See the decision log.
         .arg("-cpu")
         .arg("qemu64,+smap,+smep")
         .arg("-m")

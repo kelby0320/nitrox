@@ -479,17 +479,38 @@ Moved ahead of the blocking subsystems: the IRQ controller and CPU/FPU
 primitives are prerequisites for timers, preemptive scheduling, and
 therefore wait queues / blocking IPC / notifications.
 
-- [ ] `ArchIrq` — **local APIC only** for Phase 1: discovered via the
-      `IA32_APIC_BASE` MSR (no ACPI), LAPIC configured for the timer
-      interrupt. IOAPIC enumeration + external-device IRQ routing need ACPI
-      (MADT) and are deferred to Phase 2; Phase 1 has no IRQ-driven devices
-      (the UART is polled).
-- [ ] `ArchCpu` (CPU init, feature detection, halt)
-- [ ] `ArchFpu` (XSAVE/XRSTOR) — wired into the context switch once userspace
-      threads can touch the FPU
-- [ ] `ArchUserAccess` (SMAP/PAN window management) — formalises the existing
-      copy-primitive SMAP discipline
-- [ ] `ArchSmp` (SMP bootstrap, IPI) — stubbed in Phase 1; full SMP is Phase 3
+- [x] `ArchIrq` — **local APIC only** for Phase 1: discovered via the
+      `IA32_APIC_BASE` MSR (no ACPI). Brought up in **xAPIC (MMIO)** mode (the
+      register page mapped uncached through the kernel vmap) — **not** x2APIC,
+      which QEMU/TCG does not emulate (see the decision log). IF stays masked;
+      the timer LVT is the Timers slice, the spurious/timer IDT stubs + `IF=1`
+      the Preemptive slice. IOAPIC + external-device IRQ routing need ACPI
+      (MADT) and are deferred to Phase 2 (the UART is polled).
+- [x] `ArchCpu` — feature detection (`has_apic`) + `halt` (the new surface
+      this slice needs). Folding the existing CPU boot free fns in is the Arch
+      boundary normalization slice.
+- [ ] `ArchFpu` (XSAVE/XRSTOR) — **deferred to the Preemptive scheduling
+      slice**, alongside the context-switch FPU save/restore that is its only
+      consumer (that slice's checklist already has the wiring item). Phase-1
+      userspace is soft-float, so nothing uses the FPU yet.
+- [x] `ArchUserAccess` — formalises the existing SMAP copy primitives as a
+      neutral trait (asm + exception table unchanged).
+- [x] `ArchSmp` — single-CPU stub (`cpu_count()==1`, `current_cpu()==0`,
+      `send_ipi` unimplemented); full SMP is Phase 3.
+
+#### Arch boundary normalization
+
+Pure, behaviour-preserving refactor (no downstream dependency — can float):
+apply the arch-boundary trait convention to the legacy free-fn surface. Fold
+the paging companions (`translate`, `active_root`, `init_kernel_template`) into
+`ArchPaging`; gather the CPU free fns (`init_cpu_tables`, `init_protections`,
+`set_kernel_stack`, `halt_loop`) into `ArchCpu`. Leave naked-asm glue
+(`context_switch`/`enter_user`/syscall entry), the `serial` singleton, and
+`abi` data as free fns/modules. Re-points callers in `sched`/`mm`/`main`. See
+`docs/conventions/arch-boundary.md`.
+
+- [ ] Fold paging-companion free fns into `ArchPaging`
+- [ ] Gather CPU boot free fns into `ArchCpu`
 
 #### Timers and clocks
 

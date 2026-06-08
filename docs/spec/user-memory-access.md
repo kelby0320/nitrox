@@ -142,7 +142,7 @@ Phase 1's hard requirement on these features keeps the copy-primitive asm straig
 
 The `xtask qemu` command runs QEMU with `-cpu qemu64,+smap,+smep`. The base `qemu64` model carries long mode, NX, and basic SSE; the `+smap,+smep` opt-ins add what the kernel actually requires. Default `qemu64` (no opts) lacks SMAP, and the kernel's `init_protections` would panic at boot.
 
-Named CPU models like `Haswell-v4` or `Broadwell-v4` also work as a base, but TCG silently drops five features those models advertise (PCID, x2APIC, TSC-deadline, INVPCID, SPEC-CTRL), printing warnings on every boot. The kernel doesn't use those features today, so the minimalist `qemu64,+features` form is preferred: as future slices introduce real dependencies (`ArchTimer` will want `+tsc-deadline`, `ArchIrq` will want `+x2apic`, etc.), the xtask command grows by one flag at a time and stays a self-documenting record of which CPU features the kernel requires.
+Named CPU models like `Haswell-v4` or `Broadwell-v4` also work as a base, but TCG silently drops five features those models advertise (PCID, x2APIC, TSC-deadline, INVPCID, SPEC-CTRL), printing warnings on every boot. The kernel doesn't use those features today, so the minimalist `qemu64,+features` form is preferred: as future slices introduce real dependencies (`ArchTimer` will want `+tsc-deadline`, etc.), the xtask command grows by one flag at a time and stays a self-documenting record of which CPU features the kernel requires. (`ArchIrq` brings the local APIC up in xAPIC/MMIO mode precisely *because* TCG drops `x2apic`, so it needs no flag — see the decision log.)
 
 ## Architecture split
 

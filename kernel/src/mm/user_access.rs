@@ -47,8 +47,9 @@
 use core::marker::PhantomData;
 use core::mem::{MaybeUninit, align_of, size_of};
 
+use crate::arch::UserAccess;
 use crate::arch::abi::USER_VIRT_END;
-use crate::arch::user_access::{CstrCopyOutcome, copy_bytes_raw, copy_cstr_raw};
+use crate::arch::user_access::{ArchUserAccess, CstrCopyOutcome};
 
 /// One entry in the `.user_access_table` section: a (fault_pc,
 /// recovery_pc) pair. Inline asm in the copy primitives emits the
@@ -246,7 +247,7 @@ pub fn copy_from_user<T: Copy>(src: UserPtr<T>) -> Result<T, UserAccessError> {
     // opens the SMAP window and registers an exception-table entry
     // for the read.
     let faulted = unsafe {
-        copy_bytes_raw(out.as_mut_ptr().cast::<u8>(), addr as *const u8, n)
+        UserAccess::copy_bytes(out.as_mut_ptr().cast::<u8>(), addr as *const u8, n)
     };
     if faulted {
         return Err(UserAccessError::Fault);
@@ -279,7 +280,7 @@ pub fn copy_to_user<T: Copy>(
     // SAFETY: `src_ptr` is a valid `n`-byte read source (it is
     // `src`'s own backing storage); `addr` was validated user-half +
     // aligned-for-T. `copy_bytes_raw` handles SMAP/exception-table.
-    let faulted = unsafe { copy_bytes_raw(addr as *mut u8, src_ptr, n) };
+    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, src_ptr, n) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -299,7 +300,7 @@ pub fn copy_slice_from_user(
     }
     // SAFETY: `addr` was validated user-half + `n` bytes; `dst` is
     // exactly `n` writable bytes of caller storage.
-    let faulted = unsafe { copy_bytes_raw(dst.as_mut_ptr(), addr as *const u8, n) };
+    let faulted = unsafe { UserAccess::copy_bytes(dst.as_mut_ptr(), addr as *const u8, n) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -316,7 +317,7 @@ pub fn copy_slice_to_user(
     }
     // SAFETY: `addr` was validated user-half + `n` bytes; `src` is
     // exactly `n` readable bytes of caller storage.
-    let faulted = unsafe { copy_bytes_raw(addr as *mut u8, src.as_ptr(), n) };
+    let faulted = unsafe { UserAccess::copy_bytes(addr as *mut u8, src.as_ptr(), n) };
     if faulted { Err(UserAccessError::Fault) } else { Ok(()) }
 }
 
@@ -343,7 +344,7 @@ pub fn copy_cstr_from_user<'a>(
     // `max` writable bytes. The arch raw primitive walks user memory
     // one byte at a time, registering only the user-side load as a
     // fault site.
-    let outcome = unsafe { copy_cstr_raw(dst.as_mut_ptr(), addr as *const u8, max) };
+    let outcome = unsafe { UserAccess::copy_cstr(dst.as_mut_ptr(), addr as *const u8, max) };
     match outcome {
         CstrCopyOutcome::Ok(count) => Ok(&dst[..count]),
         CstrCopyOutcome::Fault => Err(UserAccessError::Fault),

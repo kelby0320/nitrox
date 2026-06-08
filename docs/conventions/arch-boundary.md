@@ -56,13 +56,40 @@ unchanged.
   a comment that describes the concrete behaviour is fine and often clearer.
   The boundary is about *identifiers and paths reachable outside `arch/`*,
   not prose.
-- **The neutral `arch::paging` trait module** (`ArchPaging`, `PageFlags`,
-  `MapError`) is architecture-neutral by construction and is public.
+- **Neutral trait modules** are architecture-neutral by construction and are
+  public. Each holds a `trait Arch<X>` (all-static methods, `unsafe` where they
+  touch hardware) + supporting types; the active architecture's `X86<X>` impl
+  is re-exported from `arch/mod.rs` under a neutral alias. Today:
+  `arch::paging` (`ArchPaging` → `Paging`), `arch::irq` (`ArchIrq` → `Irq`),
+  `arch::cpu` (`ArchCpu` → `Cpu`), `arch::user_access` (`ArchUserAccess` →
+  `UserAccess`), `arch::smp` (`ArchSmp` → `Smp`); future `arch::timer`,
+  `arch::fpu`.
 - A few re-exported module names are themselves neutral and acceptable:
-  `arch::abi` (the platform ABI constants), `arch::user_access` (the
-  user-copy primitives), `arch::serial` (the debug console). Their *names*
-  carry no architecture jargon even though their implementations are
-  arch-specific.
+  `arch::abi` (the platform ABI constants) and `arch::serial` (the debug
+  console). Their *names* carry no architecture jargon even though their
+  implementations are arch-specific.
+
+## When a subsystem earns a trait
+
+Use a **trait** for each behavioural subsystem whose operations are ordinary
+functions with genuinely divergent per-architecture logic and a neutral
+consumer (paging, cpu, irq, user-access, smp, timer, fpu). Group a subsystem's
+operations under one trait; do **not** scatter them as loose free functions.
+
+Keep **free functions / plain modules** for:
+
+- **Naked-asm entry/switch glue** — `context_switch`, `enter_user`, the syscall
+  entry/stack setup. These are single-call-site, irreducibly arch-specific
+  glue; an all-static "namespace trait" around them is ceremony without payoff.
+- **Stateful singletons** — `serial` (a `SERIAL` lock + log macros).
+- **Pure data** — `abi` (constants).
+
+> **Normalization in progress.** Some legacy free functions pre-date this rule
+> and still sit beside the trait they belong to — the paging companions
+> (`translate`, `active_root`, `init_kernel_template`) and the CPU boot fns
+> (`init_cpu_tables`, `init_protections`, `set_kernel_stack`, `halt_loop`). The
+> "Arch boundary normalization" slice folds them into `ArchPaging`/`ArchCpu`.
+> New arch surface should follow the rule above from the start.
 
 ## Examples
 

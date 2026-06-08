@@ -18,6 +18,8 @@ Surprisingly much.
 
 **SMP boot.** MADT lists CPUs and APIC addresses. With this, you can program the local APIC and IOAPIC, bring up additional cores via Limine, and run a multiprocessor kernel.
 
+> **Note — the *local* APIC needs no ACPI at all.** The current CPU's local-APIC register base is in the `IA32_APIC_BASE` MSR, so the OS-Phase-1 "architecture trait completion" slice brings the local APIC up (in xAPIC/MMIO mode) straight from the MSR, with no ACPI table parsing. ACPI's MADT is needed for the *IOAPIC* (external-device IRQ routing) and for enumerating the *other* CPUs — both deferred to OS Phase 2. (xAPIC rather than x2APIC because the QEMU/TCG dev loop does not emulate x2APIC; see the decision log.)
+
 **Timers.** FADT and HPET tell you the timer addresses. TSC calibration via HPET works.
 
 **PCIe enumeration.** MCFG gives you the ECAM (Enhanced Configuration Access Mechanism) base address. From there, PCIe configuration space is just MMIO at predictable offsets. You can walk the bus tree, identify devices, size BARs, build the device tree.
