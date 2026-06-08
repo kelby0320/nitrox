@@ -24,7 +24,11 @@
 //! the active architecture's implementation is re-exported here as
 //! [`Paging`].
 
+pub mod cpu;
+pub mod irq;
 pub mod paging;
+pub mod smp;
+pub mod user_access;
 
 #[cfg(target_arch = "x86_64")]
 mod x86_64;
@@ -32,9 +36,19 @@ mod x86_64;
 // Neutral modules and free functions (defined at the x86_64 root). The
 // `set_kernel_stack` gives a neutral name to the GDT/TSS RSP0 setter.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{
-    abi, halt_loop, init_cpu_tables, serial, set_kernel_stack, user_access,
-};
+pub use x86_64::{abi, halt_loop, init_cpu_tables, serial, set_kernel_stack};
+
+// Architecture-trait implementations, re-exported under neutral names (see
+// `docs/conventions/arch-boundary.md`): one trait per divergent behavioural
+// subsystem, mirroring `paging::ArchPaging` → `Paging`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::apic::XApic as Irq;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::cpu::X86Cpu as Cpu;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::smp::X86Smp as Smp;
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::user_access::X86UserAccess as UserAccess;
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, thread_trampoline};

@@ -1,12 +1,15 @@
 //! x86_64-specific primitives.
 
 pub mod abi;
+pub mod apic;
 pub mod context;
+pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
 pub mod regs;
 pub mod serial;
+pub mod smp;
 pub mod syscall;
 pub mod user_access;
 

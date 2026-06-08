@@ -108,7 +108,7 @@ pub(crate) unsafe fn copy_bytes_raw(
 
 /// Outcome of a byte-by-byte NUL-terminated user copy.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub(crate) enum CstrCopyOutcome {
+pub enum CstrCopyOutcome {
     /// NUL terminator was found within `max_len` bytes. The `usize`
     /// is the number of bytes written to `dst`, including the NUL.
     Ok(usize),
@@ -226,4 +226,23 @@ pub(crate) unsafe fn copy_cstr_raw(
         }
     }
     CstrCopyOutcome::NoTerminator
+}
+
+/// The x86_64 [`ArchUserAccess`](crate::arch::user_access::ArchUserAccess)
+/// implementation. Zero-sized; re-exported as `crate::arch::UserAccess`. The
+/// methods forward to the SMAP-windowed copy primitives above — the asm and
+/// exception-table mechanism are unchanged; the trait only formalises the
+/// neutral call surface.
+pub struct X86UserAccess;
+
+impl crate::arch::user_access::ArchUserAccess for X86UserAccess {
+    unsafe fn copy_bytes(dst: *mut u8, src: *const u8, len: usize) -> bool {
+        // SAFETY: forwarded verbatim to `copy_bytes_raw`'s contract.
+        unsafe { copy_bytes_raw(dst, src, len) }
+    }
+
+    unsafe fn copy_cstr(dst: *mut u8, src: *const u8, max_len: usize) -> CstrCopyOutcome {
+        // SAFETY: forwarded verbatim to `copy_cstr_raw`'s contract.
+        unsafe { copy_cstr_raw(dst, src, max_len) }
+    }
 }

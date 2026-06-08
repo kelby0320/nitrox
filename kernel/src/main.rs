@@ -116,6 +116,22 @@ fn kernel_main() {
     paging_init();
     paging_smoke_test();
 
+    // Bring up this CPU's local interrupt controller (xAPIC). Interrupts
+    // stay masked (IF=0) for this whole slice — nothing is delivered yet; the
+    // timer source lands with the Timers slice and the spurious/timer IDT
+    // stubs + IF=1 with the preemptive-scheduling slice.
+    {
+        use arch::irq::ArchIrq;
+        // SAFETY: ring 0, single CPU, called once during boot after CPU
+        // feature enablement and after the kernel-vmap allocator is up; IF is
+        // 0, so software-enabling the controller delivers nothing.
+        if unsafe { arch::Irq::init() }.is_err() {
+            kprintln!("local APIC bring-up failed — halting");
+            return;
+        }
+        kprintln!("local APIC up (xAPIC, id {})", arch::Irq::id());
+    }
+
     // Bring up the single global handle table. It eagerly allocates its
     // first segment, so the heap must be up (it is — `init_memory` ran); it
     // must be live before any userspace can issue a handle syscall.
