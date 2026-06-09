@@ -514,15 +514,22 @@ the paging companions (`translate`, `active_root`, `init_kernel_template`) into
 - [x] Gather CPU boot free fns into `ArchCpu` (`init_tables`/`init_protections`/
       `set_kernel_stack`/`halt_loop`)
 
-#### Timers and clocks
+#### Timers and clocks (timekeeping foundation)
 
-- [ ] `Timer` kernel object
-- [ ] Kernel timer min-heap
-- [ ] `ArchTimer` trait with x86_64 implementation: **LAPIC timer + TSC,
-      calibrated against the legacy PIT** (no ACPI). HPET (which needs ACPI
-      to locate) is deferred to Phase 2.
-- [ ] `sys_timer_create` / `sys_timer_set`
-- [ ] `sys_clock_read` (Monotonic, Realtime, ProcessCpu, ThreadCpu)
+Scoped to the minimum that unblocks preemptive scheduling (the next slice).
+The `Timer` kernel object, the deadline min-heap, and `sys_timer_create`/`set`
+are deferred to **Wait queues** below — their consumers (firing via the
+unmasked timer IRQ, `sys_wait` deadlines, notification signalling) live there,
+so building them earlier would be untested scaffolding. (Decision log,
+2026-06-08.)
+
+- [x] `ArchTimer` trait with x86_64 implementation: **LAPIC timer (count-down
+      mode, not TSC-deadline — TCG) + TSC, calibrated against the legacy PIT**
+      (no ACPI). HPET (which needs ACPI to locate) is deferred to Phase 2.
+      Arming methods are dormant (IF=0) but the countdown is observable.
+- [x] `sys_clock_read` — **Monotonic only** this slice; `Realtime`/`ProcessCpu`/
+      `ThreadCpu` return `Unsupported` (Realtime needs a wall-clock offset
+      service; the per-CPU clocks need scheduler CPU accounting).
 
 #### Preemptive scheduling (single-CPU)
 
@@ -566,6 +573,12 @@ by that refactor.
 With the IRQ-driven scheduler, timers, and the `Blocked` state in place,
 `sys_wait` (the unified blocking primitive) and per-object wait queues land.
 
+- [ ] `Timer` kernel object (deferred from Timers and clocks — needs the
+      timer IRQ, `sys_wait`, and notifications to fire/wait/signal)
+- [ ] Kernel timer deadline min-heap (deferred from Timers and clocks — its
+      consumer is the `sys_wait` deadline path below)
+- [ ] `sys_timer_create` / `sys_timer_set` (deferred from Timers and clocks;
+      take syscall numbers 8/9 on landing)
 - [ ] `WaitQueue` with intrusive linked list per object
 - [ ] `WaitNode` pre-allocated array on `Thread`
 - [ ] `sys_wait` with multi-handle support and deadline (deadline uses the

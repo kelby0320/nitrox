@@ -22,6 +22,8 @@ Surprisingly much.
 
 **Timers.** FADT and HPET tell you the timer addresses. TSC calibration via HPET works.
 
+> **Note — Phase-1 timekeeping needs no ACPI either.** The OS-Phase-1 "timers and clocks" slice builds the monotonic clock and the per-CPU timer from the **local-APIC timer + TSC, calibrated against the legacy PIT** (channel 2, at its fixed legacy ports) — no HPET, no FADT. HPET (which needs ACPI/FADT to locate) stays deferred to OS Phase 2; the LAPIC timer runs in count-down mode rather than TSC-deadline mode because the QEMU/TCG dev loop does not emulate the TSC-deadline timer (see the decision log).
+
 **PCIe enumeration.** MCFG gives you the ECAM (Enhanced Configuration Access Mechanism) base address. From there, PCIe configuration space is just MMIO at predictable offsets. You can walk the bus tree, identify devices, size BARs, build the device tree.
 
 **IOMMU programming.** DMAR (Intel) or IVRS (AMD) describes the IOMMU. Programming the IOMMU is straightforward MMIO once you know its address.

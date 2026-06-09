@@ -134,6 +134,25 @@ fn kernel_main() {
         kprintln!("local APIC up (xAPIC, id {})", arch::Irq::id());
     }
 
+    // Calibrate the monotonic time source (TSC) and the per-CPU timer (LAPIC
+    // timer) against the legacy PIT. Must follow Irq::init — the local
+    // controller's MMIO has to be mapped before its timer can be programmed.
+    // Interrupts stay masked (IF=0): the timer is calibrated and armable, but
+    // fires nothing this slice (the periodic tick lands with preemptive
+    // scheduling, one-shot deadlines with wait queues).
+    {
+        use arch::timer::ArchTimer;
+        // SAFETY: ring 0, single CPU, called once during boot after Irq::init
+        // mapped the local-controller MMIO; IF=0, so arming delivers nothing.
+        unsafe { arch::Timer::init() };
+        kprintln!(
+            "timer up: monotonic {} MHz, per-CPU timer {} MHz (clock t0={} ns)",
+            arch::Timer::monotonic_hz() / 1_000_000,
+            arch::Timer::timer_hz() / 1_000_000,
+            arch::Timer::read_ns(),
+        );
+    }
+
     // Bring up the single global handle table. It eagerly allocates its
     // first segment, so the heap must be up (it is — `init_memory` ran); it
     // must be live before any userspace can issue a handle syscall.

@@ -10,10 +10,13 @@
 
 use super::error::{KError, SysResult, encode, from_user_access};
 use crate::arch::Paging;
+use crate::arch::Timer;
 use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::ArchPaging;
+use crate::arch::timer::ArchTimer;
 use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable};
+use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
 use crate::libkern::{KBox, MemFlags};
 use crate::mm::addr_space::{AddressSpace, MapError};
@@ -42,6 +45,10 @@ pub const SYS_MEMORY_CREATE: u64 = 4;
 pub const SYS_MEMORY_MAP: u64 = 5;
 /// `sys_memory_unmap` — unmap a region of the caller's address space.
 pub const SYS_MEMORY_UNMAP: u64 = 6;
+/// `sys_clock_read` — read a clock's value (nanoseconds) into user memory.
+/// `sys_timer_create`/`sys_timer_set` will take 7's successors (8/9) when the
+/// wait-queues slice lands; syscall numbers are assigned in landing order.
+pub const SYS_CLOCK_READ: u64 = 7;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -73,6 +80,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64)
         SYS_MEMORY_CREATE => encode(sys_memory_create(a0, a1)),
         SYS_MEMORY_MAP => encode(sys_memory_map(a0, a1, a2, a3)),
         SYS_MEMORY_UNMAP => encode(sys_memory_unmap(a0, a1)),
+        SYS_CLOCK_READ => encode(sys_clock_read(a0, a1)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Diverges into the scheduler; never returns to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -400,6 +408,35 @@ pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
     }
 }
 
+// --- Clock syscall ------------------------------------------------------
+
+/// `sys_clock_read(clock, out)` — write the selected clock's value, in
+/// nanoseconds, to the user `u64` at `out`. Returns 0.
+///
+/// Only [`ClockId::Monotonic`] is serviced this slice; the rest return
+/// `Unsupported`. The selector and pointer are validated before any clock is
+/// read, so the invalid-selector and unsupported-clock paths are reachable
+/// without touching user memory (host-testable).
+///
+/// TODO(realtime): `Realtime` needs a wall-clock offset service (none yet).
+/// TODO(sched-acct): `ProcessCpu`/`ThreadCpu` need per-thread CPU accounting
+/// from the scheduler tick (none yet). See docs/planning/implementation-plan.md.
+pub fn sys_clock_read(clock: u64, out: u64) -> SysResult {
+    let id = u32::try_from(clock)
+        .ok()
+        .and_then(ClockId::from_u32)
+        .ok_or(KError::InvalidArgument)?;
+    let uptr = UserMutPtr::<u64>::new(out).map_err(from_user_access)?;
+    let ns = match id {
+        ClockId::Monotonic => Timer::read_ns(),
+        ClockId::Realtime | ClockId::ProcessCpu | ClockId::ThreadCpu => {
+            return Err(KError::Unsupported);
+        }
+    };
+    copy_to_user(uptr, &ns).map_err(from_user_access)?;
+    Ok(0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -411,6 +448,27 @@ mod tests {
     #[test]
     fn unknown_number_is_unsupported() {
         assert_eq!(dispatch(0xDEAD, 0, 0, 0, 0, 0, 0), KError::Unsupported.as_isize());
+    }
+
+    #[test]
+    fn clock_read_invalid_selector_is_invalid_argument() {
+        // An unknown ClockId is rejected before the pointer is examined, so the
+        // `out` address is never touched (host-reachable).
+        assert_eq!(sys_clock_read(99, 0xDEAD_BEEF), Err(KError::InvalidArgument));
+        assert_eq!(
+            dispatch(SYS_CLOCK_READ, 99, 0xDEAD_BEEF, 0, 0, 0, 0),
+            KError::InvalidArgument.as_isize(),
+        );
+    }
+
+    #[test]
+    fn clock_read_unsupported_clocks_are_unsupported() {
+        // A valid user pointer (never dereferenced here) plus a not-yet-serviced
+        // clock returns Unsupported before any clock read or copy-out.
+        let valid_out = 0x1000u64; // page-aligned, u64-aligned, user-half
+        assert_eq!(sys_clock_read(1, valid_out), Err(KError::Unsupported)); // Realtime
+        assert_eq!(sys_clock_read(2, valid_out), Err(KError::Unsupported)); // ProcessCpu
+        assert_eq!(sys_clock_read(3, valid_out), Err(KError::Unsupported)); // ThreadCpu
     }
 
     #[test]

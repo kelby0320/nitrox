@@ -41,6 +41,21 @@ const REG_SVR: u64 = 0xF0;
 /// SVR bit 8 — APIC software enable.
 const SVR_SOFTWARE_ENABLE: u32 = 1 << 8;
 
+// --- xAPIC timer registers -------------------------------------------------
+//
+// Programmed by the timekeeping impl (`arch::x86_64::timer`); exposed here as
+// `pub(crate)` (with the MMIO shims below) so `apic.rs` stays the single owner
+// of `LAPIC_BASE` and the volatile-access logic.
+/// LVT Timer entry: vector (bits 0–7), delivery mask (bit 16), and timer mode
+/// (bits 18:17 — `00` one-shot, `01` periodic, `10` TSC-deadline).
+pub(crate) const REG_LVT_TIMER: u64 = 0x320;
+/// Timer Initial Count — writing a non-zero value (re)starts the countdown.
+pub(crate) const REG_TIMER_INIT_COUNT: u64 = 0x380;
+/// Timer Current Count — the live, read-only countdown value.
+pub(crate) const REG_TIMER_CUR_COUNT: u64 = 0x390;
+/// Timer Divide Configuration — divides the input clock before the countdown.
+pub(crate) const REG_TIMER_DIV_CONFIG: u64 = 0x3E0;
+
 /// Kernel-virtual base of the mapped LAPIC MMIO page. Set once by [`init`];
 /// `0` means not-yet-initialised. Read by `eoi`/`id`.
 static LAPIC_BASE: AtomicU64 = AtomicU64::new(0);
@@ -67,6 +82,32 @@ unsafe fn write_reg(reg: u64, val: u32) {
     debug_assert!(base != 0, "LAPIC accessed before init");
     // SAFETY: as `read_reg`, for a 32-bit volatile write.
     unsafe { core::ptr::write_volatile((base + reg) as *mut u32, val) };
+}
+
+/// LAPIC register read for sibling arch modules (the timekeeping impl programs
+/// the timer LVT through this). Forwards to the private [`read_reg`].
+///
+/// # Safety
+/// As [`read_reg`]: [`init`] must have run; `reg` a valid 4-byte-aligned offset.
+pub(crate) unsafe fn read_reg_shared(reg: u64) -> u32 {
+    // SAFETY: forwarded under the caller's contract.
+    unsafe { read_reg(reg) }
+}
+
+/// LAPIC register write for sibling arch modules. Forwards to the private
+/// [`write_reg`].
+///
+/// # Safety
+/// As [`write_reg`].
+pub(crate) unsafe fn write_reg_shared(reg: u64, val: u32) {
+    // SAFETY: forwarded under the caller's contract.
+    unsafe { write_reg(reg, val) };
+}
+
+/// `true` once [`init`] has mapped the LAPIC MMIO page — the precondition the
+/// timekeeping impl asserts before programming the timer registers.
+pub(crate) fn is_initialised() -> bool {
+    LAPIC_BASE.load(Ordering::Relaxed) != 0
 }
 
 /// The x86_64 [`ArchIrq`] implementation (xAPIC). Zero-sized; re-exported as

@@ -17,6 +17,7 @@
 //! [`KString`] call the slab allocator directly and report exhaustion as
 //! [`AllocError`]. See the decision log entry of 2026-05-20.
 
+pub mod clock;
 pub mod handle;
 pub mod kbox;
 pub mod kstring;
@@ -24,6 +25,7 @@ pub mod kvec;
 pub mod memory;
 pub mod spinlock;
 
+pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
 pub use kbox::KBox;
 pub use memory::MemFlags;
