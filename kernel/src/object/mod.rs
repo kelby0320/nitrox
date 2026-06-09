@@ -24,8 +24,10 @@ pub mod header;
 pub mod memory_object;
 pub mod process;
 pub mod thread;
+pub mod timer;
 
 pub use header::{KObjectHeader, ObjectRef};
 pub use memory_object::MemoryObject;
 pub use process::Process;
-pub use thread::{Thread, ThreadEntry, ThreadState};
+pub use thread::{MAX_WAIT_HANDLES, Thread, ThreadEntry, ThreadState, WaitPhase};
+pub use timer::Timer;

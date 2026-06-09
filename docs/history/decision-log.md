@@ -2530,3 +2530,68 @@ shows `preemption armed (IF=1, 100 Hz tick)`, then three CPU-bound workers that
 never yield **interleave** their output (`worker 1/2/3 round 0`, `… round 1`, …
 — cooperatively worker 1 would have finished first), the ring-3 `hello` runs
 preemptibly, and the system idles cleanly at end of boot (no panic, no freeze).
+
+## 2026-06-09 — Phase 1, slice 18: wait queues (`sys_wait` + Timer kobject)
+
+Built the blocking machinery: the `Blocked` thread state + block/unblock,
+per-object wait queues, `sys_wait`, and the `Timer` kernel object (deferred from
+the timers slice) as the first demonstrable waitable.
+
+- **`Blocked` state + parking.** `ThreadState` gains `Blocked`; a blocking
+  thread moves its `ObjectRef` from `current` into a new `SchedState::blocked`
+  list (pinning it + its kernel stack), via `block_current_and_switch` — which
+  mirrors `switch_to_next`'s IF-bracket exactly but does **not** re-enqueue the
+  outgoing thread. `make_runnable` moves it back to `ready` on wake.
+- **Single lock domain; direct wakeup (DPC deferred).** Wait-queue state, the
+  deadline min-heap, and the blocked parking all live under the rank-1 `SCHED`
+  `IrqSpinLock`. The one LAPIC timer is already periodic for preemption, so
+  deadlines are checked on the existing 100 Hz tick (~10 ms granularity;
+  `arm_oneshot_in` stays dormant) and `on_timer_tick` fires expired timers and
+  wakes their waiters **directly** under `SCHED`. A DPC queue would only be
+  exercised by this path today and its real consumer (deferring work out of a
+  *device* IRQ) doesn't exist until drivers — **deferred**. Rank 2 stays
+  reserved in `lock-ordering.md` for the SMP split.
+- **No lost wakeup.** Registration (on each object's waiter list + the deadline
+  heap) and the block happen under one uninterrupted `SCHED` hold (IF masked by
+  the `IrqSpinLock`), so on single-CPU a waker cannot run between them. A
+  per-thread `wait_phase: AtomicU8` CAS (`Waiting→Woken`) dedups multiple
+  signals for one multi-handle wait (and is the SMP-future backstop); the woken
+  thread reads its per-slot `wait_signaled` flags to decide `Signaled` vs
+  `TimedOut`, and always unregisters from all objects + the heap on resume.
+- **`Timer` kobject + tagged deadline min-heap.** `object/timer.rs`: a waitable
+  with `deadline_ns`/`interval_ns` + a pre-reserved waiter list, all interior
+  state under `SCHED` (`UnsafeCell`, accessed only via `*mut Timer` while the
+  lock is held). The heap (`KVec` binary min-heap in `SchedState`) keys on
+  absolute monotonic ns; each `Entry` has an `is_thread` flag distinguishing a
+  Timer fire from a `sys_wait` thread-deadline (woken directly → timeout). All
+  reserves (blocked, heap, per-timer waiters, per-thread wait slots) are
+  pre-allocated — no allocation under the lock.
+- **Syscalls 8/9/10.** `sys_timer_create` (mints `WAIT|DUPLICATE|INSPECT|
+  TRANSFER`), `sys_timer_set` (absolute deadline; `0` disarms), `sys_wait`
+  (`Timer`-only this slice; others → `Unsupported`; `count ≤ MAX_WAIT_HANDLES`
+  = 8; poll → `WouldBlock`, deadline → `TimedOut`). New `IoResult` value type
+  (`#[repr(C)]`, 16 B) and `TimerFlags`; new `KError::{WouldBlock=-11,
+  TimedOut=-12}`.
+- **Deferred (no consumer):** the **DPC mechanism**; **Process-exit
+  waitability**, **IPC**, **notifications**, **`PendingOperation`** as waitables
+  (their objects don't exist); the **intrusive wait-list** (Phase 1 uses
+  pre-reserved `KVec` waiter lists + per-thread wait slots).
+
+**ABI-hash impact: yes (per spec; not yet enforced).** Per
+`docs/spec/abi-version-hash.md`, the new **`IoResult` layout** (§ "IoOp and
+IoResult layouts") and the two new **`KError` variants** (§ "KError enum
+layout") would change the kernel ABI hash. The hash is not yet computed in code
+(no `export!`/SHA-256 machinery), so nothing is enforced today — noted here for
+when it lands. **Unchanged:** `KObjectType` (`Timer = 7` already present — no
+discriminant change), `Rights` (`WAIT` already present), `KObjectHeader`.
+`ThreadState`/`Thread`/`TimerFlags`/`ClockId`/syscall numbers are
+kernel-internal / not hashed.
+
+Verified: `cargo xtask check-arch` clean; `build` clean; `test` (326 host tests —
+deadline-heap ordering/remove/over-reserve, `IoResult`/`TimerFlags` layout, the
+two `KError` discriminants, `Timer` accessors + dispatch, `Thread` wait
+round-trip, `timer_rights` allocatable, `sys_wait`/`sys_timer` arg validation)
+green; `qemu` shows the ring-3 `hello` block on a +50 ms timer and wake
+(`timer: waited and woke ok`), a poll return `WouldBlock` (`wait: poll empty as
+expected`), and a near-deadline `TimedOut` (`wait: timed out as expected`), with
+preemption still interleaving and a clean idle at end of boot.

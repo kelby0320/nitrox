@@ -35,7 +35,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
-use crate::object::{MemoryObject, Process, Thread};
+use crate::object::{MemoryObject, Process, Thread, Timer};
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
 /// references — a catastrophic bug, not a recoverable condition — so we
@@ -276,6 +276,12 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::MemoryObject);
         }
+        KObjectType::Timer => {
+            // SAFETY: last ref to a `Timer` produced by KBox::into_raw.
+            drop(unsafe { KBox::<Timer>::from_raw(NonNull::new_unchecked(ptr as *mut Timer)) });
+            #[cfg(test)]
+            test_probe::note(KObjectType::Timer);
+        }
         // No other kernel object types are implemented this slice; they
         // land behind their respective Phase 1 slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -298,6 +304,7 @@ pub(crate) mod test_probe {
         static PROCESS_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static THREAD_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static MEMORY_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static TIMER_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -307,6 +314,7 @@ pub(crate) mod test_probe {
             KObjectType::MemoryObject => {
                 MEMORY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1))
             }
+            KObjectType::Timer => TIMER_DESTROYS.with(|c| c.set(c.get() + 1)),
             _ => {}
         }
     }
@@ -323,10 +331,15 @@ pub(crate) mod test_probe {
         MEMORY_OBJECT_DESTROYS.with(Cell::get)
     }
 
+    pub(crate) fn timer_destroys() -> usize {
+        TIMER_DESTROYS.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PROCESS_DESTROYS.with(|c| c.set(0));
         THREAD_DESTROYS.with(|c| c.set(0));
         MEMORY_OBJECT_DESTROYS.with(|c| c.set(0));
+        TIMER_DESTROYS.with(|c| c.set(0));
     }
 }
 

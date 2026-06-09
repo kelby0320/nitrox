@@ -1,13 +1,11 @@
 //! The [`Thread`] kernel object.
 //!
-//! A thread is a register state, a kernel stack, scheduling state, and an
-//! entry point. This slice (threading-and-context-switch) adds those
-//! fields for **kernel** threads driven by the cooperative scheduler in
-//! [`crate::sched`]; the FPU/XSAVE context, TLS `fs_base`, wait state, and
-//! the owning-`Process` pointer arrive with later slices (see the deferred
-//! notes on the fields below and `docs/planning/implementation-plan.md`).
-//! The owning process is still referenced by id, not pointer, to avoid a
-//! refcount cycle.
+//! A thread is a register state, a kernel stack, scheduling state, an entry
+//! point, the owning process, and — for a thread blocked in `sys_wait` — its
+//! wait bookkeeping (the objects it waits on + the wake handshake; see the
+//! `wait_*` fields). The FPU/XSAVE context and TLS `fs_base` still arrive with
+//! later slices (see the deferred notes on the fields below and
+//! `docs/planning/implementation-plan.md`).
 //!
 //! ## Mutation discipline
 //!
@@ -20,6 +18,8 @@
 //! fields through raw pointers — never forming a `&mut Thread` that would
 //! alias the atomically-accessed [`KObjectHeader`].
 
+use core::sync::atomic::{AtomicU8, Ordering};
+
 use crate::arch::{ArchThreadContext, fabricate_frame, thread_trampoline};
 use crate::libkern::handle::KObjectType;
 use crate::arch::paging::ArchPaging;
@@ -30,15 +30,17 @@ use crate::object::Process;
 use crate::object::header::KObjectHeader;
 use crate::object::ObjectRef;
 
+/// Maximum number of handles one `sys_wait` call may block on. Bounds the
+/// per-thread wait arrays (so registration never allocates under the scheduler
+/// lock) and the `count` a caller may pass.
+pub const MAX_WAIT_HANDLES: usize = 8;
+
 /// A kernel thread's entry point. `extern "C"` so the
 /// [`thread_trampoline`](crate::arch::thread_trampoline) → `thread_enter`
 /// path can call it with a stable ABI; the `usize` argument is opaque.
 pub type ThreadEntry = extern "C" fn(arg: usize);
 
 /// Lifecycle state of a thread, tracked by the scheduler.
-///
-/// `Blocked` is intentionally absent — there is no wait-queue subsystem
-/// this slice; it arrives with IPC / `sys_wait`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 #[repr(u8)]
 pub enum ThreadState {
@@ -46,9 +48,29 @@ pub enum ThreadState {
     Ready,
     /// The currently executing thread.
     Running,
+    /// Off the run queue, blocked in `sys_wait` on ≥1 object and/or a deadline;
+    /// parked in the scheduler's `blocked` list until a waker makes it runnable.
+    Blocked,
     /// Body returned or [`exit`](crate::sched::exit) called; awaiting
     /// reclamation by the next scheduler entry.
     Exited,
+}
+
+/// The wait wake-handshake state, stored as an [`AtomicU8`] on each [`Thread`]
+/// so a waker (the timer-tick fire path, under `SCHED`) and the blocking thread
+/// agree on a single source of truth for "was I claimed for wakeup?".
+///
+/// `Running` → not waiting. `Waiting` → registered and (about to be) blocked.
+/// `Woken` → a waker (a signal or the deadline) has claimed this thread. The
+/// CAS `Waiting → Woken` ([`Thread::wait_try_wake`]) deduplicates multiple
+/// signals for one multi-handle wait: the first waker wins and makes the thread
+/// runnable; later wakers still mark their slot but skip the re-enqueue.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum WaitPhase {
+    Running = 0,
+    Waiting = 1,
+    Woken = 2,
 }
 
 /// A thread kernel object.
@@ -89,10 +111,25 @@ pub struct Thread {
     /// the address space. No refcount cycle: the `Process` does not hold
     /// the thread. `None` for kernel/boot threads.
     process: Option<ObjectRef>,
+    /// Wait bookkeeping (meaningful only while `state == Blocked`), touched only
+    /// under `SCHED` except `wait_phase`. `wait_objs[0..wait_count]` are the
+    /// type-erased object *addresses* (`as usize`, so `Thread` carries no raw
+    /// pointer — mirrors the scheduler's `idle_addr`) this thread is registered
+    /// as a waiter on; `wait_signaled[i]` is set by the waker when that object
+    /// fires.
+    wait_objs: [usize; MAX_WAIT_HANDLES],
+    /// Per-slot fired flag, parallel to `wait_objs`.
+    wait_signaled: [bool; MAX_WAIT_HANDLES],
+    /// Number of live entries in `wait_objs`/`wait_signaled`; `0` when not waiting.
+    wait_count: u8,
+    /// `true` if this wait registered a finite deadline (so on resume the thread
+    /// removes its deadline-heap entry).
+    wait_has_deadline: bool,
+    /// The wake handshake; a [`WaitPhase`] discriminant in an [`AtomicU8`].
+    wait_phase: AtomicU8,
     // Deferred to later slices:
     //   fpu_context  — kernel is soft-float; lands with userspace threads.
     //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
-    //   wait_*       — no wait-queue subsystem (`Blocked`) yet.
 }
 
 /// A non-scheduling default entry, used for threads that exist only as
@@ -117,6 +154,11 @@ impl Thread {
             addr_space_root: None,
             user_entry: None,
             process: None,
+            wait_objs: [0; MAX_WAIT_HANDLES],
+            wait_signaled: [false; MAX_WAIT_HANDLES],
+            wait_count: 0,
+            wait_has_deadline: false,
+            wait_phase: AtomicU8::new(WaitPhase::Running as u8),
         })
     }
 
@@ -139,6 +181,11 @@ impl Thread {
             addr_space_root: None,
             user_entry: None,
             process: None,
+            wait_objs: [0; MAX_WAIT_HANDLES],
+            wait_signaled: [false; MAX_WAIT_HANDLES],
+            wait_count: 0,
+            wait_has_deadline: false,
+            wait_phase: AtomicU8::new(WaitPhase::Running as u8),
         })
     }
 
@@ -173,6 +220,11 @@ impl Thread {
             addr_space_root: None,
             user_entry: None,
             process: None,
+            wait_objs: [0; MAX_WAIT_HANDLES],
+            wait_signaled: [false; MAX_WAIT_HANDLES],
+            wait_count: 0,
+            wait_has_deadline: false,
+            wait_phase: AtomicU8::new(WaitPhase::Running as u8),
         })
     }
 
@@ -221,6 +273,11 @@ impl Thread {
             addr_space_root: Some(root),
             user_entry: Some((entry, user_sp)),
             process: Some(process),
+            wait_objs: [0; MAX_WAIT_HANDLES],
+            wait_signaled: [false; MAX_WAIT_HANDLES],
+            wait_count: 0,
+            wait_has_deadline: false,
+            wait_phase: AtomicU8::new(WaitPhase::Running as u8),
         })
     }
 
@@ -341,6 +398,129 @@ impl Thread {
         // KernelStack is not Copy and owns mappings) and project to its top.
         unsafe { (*(&raw const (*p).stack)).as_ref().map(|s| s.top().as_u64()) }
     }
+
+    // --- Wait bookkeeping (scheduler-only; same accessor contract) ------
+
+    /// Register `objs` (type-erased object addresses, `len <= MAX_WAIT_HANDLES`)
+    /// as this thread's wait set, all slots un-signaled, recording whether a
+    /// finite deadline accompanies the wait, and set the wake phase to
+    /// `Waiting`.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn wait_register(obj: *mut (), objs: &[usize], has_deadline: bool) {
+        debug_assert!(objs.len() <= MAX_WAIT_HANDLES);
+        let p = obj as *mut Thread;
+        // SAFETY: `obj` is a live Thread; SCHED serialises these field writes.
+        unsafe {
+            for (i, &o) in objs.iter().enumerate() {
+                (*p).wait_objs[i] = o;
+                (*p).wait_signaled[i] = false;
+            }
+            (*p).wait_count = objs.len() as u8;
+            (*p).wait_has_deadline = has_deadline;
+            (*p).wait_phase.store(WaitPhase::Waiting as u8, Ordering::Release);
+        }
+    }
+
+    /// Mark the slot registered for object `target` signaled, if present.
+    /// Returns `true` iff a slot matched.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn wait_mark_signaled(obj: *mut (), target: usize) -> bool {
+        let p = obj as *mut Thread;
+        // SAFETY: live Thread, SCHED held.
+        unsafe {
+            let n = (*p).wait_count as usize;
+            for i in 0..n {
+                if (*p).wait_objs[i] == target {
+                    (*p).wait_signaled[i] = true;
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    /// Copy the per-slot `(object_addr, signaled)` pairs into `out` and return
+    /// the wait count. `out` must be at least `MAX_WAIT_HANDLES` long.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn wait_snapshot(obj: *mut (), out: &mut [(usize, bool)]) -> usize {
+        let p = obj as *mut Thread;
+        // SAFETY: live Thread, SCHED held.
+        unsafe {
+            let n = (*p).wait_count as usize;
+            debug_assert!(out.len() >= n);
+            for i in 0..n {
+                out[i] = ((*p).wait_objs[i], (*p).wait_signaled[i]);
+            }
+            n
+        }
+    }
+
+    /// `true` iff this wait registered a finite deadline (heap entry to remove
+    /// on resume).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn wait_has_deadline(obj: *mut ()) -> bool {
+        let p = obj as *mut Thread;
+        // SAFETY: live Thread, SCHED held.
+        unsafe { core::ptr::read(&raw const (*p).wait_has_deadline) }
+    }
+
+    /// Clear the wait set (count 0) and reset the wake phase to `Running`.
+    /// Called on resume after the thread has unregistered from all objects.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn wait_clear(obj: *mut ()) {
+        let p = obj as *mut Thread;
+        // SAFETY: live Thread, SCHED held.
+        unsafe {
+            (*p).wait_count = 0;
+            (*p).wait_has_deadline = false;
+            (*p).wait_phase.store(WaitPhase::Running as u8, Ordering::Release);
+        }
+    }
+
+    /// CAS the wake phase `Waiting → Woken`. Returns `true` if this caller won
+    /// (the thread was still `Waiting` and is now claimed for wakeup), so the
+    /// waker should make it runnable; `false` if already `Woken` (another waker
+    /// won this multi-handle wait).
+    ///
+    /// # Safety
+    /// See the accessor contract above (the `AtomicU8` is valid for the live
+    /// Thread; the CAS is the cross-context handshake).
+    pub(crate) unsafe fn wait_try_wake(obj: *mut ()) -> bool {
+        let p = obj as *mut Thread;
+        // SAFETY: live Thread; `wait_phase` is an atomic, so a shared borrow to
+        // CAS it is sound even though other fields are SCHED-serialised.
+        unsafe {
+            (*p).wait_phase
+                .compare_exchange(
+                    WaitPhase::Waiting as u8,
+                    WaitPhase::Woken as u8,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+        }
+    }
+
+    /// Read the current wake phase. Test-only.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    #[cfg(test)]
+    pub(crate) unsafe fn wait_phase(obj: *mut ()) -> u8 {
+        let p = obj as *mut Thread;
+        // SAFETY: live Thread; atomic load.
+        unsafe { (*p).wait_phase.load(Ordering::Acquire) }
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +622,11 @@ mod tests {
             addr_space_root: Some(root),
             user_entry: Some((entry, user_sp)),
             process: Some(process),
+            wait_objs: [0; MAX_WAIT_HANDLES],
+            wait_signaled: [false; MAX_WAIT_HANDLES],
+            wait_count: 0,
+            wait_has_deadline: false,
+            wait_phase: AtomicU8::new(WaitPhase::Running as u8),
         })
         .unwrap()
     }
@@ -485,5 +670,48 @@ mod tests {
         // link carries ownership with no back-reference cycle.
         assert_eq!(test_probe::thread_destroys(), 1);
         assert_eq!(test_probe::process_destroys(), 1);
+    }
+
+    #[test]
+    fn wait_bookkeeping_round_trips() {
+        init_global_heap();
+        let t = Thread::try_new(1, 1).unwrap();
+        let obj = KBox::into_raw(t).as_ptr() as *mut ();
+        // SAFETY: live Thread, single-threaded test (stands in for SCHED).
+        unsafe {
+            // Initially Running phase, no wait.
+            assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
+
+            // Register two objects with a finite deadline.
+            Thread::wait_register(obj, &[0xAA, 0xBB], true);
+            assert_eq!(Thread::wait_phase(obj), WaitPhase::Waiting as u8);
+            assert!(Thread::wait_has_deadline(obj));
+
+            // Mark one signaled; the other stays false; unknown target no-ops.
+            assert!(Thread::wait_mark_signaled(obj, 0xBB));
+            assert!(!Thread::wait_mark_signaled(obj, 0xCC));
+
+            // Snapshot reflects the registration + the one signal.
+            let mut out = [(0usize, false); MAX_WAIT_HANDLES];
+            let n = Thread::wait_snapshot(obj, &mut out);
+            assert_eq!(n, 2);
+            assert_eq!(out[0], (0xAA, false));
+            assert_eq!(out[1], (0xBB, true));
+
+            // First wake wins the CAS; a second loses (dedup).
+            assert!(Thread::wait_try_wake(obj));
+            assert!(!Thread::wait_try_wake(obj));
+            assert_eq!(Thread::wait_phase(obj), WaitPhase::Woken as u8);
+
+            // Clear resets count + phase.
+            Thread::wait_clear(obj);
+            assert_eq!(Thread::wait_phase(obj), WaitPhase::Running as u8);
+            assert!(!Thread::wait_has_deadline(obj));
+            assert_eq!(Thread::wait_snapshot(obj, &mut out), 0);
+
+            drop(KBox::<Thread>::from_raw(core::ptr::NonNull::new_unchecked(
+                obj as *mut Thread,
+            )));
+        }
     }
 }
