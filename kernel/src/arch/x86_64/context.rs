@@ -1,4 +1,5 @@
-//! Cooperative kernel-thread context switch, emitted from Rust.
+//! Kernel-thread context switch, emitted from Rust. Shared by the cooperative
+//! (`yield_now`/`exit`) and preemptive (timer-IRQ) scheduler paths.
 //!
 //! The switch is a `#[unsafe(naked)]` function using `naked_asm!`, not a
 //! standalone NASM file — consistent with every other piece of kernel
@@ -17,11 +18,17 @@
 //! they are already clobbered across any `call`, and `context_switch` is
 //! reached only by a normal `call` from the scheduler.
 //!
-//! RFLAGS is deliberately not saved/restored: Phase 1 runs with interrupts
-//! masked everywhere (IF=0, no preemption), and DF / the arithmetic flags
-//! are caller-saved per the ABI exactly as after any `call`. The future
-//! preemptive path entered from an IRQ is a *different* entry that saves a
-//! full interrupt frame; it does not go through this function.
+//! RFLAGS is deliberately not saved/restored here: DF / the arithmetic flags
+//! are caller-saved per the ABI exactly as after any `call`, and the interrupt
+//! flag is handled around the switch by the scheduler, not inside it. The
+//! **preemptive** path reuses this same function from inside the timer IRQ
+//! handler: the interrupted thread's full register frame (CPU-pushed
+//! `rip/cs/rflags/rsp/ss` + the stub-pushed GPRs) already sits on its kernel
+//! stack *below* the callee-saved frame this switch parks, so when that thread
+//! is later resumed it returns up through `context_switch` into the timer-stub
+//! epilogue, which `iretq`s the original interrupt frame (including IF) back.
+//! The scheduler holds interrupts masked across the switch in both paths (see
+//! `sched.rs` and `kernel/docs/lock-ordering.md`).
 //!
 //! CR3 is not switched: every kernel thread shares the boot PML4 and the
 //! shared kernel vmap. Address-space switching arrives with the userspace
@@ -157,10 +164,14 @@ pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64) {
 pub extern "C" fn thread_trampoline() -> ! {
     // SAFETY: naked — reached only via the fabricated frame's `ret` with an
     // empty, 16-aligned stack. `and rsp, -16` is a no-op for a page-aligned
-    // kernel-stack top; the `call` then establishes the SysV entry
-    // alignment for `thread_enter`, which is `-> !`.
+    // kernel-stack top; `sti` enables interrupts so this freshly-scheduled
+    // thread runs preemptible (it did not arrive via an `iretq` that would
+    // restore IF — the switcher left interrupts masked across the stack swap);
+    // the `call` then establishes the SysV entry alignment for `thread_enter`,
+    // which is `-> !`.
     naked_asm!(
         "and rsp, -16",
+        "sti",
         "call {enter}",
         "ud2",
         enter = sym crate::sched::thread_enter,

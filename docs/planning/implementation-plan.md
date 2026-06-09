@@ -489,10 +489,13 @@ therefore wait queues / blocking IPC / notifications.
 - [x] `ArchCpu` — feature detection (`has_apic`) + `halt` (the new surface
       this slice needs). Folding the existing CPU boot free fns in is the Arch
       boundary normalization slice.
-- [ ] `ArchFpu` (XSAVE/XRSTOR) — **deferred to the Preemptive scheduling
-      slice**, alongside the context-switch FPU save/restore that is its only
-      consumer (that slice's checklist already has the wiring item). Phase-1
-      userspace is soft-float, so nothing uses the FPU yet.
+- [ ] `ArchFpu` (XSAVE/XRSTOR) — **deferred until a userspace thread can touch
+      the FPU.** The preemptive-scheduling slice (2026-06-08) considered wiring
+      it but found no consumer: the kernel is soft-float and the single user
+      thread is soft-float, so no thread touches the FPU and a preempt→switch→
+      resume cannot corrupt FPU/XMM state. It lands with its first real consumer
+      (a hard-float userspace target or a second FPU-using thread), wired into
+      both switch paths then.
 - [x] `ArchUserAccess` — formalises the existing SMAP copy primitives as a
       neutral trait (asm + exception table unchanged).
 - [x] `ArchSmp` — single-CPU stub (`cpu_count()==1`, `current_cpu()==0`,
@@ -537,29 +540,33 @@ Switches the cooperative scheduler (the threading slice) to a preemptive
 one, still on a single CPU. Depends on a periodic timer (Timers and clocks)
 and an enabled interrupt controller (`ArchIrq`). Deliberately separate from
 SMP: get preemption correct on one CPU first; multiple CPUs come in Phase 3.
-This slice also introduces the `Blocked` thread state + block/unblock that
-**wait queues** build on. (Decision log, 2026-05-29; re-sequenced 2026-06-04.)
+(Decision log, 2026-05-29; re-sequenced 2026-06-04; landed 2026-06-08.)
 
-- [ ] `IrqSpinLock` — the `cli` + save/restore-`RFLAGS` lock variant
-      `kernel/src/libkern/spinlock.rs` already anticipates. Audit every
-      existing `SpinLock` site reachable from IRQ context (the runqueue
-      lock becomes an `IrqSpinLock`).
-- [ ] Enable interrupts (`IF=1`) — the model-wide flip from Phase 1's
-      "interrupts masked everywhere"; re-audit all lock sites against the
-      new IRQ-reentrancy.
-- [ ] Preemptive switch path — a timer-IRQ-driven switch distinct from the
-      cooperative `context_switch`. The IRQ stub saves the full register
-      frame (as the exception stubs do); the switch swaps at the
-      interrupt-frame level and returns via `iretq`. The cooperative
-      voluntary-yield/`exit` path is retained, not replaced.
-- [ ] `Blocked` thread state + block/unblock scheduler operations — the
-      descheduling primitive wait queues consume.
-- [ ] Timer-tick reschedule: per-thread quantum/time-slice; on expiry the
-      tick requests a reschedule. Round-robin still (no classes yet).
-- [ ] Idle thread: per-CPU placeholder that `hlt`s when the runqueue is
-      empty.
-- [ ] Wire eager FPU save/restore (`ArchFpu`) into **both** switch paths
-      once userspace threads can touch the FPU.
+- [x] `IrqSpinLock` — the `cli` + save/restore-`RFLAGS` lock variant. Audit
+      done: only `SCHED` (rank 1) and `SERIAL` (rank 7) are reachable from the
+      timer IRQ, so only those two became `IrqSpinLock`; all other locks stay
+      plain `SpinLock` (the handler touches nothing else and never allocates).
+- [x] Enable interrupts (`IF=1`) — the model-wide flip from "interrupts masked
+      everywhere"; IF control added to `ArchCpu` (`interrupts_enable/disable/
+      restore/enabled`); armed at boot after the scheduler + timer are up.
+- [x] Preemptive switch path — the timer IRQ stub builds the full interrupt
+      frame (like the exception stubs) and **reuses** `context_switch` from
+      inside the handler: the frame sits on the kernel stack below the switch's
+      parked callee-saved frame, so a later resume returns into the stub
+      epilogue and `iretq`s back. The cooperative `yield_now`/`exit` path is
+      retained; both share the `switch_to_next` core.
+- [x] Timer-tick reschedule: scheduler-side quantum (`QUANTUM_TICKS`, one
+      10 ms tick) → round-robin reschedule. Round-robin only (no classes yet).
+- [x] Idle thread: a kernel thread that `hlt`s (IF=1) when the run queue is
+      empty; kept out of the ready/reap sets, reaps the exited boot thread.
+- [ ] `Blocked` thread state + block/unblock — **moved to the Wait queues
+      slice** (its only consumer is `sys_wait`; adding it here would be dead
+      code). See Wait queues.
+- [ ] Wire eager FPU save/restore (`ArchFpu`) into **both** switch paths —
+      **deferred** until a userspace thread can actually touch the FPU
+      (kernel is soft-float and the single user thread is soft-float, so no
+      thread touches the FPU and a preempt→switch→resume cannot corrupt
+      FPU/XMM state — eager XSAVE would be dormant code).
 
 Note: the threading slice's global `SCHED`/`current` are explicit
 single-CPU stand-ins. Phase 3 SMP refactors `SchedState` into per-CPU
@@ -570,9 +577,12 @@ by that refactor.
 
 #### Wait queues
 
-With the IRQ-driven scheduler, timers, and the `Blocked` state in place,
-`sys_wait` (the unified blocking primitive) and per-object wait queues land.
+With the IRQ-driven scheduler and timers in place, `sys_wait` (the unified
+blocking primitive) and per-object wait queues land.
 
+- [ ] `Blocked` thread state + block/unblock scheduler operations — the
+      descheduling primitive wait queues consume (moved here from preemptive
+      scheduling, where it would have been dead code with no caller).
 - [ ] `Timer` kernel object (deferred from Timers and clocks — needs the
       timer IRQ, `sys_wait`, and notifications to fire/wait/signal)
 - [ ] Kernel timer deadline min-heap (deferred from Timers and clocks — its

@@ -202,6 +202,52 @@ pub unsafe fn invlpg(virt: u64) {
     }
 }
 
+/// Read `RFLAGS`.
+///
+/// Safe in ring 0: `pushfq` then a pop snapshots the flags into a GPR with
+/// no lasting side effect (the push/pop pair is balanced). Used to read the
+/// interrupt-enable bit (`IF`, bit 9) for the `IrqSpinLock` save/restore.
+#[inline]
+pub fn read_rflags() -> u64 {
+    let val: u64;
+    // SAFETY: `pushfq; pop reg` reads RFLAGS into `val`. It uses the stack
+    // (balanced push+pop), so `nostack` is omitted; we must read the flags,
+    // so `preserves_flags` is omitted too. No memory we model is touched.
+    unsafe {
+        asm!("pushfq", "pop {}", out(reg) val, options(nomem));
+    }
+    val
+}
+
+/// Clear the interrupt flag (`cli`) — mask maskable interrupts on this CPU.
+///
+/// # Safety
+/// Ring-0 only. Leaving interrupts masked indefinitely stalls preemption;
+/// callers must bound the masked window (see [`crate::libkern::IrqSpinLock`]).
+#[inline]
+pub unsafe fn cli() {
+    // SAFETY: `cli` clears IF; ring-0 instruction, no memory effect. IF is not
+    // one of the arithmetic flags `preserves_flags` tracks, so the option set
+    // matches the `cli` in `cpu.rs::halt_loop`.
+    unsafe {
+        asm!("cli", options(nomem, nostack, preserves_flags));
+    }
+}
+
+/// Set the interrupt flag (`sti`) — unmask maskable interrupts on this CPU.
+///
+/// # Safety
+/// Ring-0 only. The IDT must be installed and a sane interrupt environment
+/// established before enabling delivery.
+#[inline]
+pub unsafe fn sti() {
+    // SAFETY: `sti` sets IF; ring-0 instruction, no memory effect. See `cli`
+    // re: `preserves_flags`.
+    unsafe {
+        asm!("sti", options(nomem, nostack, preserves_flags));
+    }
+}
+
 /// Read the Time-Stamp Counter — a 64-bit cycle counter that increments
 /// monotonically with the core clock (the value is returned across
 /// `edx:eax`).

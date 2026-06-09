@@ -10,9 +10,9 @@
 //!
 //! Calibration uses **PIT channel 2**, which is software-gated (port `0x61`
 //! bit 0) and whose output is pollable (port `0x61` bit 5) — so it needs no
-//! interrupt, which matters because interrupts are masked (IF=0) for this whole
-//! slice. We run the channel for a fixed ~10 ms window and count how far the
-//! TSC and the LAPIC timer advance, yielding both frequencies.
+//! interrupt, which matters because it runs at boot before interrupts are
+//! enabled (IF is still 0). We run the channel for a fixed ~10 ms window and
+//! count how far the TSC and the LAPIC timer advance, yielding both frequencies.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -148,8 +148,9 @@ impl ArchTimer for X86Timer {
 
     unsafe fn start_periodic(period_ns: u64) {
         let count = ns_to_timer_ticks(period_ns);
-        // SAFETY: LAPIC MMIO mapped (post-init). Periodic LVT at the timer
-        // vector; with IF=0 nothing is delivered, but the countdown runs.
+        // SAFETY: LAPIC MMIO mapped (post-init). Unmasked periodic LVT at the
+        // timer vector — once IF=1 (preemptive scheduling) this fires the timer
+        // IRQ every `period_ns`.
         unsafe {
             apic::write_reg_shared(apic::REG_TIMER_DIV_CONFIG, LAPIC_TIMER_DIV16_DCR);
             apic::write_reg_shared(apic::REG_LVT_TIMER, LVT_TIMER_PERIODIC | TIMER_VECTOR as u32);

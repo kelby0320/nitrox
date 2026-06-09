@@ -8,20 +8,22 @@
 //!
 //! Two access paths exist:
 //!
-//! * [`SERIAL`] — the normal path: a [`SpinLock`]-guarded port that the
-//!   `kprint!` / `kprintln!` macros drive.
+//! * [`SERIAL`] — the normal path: an [`IrqSpinLock`]-guarded port that the
+//!   `kprint!` / `kprintln!` macros drive. It is an `IrqSpinLock` (masks
+//!   interrupts while held) because a thread can be printing when the timer IRQ
+//!   fires; the mask makes the print uninterruptible, so the handler can never
+//!   find the lock held by the context it interrupted.
 //! * [`emergency_writer`] — an *unsynchronised* path for the panic and
-//!   exception handlers. [`SpinLock`] cannot be force-unlocked, so a
-//!   handler that ran while [`SERIAL`] was locked would deadlock trying
-//!   to take it. The emergency path constructs a throwaway [`SerialPort`]
-//!   to the fixed COM1 port instead. This is sound only because Phase 1
-//!   is single-CPU with interrupts masked: at fault time no other context
-//!   can be driving the UART. It must be revisited at SMP.
+//!   exception handlers. The lock cannot be force-unlocked, so a handler that
+//!   ran while [`SERIAL`] was locked would deadlock trying to take it. The
+//!   emergency path constructs a throwaway [`SerialPort`] to the fixed COM1 port
+//!   instead. This is sound only because Phase 1 is single-CPU: at fault time no
+//!   other context can be driving the UART. It must be revisited at SMP.
 
 use core::fmt;
 
 use crate::arch::x86_64::regs;
-use crate::libkern::SpinLock;
+use crate::libkern::IrqSpinLock;
 
 /// COM1 base I/O port. Fixed by the PC platform.
 const COM1_BASE: u16 = 0x3F8;
@@ -113,7 +115,7 @@ impl fmt::Write for SerialPort {
 /// The kernel's COM1 serial port behind a spin lock. The `kprint!` /
 /// `kprintln!` macros drive this; the panic and exception handlers use
 /// [`emergency_writer`] instead (see the module docs).
-pub static SERIAL: SpinLock<SerialPort> = SpinLock::new(SerialPort::new(COM1_BASE));
+pub static SERIAL: IrqSpinLock<SerialPort> = IrqSpinLock::new(SerialPort::new(COM1_BASE));
 
 /// Initialise the COM1 UART. Call once, early in boot, before the first
 /// `kprintln!`.

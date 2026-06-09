@@ -261,7 +261,7 @@ pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64) -> ! {
     naked_asm!(
         "push {user_ss}",           // SS
         "push rsi",                 // RSP = user_sp
-        "push {rflags}",            // RFLAGS (IF=0; bit1 reserved=1)
+        "push {rflags}",            // RFLAGS (IF=1; bit1 reserved=1) — ring 3 runs preemptible
         "push {user_cs}",           // CS
         "push rdi",                 // RIP = entry
         "xor eax, eax",
@@ -282,6 +282,9 @@ pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64) -> ! {
         "iretq",
         user_ss = const gdt::USER_DATA_SELECTOR as u64,
         user_cs = const gdt::USER_CODE_SELECTOR as u64,
-        rflags  = const 0x2u64,
+        // bit 1 reserved (always 1) + IF (bit 9): ring 3 runs with interrupts
+        // enabled so the periodic timer preempts user threads. A `syscall` back
+        // into the kernel re-masks IF via SFMASK.
+        rflags  = const 0x202u64,
     );
 }

@@ -2471,3 +2471,62 @@ to `timer.rs` are `pub(crate)`, never crossing the arch boundary); `build` clean
 cases included) green; `qemu` shows `timer up: monotonic 2302 MHz, per-CPU timer
 62 MHz (clock t0=… ns)` and the hello ring-3 demo prints `clock: monotonic
 advancing`.
+
+## 2026-06-08 — Phase 1, slice 17: preemptive scheduling (single-CPU)
+
+Flipped the kernel from "interrupts masked everywhere (IF=0), cooperative" to
+single-CPU **preemptive** scheduling driven by the periodic LAPIC timer. The
+cooperative `yield_now`/`exit` path is retained; preemption adds a second,
+IRQ-driven entry into the same switch core.
+
+- **IF=1 after boot.** Added interrupt-flag control to `ArchCpu`
+  (`interrupts_enabled`/`interrupts_disable`/`interrupts_enable`/
+  `interrupts_restore`) over new `regs::{read_rflags, cli, sti}`. Boot arms the
+  periodic tick (`Timer::start_periodic`) then raises IF, right after the
+  scheduler (with its idle thread) is up.
+- **`IrqSpinLock`.** New `SpinLock` variant that captures the prior IF and
+  `cli`s **before** spinning, restoring on drop (release-before-restore).
+  **Audit:** only `SCHED` (rank 1) and `SERIAL` (rank 7) are reachable from the
+  timer handler (reschedule + the occasional `kprintln`), and the handler never
+  allocates, so only those two migrated; all other locks stay plain `SpinLock`.
+  Single-CPU deadlock-freedom: a thread holding an `IrqSpinLock` can't be
+  preempted, so the handler never finds it held by the interrupted context.
+- **IRQ reuses `context_switch`.** Rather than a separate IRQ-level switcher,
+  the returning timer stub builds the full interrupt frame on the kernel stack
+  and the handler calls the *same* `context_switch`. The interrupted frame sits
+  below the switch's parked callee-saved frame, so a later resume returns into
+  the stub epilogue and `iretq`s the original context (incl. IF) back. The
+  cooperative and preemptive paths share one `switch_to_next` core.
+- **Interrupts masked across the switch.** A timer IRQ mid-`context_switch`
+  would corrupt a half-swapped stack. Reconciled with the cardinal "lock dropped
+  before the switch" rule via `IrqSpinLockGuard::release_keeping_irqs_masked`
+  (release the lock, keep IF=0); the cooperative path restores IF on resume, the
+  preemptive path's `iretq` does. Fresh threads (reached via `thread_trampoline`,
+  not an `iretq`) `sti` for themselves; user threads get IF=1 via `enter_user`'s
+  RFLAGS `0x202` (SFMASK already re-masks IF on the `syscall` back-edge).
+- **Quantum + idle.** Scheduler-side `quantum` (one 10 ms tick, `QUANTUM_TICKS`)
+  → round-robin reschedule; kept off `Thread` (no layout/ABI change). An idle
+  thread (`hlt` with IF=1) runs when nothing is ready and reaps the boot thread;
+  it is kept out of the ready/reap sets. `kernel_main` ends by `exit`ing the
+  boot thread into idle (not `halt_loop`, which would `cli` and freeze the tick).
+- **Spurious vector.** Installed a `0xFF` stub that just `iretq`s (a spurious
+  LAPIC interrupt takes no EOI), now that IF=1 makes it possible.
+- **Deferred (no consumer):** **FPU/`ArchFpu`** save-restore — kernel is
+  soft-float and the single user thread is soft-float, so no thread touches the
+  FPU and a preempt→switch→resume cannot corrupt FPU/XMM state; lands when a
+  userspace thread can touch the FPU. **`Blocked` state + block/unblock** —
+  moved to the wait-queues slice (its only consumer is `sys_wait`); adding it
+  here would be dead code. `ThreadState` keeps `Ready/Running/Exited`.
+
+**ABI-hash impact: none** — no `export!` change; no `KObjectType`/`Notification`/
+`Irp`/`KObjectHeader` layout or discriminant change; `ThreadState` gains no
+variant; `Thread` `#[repr(C)]` unchanged (quantum/idle live in `SchedState`);
+new `ArchCpu` methods + `IrqSpinLock` are internal; `ExceptionFrame` is
+arch-internal.
+
+Verified: `cargo xtask check-arch` clean; `build` clean; `test` (309 host tests —
+new `IrqSpinLock` save/restore + `tick_quantum` cases included) green; `qemu`
+shows `preemption armed (IF=1, 100 Hz tick)`, then three CPU-bound workers that
+never yield **interleave** their output (`worker 1/2/3 round 0`, `… round 1`, …
+— cooperatively worker 1 would have finished first), the ring-3 `hello` runs
+preemptibly, and the system idles cleanly at end of boot (no panic, no freeze).

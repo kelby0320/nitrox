@@ -1,28 +1,25 @@
 //! Architecture-neutral local interrupt-controller contract.
 //!
 //! [`ArchIrq`] is the per-CPU local interrupt controller (the local APIC on
-//! x86_64, the GIC CPU interface on aarch64). This slice only *brings it up*
-//! and exposes end-of-interrupt + identity; interrupts stay masked (IF=0) for
-//! the whole slice, so nothing is delivered yet. The timer source (the
-//! controller's timer local-vector) is programmed by the Timers slice, and
-//! the IRQ entry stub / `IF=1` / masking-lock land with the Preemptive
-//! scheduling slice.
+//! x86_64, the GIC CPU interface on aarch64): bring-up, end-of-interrupt, and
+//! identity. The timer local-vector is programmed by the timekeeping slice
+//! (`ArchTimer`), and the preemptive-scheduling slice added the IRQ entry stubs
+//! and raised `IF=1`, so the periodic timer now drives the scheduler.
 //!
 //! The active architecture's implementation is re-exported from
 //! `crate::arch` as `Irq` (see `kernel/src/arch/mod.rs`).
 
 use crate::libkern::AllocError;
 
-/// Interrupt vector reserved for the controller's spurious interrupt. The
-/// controller is told to deliver unclassifiable interrupts here; no handler
-/// is installed this slice (with IF=0 nothing is delivered — the spurious
-/// handler lands with the preemptive-scheduling slice that raises IF).
+/// Interrupt vector for the controller's spurious interrupt. The controller is
+/// told to deliver unclassifiable interrupts here; the IDT installs a stub that
+/// simply `iretq`s (a spurious interrupt takes no EOI).
 pub const SPURIOUS_VECTOR: u8 = 0xFF;
 
-/// Interrupt vector the per-CPU timer will raise. Programmed into the timer's
-/// local-vector entry by the Timers slice; reserved here so the two slices
-/// agree on the number. `0x20` is the first vector above the 0–31 range the
-/// CPU reserves for exceptions.
+/// Interrupt vector the per-CPU timer raises. Programmed into the timer's
+/// local-vector entry by `ArchTimer`, handled by the IDT's returning timer stub
+/// (which drives the preemptive scheduler). `0x20` is the first vector above
+/// the 0–31 range the CPU reserves for exceptions.
 pub const TIMER_VECTOR: u8 = 0x20;
 
 /// Per-CPU local interrupt-controller operations.

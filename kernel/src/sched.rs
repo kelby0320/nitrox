@@ -1,31 +1,39 @@
-//! Minimal cooperative round-robin scheduler for kernel threads.
+//! Single-CPU preemptive round-robin scheduler for kernel and user threads.
 //!
-//! Phase 1 is single-CPU with interrupts masked everywhere (IF=0, no
-//! timer, no preemption), so scheduling is **cooperative**: a thread runs
-//! until it calls [`yield_now`] or [`exit`]. This module owns the run
-//! queue, the current-thread pointer, and the switch sequencing on top of
-//! the arch primitive [`context_switch`](crate::arch::context_switch) and
-//! the [`Thread`] kernel object. Preemptive, multi-class, per-CPU
-//! scheduling arrives with the timer/IRQ and SMP slices.
+//! A thread runs until either (a) it voluntarily calls [`yield_now`]/[`exit`]
+//! — the **cooperative** path — or (b) the periodic timer IRQ fires
+//! [`on_timer_tick`], whose quantum-expiry **preempts** it. Both paths funnel
+//! through the same [`switch_to_next`] core on top of the arch primitive
+//! [`context_switch`](crate::arch::context_switch) and the [`Thread`] kernel
+//! object. An [idle thread](idle_body) runs (`hlt`) whenever nothing else is
+//! ready. Multi-class scheduling and per-CPU/SMP arrive in later slices.
 //!
-//! ## The run-queue lock and the switch
+//! ## The run-queue lock, interrupts, and the switch
 //!
 //! [`SCHED`] is the **rank-1** run-queue lock (`kernel/docs/lock-ordering.md`).
-//! The one hard rule: the lock is **dropped before every
-//! [`context_switch`] and re-acquired fresh on resume** — it is never
-//! carried across a stack switch. Carrying it would have the *resumed*
-//! thread drop a guard it never acquired. Every resume point
-//! ([`yield_now`] after the switch, and [`thread_enter`]) therefore runs
-//! with the lock not held. The brief window between publishing the next
-//! thread and executing the register switch is safe under single-CPU /
-//! IF=0 / no-preemption: nothing else can run.
+//! It is now an [`IrqSpinLock`](crate::libkern::IrqSpinLock): it `cli`s before
+//! acquiring, so a thread holding it cannot be preempted — the timer handler
+//! can never find it already held by the context it interrupted (single-CPU
+//! deadlock-freedom).
 //!
-//! Allocation never happens under the lock: [`init`] installs a
-//! pre-reserved run queue, and the heavy work in [`spawn`]
-//! (stack allocation, frame fabrication) runs before the enqueue lock is
-//! taken. Reaping an exited thread's stack (which takes rank-6 allocator
-//! locks via [`KernelStack`](crate::mm)'s `Drop`) likewise runs outside
-//! the rank-1 lock.
+//! The cardinal rule still holds: the lock is **dropped before every
+//! [`context_switch`]** and re-acquired fresh on resume — never carried across
+//! a stack switch. But interrupts must stay masked **across** the switch (a
+//! timer mid-switch would corrupt a half-swapped stack), so the switch core
+//! drops the lock via [`release_keeping_irqs_masked`] (release the lock, keep
+//! IF=0) and restores the interrupt state on resume. The preemptive path is
+//! already IF=0 (the timer interrupt gate clears it) and resumes by returning
+//! into the timer-stub epilogue, which `iretq`s the original interrupt state
+//! back.
+//!
+//! Allocation never happens under the lock: [`init`] installs a pre-reserved
+//! run queue (and the idle thread) and the heavy work in [`spawn`] (stack
+//! allocation, frame fabrication) runs before the enqueue lock is taken.
+//! Reaping an exited thread's stack (rank-6 allocator locks via
+//! [`KernelStack`](crate::mm)'s `Drop`) runs outside the rank-1 lock — and
+//! never from the timer handler (which performs no allocation).
+//!
+//! [`release_keeping_irqs_masked`]: crate::libkern::IrqSpinLockGuard::release_keeping_irqs_masked
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
@@ -33,7 +41,7 @@ use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
 use crate::arch::{Cpu, Paging, context_switch};
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec, SpinLock};
+use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
 use crate::object::{ObjectRef, Thread, ThreadEntry, ThreadState};
 
@@ -41,6 +49,21 @@ use crate::object::{ObjectRef, Thread, ThreadEntry, ThreadState};
 /// kernel threads; enqueueing beyond this is a logic error (debug-asserted)
 /// rather than an allocation under the rank-1 lock.
 const READY_RESERVE: usize = 16;
+
+/// Periodic scheduler tick: 10 ms (100 Hz). Matches the PIT calibration
+/// window; fine-grained enough for round-robin without excessive IRQ overhead.
+pub const TICK_NS: u64 = 10_000_000;
+
+/// Ticks per scheduling quantum. One tick — reschedule on every tick — is the
+/// simplest correct round-robin policy. The field stays (see [`SchedState`]) so
+/// a later slice can lengthen slices without re-plumbing the tick path.
+const QUANTUM_TICKS: u32 = 1;
+
+/// Thread id for the idle thread — a reserved sentinel distinct from the
+/// monotonic `next_tid` range (which starts at 1 and would need ~4 billion
+/// spawns to reach this). Used only for diagnostics; idle identity is by
+/// object address (`SchedState::idle_addr`).
+const IDLE_TID: u32 = u32::MAX;
 
 /// The kernel/boot page-table root, captured once at [`init`]. Threads with
 /// no per-process address space (`addr_space_root == None`) run on this root;
@@ -73,13 +96,28 @@ struct SchedState {
     reap: Option<ObjectRef>,
     /// Monotonic thread-id source.
     next_tid: u32,
+    /// Ticks remaining in the current thread's slice; reset to
+    /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
+    /// here rather than on `Thread` (no `Thread` layout/ABI change).
+    quantum: u32,
+    /// The idle thread, parked here whenever it is **not** the current thread.
+    /// Kept out of `ready`/`reap`; runs (`hlt`) only when nothing else is
+    /// ready. `None` only before [`init`] or while idle is current.
+    idle: Option<ObjectRef>,
+    /// The idle thread's object address — its stable identity (the `idle` slot
+    /// is empty while idle runs). Stored as `usize` (not a raw pointer) so
+    /// `SchedState` stays `Send`. `0` before [`init`].
+    idle_addr: usize,
 }
 
-static SCHED: SpinLock<SchedState> = SpinLock::new(SchedState {
+static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     ready: KVec::new(),
     current: None,
     reap: None,
     next_tid: 1,
+    quantum: QUANTUM_TICKS,
+    idle: None,
+    idle_addr: 0,
 });
 
 /// Adopt a freshly created `Thread` into an [`ObjectRef`], transferring the
@@ -107,9 +145,19 @@ pub fn init() -> Result<(), AllocError> {
     let boot = Thread::try_new_boot(0, 0)?;
     let boot_ref = into_objref(boot);
 
+    // The idle thread: a runnable kernel thread with its own stack that just
+    // halts. Built outside the lock (it allocates a kernel stack). It is never
+    // enqueued or reaped — its body loops forever.
+    let idle = Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?;
+    let idle_ref = into_objref(idle);
+    let idle_addr = idle_ref.as_ptr() as usize;
+
     let mut g = SCHED.lock();
     g.ready = ready;
     g.current = Some(boot_ref);
+    g.idle = Some(idle_ref);
+    g.idle_addr = idle_addr;
+    g.quantum = QUANTUM_TICKS;
     Ok(())
 }
 
@@ -178,57 +226,114 @@ pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64) -> Result<u32, A
 }
 
 /// Cooperatively yield to the next ready thread, round-robin. Returns
-/// immediately (still current) if no other thread is ready. Resumes here,
-/// lock-free, when this thread is scheduled again.
+/// immediately (still current) if no other thread is ready — it does **not**
+/// yield to the idle thread, so the boot drainer's [`ready_is_empty`] gate
+/// still works. Resumes here, lock-free, when this thread is scheduled again.
 pub fn yield_now() {
     // Reclaim any previously-exited thread's stack first (outside the lock).
     reap_pending();
 
-    let switch: Option<(*mut u64, u64, PhysAddr)> = {
-        let mut g = SCHED.lock();
-        match dequeue_front(&mut g) {
-            None => None, // nothing else ready — keep running
-            Some(next) => {
-                let prev = g.current.take().expect("current set after init");
-                let prev_obj = prev.as_ptr();
-                let next_obj = next.as_ptr();
-                // SAFETY: both threads are pinned alive (prev about to be
-                // re-enqueued, next becoming current) and we hold the
-                // run-queue lock, satisfying the Thread accessor contract.
-                unsafe {
-                    Thread::set_state(prev_obj, ThreadState::Ready);
-                    Thread::set_state(next_obj, ThreadState::Running);
-                }
-                let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
-                let next_sp = unsafe { Thread::saved_sp(next_obj) };
-                let next_root = unsafe { resolve_root(next_obj) };
-                debug_assert!(g.ready.len() < g.ready.capacity());
-                // Re-enqueue prev at the tail, then install next as current.
-                g.ready
-                    .try_push(prev)
-                    .expect("run queue within reserve");
-                g.current = Some(next);
-                Some((prev_slot, next_sp, next_root))
-            }
-        }
-        // Guard dropped here — lock released before the switch.
-    };
-
-    if let Some((prev_slot, next_sp, next_root)) = switch {
-        // Make the incoming thread's address space active before swapping
-        // stacks. Safe to switch CR3 here: every kernel stack (incl. both
-        // threads' and this code) lives in the shared kernel half, mapped
-        // identically in every address space.
-        // SAFETY: `next_root` is a fully-formed PML4 (boot root or a process
-        // root with the kernel half inherited).
-        unsafe { Paging::set_page_table(next_root) };
-        // SAFETY: the lock is released; `prev_slot` points into the prev
-        // thread (pinned in `ready`) and `next_sp` is the saved RSP of the
-        // now-current thread (pinned in `current`). Single-CPU: no other
-        // context touches either across the switch.
-        unsafe { context_switch(prev_slot, next_sp) };
-        // Resumed: we are current again and the lock is not held.
+    let g = SCHED.lock();
+    if g.ready.is_empty() {
+        return; // nothing else ready — keep running (guard drops, IF restored)
     }
+    switch_to_next(g);
+}
+
+/// Periodic timer-tick entry, called from the timer IRQ dispatcher with
+/// interrupts masked (the timer interrupt gate cleared IF). Decrements the
+/// current quantum; on expiry it resets the quantum and, if another thread is
+/// ready, reschedules round-robin (reusing [`switch_to_next`]).
+pub fn on_timer_tick() {
+    let mut g = SCHED.lock();
+    let (new_quantum, reschedule) = tick_quantum(g.quantum, !g.ready.is_empty());
+    g.quantum = new_quantum;
+    if reschedule {
+        switch_to_next(g); // consumes the guard; switches with IF masked
+    }
+    // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
+}
+
+/// Decide the quantum update and whether to reschedule on a timer tick. Pure
+/// (no lock, no switch) so it is host-testable.
+///
+/// Decrement the quantum; on expiry reset it to [`QUANTUM_TICKS`] and reschedule
+/// **iff another thread is ready** — if nothing else is runnable, the current
+/// thread (worker or idle) keeps running, since switching to the idle thread (or
+/// idle→idle) would be pointless churn.
+fn tick_quantum(quantum: u32, ready_nonempty: bool) -> (u32, bool) {
+    let q = quantum.saturating_sub(1);
+    if q == 0 {
+        (QUANTUM_TICKS, ready_nonempty)
+    } else {
+        (q, false)
+    }
+}
+
+/// The shared switch core used by [`yield_now`] and [`on_timer_tick`]: the
+/// outgoing `current` is re-homed (re-enqueued, or re-parked if it is the idle
+/// thread) and the next thread (front of `ready`, else the idle thread) becomes
+/// current. Consumes the run-queue guard.
+///
+/// Callers ensure there is genuinely something else to run (`ready` non-empty,
+/// or the current thread is idle and `ready` is non-empty). Drops the lock but
+/// holds interrupts masked **across** the `context_switch` via
+/// [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked),
+/// restoring the prior interrupt state on resume. Reusing
+/// [`context_switch`](crate::arch::context_switch) is sound from the preemptive
+/// path too: the interrupted thread's full register frame is already on its
+/// kernel stack (pushed by the timer stub) *below* the callee-saved frame this
+/// switch parks, so on resume it returns up into the timer-stub epilogue, which
+/// `iretq`s the original context back.
+fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
+    let next = match dequeue_front(&mut g) {
+        Some(n) => n,
+        // Only reachable if a caller violates the precondition; idle is the
+        // safe fallback when it is parked (i.e. not the current thread).
+        None => g.idle.take().expect("a runnable thread (ready or idle)"),
+    };
+    let prev = g.current.take().expect("current set after init");
+    let prev_obj = prev.as_ptr();
+    let next_obj = next.as_ptr();
+    // SAFETY: both pinned alive (prev re-homed, next becoming current) and we
+    // hold the run-queue lock — the Thread accessor contract.
+    unsafe {
+        Thread::set_state(prev_obj, ThreadState::Ready);
+        Thread::set_state(next_obj, ThreadState::Running);
+    }
+    let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
+    let next_sp = unsafe { Thread::saved_sp(next_obj) };
+    let next_root = unsafe { resolve_root(next_obj) };
+
+    // Re-home prev: the idle thread parks in its slot (never in `ready`);
+    // every other thread re-enqueues at the tail.
+    if g.idle_addr == prev_obj as usize {
+        debug_assert!(g.idle.is_none());
+        g.idle = Some(prev);
+    } else {
+        debug_assert!(g.ready.len() < g.ready.capacity());
+        g.ready.try_push(prev).expect("run queue within reserve");
+    }
+    g.current = Some(next);
+
+    // Drop the lock but keep interrupts masked across the switch (cardinal rule
+    // + the no-IRQ-mid-switch invariant). `saved_if` is this thread's prior
+    // interrupt state, restored when *this* thread next resumes here.
+    let saved_if = g.release_keeping_irqs_masked();
+    // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
+    // with the kernel half inherited); all kernel stacks are mapped in every
+    // root, so switching CR3 before the stack swap is sound.
+    unsafe { Paging::set_page_table(next_root) };
+    // SAFETY: lock released; interrupts masked; `prev_slot` points into the
+    // re-homed prev thread (pinned) and `next_sp` is the saved RSP of the
+    // now-current thread (pinned). Single-CPU: nothing else touches either.
+    unsafe { context_switch(prev_slot, next_sp) };
+    // Resumed (cooperative path): restore the interrupt state this thread had
+    // on entry. On the preemptive path the resume instead returns into the
+    // timer-stub epilogue (which `iretq`s IF back), and `saved_if` is false →
+    // this is a no-op.
+    // SAFETY: ring-0; restoring this thread's own captured interrupt state.
+    unsafe { Cpu::interrupts_restore(saved_if) };
 }
 
 /// Terminate the current thread and switch away forever. The thread's
@@ -239,55 +344,46 @@ pub fn exit() -> ! {
     // Reclaim any earlier exited thread first, so `reap` is free for us.
     reap_pending();
 
-    let switch: Option<(*mut u64, u64, PhysAddr)> = {
-        let mut g = SCHED.lock();
-        let me = g.current.take().expect("current set");
-        let me_obj = me.as_ptr();
-        // SAFETY: `me` is the running thread, pinned, lock held.
-        unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
-        let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
-        // Park self for deferred reclamation (reap is empty after the
-        // reap_pending above).
-        debug_assert!(g.reap.is_none());
-        g.reap = Some(me);
+    let mut g = SCHED.lock();
+    let me = g.current.take().expect("current set");
+    let me_obj = me.as_ptr();
+    // SAFETY: `me` is the running thread, pinned, lock held. (The idle thread
+    // never exits, so `me` is never the idle thread.)
+    unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
+    let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
+    // Park self for deferred reclamation (reap is empty after reap_pending).
+    debug_assert!(g.reap.is_none());
+    g.reap = Some(me);
 
-        match dequeue_front(&mut g) {
-            Some(next) => {
-                let next_obj = next.as_ptr();
-                // SAFETY: next is pinned, becoming current; lock held.
-                unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-                let next_sp = unsafe { Thread::saved_sp(next_obj) };
-                let next_root = unsafe { resolve_root(next_obj) };
-                g.current = Some(next);
-                Some((me_slot, next_sp, next_root))
-            }
-            None => None,
-        }
+    // Switch to the next ready thread, else the idle thread (which always
+    // exists post-init and is parked here, since `me` was current, not idle).
+    let next = match dequeue_front(&mut g) {
+        Some(n) => n,
+        None => g.idle.take().expect("idle thread exists after init"),
     };
+    let next_obj = next.as_ptr();
+    // SAFETY: next is pinned, becoming current; lock held.
+    unsafe { Thread::set_state(next_obj, ThreadState::Running) };
+    let next_sp = unsafe { Thread::saved_sp(next_obj) };
+    let next_root = unsafe { resolve_root(next_obj) };
+    g.current = Some(next);
 
-    match switch {
-        Some((me_slot, next_sp, next_root)) => {
-            // Load the incoming thread's root BEFORE switching away. When a
-            // user thread exits, `next_root` is the boot root, so CR3 is
-            // restored to the kernel table before this (parked-in-`reap`)
-            // thread is reaped — its `AddressSpace::Drop` frees the PML4 CR3
-            // would otherwise still reference.
-            // SAFETY: `next_root` is a fully-formed PML4; all kernel stacks
-            // are mapped identically across roots.
-            unsafe { Paging::set_page_table(next_root) };
-            // SAFETY: lock released. We switch away from this stack forever;
-            // `me_slot` (our own, now-Exited thread, pinned in `reap`) is
-            // written by the switch and never read again. `next_sp` is the
-            // incoming thread's saved RSP (pinned in `current`).
-            unsafe { context_switch(me_slot, next_sp) };
-            unreachable!("switched away from an exited thread");
-        }
-        // No other thread to run: we cannot free our own stack, and there
-        // is nothing to switch to. Halt — a defensive tripwire; in the
-        // Phase 1 demo the boot thread is always queued when a worker
-        // exits, so this branch is not reached.
-        None => Cpu::halt_loop(),
-    }
+    // Drop the lock but keep interrupts masked across the final switch; we
+    // never resume, so the captured prior state is discarded (the incoming
+    // thread restores its own).
+    let _ = g.release_keeping_irqs_masked();
+    // Load the incoming thread's root BEFORE switching away. When a user thread
+    // exits, `next_root` is the boot root, so CR3 is restored to the kernel
+    // table before this (parked-in-`reap`) thread is reaped — its
+    // `AddressSpace::Drop` frees the PML4 CR3 would otherwise still reference.
+    // SAFETY: `next_root` is a fully-formed PML4; all kernel stacks are mapped
+    // identically across roots.
+    unsafe { Paging::set_page_table(next_root) };
+    // SAFETY: lock released. We switch away from this stack forever; `me_slot`
+    // (our own now-Exited thread, pinned in `reap`) is written by the switch and
+    // never read again; `next_sp` is the incoming thread's saved RSP (pinned).
+    unsafe { context_switch(me_slot, next_sp) };
+    unreachable!("switched away from an exited thread");
 }
 
 /// Drop the pending reaped thread, if any, **outside** the run-queue lock
@@ -359,6 +455,25 @@ pub fn current_process() -> Option<ObjectRef> {
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.process_ref()
 }
 
+/// The idle thread body: reap any exited thread, then `hlt` until the next
+/// interrupt. Runs with IF=1 (set by
+/// [`thread_trampoline`](crate::arch::thread_trampoline)), so the periodic
+/// timer wakes it; if a thread became ready, the tick reschedules to it,
+/// otherwise control returns here and halts again. Never returns, so the idle
+/// thread is never enqueued or reaped.
+///
+/// Reaping here (outside any IRQ context, holding no other lock) is the safe
+/// home for draining the `reap` slot when the system would otherwise sit idle
+/// — e.g. the boot thread parked in `reap` after it `exit`s at end of boot.
+extern "C" fn idle_body(_arg: usize) {
+    loop {
+        reap_pending();
+        // SAFETY: ring-0; IF=1 here, so the periodic timer (or any IRQ) wakes
+        // the CPU and drives a reschedule when a thread becomes ready.
+        unsafe { Cpu::halt() };
+    }
+}
+
 /// Rust entry reached from
 /// [`thread_trampoline`](crate::arch::thread_trampoline) the first time a
 /// thread is scheduled. Runs the thread body, then exits cleanly if it
@@ -425,15 +540,24 @@ mod tests {
         into_objref(Thread::try_new(tid, 0).unwrap())
     }
 
-    #[test]
-    fn dequeue_front_is_round_robin() {
-        init_global_heap();
-        let mut st = SchedState {
+    /// A fresh `SchedState` for data-structure tests (no idle thread; no real
+    /// paging needed since the refs are inert).
+    fn test_state() -> SchedState {
+        SchedState {
             ready: KVec::new(),
             current: None,
             reap: None,
             next_tid: 1,
-        };
+            quantum: QUANTUM_TICKS,
+            idle: None,
+            idle_addr: 0,
+        }
+    }
+
+    #[test]
+    fn dequeue_front_is_round_robin() {
+        init_global_heap();
+        let mut st = test_state();
         st.ready.try_reserve(READY_RESERVE).unwrap();
         for tid in 1..=3 {
             st.ready.try_push(inert_ref(tid)).unwrap();
@@ -453,13 +577,26 @@ mod tests {
     #[test]
     fn dequeue_front_empty_is_none() {
         init_global_heap();
-        let mut st = SchedState {
-            ready: KVec::new(),
-            current: None,
-            reap: None,
-            next_tid: 1,
-        };
+        let mut st = test_state();
         assert!(dequeue_front(&mut st).is_none());
+    }
+
+    #[test]
+    fn tick_quantum_decrements_then_reschedules_on_expiry() {
+        // A multi-tick quantum counts down and only reschedules at 0.
+        assert_eq!(tick_quantum(3, true), (2, false));
+        assert_eq!(tick_quantum(2, true), (1, false));
+        // Expiry with a ready thread → reset + reschedule.
+        assert_eq!(tick_quantum(1, true), (QUANTUM_TICKS, true));
+        // Expiry with nothing ready → reset but do NOT reschedule (keep running
+        // the current thread; switching to idle would be pointless churn).
+        assert_eq!(tick_quantum(1, false), (QUANTUM_TICKS, false));
+    }
+
+    #[test]
+    fn tick_quantum_one_tick_quantum_reschedules_every_tick_when_ready() {
+        // With QUANTUM_TICKS == 1 the live config reschedules each tick.
+        assert_eq!(tick_quantum(QUANTUM_TICKS, true).1, QUANTUM_TICKS == 1);
     }
 
     #[test]
@@ -467,12 +604,7 @@ mod tests {
         init_global_heap();
         test_probe::reset();
         {
-            let mut st = SchedState {
-                ready: KVec::new(),
-                current: None,
-                reap: None,
-                next_tid: 1,
-            };
+            let mut st = test_state();
             st.ready.try_reserve(READY_RESERVE).unwrap();
             for tid in 1..=4 {
                 st.ready.try_push(inert_ref(tid)).unwrap();

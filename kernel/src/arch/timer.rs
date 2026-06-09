@@ -7,12 +7,11 @@
 //! `arch/x86_64/timer.rs`); a future aarch64 port would back it with the
 //! generic timer.
 //!
-//! This slice ships **timekeeping only**: [`read_ns`](ArchTimer::read_ns) is
-//! live, but the arming methods program the hardware while staying *dormant* —
-//! interrupts are masked (IF=0) for the whole slice, so the countdown is
-//! observable (the current-count register decrements) but never fires. The
-//! periodic-tick consumer (plus the IRQ stub and `IF=1`) lands with preemptive
-//! scheduling; the one-shot deadline consumer with wait queues.
+//! [`read_ns`](ArchTimer::read_ns) is the monotonic clock;
+//! [`start_periodic`](ArchTimer::start_periodic) drives the preemptive
+//! scheduler tick (its consumer landed with preemptive scheduling, which raised
+//! `IF=1`). [`arm_oneshot_in`](ArchTimer::arm_oneshot_in) remains dormant until
+//! its consumer — wait-queue deadlines — lands.
 //!
 //! NOTE: `crate::arch::Timer` — the *hardware* timer re-exported from this
 //! trait — is a distinct namespace from the future `crate::object::Timer`, the
@@ -43,8 +42,7 @@ pub trait ArchTimer {
     fn read_ns() -> u64;
 
     /// Arm the per-CPU timer to fire repeatedly every `period_ns` at the
-    /// kernel's timer vector. Consumer: the preemptive-scheduling tick. Dormant
-    /// this slice (IF=0), but the countdown runs.
+    /// kernel's timer vector. Consumer: the preemptive-scheduling tick.
     ///
     /// # Safety
     /// Ring-0 only; valid after [`init`](ArchTimer::init). Reconfigures

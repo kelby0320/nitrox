@@ -41,7 +41,37 @@ pub trait ArchCpu {
     ///
     /// # Safety
     /// Ring-0 only. The caller owns the interrupt-flag state that decides
-    /// what (if anything) can wake the CPU: with interrupts masked (IF=0,
-    /// as in this Phase-1 slice) only an NMI/SMI resumes it.
+    /// what (if anything) can wake the CPU: with interrupts masked (IF=0)
+    /// only an NMI/SMI resumes it; the idle thread runs this with IF=1 so the
+    /// periodic timer wakes it.
     unsafe fn halt();
+
+    /// `true` if maskable interrupts are currently enabled on this CPU (the
+    /// neutral name for `RFLAGS.IF` on x86_64).
+    fn interrupts_enabled() -> bool;
+
+    /// Mask maskable interrupts, returning the prior enabled-state so the
+    /// caller can restore it. The save/`cli` half of the [`IrqSpinLock`]
+    /// discipline.
+    ///
+    /// # Safety
+    /// Ring-0 only; the caller must bound the masked window (see
+    /// [`IrqSpinLock`]).
+    ///
+    /// [`IrqSpinLock`]: crate::libkern::IrqSpinLock
+    unsafe fn interrupts_disable() -> bool;
+
+    /// Unmask maskable interrupts. Used once at boot to arm preemption.
+    ///
+    /// # Safety
+    /// Ring-0 only; the IDT and a timer source must be live before enabling.
+    unsafe fn interrupts_enable();
+
+    /// Restore a prior interrupt-enabled state captured by
+    /// [`interrupts_disable`](ArchCpu::interrupts_disable): unmask iff `prev`,
+    /// else leave masked.
+    ///
+    /// # Safety
+    /// Ring-0 only.
+    unsafe fn interrupts_restore(prev: bool);
 }
