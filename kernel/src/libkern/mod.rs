@@ -31,7 +31,7 @@ pub use kbox::KBox;
 pub use memory::MemFlags;
 pub use kstring::KString;
 pub use kvec::KVec;
-pub use spinlock::{SpinLock, SpinLockGuard};
+pub use spinlock::{IrqSpinLock, IrqSpinLockGuard, SpinLock, SpinLockGuard};
 
 /// Error returned by the fallible `libkern` allocators ([`KBox`],
 /// [`KVec`], [`KString`]) when the kernel heap cannot satisfy a request.

@@ -173,15 +173,25 @@ fn kernel_main() {
     // (Throwaway harness — replaced next slice by an ELF-loaded process.)
     run_first_userspace();
 
+    // Best-effort boot screen, then retire the boot thread into the idle
+    // thread. We must NOT fall through to `_start`'s `halt_loop` (it `cli`s,
+    // which would freeze preemption): `exit` switches to the idle thread, which
+    // `hlt`s with interrupts enabled so the periodic tick keeps running.
+    draw_boot_screen();
+    sched::exit();
+}
+
+/// Draw the boot screen to Limine's framebuffer, if one is present. Best-effort:
+/// any missing piece simply skips the draw. Runs in the boot thread.
+fn draw_boot_screen() {
     // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before
-    // jumping to `_start`. We are the sole reader; no other thread exists.
+    // jumping to `_start`. We are the sole reader.
     let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
     if response.is_null() {
         return;
     }
     // SAFETY: A non-null response pointer guarantees Limine populated a
-    // valid `FramebufferResponse`. The framebuffer count and array
-    // pointer come straight from the protocol contract.
+    // valid `FramebufferResponse`.
     let response = unsafe { &*response };
     if response.framebuffer_count == 0 || response.framebuffers.is_null() {
         return;
@@ -207,40 +217,69 @@ fn kernel_main() {
     draw_nitrox_band(&mut writer);
 }
 
-/// A demo kernel thread: print a few rounds, yielding cooperatively
-/// between each, then return (the trampoline calls [`sched::exit`]).
-extern "C" fn demo_worker(arg: usize) {
+/// A CPU-bound demo kernel thread that **never yields**: each round spins on a
+/// bounded busy loop, then prints. Under preemption the periodic timer forces
+/// the workers (and the boot thread) to interleave — cooperatively, worker 1
+/// would finish all its rounds before worker 2 ever printed. The interleaved
+/// output is the proof of preemption. Returns when done (the trampoline calls
+/// [`sched::exit`]).
+extern "C" fn busy_worker(arg: usize) {
     for round in 0..3 {
+        // Enough work to span several 10 ms ticks so preemption is visible.
+        let mut acc: u64 = 0;
+        for i in 0..20_000_000u64 {
+            acc = acc.wrapping_add(i ^ arg as u64);
+        }
+        core::hint::black_box(acc);
         kprintln!("worker {} round {}", arg, round);
-        sched::yield_now();
     }
     kprintln!("worker {} exiting", arg);
 }
 
-/// Initialise the scheduler, spawn three demo workers, and drain them
-/// cooperatively from the boot thread. Proves switch-in, round-robin
-/// rotation, cooperative yield, clean exit, and stack reclamation. The
-/// boot thread returns here once the run queue is empty.
+/// Initialise the scheduler, **arm preemption** (periodic timer + IF=1), spawn
+/// three CPU-bound workers that never yield, and let the timer interleave them.
+/// Proves switch-in, the timer-IRQ-driven preemptive switch, round-robin
+/// rotation, clean exit, and stack reclamation. The boot thread itself is
+/// preempted while it busy-waits for the queue to drain.
 fn run_scheduler_demo() {
+    use arch::cpu::ArchCpu;
+    use arch::timer::ArchTimer;
+
     if sched::init().is_err() {
         kprintln!("sched: init failed — skipping demo");
         return;
     }
+
+    // Arm the periodic tick, then raise IF. Order matters: program the timer's
+    // period before enabling delivery. The IDT timer stub (installed by
+    // `Cpu::init_tables`) and the calibrated timer (`Timer::init`) are already
+    // in place.
+    // SAFETY: ring 0, single CPU, once; the IDT + calibrated timer are live.
+    unsafe {
+        arch::Timer::start_periodic(sched::TICK_NS);
+        arch::Cpu::interrupts_enable();
+    }
+    kprintln!(
+        "preemption armed (IF=1, {} Hz tick)",
+        1_000_000_000 / sched::TICK_NS
+    );
+
     for id in 1..=3 {
-        if sched::spawn(demo_worker, id).is_err() {
+        if sched::spawn(busy_worker, id).is_err() {
             kprintln!("sched: spawn {} failed", id);
         }
     }
-    // Cooperatively run every ready thread to completion, reclaiming each
-    // exited thread's stack between turns.
+    // Busy-wait (no cooperative yield) until every worker has run to completion;
+    // the timer preempts the boot thread too. `reap_pending` reclaims each
+    // exited worker's stack.
     loop {
         sched::reap_pending();
         if sched::ready_is_empty() {
             break;
         }
-        sched::yield_now();
+        core::hint::spin_loop();
     }
-    kprintln!("sched: all workers done; boot thread halting");
+    kprintln!("sched: all workers done (preemptively interleaved)");
 }
 
 // --- First userspace process --------------------------------------------

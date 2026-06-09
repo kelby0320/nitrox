@@ -10,6 +10,9 @@ use crate::arch::x86_64::{gdt, idt, regs};
 /// CPUID.01H:EDX bit 9 — on-chip local APIC present.
 const CPUID_1_EDX_APIC: u32 = 1 << 9;
 
+/// `RFLAGS` bit 9 — the interrupt-enable flag (`IF`).
+const RFLAGS_IF: u64 = 1 << 9;
+
 /// The Extended Feature Enable Register MSR.
 const MSR_EFER: u32 = 0xC000_0080;
 /// `EFER` bit 11 — no-execute enable.
@@ -71,6 +74,31 @@ impl ArchCpu for X86Cpu {
         // it parks the CPU until the next interrupt. The caller owns the
         // interrupt-flag state that governs wake-up (see the trait contract).
         unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
+    }
+
+    fn interrupts_enabled() -> bool {
+        regs::read_rflags() & RFLAGS_IF != 0
+    }
+
+    unsafe fn interrupts_disable() -> bool {
+        let was = Self::interrupts_enabled();
+        // SAFETY: ring-0; the caller bounds the masked window (IrqSpinLock).
+        unsafe { regs::cli() };
+        was
+    }
+
+    unsafe fn interrupts_enable() {
+        // SAFETY: ring-0; called at boot after the IDT + timer are live, and
+        // by `interrupts_restore`.
+        unsafe { regs::sti() };
+    }
+
+    unsafe fn interrupts_restore(prev: bool) {
+        if prev {
+            // SAFETY: ring-0; restoring a previously-enabled interrupt state.
+            unsafe { regs::sti() };
+        }
+        // else: leave IF clear — it already is.
     }
 }
 

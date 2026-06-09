@@ -1,10 +1,13 @@
-//! Minimal Interrupt Descriptor Table: dump-and-halt handlers for the 32
-//! CPU exception vectors, with a recovery path for `#PF`.
+//! Interrupt Descriptor Table: dump-and-halt handlers for the 32 CPU exception
+//! vectors (with a recovery path for `#PF`), plus the hardware-IRQ vectors used
+//! once interrupts are enabled — the periodic timer (`0x20`) and the local-APIC
+//! spurious vector (`0xFF`).
 //!
-//! Every exception vector (0-31) gets a handler that prints the faulting
-//! state to the serial console and halts. Hardware IRQs are not handled
-//! at all: the kernel never executes `sti` in Phase 1, so only
-//! non-maskable CPU exceptions can fire.
+//! Every exception vector (0-31) gets a handler that prints the faulting state
+//! to the serial console and halts. The timer vector is a **returning** stub
+//! (it `iretq`s back) that drives the preemptive scheduler; the spurious vector
+//! just `iretq`s. After the preemptive-scheduling slice the kernel runs with
+//! interrupts enabled (IF=1).
 //!
 //! `#PF` (vector 14) is the one exception with a recovery path: the
 //! handler consults the user-memory-access exception table (see
@@ -40,6 +43,7 @@ use core::fmt::Write;
 
 use crate::arch::Cpu;
 use crate::arch::cpu::ArchCpu;
+use crate::arch::irq::{ArchIrq, SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
 use crate::arch::x86_64::regs;
 use crate::arch::x86_64::serial;
@@ -275,6 +279,71 @@ extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
     dump_and_halt(f);
 }
 
+// --- Timer IRQ stub (vector 0x20) ---------------------------------------
+//
+// A *returning* stub (unlike the `-> !` exception stubs): the dispatcher EOIs
+// and may reschedule, then control returns here to `iretq` back to the
+// interrupted context — or, after a preemptive context switch, to whichever
+// context last parked in this same stub. Runs with IF=0 (the interrupt gate
+// clears it) and the dispatcher never `sti`s, so there is no nesting until the
+// `iretq`. The frame layout matches [`ExceptionFrame`]; vectors ≥ 32 carry no
+// CPU error code, so a dummy `0` fills that slot.
+
+/// Timer IRQ (vector `0x20`) entry stub. See the module doc.
+#[unsafe(naked)]
+extern "C" fn timer_stub() {
+    ::core::arch::naked_asm!(
+        // Build a full `ExceptionFrame`: dummy error code, vector, 15 GPRs.
+        concat!(
+            "push 0\n",
+            "push 0x20\n",
+            "push rax\npush rbx\npush rcx\npush rdx\n",
+            "push rsi\npush rdi\npush rbp\n",
+            "push r8\npush r9\npush r10\npush r11\n",
+            "push r12\npush r13\npush r14\npush r15\n",
+            "mov rdi, rsp\n",
+        ),
+        "call {dispatch}",
+        // The dispatcher returned: pop the GPRs, drop the vector + dummy
+        // error-code slots (16 bytes), and `iretq` to the interrupted context
+        // (restoring its RIP/CS/RFLAGS/RSP/SS, including IF).
+        concat!(
+            "pop r15\npop r14\npop r13\npop r12\n",
+            "pop r11\npop r10\npop r9\npop r8\n",
+            "pop rbp\npop rdi\npop rsi\n",
+            "pop rdx\npop rcx\npop rbx\npop rax\n",
+            "add rsp, 16\n",
+            "iretq\n",
+        ),
+        dispatch = sym timer_dispatch,
+    );
+}
+
+/// Spurious-interrupt (vector `0xFF`) entry stub. A spurious local-APIC
+/// interrupt requires **no** EOI (the controller is telling us it had nothing
+/// to deliver), and we touch no registers, so this just `iretq`s.
+#[unsafe(naked)]
+extern "C" fn spurious_stub() {
+    ::core::arch::naked_asm!("iretq");
+}
+
+/// Timer IRQ dispatcher. Signals end-of-interrupt **first** — the handler may
+/// switch away via [`crate::sched::on_timer_tick`] and not return to this frame
+/// for a long time, so EOI-ing late would block all further timer delivery —
+/// then drives the scheduler tick. Returns to [`timer_stub`], which `iretq`s.
+///
+/// Runs entirely with IF=0 (the interrupt gate), so it never nests and may take
+/// the (interrupt-safe) run-queue lock inside `on_timer_tick`.
+///
+/// `*mut ExceptionFrame` matches the stub's `mov rdi, rsp`; the frame is read
+/// only for future use (frame patching) and is otherwise unused today.
+extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
+    // SAFETY: ring-0, only ever reached from the timer IRQ after `Irq::init`
+    // mapped the local APIC; a single MMIO write acknowledges the interrupt.
+    unsafe { crate::arch::Irq::eoi() };
+    crate::sched::on_timer_tick();
+}
+
 /// Entry stubs for CPU exception vectors 0-31, indexed by vector number.
 const STUBS: [extern "C" fn() -> !; 32] = [
     vec0, vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, vec9, vec10, vec11, vec12, vec13, vec14,
@@ -374,6 +443,17 @@ pub fn init() {
         let ist = if vector == 8 { 1 } else { 0 };
         idt[vector].set_handler(stub as usize as u64, ist);
     }
+
+    // Hardware-IRQ vectors used once interrupts are enabled (preemptive
+    // scheduling): the periodic timer and the local-APIC spurious vector. Both
+    // use IST0 — the timer can fire from ring 3, landing on TSS.RSP0 (kept
+    // current by the scheduler), or from ring 0 on the current kernel stack.
+    // Coerce the fn items to fn pointers before the address cast (the STUBS
+    // array entries are already pointers; these two are bare items).
+    let timer: extern "C" fn() = timer_stub;
+    let spurious: extern "C" fn() = spurious_stub;
+    idt[TIMER_VECTOR as usize].set_handler(timer as usize as u64, 0);
+    idt[SPURIOUS_VECTOR as usize].set_handler(spurious as usize as u64, 0);
 
     let ptr = IdtPointer { limit, base };
     // SAFETY: `ptr` describes the fully-populated IDT. Interrupts are

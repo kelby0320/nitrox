@@ -15,7 +15,7 @@ enforced by code review.
 
 | Rank | Lock                                         | Status                                   |
 |------|----------------------------------------------|------------------------------------------|
-| 1    | Scheduler runqueue (`SCHED`)                 | live as of Phase 1 slice 9 (scheduler)   |
+| 1    | Scheduler runqueue (`SCHED`, **`IrqSpinLock`**)| live as of Phase 1 slice 9 (scheduler) |
 | 2    | Wait queue                                   | not yet present                          |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
@@ -24,7 +24,11 @@ enforced by code review.
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
 | 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
-| 7    | Serial port (`SERIAL`)                       | live as of Phase 1 slice 4 (diagnostics) |
+| 7    | Serial port (`SERIAL`, **`IrqSpinLock`**)    | live as of Phase 1 slice 4 (diagnostics) |
+
+`SCHED` and `SERIAL` are [`IrqSpinLock`]s (they mask interrupts while held);
+every other lock is a plain `SpinLock`. See § Interrupt semantics for why only
+these two need it.
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
@@ -32,21 +36,32 @@ either order — with one exception, called out below.
 
 ## Scheduler runqueue lock is dropped before every context switch
 
-`SCHED` (`kernel/src/sched.rs`) is the rank-1 runqueue lock. The cardinal
-rule: **the lock is released before every
+`SCHED` (`kernel/src/sched.rs`) is the rank-1 runqueue lock, an
+[`IrqSpinLock`]. The cardinal rule: **the lock is released before every
 `context_switch` and re-acquired fresh on resume — it is never held across
-a stack switch.** `yield_now`/`exit` acquire it, mutate the queue and the
-current-thread pointer, capture the `(prev_sp_slot, next_sp)` pair, drop
-the guard, and only then call the switch. Every point a thread *resumes*
-at (the instruction after `context_switch`, and `thread_enter` for a
+a stack switch.** The cooperative `yield_now`/`exit` and the preemptive
+`on_timer_tick` all funnel through `switch_to_next`, which mutates the queue
+and the current-thread pointer, captures the `(prev_sp_slot, next_sp)` pair,
+drops the guard, and only then calls the switch. Every point a thread
+*resumes* at (the instruction after `context_switch`, and `thread_enter` for a
 freshly scheduled thread) therefore runs with the lock not held.
 
 If the lock were carried across the switch, the *resumed* thread — which
 parked at its own `context_switch` call site, lock-free — would eventually
 drop a guard it never acquired, releasing a lock another thread still
-believes it holds. Single-CPU / IF=0 / no-preemption makes the brief
-window between publishing the next thread and executing the register
-switch safe: nothing else can run.
+believes it holds.
+
+**Interrupts must stay masked across the switch**, though — a timer IRQ that
+fired mid-`context_switch` would run the handler (and possibly reschedule) on a
+half-swapped stack. The cardinal rule (drop the lock first) and this invariant
+(keep IF=0 across the switch) are reconciled by
+`IrqSpinLockGuard::release_keeping_irqs_masked`: it releases the lock but
+*keeps interrupts masked*, returning the prior interrupt state. The switch core
+then runs the `context_switch` with IF=0 and restores the prior state on resume
+(the cooperative path), while the preemptive path is already IF=0 from the timer
+interrupt gate and restores IF via the `iretq` in the timer-stub epilogue. A
+freshly scheduled thread (reached via `thread_trampoline`, not an `iretq`)
+`sti`s for itself before running its body.
 
 Two corollaries:
 
@@ -163,13 +178,18 @@ a byte — it allocates nothing, calls into no other subsystem, and takes
 no other lock. It may therefore be acquired while holding any
 higher-ranked lock, and nothing is ever acquired while holding it.
 
+`SERIAL` is an [`IrqSpinLock`]: it masks interrupts while held, so a thread
+printing via `kprintln!` cannot be preempted mid-write, and the timer handler
+(were it ever to print) could not find the lock held by the context it
+interrupted. See § Interrupt semantics.
+
 The panic handler and the CPU exception handlers do **not** take this
 lock. They write through `serial::emergency_writer()`, an unsynchronised
-path that drives the UART directly. `SpinLock` cannot be force-unlocked,
+path that drives the UART directly. The lock cannot be force-unlocked,
 so a handler that tried to lock `SERIAL` after a fault that struck while
 the lock was held would deadlock. Bypassing the lock is sound only
-because Phase 1 is single-CPU with interrupts masked: at fault time no
-other context can be driving the UART. This must be revisited at SMP.
+because Phase 1 is single-CPU: at fault time no other context can be driving
+the UART. This must be revisited at SMP.
 
 The syscall path (`sys_kprint`) takes only `SERIAL`, at rank 7, and holds
 **no** lock across the user-memory copy: `copy_slice_from_user` runs its
@@ -180,23 +200,34 @@ acquisition.
 
 ## Interrupt semantics
 
-The `SpinLock` (`kernel/src/libkern/spinlock.rs`) does **not** mask
-interrupts. As of the Phase 1 diagnostics slice an IDT is installed, but
-it handles only CPU exceptions — non-maskable faults — and the kernel
-still never executes `sti`, so no hardware IRQ ever fires. The exception
-handlers take no lock at all (they use the unsynchronised emergency
-serial path described above and then halt), so there is still exactly
-one lock-taking execution context and masking remains unnecessary.
+As of the **preemptive-scheduling slice** the kernel runs with interrupts
+enabled (IF=1) after boot, and the periodic timer IRQ drives the scheduler.
+Two lock families coexist:
 
-When hardware interrupts are eventually enabled (a later slice, with
-PIC/APIC bring-up), every spin lock that protects data touched by an IRQ
-handler must switch to an `IrqSpinLock` variant that saves and restores
-`RFLAGS` on lock/unlock. The audit will visit each call site and decide;
-both allocator locks (6a and 6b) are likely candidates because
-allocations from IRQ context are forbidden but the locks themselves may
-be observed during shutdown paths that race with interrupts.
+- **Plain [`SpinLock`]** — does not mask interrupts. Correct for data **never**
+  touched from an interrupt handler. The timer handler touches only the
+  scheduler and the local-APIC EOI register (and performs no allocation), so a
+  timer IRQ that preempts a thread holding any of these never tries to take
+  them, and there is no reentrancy: the allocators (6a/6b), the kernel vmap
+  (6d), the PML4 template (6c), the `AddressSpace` locks (4), and the
+  handle-table segment locks (3) all stay plain `SpinLock`.
+- **[`IrqSpinLock`]** — captures the prior interrupt state and `cli`s **before**
+  acquiring, restoring it after releasing. Required for data shared between
+  thread and IRQ context: `SCHED` (the timer reschedules) and `SERIAL` (a
+  thread may be printing when the timer fires). These are the **only** two.
 
-Until that variant exists: no IRQ handler may take any `SpinLock`.
+**Single-CPU deadlock-freedom.** Because an `IrqSpinLock` masks interrupts for
+its whole hold window, a thread holding `SCHED`/`SERIAL` cannot be preempted, so
+the timer handler can never find one of them already held by the context it
+interrupted — the self-deadlock (handler spins on a lock the preempted code
+holds) is impossible. **No IRQ nesting:** the timer/spurious gates are interrupt
+gates (they clear IF) and the handler never `sti`s, so handler depth is
+single-level and kernel-stack growth is bounded (one interrupt frame).
+
+The audit conclusion (only `SCHED` + `SERIAL` need `IrqSpinLock`) holds as long
+as the timer handler keeps doing only EOI + reschedule with no allocation; a
+future handler that touches another locked subsystem must re-run this audit.
+Allocation from any interrupt/DPC context remains forbidden.
 
 ## Adding a new lock
 
