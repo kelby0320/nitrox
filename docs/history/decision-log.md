@@ -2414,3 +2414,60 @@ Verified: `cargo xtask check-arch` clean; `build` clean; `test` (293 host tests,
 now exercising `Paging::translate`/`active_root` through the trait) green; `qemu`
 boot trace byte-for-byte identical (`local APIC up (xAPIC, id 0)` → hello ring-3
 `memory: roundtrip ok` → `handle-ops ok` → `memory: unmap ok`).
+
+## 2026-06-08 — Phase 1, slice 16: timekeeping foundation (timers & clocks)
+
+Scoped this slice to the **bare minimum that unblocks the next slice (preemptive
+scheduling)**: a monotonic clock plus an `ArchTimer` device. The richer timer
+features were deferred because their consumers all arrive later (see below).
+
+- **`ArchTimer` trait + `X86Timer`.** New neutral `arch::timer::ArchTimer`
+  (re-exported as `crate::arch::Timer`), backed by the TSC (monotonic ns) and the
+  local-APIC timer, both **calibrated against the legacy PIT** (channel 2,
+  software-gated and output-pollable — no IRQ needed, which matters because
+  interrupts stay masked, IF=0, this whole slice). No HPET/ACPI: the PIT is at
+  fixed ports and the LAPIC at its MSR-reported base. Surface: `read_ns`,
+  `start_periodic` (preemptive tick), `arm_oneshot_in` (wait-queue deadlines),
+  `stop`, `monotonic_hz`/`timer_hz`. The arming methods program the hardware but
+  are **dormant** (IF=0) — the countdown is observable via the current-count
+  register but never fires; that observable-but-dormant countdown is the QEMU
+  smoke test.
+- **LAPIC timer in count-down mode, not TSC-deadline.** The QEMU/TCG dev loop
+  does not emulate the TSC-deadline timer (the same reason `apic.rs` uses xAPIC,
+  not x2APIC — see slice 14's "xAPIC (MMIO), not x2APIC" entry above). Confirmed
+  working under TCG: calibration
+  reports ~2.3 GHz TSC and ~62 MHz LAPIC timer (≈ QEMU's 1 GHz APIC bus ÷ 16).
+- **Invariant TSC: warn, not fail.** `CPUID.80000007H:EDX.8` is checked; a CPU
+  that doesn't advertise it (QEMU/TCG doesn't, though its TSC is in fact stable)
+  gets a warning, not a halt. On bare metal without the bit the monotonic clock
+  could drift with P-states — acceptable for Phase 1, revisit if it bites.
+- **TSC→ns conversion** uses a precomputed multiply-shift (`compute_ns_mul_shift`)
+  with a u128 intermediate, so `read_ns` needs no per-call 128-bit division and
+  cannot overflow for any `u64` TSC delta ((2⁶⁴−1)² < 2¹²⁸−1). Host-tested
+  against a u128 reference.
+- **`sys_clock_read` = syscall 7, `Monotonic` only.** `Realtime`/`ProcessCpu`/
+  `ThreadCpu` return `Unsupported` (Realtime needs a wall-clock offset service;
+  the per-CPU clocks need scheduler CPU accounting — neither exists yet). New
+  `#[repr(u32)] ClockId` boundary type in `libkern::clock`.
+- **Deferred to the wait-queues slice:** the `Timer` kernel object, the kernel
+  deadline **min-heap**, and `sys_timer_create`/`sys_timer_set` (which take
+  syscall numbers 8/9 on landing). Rationale: a `Timer` can't fire (IF=0 until
+  preemptive owns the IRQ stub + IF=1), be waited on (no `sys_wait`), or signal
+  (no notification queue) until those mechanisms exist — building them now would
+  be untested scaffolding the wait-queues slice has to wire up regardless, so
+  they ship with their consumers. Preemptive scheduling (the *next* slice) needs
+  only `ArchTimer::start_periodic` + `read_ns`, both of which land here.
+- **Naming.** `crate::arch::Timer` (the hardware timer) is a distinct namespace
+  from the future `crate::object::Timer` (the waitable kernel object); flagged in
+  both module docs.
+
+**ABI-hash impact: none** — a new syscall number (not hashed) and a fresh
+`#[repr(u32)] ClockId` value type (not an `export!` symbol, not a hashed
+`KObjectType`/`Notification`/`Irp`/`KObjectHeader` layout/discriminant).
+
+Verified: `cargo xtask check-arch` clean (the LAPIC MMIO shims `apic.rs` exposes
+to `timer.rs` are `pub(crate)`, never crossing the arch boundary); `build` clean;
+`test` (302 host tests — the new mul-shift/`ns_to_ticks`/`ClockId`/`sys_clock_read`
+cases included) green; `qemu` shows `timer up: monotonic 2302 MHz, per-CPU timer
+62 MHz (clock t0=… ns)` and the hello ring-3 demo prints `clock: monotonic
+advancing`.

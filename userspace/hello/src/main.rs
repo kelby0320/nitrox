@@ -9,6 +9,7 @@
 //!    mapped page (the proof that user PTEs point at the object's frames);
 //! 4. `sys_handle_stat` / `duplicate` / `restrict` / `close` on the memory
 //!    handle — the handle-operation syscalls' first end-to-end ring-3 run;
+//! 4b. `sys_clock_read(Monotonic)` twice — the monotonic clock must advance;
 //! 5. `sys_memory_unmap`, then `sys_process_exit`.
 //!
 //! It exists only to demonstrate the kernel can load an ELF, build a process +
@@ -35,6 +36,7 @@ const SYS_HANDLE_STAT: u64 = 3;
 const SYS_MEMORY_CREATE: u64 = 4;
 const SYS_MEMORY_MAP: u64 = 5;
 const SYS_MEMORY_UNMAP: u64 = 6;
+const SYS_CLOCK_READ: u64 = 7;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 const SYS_PROCESS_EXIT: u64 = 0xFFFF_0001;
 
@@ -45,6 +47,9 @@ const RIGHT_MAP_READ: u64 = 1 << 15;
 const RIGHT_MAP_WRITE: u64 = 1 << 16;
 
 const PAGE: u64 = 4096;
+
+/// `ClockId::Monotonic` (`kernel/src/libkern/clock.rs`).
+const CLOCK_MONOTONIC: u64 = 0;
 
 /// Object-type discriminant for a `MemoryObject` (`KObjectType::MemoryObject`).
 const KOBJ_MEMORY_OBJECT: u32 = 4;
@@ -66,6 +71,9 @@ static mut STAT_BUF: HandleInfoBuf = HandleInfoBuf {
     object_type: 0,
     generation: 0,
 };
+
+/// Out-parameter for `sys_clock_read`. Writable `.bss`, naturally 8-aligned.
+static mut CLOCK_BUF: u64 = 0;
 
 /// Issue a syscall with up to four arguments. ABI: `rax` = number, args in
 /// `rdi`/`rsi`/`rdx`/`r10`; `syscall` clobbers `rcx`/`r11`; result in `rax`.
@@ -200,6 +208,28 @@ pub extern "C" fn _start() -> ! {
         kprint(b"handle-ops ok\n");
     } else {
         kprint(b"handle-ops FAIL\n");
+    }
+
+    // 4b. Read the monotonic clock twice with work in between; it must advance.
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-parameter.
+    let r1 = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: on success the kernel wrote the nanosecond count into CLOCK_BUF.
+    let t1 = unsafe { (&raw const CLOCK_BUF).read() };
+    // A little observable work so the counter advances measurably between reads.
+    let mut spin = 0u64;
+    for _ in 0..200_000 {
+        // SAFETY-free: a volatile-style accumulate the optimiser can't drop.
+        spin = spin.wrapping_add(core::hint::black_box(1));
+    }
+    let _ = spin;
+    // SAFETY: as the first read.
+    let r2 = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: as the first read.
+    let t2 = unsafe { (&raw const CLOCK_BUF).read() };
+    if r1 == 0 && r2 == 0 && t2 > t1 {
+        kprint(b"clock: monotonic advancing\n");
+    } else {
+        kprint(b"clock: monotonic FAIL\n");
     }
 
     // 5. Unmap and exit.

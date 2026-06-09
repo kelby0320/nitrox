@@ -79,6 +79,9 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `4` | `sys_memory_create` |
 | `5` | `sys_memory_map` |
 | `6` | `sys_memory_unmap` |
+| `7` | `sys_clock_read` |
+
+Numbers are assigned in landing order, not in the order syscalls appear below. `sys_timer_create` and `sys_timer_set` are deferred to the wait-queues slice and will take the next free numbers (`8`/`9`) when they land.
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -290,12 +293,12 @@ Receives a message from `ch`. Blocks via `sys_wait` if no message is queued. Wri
 ```rust
 fn sys_timer_create(flags: TimerFlags) -> isize
 ```
-Creates a new `Timer` kernel object. Returns a handle.
+Creates a new `Timer` kernel object. Returns a handle. **Deferred to the wait-queues slice** (number `8` on landing): a `Timer` cannot fire (interrupts are masked until preemptive scheduling), be waited on (`sys_wait`), or signal (notifications) until those mechanisms exist, so it ships with its consumers.
 
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize
 ```
-Programs the timer to fire at `deadline_ns` (monotonic ns) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot.
+Programs the timer to fire at `deadline_ns` (monotonic ns) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. **Deferred to the wait-queues slice** (number `9` on landing), alongside `sys_timer_create` and the kernel deadline min-heap.
 
 ```rust
 fn sys_notif_recv(queue: RawHandle, out: UserMutPtr<Notification>) -> isize
@@ -305,7 +308,9 @@ Receives one notification from the queue. Returns `0` and writes notification to
 ```rust
 fn sys_clock_read(clock: ClockId, out: UserMutPtr<u64>) -> isize
 ```
-Reads the current value of the specified clock (Monotonic, Realtime, ProcessCpu, ThreadCpu) in nanoseconds. Writes to `*out`.
+Reads the current value of the specified clock (Monotonic, Realtime, ProcessCpu, ThreadCpu) in nanoseconds. Writes to `*out`. Returns `0`. (Syscall number `7`.)
+
+**This slice services `Monotonic` only**; `Realtime`, `ProcessCpu`, and `ThreadCpu` return `Unsupported`. `Realtime` needs a wall-clock offset service, and the per-CPU clocks need scheduler CPU accounting — neither exists yet. The selector and the `out` pointer are validated before any clock is read, so an unknown `ClockId` returns `InvalidArgument` and an unsupported clock returns `Unsupported` without touching `*out`.
 
 ```rust
 fn sys_device_map_mmio(
@@ -345,7 +350,8 @@ Argument types referenced above are defined in `libkern`:
 - `RawHandle`: `#[repr(transparent)] pub struct RawHandle(u64);`
 - `Rights`: a bitflags type, see [handle-encoding.md](handle-encoding.md)
 - `IoOp`, `IoResult`, `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents
-- `ClockId`, `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`, `TimerFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`
+- `ClockId`: `#[repr(u32)]` enum, `Monotonic = 0`, `Realtime = 1`, `ProcessCpu = 2`, `ThreadCpu = 3`; defined in `kernel/src/libkern/clock.rs`
+- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`, `TimerFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`
 
 ## Stability
 

@@ -28,6 +28,7 @@ pub mod cpu;
 pub mod irq;
 pub mod paging;
 pub mod smp;
+pub mod timer;
 pub mod user_access;
 
 #[cfg(target_arch = "x86_64")]
@@ -48,6 +49,11 @@ pub use x86_64::apic::XApic as Irq;
 pub use x86_64::cpu::X86Cpu as Cpu;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::smp::X86Smp as Smp;
+// `Timer` here is the *hardware* timer (monotonic time + the per-CPU countdown
+// timer); distinct from the future `crate::object::Timer` waitable kernel
+// object. See `arch/timer.rs`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::timer::X86Timer as Timer;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::user_access::X86UserAccess as UserAccess;
 

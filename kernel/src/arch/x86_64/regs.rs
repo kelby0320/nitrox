@@ -7,7 +7,9 @@
 //! port primitives (the 16550 UART speaks port I/O) and a `CR2` read (the
 //! page-fault handler reports the faulting linear address from it). The
 //! paging slice adds `CR3` access, `invlpg`, and MSR read/write — the
-//! page-table root, single-page TLB invalidation, and `EFER.NXE`.
+//! page-table root, single-page TLB invalidation, and `EFER.NXE`. The
+//! timekeeping slice adds `rdtsc` — the cycle counter the monotonic clock
+//! reads.
 
 use core::arch::asm;
 
@@ -198,6 +200,30 @@ pub unsafe fn invlpg(virt: u64) {
         asm!("invlpg [{}]", in(reg) virt,
              options(nostack, preserves_flags));
     }
+}
+
+/// Read the Time-Stamp Counter — a 64-bit cycle counter that increments
+/// monotonically with the core clock (the value is returned across
+/// `edx:eax`).
+///
+/// Safe in ring 0: `rdtsc` has no memory side effects and touches no
+/// arithmetic flags. It is **not** serializing — the CPU may reorder it a
+/// few instructions either way. That is acceptable for the monotonic wall
+/// clock built on it (a handful of cycles of skew is far below the clock's
+/// nanosecond resolution); a caller needing an exact instruction-boundary
+/// timestamp would use a serializing variant, which the kernel does not
+/// yet need.
+#[inline]
+pub fn rdtsc() -> u64 {
+    let low: u32;
+    let high: u32;
+    // SAFETY: `rdtsc` reads the counter into `edx:eax`. No memory side
+    // effects, no flag changes; valid in ring 0.
+    unsafe {
+        asm!("rdtsc", out("eax") low, out("edx") high,
+             options(nomem, nostack, preserves_flags));
+    }
+    ((high as u64) << 32) | (low as u64)
 }
 
 /// Read model-specific register `msr`.
