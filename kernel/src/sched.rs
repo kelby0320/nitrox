@@ -8,6 +8,19 @@
 //! object. An [idle thread](idle_body) runs (`hlt`) whenever nothing else is
 //! ready. Multi-class scheduling and per-CPU/SMP arrive in later slices.
 //!
+//! ## Blocking and deadlines (wait queues)
+//!
+//! A thread can also **block** in `sys_wait`: [`wait_on`] registers it as a
+//! waiter on each target object and (optionally) on the deadline min-heap
+//! ([`deadline`]), then [`block_current_and_switch`] parks it in
+//! [`SchedState::blocked`] (state `Blocked`) — like [`switch_to_next`] but
+//! without re-enqueuing. A waker calls [`make_runnable`] to move it back to
+//! `ready`. Timer/`sys_wait` deadlines are checked on the periodic tick
+//! ([`on_timer_tick`] → [`fire_expired_deadlines`]) and waiters woken
+//! **directly** under `SCHED` — no DPC. The wait/timer/blocked state all live
+//! under the rank-1 `SCHED` lock for Phase 1 (single lock domain → no
+//! lost-wakeup window; see `kernel/docs/lock-ordering.md`).
+//!
 //! ## The run-queue lock, interrupts, and the switch
 //!
 //! [`SCHED`] is the **rank-1** run-queue lock (`kernel/docs/lock-ordering.md`).
@@ -39,11 +52,17 @@ use core::sync::atomic::{AtomicU64, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
+use crate::arch::timer::ArchTimer;
 use crate::arch::{Cpu, Paging, context_switch};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
-use crate::object::{ObjectRef, Thread, ThreadEntry, ThreadState};
+use crate::object::{MAX_WAIT_HANDLES, ObjectRef, Thread, ThreadEntry, ThreadState, Timer};
+
+// `Timer` above is the kernel object (`crate::object::Timer`); the hardware
+// monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
+// (the `ArchTimer` trait, imported above, provides `read_ns`). The two names
+// live in different paths — see `arch/timer.rs`.
 
 /// Run-queue capacity reserved once at [`init`]. Phase 1 runs a handful of
 /// kernel threads; enqueueing beyond this is a logic error (debug-asserted)
@@ -64,6 +83,128 @@ const QUANTUM_TICKS: u32 = 1;
 /// spawns to reach this). Used only for diagnostics; idle identity is by
 /// object address (`SchedState::idle_addr`).
 const IDLE_TID: u32 = u32::MAX;
+
+/// Pre-reserved capacity for the blocked-thread parking list. Like
+/// [`READY_RESERVE`], blocking beyond this is refused rather than allocating
+/// under the rank-1 lock.
+const BLOCKED_RESERVE: usize = 16;
+
+/// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by
+/// absolute monotonic ns, drained on each periodic tick. A pure binary heap in
+/// a [`KVec`], living in [`SchedState`] under `SCHED`; host-tested.
+mod deadline {
+    use crate::libkern::{AllocError, KVec};
+
+    /// One pending deadline. `is_thread` distinguishes a [`Timer`] fire
+    /// (`target` = the Timer object address) from a `sys_wait` thread-deadline
+    /// (`target` = the waiting Thread object address, woken directly → timeout).
+    ///
+    /// [`Timer`]: crate::object::Timer
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) struct Entry {
+        pub deadline_ns: u64,
+        pub target: usize,
+        pub is_thread: bool,
+    }
+
+    /// Pre-reserved heap capacity (one entry per armed timer / pending wait
+    /// deadline). Reserved at [`init`](super::init) outside the lock.
+    pub(super) const HEAP_RESERVE: usize = 16;
+
+    /// The earliest entry, or `None` if empty.
+    pub(super) fn peek(h: &KVec<Entry>) -> Option<Entry> {
+        h.first().copied()
+    }
+
+    /// Insert `e`, sifting up by `deadline_ns`. `Err` if at reserve (the caller
+    /// maps it to an out-of-memory failure; never grows under the lock).
+    pub(super) fn push(h: &mut KVec<Entry>, e: Entry) -> Result<(), AllocError> {
+        if h.len() >= h.capacity() {
+            return Err(AllocError);
+        }
+        h.try_push(e).expect("within reserved heap capacity");
+        let mut i = h.len() - 1;
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            if h[i].deadline_ns < h[parent].deadline_ns {
+                h.swap(i, parent);
+                i = parent;
+            } else {
+                break;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove and return the earliest entry, sifting the moved-up last element
+    /// down. `None` if empty.
+    pub(super) fn pop_min(h: &mut KVec<Entry>) -> Option<Entry> {
+        let n = h.len();
+        if n == 0 {
+            return None;
+        }
+        h.swap(0, n - 1);
+        let min = h.pop();
+        sift_down(h, 0);
+        min
+    }
+
+    /// Remove the first entry matching `(target, is_thread)`. Returns `true` if
+    /// one was removed. Used when a `sys_wait` resumes (drop its deadline) or a
+    /// timer is re-armed (drop its stale entry).
+    pub(super) fn remove(h: &mut KVec<Entry>, target: usize, is_thread: bool) -> bool {
+        let Some(i) = h
+            .iter()
+            .position(|e| e.target == target && e.is_thread == is_thread)
+        else {
+            return false;
+        };
+        let n = h.len();
+        h.swap(i, n - 1);
+        h.pop();
+        // The element now at `i` may be too small (sift up) or too large (down).
+        if i < h.len() {
+            if i > 0 && h[i].deadline_ns < h[(i - 1) / 2].deadline_ns {
+                sift_up(h, i);
+            } else {
+                sift_down(h, i);
+            }
+        }
+        true
+    }
+
+    fn sift_up(h: &mut KVec<Entry>, mut i: usize) {
+        while i > 0 {
+            let parent = (i - 1) / 2;
+            if h[i].deadline_ns < h[parent].deadline_ns {
+                h.swap(i, parent);
+                i = parent;
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn sift_down(h: &mut KVec<Entry>, mut i: usize) {
+        let n = h.len();
+        loop {
+            let l = 2 * i + 1;
+            let r = 2 * i + 2;
+            let mut smallest = i;
+            if l < n && h[l].deadline_ns < h[smallest].deadline_ns {
+                smallest = l;
+            }
+            if r < n && h[r].deadline_ns < h[smallest].deadline_ns {
+                smallest = r;
+            }
+            if smallest == i {
+                break;
+            }
+            h.swap(i, smallest);
+            i = smallest;
+        }
+    }
+}
 
 /// The kernel/boot page-table root, captured once at [`init`]. Threads with
 /// no per-process address space (`addr_space_root == None`) run on this root;
@@ -108,6 +249,13 @@ struct SchedState {
     /// is empty while idle runs). Stored as `usize` (not a raw pointer) so
     /// `SchedState` stays `Send`. `0` before [`init`].
     idle_addr: usize,
+    /// Threads blocked in `sys_wait`, parked off the run queue. Each holds one
+    /// refcount on its `Thread` (keeping it and its kernel stack alive); a
+    /// waker moves it back to `ready`. Pre-reserved (see [`BLOCKED_RESERVE`]).
+    blocked: KVec<ObjectRef>,
+    /// The deadline min-heap (armed timers + `sys_wait` deadlines), drained on
+    /// each periodic tick. Pre-reserved (see [`deadline::HEAP_RESERVE`]).
+    deadlines: KVec<deadline::Entry>,
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
@@ -118,6 +266,8 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     quantum: QUANTUM_TICKS,
     idle: None,
     idle_addr: 0,
+    blocked: KVec::new(),
+    deadlines: KVec::new(),
 });
 
 /// Adopt a freshly created `Thread` into an [`ObjectRef`], transferring the
@@ -139,9 +289,15 @@ pub fn init() -> Result<(), AllocError> {
     // real boot, never in host tests (which never call `init`).
     BOOT_ROOT.store(Paging::active_root().as_u64(), Ordering::Relaxed);
 
-    // Build the pre-reserved run queue OUTSIDE the lock (the only growth).
+    // Build the pre-reserved run queue + blocked list + deadline heap OUTSIDE
+    // the lock (the only growth). Blocking and timer arming stay within these
+    // reserves, never allocating under the rank-1 lock.
     let mut ready: KVec<ObjectRef> = KVec::new();
     ready.try_reserve(READY_RESERVE)?;
+    let mut blocked: KVec<ObjectRef> = KVec::new();
+    blocked.try_reserve(BLOCKED_RESERVE)?;
+    let mut deadlines: KVec<deadline::Entry> = KVec::new();
+    deadlines.try_reserve(deadline::HEAP_RESERVE)?;
     let boot = Thread::try_new_boot(0, 0)?;
     let boot_ref = into_objref(boot);
 
@@ -154,6 +310,8 @@ pub fn init() -> Result<(), AllocError> {
 
     let mut g = SCHED.lock();
     g.ready = ready;
+    g.blocked = blocked;
+    g.deadlines = deadlines;
     g.current = Some(boot_ref);
     g.idle = Some(idle_ref);
     g.idle_addr = idle_addr;
@@ -246,12 +404,287 @@ pub fn yield_now() {
 /// ready, reschedules round-robin (reusing [`switch_to_next`]).
 pub fn on_timer_tick() {
     let mut g = SCHED.lock();
+    // Fire any deadlines that have elapsed FIRST, so a just-woken thread is in
+    // `ready` and the reschedule below can pick it. This is the direct-wakeup
+    // path: no DPC, all under the one scheduler lock (see the module docs).
+    let now = crate::arch::Timer::read_ns();
+    fire_expired_deadlines(&mut g, now);
     let (new_quantum, reschedule) = tick_quantum(g.quantum, !g.ready.is_empty());
     g.quantum = new_quantum;
     if reschedule {
         switch_to_next(g); // consumes the guard; switches with IF masked
     }
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
+}
+
+/// Drain every deadline at or before `now`, firing each: a timer entry signals
+/// + wakes its waiters (and re-arms if periodic); a `sys_wait` thread-deadline
+/// entry wakes that thread directly (its wait slots stay un-signaled → the
+/// thread observes a timeout). Caller holds `SCHED`. Performs **no allocation**
+/// and **no blocking** — safe in the timer IRQ.
+fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
+    while let Some(top) = deadline::peek(&g.deadlines) {
+        if top.deadline_ns > now {
+            break;
+        }
+        deadline::pop_min(&mut g.deadlines);
+        if top.is_thread {
+            // A `sys_wait` deadline: wake the waiting thread directly.
+            let th = top.target as *mut ();
+            // SAFETY: a heaped thread-deadline names a thread blocked in
+            // `wait_on`, pinned in `blocked`; `SCHED` held.
+            if unsafe { Thread::wait_try_wake(th) } {
+                make_runnable(g, th);
+            }
+        } else {
+            let timer = top.target as *mut ();
+            // SAFETY: a heaped timer is kept alive by its waiter(s)' `sys_wait`
+            // `ObjectRef`s (or the owner's handle); `SCHED` held.
+            unsafe { Timer::set_in_heap(timer, false) };
+            fire_timer(g, timer, now);
+        }
+    }
+}
+
+/// Fire one timer: signal + wake all its waiters, then re-arm if periodic.
+/// Caller holds `SCHED`.
+fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
+    let mut buf = [core::ptr::null_mut(); Timer::MAX_WAITERS];
+    // SAFETY: live Timer, `SCHED` held — drains its waiter list.
+    let n = unsafe { Timer::take_waiters(timer, &mut buf) };
+    for &th in &buf[..n] {
+        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
+        // `blocked`; `SCHED` held. Mark this timer's slot signaled, then claim
+        // the thread for wakeup (CAS); the first claimer makes it runnable.
+        unsafe {
+            Thread::wait_mark_signaled(th, timer as usize);
+            if Thread::wait_try_wake(th) {
+                make_runnable(g, th);
+            }
+        }
+    }
+    // SAFETY: live Timer, `SCHED` held.
+    let interval = unsafe { Timer::interval(timer) };
+    if interval > 0 {
+        let next = now.saturating_add(interval);
+        // SAFETY: live Timer, `SCHED` held — re-arm the periodic timer.
+        unsafe {
+            Timer::set_armed(timer, next, interval);
+            Timer::set_in_heap(timer, true);
+        }
+        // Re-push: a periodic timer that just had ≥1 waiter keeps a heap slot
+        // free (its entry was just popped), so this stays within reserve.
+        let _ = deadline::push(
+            &mut g.deadlines,
+            deadline::Entry { deadline_ns: next, target: timer as usize, is_thread: false },
+        );
+    } else {
+        // SAFETY: live Timer, `SCHED` held — one-shot: disarm.
+        unsafe { Timer::set_armed(timer, 0, 0) };
+    }
+}
+
+/// Park the current thread (set `Blocked`, move into `blocked`) and switch to
+/// the next runnable thread. Mirrors [`switch_to_next`]'s IF-bracket exactly,
+/// but does **not** re-enqueue the outgoing thread — the caller ([`wait_on`])
+/// has already registered it on its objects' wait queues / the deadline heap
+/// under this same `SCHED` hold, so there is no lost-wakeup window. Resumes
+/// here (lock-free) when a waker calls [`make_runnable`] and the scheduler
+/// later picks this thread. Consumes the guard.
+fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
+    let next = match dequeue_front(&mut g) {
+        Some(n) => n,
+        None => g.idle.take().expect("idle thread exists after init"),
+    };
+    let prev = g.current.take().expect("current set");
+    let prev_obj = prev.as_ptr();
+    let next_obj = next.as_ptr();
+    // SAFETY: both pinned (prev parked in `blocked`, next becoming current);
+    // `SCHED` held — the Thread accessor contract. (The idle thread never
+    // blocks, so `prev` is never the idle thread.)
+    unsafe {
+        Thread::set_state(prev_obj, ThreadState::Blocked);
+        Thread::set_state(next_obj, ThreadState::Running);
+    }
+    let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
+    let next_sp = unsafe { Thread::saved_sp(next_obj) };
+    let next_root = unsafe { resolve_root(next_obj) };
+
+    // Park prev in `blocked` (NOT ready/idle) — its `ObjectRef` keeps it alive.
+    debug_assert!(g.blocked.len() < g.blocked.capacity());
+    g.blocked.try_push(prev).expect("blocked list within reserve");
+    g.current = Some(next);
+
+    // Identical IF-bracket to `switch_to_next`.
+    let saved_if = g.release_keeping_irqs_masked();
+    // SAFETY: as `switch_to_next`.
+    unsafe { Paging::set_page_table(next_root) };
+    // SAFETY: as `switch_to_next`.
+    unsafe { context_switch(prev_slot, next_sp) };
+    // Resumed: a waker moved us back to `ready` and the scheduler switched us
+    // in. Restore our own captured interrupt state (cooperative resume).
+    // SAFETY: ring-0.
+    unsafe { Cpu::interrupts_restore(saved_if) };
+}
+
+/// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller
+/// holds `SCHED`. Returns `false` (no-op) if `thread` is not in `blocked` —
+/// the backstop for a second waker after the wake-CAS already claimed it. The
+/// `ObjectRef` moves `blocked`→`ready` with no refcount change.
+fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
+    let Some(i) = g.blocked.iter().position(|r| r.as_ptr() == thread) else {
+        return false;
+    };
+    let r = g.blocked.remove(i);
+    // SAFETY: `r` pins `thread`; `SCHED` held.
+    unsafe { Thread::set_state(thread, ThreadState::Ready) };
+    debug_assert!(g.ready.len() < g.ready.capacity());
+    g.ready.try_push(r).expect("ready within reserve");
+    true
+}
+
+/// Outcome of [`wait_on`].
+pub enum WaitResult {
+    /// At least one object signaled. `signaled[i]` corresponds to `objs[i]`
+    /// (the input order); set bits mark the handles to report.
+    Signaled([bool; MAX_WAIT_HANDLES]),
+    /// Nothing signaled before the deadline (or a poll found nothing ready).
+    TimedOut,
+    /// Registration exceeded a per-object or heap reserve.
+    OutOfMemory,
+}
+
+/// Register the current thread as a waiter on every object in `objs` (their
+/// type-erased addresses) with an optional `deadline_ns` (absolute monotonic;
+/// `0` = poll, `u64::MAX` = no timeout), block until one fires, then
+/// unregister and report which signaled. `now` is the current monotonic time.
+///
+/// Registration + block happen under a single `SCHED` hold, so a waker cannot
+/// slip between them (single-CPU, interrupts masked) — no lost wakeup.
+pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
+    debug_assert!(objs.len() <= MAX_WAIT_HANDLES);
+    let me_ptr;
+    {
+        let mut g = SCHED.lock();
+        me_ptr = g.current.as_ref().expect("current set when a thread runs").as_ptr();
+
+        // Fast path: any object already signaled?
+        let mut signaled = [false; MAX_WAIT_HANDLES];
+        let mut any = false;
+        for (i, &o) in objs.iter().enumerate() {
+            // SAFETY: `o` is a live Timer pinned by the caller's `ObjectRef`;
+            // `SCHED` held.
+            if unsafe { Timer::already_signaled(o as *mut (), now) } {
+                signaled[i] = true;
+                any = true;
+            }
+        }
+        if any {
+            return WaitResult::Signaled(signaled);
+        }
+        if deadline_ns == 0 {
+            // Poll with nothing ready.
+            return WaitResult::TimedOut;
+        }
+
+        // Register the wait set on the thread, then on each object. All under
+        // this one hold → atomic w.r.t. any waker.
+        let has_deadline = deadline_ns != u64::MAX;
+        // SAFETY: live Thread (current), `SCHED` held.
+        unsafe { Thread::wait_register(me_ptr, objs, has_deadline) };
+        let mut registered = 0usize;
+        let mut failed = false;
+        for &o in objs {
+            // SAFETY: live Timer, `SCHED` held.
+            if unsafe { Timer::add_waiter(o as *mut (), me_ptr) }.is_err() {
+                failed = true;
+                break;
+            }
+            registered += 1;
+        }
+        if !failed && has_deadline {
+            failed = deadline::push(
+                &mut g.deadlines,
+                deadline::Entry { deadline_ns, target: me_ptr as usize, is_thread: true },
+            )
+            .is_err();
+        }
+        if failed {
+            // Unwind the partial registration and bail without blocking.
+            for &o in &objs[..registered] {
+                // SAFETY: live Timer, `SCHED` held.
+                unsafe { Timer::remove_waiter(o as *mut (), me_ptr) };
+            }
+            // SAFETY: live Thread, `SCHED` held.
+            unsafe { Thread::wait_clear(me_ptr) };
+            return WaitResult::OutOfMemory;
+        }
+
+        // Block. Registration above + this block are one uninterrupted hold.
+        block_current_and_switch(g); // consumes g; resumes here when woken
+    }
+
+    // Resumed (woken by a signal or the deadline). Unregister everything under
+    // a fresh hold, snapshot which slots fired, then build the result.
+    let mut snap = [(0usize, false); MAX_WAIT_HANDLES];
+    let signaled;
+    {
+        let mut g = SCHED.lock();
+        // SAFETY: live Thread (we run on it), `SCHED` held.
+        let n = unsafe { Thread::wait_snapshot(me_ptr, &mut snap) };
+        for &o in objs {
+            // SAFETY: live Timer (caller still holds its `ObjectRef`), `SCHED` held.
+            unsafe { Timer::remove_waiter(o as *mut (), me_ptr) };
+        }
+        // SAFETY: live Thread, `SCHED` held.
+        if unsafe { Thread::wait_has_deadline(me_ptr) } {
+            deadline::remove(&mut g.deadlines, me_ptr as usize, true);
+        }
+        // SAFETY: live Thread, `SCHED` held.
+        unsafe { Thread::wait_clear(me_ptr) };
+
+        let mut bits = [false; MAX_WAIT_HANDLES];
+        let mut any = false;
+        for i in 0..n {
+            bits[i] = snap[i].1;
+            any |= snap[i].1;
+        }
+        signaled = if any { Some(bits) } else { None };
+    }
+    match signaled {
+        Some(bits) => WaitResult::Signaled(bits),
+        None => WaitResult::TimedOut,
+    }
+}
+
+/// Arm (or, with `deadline_ns == 0`, disarm) a timer: set its
+/// deadline/interval and (re)insert its deadline-heap entry. `deadline_ns` is
+/// absolute monotonic ns. Returns `Err(())` if the heap is at reserve.
+pub fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(), ()> {
+    let mut g = SCHED.lock();
+    // Drop any stale heap entry (re-arm).
+    // SAFETY: live Timer (caller holds its `ObjectRef`), `SCHED` held.
+    if unsafe { Timer::in_heap(timer) } {
+        deadline::remove(&mut g.deadlines, timer as usize, false);
+        unsafe { Timer::set_in_heap(timer, false) };
+    }
+    // SAFETY: live Timer, `SCHED` held.
+    unsafe { Timer::set_armed(timer, deadline_ns, interval_ns) };
+    if deadline_ns != 0 {
+        if deadline::push(
+            &mut g.deadlines,
+            deadline::Entry { deadline_ns, target: timer as usize, is_thread: false },
+        )
+        .is_err()
+        {
+            // SAFETY: live Timer, `SCHED` held — undo the arm on heap overflow.
+            unsafe { Timer::set_armed(timer, 0, 0) };
+            return Err(());
+        }
+        // SAFETY: live Timer, `SCHED` held.
+        unsafe { Timer::set_in_heap(timer, true) };
+    }
+    Ok(())
 }
 
 /// Decide the quantum update and whether to reschedule on a timer tick. Pure
@@ -551,6 +984,8 @@ mod tests {
             quantum: QUANTUM_TICKS,
             idle: None,
             idle_addr: 0,
+            blocked: KVec::new(),
+            deadlines: KVec::new(),
         }
     }
 
@@ -579,6 +1014,62 @@ mod tests {
         init_global_heap();
         let mut st = test_state();
         assert!(dequeue_front(&mut st).is_none());
+    }
+
+    // --- Deadline min-heap (pure) -------------------------------------
+
+    fn entry(deadline_ns: u64, target: usize) -> deadline::Entry {
+        deadline::Entry { deadline_ns, target, is_thread: false }
+    }
+
+    #[test]
+    fn heap_pops_in_deadline_order() {
+        init_global_heap();
+        let mut h: KVec<deadline::Entry> = KVec::new();
+        h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+        for &d in &[50u64, 10, 30, 20, 40] {
+            deadline::push(&mut h, entry(d, d as usize)).unwrap();
+        }
+        let mut got = [0u64; 5];
+        for slot in got.iter_mut() {
+            *slot = deadline::pop_min(&mut h).unwrap().deadline_ns;
+        }
+        assert_eq!(got, [10, 20, 30, 40, 50]);
+        assert!(deadline::pop_min(&mut h).is_none());
+        assert!(deadline::peek(&h).is_none());
+    }
+
+    #[test]
+    fn heap_peek_is_min_and_remove_targets() {
+        init_global_heap();
+        let mut h: KVec<deadline::Entry> = KVec::new();
+        h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+        deadline::push(&mut h, entry(30, 0xC)).unwrap();
+        deadline::push(&mut h, entry(10, 0xA)).unwrap();
+        deadline::push(&mut h, entry(20, 0xB)).unwrap();
+        assert_eq!(deadline::peek(&h).unwrap().target, 0xA);
+        // Remove the middle target; ordering of the rest is preserved.
+        assert!(deadline::remove(&mut h, 0xB, false));
+        assert!(!deadline::remove(&mut h, 0xB, false)); // gone
+        assert!(!deadline::remove(&mut h, 0xA, true)); // wrong is_thread
+        assert_eq!(deadline::pop_min(&mut h).unwrap().target, 0xA);
+        assert_eq!(deadline::pop_min(&mut h).unwrap().target, 0xC);
+        assert!(deadline::pop_min(&mut h).is_none());
+    }
+
+    #[test]
+    fn heap_push_refuses_over_reserve() {
+        init_global_heap();
+        let mut h: KVec<deadline::Entry> = KVec::new();
+        h.try_reserve(2).unwrap();
+        // Fill to the actual capacity (try_reserve may round up), then the next
+        // push must refuse rather than grow under the (eventual) lock.
+        let cap = h.capacity();
+        for i in 0..cap {
+            assert!(deadline::push(&mut h, entry(i as u64 + 1, i + 1)).is_ok());
+        }
+        assert!(deadline::push(&mut h, entry(9999, 9999)).is_err());
+        assert_eq!(h.len(), cap);
     }
 
     #[test]

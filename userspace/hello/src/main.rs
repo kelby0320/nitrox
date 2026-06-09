@@ -10,6 +10,9 @@
 //! 4. `sys_handle_stat` / `duplicate` / `restrict` / `close` on the memory
 //!    handle — the handle-operation syscalls' first end-to-end ring-3 run;
 //! 4b. `sys_clock_read(Monotonic)` twice — the monotonic clock must advance;
+//! 4c. `sys_timer_create` + `sys_timer_set` (~50 ms) + `sys_wait` — block on a
+//!     timer and wake when it fires; plus a poll (`WouldBlock`) and a pure
+//!     timeout (`TimedOut`) case;
 //! 5. `sys_memory_unmap`, then `sys_process_exit`.
 //!
 //! It exists only to demonstrate the kernel can load an ELF, build a process +
@@ -37,6 +40,9 @@ const SYS_MEMORY_CREATE: u64 = 4;
 const SYS_MEMORY_MAP: u64 = 5;
 const SYS_MEMORY_UNMAP: u64 = 6;
 const SYS_CLOCK_READ: u64 = 7;
+const SYS_TIMER_CREATE: u64 = 8;
+const SYS_TIMER_SET: u64 = 9;
+const SYS_WAIT: u64 = 10;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 const SYS_PROCESS_EXIT: u64 = 0xFFFF_0001;
 
@@ -50,6 +56,23 @@ const PAGE: u64 = 4096;
 
 /// `ClockId::Monotonic` (`kernel/src/libkern/clock.rs`).
 const CLOCK_MONOTONIC: u64 = 0;
+
+/// Errors (`kernel/src/syscall/error.rs`), as returned (negated) in rax.
+const E_WOULD_BLOCK: i64 = -11;
+const E_TIMED_OUT: i64 = -12;
+
+/// `IoResult` mirror (`kernel/src/libkern/io_result.rs`): 16 bytes, 8-aligned.
+#[repr(C, align(8))]
+struct IoResultBuf {
+    handle: u64,
+    status: i32,
+    reserved: u32,
+}
+
+/// Out-buffer for one `sys_wait` result + a one-entry handles array, both in
+/// writable `.bss`.
+static mut WAIT_RESULTS: IoResultBuf = IoResultBuf { handle: 0, status: 0, reserved: 0 };
+static mut WAIT_HANDLES: [u64; 1] = [0];
 
 /// Object-type discriminant for a `MemoryObject` (`KObjectType::MemoryObject`).
 const KOBJ_MEMORY_OBJECT: u32 = 4;
@@ -231,6 +254,81 @@ pub extern "C" fn _start() -> ! {
     } else {
         kprint(b"clock: monotonic FAIL\n");
     }
+
+    // 4c. Timer + sys_wait: create a timer, arm it ~50 ms out, and block on it.
+    // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
+    let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
+    if th < 0 {
+        kprint(b"timer: create FAIL\n");
+        exit(1);
+    }
+    let th = th as u64;
+
+    // Read t0, arm for t0 + 50 ms (absolute monotonic, one-shot), wait on it.
+    // SAFETY: CLOCK_BUF is a writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    let t0 = unsafe { (&raw const CLOCK_BUF).read() };
+    let fire_at = t0 + 50_000_000; // +50 ms
+    // SAFETY: arming our own timer handle.
+    let sr = unsafe { syscall4(SYS_TIMER_SET, th, fire_at, 0, 0) };
+    // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = th;
+        // Generous 5 s overall deadline so the timer (not the deadline) wakes us.
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            t0 + 5_000_000_000,
+        )
+    };
+    // SAFETY: on success (waited == 1) the kernel wrote one IoResult.
+    let woke_handle = unsafe { (&raw const WAIT_RESULTS.handle).read() };
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    let t_after = unsafe { (&raw const CLOCK_BUF).read() };
+    if sr == 0 && waited == 1 && woke_handle == th && t_after >= fire_at {
+        kprint(b"timer: waited and woke ok\n");
+    } else {
+        kprint(b"timer: wait FAIL\n");
+    }
+
+    // 4d. Poll an unset timer (deadline 0) — nothing ready → WouldBlock.
+    let th2 = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
+    if th2 >= 0 {
+        let th2 = th2 as u64;
+        let pr = unsafe {
+            WAIT_HANDLES[0] = th2;
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, 0)
+        };
+        if pr == E_WOULD_BLOCK {
+            kprint(b"wait: poll empty as expected\n");
+        } else {
+            kprint(b"wait: poll FAIL\n");
+        }
+
+        // 4e. Pure timeout: arm far in the future, wait with a near deadline.
+        unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+        let now = unsafe { (&raw const CLOCK_BUF).read() };
+        unsafe { syscall4(SYS_TIMER_SET, th2, now + 10_000_000_000, 0, 0) }; // +10 s
+        let tr = unsafe {
+            WAIT_HANDLES[0] = th2;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                now + 30_000_000, // +30 ms
+            )
+        };
+        if tr == E_TIMED_OUT {
+            kprint(b"wait: timed out as expected\n");
+        } else {
+            kprint(b"wait: timeout FAIL\n");
+        }
+        unsafe { syscall1(SYS_HANDLE_CLOSE, th2) };
+    }
+    unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 
     // 5. Unmap and exit.
     // SAFETY: valid syscall on a region we mapped above.

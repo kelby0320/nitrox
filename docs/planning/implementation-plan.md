@@ -580,21 +580,27 @@ by that refactor.
 With the IRQ-driven scheduler and timers in place, `sys_wait` (the unified
 blocking primitive) and per-object wait queues land.
 
-- [ ] `Blocked` thread state + block/unblock scheduler operations — the
-      descheduling primitive wait queues consume (moved here from preemptive
-      scheduling, where it would have been dead code with no caller).
-- [ ] `Timer` kernel object (deferred from Timers and clocks — needs the
-      timer IRQ, `sys_wait`, and notifications to fire/wait/signal)
-- [ ] Kernel timer deadline min-heap (deferred from Timers and clocks — its
-      consumer is the `sys_wait` deadline path below)
-- [ ] `sys_timer_create` / `sys_timer_set` (deferred from Timers and clocks;
-      take syscall numbers 8/9 on landing)
-- [ ] `WaitQueue` with intrusive linked list per object
-- [ ] `WaitNode` pre-allocated array on `Thread`
-- [ ] `sys_wait` with multi-handle support and deadline (deadline uses the
-      timer min-heap; wakeup via DPC from the timer IRQ)
-- [ ] DPC integration for wakeup (DPCs queued from IRQ context; wake threads via wait queue)
-- [ ] Unified wait works across `PendingOperation`, `IpcChannel`, `Timer`, `NotificationChannel`, `Process`
+- [x] `Blocked` thread state + block/unblock scheduler operations
+      (`block_current_and_switch` / `make_runnable`; blocked threads parked in
+      `SchedState::blocked`).
+- [x] `Timer` kernel object (`object/timer.rs`; syscalls 8/9).
+- [x] Kernel timer deadline min-heap (`sched::deadline`, a `KVec` binary heap;
+      tagged entries for timer-fire vs `sys_wait` thread-deadline).
+- [x] `sys_timer_create` / `sys_timer_set` (numbers 8/9).
+- [x] Wait queues + per-thread wait slots — realized as a pre-reserved
+      `KVec<*mut ()>` waiter list per `Timer` + a fixed wait-slot array on
+      `Thread` (`MAX_WAIT_HANDLES` = 8), **not** the intrusive-linked-list
+      design — simpler and allocation-free for Phase 1; the intrusive list is a
+      later scale/SMP optimization.
+- [x] `sys_wait` with multi-handle support and deadline (number 10; deadline via
+      the min-heap; **direct wakeup on the periodic tick**, not via DPC).
+- [ ] DPC integration for wakeup — **deferred**: the direct-wakeup tick path
+      suffices; build the DPC queue when a device-IRQ consumer exists.
+- [ ] Unified wait across `PendingOperation`/`IpcChannel`/`NotificationChannel`/
+      `Process` — **deferred to those slices** (their objects don't exist yet).
+      `sys_wait` supports `Timer` now; the wait API is generic (embeddable in any
+      kobject), so adding a waitable later is just "embed a waiter list + signal
+      it".
 
 #### Notifications
 

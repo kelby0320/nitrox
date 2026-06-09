@@ -19,16 +19,20 @@
 
 pub mod clock;
 pub mod handle;
+pub mod io_result;
 pub mod kbox;
 pub mod kstring;
 pub mod kvec;
 pub mod memory;
 pub mod spinlock;
+pub mod timer_flags;
 
 pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
+pub use io_result::IoResult;
 pub use kbox::KBox;
 pub use memory::MemFlags;
+pub use timer_flags::TimerFlags;
 pub use kstring::KString;
 pub use kvec::KVec;
 pub use spinlock::{IrqSpinLock, IrqSpinLockGuard, SpinLock, SpinLockGuard};

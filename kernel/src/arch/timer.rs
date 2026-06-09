@@ -51,8 +51,12 @@ pub trait ArchTimer {
 
     /// Arm the per-CPU timer to fire **once** `delay_ns` from now at the timer
     /// vector. Relative by design — the timer is inherently a counting-down
-    /// initial count, so the deadline→delay subtraction belongs in the
-    /// wait-queue consumer. Consumer: wait-queue deadlines. Dormant this slice.
+    /// initial count.
+    ///
+    /// **Still dormant.** The wait-queues slice checks deadlines on the periodic
+    /// preemption tick (the one LAPIC timer is already in periodic mode for
+    /// preemption, so a concurrent one-shot isn't available), so this has no
+    /// consumer yet. It awaits a tickless or second-timer design.
     ///
     /// # Safety
     /// As [`start_periodic`](ArchTimer::start_periodic).

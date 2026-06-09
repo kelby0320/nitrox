@@ -18,12 +18,16 @@ use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
-use crate::libkern::{KBox, MemFlags};
+use crate::libkern::{IoResult, KBox, MemFlags, TimerFlags};
 use crate::mm::addr_space::{AddressSpace, MapError};
-use crate::mm::user_access::{UserMutPtr, UserPtr, copy_slice_from_user, copy_to_user};
+use crate::mm::user_access::{
+    UserMutPtr, UserPtr, copy_slice_from_user, copy_slice_to_user, copy_to_user,
+};
 use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
-use crate::object::{MemoryObject, ObjectRef, Process};
+// `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
+// object is referenced as `TimerObject` to avoid the name clash.
+use crate::object::{MAX_WAIT_HANDLES, MemoryObject, ObjectRef, Process, Timer as TimerObject};
 
 // --- Stable ABI syscall numbers -----------------------------------------
 //
@@ -46,9 +50,14 @@ pub const SYS_MEMORY_MAP: u64 = 5;
 /// `sys_memory_unmap` — unmap a region of the caller's address space.
 pub const SYS_MEMORY_UNMAP: u64 = 6;
 /// `sys_clock_read` — read a clock's value (nanoseconds) into user memory.
-/// `sys_timer_create`/`sys_timer_set` will take 7's successors (8/9) when the
-/// wait-queues slice lands; syscall numbers are assigned in landing order.
 pub const SYS_CLOCK_READ: u64 = 7;
+/// `sys_timer_create` — create a `Timer` kernel object, return its handle.
+pub const SYS_TIMER_CREATE: u64 = 8;
+/// `sys_timer_set` — arm/disarm a timer at an absolute monotonic deadline.
+pub const SYS_TIMER_SET: u64 = 9;
+/// `sys_wait` — block until ≥1 of the given handles signals or the deadline
+/// elapses; the unified blocking primitive.
+pub const SYS_WAIT: u64 = 10;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -81,6 +90,9 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64)
         SYS_MEMORY_MAP => encode(sys_memory_map(a0, a1, a2, a3)),
         SYS_MEMORY_UNMAP => encode(sys_memory_unmap(a0, a1)),
         SYS_CLOCK_READ => encode(sys_clock_read(a0, a1)),
+        SYS_TIMER_CREATE => encode(sys_timer_create(a0)),
+        SYS_TIMER_SET => encode(sys_timer_set(a0, a1, a2)),
+        SYS_WAIT => encode(sys_wait(a0, a1 as usize, a2, a3)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Diverges into the scheduler; never returns to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -437,6 +449,136 @@ pub fn sys_clock_read(clock: u64, out: u64) -> SysResult {
     Ok(0)
 }
 
+// --- Timer + wait syscalls ----------------------------------------------
+
+/// Rights minted on a fresh `Timer` handle: `WAIT` (it is a waitable) plus the
+/// generic management band. No principal rights — a `Timer`'s principal mask is
+/// empty (`handle/type_rights.rs`), so this set is allocatable.
+fn timer_rights() -> Rights {
+    Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
+}
+
+/// `sys_timer_create(flags)` — create an unarmed `Timer` and return a handle
+/// (with [`timer_rights`]). `flags` must be a valid [`TimerFlags`] (none defined
+/// yet → must be 0).
+pub fn sys_timer_create(flags: u64) -> SysResult {
+    if TimerFlags::from_bits(flags).is_none() {
+        return Err(KError::InvalidArgument);
+    }
+    let obj = TimerObject::try_new().map_err(|_| KError::OutOfMemory)?;
+    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
+    let pid = crate::sched::current_owner_pid();
+    match global::get().allocate(pid, ptr, KObjectType::Timer, timer_rights()) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // `allocate` did not adopt the creation reference; reclaim + drop it
+            // (running `Timer::Drop`) outside the table call.
+            // SAFETY: `ptr` carries the single outstanding creation reference.
+            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Timer) });
+            Err(map_handle_err(e))
+        }
+    }
+}
+
+/// `sys_timer_set(timer, deadline_ns, interval_ns)` — arm `timer` to fire at the
+/// absolute monotonic deadline `deadline_ns` (`0` disarms), re-arming every
+/// `interval_ns` thereafter (`0` = one-shot). Returns 0. Requires only handle
+/// ownership (no special right — `WAIT` gates `sys_wait`, not arming).
+pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(timer_h), pid, Rights::empty())
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::Timer {
+        return Err(KError::InvalidArgument);
+    }
+    // `ok.object` (an ObjectRef) is held across the arm, keeping the Timer alive.
+    crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns)
+        .map_err(|()| KError::OutOfMemory)?;
+    Ok(0)
+}
+
+/// `sys_wait(handles, count, results, deadline)` — block until ≥1 of
+/// `handles[0..count]` signals or `deadline` (absolute monotonic ns; `0` =
+/// poll, `u64::MAX` = no timeout) elapses. Writes one [`IoResult`] per signaled
+/// handle to `results` and returns the count signaled (≥1), or `TimedOut` /
+/// `WouldBlock`. This slice only supports `Timer` handles (others →
+/// `Unsupported`).
+pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u64) -> SysResult {
+    // Validate count + pointers before any lock (host-reachable failures).
+    if count == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    if count > MAX_WAIT_HANDLES {
+        return Err(KError::TooLarge);
+    }
+    let hptr = UserPtr::<u8>::new(handles_ptr).map_err(from_user_access)?;
+    let rptr = UserMutPtr::<u8>::new(results_ptr).map_err(from_user_access)?;
+
+    // Copy in the handle array (count × 8 bytes) and decode.
+    let mut hbytes = [0u8; MAX_WAIT_HANDLES * 8];
+    copy_slice_from_user(&mut hbytes[..count * 8], hptr).map_err(from_user_access)?;
+    let mut handles = [0u64; MAX_WAIT_HANDLES];
+    for i in 0..count {
+        handles[i] = u64::from_ne_bytes(hbytes[i * 8..i * 8 + 8].try_into().unwrap());
+    }
+
+    // Resolve each handle (requires `WAIT`) to an ObjectRef held for the call;
+    // only `Timer` is waitable this slice.
+    let pid = crate::sched::current_owner_pid();
+    let mut refs: [Option<ObjectRef>; MAX_WAIT_HANDLES] = core::array::from_fn(|_| None);
+    let mut objs = [0usize; MAX_WAIT_HANDLES];
+    for i in 0..count {
+        let ok = global::get()
+            .lookup(RawHandle(handles[i]), pid, Rights::WAIT)
+            .map_err(map_handle_err)?;
+        if ok.object.object_type() != KObjectType::Timer {
+            return Err(KError::Unsupported);
+        }
+        objs[i] = ok.object.as_ptr() as usize;
+        refs[i] = Some(ok.object);
+    }
+
+    // Block (or fast-path). `refs` stay alive across the block (they live on
+    // this thread's kernel stack, pinned while it is parked), keeping the
+    // waited Timers alive for the wakeup path.
+    let now = Timer::read_ns();
+    let result = crate::sched::wait_on(&objs[..count], deadline_ns, now);
+    drop(refs); // release the extra lookup references (handles still pin them)
+
+    match result {
+        crate::sched::WaitResult::Signaled(bits) => {
+            let mut out = [IoResult::ready(0); MAX_WAIT_HANDLES];
+            let mut k = 0usize;
+            for i in 0..count {
+                if bits[i] {
+                    out[k] = IoResult::ready(handles[i]);
+                    k += 1;
+                }
+            }
+            // SAFETY: `IoResult` is `#[repr(C)]` with every byte initialised and
+            // no padding (asserted in `libkern::io_result`); reinterpret the
+            // first `k` records as a byte slice to copy out.
+            let bytes = unsafe {
+                core::slice::from_raw_parts(
+                    out.as_ptr() as *const u8,
+                    k * core::mem::size_of::<IoResult>(),
+                )
+            };
+            copy_slice_to_user(rptr, bytes).map_err(from_user_access)?;
+            Ok(k as isize)
+        }
+        crate::sched::WaitResult::TimedOut => {
+            if deadline_ns == 0 {
+                Err(KError::WouldBlock) // poll found nothing ready
+            } else {
+                Err(KError::TimedOut)
+            }
+        }
+        crate::sched::WaitResult::OutOfMemory => Err(KError::OutOfMemory),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -469,6 +611,52 @@ mod tests {
         assert_eq!(sys_clock_read(1, valid_out), Err(KError::Unsupported)); // Realtime
         assert_eq!(sys_clock_read(2, valid_out), Err(KError::Unsupported)); // ProcessCpu
         assert_eq!(sys_clock_read(3, valid_out), Err(KError::Unsupported)); // ThreadCpu
+    }
+
+    #[test]
+    fn timer_create_rejects_unknown_flags() {
+        // Unknown flag bits are rejected before `current_owner_pid` (which needs
+        // a running thread), so this is host-reachable.
+        assert_eq!(sys_timer_create(1), Err(KError::InvalidArgument));
+        assert_eq!(
+            dispatch(SYS_TIMER_CREATE, 0x8000_0000, 0, 0, 0, 0, 0),
+            KError::InvalidArgument.as_isize(),
+        );
+    }
+
+    #[test]
+    fn wait_rejects_bad_count() {
+        // count == 0 and count > MAX are checked before any lock / pointer use.
+        assert_eq!(sys_wait(0xDEAD, 0, 0xBEEF, 0), Err(KError::InvalidArgument));
+        assert_eq!(
+            sys_wait(0xDEAD, MAX_WAIT_HANDLES + 1, 0xBEEF, 0),
+            Err(KError::TooLarge),
+        );
+    }
+
+    #[test]
+    fn wait_rejects_bad_pointers() {
+        // A valid count then an out-of-range user pointer fails before locks.
+        // USER_VIRT_END is the user-half ceiling; anything ≥ it is rejected.
+        let bad = USER_VIRT_END;
+        assert_eq!(sys_wait(bad, 1, 0x1000, 1000), Err(KError::FaultFromUser));
+        assert_eq!(sys_wait(0x1000, 1, bad, 1000), Err(KError::FaultFromUser));
+    }
+
+    #[test]
+    fn timer_rights_are_allocatable_on_a_timer() {
+        // The minted Timer rights must be accepted by the handle table for a
+        // Timer (all generic; Timer's principal mask is empty).
+        init_global_heap();
+        let t = HandleTable::try_new(0x1234_5678_9ABC_DEF0).unwrap();
+        let timer = crate::object::Timer::try_new().unwrap();
+        let ptr = KBox::into_raw(timer).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, ptr, KObjectType::Timer, timer_rights())
+            .expect("timer_rights must be valid for a Timer");
+        // Clean up: close releases the handle's ref, freeing the object.
+        let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }
 
     #[test]

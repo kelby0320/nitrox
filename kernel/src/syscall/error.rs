@@ -27,6 +27,12 @@ pub enum KError {
     OutOfMemory = -4,
     /// A named resource does not exist.
     NotFound = -10,
+    /// A non-blocking operation could not complete immediately (e.g. a poll —
+    /// `sys_wait` with `deadline == 0` — found nothing signaled).
+    WouldBlock = -11,
+    /// A blocking operation's deadline elapsed before it completed (e.g.
+    /// `sys_wait` timed out with no handle signaled).
+    TimedOut = -12,
     /// An argument was malformed or out of range.
     InvalidArgument = -30,
     /// A user buffer was inaccessible (bad address or page fault).
@@ -83,6 +89,8 @@ mod tests {
     #[test]
     fn discriminants_match_spec() {
         assert_eq!(KError::InvalidHandle.as_isize(), -1);
+        assert_eq!(KError::WouldBlock.as_isize(), -11);
+        assert_eq!(KError::TimedOut.as_isize(), -12);
         assert_eq!(KError::FaultFromUser.as_isize(), -31);
         assert_eq!(KError::TooLarge.as_isize(), -32);
         assert_eq!(KError::Unsupported.as_isize(), -52);

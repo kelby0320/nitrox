@@ -16,7 +16,7 @@ enforced by code review.
 | Rank | Lock                                         | Status                                   |
 |------|----------------------------------------------|------------------------------------------|
 | 1    | Scheduler runqueue (`SCHED`, **`IrqSpinLock`**)| live as of Phase 1 slice 9 (scheduler) |
-| 2    | Wait queue                                   | not yet present                          |
+| 2    | Wait queue                                   | reserved (Phase 1 folds wait/timer state into rank 1 — see § Wait queues) |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
 | 5    | IPC channel                                  | not yet present                          |
@@ -227,7 +227,34 @@ single-level and kernel-stack growth is bounded (one interrupt frame).
 The audit conclusion (only `SCHED` + `SERIAL` need `IrqSpinLock`) holds as long
 as the timer handler keeps doing only EOI + reschedule with no allocation; a
 future handler that touches another locked subsystem must re-run this audit.
-Allocation from any interrupt/DPC context remains forbidden.
+Allocation from any interrupt/DPC context remains forbidden. As of the
+wait-queues slice the timer handler also drains the deadline heap and wakes
+waiters — all still under `SCHED`, with no allocation (the heap/waiter/blocked
+collections are pre-reserved) and one new lock-free call (`arch::Timer::read_ns`,
+a TSC read). So the conclusion is unchanged.
+
+## Wait queues and the deadline heap live under rank 1 (Phase 1)
+
+`sys_wait`, the per-object waiter lists (e.g. inside a `Timer`), the deadline
+min-heap, and the blocked-thread parking are all protected by the **rank-1
+`SCHED` lock** for Phase 1, not by a separate rank-2 lock. On single-CPU this
+one-lock domain removes both the rank-2-from-IRQ ordering question and the
+wait/wakeup race:
+
+- **No lost wakeup.** `sys_wait` registers the thread on every object's waiter
+  list and (for a finite deadline) pushes a heap entry, then blocks — all under
+  **one uninterrupted `SCHED` hold** (the `IrqSpinLock` masks interrupts the
+  whole time). A waker (the timer-tick fire path) only runs after the thread has
+  released `SCHED`, by which point it is already in `blocked` with live
+  registrations. A per-thread `wait_phase` CAS (`Waiting→Woken`) dedups multiple
+  signals for one multi-handle wait and is the SMP-future backstop.
+- **Handle resolution stays sequential.** `sys_wait` resolves handles under the
+  rank-3 handle-table lock **first** (releasing it), then takes `SCHED` to
+  register + block — never nested, no inversion.
+
+Rank 2 stays **reserved** for the SMP split, where the wait queues and the
+deadline heap move to their own rank-2 lock (and `sys_wait`'s register-then-block
+becomes a lock-ordered acquire rather than relying on single-CPU atomicity).
 
 ## Adding a new lock
 

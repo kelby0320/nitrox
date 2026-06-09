@@ -80,8 +80,11 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `5` | `sys_memory_map` |
 | `6` | `sys_memory_unmap` |
 | `7` | `sys_clock_read` |
+| `8` | `sys_timer_create` |
+| `9` | `sys_timer_set` |
+| `10` | `sys_wait` |
 
-Numbers are assigned in landing order, not in the order syscalls appear below. `sys_timer_create` and `sys_timer_set` are deferred to the wait-queues slice and will take the next free numbers (`8`/`9`) when they land.
+Numbers are assigned in landing order, not in the order syscalls appear below.
 
 Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-version-hash.md`).
 
@@ -149,7 +152,9 @@ fn sys_wait(
     deadline: u64,
 ) -> isize
 ```
-Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive) or an error.
+Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
+
+**Implemented as of the wait-queues slice, for `Timer` handles only** — other waitable types (`PendingOperation`, `IpcChannel`, `NotificationChannel`, `Process`) return `Unsupported` until their slices land. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
 
 ### Namespace
 
@@ -293,12 +298,12 @@ Receives a message from `ch`. Blocks via `sys_wait` if no message is queued. Wri
 ```rust
 fn sys_timer_create(flags: TimerFlags) -> isize
 ```
-Creates a new `Timer` kernel object. Returns a handle. **Deferred to the wait-queues slice** (number `8` on landing): a `Timer` cannot fire (interrupts are masked until preemptive scheduling), be waited on (`sys_wait`), or signal (notifications) until those mechanisms exist, so it ships with its consumers.
+Creates a new `Timer` kernel object (unarmed). Returns a handle carrying `WAIT | DUPLICATE | INSPECT | TRANSFER`. `flags` must be a valid `TimerFlags` (none defined yet → must be 0). (Syscall number `8`; implemented in the wait-queues slice.)
 
 ```rust
 fn sys_timer_set(timer: RawHandle, deadline_ns: u64, interval_ns: u64) -> isize
 ```
-Programs the timer to fire at `deadline_ns` (monotonic ns) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. **Deferred to the wait-queues slice** (number `9` on landing), alongside `sys_timer_create` and the kernel deadline min-heap.
+Programs the timer to fire at `deadline_ns` (**absolute** monotonic ns; `0` disarms) and re-fire every `interval_ns` thereafter. `interval_ns` of `0` is one-shot. Returns `0`. (Syscall number `9`; implemented in the wait-queues slice. Deadlines resolve on the periodic scheduler tick, ~10 ms granularity.)
 
 ```rust
 fn sys_notif_recv(queue: RawHandle, out: UserMutPtr<Notification>) -> isize
@@ -349,9 +354,11 @@ Argument types referenced above are defined in `libkern`:
 
 - `RawHandle`: `#[repr(transparent)] pub struct RawHandle(u64);`
 - `Rights`: a bitflags type, see [handle-encoding.md](handle-encoding.md)
-- `IoOp`, `IoResult`, `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents
+- `IoResult`: `#[repr(C)]` 16-byte record, 8-aligned, no padding: `handle: u64` (offset 0, the signaled handle), `status: i32` (offset 8, `0` = ready, negative = a `KError`), `reserved: u32` (offset 12, zeroed). Defined in `kernel/src/libkern/io_result.rs`. **Part of the ABI version hash** (`abi-version-hash.md` § "IoOp and IoResult layouts").
+- `TimerFlags`: `#[repr(transparent)]` bitflags over `u64`; no flags defined yet (must be 0). Defined in `kernel/src/libkern/timer_flags.rs`.
+- `IoOp`, `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents
 - `ClockId`: `#[repr(u32)]` enum, `Monotonic = 0`, `Realtime = 1`, `ProcessCpu = 2`, `ThreadCpu = 3`; defined in `kernel/src/libkern/clock.rs`
-- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`, `TimerFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`
+- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`
 
 ## Stability
 
