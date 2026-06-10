@@ -2868,3 +2868,95 @@ the send mode/oversize-count rejects) green; `qemu` shows
 `child[send]: transferred a memory object to the sibling` →
 `child[recv]: mapped transferred object, marker=0xc0ffee ok`, both children exit
 `0`, the parent reaps both `ChildExited` — handle transfer end to end.
+
+## 2026-06-10 — Phase 1 finale, slice ③: threads + exception suspend/resume (Phase 1 complete)
+
+The last Phase-1 slice closes the milestone's final clause: a ring-3 fault now
+**suspends** the faulting thread (rather than terminating it post-mortem), and a
+supervisor resumes or terminates it via `sys_exception_resume`. It also adds the
+threads a supervisor needs (`sys_thread_create`) and makes multi-threaded process
+exit correct.
+
+- **Suspend = block-and-switch reuse.** A ring-3 fault enters the exception stub
+  on the faulting thread's own kernel stack; the stub builds the `ExceptionFrame`
+  there and `call`s the dispatcher. "Suspend" is then just parking the thread (a
+  new `Suspended` scheduler state) and context-switching away — mechanically
+  identical to `block_current_and_switch` — leaving the `ExceptionFrame` on the
+  frozen kernel stack. `sys_exception_resume` makes the thread runnable; it
+  resumes *up through the dispatcher* to the stub, which pops the frame and
+  `iretq`s. No special trampoline; `suspend_with_fault` returns the supervisor's
+  `ResumeDisposition` to the dispatcher when the thread next runs.
+- **Uniform suspend — all user faults.** The general exception stubs used to end
+  in `ud2` (dispatcher `-> !`). They now share the `#PF`/timer stubs' pop+`iretq`
+  epilogue, `exception_dispatch` returns `()`, and both dispatchers route the
+  user-fault branch through one helper (`user_fault` → `suspend_with_fault`). The
+  epilogue is only *reached* on the Resume path (kernel faults diverge in
+  `dump_and_halt`; Terminate diverges in `exit_thread`), so it is a no-op for
+  everything else. Every user-fault vector is suspendable, matching the
+  os-design "faulting thread suspended" model.
+- **`sys_thread_create` + the thread-as-supervisor model.** A process can now
+  hold more than one thread; the returned `Thread` handle
+  (`SIGNAL | TERMINATE | INSPECT | DUPLICATE`) is the capability a sibling uses to
+  inspect/resume a faulted thread. The caller owns the user stack (allocate +
+  map, pass the top). `spawn_user` now returns the new `ObjectRef` (a clone for
+  the handle) instead of just a tid.
+- **`exit_thread` / `exit_process` split.** `exit_thread` terminates the current
+  thread and delivers `ChildExited` only if it is the process's **last** thread
+  (a sibling scan finds none). `exit_process` (behind `sys_process_exit`) tears
+  down the siblings first — an `owner_pid` scan of `ready`/`blocked`/`suspended`,
+  unregistering blocked siblings from their wait objects + the deadline heap
+  before reaping — then exits the current thread with `ChildExited`. The `reap`
+  slot became a `KVec` (a process exit reaps many threads at once), drained
+  outside `SCHED`.
+- **Full teardown via an `owner_pid` scan, not a per-process thread list.** The
+  intrusive per-process thread list (with its enumeration / external-process-kill
+  consumer) lands in Phase 2; the scan is correct for self-exit now (single-CPU,
+  all sibling threads are parked off the run queue while this one runs) and is not
+  a dead-end (decided with the user).
+- **Disposition = Resume + Terminate only.** `sys_exception_resume` takes a raw
+  `u64` disposition (`0` Resume / `2` Terminate); `ResumeSkip` / `ModifyAndResume`
+  (`1` / `3`), the 30 s auto-terminate timeout, and the debugger
+  exception-channel priority chain stay Phase 2. `Resume` is return-to-retry, so
+  the **demo uses Terminate** (without fault-fixing, Resume re-faults); Resume is
+  exercised at the data-structure level.
+- **`ArchRegisters` trait for the register snapshot.** `RegisterValues` is both
+  an ABI type (written to userspace by `sys_thread_get_registers`) *and*
+  arch-specific in content (the x86_64 register set), so it lives behind the arch
+  boundary, not in `libkern`: the neutral `arch::registers::ArchRegisters` trait
+  (`type Values; fn read_from_exception_frame(frame_ptr) -> Values`), with the
+  x86_64 `RegisterValues` type + `X86Registers` marker in
+  `arch/x86_64/registers.rs` (re-exported as `crate::arch::{RegisterValues,
+  Registers}`). The `impl` stays in `idt.rs` — where the private `ExceptionFrame`
+  it decodes is defined — so reading a suspended thread's registers needs no
+  widening of that frame's visibility. `ThreadArgs` stays in `libkern` (it is
+  arch-neutral: `entry`/`user_sp` are user VAs, `arg0` opaque). Register
+  *writeback* (for the deferred `ModifyAndResume`) joins this trait in Phase 2.
+  (The reader was first landed as a free `arch::user_registers_from_frame`
+  function with the type in `libkern`; promoted to the trait the same day so the
+  arch-specific type sits with its arch logic.)
+- **Demo:** the `parent` process (PID 1) maps a worker stack, `sys_thread_create`s
+  a worker whose entry deliberately faults, receives the `SegFault`, reads the
+  worker's registers (`sys_thread_get_registers`), prints the faulting `rip`, and
+  terminates it (`sys_exception_resume` with Terminate) — then runs the existing
+  2-child spawn/transfer demo and `sys_process_exit`s.
+
+**ABI-hash impact: yes (per spec; not yet enforced).** New cross-boundary layouts
+`RegisterValues` (144 B) and `ThreadArgs` (64 B) are hash inputs (like
+`SpawnArgs` / `IpcMsg`). Syscall numbers 19–21 are not hashed; no `KError` /
+discriminant change. The hash is still not computed in code, so this is not
+enforced — same posture as prior slices.
+
+**Phase 1 milestone met.** The kernel substrate is complete: capability handles,
+per-process address spaces, async-shaped syscalls, IPC with handle transfer,
+process spawn + lifecycle, and now multi-threading with supervised exception
+handling.
+
+Verified: `check-arch` clean; `build` clean (no warnings); `test` 372 host tests
+(+ `ThreadState::Suspended` transitions, resume sets disposition, the
+`exit_process` sibling-scan/teardown, the reap-list draining many, and the
+`sys_thread_create` / `sys_thread_get_registers` / `sys_exception_resume`
+validation rejects) green; `qemu` shows
+`parent: worker faulted @ rip=0x…400005 ; terminating` →
+`parent: worker terminated`, then the spawn/transfer demo
+(`child[recv]: …marker=0xc0ffee ok`, both `ChildExited`), and the kernel stays
+alive past `sys_process_exit`.

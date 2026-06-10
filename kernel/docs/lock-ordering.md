@@ -72,11 +72,20 @@ Two corollaries:
   (debug-asserted). This keeps the otherwise-legal rank-1 → rank-6
   descent out of the hot path entirely.
 - **Reaping runs outside rank 1.** An exited thread cannot free its own
-  kernel stack (it is still running on it), so `exit` parks itself in
-  `reap`; the next scheduler entry's `reap_pending` `take`s it under the
-  lock and drops it *after* releasing — `KernelStack`'s `Drop` unmaps and
-  returns frames to the buddy (rank 6), which must not happen under
-  rank 1.
+  kernel stack (it is still running on it), so `exit_thread`/`exit_process`
+  park it in the `reap` list; the next scheduler entry's `reap_pending`
+  drains the list (`mem::take`) under the lock and drops the threads *after*
+  releasing — `KernelStack`'s `Drop` unmaps and returns frames to the buddy
+  (rank 6), which must not happen under rank 1. `reap` is a `KVec` (not one
+  slot) because `exit_process` reaps the caller's torn-down sibling threads
+  alongside it; the drain still happens off the lock.
+- **Suspend obeys the block-and-switch discipline.** `suspend_with_fault`
+  (the ring-3 exception path) delivers the fault notification + parks the
+  thread in `suspended` and context-switches away — all under one `SCHED`
+  hold, no allocation (queue/waiters pre-reserved), mirroring
+  `block_current_and_switch`. The supervisor's `sys_thread_get_registers`
+  reads the captured frame and copies it to user memory **outside** `SCHED`
+  (the thread stays parked, so the frame is stable).
 
 ## Handle-table segment growth releases rank 3 before rank 6
 
@@ -259,18 +268,20 @@ Rank 2 stays **reserved** for the SMP split, where the wait queues and the
 deadline heap move to their own rank-2 lock (and `sys_wait`'s register-then-block
 becomes a lock-ordered acquire rather than relying on single-CPU atomicity).
 
-The notification paths obey the same discipline: `deliver_fault_and_exit` (the
-exception path) takes `SCHED` to enqueue + wake the channel's waiters, drops it,
-then takes it again inside `exit()` — two acquisitions, never nested.
-`sys_notif_recv` pops one notification under `SCHED` and copies the 64-byte
-record to user memory **after** releasing the lock (never hold the `IrqSpinLock`
-across a potentially-faulting user copy).
+The notification paths obey the same discipline: `suspend_with_fault` (the
+exception path) takes `SCHED` to enqueue + wake the channel's waiters and park
+the faulting thread, all in one hold; on resume it takes `SCHED` again to read
+the disposition — separate acquisitions, never nested. `sys_notif_recv` pops one
+notification under `SCHED` and copies the 64-byte record to user memory **after**
+releasing the lock (never hold the `IrqSpinLock` across a potentially-faulting
+user copy).
 
-Process exit obeys the same discipline: `sched::exit` delivers `ChildExited` to
-the parent's notification channel under `SCHED` (borrowing the channel pointer
-via the child `Process`'s `parent_notif`, never dropping an `ObjectRef` under the
-lock) **before** parking the exiting thread — immediate delivery so a parent
-blocked in `sys_wait` wakes, while stack reclamation stays deferred to reap.
+Process exit obeys the same discipline: `sched::exit_thread`/`exit_process`
+deliver `ChildExited` to the parent's notification channel under `SCHED`
+(borrowing the channel pointer via the child `Process`'s `parent_notif`, never
+dropping an `ObjectRef` under the lock) **before** parking the exiting thread —
+immediate delivery so a parent blocked in `sys_wait` wakes, while stack
+reclamation stays deferred to reap.
 
 A related multi-user-thread invariant (not a lock, but switch-path state): the
 per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) is re-armed for

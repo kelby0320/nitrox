@@ -94,6 +94,11 @@ const IDLE_TID: u32 = u32::MAX;
 /// under the rank-1 lock.
 const BLOCKED_RESERVE: usize = 16;
 
+/// Pre-reserved capacity for the exited-thread reap list. Holds the current
+/// thread plus any sibling threads a process exit tears down; sized like the
+/// run queue so a whole process's threads fit without allocating under the lock.
+const REAP_RESERVE: usize = 16;
+
 /// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by
 /// absolute monotonic ns, drained on each periodic tick. A pure binary heap in
 /// a [`KVec`], living in [`SchedState`] under `SCHED`; host-tested.
@@ -236,10 +241,17 @@ struct SchedState {
     ready: KVec<ObjectRef>,
     /// The currently running thread. `None` only before [`init`].
     current: Option<ObjectRef>,
-    /// An exited thread awaiting reclamation. Dropped — freeing its kernel
-    /// stack — by the next scheduler entry, never by the thread itself
-    /// (it is still running on that stack at [`exit`] time).
-    reap: Option<ObjectRef>,
+    /// Exited threads awaiting reclamation. Dropped — freeing their kernel
+    /// stacks — by the next scheduler entry, never by a thread itself (it is
+    /// still running on its stack at exit time). A **list** (not one slot) so a
+    /// process exit can reap its torn-down sibling threads alongside the caller.
+    /// Pre-reserved (see [`REAP_RESERVE`]).
+    reap: KVec<ObjectRef>,
+    /// Threads suspended after a ring-3 fault, parked off the run queue with
+    /// their `ExceptionFrame` preserved on their kernel stacks. A supervisor's
+    /// `sys_exception_resume` moves one back to `ready` (resume) or marks it for
+    /// termination. Pre-reserved (see [`BLOCKED_RESERVE`]).
+    suspended: KVec<ObjectRef>,
     /// Monotonic thread-id source.
     next_tid: u32,
     /// Monotonic process-id source. The boot parent takes pid 1; spawned
@@ -270,7 +282,8 @@ struct SchedState {
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     ready: KVec::new(),
     current: None,
-    reap: None,
+    reap: KVec::new(),
+    suspended: KVec::new(),
     next_tid: 1,
     next_pid: 2,
     quantum: QUANTUM_TICKS,
@@ -316,6 +329,10 @@ pub fn init() -> Result<(), AllocError> {
     ready.try_reserve(READY_RESERVE)?;
     let mut blocked: KVec<ObjectRef> = KVec::new();
     blocked.try_reserve(BLOCKED_RESERVE)?;
+    let mut suspended: KVec<ObjectRef> = KVec::new();
+    suspended.try_reserve(BLOCKED_RESERVE)?;
+    let mut reap: KVec<ObjectRef> = KVec::new();
+    reap.try_reserve(REAP_RESERVE)?;
     let mut deadlines: KVec<deadline::Entry> = KVec::new();
     deadlines.try_reserve(deadline::HEAP_RESERVE)?;
     let boot = Thread::try_new_boot(0, 0)?;
@@ -331,6 +348,8 @@ pub fn init() -> Result<(), AllocError> {
     let mut g = SCHED.lock();
     g.ready = ready;
     g.blocked = blocked;
+    g.suspended = suspended;
+    g.reap = reap;
     g.deadlines = deadlines;
     g.current = Some(boot_ref);
     g.idle = Some(idle_ref);
@@ -374,18 +393,20 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
 }
 
 /// Create a **user** thread for `process` that descends to ring 3 at
-/// `entry` with stack `user_sp`, and enqueue it. Returns its thread id. The
-/// `process` reference is moved into the thread (keeping its address space
-/// alive). `boot_args` are the `[rdi, rsi, rdx]` register values seeded at the
-/// thread's first ring-3 entry (the spawn hand-off; `[0; 3]` for the boot/`hello`
-/// path). The kernel stack + frame fabrication happen before the (brief) enqueue
-/// lock.
+/// `entry` with stack `user_sp`, and enqueue it. Returns a **cloned**
+/// [`ObjectRef`] to the new thread (the enqueued `ready` entry holds its own
+/// reference) so the caller can install a thread handle (`sys_thread_create`);
+/// the thread id is `Thread::tid` of the returned object. The `process`
+/// reference is moved into the thread (keeping its address space alive).
+/// `boot_args` are the `[rdi, rsi, rdx]` register values seeded at the thread's
+/// first ring-3 entry (the spawn hand-off; `[0; 3]` for the boot/`hello` path).
+/// The kernel stack + frame fabrication happen before the (brief) enqueue lock.
 pub fn spawn_user(
     process: ObjectRef,
     entry: u64,
     user_sp: u64,
     boot_args: [u64; 3],
-) -> Result<u32, AllocError> {
+) -> Result<ObjectRef, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
         let t = g.next_tid;
@@ -395,6 +416,8 @@ pub fn spawn_user(
     // Heavy work outside the lock (consumes `process` on success).
     let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
     let r = into_objref(thread);
+    // Clone the caller's handle before the enqueue moves `r` into `ready`.
+    let handle = r.clone();
 
     {
         let mut g = SCHED.lock();
@@ -402,11 +425,11 @@ pub fn spawn_user(
             g.ready
                 .try_push(r)
                 .expect("push within reserved capacity is infallible");
-            return Ok(tid);
+            return Ok(handle);
         }
     }
-    // Over capacity: `r` drops here (lock released) — releasing the thread's
-    // last reference, freeing its kernel stack, and releasing the Process.
+    // Over capacity: `r` and `handle` drop here (lock released) — releasing the
+    // thread's references, freeing its kernel stack, and releasing the Process.
     Err(AllocError)
 }
 
@@ -973,28 +996,28 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     unsafe { Cpu::interrupts_restore(saved_if) };
 }
 
-/// Terminate the current thread with exit `status` and switch away forever.
-/// The thread's `Thread` (and its kernel stack) are parked for reclamation by
-/// the next scheduler entry — they cannot be freed here because this code is
-/// still running on that stack.
-///
-/// If the exiting thread's process has a parent (its `parent_notif` channel is
-/// set), a `ChildExited { pid, status }` is delivered to that channel **here**,
-/// before parking — immediate, not deferred to reap — so a parent blocked in
-/// `sys_wait` wakes promptly even though stack reclamation is deferred. Reuses
-/// the [`deliver_fault_and_exit`] discipline: borrow the channel pointer, never
-/// drop an `ObjectRef` under `SCHED`, enqueue is allocation-free.
-pub fn exit(status: ExitStatus) -> ! {
-    // Reclaim any earlier exited thread first, so `reap` is free for us.
-    reap_pending();
+/// The action a supervisor's `sys_exception_resume` requests for a thread
+/// suspended on a fault, returned by [`suspend_with_fault`] when it resumes.
+/// Phase 1 has the two terminal dispositions; `ResumeSkip`/`ModifyAndResume`,
+/// the auto-terminate timeout, and the debugger priority chain are Phase 2.
+pub enum ResumeDisposition {
+    /// Re-enter the faulting instruction (tag `0`). The stub `iretq`s the
+    /// unmodified frame — without fault-fixing it simply re-faults, so this is
+    /// the mechanism for a supervisor that has repaired the fault's cause.
+    Resume,
+    /// Terminate the thread with `code` (tag `2`): the resume path calls
+    /// [`exit_thread`] with a crashed status carrying `code`.
+    Terminate(i32),
+}
 
-    let mut g = SCHED.lock();
-    let me = g.current.take().expect("current set");
-    let me_obj = me.as_ptr();
-
-    // Deliver ChildExited to the parent, if any, before parking.
+/// Deliver a `ChildExited { pid, status }` to `me_obj`'s process's parent
+/// channel, if it has one, and wake that channel's waiters. Caller holds
+/// `SCHED`. Borrows the channel pointer (never an owned `ObjectRef` — no
+/// destructor under `SCHED`); enqueue is allocation-free. Shared by
+/// [`exit_thread`] (last thread) and [`exit_process`].
+fn deliver_child_exited(g: &mut SchedState, me_obj: *mut (), status: ExitStatus) {
     let info: Option<(*mut (), u32)> = {
-        // SAFETY: `me` is the running thread, pinned, lock held.
+        // SAFETY: `me_obj` is the running thread, pinned, lock held.
         let th = unsafe { &*(me_obj as *const Thread) };
         th.process_ref().and_then(|p| {
             // SAFETY: `p` pins a live Process; read its parent channel + pid.
@@ -1010,16 +1033,89 @@ pub fn exit(status: ExitStatus) -> ! {
         // `parent_notif` reference (still held — `me` is not yet reaped); SCHED
         // held; no allocation (queue pre-reserved).
         let _edge = unsafe { NotificationChannel::enqueue(chan, notif) };
-        signal_channel(&mut g, chan);
+        signal_channel(g, chan);
     }
+}
 
+/// `true` if any thread in `ready`/`blocked`/`suspended` belongs to process
+/// `my_pid`. Caller holds `SCHED`. The exiting thread has already been taken
+/// out of `current`, and single-CPU only one thread is `current`, so a `false`
+/// here means the caller is genuinely the process's last live thread.
+fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
+    // SAFETY: each entry pins a live Thread; `SCHED` held — a shared read of
+    // `owner_pid` is sound (no `&mut` taken).
+    let same = |r: &ObjectRef| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid;
+    g.ready.iter().any(same) || g.blocked.iter().any(same) || g.suspended.iter().any(same)
+}
+
+/// Reap every thread of process `my_pid` parked in `list` (a `ready` or
+/// `suspended` queue — neither registers on wait objects): mark each `Exited`
+/// and move its `ObjectRef` into `reap`. Caller holds `SCHED`.
+fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid: u32) {
+    // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
+    while let Some(i) = list
+        .iter()
+        .position(|r| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid)
+    {
+        let r = list.remove(i);
+        // SAFETY: `r` pins the thread; `SCHED` held.
+        unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
+        reap.try_push(r).expect("reap within reserve");
+    }
+}
+
+/// Reap every `blocked` thread of process `my_pid`, first unregistering it from
+/// the wait objects + deadline heap it is parked on (so no waiter list or heap
+/// entry is left dangling at a reaped thread). Caller holds `SCHED`.
+fn reap_blocked_matching(
+    blocked: &mut KVec<ObjectRef>,
+    deadlines: &mut KVec<deadline::Entry>,
+    reap: &mut KVec<ObjectRef>,
+    my_pid: u32,
+) {
+    // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
+    while let Some(i) = blocked
+        .iter()
+        .position(|r| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid)
+    {
+        let r = blocked.remove(i);
+        let obj = r.as_ptr();
+        // Unregister from every object this thread was waiting on, mirroring
+        // `wait_on`'s resume-side cleanup.
+        let mut snap = [(0usize, false); MAX_WAIT_HANDLES];
+        // SAFETY: live Thread, `SCHED` held.
+        let n = unsafe { Thread::wait_snapshot(obj, &mut snap) };
+        for &(o, _) in &snap[..n] {
+            // SAFETY: the wait object is kept alive by this thread's `sys_wait`
+            // `ObjectRef`s (released only when it unblocks); `SCHED` held.
+            unsafe { obj_remove_waiter(o as *mut (), obj) };
+        }
+        // SAFETY: live Thread, `SCHED` held.
+        if unsafe { Thread::wait_has_deadline(obj) } {
+            deadline::remove(deadlines, obj as usize, true);
+        }
+        // SAFETY: live Thread, `SCHED` held.
+        unsafe {
+            Thread::wait_clear(obj);
+            Thread::set_state(obj, ThreadState::Exited);
+        }
+        reap.try_push(r).expect("reap within reserve");
+    }
+}
+
+/// Mark `me` (the current thread, already taken out of `current`) `Exited`,
+/// park it in `reap` for deferred stack reclamation, and switch away forever.
+/// Shared tail of [`exit_thread`] and [`exit_process`]. The `Thread` and its
+/// kernel stack cannot be freed here — this code is still running on that stack
+/// — so the next scheduler entry reaps them.
+fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
+    let me_obj = me.as_ptr();
     // SAFETY: `me` is the running thread, pinned, lock held. (The idle thread
     // never exits, so `me` is never the idle thread.)
     unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
-    // Park self for deferred reclamation (reap is empty after reap_pending).
-    debug_assert!(g.reap.is_none());
-    g.reap = Some(me);
+    // Park self for deferred reclamation.
+    g.reap.try_push(me).expect("reap within reserve");
 
     // Switch to the next ready thread, else the idle thread (which always
     // exists post-init and is parked here, since `me` was current, not idle).
@@ -1040,9 +1136,9 @@ pub fn exit(status: ExitStatus) -> ! {
     let _ = g.release_keeping_irqs_masked();
     // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
     unsafe { arm_kernel_stack_for(next_obj) };
-    // Load the incoming thread's root BEFORE switching away. When a user thread
-    // exits, `next_root` is the boot root, so CR3 is restored to the kernel
-    // table before this (parked-in-`reap`) thread is reaped — its
+    // Load the incoming thread's root BEFORE switching away. When the last user
+    // thread exits, `next_root` is the boot root, so CR3 is restored to the
+    // kernel table before this (parked-in-`reap`) thread is reaped — its
     // `AddressSpace::Drop` frees the PML4 CR3 would otherwise still reference.
     // SAFETY: `next_root` is a fully-formed PML4; all kernel stacks are mapped
     // identically across roots.
@@ -1054,13 +1150,205 @@ pub fn exit(status: ExitStatus) -> ! {
     unreachable!("switched away from an exited thread");
 }
 
-/// Drop the pending reaped thread, if any, **outside** the run-queue lock
-/// (its `KernelStack` `Drop` takes rank-6 allocator locks). Idempotent;
-/// called at the top of [`yield_now`]/[`exit`] and by the boot drainer.
+/// Terminate the **current thread** with exit `status` and switch away forever.
+/// Used by `sys_thread_exit`, the resume-`Terminate` fault path, and kernel
+/// thread bodies / the boot thread.
+///
+/// A `ChildExited { pid, status }` is delivered to the process's parent channel
+/// **iff this is its last thread** (no live sibling remains) — a process with
+/// other running threads has not exited, so no notification fires. Kernel/boot
+/// threads have no process and produce none. Delivery happens here, before
+/// parking, so a parent blocked in `sys_wait` wakes promptly.
+pub fn exit_thread(status: ExitStatus) -> ! {
+    // Reclaim any earlier exited thread first, so `reap` has room for us.
+    reap_pending();
+
+    let mut g = SCHED.lock();
+    let me = g.current.take().expect("current set");
+    let me_obj = me.as_ptr();
+
+    // SAFETY: `me` is the running thread, pinned, lock held.
+    let me_pid = unsafe { &*(me_obj as *const Thread) }.owner_pid();
+    // SAFETY: same.
+    let has_process = unsafe { &*(me_obj as *const Thread) }.process_ref().is_some();
+    if has_process && !has_live_siblings(&g, me_pid) {
+        deliver_child_exited(&mut g, me_obj, status);
+    }
+
+    finish_exit(g, me);
+}
+
+/// Terminate the **whole process** of the current thread with exit `status`:
+/// tear down every sibling thread (scan `ready`/`blocked`/`suspended` by
+/// `owner_pid`, unregistering blocked siblings from their waits first), then
+/// exit the current thread **with** a `ChildExited`. Used by `sys_process_exit`.
+///
+/// The per-process thread list that would let an external killer find these
+/// threads without a scan lands in Phase 2; the `owner_pid` scan is correct for
+/// self-exit now (single-CPU, all sibling threads are parked off the run queue
+/// while this one runs). A kernel/boot thread (no process) degrades to a plain
+/// [`exit_thread`]-style exit (no siblings, no notification).
+pub fn exit_process(status: ExitStatus) -> ! {
+    // Reclaim any earlier exited thread first, so `reap` has room.
+    reap_pending();
+
+    let mut g = SCHED.lock();
+    let me = g.current.take().expect("current set");
+    let me_obj = me.as_ptr();
+
+    // SAFETY: `me` is the running thread, pinned, lock held.
+    let me_pid = unsafe { &*(me_obj as *const Thread) }.owner_pid();
+    // SAFETY: same.
+    let has_process = unsafe { &*(me_obj as *const Thread) }.process_ref().is_some();
+    if has_process {
+        // Reborrow the guard once as `&mut SchedState` so the field borrows
+        // below are disjoint (through the guard's `Deref` each `&mut g.field`
+        // would borrow the whole guard, conflicting in one call).
+        let st: &mut SchedState = &mut g;
+        reap_matching(&mut st.ready, &mut st.reap, me_pid);
+        reap_matching(&mut st.suspended, &mut st.reap, me_pid);
+        reap_blocked_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap, me_pid);
+        // The process is ending: always deliver ChildExited (we are now its
+        // last thread).
+        deliver_child_exited(st, me_obj, status);
+    }
+
+    finish_exit(g, me);
+}
+
+/// Suspend the **current thread** after a ring-3 fault: deliver `notif` to its
+/// process's notification channel (waking the supervisor), record the
+/// `ExceptionFrame` at `frame_ptr` (its address on this thread's kernel stack),
+/// park the thread in `suspended`, and switch away — mirroring
+/// [`block_current_and_switch`], but parked for `sys_exception_resume` rather
+/// than a waker. Returns the [`ResumeDisposition`] the supervisor chose once the
+/// thread is made runnable again. Called from the exception dispatchers.
+pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDisposition {
+    // Reclaim any earlier exited thread first (we may be the only scheduler
+    // entry for a while if we suspend), off the rank-1 lock.
+    reap_pending();
+
+    let me_obj;
+    {
+        let mut g = SCHED.lock();
+        let me = g.current.take().expect("current set");
+        me_obj = me.as_ptr();
+
+        // Deliver the fault notification to the faulting process's channel
+        // (borrowed pointer — no `ObjectRef` destructor under `SCHED`).
+        let chan: Option<*mut ()> = {
+            // SAFETY: `me` is the running thread, pinned, lock held.
+            let th = unsafe { &*(me_obj as *const Thread) };
+            th.process_ref().and_then(|p| {
+                // SAFETY: `p` pins a live Process; read its channel pointer.
+                let proc = unsafe { &*(p.as_ptr() as *const crate::object::Process) };
+                proc.notification_channel_ptr()
+            })
+        };
+        if let Some(c) = chan {
+            // SAFETY: `c` is the channel the current Process owns a ref on (alive
+            // at least until this thread is reaped); SCHED held; queue
+            // pre-reserved.
+            let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
+            signal_channel(&mut g, c);
+        }
+
+        // Record the frame, mark Suspended, park off the run queue. The
+        // `ExceptionFrame` stays on this (now-frozen) kernel stack until resume.
+        // SAFETY: `me` is the running thread, pinned, lock held.
+        unsafe {
+            Thread::set_exception_frame(me_obj, frame_ptr);
+            Thread::set_state(me_obj, ThreadState::Suspended);
+        }
+        let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
+        debug_assert!(g.suspended.len() < g.suspended.capacity());
+        g.suspended.try_push(me).expect("suspended list within reserve");
+
+        // Switch to the next runnable thread (mirrors block_current_and_switch).
+        let next = match dequeue_front(&mut g) {
+            Some(n) => n,
+            None => g.idle.take().expect("idle thread exists after init"),
+        };
+        let next_obj = next.as_ptr();
+        // SAFETY: next is pinned, becoming current; lock held.
+        unsafe { Thread::set_state(next_obj, ThreadState::Running) };
+        let next_sp = unsafe { Thread::saved_sp(next_obj) };
+        let next_root = unsafe { resolve_root(next_obj) };
+        g.current = Some(next);
+
+        let saved_if = g.release_keeping_irqs_masked();
+        // SAFETY: `next_obj` is the pinned incoming thread.
+        unsafe { arm_kernel_stack_for(next_obj) };
+        // SAFETY: `next_root` is a fully-formed PML4; kernel half mapped in all.
+        unsafe { Paging::set_page_table(next_root) };
+        // SAFETY: lock released; interrupts masked; `me_slot` points into our own
+        // (Suspended, pinned-in-`suspended`) thread, `next_sp` is the incoming
+        // thread's saved RSP (pinned). We resume here when made runnable.
+        unsafe { context_switch(me_slot, next_sp) };
+        // Resumed: `sys_exception_resume` moved us `suspended`→`ready` and the
+        // scheduler switched us in. Restore our captured interrupt state.
+        // SAFETY: ring-0.
+        unsafe { Cpu::interrupts_restore(saved_if) };
+    }
+
+    // Read (and clear) the disposition the resume stored on us.
+    let (tag, code) = {
+        let _g = SCHED.lock();
+        // SAFETY: we run on `me_obj` again (back in `current`), `SCHED` held.
+        unsafe { Thread::take_disposition(me_obj) }
+    };
+    match tag {
+        2 => ResumeDisposition::Terminate(code),
+        _ => ResumeDisposition::Resume,
+    }
+}
+
+/// Resume a thread suspended on a fault: record the supervisor's disposition
+/// (`disp_tag`/`disp_code`) on it and move it `suspended`→`ready`. Returns
+/// `false` (no-op) if `thread` is not currently `Suspended` — the backstop
+/// `sys_exception_resume` maps to `InvalidArgument`. Caller need not hold
+/// `SCHED` (taken here).
+pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
+    let mut g = SCHED.lock();
+    let Some(i) = g.suspended.iter().position(|r| r.as_ptr() == thread) else {
+        return false;
+    };
+    let r = g.suspended.remove(i);
+    // SAFETY: `r` pins `thread`; `SCHED` held. The disposition is read by
+    // `suspend_with_fault` when this thread next runs.
+    unsafe {
+        Thread::set_disposition(thread, disp_tag, disp_code);
+        Thread::set_state(thread, ThreadState::Ready);
+    }
+    debug_assert!(g.ready.len() < g.ready.capacity());
+    g.ready.try_push(r).expect("ready within reserve");
+    true
+}
+
+/// The kernel-stack address of `thread`'s captured `ExceptionFrame`, or `None`
+/// if it is not currently `Suspended`. Used by `sys_thread_get_registers`; the
+/// thread stays parked while suspended, so the frame is stable to read after
+/// this returns (the caller drops `SCHED` before the user copy-out).
+pub fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
+    let _g = SCHED.lock();
+    // SAFETY: the caller pins `thread` via its Thread handle; `SCHED` held.
+    if unsafe { Thread::state_now(thread) } != ThreadState::Suspended {
+        return None;
+    }
+    // SAFETY: same.
+    unsafe { Thread::exception_frame(thread) }
+}
+
+/// Drop every pending reaped thread **outside** the run-queue lock (their
+/// `KernelStack` `Drop` takes rank-6 allocator locks). Idempotent; called at the
+/// top of [`yield_now`]/[`exit_thread`]/[`exit_process`]/[`suspend_with_fault`]
+/// and by the boot drainer. The list (rather than one slot) lets a process exit
+/// reap its torn-down sibling threads alongside the caller; we drain it under a
+/// brief lock into a local `KVec`, then drop them all with the lock released.
 pub fn reap_pending() {
     let reaped = {
         let mut g = SCHED.lock();
-        g.reap.take()
+        core::mem::take(&mut g.reap)
     };
     drop(reaped);
 }
@@ -1114,45 +1402,6 @@ pub fn current_tid() -> u32 {
     // SAFETY: `current` is pinned alive and the run-queue lock serialises
     // Thread access; a shared `&Thread` read of `tid` is sound.
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.tid()
-}
-
-/// Deliver a fault `notif` to the **current** (faulting) process's notification
-/// channel, wake the channel's waiters, then terminate the current thread.
-/// Never returns. Called from the exception dispatchers on a ring-3 fault.
-///
-/// The faulting thread *is* `current` (the exception entered on its kernel
-/// stack), so termination reuses [`exit`] verbatim. If the process has no
-/// channel (or the faulter is a kernel thread with no process), the fault is
-/// still contained — we just `exit()`. The supervisor that holds the channel's
-/// `ObjectRef` keeps it (and the enqueued notification) alive past this reap.
-pub fn deliver_fault_and_exit(notif: Notification) -> ! {
-    {
-        let mut g = SCHED.lock();
-        // Find the current thread's process channel pointer (borrowed, never an
-        // owned ObjectRef — we must not run a destructor under SCHED).
-        let chan: Option<*mut ()> = g.current.as_ref().and_then(|cur| {
-            // SAFETY: `current` pinned, SCHED held — shared `&Thread` read.
-            let th = unsafe { &*(cur.as_ptr() as *const crate::object::Thread) };
-            th.process_ref().and_then(|p| {
-                // SAFETY: `p` pins a live Process; read its channel pointer.
-                let proc = unsafe { &*(p.as_ptr() as *const crate::object::Process) };
-                proc.notification_channel_ptr()
-                // `p` (a cloned ObjectRef, never the last) drops here: a plain
-                // atomic decrement, no destructor, safe under SCHED.
-            })
-        });
-        if let Some(c) = chan {
-            // SAFETY: `c` is the channel the current Process owns a ref on (so
-            // it is alive at least until this thread is reaped); SCHED held. No
-            // allocation (queue/waiters pre-reserved).
-            let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
-            signal_channel(&mut g, c);
-        }
-        // guard drops here — never held across the exit() switch below.
-    }
-    // The faulting thread terminates with a Crashed status; its `ChildExited`
-    // (if it has a parent) carries the fault discriminant as the code.
-    exit(ExitStatus { kind: ExitKind::Crashed as u32, code: notif.kind() as i32 })
 }
 
 /// Pop one notification from `channel` under `SCHED` (or synthesize a dropped
@@ -1249,7 +1498,7 @@ pub(crate) extern "C" fn thread_enter() -> ! {
             // threads have no owning process, so no `ChildExited` is produced.
             let (entry, arg) = current_entry();
             entry(arg);
-            exit(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
+            exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
         }
     }
 }
@@ -1280,7 +1529,8 @@ mod tests {
         SchedState {
             ready: KVec::new(),
             current: None,
-            reap: None,
+            reap: KVec::new(),
+            suspended: KVec::new(),
             next_tid: 1,
             next_pid: 2,
             quantum: QUANTUM_TICKS,
@@ -1403,15 +1653,101 @@ mod tests {
                 st.ready.try_push(inert_ref(tid)).unwrap();
             }
             st.current = Some(inert_ref(5));
-            st.reap = Some(inert_ref(6));
+            st.reap.try_reserve(REAP_RESERVE).unwrap();
+            st.reap.try_push(inert_ref(6)).unwrap();
+            st.reap.try_push(inert_ref(7)).unwrap();
             // No destroys while the refs are held.
             assert_eq!(test_probe::thread_destroys(), 0);
         } // st dropped here — every ObjectRef drops its one reference.
         assert_eq!(
             test_probe::thread_destroys(),
-            6,
+            7,
             "each queued/current/reaped thread destroyed exactly once",
         );
+    }
+
+    /// Build an inert Thread tagged with `owner_pid = pid` (and no owning
+    /// Process / kernel stack, so no host paging is needed). The teardown tests
+    /// only read `owner_pid`, so this is enough to exercise the `pid` scans.
+    fn inert_user_ref(tid: u32, pid: u32) -> ObjectRef {
+        into_objref(Thread::try_new(tid, pid).unwrap())
+    }
+
+    #[test]
+    fn resume_suspended_moves_to_ready_and_sets_disposition() {
+        init_global_heap();
+        let mut st = test_state();
+        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.suspended.try_reserve(BLOCKED_RESERVE).unwrap();
+        let th = inert_user_ref(1, 1);
+        let obj = th.as_ptr();
+        // SAFETY: pinned, single-threaded test; mimic a suspended thread.
+        unsafe {
+            Thread::set_state(obj, ThreadState::Suspended);
+            Thread::set_exception_frame(obj, 0xdead_beef);
+        }
+        st.suspended.try_push(th).unwrap();
+
+        // resume_suspended works against the global SCHED, so drive the list ops
+        // directly here (mirroring its body) to keep the test lock-free.
+        let i = st.suspended.iter().position(|r| r.as_ptr() == obj).unwrap();
+        let r = st.suspended.remove(i);
+        // SAFETY: pinned, single-threaded.
+        unsafe {
+            Thread::set_disposition(obj, 2, 7);
+            Thread::set_state(obj, ThreadState::Ready);
+        }
+        st.ready.try_push(r).unwrap();
+
+        assert!(st.suspended.is_empty());
+        assert_eq!(st.ready.len(), 1);
+        // SAFETY: pinned. take_disposition reads (tag, code) and clears the frame.
+        let (tag, code) = unsafe { Thread::take_disposition(obj) };
+        assert_eq!((tag, code), (2, 7));
+        // SAFETY: pinned — the frame was cleared by take_disposition.
+        assert!(unsafe { Thread::exception_frame(obj) }.is_none());
+    }
+
+    #[test]
+    fn has_live_siblings_scans_all_parked_lists() {
+        init_global_heap();
+        let mut st = test_state();
+        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.blocked.try_reserve(BLOCKED_RESERVE).unwrap();
+        st.suspended.try_reserve(BLOCKED_RESERVE).unwrap();
+
+        // pid 1 has a sibling parked in `suspended`; pid 2 has none anywhere.
+        st.ready.try_push(inert_user_ref(1, 1)).unwrap();
+        st.suspended.try_push(inert_user_ref(2, 1)).unwrap();
+        st.blocked.try_push(inert_user_ref(3, 3)).unwrap();
+
+        assert!(has_live_siblings(&st, 1));
+        assert!(has_live_siblings(&st, 3));
+        assert!(!has_live_siblings(&st, 2), "no pid-2 thread is parked");
+    }
+
+    #[test]
+    fn reap_matching_moves_only_same_pid_threads() {
+        init_global_heap();
+        test_probe::reset();
+        {
+            let mut st = test_state();
+            st.ready.try_reserve(READY_RESERVE).unwrap();
+            st.reap.try_reserve(REAP_RESERVE).unwrap();
+            st.ready.try_push(inert_user_ref(1, 1)).unwrap();
+            st.ready.try_push(inert_user_ref(2, 2)).unwrap();
+            st.ready.try_push(inert_user_ref(3, 1)).unwrap();
+
+            reap_matching(&mut st.ready, &mut st.reap, 1);
+            assert_eq!(st.reap.len(), 2, "both pid-1 threads reaped");
+            assert_eq!(st.ready.len(), 1, "the pid-2 thread stays");
+            // SAFETY: pinned, single-threaded.
+            let left = unsafe { &*(st.ready.iter().next().unwrap().as_ptr() as *const Thread) };
+            assert_eq!(left.owner_pid(), 2);
+            // No destroys yet — the refs are alive in `reap`.
+            assert_eq!(test_probe::thread_destroys(), 0);
+        } // st dropped — reap + ready release their refs.
+        assert_eq!(test_probe::thread_destroys(), 3);
     }
 
     #[test]

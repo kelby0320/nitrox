@@ -180,7 +180,7 @@ fn kernel_main() {
     draw_boot_screen();
     // The boot thread has no owning process; exit with a benign status (no
     // `ChildExited` is produced for a process-less thread).
-    sched::exit(nitrox_kernel::libkern::ExitStatus {
+    sched::exit_thread(nitrox_kernel::libkern::ExitStatus {
         kind: nitrox_kernel::libkern::ExitKind::Normal as u32,
         code: 0,
     });

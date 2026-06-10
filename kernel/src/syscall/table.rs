@@ -20,8 +20,10 @@ use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{ImageId, SPAWN_MAX_HANDLES, SpawnArgs};
+use crate::arch::RegisterValues;
+use crate::arch::registers::ArchRegisters;
 use crate::libkern::{
-    ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, TimerFlags,
+    ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, ThreadArgs, TimerFlags,
 };
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::elf::load_elf;
@@ -82,6 +84,12 @@ pub const SYS_PROCESS_EXIT: u64 = 16;
 pub const SYS_THREAD_EXIT: u64 = 17;
 /// `sys_thread_set_affinity` — restrict a thread's CPU set (no-op until SMP).
 pub const SYS_THREAD_SET_AFFINITY: u64 = 18;
+/// `sys_thread_create` — start another thread in the calling process.
+pub const SYS_THREAD_CREATE: u64 = 19;
+/// `sys_thread_get_registers` — read a suspended (faulted) thread's registers.
+pub const SYS_THREAD_GET_REGISTERS: u64 = 20;
+/// `sys_exception_resume` — resume or terminate a thread suspended on a fault.
+pub const SYS_EXCEPTION_RESUME: u64 = 21;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -118,6 +126,9 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) 
         SYS_CHANNEL_RECV => encode(sys_channel_recv(a0, a1, a2, a3)),
         SYS_PROCESS_SPAWN => encode(sys_process_spawn(a0)),
         SYS_THREAD_SET_AFFINITY => encode(sys_thread_set_affinity(a0, a1)),
+        SYS_THREAD_CREATE => encode(sys_thread_create(a0)),
+        SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
+        SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -126,23 +137,22 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) 
     }
 }
 
-/// `sys_process_exit(status)` — terminate the calling process with `status`.
-/// This slice's processes are single-threaded, so process exit is the current
-/// thread's exit: the scheduler delivers a `ChildExited { pid, Normal(status) }`
-/// to the parent's notification channel (if any), then switches away and reaps
-/// this thread — releasing its last `Process` reference and freeing the address
-/// space. Never returns. (Multi-thread teardown — terminating sibling threads —
-/// lands with `sys_thread_create` in a later slice.)
+/// `sys_process_exit(status)` — terminate the calling **process** with
+/// `status`. The scheduler tears down every sibling thread of the caller's
+/// process (an `owner_pid` scan of the run/blocked/suspended queues), delivers a
+/// `ChildExited { pid, Normal(status) }` to the parent's notification channel
+/// (if any), then switches away and reaps this thread — releasing the last
+/// `Process` reference and freeing the address space. Never returns.
 fn sys_process_exit(status: i32) -> ! {
-    crate::sched::exit(ExitStatus { kind: ExitKind::Normal as u32, code: status })
+    crate::sched::exit_process(ExitStatus { kind: ExitKind::Normal as u32, code: status })
 }
 
-/// `sys_thread_exit(status)` — terminate the calling thread with `status`.
-/// Phase-1 processes are single-threaded, so this is identical to
-/// [`sys_process_exit`]; they diverge once a process can hold more than one
-/// thread (`sys_thread_create`). Never returns.
+/// `sys_thread_exit(status)` — terminate the **calling thread** with `status`.
+/// Unlike [`sys_process_exit`], sibling threads keep running: a `ChildExited`
+/// fires only if this was the process's last thread (the scheduler's last-thread
+/// check). Never returns.
 fn sys_thread_exit(status: i32) -> ! {
-    crate::sched::exit(ExitStatus { kind: ExitKind::Normal as u32, code: status })
+    crate::sched::exit_thread(ExitStatus { kind: ExitKind::Normal as u32, code: status })
 }
 
 /// Close every child-side handle a partially-built spawn allocated, so a
@@ -299,6 +309,116 @@ pub fn sys_thread_set_affinity(thread_h: u64, _cpu_mask: u64) -> SysResult {
         .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
         .map_err(map_handle_err)?;
     if ok.object.object_type() != KObjectType::Thread {
+        return Err(KError::InvalidArgument);
+    }
+    Ok(0)
+}
+
+/// `sys_thread_create(args)` — start another thread in the **calling process**
+/// and return a `Thread` handle (`SIGNAL | TERMINATE | INSPECT | DUPLICATE`) to
+/// it. The new thread begins at `args.entry` (ring 3) with `rsp = args.user_sp`
+/// and `rdx = args.arg0`; the caller owns the user stack (allocate + map it, pass
+/// its top). The `entry`/`user_sp` must be non-null user-half addresses — that
+/// they are *mapped* is the caller's responsibility, since an unmapped entry or
+/// stack faults the new thread, which is then contained by suspend/terminate.
+///
+/// This is the supervisor primitive behind exception handling: a sibling thread
+/// can hold a faulting thread's handle and act on it (`sys_thread_get_registers`
+/// / `sys_exception_resume`).
+pub fn sys_thread_create(args_ptr: u64) -> SysResult {
+    let aptr = UserPtr::<ThreadArgs>::new(args_ptr).map_err(from_user_access)?;
+    let args = copy_from_user(aptr).map_err(from_user_access)?;
+    // Reserved bytes must be zero (forward-compat).
+    if args._reserved != [0u8; 40] {
+        return Err(KError::InvalidArgument);
+    }
+    // Reject null / kernel-half entry or stack before touching the scheduler.
+    if args.entry == 0 || args.user_sp == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    UserPtr::<u8>::new(args.entry).map_err(|_| KError::InvalidArgument)?;
+    UserPtr::<u8>::new(args.user_sp).map_err(|_| KError::InvalidArgument)?;
+
+    // Require a user process (a kernel/boot thread cannot create user threads).
+    let proc = crate::sched::current_process().ok_or(KError::InvalidArgument)?;
+    let pid = crate::sched::current_owner_pid();
+
+    // Start the thread; the bootstrap delivers `arg0` in rdx (rdi/rsi unused).
+    let th = crate::sched::spawn_user(proc, args.entry, args.user_sp, [0, 0, args.arg0])
+        .map_err(|_| KError::OutOfMemory)?;
+
+    // Install a handle to it in the caller's table.
+    let (tp, tt) = th.into_raw();
+    let rights =
+        Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE;
+    match global::get().allocate(pid, tp, tt, rights) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // The thread is already running (its `ready` entry keeps it alive);
+            // reclaim only this surplus reference, off the rank-3 table lock.
+            // SAFETY: adopt + drop the single reference `into_raw` yielded.
+            drop(unsafe { ObjectRef::from_raw(tp, tt) });
+            Err(map_handle_err(e))
+        }
+    }
+}
+
+/// `sys_thread_get_registers(thread, out)` — write the user registers of a
+/// **suspended** (faulted) thread into the [`RegisterValues`] at `out`. The
+/// thread handle must carry `SIGNAL` and name a `Thread`; the thread must be
+/// suspended on a fault (else `InvalidArgument`). The captured `ExceptionFrame`
+/// lives on the suspended thread's kernel stack (in the shared kernel half,
+/// readable under the supervisor's address space); the thread stays parked, so
+/// the frame is stable across the (lock-free) copy-out.
+pub fn sys_thread_get_registers(thread_h: u64, out_ptr: u64) -> SysResult {
+    // Validate the output pointer first — a pure range check, reachable without
+    // a running thread (host-testable), and matching the spawn-args convention
+    // of validating the user pointer before resolving the handle.
+    let uptr = UserMutPtr::<RegisterValues>::new(out_ptr).map_err(from_user_access)?;
+
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::Thread {
+        return Err(KError::InvalidArgument);
+    }
+
+    // Must be suspended on a fault — yields the captured frame's address.
+    let frame_ptr = crate::sched::thread_exception_frame(ok.object.as_ptr())
+        .ok_or(KError::InvalidArgument)?;
+    // Decode the registers out of the frame (SCHED already released), then copy
+    // out to user memory (never under a lock).
+    let regs: RegisterValues = crate::arch::Registers::read_from_exception_frame(frame_ptr);
+    copy_to_user(uptr, &regs).map_err(from_user_access)?;
+    Ok(0)
+}
+
+/// `sys_exception_resume(thread, disposition, code)` — act on a thread suspended
+/// on a fault. `disposition` is `0` = **Resume** (re-enter the faulting
+/// instruction — without fixing the fault's cause it simply re-faults) or `2` =
+/// **Terminate** (exit the thread with `code`); other values are reserved
+/// (`Unsupported`). The handle must carry `SIGNAL` and name a `Thread`; the
+/// thread must currently be suspended (else `InvalidArgument`). Returns `0`.
+pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysResult {
+    // Validate the disposition first — a pure value check, reachable without a
+    // running thread (host-testable). Phase 1 dispositions: 0 = Resume, 2 =
+    // Terminate. The rest (ResumeSkip, ModifyAndResume, …) are Phase 2.
+    let tag = match disposition {
+        0 => 0u8,
+        2 => 2u8,
+        _ => return Err(KError::Unsupported),
+    };
+
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::Thread {
+        return Err(KError::InvalidArgument);
+    }
+    if !crate::sched::resume_suspended(ok.object.as_ptr(), tag, code as i32) {
+        // Not currently suspended (already resumed, or never faulted).
         return Err(KError::InvalidArgument);
     }
     Ok(0)
@@ -1231,6 +1351,44 @@ mod tests {
         assert_eq!(
             dispatch(SYS_PROCESS_SPAWN, USER_VIRT_END, 0, 0, 0, 0, 0),
             KError::FaultFromUser.as_isize(),
+        );
+    }
+
+    #[test]
+    fn thread_create_rejects_bad_args_pointer() {
+        // The `ThreadArgs` pointer is validated before `current_process` / the
+        // scheduler, so an out-of-range pointer is host-reachable.
+        assert_eq!(sys_thread_create(USER_VIRT_END), Err(KError::FaultFromUser));
+        assert_eq!(
+            dispatch(SYS_THREAD_CREATE, USER_VIRT_END, 0, 0, 0, 0, 0),
+            KError::FaultFromUser.as_isize(),
+        );
+    }
+
+    #[test]
+    fn thread_get_registers_rejects_bad_out_pointer() {
+        // The output pointer is validated first (before the handle lookup needs
+        // a running thread), so a kernel-half pointer is host-reachable.
+        assert_eq!(
+            sys_thread_get_registers(0, USER_VIRT_END),
+            Err(KError::FaultFromUser),
+        );
+        assert_eq!(
+            dispatch(SYS_THREAD_GET_REGISTERS, 0, USER_VIRT_END, 0, 0, 0, 0),
+            KError::FaultFromUser.as_isize(),
+        );
+    }
+
+    #[test]
+    fn exception_resume_rejects_unknown_disposition() {
+        // The disposition is validated first (a pure value check), so an unknown
+        // disposition is rejected without a running thread (host-reachable).
+        // 1 (ResumeSkip) and 3+ are Phase 2 / reserved → Unsupported.
+        assert_eq!(sys_exception_resume(0, 1, 0), Err(KError::Unsupported));
+        assert_eq!(sys_exception_resume(0, 9, 0), Err(KError::Unsupported));
+        assert_eq!(
+            dispatch(SYS_EXCEPTION_RESUME, 0, 5, 0, 0, 0, 0),
+            KError::Unsupported.as_isize(),
         );
     }
 

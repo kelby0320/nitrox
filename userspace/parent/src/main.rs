@@ -3,16 +3,23 @@
 //! Booted by the kernel as PID 1 with one bootstrap argument: a handle to its
 //! own notification channel (in `rdi`, the first `extern "C"` parameter). It:
 //!
+//! 0. runs the **exception demo**: maps a worker stack, creates a second thread
+//!    in this process (`sys_thread_create`) whose entry deliberately faults,
+//!    receives the `SegFault` on its notification channel, reads the faulting
+//!    thread's registers (`sys_thread_get_registers`), and terminates it
+//!    (`sys_exception_resume` with `Terminate`);
 //! 1. creates an IPC channel (`sys_channel_create`) → two endpoints;
 //! 2. spawns two `child` processes (`sys_process_spawn`), **moving** one
 //!    endpoint into each — so the children share a channel they can talk over;
 //! 3. blocks on its notification channel (`sys_wait`) and drains two
 //!    `ChildExited` notifications (`sys_notif_recv`), reporting each;
-//! 4. exits.
+//! 4. exits the whole process (`sys_process_exit`).
 //!
-//! This is the Phase-1 milestone proof: two userspace processes communicating
-//! over IPC, both spawned by a parent that learns of their exits. (A real
-//! `init` with an initramfs and a service manager is Phase 2.)
+//! This is the Phase-1 milestone proof: a multi-threaded supervisor that
+//! suspends + inspects + terminates a faulting thread, plus two userspace
+//! processes communicating over IPC, all spawned by a parent that learns of
+//! their exits. (A real `init` with an initramfs and a service manager is
+//! Phase 2.)
 
 #![no_std]
 #![no_main]
@@ -21,11 +28,16 @@ use core::arch::asm;
 
 // --- Syscall numbers (must match `kernel/src/syscall/table.rs`) ----------
 const SYS_HANDLE_CLOSE: u64 = 0;
+const SYS_MEMORY_CREATE: u64 = 4;
+const SYS_MEMORY_MAP: u64 = 5;
 const SYS_WAIT: u64 = 10;
 const SYS_NOTIF_RECV: u64 = 11;
 const SYS_CHANNEL_CREATE: u64 = 12;
 const SYS_PROCESS_SPAWN: u64 = 15;
 const SYS_PROCESS_EXIT: u64 = 16;
+const SYS_THREAD_CREATE: u64 = 19;
+const SYS_THREAD_GET_REGISTERS: u64 = 20;
+const SYS_EXCEPTION_RESUME: u64 = 21;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 
 /// Rights bits (`kernel/src/libkern/handle.rs`): the full set an endpoint
@@ -39,10 +51,41 @@ const RIGHT_RECV: u64 = 1 << 19;
 const ENDPOINT_RIGHTS: u64 =
     RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
 
+/// `MAP_*` rights bits (`kernel/src/libkern/handle.rs`) for mapping the worker
+/// stack read/write.
+const RIGHT_MAP_READ: u64 = 1 << 15;
+const RIGHT_MAP_WRITE: u64 = 1 << 16;
+
+/// One page; the worker thread's stack size.
+const PAGE: u64 = 4096;
+/// `sys_exception_resume` disposition: terminate the thread with a code.
+const DISPOSITION_TERMINATE: u64 = 2;
+
 /// `ImageId::Child` (`kernel/src/libkern/spawn.rs`).
 const IMAGE_CHILD: u32 = 0;
 /// `Notification::ChildExited` discriminant (`kernel/src/libkern/notification.rs`).
 const KIND_CHILD_EXITED: u32 = 0x0200;
+/// `Notification::SegFault` discriminant (`kernel/src/libkern/notification.rs`).
+const KIND_SEG_FAULT: u32 = 0x0100;
+
+/// Userspace mirror of the kernel `ThreadArgs` (`kernel/src/libkern/thread.rs`):
+/// a 64-byte block — `entry`, `user_sp`, `arg0`, then 40 reserved bytes.
+#[repr(C)]
+struct ThreadArgs {
+    entry: u64,
+    user_sp: u64,
+    arg0: u64,
+    reserved: [u8; 40],
+}
+
+/// Userspace mirror of the kernel `RegisterValues` (`kernel/src/libkern/thread.rs`):
+/// 18 `u64`s — the 16 GPRs (incl. `rsp`), then `rip` (index 16) and `rflags`.
+#[repr(C, align(8))]
+struct RegisterValues {
+    regs: [u64; 18],
+}
+/// Index of `rip` within [`RegisterValues::regs`].
+const REG_RIP: usize = 16;
 
 /// Userspace mirror of the kernel `SpawnArgs` (`kernel/src/libkern/spawn.rs`).
 #[repr(C)]
@@ -87,6 +130,23 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
 static mut NOTIF: NotificationBuf = NotificationBuf { kind: 0, body: [0; 60] };
 static mut WAIT_RESULTS: [u8; 16] = [0; 16];
 static mut WAIT_HANDLES: [u64; 1] = [0];
+static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, reserved: [0; 40] };
+static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
+
+/// The worker thread's entry point: write to a deliberately-unmapped address so
+/// the very first access page-faults (`#PF`). The kernel suspends the thread,
+/// delivers a `SegFault` to this process, and (after the supervisor's
+/// `sys_exception_resume`) terminates it — so this never returns normally.
+extern "C" fn worker_fault() -> ! {
+    // SAFETY: this is the whole point — `0xdead_0000` is an unmapped user
+    // address, so the store traps. The kernel never lets the store complete.
+    unsafe { core::ptr::write_volatile(0xdead_0000usize as *mut u64, 0xc0ffee) };
+    // Unreachable in practice (the kernel terminates us); spin defensively.
+    loop {
+        // SAFETY: `pause` is always valid in ring 3 and has no effects.
+        unsafe { asm!("pause", options(nomem, nostack)) };
+    }
+}
 
 #[inline]
 unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
@@ -136,11 +196,127 @@ fn kprint_u64(mut v: u64) {
     kprint(&buf[i..]);
 }
 
+/// Print a 64-bit value as `0x`-prefixed, 16-digit lowercase hex (for the
+/// faulting `rip`), no allocation.
+fn kprint_hex(v: u64) {
+    let mut buf = [0u8; 18];
+    buf[0] = b'0';
+    buf[1] = b'x';
+    for i in 0..16 {
+        let nib = ((v >> ((15 - i) * 4)) & 0xf) as u8;
+        buf[2 + i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
+    }
+    kprint(&buf);
+}
+
+/// The exception demo (step 0): create a second thread in this process that
+/// immediately faults, observe the `SegFault`, inspect the faulting registers,
+/// and terminate the thread. `notif` is this process's notification channel.
+fn worker_exception_demo(notif: u64) {
+    kprint(b"parent: mapping a worker stack\n");
+    // 1. Allocate + map a one-page worker stack (read/write).
+    // SAFETY: register-only syscalls with valid arguments.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if mem < 0 {
+        kprint(b"parent: worker stack create FAIL\n");
+        exit(1);
+    }
+    // SAFETY: maps the memory object read/write at a kernel-chosen address.
+    let base = unsafe {
+        syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
+    };
+    if base < 0 {
+        kprint(b"parent: worker stack map FAIL\n");
+        exit(1);
+    }
+    let stack_top = base as u64 + PAGE; // stacks grow down from the top
+
+    // 2. Create the worker thread (entry = worker_fault, sp = stack top).
+    // SAFETY: WORKER_ARGS is a valid writable arg block; the pointer is read by
+    // the kernel.
+    let worker = unsafe {
+        WORKER_ARGS.entry = worker_fault as *const () as usize as u64;
+        WORKER_ARGS.user_sp = stack_top;
+        WORKER_ARGS.arg0 = 0;
+        syscall1(SYS_THREAD_CREATE, (&raw const WORKER_ARGS) as u64)
+    };
+    if worker < 0 {
+        kprint(b"parent: thread_create FAIL\n");
+        exit(1);
+    }
+    kprint(b"parent: created worker thread; awaiting its fault\n");
+
+    // 3. Block on our notification channel until the worker's SegFault arrives.
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            kprint(b"parent: wait FAIL\n");
+            exit(1);
+        }
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            continue; // WouldBlock: re-block on the channel
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let kind = unsafe { (&raw const NOTIF.kind).read() };
+        if kind == KIND_SEG_FAULT {
+            break;
+        }
+        // Ignore any other notification kind.
+    }
+
+    // 4. Read the faulting thread's registers and report the faulting rip.
+    // SAFETY: WORKER_REGS is a valid writable RegisterValues out-param.
+    let gr = unsafe {
+        syscall4(SYS_THREAD_GET_REGISTERS, worker as u64, (&raw mut WORKER_REGS) as u64, 0, 0)
+    };
+    if gr != 0 {
+        kprint(b"parent: get_registers FAIL\n");
+        exit(1);
+    }
+    // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS.
+    let rip = unsafe { (&raw const WORKER_REGS.regs[REG_RIP]).read() };
+    kprint(b"parent: worker faulted @ rip=");
+    kprint_hex(rip);
+    kprint(b" ; terminating\n");
+
+    // 5. Terminate the worker (resume with the Terminate disposition, code 7).
+    // SAFETY: register-only syscall.
+    let er = unsafe {
+        syscall4(SYS_EXCEPTION_RESUME, worker as u64, DISPOSITION_TERMINATE, 7, 0)
+    };
+    if er != 0 {
+        kprint(b"parent: exception_resume FAIL\n");
+        exit(1);
+    }
+    // The worker is not this process's last thread (we are still running), so
+    // its termination produces no `ChildExited`. Drop our handle to it.
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, worker as u64) };
+    kprint(b"parent: worker terminated\n");
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle, seeded by
 /// the kernel at spawn. The other two bootstrap registers are unused here.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, _boot1: u64, _boot2: u64) -> ! {
-    kprint(b"parent: up (pid 1), creating a channel\n");
+    kprint(b"parent: up (pid 1)\n");
+
+    // 0. Exception demo: a worker thread faults; we suspend, inspect, terminate.
+    worker_exception_demo(notif);
+
+    kprint(b"parent: creating a channel\n");
 
     // 1. Create an IPC channel; depth 4.
     // SAFETY: END0/END1 are valid writable out-params.

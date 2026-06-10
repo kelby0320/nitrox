@@ -27,6 +27,7 @@
 pub mod cpu;
 pub mod irq;
 pub mod paging;
+pub mod registers;
 pub mod smp;
 pub mod timer;
 pub mod user_access;
@@ -69,3 +70,10 @@ pub use x86_64::syscall::{
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::X86Paging as Paging;
+
+// Suspended-thread register snapshot (behind `sys_thread_get_registers`): the
+// `ArchRegisters` trait's active impl + its `#[repr(C)]` ABI value type. The
+// `impl` lives in `idt.rs` (where the private exception frame is); this module
+// owns the type + marker. See `arch::registers`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::registers::{RegisterValues, X86Registers as Registers};
