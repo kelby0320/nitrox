@@ -235,11 +235,12 @@ a TSC read). So the conclusion is unchanged.
 
 ## Wait queues and the deadline heap live under rank 1 (Phase 1)
 
-`sys_wait`, the per-object waiter lists (e.g. inside a `Timer`), the deadline
-min-heap, and the blocked-thread parking are all protected by the **rank-1
-`SCHED` lock** for Phase 1, not by a separate rank-2 lock. On single-CPU this
-one-lock domain removes both the rank-2-from-IRQ ordering question and the
-wait/wakeup race:
+`sys_wait`, the per-object waiter lists (inside a `Timer` or a
+`NotificationChannel`), the `NotificationChannel` queue + drop counter, the
+deadline min-heap, and the blocked-thread parking are all protected by the
+**rank-1 `SCHED` lock** for Phase 1, not by a separate rank-2 lock. On
+single-CPU this one-lock domain removes both the rank-2-from-IRQ ordering
+question and the wait/wakeup race:
 
 - **No lost wakeup.** `sys_wait` registers the thread on every object's waiter
   list and (for a finite deadline) pushes a heap entry, then blocks — all under
@@ -255,6 +256,13 @@ wait/wakeup race:
 Rank 2 stays **reserved** for the SMP split, where the wait queues and the
 deadline heap move to their own rank-2 lock (and `sys_wait`'s register-then-block
 becomes a lock-ordered acquire rather than relying on single-CPU atomicity).
+
+The notification paths obey the same discipline: `deliver_fault_and_exit` (the
+exception path) takes `SCHED` to enqueue + wake the channel's waiters, drops it,
+then takes it again inside `exit()` — two acquisitions, never nested.
+`sys_notif_recv` pops one notification under `SCHED` and copies the 64-byte
+record to user memory **after** releasing the lock (never hold the `IrqSpinLock`
+across a potentially-faulting user copy).
 
 ## Adding a new lock
 

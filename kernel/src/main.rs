@@ -299,11 +299,12 @@ static HELLO_ELF: &[u8] =
 /// Arm the syscall fast path, load + launch the first userspace process,
 /// and drain it from the boot thread. Returns once the process has exited.
 fn run_first_userspace() {
+    use arch::timer::ArchTimer;
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::KObjectType;
-    use nitrox_kernel::object::{ObjectRef, Process};
+    use nitrox_kernel::object::{NotificationChannel, ObjectRef, Process};
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
     // per-thread (by the scheduler's `thread_enter`), not here.
@@ -327,18 +328,37 @@ fn run_first_userspace() {
         }
     };
 
-    // Wrap it in a process (pid 1) and adopt the creation reference.
-    let proc_box = match Process::try_new_user(1, aspace) {
+    // Build the process (pid 1) — but hold the KBox so we can attach a
+    // notification channel before wrapping it into an ObjectRef.
+    let mut proc_box = match Process::try_new_user(1, aspace) {
         Ok(p) => p,
         Err(_) => {
             kprintln!("init: process alloc failed");
             return;
         }
     };
+
+    // Create the process's notification channel. The kernel boot thread acts
+    // as a stand-in supervisor: it keeps one ObjectRef to the channel; the
+    // process owns another (so a fault delivers to it). When `hello` faults the
+    // kernel enqueues a SegFault here instead of halting.
+    let chan = match NotificationChannel::try_new() {
+        Ok(c) => c,
+        Err(_) => {
+            kprintln!("init: notification channel alloc failed");
+            return;
+        }
+    };
+    let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it into
+    // the process's ObjectRef, then clone for the supervisor (refcount → 2).
+    let proc_chan_ref = unsafe { ObjectRef::from_raw(chan_ptr, KObjectType::NotificationChannel) };
+    let boot_chan_ref = proc_chan_ref.clone();
+    proc_box.set_notification_channel(proc_chan_ref);
+
     let proc_ref = {
         let ptr = KBox::into_raw(proc_box).as_ptr() as *mut ();
-        // SAFETY: `into_raw` yielded the single creation reference; adopt it
-        // without bumping.
+        // SAFETY: `into_raw` yielded the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }
     };
 
@@ -348,16 +368,49 @@ fn run_first_userspace() {
         return;
     }
 
-    // Boot thread drains the run queue: run the user thread to completion,
-    // reaping it (freeing the Process + address space) when it exits.
-    loop {
-        sched::reap_pending();
-        if sched::ready_is_empty() {
-            break;
+    // Supervise: block on the channel until `hello` faults (which enqueues a
+    // SegFault notification + wakes us). `boot_chan_ref` lives on this stack,
+    // pinning the channel across the block and past the faulter's reap.
+    let now = arch::Timer::read_ns();
+    let chan_obj = boot_chan_ref.as_ptr() as usize;
+    match sched::wait_on(&[chan_obj], u64::MAX, now) {
+        sched::WaitResult::Signaled(_) => {
+            if let Some(n) = sched::notif_try_recv(boot_chan_ref.as_ptr()) {
+                supervisor_report(&n);
+            } else {
+                kprintln!("supervisor: woke but channel was empty");
+            }
         }
-        sched::yield_now();
+        _ => kprintln!("supervisor: wait returned without a signal"),
     }
-    kprintln!("init: user process exited; boot thread resuming");
+
+    // Reap the faulted thread (it parked itself in `reap` via the kernel's
+    // post-mortem exit). Drop our channel ref last (frees the channel — the
+    // process's ref already went with the reap).
+    sched::reap_pending();
+    drop(boot_chan_ref);
+    kprintln!("init: user process faulted and was contained; kernel alive");
+}
+
+/// Print a received fault notification (the supervisor's view of a crash).
+fn supervisor_report(n: &nitrox_kernel::libkern::Notification) {
+    use nitrox_kernel::libkern::notification::{
+        KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT,
+    };
+    let name = match n.kind() {
+        KIND_SEG_FAULT => "SegFault",
+        KIND_ILLEGAL_INSN => "IllegalInsn",
+        KIND_DIVIDE_BY_ZERO => "DivideByZero",
+        other => {
+            kprintln!("supervisor: caught notification kind {:#06x}", other);
+            return;
+        }
+    };
+    // For the exception variants, body layout is `thread: u32 @0`, `addr: u64 @4`.
+    let b = n.as_bytes();
+    let tid = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
+    let addr = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
+    kprintln!("supervisor: caught {} (tid {}, pid 1) @ {:#x}", name, tid, addr);
 }
 
 /// Bring up the buddy allocator and the slab on top of it. Returns false

@@ -18,7 +18,7 @@ use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
-use crate::libkern::{IoResult, KBox, MemFlags, TimerFlags};
+use crate::libkern::{IoResult, KBox, MemFlags, Notification, TimerFlags};
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::user_access::{
     UserMutPtr, UserPtr, copy_slice_from_user, copy_slice_to_user, copy_to_user,
@@ -58,6 +58,8 @@ pub const SYS_TIMER_SET: u64 = 9;
 /// `sys_wait` — block until ≥1 of the given handles signals or the deadline
 /// elapses; the unified blocking primitive.
 pub const SYS_WAIT: u64 = 10;
+/// `sys_notif_recv` — dequeue one notification from a `NotificationChannel`.
+pub const SYS_NOTIF_RECV: u64 = 11;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -93,6 +95,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64)
         SYS_TIMER_CREATE => encode(sys_timer_create(a0)),
         SYS_TIMER_SET => encode(sys_timer_set(a0, a1, a2)),
         SYS_WAIT => encode(sys_wait(a0, a1 as usize, a2, a3)),
+        SYS_NOTIF_RECV => encode(sys_notif_recv(a0, a1)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Diverges into the scheduler; never returns to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -532,8 +535,9 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
         let ok = global::get()
             .lookup(RawHandle(handles[i]), pid, Rights::WAIT)
             .map_err(map_handle_err)?;
-        if ok.object.object_type() != KObjectType::Timer {
-            return Err(KError::Unsupported);
+        match ok.object.object_type() {
+            KObjectType::Timer | KObjectType::NotificationChannel => {}
+            _ => return Err(KError::Unsupported),
         }
         objs[i] = ok.object.as_ptr() as usize;
         refs[i] = Some(ok.object);
@@ -577,6 +581,31 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
         }
         crate::sched::WaitResult::OutOfMemory => Err(KError::OutOfMemory),
     }
+}
+
+/// `sys_notif_recv(channel, out)` — copy the oldest notification on `channel`
+/// to the 64-byte [`Notification`] at `out`, remove it, return 0. `WouldBlock`
+/// if the queue is empty. The handle must reference a `NotificationChannel`.
+///
+/// Receiving is gated by handle ownership (the lookup enforces
+/// `owner_pid == caller`), not by a right — `WAIT` gates *blocking* on the
+/// channel via `sys_wait`, not draining it.
+pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
+    // Validate the user pointer first (cheap, side-effect-free; host-reachable).
+    let uptr = UserMutPtr::<Notification>::new(out).map_err(from_user_access)?;
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(channel_h), pid, Rights::empty())
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::NotificationChannel {
+        return Err(KError::InvalidArgument);
+    }
+    // Pop under SCHED into a kernel-local notification; `ok.object` (held here)
+    // pins the channel across the pop. Copy out AFTER the lock is released
+    // (never hold the IrqSpinLock across a faulting user copy).
+    let n = crate::sched::notif_try_recv(ok.object.as_ptr()).ok_or(KError::WouldBlock)?;
+    copy_to_user(uptr, &n).map_err(from_user_access)?;
+    Ok(0)
 }
 
 #[cfg(test)]
@@ -655,6 +684,28 @@ mod tests {
             .allocate(1, ptr, KObjectType::Timer, timer_rights())
             .expect("timer_rights must be valid for a Timer");
         // Clean up: close releases the handle's ref, freeing the object.
+        let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    #[test]
+    fn notif_recv_rejects_bad_pointer() {
+        // An out-of-range `out` pointer fails at UserMutPtr::new, before any lock.
+        assert_eq!(sys_notif_recv(0xDEAD, USER_VIRT_END), Err(KError::FaultFromUser));
+    }
+
+    #[test]
+    fn notif_channel_rights_are_allocatable_on_a_channel() {
+        // WAIT + the generic band (no principal rights) must be allocatable on a
+        // NotificationChannel (wait-only type, empty principal mask).
+        init_global_heap();
+        let t = HandleTable::try_new(0x0FED_CBA9_8765_4321).unwrap();
+        let chan = crate::object::NotificationChannel::try_new().unwrap();
+        let ptr = KBox::into_raw(chan).as_ptr() as *mut ();
+        let rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+        let h = t
+            .allocate(1, ptr, KObjectType::NotificationChannel, rights)
+            .expect("WAIT + generic rights must be valid for a NotificationChannel");
         let co = t.close(h, 1).unwrap();
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
     }

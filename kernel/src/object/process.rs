@@ -4,8 +4,10 @@
 //! current-working-directory handle, a list of owned handles, a syscap
 //! bitmask, and a set of threads (see `docs/architecture/overview.md`).
 //! This slice adds the **address space** (a userspace process needs one to
-//! run in ring 3); the namespace, handle table, syscaps, and thread set
-//! arrive with their respective later slices.
+//! run in ring 3) and an optional **notification channel** (the kernel delivers
+//! fault notifications here; see `docs/architecture/notifications.md`); the
+//! namespace, handle table, syscaps, and thread set arrive with their
+//! respective later slices.
 //!
 //! The address space is optional: [`try_new`](Process::try_new) builds a
 //! process with none (used where a `Process` is needed only as a
@@ -17,6 +19,7 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
+use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 
 /// A process kernel object.
@@ -38,6 +41,11 @@ pub struct Process {
     /// see `dispatch_destroy` in [`crate::object::header`]), tearing down
     /// the VMAs and freeing the top-level page table.
     address_space: Option<AddressSpace>,
+    /// This process's notification channel, if one is attached. The process
+    /// owns this reference; a supervisor may hold another. The channel does
+    /// **not** back-reference the `Process`, so there is no refcount cycle.
+    /// The exception path delivers fault notifications here.
+    notification_channel: Option<ObjectRef>,
 }
 
 impl Process {
@@ -52,6 +60,7 @@ impl Process {
             pid,
             magic: Self::MAGIC,
             address_space: None,
+            notification_channel: None,
         })
     }
 
@@ -66,6 +75,7 @@ impl Process {
             pid,
             magic: Self::MAGIC,
             address_space: Some(address_space),
+            notification_channel: None,
         })
     }
 
@@ -94,6 +104,21 @@ impl Process {
     pub fn address_space(&self) -> Option<&AddressSpace> {
         self.address_space.as_ref()
     }
+
+    /// Attach this process's notification channel (the process takes ownership
+    /// of `chan`). Called on the `KBox<Process>` before it is wrapped into an
+    /// `ObjectRef`, so `&mut self` is exclusive.
+    pub fn set_notification_channel(&mut self, chan: ObjectRef) {
+        self.notification_channel = Some(chan);
+    }
+
+    /// The type-erased pointer to the attached notification channel, or `None`.
+    /// For the exception fault path, which must **not** clone/drop an
+    /// `ObjectRef` under the scheduler lock — it borrows the pointer, and the
+    /// channel stays alive because this `Process` owns a reference to it.
+    pub fn notification_channel_ptr(&self) -> Option<*mut ()> {
+        self.notification_channel.as_ref().map(|r| r.as_ptr())
+    }
 }
 
 #[cfg(test)]
@@ -121,6 +146,26 @@ mod tests {
         assert!(p.magic_ok());
         assert_eq!(p.address_space_root(), Some(root));
         assert!(root.is_page_aligned() && root.as_u64() != 0);
+    }
+
+    #[test]
+    fn notification_channel_attach_and_read_ptr() {
+        use crate::object::NotificationChannel;
+        use crate::object::header::test_probe;
+        init_global_heap();
+        test_probe::reset();
+        let mut p = Process::try_new(1).unwrap();
+        assert!(p.notification_channel_ptr().is_none());
+        // Attach a channel; the Process takes one ref.
+        let chan = KBox::into_raw(NotificationChannel::try_new().unwrap()).as_ptr() as *mut ();
+        // SAFETY: into_raw yielded the single creation ref; adopt it.
+        let chan_ref = unsafe { ObjectRef::from_raw(chan, KObjectType::NotificationChannel) };
+        p.set_notification_channel(chan_ref);
+        assert_eq!(p.notification_channel_ptr(), Some(chan));
+        // Dropping the Process releases its channel ref exactly once.
+        assert_eq!(test_probe::notification_channel_destroys(), 0);
+        drop(p);
+        assert_eq!(test_probe::notification_channel_destroys(), 1);
     }
 
     #[test]

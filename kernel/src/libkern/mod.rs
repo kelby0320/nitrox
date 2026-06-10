@@ -24,12 +24,14 @@ pub mod kbox;
 pub mod kstring;
 pub mod kvec;
 pub mod memory;
+pub mod notification;
 pub mod spinlock;
 pub mod timer_flags;
 
 pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
 pub use io_result::IoResult;
+pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
 pub use kbox::KBox;
 pub use memory::MemFlags;
 pub use timer_flags::TimerFlags;
