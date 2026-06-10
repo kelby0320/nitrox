@@ -97,6 +97,26 @@ pub fn init_syscall_entry() {
     }
 }
 
+/// Re-assert `KERNEL_GS_BASE = &CPU0` before a thread's **first** ring-3 descent.
+///
+/// `enter_user` does no `swapgs` — it assumes the kernel reached it in the boot
+/// GS state (`GS_BASE = 0`, `KERNEL_GS_BASE = &CPU0`). That holds only if the
+/// path here never crossed a `swapgs`. But a thread that **blocks mid-syscall**
+/// (e.g. `sys_wait`) is switched away with the entry `swapgs` still in effect:
+/// `GS_BASE = &CPU0`, `KERNEL_GS_BASE =` the blocked thread's (user) GS. If the
+/// scheduler then descends a *different* thread to ring 3 for the first time via
+/// `enter_user`, that thread's first `syscall`'s `swapgs` would load the stale
+/// `KERNEL_GS_BASE` (often `0`) into `GS_BASE`, and the entry stub's `gs:`
+/// access faults (→ `#PF` → `#DF`). Writing `&CPU0` here makes the first
+/// `syscall`'s `swapgs` correct regardless of the incoming GS state; the
+/// entry/exit `swapgs` pair keeps it correct thereafter.
+pub fn arm_user_entry_cpu_base() {
+    let cpu0_addr = &raw const CPU0 as u64;
+    // SAFETY: architectural MSR; `&CPU0` is the per-CPU block the entry stub
+    // reaches through `gs:` after `swapgs`.
+    unsafe { regs::wrmsr(MSR_KERNEL_GS_BASE, cpu0_addr) };
+}
+
 /// Set the per-CPU kernel stack the `syscall` entry stub switches to. The
 /// scheduler/`thread_enter` calls this with the running user thread's kernel
 /// stack top before descending to ring 3, so a syscall lands on the right
@@ -239,8 +259,11 @@ extern "C" fn syscall_entry() -> ! {
 
 // --- Ring-3 descent -------------------------------------------------------
 
-/// Descend to ring 3 at `entry` with user stack `user_sp`. Never returns:
-/// the only way back to ring 0 is via the `syscall` entry stub (or a trap).
+/// Descend to ring 3 at `entry` with user stack `user_sp`, seeding the three
+/// bootstrap argument registers `rdi = a0`, `rsi = a1`, `rdx = a2` (the spawn
+/// hand-off by which a process learns its initial handle values; all `0` for the
+/// boot/`hello` path). Never returns: the only way back to ring 0 is via the
+/// `syscall` entry stub (or a trap).
 ///
 /// Called from `thread_enter` on a user thread's first run. The page-table
 /// root (CR3) is already the process address space (loaded by the scheduler
@@ -254,22 +277,24 @@ extern "C" fn syscall_entry() -> ! {
 /// writable in the active address space; [`init_syscall_entry`] must have
 /// run; the active CR3 must be the process address space.
 #[unsafe(naked)]
-pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64) -> ! {
-    // SAFETY: naked. SysV: rdi=entry, rsi=user_sp. Build the iretq frame
-    // (CPU pops RIP, CS, RFLAGS, RSP, SS) and drop to ring 3, zeroing every
-    // GPR first so no kernel value leaks to userspace.
+pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, a2: u64) -> ! {
+    // SAFETY: naked. SysV: rdi=entry, rsi=user_sp, rdx=a0, rcx=a1, r8=a2.
+    // Build the iretq frame (consuming rdi/rsi), then move the bootstrap args
+    // into the user's rdi/rsi/rdx and zero every other GPR so no kernel value
+    // leaks to userspace.
     naked_asm!(
         "push {user_ss}",           // SS
         "push rsi",                 // RSP = user_sp
         "push {rflags}",            // RFLAGS (IF=1; bit1 reserved=1) — ring 3 runs preemptible
         "push {user_cs}",           // CS
         "push rdi",                 // RIP = entry
+        // Seed the user's bootstrap argument registers BEFORE zeroing the rest.
+        "mov rdi, rdx",             // user rdi = a0
+        "mov rsi, rcx",             // user rsi = a1
+        "mov rdx, r8",              // user rdx = a2
         "xor eax, eax",
         "xor ebx, ebx",
         "xor ecx, ecx",
-        "xor edx, edx",
-        "xor esi, esi",
-        "xor edi, edi",
         "xor ebp, ebp",
         "xor r8d, r8d",
         "xor r9d, r9d",

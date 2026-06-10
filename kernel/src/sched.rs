@@ -57,7 +57,7 @@ use crate::arch::{Cpu, Paging, context_switch};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
-use crate::libkern::Notification;
+use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::object::{
     IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, RecvState, SendOutcome,
     StoredMsg, Thread, ThreadEntry, ThreadState, Timer,
@@ -241,6 +241,10 @@ struct SchedState {
     reap: Option<ObjectRef>,
     /// Monotonic thread-id source.
     next_tid: u32,
+    /// Monotonic process-id source. The boot parent takes pid 1; spawned
+    /// children take 2, 3, …. (Phase 1 has no pid reuse; recycling lands with a
+    /// real process table.)
+    next_pid: u32,
     /// Ticks remaining in the current thread's slice; reset to
     /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
     /// here rather than on `Thread` (no `Thread` layout/ABI change).
@@ -267,12 +271,23 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     current: None,
     reap: None,
     next_tid: 1,
+    next_pid: 2,
     quantum: QUANTUM_TICKS,
     idle: None,
     idle_addr: 0,
     blocked: KVec::new(),
     deadlines: KVec::new(),
 });
+
+/// Allocate the next process id (monotonic; no reuse in Phase 1). Takes only
+/// the rank-1 lock briefly — `sys_process_spawn` calls this before touching the
+/// rank-3 handle table.
+pub fn alloc_pid() -> u32 {
+    let mut g = SCHED.lock();
+    let pid = g.next_pid;
+    g.next_pid = g.next_pid.wrapping_add(1);
+    pid
+}
 
 /// Adopt a freshly created `Thread` into an [`ObjectRef`], transferring the
 /// `KBox` creation reference without a refcount change.
@@ -360,9 +375,16 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
 /// Create a **user** thread for `process` that descends to ring 3 at
 /// `entry` with stack `user_sp`, and enqueue it. Returns its thread id. The
 /// `process` reference is moved into the thread (keeping its address space
-/// alive). The kernel stack + frame fabrication happen before the (brief)
-/// enqueue lock.
-pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64) -> Result<u32, AllocError> {
+/// alive). `boot_args` are the `[rdi, rsi, rdx]` register values seeded at the
+/// thread's first ring-3 entry (the spawn hand-off; `[0; 3]` for the boot/`hello`
+/// path). The kernel stack + frame fabrication happen before the (brief) enqueue
+/// lock.
+pub fn spawn_user(
+    process: ObjectRef,
+    entry: u64,
+    user_sp: u64,
+    boot_args: [u64; 3],
+) -> Result<u32, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
         let t = g.next_tid;
@@ -370,7 +392,7 @@ pub fn spawn_user(process: ObjectRef, entry: u64, user_sp: u64) -> Result<u32, A
         t
     };
     // Heavy work outside the lock (consumes `process` on success).
-    let thread = Thread::try_new_user(tid, process, entry, user_sp)?;
+    let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
     let r = into_objref(thread);
 
     {
@@ -631,6 +653,23 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     }
 }
 
+/// Point the ring-0 trap stack (`TSS.RSP0`) and the per-CPU syscall stack at
+/// `obj`'s kernel stack, so a ring-3 → ring-0 transition (syscall / trap / IRQ)
+/// from this thread lands on **its** kernel stack — not a sibling's. Called on
+/// every switch-in (all three switch sites); a no-op for stackless boot/idle
+/// threads that never trap from ring 3. With a single user thread this was set
+/// once by `thread_enter`; multiple user threads require re-arming on each
+/// switch-in (or a resumed thread traps onto a stale stack → `#DF`). Caller
+/// holds `SCHED`; the writes are arch register/per-CPU stores, no locks.
+unsafe fn arm_kernel_stack_for(obj: *mut ()) {
+    // SAFETY: `obj` is the pinned incoming thread; `kstack_top` reads its field
+    // under `SCHED`. Setting TSS.RSP0 / the syscall stack are arch stores.
+    if let Some(ktop) = unsafe { Thread::kstack_top(obj) } {
+        Cpu::set_kernel_stack(ktop);
+        crate::arch::set_syscall_kernel_stack(ktop);
+    }
+}
+
 /// Park the current thread (set `Blocked`, move into `blocked`) and switch to
 /// the next runnable thread. Mirrors [`switch_to_next`]'s IF-bracket exactly,
 /// but does **not** re-enqueue the outgoing thread — the caller ([`wait_on`])
@@ -664,6 +703,8 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
 
     // Identical IF-bracket to `switch_to_next`.
     let saved_if = g.release_keeping_irqs_masked();
+    // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
+    unsafe { arm_kernel_stack_for(next_obj) };
     // SAFETY: as `switch_to_next`.
     unsafe { Paging::set_page_table(next_root) };
     // SAFETY: as `switch_to_next`.
@@ -900,6 +941,10 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     // + the no-IRQ-mid-switch invariant). `saved_if` is this thread's prior
     // interrupt state, restored when *this* thread next resumes here.
     let saved_if = g.release_keeping_irqs_masked();
+    // Re-arm the trap/syscall stack for the incoming thread (multi-user-thread
+    // correctness — see `arm_kernel_stack_for`).
+    // SAFETY: `next_obj` is the pinned incoming thread.
+    unsafe { arm_kernel_stack_for(next_obj) };
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
     // with the kernel half inherited); all kernel stacks are mapped in every
     // root, so switching CR3 before the stack swap is sound.
@@ -916,17 +961,46 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     unsafe { Cpu::interrupts_restore(saved_if) };
 }
 
-/// Terminate the current thread and switch away forever. The thread's
-/// `Thread` (and its kernel stack) are parked for reclamation by the next
-/// scheduler entry — they cannot be freed here because this code is still
-/// running on that stack.
-pub fn exit() -> ! {
+/// Terminate the current thread with exit `status` and switch away forever.
+/// The thread's `Thread` (and its kernel stack) are parked for reclamation by
+/// the next scheduler entry — they cannot be freed here because this code is
+/// still running on that stack.
+///
+/// If the exiting thread's process has a parent (its `parent_notif` channel is
+/// set), a `ChildExited { pid, status }` is delivered to that channel **here**,
+/// before parking — immediate, not deferred to reap — so a parent blocked in
+/// `sys_wait` wakes promptly even though stack reclamation is deferred. Reuses
+/// the [`deliver_fault_and_exit`] discipline: borrow the channel pointer, never
+/// drop an `ObjectRef` under `SCHED`, enqueue is allocation-free.
+pub fn exit(status: ExitStatus) -> ! {
     // Reclaim any earlier exited thread first, so `reap` is free for us.
     reap_pending();
 
     let mut g = SCHED.lock();
     let me = g.current.take().expect("current set");
     let me_obj = me.as_ptr();
+
+    // Deliver ChildExited to the parent, if any, before parking.
+    let info: Option<(*mut (), u32)> = {
+        // SAFETY: `me` is the running thread, pinned, lock held.
+        let th = unsafe { &*(me_obj as *const Thread) };
+        th.process_ref().and_then(|p| {
+            // SAFETY: `p` pins a live Process; read its parent channel + pid.
+            let proc = unsafe { &*(p.as_ptr() as *const crate::object::Process) };
+            proc.parent_notif_ptr().map(|chan| (chan, proc.pid_u32()))
+            // `p` (a cloned ObjectRef, never the last) drops here: a plain
+            // atomic decrement, no destructor, safe under SCHED.
+        })
+    };
+    if let Some((chan, child_pid)) = info {
+        let notif = Notification::child_exited(child_pid, status);
+        // SAFETY: `chan` is the parent's channel, kept alive by this process's
+        // `parent_notif` reference (still held — `me` is not yet reaped); SCHED
+        // held; no allocation (queue pre-reserved).
+        let _edge = unsafe { NotificationChannel::enqueue(chan, notif) };
+        signal_channel(&mut g, chan);
+    }
+
     // SAFETY: `me` is the running thread, pinned, lock held. (The idle thread
     // never exits, so `me` is never the idle thread.)
     unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
@@ -952,6 +1026,8 @@ pub fn exit() -> ! {
     // never resume, so the captured prior state is discarded (the incoming
     // thread restores its own).
     let _ = g.release_keeping_irqs_masked();
+    // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
+    unsafe { arm_kernel_stack_for(next_obj) };
     // Load the incoming thread's root BEFORE switching away. When a user thread
     // exits, `next_root` is the boot root, so CR3 is restored to the kernel
     // table before this (parked-in-`reap`) thread is reaped — its
@@ -1062,7 +1138,9 @@ pub fn deliver_fault_and_exit(notif: Notification) -> ! {
         }
         // guard drops here — never held across the exit() switch below.
     }
-    exit()
+    // The faulting thread terminates with a Crashed status; its `ChildExited`
+    // (if it has a parent) carries the fault discriminant as the code.
+    exit(ExitStatus { kind: ExitKind::Crashed as u32, code: notif.kind() as i32 })
 }
 
 /// Pop one notification from `channel` under `SCHED` (or synthesize a dropped
@@ -1120,7 +1198,7 @@ extern "C" fn idle_body(_arg: usize) {
 pub(crate) extern "C" fn thread_enter() -> ! {
     // Capture (under the lock) whether the current thread descends to ring 3
     // and, if so, its descent params + kernel-stack top.
-    let descent: Option<(u64, u64, u64)> = {
+    let descent: Option<(u64, u64, u64, [u64; 3])> = {
         let g = SCHED.lock();
         let cur = g.current.as_ref().expect("current set when a thread runs");
         let obj = cur.as_ptr();
@@ -1129,29 +1207,37 @@ pub(crate) extern "C" fn thread_enter() -> ! {
             Some((entry, user_sp)) => {
                 let ktop = unsafe { Thread::kstack_top(obj) }
                     .expect("a user thread has a kernel stack");
-                Some((entry, user_sp, ktop))
+                let boot = unsafe { Thread::user_boot_args(obj) };
+                Some((entry, user_sp, ktop, boot))
             }
             None => None,
         }
     };
 
     match descent {
-        Some((entry, user_sp, ktop)) => {
+        Some((entry, user_sp, ktop, boot)) => {
             // Point the ring0 trap stack (TSS.RSP0) and the per-CPU syscall
             // stack at THIS thread's kernel stack before dropping to ring 3,
             // so syscalls/traps from ring 3 land on it. CR3 is already the
             // process address space (loaded by the scheduler on switch-in).
             Cpu::set_kernel_stack(ktop);
             crate::arch::set_syscall_kernel_stack(ktop);
+            // Re-assert the per-CPU base for the upcoming first `syscall`: a
+            // thread that blocked mid-syscall is switched away with the entry
+            // GS-swap still in effect, so a fresh descent here must restore it
+            // or the child's first syscall faults. See `arm_user_entry_cpu_base`.
+            crate::arch::arm_user_entry_cpu_base();
             // SAFETY: `entry`/`user_sp` are canonical user VAs mapped X / W
             // in the active address space; the syscall fast-path is armed.
-            unsafe { crate::arch::enter_user(entry, user_sp) }
+            // `boot` seeds rdi/rsi/rdx — the spawn hand-off (handle values).
+            unsafe { crate::arch::enter_user(entry, user_sp, boot[0], boot[1], boot[2]) }
         }
         None => {
-            // Kernel thread: run the body in ring 0, then exit cleanly.
+            // Kernel thread: run the body in ring 0, then exit cleanly. Kernel
+            // threads have no owning process, so no `ChildExited` is produced.
             let (entry, arg) = current_entry();
             entry(arg);
-            exit();
+            exit(ExitStatus { kind: ExitKind::Normal as u32, code: 0 });
         }
     }
 }
@@ -1184,6 +1270,7 @@ mod tests {
             current: None,
             reap: None,
             next_tid: 1,
+            next_pid: 2,
             quantum: QUANTUM_TICKS,
             idle: None,
             idle_addr: 0,

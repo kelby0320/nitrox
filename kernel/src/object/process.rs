@@ -46,6 +46,12 @@ pub struct Process {
     /// **not** back-reference the `Process`, so there is no refcount cycle.
     /// The exception path delivers fault notifications here.
     notification_channel: Option<ObjectRef>,
+    /// The **parent's** notification channel, where this process's
+    /// `ChildExited` is delivered when it exits. `None` for the boot parent
+    /// (the root has no parent). A held `ObjectRef`, so the parent's channel
+    /// outlives this child; no cycle (the parent's channel does not reference
+    /// the child).
+    parent_notif: Option<ObjectRef>,
 }
 
 impl Process {
@@ -61,6 +67,7 @@ impl Process {
             magic: Self::MAGIC,
             address_space: None,
             notification_channel: None,
+            parent_notif: None,
         })
     }
 
@@ -76,6 +83,7 @@ impl Process {
             magic: Self::MAGIC,
             address_space: Some(address_space),
             notification_channel: None,
+            parent_notif: None,
         })
     }
 
@@ -118,6 +126,38 @@ impl Process {
     /// channel stays alive because this `Process` owns a reference to it.
     pub fn notification_channel_ptr(&self) -> Option<*mut ()> {
         self.notification_channel.as_ref().map(|r| r.as_ptr())
+    }
+
+    /// Clone this process's notification-channel reference (bumping its
+    /// refcount), or `None` if it has none. `sys_process_spawn` uses this to
+    /// give a child a held reference to its **parent's** channel (the child's
+    /// `parent_notif`), so the parent's channel outlives the child and receives
+    /// its `ChildExited`.
+    pub fn notification_channel_ref(&self) -> Option<ObjectRef> {
+        self.notification_channel.clone()
+    }
+
+    /// Attach the **parent's** notification channel (where this process's
+    /// `ChildExited` is delivered on exit). Called on the `KBox<Process>` at
+    /// spawn, before it is wrapped into an `ObjectRef`. The boot parent never
+    /// sets this (it is the root).
+    pub fn set_parent_notif(&mut self, chan: ObjectRef) {
+        self.parent_notif = Some(chan);
+    }
+
+    /// The type-erased pointer to the parent's notification channel, or `None`.
+    /// The reap path borrows this to enqueue `ChildExited` — like
+    /// [`notification_channel_ptr`](Self::notification_channel_ptr), it must not
+    /// clone/drop an `ObjectRef` under the scheduler lock; the parent's channel
+    /// stays alive because this `Process` holds a reference to it.
+    pub fn parent_notif_ptr(&self) -> Option<*mut ()> {
+        self.parent_notif.as_ref().map(|r| r.as_ptr())
+    }
+
+    /// This process's pid as a `u32` — the `child` field of a `ChildExited`
+    /// notification the reap path builds for the parent.
+    pub fn pid_u32(&self) -> u32 {
+        self.pid
     }
 }
 

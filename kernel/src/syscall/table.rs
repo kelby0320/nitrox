@@ -19,18 +19,22 @@ use crate::handle::table::{HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
-use crate::libkern::{IoResult, KBox, MemFlags, Notification, SendMode, TimerFlags};
+use crate::libkern::spawn::{ImageId, SPAWN_MAX_HANDLES, SpawnArgs};
+use crate::libkern::{
+    ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, TimerFlags,
+};
 use crate::mm::addr_space::{AddressSpace, MapError};
+use crate::mm::elf::load_elf;
 use crate::mm::user_access::{
-    UserMutPtr, UserPtr, copy_slice_from_user, copy_slice_to_user, copy_to_user,
+    UserMutPtr, UserPtr, copy_from_user, copy_slice_from_user, copy_slice_to_user, copy_to_user,
 };
 use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::{
-    IpcChannel, MAX_WAIT_HANDLES, MemoryObject, ObjectRef, Process, RecvState, SendOutcome,
-    StoredMsg, Timer as TimerObject,
+    IpcChannel, MAX_WAIT_HANDLES, MemoryObject, NotificationChannel, ObjectRef, Process, RecvState,
+    SendOutcome, StoredMsg, Timer as TimerObject,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -70,14 +74,17 @@ pub const SYS_CHANNEL_CREATE: u64 = 12;
 pub const SYS_CHANNEL_SEND: u64 = 13;
 /// `sys_channel_recv` — dequeue a message from a channel endpoint.
 pub const SYS_CHANNEL_RECV: u64 = 14;
+/// `sys_process_spawn` — create a child process, return a handle to it.
+pub const SYS_PROCESS_SPAWN: u64 = 15;
+/// `sys_process_exit` — terminate the calling process with a status.
+pub const SYS_PROCESS_EXIT: u64 = 16;
+/// `sys_thread_exit` — terminate the calling thread with a status.
+pub const SYS_THREAD_EXIT: u64 = 17;
+/// `sys_thread_set_affinity` — restrict a thread's CPU set (no-op until SMP).
+pub const SYS_THREAD_SET_AFFINITY: u64 = 18;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
-/// Terminate the calling (single-threaded) process. Routes to the
-/// scheduler's thread exit; the dying thread's last `Process` reference is
-/// released on reap, freeing its address space. Debug number for now
-/// (status plumbing / multi-thread teardown land with later slices).
-pub const SYS_PROCESS_EXIT: u64 = 0xFFFF_0001;
 
 /// Largest buffer `sys_kprint` will copy in one call. Bounds the on-stack
 /// kernel buffer; well under `MAX_USER_COPY_SIZE`.
@@ -109,20 +116,192 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) 
         SYS_CHANNEL_CREATE => encode(sys_channel_create(a0, a1, a2)),
         SYS_CHANNEL_SEND => encode(sys_channel_send(a0, a1, a2, a3, a4)),
         SYS_CHANNEL_RECV => encode(sys_channel_recv(a0, a1, a2, a3)),
+        SYS_PROCESS_SPAWN => encode(sys_process_spawn(a0)),
+        SYS_THREAD_SET_AFFINITY => encode(sys_thread_set_affinity(a0, a1)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
-        // Diverges into the scheduler; never returns to dispatch/sysret.
+        // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
+        SYS_THREAD_EXIT => sys_thread_exit(a0 as i32),
         _ => KError::Unsupported.as_isize(),
     }
 }
 
-/// `sys_process_exit(status)` — terminate the calling process. This slice's
-/// processes are single-threaded, so process exit is the current thread's
-/// exit: hand off to the scheduler, which switches to another thread and
-/// (on the next scheduler entry) reaps this one — releasing its last
-/// `Process` reference and freeing the address space. Never returns.
-fn sys_process_exit(_status: i32) -> ! {
-    crate::sched::exit()
+/// `sys_process_exit(status)` — terminate the calling process with `status`.
+/// This slice's processes are single-threaded, so process exit is the current
+/// thread's exit: the scheduler delivers a `ChildExited { pid, Normal(status) }`
+/// to the parent's notification channel (if any), then switches away and reaps
+/// this thread — releasing its last `Process` reference and freeing the address
+/// space. Never returns. (Multi-thread teardown — terminating sibling threads —
+/// lands with `sys_thread_create` in a later slice.)
+fn sys_process_exit(status: i32) -> ! {
+    crate::sched::exit(ExitStatus { kind: ExitKind::Normal as u32, code: status })
+}
+
+/// `sys_thread_exit(status)` — terminate the calling thread with `status`.
+/// Phase-1 processes are single-threaded, so this is identical to
+/// [`sys_process_exit`]; they diverge once a process can hold more than one
+/// thread (`sys_thread_create`). Never returns.
+fn sys_thread_exit(status: i32) -> ! {
+    crate::sched::exit(ExitStatus { kind: ExitKind::Normal as u32, code: status })
+}
+
+/// Close every child-side handle a partially-built spawn allocated, so a
+/// failure before the commit (the child thread enqueue) leaves no handles
+/// tagged to a process that will never run.
+fn spawn_rollback_child_handles(child_pid: u32, notif_h: RawHandle, installed: &[RawHandle]) {
+    close_and_release(notif_h, child_pid);
+    for &h in installed {
+        if !h.is_null() {
+            close_and_release(h, child_pid);
+        }
+    }
+}
+
+/// `sys_process_spawn(args)` — create a child process from a kernel-embedded
+/// image and start it. Returns a handle to the child `Process`
+/// (`SIGNAL | TERMINATE`). The child's initial handle table is populated from
+/// `args.handles` (each installed with `source_rights & args.rights[i]`; bit
+/// `i` of `args.move_mask` chooses move vs. duplicate), plus a fresh
+/// notification channel. The child learns its handle *values* via the bootstrap
+/// registers seeded at entry: `rdi` = its notification-channel handle, `rsi` =
+/// its first installed handle, `rdx` = `args.arg0`.
+///
+/// Atomic-or-fail: any failure before the child thread is enqueued rolls back
+/// every child-side allocation and leaves the parent's handles untouched (moves
+/// close the parent's source handle only after the spawn commits).
+pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
+    let aptr = UserPtr::<SpawnArgs>::new(args_ptr).map_err(from_user_access)?;
+    let args = copy_from_user(aptr).map_err(from_user_access)?;
+    let count = args.handle_count as usize;
+    if count > SPAWN_MAX_HANDLES {
+        return Err(KError::TooLarge);
+    }
+    let image = ImageId::from_u32(args.image).ok_or(KError::InvalidArgument)?;
+    let parent_pid = crate::sched::current_owner_pid();
+
+    // Build the child address space from the embedded image.
+    let asp = AddressSpace::new().map_err(|_| KError::OutOfMemory)?;
+    let info = load_elf(&asp, crate::embedded_images::image_bytes(image))
+        .map_err(|_| KError::KernelError)?; // a bad embedded image is our bug
+    let child_pid = crate::sched::alloc_pid();
+
+    // Build the child Process (owns the AS); record the parent's notification
+    // channel as its `ChildExited` target.
+    let mut proc_box = Process::try_new_user(child_pid, asp).map_err(|_| KError::OutOfMemory)?;
+    if let Some(parent_proc) = crate::sched::current_process() {
+        // SAFETY: `parent_proc` pins a live Process; clone its channel ref.
+        if let Some(c) =
+            unsafe { &*(parent_proc.as_ptr() as *const Process) }.notification_channel_ref()
+        {
+            proc_box.set_parent_notif(c);
+        }
+    }
+
+    // The child's own notification channel: the Process owns one reference; a
+    // handle in the child's table owns the other (so the child can wait/recv).
+    let chan = NotificationChannel::try_new().map_err(|_| KError::OutOfMemory)?;
+    let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it.
+    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr, KObjectType::NotificationChannel) };
+    proc_box.set_notification_channel(chan_ref.clone()); // refcount 2
+    let (cp, ct) = chan_ref.into_raw();
+    let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
+    let notif_h = match global::get().allocate(child_pid, cp, ct, notif_rights) {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: reclaim the channel-handle reference; `proc_box` drops here
+            // too, releasing its own channel reference and freeing the AS.
+            drop(unsafe { ObjectRef::from_raw(cp, ct) });
+            return Err(map_handle_err(e));
+        }
+    };
+
+    // Install the transferred handles into the child's table (clone the source
+    // reference + allocate for the child; the parent's source handle is closed
+    // only after the spawn commits, so a failure here doesn't lose it).
+    let mut installed = [RawHandle::NULL; SPAWN_MAX_HANDLES];
+    for i in 0..count {
+        let ok = match global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER) {
+            Ok(ok) => ok,
+            Err(e) => {
+                spawn_rollback_child_handles(child_pid, notif_h, &installed[..i]);
+                return Err(map_handle_err(e));
+            }
+        };
+        let child_rights = ok.rights & Rights::from_bits_truncate(args.rights[i]);
+        // SAFETY: `ok.object` pins a live object; clone bumps the refcount for
+        // the child's new handle.
+        let (op, ot) = ok.object.clone().into_raw();
+        match global::get().allocate(child_pid, op, ot, child_rights) {
+            Ok(h) => installed[i] = h,
+            Err(e) => {
+                // SAFETY: reclaim the clone; `ok.object` drops at scope end.
+                drop(unsafe { ObjectRef::from_raw(op, ot) });
+                spawn_rollback_child_handles(child_pid, notif_h, &installed[..i]);
+                return Err(map_handle_err(e));
+            }
+        }
+        // `ok.object` drops here, releasing the lookup reference.
+    }
+
+    // Wrap the child Process; keep a clone for the parent's process handle.
+    let proc_obj = {
+        let p = KBox::into_raw(proc_box).as_ptr() as *mut ();
+        // SAFETY: `into_raw` yielded the single creation reference; adopt it.
+        unsafe { ObjectRef::from_raw(p, KObjectType::Process) }
+    };
+    let proc_for_handle = proc_obj.clone();
+
+    // Commit: enqueue the child's main thread with the bootstrap registers.
+    let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
+    let boot = [notif_h.bits(), endpoint_h, args.arg0];
+    if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot)
+        .is_err()
+    {
+        // `spawn_user` consumed (and dropped) `proc_obj`; release the clone to
+        // free the Process + AS, and roll back the child handles.
+        drop(proc_for_handle);
+        spawn_rollback_child_handles(child_pid, notif_h, &installed[..count]);
+        return Err(KError::OutOfMemory);
+    }
+
+    // Allocate the parent's handle to the child Process.
+    let (pp, pt) = proc_for_handle.into_raw();
+    let parent_handle =
+        match global::get().allocate(parent_pid, pp, pt, Rights::SIGNAL | Rights::TERMINATE) {
+            Ok(h) => h,
+            Err(e) => {
+                // The child is already running; reclaim only the process-handle
+                // reference (the child stays alive, just unreferenced by us).
+                // SAFETY: adopt + drop the reference yielded by `into_raw`.
+                drop(unsafe { ObjectRef::from_raw(pp, pt) });
+                return Err(map_handle_err(e));
+            }
+        };
+
+    // The spawn committed: finalise moves by closing the parent's source handle
+    // for each move-marked entry (its reference already lives in the child).
+    for i in 0..count {
+        if (args.move_mask >> i) & 1 == 1 {
+            close_and_release(args.handles[i], parent_pid);
+        }
+    }
+
+    Ok(parent_handle.bits() as isize)
+}
+
+/// `sys_thread_set_affinity(thread, cpu_mask)` — restrict which CPUs a thread
+/// may run on. **No-op until SMP (Phase 3):** validates the handle carries
+/// `SIGNAL` and is a `Thread`, then accepts and ignores `cpu_mask`.
+pub fn sys_thread_set_affinity(thread_h: u64, _cpu_mask: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::Thread {
+        return Err(KError::InvalidArgument);
+    }
+    Ok(0)
 }
 
 /// `sys_kprint(ptr, len)` — copy `len` bytes from the user buffer at `ptr`
@@ -952,6 +1131,17 @@ mod tests {
         let co = t.close(h, 1).unwrap();
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
         drop(b);
+    }
+
+    #[test]
+    fn process_spawn_rejects_bad_args_pointer() {
+        // The `SpawnArgs` pointer is validated first (before `current_owner_pid`
+        // / the embedded image), so an out-of-range pointer is host-reachable.
+        assert_eq!(sys_process_spawn(USER_VIRT_END), Err(KError::FaultFromUser));
+        assert_eq!(
+            dispatch(SYS_PROCESS_SPAWN, USER_VIRT_END, 0, 0, 0, 0, 0),
+            KError::FaultFromUser.as_isize(),
+        );
     }
 
     #[test]

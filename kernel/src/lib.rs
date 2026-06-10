@@ -13,6 +13,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod arch;
+pub mod embedded_images;
 pub mod font;
 pub mod framebuffer;
 pub mod handle;

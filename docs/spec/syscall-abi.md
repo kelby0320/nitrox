@@ -87,6 +87,10 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `12` | `sys_channel_create` |
 | `13` | `sys_channel_send` |
 | `14` | `sys_channel_recv` |
+| `15` | `sys_process_spawn` |
+| `16` | `sys_process_exit` |
+| `17` | `sys_thread_exit` |
+| `18` | `sys_thread_set_affinity` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -97,7 +101,8 @@ Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-
 A small set of **debug-only** syscalls exists to bootstrap and exercise the kernel before the stable syscall surface lands. They occupy a deliberately high, non-stable number range (`0xFFFF_0000+`) so they never shadow the stable sequential numbers, and they are **excluded from the v1.0 ABI freeze** — they may change or be removed without notice.
 
 - `sys_debug_kprint(ptr: UserPtr<u8>, len: usize) -> isize` (`0xFFFF_0000`) — copy `len` user bytes (bounded) and write them to the kernel serial log; returns the byte count. The non-async exception to the async-first rule (it completes immediately).
-- `sys_debug_exit(status: i32) -> !` (`0xFFFF_0001`) — used only by the throwaway ring-3 bootstrap harness to return control to the kernel; removed when the first real userspace process lands.
+
+(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (17).)
 
 ## The complete syscall set
 
@@ -201,22 +206,32 @@ Creates a new empty `Namespace` kernel object. Returns a handle with full rights
 ```rust
 fn sys_process_spawn(args: UserPtr<SpawnArgs>) -> isize
 ```
-Spawns a new process per the `SpawnArgs` struct (see [SpawnArgs spec](process-spawn-args.md)). Returns a handle to the new process. The child's initial handle table is populated from `args.handles`; child's namespace is `args.namespace`.
+Spawns a new process per the `SpawnArgs` struct (see [SpawnArgs spec](process-spawn-args.md)) and returns a handle to it (`SIGNAL | TERMINATE`). The child's initial handle table is populated from `args.handles` (each installed with `source_rights & args.rights[i]`; `args.move_mask` chooses move vs. duplicate per handle), plus a fresh notification channel. (Syscall number `15`.)
+
+**Phase-1 forms (deferred to Phase 2):**
+- The image is selected by a **kernel-embedded `ImageId`** (`args.image`), not a filesystem path / `MemoryObject` handle — there is no filesystem yet.
+- The child learns its installed handle *values* through a **register bootstrap ABI** seeded at entry: `rdi` = its notification-channel handle, `rsi` = its first installed handle, `rdx` = `args.arg0`. (Phase 2 replaces this with a stack-resident bootstrap block / the init handoff.)
+- `args.namespace` is **not** yet honoured (namespaces are Phase 2).
 
 ```rust
 fn sys_thread_create(args: UserPtr<ThreadArgs>) -> isize
 ```
-Creates a new thread in the calling process. Returns a thread handle.
+Creates a new thread in the calling process. Returns a thread handle. **(Not yet implemented — lands with the threads slice.)**
 
 ```rust
 fn sys_thread_exit(status: i32) -> !
 ```
-Exits the calling thread. Does not return.
+Exits the calling thread with `status`. Does not return. (Syscall number `17`; Phase-1 processes are single-threaded, so this is identical to `sys_process_exit`.)
 
 ```rust
 fn sys_process_exit(status: i32) -> !
 ```
-Exits the calling process (terminates all its threads). Does not return.
+Exits the calling process with `status`. The kernel delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), then terminates the calling thread. Does not return. (Syscall number `16`. Multi-thread teardown — terminating sibling threads — lands with `sys_thread_create`.)
+
+```rust
+fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: u64) -> isize
+```
+Restricts which CPUs `thread` may run on (requires `SIGNAL`). **No-op until SMP (Phase 3):** validates the handle is a `Thread` carrying `SIGNAL`, then accepts and ignores `cpu_mask`. (Syscall number `18`.)
 
 ```rust
 fn sys_thread_set_tls(tls_base: usize) -> isize

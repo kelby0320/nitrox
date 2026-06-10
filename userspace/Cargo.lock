@@ -3,6 +3,10 @@
 version = 4
 
 [[package]]
+name = "child"
+version = "0.1.0"
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 
@@ -12,4 +16,8 @@ version = "0.1.0"
 
 [[package]]
 name = "libkern"
+version = "0.1.0"
+
+[[package]]
+name = "parent"
 version = "0.1.0"
