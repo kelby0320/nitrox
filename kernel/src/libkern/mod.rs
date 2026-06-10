@@ -28,6 +28,7 @@ pub mod memory;
 pub mod notification;
 pub mod spawn;
 pub mod spinlock;
+pub mod thread;
 pub mod timer_flags;
 
 pub use clock::ClockId;
@@ -36,6 +37,7 @@ pub use io_result::IoResult;
 pub use ipc::{IpcMsg, IpcMsgHeader, SendMode};
 pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
 pub use spawn::{ImageId, SpawnArgs, SPAWN_MAX_HANDLES};
+pub use thread::ThreadArgs;
 pub use kbox::KBox;
 pub use memory::MemFlags;
 pub use timer_flags::TimerFlags;

@@ -91,6 +91,9 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `16` | `sys_process_exit` |
 | `17` | `sys_thread_exit` |
 | `18` | `sys_thread_set_affinity` |
+| `19` | `sys_thread_create` |
+| `20` | `sys_thread_get_registers` |
+| `21` | `sys_exception_resume` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -216,17 +219,17 @@ Spawns a new process per the `SpawnArgs` struct (see [SpawnArgs spec](process-sp
 ```rust
 fn sys_thread_create(args: UserPtr<ThreadArgs>) -> isize
 ```
-Creates a new thread in the calling process. Returns a thread handle. **(Not yet implemented — lands with the threads slice.)**
+Creates a new thread in the **calling process** and returns a `Thread` handle (`SIGNAL | TERMINATE | INSPECT | DUPLICATE`). The new thread begins at `args.entry` (ring 3) with `rsp = args.user_sp` and `rdx = args.arg0`; the caller owns the user stack (allocate + map it via `sys_memory_create` / `sys_memory_map`, pass its top). `entry`/`user_sp` must be non-null user-half addresses — that they are *mapped* is the caller's responsibility. See [ThreadArgs spec](thread-args.md). (Syscall number `19`.) This is the supervisor primitive behind exception handling: a sibling thread holds a faulting thread's handle and acts on it via `sys_thread_get_registers` / `sys_exception_resume`.
 
 ```rust
 fn sys_thread_exit(status: i32) -> !
 ```
-Exits the calling thread with `status`. Does not return. (Syscall number `17`; Phase-1 processes are single-threaded, so this is identical to `sys_process_exit`.)
+Exits the **calling thread** with `status`. A `ChildExited { pid, Normal(status) }` fires to the parent's notification channel only if this was the process's last thread (sibling threads keep the process alive). Does not return. (Syscall number `17`.)
 
 ```rust
 fn sys_process_exit(status: i32) -> !
 ```
-Exits the calling process with `status`. The kernel delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), then terminates the calling thread. Does not return. (Syscall number `16`. Multi-thread teardown — terminating sibling threads — lands with `sys_thread_create`.)
+Exits the **calling process** with `status`: the kernel tears down every sibling thread of the caller's process (an `owner_pid` scan of the run/blocked/suspended queues — unregistering blocked siblings from their waits first), delivers `ChildExited { pid, Normal(status) }` to the parent's notification channel (if any), then terminates the calling thread and reaps the process (freeing its address space). Does not return. (Syscall number `16`.)
 
 ```rust
 fn sys_thread_set_affinity(thread: RawHandle, cpu_mask: u64) -> isize
@@ -246,12 +249,14 @@ Restricts which CPUs `thread` may run on. Requires `SIGNAL` right.
 ```rust
 fn sys_thread_get_registers(thread: RawHandle, out: UserMutPtr<RegisterValues>) -> isize
 ```
-Writes the saved register state of `thread` to `*out`. Thread must be suspended (typically due to exception). Requires `SIGNAL` right.
+Writes the saved user register state of `thread` to `*out` (the 16 GPRs plus `rip`/`rflags`; see [RegisterValues](#registervalues)). The thread must be **suspended on a fault** (else `InvalidArgument`); the captured frame lives on its kernel stack and is stable while it stays parked. Requires `SIGNAL` right and a `Thread` handle. (Syscall number `20`.)
 
 ```rust
-fn sys_exception_resume(thread: RawHandle, disposition: Disposition) -> isize
+fn sys_exception_resume(thread: RawHandle, disposition: u64, code: u64) -> isize
 ```
-Resumes a suspended thread with the specified disposition (Resume, ResumeSkip, Terminate, ModifyAndResume). Requires `SIGNAL` right. **Deferred** (the debugger/suspend model): the notifications slice uses a **post-mortem** model — a ring-3 fault delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel` and **terminates** the faulting thread (the kernel survives, vs. the old halt). Suspend + `sys_exception_resume` + register inspection land when a real userspace supervisor exists (process spawn).
+Acts on a thread **suspended on a fault**. `disposition` is `0` = **Resume** (re-enter the faulting instruction — without first fixing the fault's cause it simply re-faults) or `2` = **Terminate** (exit the thread with `code`); other values are reserved and return `Unsupported`. Requires `SIGNAL` right and a `Thread` handle; the thread must currently be suspended (else `InvalidArgument`). Returns `0`. (Syscall number `21`.)
+
+The exception model is **suspend + supervised resume/terminate**: a ring-3 fault suspends the faulting thread and delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel`; a supervisor (a sibling thread holding the faulter's handle) inspects it via `sys_thread_get_registers` and resumes or terminates it. **Deferred to Phase 2:** the `ResumeSkip` / `ModifyAndResume` dispositions (`1` / `3`), the 30 s auto-terminate timeout (`sys_exception_extend_timeout`), and the debugger exception-channel priority chain.
 
 ```rust
 fn sys_exception_extend_timeout(thread: RawHandle, additional_ns: u64) -> isize
@@ -379,9 +384,12 @@ Argument types referenced above are defined in `libkern`:
 - `Rights`: a bitflags type, see [handle-encoding.md](handle-encoding.md)
 - `IoResult`: `#[repr(C)]` 16-byte record, 8-aligned, no padding: `handle: u64` (offset 0, the signaled handle), `status: i32` (offset 8, `0` = ready, negative = a `KError`), `reserved: u32` (offset 12, zeroed). Defined in `kernel/src/libkern/io_result.rs`. **Part of the ABI version hash** (`abi-version-hash.md` § "IoOp and IoResult layouts").
 - `TimerFlags`: `#[repr(transparent)]` bitflags over `u64`; no flags defined yet (must be 0). Defined in `kernel/src/libkern/timer_flags.rs`.
-- `IoOp`, `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents
+- `IoOp`, `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents ([ThreadArgs](thread-args.md))
 - `ClockId`: `#[repr(u32)]` enum, `Monotonic = 0`, `Realtime = 1`, `ProcessCpu = 2`, `ThreadCpu = 3`; defined in `kernel/src/libkern/clock.rs`
-- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`
+- `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
+
+<a id="registervalues"></a>
+- `RegisterValues`: `#[repr(C)]` snapshot a faulted thread's registers are read into by `sys_thread_get_registers`. On x86_64: 18 `u64`s = the 16 GPRs in the order `rax, rbx, rcx, rdx, rsi, rdi, rbp, rsp, r8..r15` (offsets 0–120), then `rip` (offset 128) and `rflags` (offset 136); 144 bytes, 8-aligned. aarch64 will define its own ordering when that arch lands. **This is a per-architecture type** — it lives behind the arch boundary in `kernel/src/arch/<arch>/registers.rs` (exposed neutrally as `crate::arch::RegisterValues`, read via the `ArchRegisters` trait), not in `libkern`, because the register set itself is arch-specific. **An ABI-version-hash input** (a cross-boundary layout, like `SpawnArgs` / `ThreadArgs`); its hashed layout is the active architecture's.
 
 ## Stability
 

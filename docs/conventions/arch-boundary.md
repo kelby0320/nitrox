@@ -62,8 +62,9 @@ unchanged.
   is re-exported from `arch/mod.rs` under a neutral alias. Today:
   `arch::paging` (`ArchPaging` → `Paging`), `arch::irq` (`ArchIrq` → `Irq`),
   `arch::cpu` (`ArchCpu` → `Cpu`), `arch::user_access` (`ArchUserAccess` →
-  `UserAccess`), `arch::smp` (`ArchSmp` → `Smp`); future `arch::timer`,
-  `arch::fpu`.
+  `UserAccess`), `arch::smp` (`ArchSmp` → `Smp`), `arch::registers`
+  (`ArchRegisters` → `Registers`, with the per-arch `RegisterValues` ABI type);
+  future `arch::timer`, `arch::fpu`.
 - A few re-exported module names are themselves neutral and acceptable:
   `arch::abi` (the platform ABI constants) and `arch::serial` (the debug
   console). Their *names* carry no architecture jargon even though their

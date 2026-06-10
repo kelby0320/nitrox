@@ -4,10 +4,12 @@
 //! spurious vector (`0xFF`).
 //!
 //! Exception handling splits by privilege: a **ring-0 (kernel)** fault prints
-//! the faulting state and halts (`dump_and_halt`); a **ring-3 (user)** fault is
-//! delivered to the faulting process as a `Notification` (`SegFault` /
-//! `IllegalInsn` / `DivideByZero`) and the faulting thread is terminated, so the
-//! kernel survives (see `sched::deliver_fault_and_exit` and
+//! the faulting state and halts (`dump_and_halt`); a **ring-3 (user)** fault
+//! **suspends** the faulting thread — a `Notification` (`SegFault` /
+//! `IllegalInsn` / `DivideByZero`) is delivered to the faulting process and a
+//! supervisor decides via `sys_exception_resume` whether to retry the
+//! instruction (`Resume`) or terminate the thread (`Terminate`), so the kernel
+//! survives (see `sched::suspend_with_fault`, `user_fault`, and
 //! `docs/architecture/notifications.md`). The timer vector is a **returning**
 //! stub (it `iretq`s back) that drives the preemptive scheduler; the spurious
 //! vector just `iretq`s. After the preemptive-scheduling slice the kernel runs
@@ -54,6 +56,7 @@ use crate::arch::x86_64::serial;
 use crate::libkern::notification::{
     FaultKind, KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, Notification,
 };
+use super::registers::RegisterValues;
 
 /// A 64-bit IDT gate descriptor (16 bytes).
 #[repr(C)]
@@ -151,9 +154,15 @@ const _: () = assert!(core::mem::offset_of!(ExceptionFrame, rip) == 17 * 8);
 ///
 /// The `noerr` form pushes a dummy `0` error code first; the `err` form
 /// relies on the CPU-pushed error code. Both then push the vector number
-/// and the 15 GPRs and call [`exception_dispatch`]. The trailing `ud2`
-/// is unreachable (the dispatcher never returns) — a tripwire in case it
-/// ever does.
+/// and the 15 GPRs and call [`exception_dispatch`].
+///
+/// Like [`vec14`] and [`timer_stub`], the stub ends in a pop+`iretq` epilogue
+/// rather than `ud2`: [`exception_dispatch`] **returns** on the ring-3
+/// fault→`Resume` path (the supervisor chose to retry the instruction), and the
+/// stub then unwinds the GPRs / vector / error-code slots and `iretq`s the
+/// unmodified frame. A kernel-mode fault diverges in `dump_and_halt`, and a
+/// `Terminate` disposition diverges in `exit_thread`, so the epilogue is only
+/// *reached* on the resume path.
 macro_rules! exception_stub {
     (noerr, $name:ident, $vec:expr) => {
         exception_stub!(@build $name, $vec, "push 0\n");
@@ -163,7 +172,7 @@ macro_rules! exception_stub {
     };
     (@build $name:ident, $vec:expr, $errcode:literal) => {
         #[unsafe(naked)]
-        extern "C" fn $name() -> ! {
+        extern "C" fn $name() {
             ::core::arch::naked_asm!(
                 concat!(
                     $errcode,
@@ -175,7 +184,16 @@ macro_rules! exception_stub {
                     "mov rdi, rsp\n",
                 ),
                 "call {dispatch}",
-                "ud2",
+                // Resume path: pop the GPRs, drop the vector + error-code slots
+                // (16 bytes), and `iretq` to the (unmodified) faulting RIP.
+                concat!(
+                    "pop r15\npop r14\npop r13\npop r12\n",
+                    "pop r11\npop r10\npop r9\npop r8\n",
+                    "pop rbp\npop rdi\npop rsi\n",
+                    "pop rdx\npop rcx\npop rbx\npop rax\n",
+                    "add rsp, 16\n",
+                    "iretq\n",
+                ),
                 dispatch = sym exception_dispatch,
             );
         }
@@ -229,7 +247,7 @@ exception_stub!(noerr, vec31, 31);
 /// `#PF` (vector 14) entry stub. See the module doc for the recovery
 /// contract.
 #[unsafe(naked)]
-extern "C" fn vec14() -> ! {
+extern "C" fn vec14() {
     ::core::arch::naked_asm!(
         // The CPU pushed a #PF error code; push the vector and the 15
         // GPRs to build a full `ExceptionFrame` on the stack, then pass
@@ -285,10 +303,12 @@ extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
 
     if is_user_fault(f) {
         // A genuine ring-3 page fault (not a kernel copy-primitive fault that
-        // missed the recovery table): deliver SegFault + terminate. The CR2
-        // read here is the faulting linear address. Never returns.
+        // missed the recovery table): suspend → supervised resume/terminate.
+        // The CR2 read here is the faulting linear address. On `Resume` this
+        // returns and the stub `iretq`s; on `Terminate` it diverges.
         let cr2 = regs::read_cr2();
-        crate::sched::deliver_fault_and_exit(notif_for_vector(f, Some(cr2)));
+        user_fault(f, Some(cr2));
+        return;
     }
 
     dump_and_halt(f);
@@ -359,8 +379,10 @@ extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
     crate::sched::on_timer_tick();
 }
 
-/// Entry stubs for CPU exception vectors 0-31, indexed by vector number.
-const STUBS: [extern "C" fn() -> !; 32] = [
+/// Entry stubs for CPU exception vectors 0-31, indexed by vector number. Each
+/// `iretq`s on the ring-3 fault→`Resume` path (see [`exception_stub`]) and
+/// otherwise diverges, so the type is `extern "C" fn()` (not `-> !`).
+const STUBS: [extern "C" fn(); 32] = [
     vec0, vec1, vec2, vec3, vec4, vec5, vec6, vec7, vec8, vec9, vec10, vec11, vec12, vec13, vec14,
     vec15, vec16, vec17, vec18, vec19, vec20, vec21, vec22, vec23, vec24, vec25, vec26, vec27,
     vec28, vec29, vec30, vec31,
@@ -395,25 +417,88 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
-/// Common handler for every CPU exception except `#PF`. A **ring-3** fault is
-/// delivered to the faulting process as a [`Notification`] and the faulting
-/// thread is terminated (the kernel survives); a **ring-0** fault is fatal
-/// ([`dump_and_halt`]). Never returns either way.
+/// Common handler for every CPU exception except `#PF`. A **ring-3** fault
+/// suspends the faulting thread (delivering a [`Notification`] to its process)
+/// and acts on the supervisor's disposition via [`user_fault`] — returning here
+/// (so the stub `iretq`s the unmodified frame) on `Resume`, or diverging into
+/// `exit_thread` on `Terminate`. A **ring-0** fault is fatal ([`dump_and_halt`],
+/// diverges).
 ///
-/// Reached only from a naked stub via `call`; `extern "C"` matches the
-/// stub's `mov rdi, rsp` argument pass.
-extern "C" fn exception_dispatch(frame: *const ExceptionFrame) -> ! {
+/// `*mut ExceptionFrame` (not `*const`): the `Resume` path leaves the frame in
+/// place for the stub to `iretq`, and matches [`pf_dispatch`]. Reached only from
+/// a naked stub via `call`; `extern "C"` matches the stub's `mov rdi, rsp`.
+extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
     // SAFETY: the naked stub built a complete `ExceptionFrame` at the
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
-    let f = unsafe { &*frame };
+    let f = unsafe { &mut *frame };
     if is_user_fault(f) {
-        // Deliver the fault as a notification + terminate the faulting thread.
-        // `deliver_fault_and_exit` never returns (it switches away forever).
-        crate::sched::deliver_fault_and_exit(notif_for_vector(f, None));
+        // Suspend → supervised resume/terminate (no CR2 for non-#PF vectors).
+        user_fault(f, None);
+        return;
     }
     // Ring-0 (kernel) fault: unrecoverable — dump and halt.
     dump_and_halt(f);
+}
+
+/// Shared ring-3 fault handler for every exception vector: suspend the faulting
+/// thread with a fault [`Notification`] (delivered to its process's channel,
+/// waking the supervisor), then act on the [`ResumeDisposition`] the supervisor
+/// chose via `sys_exception_resume`. `Terminate` exits the thread (diverges);
+/// `Resume` returns, so the entry stub `iretq`s the **unmodified** frame and the
+/// faulting instruction retries. `cr2` carries the faulting address for `#PF`.
+fn user_fault(f: &mut ExceptionFrame, cr2: Option<u64>) {
+    let notif = notif_for_vector(f, cr2);
+    let frame_ptr = f as *mut ExceptionFrame as usize;
+    match crate::sched::suspend_with_fault(frame_ptr, notif) {
+        crate::sched::ResumeDisposition::Terminate(code) => {
+            // Diverges: switches away from this (now-terminated) thread forever.
+            crate::sched::exit_thread(crate::libkern::ExitStatus {
+                kind: crate::libkern::ExitKind::Crashed as u32,
+                code,
+            });
+        }
+        // Return to the stub, which `iretq`s back to the faulting RIP (retry).
+        crate::sched::ResumeDisposition::Resume => {}
+    }
+}
+
+/// Reads a suspended thread's captured user registers out of the private
+/// [`ExceptionFrame`] the entry stub built. The impl lives here (rather than in
+/// [`registers`](super::registers), which owns the [`RegisterValues`] type)
+/// precisely so `ExceptionFrame` stays private to this module — the arch
+/// boundary's [`ArchRegisters`](crate::arch::registers::ArchRegisters) contract,
+/// re-exported as `crate::arch::Registers`, behind `sys_thread_get_registers`.
+impl crate::arch::registers::ArchRegisters for super::registers::X86Registers {
+    type Values = RegisterValues;
+
+    fn read_from_exception_frame(frame_ptr: usize) -> RegisterValues {
+        // SAFETY: `frame_ptr` is the kernel-stack address of a suspended
+        // thread's `ExceptionFrame` (the thread stays parked while suspended, so
+        // the frame is stable); read-only, 8-byte aligned. The caller pins the
+        // thread.
+        let f = unsafe { &*(frame_ptr as *const ExceptionFrame) };
+        RegisterValues {
+            rax: f.rax,
+            rbx: f.rbx,
+            rcx: f.rcx,
+            rdx: f.rdx,
+            rsi: f.rsi,
+            rdi: f.rdi,
+            rbp: f.rbp,
+            rsp: f.rsp,
+            r8: f.r8,
+            r9: f.r9,
+            r10: f.r10,
+            r11: f.r11,
+            r12: f.r12,
+            r13: f.r13,
+            r14: f.r14,
+            r15: f.r15,
+            rip: f.rip,
+            rflags: f.rflags,
+        }
+    }
 }
 
 /// `true` iff the saved frame is from ring 3 (user). The CPU stores the code

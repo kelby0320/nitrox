@@ -20,9 +20,9 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
 - **Phase 0 (Foundation):** complete — kernel boots under QEMU+OVMF and
   renders a framebuffer boot screen. See the Phase 0 deviation notes for
   where it diverged from the original checklist.
-- **Phase 1 (Kernel substrate):** in progress — the
-  address-spaces-and-paging and user-memory-access slices are
-  complete. Memory foundation (buddy / slab / `libkern` containers),
+- **Phase 1 (Kernel substrate):** **complete** — every milestone clause
+  ships (IPC between two processes, a parent spawning + reaping them, and
+  supervised exception suspend/resume). Memory foundation (buddy / slab / `libkern` containers),
   kernel diagnostics (serial, GDT/TSS/IDT, fault dumps), the
   `ArchPaging` trait + x86_64 4-level page-table primitive, the VMA
   tree (interval-augmented intrusive RB-tree), `AddressSpace` (VMA
@@ -52,8 +52,13 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   **substrate-works milestone**: an embedded `ET_EXEC` (`userspace/hello`) is
   loaded into an `AddressSpace`, wrapped in a `Process`, and run as a
   scheduler-driven user thread that prints from ring 3 and exits via
-  `sys_process_exit`; the scheduler now manages per-thread CR3. Next:
-  fleshing out the real syscall surface (handle ops, memory objects, IPC).
+  `sys_process_exit`; the scheduler now manages per-thread CR3. The real
+  syscall surface then landed in full — handle ops, memory objects, clocks +
+  timers, `sys_wait`, notifications, IPC (`sys_channel_create`/`send`/`recv`)
+  with handle transfer, process spawn + lifecycle + `ChildExited`, and finally
+  `sys_thread_create` + supervised exception suspend/resume — closing the Phase 1
+  milestone. Next: Phase 2 (ACPI, SMP, the filesystem + a real init/service
+  manager, namespaces, and the async-I/O ring).
 - **Phase 2 (Filesystem and namespace):** not started
 - **Phase 3 (Service ecosystem):** not started
 - **Phase 4+ (Shell, display, networking):** not started
@@ -614,14 +619,15 @@ exception-delivery path uses the wait-queue blocking primitive above.
 - [x] Exception notification variants: `SegFault`, `IllegalInsn`, `DivideByZero`
       wired (real producer). `ChildExited` (needs spawn + real exit) and
       `PeerClosed` (needs IPC) defined as discriminants only — no producer yet.
-- [x] Exception delivery path — **post-mortem**: ring-3 fault → notification +
-      **terminate** the faulting thread (reuses `exit()`); the kernel survives.
+- [x] Exception delivery path — **suspend + supervised resume/terminate** (slice
+      ③, was post-mortem): ring-3 fault → notification + **suspend** the faulting
+      thread; a supervisor resumes or terminates it. The kernel survives.
 - [x] Overflow handling (exception-priority eviction + `NotificationsDropped`)
-- [ ] Exception **suspend** + `sys_exception_resume` with `Disposition`
-      (+ `sys_thread_get_registers`, auto-terminate timeout, debugger
-      exception-channel priority chain) — **slice ③** (its only caller is a
-      userspace supervisor holding the faulting thread's handle; a minimal
-      `Resume`/`Terminate` lands there, the rest in Phase 2).
+- [x] Exception **suspend** + `sys_exception_resume` with `Resume`/`Terminate`
+      (+ `sys_thread_get_registers`) — **slice ③**: a ring-3 fault now suspends
+      the faulting thread (uniform across all user-fault vectors) and a supervisor
+      resumes or terminates it. The debugger extras (`ResumeSkip`/`ModifyAndResume`,
+      auto-terminate timeout, exception-channel priority chain) stay Phase 2.
 
 #### IPC
 
@@ -676,16 +682,26 @@ milestone; ② clears the IPC handle-transfer deferral; ③ finishes the milesto
 - [x] Demo: a child transfers a `MemoryObject` to its sibling, which maps it and
       reads back the shared marker
 
-##### Slice ③ — Threads + minimal exception resume/terminate
+##### Slice ③ — Threads + minimal exception resume/terminate (done)
 
-- [ ] `sys_thread_create` + multi-thread process-exit teardown (terminating
-      sibling threads when a multi-threaded process exits)
-- [ ] `sys_thread_get_registers` (read a suspended thread's saved frame)
-- [ ] Exception **suspend** (vs. today's post-mortem terminate) +
-      `sys_exception_resume` with **`Resume`** / **`Terminate`** dispositions —
-      finishes the milestone's "resume or terminate" clause. The heavy debugger
-      extras (`ModifyAndResume`, auto-terminate timeout, exception-channel
-      priority chain) stay deferred to Phase 2.
+- [x] `sys_thread_create` (syscall 19; a `Thread` handle, the supervisor
+      capability) + multi-thread process-exit teardown — `exit_process` scans the
+      run/blocked/suspended queues by `owner_pid` and reaps the siblings (a
+      per-process thread list lands in Phase 2; the scan is correct now)
+- [x] `sys_thread_get_registers` (syscall 20; reads a suspended thread's saved
+      `ExceptionFrame` into the neutral `RegisterValues`)
+- [x] Exception **suspend** (uniform across all user-fault vectors, via the
+      shared stub epilogue) + `sys_exception_resume` (syscall 21) with
+      **`Resume`** / **`Terminate`** dispositions — finishes the milestone's
+      "resume or terminate" clause. The heavy debugger extras (`ResumeSkip` /
+      `ModifyAndResume`, auto-terminate timeout, exception-channel priority chain)
+      stay deferred to Phase 2.
+- [x] Demo: `userspace/parent` creates a worker thread that segfaults, receives
+      the `SegFault`, inspects its registers, and terminates it — before the
+      existing spawn/transfer demo and a final `sys_process_exit`.
+
+**Phase 1 milestone met** — the kernel substrate is complete (see the milestone
+below; every clause now ships).
 
 **Punted past Phase 1 (consumer-gated):** FPU `XSAVE` save/restore + TLS
 (`sys_thread_set_tls`) — userspace is soft-float, so no thread touches the FPU

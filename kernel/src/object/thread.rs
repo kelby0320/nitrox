@@ -51,8 +51,12 @@ pub enum ThreadState {
     /// Off the run queue, blocked in `sys_wait` on ≥1 object and/or a deadline;
     /// parked in the scheduler's `blocked` list until a waker makes it runnable.
     Blocked,
-    /// Body returned or [`exit`](crate::sched::exit) called; awaiting
-    /// reclamation by the next scheduler entry.
+    /// Off the run queue after a ring-3 fault, parked in the scheduler's
+    /// `suspended` list with its `ExceptionFrame` preserved on its kernel stack,
+    /// awaiting a supervisor's `sys_exception_resume` (resume or terminate).
+    Suspended,
+    /// Body returned or `exit` called; awaiting reclamation by the next
+    /// scheduler entry.
     Exited,
 }
 
@@ -134,6 +138,16 @@ pub struct Thread {
     wait_has_deadline: bool,
     /// The wake handshake; a [`WaitPhase`] discriminant in an [`AtomicU8`].
     wait_phase: AtomicU8,
+    /// Kernel-stack address of the `ExceptionFrame` captured when this thread
+    /// faulted in ring 3 (meaningful only while `state == Suspended`); `0` when
+    /// not suspended. The supervisor reads the frame via `sys_thread_get_registers`;
+    /// the thread itself unwinds it on resume.
+    exception_frame: usize,
+    /// Resume disposition set by `sys_exception_resume` and read when the
+    /// suspended thread resumes: `0` = Resume (retry), `2` = Terminate. `disp_code`
+    /// carries the terminate exit code.
+    disp_tag: u8,
+    disp_code: i32,
     // Deferred to later slices:
     //   fpu_context  — kernel is soft-float; lands with userspace threads.
     //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
@@ -167,6 +181,9 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
+            exception_frame: 0,
+            disp_tag: 0,
+            disp_code: 0,
         })
     }
 
@@ -195,6 +212,9 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
+            exception_frame: 0,
+            disp_tag: 0,
+            disp_code: 0,
         })
     }
 
@@ -235,6 +255,9 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
+            exception_frame: 0,
+            disp_tag: 0,
+            disp_code: 0,
         })
     }
 
@@ -290,6 +313,9 @@ impl Thread {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
+            exception_frame: 0,
+            disp_tag: 0,
+            disp_code: 0,
         })
     }
 
@@ -338,6 +364,66 @@ impl Thread {
     pub(crate) unsafe fn set_state(obj: *mut (), s: ThreadState) {
         let p = obj as *mut Thread;
         unsafe { core::ptr::write(&raw mut (*p).state, s) }
+    }
+
+    /// Read the scheduler lifecycle state (production-reachable for the
+    /// process-teardown sibling scan and the suspend/resume checks).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn state_now(obj: *mut ()) -> ThreadState {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).state) }
+    }
+
+    /// Record the kernel-stack address of the faulting `ExceptionFrame` when this
+    /// thread suspends.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_exception_frame(obj: *mut (), frame: usize) {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::write(&raw mut (*p).exception_frame, frame) }
+    }
+
+    /// The stored `ExceptionFrame` address, or `None` if this thread is not
+    /// suspended on a fault.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn exception_frame(obj: *mut ()) -> Option<usize> {
+        let p = obj as *mut Thread;
+        let v = unsafe { core::ptr::read(&raw const (*p).exception_frame) };
+        if v == 0 { None } else { Some(v) }
+    }
+
+    /// Set the resume disposition (`sys_exception_resume`): tag `0` = Resume,
+    /// `2` = Terminate (with `code`).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_disposition(obj: *mut (), tag: u8, code: i32) {
+        let p = obj as *mut Thread;
+        unsafe {
+            core::ptr::write(&raw mut (*p).disp_tag, tag);
+            core::ptr::write(&raw mut (*p).disp_code, code);
+        }
+    }
+
+    /// Read the resume disposition `(tag, code)` set by `sys_exception_resume`,
+    /// and clear the stored frame (the thread is unwinding it). Read when a
+    /// suspended thread resumes.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn take_disposition(obj: *mut ()) -> (u8, i32) {
+        let p = obj as *mut Thread;
+        unsafe {
+            let tag = core::ptr::read(&raw const (*p).disp_tag);
+            let code = core::ptr::read(&raw const (*p).disp_code);
+            core::ptr::write(&raw mut (*p).exception_frame, 0);
+            (tag, code)
+        }
     }
 
     /// Read the saved stack pointer of this thread's parked context.
@@ -650,6 +736,9 @@ mod tests {
             wait_count: 0,
             wait_has_deadline: false,
             wait_phase: AtomicU8::new(WaitPhase::Running as u8),
+            exception_frame: 0,
+            disp_tag: 0,
+            disp_code: 0,
         })
         .unwrap()
     }

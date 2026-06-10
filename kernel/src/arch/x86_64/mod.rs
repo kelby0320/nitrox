@@ -7,6 +7,7 @@ pub mod cpu;
 pub mod gdt;
 pub mod idt;
 pub mod paging;
+pub mod registers;
 pub mod regs;
 pub mod serial;
 pub mod smp;
