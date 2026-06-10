@@ -84,6 +84,9 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `9` | `sys_timer_set` |
 | `10` | `sys_wait` |
 | `11` | `sys_notif_recv` |
+| `12` | `sys_channel_create` |
+| `13` | `sys_channel_send` |
+| `14` | `sys_channel_recv` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -155,7 +158,7 @@ fn sys_wait(
 ```
 Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
 
-**Implemented for `Timer` and `NotificationChannel` handles** (a channel is signaled when its queue is non-empty); other waitable types (`PendingOperation`, `IpcChannel`, `Process`) return `Unsupported` until their slices land. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
+**Implemented for `Timer`, `NotificationChannel`, and `IpcChannel` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed); other waitable types (`PendingOperation`, `Process`) return `Unsupported` until their slices land. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
 
 ### Namespace
 
@@ -271,7 +274,7 @@ fn sys_channel_create(
     queue_depth: u32,
 ) -> isize
 ```
-Creates a new IPC channel with the specified queue depth. Writes the two endpoint handles to `*end0` and `*end1`.
+Creates a new IPC channel with the specified queue depth (`0` → default 16; `> 1024` → `InvalidArgument`). Writes the two endpoint handles to `*end0` and `*end1`, each carrying `SEND | RECV | DUPLICATE | TRANSFER | INSPECT | WAIT`. (Syscall number `12`.)
 
 ```rust
 fn sys_channel_send(
@@ -282,7 +285,9 @@ fn sys_channel_send(
     mode:    SendMode,
 ) -> isize
 ```
-Sends `*msg` plus `handles[0..count]` over `ch`. `mode` controls blocking behavior (Block, NoBlock, BlockBounded). Returns a `PendingOperation` handle.
+Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel stamps `header.sender_pid` / `timestamp`. Returns `0`, `WouldBlock` if the queue is full (`NoBlock`), or `PeerClosed` if the peer endpoint has closed. (Syscall number `13`.)
+
+**Implemented subset:** `mode == NoBlock` only — `Block` / `BlockBounded` (which block via a `PendingOperation`, returning that handle) are deferred to the async-I/O slice and currently return `Unsupported`. Handle transfer is deferred to process spawn: `count` must be `0` (non-zero → `Unsupported`); the `handles`/`count` parameters are retained in the ABI for stability.
 
 ```rust
 fn sys_channel_recv(
@@ -292,7 +297,7 @@ fn sys_channel_recv(
     count:   UserMutPtr<usize>,
 ) -> isize
 ```
-Receives a message from `ch`. Blocks via `sys_wait` if no message is queued. Writes the received message to `*msg`, transferred handles to `handles[]`, and the actual handle count to `*count`.
+Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no message is queued — the caller `sys_wait`s on `ch` to block — or `PeerClosed` if the inbox is empty and the peer has closed. On success writes the 4096-byte message to `*msg` and the transferred-handle count to `*count` (`0` this slice — handle transfer deferred). (Syscall number `14`.)
 
 ### Kernel Objects
 

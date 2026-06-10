@@ -19,7 +19,7 @@ enforced by code review.
 | 2    | Wait queue                                   | reserved (Phase 1 folds wait/timer state into rank 1 — see § Wait queues) |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
 | 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
-| 5    | IPC channel                                  | not yet present                          |
+| 5    | IPC channel                                  | reserved (Phase 1 folds endpoint state into rank 1 — see § Wait queues) |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
@@ -235,10 +235,12 @@ a TSC read). So the conclusion is unchanged.
 
 ## Wait queues and the deadline heap live under rank 1 (Phase 1)
 
-`sys_wait`, the per-object waiter lists (inside a `Timer` or a
-`NotificationChannel`), the `NotificationChannel` queue + drop counter, the
-deadline min-heap, and the blocked-thread parking are all protected by the
-**rank-1 `SCHED` lock** for Phase 1, not by a separate rank-2 lock. On
+`sys_wait`, the per-object waiter lists (inside a `Timer`, a
+`NotificationChannel`, or an `IpcChannel` endpoint), the `NotificationChannel`
+queue + drop counter, each `IpcChannel` endpoint's receive ring + `peer` pointer,
+the deadline min-heap, and the blocked-thread parking are all protected by the
+**rank-1 `SCHED` lock** for Phase 1 (the rank-5 "IPC channel" slot stays reserved
+for the SMP split, like rank 2). On
 single-CPU this one-lock domain removes both the rank-2-from-IRQ ordering
 question and the wait/wakeup race:
 
@@ -263,6 +265,16 @@ then takes it again inside `exit()` — two acquisitions, never nested.
 `sys_notif_recv` pops one notification under `SCHED` and copies the 64-byte
 record to user memory **after** releasing the lock (never hold the `IrqSpinLock`
 across a potentially-faulting user copy).
+
+The IPC paths obey the same discipline. `sys_channel_send` copies the 4096-byte
+message **in** from user memory before taking `SCHED`, then pushes into the peer's
+ring + wakes its receivers under one hold; `sys_channel_recv` peeks under `SCHED`
+(the empty-poll `WouldBlock` path allocates nothing), pops under a second hold,
+then copies the message **out** after releasing the lock. `IpcChannel::Drop`
+(an endpoint's last handle closing) takes `SCHED` to null the surviving peer's
+back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are
+released only outside `SCHED` (handle close, the `sys_wait`/lookup references),
+never under it, so the destructor's acquire can never nest on a held `SCHED`.
 
 ## Adding a new lock
 

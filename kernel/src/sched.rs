@@ -59,7 +59,8 @@ use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
 use crate::libkern::Notification;
 use crate::object::{
-    MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, Thread, ThreadEntry, ThreadState, Timer,
+    IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, RecvState, SendOutcome,
+    StoredMsg, Thread, ThreadEntry, ThreadState, Timer,
 };
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
@@ -509,6 +510,7 @@ unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
         KObjectType::NotificationChannel => unsafe {
             NotificationChannel::already_signaled(obj)
         },
+        KObjectType::IpcChannel => unsafe { IpcChannel::already_signaled(obj) },
         _ => false,
     }
 }
@@ -519,6 +521,7 @@ unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
     match unsafe { obj_type(obj) } {
         KObjectType::Timer => unsafe { Timer::add_waiter(obj, th) },
         KObjectType::NotificationChannel => unsafe { NotificationChannel::add_waiter(obj, th) },
+        KObjectType::IpcChannel => unsafe { IpcChannel::add_waiter(obj, th) },
         _ => Err(()),
     }
 }
@@ -529,6 +532,7 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
     match unsafe { obj_type(obj) } {
         KObjectType::Timer => unsafe { Timer::remove_waiter(obj, th) },
         KObjectType::NotificationChannel => unsafe { NotificationChannel::remove_waiter(obj, th) },
+        KObjectType::IpcChannel => unsafe { IpcChannel::remove_waiter(obj, th) },
         _ => {}
     }
 }
@@ -549,6 +553,81 @@ fn signal_channel(g: &mut SchedState, channel: *mut ()) {
                 make_runnable(g, th);
             }
         }
+    }
+}
+
+/// Wake every thread blocked recv-ing on `endpoint` (a message just arrived in
+/// its inbox, or its peer just closed). Caller holds `SCHED`. No allocation, no
+/// blocking. Mirrors [`signal_channel`] but drains an [`IpcChannel`]'s
+/// recv-waiter list.
+fn signal_ipc_endpoint(g: &mut SchedState, endpoint: *mut ()) {
+    let mut buf = [core::ptr::null_mut(); IpcChannel::MAX_WAITERS];
+    // SAFETY: live endpoint, `SCHED` held — drains its recv-waiter list.
+    let n = unsafe { IpcChannel::take_waiters(endpoint, &mut buf) };
+    for &th in &buf[..n] {
+        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
+        // `blocked`; `SCHED` held.
+        unsafe {
+            Thread::wait_mark_signaled(th, endpoint as usize);
+            if Thread::wait_try_wake(th) {
+                make_runnable(g, th);
+            }
+        }
+    }
+}
+
+/// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,
+/// waking the peer's blocked receivers if the ring went empty→non-empty. The
+/// caller has already copied the message in from user memory (no copy under the
+/// lock). Returns the [`SendOutcome`] (`Sent` / `Full` → `WouldBlock` /
+/// `PeerClosed`).
+pub fn ipc_send_push(endpoint: *mut (), msg: &StoredMsg) -> SendOutcome {
+    let mut g = SCHED.lock();
+    // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
+    let outcome = unsafe { IpcChannel::send_push(endpoint, msg) };
+    if let SendOutcome::Sent { woke_edge: true } = outcome {
+        // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
+        let peer = unsafe { IpcChannel::peer_of(endpoint) };
+        if !peer.is_null() {
+            signal_ipc_endpoint(&mut g, peer);
+        }
+    }
+    outcome
+}
+
+/// Inspect `endpoint`'s receive side under `SCHED` without dequeuing — so the
+/// empty-poll `WouldBlock` path allocates no bounce buffer.
+pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
+    let _g = SCHED.lock();
+    // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
+    unsafe { IpcChannel::recv_peek(endpoint) }
+}
+
+/// Pop the oldest message from `endpoint`'s inbox into `dst` under `SCHED`.
+/// Returns `false` if it was drained between the peek and now. The caller copies
+/// `dst` out to user memory **after** this returns (never under the lock).
+pub fn ipc_recv_pop_into(endpoint: *mut (), dst: &mut StoredMsg) -> bool {
+    let _g = SCHED.lock();
+    // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
+    unsafe { IpcChannel::recv_pop_into(endpoint, dst) }
+}
+
+/// An IPC endpoint is being destroyed (its last handle closed). Under `SCHED`,
+/// null the surviving peer's back-pointer to us and wake its blocked receivers
+/// (which then observe `PeerClosed`). Called only from
+/// [`IpcChannel::drop`](crate::object::IpcChannel) — see that type's docs for
+/// the no-use-after-free argument and the "refs released only outside `SCHED`"
+/// invariant that makes taking the lock here sound.
+pub fn ipc_endpoint_closing(endpoint: *mut ()) {
+    let mut g = SCHED.lock();
+    // SAFETY: `endpoint` is the object being dropped (still valid memory);
+    // `SCHED` held.
+    let peer = unsafe { IpcChannel::peer_of(endpoint) };
+    if !peer.is_null() {
+        // SAFETY: `peer` is the surviving endpoint, kept alive by its own handle
+        // / a waiter's `ObjectRef`; `SCHED` held.
+        unsafe { IpcChannel::clear_peer(peer) };
+        signal_ipc_endpoint(&mut g, peer);
     }
 }
 

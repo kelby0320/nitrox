@@ -21,6 +21,7 @@
 //! behind their respective Phase 1 slices.
 
 pub mod header;
+pub mod ipc_channel;
 pub mod memory_object;
 pub mod notification_channel;
 pub mod process;
@@ -28,6 +29,7 @@ pub mod thread;
 pub mod timer;
 
 pub use header::{KObjectHeader, ObjectRef};
+pub use ipc_channel::{IpcChannel, RecvState, SendOutcome, StoredMsg};
 pub use memory_object::MemoryObject;
 pub use notification_channel::NotificationChannel;
 pub use process::Process;
