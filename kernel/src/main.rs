@@ -178,7 +178,12 @@ fn kernel_main() {
     // which would freeze preemption): `exit` switches to the idle thread, which
     // `hlt`s with interrupts enabled so the periodic tick keeps running.
     draw_boot_screen();
-    sched::exit();
+    // The boot thread has no owning process; exit with a benign status (no
+    // `ChildExited` is produced for a process-less thread).
+    sched::exit(nitrox_kernel::libkern::ExitStatus {
+        kind: nitrox_kernel::libkern::ExitKind::Normal as u32,
+        code: 0,
+    });
 }
 
 /// Draw the boot screen to Limine's framebuffer, if one is present. Best-effort:
@@ -290,20 +295,25 @@ fn run_scheduler_demo() {
 // the scheduler — the thread is reaped on the next scheduler entry, freeing
 // the Process and its address space. This is the substrate-works milestone.
 
-/// The first userspace program, embedded at kernel build time. Built by
-/// `cargo xtask` (which builds `userspace/hello` before the kernel) as a
-/// static, non-PIE `ET_EXEC` — see `userspace/hello`.
-static HELLO_ELF: &[u8] =
-    include_bytes!("../../userspace/target/x86_64-unknown-none/release/hello");
+/// The first userspace program (the spawn-demo **parent**), embedded at kernel
+/// build time. Built by `cargo xtask` (which builds `userspace/parent` before
+/// the kernel) as a static, non-PIE `ET_EXEC`. Spawn-able children are embedded
+/// in the kernel lib (`embedded_images`).
+static PARENT_ELF: &[u8] =
+    include_bytes!("../../userspace/target/x86_64-unknown-none/release/parent");
 
-/// Arm the syscall fast path, load + launch the first userspace process,
-/// and drain it from the boot thread. Returns once the process has exited.
+/// Arm the syscall fast path, then load + launch the **parent** process (pid 1)
+/// with a handle to its own notification channel in the bootstrap register
+/// `rdi`. The parent then drives the demo entirely from userspace: it creates a
+/// channel, spawns two children over it, and reaps their `ChildExited`s. This
+/// boot thread hands off (via `sched::exit` in `kernel_main`) into the parent
+/// and then idles; the parent is the supervisor now (not the kernel).
 fn run_first_userspace() {
-    use arch::timer::ArchTimer;
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;
+    use nitrox_kernel::handle::global;
     use nitrox_kernel::libkern::KBox;
-    use nitrox_kernel::libkern::handle::KObjectType;
+    use nitrox_kernel::libkern::handle::{KObjectType, Rights};
     use nitrox_kernel::object::{NotificationChannel, ObjectRef, Process};
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
@@ -311,8 +321,7 @@ fn run_first_userspace() {
     arch::init_syscall_entry();
     kprintln!("syscall fast-path armed");
 
-    // Fresh address space (kernel half inherited → loadable), populated from
-    // the embedded ELF.
+    // Fresh address space (kernel half inherited → loadable), from the parent ELF.
     let aspace = match AddressSpace::new() {
         Ok(a) => a,
         Err(_) => {
@@ -320,7 +329,7 @@ fn run_first_userspace() {
             return;
         }
     };
-    let info = match load_elf(&aspace, HELLO_ELF) {
+    let info = match load_elf(&aspace, PARENT_ELF) {
         Ok(i) => i,
         Err(e) => {
             kprintln!("init: ELF load failed: {:?}", e);
@@ -328,8 +337,7 @@ fn run_first_userspace() {
         }
     };
 
-    // Build the process (pid 1) — but hold the KBox so we can attach a
-    // notification channel before wrapping it into an ObjectRef.
+    // Build the parent process (pid 1; it is the root — no `parent_notif`).
     let mut proc_box = match Process::try_new_user(1, aspace) {
         Ok(p) => p,
         Err(_) => {
@@ -338,10 +346,9 @@ fn run_first_userspace() {
         }
     };
 
-    // Create the process's notification channel. The kernel boot thread acts
-    // as a stand-in supervisor: it keeps one ObjectRef to the channel; the
-    // process owns another (so a fault delivers to it). When `hello` faults the
-    // kernel enqueues a SegFault here instead of halting.
+    // The parent's notification channel: the Process owns one reference; a
+    // handle in pid 1's table owns the other (passed to the parent in `rdi` so
+    // it can `sys_wait` / `sys_notif_recv` for its children's `ChildExited`).
     let chan = match NotificationChannel::try_new() {
         Ok(c) => c,
         Err(_) => {
@@ -350,11 +357,21 @@ fn run_first_userspace() {
         }
     };
     let chan_ptr = KBox::into_raw(chan).as_ptr() as *mut ();
-    // SAFETY: `into_raw` yielded the single creation reference; adopt it into
-    // the process's ObjectRef, then clone for the supervisor (refcount → 2).
-    let proc_chan_ref = unsafe { ObjectRef::from_raw(chan_ptr, KObjectType::NotificationChannel) };
-    let boot_chan_ref = proc_chan_ref.clone();
-    proc_box.set_notification_channel(proc_chan_ref);
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
+    // one for the Process, install the other as a handle (refcount → 2).
+    let chan_ref = unsafe { ObjectRef::from_raw(chan_ptr, KObjectType::NotificationChannel) };
+    proc_box.set_notification_channel(chan_ref.clone());
+    let (cp, ct) = chan_ref.into_raw();
+    let notif_rights = Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT;
+    let notif_h = match global::get().allocate(1, cp, ct, notif_rights) {
+        Ok(h) => h,
+        Err(_) => {
+            // SAFETY: reclaim the channel-handle reference; `proc_box` drops too.
+            drop(unsafe { ObjectRef::from_raw(cp, ct) });
+            kprintln!("init: notification handle alloc failed");
+            return;
+        }
+    };
 
     let proc_ref = {
         let ptr = KBox::into_raw(proc_box).as_ptr() as *mut ();
@@ -362,55 +379,19 @@ fn run_first_userspace() {
         unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }
     };
 
-    // Spawn the user thread (moves `proc_ref` into the thread) and run it.
-    if sched::spawn_user(proc_ref, info.entry_point.as_u64(), info.stack_top.as_u64()).is_err() {
+    // Spawn the parent's main thread, seeding `rdi` = its notification handle.
+    if sched::spawn_user(
+        proc_ref,
+        info.entry_point.as_u64(),
+        info.stack_top.as_u64(),
+        [notif_h.bits(), 0, 0],
+    )
+    .is_err()
+    {
         kprintln!("init: spawn_user failed");
         return;
     }
-
-    // Supervise: block on the channel until `hello` faults (which enqueues a
-    // SegFault notification + wakes us). `boot_chan_ref` lives on this stack,
-    // pinning the channel across the block and past the faulter's reap.
-    let now = arch::Timer::read_ns();
-    let chan_obj = boot_chan_ref.as_ptr() as usize;
-    match sched::wait_on(&[chan_obj], u64::MAX, now) {
-        sched::WaitResult::Signaled(_) => {
-            if let Some(n) = sched::notif_try_recv(boot_chan_ref.as_ptr()) {
-                supervisor_report(&n);
-            } else {
-                kprintln!("supervisor: woke but channel was empty");
-            }
-        }
-        _ => kprintln!("supervisor: wait returned without a signal"),
-    }
-
-    // Reap the faulted thread (it parked itself in `reap` via the kernel's
-    // post-mortem exit). Drop our channel ref last (frees the channel — the
-    // process's ref already went with the reap).
-    sched::reap_pending();
-    drop(boot_chan_ref);
-    kprintln!("init: user process faulted and was contained; kernel alive");
-}
-
-/// Print a received fault notification (the supervisor's view of a crash).
-fn supervisor_report(n: &nitrox_kernel::libkern::Notification) {
-    use nitrox_kernel::libkern::notification::{
-        KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT,
-    };
-    let name = match n.kind() {
-        KIND_SEG_FAULT => "SegFault",
-        KIND_ILLEGAL_INSN => "IllegalInsn",
-        KIND_DIVIDE_BY_ZERO => "DivideByZero",
-        other => {
-            kprintln!("supervisor: caught notification kind {:#06x}", other);
-            return;
-        }
-    };
-    // For the exception variants, body layout is `thread: u32 @0`, `addr: u64 @4`.
-    let b = n.as_bytes();
-    let tid = u32::from_le_bytes([b[4], b[5], b[6], b[7]]);
-    let addr = u64::from_le_bytes([b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15]]);
-    kprintln!("supervisor: caught {} (tid {}, pid 1) @ {:#x}", name, tid, addr);
+    kprintln!("init: spawned parent (pid 1); handing off to userspace");
 }
 
 /// Bring up the buddy allocator and the slab on top of it. Returns false

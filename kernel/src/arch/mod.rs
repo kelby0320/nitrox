@@ -63,7 +63,9 @@ pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, th
 // Syscall fast-path: arm it once at boot, set the per-thread kernel stack on
 // switch-in, and descend to ring 3 from a scheduled user thread.
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::syscall::{enter_user, init_syscall_entry, set_syscall_kernel_stack};
+pub use x86_64::syscall::{
+    arm_user_entry_cpu_base, enter_user, init_syscall_entry, set_syscall_kernel_stack,
+};
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::X86Paging as Paging;

@@ -2743,3 +2743,76 @@ and the `sys_channel_*` validation + endpoint-rights tests) green; `qemu` shows
 `hello`'s full IPC round-trip (`ipc: empty-endpoint would-block ok` → `received
 message from pid 1 ok` → `drained would-block ok` → `peer-closed detected ok` →
 `ipc: ok`), then the deliberate fault still contained — kernel alive.
+
+## 2026-06-10 — Phase 1, slice 21: process spawn + lifecycle + `ChildExited`
+
+The keystone of the Phase-1 finale: `sys_process_spawn` + real exit + the
+`ChildExited` producer, delivering the milestone's process/IPC clauses — **two
+userspace processes communicate over IPC, both spawned by a parent that learns
+of their exits**. (The remaining clause, `sys_exception_resume`, is slice 23; the
+IPC-message handle-transfer deferral is slice 22.) This is the first of three
+final Phase-1 slices (agreed structure: ① spawn → ② handle transfer + PeerClosed
+notification → ③ threads + minimal exception resume/terminate).
+
+- **`sys_process_spawn = 15`** (`SpawnArgs` block; `docs/spec/process-spawn-args.md`,
+  new). Builds the child (pid from a new monotonic `SchedState.next_pid`; a fresh
+  `AddressSpace` + `load_elf`; a `Process`; its own notification channel), installs
+  the parent-supplied initial handles into the **child's** table (cross-pid
+  `allocate`, already supported), enqueues the main thread, and returns a child
+  `Process` handle (`SIGNAL | TERMINATE`). Atomic-or-fail: any failure before the
+  thread is enqueued rolls back every child-side allocation; **move** is
+  implemented as duplicate-then-close-source-on-commit, so a failed spawn never
+  consumes the parent's handles.
+- **Child image = kernel-embedded `ImageId` (decided with the user).** No
+  filesystem yet, so spawn-able images are `include_bytes!`d (`embedded_images`)
+  and selected by id. Phase 2 swaps the selector for an initramfs path /
+  `MemoryObject`.
+- **Bootstrap ABI = three argument registers (decided with the user).** No
+  argc/argv/auxv exists; `enter_user` is extended to seed `rdi`/`rsi`/`rdx`
+  (notification-channel handle / first installed handle / `arg0`) at the child's
+  first ring-3 entry, read directly as the child `_start`'s `extern "C"` params.
+  Phase 2 replaces this with a stack-resident bootstrap block.
+- **Real exit + `ChildExited`.** `sys_process_exit = 16` / `sys_thread_exit = 17`
+  (stable; the debug `0xFFFF_0001` is retired) carry a status. `sched::exit` now
+  takes an `ExitStatus` and, **before parking the thread**, delivers
+  `ChildExited { pid, status }` to the parent's notification channel (stored on
+  the child `Process` as `parent_notif`) — immediate, not at reap, so a parent
+  blocked in `sys_wait` for its *second* child wakes (deferred-to-reap delivery
+  would deadlock). Reuses the `deliver_fault_and_exit` lock discipline. The boot
+  parent (pid 1, the root) has no `parent_notif`.
+- **Multi-user-thread correctness — two CPU-state bugs the slice surfaced** (a
+  single user thread never exercised either):
+  - The per-CPU **kernel/syscall stack** (TSS.RSP0 + the syscall-entry stack) was
+    set only by `thread_enter` on first descent. A *resumed* user thread then
+    trapped onto a stale (sibling's) stack → `#DF`. Fix: re-arm it on **every**
+    switch-in (`arm_kernel_stack_for`, called at all three switch sites).
+  - A thread that **blocks mid-syscall** (`sys_wait`) is switched away with the
+    entry `swapgs` still in effect (`GS_BASE = &CPU0`, `KERNEL_GS_BASE =` its user
+    GS). `enter_user` does no `swapgs`, so a different thread's *first* descent
+    inherited a stale `KERNEL_GS_BASE`, and its first `syscall`'s `swapgs` loaded
+    `GS_BASE = 0` → the entry stub's `gs:` access faulted (`#PF` → `#DF`). Fix:
+    re-assert `KERNEL_GS_BASE = &CPU0` at first descent (`arm_user_entry_cpu_base`,
+    via the neutral `crate::arch` interface).
+- **Boot rework:** `run_first_userspace` now boots the **parent** (pid 1) with a
+  notification-channel handle in `rdi` and hands off; the parent is the
+  supervisor (not the kernel boot thread). New `userspace/parent` + `userspace/child`
+  crates (embedded; built by `xtask`); `hello` remains a workspace member but is
+  no longer the boot image.
+
+**Punted past Phase 1 (decided with the user):** FPU `XSAVE` save/restore + TLS
+(`sys_thread_set_tls`) — userspace is soft-float, so nothing touches the FPU even
+with many processes (no consumer); DPC, the `test-qemu` harness. Documented as
+consumer-gated, out of the Phase-1 milestone.
+
+**ABI-hash impact: yes (per spec; not yet enforced).** `SpawnArgs` is a new
+cross-boundary layout (hash input, like `IpcMsg`/`Notification`); `ChildExited` /
+`ExitStatus` were already defined. Syscall numbers 15–18 are not hashed. The
+debug `SYS_PROCESS_EXIT = 0xFFFF_0001` is retired for stable 16. The hash is still
+not computed in code → not enforced; noted (same posture as prior slices).
+
+Verified: `check-arch` clean; `build` clean (no warnings); `test` 362 host tests
+(`SpawnArgs`/`ImageId` layout, `child_exited` offsets, spawn bad-pointer reject)
+green; `qemu` shows the parent spawn two children that exchange an IPC message
+(`child[recv]: got a message: child: ping from the sender`) and the parent reap
+both via `sys_wait` (`child exited pid=2 code=0`, `pid=3 code=1`), then exit —
+the Phase-1 milestone's spawn/IPC/`ChildExited` clauses, end to end.

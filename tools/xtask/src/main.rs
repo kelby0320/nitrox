@@ -120,10 +120,12 @@ fn limine_conf() -> PathBuf {
 // --- Subcommands --------------------------------------------------------
 
 fn cmd_build() -> R<()> {
-    // Build the first userspace program BEFORE the kernel: the kernel embeds
-    // its ELF via `include_bytes!`, so the artifact must exist at kernel
-    // compile time.
+    // Build the userspace programs BEFORE the kernel: the kernel embeds their
+    // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
+    // time.
     cmd_build_hello()?;
+    build_userspace_bin("parent")?;
+    build_userspace_bin("child")?;
 
     let kernel_dir = repo_root().join("kernel");
     run(Command::new("cargo").arg("build").current_dir(&kernel_dir))?;
@@ -158,6 +160,28 @@ fn cmd_build_hello() -> R<()> {
         return Err(format!("hello ELF missing after build: {}", elf.display()).into());
     }
     println!("xtask: built hello ELF at {}", elf.display());
+    Ok(())
+}
+
+/// Build the userspace program `name` as a static `ET_EXEC` for the bare
+/// target (run from its own crate dir so its `.cargo/config.toml` applies). The
+/// kernel embeds the result via `include_bytes!`. Generalises `cmd_build_hello`
+/// for the spawn-demo binaries (`parent`, `child`).
+fn build_userspace_bin(name: &str) -> R<()> {
+    let dir = repo_root().join("userspace").join(name);
+    run(Command::new("cargo")
+        .arg("build")
+        .arg("--release")
+        .arg("--target")
+        .arg("x86_64-unknown-none")
+        .current_dir(&dir))?;
+    let elf = repo_root()
+        .join("userspace/target/x86_64-unknown-none/release")
+        .join(name);
+    if !elf.exists() {
+        return Err(format!("{name} ELF missing after build: {}", elf.display()).into());
+    }
+    println!("xtask: built {name} ELF at {}", elf.display());
     Ok(())
 }
 

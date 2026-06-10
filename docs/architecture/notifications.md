@@ -51,8 +51,12 @@ faulting thread's handle.
 - **Implemented:** `NotificationChannel`, the `Notification` value type +
   exception variants, `sys_notif_recv`, `sys_wait` over a channel, the overflow
   / exception-priority-eviction policy, and post-mortem exception delivery.
-- **Deferred to their producers' slices:** `ChildExited` (process spawn + real
-  exit), `PeerClosed` (IPC), the debugger suspend/resume path
+- **`ChildExited` is now produced** (process-spawn slice): `sys_process_exit` /
+  `sys_thread_exit` deliver `ChildExited { pid, status }` to the parent's
+  notification channel (the `parent_notif` recorded on the child `Process` at
+  spawn), at exit time so a parent blocked in `sys_wait` wakes promptly.
+- **Deferred to their producers' slices:** `PeerClosed` (IPC handle-transfer
+  slice), the debugger suspend/resume path
   (`sys_exception_resume` + register inspection + the 30 s auto-terminate
   timeout + the debugger exception-channel priority chain), and per-process
   queue-capacity tuning via spawn flags. The variant discriminants for the

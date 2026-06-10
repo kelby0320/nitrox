@@ -619,8 +619,9 @@ exception-delivery path uses the wait-queue blocking primitive above.
 - [x] Overflow handling (exception-priority eviction + `NotificationsDropped`)
 - [ ] Exception **suspend** + `sys_exception_resume` with `Disposition`
       (+ `sys_thread_get_registers`, auto-terminate timeout, debugger
-      exception-channel priority chain) — **deferred to process spawn** (its only
-      caller is a userspace supervisor holding the faulting thread's handle).
+      exception-channel priority chain) — **slice ③** (its only caller is a
+      userspace supervisor holding the faulting thread's handle; a minimal
+      `Resume`/`Terminate` lands there, the rest in Phase 2).
 
 #### IPC
 
@@ -633,23 +634,59 @@ exception-delivery path uses the wait-queue blocking primitive above.
       deferred to the async-I/O slice (they need a `PendingOperation`)
 - [x] `sys_channel_recv` (syscall 14) — `WouldBlock` if empty + `sys_wait`-able
 - [ ] Handle transfer mechanics during send (move and duplicate paths) —
-      **deferred to process spawn** (cross-process value); ABI keeps the
-      `handles`/`count` args, `count` must be `0` for now
+      **slice ②** (cross-process value, now that spawn exists); ABI keeps the
+      `handles`/`count` args, `count` must be `0` until then
 - [x] Dead-peer handling: send/recv `PeerClosed` errors + blocked-recv wakeup.
-      The async `PeerClosed` **notification** is deferred to spawn (needs the
+      The async `PeerClosed` **notification** is **slice ②** (needs the
       channel→peer-process-notification-channel link)
 
-#### Other syscalls
+#### Final slices: process spawn → handle transfer → threads + exceptions
 
-- [ ] `sys_process_spawn` per [docs/spec/syscall-abi.md] (allocates the
-      child's initial handles in the global table tagged with the child's
-      `owner_pid`, and uses IPC for passing channel endpoints)
-- [ ] `sys_process_exit`, `sys_thread_exit` — real versions: exit status →
-      parent's `ChildExited` notification, replacing the debug
-      `sys_process_exit`
-- [ ] `sys_thread_create`
-- [ ] `sys_thread_set_affinity` (a no-op until SMP; Phase 3)
-- [ ] `sys_thread_get_registers`
+The original "Other syscalls" step is split into three focused slices (each its
+own explore → design → implement → verify cycle). Slice ① delivers most of the
+milestone; ② clears the IPC handle-transfer deferral; ③ finishes the milestone's
+`sys_exception_resume` clause.
+
+##### Slice ① — Process spawn + lifecycle + `ChildExited` (done)
+
+- [x] `sys_process_spawn` (syscall 15) — allocates the child's initial handles
+      in the global table tagged with the child's `owner_pid` (move/duplicate);
+      Phase-1 forms: kernel-embedded image selector + register bootstrap ABI
+      (filesystem/`MemoryObject` image + stack bootstrap block → Phase 2)
+- [x] `sys_process_exit` (16), `sys_thread_exit` (17) — real versions: exit
+      status → parent's `ChildExited` notification, replacing the debug
+      `sys_process_exit`. (Multi-thread teardown lands with `sys_thread_create`.)
+- [x] `ChildExited` producer — delivered to the parent's notification channel at
+      exit time (so a `sys_wait`ing parent wakes promptly)
+- [x] pid allocation; bootstrap-register entry ABI; multi-user-thread CPU-state
+      fixes (per-switch trap/syscall-stack re-arm; `KERNEL_GS_BASE` re-assert)
+- [x] `sys_thread_set_affinity` (syscall 18; a no-op until SMP; Phase 3)
+- [x] Demo: `userspace/parent` spawns two `userspace/child` processes that talk
+      over IPC; the parent reaps both via `ChildExited`
+
+##### Slice ② — IPC handle transfer + `PeerClosed` notification
+
+- [ ] Handle transfer mechanics during `sys_channel_send` (the `count > 0` path:
+      move + duplicate, `TRANSFER`-gated, atomic-or-fail; receiver-side install)
+- [ ] `sys_channel_recv` surfaces the transferred handles + count
+- [ ] Async `PeerClosed` **notification** (the dead-peer error path already ships;
+      this delivers the notification to holders of the still-open endpoint)
+
+##### Slice ③ — Threads + minimal exception resume/terminate
+
+- [ ] `sys_thread_create` + multi-thread process-exit teardown (terminating
+      sibling threads when a multi-threaded process exits)
+- [ ] `sys_thread_get_registers` (read a suspended thread's saved frame)
+- [ ] Exception **suspend** (vs. today's post-mortem terminate) +
+      `sys_exception_resume` with **`Resume`** / **`Terminate`** dispositions —
+      finishes the milestone's "resume or terminate" clause. The heavy debugger
+      extras (`ModifyAndResume`, auto-terminate timeout, exception-channel
+      priority chain) stay deferred to Phase 2.
+
+**Punted past Phase 1 (consumer-gated):** FPU `XSAVE` save/restore + TLS
+(`sys_thread_set_tls`) — userspace is soft-float, so no thread touches the FPU
+even with multiple processes (no consumer until a hard-float userspace exists);
+the DPC queue and the `xtask test-qemu` harness (Phase 2+/opportunistic).
 
 ### Milestone
 

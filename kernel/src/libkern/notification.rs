@@ -137,6 +137,17 @@ impl Notification {
         n
     }
 
+    /// `ChildExited { child, status }` — `child` (pid) at body+0, `status.kind`
+    /// at body+4, `status.code` at body+8 (per the spec). Delivered to the
+    /// parent's notification channel when a child process exits.
+    pub fn child_exited(child: u32, status: ExitStatus) -> Self {
+        let mut n = Self::zeroed(KIND_CHILD_EXITED);
+        n.body[0..4].copy_from_slice(&child.to_le_bytes());
+        n.body[4..8].copy_from_slice(&status.kind.to_le_bytes());
+        n.body[8..12].copy_from_slice(&status.code.to_le_bytes());
+        n
+    }
+
     /// `NotificationsDropped { count }` — synthesized by a channel on overflow.
     pub fn notifications_dropped(count: u32) -> Self {
         let mut n = Self::zeroed(KIND_NOTIFICATIONS_DROPPED);
@@ -187,6 +198,23 @@ mod tests {
         let i = Notification::illegal_insn(9, 0x5000);
         assert_eq!(i.kind(), KIND_ILLEGAL_INSN);
         assert_eq!(u64::from_le_bytes(i.as_bytes()[8..16].try_into().unwrap()), 0x5000);
+    }
+
+    #[test]
+    fn child_exited_writes_spec_offsets() {
+        let n = Notification::child_exited(
+            42,
+            ExitStatus { kind: ExitKind::Crashed as u32, code: -7 },
+        );
+        let b = n.as_bytes();
+        assert_eq!(u32::from_le_bytes(b[0..4].try_into().unwrap()), KIND_CHILD_EXITED);
+        // child pid @ body+0 (overall +4).
+        assert_eq!(u32::from_le_bytes(b[4..8].try_into().unwrap()), 42);
+        // status.kind @ body+4 (overall +8).
+        assert_eq!(u32::from_le_bytes(b[8..12].try_into().unwrap()), ExitKind::Crashed as u32);
+        // status.code @ body+8 (overall +12).
+        assert_eq!(i32::from_le_bytes(b[12..16].try_into().unwrap()), -7);
+        assert!(!n.is_exception());
     }
 
     #[test]

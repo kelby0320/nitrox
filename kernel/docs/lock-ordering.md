@@ -266,6 +266,20 @@ then takes it again inside `exit()` — two acquisitions, never nested.
 record to user memory **after** releasing the lock (never hold the `IrqSpinLock`
 across a potentially-faulting user copy).
 
+Process exit obeys the same discipline: `sched::exit` delivers `ChildExited` to
+the parent's notification channel under `SCHED` (borrowing the channel pointer
+via the child `Process`'s `parent_notif`, never dropping an `ObjectRef` under the
+lock) **before** parking the exiting thread — immediate delivery so a parent
+blocked in `sys_wait` wakes, while stack reclamation stays deferred to reap.
+
+A related multi-user-thread invariant (not a lock, but switch-path state): the
+per-CPU trap/syscall stack (TSS.RSP0 + the syscall-entry stack) is re-armed for
+the incoming thread on **every** switch-in (`arm_kernel_stack_for`, all three
+switch sites), and `KERNEL_GS_BASE` is re-asserted at each thread's first ring-3
+descent (`arm_user_entry_cpu_base`) — a thread that blocks mid-syscall is
+switched away with the entry `swapgs` still in effect, so a fresh descent must
+restore it. With a single user thread neither mattered; multiple do.
+
 The IPC paths obey the same discipline. `sys_channel_send` copies the 4096-byte
 message **in** from user memory before taking `SCHED`, then pushes into the peer's
 ring + wakes its receivers under one hold; `sys_channel_recv` peeks under `SCHED`
