@@ -113,16 +113,14 @@ pub enum SendMode {
 
 ## Handle transfer in messages
 
-The `handles[]` array carries handle values that the kernel will transfer to the receiver as part of message delivery. The transfer is atomic with the message receive:
+A sender passes the handles to transfer via `sys_channel_send`'s separate `handles`/`count` arguments (not the in-message `handles[]`, which the kernel fills with the *receiver's* values on receive). Transfer is **always move**, and the install happens at the receiver:
 
-1. Sender calls `sys_channel_send` with handles in `msg.handles[0..handle_count]`. These must be valid handles in the sender's table with `TRANSFER` right.
-2. Kernel validates each handle: exists in sender's table, has `TRANSFER` right.
-3. Kernel allocates the message slot in the channel's queue.
-4. Kernel performs handle transfer per the [handle transfer protocol](handle-encoding.md):
-   - For each handle, a destination slot is reserved in the receiver's table (or, for move semantics, the source slot is updated)
-   - The destination handle values are written to the message slot's `handles[]`
-5. Kernel marks the message slot as ready for receive.
-6. Receiver's `sys_channel_recv` copies the message and the handles into receiver-side memory; the handles are now valid in the receiver's handle table.
+1. Sender calls `sys_channel_send(ch, msg, handles, count, mode)` with `count` handles. Each must be valid in the sender's table with the `TRANSFER` right.
+2. Kernel validates + pins each handle (`lookup` with `TRANSFER`); any bad handle fails the whole send (atomic-or-fail) with the sender's table untouched.
+3. Kernel queues the message slot, **moving** the pinned references into it ("in flight"). Only then does it **commit the move** by closing the sender's source handles — so a `WouldBlock`/`PeerClosed` send loses no capability.
+4. Receiver's `sys_channel_recv` dequeues the message and **installs** each in-flight reference into its **own** table (with the rights the sender's handle carried), writing the new handle values into both the `handles` out-buffer and the in-message `handles[]`, and the count into `*count`. The handles are now valid in the receiver's table; the install is atomic-or-fail (a partial failure reclaims what it installed).
+
+If the receiving endpoint is destroyed with the message still queued, the undelivered in-flight references are released (the objects lose that reference).
 
 If transfer fails partway through (e.g., receiver is out of handle table space), the entire send fails atomically — no handles are transferred and the source's handles remain valid.
 
@@ -175,16 +173,17 @@ When one endpoint's last handle is closed, the channel transitions to "peer-clos
 
 The channel object is freed when both endpoints' handle counts reach zero.
 
-> **Implemented:** the **error** half (send/recv on a peer-closed endpoint return `PeerClosed = -13`, and a blocked receiver wakes to return it). The async **`Notification::PeerClosed`** is deferred to process spawn — delivering it needs the channel→peer-process-notification-channel link, which only matters once endpoints live in different processes. See [§ Implementation status](#implementation-status).
+> **Implemented:** the **error** half (send/recv on a peer-closed endpoint return `PeerClosed = -13`, and a blocked receiver wakes to return it). The async **`Notification::PeerClosed`** is deferred to **Phase 2**: delivering it to *every* holder of the still-open endpoint wants handle duplication + a per-endpoint holder registry (a single holder→notification-channel link only covers the common one-holder case and would have to be rebuilt as a registry), which is Phase-2-shaped. See [§ Implementation status](#implementation-status).
 
 ## Implementation status
 
-The channel mechanism (`IpcChannel`, `sys_channel_create` = 12, `sys_channel_send` = 13, `sys_channel_recv` = 14, `sys_wait` integration) is implemented. Internally a channel is a **pair of endpoint kobjects** (each `KObjectType::IpcChannel`), each owning its own receive ring + recv-waiter list and linked by a mutual `peer` pointer — "two endpoint handles, separate queues per direction" with one kobject per endpoint. (A single shared object can't be used: a handle→object pointer carries no per-handle tag to distinguish the two ends for the asymmetric routing.)
+The channel mechanism (`IpcChannel`, `sys_channel_create` = 12, `sys_channel_send` = 13, `sys_channel_recv` = 14, `sys_wait` integration) **and message-borne handle transfer** are implemented. Internally a channel is a **pair of endpoint kobjects** (each `KObjectType::IpcChannel`), each owning its own receive ring + recv-waiter list and linked by a mutual `peer` pointer — "two endpoint handles, separate queues per direction" with one kobject per endpoint. (A single shared object can't be used: a handle→object pointer carries no per-handle tag to distinguish the two ends for the asymmetric routing.)
 
-Deferred to **process spawn** (where two real processes make them testable end-to-end):
+**Handle transfer** is **always move** (a sender that wants to keep a copy `sys_handle_duplicate`s first and sends the duplicate — there is no move/duplicate flag). The kernel pins the transferred objects "in flight" in the queued message slot and installs them into the **receiver's** table at `sys_channel_recv` (the receiver is `current` then), writing their receiver-side handle values into both the separate `handles` out-buffer and the in-message `handles[]`. The move is committed (the sender's handles closed) only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability; install is atomic-or-fail.
 
-- **Handle transfer** (the `handles[]` array / move + duplicate). The send/recv ABI keeps the `handles`/`count` parameters for stability, but `sys_channel_send` requires `count == 0` (non-zero → `Unsupported`).
-- **`Notification::PeerClosed`** delivery (the error half ships now).
+Deferred to **Phase 2**:
+
+- **`Notification::PeerClosed`** delivery (the error half ships now; the multi-holder "every holder" delivery wants handle duplication + a holder registry).
 
 Deferred to the **async-I/O slice**: `Block` / `BlockBounded` send modes and the `PendingOperation`-returning send. `NoBlock` ships now.
 

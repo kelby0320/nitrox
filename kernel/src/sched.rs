@@ -58,9 +58,10 @@ use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
 use crate::libkern::{ExitKind, ExitStatus, Notification};
+use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::object::{
     IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, RecvState, SendOutcome,
-    StoredMsg, Thread, ThreadEntry, ThreadState, Timer,
+    StoredMsg, Thread, ThreadEntry, ThreadState, Timer, TransferRef,
 };
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
@@ -599,14 +600,19 @@ fn signal_ipc_endpoint(g: &mut SchedState, endpoint: *mut ()) {
 }
 
 /// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,
-/// waking the peer's blocked receivers if the ring went empty→non-empty. The
-/// caller has already copied the message in from user memory (no copy under the
-/// lock). Returns the [`SendOutcome`] (`Sent` / `Full` → `WouldBlock` /
-/// `PeerClosed`).
-pub fn ipc_send_push(endpoint: *mut (), msg: &StoredMsg) -> SendOutcome {
+/// **moving** any `transfers` it carries into the queued slot and waking the
+/// peer's blocked receivers if the ring went empty→non-empty. The caller has
+/// already copied the message in from user memory (no copy under the lock). On
+/// `Full`/`PeerClosed` the `transfers` are left with the caller (untaken), to be
+/// dropped **outside** `SCHED`. Returns the [`SendOutcome`].
+pub fn ipc_send_push(
+    endpoint: *mut (),
+    msg: &StoredMsg,
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+) -> SendOutcome {
     let mut g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
-    let outcome = unsafe { IpcChannel::send_push(endpoint, msg) };
+    let outcome = unsafe { IpcChannel::send_push(endpoint, msg, transfers) };
     if let SendOutcome::Sent { woke_edge: true } = outcome {
         // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
         let peer = unsafe { IpcChannel::peer_of(endpoint) };
@@ -625,13 +631,19 @@ pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
     unsafe { IpcChannel::recv_peek(endpoint) }
 }
 
-/// Pop the oldest message from `endpoint`'s inbox into `dst` under `SCHED`.
-/// Returns `false` if it was drained between the peek and now. The caller copies
-/// `dst` out to user memory **after** this returns (never under the lock).
-pub fn ipc_recv_pop_into(endpoint: *mut (), dst: &mut StoredMsg) -> bool {
+/// Pop the oldest message from `endpoint`'s inbox into `dst` under `SCHED`,
+/// **moving** its transferred-handle references into `out`. Returns `false` if it
+/// was drained between the peek and now. The caller copies `dst` out to user
+/// memory and installs/drops the `out` transfers **after** this returns (never
+/// under the lock — `ObjectRef` Drop / `allocate` must not run under `SCHED`).
+pub fn ipc_recv_pop_into(
+    endpoint: *mut (),
+    dst: &mut StoredMsg,
+    out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+) -> bool {
     let _g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
-    unsafe { IpcChannel::recv_pop_into(endpoint, dst) }
+    unsafe { IpcChannel::recv_pop_into(endpoint, dst, out) }
 }
 
 /// An IPC endpoint is being destroyed (its last handle closed). Under `SCHED`,

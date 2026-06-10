@@ -284,7 +284,14 @@ The IPC paths obey the same discipline. `sys_channel_send` copies the 4096-byte
 message **in** from user memory before taking `SCHED`, then pushes into the peer's
 ring + wakes its receivers under one hold; `sys_channel_recv` peeks under `SCHED`
 (the empty-poll `WouldBlock` path allocates nothing), pops under a second hold,
-then copies the message **out** after releasing the lock. `IpcChannel::Drop`
+then copies the message **out** after releasing the lock. **Handle transfer** rides
+the same boundary: a transferred handle's `ObjectRef` is **moved** in/out of the
+queued message slot under `SCHED` (a `mem::take`, which never touches a refcount —
+only `ObjectRef` *Drop* is forbidden under the lock), while the receiver-side
+install (`allocate`) and any error/undelivered-transfer *drop* run **outside**
+`SCHED` (the send commits the move by closing the sender's handles after the push;
+undelivered transfers release their refs when the ring drops, in destructor
+context). `IpcChannel::Drop`
 (an endpoint's last handle closing) takes `SCHED` to null the surviving peer's
 back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are
 released only outside `SCHED` (handle close, the `sys_wait`/lookup references),

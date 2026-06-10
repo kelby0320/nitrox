@@ -2816,3 +2816,55 @@ green; `qemu` shows the parent spawn two children that exchange an IPC message
 (`child[recv]: got a message: child: ping from the sender`) and the parent reap
 both via `sys_wait` (`child exited pid=2 code=0`, `pid=3 code=1`), then exit —
 the Phase-1 milestone's spawn/IPC/`ChildExited` clauses, end to end.
+
+## 2026-06-10 — Phase 1 finale, slice ②: IPC handle transfer
+
+The second of the three final Phase-1 slices: message-borne **handle transfer**,
+the capability-propagation core of IPC. Slice ① deferred the `sys_channel_send`
+`count > 0` path (`Unsupported`); now that spawn exists, two real processes can
+exchange capabilities, so this implements it end to end.
+
+- **Always move (per the spec).** There is no move/duplicate flag in a message —
+  a sender that wants to keep a copy `sys_handle_duplicate`s first and sends the
+  duplicate. So `sys_channel_send` moves the listed handles to the receiver.
+- **References pinned "in flight"; installed at recv.** At send time the receiver
+  isn't known (any process holding the peer endpoint may recv), so the kernel
+  can't install into the receiver's table at send. Instead each transferred
+  object's reference is carried **in the queued message** and installed at
+  `sys_channel_recv` (the receiver is `current` then — `allocate(recv_pid, …)`,
+  reusing the spawn slice's cross-pid install). Mechanically: `MsgRing`'s element
+  became a `RingSlot { msg: StoredMsg, transfers: [Option<TransferRef>; 8] }`
+  (non-`Copy`); `push_from`/`pop_into` copy the bytes and **move** the
+  `TransferRef`s (a `mem::take`) — sound under `SCHED` because only `ObjectRef`
+  *Drop* is forbidden there, and a move never touches a refcount. The receiver
+  installs (and any error/undelivered transfer drops the refs) **outside** `SCHED`.
+- **Atomic-or-fail, move-on-commit.** Send validates + pins every handle
+  (`lookup` with `TRANSFER`) before touching anything; the sender's source
+  handles are closed only **after** the message is queued, so a `WouldBlock` /
+  `PeerClosed` send loses no capability. Recv installs each transfer and rolls
+  back (closes what it installed) on a partial failure; a recv-install OOM/fault
+  loses the already-dequeued message (a documented Phase-1 edge). Undelivered
+  transfers (endpoint destroyed with messages queued) release their refs when the
+  ring drops, in destructor context outside `SCHED`.
+- **`sys_channel_recv`** now writes the receiver-side handle values into both the
+  separate `handles` out-buffer and the in-message `handles[]`, plus the count.
+- **`PeerClosed` notification deferred to Phase 2 (decided with the user).** The
+  dead-peer *error* path already ships; the async notification needs a per-endpoint
+  holder→notification-channel link that updates on every endpoint transfer, and
+  the spec's "every holder" delivery wants handle duplication + a holder registry
+  — a Phase-2-shaped design with no Phase-1 milestone driver.
+- **Demo:** child A creates a `MemoryObject`, maps it, writes `0xC0FFEE`, and
+  **transfers the handle** to sibling B over their channel; B receives the handle,
+  maps the same object, and reads the marker back — proving the capability crossed
+  the process boundary and aliases shared frames.
+
+**ABI-hash impact: none.** `TransferRef`/`RingSlot` are kernel-internal; `IpcMsg`
+already defines `handles`/`handle_count`; no `KError` change; syscall numbers
+unchanged.
+
+Verified: `check-arch` clean; `build` clean (no warnings); `test` 364 host tests
+(+ `MsgRing` moves `TransferRef`s and releases an undelivered transfer on destroy;
+the send mode/oversize-count rejects) green; `qemu` shows
+`child[send]: transferred a memory object to the sibling` →
+`child[recv]: mapped transferred object, marker=0xc0ffee ok`, both children exit
+`0`, the parent reaps both `ChildExited` — handle transfer end to end.

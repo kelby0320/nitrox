@@ -29,7 +29,7 @@ pub mod thread;
 pub mod timer;
 
 pub use header::{KObjectHeader, ObjectRef};
-pub use ipc_channel::{IpcChannel, RecvState, SendOutcome, StoredMsg};
+pub use ipc_channel::{IpcChannel, RecvState, SendOutcome, StoredMsg, TransferRef};
 pub use memory_object::MemoryObject;
 pub use notification_channel::NotificationChannel;
 pub use process::Process;

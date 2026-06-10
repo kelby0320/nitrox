@@ -34,7 +34,7 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::{
     IpcChannel, MAX_WAIT_HANDLES, MemoryObject, NotificationChannel, ObjectRef, Process, RecvState,
-    SendOutcome, StoredMsg, Timer as TimerObject,
+    SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -882,28 +882,36 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
 }
 
 /// `sys_channel_send(ch, msg, handles, count, mode)` — enqueue `*msg` on the
-/// peer of endpoint `ch`. This slice supports `NoBlock` only (`Block` /
-/// `BlockBounded` → `Unsupported`, pending the async-I/O slice) and no handle
-/// transfer (`count != 0` → `Unsupported`, pending process spawn). Returns `0`
+/// peer of endpoint `ch`, **moving** `handles[0..count]` to the receiver. This
+/// slice supports `NoBlock` only (`Block` / `BlockBounded` → `Unsupported`,
+/// pending the async-I/O slice). Each transferred handle must carry the
+/// `TRANSFER` right; the move is committed (the sender's handles closed) only
+/// after the message is queued — a failed send loses no capability. Returns `0`
 /// on success, `WouldBlock` if the queue is full, `PeerClosed` if the peer has
 /// gone.
-pub fn sys_channel_send(
-    ch: u64,
-    msg: u64,
-    _handles: u64,
-    count: u64,
-    mode: u64,
-) -> SysResult {
-    // Mode + transfer gating first (host-reachable, no pointer/lock use).
+pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) -> SysResult {
+    // Mode gating first (host-reachable, no pointer/lock use).
     match SendMode::from_u32(mode as u32) {
         Some(SendMode::NoBlock) => {}
         Some(SendMode::Block) | Some(SendMode::BlockBounded) => return Err(KError::Unsupported),
         None => return Err(KError::InvalidArgument),
     }
-    if count != 0 {
-        return Err(KError::Unsupported); // handle transfer lands with spawn
+    let count = count as usize;
+    if count > IPC_HANDLE_MAX {
+        return Err(KError::TooLarge);
     }
     let mptr = UserPtr::<u8>::new(msg).map_err(from_user_access)?;
+
+    // Copy in the transferred-handle array (count × 8 bytes), if any.
+    let mut h_raw = [0u64; IPC_HANDLE_MAX];
+    if count > 0 {
+        let hptr = UserPtr::<u8>::new(handles).map_err(from_user_access)?;
+        let mut hbytes = [0u8; IPC_HANDLE_MAX * 8];
+        copy_slice_from_user(&mut hbytes[..count * 8], hptr).map_err(from_user_access)?;
+        for i in 0..count {
+            h_raw[i] = u64::from_ne_bytes(hbytes[i * 8..i * 8 + 8].try_into().unwrap());
+        }
+    }
 
     let pid = crate::sched::current_owner_pid();
     let ok = global::get()
@@ -913,6 +921,18 @@ pub fn sys_channel_send(
         return Err(KError::InvalidArgument);
     }
 
+    // Look up + pin each transferred handle (requires `TRANSFER`). Collect the
+    // in-flight references; on any failure, the collected refs drop here (outside
+    // SCHED) and nothing in the sender's table has changed — atomic-or-fail.
+    let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    for i in 0..count {
+        let h = RawHandle(h_raw[i]);
+        let t = global::get()
+            .lookup(h, pid, Rights::TRANSFER)
+            .map_err(map_handle_err)?;
+        transfers[i] = Some(TransferRef { obj: t.object, rights: t.rights });
+    }
+
     // Bounce the 4096-byte message in from user memory (outside any lock — a
     // user copy may fault). One heap slot per send; optimisation target later.
     let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
@@ -920,25 +940,47 @@ pub fn sys_channel_send(
     if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
         return Err(KError::InvalidArgument);
     }
-    // Stamp the kernel-controlled header fields; clear the (unused) handle region.
+    // Stamp the kernel-controlled header fields; the receiver fills the wire
+    // `handles[]` with its own handle values at recv.
     bounce.header.sender_pid = pid;
     bounce.header.timestamp = Timer::read_ns();
-    bounce.header.handle_count = 0;
+    bounce.header.handle_count = count as u8;
     bounce.handles = [0u64; IPC_HANDLE_MAX];
 
-    // `ok.object` (held here) pins the endpoint across the push.
-    match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce) {
-        SendOutcome::Sent { .. } => Ok(0),
+    // `ok.object` (held here) pins the endpoint across the push. On `Sent` the
+    // queue took the transfers; commit the move by closing the sender's handles.
+    match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) {
+        SendOutcome::Sent { .. } => {
+            for i in 0..count {
+                close_and_release(RawHandle(h_raw[i]), pid);
+            }
+            Ok(0)
+        }
+        // `transfers` were left untaken; they drop here (outside SCHED) and the
+        // sender's handles are untouched — no capability is lost on a failed send.
         SendOutcome::Full => Err(KError::WouldBlock),
         SendOutcome::PeerClosed => Err(KError::PeerClosed),
     }
 }
 
+/// Close every handle a partial `sys_channel_recv` installed in the receiver's
+/// table, so a copy-out fault or a mid-install error after the message was
+/// dequeued doesn't leak the installed handles.
+fn recv_rollback_installed(installed: &[RawHandle], pid: u32) {
+    for &h in installed {
+        if !h.is_null() {
+            close_and_release(h, pid);
+        }
+    }
+}
+
 /// `sys_channel_recv(ch, msg, handles, count)` — dequeue the oldest message on
-/// endpoint `ch` into `*msg` (4096 bytes) and write the transferred-handle count
-/// (`0` this slice) to `*count`. `WouldBlock` if the inbox is empty (caller
-/// `sys_wait`s on `ch`); `PeerClosed` if empty and the peer has gone.
-pub fn sys_channel_recv(ch: u64, msg: u64, _handles: u64, count: u64) -> SysResult {
+/// endpoint `ch` into `*msg` (4096 bytes), **install** any transferred handles
+/// into the caller's table (writing their values to `handles[0..*count]` and into
+/// the in-message `handles[]`), and write the count to `*count`. `WouldBlock` if
+/// the inbox is empty (caller `sys_wait`s on `ch`); `PeerClosed` if empty and the
+/// peer has gone.
+pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResult {
     let mptr = UserMutPtr::<u8>::new(msg).map_err(from_user_access)?;
     let cptr = UserMutPtr::<usize>::new(count).map_err(from_user_access)?;
 
@@ -957,14 +999,58 @@ pub fn sys_channel_recv(ch: u64, msg: u64, _handles: u64, count: u64) -> SysResu
         RecvState::HasMsg => {}
     }
     let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
-    if !crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce) {
+    let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    if !crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers) {
         // Drained between the peek and the pop (only possible under future SMP).
         return Err(KError::WouldBlock);
     }
+    // The message is now dequeued. From here, any error must reclaim what we've
+    // installed and drop the remaining transfers (which the `transfers` array
+    // does on scope exit, outside SCHED).
+    let n = bounce.header.handle_count as usize;
+    let mut installed = [RawHandle::NULL; IPC_HANDLE_MAX];
+    for i in 0..n.min(IPC_HANDLE_MAX) {
+        if let Some(tr) = transfers[i].take() {
+            // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
+            let (op, ot) = tr.obj.into_raw();
+            match global::get().allocate(pid, op, ot, tr.rights) {
+                Ok(h) => {
+                    installed[i] = h;
+                    bounce.handles[i] = h.bits();
+                }
+                Err(e) => {
+                    // SAFETY: reclaim the reference `into_raw` yielded.
+                    drop(unsafe { ObjectRef::from_raw(op, ot) });
+                    recv_rollback_installed(&installed[..i], pid);
+                    return Err(map_handle_err(e));
+                }
+            }
+        }
+    }
+
     // Copy out AFTER the lock is released (never hold SCHED across a user copy).
-    copy_slice_to_user(mptr, bounce.as_bytes()).map_err(from_user_access)?;
-    let handle_count: usize = 0;
-    copy_to_user(cptr, &handle_count).map_err(from_user_access)?;
+    if let Err(e) = copy_slice_to_user(mptr, bounce.as_bytes()) {
+        recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
+        return Err(from_user_access(e));
+    }
+    if n > 0 {
+        let hptr = UserMutPtr::<u8>::new(handles).map_err(|e| {
+            recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
+            from_user_access(e)
+        })?;
+        let mut hbytes = [0u8; IPC_HANDLE_MAX * 8];
+        for i in 0..n.min(IPC_HANDLE_MAX) {
+            hbytes[i * 8..i * 8 + 8].copy_from_slice(&installed[i].bits().to_le_bytes());
+        }
+        if let Err(e) = copy_slice_to_user(hptr, &hbytes[..n * 8]) {
+            recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
+            return Err(from_user_access(e));
+        }
+    }
+    if let Err(e) = copy_to_user(cptr, &n) {
+        recv_rollback_installed(&installed[..n.min(IPC_HANDLE_MAX)], pid);
+        return Err(from_user_access(e));
+    }
     Ok(0)
 }
 
@@ -1090,14 +1176,18 @@ mod tests {
     }
 
     #[test]
-    fn channel_send_rejects_mode_and_transfer_before_pointers() {
+    fn channel_send_rejects_mode_and_oversize_count_before_pointers() {
         // Mode is checked first: Block/BlockBounded are deferred (Unsupported),
         // an unknown selector is InvalidArgument — all before any pointer/lock.
         assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 0), Err(KError::Unsupported)); // Block
         assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 2), Err(KError::Unsupported)); // BlockBounded
         assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99), Err(KError::InvalidArgument));
-        // NoBlock but a non-zero handle count → transfer not implemented yet.
-        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 1, 1), Err(KError::Unsupported));
+        // NoBlock but more transferred handles than a message can carry → TooLarge
+        // (checked before any pointer use).
+        assert_eq!(
+            sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1),
+            Err(KError::TooLarge),
+        );
     }
 
     #[test]
