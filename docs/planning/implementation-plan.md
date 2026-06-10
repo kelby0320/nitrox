@@ -607,14 +607,20 @@ blocking primitive) and per-object wait queues land.
 Ordered before IPC so IPC's dead-peer path has its `PeerClosed` variant; the
 exception-delivery path uses the wait-queue blocking primitive above.
 
-- [ ] `NotificationChannel` kernel object per [docs/spec/notification-format.md]
-- [ ] Bounded queue (default 64 entries) in kernel memory
-- [ ] Notification enum with sparse category-based discriminants
-- [ ] `sys_notif_recv`
-- [ ] First notification variants: `ChildExited`, `SegFault`, `PeerClosed`
-- [ ] Exception delivery path: thread fault → suspend → notification
-- [ ] `sys_exception_resume` with Disposition enum
-- [ ] Overflow handling (exception-priority eviction)
+- [x] `NotificationChannel` kernel object per [docs/spec/notification-format.md]
+- [x] Bounded queue (default 64 entries) in kernel memory
+- [x] `Notification` (flat 64-byte record) with sparse category-based discriminants
+- [x] `sys_notif_recv` (syscall 11); `NotificationChannel` is a 2nd `sys_wait` waitable
+- [x] Exception notification variants: `SegFault`, `IllegalInsn`, `DivideByZero`
+      wired (real producer). `ChildExited` (needs spawn + real exit) and
+      `PeerClosed` (needs IPC) defined as discriminants only — no producer yet.
+- [x] Exception delivery path — **post-mortem**: ring-3 fault → notification +
+      **terminate** the faulting thread (reuses `exit()`); the kernel survives.
+- [x] Overflow handling (exception-priority eviction + `NotificationsDropped`)
+- [ ] Exception **suspend** + `sys_exception_resume` with `Disposition`
+      (+ `sys_thread_get_registers`, auto-terminate timeout, debugger
+      exception-channel priority chain) — **deferred to process spawn** (its only
+      caller is a userspace supervisor holding the faulting thread's handle).
 
 #### IPC
 

@@ -3,11 +3,15 @@
 //! once interrupts are enabled — the periodic timer (`0x20`) and the local-APIC
 //! spurious vector (`0xFF`).
 //!
-//! Every exception vector (0-31) gets a handler that prints the faulting state
-//! to the serial console and halts. The timer vector is a **returning** stub
-//! (it `iretq`s back) that drives the preemptive scheduler; the spurious vector
-//! just `iretq`s. After the preemptive-scheduling slice the kernel runs with
-//! interrupts enabled (IF=1).
+//! Exception handling splits by privilege: a **ring-0 (kernel)** fault prints
+//! the faulting state and halts (`dump_and_halt`); a **ring-3 (user)** fault is
+//! delivered to the faulting process as a `Notification` (`SegFault` /
+//! `IllegalInsn` / `DivideByZero`) and the faulting thread is terminated, so the
+//! kernel survives (see `sched::deliver_fault_and_exit` and
+//! `docs/architecture/notifications.md`). The timer vector is a **returning**
+//! stub (it `iretq`s back) that drives the preemptive scheduler; the spurious
+//! vector just `iretq`s. After the preemptive-scheduling slice the kernel runs
+//! with interrupts enabled (IF=1).
 //!
 //! `#PF` (vector 14) is the one exception with a recovery path: the
 //! handler consults the user-memory-access exception table (see
@@ -47,6 +51,9 @@ use crate::arch::irq::{ArchIrq, SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
 use crate::arch::x86_64::regs;
 use crate::arch::x86_64::serial;
+use crate::libkern::notification::{
+    FaultKind, KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, Notification,
+};
 
 /// A 64-bit IDT gate descriptor (16 bytes).
 #[repr(C)]
@@ -276,6 +283,14 @@ extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
         return;
     }
 
+    if is_user_fault(f) {
+        // A genuine ring-3 page fault (not a kernel copy-primitive fault that
+        // missed the recovery table): deliver SegFault + terminate. The CR2
+        // read here is the faulting linear address. Never returns.
+        let cr2 = regs::read_cr2();
+        crate::sched::deliver_fault_and_exit(notif_for_vector(f, Some(cr2)));
+    }
+
     dump_and_halt(f);
 }
 
@@ -380,8 +395,10 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
-/// Common handler for every CPU exception except `#PF`. Hands the
-/// frame to [`dump_and_halt`], which never returns.
+/// Common handler for every CPU exception except `#PF`. A **ring-3** fault is
+/// delivered to the faulting process as a [`Notification`] and the faulting
+/// thread is terminated (the kernel survives); a **ring-0** fault is fatal
+/// ([`dump_and_halt`]). Never returns either way.
 ///
 /// Reached only from a naked stub via `call`; `extern "C"` matches the
 /// stub's `mov rdi, rsp` argument pass.
@@ -390,7 +407,64 @@ extern "C" fn exception_dispatch(frame: *const ExceptionFrame) -> ! {
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
     let f = unsafe { &*frame };
+    if is_user_fault(f) {
+        // Deliver the fault as a notification + terminate the faulting thread.
+        // `deliver_fault_and_exit` never returns (it switches away forever).
+        crate::sched::deliver_fault_and_exit(notif_for_vector(f, None));
+    }
+    // Ring-0 (kernel) fault: unrecoverable — dump and halt.
     dump_and_halt(f);
+}
+
+/// `true` iff the saved frame is from ring 3 (user). The CPU stores the code
+/// selector with its RPL in the low two bits; ring 3 is `cs & 3 == 3`.
+fn is_user_fault(f: &ExceptionFrame) -> bool {
+    f.cs & 3 == 3
+}
+
+/// Build the post-mortem [`Notification`] for a ring-3 fault. `cr2` carries the
+/// faulting linear address for `#PF` (read from CR2); other vectors use the
+/// faulting `rip`. Reads the current thread's tid for the notification's
+/// `thread` field.
+fn notif_for_vector(f: &ExceptionFrame, cr2: Option<u64>) -> Notification {
+    let tid = crate::sched::current_tid();
+    let (kind, addr, fault) = fault_shape(f.vector, f.error_code, f.rip, cr2);
+    match kind {
+        KIND_DIVIDE_BY_ZERO => Notification::divide_by_zero(tid, addr),
+        KIND_ILLEGAL_INSN => Notification::illegal_insn(tid, addr),
+        // KIND_SEG_FAULT and the generic fallback.
+        _ => Notification::seg_fault(tid, addr, fault),
+    }
+}
+
+/// Pure vector→notification-shape mapping (host-testable; no scheduler/CR2
+/// access). Returns `(kind discriminant, fault address, FaultKind)`. `cr2` is
+/// the #PF faulting address; other vectors use `rip`.
+fn fault_shape(vector: u64, error_code: u64, rip: u64, cr2: Option<u64>) -> (u32, u64, FaultKind) {
+    match vector {
+        0 => (KIND_DIVIDE_BY_ZERO, rip, FaultKind::UnknownFault), // #DE
+        6 => (KIND_ILLEGAL_INSN, rip, FaultKind::UnknownFault),   // #UD
+        14 => (KIND_SEG_FAULT, cr2.unwrap_or(rip), pf_fault_kind(error_code)), // #PF
+        // #GP/#SS/#NP/#AC and the rest: a protection/segmentation fault.
+        _ => (KIND_SEG_FAULT, rip, FaultKind::UnknownFault),
+    }
+}
+
+/// Decode a `#PF` error code (Intel SDM Vol.3 §4.7) into a [`FaultKind`].
+/// bit0 P (0 = not present), bit1 W/R (1 = write), bit4 I/D (1 = insn fetch).
+fn pf_fault_kind(error_code: u64) -> FaultKind {
+    let present = error_code & 1 != 0;
+    let write = error_code & (1 << 1) != 0;
+    let insn = error_code & (1 << 4) != 0;
+    if !present {
+        FaultKind::NotMapped
+    } else if insn {
+        FaultKind::NotExecutable
+    } else if write {
+        FaultKind::NotWritable
+    } else {
+        FaultKind::NotReadable
+    }
 }
 
 /// Dump the faulting state to the serial console and halt. Shared
@@ -496,6 +570,30 @@ mod tests {
         let mut e = IdtEntry::EMPTY;
         e.set_handler(0, 0xFF);
         assert_eq!(e.ist, 0x7);
+    }
+
+    #[test]
+    fn pf_fault_kind_decodes_error_bits() {
+        // bit0 P, bit1 W/R, bit4 I/D.
+        assert_eq!(pf_fault_kind(0b0000), FaultKind::NotMapped); // not present
+        assert_eq!(pf_fault_kind(0b0001), FaultKind::NotReadable); // present, read
+        assert_eq!(pf_fault_kind(0b0011), FaultKind::NotWritable); // present, write
+        assert_eq!(pf_fault_kind(0b1_0001), FaultKind::NotExecutable); // present, insn fetch
+        // not-present wins regardless of W/I bits.
+        assert_eq!(pf_fault_kind(0b1_0010), FaultKind::NotMapped);
+    }
+
+    #[test]
+    fn fault_shape_maps_vectors() {
+        // #DE → divide-by-zero, addr = rip.
+        assert_eq!(fault_shape(0, 0, 0xAAAA, None), (KIND_DIVIDE_BY_ZERO, 0xAAAA, FaultKind::UnknownFault));
+        // #UD → illegal instruction, addr = rip.
+        assert_eq!(fault_shape(6, 0, 0xBBBB, None).0, KIND_ILLEGAL_INSN);
+        // #PF → seg fault, addr = cr2, kind from error code.
+        let (k, addr, fk) = fault_shape(14, 0b0011, 0xCCCC, Some(0x1000));
+        assert_eq!((k, addr, fk), (KIND_SEG_FAULT, 0x1000, FaultKind::NotWritable));
+        // #GP and others → seg fault, addr = rip.
+        assert_eq!(fault_shape(13, 0, 0xDDDD, None), (KIND_SEG_FAULT, 0xDDDD, FaultKind::UnknownFault));
     }
 
     #[test]

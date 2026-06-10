@@ -83,6 +83,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `8` | `sys_timer_create` |
 | `9` | `sys_timer_set` |
 | `10` | `sys_wait` |
+| `11` | `sys_notif_recv` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -154,7 +155,7 @@ fn sys_wait(
 ```
 Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
 
-**Implemented as of the wait-queues slice, for `Timer` handles only** — other waitable types (`PendingOperation`, `IpcChannel`, `NotificationChannel`, `Process`) return `Unsupported` until their slices land. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
+**Implemented for `Timer` and `NotificationChannel` handles** (a channel is signaled when its queue is non-empty); other waitable types (`PendingOperation`, `IpcChannel`, `Process`) return `Unsupported` until their slices land. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
 
 ### Namespace
 
@@ -232,7 +233,7 @@ Writes the saved register state of `thread` to `*out`. Thread must be suspended 
 ```rust
 fn sys_exception_resume(thread: RawHandle, disposition: Disposition) -> isize
 ```
-Resumes a suspended thread with the specified disposition (Resume, ResumeSkip, Terminate, ModifyAndResume). Requires `SIGNAL` right.
+Resumes a suspended thread with the specified disposition (Resume, ResumeSkip, Terminate, ModifyAndResume). Requires `SIGNAL` right. **Deferred** (the debugger/suspend model): the notifications slice uses a **post-mortem** model — a ring-3 fault delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel` and **terminates** the faulting thread (the kernel survives, vs. the old halt). Suspend + `sys_exception_resume` + register inspection land when a real userspace supervisor exists (process spawn).
 
 ```rust
 fn sys_exception_extend_timeout(thread: RawHandle, additional_ns: u64) -> isize
@@ -308,7 +309,7 @@ Programs the timer to fire at `deadline_ns` (**absolute** monotonic ns; `0` disa
 ```rust
 fn sys_notif_recv(queue: RawHandle, out: UserMutPtr<Notification>) -> isize
 ```
-Receives one notification from the queue. Returns `0` and writes notification to `*out` on success; returns `WouldBlock` if no notification is queued.
+Receives one notification from the queue (a `NotificationChannel` handle). Returns `0` and writes the 64-byte `Notification` to `*out` on success; returns `WouldBlock` if the queue is empty. A pending overflow surfaces as a synthetic `NotificationsDropped { count }` before further entries. Gated by handle ownership (no special right; `WAIT` gates *blocking* on the channel via `sys_wait`). (Syscall number `11`; implemented in the notifications slice.)
 
 ```rust
 fn sys_clock_read(clock: ClockId, out: UserMutPtr<u64>) -> isize

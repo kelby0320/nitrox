@@ -2595,3 +2595,72 @@ green; `qemu` shows the ring-3 `hello` block on a +50 ms timer and wake
 (`timer: waited and woke ok`), a poll return `WouldBlock` (`wait: poll empty as
 expected`), and a near-deadline `TimedOut` (`wait: timed out as expected`), with
 preemption still interleaving and a clean idle at end of boot.
+
+## 2026-06-10 — Phase 1, slice 19: notifications (NotificationChannel + exception delivery)
+
+Built the async notification primitive that replaces Unix signals, plus its
+first real producer — CPU exceptions. **Headline:** a ring-3 fault used to
+`dump_and_halt` the whole kernel; now it delivers a `Notification` and
+terminates just the faulting thread, so the kernel survives.
+
+- **`Notification` value type** (`libkern/notification.rs`): a flat 64-byte
+  `#[repr(C)] { kind: u32, body: [u8; 60] }` record with typed constructors that
+  write the spec field offsets — **not** a fieldful `#[repr(C, u32)]` enum. The
+  flat form *is* the wire bytes (one `copy_to_user`, userspace decodes by
+  discriminant), mirroring the `IoResult` precedent.
+- **`NotificationChannel` kobject** (`object/notification_channel.rs`, mirrors
+  `Timer`): a bounded FIFO (64) + drop counter + waiter list, all under the
+  rank-1 `SCHED` lock; waitable (signals empty→non-empty). Overflow:
+  exception-category notifications evict the oldest non-exception entry;
+  otherwise a drop counter increments and the next recv returns a synthetic
+  `NotificationsDropped`.
+- **Second `sys_wait` waitable.** `wait_on` now dispatches its three waitable
+  ops (`already_signaled`/`add_waiter`/`remove_waiter`) by the object type read
+  from the `KObjectHeader` at offset 0 (Timer | NotificationChannel) — no
+  signature change. Channel enqueue wakes waiters via the same path as a timer
+  fire.
+- **Post-mortem exception delivery (decided with the user).** A ring-3 fault
+  (`cs & 3 == 3`) → build a `Notification` from the vector (#PF→SegFault with
+  the CR2 address + a FaultKind from the error code; #DE→DivideByZero;
+  #UD→IllegalInsn; others→SegFault) → enqueue on the faulting process's channel
+  + wake its waiters → **terminate the faulting thread by reusing `exit()`**.
+  No IDT returning-stub refactor, no suspended state, no `sys_exception_resume`.
+  Sound because the exception runs on the faulting thread's own kernel stack, so
+  `current` *is* the faulter, and `exit()` already handles
+  terminate-current + reap (loading the boot root before the AS is freed). The
+  supervisor's channel `ObjectRef` keeps the channel (and the enqueued
+  notification) alive past the faulter's reap (the channel does not
+  back-reference the `Process` → no cycle). Kernel-mode faults still
+  `dump_and_halt`.
+- **`sys_notif_recv` = syscall 11.** Ownership-gated (no special right; `WAIT`
+  gates blocking via `sys_wait`); pops one notification under `SCHED`, copies the
+  64 bytes out **after** releasing the lock; `WouldBlock` if empty. `Process`
+  gains a `notification_channel: Option<ObjectRef>` field (kernel-internal, not
+  hashed; no cycle).
+- **Demo:** the kernel boot thread is a stand-in supervisor — it owns the
+  first user process's channel, blocks on it via the in-kernel `wait_on`, and
+  reports the `SegFault` when `hello` deliberately faults.
+- **Deferred:** the debugger model (suspend + `sys_exception_resume` +
+  `Disposition` + `sys_thread_get_registers` + auto-terminate timeout +
+  exception-channel priority chain) → needs a userspace supervisor (spawn);
+  `ChildExited` producer (spawn + real exit); `PeerClosed` producer (IPC);
+  per-process queue-capacity spawn flag; a process recv-ing on its own channel
+  from ring 3 (spawn provides the channel handle). The deferred producers'
+  discriminants are defined now (ABI).
+
+**ABI-hash impact: yes (per spec; not yet enforced).** The new **`Notification`
+layout** is a hash input (`abi-version-hash.md` § "Notification enum layout"), so
+it would move the kernel ABI hash — but the hash is not yet computed in code, so
+nothing is enforced; noted here (same posture as `IoResult`). **Unchanged:**
+`KObjectType::NotificationChannel = 6` already present (no discriminant change),
+`KError` (reuses `WouldBlock`), syscall numbers (not hashed), `Process`/`Thread`
+(kernel-internal).
+
+Verified: `cargo xtask check-arch` clean; `build` clean (no warnings); `test`
+(342 host tests — `Notification` layout/constructors, channel
+enqueue/recv/overflow/eviction/dropped-synth/waiters/dispatch, `pf_fault_kind` +
+`fault_shape` mapping, `sys_notif_recv` bad-ptr + channel-rights allocatable)
+green; `qemu` shows `hello` run its demo, then `hello: triggering a deliberate
+fault` → `supervisor: caught SegFault (tid 4, pid 1) @ 0x1000` → `init: user
+process faulted and was contained; kernel alive` — the kernel survives a
+userspace fault that previously halted it.

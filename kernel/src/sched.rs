@@ -57,7 +57,10 @@ use crate::arch::{Cpu, Paging, context_switch};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
-use crate::object::{MAX_WAIT_HANDLES, ObjectRef, Thread, ThreadEntry, ThreadState, Timer};
+use crate::libkern::Notification;
+use crate::object::{
+    MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, Thread, ThreadEntry, ThreadState, Timer,
+};
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -484,6 +487,71 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
     }
 }
 
+// --- Waitable dispatch (Timer | NotificationChannel) -------------------
+//
+// `wait_on` works over type-erased object pointers; it dispatches the three
+// waitable operations by the kobject type read from the `KObjectHeader` at
+// offset 0 (every kobject is `#[repr(C)]` with the header first). `sys_wait`
+// has already rejected non-waitables before these run.
+
+/// The kobject type at the head of a type-erased object pointer.
+/// # Safety: `obj` is a live kobject (header at offset 0); `SCHED` held.
+unsafe fn obj_type(obj: *mut ()) -> KObjectType {
+    // SAFETY: every kobject begins with a `KObjectHeader` (see object::header).
+    unsafe { (*(obj as *const crate::object::header::KObjectHeader)).object_type() }
+}
+
+/// Is this waitable currently signaled? (Timer deadline elapsed / channel non-empty.)
+/// # Safety: live waitable, `SCHED` held.
+unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
+    match unsafe { obj_type(obj) } {
+        KObjectType::Timer => unsafe { Timer::already_signaled(obj, now) },
+        KObjectType::NotificationChannel => unsafe {
+            NotificationChannel::already_signaled(obj)
+        },
+        _ => false,
+    }
+}
+
+/// Register the current thread as a waiter. `Err` over the object's reserve.
+/// # Safety: live waitable, `SCHED` held.
+unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
+    match unsafe { obj_type(obj) } {
+        KObjectType::Timer => unsafe { Timer::add_waiter(obj, th) },
+        KObjectType::NotificationChannel => unsafe { NotificationChannel::add_waiter(obj, th) },
+        _ => Err(()),
+    }
+}
+
+/// Unregister a waiter (idempotent).
+/// # Safety: live waitable, `SCHED` held.
+unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
+    match unsafe { obj_type(obj) } {
+        KObjectType::Timer => unsafe { Timer::remove_waiter(obj, th) },
+        KObjectType::NotificationChannel => unsafe { NotificationChannel::remove_waiter(obj, th) },
+        _ => {}
+    }
+}
+
+/// Wake every thread blocked on `channel` (its queue just went non-empty).
+/// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path.
+/// Mirrors [`fire_timer`]'s waiter-drain.
+fn signal_channel(g: &mut SchedState, channel: *mut ()) {
+    let mut buf = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
+    // SAFETY: live channel, `SCHED` held — drains its waiter list.
+    let n = unsafe { NotificationChannel::take_waiters(channel, &mut buf) };
+    for &th in &buf[..n] {
+        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
+        // `blocked`; `SCHED` held.
+        unsafe {
+            Thread::wait_mark_signaled(th, channel as usize);
+            if Thread::wait_try_wake(th) {
+                make_runnable(g, th);
+            }
+        }
+    }
+}
+
 /// Park the current thread (set `Blocked`, move into `blocked`) and switch to
 /// the next runnable thread. Mirrors [`switch_to_next`]'s IF-bracket exactly,
 /// but does **not** re-enqueue the outgoing thread — the caller ([`wait_on`])
@@ -572,9 +640,9 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
         let mut signaled = [false; MAX_WAIT_HANDLES];
         let mut any = false;
         for (i, &o) in objs.iter().enumerate() {
-            // SAFETY: `o` is a live Timer pinned by the caller's `ObjectRef`;
-            // `SCHED` held.
-            if unsafe { Timer::already_signaled(o as *mut (), now) } {
+            // SAFETY: `o` is a live waitable pinned by the caller's `ObjectRef`;
+            // `SCHED` held. Dispatches by the object's header type.
+            if unsafe { obj_already_signaled(o as *mut (), now) } {
                 signaled[i] = true;
                 any = true;
             }
@@ -595,8 +663,8 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
         let mut registered = 0usize;
         let mut failed = false;
         for &o in objs {
-            // SAFETY: live Timer, `SCHED` held.
-            if unsafe { Timer::add_waiter(o as *mut (), me_ptr) }.is_err() {
+            // SAFETY: live waitable, `SCHED` held.
+            if unsafe { obj_add_waiter(o as *mut (), me_ptr) }.is_err() {
                 failed = true;
                 break;
             }
@@ -613,7 +681,7 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
             // Unwind the partial registration and bail without blocking.
             for &o in &objs[..registered] {
                 // SAFETY: live Timer, `SCHED` held.
-                unsafe { Timer::remove_waiter(o as *mut (), me_ptr) };
+                unsafe { obj_remove_waiter(o as *mut (), me_ptr) };
             }
             // SAFETY: live Thread, `SCHED` held.
             unsafe { Thread::wait_clear(me_ptr) };
@@ -634,7 +702,7 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
         let n = unsafe { Thread::wait_snapshot(me_ptr, &mut snap) };
         for &o in objs {
             // SAFETY: live Timer (caller still holds its `ObjectRef`), `SCHED` held.
-            unsafe { Timer::remove_waiter(o as *mut (), me_ptr) };
+            unsafe { obj_remove_waiter(o as *mut (), me_ptr) };
         }
         // SAFETY: live Thread, `SCHED` held.
         if unsafe { Thread::wait_has_deadline(me_ptr) } {
@@ -869,6 +937,62 @@ pub fn current_owner_pid() -> u32 {
     // access to the `Thread`. Forming a shared `&Thread` to read `owner_pid`
     // is sound; no `&mut` is taken anywhere under this lock.
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.owner_pid()
+}
+
+/// The tid of the currently running thread. Used by the exception path to fill
+/// the `thread` field of a fault notification. Takes only the rank-1 lock.
+pub fn current_tid() -> u32 {
+    let g = SCHED.lock();
+    let cur = g.current.as_ref().expect("current set when a thread runs");
+    // SAFETY: `current` is pinned alive and the run-queue lock serialises
+    // Thread access; a shared `&Thread` read of `tid` is sound.
+    unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.tid()
+}
+
+/// Deliver a fault `notif` to the **current** (faulting) process's notification
+/// channel, wake the channel's waiters, then terminate the current thread.
+/// Never returns. Called from the exception dispatchers on a ring-3 fault.
+///
+/// The faulting thread *is* `current` (the exception entered on its kernel
+/// stack), so termination reuses [`exit`] verbatim. If the process has no
+/// channel (or the faulter is a kernel thread with no process), the fault is
+/// still contained — we just `exit()`. The supervisor that holds the channel's
+/// `ObjectRef` keeps it (and the enqueued notification) alive past this reap.
+pub fn deliver_fault_and_exit(notif: Notification) -> ! {
+    {
+        let mut g = SCHED.lock();
+        // Find the current thread's process channel pointer (borrowed, never an
+        // owned ObjectRef — we must not run a destructor under SCHED).
+        let chan: Option<*mut ()> = g.current.as_ref().and_then(|cur| {
+            // SAFETY: `current` pinned, SCHED held — shared `&Thread` read.
+            let th = unsafe { &*(cur.as_ptr() as *const crate::object::Thread) };
+            th.process_ref().and_then(|p| {
+                // SAFETY: `p` pins a live Process; read its channel pointer.
+                let proc = unsafe { &*(p.as_ptr() as *const crate::object::Process) };
+                proc.notification_channel_ptr()
+                // `p` (a cloned ObjectRef, never the last) drops here: a plain
+                // atomic decrement, no destructor, safe under SCHED.
+            })
+        });
+        if let Some(c) = chan {
+            // SAFETY: `c` is the channel the current Process owns a ref on (so
+            // it is alive at least until this thread is reaped); SCHED held. No
+            // allocation (queue/waiters pre-reserved).
+            let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
+            signal_channel(&mut g, c);
+        }
+        // guard drops here — never held across the exit() switch below.
+    }
+    exit()
+}
+
+/// Pop one notification from `channel` under `SCHED` (or synthesize a dropped
+/// notice). The lock-guarded core of `sys_notif_recv` and the in-kernel
+/// supervisor; the caller copies the result out **after** this returns.
+pub fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
+    let _g = SCHED.lock();
+    // SAFETY: the caller holds an `ObjectRef` pinning the channel; SCHED held.
+    unsafe { NotificationChannel::try_recv(channel) }
 }
 
 /// The [`Process`](crate::object::Process) owning the currently running

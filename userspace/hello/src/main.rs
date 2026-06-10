@@ -330,7 +330,7 @@ pub extern "C" fn _start() -> ! {
     }
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 
-    // 5. Unmap and exit.
+    // 5. Unmap.
     // SAFETY: valid syscall on a region we mapped above.
     let ur = unsafe { syscall2(SYS_MEMORY_UNMAP, addr, PAGE) };
     if ur == 0 {
@@ -339,7 +339,19 @@ pub extern "C" fn _start() -> ! {
         kprint(b"memory: unmap FAIL\n");
     }
 
-    exit(0);
+    // 6. Deliberately fault. With notifications, a userspace fault is delivered
+    //    to the process's supervisor as a SegFault notification and this thread
+    //    is terminated — the kernel survives (it used to halt). The supervisor
+    //    (the kernel boot thread, this slice) reports the catch. We write to a
+    //    never-mapped low address (page 1) → #PF (not-present, write).
+    kprint(b"hello: triggering a deliberate fault\n");
+    // SAFETY-NOT: an intentional fault; control never returns past this store.
+    unsafe { core::ptr::write_volatile(0x1000 as *mut u64, 0xDEAD) };
+    // Unreachable: the store faults and the kernel terminates this thread.
+    loop {
+        // SAFETY: `pause` is always valid in ring 3 and has no effects.
+        unsafe { asm!("pause", options(nomem, nostack)) };
+    }
 }
 
 #[panic_handler]
