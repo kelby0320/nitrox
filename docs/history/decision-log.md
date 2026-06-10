@@ -2664,3 +2664,82 @@ green; `qemu` shows `hello` run its demo, then `hello: triggering a deliberate
 fault` → `supervisor: caught SegFault (tid 4, pid 1) @ 0x1000` → `init: user
 process faulted and was contained; kernel alive` — the kernel survives a
 userspace fault that previously halted it.
+
+## 2026-06-10 — Phase 1, slice 20: IPC (`IpcChannel` + `sys_channel_create`/`send`/`recv`)
+
+Built the IPC channel primitive and its three syscalls — the backbone for
+resource servers, the namespace, and (next) process spawn, which passes a child
+its initial endpoints *through* IPC, so IPC lands first. Single-process-demoable:
+`hello` round-trips a message to itself across a channel it holds both ends of.
+
+- **Endpoint model: two endpoint kobjects, mutual peer pointers.** A channel is a
+  *pair* of `IpcChannel` endpoint objects (both `KObjectType::IpcChannel = 5`),
+  each owning its own receive ring + recv-waiter list, linked by a mutual raw
+  `peer` pointer. Send on S → push into S's peer's ring; recv on R → pop R's own
+  ring. **Why two objects, not one:** the spec phrases it as "two endpoint
+  handles, separate queues per direction," but a single shared object can't be
+  used — a handle→object pointer carries no per-handle tag to tell the two ends
+  apart for the asymmetric routing. (The spec is pre-stabilization; this is a
+  compatible implementation choice, not a contract change.)
+- **`IpcMsg` size reconciliation.** The spec listed `IPC_PAYLOAD_SIZE = 4032`,
+  making header + payload + handles sum to `4120 ≠ 4096` — internally
+  inconsistent. Pinned the clean one-page layout: `payload = 4096 − 24 − 64 =
+  **4008**`, asserted at compile time in `libkern/ipc.rs`. Source wins; the spec
+  doc is updated to match. The kernel queues messages in a byte-identical,
+  natural-alignment `StoredMsg` twin (page alignment matters only to the
+  userspace buffer, not the kernel's heap slots).
+- **NoBlock-only send (architecture-forced, not a fork).** The spec has
+  `sys_channel_send` return a `PendingOperation` and `Block`/`BlockBounded` block
+  via it — but `PendingOperation` is the async-I/O slice, and a bidirectional
+  endpoint can't express both a readable and a writable wait edge through
+  `sys_wait`'s single signaled bit. So send is `NoBlock` now (returns `0` /
+  `WouldBlock`); `Block`/`BlockBounded` → `Unsupported`, deferred to the async
+  slice. `recv` fits today's model: `WouldBlock` if empty + `sys_wait` for the
+  readable edge, exactly like `sys_notif_recv`.
+- **Third `sys_wait` waitable.** Added an `IpcChannel` arm to the three `wait_on`
+  dispatch helpers; an endpoint signals when its receive ring is non-empty **or**
+  its peer has closed (so a blocked receiver always wakes — to a message or to
+  `PeerClosed`). The user copies (4096 bytes each way) run *outside* `SCHED`; the
+  empty-poll path peeks under the lock and allocates no bounce buffer.
+- **Dead peer: errors now, notification deferred (decided with the user).**
+  `send`/`recv` on a peer-closed endpoint return the new `PeerClosed = -13`, and a
+  blocked receiver wakes to return it. On close, the endpoint's destructor (under
+  `SCHED`) nulls the surviving peer's back-pointer and wakes its receivers; the
+  second-to-close sees its own peer already null and skips — no use-after-free,
+  serialized by the single-CPU lock. `IpcChannel::Drop` therefore takes `SCHED`;
+  sound because endpoint refs are released only outside `SCHED` (handle close,
+  the `sys_wait`/lookup `ObjectRef`s). The async `Notification::PeerClosed` is
+  deferred to spawn (it needs the channel→peer-process-notification-channel link,
+  which only matters cross-process).
+- **Handle transfer deferred to spawn (decided with the user).** The `handles[]`
+  array / move + duplicate paths exist for cross-process capability propagation,
+  which can't be exercised with one process. The send/recv ABI keeps the
+  `handles`/`count` parameters for stability, but `sys_channel_send` requires
+  `count == 0` (non-zero → `Unsupported`). The handle-table primitives
+  (`allocate`/`lookup`/`close` over an arbitrary `owner_pid`) already support it
+  when spawn lands.
+- **Syscalls 12/13/14** (`sys_channel_create`/`send`/`recv`); send forwards the
+  `a4` register (mode). `sys_channel_create` writes two endpoint handles with full
+  rights, rolling back on a partial-failure (alloc/copy) without leaking
+  endpoints.
+- **Demo:** `hello` creates a channel (depth 4), sends `ipc: ping` end0→end1,
+  confirms `WouldBlock` polling the empty end0, blocks on end1 via `sys_wait`,
+  receives + verifies the payload and `sender_pid == 1`, confirms `WouldBlock` on
+  the drained endpoint, closes end0, and confirms `PeerClosed` recv-ing on end1 —
+  then proceeds to its existing deliberate fault (still contained).
+
+**ABI-hash impact: yes (per spec; not yet enforced).** `KError` gains
+`PeerClosed = -13` (enum discriminants are hash inputs) → moves the hash.
+`IpcMsg`/`IpcMsgHeader`/`SendMode` are cross-boundary layouts (hash inputs like
+`Notification`/`IoResult`). The hash is still not computed in code, so nothing is
+enforced; noted here (same posture as prior slices). **Unchanged:**
+`KObjectType::IpcChannel = 5` already present (no discriminant change); syscall
+numbers (not hashed).
+
+Verified: `cargo xtask check-arch` clean; `build` clean (no warnings); `test`
+(358 host tests — `IpcMsg`/`SendMode` layout, `MsgRing` FIFO/full/wrap,
+`IpcChannel` pair/route/drain/already-signaled/waiters/dispatch-destroy/peer-close,
+and the `sys_channel_*` validation + endpoint-rights tests) green; `qemu` shows
+`hello`'s full IPC round-trip (`ipc: empty-endpoint would-block ok` → `received
+message from pid 1 ok` → `drained would-block ok` → `peer-closed detected ok` →
+`ipc: ok`), then the deliberate fault still contained — kernel alive.

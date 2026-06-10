@@ -2,43 +2,45 @@
 
 This document specifies the on-wire format of IPC messages — `IpcMsg` and its header. This is the kernel-level message envelope. Higher-level protocols (such as the resource server protocol) ride on top of this; see [rsproto-wire-format.md](rsproto-wire-format.md) for that layer.
 
-**Status:** Pre-stabilization. Subject to change before v1.0.
+**Status:** Pre-stabilization. Implemented (kernel `IpcChannel` + `sys_channel_create`/`send`/`recv`) with documented deferrals — see [§ Implementation status](#implementation-status). Subject to change before v1.0.
 
 ## Constants
 
 | Constant | Value | Purpose |
 |---|---|---|
 | `IPC_MSG_SIZE` | 4096 | Total size of an `IpcMsg` in bytes |
-| `IPC_PAYLOAD_SIZE` | 4032 | Bytes of payload per message |
+| `IPC_PAYLOAD_SIZE` | 4008 | Bytes of payload per message |
 | `IPC_HANDLE_MAX` | 8 | Maximum transferable handles per message |
 | `IPC_HEADER_SIZE` | 24 | Size of `IpcMsgHeader` in bytes |
 
-`IPC_MSG_SIZE = IPC_HEADER_SIZE + IPC_PAYLOAD_SIZE + (IPC_HANDLE_MAX × 8) - alignment_padding`. The alignment is deliberate: `IpcMsg` is one page on x86_64.
+`IPC_MSG_SIZE = IPC_HEADER_SIZE + IPC_PAYLOAD_SIZE + (IPC_HANDLE_MAX × 8)` — exactly `24 + 4008 + 64 = 4096`. The three regions tile one page with no interior padding; `IpcMsg` is one page on x86_64 by design.
+
+> **Reconciliation note.** An earlier draft listed `IPC_PAYLOAD_SIZE = 4032`, which made the regions sum to `4120 ≠ 4096` — the document was internally inconsistent (it claimed both a one-page envelope and a 4120-byte struct). The implementation pins the clean one-page layout below (`payload = 4096 − 24 − 64 = 4008`); the source is authoritative and this spec is updated to match (decision log, 2026-06-10).
 
 ## IpcMsg layout
 
 ```rust
 #[repr(C, align(4096))]
 pub struct IpcMsg {
-    pub header:   IpcMsgHeader,                 // 24 bytes
-    pub payload:  [u8; IPC_PAYLOAD_SIZE],       // 4032 bytes
-    pub handles:  [RawHandle; IPC_HANDLE_MAX],  // 64 bytes (8 × 8)
+    pub header:   IpcMsgHeader,                 // 24 bytes   @ offset 0
+    pub payload:  [u8; IPC_PAYLOAD_SIZE],       // 4008 bytes @ offset 24
+    pub handles:  [RawHandle; IPC_HANDLE_MAX],  // 64 bytes   @ offset 4032
 }
 ```
 
-Total size: 24 + 4032 + 64 = 4120 bytes. With page alignment, the structure occupies a 4096-byte slot in the channel queue's slot pool, with the handles array overlapping the tail of the payload region in the wire layout. The actual on-wire structure is:
+The wire layout, exactly one page:
 
 ```
 Offset  Size  Field
 ─────── ────  ─────────────
    0     24   header
-  24    4032  payload
-4056      64  handles
+  24    4008  payload
+4032      64  handles
 ─────── ────
-        4120  (4096 with packing — see below)
+        4096
 ```
 
-**Packing note:** the actual in-memory layout uses 4096 bytes with the handles array starting at offset 4032 (immediately after payload). The `IpcMsgHeader` is 24 bytes, leaving 4072 bytes for payload + handles. Userspace and kernel share this layout via `#[repr(C)]`. The exact byte offsets are pinned in `libkern`'s definition.
+Userspace and kernel share this layout via `#[repr(C)]`; the exact byte offsets are pinned by compile-time asserts in `kernel/src/libkern/ipc.rs`. (The kernel stores queued messages in a byte-identical, natural-alignment `StoredMsg` twin — the page alignment matters only to the userspace-facing buffer, not to the kernel's queue slots.)
 
 ## IpcMsgHeader
 
@@ -107,6 +109,8 @@ pub enum SendMode {
 
 `BlockBounded` mode requires the caller to also pass a deadline, communicated via `IoOp` parameters (see `sys_io_submit`).
 
+> **Implemented:** `NoBlock` only. `Block` / `BlockBounded` return `Unsupported` until the async-I/O slice lands — they block via a `PendingOperation`, which does not exist yet, and a bidirectional endpoint cannot ride `sys_wait`'s single signaled bit for both "readable" and "writable". See [§ Implementation status](#implementation-status).
+
 ## Handle transfer in messages
 
 The `handles[]` array carries handle values that the kernel will transfer to the receiver as part of message delivery. The transfer is atomic with the message receive:
@@ -170,6 +174,19 @@ When one endpoint's last handle is closed, the channel transitions to "peer-clos
 - A `Notification::PeerClosed { handle }` is delivered to every process holding a handle to the still-open endpoint with `WAIT` right.
 
 The channel object is freed when both endpoints' handle counts reach zero.
+
+> **Implemented:** the **error** half (send/recv on a peer-closed endpoint return `PeerClosed = -13`, and a blocked receiver wakes to return it). The async **`Notification::PeerClosed`** is deferred to process spawn — delivering it needs the channel→peer-process-notification-channel link, which only matters once endpoints live in different processes. See [§ Implementation status](#implementation-status).
+
+## Implementation status
+
+The channel mechanism (`IpcChannel`, `sys_channel_create` = 12, `sys_channel_send` = 13, `sys_channel_recv` = 14, `sys_wait` integration) is implemented. Internally a channel is a **pair of endpoint kobjects** (each `KObjectType::IpcChannel`), each owning its own receive ring + recv-waiter list and linked by a mutual `peer` pointer — "two endpoint handles, separate queues per direction" with one kobject per endpoint. (A single shared object can't be used: a handle→object pointer carries no per-handle tag to distinguish the two ends for the asymmetric routing.)
+
+Deferred to **process spawn** (where two real processes make them testable end-to-end):
+
+- **Handle transfer** (the `handles[]` array / move + duplicate). The send/recv ABI keeps the `handles`/`count` parameters for stability, but `sys_channel_send` requires `count == 0` (non-zero → `Unsupported`).
+- **`Notification::PeerClosed`** delivery (the error half ships now).
+
+Deferred to the **async-I/O slice**: `Block` / `BlockBounded` send modes and the `PendingOperation`-returning send. `NoBlock` ships now.
 
 ## Bulk data: companion memory objects
 

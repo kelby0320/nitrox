@@ -18,7 +18,8 @@ use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable};
 use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
-use crate::libkern::{IoResult, KBox, MemFlags, Notification, TimerFlags};
+use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
+use crate::libkern::{IoResult, KBox, MemFlags, Notification, SendMode, TimerFlags};
 use crate::mm::addr_space::{AddressSpace, MapError};
 use crate::mm::user_access::{
     UserMutPtr, UserPtr, copy_slice_from_user, copy_slice_to_user, copy_to_user,
@@ -27,7 +28,10 @@ use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
-use crate::object::{MAX_WAIT_HANDLES, MemoryObject, ObjectRef, Process, Timer as TimerObject};
+use crate::object::{
+    IpcChannel, MAX_WAIT_HANDLES, MemoryObject, ObjectRef, Process, RecvState, SendOutcome,
+    StoredMsg, Timer as TimerObject,
+};
 
 // --- Stable ABI syscall numbers -----------------------------------------
 //
@@ -60,6 +64,12 @@ pub const SYS_TIMER_SET: u64 = 9;
 pub const SYS_WAIT: u64 = 10;
 /// `sys_notif_recv` — dequeue one notification from a `NotificationChannel`.
 pub const SYS_NOTIF_RECV: u64 = 11;
+/// `sys_channel_create` — create an IPC channel, return its two endpoint handles.
+pub const SYS_CHANNEL_CREATE: u64 = 12;
+/// `sys_channel_send` — enqueue a message on a channel endpoint (NoBlock).
+pub const SYS_CHANNEL_SEND: u64 = 13;
+/// `sys_channel_recv` — dequeue a message from a channel endpoint.
+pub const SYS_CHANNEL_RECV: u64 = 14;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -76,7 +86,7 @@ const KPRINT_MAX: usize = 4096;
 /// Route a decoded syscall to its handler. `nr` is the number (from RAX);
 /// `a0..a5` are the six argument registers (RDI, RSI, RDX, R10, R8, R9).
 /// Returns the `isize` the ABI hands back in RAX.
-pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64) -> isize {
+pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> isize {
     // No explicit grace `quiesce` is needed on this dispatch path: every
     // handle syscall below routes through a `HandleTable` method that takes
     // and drops a read guard, which marks the calling context (ctx 0 in
@@ -96,6 +106,9 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, _a4: u64, _a5: u64)
         SYS_TIMER_SET => encode(sys_timer_set(a0, a1, a2)),
         SYS_WAIT => encode(sys_wait(a0, a1 as usize, a2, a3)),
         SYS_NOTIF_RECV => encode(sys_notif_recv(a0, a1)),
+        SYS_CHANNEL_CREATE => encode(sys_channel_create(a0, a1, a2)),
+        SYS_CHANNEL_SEND => encode(sys_channel_send(a0, a1, a2, a3, a4)),
+        SYS_CHANNEL_RECV => encode(sys_channel_recv(a0, a1, a2, a3)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Diverges into the scheduler; never returns to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -536,7 +549,7 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
             .lookup(RawHandle(handles[i]), pid, Rights::WAIT)
             .map_err(map_handle_err)?;
         match ok.object.object_type() {
-            KObjectType::Timer | KObjectType::NotificationChannel => {}
+            KObjectType::Timer | KObjectType::NotificationChannel | KObjectType::IpcChannel => {}
             _ => return Err(KError::Unsupported),
         }
         objs[i] = ok.object.as_ptr() as usize;
@@ -605,6 +618,174 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
     // (never hold the IrqSpinLock across a faulting user copy).
     let n = crate::sched::notif_try_recv(ok.object.as_ptr()).ok_or(KError::WouldBlock)?;
     copy_to_user(uptr, &n).map_err(from_user_access)?;
+    Ok(0)
+}
+
+/// The full rights a freshly created channel endpoint carries
+/// (`docs/spec/ipc-message-format.md` § "Channel creation"). The creator
+/// attenuates before handing an endpoint to another party.
+fn channel_endpoint_rights() -> Rights {
+    Rights::SEND
+        | Rights::RECV
+        | Rights::DUPLICATE
+        | Rights::TRANSFER
+        | Rights::INSPECT
+        | Rights::WAIT
+}
+
+/// Close a handle the kernel just allocated and release the reference it held —
+/// the rollback primitive for `sys_channel_create`'s partial-failure paths.
+fn close_and_release(h: RawHandle, pid: u32) {
+    if let Ok(co) = global::get().close(h, pid) {
+        // SAFETY: `close` transferred one reference into the token without
+        // decrementing; adopt it into an `ObjectRef` and drop to release.
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+}
+
+/// `sys_channel_create(end0, end1, queue_depth)` — create a bidirectional IPC
+/// channel and write its two endpoint handles to `*end0` / `*end1`. Each
+/// direction gets a `queue_depth`-slot ring (`0` → default; `> IPC_MAX_QUEUE_DEPTH`
+/// rejected). Both endpoints carry [`channel_endpoint_rights`].
+pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
+    // Validate the two out-pointers + depth before allocating (host-reachable).
+    let e0 = UserMutPtr::<RawHandle>::new(end0).map_err(from_user_access)?;
+    let e1 = UserMutPtr::<RawHandle>::new(end1).map_err(from_user_access)?;
+    let depth = if queue_depth == 0 {
+        IPC_DEFAULT_QUEUE_DEPTH
+    } else if queue_depth > IPC_MAX_QUEUE_DEPTH as u64 {
+        return Err(KError::InvalidArgument);
+    } else {
+        queue_depth as u32
+    };
+
+    let pid = crate::sched::current_owner_pid();
+    let (a, b) = IpcChannel::try_new_pair(depth).map_err(|_| KError::OutOfMemory)?;
+    let a_ptr = KBox::into_raw(a).as_ptr() as *mut ();
+    let b_ptr = KBox::into_raw(b).as_ptr() as *mut ();
+    let rights = channel_endpoint_rights();
+
+    // Install endpoint 0. On failure, reclaim both creation references.
+    let h0 = match global::get().allocate(pid, a_ptr, KObjectType::IpcChannel, rights) {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: each pointer still owns its single creation reference.
+            drop(unsafe { ObjectRef::from_raw(a_ptr, KObjectType::IpcChannel) });
+            drop(unsafe { ObjectRef::from_raw(b_ptr, KObjectType::IpcChannel) });
+            return Err(map_handle_err(e));
+        }
+    };
+    // Install endpoint 1. On failure, close `h0` (drops endpoint a, which nulls
+    // b's peer) and reclaim b's still-held creation reference.
+    let h1 = match global::get().allocate(pid, b_ptr, KObjectType::IpcChannel, rights) {
+        Ok(h) => h,
+        Err(e) => {
+            close_and_release(h0, pid);
+            // SAFETY: b_ptr still owns its creation reference.
+            drop(unsafe { ObjectRef::from_raw(b_ptr, KObjectType::IpcChannel) });
+            return Err(map_handle_err(e));
+        }
+    };
+
+    // Publish the handles. A faulting copy rolls both back so we never leak an
+    // endpoint into a process that cannot observe it.
+    if let Err(e) = copy_to_user(e0, &h0) {
+        close_and_release(h0, pid);
+        close_and_release(h1, pid);
+        return Err(from_user_access(e));
+    }
+    if let Err(e) = copy_to_user(e1, &h1) {
+        close_and_release(h0, pid);
+        close_and_release(h1, pid);
+        return Err(from_user_access(e));
+    }
+    Ok(0)
+}
+
+/// `sys_channel_send(ch, msg, handles, count, mode)` — enqueue `*msg` on the
+/// peer of endpoint `ch`. This slice supports `NoBlock` only (`Block` /
+/// `BlockBounded` → `Unsupported`, pending the async-I/O slice) and no handle
+/// transfer (`count != 0` → `Unsupported`, pending process spawn). Returns `0`
+/// on success, `WouldBlock` if the queue is full, `PeerClosed` if the peer has
+/// gone.
+pub fn sys_channel_send(
+    ch: u64,
+    msg: u64,
+    _handles: u64,
+    count: u64,
+    mode: u64,
+) -> SysResult {
+    // Mode + transfer gating first (host-reachable, no pointer/lock use).
+    match SendMode::from_u32(mode as u32) {
+        Some(SendMode::NoBlock) => {}
+        Some(SendMode::Block) | Some(SendMode::BlockBounded) => return Err(KError::Unsupported),
+        None => return Err(KError::InvalidArgument),
+    }
+    if count != 0 {
+        return Err(KError::Unsupported); // handle transfer lands with spawn
+    }
+    let mptr = UserPtr::<u8>::new(msg).map_err(from_user_access)?;
+
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(ch), pid, Rights::SEND)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::IpcChannel {
+        return Err(KError::InvalidArgument);
+    }
+
+    // Bounce the 4096-byte message in from user memory (outside any lock — a
+    // user copy may fault). One heap slot per send; optimisation target later.
+    let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
+    copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
+    if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
+        return Err(KError::InvalidArgument);
+    }
+    // Stamp the kernel-controlled header fields; clear the (unused) handle region.
+    bounce.header.sender_pid = pid;
+    bounce.header.timestamp = Timer::read_ns();
+    bounce.header.handle_count = 0;
+    bounce.handles = [0u64; IPC_HANDLE_MAX];
+
+    // `ok.object` (held here) pins the endpoint across the push.
+    match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce) {
+        SendOutcome::Sent { .. } => Ok(0),
+        SendOutcome::Full => Err(KError::WouldBlock),
+        SendOutcome::PeerClosed => Err(KError::PeerClosed),
+    }
+}
+
+/// `sys_channel_recv(ch, msg, handles, count)` — dequeue the oldest message on
+/// endpoint `ch` into `*msg` (4096 bytes) and write the transferred-handle count
+/// (`0` this slice) to `*count`. `WouldBlock` if the inbox is empty (caller
+/// `sys_wait`s on `ch`); `PeerClosed` if empty and the peer has gone.
+pub fn sys_channel_recv(ch: u64, msg: u64, _handles: u64, count: u64) -> SysResult {
+    let mptr = UserMutPtr::<u8>::new(msg).map_err(from_user_access)?;
+    let cptr = UserMutPtr::<usize>::new(count).map_err(from_user_access)?;
+
+    let pid = crate::sched::current_owner_pid();
+    let ok = global::get()
+        .lookup(RawHandle(ch), pid, Rights::RECV)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != KObjectType::IpcChannel {
+        return Err(KError::InvalidArgument);
+    }
+
+    // Peek under SCHED so the empty-poll path allocates no bounce buffer.
+    match crate::sched::ipc_recv_peek(ok.object.as_ptr()) {
+        RecvState::Empty => return Err(KError::WouldBlock),
+        RecvState::PeerClosed => return Err(KError::PeerClosed),
+        RecvState::HasMsg => {}
+    }
+    let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
+    if !crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce) {
+        // Drained between the peek and the pop (only possible under future SMP).
+        return Err(KError::WouldBlock);
+    }
+    // Copy out AFTER the lock is released (never hold SCHED across a user copy).
+    copy_slice_to_user(mptr, bounce.as_bytes()).map_err(from_user_access)?;
+    let handle_count: usize = 0;
+    copy_to_user(cptr, &handle_count).map_err(from_user_access)?;
     Ok(0)
 }
 
@@ -708,6 +889,69 @@ mod tests {
             .expect("WAIT + generic rights must be valid for a NotificationChannel");
         let co = t.close(h, 1).unwrap();
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    #[test]
+    fn channel_create_rejects_bad_pointer_and_oversize_depth() {
+        // The out-pointers are validated first (USER_VIRT_END is out of range),
+        // then the depth bound — both before `current_owner_pid`/allocation.
+        assert_eq!(
+            sys_channel_create(USER_VIRT_END, 0x1000, 4),
+            Err(KError::FaultFromUser),
+        );
+        assert_eq!(
+            sys_channel_create(0x1000, USER_VIRT_END, 4),
+            Err(KError::FaultFromUser),
+        );
+        // Valid pointers + a depth past the cap → InvalidArgument.
+        assert_eq!(
+            sys_channel_create(0x1000, 0x1000, IPC_MAX_QUEUE_DEPTH as u64 + 1),
+            Err(KError::InvalidArgument),
+        );
+    }
+
+    #[test]
+    fn channel_send_rejects_mode_and_transfer_before_pointers() {
+        // Mode is checked first: Block/BlockBounded are deferred (Unsupported),
+        // an unknown selector is InvalidArgument — all before any pointer/lock.
+        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 0), Err(KError::Unsupported)); // Block
+        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 2), Err(KError::Unsupported)); // BlockBounded
+        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99), Err(KError::InvalidArgument));
+        // NoBlock but a non-zero handle count → transfer not implemented yet.
+        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 1, 1), Err(KError::Unsupported));
+    }
+
+    #[test]
+    fn channel_send_rejects_bad_message_pointer() {
+        // NoBlock + count 0, then a bad `msg` pointer fails before lookup/lock.
+        assert_eq!(
+            sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1),
+            Err(KError::FaultFromUser),
+        );
+    }
+
+    #[test]
+    fn channel_recv_rejects_bad_pointers() {
+        // Either out-pointer being out of range fails before lookup/lock.
+        assert_eq!(sys_channel_recv(0xDEAD, USER_VIRT_END, 0, 0x1000), Err(KError::FaultFromUser));
+        assert_eq!(sys_channel_recv(0xDEAD, 0x1000, 0, USER_VIRT_END), Err(KError::FaultFromUser));
+    }
+
+    #[test]
+    fn channel_endpoint_rights_are_allocatable_on_a_channel() {
+        // The minted endpoint rights (SEND|RECV principal + the generic band)
+        // must be accepted by the handle table for an IpcChannel.
+        init_global_heap();
+        let t = HandleTable::try_new(0x1357_9BDF_0246_8ACE).unwrap();
+        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+        let a_ptr = KBox::into_raw(a).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, a_ptr, KObjectType::IpcChannel, channel_endpoint_rights())
+            .expect("channel_endpoint_rights must be valid for an IpcChannel");
+        // Close endpoint a (frees it, nulling b's peer), then drop b's box.
+        let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+        drop(b);
     }
 
     #[test]

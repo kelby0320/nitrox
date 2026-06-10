@@ -43,8 +43,14 @@ const SYS_CLOCK_READ: u64 = 7;
 const SYS_TIMER_CREATE: u64 = 8;
 const SYS_TIMER_SET: u64 = 9;
 const SYS_WAIT: u64 = 10;
+const SYS_CHANNEL_CREATE: u64 = 12;
+const SYS_CHANNEL_SEND: u64 = 13;
+const SYS_CHANNEL_RECV: u64 = 14;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 const SYS_PROCESS_EXIT: u64 = 0xFFFF_0001;
+
+/// `SendMode::NoBlock` (`kernel/src/libkern/ipc.rs`).
+const SENDMODE_NOBLOCK: u64 = 1;
 
 // --- Rights bits (must match `kernel/src/libkern/handle.rs`) -------------
 const RIGHT_DUPLICATE: u64 = 1 << 0;
@@ -60,6 +66,7 @@ const CLOCK_MONOTONIC: u64 = 0;
 /// Errors (`kernel/src/syscall/error.rs`), as returned (negated) in rax.
 const E_WOULD_BLOCK: i64 = -11;
 const E_TIMED_OUT: i64 = -12;
+const E_PEER_CLOSED: i64 = -13;
 
 /// `IoResult` mirror (`kernel/src/libkern/io_result.rs`): 16 bytes, 8-aligned.
 #[repr(C, align(8))]
@@ -73,6 +80,47 @@ struct IoResultBuf {
 /// writable `.bss`.
 static mut WAIT_RESULTS: IoResultBuf = IoResultBuf { handle: 0, status: 0, reserved: 0 };
 static mut WAIT_HANDLES: [u64; 1] = [0];
+
+/// Userspace mirror of the kernel `IpcMsg` (`kernel/src/libkern/ipc.rs`): one
+/// page, `#[repr(C, align(4096))]`, header fields flat (offsets 0/4/8/10/16),
+/// then a 4008-byte payload and an 8-entry transfer-handle array.
+#[repr(C, align(4096))]
+struct IpcMsgBuf {
+    sender_pid: u32,
+    payload_len: u32,
+    handle_count: u8,
+    _pad1: u8,
+    flags: u16,
+    _pad2: [u8; 4],
+    timestamp: u64,
+    payload: [u8; 4008],
+    handles: [u64; 8],
+}
+
+impl IpcMsgBuf {
+    const ZEROED: IpcMsgBuf = IpcMsgBuf {
+        sender_pid: 0,
+        payload_len: 0,
+        handle_count: 0,
+        _pad1: 0,
+        flags: 0,
+        _pad2: [0; 4],
+        timestamp: 0,
+        payload: [0; 4008],
+        handles: [0; 8],
+    };
+}
+
+/// The channel endpoint handles `sys_channel_create` writes back. Writable `.bss`.
+static mut END0: u64 = 0;
+static mut END1: u64 = 0;
+/// Send/receive message buffers + the recv handle-count out-param.
+static mut SEND_MSG: IpcMsgBuf = IpcMsgBuf::ZEROED;
+static mut RECV_MSG: IpcMsgBuf = IpcMsgBuf::ZEROED;
+static mut RECV_COUNT: usize = 0;
+
+/// The payload `hello` sends to itself over IPC.
+const IPC_PING: &[u8] = b"ipc: ping\n";
 
 /// Object-type discriminant for a `MemoryObject` (`KObjectType::MemoryObject`).
 const KOBJ_MEMORY_OBJECT: u32 = 4;
@@ -135,6 +183,32 @@ unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
 unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
     // SAFETY: see `syscall4`.
     unsafe { syscall4(nr, a0, a1, 0, 0) }
+}
+
+/// Issue a syscall with five arguments — the fifth in `r8` (`sys_channel_send`
+/// needs it for the `SendMode`).
+///
+/// # Safety
+/// As [`syscall4`].
+#[inline]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    let ret;
+    // SAFETY: a register-only syscall; same clobber set as `syscall4` plus `r8`.
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") nr,
+            in("rdi") a0,
+            in("rsi") a1,
+            in("rdx") a2,
+            in("r10") a3,
+            in("r8") a4,
+            out("rcx") _,
+            out("r11") _,
+            lateout("rax") ret,
+        );
+    }
+    ret
 }
 
 /// Write `msg` to the kernel serial log via the debug syscall.
@@ -337,6 +411,120 @@ pub extern "C" fn _start() -> ! {
         kprint(b"memory: unmap ok\n");
     } else {
         kprint(b"memory: unmap FAIL\n");
+    }
+
+    // 5b. IPC round-trip. Create a channel, hold both endpoints, and send a
+    //     message end0→end1, then receive it on end1 — a full ring-3
+    //     create/send/wait/recv/peer-closed exercise of `sys_channel_*`.
+    //     (Cross-process IPC + handle transfer arrive with process spawn.)
+    let mut ipc_ok = true;
+    // SAFETY: END0/END1 are valid writable u64 out-params; depth 4.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
+    };
+    // SAFETY: on success the kernel wrote both endpoint handles.
+    let (e0, e1) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
+    if cr != 0 {
+        ipc_ok = false;
+    }
+
+    // Fill the send buffer's payload and send on end0 (NoBlock). The message
+    // lands in end1's inbox.
+    // SAFETY: SEND_MSG is a valid writable buffer in .bss.
+    unsafe {
+        SEND_MSG.payload_len = IPC_PING.len() as u32;
+        let mut i = 0;
+        while i < IPC_PING.len() {
+            SEND_MSG.payload[i] = IPC_PING[i];
+            i += 1;
+        }
+    }
+    // SAFETY: valid endpoint handle + message pointer; NoBlock, no handles.
+    let sr = unsafe {
+        syscall5(SYS_CHANNEL_SEND, e0, (&raw const SEND_MSG) as u64, 0, 0, SENDMODE_NOBLOCK)
+    };
+    if sr != 0 {
+        ipc_ok = false;
+    }
+
+    // Polling end0 finds nothing — the message went to end1's inbox, not end0's.
+    // SAFETY: RECV_MSG / RECV_COUNT are valid writable out-params; handles unused.
+    let pr = unsafe {
+        syscall4(SYS_CHANNEL_RECV, e0, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
+    };
+    if pr == E_WOULD_BLOCK {
+        kprint(b"ipc: empty-endpoint would-block ok\n");
+    } else {
+        ipc_ok = false;
+    }
+
+    // Block on end1 (immediately signaled), then receive and verify the message.
+    // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = e1;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    // SAFETY: valid endpoint handle + writable out-params.
+    let rr = unsafe {
+        syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
+    };
+    // SAFETY: on success the kernel wrote a full message into RECV_MSG.
+    let (rsp, rlen) =
+        unsafe { ((&raw const RECV_MSG.sender_pid).read(), (&raw const RECV_MSG.payload_len).read()) };
+    // SAFETY: RECV_MSG.payload is initialised; compare the echoed bytes.
+    let payload_match = unsafe {
+        let mut ok = rlen as usize == IPC_PING.len();
+        let mut i = 0;
+        while i < IPC_PING.len() {
+            if RECV_MSG.payload[i] != IPC_PING[i] {
+                ok = false;
+            }
+            i += 1;
+        }
+        ok
+    };
+    if rr == 0 && waited == 1 && rsp == 1 && payload_match {
+        kprint(b"ipc: received message from pid 1 ok\n");
+    } else {
+        ipc_ok = false;
+    }
+
+    // A second recv on the now-drained end1 would block.
+    // SAFETY: valid out-params.
+    let dr = unsafe {
+        syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
+    };
+    if dr == E_WOULD_BLOCK {
+        kprint(b"ipc: drained would-block ok\n");
+    } else {
+        ipc_ok = false;
+    }
+
+    // Close end0; receiving on end1 now reports the closed peer.
+    // SAFETY: closing our own endpoint handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, e0) };
+    // SAFETY: valid out-params.
+    let pc = unsafe {
+        syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
+    };
+    if pc == E_PEER_CLOSED {
+        kprint(b"ipc: peer-closed detected ok\n");
+    } else {
+        ipc_ok = false;
+    }
+    // SAFETY: closing the surviving endpoint handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, e1) };
+
+    if ipc_ok {
+        kprint(b"ipc: ok\n");
+    } else {
+        kprint(b"ipc: FAIL\n");
     }
 
     // 6. Deliberately fault. With notifications, a userspace fault is delivered

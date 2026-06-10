@@ -624,14 +624,20 @@ exception-delivery path uses the wait-queue blocking primitive above.
 
 #### IPC
 
-- [ ] `IpcChannel` kernel object per [docs/spec/ipc-message-format.md]
-- [ ] Per-channel queue with configurable depth, slot pool allocation
-- [ ] `sys_channel_create`
-- [ ] `sys_channel_send` with Block / NoBlock / BlockBounded modes (Block /
-      BlockBounded use wait queues + timers)
-- [ ] `sys_channel_recv`
-- [ ] Handle transfer mechanics during send (move and duplicate paths)
-- [ ] Dead-peer handling (`PeerClosed` notification, send/recv errors)
+- [x] `IpcChannel` kernel object per [docs/spec/ipc-message-format.md] (an
+      endpoint **pair**: two `IpcChannel` kobjects with mutual peer pointers)
+- [x] Per-channel queue with configurable depth, slot pool allocation
+      (per-endpoint receive ring, pre-allocated, default depth 16)
+- [x] `sys_channel_create` (syscall 12)
+- [x] `sys_channel_send` (syscall 13) — **NoBlock** only; Block / BlockBounded
+      deferred to the async-I/O slice (they need a `PendingOperation`)
+- [x] `sys_channel_recv` (syscall 14) — `WouldBlock` if empty + `sys_wait`-able
+- [ ] Handle transfer mechanics during send (move and duplicate paths) —
+      **deferred to process spawn** (cross-process value); ABI keeps the
+      `handles`/`count` args, `count` must be `0` for now
+- [x] Dead-peer handling: send/recv `PeerClosed` errors + blocked-recv wakeup.
+      The async `PeerClosed` **notification** is deferred to spawn (needs the
+      channel→peer-process-notification-channel link)
 
 #### Other syscalls
 

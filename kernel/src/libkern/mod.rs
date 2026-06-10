@@ -20,6 +20,7 @@
 pub mod clock;
 pub mod handle;
 pub mod io_result;
+pub mod ipc;
 pub mod kbox;
 pub mod kstring;
 pub mod kvec;
@@ -31,6 +32,7 @@ pub mod timer_flags;
 pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
 pub use io_result::IoResult;
+pub use ipc::{IpcMsg, IpcMsgHeader, SendMode};
 pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
 pub use kbox::KBox;
 pub use memory::MemFlags;
