@@ -302,7 +302,9 @@ fn sys_channel_send(
 ```
 Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel stamps `header.sender_pid` / `timestamp`. Returns `0`, `WouldBlock` if the queue is full (`NoBlock`), or `PeerClosed` if the peer endpoint has closed. (Syscall number `13`.)
 
-**Implemented subset:** `mode == NoBlock` only — `Block` / `BlockBounded` (which block via a `PendingOperation`, returning that handle) are deferred to the async-I/O slice and currently return `Unsupported`. Handle transfer is deferred to process spawn: `count` must be `0` (non-zero → `Unsupported`); the `handles`/`count` parameters are retained in the ABI for stability.
+Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability.
+
+**Implemented subset:** `mode == NoBlock` only — `Block` / `BlockBounded` (which block via a `PendingOperation`, returning that handle) are deferred to the async-I/O slice and currently return `Unsupported`.
 
 ```rust
 fn sys_channel_recv(
@@ -312,7 +314,7 @@ fn sys_channel_recv(
     count:   UserMutPtr<usize>,
 ) -> isize
 ```
-Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no message is queued — the caller `sys_wait`s on `ch` to block — or `PeerClosed` if the inbox is empty and the peer has closed. On success writes the 4096-byte message to `*msg` and the transferred-handle count to `*count` (`0` this slice — handle transfer deferred). (Syscall number `14`.)
+Receives a message from `ch` (requires `RECV`). Returns `WouldBlock` if no message is queued — the caller `sys_wait`s on `ch` to block — or `PeerClosed` if the inbox is empty and the peer has closed. On success writes the 4096-byte message to `*msg`, installs any transferred handles into the caller's table (their values written to `handles[0..*count]` and the in-message `handles[]`), and writes the count to `*count`. (Syscall number `14`.)
 
 ### Kernel Objects
 

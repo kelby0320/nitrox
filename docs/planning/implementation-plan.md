@@ -633,12 +633,11 @@ exception-delivery path uses the wait-queue blocking primitive above.
 - [x] `sys_channel_send` (syscall 13) — **NoBlock** only; Block / BlockBounded
       deferred to the async-I/O slice (they need a `PendingOperation`)
 - [x] `sys_channel_recv` (syscall 14) — `WouldBlock` if empty + `sys_wait`-able
-- [ ] Handle transfer mechanics during send (move and duplicate paths) —
-      **slice ②** (cross-process value, now that spawn exists); ABI keeps the
-      `handles`/`count` args, `count` must be `0` until then
+- [x] Handle transfer mechanics during send (**slice ②**) — always move,
+      `TRANSFER`-gated, install at recv into the receiver's table
 - [x] Dead-peer handling: send/recv `PeerClosed` errors + blocked-recv wakeup.
-      The async `PeerClosed` **notification** is **slice ②** (needs the
-      channel→peer-process-notification-channel link)
+      The async `PeerClosed` **notification** is **deferred to Phase 2** (multi-
+      holder "every holder" delivery wants handle duplication + a holder registry)
 
 #### Final slices: process spawn → handle transfer → threads + exceptions
 
@@ -664,13 +663,18 @@ milestone; ② clears the IPC handle-transfer deferral; ③ finishes the milesto
 - [x] Demo: `userspace/parent` spawns two `userspace/child` processes that talk
       over IPC; the parent reaps both via `ChildExited`
 
-##### Slice ② — IPC handle transfer + `PeerClosed` notification
+##### Slice ② — IPC handle transfer (done)
 
-- [ ] Handle transfer mechanics during `sys_channel_send` (the `count > 0` path:
-      move + duplicate, `TRANSFER`-gated, atomic-or-fail; receiver-side install)
-- [ ] `sys_channel_recv` surfaces the transferred handles + count
-- [ ] Async `PeerClosed` **notification** (the dead-peer error path already ships;
-      this delivers the notification to holders of the still-open endpoint)
+- [x] Handle transfer mechanics during `sys_channel_send` (the `count > 0` path:
+      **always move**, `TRANSFER`-gated, atomic-or-fail with move-on-commit;
+      references pinned "in flight" in the queued message)
+- [x] `sys_channel_recv` installs the transferred handles into the receiver's
+      table + surfaces their values and the count
+- [ ] Async `PeerClosed` **notification** — **deferred to Phase 2** (the dead-peer
+      error path ships; the "every holder" delivery wants handle duplication + a
+      per-endpoint holder registry, a Phase-2-shaped design)
+- [x] Demo: a child transfers a `MemoryObject` to its sibling, which maps it and
+      reads back the shared marker
 
 ##### Slice ③ — Threads + minimal exception resume/terminate
 

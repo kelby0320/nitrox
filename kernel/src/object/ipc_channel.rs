@@ -36,9 +36,12 @@
 
 use core::cell::UnsafeCell;
 
-use crate::libkern::handle::KObjectType;
-use crate::libkern::ipc::{IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader};
+use crate::libkern::handle::{KObjectType, Rights};
+use crate::libkern::ipc::{
+    IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, IpcMsgHeader,
+};
 use crate::libkern::{AllocError, KBox, KVec};
+use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 
 /// A queued message in kernel storage: the byte-identical, natural-alignment
@@ -85,14 +88,44 @@ impl StoredMsg {
     }
 }
 
-/// A fixed-capacity ring of [`StoredMsg`] slots. The backing [`KVec`] is
-/// pre-filled with `cap` zeroed slots at construction (the only fallible
-/// growth); `push_from`/`pop_into` then move messages in place — no element
-/// shifting, no reallocation, no large stack temporaries — so they are safe to
-/// run under `SCHED`.
+/// One handle moved through IPC, held by the kernel while the message is queued
+/// ("in flight"): the object reference (pinning it) plus the rights to install it
+/// with in the receiver's table (captured from the sender's handle at send). The
+/// receiver consumes this at `sys_channel_recv`; an undelivered transfer's ref is
+/// released when the queue (the endpoint) is destroyed.
+pub struct TransferRef {
+    /// The pinned transferred object.
+    pub obj: ObjectRef,
+    /// Rights to install the receiver's new handle with (the sender's, by move).
+    pub rights: Rights,
+}
+
+/// A queued message slot: the wire bytes plus the in-flight transferred-handle
+/// references (`None` per slot for a no-handle message). Not `Copy` — the
+/// `TransferRef`s are **moved** in/out, never bytewise-copied.
+struct RingSlot {
+    msg: StoredMsg,
+    transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
+}
+
+impl RingSlot {
+    fn empty() -> Self {
+        RingSlot {
+            msg: StoredMsg::zeroed(),
+            transfers: core::array::from_fn(|_| None),
+        }
+    }
+}
+
+/// A fixed-capacity ring of message slots. The backing [`KVec`] is pre-filled
+/// with `cap` empty slots at construction (the only fallible growth);
+/// `push_from`/`pop_into` then move messages (bytes copied, transfer references
+/// moved) in place — no element shifting, no reallocation, no large stack
+/// temporaries — so they are safe to run under `SCHED`. (No `ObjectRef` *Drop*
+/// ever runs here; only moves, which never touch a refcount.)
 struct MsgRing {
     /// Exactly `cap` storage slots; `slots.len()` is the capacity.
-    slots: KVec<StoredMsg>,
+    slots: KVec<RingSlot>,
     /// Index of the oldest queued message.
     head: usize,
     /// Number of queued messages, `0..=cap`.
@@ -102,11 +135,11 @@ struct MsgRing {
 impl MsgRing {
     /// A ring holding `cap` (`≥ 1`) pre-allocated, initially empty slots.
     fn with_capacity(cap: usize) -> Result<Self, AllocError> {
-        let mut slots: KVec<StoredMsg> = KVec::new();
+        let mut slots: KVec<RingSlot> = KVec::new();
         slots.try_reserve(cap)?;
         for _ in 0..cap {
             // Within the reserved capacity — never reallocates.
-            slots.try_push(StoredMsg::zeroed())?;
+            slots.try_push(RingSlot::empty())?;
         }
         Ok(MsgRing { slots, head: 0, len: 0 })
     }
@@ -123,24 +156,43 @@ impl MsgRing {
         self.len == self.cap()
     }
 
-    /// Copy `src` into the tail slot. Returns `false` if full.
-    fn push_from(&mut self, src: &StoredMsg) -> bool {
+    /// Copy `src` into the tail slot and **move** any `transfers` into it
+    /// (`take`-ing them from the caller's array). Returns `false` if full (and
+    /// leaves `transfers` untouched for the caller to reclaim).
+    fn push_from(
+        &mut self,
+        src: &StoredMsg,
+        transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    ) -> bool {
         if self.is_full() {
             return false;
         }
         let cap = self.cap();
         let idx = (self.head + self.len) % cap;
-        self.slots[idx] = *src;
+        let slot = &mut self.slots[idx];
+        slot.msg = *src;
+        for i in 0..IPC_HANDLE_MAX {
+            slot.transfers[i] = transfers[i].take();
+        }
         self.len += 1;
         true
     }
 
-    /// Copy the head slot into `dst` and advance. Returns `false` if empty.
-    fn pop_into(&mut self, dst: &mut StoredMsg) -> bool {
+    /// Copy the head slot's bytes into `dst`, **move** its transfers into `out`,
+    /// and advance. Returns `false` if empty.
+    fn pop_into(
+        &mut self,
+        dst: &mut StoredMsg,
+        out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    ) -> bool {
         if self.is_empty() {
             return false;
         }
-        *dst = self.slots[self.head];
+        let slot = &mut self.slots[self.head];
+        *dst = slot.msg;
+        for i in 0..IPC_HANDLE_MAX {
+            out[i] = slot.transfers[i].take();
+        }
         self.head = (self.head + 1) % self.cap();
         self.len -= 1;
         true
@@ -281,12 +333,18 @@ impl IpcChannel {
         unsafe { Self::inner(obj) }.peer = core::ptr::null_mut();
     }
 
-    /// Push `msg` into the **peer**'s receive ring. The `woke_edge` flag on
-    /// `Sent` reports whether the peer went empty→non-empty.
+    /// Push `msg` (and **move** any `transfers` it carries) into the **peer**'s
+    /// receive ring. The `woke_edge` flag on `Sent` reports whether the peer went
+    /// empty→non-empty. On `Full`/`PeerClosed` the `transfers` are left untouched
+    /// (the caller reclaims them).
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn send_push(obj: *mut (), msg: &StoredMsg) -> SendOutcome {
+    pub(crate) unsafe fn send_push(
+        obj: *mut (),
+        msg: &StoredMsg,
+        transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    ) -> SendOutcome {
         let peer = unsafe { Self::inner(obj) }.peer;
         if peer.is_null() {
             return SendOutcome::PeerClosed;
@@ -295,7 +353,7 @@ impl IpcChannel {
         // borrow does not alias the first (which has ended).
         let peer_inner = unsafe { Self::inner(peer as *mut ()) };
         let was_empty = peer_inner.recv.is_empty();
-        if peer_inner.recv.push_from(msg) {
+        if peer_inner.recv.push_from(msg, transfers) {
             SendOutcome::Sent { woke_edge: was_empty }
         } else {
             SendOutcome::Full
@@ -317,12 +375,17 @@ impl IpcChannel {
         }
     }
 
-    /// Pop the oldest message into `dst`. Returns `false` if empty.
+    /// Pop the oldest message into `dst` and **move** its transferred-handle
+    /// references into `out`. Returns `false` if empty.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn recv_pop_into(obj: *mut (), dst: &mut StoredMsg) -> bool {
-        unsafe { Self::inner(obj) }.recv.pop_into(dst)
+    pub(crate) unsafe fn recv_pop_into(
+        obj: *mut (),
+        dst: &mut StoredMsg,
+        out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    ) -> bool {
+        unsafe { Self::inner(obj) }.recv.pop_into(dst, out)
     }
 
     /// `true` iff a recv would return something (a queued message) or report a
@@ -427,6 +490,20 @@ mod tests {
         m
     }
 
+    /// `send_push` with no transferred handles (the common test case).
+    /// # Safety: as `IpcChannel::send_push`.
+    unsafe fn push_no_xfer(obj: *mut (), msg: &StoredMsg) -> SendOutcome {
+        let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        unsafe { IpcChannel::send_push(obj, msg, &mut t) }
+    }
+
+    /// `recv_pop_into` discarding any (absent) transfers.
+    /// # Safety: as `IpcChannel::recv_pop_into`.
+    unsafe fn pop_no_xfer(obj: *mut (), dst: &mut StoredMsg) -> bool {
+        let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        unsafe { IpcChannel::recv_pop_into(obj, dst, &mut t) }
+    }
+
     #[test]
     fn pair_has_mutual_peers() {
         init_global_heap();
@@ -448,9 +525,9 @@ mod tests {
         unsafe {
             // a is empty; sending on a targets b's inbox, so a stays empty.
             assert!(!IpcChannel::already_signaled(a));
-            let edge = IpcChannel::send_push(a, &a_msg(0x11, 3));
+            let edge = push_no_xfer(a, &a_msg(0x11, 3));
             assert_eq!(edge, SendOutcome::Sent { woke_edge: true });
-            let edge2 = IpcChannel::send_push(a, &a_msg(0x22, 5));
+            let edge2 = push_no_xfer(a, &a_msg(0x22, 5));
             assert_eq!(edge2, SendOutcome::Sent { woke_edge: false });
             // a's own inbox is still empty; b's has two messages.
             assert!(!IpcChannel::already_signaled(a));
@@ -458,13 +535,13 @@ mod tests {
             assert_eq!(IpcChannel::recv_peek(b), RecvState::HasMsg);
             // FIFO drain on b.
             let mut got = StoredMsg::zeroed();
-            assert!(IpcChannel::recv_pop_into(b, &mut got));
+            assert!(pop_no_xfer(b, &mut got));
             assert_eq!(got.header.payload_len, 3);
             assert_eq!(got.payload[0], 0x11);
-            assert!(IpcChannel::recv_pop_into(b, &mut got));
+            assert!(pop_no_xfer(b, &mut got));
             assert_eq!(got.header.payload_len, 5);
             assert_eq!(got.payload[0], 0x22);
-            assert!(!IpcChannel::recv_pop_into(b, &mut got));
+            assert!(!pop_no_xfer(b, &mut got));
             assert_eq!(IpcChannel::recv_peek(b), RecvState::Empty);
         }
         drop_endpoint(a);
@@ -479,12 +556,12 @@ mod tests {
         unsafe {
             for _ in 0..4 {
                 assert!(matches!(
-                    IpcChannel::send_push(a, &a_msg(0xAB, 1)),
+                    push_no_xfer(a, &a_msg(0xAB, 1)),
                     SendOutcome::Sent { .. }
                 ));
             }
             // Fifth send: b's inbox (depth 4) is full.
-            assert_eq!(IpcChannel::send_push(a, &a_msg(0xAB, 1)), SendOutcome::Full);
+            assert_eq!(push_no_xfer(a, &a_msg(0xAB, 1)), SendOutcome::Full);
         }
         drop_endpoint(a);
         drop_endpoint(b);
@@ -499,21 +576,21 @@ mod tests {
             let mut got = StoredMsg::zeroed();
             // Push 3, pop 2, push 3 more → wraps past the end; drain in order.
             for i in 0..3u8 {
-                IpcChannel::send_push(a, &a_msg(i, 1));
+                push_no_xfer(a, &a_msg(i, 1));
             }
             for i in 0..2u8 {
-                assert!(IpcChannel::recv_pop_into(b, &mut got));
+                assert!(pop_no_xfer(b, &mut got));
                 assert_eq!(got.payload[0], i);
             }
             for i in 3..6u8 {
-                assert!(matches!(IpcChannel::send_push(a, &a_msg(i, 1)), SendOutcome::Sent { .. }));
+                assert!(matches!(push_no_xfer(a, &a_msg(i, 1)), SendOutcome::Sent { .. }));
             }
             // Remaining: 2,3,4,5 in FIFO order (1 left from first batch + 3 new).
             for i in 2..6u8 {
-                assert!(IpcChannel::recv_pop_into(b, &mut got));
+                assert!(pop_no_xfer(b, &mut got));
                 assert_eq!(got.payload[0], i);
             }
-            assert!(!IpcChannel::recv_pop_into(b, &mut got));
+            assert!(!pop_no_xfer(b, &mut got));
         }
         drop_endpoint(a);
         drop_endpoint(b);
@@ -526,7 +603,7 @@ mod tests {
         // SAFETY: live endpoints, single-threaded test.
         unsafe {
             // Queue one message into b before closing a.
-            IpcChannel::send_push(a, &a_msg(0x7E, 2));
+            push_no_xfer(a, &a_msg(0x7E, 2));
         }
         // Close a (drops its only reference → `drop` nulls b's peer pointer).
         drop_endpoint(a);
@@ -536,14 +613,14 @@ mod tests {
             // b still drains its queued message first ...
             assert_eq!(IpcChannel::recv_peek(b), RecvState::HasMsg);
             let mut got = StoredMsg::zeroed();
-            assert!(IpcChannel::recv_pop_into(b, &mut got));
+            assert!(pop_no_xfer(b, &mut got));
             assert_eq!(got.payload[0], 0x7E);
             // ... then reports the closed peer (and a closed peer is "signaled"
             // so a blocked recv wakes to see it).
             assert_eq!(IpcChannel::recv_peek(b), RecvState::PeerClosed);
             assert!(IpcChannel::already_signaled(b));
             // Sending from b now fails: the peer is gone.
-            assert_eq!(IpcChannel::send_push(b, &a_msg(0, 1)), SendOutcome::PeerClosed);
+            assert_eq!(push_no_xfer(b, &a_msg(0, 1)), SendOutcome::PeerClosed);
         }
         drop_endpoint(b);
     }
@@ -579,6 +656,69 @@ mod tests {
         drop_endpoint(a);
         drop_endpoint(b);
         assert_eq!(test_probe::ipc_channel_destroys(), 2);
+    }
+
+    #[test]
+    fn transfer_moves_with_message_and_releases_on_drop() {
+        use crate::object::Process;
+        init_global_heap();
+        test_probe::reset();
+        let (a, b) = new_pair();
+        // An object to transfer (a Process; refcount 1 via its creation ref).
+        let p = KBox::into_raw(Process::try_new(99).unwrap()).as_ptr() as *mut ();
+        let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
+        // SAFETY: live endpoints, single-threaded test.
+        unsafe {
+            let mut send_t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+            send_t[0] = Some(TransferRef { obj: pref, rights: Rights::empty() });
+            let mut msg = a_msg(0, 0);
+            msg.header.handle_count = 1;
+            // Send on a → b's inbox; the transfer moves into the queued slot.
+            assert!(matches!(
+                IpcChannel::send_push(a, &msg, &mut send_t),
+                SendOutcome::Sent { .. }
+            ));
+            assert!(send_t[0].is_none(), "transfer moved into the queue");
+            // Pop on b → the transfer moves back out.
+            let mut got = StoredMsg::zeroed();
+            let mut recv_t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+            assert!(IpcChannel::recv_pop_into(b, &mut got, &mut recv_t));
+            assert_eq!(got.header.handle_count, 1);
+            let tr = recv_t[0].take().unwrap();
+            assert_eq!(tr.obj.as_ptr(), p);
+            // The reference is still held (not destroyed); dropping it destroys
+            // the object (refcount 1 → 0).
+            assert_eq!(test_probe::process_destroys(), 0);
+            drop(tr);
+            assert_eq!(test_probe::process_destroys(), 1);
+        }
+        drop_endpoint(a);
+        drop_endpoint(b);
+    }
+
+    #[test]
+    fn undelivered_transfer_released_when_endpoint_destroyed() {
+        use crate::object::Process;
+        init_global_heap();
+        test_probe::reset();
+        let (a, b) = new_pair();
+        let p = KBox::into_raw(Process::try_new(7).unwrap()).as_ptr() as *mut ();
+        let pref = unsafe { ObjectRef::from_raw(p, KObjectType::Process) };
+        // SAFETY: live endpoints, single-threaded test.
+        unsafe {
+            let mut t: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+            t[0] = Some(TransferRef { obj: pref, rights: Rights::empty() });
+            let mut msg = a_msg(0, 0);
+            msg.header.handle_count = 1;
+            // Queue the transfer into b's inbox but never receive it.
+            IpcChannel::send_push(a, &msg, &mut t);
+        }
+        assert_eq!(test_probe::process_destroys(), 0);
+        // Destroying the endpoints (b holds the queued message) drops the
+        // undelivered transfer's reference → the object is released.
+        drop_endpoint(a);
+        drop_endpoint(b);
+        assert_eq!(test_probe::process_destroys(), 1);
     }
 
     #[test]
