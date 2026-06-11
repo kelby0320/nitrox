@@ -772,14 +772,19 @@ These were implicit in the original plan; each gates one or more later slices.
 Author the two missing architecture docs first — slices 1 and 5 implement
 *against* contracts that have not been written.
 
-- [ ] **Architecture docs.** Write `docs/architecture/namespace-and-resource-servers.md`
-  (the `ResourceServer`/`OpStatus`/registry contract that slice 1 implements)
-  and `docs/architecture/drivers-and-irps.md` (the IRP / completion-routine /
-  `InterruptObject` contract that the storage slice implements). Both are
-  cited by the slices below but do not yet exist.
-- [ ] **ACPI table parser** (pure-Rust RSDP → XSDT/RSDT → MADT + MCFG; no AML).
+- [~] **Architecture docs.** `docs/architecture/drivers-and-irps.md` (the IRP /
+  completion-routine / `InterruptObject` contract the storage slice implements)
+  is **done** (`phase-2/drivers-irps-doc`). `docs/architecture/namespace-and-resource-servers.md`
+  (the `ResourceServer`/`OpStatus`/registry contract slice 1 implements) is still
+  to be written — it gates slice 1, not the prereq code items, so it lands just
+  before slice 1.
+- [x] **ACPI table parser** (pure-Rust RSDP → XSDT/RSDT → MADT + MCFG; no AML).
   Enables IOAPIC (MADT) and PCI ECAM (MCFG). No external crate. Gates the
-  IOAPIC and storage slices.
+  IOAPIC and storage slices. **Done** (`phase-2/acpi-tables`): behind a new
+  arch-neutral `ArchPlatform` trait (`arch/platform.rs`) — the x86 ACPI parser
+  (`arch/x86_64/acpi.rs`) exposes only the PCIe ECAM regions neutrally; the
+  MADT interrupt-routing facts (IOAPIC/GSI/source-overrides) stay arch-internal
+  for the IOAPIC item. See the decision log (2026-06-11).
 - [ ] **IOAPIC bring-up + external IRQ routing.** The Phase-1 `ArchIrq`
   deferral (LAPIC-only). Without it no device interrupt is deliverable, so
   AHCI cannot signal completion. Extend the `IrqSpinLock` audit to any new

@@ -3176,3 +3176,53 @@ No code; no ABI impact (Markdown only). Branch `phase-2/drivers-irps-doc` off
 Phase 2 prerequisite band; the implementing items (`phase-2/acpi-tables`,
 `phase-2/ioapic`, `phase-2/dpc`, `phase-2/pending-operation`, then the storage
 slice) follow per `docs/planning/implementation-plan.md`.
+
+---
+
+## 2026-06-11 — Phase 2 prereq: ACPI table parser behind `ArchPlatform`
+
+Second Phase 2 prerequisite item (`phase-2/acpi-tables`). Adds the pure-Rust
+ACPI static-table parser (RSDP → XSDT/RSDT → MADT + MCFG; no AML), the firmware
+discovery the IOAPIC and PCI-enumeration items depend on.
+
+**The boundary decision (the substance).** ACPI is x86-specific (aarch64 uses a
+Device Tree Blob), so it lives behind the arch boundary. The load-bearing
+question was *what crosses as neutral facts vs. what stays arch-internal*. The
+split:
+
+- **Neutral** (new `ArchPlatform` trait, `arch/platform.rs`, re-exported as
+  `arch::Platform`): only the **PCIe ECAM regions** (`EcamRegion { base, segment,
+  bus_start, bus_end }`), via `Platform::pcie_ecam_regions()`. PCIe config space
+  is a PCI-SIG standard identical across arches; only *where the ECAM window is*
+  differs (ACPI MCFG vs. DTB), so the neutral PCI enumerator (storage slice) can
+  consume this and build arch-independent `DeviceNode`s. ("ECAM"/"PCIe" are
+  bus-standard terms, not arch jargon.)
+- **Arch-internal** (inside `arch/x86_64/acpi.rs`, NOT on the trait): the MADT
+  interrupt-routing facts — IOAPIC base(s), GSI base, ISA-IRQ→GSI source
+  overrides, CPU APIC ids. These have no aarch64 (GIC) analogue; the x86 ACPI
+  parser caches them and the (next) x86 IOAPIC code reads them via `pub(crate)`
+  accessors. IOAPIC / GSI / MADT never appear in neutral names (check-arch
+  clean). This is the "arch-neutral device discovery" shape: neutral PCI
+  enumeration over neutral ECAM regions; arch-specific interrupt routing stays
+  in the arch layer.
+
+**Other decisions.** `ArchPlatform::init()` takes no firmware argument and
+sources its own RSDP from a Limine request it owns — consistent with every other
+`ArchX::init()` (`Irq`/`Timer`), so `main.rs` stays arch-agnostic. The
+`RsdpRequest`/`RsdpResponse` protocol bindings sit in `limine.rs`; the request
+*static* lives in `arch/x86_64/acpi.rs` (`.limine_requests` section — confirmed
+the linker collects a submodule's request, the bootloader populates it). The
+byte-level parsers are pure functions over `&[u8]` (host-tested against
+synthetic RSDP/XSDT/MADT/MCFG blobs); results cache in fixed-size static arrays
++ atomic counts (no allocation; "write once at boot, read after", the
+`apic::LAPIC_BASE` discipline). Tables are read through the HHDM (with an
+already-virtual-pointer guard for older Limine). Missing/malformed tables are
+logged, not fatal, at this stage.
+
+ABI impact: none (no `#[repr(C)]` boundary type or syscall). Verified:
+`check-arch` clean; `build` clean (no warnings); `test` 382 host tests (+8 ACPI
+parser tests); `qemu` on q35 logs `acpi: RSDP rev 2 (XSDT); 1 IOAPIC, 5
+src-override, 1 CPU; 1 ECAM region` / `IOAPIC0 @0xfec00000 gsi_base 0` / `ECAM0
+@0xe0000000 seg 0 bus 0-255`, and the userspace demo runs unchanged. Branch
+`phase-2/acpi-tables` off `main` (includes merged PR #30). Next: `phase-2/ioapic`
+consumes the cached MADT facts.

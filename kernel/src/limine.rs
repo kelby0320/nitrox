@@ -240,3 +240,46 @@ pub struct HhdmResponse {
     pub revision: u64,
     pub offset: u64,
 }
+
+// --- ACPI RSDP request ---------------------------------------------------
+//
+// Limine locates the ACPI Root System Description Pointer and hands back its
+// address. On x86_64 the RSDP is the root of the ACPI table tree (RSDT/XSDT →
+// MADT, MCFG, …); the platform layer parses it for interrupt routing and the
+// PCIe ECAM window. Newer Limine revisions return a *physical* address (the
+// consumer translates via the HHDM and tolerates an already-virtual pointer
+// from older bootloaders). This is x86 firmware territory — aarch64 uses a
+// Device Tree Blob request instead.
+
+const RSDP_ID_2: u64 = 0xc5e77b6b397e7b43;
+const RSDP_ID_3: u64 = 0x27637845accdcf3c;
+
+#[repr(C)]
+pub struct RsdpRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut RsdpResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests
+// in this file — written once by Limine before `_start`, read by single-
+// threaded boot code thereafter.
+unsafe impl Sync for RsdpRequest {}
+
+impl RsdpRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, RSDP_ID_2, RSDP_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct RsdpResponse {
+    pub revision: u64,
+    /// Address of the RSDP. Physical on recent Limine revisions (translate via
+    /// the HHDM); may be an HHDM-virtual pointer on older bootloaders.
+    pub address: u64,
+}
