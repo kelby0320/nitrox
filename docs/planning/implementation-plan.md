@@ -785,10 +785,15 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   (`arch/x86_64/acpi.rs`) exposes only the PCIe ECAM regions neutrally; the
   MADT interrupt-routing facts (IOAPIC/GSI/source-overrides) stay arch-internal
   for the IOAPIC item. See the decision log (2026-06-11).
-- [ ] **IOAPIC bring-up + external IRQ routing.** The Phase-1 `ArchIrq`
+- [x] **IOAPIC bring-up + external IRQ routing.** The Phase-1 `ArchIrq`
   deferral (LAPIC-only). Without it no device interrupt is deliverable, so
-  AHCI cannot signal completion. Extend the `IrqSpinLock` audit to any new
-  IRQ-reachable locks.
+  AHCI cannot signal completion. **Done** (`phase-2/ioapic`): a new
+  arch-neutral `ArchIrqRouter` trait (`arch::IrqRouter`, x86 impl `X86IoApic`,
+  distinct from `ArchIrq` the per-CPU local controller) + IDT device-IRQ vectors
+  (0x30..) with a handler registry; brings up the IOAPIC from the cached MADT
+  facts, masks the 8259s, and a PIT self-test proves GSI→IOAPIC→vector→ISR→EOI
+  end-to-end. See the decision log (2026-06-11). (The `IrqSpinLock` audit for
+  new IRQ-reachable locks lands with the DPC item / real device handlers.)
 - [ ] **DPC / softirq queue**, wired into the timer-tick wakeup path (the
   Phase-1 "DPC integration for wakeup" deferral). Device IRQ handlers defer
   their real work here (no allocation / unbounded work in IRQ context).
