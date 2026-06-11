@@ -26,6 +26,7 @@
 
 pub mod cpu;
 pub mod irq;
+pub mod irq_router;
 pub mod paging;
 pub mod platform;
 pub mod registers;
@@ -47,6 +48,10 @@ pub use x86_64::{abi, serial};
 // subsystem, mirroring `paging::ArchPaging` → `Paging`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::apic::XApic as Irq;
+// The system interrupt router (the IOAPIC on x86; GIC distributor on aarch64) —
+// distinct from `Irq`, the per-CPU local controller. See `arch/irq_router.rs`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::ioapic::X86IoApic as IrqRouter;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::cpu::X86Cpu as Cpu;
 // Platform/firmware discovery (the x86 impl parses ACPI tables; aarch64 would

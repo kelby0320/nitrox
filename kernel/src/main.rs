@@ -166,6 +166,25 @@ fn kernel_main() {
         );
     }
 
+    // Bring up the system interrupt router (the IOAPIC) so external device
+    // interrupts can be delivered, then prove the routing path end-to-end with
+    // a brief self-test. This runs while the LAPIC timer is still masked and the
+    // scheduler is not yet running, so the self-test's short interrupt-enabled
+    // window fires only the source it routes (the legacy PIT). The router needs
+    // the local controller (Irq::init) up — routed interrupts land on a LAPIC.
+    {
+        use arch::irq_router::ArchIrqRouter;
+        // SAFETY: ring 0, single CPU, once during boot after Irq/Timer init; the
+        // ACPI MADT facts are cached (Platform::init ran).
+        if unsafe { arch::IrqRouter::init() }.is_err() {
+            kprintln!("interrupt router bring-up failed — halting");
+            return;
+        }
+        // SAFETY: ring 0, after the router is up and before the scheduler arms
+        // its periodic timer; briefly enables interrupts for the routed source.
+        unsafe { arch::IrqRouter::self_test() };
+    }
+
     // Bring up the single global handle table. It eagerly allocates its
     // first segment, so the heap must be up (it is — `init_memory` ran); it
     // must be live before any userspace can issue a handle syscall.

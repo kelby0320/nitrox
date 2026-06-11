@@ -46,6 +46,7 @@
 
 use core::arch::asm;
 use core::fmt::Write;
+use core::sync::atomic::{AtomicUsize, Ordering};
 
 use crate::arch::Cpu;
 use crate::arch::cpu::ArchCpu;
@@ -379,6 +380,110 @@ extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
     crate::sched::on_timer_tick();
 }
 
+// --- Device-IRQ vectors (external interrupts routed by the IOAPIC) ----------
+//
+// The system interrupt router (`arch::IrqRouter`) routes a device's interrupt
+// line to one of these vectors; the stub builds a frame, the shared dispatcher
+// runs the registered handler and EOIs the local controller. Each vector has its
+// own stub (it must push its own vector immediate); a small registry maps the
+// vector back to a handler so a driver registers without touching the IDT.
+
+/// First device-IRQ vector. Above the timer (`0x20`) and the exception range.
+const DEVICE_IRQ_BASE: u8 = 0x30;
+/// Number of device-IRQ vectors (`0x30..=0x37`). Plenty for Phase 2 (AHCI +
+/// a few); grow by adding stubs to `DEVICE_STUBS` if a board needs more.
+const DEVICE_IRQ_COUNT: usize = 8;
+
+/// Registered handler per device vector, as a function pointer stored in a
+/// `usize` (`0` = none). Written once at registration (boot), read in IRQ
+/// context — lock-free.
+static DEVICE_HANDLERS: [AtomicUsize; DEVICE_IRQ_COUNT] =
+    [const { AtomicUsize::new(0) }; DEVICE_IRQ_COUNT];
+/// Next free device-vector slot, handed out by [`register_device_handler`].
+static NEXT_DEVICE_SLOT: AtomicUsize = AtomicUsize::new(0);
+
+/// Shared dispatcher for every device-IRQ vector. Runs the registered handler,
+/// then signals end-of-interrupt to the local controller. Edge-triggered only
+/// for now (the PIT bring-up source and the level-triggered IOAPIC-EOI path
+/// land with the first level-triggered device).
+extern "C" fn device_irq_dispatch(frame: *mut ExceptionFrame) {
+    // SAFETY: `frame` is the stub-built `ExceptionFrame` in RDI; `vector` is the
+    // immediate the stub pushed, always in `DEVICE_IRQ_BASE..+COUNT`.
+    let vector = unsafe { (*frame).vector } as usize;
+    let slot = vector.wrapping_sub(DEVICE_IRQ_BASE as usize);
+    if slot < DEVICE_IRQ_COUNT {
+        let h = DEVICE_HANDLERS[slot].load(Ordering::Acquire);
+        if h != 0 {
+            // SAFETY: a non-zero slot holds a function pointer installed by
+            // `register_device_handler` (a real `extern "C" fn()`); single
+            // writer at boot, so the value is valid.
+            let f: extern "C" fn() = unsafe { core::mem::transmute(h) };
+            f();
+        }
+    }
+    // SAFETY: ring-0, reached only from a device IRQ after `Irq::init`.
+    unsafe { crate::arch::Irq::eoi() };
+}
+
+/// Register `handler` for the next free device-IRQ vector and return that
+/// vector. The IDT gate for every device vector is pre-installed by [`init`];
+/// this only fills the handler registry, so a driver wires `(GSI → vector)` at
+/// the router and `(vector → handler)` here without touching the IDT.
+///
+/// Panics if the device-vector pool is exhausted — a static configuration
+/// error, not a runtime condition.
+pub(crate) fn register_device_handler(handler: extern "C" fn()) -> u8 {
+    let slot = NEXT_DEVICE_SLOT.fetch_add(1, Ordering::Relaxed);
+    assert!(slot < DEVICE_IRQ_COUNT, "device-IRQ vector pool exhausted");
+    DEVICE_HANDLERS[slot].store(handler as usize, Ordering::Release);
+    DEVICE_IRQ_BASE + slot as u8
+}
+
+/// One device-IRQ entry stub — mirrors [`timer_stub`] but pushes its own vector
+/// and routes through the shared [`device_irq_dispatch`].
+macro_rules! device_irq_stub {
+    ($name:ident, $vec:literal) => {
+        #[unsafe(naked)]
+        extern "C" fn $name() {
+            ::core::arch::naked_asm!(
+                concat!(
+                    "push 0\n",
+                    "push ", $vec, "\n",
+                    "push rax\npush rbx\npush rcx\npush rdx\n",
+                    "push rsi\npush rdi\npush rbp\n",
+                    "push r8\npush r9\npush r10\npush r11\n",
+                    "push r12\npush r13\npush r14\npush r15\n",
+                    "mov rdi, rsp\n",
+                ),
+                "call {dispatch}",
+                concat!(
+                    "pop r15\npop r14\npop r13\npop r12\n",
+                    "pop r11\npop r10\npop r9\npop r8\n",
+                    "pop rbp\npop rdi\npop rsi\n",
+                    "pop rdx\npop rcx\npop rbx\npop rax\n",
+                    "add rsp, 16\n",
+                    "iretq\n",
+                ),
+                dispatch = sym device_irq_dispatch,
+            );
+        }
+    };
+}
+
+device_irq_stub!(dev_irq_30, "0x30");
+device_irq_stub!(dev_irq_31, "0x31");
+device_irq_stub!(dev_irq_32, "0x32");
+device_irq_stub!(dev_irq_33, "0x33");
+device_irq_stub!(dev_irq_34, "0x34");
+device_irq_stub!(dev_irq_35, "0x35");
+device_irq_stub!(dev_irq_36, "0x36");
+device_irq_stub!(dev_irq_37, "0x37");
+
+/// Device-IRQ entry stubs, indexed by `vector - DEVICE_IRQ_BASE`.
+const DEVICE_STUBS: [extern "C" fn(); DEVICE_IRQ_COUNT] = [
+    dev_irq_30, dev_irq_31, dev_irq_32, dev_irq_33, dev_irq_34, dev_irq_35, dev_irq_36, dev_irq_37,
+];
+
 /// Entry stubs for CPU exception vectors 0-31, indexed by vector number. Each
 /// `iretq`s on the ring-3 fault→`Resume` path (see [`exception_stub`]) and
 /// otherwise diverges, so the type is `extern "C" fn()` (not `-> !`).
@@ -613,6 +718,13 @@ pub fn init() {
     let spurious: extern "C" fn() = spurious_stub;
     idt[TIMER_VECTOR as usize].set_handler(timer as usize as u64, 0);
     idt[SPURIOUS_VECTOR as usize].set_handler(spurious as usize as u64, 0);
+
+    // Device-IRQ vectors (0x30..): the gates are pre-installed here; a driver
+    // routes a GSI to one of these and registers a handler via
+    // `register_device_handler` (the IDT is not touched again). IST0.
+    for (i, &stub) in DEVICE_STUBS.iter().enumerate() {
+        idt[DEVICE_IRQ_BASE as usize + i].set_handler(stub as usize as u64, 0);
+    }
 
     let ptr = IdtPointer { limit, base };
     // SAFETY: `ptr` describes the fully-populated IDT. Interrupts are

@@ -3226,3 +3226,56 @@ src-override, 1 CPU; 1 ECAM region` / `IOAPIC0 @0xfec00000 gsi_base 0` / `ECAM0
 @0xe0000000 seg 0 bus 0-255`, and the userspace demo runs unchanged. Branch
 `phase-2/acpi-tables` off `main` (includes merged PR #30). Next: `phase-2/ioapic`
 consumes the cached MADT facts.
+
+---
+
+## 2026-06-11 — Phase 2 prereq: IOAPIC bring-up + `ArchIrqRouter`
+
+Third Phase 2 prerequisite (`phase-2/ioapic`). Brings up the IOAPIC (located by
+the ACPI item's MADT facts) so external device interrupts can be delivered — the
+path AHCI and the future `InterruptObject` build on: route a hardware line → an
+IDT vector → a registered ISR → LAPIC EOI.
+
+**The trait decision (the substance).** The IOAPIC could have been folded into
+`ArchIrq`, but on reflection it is a *distinct controller* from the per-CPU local
+controller `ArchIrq` models (the local APIC / GIC CPU interface). The hardware
+splits cleanly on both arches into a **per-CPU local controller** (LAPIC ↔ GIC
+CPU interface/redistributor: EOI, id, IPIs, the local timer) and a **system
+interrupt router** (IOAPIC ↔ GIC distributor: map an external line → CPU+vector,
+trigger/polarity, mask, affinity). They have different cardinality (local =
+per-CPU; router = once) and the project already splits even the *one* LAPIC chip
+across `ArchIrq` (delivery/ack) and `ArchTimer` (timer) by concern. So the router
+gets its own sibling trait, **`ArchIrqRouter`** (`arch/irq_router.rs`,
+re-exported `arch::IrqRouter`, x86 impl `X86IoApic`), consistent with the
+one-trait-per-divergent-subsystem convention. Long-term this is where SMP IRQ
+**affinity** and **MSI/MSI-X** routing ("route an external source → CPU+vector")
+naturally live, and it mirrors the GICv3 distributor/redistributor split on
+aarch64. (An earlier sketch used thin `init_syscall_entry`-style free fns — too
+ad-hoc; rejected.)
+
+**Mechanism (all arch-internal behind the trait):**
+- `X86IoApic::init` maps the IOAPIC MMIO uncached (mirroring `apic.rs`), reads
+  the version for the entry count, **masks every redirection entry**, and **masks
+  the legacy 8259 PICs** (`0x21`/`0xA1` ← `0xFF`) so external IRQs flow only via
+  the IOAPIC.
+- `route`/`mask`/`unmask` program redirection entries; the pure `encode_rte`
+  (RTE bit layout) and `resolve_isa_irq` (ISA IRQ → GSI via the MADT source
+  overrides, ISA edge/high defaults) are host-tested.
+- IDT gains a device-IRQ vector range (`0x30..=0x37`, macro-generated returning
+  stubs like `timer_stub`) → one `device_irq_dispatch` that reads `frame.vector`,
+  runs the registered handler from a lock-free `[AtomicUsize; N]` registry, then
+  EOIs. `register_device_handler(fn) -> vector` wires a driver without touching
+  the IDT. Edge-triggered only for now (the level-triggered IOAPIC-EOI path lands
+  with the first level device).
+- `self_test()` (a neutral trait diagnostic) routes the legacy **PIT** (IRQ0 →
+  GSI2) to a device vector in a brief interrupt-enabled window — safe because the
+  LAPIC timer LVT is still masked and the scheduler isn't running yet, so only
+  the PIT fires — counts a few ticks, masks the line, and logs. Proves the full
+  path before any device driver exists; replaced by real device IRQs at AHCI.
+
+ABI impact: none. Verified: `check-arch` clean (no IOAPIC/GSI/RTE/8259 jargon in
+neutral names); `build` clean (no warnings); `test` 385 host tests (+3:
+`encode_rte`, `resolve_isa_irq` ×2); `qemu` on q35 logs `ioapic: up (24 entries),
+8259 masked` then `ioapic: routed PIT IRQ0→GSI2→vec0x30; took 3 interrupts`, and
+the userspace demo runs unchanged (the scheduler's LAPIC tick is undisturbed).
+Branch `phase-2/ioapic` off `main` (includes merged PR #31). Next: `phase-2/dpc`.
