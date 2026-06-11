@@ -3130,3 +3130,49 @@ capability systems do. **Decision: wrap the generation modulo `2³¹`** (mask to
 non-negative-`isize` fix is independent and stays. `docs/spec/handle-encoding.md`
 § "Wraparound at `GENERATION_MAX`" updated; the retirement test replaced by
 `generation_wraps_at_max_without_retiring_the_slot`. Host tests green (374).
+
+---
+
+## 2026-06-11 — Phase 2 prereq: drivers-and-IRPs architecture doc
+
+First Phase 2 prerequisite item (doc-only). Wrote
+`docs/architecture/drivers-and-irps.md`, the IRP / interrupt / completion
+contract that the rest of the prerequisite band (IOAPIC, DPC queue,
+`PendingOperation`) and the storage slice (PCI/AHCI/GPT, `DeviceNode`,
+`InterruptObject`) implement against. The plan listed it as a prereq because the
+storage slice cites the file but it never existed. It distills the authoritative
+design in `os-design-v5.1.md` § "Driver Subsystem" and reconciles it with what
+Phase 1 actually built.
+
+Load-bearing decisions recorded:
+
+- **Execution contexts `IRQ > DPC > Thread`.** ISR does the minimum (ack +
+  queue a DPC / signal a waitable); DPCs run completion work non-blocking, above
+  thread priority, with inline `DpcNode`s (no heap alloc on the completion fast
+  path); threads initiate IRPs and block in `sys_wait`.
+- **`InterruptObject` is a waitable.** The ISR signals it and a driver thread
+  blocked in `sys_wait` wakes — one programming model for in-kernel (Tier 1) and
+  future userspace (Tier 2) drivers. Two patterns over the same ISR→DPC base:
+  block-on-`InterruptObject` (primary) and DPC completion routine (in-kernel).
+- **Async completion via `PendingOperation`.** The IRP owns one; completing the
+  IRP signals it; immediate completions return a pre-signalled handle so callers
+  have one code path. It is a new waitable on the **Phase-1** wait machinery, not
+  v5.1's intrusive `WaitNode` list.
+- **Discovery: ACPI MCFG/MADT → `DeviceNode` → Tier-1 matching** (a built-in
+  table) for Phase 2. `sys_device_map_mmio` returns a `MemoryObject` over a BAR.
+- **Two Phase-1 reconciliations made explicit in the doc:** the waiter mechanism
+  (fixed-array waiter list + 8-slot `Thread` wait array, `match KObjectType` in
+  `sched.rs`), and the DPC (deferred in Phase 1 — timer tick wakes directly;
+  migrates onto the DPC queue when `phase-2/dpc` lands).
+
+Deferrals recorded in `docs/rationale/deferred-decisions.md` (new "Drivers and
+interrupts" section): Tier 2 / LKM loading, MSI/MSI-X, shared INTx chaining,
+IOMMU + userspace drivers, IRP cancellation + 30 s timeout, filter drivers,
+NVMe, writeback IRPs. Phase 2 uses IOAPIC-routed non-shared interrupts and
+shallow IRP stacks.
+
+No code; no ABI impact (Markdown only). Branch `phase-2/drivers-irps-doc` off
+`main` (which now includes the merged phase-1.5, PR #29). This is item 1 of the
+Phase 2 prerequisite band; the implementing items (`phase-2/acpi-tables`,
+`phase-2/ioapic`, `phase-2/dpc`, `phase-2/pending-operation`, then the storage
+slice) follow per `docs/planning/implementation-plan.md`.
