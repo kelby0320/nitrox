@@ -3279,3 +3279,48 @@ neutral names); `build` clean (no warnings); `test` 385 host tests (+3:
 8259 masked` then `ioapic: routed PIT IRQ0→GSI2→vec0x30; took 3 interrupts`, and
 the userspace demo runs unchanged (the scheduler's LAPIC tick is undisturbed).
 Branch `phase-2/ioapic` off `main` (includes merged PR #31). Next: `phase-2/dpc`.
+
+---
+
+## 2026-06-11 — APIC mode strategy (x2APIC) + minimum-hardware baseline
+
+A take-stock decision prompted by the IOAPIC work: we use **xAPIC** (MMIO) and
+deferred x2APIC because "QEMU/TCG doesn't emulate x2APIC". That premise needed
+re-checking, and the answer shapes both the local-APIC plan and the project's
+hardware floor. No code change — two recorded decisions plus comment fixes
+(`apic.rs`, the `xtask qemu` CPU-model comment) and a deferred-decisions entry.
+
+**QEMU fact (corrected).** TCG *does* emulate x2APIC, but only since **QEMU 9.0**
+(commit `b5ee0468`, "apic: add support for x2APIC mode", Feb 2024 — after the 8.2
+branch). The local dev loop runs older QEMU (8.2.x) under TCG, where x2APIC is
+*not* available; the `+x2apic` CPUID bit is accepted but the userspace APIC won't
+service MSR access. KVM's in-kernel irqchip has emulated x2APIC for years,
+independent of QEMU version. So x2APIC is testable under emulation only via
+**QEMU ≥ 9.0 (TCG) or KVM**. The stale "TCG does not emulate x2APIC" comments in
+`apic.rs` and `xtask` are corrected to say "TCG before 9.0".
+
+**Decision 1 — minimum-hardware baseline (no legacy).** The kernel already
+requires SMEP and SMAP (enabled + asserted; dev loop passes `+smep,+smap`). SMAP
+is Broadwell, so the de-facto x86 floor is **≈ 2014**. We adopt that explicitly:
+the baseline is roughly **x86-64-v2 ISA + SMEP/SMAP**, and on any CPU meeting it,
+an **invariant TSC and x2APIC are guaranteed**. Recorded as a permanent non-goal
+("legacy / pre-2014 hardware") in `deferred-decisions.md`. (This also explains
+the `timer: no invariant TSC` warning under `-cpu qemu64` — an ancient model; a
+real target or `-cpu host`/`max` would not warn.)
+
+**Decision 2 — local APIC: dual-mode, prefer x2APIC, deferred.** Since every
+supported CPU has x2APIC, and it is *mandatory* for SMP beyond 255 logical CPUs
+(8-bit xAPIC IDs can't address them), the plan is **dual-mode**: auto-detect
+(`CPUID.01H:ECX[21]`) and prefer x2APIC, keeping xAPIC for the early-boot
+transition (firmware hands off in xAPIC mode), as a fallback, and for the
+pre-9.0 TCG dev loop. The xAPIC↔x2APIC difference is confined to `apic.rs`'s
+register accessors (`read_reg`/`write_reg`) plus the 32-bit `id()` and the
+single-MSR ICR write for IPIs — everything else (IOAPIC, timer, IDT) is
+unaffected — so it is a small, contained change. **Deferred** to Phase 3 SMP /
+real-hardware bring-up; implement alongside a dev-QEMU floor bump to ≥ 9.0 or an
+opt-in `xtask qemu --kvm`. Tracked in `deferred-decisions.md` ("x2APIC mode").
+
+**Dev loop posture.** Keep TCG + xAPIC as the default (portable, no `/dev/kvm`
+needed, deterministic serial output for the byte-identical qemu checks). KVM
+stays a future *opt-in* accelerator (faster, exercises x2APIC), not a
+requirement. The current QEMU/CPU-model pin is unchanged.

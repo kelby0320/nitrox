@@ -205,10 +205,13 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
         // SSE; the `+smap,+smep` opt-ins give us the user-access
         // protections `arch::init_protections` asserts on. The local
         // APIC is brought up in **xAPIC** (MMIO) mode — the on-chip APIC
-        // (CPUID.01H:EDX.9) is present in `qemu64` by default, and TCG does
-        // not emulate x2APIC, so no extra CPU flag is needed. Future slices
-        // add features as they need them (the `ArchTimer` slice will want
-        // `+tsc-deadline`, etc.). See the decision log.
+        // (CPUID.01H:EDX.9) is present in `qemu64` by default, so no extra CPU
+        // flag is needed. x2APIC is deferred (see the decision log, 2026-06-11):
+        // TCG only emulates it from **QEMU 9.0**, so testing the future x2APIC
+        // path under this loop needs QEMU ≥ 9.0 (then `+x2apic`) or KVM
+        // (`-enable-kvm -cpu host`, any modern QEMU); the pin is unchanged until
+        // that work lands. Future slices add features as they need them (the
+        // `ArchTimer` slice wanted `+tsc-deadline`, etc.).
         .arg("-cpu")
         .arg("qemu64,+smap,+smep")
         .arg("-m")
