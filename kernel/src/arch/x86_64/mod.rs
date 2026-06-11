@@ -1,6 +1,7 @@
 //! x86_64-specific primitives.
 
 pub mod abi;
+pub mod acpi;
 pub mod apic;
 pub mod context;
 pub mod cpu;

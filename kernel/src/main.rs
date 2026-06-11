@@ -118,6 +118,19 @@ fn kernel_main() {
     paging_init();
     paging_smoke_test();
 
+    // Discover platform hardware from the firmware tables (ACPI on x86_64): the
+    // PCIe ECAM window (for PCI enumeration) and the interrupt-routing topology
+    // (for the IOAPIC bring-up). Reads firmware memory through the HHDM, so it
+    // runs after the allocator/HHDM are up; before the local controller so the
+    // future IOAPIC step can consume the cached routing facts. Missing or
+    // malformed tables are logged, not fatal, and the parser logs its summary.
+    {
+        use arch::platform::ArchPlatform;
+        // SAFETY: ring 0, single CPU, called once during boot after the HHDM is
+        // available; reads firmware-owned physical memory, no allocation.
+        let _ = unsafe { arch::Platform::init() };
+    }
+
     // Bring up this CPU's local interrupt controller (xAPIC). Interrupts
     // stay masked (IF=0) for this whole slice — nothing is delivered yet; the
     // timer source lands with the Timers slice and the spurious/timer IDT

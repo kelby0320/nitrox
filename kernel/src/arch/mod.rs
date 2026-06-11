@@ -27,6 +27,7 @@
 pub mod cpu;
 pub mod irq;
 pub mod paging;
+pub mod platform;
 pub mod registers;
 pub mod smp;
 pub mod timer;
@@ -48,6 +49,12 @@ pub use x86_64::{abi, serial};
 pub use x86_64::apic::XApic as Irq;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::cpu::X86Cpu as Cpu;
+// Platform/firmware discovery (the x86 impl parses ACPI tables; aarch64 would
+// parse a DTB). Exposes neutral facts only — the PCIe ECAM regions; the
+// arch-specific interrupt-routing facts stay inside the arch layer. See
+// `arch/platform.rs`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::acpi::X86Platform as Platform;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::smp::X86Smp as Smp;
 // `Timer` here is the *hardware* timer (monotonic time + the per-CPU countdown
