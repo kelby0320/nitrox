@@ -56,6 +56,13 @@ pub(crate) unsafe fn copy_bytes_raw(
     unsafe {
         core::arch::asm!(
             "stac",
+            // `rep movsb` advances forward only with DF=0. The syscall
+            // entry path clears DF via SFMASK, but these primitives are
+            // also reachable from contexts that don't (a future #PF
+            // handler or DPC copying user memory), where DF is whatever
+            // the interrupted code left. Clear it explicitly so the copy
+            // can never run backwards and corrupt memory.
+            "cld",
             // Fault PC: the `rep movsb` instruction itself. On a
             // user-side #PF the CPU leaves RIP pointing here so the
             // exception-table match below can find it.
@@ -142,6 +149,11 @@ pub(crate) unsafe fn copy_cstr_raw(
     unsafe {
         core::arch::asm!(
             "stac",
+            // `lodsb`/`stosb` advance forward only with DF=0; clear it
+            // explicitly so the copy is correct regardless of the DF
+            // state of whatever context reached this primitive (see the
+            // note in `copy_bytes_raw`).
+            "cld",
             "xor rdx, rdx",
             // Fault PC. Only `lodsb` reads from user memory; the
             // subsequent `stosb`, `inc`, `test`, `cmp`, `jb` touch

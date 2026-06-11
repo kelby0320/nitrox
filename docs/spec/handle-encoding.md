@@ -13,13 +13,15 @@ A handle is a 64-bit opaque integer:
 pub struct RawHandle(u64);
 ```
 
-The 64 bits decompose into a 32-bit slot identifier and a 32-bit generation counter:
+The 64 bits decompose into a 32-bit slot identifier and a 31-bit generation counter, with bit 63 reserved zero:
 
 ```
- 63                              32 31                              0
-┌─────────────────────────────────┬─────────────────────────────────┐
-│      generation counter (32)    │        slot identifier (32)     │
-└─────────────────────────────────┴─────────────────────────────────┘
+ 63 62                           32 31                              0
+┌──┬──────────────────────────────┬─────────────────────────────────┐
+│ 0│   generation counter (31)    │        slot identifier (32)     │
+└──┴──────────────────────────────┴─────────────────────────────────┘
+  ▲
+  └─ reserved zero
 ```
 
 The slot identifier further decomposes:
@@ -33,9 +35,12 @@ The slot identifier further decomposes:
 
 | Field | Bits | Range | Purpose |
 |---|---|---|---|
+| reserved | 63 | 0 | Reserved zero (see below) |
 | segment id | 31:20 | 0 – 4095 | Top-level directory index |
 | index in segment | 19:0 | 0 – 1,048,575 | Slot index within segment |
-| generation | 63:32 | 0 – 4,294,967,295 | Detects use-after-close |
+| generation | 62:32 | 0 – 2,147,483,647 | Detects use-after-close |
+
+**Bit 63 is reserved zero.** Syscalls return handles in the result register, which also encodes error values (`KError`) as *negative* `isize`. A full 32-bit generation would let a handle whose generation reached `0x8000_0000` set bit 63 and read back as a negative `isize`, aliasing an error code. Capping the generation at 31 bits (`GENERATION_MAX = 0x7FFF_FFFF`) keeps every issued handle a non-negative `isize`, so the value and error spaces never collide. This is why the generation field is 31 bits, not 32, and why a slot is *retired* rather than wrapped at the cap (see [Generation counter behavior](#generation-counter-behavior)).
 
 Encoding and decoding helpers in `libkern`:
 
@@ -43,9 +48,13 @@ Encoding and decoding helpers in `libkern`:
 impl RawHandle {
     pub const NULL: RawHandle = RawHandle(0);
 
+    /// Largest generation a slot may be issued with (31 bits; bit 63 reserved).
+    pub const GENERATION_MAX: u32 = (1 << 31) - 1; // 0x7FFF_FFFF
+
     pub fn encode(seg_id: u32, slot_id: u32, generation: u32) -> Self {
         debug_assert!(seg_id < 4096);
         debug_assert!(slot_id < (1 << 20));
+        debug_assert!(generation <= Self::GENERATION_MAX); // bit 63 reserved zero
         let slot = ((seg_id as u64) << 20) | (slot_id as u64);
         Self(((generation as u64) << 32) | slot)
     }
@@ -123,10 +132,21 @@ The owner check (step 10) is the security-critical one. See [why-capabilities.md
 ## Generation counter behavior
 
 - Generation starts at `0` for a freshly-allocated segment slot.
-- On every allocation that uses a slot, generation is incremented (wrapping `u32`).
+- On every allocation that reuses a slot, generation is incremented by one, **modulo `GENERATION_MAX + 1`** (i.e. masked to 31 bits — see wraparound below).
 - Generation is **not** incremented on close; it's incremented on the next allocation that reuses the slot.
 - This means: a closed handle's last-known-valid generation matches the entry's current generation. Lookups against the closed handle fail because `entry.object` is null (step 6) and because the next allocation (which bumps the generation) hasn't happened yet.
 - After the slot is reused, the new handle has a new generation; the old handle value with the old generation will fail the generation check (step 9).
+
+### Wraparound at `GENERATION_MAX`
+
+The generation field is 31 bits (bit 63 reserved zero, per [RawHandle layout](#rawhandle-layout)), so it is bumped modulo `GENERATION_MAX + 1 = 0x8000_0000`: a slot is issued generations `1, 2, …, GENERATION_MAX, 0, 1, …`. The mask both performs the wrap and guarantees bit 63 stays clear.
+
+This admits a bounded ABA: a stale handle for slot `S` at generation `G`, held **unused** across exactly `2³¹` reuses of *that same slot*, would re-validate against whatever object occupies `S` at generation `G` then. This is accepted, because:
+
+- It requires `2³¹` (~2.1 billion) reuses of one specific slot while a single handle value is retained and unused — unreachable in practice.
+- The owner-PID check (step 10) confines it: the re-validated object must currently be owned by the **same process** issuing the stale handle. So the worst case is a process confusing two of *its own* handles — a within-process correctness hazard, **not** a cross-process privilege escalation. It is outside the threat model capabilities exist to enforce.
+
+The rejected alternative — *retiring* a slot at `GENERATION_MAX` (never recycling it) — would make the generation strictly non-repeating but turns a trivial unprivileged `open`/`close` loop into a slow, permanent, global handle-table leak (the table is global; any process can drive it). The wrap is steady-state and never loses a slot, which is the better property for a long-lived system. See the decision log (2026-06-11) for the full analysis. Implementation: `kernel/src/handle/table.rs` (the generation bump in `allocate`).
 
 ## Rights bitmask
 

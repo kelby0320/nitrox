@@ -2960,3 +2960,173 @@ validation rejects) green; `qemu` shows
 `parent: worker terminated`, then the spawn/transfer demo
 (`child[recv]: …marker=0xc0ffee ok`, both `ChildExited`), and the kernel stays
 alive past `sys_process_exit`.
+
+---
+
+## 2026-06-11 — Phase 1 stock-take: Phase 1.5 hardening pass + Phase 2 re-sequencing
+
+A take-stock pass after Phase 1 completed: a four-subsystem code-quality audit
+(memory, arch, scheduler/objects, handle/syscall) plus a Phase 2 dependency
+analysis. The audit found Phase 1 structurally sound — no CRITICAL/HIGH
+soundness bug, ~100% `SAFETY`-comment coverage, correct lock discipline and
+atomic orderings — so this is a polish-and-harden pass, not a rescue. Two
+outputs: a **Phase 1.5 hardening pass** (this code change) and a **Phase 2 plan
+restructure** (doc only; see `docs/planning/implementation-plan.md`).
+
+### Phase 1.5 — code-quality hardening
+
+Each item is a fix the audit surfaced; all gates stayed green throughout.
+
+- **Handle value can no longer alias a `KError` (`RawHandle` encoding).** The
+  generation counter occupied bits 63:32, so once a slot's generation reached
+  `0x8000_0000` the handle's bit 63 set and `handle.bits() as isize` read back
+  *negative* — indistinguishable from a `KError` in the syscall result
+  register. **Bit 63 is now reserved zero; the generation is 31 bits**
+  (`GENERATION_MAX = 0x7FFF_FFFF`), so every issued handle is a non-negative
+  `isize`. Normative spec updated (`docs/spec/handle-encoding.md`).
+
+- **Generation overflow is now design-enforced, not assumed.** The old counter
+  wrapped (`wrapping_add`), so after `2³²` reuses of one slot a stale handle
+  could re-validate and alias a different object (classic generation ABA). The
+  audit/user flagged that wraparound was never actually handled. New policy:
+  **a slot is retired — removed from the freelist permanently — when its
+  generation reaches `GENERATION_MAX`** (`HandleTable::drain_expired`, the sole
+  point a used slot returns to the freelist). The generation is therefore
+  *strictly monotonic and non-repeating per slot*, a toolchain-checkable
+  invariant rather than a probabilistic argument. Cost: one slot leaked per
+  `2³¹` reuses (tracked in per-segment `retired` so live-handle accounting
+  stays exact) — negligible. Reserving the sign bit *halved* the reuse budget
+  (`2³²`→`2³¹`), so the aliasing fix and the overflow policy are coupled and
+  landed together. Host test `slot_is_retired_at_generation_max_and_not_reissued`
+  drives a slot to the cap (via a test-only generation poke) and proves
+  retirement + non-negativity; the prior `generation_wraps_at_u32_max` test
+  (which asserted the *removed* wrap behavior) is replaced.
+  **ABI-hash impact:** `RawHandle` layout (still `repr(transparent)` `u64`) is
+  unchanged, but the *semantics* of bit 63 and the generation width changed —
+  a pre-stabilization ABI-semantics change, noted here per the spec posture
+  (hash still not computed in code).
+
+- **`kernel/CLAUDE.md` FPU claim corrected.** It stated "User FPU state is
+  saved/restored on context switch" — false: `context.rs` saves no FPU state
+  and userspace is soft-float. Reworded to match reality (XSAVE is
+  consumer-gated, lands with the first hard-float userspace thread). The claim
+  would have misled the first real userspace work in Phase 2.
+
+- **Buddy bitmap region over-skip (`mm/buddy.rs`).** `find_bitmap_region`
+  validated a candidate against `bitmap_bytes` while `new()` reserved the
+  page-rounded `bitmap_pages * PAGE_SIZE`; a region sized between the two left
+  `bitmap_phys_end` past the entry, and the pass-2 skip check then stripped
+  frames from the *next* usable entry. Now searches for the page-rounded
+  reservation size.
+
+- **`sys_channel_recv` handle-count guard (`syscall/table.rs`).** The handler
+  trusted the stored message's `handle_count` before indexing fixed-size
+  `[_; IPC_HANDLE_MAX]` buffers and slicing `hbytes[..n*8]`; a corrupted count
+  `> IPC_HANDLE_MAX` would panic the kernel (the `.min()` masked but did not
+  reject it). Now explicitly rejects with `KError::KernelError` after dequeue
+  (the in-flight `transfers[]` drop on return, reclaiming references).
+
+- **`cld` added to the user-copy asm (`arch/x86_64/user_access.rs`).**
+  `copy_bytes_raw`/`copy_cstr_raw` use `rep movsb`/`lodsb`/`stosb`, which
+  require `DF=0`. This held only because the syscall entry path clears DF via
+  `SFMASK`; a Phase-2 `#PF` handler or DPC copying user memory runs with
+  arbitrary DF and could copy backwards, corrupting memory. A `cld` at the top
+  of each block closes the window cheaply (verified safe today; hardening for
+  the new callers Phase 2 introduces).
+
+- **Refactor: `lookup_typed` helper (`syscall/table.rs`).** The
+  lookup-then-type-check idiom (`lookup(...).map_err(map_handle_err)?; if
+  object_type != EXPECTED { InvalidArgument }`) was copy-pasted across 8
+  handlers. Folded into one `lookup_typed(h, pid, required, expected)` so the
+  type-confusion check cannot be forgotten on a new handler. No behavior change.
+
+- **Refactor: `switch_into` scheduler switch-core (`sched.rs`).** The
+  IF-bracket + re-arm-kernel-stack + CR3-load + `context_switch` +
+  interrupt-restore tail was duplicated across `block_current_and_switch`,
+  `switch_to_next`, `finish_exit`, and `suspend_with_fault` — the most
+  safety-critical code in the kernel, where a future edit updating three sites
+  but not the fourth is a latent `#DF`/corruption. Factored into one
+  `unsafe fn switch_into(g, out_slot, next_obj)` that consumes the guard;
+  callers now only re-home the outgoing thread and install the incoming one.
+  `finish_exit`'s terminal path simply never reaches the (now-shared) restore.
+  Behavior-preserving — **verified by the QEMU round-trip**, which is
+  byte-identical to the prior Phase 1 output and exercises all four paths
+  (preemptive worker round-robin → `switch_to_next`/`finish_exit`; the
+  fault→suspend→resume(Terminate) → `suspend_with_fault`; `sys_wait` on the
+  channel → `block_current_and_switch`).
+
+**Deliberately deferred (low value / poor risk-reward):** the triplicated IDT
+GPR-save/`iretq` epilogue (`idt.rs` stub macro / `vec14` / timer stub) — risky
+exception-entry asm surgery for a maintainability-only win, rated LOW by the
+audit; and lifting the duplicated `FakeMem` test helper (`buddy.rs`/`slab.rs`)
+into `mm::test_support` — trivial but low-value test-only churn. Both remain as
+tracked cleanup if a future change touches that code.
+
+Verified: `check-arch` clean; `build` clean (no warnings); `test` **375** host
+tests (was 372; +3 handle-generation tests, the wrap test replaced) green;
+`qemu` round-trip byte-identical to Phase 1 (`worker faulted @
+rip=0x…400005 ; terminating` → `worker terminated` → spawn/transfer demo →
+both `ChildExited` → alive past `sys_process_exit`).
+
+### Phase 2 re-sequencing (plan doc only)
+
+The dependency analysis found the Phase 2 plan assumed infrastructure that was
+never scheduled, plus one internal inversion. Corrected in
+`docs/planning/implementation-plan.md`:
+
+- **The "async-I/O slice" was referenced but undefined.** Multiple slices defer
+  `PendingOperation` + blocking IPC send "to the async-I/O slice," but no slice
+  built it. Every block-device read (AHCI → fs-server → page cache) needs it.
+- **Device IRQs need an IOAPIC, which needs ACPI MADT parsing**; PCI ECAM needs
+  the ACPI MCFG table. Phase 1 shipped LAPIC-only and deferred IOAPIC "to Phase
+  2" without a slice. (This is the small pure-Rust table-parsing layer, distinct
+  from the ACPICA/AML work gated separately in `why-phased-acpi.md`.)
+- **The DPC/softirq queue** (Phase-1-deferred until a device-IRQ consumer
+  exists) and a **demand-paging `#PF` handler + `MappingKind::FileBacked`**
+  (the current `#PF` is exception-table-only; page cache is impossible without
+  fault-in) were both assumed but unscheduled.
+- **Entropy** was both its own slice and an item inside the in-kernel-RS slice
+  (`/dev/entropy`) — a forward self-reference.
+- **FAT was justified as "required to boot Limine"** — false (UEFI/Limine read
+  the ESP, not Nitrox); nothing in the Phase 2 milestone consumes it.
+
+Fix: a **prerequisite band** (architecture docs for namespace/RS and
+drivers/IRPs; ACPI table parser; IOAPIC; DPC queue; demand-paging `#PF` +
+`FileBacked`; `PendingOperation`/async-I/O + `Block` IPC modes; DMA allocation)
+now precedes slice 1; Entropy moved ahead of the in-kernel resource servers;
+slices renumbered with explicit dependency notes; the FAT justification
+corrected; init clarified as a *bootstrapping* form (milestone-complete only
+once storage/fs/page-cache land). Milestone unchanged. These prerequisites are
+genuine Phase 2 feature work, distinct from the Phase 1.5 code hardening above.
+
+No commit/push/PR performed — left for the user to review.
+
+### 2026-06-11 addendum — generation overflow: retirement → wrap
+
+On review, the generation-overflow decision above (retire a slot at
+`GENERATION_MAX`) was reconsidered and **reversed in favor of wrapping**. The
+trade was re-examined with the actual numbers and threat model:
+
+- **Retirement is a permanent, global, unprivileged resource leak.** The handle
+  table is global; any process can drive a slot's generation with a trivial
+  `open`/`close` loop, and the LIFO freelist concentrates that on one slot. At
+  an aggressive sustained 1M handle-ops/s a slot retires every ~36 min, a
+  4096-slot segment in ~102 days, the whole 256-segment table in ~71 years.
+  Not a *practical* exhaustion, but it is permanent global degradation reachable
+  by unprivileged code — the wrong shape for a long-lived system.
+- **Wrapping's ABA is far weaker than it first appears.** A wrapped generation
+  can only re-validate a stale handle after `2³¹` reuses of the *same* slot
+  while that handle is held unused, **and** the `owner_pid` check (step 10)
+  confines the confusion to the *same owning process* — a within-process
+  correctness hazard, not a cross-process escalation. It is outside the
+  capability threat model and unreachable in practice.
+
+So the residual hazards are asymmetric: retirement gives a reachable-by-trivial-
+code global leak; wrapping gives a non-reachable, within-process-only ABA.
+Wrapping is steady-state (never loses a slot), removes code (the retirement
+check + the per-segment `retired` counter), and matches what production
+capability systems do. **Decision: wrap the generation modulo `2³¹`** (mask to
+31 bits, which also keeps the reserved bit 63 clear). The bit-63 reservation /
+non-negative-`isize` fix is independent and stays. `docs/spec/handle-encoding.md`
+§ "Wraparound at `GENERATION_MAX`" updated; the retirement test replaced by
+`generation_wraps_at_max_without_retiring_the_slot`. Host tests green (374).

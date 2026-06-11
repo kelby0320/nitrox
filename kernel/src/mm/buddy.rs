@@ -142,13 +142,20 @@ impl BuddyAllocator {
         }
         let bitmap_bytes = total_words * 8;
         let bitmap_pages = (bitmap_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+        // We reserve whole pages for the bitmap, so the region we need is
+        // the page-rounded size, not `bitmap_bytes`. Searching for only
+        // `bitmap_bytes` could pick a region with `bitmap_bytes <= span <
+        // bitmap_pages * PAGE_SIZE`, leaving `bitmap_phys_end` past the
+        // entry's end — the pass-2 skip check would then strip frames from
+        // the *next* usable entry.
+        let bitmap_reservation = (bitmap_pages * PAGE_SIZE) as u64;
 
         // Reserve a contiguous region for the bitmap. Must be page-aligned
         // and above 1 MiB.
         // SAFETY: caller asserts `memory_map` is valid.
-        let bitmap_phys = unsafe { find_bitmap_region(memory_map, bitmap_bytes as u64) }
+        let bitmap_phys = unsafe { find_bitmap_region(memory_map, bitmap_reservation) }
             .expect("buddy: no usable region large enough for coalesce bitmap");
-        let bitmap_phys_end = bitmap_phys + (bitmap_pages * PAGE_SIZE) as u64;
+        let bitmap_phys_end = bitmap_phys + bitmap_reservation;
 
         // Zero the bitmap through the HHDM.
         // SAFETY: `bitmap_phys..+bitmap_bytes` was returned by
@@ -435,13 +442,15 @@ fn clip_to_managed(entry: &MemoryMapEntry) -> (u64, u64) {
 }
 
 /// Find a page-aligned, above-1-MiB physical address inside some Usable
-/// entry where `bitmap_bytes` consecutive bytes will fit.
+/// entry where `reservation_bytes` consecutive bytes will fit. Callers
+/// pass the page-rounded reservation size (not the bare bitmap length)
+/// so the chosen region fully contains every page the bitmap occupies.
 ///
 /// # Safety
 /// `memory_map` must be a valid Limine response.
 unsafe fn find_bitmap_region(
     memory_map: &MemoryMapResponse,
-    bitmap_bytes: u64,
+    reservation_bytes: u64,
 ) -> Option<u64> {
     let mut chosen: Option<u64> = None;
     // SAFETY: caller asserts `memory_map` is valid.
@@ -454,7 +463,7 @@ unsafe fn find_bitmap_region(
             if end == 0 {
                 return;
             }
-            if end - start >= bitmap_bytes {
+            if end - start >= reservation_bytes {
                 chosen = Some(start);
             }
         });

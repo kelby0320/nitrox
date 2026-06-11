@@ -735,7 +735,75 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 
 ### Tasks (in suggested execution order)
 
-#### Namespace and resource server foundation
+> **2026-06-11 re-sequencing (stock-take after Phase 1).** The original
+> Phase 2 ordering silently assumed several pieces of infrastructure that do
+> not yet exist, and had one internal ordering inversion. A dependency audit
+> (see the decision log entry of 2026-06-11) found:
+>
+> - **The "async-I/O slice" is referenced but never defined.** The Phase 1
+>   status note and the IPC slice both defer `PendingOperation` + blocking IPC
+>   send "to the async-I/O slice," but no slice built it. Every block-device
+>   read (AHCI → fs-server → page cache) is an async operation that needs it.
+> - **Device IRQs need an IOAPIC, which needs ACPI MADT parsing** — Phase 1
+>   shipped LAPIC-only and deferred IOAPIC "to Phase 2" without giving it a
+>   slice. PCI ECAM likewise needs the ACPI MCFG table. (This is the small
+>   pure-Rust *table-parsing* layer, distinct from the ACPICA/AML work that is
+>   correctly deferred to its own trigger — see `why-phased-acpi.md`.)
+> - **The DPC/softirq queue** was deferred in Phase 1 "until a device-IRQ
+>   consumer exists" — storage drivers are that consumer.
+> - **The page cache needs a demand-paging `#PF` handler** (not-present →
+>   VMA lookup → fault-in) and the `MappingKind::FileBacked` VMA variant,
+>   both still Phase-1 stubs (the current `#PF` handler only consults the
+>   exception table).
+> - **Entropy was listed both as its own slice and as an item inside the
+>   in-kernel-RS slice** (`/dev/entropy`), a forward self-reference.
+> - **FAT was justified as "required to boot Limine"** — false; UEFI/Limine
+>   read the ESP, not Nitrox. Nothing in the Phase 2 milestone consumes it.
+>
+> The missing infrastructure is now scheduled explicitly as a **prerequisite
+> band** ahead of slice 1, the slices are reordered, and the misleading notes
+> are corrected. (These prerequisites are genuine Phase 2 feature work; they
+> are distinct from the Phase 1.5 code-quality hardening pass also recorded
+> in the decision log on 2026-06-11.)
+
+#### Phase 2 prerequisites (land before the namespace slice)
+
+These were implicit in the original plan; each gates one or more later slices.
+Author the two missing architecture docs first — slices 1 and 5 implement
+*against* contracts that have not been written.
+
+- [ ] **Architecture docs.** Write `docs/architecture/namespace-and-resource-servers.md`
+  (the `ResourceServer`/`OpStatus`/registry contract that slice 1 implements)
+  and `docs/architecture/drivers-and-irps.md` (the IRP / completion-routine /
+  `InterruptObject` contract that the storage slice implements). Both are
+  cited by the slices below but do not yet exist.
+- [ ] **ACPI table parser** (pure-Rust RSDP → XSDT/RSDT → MADT + MCFG; no AML).
+  Enables IOAPIC (MADT) and PCI ECAM (MCFG). No external crate. Gates the
+  IOAPIC and storage slices.
+- [ ] **IOAPIC bring-up + external IRQ routing.** The Phase-1 `ArchIrq`
+  deferral (LAPIC-only). Without it no device interrupt is deliverable, so
+  AHCI cannot signal completion. Extend the `IrqSpinLock` audit to any new
+  IRQ-reachable locks.
+- [ ] **DPC / softirq queue**, wired into the timer-tick wakeup path (the
+  Phase-1 "DPC integration for wakeup" deferral). Device IRQ handlers defer
+  their real work here (no allocation / unbounded work in IRQ context).
+- [ ] **Demand-paging `#PF` handler** (not-present fault → active-AS VMA
+  lookup → fault-in) **+ `MappingKind::FileBacked`** VMA variant. Completes
+  the Phase-1 `#PF` stub and the `Anonymous`-only `MappingKind`. Unblocks
+  both lazy anonymous/`MemoryObject` paging and the page cache. Also enables
+  retiring the eager per-page allocation in `AddressSpace::map_vma`.
+- [ ] **`PendingOperation` kernel object + `sys_wait` I/O-completion
+  integration** (the long-promised "async-I/O slice"), plus the `Block` /
+  `BlockBounded` IPC send modes that were deferred to it, and the `IoRing`
+  transport if the rsproto wire format needs it. This is the blocking
+  primitive every device/fs request depends on. Gates the storage, fs-server,
+  and page-cache slices.
+- [ ] **DMA-capable allocation** (page-multiple alignment / a `dma_alloc`
+  path; the `align > SLAB_SIZE` deferral). AHCI command lists / PRDTs need
+  physically-contiguous aligned buffers. Folded into the storage slice if not
+  landed earlier.
+
+#### 1. Namespace and resource server foundation
 
 - [ ] `Namespace` kernel object with binding tree (RB-tree or similar)
 - [ ] Path resolution engine (parse, walk, dispatch)
@@ -748,24 +816,33 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 - [ ] `sys_ns_bind` (gated by `SysCaps::BIND_NAMESPACE`)
 - [ ] `sys_ns_unbind`
 
-#### In-kernel resource servers
+#### 2. Entropy
 
-- [ ] Initramfs resource server (parses Limine-loaded CPIO newc blob)
-- [ ] Device resource server stub (`/dev`)
-- [ ] Process resource server stub (`/proc`)
-- [ ] Kernel log resource server (`/dev/log`)
-- [ ] Entropy resource server (`/dev/entropy`) — with the entropy subsystem from below
-- [ ] Framebuffer resource server (`/dev/framebuffer`) — for pre-compositor era
-- [ ] Synthetic `/proc/self/*` resources
-
-#### Entropy
+Moved ahead of the in-kernel resource servers: the `/dev/entropy` server in
+the next slice depends on this subsystem (the original plan listed it in both
+places — a forward self-reference).
 
 - [ ] Hardware RNG access (RDSEED preferred, RDRAND fallback)
 - [ ] Software entropy mixing (TSC jitter at interrupt dispatch)
 - [ ] ChaCha20 CSPRNG with periodic reseed
 - [ ] `EntropyObject` handle, blocks until pool is seeded
 
-#### Init (PID 1)
+#### 3. In-kernel resource servers
+
+- [ ] Initramfs resource server (parses Limine-loaded CPIO newc blob)
+- [ ] Device resource server stub (`/dev`)
+- [ ] Process resource server stub (`/proc`)
+- [ ] Kernel log resource server (`/dev/log`)
+- [ ] Entropy resource server (`/dev/entropy`) — consumes the entropy subsystem (slice 2)
+- [ ] Framebuffer resource server (`/dev/framebuffer`) — for pre-compositor era
+- [ ] Synthetic `/proc/self/*` resources
+
+#### 4. Init (PID 1) — bootstrapping form
+
+This slice lands a *bootstrapping* init: it starts (handle-set reception, TOML
+parsing, reaping loop) on top of slices 1 and 3. Its full critical-path mount
+loop is not milestone-complete until the storage + fs-server slices (5–8)
+land; see the milestone note.
 
 - [ ] `userspace/init/` crate, `libkern + alloc` only
 - [ ] Initial handle set reception from kernel
@@ -775,22 +852,32 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 - [ ] Reaping loop for `ChildExited` notifications
 - [ ] `sys_release_initramfs` syscall and init's call to it once boot is stable
 
-#### Storage drivers
+#### 5. Storage drivers
+
+Depends on the prerequisite band: ACPI MCFG (ECAM), IOAPIC (device IRQs), the
+DPC queue (completion handling), `PendingOperation` (blocking reads), and DMA
+allocation (command lists / PRDTs).
 
 - [ ] PCI/PCIe enumeration via ECAM (MCFG-based on x86_64)
 - [ ] DeviceNode kernel objects for discovered devices
 - [ ] AHCI driver (start here; simpler than NVMe)
 - [ ] IRP framework per [docs/architecture/drivers-and-irps.md]
 - [ ] InterruptObject kernel object for hardware IRQs
+- [ ] DMA buffer allocation (if not landed in the prerequisite band)
 - [ ] Block device resource server registration
 
-#### Partition handling
+#### 6. Partition handling
 
 - [ ] GPT driver (Tier 1)
 - [ ] Partition DeviceNode registration
 - [ ] `/dev/disk/by-partuuid/*` and `/dev/disk/by-partlabel/*` namespace entries
 
-#### Filesystem in userspace
+#### 7. Filesystem in userspace
+
+Decide the transport explicitly: the rsproto client API is async-shaped, so
+either `PendingOperation`-backed requests or at least one blocking IPC
+direction (both from the prerequisite band) are needed for real request/reply
+under backpressure; `NoBlock` send + `sys_wait`-on-recv is the fallback.
 
 - [ ] `userspace/librsproto/` crate per [docs/spec/rsproto-wire-format.md]
 - [ ] Meta operations: Hello, Goodbye, QueryCaps, Ping, Ready
@@ -805,24 +892,36 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
   - [ ] Control channel + Ready handshake
   - [ ] Init binds the endpoint via `sys_ns_bind`
 
-#### Page cache integration with fs-server
+#### 8. Page cache integration with fs-server
+
+Depends on the demand-paging `#PF` handler + `MappingKind::FileBacked` from the
+prerequisite band — the fault-in path is what makes "reads files" real.
 
 - [ ] Page cache for file-backed memory in kernel
 - [ ] `sys_memory_map` on file handles asks fs-server for extents
 - [ ] Kernel reads blocks into page cache pages, maps into client address space
 - [ ] Writeback (deferred to Phase 3 along with fs-server-ext4 RW)
 
-#### Emergency shell
+#### 9. Emergency shell
+
+Floats after init (slice 4); its read-kernel-log feature depends on `/dev/log`
+(slice 3).
 
 - [ ] `userspace/eshell/` crate
 - [ ] Minimal command interface over serial console
 - [ ] Inspect mounts, list block devices, read kernel log, edit initramfs files, reboot
 - [ ] Init invokes eshell on critical-path failure
 
-#### FAT for completeness (RO is fine for now)
+#### 10. FAT for completeness (RO is fine for now)
+
+Kept last (or a candidate to defer to Phase 3): **no Phase 2 milestone clause
+consumes `fs-server-fat`.** The ESP's FAT32 is read by UEFI firmware and
+Limine, *not* by Nitrox — booting never requires Nitrox to read its own ESP.
+This server exists for parity/completeness, not for boot.
 
 - [ ] `userspace/fs-server-fat/` crate (FAT32/FAT16/FAT12 read-only)
-- [ ] Required because UEFI mandates FAT32 for the ESP
+- [ ] Needed only for in-OS access to FAT volumes (e.g. updating the ESP from
+  within the OS), not for booting
 
 ### Milestone
 
@@ -836,9 +935,20 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 
 Disk image is built by `xtask build-disk` with a real ext4 partition containing test data.
 
+The milestone is **unchanged** by the 2026-06-11 re-sequencing — only the
+slice order and the explicit prerequisite band changed. Note that init
+(slice 4) is only *milestone-complete* once the storage/fs-server/page-cache
+slices land (it can spawn fs-server-ext4, wait for Ready, and bind `/`).
+
 ### Notes / deviations
 
-(Add notes here.)
+- **2026-06-11 — Phase 2 re-sequencing.** Added the explicit prerequisite
+  band (architecture docs, ACPI table parser, IOAPIC, DPC queue, demand-paging
+  `#PF` + `FileBacked`, `PendingOperation`/async-I/O, DMA allocation); moved
+  Entropy ahead of the in-kernel resource servers; corrected the FAT
+  "required to boot" justification; clarified that slice-4 init is the
+  bootstrapping form. Rationale and the full dependency analysis are in the
+  decision log entry of 2026-06-11. No milestone change.
 
 ---
 

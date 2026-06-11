@@ -9,7 +9,7 @@ Kernel workspace constraints. Loaded when Claude Code reads files under `kernel/
 - **No `alloc` crate at startup.** `KBox`, `KVec`, etc., become available only after the kernel allocator is initialized in early boot (see `kernel/src/main.rs` initialization sequence). Code in the early-init path cannot allocate; later code can.
 - **Target**: the built-in `x86_64-unknown-none` rustc target. It already implies soft-float, no MMX/SSE, and no red zone — exactly the semantics the kernel needs. Staying on a built-in target keeps us on stable Rust without `-Z build-std`, which is nightly-only. If we ever need a feature the built-in spec doesn't expose, we switch to a custom JSON at that point — but not before. The aarch64 equivalent is `aarch64-unknown-none`. (Decision recorded in `docs/history/decision-log.md` 2026-05-13.)
 - **`panic = "abort"`** — no stack unwinding in the kernel.
-- The target already disables MMX/SSE and forces soft-float; the kernel does not use FPU. User FPU state is saved/restored on context switch.
+- The target already disables MMX/SSE and forces soft-float; the kernel does not use the FPU. Userspace is currently soft-float as well, so no thread touches FPU/SSE/AVX state and the context switch saves **none** — there is nothing to preserve. Per-thread FPU save/restore (XSAVE/XRSTOR) is consumer-gated: it lands with the first hard-float userspace thread, wired into both switch paths then. See `docs/planning/implementation-plan.md` (Phase 1 "FPU state" deferral) and `docs/rationale/deferred-decisions.md`.
 
 ## No external crates
 
