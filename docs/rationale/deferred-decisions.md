@@ -54,6 +54,55 @@ These will eventually be done, but aren't in initial scope. Each entry documents
 
 **Live kernel patching / hot upgrade.** Not in scope.
 
+### Drivers and interrupts
+
+See `docs/architecture/drivers-and-irps.md` for the framework these defer from.
+
+**Tier 2 (runtime-loadable) drivers.** Phase 2 ships only Tier 1 drivers
+(compiled into the kernel ELF via Cargo features: `pci`, `ahci`, `gpt`). The
+userspace driver manager — matching `DeviceNode`s to loadable modules and
+handing a driver process a `Handle<DeviceNode>` — needs the kernel-module
+loader (`export!` table, ELF relocation, ABI-hash enforcement) which is itself
+deferred (see "Kernel module infrastructure" above). Trigger: hot-pluggable or
+optional hardware that isn't on the boot path.
+
+**MSI / MSI-X (message-signalled interrupts).** Phase 2 routes device
+interrupts through the IOAPIC (legacy line interrupts), which is sufficient for
+the QEMU AHCI controller. MSI/MSI-X (and the per-vector affinity they enable)
+land when a device needs them. Trigger: NVMe, multi-queue NICs, or performance
+work on interrupt-heavy devices.
+
+**Shared PCI INTx interrupt chaining.** The "chain of handlers, each returning
+*mine* / *not mine*" model for shared legacy interrupt lines is deferred; Phase 2
+assumes each handled GSI has one owner. MSI/MSI-X are never shared, so this only
+matters for legacy INTx sharing. Trigger: real hardware where INTx lines are
+shared across functions.
+
+**IOMMU programming and userspace drivers.** Granting a `DeviceNode` /
+`InterruptObject` to a userspace driver process safely requires programming the
+IOMMU (VT-d / AMD-Vi / SMMU) to constrain the device's DMA to memory the driver
+legitimately holds. Phase 2 has only in-kernel drivers, so neither the IOMMU
+programming nor userspace driver hosting is built. Trigger: a userspace driver
+(e.g. a userspace NIC or GPU driver).
+
+**IRP cancellation and the completion timeout.** The IRP framework lands without
+request cancellation or the 30-second force-complete timeout. Phase 2 stacks are
+shallow and the boot-path block driver completes promptly. Trigger: long-running
+or cancellable I/O (network, user-abortable operations) and Tier 2 module unload
+(which drains in-flight IRPs).
+
+**Filter drivers.** Transparent insertion of a driver into a stack (encryption,
+compression, logging, LUKS, LVM) is part of the IRP design but unimplemented.
+Phase 2 has single- and two-layer stacks only (AHCI; GPT-over-block). Trigger:
+the first filter use case (encrypted root / LVM, both already deferred under
+"Filesystems").
+
+**NVMe.** Phase 2's first storage driver is AHCI (simpler than NVMe). The `nvme`
+Tier 1 feature follows. Trigger: NVMe hardware or a faster boot device matters.
+
+**Writeback IRPs.** The page cache initially flows reads only; dirty-page
+writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
+
 ### Networking
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
