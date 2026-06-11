@@ -7,9 +7,15 @@
 //! straight from the MSR — no ACPI/MADT needed (see
 //! `docs/rationale/why-phased-acpi.md`).
 //!
-//! xAPIC (not x2APIC) because the project's QEMU dev loop runs under TCG, which
-//! does not emulate x2APIC; xAPIC is fully supported there. See the decision
-//! log.
+//! **xAPIC, not x2APIC, for now.** x2APIC accesses the same registers through
+//! MSRs (`0x800 + reg>>4`) instead of MMIO and uses 32-bit APIC IDs; it is the
+//! right mode on real hardware (and mandatory once SMP exceeds 255 logical
+//! CPUs). It is deferred: TCG only began emulating x2APIC in **QEMU 9.0** (the
+//! dev loop runs older QEMU under TCG), and it is not needed until SMP /
+//! real-hardware bring-up. The xAPIC↔x2APIC difference is localised to the
+//! register accessors here, so dual-mode (auto-detect, prefer x2APIC) is a small
+//! change when the time comes. See `docs/rationale/deferred-decisions.md`
+//! ("x2APIC mode") and the decision log (2026-06-11).
 
 use core::sync::atomic::{AtomicU64, Ordering};
 
