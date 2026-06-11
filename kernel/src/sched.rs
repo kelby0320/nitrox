@@ -705,6 +705,67 @@ unsafe fn arm_kernel_stack_for(obj: *mut ()) {
     }
 }
 
+/// The common context-switch tail shared by every voluntary/involuntary
+/// switch: [`block_current_and_switch`], [`switch_to_next`], [`finish_exit`],
+/// and [`suspend_with_fault`]. The caller must have already re-homed the
+/// outgoing thread (onto `ready` / `blocked` / `suspended` / `reap`), set the
+/// incoming thread's state to `Running`, and installed it as `current`, all
+/// under the held `SCHED` guard `g`. This consumes `g`.
+///
+/// `out_slot` is the outgoing thread's saved-SP slot (where the switch stashes
+/// its kernel RSP); `next_obj` is the pinned incoming thread just made current.
+///
+/// It drops the lock keeping interrupts masked (the cardinal
+/// no-IRQ-mid-switch rule — see the module docs and
+/// [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked)),
+/// re-arms the incoming thread's trap/syscall kernel stack, loads its
+/// page-table root **before** switching away (so a dying thread's CR3 is off
+/// its soon-to-be-freed root), and performs the stack switch. On a resuming
+/// caller, control returns here and the caller's own captured interrupt state
+/// is restored; a terminal caller ([`finish_exit`]) never switches back, so
+/// the restore is simply never reached.
+///
+/// Factoring this once means the four parking dispositions cannot drift apart
+/// — a divergence in this sequence (e.g. forgetting `arm_kernel_stack_for` or
+/// the CR3 load on one path) would be a latent `#DF`/corruption bug.
+///
+/// # Safety
+/// `out_slot` must be the saved-SP slot of the (pinned) outgoing thread and
+/// `next_obj` the pinned incoming thread the caller just made `current`, both
+/// under the `SCHED` hold being released here. Single-CPU: nothing else
+/// touches either thread's saved SP across the switch.
+unsafe fn switch_into(
+    g: IrqSpinLockGuard<'_, SchedState>,
+    out_slot: *mut u64,
+    next_obj: *mut (),
+) {
+    // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
+    // here, satisfying the Thread accessor contract for these reads.
+    let next_sp = unsafe { Thread::saved_sp(next_obj) };
+    let next_root = unsafe { resolve_root(next_obj) };
+    // Drop the lock but keep interrupts masked across the switch. `saved_if`
+    // is this thread's prior interrupt state, restored when it next resumes.
+    let saved_if = g.release_keeping_irqs_masked();
+    // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
+    unsafe { arm_kernel_stack_for(next_obj) };
+    // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
+    // with the kernel half inherited); all kernel stacks are mapped in every
+    // root, so switching CR3 before the stack swap is sound. Loading it before
+    // the switch also ensures a dying thread leaves CR3 on the incoming root
+    // before it is reaped (its `AddressSpace::Drop` may free the old PML4).
+    unsafe { Paging::set_page_table(next_root) };
+    // SAFETY: lock released; interrupts masked; `out_slot` points into the
+    // re-homed outgoing thread (pinned) and `next_sp` is the saved RSP of the
+    // now-current thread (pinned). Single-CPU: nothing else touches either.
+    unsafe { context_switch(out_slot, next_sp) };
+    // Resumed (cooperative path): restore the interrupt state this thread had
+    // on entry. On the preemptive path the resume returns into the timer-stub
+    // epilogue (which `iretq`s IF back) and `saved_if` is false → no-op. A
+    // terminal caller (`finish_exit`) never reaches this.
+    // SAFETY: ring-0; restoring this thread's own captured interrupt state.
+    unsafe { Cpu::interrupts_restore(saved_if) };
+}
+
 /// Park the current thread (set `Blocked`, move into `blocked`) and switch to
 /// the next runnable thread. Mirrors [`switch_to_next`]'s IF-bracket exactly,
 /// but does **not** re-enqueue the outgoing thread — the caller ([`wait_on`])
@@ -728,26 +789,17 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Thread::set_state(next_obj, ThreadState::Running);
     }
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
-    let next_sp = unsafe { Thread::saved_sp(next_obj) };
-    let next_root = unsafe { resolve_root(next_obj) };
 
     // Park prev in `blocked` (NOT ready/idle) — its `ObjectRef` keeps it alive.
     debug_assert!(g.blocked.len() < g.blocked.capacity());
     g.blocked.try_push(prev).expect("blocked list within reserve");
     g.current = Some(next);
 
-    // Identical IF-bracket to `switch_to_next`.
-    let saved_if = g.release_keeping_irqs_masked();
-    // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
-    unsafe { arm_kernel_stack_for(next_obj) };
-    // SAFETY: as `switch_to_next`.
-    unsafe { Paging::set_page_table(next_root) };
-    // SAFETY: as `switch_to_next`.
-    unsafe { context_switch(prev_slot, next_sp) };
-    // Resumed: a waker moved us back to `ready` and the scheduler switched us
-    // in. Restore our own captured interrupt state (cooperative resume).
-    // SAFETY: ring-0.
-    unsafe { Cpu::interrupts_restore(saved_if) };
+    // Switch into `next`; we resume here (lock-free) when a waker moves us back
+    // to `ready` and the scheduler later picks us.
+    // SAFETY: `prev_slot` is the outgoing (now-`Blocked`, pinned-in-`blocked`)
+    // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
+    unsafe { switch_into(g, prev_slot, next_obj) };
 }
 
 /// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller
@@ -958,8 +1010,6 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Thread::set_state(next_obj, ThreadState::Running);
     }
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
-    let next_sp = unsafe { Thread::saved_sp(next_obj) };
-    let next_root = unsafe { resolve_root(next_obj) };
 
     // Re-home prev: the idle thread parks in its slot (never in `ready`);
     // every other thread re-enqueues at the tail.
@@ -972,28 +1022,9 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     }
     g.current = Some(next);
 
-    // Drop the lock but keep interrupts masked across the switch (cardinal rule
-    // + the no-IRQ-mid-switch invariant). `saved_if` is this thread's prior
-    // interrupt state, restored when *this* thread next resumes here.
-    let saved_if = g.release_keeping_irqs_masked();
-    // Re-arm the trap/syscall stack for the incoming thread (multi-user-thread
-    // correctness — see `arm_kernel_stack_for`).
-    // SAFETY: `next_obj` is the pinned incoming thread.
-    unsafe { arm_kernel_stack_for(next_obj) };
-    // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
-    // with the kernel half inherited); all kernel stacks are mapped in every
-    // root, so switching CR3 before the stack swap is sound.
-    unsafe { Paging::set_page_table(next_root) };
-    // SAFETY: lock released; interrupts masked; `prev_slot` points into the
-    // re-homed prev thread (pinned) and `next_sp` is the saved RSP of the
-    // now-current thread (pinned). Single-CPU: nothing else touches either.
-    unsafe { context_switch(prev_slot, next_sp) };
-    // Resumed (cooperative path): restore the interrupt state this thread had
-    // on entry. On the preemptive path the resume instead returns into the
-    // timer-stub epilogue (which `iretq`s IF back), and `saved_if` is false →
-    // this is a no-op.
-    // SAFETY: ring-0; restoring this thread's own captured interrupt state.
-    unsafe { Cpu::interrupts_restore(saved_if) };
+    // SAFETY: `prev_slot` is the re-homed outgoing (now-`Ready`, pinned)
+    // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
+    unsafe { switch_into(g, prev_slot, next_obj) };
 }
 
 /// The action a supervisor's `sys_exception_resume` requests for a thread
@@ -1126,27 +1157,17 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     let next_obj = next.as_ptr();
     // SAFETY: next is pinned, becoming current; lock held.
     unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-    let next_sp = unsafe { Thread::saved_sp(next_obj) };
-    let next_root = unsafe { resolve_root(next_obj) };
     g.current = Some(next);
 
-    // Drop the lock but keep interrupts masked across the final switch; we
-    // never resume, so the captured prior state is discarded (the incoming
-    // thread restores its own).
-    let _ = g.release_keeping_irqs_masked();
-    // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
-    unsafe { arm_kernel_stack_for(next_obj) };
-    // Load the incoming thread's root BEFORE switching away. When the last user
-    // thread exits, `next_root` is the boot root, so CR3 is restored to the
-    // kernel table before this (parked-in-`reap`) thread is reaped — its
+    // Switch away forever. `switch_into` loads the incoming root before the
+    // stack swap, so when the last user thread exits CR3 is restored to the
+    // boot root before this (parked-in-`reap`) thread is reaped — its
     // `AddressSpace::Drop` frees the PML4 CR3 would otherwise still reference.
-    // SAFETY: `next_root` is a fully-formed PML4; all kernel stacks are mapped
-    // identically across roots.
-    unsafe { Paging::set_page_table(next_root) };
-    // SAFETY: lock released. We switch away from this stack forever; `me_slot`
-    // (our own now-Exited thread, pinned in `reap`) is written by the switch and
-    // never read again; `next_sp` is the incoming thread's saved RSP (pinned).
-    unsafe { context_switch(me_slot, next_sp) };
+    // SAFETY: `me_slot` is our own (now-`Exited`, pinned-in-`reap`) saved-SP
+    // slot — written by the switch and never read again; `next_obj` is the
+    // pinned incoming thread. We never resume, so the restore inside
+    // `switch_into` is never reached.
+    unsafe { switch_into(g, me_slot, next_obj) };
     unreachable!("switched away from an exited thread");
 }
 
@@ -1272,23 +1293,13 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         let next_obj = next.as_ptr();
         // SAFETY: next is pinned, becoming current; lock held.
         unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-        let next_sp = unsafe { Thread::saved_sp(next_obj) };
-        let next_root = unsafe { resolve_root(next_obj) };
         g.current = Some(next);
 
-        let saved_if = g.release_keeping_irqs_masked();
-        // SAFETY: `next_obj` is the pinned incoming thread.
-        unsafe { arm_kernel_stack_for(next_obj) };
-        // SAFETY: `next_root` is a fully-formed PML4; kernel half mapped in all.
-        unsafe { Paging::set_page_table(next_root) };
-        // SAFETY: lock released; interrupts masked; `me_slot` points into our own
-        // (Suspended, pinned-in-`suspended`) thread, `next_sp` is the incoming
-        // thread's saved RSP (pinned). We resume here when made runnable.
-        unsafe { context_switch(me_slot, next_sp) };
-        // Resumed: `sys_exception_resume` moved us `suspended`→`ready` and the
-        // scheduler switched us in. Restore our captured interrupt state.
-        // SAFETY: ring-0.
-        unsafe { Cpu::interrupts_restore(saved_if) };
+        // Switch into `next`; we resume here when `sys_exception_resume` moves
+        // us `suspended`→`ready` and the scheduler switches us in.
+        // SAFETY: `me_slot` is our own (now-`Suspended`, pinned-in-`suspended`)
+        // saved-SP slot; `next_obj` is the pinned incoming thread.
+        unsafe { switch_into(g, me_slot, next_obj) };
     }
 
     // Read (and clear) the disposition the resume stored on us.

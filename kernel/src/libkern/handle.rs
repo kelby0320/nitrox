@@ -20,12 +20,21 @@ use core::ops::{BitAnd, BitOr, BitOrAssign};
 /// Bit layout, per `docs/spec/handle-encoding.md`:
 ///
 /// ```text
-///  63                              32 31              20 19              0
-/// ┌────────────────────────────────┬──────────────────┬──────────────────┐
-/// │       generation counter       │   segment id     │ index in segment │
-/// └────────────────────────────────┴──────────────────┴──────────────────┘
-///        u32                          12 bits             20 bits
+///  63  62                          32 31              20 19              0
+/// ┌──┬─────────────────────────────┬──────────────────┬──────────────────┐
+/// │ 0│      generation counter      │   segment id     │ index in segment │
+/// └──┴─────────────────────────────┴──────────────────┴──────────────────┘
+///   ▲          31 bits                  12 bits             20 bits
+///   └─ reserved zero
 /// ```
+///
+/// **Bit 63 is reserved zero.** Syscalls return handles in the result
+/// register, which also encodes [`KError`](crate::syscall) values as
+/// *negative* `isize`. Were the generation a full 32 bits, a handle
+/// whose generation reached `0x8000_0000` would set bit 63 and read
+/// back as a negative `isize`, aliasing an error code. Capping the
+/// generation at 31 bits keeps every issued handle a non-negative
+/// `isize`, so the value/error spaces never collide.
 ///
 /// [`RawHandle::NULL`] is reserved and never issued by the kernel; it
 /// is the canonical "no handle" sentinel for userspace and the kernel's
@@ -40,17 +49,38 @@ impl RawHandle {
     /// for userspace to use as a "no handle" placeholder.
     pub const NULL: RawHandle = RawHandle(0);
 
+    /// Width of the generation field. Bit 63 of a handle is reserved
+    /// zero (see the type-level docs), so the generation occupies bits
+    /// 62:32 — 31 bits, not 32.
+    pub const GENERATION_BITS: u32 = 31;
+
+    /// Largest generation a slot may be issued with. The handle table
+    /// bumps a slot's generation modulo `GENERATION_MAX + 1`, so it
+    /// **wraps** `GENERATION_MAX` → `0` and bit 63 stays clear. Distinct
+    /// generations let a stale `RawHandle` for a recycled slot fail the
+    /// generation check; the wrap admits a narrow, accepted ABA (a stale
+    /// handle re-validating only after `2^31` reuses of the *same* slot,
+    /// and only within the same owning process). See
+    /// `docs/spec/handle-encoding.md` § "Generation counter behavior".
+    pub const GENERATION_MAX: u32 = (1 << Self::GENERATION_BITS) - 1;
+
     /// Pack a `(segment, slot, generation)` triple into a `RawHandle`.
     ///
-    /// `seg_id` must be `< 4096` (12 bits) and `slot_id` must be
-    /// `< 1 << 20` (20 bits); violations trip a debug assertion. In
-    /// release builds out-of-range bits silently overlap the next
-    /// field, which the decode side reads back as a structurally
-    /// valid but logically wrong handle that will fail the table's
-    /// directory or per-segment bounds check on first lookup.
+    /// `seg_id` must be `< 4096` (12 bits), `slot_id` must be
+    /// `< 1 << 20` (20 bits), and `generation` must be
+    /// `<= GENERATION_MAX` (31 bits, bit 63 reserved zero); violations
+    /// trip a debug assertion. In release builds out-of-range bits
+    /// silently overlap the next field, which the decode side reads
+    /// back as a structurally valid but logically wrong handle that
+    /// will fail the table's directory / per-segment bounds check or
+    /// the generation check on first lookup.
     pub const fn encode(seg_id: u32, slot_id: u32, generation: u32) -> Self {
         debug_assert!(seg_id < 4096, "segment id overflows 12-bit field");
         debug_assert!(slot_id < (1 << 20), "slot id overflows 20-bit field");
+        debug_assert!(
+            generation <= Self::GENERATION_MAX,
+            "generation overflows 31-bit field — bit 63 is reserved zero",
+        );
         let slot = ((seg_id as u64) << 20) | (slot_id as u64);
         Self(((generation as u64) << 32) | slot)
     }
@@ -291,7 +321,8 @@ pub struct HandleInfo {
     pub rights: u64,
     /// The referenced object's [`KObjectType`] discriminant (`as u32`).
     pub object_type: u32,
-    /// The handle's generation counter (bits 63:32 of the [`RawHandle`]).
+    /// The handle's generation counter (bits 62:32 of the [`RawHandle`];
+    /// bit 63 is reserved zero).
     pub generation: u32,
 }
 
@@ -329,12 +360,15 @@ mod tests {
 
     #[test]
     fn encode_decode_round_trip_at_field_corners() {
+        // Generation tops out at `GENERATION_MAX` (31 bits); bit 63 of the
+        // handle is reserved zero, so `u32::MAX`-style generations are no
+        // longer representable (and trip the encode assertion).
         for (seg, slot, generation) in [
             (0u32, 0u32, 0u32),
             (1, 1, 1),
-            (4095, (1 << 20) - 1, u32::MAX),
-            (42, 12345, 0xCAFEF00D),
-            (1, 0, u32::MAX),
+            (4095, (1 << 20) - 1, RawHandle::GENERATION_MAX),
+            (42, 12345, 0x4AFE_F00D),
+            (1, 0, RawHandle::GENERATION_MAX),
             (0, (1 << 20) - 1, 0),
         ] {
             let h = RawHandle::encode(seg, slot, generation);
@@ -347,12 +381,33 @@ mod tests {
     }
 
     #[test]
+    fn issued_handles_are_non_negative_isize() {
+        // Bit 63 is reserved zero, so even a max-generation handle on the
+        // last segment/slot stays a non-negative `isize` and can never be
+        // mistaken for a `KError` in the syscall result register.
+        assert_eq!(RawHandle::GENERATION_MAX, 0x7FFF_FFFF);
+        let h = RawHandle::encode(4095, (1 << 20) - 1, RawHandle::GENERATION_MAX);
+        assert_eq!(h.bits() >> 63, 0, "bit 63 must be reserved zero");
+        assert!((h.bits() as i64) >= 0);
+    }
+
+    #[test]
+    #[should_panic]
+    fn encode_rejects_generation_above_max() {
+        // A generation past `GENERATION_MAX` would set the reserved bit 63;
+        // debug builds catch it.
+        let _ = RawHandle::encode(0, 0, RawHandle::GENERATION_MAX + 1);
+    }
+
+    #[test]
     fn encoded_bit_positions_match_spec() {
-        // generation occupies bits 63..32; segment occupies 31..20;
-        // slot occupies 19..0.
-        let h = RawHandle::encode(0xABC, 0x12345, 0xDEAD_BEEF);
+        // generation occupies bits 62..32 (bit 63 reserved zero); segment
+        // occupies 31..20; slot occupies 19..0.
+        let generation = 0x5EAD_BEEF; // <= GENERATION_MAX, bit 31 clear
+        let h = RawHandle::encode(0xABC, 0x12345, generation);
         let raw = h.bits();
-        assert_eq!((raw >> 32) as u32, 0xDEAD_BEEF, "generation lives in bits 63:32");
+        assert_eq!(raw >> 63, 0, "bit 63 is reserved zero");
+        assert_eq!((raw >> 32) as u32, generation, "generation lives in bits 62:32");
         assert_eq!(((raw as u32) >> 20) & 0xFFF, 0xABC, "segment id lives in bits 31:20");
         assert_eq!((raw as u32) & ((1 << 20) - 1), 0x12345, "slot id lives in bits 19:0");
     }

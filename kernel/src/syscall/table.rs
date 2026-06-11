@@ -15,7 +15,7 @@ use crate::arch::abi::USER_VIRT_END;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
 use crate::handle::global;
-use crate::handle::table::{HandleError, HandleTable};
+use crate::handle::table::{HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
@@ -305,12 +305,7 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
 /// `SIGNAL` and is a `Thread`, then accepts and ignores `cpu_mask`.
 pub fn sys_thread_set_affinity(thread_h: u64, _cpu_mask: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::Thread {
-        return Err(KError::InvalidArgument);
-    }
+    lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
     Ok(0)
 }
 
@@ -377,12 +372,7 @@ pub fn sys_thread_get_registers(thread_h: u64, out_ptr: u64) -> SysResult {
     let uptr = UserMutPtr::<RegisterValues>::new(out_ptr).map_err(from_user_access)?;
 
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::Thread {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
 
     // Must be suspended on a fault — yields the captured frame's address.
     let frame_ptr = crate::sched::thread_exception_frame(ok.object.as_ptr())
@@ -411,12 +401,7 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
     };
 
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(thread_h), pid, Rights::SIGNAL)
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::Thread {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
     if !crate::sched::resume_suspended(ok.object.as_ptr(), tag, code as i32) {
         // Not currently suspended (already resumed, or never faulted).
         return Err(KError::InvalidArgument);
@@ -482,6 +467,29 @@ fn map_handle_err(e: HandleError) -> KError {
         HandleError::OutOfMemory => KError::OutOfMemory,
         HandleError::BadRights => KError::InvalidArgument,
     }
+}
+
+/// Look up `h` for `pid`, require `required` rights, and confirm the object
+/// is of type `expected`.
+///
+/// Collapses the lookup-then-type-check idiom shared by almost every
+/// handle-taking syscall into one place, so the type-confusion check (wrong
+/// `KObjectType` → `InvalidArgument`) cannot be forgotten on a new handler.
+/// Returns the pinned [`LookupOk`]; its `ObjectRef` keeps the object alive
+/// until the caller drops it, and `rights` carries the handle's full rights.
+fn lookup_typed(
+    h: u64,
+    pid: u32,
+    required: Rights,
+    expected: KObjectType,
+) -> Result<LookupOk, KError> {
+    let ok = global::get()
+        .lookup(RawHandle(h), pid, required)
+        .map_err(map_handle_err)?;
+    if ok.object.object_type() != expected {
+        return Err(KError::InvalidArgument);
+    }
+    Ok(ok)
 }
 
 /// Core of `sys_handle_close`: close `h` in `t` on behalf of `pid`.
@@ -655,12 +663,7 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
     let asp = current_address_space(&proc_ref).ok_or(KError::KernelError)?;
 
-    let ok = global::get()
-        .lookup(RawHandle(obj_h), pid, required)
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::MemoryObject {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(obj_h, pid, required, KObjectType::MemoryObject)?;
     // SAFETY: `object_type` confirms a live `MemoryObject`; `lookup` pinned it.
     // The borrow is from a raw pointer, so it does not block moving `ok.object`
     // into `map_object` below (it is unused after `size()` is read).
@@ -801,12 +804,7 @@ pub fn sys_timer_create(flags: u64) -> SysResult {
 /// ownership (no special right — `WAIT` gates `sys_wait`, not arming).
 pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(timer_h), pid, Rights::empty())
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::Timer {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(timer_h, pid, Rights::empty(), KObjectType::Timer)?;
     // `ok.object` (an ObjectRef) is held across the arm, keeping the Timer alive.
     crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns)
         .map_err(|()| KError::OutOfMemory)?;
@@ -906,12 +904,7 @@ pub fn sys_notif_recv(channel_h: u64, out: u64) -> SysResult {
     // Validate the user pointer first (cheap, side-effect-free; host-reachable).
     let uptr = UserMutPtr::<Notification>::new(out).map_err(from_user_access)?;
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(channel_h), pid, Rights::empty())
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::NotificationChannel {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(channel_h, pid, Rights::empty(), KObjectType::NotificationChannel)?;
     // Pop under SCHED into a kernel-local notification; `ok.object` (held here)
     // pins the channel across the pop. Copy out AFTER the lock is released
     // (never hold the IrqSpinLock across a faulting user copy).
@@ -1034,12 +1027,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) 
     }
 
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(ch), pid, Rights::SEND)
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::IpcChannel {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(ch, pid, Rights::SEND, KObjectType::IpcChannel)?;
 
     // Look up + pin each transferred handle (requires `TRANSFER`). Collect the
     // in-flight references; on any failure, the collected refs drop here (outside
@@ -1105,12 +1093,7 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     let cptr = UserMutPtr::<usize>::new(count).map_err(from_user_access)?;
 
     let pid = crate::sched::current_owner_pid();
-    let ok = global::get()
-        .lookup(RawHandle(ch), pid, Rights::RECV)
-        .map_err(map_handle_err)?;
-    if ok.object.object_type() != KObjectType::IpcChannel {
-        return Err(KError::InvalidArgument);
-    }
+    let ok = lookup_typed(ch, pid, Rights::RECV, KObjectType::IpcChannel)?;
 
     // Peek under SCHED so the empty-poll path allocates no bounce buffer.
     match crate::sched::ipc_recv_peek(ok.object.as_ptr()) {
@@ -1128,8 +1111,18 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     // installed and drop the remaining transfers (which the `transfers` array
     // does on scope exit, outside SCHED).
     let n = bounce.header.handle_count as usize;
+    // `handle_count` is stamped at send time and bounded to `IPC_HANDLE_MAX`
+    // (`sys_channel_send` rejects more), so a larger value here can only mean
+    // a corrupted stored message. Refuse it rather than trust it: the loops
+    // below index fixed-size `[_; IPC_HANDLE_MAX]` buffers and the copy-out
+    // slices `hbytes[..n * 8]`, both of which would panic the kernel for
+    // `n > IPC_HANDLE_MAX`. `transfers[]` drops on this return (outside SCHED),
+    // reclaiming any in-flight references.
+    if n > IPC_HANDLE_MAX {
+        return Err(KError::KernelError);
+    }
     let mut installed = [RawHandle::NULL; IPC_HANDLE_MAX];
-    for i in 0..n.min(IPC_HANDLE_MAX) {
+    for i in 0..n {
         if let Some(tr) = transfers[i].take() {
             // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
             let (op, ot) = tr.obj.into_raw();

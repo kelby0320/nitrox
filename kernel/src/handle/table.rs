@@ -383,10 +383,20 @@ impl HandleTable {
                         guard.segment_meta[seg_id].free_head = next_head;
                         guard.segment_meta[seg_id].free_count -= 1;
 
+                        // Bump the generation, wrapping within its 31-bit
+                        // field (the mask both wraps `GENERATION_MAX` → 0 and
+                        // keeps bit 63 — the reserved sign bit — clear). The
+                        // counter therefore never overflows the field; the
+                        // negligible generation-ABA this admits (a stale handle
+                        // re-validating after 2^31 reuses of the *same* slot,
+                        // and only within the same owning process) is accepted.
+                        // See docs/spec/handle-encoding.md § "Generation
+                        // counter behavior".
                         let new_gen = entry
                             .generation
                             .load(Ordering::Relaxed)
-                            .wrapping_add(1);
+                            .wrapping_add(1)
+                            & RawHandle::GENERATION_MAX;
                         {
                             let _wg = WriteGuard::new(entry);
                             entry.generation.store(new_gen, Ordering::Relaxed);
@@ -1073,6 +1083,50 @@ mod tests {
         close_release(&t, h2, 1).unwrap();
     }
 
+    #[test]
+    fn generation_wraps_at_max_without_retiring_the_slot() {
+        let t = fresh_table();
+        let h1 = t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap();
+        let (seg, slot, _) = h1.decode();
+
+        // Drive this slot's live generation to the maximum (standing in for
+        // 2^31 real reuses) and mint a valid handle at that generation.
+        {
+            let _guard = t.inner.lock();
+            let entries_ptr = t.directory[seg as usize].load(Ordering::Acquire);
+            assert!(!entries_ptr.is_null());
+            // SAFETY: segment published once, outlives the table; we hold the
+            // rank-3 lock so we are the only writer.
+            let entry = unsafe { &(*entries_ptr)[slot as usize] };
+            let _wg = WriteGuard::new(entry);
+            entry
+                .generation
+                .store(RawHandle::GENERATION_MAX, Ordering::Relaxed);
+        }
+        let h_max = RawHandle::encode(seg, slot, RawHandle::GENERATION_MAX);
+        // A max-generation handle still has bit 63 clear — never a negative isize.
+        assert!(
+            (h_max.bits() as i64) >= 0,
+            "max-generation handle aliases an error code",
+        );
+        assert!(t.lookup(h_max, 1, sig()).is_ok());
+
+        // Close it and reallocate: the slot is RECYCLED (not retired), and its
+        // generation wraps `GENERATION_MAX` → 0 within the 31-bit field.
+        close_release(&t, h_max, 1).unwrap();
+        let h_next = t.allocate(1, mk_process(2), KObjectType::Process, sig()).unwrap();
+        let (nseg, nslot, ngen) = h_next.decode();
+        assert_eq!((nseg, nslot), (seg, slot), "slot must be recycled, not retired");
+        assert_eq!(ngen, 0, "generation wraps from GENERATION_MAX to 0");
+        assert!((h_next.bits() as i64) >= 0, "wrapped handle stays non-negative");
+        // The stale max-generation handle no longer validates (generation moved).
+        assert_eq!(
+            t.lookup(h_max, 1, sig()).unwrap_err(),
+            HandleError::InvalidHandle,
+        );
+        close_release(&t, h_next, 1).unwrap();
+    }
+
     // --- Restrict ----------------------------------------------------
 
     #[test]
@@ -1361,41 +1415,6 @@ mod tests {
         close_release(&t, ht, 1).unwrap();
         assert_eq!(test_probe::process_destroys(), 1);
         assert_eq!(test_probe::thread_destroys(), 1, "Thread destructor did not run");
-    }
-
-    // --- Generation wrap --------------------------------------------
-
-    #[test]
-    fn generation_wraps_at_u32_max() {
-        let t = fresh_table();
-        let h1_initial = t
-            .allocate(1, mk_process(1), KObjectType::Process, sig())
-            .unwrap();
-        let (seg, slot, _) = h1_initial.decode();
-        // Poke the entry's generation to `u32::MAX - 1`. The handle we
-        // close with must agree, so re-encode it.
-        let entries_ptr = t.directory[seg as usize].load(Ordering::Acquire);
-        let entry = unsafe { &(*entries_ptr)[slot as usize] };
-        entry.generation.store(u32::MAX - 1, Ordering::Relaxed);
-        let h1_poked = RawHandle::encode(seg, slot, u32::MAX - 1);
-        close_release(&t, h1_poked, 1).unwrap();
-        // The next allocation pops the LIFO freelist head — the slot we
-        // just closed — and bumps its generation to `u32::MAX`.
-        let h2 = t
-            .allocate(1, mk_process(2), KObjectType::Process, sig())
-            .unwrap();
-        let (s2, sl2, g2) = h2.decode();
-        assert_eq!((s2, sl2), (seg, slot), "expected LIFO reuse of closed slot");
-        assert_eq!(g2, u32::MAX, "generation must bump from MAX-1 to MAX");
-        close_release(&t, h2, 1).unwrap();
-        // And the next one wraps to 0.
-        let h3 = t
-            .allocate(1, mk_process(3), KObjectType::Process, sig())
-            .unwrap();
-        let (s3, sl3, g3) = h3.decode();
-        assert_eq!((s3, sl3), (seg, slot));
-        assert_eq!(g3, 0, "generation wraps from u32::MAX to 0");
-        close_release(&t, h3, 1).unwrap();
     }
 
     // --- Multi-thread tests -----------------------------------------
