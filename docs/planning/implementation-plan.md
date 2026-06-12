@@ -752,9 +752,10 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 > - **The DPC/softirq queue** was deferred in Phase 1 "until a device-IRQ
 >   consumer exists" — storage drivers are that consumer.
 > - **The page cache needs a demand-paging `#PF` handler** (not-present →
->   VMA lookup → fault-in) and the `MappingKind::FileBacked` VMA variant,
->   both still Phase-1 stubs (the current `#PF` handler only consults the
->   exception table).
+>   VMA lookup → fault-in) and the `MappingKind::FileBacked` VMA variant —
+>   **both now landed** (`phase-2/demand-paging`): `AddressSpace::fault_in`
+>   resolves not-present user faults and the `FileBacked` variant + dispatch
+>   arms await the page cache's producer.
 > - **Entropy was listed both as its own slice and as an item inside the
 >   in-kernel-RS slice** (`/dev/entropy`), a forward self-reference.
 > - **FAT was justified as "required to boot Limine"** — false; UEFI/Limine
@@ -803,11 +804,17 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   deadline-firing stays inline (timekeeping work, not migrated — a correction to
   `drivers-and-irps.md`); the queue serves device ISRs. Proven by the PIT
   self-test driving a DPC end-to-end. See the decision log (2026-06-12).
-- [ ] **Demand-paging `#PF` handler** (not-present fault → active-AS VMA
-  lookup → fault-in) **+ `MappingKind::FileBacked`** VMA variant. Completes
-  the Phase-1 `#PF` stub and the `Anonymous`-only `MappingKind`. Unblocks
-  both lazy anonymous/`MemoryObject` paging and the page cache. Also enables
-  retiring the eager per-page allocation in `AddressSpace::map_vma`.
+- [x] **Demand-paging `#PF` handler** (not-present fault → active-AS VMA
+  lookup → fault-in) **+ `MappingKind::FileBacked`** VMA variant. **Done**
+  (`phase-2/demand-paging`): `pf_dispatch` offers a not-present ring-3 fault to
+  `AddressSpace::fault_in` (VMA lookup → access check → alloc-zero-map-flush)
+  before the fatal SegFault path; `map_vma_lazy` reserves anonymous ranges
+  unbacked and the ELF loader reserves user stacks this way (PT_LOAD stays
+  eager — file bytes). `MappingKind::FileBacked` + its dispatch arms exist for
+  the page cache (no producer yet). Proven by a boot smoke test + the userspace
+  demo running on a demand-faulted stack. Unblocks lazy `MemoryObject` paging
+  (the `MAX_SIZE` cap — needs a sparse object frame table + accounting) and the
+  page cache. See the decision log (2026-06-12).
 - [ ] **`PendingOperation` kernel object + `sys_wait` I/O-completion
   integration** (the long-promised "async-I/O slice"), plus the `Block` /
   `BlockBounded` IPC send modes that were deferred to it, and the `IoRing`

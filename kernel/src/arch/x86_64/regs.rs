@@ -192,6 +192,14 @@ pub unsafe fn write_cr3(value: u64) {
 /// the invalidation reflects a real change.
 #[inline]
 pub unsafe fn invlpg(virt: u64) {
+    // Host unit tests run in ring 3, where `invlpg` would `#GP`. The kernel
+    // proper always runs in ring 0; the instruction only evicts a TLB entry,
+    // which a host test (no MMU state of its own) cannot observe, so a test
+    // build elides it. This lets the demand-paging fault-in path — which must
+    // flush after installing a PTE — be exercised host-side.
+    #[cfg(test)]
+    let _ = virt;
+    #[cfg(not(test))]
     // SAFETY: `invlpg [mem]` invalidates the TLB entry for the addressed
     // page; it is a ring-0 instruction with no flag effects. `nomem` is
     // omitted because it has memory-ordering semantics over the page

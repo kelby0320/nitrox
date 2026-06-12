@@ -210,6 +210,11 @@ fn kernel_main() {
     // returns here. See `docs/architecture/overview.md` § Scheduling.
     run_scheduler_demo();
 
+    // Prove the demand-paging on-fault path in the live kernel before handing
+    // off — the first userspace process then exercises it for real (its stack
+    // is reserved lazily and faults in on first use).
+    demand_paging_smoke_test();
+
     // Arm the syscall fast path and prove it end-to-end by dropping to
     // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
     // (Throwaway harness — replaced next slice by an ELF-loaded process.)
@@ -519,6 +524,68 @@ fn paging_smoke_test() {
             "paging: translate {:#x} -> UNMAPPED — walk disagrees with hardware",
             probe.as_u64()
         ),
+    }
+}
+
+/// Demand-paging smoke test: exercise the on-fault path end-to-end in the live
+/// kernel. Reserve a lazy anonymous range (`map_vma_lazy` — no frames), confirm
+/// it is genuinely unbacked (the hardware walk finds no translation), fault each
+/// page in via `AddressSpace::fault_in`, and confirm the pages are now mapped.
+/// The throwaway address space is torn down on drop. The first userspace process
+/// additionally exercises this path for real: its stack is reserved lazily and
+/// faults in on use.
+fn demand_paging_smoke_test() {
+    use nitrox_kernel::libkern::KBox;
+    use nitrox_kernel::mm::addr_space::{AddressSpace, FaultIn};
+    use nitrox_kernel::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma};
+
+    let page = mm::PAGE_SIZE as u64;
+    let Ok(asp) = AddressSpace::new() else {
+        kprintln!("demand-paging: smoke test skipped (AS alloc failed)");
+        return;
+    };
+    // Arbitrary page-aligned user-half address for the reservation.
+    let base = 0x4000_0000u64;
+    let range = VAddrRange::new(mm::VirtAddr::new(base), mm::VirtAddr::new(base + 2 * page))
+        .expect("smoke-test range is valid by construction");
+    let Ok(vma) = KBox::try_new(Vma::new(
+        range,
+        Protection::WRITE | Protection::USER,
+        MappingKind::Anonymous,
+    )) else {
+        kprintln!("demand-paging: smoke test skipped (VMA alloc failed)");
+        return;
+    };
+    if asp.map_vma_lazy(vma).is_err() {
+        kprintln!("demand-paging: smoke test skipped (lazy reserve failed)");
+        return;
+    }
+
+    // Reserved but unbacked: the hardware walk must find no translation yet.
+    // SAFETY: `translate` only reads this AS's own page-table memory via the
+    // HHDM; it installs and switches nothing.
+    let before = unsafe { arch::Paging::translate(asp.root(), mm::VirtAddr::new(base)) };
+
+    // Fault each page in — a write to page 0, a read to page 1.
+    let r0 = asp.fault_in(mm::VirtAddr::new(base), FaultAccess::Write);
+    let r1 = asp.fault_in(mm::VirtAddr::new(base + page), FaultAccess::Read);
+
+    // SAFETY: as above — page 0 should now resolve.
+    let after = unsafe { arch::Paging::translate(asp.root(), mm::VirtAddr::new(base)) };
+
+    if before.is_none() && after.is_some() && r0 == FaultIn::Mapped && r1 == FaultIn::Mapped {
+        kprintln!(
+            "demand-paging: on-fault path OK — 2 anonymous pages backed lazily ({} faulted in since boot)",
+            mm::demand_fault_count()
+        );
+    } else {
+        kprintln!(
+            "demand-paging: smoke test FAILED (before={:?} after={:?} r0={:?} r1={:?})",
+            before,
+            after,
+            r0,
+            r1
+        );
     }
 }
 

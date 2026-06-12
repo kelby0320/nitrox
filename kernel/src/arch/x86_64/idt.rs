@@ -303,16 +303,66 @@ extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
     }
 
     if is_user_fault(f) {
-        // A genuine ring-3 page fault (not a kernel copy-primitive fault that
-        // missed the recovery table): suspend → supervised resume/terminate.
-        // The CR2 read here is the faulting linear address. On `Resume` this
-        // returns and the stub `iretq`s; on `Terminate` it diverges.
+        // The CR2 read here is the faulting linear address.
         let cr2 = regs::read_cr2();
+
+        // Demand paging: a *not-present* ring-3 fault may fall in a reserved-
+        // but-unbacked anonymous VMA (a lazily-mapped stack/anon page). Try to
+        // fault it in; on success the stub `iretq`s and the access retries.
+        // error_code bit0 = present (see `pf_fault_kind`).
+        let present = f.error_code & 1 != 0;
+        if !present && try_fault_in(cr2, f.error_code) {
+            return;
+        }
+
+        // A genuine fatal ring-3 fault (no covering VMA, a protection
+        // violation, or OOM): suspend → supervised resume/terminate. On
+        // `Resume` this returns and the stub `iretq`s; on `Terminate` it
+        // diverges.
         user_fault(f, Some(cr2));
         return;
     }
 
     dump_and_halt(f);
+}
+
+/// Try to demand-fault the page at `cr2` into the running process's address
+/// space. `error_code` is the `#PF` code (bit1 = write, bit4 = instruction
+/// fetch); the caller has already confirmed the not-present (bit0 = 0) case, so
+/// only the access *kind* is taken from it. Returns `true` iff a frame was
+/// faulted in and the faulting instruction may be retried.
+///
+/// Reached only for ring-3 (`cs & 3 == 3`) faults, so the faulting thread is in
+/// user mode and holds no kernel locks — taking the address-space lock here
+/// cannot deadlock against the faulting context. Kernel copy-primitive faults
+/// are caught earlier by `lookup_recovery` and never reach this path. (Kernel
+/// access to a not-yet-faulted user page is therefore *not* auto-populated;
+/// nothing does that today — see `docs/rationale/deferred-decisions.md`.)
+fn try_fault_in(cr2: u64, error_code: u64) -> bool {
+    use crate::mm::vmm::FaultAccess;
+
+    let write = error_code & (1 << 1) != 0;
+    let insn = error_code & (1 << 4) != 0;
+    let access = if insn {
+        FaultAccess::Execute
+    } else if write {
+        FaultAccess::Write
+    } else {
+        FaultAccess::Read
+    };
+
+    // No owning process (a kernel/boot thread) ⇒ nothing to demand-page.
+    let Some(proc_ref) = crate::sched::current_process() else {
+        return false;
+    };
+    // SAFETY: `proc_ref` references a live `Process` (its `KObjectHeader` is at
+    // offset 0), pinned by the current user thread for the duration of this
+    // fault. The borrow does not outlive `proc_ref`.
+    let proc = unsafe { &*(proc_ref.as_ptr() as *const crate::object::Process) };
+    let Some(asp) = proc.address_space() else {
+        return false;
+    };
+    asp.fault_in(crate::mm::VirtAddr::new(cr2), access) == crate::mm::addr_space::FaultIn::Mapped
 }
 
 // --- Timer IRQ stub (vector 0x20) ---------------------------------------
