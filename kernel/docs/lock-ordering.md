@@ -25,10 +25,11 @@ enforced by code review.
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
 | 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`, **`IrqSpinLock`**)    | live as of Phase 1 slice 4 (diagnostics) |
+| leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); a **leaf** — held alone, see § The DPC queue lock |
 
-`SCHED` and `SERIAL` are [`IrqSpinLock`]s (they mask interrupts while held);
-every other lock is a plain `SpinLock`. See § Interrupt semantics for why only
-these two need it.
+`SCHED`, `SERIAL`, and `DPC_QUEUE` are [`IrqSpinLock`]s (they mask interrupts
+while held); every other lock is a plain `SpinLock`. See § Interrupt semantics
+for why these need it.
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
@@ -86,6 +87,25 @@ Two corollaries:
   `block_current_and_switch`. The supervisor's `sys_thread_get_registers`
   reads the captured frame and copies it to user memory **outside** `SCHED`
   (the thread stays parked, so the frame is stable).
+
+## The DPC queue lock is a leaf
+
+`DPC_QUEUE` (`kernel/src/dpc.rs`) is an `IrqSpinLock` taken in interrupt context,
+but it is a **leaf** — nothing is acquired while it is held, so it imposes no
+rank-ordering constraint beyond "acquire no other lock while holding it":
+
+- **`enqueue`** takes the lock, pushes one node pointer (within the pre-reserved
+  capacity — no allocation), and releases. It touches no other subsystem.
+- **`run_pending`** takes the lock, snapshots-and-clears the queue into a stack
+  buffer, **releases the lock**, and only *then* runs the handlers. A handler may
+  take `SCHED` (to make a thread runnable) or `SERIAL` (to log) — but always
+  *after* the queue lock is dropped, so `DPC_QUEUE` never nests with them.
+
+Because it holds nothing, it ranks below every other lock: it is legal to
+`enqueue` while holding `SCHED` (rank 1), and the drain re-acquires the
+higher-ranked `SCHED` inside a handler only after releasing `DPC_QUEUE`. Like the
+deadline heap and the per-object waiter lists, the queue is pre-reserved at boot
+(`dpc::init`) so `enqueue` never allocates in interrupt context.
 
 ## Handle-table segment growth releases rank 3 before rank 6
 

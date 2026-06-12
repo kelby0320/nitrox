@@ -3324,3 +3324,51 @@ opt-in `xtask qemu --kvm`. Tracked in `deferred-decisions.md` ("x2APIC mode").
 needed, deterministic serial output for the byte-identical qemu checks). KVM
 stays a future *opt-in* accelerator (faster, exercises x2APIC), not a
 requirement. The current QEMU/CPU-model pin is unchanged.
+
+---
+
+## 2026-06-12 — Phase 2 prereq: DPC (deferred procedure call) queue
+
+Fourth Phase 2 prerequisite (`phase-2/dpc`). Builds the **IRQ > DPC > Thread**
+deferral mechanism (`kernel/src/dpc.rs`): an ISR does the minimum and `enqueue`s
+a `Dpc`; the deferred completion work (run an IRP's completion routines, signal a
+`PendingOperation` → wake its waiters) runs when the queue is drained at the
+interrupt-dispatch tail. The primitive the storage slice (AHCI completion → wake
+the driver) and `phase-2/pending-operation` consume.
+
+**Design.** `Dpc { handler: fn(*mut()), ctx, queued: AtomicBool }` embedded
+inline in an owning struct (no heap alloc to queue). A global pre-reserved
+`IrqSpinLock<KVec<usize>>` (node addresses; `*mut Dpc` isn't `Send`) — drained
+into a stack buffer, looped until empty. Runs with **IF=0** (the gate masks
+interrupts), so no re-entrancy guard. Mirrors the deadline-heap / waiter-list
+pattern. Drain hooks in `idt.rs`: `device_irq_dispatch` (after handler + EOI) and
+`timer_dispatch` (after EOI, before `on_timer_tick`, so device-DPC wakeups land
+in `ready` before the tick's reschedule). Lock is a **leaf** (held alone; nothing
+acquired while held — the drain releases it *before* a handler may take `SCHED`).
+
+**Decision — the timer wakeup stays inline (corrects `drivers-and-irps.md`).**
+That doc said the timer-tick wakeup would "migrate onto the DPC queue." On tracing
+the code, that's the wrong migration: the timer's own deadline-firing
+(`fire_expired_deadlines` → wake) is the *timekeeping subsystem's* tick work,
+already at the right point (under `SCHED`, before the reschedule, bounded + fast).
+It stays inline; the DPC queue serves **device-ISR** deferred work — the
+substantive thing the IRQ>DPC>Thread model exists for. The doc is corrected.
+
+**SMP.** This is SMP-neutral. At SMP the whole tick is rebuilt around per-CPU
+runqueues / timers / `SchedState`, so `on_timer_tick` is rewritten regardless and
+inline-vs-DPC is decided fresh then — no migration debt now. The hard SMP problem
+(cross-CPU thread placement — a wake targeting another CPU's runqueue, via that
+CPU's lock or an IPI) is identical whether the wake is inline or a DPC. DPCs are
+inherently per-CPU, so the single global `DPC_QUEUE` is a **single-CPU stand-in**
+(like today's global `SCHED`/`current`): the Phase-3 per-CPU refactor changes its
+storage, not the `enqueue`/`run_pending` API.
+
+*(Deferred: IF=1 draining for responsiveness under heavy IRQ load; level-triggered
+IOAPIC-EOI — both land with their first consumer.)*
+
+ABI impact: none. Verified: `check-arch` clean (`dpc.rs` is neutral kernel code);
+`build` clean (no warnings); `test` 390 host tests (+5: enqueue/drain order/
+dedup/requeue/empty); `qemu` on q35 logs `ioapic: routed PIT IRQ0→GSI2→vec0x30;
+took 3 interrupts (3 via DPC)` — the ISR→enqueue→drain→handler path end-to-end —
+and the scheduler + userspace demo run unchanged. Branch `phase-2/dpc` off `main`
+(includes merged PRs #32, #33). Next: `phase-2/demand-paging`.

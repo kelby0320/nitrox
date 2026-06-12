@@ -63,11 +63,17 @@ A **`DpcNode`** is an inline field of its owning structure (an `Irp`, a `Timer`)
 fast path allocates nothing. This matters: per `kernel/CLAUDE.md`, allocation in
 IRQ/DPC context is forbidden.
 
-> **Reconciliation with Phase 1.** Phase 1 deferred the DPC queue and instead
-> wakes `sys_wait`ers *directly* from the timer-tick handler under the rank-1
-> scheduler lock (see the decision log, 2026-06-08). The `phase-2/dpc` item
-> builds the DPC queue described here; the existing timer-tick wakeup migrates
-> onto it at that point, and device ISRs become its first external producers.
+> **Reconciliation with Phase 1.** Phase 1 wakes `sys_wait`ers *directly* from
+> the timer-tick handler under the rank-1 scheduler lock (see the decision log,
+> 2026-06-08). The `phase-2/dpc` item builds the DPC queue described here and
+> drains it at the interrupt-dispatch tail; **device ISRs** are its producers.
+> The timer's *own* deadline-firing stays inline — it is the timekeeping
+> subsystem's tick work, already at the right point (bounded, before the
+> reschedule) — rather than migrating onto the queue; the DPC queue serves
+> device-ISR deferred work, which is what the IRQ>DPC>Thread model exists for.
+> (An earlier draft of this doc said the timer wakeup would migrate onto the
+> queue; see the decision log, 2026-06-12.) On a device IRQ the dispatcher runs
+> the registered ISR, EOIs, then drains pending DPCs before returning.
 
 ## Interrupts
 
