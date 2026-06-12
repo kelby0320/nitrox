@@ -157,6 +157,8 @@ writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
 
 ### Concurrency primitives
 
+**IPC `BlockBounded` send mode (deadline-bounded blocking send).** The async-I/O slice (2026-06-12) shipped the `Block` send mode — a full receive ring holds the message in a bounded per-endpoint pending-sender queue and returns a `PendingOperation` that completes when the peer next receives. `BlockBounded` adds a *delivery deadline*: if the held message is not delivered by the deadline, the operation is cancelled (its `PendingOperation` completed `TimedOut`, the message reclaimed). It is deferred to its own focused change because it needs (a) the scheduler deadline-heap `Entry` to grow from `is_thread: bool` to a 3-way kind (`Thread`/`Timer`/`PendingSend`) plus a channel back-pointer, (b) a timer-tick timeout-cancel arm (marking the held send cancelled + completing its PO, no `ObjectRef` drop under `SCHED`), and (c) a deadline argument on `sys_channel_send` (a 6th register). `sys_channel_send` returns `Unsupported` for `BlockBounded` until then. Trigger: a consumer needing a bounded blocking send (the `Block` infinite-wait variant suffices for the current storage/IPC paths). See the decision log (2026-06-12).
+
 **Priority inheritance for userspace synchronization.** Userspace mutex/condvar implementations built on `sys_wait` don't initially address priority inversion. Trigger: a real-time workload where priority inversion is a problem.
 
 **Deadline scheduling (EDF) as a fourth scheduler class.** RealTime class uses fixed priority, not EDF. Adding EDF is possible without architectural changes — fourth scheduler class. Trigger: a workload that benefits.

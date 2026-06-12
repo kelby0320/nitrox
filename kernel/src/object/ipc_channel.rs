@@ -211,6 +211,40 @@ pub enum SendOutcome {
     PeerClosed,
 }
 
+/// Outcome of a blocking send ([`send_or_queue`](IpcChannel::send_or_queue)) —
+/// the `Block` / `BlockBounded` path. Unlike [`SendOutcome`] there is no plain
+/// "full": a full receive ring means the message is **held** (`Queued`) until a
+/// recv frees space; the only hard failure is the bounded pending-send queue
+/// itself overflowing.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum BlockSendOutcome {
+    /// Delivered straight into the peer's receive ring. `woke_edge` is `true`
+    /// iff the ring went empty→non-empty (wake the peer's receivers). The
+    /// caller's [`PendingOperation`] is completed immediately (pre-signalled).
+    Sent { woke_edge: bool },
+    /// The peer's ring was full; the message (and its transfers + a reference to
+    /// the caller's `PendingOperation`) is held in the peer's pending-send queue
+    /// and will be delivered — completing the PO — when the peer next receives.
+    Queued,
+    /// The peer's pending-send queue is at capacity — back-pressure. The
+    /// transfers are left untaken for the caller to reclaim (→ `WouldBlock`).
+    PendingFull,
+    /// The peer endpoint has closed.
+    PeerClosed,
+}
+
+/// A blocking send held in a receiving endpoint's pending-send queue: the copied
+/// message, the in-flight transferred-handle references it carries, and an owning
+/// reference to the sender's [`PendingOperation`] (kept alive even if the sender
+/// closes its handle early). Delivered — moving `msg`/`transfers` into the ring
+/// and completing `po` (status 0) — when the endpoint next receives, or completed
+/// with `PeerClosed` (and its `transfers` reclaimed) when the endpoint closes.
+struct PendingSend {
+    msg: StoredMsg,
+    transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
+    po: ObjectRef,
+}
+
 /// State of an endpoint's own receive side, for [`recv_peek`](IpcChannel::recv_peek).
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum RecvState {
@@ -241,6 +275,11 @@ struct Inner {
     /// non-owning; removed before a waiter unparks). Pre-reserved to
     /// [`IpcChannel::MAX_WAITERS`] so `add_waiter` never allocates under `SCHED`.
     recv_waiters: KVec<*mut ()>,
+    /// Blocking senders whose message is waiting for space in **this** endpoint's
+    /// receive ring (`Block` / `BlockBounded`). FIFO; promoted into `recv` when a
+    /// recv frees a slot. Pre-reserved to [`IpcChannel::MAX_PENDING_SENDS`] so
+    /// `send_or_queue` never allocates under `SCHED`.
+    pending_sends: KVec<PendingSend>,
     /// The other endpoint, or null once it has closed.
     peer: *mut IpcChannel,
 }
@@ -261,6 +300,13 @@ impl IpcChannel {
     ///
     /// [`Timer::MAX_WAITERS`]: crate::object::Timer::MAX_WAITERS
     pub const MAX_WAITERS: usize = 4;
+
+    /// Maximum messages held in one endpoint's pending-send queue (blocking
+    /// senders whose message awaits space in this endpoint's receive ring).
+    /// Bounds the pre-reserved `pending_sends` vector so `send_or_queue` never
+    /// allocates under `SCHED`; beyond it, a blocking send gets `WouldBlock`
+    /// back-pressure.
+    pub const MAX_PENDING_SENDS: usize = 4;
 
     /// Create a connected endpoint **pair**, each with a `depth`-slot receive
     /// ring (clamped to `1..=IPC_MAX_QUEUE_DEPTH`). The two returned `KBox`es
@@ -286,10 +332,17 @@ impl IpcChannel {
         let recv = MsgRing::with_capacity(cap)?;
         let mut recv_waiters: KVec<*mut ()> = KVec::new();
         recv_waiters.try_reserve(Self::MAX_WAITERS)?;
+        let mut pending_sends: KVec<PendingSend> = KVec::new();
+        pending_sends.try_reserve(Self::MAX_PENDING_SENDS)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::IpcChannel),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(Inner { recv, recv_waiters, peer: core::ptr::null_mut() }),
+            inner: UnsafeCell::new(Inner {
+                recv,
+                recv_waiters,
+                pending_sends,
+                peer: core::ptr::null_mut(),
+            }),
         })
     }
 
@@ -440,6 +493,88 @@ impl IpcChannel {
             out[i] = w;
         }
         inner.recv_waiters.clear();
+        n
+    }
+
+    // --- Blocking-send (pending-sender) accessors ----------------------
+
+    /// Blocking-send entry: try to deliver `msg` straight into the **peer**'s
+    /// receive ring; if the ring is full, **hold** it in the peer's pending-send
+    /// queue together with a cloned reference to the caller's `PendingOperation`
+    /// `po`. On `Sent`/`Queued` the `transfers` are moved out (taken); on
+    /// `PendingFull`/`PeerClosed` they are left for the caller to reclaim.
+    ///
+    /// # Safety
+    /// See the accessor contract above; `po` references a live `PendingOperation`.
+    pub(crate) unsafe fn send_or_queue(
+        obj: *mut (),
+        msg: &StoredMsg,
+        transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+        po: &ObjectRef,
+    ) -> BlockSendOutcome {
+        let peer = unsafe { Self::inner(obj) }.peer;
+        if peer.is_null() {
+            return BlockSendOutcome::PeerClosed;
+        }
+        // Distinct object from `obj`; the first borrow has ended.
+        let peer_inner = unsafe { Self::inner(peer as *mut ()) };
+        let was_empty = peer_inner.recv.is_empty();
+        if peer_inner.recv.push_from(msg, transfers) {
+            return BlockSendOutcome::Sent { woke_edge: was_empty };
+        }
+        // Ring full — hold the message if the pending-send queue has room.
+        if peer_inner.pending_sends.len() >= Self::MAX_PENDING_SENDS {
+            return BlockSendOutcome::PendingFull; // transfers left for the caller
+        }
+        let mut held: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+        for i in 0..IPC_HANDLE_MAX {
+            held[i] = transfers[i].take();
+        }
+        // `po.clone()` bumps the refcount (atomic; no alloc/drop) — sound under SCHED.
+        peer_inner
+            .pending_sends
+            .try_push(PendingSend { msg: *msg, transfers: held, po: po.clone() })
+            .expect("within reserved pending-send capacity");
+        BlockSendOutcome::Queued
+    }
+
+    /// After a recv frees a slot, promote the **oldest** held sender into this
+    /// endpoint's receive ring (FIFO): move its message + transfers into `recv`
+    /// and return its `PendingOperation` reference. The caller completes that PO
+    /// (status 0) under `SCHED` and drops the returned reference **outside**
+    /// `SCHED`. Returns `None` if nothing was held.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn promote_pending_send(obj: *mut ()) -> Option<ObjectRef> {
+        let inner = unsafe { Self::inner(obj) };
+        if inner.recv.is_full() || inner.pending_sends.is_empty() {
+            return None; // no freed slot, or nothing waiting
+        }
+        let mut ps = inner.pending_sends.remove(0);
+        let pushed = inner.recv.push_from(&ps.msg, &mut ps.transfers);
+        debug_assert!(pushed, "promote into a non-full ring must succeed");
+        // `ps.msg` is Copy and `ps.transfers` are now all `None`; only `ps.po`
+        // (moved out below) carries a refcount. The rest drops harmlessly here.
+        Some(ps.po)
+    }
+
+    /// Copy the `PendingOperation` pointers of every held sender into `out` (for
+    /// the closing path to complete them `PeerClosed`), returning the count. Does
+    /// **not** remove them — their references are released when this endpoint's
+    /// `Inner` drops, outside `SCHED`.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn pending_send_pos(obj: *mut (), out: &mut [*mut ()]) -> usize {
+        let inner = unsafe { Self::inner(obj) };
+        let mut n = 0;
+        for p in inner.pending_sends.iter() {
+            if n < out.len() {
+                out[n] = p.po.as_ptr();
+                n += 1;
+            }
+        }
         n
     }
 }
@@ -726,5 +861,115 @@ mod tests {
         // Guard the reconciled constant from drifting.
         assert_eq!(IPC_PAYLOAD_SIZE, 4008);
         assert_eq!(core::mem::size_of::<StoredMsg>(), 4096);
+    }
+
+    // --- Blocking send (pending-sender queue) --------------------------
+
+    /// A fresh `PendingOperation`, adopting its creation reference.
+    fn make_po() -> ObjectRef {
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(crate::object::PendingOperation::try_new().unwrap()).as_ptr()
+                    as *mut (),
+                KObjectType::PendingOperation,
+            )
+        }
+    }
+
+    fn empty_xfer() -> [Option<TransferRef>; IPC_HANDLE_MAX] {
+        core::array::from_fn(|_| None)
+    }
+
+    #[test]
+    fn blocking_send_to_ring_with_space_delivers_immediately() {
+        init_global_heap();
+        let (a, b) = new_pair();
+        let po = make_po();
+        // SAFETY: live endpoints/PO; single-threaded test stands in for SCHED.
+        unsafe {
+            let mut t = empty_xfer();
+            assert_eq!(
+                IpcChannel::send_or_queue(a, &a_msg(7, 1), &mut t, &po),
+                BlockSendOutcome::Sent { woke_edge: true }
+            );
+            // Delivered straight into b's ring; nothing held.
+            let mut d = a_msg(0, 0);
+            assert!(pop_no_xfer(b, &mut d));
+            assert_eq!(d.payload[0], 7);
+            assert!(IpcChannel::promote_pending_send(b).is_none());
+        }
+        drop(po);
+        drop_endpoint(a);
+        drop_endpoint(b);
+    }
+
+    #[test]
+    fn blocking_send_to_full_ring_queues_then_recv_promotes_fifo() {
+        init_global_heap();
+        test_probe::reset();
+        let (a, b) = new_pair(); // cap 4; sending on a fills b's ring
+        let po = make_po();
+        // SAFETY: live endpoints/PO; single-threaded test stands in for SCHED.
+        unsafe {
+            for i in 0..4u8 {
+                assert!(matches!(push_no_xfer(a, &a_msg(i, 1)), SendOutcome::Sent { .. }));
+            }
+            // 5th send: ring full → held in b's pending-send queue.
+            let mut t = empty_xfer();
+            assert_eq!(
+                IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po),
+                BlockSendOutcome::Queued
+            );
+            // Receive one (frees a slot): FIFO byte 0.
+            let mut d = a_msg(0, 0);
+            assert!(pop_no_xfer(b, &mut d));
+            assert_eq!(d.payload[0], 0);
+            // Promote the held sender into b's ring; returns its PO reference.
+            let promoted = IpcChannel::promote_pending_send(b);
+            assert!(promoted.is_some());
+            // Drain the rest: 1, 2, 3, then the promoted 99 (FIFO preserved).
+            for expect in [1u8, 2, 3, 99] {
+                let mut dd = a_msg(0, 0);
+                assert!(pop_no_xfer(b, &mut dd));
+                assert_eq!(dd.payload[0], expect, "FIFO order");
+            }
+            assert!(IpcChannel::promote_pending_send(b).is_none());
+            drop(promoted); // the queue's PO reference (clone)
+        }
+        drop(po); // creation reference → last ref, PO destroyed
+        assert_eq!(test_probe::pending_op_destroys(), 1);
+        drop_endpoint(a);
+        drop_endpoint(b);
+    }
+
+    #[test]
+    fn closing_receiver_releases_a_held_pending_send() {
+        init_global_heap();
+        test_probe::reset();
+        let (a, b) = new_pair();
+        let po = make_po();
+        // SAFETY: live endpoints/PO; single-threaded test stands in for SCHED.
+        unsafe {
+            for i in 0..4u8 {
+                push_no_xfer(a, &a_msg(i, 1));
+            }
+            let mut t = empty_xfer();
+            assert_eq!(
+                IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po),
+                BlockSendOutcome::Queued
+            );
+            // The held sender is visible to the closing path.
+            let mut pos = [core::ptr::null_mut(); IpcChannel::MAX_PENDING_SENDS];
+            assert_eq!(IpcChannel::pending_send_pos(b, &mut pos), 1);
+            assert_eq!(pos[0], po.as_ptr());
+        }
+        // Dropping b (the receiver holding the pending send) releases the queued
+        // PO reference (and the held transfers) via its `Inner` drop.
+        drop_endpoint(b);
+        assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held");
+        drop(po); // last ref → PO destroyed
+        assert_eq!(test_probe::pending_op_destroys(), 1);
+        drop_endpoint(a);
     }
 }

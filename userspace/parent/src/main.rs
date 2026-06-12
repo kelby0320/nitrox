@@ -33,12 +33,18 @@ const SYS_MEMORY_MAP: u64 = 5;
 const SYS_WAIT: u64 = 10;
 const SYS_NOTIF_RECV: u64 = 11;
 const SYS_CHANNEL_CREATE: u64 = 12;
+const SYS_CHANNEL_SEND: u64 = 13;
+const SYS_CHANNEL_RECV: u64 = 14;
 const SYS_PROCESS_SPAWN: u64 = 15;
 const SYS_PROCESS_EXIT: u64 = 16;
 const SYS_THREAD_CREATE: u64 = 19;
 const SYS_THREAD_GET_REGISTERS: u64 = 20;
 const SYS_EXCEPTION_RESUME: u64 = 21;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
+
+/// `SendMode` values (`kernel/src/libkern/ipc.rs`).
+const SENDMODE_BLOCK: u64 = 0;
+const SENDMODE_NOBLOCK: u64 = 1;
 
 /// Rights bits (`kernel/src/libkern/handle.rs`): the full set an endpoint
 /// carries, handed to each child.
@@ -130,6 +136,13 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
 static mut NOTIF: NotificationBuf = NotificationBuf { kind: 0, body: [0; 60] };
 static mut WAIT_RESULTS: [u8; 16] = [0; 16];
 static mut WAIT_HANDLES: [u64; 1] = [0];
+/// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
+/// blocking-send demo, used for both send and recv.
+static mut MSGBUF: [u8; 4096] = [0; 4096];
+/// Transferred-handle out-array for recv (always empty in the demo).
+static mut HBUF: [u64; 8] = [0; 8];
+/// Recv'd handle-count out-param.
+static mut RECV_COUNT: usize = 0;
 static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, reserved: [0; 40] };
 static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
 
@@ -166,6 +179,20 @@ unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
 unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
     // SAFETY: see `syscall4`.
     unsafe { syscall4(nr, a0, 0, 0, 0) }
+}
+
+#[inline]
+unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
+    let ret;
+    // SAFETY: as `syscall4`, plus `r8` for the 5th argument.
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4,
+            out("rcx") _, out("r11") _, lateout("rax") ret,
+        );
+    }
+    ret
 }
 
 fn kprint(msg: &[u8]) {
@@ -307,6 +334,103 @@ fn worker_exception_demo(notif: u64) {
     kprint(b"parent: worker terminated\n");
 }
 
+/// Demonstrate the blocking-send / `PendingOperation` path end-to-end against the
+/// live kernel: fill a channel's receive ring, then a `Block` send returns a
+/// `PendingOperation` handle (the message is held in-kernel); a recv frees a slot,
+/// promoting the held message and completing the PO; `sys_wait` on the PO then
+/// reports the completion (status 0). Self-contained — the parent holds both ends.
+fn block_send_demo() {
+    // Fresh channel pair, depth 4, both ends held here.
+    // SAFETY: END0/END1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        kprint(b"parent: block-demo channel create FAIL\n");
+        return;
+    }
+    // SAFETY: the kernel wrote both endpoint handles.
+    let (a, b) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
+
+    // Fill b's receive ring: NoBlock-send a->b until WouldBlock.
+    let mut filled = 0u64;
+    loop {
+        // SAFETY: valid endpoint + zeroed message; count 0 (no transfers).
+        let r = unsafe {
+            syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_NOBLOCK)
+        };
+        if r == 0 {
+            filled += 1;
+        } else {
+            break; // WouldBlock: the ring is full
+        }
+    }
+
+    // One more, blocking: the ring is full, so this returns a PendingOperation
+    // handle (>= 0) rather than blocking inside the syscall.
+    // SAFETY: as above, with Block mode.
+    let po = unsafe {
+        syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCK)
+    };
+    if po < 0 {
+        kprint(b"parent: block send FAIL\n");
+        return;
+    }
+    let po = po as u64;
+
+    // Receive one from b: frees a slot, so the held sender is promoted into the
+    // ring and its PendingOperation completes.
+    // SAFETY: valid out-params; the demo message carries no transferred handles.
+    let rr = unsafe {
+        syscall4(SYS_CHANNEL_RECV, b, (&raw mut MSGBUF) as u64, (&raw mut HBUF) as u64, (&raw mut RECV_COUNT) as u64)
+    };
+    if rr != 0 {
+        kprint(b"parent: block-demo recv FAIL\n");
+        return;
+    }
+
+    // Wait on the PendingOperation; it is now complete (status 0 = delivered).
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    if waited == 1 && status == 0 {
+        kprint(b"parent: blocking send completed via PendingOperation (");
+        kprint_u64(filled);
+        kprint(b" queued, 1 blocked-then-delivered)\n");
+    } else {
+        kprint(b"parent: block-demo wait unexpected\n");
+    }
+
+    // Drain the rest of b and close every handle.
+    loop {
+        // SAFETY: valid out-params.
+        let r = unsafe {
+            syscall4(SYS_CHANNEL_RECV, b, (&raw mut MSGBUF) as u64, (&raw mut HBUF) as u64, (&raw mut RECV_COUNT) as u64)
+        };
+        if r != 0 {
+            break;
+        }
+    }
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, po);
+        syscall1(SYS_HANDLE_CLOSE, a);
+        syscall1(SYS_HANDLE_CLOSE, b);
+    }
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle, seeded by
 /// the kernel at spawn. The other two bootstrap registers are unused here.
 #[unsafe(no_mangle)]
@@ -315,6 +439,9 @@ pub extern "C" fn _start(notif: u64, _boot1: u64, _boot2: u64) -> ! {
 
     // 0. Exception demo: a worker thread faults; we suspend, inspect, terminate.
     worker_exception_demo(notif);
+
+    // 0b. Blocking-send / PendingOperation demo (async-I/O primitive).
+    block_send_demo();
 
     kprint(b"parent: creating a channel\n");
 

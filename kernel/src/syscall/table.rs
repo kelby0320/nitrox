@@ -35,8 +35,8 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::{
-    IpcChannel, MAX_WAIT_HANDLES, MemoryObject, NotificationChannel, ObjectRef, Process, RecvState,
-    SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
+    BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, NotificationChannel, ObjectRef,
+    PendingOperation, Process, RecvState, SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -776,6 +776,14 @@ fn timer_rights() -> Rights {
     Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
 }
 
+/// Rights for a freshly-created `PendingOperation` handle. Wait-only (its
+/// principal mask is empty, like a Timer — `handle/type_rights.rs`), plus the
+/// generic management band so the completion can be duplicated/transferred and
+/// inspected.
+fn pending_op_rights() -> Rights {
+    Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
+}
+
 /// `sys_timer_create(flags)` — create an unarmed `Timer` and return a handle
 /// (with [`timer_rights`]). `flags` must be a valid [`TimerFlags`] (none defined
 /// yet → must be 0).
@@ -836,19 +844,23 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
         handles[i] = u64::from_ne_bytes(hbytes[i * 8..i * 8 + 8].try_into().unwrap());
     }
 
-    // Resolve each handle (requires `WAIT`) to an ObjectRef held for the call;
-    // only `Timer` is waitable this slice.
+    // Resolve each handle (requires `WAIT`) to an ObjectRef held for the call.
     let pid = crate::sched::current_owner_pid();
     let mut refs: [Option<ObjectRef>; MAX_WAIT_HANDLES] = core::array::from_fn(|_| None);
     let mut objs = [0usize; MAX_WAIT_HANDLES];
+    let mut types = [KObjectType::Invalid; MAX_WAIT_HANDLES];
     for i in 0..count {
         let ok = global::get()
             .lookup(RawHandle(handles[i]), pid, Rights::WAIT)
             .map_err(map_handle_err)?;
         match ok.object.object_type() {
-            KObjectType::Timer | KObjectType::NotificationChannel | KObjectType::IpcChannel => {}
+            KObjectType::Timer
+            | KObjectType::NotificationChannel
+            | KObjectType::IpcChannel
+            | KObjectType::PendingOperation => {}
             _ => return Err(KError::Unsupported),
         }
+        types[i] = ok.object.object_type();
         objs[i] = ok.object.as_ptr() as usize;
         refs[i] = Some(ok.object);
     }
@@ -866,7 +878,18 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
             let mut k = 0usize;
             for i in 0..count {
                 if bits[i] {
-                    out[k] = IoResult::ready(handles[i]);
+                    // A `PendingOperation` reports its completion status; the
+                    // edge-style waitables (Timer/channel/notification) are an
+                    // unconditional "ready" (status 0). The handle still pins the
+                    // object, so reading the (one-shot, now-stable) status is sound.
+                    out[k] = if types[i] == KObjectType::PendingOperation {
+                        IoResult::completed(
+                            handles[i],
+                            crate::sched::pending_op_status(objs[i] as *mut ()),
+                        )
+                    } else {
+                        IoResult::ready(handles[i])
+                    };
                     k += 1;
                 }
             }
@@ -1003,12 +1026,13 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
 /// on success, `WouldBlock` if the queue is full, `PeerClosed` if the peer has
 /// gone.
 pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) -> SysResult {
-    // Mode gating first (host-reachable, no pointer/lock use).
-    match SendMode::from_u32(mode as u32) {
-        Some(SendMode::NoBlock) => {}
-        Some(SendMode::Block) | Some(SendMode::BlockBounded) => return Err(KError::Unsupported),
+    // Mode gating first (host-reachable, no pointer/lock use). `BlockBounded`
+    // (deadline-bounded) lands with the deadline-arg ABI in a follow-up.
+    let send_mode = match SendMode::from_u32(mode as u32) {
+        Some(m @ (SendMode::NoBlock | SendMode::Block)) => m,
+        Some(SendMode::BlockBounded) => return Err(KError::Unsupported),
         None => return Err(KError::InvalidArgument),
-    }
+    };
     let count = count as usize;
     if count > IPC_HANDLE_MAX {
         return Err(KError::TooLarge);
@@ -1055,19 +1079,78 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) 
     bounce.header.handle_count = count as u8;
     bounce.handles = [0u64; IPC_HANDLE_MAX];
 
-    // `ok.object` (held here) pins the endpoint across the push. On `Sent` the
-    // queue took the transfers; commit the move by closing the sender's handles.
-    match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) {
-        SendOutcome::Sent { .. } => {
-            for i in 0..count {
-                close_and_release(RawHandle(h_raw[i]), pid);
+    // `ok.object` (held here) pins the endpoint across the push.
+    match send_mode {
+        // Synchronous attempt: `Sent` commits the transfer move (close the
+        // sender's handles); a full ring / dead peer leaves the transfers untaken
+        // (they drop here, outside SCHED) so no capability is lost.
+        SendMode::NoBlock => {
+            match crate::sched::ipc_send_push(ok.object.as_ptr(), &bounce, &mut transfers) {
+                SendOutcome::Sent { .. } => {
+                    for i in 0..count {
+                        close_and_release(RawHandle(h_raw[i]), pid);
+                    }
+                    Ok(0)
+                }
+                SendOutcome::Full => Err(KError::WouldBlock),
+                SendOutcome::PeerClosed => Err(KError::PeerClosed),
             }
-            Ok(0)
         }
-        // `transfers` were left untaken; they drop here (outside SCHED) and the
-        // sender's handles are untouched — no capability is lost on a failed send.
-        SendOutcome::Full => Err(KError::WouldBlock),
-        SendOutcome::PeerClosed => Err(KError::PeerClosed),
+        // Blocking: return a `PendingOperation` that completes when the message
+        // is delivered — immediately if the ring has space, else when the peer
+        // next receives. The message is committed either way, so the transfer
+        // move is committed too (handles closed). Honors the async-first rule:
+        // the syscall never parks; the caller `sys_wait`s on the returned handle.
+        SendMode::Block => {
+            let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
+            // SAFETY: `into_raw` yields the single creation reference; adopt it.
+            let po_ref = unsafe {
+                ObjectRef::from_raw(
+                    KBox::into_raw(po).as_ptr() as *mut (),
+                    KObjectType::PendingOperation,
+                )
+            };
+            match crate::sched::ipc_send_push_blocking(
+                ok.object.as_ptr(),
+                &bounce,
+                &mut transfers,
+                &po_ref,
+            ) {
+                BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
+                    // Message committed (delivered or held) — commit the transfers.
+                    for i in 0..count {
+                        close_and_release(RawHandle(h_raw[i]), pid);
+                    }
+                    // Install the PO handle (adopting the creation reference) and
+                    // return it for the caller to `sys_wait` on.
+                    let (op, ot) = po_ref.into_raw();
+                    match global::get().allocate(pid, op, ot, pending_op_rights()) {
+                        Ok(h) => Ok(h.bits() as isize),
+                        // Handle table full: the message was still committed; we
+                        // just can't hand back the PO. Drop our creation ref — a
+                        // `Queued` PO stays alive via the pending-send queue's ref
+                        // (signalled on delivery); a `Sent` PO was pre-signalled
+                        // and is reclaimed here. SAFETY: reclaim `into_raw`'s ref.
+                        Err(e) => {
+                            drop(unsafe { ObjectRef::from_raw(op, ot) });
+                            Err(map_handle_err(e))
+                        }
+                    }
+                }
+                // Back-pressure / dead peer: nothing committed — `transfers` drop
+                // here (outside SCHED), the PO is unused, sender keeps its handles.
+                BlockSendOutcome::PendingFull => {
+                    drop(po_ref);
+                    Err(KError::WouldBlock)
+                }
+                BlockSendOutcome::PeerClosed => {
+                    drop(po_ref);
+                    Err(KError::PeerClosed)
+                }
+            }
+        }
+        // Rejected during mode gating above.
+        SendMode::BlockBounded => unreachable!("BlockBounded rejected during mode gating"),
     }
 }
 
@@ -1103,7 +1186,13 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     }
     let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
-    if !crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers) {
+    // Popping frees a ring slot, so a blocking sender may be promoted into it;
+    // `_promoted_po` is that sender's now-completed `PendingOperation` reference,
+    // dropped here at scope exit — **outside** `SCHED` (no `ObjectRef` Drop under
+    // the lock).
+    let (popped, _promoted_po) =
+        crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers);
+    if !popped {
         // Drained between the peek and the pop (only possible under future SMP).
         return Err(KError::WouldBlock);
     }
@@ -1290,9 +1379,10 @@ mod tests {
 
     #[test]
     fn channel_send_rejects_mode_and_oversize_count_before_pointers() {
-        // Mode is checked first: Block/BlockBounded are deferred (Unsupported),
-        // an unknown selector is InvalidArgument — all before any pointer/lock.
-        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 0), Err(KError::Unsupported)); // Block
+        // Mode is checked first: `BlockBounded` is still deferred (Unsupported,
+        // pending its deadline-arg ABI), an unknown selector is InvalidArgument —
+        // both before any pointer/lock. (`NoBlock`/`Block` proceed past gating;
+        // they are exercised end-to-end in the QEMU demo, not here.)
         assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 2), Err(KError::Unsupported)); // BlockBounded
         assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99), Err(KError::InvalidArgument));
         // NoBlock but more transferred handles than a message can carry → TooLarge

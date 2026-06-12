@@ -60,8 +60,9 @@ use crate::mm::PhysAddr;
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::object::{
-    IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef, RecvState, SendOutcome,
-    StoredMsg, Thread, ThreadEntry, ThreadState, Timer, TransferRef,
+    BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
+    PendingOperation, RecvState, SendOutcome, StoredMsg, Thread, ThreadEntry, ThreadState, Timer,
+    TransferRef,
 };
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
@@ -557,6 +558,7 @@ unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
             NotificationChannel::already_signaled(obj)
         },
         KObjectType::IpcChannel => unsafe { IpcChannel::already_signaled(obj) },
+        KObjectType::PendingOperation => unsafe { PendingOperation::already_signaled(obj) },
         _ => false,
     }
 }
@@ -568,6 +570,7 @@ unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
         KObjectType::Timer => unsafe { Timer::add_waiter(obj, th) },
         KObjectType::NotificationChannel => unsafe { NotificationChannel::add_waiter(obj, th) },
         KObjectType::IpcChannel => unsafe { IpcChannel::add_waiter(obj, th) },
+        KObjectType::PendingOperation => unsafe { PendingOperation::add_waiter(obj, th) },
         _ => Err(()),
     }
 }
@@ -579,6 +582,7 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
         KObjectType::Timer => unsafe { Timer::remove_waiter(obj, th) },
         KObjectType::NotificationChannel => unsafe { NotificationChannel::remove_waiter(obj, th) },
         KObjectType::IpcChannel => unsafe { IpcChannel::remove_waiter(obj, th) },
+        KObjectType::PendingOperation => unsafe { PendingOperation::remove_waiter(obj, th) },
         _ => {}
     }
 }
@@ -622,6 +626,42 @@ fn signal_ipc_endpoint(g: &mut SchedState, endpoint: *mut ()) {
     }
 }
 
+/// Complete a [`PendingOperation`] with `status` and wake every thread blocked
+/// on it. One-shot: a second call is a no-op (the first completion wins), so it
+/// is safe to call from both the delivery path and a timeout. Caller holds
+/// `SCHED`. No allocation, no blocking, no `ObjectRef` drop. Mirrors
+/// [`signal_ipc_endpoint`] but drains a `PendingOperation`'s waiter list.
+fn signal_pending_op(g: &mut SchedState, po: *mut (), status: i32) {
+    // SAFETY: live PO, `SCHED` held. One-shot; a re-signal returns `false`.
+    if !unsafe { PendingOperation::signal(po, status) } {
+        return; // already completed — its waiters were handled the first time
+    }
+    let mut buf = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
+    // SAFETY: live PO, `SCHED` held — drains its waiter list.
+    let n = unsafe { PendingOperation::take_waiters(po, &mut buf) };
+    for &th in &buf[..n] {
+        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
+        // `blocked`; `SCHED` held.
+        unsafe {
+            Thread::wait_mark_signaled(th, po as usize);
+            if Thread::wait_try_wake(th) {
+                make_runnable(g, th);
+            }
+        }
+    }
+}
+
+/// Read a completed [`PendingOperation`]'s status under `SCHED`. Called by
+/// `sys_wait` when building the `IoResult` for a signaled PO; the value is stable
+/// after the one-shot completion, but the lock is taken to honor the accessor
+/// contract. The caller's handle pins `po` for the duration.
+pub fn pending_op_status(po: *mut ()) -> i32 {
+    let _g = SCHED.lock();
+    // SAFETY: `po` is a live `PendingOperation` pinned by the caller's handle;
+    // `SCHED` held.
+    unsafe { PendingOperation::status(po) }
+}
+
 /// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,
 /// **moving** any `transfers` it carries into the queued slot and waking the
 /// peer's blocked receivers if the ring went empty→non-empty. The caller has
@@ -646,6 +686,37 @@ pub fn ipc_send_push(
     outcome
 }
 
+/// Blocking send (`Block` / `BlockBounded`): deliver `msg` into the peer's
+/// receive ring, or — if it is full — **hold** it in the peer's pending-send
+/// queue with a reference to the caller's `PendingOperation` `po`, to be
+/// delivered (completing `po`) when the peer next receives. On immediate
+/// delivery `po` is **pre-completed** (status 0) here so the caller's `sys_wait`
+/// returns at once. The caller has copied the message in and holds `po`'s
+/// creation reference + the endpoint reference. Returns the [`BlockSendOutcome`];
+/// on `PendingFull`/`PeerClosed` the `transfers` are left for the caller to drop.
+pub fn ipc_send_push_blocking(
+    endpoint: *mut (),
+    msg: &StoredMsg,
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    po: &ObjectRef,
+) -> BlockSendOutcome {
+    let mut g = SCHED.lock();
+    // SAFETY: the caller holds an `ObjectRef` pinning `endpoint` and `po`; `SCHED` held.
+    let outcome = unsafe { IpcChannel::send_or_queue(endpoint, msg, transfers, po) };
+    if let BlockSendOutcome::Sent { woke_edge } = outcome {
+        if woke_edge {
+            // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
+            let peer = unsafe { IpcChannel::peer_of(endpoint) };
+            if !peer.is_null() {
+                signal_ipc_endpoint(&mut g, peer);
+            }
+        }
+        // Delivered synchronously — complete the PO now (no waiters yet).
+        signal_pending_op(&mut g, po.as_ptr(), 0);
+    }
+    outcome
+}
+
 /// Inspect `endpoint`'s receive side under `SCHED` without dequeuing — so the
 /// empty-poll `WouldBlock` path allocates no bounce buffer.
 pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
@@ -659,14 +730,30 @@ pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
 /// was drained between the peek and now. The caller copies `dst` out to user
 /// memory and installs/drops the `out` transfers **after** this returns (never
 /// under the lock — `ObjectRef` Drop / `allocate` must not run under `SCHED`).
+/// Returns `(popped, promoted_po)`: `popped` is `false` if the inbox was drained
+/// between peek and pop. Popping frees a ring slot, so a held blocking sender (a
+/// `Block`/`BlockBounded` send waiting for space) is **promoted** into the ring
+/// and its `PendingOperation` completed (status 0) under `SCHED`; its returned
+/// reference must be dropped by the caller **outside** `SCHED` (no `ObjectRef`
+/// Drop under the lock).
 pub fn ipc_recv_pop_into(
     endpoint: *mut (),
     dst: &mut StoredMsg,
     out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
-) -> bool {
-    let _g = SCHED.lock();
+) -> (bool, Option<ObjectRef>) {
+    let mut g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
-    unsafe { IpcChannel::recv_pop_into(endpoint, dst, out) }
+    let popped = unsafe { IpcChannel::recv_pop_into(endpoint, dst, out) };
+    if !popped {
+        return (false, None);
+    }
+    // SAFETY: `endpoint` is pinned; `SCHED` held. A slot just freed.
+    let promoted = unsafe { IpcChannel::promote_pending_send(endpoint) };
+    if let Some(ref po) = promoted {
+        // The held sender's message is now in the ring — complete its PO.
+        signal_pending_op(&mut g, po.as_ptr(), 0);
+    }
+    (true, promoted)
 }
 
 /// An IPC endpoint is being destroyed (its last handle closed). Under `SCHED`,
@@ -685,6 +772,17 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
         // / a waiter's `ObjectRef`; `SCHED` held.
         unsafe { IpcChannel::clear_peer(peer) };
         signal_ipc_endpoint(&mut g, peer);
+    }
+    // Complete every blocking sender held on THIS endpoint with `PeerClosed`:
+    // our receive ring is gone, so their messages can never be delivered. We
+    // only *signal* them here (waking the senders); each held entry's message,
+    // transfers, and PO reference are released when this endpoint's `Inner`
+    // drops, immediately after this returns — outside `SCHED`.
+    let mut pos = [core::ptr::null_mut(); IpcChannel::MAX_PENDING_SENDS];
+    // SAFETY: `endpoint` is valid; `SCHED` held.
+    let n = unsafe { IpcChannel::pending_send_pos(endpoint, &mut pos) };
+    for &po in &pos[..n] {
+        signal_pending_op(&mut g, po, crate::syscall::error::KError::PeerClosed as i32);
     }
 }
 

@@ -34,9 +34,22 @@ const _: () = assert!(core::mem::offset_of!(IoResult, status) == 8);
 const _: () = assert!(core::mem::offset_of!(IoResult, reserved) == 12);
 
 impl IoResult {
-    /// A "ready" result for `handle` (status 0, reserved 0).
+    /// A "ready" result for `handle` (status 0, reserved 0). Used for edge-style
+    /// waitables (a Timer firing, a channel going non-empty) that carry no
+    /// operation status of their own.
     pub const fn ready(handle: u64) -> Self {
         Self { handle, status: 0, reserved: 0 }
+    }
+
+    /// A completion result for `handle` carrying an operation `status` (`0` =
+    /// success; a negative value is a [`KError`](crate::syscall::error::KError)
+    /// discriminant). Used for a signaled [`PendingOperation`], whose completion
+    /// status — e.g. the `TimedOut` / `PeerClosed` outcome of a blocking IPC
+    /// send — is reported here.
+    ///
+    /// [`PendingOperation`]: crate::object::PendingOperation
+    pub const fn completed(handle: u64, status: i32) -> Self {
+        Self { handle, status, reserved: 0 }
     }
 }
 

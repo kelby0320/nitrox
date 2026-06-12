@@ -24,14 +24,18 @@ pub mod header;
 pub mod ipc_channel;
 pub mod memory_object;
 pub mod notification_channel;
+pub mod pending_op;
 pub mod process;
 pub mod thread;
 pub mod timer;
 
 pub use header::{KObjectHeader, ObjectRef};
-pub use ipc_channel::{IpcChannel, RecvState, SendOutcome, StoredMsg, TransferRef};
+pub use ipc_channel::{
+    BlockSendOutcome, IpcChannel, RecvState, SendOutcome, StoredMsg, TransferRef,
+};
 pub use memory_object::MemoryObject;
 pub use notification_channel::NotificationChannel;
+pub use pending_op::PendingOperation;
 pub use process::Process;
 pub use thread::{MAX_WAIT_HANDLES, Thread, ThreadEntry, ThreadState, WaitPhase};
 pub use timer::Timer;
