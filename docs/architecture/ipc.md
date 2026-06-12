@@ -82,9 +82,11 @@ blocked waiter's reference) at the moment the first one nulls it.
   and delivered (completing the PO) when the peer next receives. Closing an
   endpoint completes its held senders with `PeerClosed`. The send never parks
   inside the syscall (the async-first rule); the caller `sys_wait`s on the
-  returned PO. **`BlockBounded`** (a `Block` with a delivery deadline) is still
-  `Unsupported` — a follow-up (it needs the deadline-heap kind + a send deadline
-  arg). See the decision log (2026-06-12).
+  returned PO. **`BlockBounded`** is `Block` with a delivery deadline (absolute
+  monotonic ns, the 6th `sys_channel_send` arg): if the held message is not
+  delivered by the deadline, the scheduler's timer tick cancels it — the PO
+  completes `TimedOut` and the message is reclaimed (swept out of the pending-send
+  queue on the next recv, or at close). See the decision log (2026-06-12).
 - **Demo:** `hello` creates a channel, holds both endpoints, sends a message to
   itself end0→end1, blocks on end1 via `sys_wait`, receives and verifies it,
   observes `WouldBlock` on an empty endpoint, then closes one end and observes

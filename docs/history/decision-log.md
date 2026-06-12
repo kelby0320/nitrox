@@ -3506,3 +3506,42 @@ unchanged. (Found + fixed a self-inflicted bug en route: an edit split
 `#[unsafe(no_mangle)]` from the parent's `_start`, GC-ing the binary to an empty
 664-byte ELF.) Branch `phase-2/pending-operation` off `main` (includes merged PR #35).
 Next: `phase-2/dma-alloc`, then the IPC `BlockBounded` follow-up.
+
+## 2026-06-12 — IPC `BlockBounded` (deadline-bounded blocking send)
+
+The follow-up carved out of the PendingOperation slice (#37). `BlockBounded` is
+`Block` plus a *delivery deadline*: a held (undelivered) send whose deadline
+elapses is cancelled — its `PendingOperation` completes `TimedOut` and the message
+is reclaimed.
+
+**Deadline heap.** The scheduler `deadline::Entry`'s `is_thread: bool` grew to a
+3-way `kind: DeadlineKind { Thread, Timer, PendingSend }` plus a `channel: usize`
+back-pointer; `remove(target, kind)` keys on the pair. `fire_expired_deadlines`
+branches on `kind`: the new `PendingSend` arm cancels the held send
+(`IpcChannel::cancel_pending_send`, a flag-set only — **no `ObjectRef` drop under
+`SCHED`**) and completes its PO `TimedOut`. The send registers its deadline (target
+= PO, channel = the receiving peer) on a `Queued` outcome; it is removed when the
+send is delivered early (in `ipc_recv_pop_into`) or its endpoint closes
+(`ipc_endpoint_closing`) — the latter mandatory, else a stale deadline could fire
+against a freed channel. A 6th `sys_channel_send` arg carries the deadline
+(absolute monotonic ns; the dispatch already forwarded the register).
+
+**Timeout reclaim = reclaim-on-recv** (the recommendation from the planning
+discussion). The timeout only tombstones the held send (`cancelled` flag);
+`promote_pending_send` sweeps cancelled entries on the next recv into a
+`ReclaimedSend` buffer the recv **syscall** drops outside `SCHED`, and delivers the
+oldest live send. Close reclaims any remainder via the endpoint's `Inner` drop. So
+no `ObjectRef` is ever dropped under `SCHED`, and no permanent wedge exists for a
+channel still being received on. The **general** deferred-free mechanism (a list
+drained via the DPC queue) is the long-term home for `SCHED`/IRQ-context
+reclamation — deferred until a consumer with no natural drain (device-I/O cancel)
+needs it. See `deferred-decisions.md`.
+
+ABI impact: the `sys_channel_send` **deadline arg** is a syscall-surface change (a
+previously-ignored 6th register), not a hashed type layout — **no version-hash
+impact**. Verified: `check-arch` clean; `build` clean (no warnings); `test` 408
+host tests (+3: deadline-kind coexistence, `cancel_pending_send`, recv-sweep-then-
+promote); `qemu` logs `parent: blocking send timed out via PendingOperation
+(BlockBounded)` alongside the existing `Block` line, and the rest of the
+parent/child demo runs unchanged. Branch `phase-2/block-bounded` off `main`
+(includes merged PRs #36, #37). Next: `phase-2/dma-alloc` (the last prereq).

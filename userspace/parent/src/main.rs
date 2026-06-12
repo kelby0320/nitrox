@@ -45,6 +45,10 @@ const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// `SendMode` values (`kernel/src/libkern/ipc.rs`).
 const SENDMODE_BLOCK: u64 = 0;
 const SENDMODE_NOBLOCK: u64 = 1;
+const SENDMODE_BLOCKBOUNDED: u64 = 2;
+
+/// `KError::TimedOut` (`kernel/src/syscall/error.rs`), as an `IoResult.status`.
+const KERR_TIMED_OUT: i32 = -12;
 
 /// Rights bits (`kernel/src/libkern/handle.rs`): the full set an endpoint
 /// carries, handed to each child.
@@ -189,6 +193,21 @@ unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 
         asm!(
             "syscall",
             in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4,
+            out("rcx") _, out("r11") _, lateout("rax") ret,
+        );
+    }
+    ret
+}
+
+#[inline]
+unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
+    let ret;
+    // SAFETY: as `syscall5`, plus `r9` for the 6th argument.
+    unsafe {
+        asm!(
+            "syscall",
+            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4,
+            in("r9") a5,
             out("rcx") _, out("r11") _, lateout("rax") ret,
         );
     }
@@ -431,6 +450,76 @@ fn block_send_demo() {
     }
 }
 
+/// Demonstrate the `BlockBounded` (deadline-bounded) send: fill a channel's ring
+/// and issue a `BlockBounded` send with a deadline already in the past to an
+/// endpoint no one receives. The held message can never be delivered, so on the
+/// next timer tick its deadline elapses and the returned `PendingOperation`
+/// completes `TimedOut` — `sys_wait` reports that status.
+fn block_bounded_demo() {
+    // SAFETY: END0/END1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        kprint(b"parent: block-bounded channel create FAIL\n");
+        return;
+    }
+    // SAFETY: the kernel wrote both endpoint handles.
+    let (a, b) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
+
+    // Fill b's receive ring so the next send must be held.
+    loop {
+        // SAFETY: valid endpoint + zeroed message; count 0 (no transfers).
+        let r = unsafe {
+            syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_NOBLOCK)
+        };
+        if r != 0 {
+            break; // WouldBlock: full
+        }
+    }
+
+    // BlockBounded send, deadline `1` (already in the past) → held now, timed out
+    // on the next tick. The deadline is the 6th arg.
+    // SAFETY: as above, BlockBounded mode + a past deadline.
+    let po = unsafe {
+        syscall6(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCKBOUNDED, 1)
+    };
+    if po < 0 {
+        kprint(b"parent: block-bounded send FAIL\n");
+        return;
+    }
+    let po = po as u64;
+
+    // Wait on the PO; it completes `TimedOut` once the deadline fires.
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    // `IoResult.status` is the i32 at bytes 8..12 of the 16-byte record.
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    if waited == 1 && status == KERR_TIMED_OUT {
+        kprint(b"parent: blocking send timed out via PendingOperation (BlockBounded)\n");
+    } else {
+        kprint(b"parent: block-bounded demo unexpected\n");
+    }
+
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, po);
+        syscall1(SYS_HANDLE_CLOSE, a);
+        syscall1(SYS_HANDLE_CLOSE, b);
+    }
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle, seeded by
 /// the kernel at spawn. The other two bootstrap registers are unused here.
 #[unsafe(no_mangle)]
@@ -440,8 +529,9 @@ pub extern "C" fn _start(notif: u64, _boot1: u64, _boot2: u64) -> ! {
     // 0. Exception demo: a worker thread faults; we suspend, inspect, terminate.
     worker_exception_demo(notif);
 
-    // 0b. Blocking-send / PendingOperation demo (async-I/O primitive).
+    // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();
+    block_bounded_demo();
 
     kprint(b"parent: creating a channel\n");
 

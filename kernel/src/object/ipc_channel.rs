@@ -243,6 +243,23 @@ struct PendingSend {
     msg: StoredMsg,
     transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
     po: ObjectRef,
+    /// Set when a `BlockBounded` delivery deadline elapsed before delivery: the
+    /// `po` was already completed `TimedOut`, so this entry is **not** delivered
+    /// — it is swept out and reclaimed at the next `promote_pending_send` (or at
+    /// close). Always `false` for `Block`. See [`cancel_pending_send`].
+    ///
+    /// [`cancel_pending_send`]: IpcChannel::cancel_pending_send
+    cancelled: bool,
+}
+
+/// The droppable parts of a cancelled (timed-out) [`PendingSend`], handed back by
+/// [`promote_pending_send`](IpcChannel::promote_pending_send) for the caller to
+/// release **outside** `SCHED` (the `Drop`s of `po` / a transferred object may
+/// take lower-rank locks — e.g. the buddy allocator — which must not nest under
+/// the rank-1 scheduler lock). The message bytes are `Copy` and need no reclaim.
+pub struct ReclaimedSend {
+    pub po: ObjectRef,
+    pub transfers: [Option<TransferRef>; IPC_HANDLE_MAX],
 }
 
 /// State of an endpoint's own receive side, for [`recv_peek`](IpcChannel::recv_peek).
@@ -533,30 +550,78 @@ impl IpcChannel {
         // `po.clone()` bumps the refcount (atomic; no alloc/drop) — sound under SCHED.
         peer_inner
             .pending_sends
-            .try_push(PendingSend { msg: *msg, transfers: held, po: po.clone() })
+            .try_push(PendingSend {
+                msg: *msg,
+                transfers: held,
+                po: po.clone(),
+                cancelled: false,
+            })
             .expect("within reserved pending-send capacity");
         BlockSendOutcome::Queued
     }
 
-    /// After a recv frees a slot, promote the **oldest** held sender into this
-    /// endpoint's receive ring (FIFO): move its message + transfers into `recv`
-    /// and return its `PendingOperation` reference. The caller completes that PO
-    /// (status 0) under `SCHED` and drops the returned reference **outside**
-    /// `SCHED`. Returns `None` if nothing was held.
+    /// Mark the held sender whose `PendingOperation` is `po` as **cancelled** (a
+    /// `BlockBounded` delivery deadline elapsed). The entry is not removed here —
+    /// its `po` was already completed `TimedOut` by the caller, and its message +
+    /// refs are reclaimed at the next [`promote_pending_send`] / at close (a drop
+    /// must not run under `SCHED`). Returns `true` if a matching held send was
+    /// found (idempotent; a no-op if it was already delivered/removed).
+    ///
+    /// [`promote_pending_send`]: IpcChannel::promote_pending_send
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn promote_pending_send(obj: *mut ()) -> Option<ObjectRef> {
+    pub(crate) unsafe fn cancel_pending_send(obj: *mut (), po: *mut ()) -> bool {
         let inner = unsafe { Self::inner(obj) };
-        if inner.recv.is_full() || inner.pending_sends.is_empty() {
-            return None; // no freed slot, or nothing waiting
+        if let Some(p) = inner.pending_sends.iter_mut().find(|p| p.po.as_ptr() == po) {
+            p.cancelled = true;
+            true
+        } else {
+            false
         }
-        let mut ps = inner.pending_sends.remove(0);
-        let pushed = inner.recv.push_from(&ps.msg, &mut ps.transfers);
-        debug_assert!(pushed, "promote into a non-full ring must succeed");
-        // `ps.msg` is Copy and `ps.transfers` are now all `None`; only `ps.po`
-        // (moved out below) carries a refcount. The rest drops harmlessly here.
-        Some(ps.po)
+    }
+
+    /// After a recv frees a slot, sweep out any **cancelled** (timed-out) held
+    /// sends — oldest first — collecting their droppable parts into `reclaimed`
+    /// for the caller to release **outside** `SCHED`, then promote the oldest
+    /// **live** sender into this endpoint's receive ring (FIFO): move its message
+    /// + transfers into `recv` and return its `PendingOperation` reference (the
+    /// caller completes it status 0 under `SCHED`, drops it outside). Returns
+    /// `None` if no live sender was promoted (the ring stays one slot freer).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn promote_pending_send(
+        obj: *mut (),
+        reclaimed: &mut [Option<ReclaimedSend>; Self::MAX_PENDING_SENDS],
+    ) -> Option<ObjectRef> {
+        let inner = unsafe { Self::inner(obj) };
+        let mut r = 0;
+        loop {
+            // Peek the front entry's `cancelled` flag (Copy) so the immutable
+            // borrow ends before the mutating `remove` below.
+            let cancelled = match inner.pending_sends.first() {
+                None => return None, // queue drained
+                Some(p) => p.cancelled,
+            };
+            if cancelled {
+                // Reclaim it (move its refs out for outside-SCHED drop); the
+                // message bytes are Copy and discarded.
+                let ps = inner.pending_sends.remove(0);
+                debug_assert!(r < reclaimed.len());
+                reclaimed[r] = Some(ReclaimedSend { po: ps.po, transfers: ps.transfers });
+                r += 1;
+                continue;
+            }
+            // The oldest live entry: deliver it into the freed ring slot.
+            if inner.recv.is_full() {
+                return None; // no freed slot to promote into
+            }
+            let mut ps = inner.pending_sends.remove(0);
+            let pushed = inner.recv.push_from(&ps.msg, &mut ps.transfers);
+            debug_assert!(pushed, "promote into a non-full ring must succeed");
+            return Some(ps.po);
+        }
     }
 
     /// Copy the `PendingOperation` pointers of every held sender into `out` (for
@@ -881,6 +946,10 @@ mod tests {
         core::array::from_fn(|_| None)
     }
 
+    fn empty_reclaim() -> [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS] {
+        core::array::from_fn(|_| None)
+    }
+
     #[test]
     fn blocking_send_to_ring_with_space_delivers_immediately() {
         init_global_heap();
@@ -897,7 +966,7 @@ mod tests {
             let mut d = a_msg(0, 0);
             assert!(pop_no_xfer(b, &mut d));
             assert_eq!(d.payload[0], 7);
-            assert!(IpcChannel::promote_pending_send(b).is_none());
+            assert!(IpcChannel::promote_pending_send(b, &mut empty_reclaim()).is_none());
         }
         drop(po);
         drop_endpoint(a);
@@ -926,7 +995,7 @@ mod tests {
             assert!(pop_no_xfer(b, &mut d));
             assert_eq!(d.payload[0], 0);
             // Promote the held sender into b's ring; returns its PO reference.
-            let promoted = IpcChannel::promote_pending_send(b);
+            let promoted = IpcChannel::promote_pending_send(b, &mut empty_reclaim());
             assert!(promoted.is_some());
             // Drain the rest: 1, 2, 3, then the promoted 99 (FIFO preserved).
             for expect in [1u8, 2, 3, 99] {
@@ -934,7 +1003,7 @@ mod tests {
                 assert!(pop_no_xfer(b, &mut dd));
                 assert_eq!(dd.payload[0], expect, "FIFO order");
             }
-            assert!(IpcChannel::promote_pending_send(b).is_none());
+            assert!(IpcChannel::promote_pending_send(b, &mut empty_reclaim()).is_none());
             drop(promoted); // the queue's PO reference (clone)
         }
         drop(po); // creation reference → last ref, PO destroyed
@@ -971,5 +1040,74 @@ mod tests {
         drop(po); // last ref → PO destroyed
         assert_eq!(test_probe::pending_op_destroys(), 1);
         drop_endpoint(a);
+    }
+
+    #[test]
+    fn cancel_marks_the_matching_held_send() {
+        init_global_heap();
+        let (a, b) = new_pair();
+        let po = make_po();
+        // SAFETY: live endpoints/PO; single-threaded test stands in for SCHED.
+        unsafe {
+            for i in 0..4u8 {
+                push_no_xfer(a, &a_msg(i, 1));
+            }
+            let mut t = empty_xfer();
+            assert_eq!(
+                IpcChannel::send_or_queue(a, &a_msg(99, 1), &mut t, &po),
+                BlockSendOutcome::Queued
+            );
+            // Cancel finds the held send by its PO; an unknown PO is a no-op.
+            assert!(!IpcChannel::cancel_pending_send(b, 0xDEAD as *mut ()));
+            assert!(IpcChannel::cancel_pending_send(b, po.as_ptr()));
+        }
+        // The cancelled (un-promoted) send is reclaimed via b's Inner drop.
+        drop(po);
+        drop_endpoint(a);
+        drop_endpoint(b);
+    }
+
+    #[test]
+    fn recv_sweeps_cancelled_then_promotes_the_live_send() {
+        init_global_heap();
+        test_probe::reset();
+        let (a, b) = new_pair();
+        let po1 = make_po(); // will be cancelled (timed out)
+        let po2 = make_po(); // will be delivered
+        // SAFETY: live endpoints/POs; single-threaded test stands in for SCHED.
+        unsafe {
+            for i in 0..4u8 {
+                push_no_xfer(a, &a_msg(i, 1));
+            }
+            let mut t1 = empty_xfer();
+            assert_eq!(
+                IpcChannel::send_or_queue(a, &a_msg(50, 1), &mut t1, &po1),
+                BlockSendOutcome::Queued
+            );
+            let mut t2 = empty_xfer();
+            assert_eq!(
+                IpcChannel::send_or_queue(a, &a_msg(51, 1), &mut t2, &po2),
+                BlockSendOutcome::Queued
+            );
+            // po1 times out.
+            assert!(IpcChannel::cancel_pending_send(b, po1.as_ptr()));
+            // A recv frees a slot: promote sweeps the cancelled po1 (reclaimed)
+            // and delivers the live po2.
+            let mut d = a_msg(0, 0);
+            assert!(pop_no_xfer(b, &mut d));
+            let mut rc = empty_reclaim();
+            let promoted = IpcChannel::promote_pending_send(b, &mut rc);
+            assert_eq!(promoted.as_ref().map(|p| p.as_ptr()), Some(po2.as_ptr()));
+            assert_eq!(rc[0].as_ref().map(|r| r.po.as_ptr()), Some(po1.as_ptr()));
+            assert!(rc[1].is_none(), "only the one cancelled send was swept");
+            drop(promoted); // release po2's queue ref
+            drop(rc); // release po1's queue ref (the reclaimed entry)
+        }
+        // Both creation refs now the last → both POs destroyed.
+        drop(po1);
+        drop(po2);
+        assert_eq!(test_probe::pending_op_destroys(), 2);
+        drop_endpoint(a);
+        drop_endpoint(b);
     }
 }
