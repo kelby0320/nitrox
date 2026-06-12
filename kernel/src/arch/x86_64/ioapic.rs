@@ -59,8 +59,15 @@ static IOAPIC_BASE: AtomicU64 = AtomicU64::new(0);
 static IOAPIC_GSI_BASE: AtomicU32 = AtomicU32::new(0);
 /// Number of redirection-table entries (GSIs this IOAPIC covers).
 static IOAPIC_MAX_ENTRIES: AtomicU32 = AtomicU32::new(0);
-/// PIT interrupt counter, bumped by the self-test handler.
+/// PIT interrupt counter, bumped by the self-test ISR handler.
 static PIT_TICKS: AtomicU32 = AtomicU32::new(0);
+/// PIT deferred-call counter, bumped by the self-test's DPC handler — proves the
+/// ISR → DPC → handler path (the ISR enqueues `PIT_DPC`; the device-IRQ dispatch
+/// tail drains it).
+static PIT_DPC_RUNS: AtomicU32 = AtomicU32::new(0);
+/// The DPC the PIT self-test ISR queues — a `static` so queuing it allocates
+/// nothing, the model real device drivers use (an inline DPC in the IRP).
+static PIT_DPC: crate::dpc::Dpc = crate::dpc::Dpc::new(pit_dpc_handler, core::ptr::null_mut());
 
 /// Read an IOAPIC register by index (IOREGSEL → IOWIN).
 ///
@@ -169,6 +176,15 @@ unsafe fn set_rte_mask(gsi: u32, masked: bool) {
 /// The self-test interrupt handler: count PIT ticks. (EOI is the dispatcher's.)
 extern "C" fn pit_tick() {
     PIT_TICKS.fetch_add(1, Ordering::Relaxed);
+    // Defer the "real work" to a DPC — the ISR → DPC pattern device drivers use
+    // (an AHCI completion ISR queues a DPC that runs the IRP completion). Here it
+    // just bumps a counter, drained at the device-IRQ dispatch tail.
+    crate::dpc::enqueue(&PIT_DPC);
+}
+
+/// The PIT self-test's deferred-call handler — runs at the interrupt tail.
+fn pit_dpc_handler(_ctx: *mut ()) {
+    PIT_DPC_RUNS.fetch_add(1, Ordering::Relaxed);
 }
 
 /// Program PIT channel 0 as a ~`PIT_INPUT_HZ / count` Hz rate generator (mode 2)
@@ -265,6 +281,7 @@ impl ArchIrqRouter for X86IoApic {
         let (gsi, polarity, trigger) = resolve_isa_irq(0, acpi::source_overrides());
         let vector = idt::register_device_handler(pit_tick);
         PIT_TICKS.store(0, Ordering::Relaxed);
+        PIT_DPC_RUNS.store(0, Ordering::Relaxed);
 
         // Route the PIT's GSI to our vector on the boot CPU, and start the PIT.
         // SAFETY: ring-0, post-init; the handler for `vector` is registered.
@@ -290,10 +307,11 @@ impl ArchIrqRouter for X86IoApic {
         // SAFETY: ring-0; mask the line again (the PIT free-runs, ignored).
         unsafe { Self::mask(gsi) };
         crate::kprintln!(
-            "ioapic: routed PIT IRQ0\u{2192}GSI{}\u{2192}vec{:#x}; took {} interrupts",
+            "ioapic: routed PIT IRQ0\u{2192}GSI{}\u{2192}vec{:#x}; took {} interrupts ({} via DPC)",
             gsi,
             vector,
             PIT_TICKS.load(Ordering::Relaxed),
+            PIT_DPC_RUNS.load(Ordering::Relaxed),
         );
     }
 }

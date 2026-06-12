@@ -22,6 +22,7 @@ use core::panic::PanicInfo;
 use nitrox_kernel::arch;
 use nitrox_kernel::arch::cpu::ArchCpu;
 use nitrox_kernel::arch::paging::ArchPaging;
+use nitrox_kernel::dpc;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
@@ -164,6 +165,15 @@ fn kernel_main() {
             arch::Timer::timer_hz() / 1_000_000,
             arch::Timer::read_ns(),
         );
+    }
+
+    // Reserve the DPC (deferred-procedure-call) queue before any interrupt can
+    // enqueue onto it — the IOAPIC self-test below routes the PIT, whose ISR
+    // queues a DPC, and device IRQs queue DPCs in general. Needs the allocator
+    // (it reserves its backing list once); never allocates again.
+    if dpc::init().is_err() {
+        kprintln!("DPC queue init failed — halting");
+        return;
     }
 
     // Bring up the system interrupt router (the IOAPIC) so external device

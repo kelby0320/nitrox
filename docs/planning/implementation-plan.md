@@ -794,9 +794,15 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   facts, masks the 8259s, and a PIT self-test proves GSI→IOAPIC→vector→ISR→EOI
   end-to-end. See the decision log (2026-06-11). (The `IrqSpinLock` audit for
   new IRQ-reachable locks lands with the DPC item / real device handlers.)
-- [ ] **DPC / softirq queue**, wired into the timer-tick wakeup path (the
-  Phase-1 "DPC integration for wakeup" deferral). Device IRQ handlers defer
-  their real work here (no allocation / unbounded work in IRQ context).
+- [x] **DPC / softirq queue** (the Phase-1 "DPC integration for wakeup"
+  deferral). Device IRQ handlers defer their real work here (no allocation /
+  unbounded work in IRQ context). **Done** (`phase-2/dpc`): `kernel/src/dpc.rs`
+  — an inline `Dpc { handler, ctx, queued }` + a pre-reserved global queue
+  (single-CPU stand-in, per-CPU at SMP); `enqueue` from an ISR, `run_pending`
+  drained at the interrupt-dispatch tail (a leaf `IrqSpinLock`). The timer's own
+  deadline-firing stays inline (timekeeping work, not migrated — a correction to
+  `drivers-and-irps.md`); the queue serves device ISRs. Proven by the PIT
+  self-test driving a DPC end-to-end. See the decision log (2026-06-12).
 - [ ] **Demand-paging `#PF` handler** (not-present fault → active-AS VMA
   lookup → fault-in) **+ `MappingKind::FileBacked`** VMA variant. Completes
   the Phase-1 `#PF` stub and the `Anonymous`-only `MappingKind`. Unblocks

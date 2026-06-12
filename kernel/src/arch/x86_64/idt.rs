@@ -377,6 +377,9 @@ extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
     // SAFETY: ring-0, only ever reached from the timer IRQ after `Irq::init`
     // mapped the local APIC; a single MMIO write acknowledges the interrupt.
     unsafe { crate::arch::Irq::eoi() };
+    // Drain any pending DPCs before the tick's reschedule, so threads a device
+    // DPC woke are already in `ready` when `on_timer_tick` picks the next one.
+    crate::dpc::run_pending();
     crate::sched::on_timer_tick();
 }
 
@@ -423,6 +426,9 @@ extern "C" fn device_irq_dispatch(frame: *mut ExceptionFrame) {
     }
     // SAFETY: ring-0, reached only from a device IRQ after `Irq::init`.
     unsafe { crate::arch::Irq::eoi() };
+    // Run any DPCs the handler queued — the deferred completion work (run at the
+    // interrupt tail, IF=0; see `crate::dpc`).
+    crate::dpc::run_pending();
 }
 
 /// Register `handler` for the next free device-IRQ vector and return that
