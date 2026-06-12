@@ -141,7 +141,13 @@ pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadEr
         }
     }
 
-    // Allocate the initial stack VMA.
+    // Reserve the initial stack VMA **lazily**: no frames are allocated here
+    // — each page is faulted in (zeroed) on first touch by
+    // `AddressSpace::fault_in`. The stack is the clean demand-paging candidate:
+    // pure zero-fill, with no loader-written content (the userspace entry is
+    // register-based — no argv/envp/auxv is placed on the stack). PT_LOAD
+    // segments below stay eager because the loader copies file bytes into their
+    // frames. See docs/architecture and docs/rationale/deferred-decisions.md.
     let stack_range = VAddrRange::new(
         VirtAddr::new(STACK_TOP - STACK_SIZE),
         VirtAddr::new(STACK_TOP),
@@ -153,8 +159,10 @@ pub fn load_elf(asp: &AddressSpace, bytes: &[u8]) -> Result<EntryInfo, ElfLoadEr
         MappingKind::Anonymous,
     ))
     .map_err(|_| ElfLoadError::OutOfMemory)?;
-    match asp.map_vma(stack_vma) {
+    match asp.map_vma_lazy(stack_vma) {
         Ok(()) => {}
+        // map_vma_lazy allocates nothing, so OutOfMemory cannot occur; the
+        // arm remains for exhaustiveness over MapError.
         Err((_, MapError::OutOfMemory)) => return Err(ElfLoadError::OutOfMemory),
         Err((_, MapError::Overlap)) => return Err(ElfLoadError::SegmentOverlap),
         Err((_, MapError::NotCanonical | MapError::NotUserHalf)) => {
@@ -699,7 +707,9 @@ mod tests {
     }
 
     #[test]
-    fn stack_vma_lives_at_fixed_top_of_user_space() {
+    fn stack_vma_is_reserved_lazily_at_fixed_top_of_user_space() {
+        use crate::mm::addr_space::FaultIn;
+        use crate::mm::vmm::FaultAccess;
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let bytes = ElfBuilder::new()
@@ -707,12 +717,24 @@ mod tests {
             .build();
         let info = load_elf(&asp, &bytes).expect("load must succeed");
         assert_eq!(info.stack_top, VirtAddr::new(STACK_TOP));
-        // The first byte of the stack region (top - 1) must be
-        // mapped and zero-initialised.
+
+        // The stack is reserved lazily — its pages are NOT backed until first
+        // touch, so nothing translates yet.
         let last_stack_byte = VirtAddr::new(STACK_TOP - 1);
-        assert_eq!(read_user_byte(&asp, last_stack_byte), 0);
         let first_stack_byte = VirtAddr::new(STACK_TOP - STACK_SIZE);
-        assert_eq!(read_user_byte(&asp, first_stack_byte), 0);
+        assert!(
+            unsafe { Paging::translate(asp.root(), last_stack_byte) }.is_none(),
+            "stack must be demand-paged, not eagerly backed"
+        );
+
+        // Faulting a stack page in (as a real first stack write would) yields a
+        // freshly zero-filled page; an as-yet-untouched page stays unbacked.
+        assert_eq!(asp.fault_in(last_stack_byte, FaultAccess::Write), FaultIn::Mapped);
+        assert_eq!(read_user_byte(&asp, last_stack_byte), 0);
+        assert!(
+            unsafe { Paging::translate(asp.root(), first_stack_byte) }.is_none(),
+            "an untouched stack page must remain unbacked"
+        );
     }
 
     /// The ELF `PF_R` (readable) bit. The loader doesn't consult it

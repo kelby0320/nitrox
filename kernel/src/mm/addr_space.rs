@@ -29,11 +29,15 @@
 //!   today, so the TLB never holds entries for the new mappings. When
 //!   the scheduler arrives it will gain a `set_active` entry point
 //!   that takes responsibility for flushing.
-//! - **Eager anonymous allocation.** `map_vma` allocates one frame per
-//!   page up front. Lazy on-fault allocation is a real OS pattern but
-//!   needs a working page-fault handler — the current one is dump-and-
-//!   halt. Eager allocation works today; the switch to lazy will come
-//!   with the upgraded `#PF` handler.
+//! - **Eager vs lazy anonymous allocation.** [`map_vma`](AddressSpace::map_vma)
+//!   allocates one frame per page up front; [`map_vma_lazy`](AddressSpace::map_vma_lazy)
+//!   reserves the range with no frames and lets
+//!   [`fault_in`](AddressSpace::fault_in) back each page on first touch (the
+//!   demand-paging slice; the `#PF` handler now resolves not-present user
+//!   faults against the VMA tree). The ELF loader reserves stacks lazily;
+//!   object- and the (future) file-backed paths have their own backing
+//!   sources. Lazy `MemoryObject` backing — which would lift the eager-
+//!   allocation DoS cap — is the next consumer of this machinery.
 //! - **Intermediate page-table frames are not reclaimed on unmap.**
 //!   This matches the deferred decision documented for
 //!   `ArchPaging::unmap_page` (see [deferred-decisions.md]). `Drop`
@@ -50,7 +54,7 @@ use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_VIR
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, SpinLock};
-use crate::mm::vmm::{MappingKind, Protection, VAddrRange, Vma, VmaTree};
+use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{MemoryObject, ObjectRef};
 
@@ -81,6 +85,29 @@ pub enum MapError {
     /// frame) failed. Any frames installed before the failure are
     /// rolled back before this is returned.
     OutOfMemory,
+}
+
+/// Outcome of [`AddressSpace::fault_in`] — the resolution of a page fault
+/// against this address space. Only [`Mapped`](FaultIn::Mapped) lets the
+/// faulting instruction retry; every other variant means the fault is fatal to
+/// the thread (the arch handler turns them into a SegFault notification).
+#[derive(Debug, PartialEq, Eq)]
+pub enum FaultIn {
+    /// A frame was faulted in (or was already present): the faulting
+    /// instruction may be retried.
+    Mapped,
+    /// No VMA covers the faulting address — an access to unmapped memory.
+    NoVma,
+    /// A VMA covers the address but does not permit the attempted access
+    /// (a write to a read-only mapping, or a fetch from a non-exec one).
+    Protection,
+    /// A VMA covers the address and permits the access, but a backing frame
+    /// could not be allocated.
+    Oom,
+    /// The address falls in a [`FileBacked`](MappingKind::FileBacked) mapping,
+    /// which has no page cache to serve it yet (no producer exists). Fatal
+    /// until the page-cache slice lands.
+    NoPageCache,
 }
 
 /// A per-process virtual address space.
@@ -232,6 +259,146 @@ impl AddressSpace {
                 rollback_partial_map(root, range.start(), installed);
                 Err((b, MapError::Overlap))
             }
+        }
+    }
+
+    /// Reserve an **anonymous** VMA without backing it: insert the `Vma` into
+    /// the tree but allocate **no** frames and install **no** PTEs. The pages
+    /// are faulted in lazily — zeroed one at a time on first touch — by
+    /// [`fault_in`](Self::fault_in) when the running thread takes a not-present
+    /// page fault in the range.
+    ///
+    /// This is the demand-paged counterpart to [`map_vma`](Self::map_vma)'s
+    /// eager allocation. It is anonymous-only: object- and (future)
+    /// file-backed mappings have their own backing-frame sources.
+    /// `boxed.mapping` must be [`MappingKind::Anonymous`].
+    ///
+    /// Same canonicality / user-half / overlap rejections as `map_vma`; the
+    /// box is returned on any rejection. Allocates nothing, so the only error
+    /// is a structural rejection — never [`OutOfMemory`](MapError::OutOfMemory).
+    pub fn map_vma_lazy(&self, boxed: KBox<Vma>) -> Result<(), (KBox<Vma>, MapError)> {
+        debug_assert_eq!(
+            boxed.mapping,
+            MappingKind::Anonymous,
+            "map_vma_lazy is for anonymous mappings only"
+        );
+        let range = boxed.range;
+
+        // Endpoint canonicality (same reasoning as map_vma: test end-1).
+        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
+        if !range.start().is_canonical() || !last_byte.is_canonical() {
+            return Err((boxed, MapError::NotCanonical));
+        }
+        if range.end().as_u64() > USER_VIRT_END {
+            return Err((boxed, MapError::NotUserHalf));
+        }
+
+        let mut guard = self.inner.lock();
+        if guard.vma_tree.find_first_overlapping(range).is_some() {
+            return Err((boxed, MapError::Overlap));
+        }
+
+        // No frame allocation, no PTE install — the range is reserved in the
+        // tree only; `fault_in` backs each page on demand.
+        match guard.vma_tree.insert(boxed) {
+            Ok(()) => Ok(()),
+            // Unreachable: overlap was pre-checked under the same lock.
+            Err(b) => Err((b, MapError::Overlap)),
+        }
+    }
+
+    /// Resolve a page fault at `addr` for the access `access`, against this
+    /// (currently-loaded) address space. Called from the architecture's
+    /// page-fault handler for a **not-present** ring-3 fault, before it falls
+    /// back to delivering a fatal segmentation fault.
+    ///
+    /// Looks up the covering VMA, checks the attempted access against its
+    /// protection, and — for an [`Anonymous`](MappingKind::Anonymous) mapping —
+    /// allocates and zeroes one frame, installs the leaf PTE for the faulting
+    /// page, and flushes that page's stale (not-present) TLB entry. Returns
+    /// [`FaultIn::Mapped`] on success (the instruction may retry); every other
+    /// outcome is fatal to the thread.
+    ///
+    /// The faulting address space **is live in the MMU** when this runs (unlike
+    /// the eager `map_vma`, which maps into a not-yet-loaded AS), so the TLB
+    /// flush here is mandatory: the CPU cached the not-present translation when
+    /// it faulted.
+    pub fn fault_in(&self, addr: VirtAddr, access: FaultAccess) -> FaultIn {
+        // The page-table install writes through `guard.root` (a `PhysAddr`
+        // copied out below), not through the guard, and the tree is only read
+        // here — so an immutable guard suffices.
+        let guard = self.inner.lock();
+
+        let Some(vma) = guard.vma_tree.find_covering(addr) else {
+            return FaultIn::NoVma;
+        };
+
+        // Protection check: a present VMA is always readable, so only writes
+        // and instruction fetches can be refused.
+        match access {
+            FaultAccess::Write if !vma.prot.contains(Protection::WRITE) => {
+                return FaultIn::Protection;
+            }
+            FaultAccess::Execute if !vma.prot.contains(Protection::EXEC) => {
+                return FaultIn::Protection;
+            }
+            _ => {}
+        }
+
+        let flags = protection_to_page_flags(vma.prot);
+        let kind = vma.mapping;
+        let root = guard.root;
+        // Round the faulting address down to its page base.
+        let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
+
+        match kind {
+            MappingKind::Anonymous => {
+                let Some(phys) = heap::buddy_alloc(0) else {
+                    return FaultIn::Oom;
+                };
+                // SAFETY: `phys` was just allocated, is not aliased, and is
+                // HHDM-reachable; we zero the whole frame before it is mapped.
+                unsafe {
+                    let v = (phys.as_u64() + heap::hhdm_offset()) as *mut u8;
+                    ptr::write_bytes(v, 0, PAGE_SIZE);
+                }
+                // SAFETY: `root` is this AS's PML4; `phys` is the fresh,
+                // zeroed frame; `page_base` is the page-aligned faulting
+                // address, in the validated user-half VMA range. The PTE is
+                // absent (this was a not-present fault), so `map_page` installs
+                // a new leaf rather than aliasing.
+                match unsafe { Paging::map_page(root, page_base, phys, flags) } {
+                    Ok(()) => {}
+                    Err(ArchMapError::OutOfMemory) => {
+                        heap::buddy_free(phys, 0);
+                        return FaultIn::Oom;
+                    }
+                    // Impossible: not-present fault ⇒ no existing PTE; and
+                    // `page_base` is page-aligned by construction.
+                    Err(ArchMapError::AlreadyMapped | ArchMapError::Misaligned) => {
+                        heap::buddy_free(phys, 0);
+                        unreachable!(
+                            "fault_in: map_page rejected a fresh page-aligned not-present mapping"
+                        );
+                    }
+                }
+                // SAFETY: ring-0 `invlpg` evicting the not-present entry the
+                // CPU cached for this page on the fault we are servicing.
+                unsafe {
+                    Paging::flush_tlb_page(page_base);
+                }
+                crate::mm::record_demand_fault();
+                FaultIn::Mapped
+            }
+            // Object mappings are installed eagerly by `map_object`; a
+            // not-present fault on one is a bug or a torn-down race — treat it
+            // as an access to nothing.
+            MappingKind::Object => FaultIn::NoVma,
+            // TODO(phase-2 page cache): page the file's content in from the
+            // cache. No producer constructs a FileBacked VMA yet, so this arm
+            // is currently unreachable; until the page cache lands a fault here
+            // is fatal. See docs/rationale/deferred-decisions.md.
+            MappingKind::FileBacked => FaultIn::NoPageCache,
         }
     }
 
@@ -402,6 +569,11 @@ fn free_vma_pages(root: PhysAddr, vma: &Vma) {
                 // on its last-ref drop — which includes this VMA's `object`
                 // reference being released when `vma` drops — never here.
                 MappingKind::Object => {}
+                // TODO(phase-2 page cache): file pages are owned by the page
+                // cache, not this mapping, so (like Object) the PTE is removed
+                // but the frame is not freed here. No FileBacked VMA is ever
+                // constructed yet, so this arm is currently unreachable.
+                MappingKind::FileBacked => {}
             }
         }
     }
@@ -721,5 +893,123 @@ mod tests {
         let r = asp.find_free_range(PAGE).expect("empty AS has room");
         assert_eq!(r.start().as_u64(), MMAP_BASE);
         assert_eq!(r.len(), PAGE);
+    }
+
+    // --- Demand paging: lazy reservation + on-fault backing --------------
+
+    /// Probe whether a page currently translates in `asp`.
+    fn is_mapped(asp: &AddressSpace, v: VirtAddr) -> bool {
+        // SAFETY: read-only walk of `asp`'s own page tables.
+        unsafe { Paging::translate(asp.root(), v) }.is_some()
+    }
+
+    #[test]
+    fn map_vma_lazy_installs_no_ptes() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let r = range(PAGE * 4, PAGE * 8);
+        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER))
+            .expect("lazy reserve must succeed");
+        // The VMA is in the tree...
+        assert_eq!(asp.len(), 1);
+        // ...but no page is backed yet.
+        for i in 4..8 {
+            assert!(!is_mapped(&asp, va(PAGE * i)), "page {i} unexpectedly backed");
+        }
+    }
+
+    #[test]
+    fn fault_in_backs_one_anonymous_page_on_demand() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let r = range(PAGE * 4, PAGE * 8);
+        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER))
+            .unwrap();
+
+        // Fault in only the page at PAGE*5 (a sub-page-aligned address rounds
+        // down to its page base).
+        let outcome = asp.fault_in(va(PAGE * 5 + 0x40), FaultAccess::Write);
+        assert_eq!(outcome, FaultIn::Mapped);
+        assert!(is_mapped(&asp, va(PAGE * 5)), "faulted page not backed");
+        // Its neighbours stay unbacked — fault-in is per-page, not per-VMA.
+        assert!(!is_mapped(&asp, va(PAGE * 4)));
+        assert!(!is_mapped(&asp, va(PAGE * 6)));
+    }
+
+    #[test]
+    fn fault_in_with_no_covering_vma_is_no_vma() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        assert_eq!(asp.fault_in(va(PAGE * 9), FaultAccess::Read), FaultIn::NoVma);
+    }
+
+    #[test]
+    fn fault_in_write_to_readonly_is_protection() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        // USER but not WRITE: a read-only user mapping.
+        asp.map_vma_lazy(anon_box(range(PAGE * 4, PAGE * 5), Protection::USER))
+            .unwrap();
+        assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Write), FaultIn::Protection);
+        // Refused — still unbacked.
+        assert!(!is_mapped(&asp, va(PAGE * 4)));
+        // A read to the same range is permitted and backs the page.
+        assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Read), FaultIn::Mapped);
+        assert!(is_mapped(&asp, va(PAGE * 4)));
+    }
+
+    #[test]
+    fn fault_in_exec_from_nonexec_is_protection() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        // WRITE|USER but not EXEC.
+        asp.map_vma_lazy(anon_box(
+            range(PAGE * 4, PAGE * 5),
+            Protection::WRITE | Protection::USER,
+        ))
+        .unwrap();
+        assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Execute), FaultIn::Protection);
+        assert!(!is_mapped(&asp, va(PAGE * 4)));
+    }
+
+    #[test]
+    fn dropping_a_partially_faulted_lazy_as_frees_only_backed_frames() {
+        // A lazily-reserved 4-page VMA with only 2 pages faulted in: unmap
+        // must free the 2 backed frames and skip the 2 never-backed pages
+        // (their unmap_page returns Err and is ignored) — no panic, no leak.
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let r = range(PAGE * 4, PAGE * 8);
+        asp.map_vma_lazy(anon_box(r, Protection::WRITE | Protection::USER))
+            .unwrap();
+        assert_eq!(asp.fault_in(va(PAGE * 4), FaultAccess::Write), FaultIn::Mapped);
+        assert_eq!(asp.fault_in(va(PAGE * 6), FaultAccess::Write), FaultIn::Mapped);
+
+        let removed = asp.unmap_covering(va(PAGE * 5)).expect("covering vma");
+        assert_eq!(removed.range, r);
+        assert!(asp.is_empty());
+        // Every page — backed or not — is unmapped afterwards.
+        for i in 4..8 {
+            assert!(!is_mapped(&asp, va(PAGE * i)), "page {i} still mapped");
+        }
+    }
+
+    #[test]
+    fn fault_in_is_idempotent_friendly_across_a_lazy_drop() {
+        // Repeatedly build, lazily reserve, fault a few pages, and drop: this
+        // would exhaust the test heap if drop leaked the demand-faulted frames.
+        init_global_heap();
+        for _ in 0..8 {
+            let asp = AddressSpace::new().unwrap();
+            asp.map_vma_lazy(anon_box(
+                range(PAGE * 4, PAGE * 12),
+                Protection::WRITE | Protection::USER,
+            ))
+            .unwrap();
+            for i in 4..12u64 {
+                assert_eq!(asp.fault_in(va(PAGE * i), FaultAccess::Write), FaultIn::Mapped);
+            }
+            // Drop frees all eight faulted frames + the PML4.
+        }
     }
 }

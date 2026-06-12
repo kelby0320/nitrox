@@ -3372,3 +3372,74 @@ dedup/requeue/empty); `qemu` on q35 logs `ioapic: routed PIT IRQ0→GSI2→vec0x
 took 3 interrupts (3 via DPC)` — the ISR→enqueue→drain→handler path end-to-end —
 and the scheduler + userspace demo run unchanged. Branch `phase-2/dpc` off `main`
 (includes merged PRs #32, #33). Next: `phase-2/demand-paging`.
+
+## 2026-06-12 — Phase 2 prereq: demand paging (`#PF` fault-in + lazy anonymous + `FileBacked`)
+
+Fifth Phase 2 prerequisite (`phase-2/demand-paging`). Closes two Phase-1 stubs the
+page cache depends on: the `#PF` handler did no fault-in (any genuine ring-3 fault →
+SegFault), and anonymous VMAs were eager (`map_vma` allocated + zeroed every page up
+front).
+
+**Design.** A neutral `AddressSpace::fault_in(addr, access) -> FaultIn` (`mm/addr_space.rs`):
+under the rank-4 AS lock, look up the covering VMA (`VmaTree::find_covering`), check
+the attempted access (`FaultAccess::{Read,Write,Execute}`) against the VMA's
+`Protection`, and for an `Anonymous` page allocate + zero one frame, install the leaf
+PTE (`Paging::map_page`), and **flush** the stale not-present TLB entry
+(`Paging::flush_tlb_page`) — the faulting AS *is* live in the MMU, unlike eager
+`map_vma`. `FaultIn` is `{Mapped, NoVma, Protection, Oom, NoPageCache}`; only `Mapped`
+retries. `map_vma_lazy` reserves an anonymous VMA with **no** frames (same structural
+rejections as `map_vma`, allocates nothing). The x86 `#PF` handler (`pf_dispatch`)
+decodes the error code (bit0 present, bit1 write, bit4 insn) into a neutral
+`FaultAccess` and, for a **not-present ring-3** fault, calls `fault_in` *before* the
+fatal `user_fault` path; success `iretq`s and the instruction retries.
+
+**Decisions.**
+- **Lazy scope = the ELF stack.** The loader reserves the user stack via
+  `map_vma_lazy`; PT_LOAD segments stay eager (the loader copies file bytes into their
+  frames via the HHDM, so the frames must exist at load time). The stack is the clean
+  candidate — pure zero-fill, register-based bootstrap, no argv/envp/auxv written to
+  it — so every userspace process now demand-faults its stack on first use, exercising
+  the real path with no extra wiring. (Demonstrated live: the `parent` demo runs to
+  completion on a demand-faulted stack; plus a boot smoke test `demand-paging:
+  on-fault path OK`.)
+  - *Lazy vs eager for today's tiny stack (raised 2026-06-12).* The stack is only 4
+    pages (`DEFAULT_USER_STACK_SIZE`), so eager would also be fine — the memory/zeroing
+    savings from lazy are negligible at this size. Kept lazy anyway because: (1) it is
+    the only *live* exerciser of the real hardware `#PF → pf_dispatch → fault_in → iretq`
+    path (the boot smoke test calls `fault_in` directly on a non-active AS; the host
+    tests are pure logic — neither triggers an actual fault); (2) it is the design a
+    realistic stack must adopt — a larger grow-down reservation with an unmapped **guard
+    page** below it requires demand paging, and cannot be expressed with full eager
+    commit; (3) the cost is a one-time first-touch fault per page actually used (a
+    context switch never touches the user stack, so it does not refault) — not a
+    per-switch cost. A guard page is a natural follow-up.
+- **`MappingKind::FileBacked` added now** (variant + `fault_in` arm `→ NoPageCache` +
+  `free_vma_pages` arm), even though no producer constructs one yet — it establishes
+  the dispatch shape the page-cache slice fills in. Tracked in `deferred-decisions.md`
+  with TODOs; dead but documented.
+- **Ring-3 only.** `fault_in` is reached solely for `cs & 3 == 3` faults, so the
+  faulting thread holds no kernel locks (no self-deadlock on the AS lock), and kernel
+  copy-primitive faults are caught earlier by the user-access recovery table.
+  Corollary: kernel access to a not-yet-faulted user page is **not** auto-populated;
+  nothing does that today (the stack carries no loader-written content) — revisit when
+  argv-on-stack / the page cache need it.
+- **`regs::invlpg` is a no-op under `cfg(test)`.** It is the first host-tested code
+  path to flush the TLB; `invlpg` `#GP`s in the ring-3 test process. The kernel always
+  runs ring 0 and the eviction has no host-observable effect, so a test build elides
+  it — letting `fault_in` be exercised host-side.
+
+This unblocks lazy `MemoryObject` backing (lifting the `MemoryObject::MAX_SIZE` DoS
+cap — still needs a sparse per-object frame table + `Process` accounting) and the page
+cache.
+
+ABI impact: none. `MappingKind` is an internal mm enum (not an ABI-boundary type);
+`FileBacked` is appended last, preserving existing discriminants. Verified: `check-arch`
+clean (`fault_in`/`FaultAccess`/`FileBacked` are neutral mm code; the arch handler
+reaches them via `crate::mm`/`crate::arch::Paging`); `build` clean (no warnings);
+`test` 397 host tests (+7 demand-paging: lazy-no-PTE / per-page fault-in / no-VMA /
+write-to-RO / exec-from-NX / partial-drop-frees / repeated-drop-no-leak; the elf
+stack test rewritten for lazy reservation); `qemu` on q35 logs `demand-paging:
+on-fault path OK — 2 anonymous pages backed lazily` and the scheduler + userspace
+`parent` demo run unchanged on demand-faulted stacks. Branch `phase-2/demand-paging`
+off `main` (includes merged PR #34). Next: `phase-2/pending-operation` (async-I/O) or
+`phase-2/dma-alloc`.

@@ -167,24 +167,48 @@ impl core::ops::BitOr for Protection {
 
 /// What backs a [`Vma`]'s pages.
 ///
-/// `FileBacked(Handle)` lands with the page-cache and fs-server integration
-/// in Phase 2; `Device(PhysAddr)` lands with the driver MMIO mapper. The enum
-/// is a `Copy` marker — the per-mapping owning reference for [`Object`] lives
-/// in [`Vma::object`], not here, so the enum stays `Copy`/`Eq`. Adding a
-/// variant only touches the call sites that need to act on the new backing
-/// kind (notably the `match` in `AddressSpace::free_vma_pages`).
+/// `Device(PhysAddr)` lands with the driver MMIO mapper. The enum is a `Copy`
+/// marker — the per-mapping owning reference for [`Object`] lives in
+/// [`Vma::object`], not here, so the enum stays `Copy`/`Eq`. Adding a variant
+/// only touches the call sites that need to act on the new backing kind
+/// (notably the `match`es in `AddressSpace::free_vma_pages` and
+/// `AddressSpace::fault_in`).
 ///
 /// [`Object`]: MappingKind::Object
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum MappingKind {
     /// Zero-initialised; backed by anonymous physical frames owned by the
-    /// VMA itself (allocated at map time, freed on unmap).
+    /// VMA itself. Frames are faulted in lazily on first touch (see
+    /// `AddressSpace::fault_in`) when reserved via `map_vma_lazy`, or
+    /// allocated up front by `map_vma`; either way freed on unmap.
     Anonymous,
     /// Backed by a [`MemoryObject`](crate::object::MemoryObject)'s own,
     /// pre-allocated frames. The owning [`ObjectRef`] is held in
     /// [`Vma::object`]; the frames are freed by the object on its last-ref
     /// drop, **not** by unmap.
     Object,
+    /// Backed by a file's pages served through the page cache. The variant and
+    /// its fault-in / teardown dispatch arms exist as of the demand-paging
+    /// slice, but **no producer constructs a `FileBacked` VMA yet** — the
+    /// page-cache and fs-server integration that fills them in is a later
+    /// Phase 2 slice. Until then a fault on such a mapping is a fatal fault.
+    FileBacked,
+}
+
+/// The kind of access that triggered a page fault, decoded from the
+/// architecture's fault information into an arch-neutral form. Drives the
+/// protection check in [`AddressSpace::fault_in`].
+///
+/// "Readable" subsumes any access that is not a write or an instruction fetch;
+/// a present VMA is always readable (see [`Protection`]).
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum FaultAccess {
+    /// A data read.
+    Read,
+    /// A data write.
+    Write,
+    /// An instruction fetch.
+    Execute,
 }
 
 /// Red-black tree node colour for the intrusive link in [`Vma`].

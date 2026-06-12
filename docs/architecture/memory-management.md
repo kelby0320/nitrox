@@ -321,11 +321,18 @@ updates both atomically; `unmap_covering` does the inverse.
   box, allocated before the lock) is handed back in the error tuple on
   any failure. Mapping the same object at two ranges installs PTEs to the
   same frames, so the two mappings alias.
-- **Eager anonymous allocation.** One frame per page is allocated at
-  `map_vma` time; on-demand allocation via the page-fault handler
-  would be the real-OS pattern but needs an upgraded `#PF` handler
-  (today's is dump-and-halt). The switch lands when the PF handler
-  does.
+- **Eager *or* lazy anonymous allocation.** `map_vma` allocates one
+  frame per page at map time; **`map_vma_lazy` reserves the range with
+  no frames** and lets the page-fault handler back each page on first
+  touch. `fault_in(addr, access)` looks up the covering VMA, checks the
+  attempted access against its protection, and for a `MappingKind::Anonymous`
+  page allocates + zeroes one frame, installs the leaf PTE, and flushes the
+  stale not-present TLB entry (the faulting AS is live in the MMU). The ELF
+  loader reserves user stacks lazily; PT_LOAD segments stay eager because the
+  loader copies file bytes into their frames. `MappingKind::FileBacked` is the
+  page-cache backing kind — its enum variant and fault-in/teardown dispatch
+  arms exist, but no producer constructs one yet, so a fault on it is fatal
+  until the page cache lands.
 - **Frame ownership depends on the backing kind.**
   `ArchPaging::unmap_page` returns the `PhysAddr` it cleared;
   `unmap_covering` and `Drop` branch on `Vma.mapping`: for
@@ -559,9 +566,14 @@ management story.
   rodata section (bracketed by linker symbols). The `#PF` handler
   ([`arch::idt::pf_dispatch`](../../kernel/src/arch/x86_64/idt.rs))
   consults the table on every fault: on match it patches the saved
-  RIP to the recovery PC and `iretq`s; on miss it dump-and-halts.
-  The recovery code closes the SMAP window and signals failure to
-  the Rust wrapper.
+  RIP to the recovery PC and `iretq`s. The recovery code closes the
+  SMAP window and signals failure to the Rust wrapper. On a table
+  miss the handler branches on the fault: a **not-present ring-3**
+  fault is offered to `AddressSpace::fault_in` for demand paging
+  (success retries the instruction); a fault that cannot be served —
+  no covering VMA, a protection violation, or a non-user fault — is
+  fatal (a ring-3 fault becomes a `SegFault` notification + suspend;
+  a kernel fault dump-and-halts).
 - **User-access protections enabled at boot.**
   [`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs)
   runs in `paging_init`. On x86_64 it enables NX, SMEP, and SMAP

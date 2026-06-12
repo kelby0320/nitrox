@@ -20,6 +20,26 @@ pub mod vmm;
 #[cfg(test)]
 pub(crate) mod test_support;
 
+use core::sync::atomic::{AtomicU64, Ordering};
+
+/// Count of anonymous pages faulted in on demand by
+/// [`AddressSpace::fault_in`](addr_space::AddressSpace::fault_in) since boot.
+/// A diagnostic-only counter (relaxed, lock-free): it makes the otherwise-
+/// invisible demand-paging path observable — the boot demo logs it to prove
+/// lazily-reserved stacks are faulted in rather than eagerly allocated.
+static DEMAND_FAULTS: AtomicU64 = AtomicU64::new(0);
+
+/// Record one successful demand fault-in. Called from `fault_in` on each
+/// [`FaultIn::Mapped`](addr_space::FaultIn::Mapped) for an anonymous page.
+pub fn record_demand_fault() {
+    DEMAND_FAULTS.fetch_add(1, Ordering::Relaxed);
+}
+
+/// The number of anonymous pages faulted in on demand since boot.
+pub fn demand_fault_count() -> u64 {
+    DEMAND_FAULTS.load(Ordering::Relaxed)
+}
+
 /// Page size in bytes. The kernel uses 4 KiB pages on x86_64; large pages
 /// are an optimisation handled inside the VMM, not a different unit of
 /// allocation.

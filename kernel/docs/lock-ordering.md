@@ -18,7 +18,7 @@ enforced by code review.
 | 1    | Scheduler runqueue (`SCHED`, **`IrqSpinLock`**)| live as of Phase 1 slice 9 (scheduler) |
 | 2    | Wait queue                                   | reserved (Phase 1 folds wait/timer state into rank 1 — see § Wait queues) |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
-| 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3)      |
+| 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3); also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
 | 5    | IPC channel                                  | reserved (Phase 1 folds endpoint state into rank 1 — see § Wait queues) |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
@@ -106,6 +106,29 @@ Because it holds nothing, it ranks below every other lock: it is legal to
 higher-ranked `SCHED` inside a handler only after releasing `DPC_QUEUE`. Like the
 deadline heap and the per-object waiter lists, the queue is pre-reserved at boot
 (`dpc::init`) so `enqueue` never allocates in interrupt context.
+
+## The AddressSpace lock and the page-fault handler
+
+`AddressSpace::fault_in` (`kernel/src/mm/addr_space.rs`) is called from the x86
+`#PF` handler (`pf_dispatch`) to demand-fault a not-present ring-3 page. It takes
+the rank-4 `AddressSpace` lock — a plain `SpinLock` — from interrupt context.
+This is sound:
+
+- The `#PF` gate is an **interrupt gate**, so the handler runs with **IF=0**. No
+  other interrupt (timer, device IRQ) can fire and try to take the lock while it
+  is held; the handler acquires nothing higher-ranked first (it reaches the AS
+  through `current_process()`, which takes rank-1 `SCHED` *briefly and releases
+  it* before returning), so rank 4 is the only lock held during the fault-in.
+- It is reached **only for ring-3 faults** (`cs & 3 == 3`). A user thread never
+  holds the kernel `AddressSpace` lock, so the faulting context cannot already
+  own the lock the handler is about to take — no self-deadlock. Kernel
+  copy-primitive faults are caught earlier by the user-access recovery table and
+  never reach `fault_in`.
+
+The faulting address space **is live in the MMU**, so `fault_in` flushes the
+faulted page's stale not-present TLB entry after installing the PTE (unlike the
+eager `map_vma`, which maps into a not-yet-loaded address space and skips the
+flush).
 
 ## Handle-table segment growth releases rank 3 before rank 6
 
