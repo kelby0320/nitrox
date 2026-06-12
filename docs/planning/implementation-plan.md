@@ -815,12 +815,25 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   demo running on a demand-faulted stack. Unblocks lazy `MemoryObject` paging
   (the `MAX_SIZE` cap — needs a sparse object frame table + accounting) and the
   page cache. See the decision log (2026-06-12).
-- [ ] **`PendingOperation` kernel object + `sys_wait` I/O-completion
-  integration** (the long-promised "async-I/O slice"), plus the `Block` /
-  `BlockBounded` IPC send modes that were deferred to it, and the `IoRing`
-  transport if the rsproto wire format needs it. This is the blocking
-  primitive every device/fs request depends on. Gates the storage, fs-server,
-  and page-cache slices.
+- [x] **`PendingOperation` kernel object + `sys_wait` I/O-completion
+  integration** (the long-promised "async-I/O slice"). **Done**
+  (`phase-2/pending-operation`): a one-shot waitable `PendingOperation`
+  (`object/pending_op.rs`) wired into the generic wait/wake machinery (3 sched
+  dispatch arms + `signal_pending_op`); `sys_wait` reports its completion status
+  via `IoResult.status`. First consumer: the IPC **`Block`** send mode — a full
+  ring holds the message in a per-endpoint pending-sender queue and returns a PO
+  that completes (the message delivered) when the peer next receives; close
+  completes held senders `PeerClosed`. Proven by host tests + a parent demo
+  (`blocking send completed via PendingOperation`). **`BlockBounded`** (the
+  deadline-bounded variant) is carved out to its own follow-up (it needs the
+  deadline-heap kind extension + a `sys_channel_send` deadline arg) — still
+  `Unsupported`. `IoRing` lands with the rsproto transport when needed. Gates the
+  storage, fs-server, and page-cache slices. See the decision log (2026-06-12).
+- [ ] **IPC `BlockBounded` send mode** (follow-up to the above): the deadline-
+  bounded blocking send — a `Block` whose held message is cancelled (PO completed
+  `TimedOut`) if undelivered by a deadline. Needs the deadline-heap `Entry` to
+  grow a kind (Thread/Timer/PendingSend) + channel back-pointer, a timer-tick
+  timeout-cancel arm, and a deadline argument on `sys_channel_send`.
 - [ ] **DMA-capable allocation** (page-multiple alignment / a `dma_alloc`
   path; the `align > SLAB_SIZE` deferral). AHCI command lists / PRDTs need
   physically-contiguous aligned buffers. Folded into the storage slice if not

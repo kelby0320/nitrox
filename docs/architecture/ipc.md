@@ -72,10 +72,19 @@ blocked waiter's reference) at the moment the first one nulls it.
   parameters; `count` must be `0` for now. Also deferred: the async
   **`Notification::PeerClosed`** (the error half ships now; delivering the
   notification needs the channel→peer-process-notification-channel link).
-- **Deferred to the async-I/O slice:** `Block` / `BlockBounded` send modes and
-  the `PendingOperation`-returning send. `NoBlock` ships now (a bidirectional
-  endpoint cannot express both a readable and a writable wait edge through
-  `sys_wait`'s single signaled bit; blocking send wants a `PendingOperation`).
+- **`Block` send (live as of the async-I/O slice).** A bidirectional endpoint
+  cannot express both a readable and a writable wait edge through `sys_wait`'s
+  single signaled bit (recv waits for "queue non-empty / peer closed"; a blocking
+  send needs "queue has space"), so `Block` returns a `PendingOperation` for the
+  writable edge rather than overloading the endpoint. The message is **committed**
+  to the kernel — delivered straight into the peer's ring if it has space (the PO
+  is pre-completed), or held in a bounded per-endpoint **pending-sender queue**
+  and delivered (completing the PO) when the peer next receives. Closing an
+  endpoint completes its held senders with `PeerClosed`. The send never parks
+  inside the syscall (the async-first rule); the caller `sys_wait`s on the
+  returned PO. **`BlockBounded`** (a `Block` with a delivery deadline) is still
+  `Unsupported` — a follow-up (it needs the deadline-heap kind + a send deadline
+  arg). See the decision log (2026-06-12).
 - **Demo:** `hello` creates a channel, holds both endpoints, sends a message to
   itself end0→end1, blocks on end1 via `sys_wait`, receives and verifies it,
   observes `WouldBlock` on an empty endpoint, then closes one end and observes

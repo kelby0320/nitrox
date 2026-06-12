@@ -3443,3 +3443,66 @@ on-fault path OK — 2 anonymous pages backed lazily` and the scheduler + usersp
 `parent` demo run unchanged on demand-faulted stacks. Branch `phase-2/demand-paging`
 off `main` (includes merged PR #34). Next: `phase-2/pending-operation` (async-I/O) or
 `phase-2/dma-alloc`.
+
+## 2026-06-12 — Phase 2 prereq: `PendingOperation` + async-I/O `sys_wait` + IPC `Block`
+
+Sixth Phase 2 prerequisite (`phase-2/pending-operation`) — the async-first blocking
+primitive (CLAUDE.md: *every potentially-blocking op returns a `PendingOperation`;
+the thread blocks on `sys_wait`, never inside another syscall*). `KObjectType::
+PendingOperation = 9` was already reserved but unimplemented; `sys_wait` rejected it
+and the IPC `Block`/`BlockBounded` send modes were `Unsupported`.
+
+**The object.** `object/pending_op.rs`: a one-shot waitable mirroring `Timer`
+(`#[repr(C)]`, `KObjectHeader` first, `UnsafeCell<Inner { signaled, status, waiters }>`
+touched only under the rank-1 `SCHED` lock). `signal(status)` is idempotent (first
+completion wins); `status` is stable once signalled. Destructor + `test_probe` arms
+added.
+
+**Wait/wake.** The wait machinery is already generic — three `KObjectType::
+PendingOperation` dispatch arms (`obj_already_signaled`/`add_waiter`/`remove_waiter`)
+plus `signal_pending_op` (modelled on `signal_ipc_endpoint`). `sys_wait` gained the
+type-check arm and now populates `IoResult.status` (which already existed) from a
+signaled PO via `pending_op_status` — Timer/channel/notification stay status 0.
+
+**First consumer — IPC `Block`, commit-message model.** A blocking send returns a PO
+that completes when the message is *delivered* (the submit→complete shape storage
+will reuse), not a "space-available, retry" readiness signal. `IpcChannel::Inner`
+gained a bounded `pending_sends: KVec<PendingSend { msg, transfers, po: ObjectRef }>`
+on the **receiving** endpoint (whose recv frees space). `send_or_queue` delivers into
+the peer ring if there's room (PO pre-signalled) or holds the message + a cloned PO
+ref; `promote_pending_send` (run from the recv path) moves the oldest held message
+into the freed slot and completes its PO; endpoint close completes held senders
+`PeerClosed`. `ObjectRef` discipline: refs are *moved* in/out under `SCHED` and only
+*dropped* outside it (the recv syscall drops the promoted ref; the closing endpoint's
+`Inner` drop reclaims held entries). `sys_channel_send(Block)` always returns a PO
+handle (honoring "never block inside a syscall"); `PendingFull`/`PeerClosed` are
+synchronous errors.
+
+**Scope decisions.**
+- **One PR; `Block` only, `BlockBounded` deferred.** `Block` fully exercises the
+  primitive (object + `sys_wait` + commit-message + completion). `BlockBounded`'s
+  deadline-bounded variant needs deadline-heap surgery (`is_thread: bool` → a 3-way
+  kind + channel back-pointer), a timer-tick timeout-cancel arm, and a
+  `sys_channel_send` deadline arg — carved out to a focused follow-up to keep this PR
+  off the safety-critical timeout paths. `BlockBounded` stays `Unsupported`; the
+  anticipatory `cancelled` field on `PendingSend` was stripped (returns with its
+  producer). See `deferred-decisions.md`.
+- **`Block` = commit the message, PO completes on delivery** (not writable-edge
+  readiness) — the shape the storage/fs/page-cache slices reuse.
+
+**No DPC needed.** IPC completion is signalled synchronously on peer-receive (under
+`SCHED`); the DPC queue (built earlier) is the path device I/O will use to signal a
+PO from an ISR's deferred work — same `signal_pending_op`, a later consumer.
+
+ABI impact: **none to the version hash** — `PendingOperation = 9` already existed,
+`IoResult` layout is unchanged (its `status` field already existed), `SendMode` was
+already defined. (`IoResult::completed(handle, status)` is a new constructor over the
+same layout; a `sys_channel_send` deadline arg arrives with `BlockBounded`.) Verified:
+`check-arch` clean; `build` clean (no warnings); `test` 405 host tests (+13: PO object
+signal/one-shot/waiters/destroy, IPC pending-send immediate / queue-promote-FIFO /
+close-release); `qemu` logs `parent: blocking send completed via PendingOperation
+(4 queued, 1 blocked-then-delivered)` and the rest of the parent/child demo runs
+unchanged. (Found + fixed a self-inflicted bug en route: an edit split
+`#[unsafe(no_mangle)]` from the parent's `_start`, GC-ing the binary to an empty
+664-byte ELF.) Branch `phase-2/pending-operation` off `main` (includes merged PR #35).
+Next: `phase-2/dma-alloc`, then the IPC `BlockBounded` follow-up.

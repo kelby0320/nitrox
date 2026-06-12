@@ -35,7 +35,9 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
-use crate::object::{IpcChannel, MemoryObject, NotificationChannel, Process, Thread, Timer};
+use crate::object::{
+    IpcChannel, MemoryObject, NotificationChannel, PendingOperation, Process, Thread, Timer,
+};
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
 /// references — a catastrophic bug, not a recoverable condition — so we
@@ -301,8 +303,18 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::IpcChannel);
         }
-        // No other kernel object types are implemented this slice; they
-        // land behind their respective Phase 1 slices.
+        KObjectType::PendingOperation => {
+            // SAFETY: last ref to a `PendingOperation` produced by KBox::into_raw.
+            drop(unsafe {
+                KBox::<PendingOperation>::from_raw(NonNull::new_unchecked(
+                    ptr as *mut PendingOperation,
+                ))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::PendingOperation);
+        }
+        // No other kernel object types are implemented yet; they land behind
+        // their respective slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
     }
 }
@@ -326,6 +338,7 @@ pub(crate) mod test_probe {
         static TIMER_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static NOTIFICATION_CHANNEL_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static IPC_CHANNEL_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static PENDING_OP_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -340,6 +353,7 @@ pub(crate) mod test_probe {
                 NOTIFICATION_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1))
             }
             KObjectType::IpcChannel => IPC_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1)),
+            KObjectType::PendingOperation => PENDING_OP_DESTROYS.with(|c| c.set(c.get() + 1)),
             _ => {}
         }
     }
@@ -366,6 +380,10 @@ pub(crate) mod test_probe {
 
     pub(crate) fn ipc_channel_destroys() -> usize {
         IPC_CHANNEL_DESTROYS.with(Cell::get)
+    }
+
+    pub(crate) fn pending_op_destroys() -> usize {
+        PENDING_OP_DESTROYS.with(Cell::get)
     }
 
     pub(crate) fn reset() {

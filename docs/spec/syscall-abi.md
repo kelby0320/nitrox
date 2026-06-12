@@ -166,7 +166,7 @@ fn sys_wait(
 ```
 Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
 
-**Implemented for `Timer`, `NotificationChannel`, and `IpcChannel` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed); other waitable types (`PendingOperation`, `Process`) return `Unsupported` until their slices land. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
+**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, and `PendingOperation` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
 
 ### Namespace
 
@@ -309,7 +309,7 @@ Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel st
 
 Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability.
 
-**Implemented subset:** `mode == NoBlock` only — `Block` / `BlockBounded` (which block via a `PendingOperation`, returning that handle) are deferred to the async-I/O slice and currently return `Unsupported`.
+**Implemented subset:** `mode == NoBlock` returns `0` / `WouldBlock` / `PeerClosed` as above. `mode == Block` returns a **`PendingOperation` handle** (non-negative): the message is committed to the kernel (delivered into the peer ring if it has space, else held in a bounded per-endpoint pending-sender queue) and the PO completes — `sys_wait` then reports `status 0` — when the message is delivered; a dead peer / full pending queue is the synchronous `PeerClosed` / `WouldBlock` error. `mode == BlockBounded` (a `Block` with a delivery deadline) is deferred and currently returns `Unsupported`.
 
 ```rust
 fn sys_channel_recv(
