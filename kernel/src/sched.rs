@@ -61,8 +61,8 @@ use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::object::{
     BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
-    PendingOperation, RecvState, SendOutcome, StoredMsg, Thread, ThreadEntry, ThreadState, Timer,
-    TransferRef,
+    PendingOperation, ReclaimedSend, RecvState, SendOutcome, StoredMsg, Thread, ThreadEntry,
+    ThreadState, Timer, TransferRef,
 };
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
@@ -106,16 +106,30 @@ const REAP_RESERVE: usize = 16;
 mod deadline {
     use crate::libkern::{AllocError, KVec};
 
-    /// One pending deadline. `is_thread` distinguishes a [`Timer`] fire
-    /// (`target` = the Timer object address) from a `sys_wait` thread-deadline
-    /// (`target` = the waiting Thread object address, woken directly → timeout).
+    /// What a deadline-heap entry fires when its `deadline_ns` elapses.
     ///
     /// [`Timer`]: crate::object::Timer
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub(super) enum DeadlineKind {
+        /// A `sys_wait` thread-deadline: `target` is the waiting Thread object,
+        /// woken directly (its wait slots stay un-signaled → it sees a timeout).
+        Thread,
+        /// A [`Timer`] fire: `target` is the Timer object address.
+        Timer,
+        /// A `BlockBounded` IPC send's delivery deadline: `target` is the
+        /// [`PendingOperation`](crate::object::PendingOperation), `channel` the
+        /// receiving endpoint holding the (undelivered) send.
+        PendingSend,
+    }
+
+    /// One pending deadline, keyed by `(target, kind)` for removal.
     #[derive(Clone, Copy, PartialEq, Eq, Debug)]
     pub(super) struct Entry {
         pub deadline_ns: u64,
         pub target: usize,
-        pub is_thread: bool,
+        pub kind: DeadlineKind,
+        /// The receiving endpoint, for [`DeadlineKind::PendingSend`]; `0` else.
+        pub channel: usize,
     }
 
     /// Pre-reserved heap capacity (one entry per armed timer / pending wait
@@ -160,13 +174,14 @@ mod deadline {
         min
     }
 
-    /// Remove the first entry matching `(target, is_thread)`. Returns `true` if
-    /// one was removed. Used when a `sys_wait` resumes (drop its deadline) or a
-    /// timer is re-armed (drop its stale entry).
-    pub(super) fn remove(h: &mut KVec<Entry>, target: usize, is_thread: bool) -> bool {
+    /// Remove the first entry matching `(target, kind)`. Returns `true` if one
+    /// was removed. Used when a `sys_wait` resumes (drop its deadline), a timer
+    /// is re-armed (drop its stale entry), or a `BlockBounded` send is delivered
+    /// early / its endpoint closes (drop its pending-send deadline).
+    pub(super) fn remove(h: &mut KVec<Entry>, target: usize, kind: DeadlineKind) -> bool {
         let Some(i) = h
             .iter()
-            .position(|e| e.target == target && e.is_thread == is_thread)
+            .position(|e| e.target == target && e.kind == kind)
         else {
             return false;
         };
@@ -479,20 +494,38 @@ fn fire_expired_deadlines(g: &mut SchedState, now: u64) {
             break;
         }
         deadline::pop_min(&mut g.deadlines);
-        if top.is_thread {
-            // A `sys_wait` deadline: wake the waiting thread directly.
-            let th = top.target as *mut ();
-            // SAFETY: a heaped thread-deadline names a thread blocked in
-            // `wait_on`, pinned in `blocked`; `SCHED` held.
-            if unsafe { Thread::wait_try_wake(th) } {
-                make_runnable(g, th);
+        match top.kind {
+            deadline::DeadlineKind::Thread => {
+                // A `sys_wait` deadline: wake the waiting thread directly.
+                let th = top.target as *mut ();
+                // SAFETY: a heaped thread-deadline names a thread blocked in
+                // `wait_on`, pinned in `blocked`; `SCHED` held.
+                if unsafe { Thread::wait_try_wake(th) } {
+                    make_runnable(g, th);
+                }
             }
-        } else {
-            let timer = top.target as *mut ();
-            // SAFETY: a heaped timer is kept alive by its waiter(s)' `sys_wait`
-            // `ObjectRef`s (or the owner's handle); `SCHED` held.
-            unsafe { Timer::set_in_heap(timer, false) };
-            fire_timer(g, timer, now);
+            deadline::DeadlineKind::Timer => {
+                let timer = top.target as *mut ();
+                // SAFETY: a heaped timer is kept alive by its waiter(s)'
+                // `sys_wait` `ObjectRef`s (or the owner's handle); `SCHED` held.
+                unsafe { Timer::set_in_heap(timer, false) };
+                fire_timer(g, timer, now);
+            }
+            deadline::DeadlineKind::PendingSend => {
+                // A `BlockBounded` send's delivery deadline elapsed: cancel the
+                // held send and complete its `PendingOperation` with `TimedOut`.
+                // No `ObjectRef` drop here (rank-1 `SCHED` held — a transferred
+                // object's `Drop` could take the buddy lock); the message + refs
+                // are reclaimed on the next recv / at close (see `ipc_channel`).
+                let channel = top.channel as *mut ();
+                let po = top.target as *mut ();
+                // SAFETY: `channel` is still open — `ipc_endpoint_closing`
+                // removes its held sends' deadline entries, so a fired
+                // pending-send deadline always names a live endpoint; `SCHED`
+                // held. `cancel_pending_send` only sets a flag (no drop).
+                unsafe { IpcChannel::cancel_pending_send(channel, po) };
+                signal_pending_op(g, po, crate::syscall::error::KError::TimedOut as i32);
+            }
         }
     }
 }
@@ -527,7 +560,12 @@ fn fire_timer(g: &mut SchedState, timer: *mut (), now: u64) {
         // free (its entry was just popped), so this stays within reserve.
         let _ = deadline::push(
             &mut g.deadlines,
-            deadline::Entry { deadline_ns: next, target: timer as usize, is_thread: false },
+            deadline::Entry {
+                deadline_ns: next,
+                target: timer as usize,
+                kind: deadline::DeadlineKind::Timer,
+                channel: 0,
+            },
         );
     } else {
         // SAFETY: live Timer, `SCHED` held — one-shot: disarm.
@@ -694,25 +732,51 @@ pub fn ipc_send_push(
 /// returns at once. The caller has copied the message in and holds `po`'s
 /// creation reference + the endpoint reference. Returns the [`BlockSendOutcome`];
 /// on `PendingFull`/`PeerClosed` the `transfers` are left for the caller to drop.
+/// `deadline_ns` is the `BlockBounded` delivery deadline (absolute monotonic ns);
+/// `u64::MAX` for plain `Block` (no deadline). On a `Queued` outcome with a finite
+/// deadline, a `PendingSend` deadline-heap entry is registered against the PO (so
+/// the timer tick can time the held message out — see `fire_expired_deadlines`).
 pub fn ipc_send_push_blocking(
     endpoint: *mut (),
     msg: &StoredMsg,
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
     po: &ObjectRef,
+    deadline_ns: u64,
 ) -> BlockSendOutcome {
     let mut g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint` and `po`; `SCHED` held.
     let outcome = unsafe { IpcChannel::send_or_queue(endpoint, msg, transfers, po) };
-    if let BlockSendOutcome::Sent { woke_edge } = outcome {
-        if woke_edge {
-            // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
-            let peer = unsafe { IpcChannel::peer_of(endpoint) };
-            if !peer.is_null() {
-                signal_ipc_endpoint(&mut g, peer);
+    match outcome {
+        BlockSendOutcome::Sent { woke_edge } => {
+            if woke_edge {
+                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
+                let peer = unsafe { IpcChannel::peer_of(endpoint) };
+                if !peer.is_null() {
+                    signal_ipc_endpoint(&mut g, peer);
+                }
             }
+            // Delivered synchronously — complete the PO now (no waiters yet).
+            signal_pending_op(&mut g, po.as_ptr(), 0);
         }
-        // Delivered synchronously — complete the PO now (no waiters yet).
-        signal_pending_op(&mut g, po.as_ptr(), 0);
+        BlockSendOutcome::Queued if deadline_ns != u64::MAX => {
+            // `BlockBounded`: register the delivery deadline against the PO. The
+            // held send lives on the peer (receiving) endpoint.
+            // SAFETY: the send queued, proving the peer is non-null; `SCHED` held.
+            let peer = unsafe { IpcChannel::peer_of(endpoint) };
+            // Heap-full degrades to an unbounded `Block` (the message still
+            // delivers, just without a timeout) — the reserve (16) far exceeds
+            // realistic pending sends, so this is a pathological edge only.
+            let _ = deadline::push(
+                &mut g.deadlines,
+                deadline::Entry {
+                    deadline_ns,
+                    target: po.as_ptr() as usize,
+                    kind: deadline::DeadlineKind::PendingSend,
+                    channel: peer as usize,
+                },
+            );
+        }
+        _ => {}
     }
     outcome
 }
@@ -736,10 +800,17 @@ pub fn ipc_recv_peek(endpoint: *mut ()) -> RecvState {
 /// and its `PendingOperation` completed (status 0) under `SCHED`; its returned
 /// reference must be dropped by the caller **outside** `SCHED` (no `ObjectRef`
 /// Drop under the lock).
+/// Pop into `dst`; on success, sweep any **timed-out** held sends into
+/// `reclaimed` (the caller drops them outside `SCHED`) and promote the oldest
+/// **live** held sender into the freed slot, completing its `PendingOperation`
+/// (and dropping its pending-send deadline). Returns `(popped, promoted_po)`; the
+/// `promoted_po` and the `reclaimed` entries are released by the caller outside
+/// `SCHED`.
 pub fn ipc_recv_pop_into(
     endpoint: *mut (),
     dst: &mut StoredMsg,
     out: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    reclaimed: &mut [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS],
 ) -> (bool, Option<ObjectRef>) {
     let mut g = SCHED.lock();
     // SAFETY: the caller holds an `ObjectRef` pinning `endpoint`; `SCHED` held.
@@ -747,10 +818,17 @@ pub fn ipc_recv_pop_into(
     if !popped {
         return (false, None);
     }
-    // SAFETY: `endpoint` is pinned; `SCHED` held. A slot just freed.
-    let promoted = unsafe { IpcChannel::promote_pending_send(endpoint) };
+    // SAFETY: `endpoint` is pinned; `SCHED` held. A slot just freed — sweep
+    // timed-out sends and promote the oldest live one.
+    let promoted = unsafe { IpcChannel::promote_pending_send(endpoint, reclaimed) };
     if let Some(ref po) = promoted {
-        // The held sender's message is now in the ring — complete its PO.
+        // Delivered before its deadline: drop its pending-send deadline entry
+        // (idempotent — a plain `Block` send registered none), then complete it.
+        deadline::remove(
+            &mut g.deadlines,
+            po.as_ptr() as usize,
+            deadline::DeadlineKind::PendingSend,
+        );
         signal_pending_op(&mut g, po.as_ptr(), 0);
     }
     (true, promoted)
@@ -782,6 +860,11 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     // SAFETY: `endpoint` is valid; `SCHED` held.
     let n = unsafe { IpcChannel::pending_send_pos(endpoint, &mut pos) };
     for &po in &pos[..n] {
+        // Drop each held send's pending-send deadline entry **before** the
+        // endpoint is freed — otherwise a still-live `BlockBounded` deadline could
+        // fire later and dereference this now-dead `channel`. Idempotent (a
+        // plain `Block` send, or one already timed out, has no live entry).
+        deadline::remove(&mut g.deadlines, po as usize, deadline::DeadlineKind::PendingSend);
         signal_pending_op(&mut g, po, crate::syscall::error::KError::PeerClosed as i32);
     }
 }
@@ -978,7 +1061,12 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
         if !failed && has_deadline {
             failed = deadline::push(
                 &mut g.deadlines,
-                deadline::Entry { deadline_ns, target: me_ptr as usize, is_thread: true },
+                deadline::Entry {
+                    deadline_ns,
+                    target: me_ptr as usize,
+                    kind: deadline::DeadlineKind::Thread,
+                    channel: 0,
+                },
             )
             .is_err();
         }
@@ -1011,7 +1099,7 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
         }
         // SAFETY: live Thread, `SCHED` held.
         if unsafe { Thread::wait_has_deadline(me_ptr) } {
-            deadline::remove(&mut g.deadlines, me_ptr as usize, true);
+            deadline::remove(&mut g.deadlines, me_ptr as usize, deadline::DeadlineKind::Thread);
         }
         // SAFETY: live Thread, `SCHED` held.
         unsafe { Thread::wait_clear(me_ptr) };
@@ -1038,7 +1126,7 @@ pub fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(
     // Drop any stale heap entry (re-arm).
     // SAFETY: live Timer (caller holds its `ObjectRef`), `SCHED` held.
     if unsafe { Timer::in_heap(timer) } {
-        deadline::remove(&mut g.deadlines, timer as usize, false);
+        deadline::remove(&mut g.deadlines, timer as usize, deadline::DeadlineKind::Timer);
         unsafe { Timer::set_in_heap(timer, false) };
     }
     // SAFETY: live Timer, `SCHED` held.
@@ -1046,7 +1134,12 @@ pub fn timer_arm(timer: *mut (), deadline_ns: u64, interval_ns: u64) -> Result<(
     if deadline_ns != 0 {
         if deadline::push(
             &mut g.deadlines,
-            deadline::Entry { deadline_ns, target: timer as usize, is_thread: false },
+            deadline::Entry {
+                deadline_ns,
+                target: timer as usize,
+                kind: deadline::DeadlineKind::Timer,
+                channel: 0,
+            },
         )
         .is_err()
         {
@@ -1221,7 +1314,7 @@ fn reap_blocked_matching(
         }
         // SAFETY: live Thread, `SCHED` held.
         if unsafe { Thread::wait_has_deadline(obj) } {
-            deadline::remove(deadlines, obj as usize, true);
+            deadline::remove(deadlines, obj as usize, deadline::DeadlineKind::Thread);
         }
         // SAFETY: live Thread, `SCHED` held.
         unsafe {
@@ -1680,7 +1773,12 @@ mod tests {
     // --- Deadline min-heap (pure) -------------------------------------
 
     fn entry(deadline_ns: u64, target: usize) -> deadline::Entry {
-        deadline::Entry { deadline_ns, target, is_thread: false }
+        deadline::Entry {
+            deadline_ns,
+            target,
+            kind: deadline::DeadlineKind::Timer,
+            channel: 0,
+        }
     }
 
     #[test]
@@ -1710,12 +1808,50 @@ mod tests {
         deadline::push(&mut h, entry(20, 0xB)).unwrap();
         assert_eq!(deadline::peek(&h).unwrap().target, 0xA);
         // Remove the middle target; ordering of the rest is preserved.
-        assert!(deadline::remove(&mut h, 0xB, false));
-        assert!(!deadline::remove(&mut h, 0xB, false)); // gone
-        assert!(!deadline::remove(&mut h, 0xA, true)); // wrong is_thread
+        assert!(deadline::remove(&mut h, 0xB, deadline::DeadlineKind::Timer));
+        assert!(!deadline::remove(&mut h, 0xB, deadline::DeadlineKind::Timer)); // gone
+        assert!(!deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Thread)); // wrong kind
         assert_eq!(deadline::pop_min(&mut h).unwrap().target, 0xA);
         assert_eq!(deadline::pop_min(&mut h).unwrap().target, 0xC);
         assert!(deadline::pop_min(&mut h).is_none());
+    }
+
+    #[test]
+    fn heap_remove_distinguishes_kind_for_same_target() {
+        init_global_heap();
+        let mut h: KVec<deadline::Entry> = KVec::new();
+        h.try_reserve(deadline::HEAP_RESERVE).unwrap();
+        // The same `target` can hold entries of different kinds — each removable
+        // independently by `(target, kind)`.
+        deadline::push(
+            &mut h,
+            deadline::Entry {
+                deadline_ns: 10,
+                target: 0xA,
+                kind: deadline::DeadlineKind::Thread,
+                channel: 0,
+            },
+        )
+        .unwrap();
+        deadline::push(
+            &mut h,
+            deadline::Entry {
+                deadline_ns: 20,
+                target: 0xA,
+                kind: deadline::DeadlineKind::PendingSend,
+                channel: 0xBEEF,
+            },
+        )
+        .unwrap();
+        // Neither is a Timer.
+        assert!(!deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Timer));
+        // Remove the Thread entry; the PendingSend one survives, channel intact.
+        assert!(deadline::remove(&mut h, 0xA, deadline::DeadlineKind::Thread));
+        let e = deadline::peek(&h).unwrap();
+        assert_eq!(e.kind, deadline::DeadlineKind::PendingSend);
+        assert_eq!(e.channel, 0xBEEF);
+        assert!(deadline::remove(&mut h, 0xA, deadline::DeadlineKind::PendingSend));
+        assert!(deadline::peek(&h).is_none());
     }
 
     #[test]

@@ -36,7 +36,8 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::{
     BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, NotificationChannel, ObjectRef,
-    PendingOperation, Process, RecvState, SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
+    PendingOperation, Process, ReclaimedSend, RecvState, SendOutcome, StoredMsg,
+    Timer as TimerObject, TransferRef,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -101,7 +102,7 @@ const KPRINT_MAX: usize = 4096;
 /// Route a decoded syscall to its handler. `nr` is the number (from RAX);
 /// `a0..a5` are the six argument registers (RDI, RSI, RDX, R10, R8, R9).
 /// Returns the `isize` the ABI hands back in RAX.
-pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) -> isize {
+pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> isize {
     // No explicit grace `quiesce` is needed on this dispatch path: every
     // handle syscall below routes through a `HandleTable` method that takes
     // and drops a read guard, which marks the calling context (ctx 0 in
@@ -122,7 +123,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, _a5: u64) 
         SYS_WAIT => encode(sys_wait(a0, a1 as usize, a2, a3)),
         SYS_NOTIF_RECV => encode(sys_notif_recv(a0, a1)),
         SYS_CHANNEL_CREATE => encode(sys_channel_create(a0, a1, a2)),
-        SYS_CHANNEL_SEND => encode(sys_channel_send(a0, a1, a2, a3, a4)),
+        SYS_CHANNEL_SEND => encode(sys_channel_send(a0, a1, a2, a3, a4, a5)),
         SYS_CHANNEL_RECV => encode(sys_channel_recv(a0, a1, a2, a3)),
         SYS_PROCESS_SPAWN => encode(sys_process_spawn(a0)),
         SYS_THREAD_SET_AFFINITY => encode(sys_thread_set_affinity(a0, a1)),
@@ -1017,20 +1018,30 @@ pub fn sys_channel_create(end0: u64, end1: u64, queue_depth: u64) -> SysResult {
     Ok(0)
 }
 
-/// `sys_channel_send(ch, msg, handles, count, mode)` — enqueue `*msg` on the
-/// peer of endpoint `ch`, **moving** `handles[0..count]` to the receiver. This
-/// slice supports `NoBlock` only (`Block` / `BlockBounded` → `Unsupported`,
-/// pending the async-I/O slice). Each transferred handle must carry the
-/// `TRANSFER` right; the move is committed (the sender's handles closed) only
-/// after the message is queued — a failed send loses no capability. Returns `0`
-/// on success, `WouldBlock` if the queue is full, `PeerClosed` if the peer has
-/// gone.
-pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) -> SysResult {
-    // Mode gating first (host-reachable, no pointer/lock use). `BlockBounded`
-    // (deadline-bounded) lands with the deadline-arg ABI in a follow-up.
+/// `sys_channel_send(ch, msg, handles, count, mode, deadline)` — enqueue `*msg`
+/// on the peer of endpoint `ch`, **moving** `handles[0..count]` to the receiver.
+/// Each transferred handle must carry the `TRANSFER` right; the move is committed
+/// (the sender's handles closed) only after the message is queued/held — a failed
+/// send loses no capability.
+///
+/// - `NoBlock`: returns `0`, `WouldBlock` if the peer ring is full, or `PeerClosed`.
+/// - `Block` / `BlockBounded`: returns a `PendingOperation` handle that completes
+///   when the message is delivered (the message is held in the peer's pending-send
+///   queue if the ring is full). `BlockBounded` additionally completes the PO
+///   `TimedOut` (reclaiming the message) if undelivered by `deadline` (absolute
+///   monotonic ns); `deadline` is ignored for `NoBlock`/`Block`.
+pub fn sys_channel_send(
+    ch: u64,
+    msg: u64,
+    handles: u64,
+    count: u64,
+    mode: u64,
+    deadline: u64,
+) -> SysResult {
+    // Mode gating first (host-reachable, no pointer/lock use). `deadline` (absolute
+    // monotonic ns) is consumed only by `BlockBounded`; ignored for `NoBlock`/`Block`.
     let send_mode = match SendMode::from_u32(mode as u32) {
-        Some(m @ (SendMode::NoBlock | SendMode::Block)) => m,
-        Some(SendMode::BlockBounded) => return Err(KError::Unsupported),
+        Some(m) => m,
         None => return Err(KError::InvalidArgument),
     };
     let count = count as usize;
@@ -1101,7 +1112,14 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) 
         // next receives. The message is committed either way, so the transfer
         // move is committed too (handles closed). Honors the async-first rule:
         // the syscall never parks; the caller `sys_wait`s on the returned handle.
-        SendMode::Block => {
+        // `BlockBounded` additionally times out (PO completes `TimedOut`, message
+        // reclaimed) if undelivered by `deadline`; `Block` waits unbounded.
+        SendMode::Block | SendMode::BlockBounded => {
+            let deadline_ns = if send_mode == SendMode::BlockBounded {
+                deadline
+            } else {
+                u64::MAX
+            };
             let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
             // SAFETY: `into_raw` yields the single creation reference; adopt it.
             let po_ref = unsafe {
@@ -1115,6 +1133,7 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) 
                 &bounce,
                 &mut transfers,
                 &po_ref,
+                deadline_ns,
             ) {
                 BlockSendOutcome::Sent { .. } | BlockSendOutcome::Queued => {
                     // Message committed (delivered or held) — commit the transfers.
@@ -1149,8 +1168,6 @@ pub fn sys_channel_send(ch: u64, msg: u64, handles: u64, count: u64, mode: u64) 
                 }
             }
         }
-        // Rejected during mode gating above.
-        SendMode::BlockBounded => unreachable!("BlockBounded rejected during mode gating"),
     }
 }
 
@@ -1186,12 +1203,19 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
     }
     let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
-    // Popping frees a ring slot, so a blocking sender may be promoted into it;
-    // `_promoted_po` is that sender's now-completed `PendingOperation` reference,
-    // dropped here at scope exit — **outside** `SCHED` (no `ObjectRef` Drop under
-    // the lock).
-    let (popped, _promoted_po) =
-        crate::sched::ipc_recv_pop_into(ok.object.as_ptr(), &mut bounce, &mut transfers);
+    // Popping frees a ring slot, so a held blocking sender may be promoted into
+    // it; `_promoted_po` is that sender's now-completed `PendingOperation`, and
+    // `_reclaimed` collects any timed-out (`BlockBounded`) sends swept out of the
+    // queue. Both drop here at scope exit — **outside** `SCHED` (no `ObjectRef`
+    // Drop under the lock).
+    let mut _reclaimed: [Option<ReclaimedSend>; IpcChannel::MAX_PENDING_SENDS] =
+        core::array::from_fn(|_| None);
+    let (popped, _promoted_po) = crate::sched::ipc_recv_pop_into(
+        ok.object.as_ptr(),
+        &mut bounce,
+        &mut transfers,
+        &mut _reclaimed,
+    );
     if !popped {
         // Drained between the peek and the pop (only possible under future SMP).
         return Err(KError::WouldBlock);
@@ -1379,16 +1403,18 @@ mod tests {
 
     #[test]
     fn channel_send_rejects_mode_and_oversize_count_before_pointers() {
-        // Mode is checked first: `BlockBounded` is still deferred (Unsupported,
-        // pending its deadline-arg ABI), an unknown selector is InvalidArgument —
-        // both before any pointer/lock. (`NoBlock`/`Block` proceed past gating;
-        // they are exercised end-to-end in the QEMU demo, not here.)
-        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 2), Err(KError::Unsupported)); // BlockBounded
-        assert_eq!(sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99), Err(KError::InvalidArgument));
-        // NoBlock but more transferred handles than a message can carry → TooLarge
-        // (checked before any pointer use).
+        // An unknown mode selector is InvalidArgument before any pointer/lock.
+        // All three real modes (NoBlock/Block/BlockBounded) proceed past gating —
+        // exercised end-to-end in the QEMU demo, not here. The deadline arg (6th)
+        // is ignored at this stage.
         assert_eq!(
-            sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1),
+            sys_channel_send(0xDEAD, 0xDEAD, 0, 0, 99, 0),
+            Err(KError::InvalidArgument),
+        );
+        // More transferred handles than a message can carry → TooLarge (checked
+        // before any pointer use).
+        assert_eq!(
+            sys_channel_send(0xDEAD, 0xDEAD, 0, (IPC_HANDLE_MAX + 1) as u64, 1, 0),
             Err(KError::TooLarge),
         );
     }
@@ -1397,7 +1423,7 @@ mod tests {
     fn channel_send_rejects_bad_message_pointer() {
         // NoBlock + count 0, then a bad `msg` pointer fails before lookup/lock.
         assert_eq!(
-            sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1),
+            sys_channel_send(0xDEAD, USER_VIRT_END, 0, 0, 1, 0),
             Err(KError::FaultFromUser),
         );
     }

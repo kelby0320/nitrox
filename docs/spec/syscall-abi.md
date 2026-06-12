@@ -298,18 +298,19 @@ Creates a new IPC channel with the specified queue depth (`0` → default 16; `>
 
 ```rust
 fn sys_channel_send(
-    ch:      RawHandle,
-    msg:     UserPtr<IpcMsg>,
-    handles: UserPtr<RawHandle>,
-    count:   usize,
-    mode:    SendMode,
+    ch:       RawHandle,
+    msg:      UserPtr<IpcMsg>,
+    handles:  UserPtr<RawHandle>,
+    count:    usize,
+    mode:     SendMode,
+    deadline: u64,        // absolute monotonic ns; consumed only by BlockBounded
 ) -> isize
 ```
 Sends `*msg` plus `handles[0..count]` over `ch` (requires `SEND`). The kernel stamps `header.sender_pid` / `timestamp`. Returns `0`, `WouldBlock` if the queue is full (`NoBlock`), or `PeerClosed` if the peer endpoint has closed. (Syscall number `13`.)
 
 Sends `handles[0..count]` along with the message (always **move**; a sender that wants to keep a copy `sys_handle_duplicate`s first). Each transferred handle must carry `TRANSFER`; the move commits only after the message is queued, so a `WouldBlock`/`PeerClosed` send loses no capability.
 
-**Implemented subset:** `mode == NoBlock` returns `0` / `WouldBlock` / `PeerClosed` as above. `mode == Block` returns a **`PendingOperation` handle** (non-negative): the message is committed to the kernel (delivered into the peer ring if it has space, else held in a bounded per-endpoint pending-sender queue) and the PO completes — `sys_wait` then reports `status 0` — when the message is delivered; a dead peer / full pending queue is the synchronous `PeerClosed` / `WouldBlock` error. `mode == BlockBounded` (a `Block` with a delivery deadline) is deferred and currently returns `Unsupported`.
+**Implemented subset:** `mode == NoBlock` returns `0` / `WouldBlock` / `PeerClosed` as above. `mode == Block` returns a **`PendingOperation` handle** (non-negative): the message is committed to the kernel (delivered into the peer ring if it has space, else held in a bounded per-endpoint pending-sender queue) and the PO completes — `sys_wait` then reports `status 0` — when the message is delivered; a dead peer / full pending queue is the synchronous `PeerClosed` / `WouldBlock` error. `mode == BlockBounded` is `Block` with a delivery deadline (the 6th arg, absolute monotonic ns): identical to `Block`, except a held (undelivered) message is cancelled when the deadline elapses — its PO completes `TimedOut` and the message is reclaimed. The `deadline` arg is ignored for `NoBlock`/`Block`.
 
 ```rust
 fn sys_channel_recv(

@@ -829,11 +829,14 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   deadline-heap kind extension + a `sys_channel_send` deadline arg) — still
   `Unsupported`. `IoRing` lands with the rsproto transport when needed. Gates the
   storage, fs-server, and page-cache slices. See the decision log (2026-06-12).
-- [ ] **IPC `BlockBounded` send mode** (follow-up to the above): the deadline-
-  bounded blocking send — a `Block` whose held message is cancelled (PO completed
-  `TimedOut`) if undelivered by a deadline. Needs the deadline-heap `Entry` to
-  grow a kind (Thread/Timer/PendingSend) + channel back-pointer, a timer-tick
-  timeout-cancel arm, and a deadline argument on `sys_channel_send`.
+- [x] **IPC `BlockBounded` send mode** (follow-up to the above). **Done**
+  (`phase-2/block-bounded`): the deadline-heap `Entry` grew a 3-way kind
+  (`Thread`/`Timer`/`PendingSend`) + channel back-pointer; a timer-tick arm cancels
+  a held send whose delivery deadline elapsed (PO completes `TimedOut`); a 6th
+  `sys_channel_send` arg carries the deadline. Timed-out sends are reclaimed
+  outside `SCHED` via **reclaim-on-recv** (swept on the next recv / at close).
+  Proven by host tests + a parent demo (`blocking send timed out via
+  PendingOperation`). See the decision log (2026-06-12).
 - [ ] **DMA-capable allocation** (page-multiple alignment / a `dma_alloc`
   path; the `align > SLAB_SIZE` deferral). AHCI command lists / PRDTs need
   physically-contiguous aligned buffers. Folded into the storage slice if not
