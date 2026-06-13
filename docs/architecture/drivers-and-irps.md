@@ -216,9 +216,13 @@ would simultaneously program the IOMMU — **deferred**, since Phase 2 has no
 userspace drivers.
 
 **DMA.** Bus-mastering devices need physically-contiguous, suitably-aligned
-buffers (AHCI command lists and PRDTs, for example). The `phase-2/dma-alloc`
-item adds that allocation path. IOMMU-constrained DMA (so a userspace driver can
-only touch memory it legitimately holds) is **deferred** with userspace drivers.
+buffers (AHCI command lists and PRDTs, for example) and their **physical
+address**. That path exists: [`mm::dma::DmaBuffer`](../../kernel/src/mm/dma.rs)
+(the `phase-2/dma-alloc` item) — a zeroed, page-aligned contiguous block from the
+buddy allocator that exposes both a CPU (HHDM) pointer and `phys()`. (x86 DMA is
+snoop-coherent, so no cache maintenance; a non-coherent arch will add an `ArchDma`
+clean/invalidate hook.) IOMMU-constrained DMA (so a userspace driver can only
+touch memory it legitimately holds) is **deferred** with userspace drivers.
 
 ## Module tiers
 

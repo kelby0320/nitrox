@@ -36,8 +36,11 @@
 //!   path (see [`large_alloc`]) using an `owner = null` sentinel in the
 //!   descriptor.
 //! - No empty-slab reclaim; once grown, a cache holds onto its pages.
-//! - No alignment > `SLAB_SIZE`; requests are rejected. DMA buffers in
-//!   Phase 2 will need a real answer.
+//! - No alignment > `SLAB_SIZE`; requests are rejected. The real answer for the
+//!   one client that needs it — DMA buffers, which also need a physical address
+//!   and contiguity the slab can't express — is the separate
+//!   [`DmaBuffer`](crate::mm::DmaBuffer) path over the buddy allocator, not a
+//!   `kmalloc` extension.
 //!
 //! See `kernel/docs/lock-ordering.md` for how the slab cache lock (rank
 //! 6a) relates to the buddy lock (rank 6b) — slab `grow` holds the cache
@@ -401,7 +404,9 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
         return align.max(1) as *mut u8;
     }
     if align > SLAB_SIZE {
-        // TODO: support alignments above SLAB_SIZE for DMA buffers (Phase 2).
+        // Above-`SLAB_SIZE` alignment is intentionally not served here: its one
+        // client, DMA, uses `mm::dma::DmaBuffer` (buddy-backed, exposes a phys
+        // address). See this module's docs.
         return ptr::null_mut();
     }
     if !SLAB_INITIALISED.load(Ordering::Acquire) {
