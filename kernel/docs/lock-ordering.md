@@ -18,7 +18,7 @@ enforced by code review.
 | 1    | Scheduler runqueue (`SCHED`, **`IrqSpinLock`**)| live as of Phase 1 slice 9 (scheduler) |
 | 2    | Wait queue                                   | reserved (Phase 1 folds wait/timer state into rank 1 — see § Wait queues) |
 | 3    | Handle-table segment allocation              | live as of Phase 1 slice 7 (handle table)|
-| 4    | Kernel-object internal locks (`AddressSpace`)| live as of Phase 1 slice 5 (item 3); also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
+| 4    | Kernel-object internal locks (`AddressSpace`, `Namespace`)| live as of Phase 1 slice 5 (item 3); `Namespace` binding store added Phase 2 slice 1; also taken from the `#PF` handler — see § The AddressSpace lock and the page-fault handler |
 | 5    | IPC channel                                  | reserved (Phase 1 folds endpoint state into rank 1 — see § Wait queues) |
 | 6a   | Slab cache lock (per `SlabCache`)            | live as of Phase 1 slice 2 (slab)        |
 | 6b   | Buddy allocator (single global `BUDDY`)      | live as of Phase 1 slice 2 (slab)        |
@@ -129,6 +129,20 @@ The faulting address space **is live in the MMU**, so `fault_in` flushes the
 faulted page's stale not-present TLB entry after installing the PTE (unlike the
 eager `map_vma`, which maps into a not-yet-loaded address space and skips the
 flush).
+
+## The Namespace binding lock
+
+`Namespace` (`kernel/src/object/namespace.rs`) is a syscall-accessed object — its
+binding store is touched only by the owning thread's namespace syscalls, never by
+the scheduler — so it follows the `AddressSpace` model: a rank-4 `SpinLock<Inner>`,
+not the under-`SCHED` `UnsafeCell` pattern used by scheduler-touched objects
+(`Timer`, `IpcChannel`). `bind` allocates under the lock (the path copy and the
+binding push), which acquires the rank-6 allocator beneath rank 4 — correctly
+ordered (rank N held while acquiring rank M > N). The no-allocation rule applies
+only to the rank-1 `SCHED` lock. `bind`/`unbind` hand the target `ObjectRef` back
+to the caller on every path so it is dropped **outside** the lock (an `ObjectRef`
+drop may run a destructor that takes a higher-ranked lock); `resolve` only *clones*
+the target (an atomic refcount bump, sound under the lock).
 
 ## Handle-table segment growth releases rank 3 before rank 6
 

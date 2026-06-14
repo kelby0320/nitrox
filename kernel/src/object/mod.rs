@@ -23,6 +23,7 @@
 pub mod header;
 pub mod ipc_channel;
 pub mod memory_object;
+pub mod namespace;
 pub mod notification_channel;
 pub mod pending_op;
 pub mod process;
@@ -34,6 +35,7 @@ pub use ipc_channel::{
     BlockSendOutcome, IpcChannel, ReclaimedSend, RecvState, SendOutcome, StoredMsg, TransferRef,
 };
 pub use memory_object::MemoryObject;
+pub use namespace::{Namespace, NsError};
 pub use notification_channel::NotificationChannel;
 pub use pending_op::PendingOperation;
 pub use process::Process;
