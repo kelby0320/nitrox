@@ -3623,3 +3623,56 @@ registry, IPC-forwarded lookup, the rsproto namespace ops. Spec updated
 plan's slice-1 section re-expressed as the A/B/C/D breakdown. No code yet — Part A is
 docs-only. Branch `phase-2/namespace-design` off `main` (includes merged PR #39).
 Next: Part B (the `Namespace` object + resolver).
+
+## 2026-06-14 — Phase 2 slice 1: Namespace object (Part B) + syscalls/async lookup (Part C)
+
+**Part B (PR #41)** built the `Namespace` kernel object (`KObjectType::Namespace`):
+a rank-4 `SpinLock<Inner>` over a `KVec<Binding { path: KVec<u8>, target: ObjectRef,
+rights }>` (the `AddressSpace` model — syscall-accessed, not scheduler-touched), with
+`bind`/`unbind`/`resolve` (longest-prefix, component-boundary match) and path
+validation. Drop-under-lock hazard avoided: `try_reserve` before the committing push,
+the target `ObjectRef` handed back on every error path, `resolve` only *clones*. Host
+tests only (no syscalls).
+
+**Part C (this PR)** wired it to userspace — the four `sys_ns_*` syscalls (22–25), the
+async-lookup result plumbing, and `Process::namespace`.
+
+**Decision — `IoResult` grows to 24 bytes (ABI break).** A `result: u64` word is
+appended at offset 16 (earlier offsets unchanged) so a completion can return a value,
+not just an `i32` status. `PendingOperation` gains a matching `result` payload
+(`signal_with_result` / `pending_op_completion`). `sys_ns_lookup` returns a
+**pre-signalled** PO carrying the resolved handle — direct-handle resolution finishes
+in the caller's syscall context, so `complete_pending_op` records the outcome in place
+(no waiters yet) and the caller's `sys_wait` takes the already-signalled fast path. All
+three userspace wait buffers (`parent`/`child`/`hello`) grew to 24 bytes in lockstep.
+The ABI version hash is invalidated (noted in `abi-version-hash.md`).
+
+**Decision — lookup error delivery splits sync vs. via-PO.** *Resolution* failures
+(no covering binding, or a non-empty suffix on a direct-handle leaf) complete the PO
+with a `NotFound` status — "you are not told *why* a path doesn't resolve." *Argument /
+permission / allocation* failures (bad `ns` handle, missing `LOOKUP`, malformed path,
+PO/handle exhaustion) return **synchronously** as a negative isize with **no** PO
+created. The PO + its handle are allocated *before* resolution so every resolution
+outcome flows through the PO uniformly.
+
+**Decision — `Process::namespace` lands now, populated at boot.** The design has each
+process resolve names against a root `Namespace` it holds (`Process::namespace`). Part C
+adds the field (mirroring `notification_channel`) and the boot code gives **pid 1** a
+root namespace: the `Process` owns one reference, a handle is installed in pid 1's table
+and passed to the parent in `rsi` (slot [1], alongside the notif handle in `rdi`). The
+four syscalls still operate on an **explicit** namespace handle (per the spec); the
+root is what a process resolves against and what children will inherit. Deriving a
+*child's* `Process::namespace` from its parent at spawn is **Part D**.
+
+**Decision — `bind` rights, `UNBIND` allocatability.** `bind` clones the resource
+handle's reference into the binding (the caller's handle stays valid) and records the
+handle's **current rights** as the binding's cap; `lookup` attenuates to `requested ∩
+binding.rights`. `namespace_rights()` mints `LOOKUP | BIND | UNBIND` + the generic band;
+`UNBIND` is a modifier-band right (bit 35), already allocatable on a `Namespace`, so
+`type_rights.rs` needed no change.
+
+The full `create → bind → lookup → wait → use → unbind` round-trip needs the scheduler,
+so it is verified by the QEMU `ns_demo` in `userspace/parent` (host tests cover the
+rights-allocatability, the `NsError`→`KError` map, the path-length bounds, the PO result
+payload, and `Process::namespace` ownership/release). Branch `phase-2/namespace-syscalls`
+off `main` (includes merged PR #41). Next: Part D (lookup cache + spawn inheritance).

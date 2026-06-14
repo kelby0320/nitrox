@@ -40,6 +40,10 @@ const SYS_PROCESS_EXIT: u64 = 16;
 const SYS_THREAD_CREATE: u64 = 19;
 const SYS_THREAD_GET_REGISTERS: u64 = 20;
 const SYS_EXCEPTION_RESUME: u64 = 21;
+const SYS_NS_CREATE: u64 = 22;
+const SYS_NS_LOOKUP: u64 = 23;
+const SYS_NS_BIND: u64 = 24;
+const SYS_NS_UNBIND: u64 = 25;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 
 /// `SendMode` values (`kernel/src/libkern/ipc.rs`).
@@ -138,7 +142,7 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
 };
 static mut NOTIF: NotificationBuf = NotificationBuf { kind: 0, body: [0; 60] };
-static mut WAIT_RESULTS: [u8; 16] = [0; 16];
+static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
 /// blocking-send demo, used for both send and recv.
@@ -520,10 +524,159 @@ fn block_bounded_demo() {
     }
 }
 
-/// `notif` (in `rdi`) is this process's notification-channel handle, seeded by
-/// the kernel at spawn. The other two bootstrap registers are unused here.
+/// Namespace demo: exercise the full `create → bind → lookup → wait → use`
+/// path against this process's **root namespace** (`root_ns`, seeded in `rsi` by
+/// the kernel — `Process::namespace`). Proves all four `sys_ns_*` syscalls plus
+/// the async-lookup result word (`IoResult.result` carries the resolved handle).
+fn ns_demo(root_ns: u64) {
+    kprint(b"parent: ns-demo start (root ns in rsi)\n");
+
+    // (a) sys_ns_create: a fresh, independent namespace; close it after — proves
+    //     create returns a usable, full-rights handle distinct from the root.
+    // SAFETY: register-only syscall.
+    let fresh = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    if fresh < 0 {
+        kprint(b"parent: ns_create FAIL\n");
+        return;
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, fresh as u64) };
+    kprint(b"parent: ns_create ok\n");
+
+    // (b) Create a MemoryObject to bind as a direct-handle resource.
+    // SAFETY: register-only syscall.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if mem < 0 {
+        kprint(b"parent: ns-demo mem create FAIL\n");
+        return;
+    }
+    let mem = mem as u64;
+
+    // (c) sys_ns_bind: bind the MemoryObject at "/store" in the root namespace.
+    // SAFETY: PATH is a valid readable byte slice; valid handles.
+    let path = b"/store";
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, root_ns, path.as_ptr() as u64, path.len() as u64, mem)
+    };
+    if br != 0 {
+        kprint(b"parent: ns_bind FAIL\n");
+        return;
+    }
+    kprint(b"parent: ns_bind /store ok\n");
+
+    // (d) sys_ns_lookup: resolve "/store" requesting MAP_READ|MAP_WRITE. Returns
+    //     a PendingOperation; (e) sys_wait yields the resolved handle in
+    //     IoResult.result.
+    // SAFETY: valid path pointer + handle.
+    let po = unsafe {
+        syscall4(
+            SYS_NS_LOOKUP,
+            root_ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+        )
+    };
+    if po < 0 {
+        kprint(b"parent: ns_lookup FAIL\n");
+        return;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    let resolved = unsafe {
+        u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ])
+    };
+    if waited != 1 || status != 0 || resolved == 0 {
+        kprint(b"parent: ns_lookup wait unexpected\n");
+        return;
+    }
+    kprint(b"parent: ns_lookup -> resolved handle=");
+    kprint_u64(resolved);
+    kprint(b"\n");
+
+    // (f) Use the resolved handle: map it read/write — proves the binding handed
+    //     back a usable, rights-attenuated MemoryObject handle.
+    // SAFETY: `resolved` is a MemoryObject handle carrying MAP_READ|MAP_WRITE.
+    let mapped = unsafe {
+        syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
+    };
+    if mapped < 0 {
+        kprint(b"parent: ns-demo map resolved FAIL\n");
+        return;
+    }
+    kprint(b"parent: mapped resolved /store handle ok\n");
+
+    // (g) sys_ns_unbind: remove "/store"; a follow-up lookup must complete the PO
+    //     with a NotFound status (error delivered through the PO, not the syscall).
+    // SAFETY: valid path pointer + handle.
+    let ur = unsafe {
+        syscall4(SYS_NS_UNBIND, root_ns, path.as_ptr() as u64, path.len() as u64, 0)
+    };
+    if ur != 0 {
+        kprint(b"parent: ns_unbind FAIL\n");
+        return;
+    }
+    // SAFETY: valid path pointer + handle.
+    let po2 = unsafe {
+        syscall4(SYS_NS_LOOKUP, root_ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
+    };
+    if po2 < 0 {
+        kprint(b"parent: ns_lookup-after-unbind FAIL\n");
+        return;
+    }
+    // SAFETY: valid wait buffers.
+    let waited2 = unsafe {
+        WAIT_HANDLES[0] = po2 as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    let status2 = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    // KError::NotFound = -10.
+    if waited2 == 1 && status2 == -10 {
+        kprint(b"parent: ns_unbind ok (lookup-after-unbind -> NotFound)\n");
+    } else {
+        kprint(b"parent: ns-demo unbind unexpected\n");
+    }
+
+    // Close the demo handles we still hold (resolved + the original mem + the POs).
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, po as u64);
+        syscall1(SYS_HANDLE_CLOSE, po2 as u64);
+        syscall1(SYS_HANDLE_CLOSE, resolved);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
+    kprint(b"parent: ns-demo done\n");
+}
+
+/// `notif` (in `rdi`) is this process's notification-channel handle and
+/// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
+/// spawn. The third bootstrap register is unused here.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, _boot1: u64, _boot2: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"parent: up (pid 1)\n");
 
     // 0. Exception demo: a worker thread faults; we suspend, inspect, terminate.
@@ -532,6 +685,10 @@ pub extern "C" fn _start(notif: u64, _boot1: u64, _boot2: u64) -> ! {
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();
     block_bounded_demo();
+
+    // 0c. Namespace demo: create / bind / lookup / wait / use / unbind against
+    //     this process's root namespace (Process::namespace, in rsi).
+    ns_demo(root_ns);
 
     kprint(b"parent: creating a channel\n");
 

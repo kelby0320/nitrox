@@ -52,6 +52,13 @@ pub struct Process {
     /// outlives this child; no cycle (the parent's channel does not reference
     /// the child).
     parent_notif: Option<ObjectRef>,
+    /// This process's **root namespace** — the `Namespace` it resolves names
+    /// against (`docs/architecture/namespace-and-resource-servers.md`). The
+    /// process owns this reference, so the namespace outlives the handle the
+    /// process holds to it; `None` until one is attached (the boot root is set
+    /// at pid-1 construction; a child's is derived from its parent's at spawn —
+    /// Part D). No cycle: the namespace does not back-reference the `Process`.
+    namespace: Option<ObjectRef>,
 }
 
 impl Process {
@@ -68,6 +75,7 @@ impl Process {
             address_space: None,
             notification_channel: None,
             parent_notif: None,
+            namespace: None,
         })
     }
 
@@ -84,6 +92,7 @@ impl Process {
             address_space: Some(address_space),
             notification_channel: None,
             parent_notif: None,
+            namespace: None,
         })
     }
 
@@ -135,6 +144,21 @@ impl Process {
     /// its `ChildExited`.
     pub fn notification_channel_ref(&self) -> Option<ObjectRef> {
         self.notification_channel.clone()
+    }
+
+    /// Attach this process's root [`Namespace`](crate::object::Namespace) (the
+    /// process takes ownership of `ns`). Called on the `KBox<Process>` before it
+    /// is wrapped into an `ObjectRef`, so `&mut self` is exclusive. The boot code
+    /// sets pid 1's root here; child inheritance (Part D) sets a derived one.
+    pub fn set_namespace(&mut self, ns: ObjectRef) {
+        self.namespace = Some(ns);
+    }
+
+    /// Clone this process's root-namespace reference (bumping its refcount), or
+    /// `None` if it has none. Used by spawn (Part D) to give a child a reference
+    /// to its inherited namespace, so the namespace outlives the parent.
+    pub fn namespace_ref(&self) -> Option<ObjectRef> {
+        self.namespace.clone()
     }
 
     /// Attach the **parent's** notification channel (where this process's
@@ -206,6 +230,29 @@ mod tests {
         assert_eq!(test_probe::notification_channel_destroys(), 0);
         drop(p);
         assert_eq!(test_probe::notification_channel_destroys(), 1);
+    }
+
+    #[test]
+    fn namespace_attach_is_owned_and_released_on_drop() {
+        use crate::object::Namespace;
+        use crate::object::header::test_probe;
+        init_global_heap();
+        test_probe::reset();
+        let mut p = Process::try_new(1).unwrap();
+        assert!(p.namespace_ref().is_none());
+        // Attach a root namespace; the Process takes one ref.
+        let ns = KBox::into_raw(Namespace::try_new().unwrap()).as_ptr() as *mut ();
+        // SAFETY: into_raw yielded the single creation ref; adopt it.
+        let ns_ref = unsafe { ObjectRef::from_raw(ns, KObjectType::Namespace) };
+        p.set_namespace(ns_ref);
+        // `namespace_ref` clones it (refcount → 2); drop that extra clone.
+        let cloned = p.namespace_ref().expect("namespace attached");
+        assert_eq!(cloned.as_ptr(), ns);
+        drop(cloned);
+        // The Process still owns its ref, so nothing is destroyed yet.
+        assert_eq!(test_probe::namespace_destroys(), 0);
+        drop(p);
+        assert_eq!(test_probe::namespace_destroys(), 1);
     }
 
     #[test]

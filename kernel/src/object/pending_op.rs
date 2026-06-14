@@ -51,6 +51,12 @@ struct PendingOpInner {
     /// `TimedOut` / `PeerClosed` outcomes of a blocking IPC send). Surfaced to
     /// userspace as the `status` of the `IoResult` `sys_wait` writes.
     status: i32,
+    /// The completion **result payload**, valid once `signaled` and meaningful
+    /// when `status == 0` for operations that return a value rather than just a
+    /// status — a namespace lookup delivers its **resolved handle** here.
+    /// Surfaced as the `result` of the `IoResult` `sys_wait` writes; `0` for
+    /// status-only completions (a blocking IPC send) and edge-style waitables.
+    result: u64,
     /// Threads blocked on this PO, as type-erased `Thread` object pointers
     /// (non-owning — each waiter is kept alive by its own parked `ObjectRef` in
     /// the scheduler `blocked` list, and is removed from here before it unparks).
@@ -88,6 +94,7 @@ impl PendingOperation {
             inner: UnsafeCell::new(PendingOpInner {
                 signaled: false,
                 status: 0,
+                result: 0,
                 waiters,
             }),
         })
@@ -117,19 +124,22 @@ impl PendingOperation {
         unsafe { &mut *p.inner.get() }
     }
 
-    /// Mark the operation complete with `status`, **one-shot**: a PO already
-    /// signalled is left untouched (the first completion wins). Returns `true`
-    /// iff this call performed the transition (so the caller knows to wake
-    /// waiters). Pairs with the scheduler's `signal_pending_op`.
+    /// Mark the operation complete with `status` **and** a `result` payload,
+    /// **one-shot**: a PO already signalled is left untouched (the first
+    /// completion wins). Returns `true` iff this call performed the transition
+    /// (so the caller knows to wake waiters). Pairs with the scheduler's
+    /// `signal_pending_op_with_result`. A namespace lookup uses this to deliver
+    /// its resolved handle in `result`.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn signal(obj: *mut (), status: i32) -> bool {
+    pub(crate) unsafe fn signal_with_result(obj: *mut (), status: i32, result: u64) -> bool {
         let inner = unsafe { Self::inner(obj) };
         if inner.signaled {
             return false;
         }
         inner.status = status;
+        inner.result = result;
         inner.signaled = true;
         true
     }
@@ -142,6 +152,16 @@ impl PendingOperation {
     /// See the accessor contract above.
     pub(crate) unsafe fn status(obj: *mut ()) -> i32 {
         unsafe { Self::inner(obj) }.status
+    }
+
+    /// The completion result payload (meaningful once signalled with `status ==
+    /// 0`; `0` before). Stable after the one-shot transition, so it may be read
+    /// at `sys_wait` result-build time alongside [`status`](Self::status).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn result(obj: *mut ()) -> u64 {
+        unsafe { Self::inner(obj) }.result
     }
 
     /// `true` iff the operation has completed — the waitable "signaled"
@@ -252,11 +272,11 @@ mod tests {
         let obj = fresh();
         // SAFETY: live PO, single-threaded test.
         unsafe {
-            assert!(PendingOperation::signal(obj, 0));
+            assert!(PendingOperation::signal_with_result(obj, 0, 0));
             assert!(PendingOperation::already_signaled(obj));
             assert_eq!(PendingOperation::status(obj), 0);
             // A second signal is a no-op: the first completion wins.
-            assert!(!PendingOperation::signal(obj, -12));
+            assert!(!PendingOperation::signal_with_result(obj, -12, 0));
             assert_eq!(PendingOperation::status(obj), 0, "status must not change");
         }
         free(obj);
@@ -267,9 +287,30 @@ mod tests {
         let obj = fresh();
         // SAFETY: live PO, single-threaded test.
         unsafe {
-            assert!(PendingOperation::signal(obj, -12)); // e.g. TimedOut
+            assert!(PendingOperation::signal_with_result(obj, -12, 0)); // e.g. TimedOut
             assert!(PendingOperation::already_signaled(obj));
             assert_eq!(PendingOperation::status(obj), -12);
+            // A status-only completion leaves the payload zero.
+            assert_eq!(PendingOperation::result(obj), 0);
+        }
+        free(obj);
+    }
+
+    #[test]
+    fn signal_with_result_records_status_and_payload() {
+        let obj = fresh();
+        // SAFETY: live PO, single-threaded test.
+        unsafe {
+            assert_eq!(PendingOperation::result(obj), 0, "zero before signal");
+            // A successful lookup-style completion: status 0, resolved handle.
+            assert!(PendingOperation::signal_with_result(obj, 0, 0xCAFE));
+            assert!(PendingOperation::already_signaled(obj));
+            assert_eq!(PendingOperation::status(obj), 0);
+            assert_eq!(PendingOperation::result(obj), 0xCAFE);
+            // One-shot: a second completion (even with a payload) is a no-op.
+            assert!(!PendingOperation::signal_with_result(obj, -10, 0xDEAD));
+            assert_eq!(PendingOperation::status(obj), 0, "status unchanged");
+            assert_eq!(PendingOperation::result(obj), 0xCAFE, "result unchanged");
         }
         free(obj);
     }
