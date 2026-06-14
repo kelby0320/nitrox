@@ -36,7 +36,8 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
-    IpcChannel, MemoryObject, NotificationChannel, PendingOperation, Process, Thread, Timer,
+    IpcChannel, MemoryObject, Namespace, NotificationChannel, PendingOperation, Process, Thread,
+    Timer,
 };
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
@@ -313,6 +314,15 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::PendingOperation);
         }
+        KObjectType::Namespace => {
+            // SAFETY: last ref to a `Namespace` produced by KBox::into_raw.
+            // Dropping the box releases every binding's target `ObjectRef`.
+            drop(unsafe {
+                KBox::<Namespace>::from_raw(NonNull::new_unchecked(ptr as *mut Namespace))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::Namespace);
+        }
         // No other kernel object types are implemented yet; they land behind
         // their respective slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -339,6 +349,7 @@ pub(crate) mod test_probe {
         static NOTIFICATION_CHANNEL_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static IPC_CHANNEL_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static PENDING_OP_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static NAMESPACE_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -354,6 +365,7 @@ pub(crate) mod test_probe {
             }
             KObjectType::IpcChannel => IPC_CHANNEL_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::PendingOperation => PENDING_OP_DESTROYS.with(|c| c.set(c.get() + 1)),
+            KObjectType::Namespace => NAMESPACE_DESTROYS.with(|c| c.set(c.get() + 1)),
             _ => {}
         }
     }
@@ -386,6 +398,10 @@ pub(crate) mod test_probe {
         PENDING_OP_DESTROYS.with(Cell::get)
     }
 
+    pub(crate) fn namespace_destroys() -> usize {
+        NAMESPACE_DESTROYS.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PROCESS_DESTROYS.with(|c| c.set(0));
         THREAD_DESTROYS.with(|c| c.set(0));
@@ -393,6 +409,8 @@ pub(crate) mod test_probe {
         TIMER_DESTROYS.with(|c| c.set(0));
         NOTIFICATION_CHANNEL_DESTROYS.with(|c| c.set(0));
         IPC_CHANNEL_DESTROYS.with(|c| c.set(0));
+        PENDING_OP_DESTROYS.with(|c| c.set(0));
+        NAMESPACE_DESTROYS.with(|c| c.set(0));
     }
 }
 
