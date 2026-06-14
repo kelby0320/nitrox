@@ -773,12 +773,12 @@ These were implicit in the original plan; each gates one or more later slices.
 Author the two missing architecture docs first — slices 1 and 5 implement
 *against* contracts that have not been written.
 
-- [~] **Architecture docs.** `docs/architecture/drivers-and-irps.md` (the IRP /
+- [x] **Architecture docs.** `docs/architecture/drivers-and-irps.md` (the IRP /
   completion-routine / `InterruptObject` contract the storage slice implements)
   is **done** (`phase-2/drivers-irps-doc`). `docs/architecture/namespace-and-resource-servers.md`
-  (the `ResourceServer`/`OpStatus`/registry contract slice 1 implements) is still
-  to be written — it gates slice 1, not the prereq code items, so it lands just
-  before slice 1.
+  (the namespace data model + resolution + async-lookup contract + the
+  `ResourceServer`/`OpStatus`/registry model) is **done**
+  (`phase-2/namespace-design`) — it gates slice 1.
 - [x] **ACPI table parser** (pure-Rust RSDP → XSDT/RSDT → MADT + MCFG; no AML).
   Enables IOAPIC (MADT) and PCI ECAM (MCFG). No external crate. Gates the
   IOAPIC and storage slices. **Done** (`phase-2/acpi-tables`): behind a new
@@ -852,18 +852,29 @@ Author the two missing architecture docs first — slices 1 and 5 implement
 > allocation — have landed. Phase 2 proper (the storage slice → fs-server → page
 > cache) can begin.
 
-#### 1. Namespace and resource server foundation
+#### 1. Namespace foundation (the per-process name-resolution substrate)
 
-- [ ] `Namespace` kernel object with binding tree (RB-tree or similar)
-- [ ] Path resolution engine (parse, walk, dispatch)
-- [ ] Lookup cache (recently-resolved paths → handles)
-- [ ] `ResourceServer` trait per [docs/architecture/namespace-and-resource-servers.md]
-- [ ] `OpStatus` (Completed, Pending, Rejected)
-- [ ] `ResourceServerRegistry` (flat list of registered servers)
-- [ ] `sys_ns_create`
-- [ ] `sys_ns_lookup`
-- [ ] `sys_ns_bind` (gated by `SysCaps::BIND_NAMESPACE`)
-- [ ] `sys_ns_unbind`
+Design: [`docs/architecture/namespace-and-resource-servers.md`]. Broken into a
+docs-first design pass (**done**) + three code parts, each its own PR. The
+`ResourceServer` trait / `OpStatus` / registry / IPC-forwarded lookup are *designed*
+here but **implemented with slice 3** (resource servers) — there are no servers to
+route to until then. Lookup is a `PendingOperation` from the start (a real lookup
+forwards over IPC → async); slice 1 binds **direct handles** and returns a
+pre-signalled PO carrying the resolved handle via `IoResult.result`.
+
+- [x] **Part A — design doc** (`phase-2/namespace-design`): the model, path grammar,
+  longest-prefix resolution, binding kinds, async-lookup contract, capability model,
+  cache, kernel/userspace split, slice-1-vs-slice-3 scope. Spec: `sys_ns_*` numbers
+  22–25 reserved + `IoResult.result` word noted.
+- [ ] **Part B** — `Namespace` kernel object + binding store + longest-prefix
+  resolution engine (host-tested; no syscalls).
+- [ ] **Part C** — `IoResult.result` + `PendingOperation` result payload; the four
+  `sys_ns_*` syscalls (lookup → pre-signalled PO; bind gated by the `BIND` handle
+  right, `BIND_NAMESPACE` syscap deferred to the syscap model); per-process
+  `Namespace` field; QEMU create→bind→lookup→wait→use demo.
+- [ ] **Part D** — lookup cache + spawn/namespace inheritance (sandbox-by-construction).
+- *(slice 3)* `ResourceServer` trait, `OpStatus`, `ResourceServerRegistry`,
+  IPC-forwarded lookup + cross-context handle install.
 
 #### 2. Entropy
 

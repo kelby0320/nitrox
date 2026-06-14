@@ -3587,3 +3587,39 @@ and the scheduler + userspace demos run unchanged. Branch `phase-2/dma-alloc` of
 doc, ACPI, IOAPIC, DPC, demand paging, `PendingOperation`/async-I/O + IPC
 `Block`/`BlockBounded`, DMA allocation) have landed. Next: **Phase 2 proper** — the
 storage slice (AHCI/GPT) → fs-server → page cache.
+
+## 2026-06-14 — Phase 2 slice 1: namespace design (Part A) + lookup-as-PendingOperation
+
+Started Phase 2 proper slice 1 (per-process namespaces). It's large, so it's split
+into a docs-first design pass + three code parts (B: object+resolver, C: syscalls +
+async lookup + per-process namespace, D: cache + spawn inheritance), each its own PR.
+This entry covers **Part A**, the design doc
+`docs/architecture/namespace-and-resource-servers.md` (the contract the plan required
+before slice 1, per 2026-06-11). It pins the data model, path grammar, longest-prefix
+resolution + rights attenuation, binding kinds (DirectHandle now; ResourceServer /
+SubNamespace / Rewrite later), the capability model, the lookup cache, and the
+kernel/userspace split, with an explicit slice-1-vs-slice-3 scope table.
+
+**Decision — `sys_ns_lookup` is async (`PendingOperation`) from the start.** A real
+lookup forwards over IPC to a resource server (blocking) → it must be async per the
+async-first rule (the spec already specified a PO). Building it synchronous now and
+breaking the ABI later — on a syscall every fs client uses — is worse. Implication
+fixed now: a PO must convey a **result handle**, so `IoResult` grows a `result: u64`
+word (the payload `io_result.rs` already anticipated for "richer waitables that report
+payloads") and a PO can complete with a result. In slice 1, direct-handle bindings
+resolve in-context and return a **pre-signalled** PO carrying the resolved handle —
+the full async result path without any resource-server machinery; IPC-forwarding and
+the cross-context handle install land in slice 3.
+
+**Decision — bind gating.** Slice 1 enforces the `BIND` **handle right** (you can only
+bind into a namespace you hold a `BIND`-righted handle to; supervisors hand clients
+`LOOKUP`-only handles). The system-wide `BIND_NAMESPACE` **syscap** is an additional
+gate that lands with the process-capability model (not yet designed); both apply in
+the final design (`why-supervisor-registration.md`).
+
+Slice-3 work (designed, not built): the `ResourceServer` trait, `OpStatus`, the
+registry, IPC-forwarded lookup, the rsproto namespace ops. Spec updated
+(`syscall-abi.md`: `SYS_NS_*` = 22–25 reserved, the `IoResult.result` word) and the
+plan's slice-1 section re-expressed as the A/B/C/D breakdown. No code yet — Part A is
+docs-only. Branch `phase-2/namespace-design` off `main` (includes merged PR #39).
+Next: Part B (the `Namespace` object + resolver).
