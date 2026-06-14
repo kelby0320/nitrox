@@ -71,7 +71,7 @@ static mut RECV_COUNT: usize = 0;
 /// `sys_channel_send`/`recv` transferred-handle arrays.
 static mut SEND_HANDLES: [u64; 1] = [0];
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_RESULTS: [u8; 16] = [0; 16];
+static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
 
 #[inline]

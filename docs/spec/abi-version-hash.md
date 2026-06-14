@@ -72,7 +72,10 @@ Every variant of `Notification` and its discriminant value, plus the byte offset
 
 Field offsets, types, and sizes of:
 - `IoOp`
-- `IoResult`
+- `IoResult` — **24 bytes** as of Phase 2 slice 1 (grew from 16: a `result: u64`
+  payload word was appended at offset 16 for completions that return a value,
+  e.g. a namespace lookup's resolved handle; the earlier `handle`/`status`/
+  `reserved` offsets are unchanged). Any change to `IoResult` invalidates the hash.
 - `IoOpcode` enum
 
 ### KError enum layout

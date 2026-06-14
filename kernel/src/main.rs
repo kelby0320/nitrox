@@ -364,7 +364,7 @@ fn run_first_userspace() {
     use nitrox_kernel::handle::global;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
-    use nitrox_kernel::object::{NotificationChannel, ObjectRef, Process};
+    use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
     // per-thread (by the scheduler's `thread_enter`), not here.
@@ -423,18 +423,55 @@ fn run_first_userspace() {
         }
     };
 
+    // The parent's root namespace (the namespace it resolves names against —
+    // `Process::namespace`). The Process owns one reference; a handle in pid 1's
+    // table owns the other, passed to the parent in `rsi` so it can bind into and
+    // look up against its root namespace. Mirrors the notification channel above.
+    let ns = match Namespace::try_new() {
+        Ok(n) => n,
+        Err(_) => {
+            kprintln!("init: namespace alloc failed");
+            return;
+        }
+    };
+    let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
+    // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
+    // one for the Process, install the other as a handle (refcount → 2).
+    let ns_ref = unsafe { ObjectRef::from_raw(ns_ptr, KObjectType::Namespace) };
+    proc_box.set_namespace(ns_ref.clone());
+    let (np, nt) = ns_ref.into_raw();
+    // Full namespace rights — kept in sync with `syscall::table::namespace_rights`
+    // (LOOKUP|BIND principals + the UNBIND modifier + the generic band).
+    let ns_rights = Rights::LOOKUP
+        | Rights::BIND
+        | Rights::UNBIND
+        | Rights::DUPLICATE
+        | Rights::TRANSFER
+        | Rights::INSPECT;
+    let ns_h = match global::get().allocate(1, np, nt, ns_rights) {
+        Ok(h) => h,
+        Err(_) => {
+            // SAFETY: reclaim the namespace-handle reference; `proc_box` (which
+            // still owns its clone) drops on return.
+            drop(unsafe { ObjectRef::from_raw(np, nt) });
+            kprintln!("init: namespace handle alloc failed");
+            return;
+        }
+    };
+
     let proc_ref = {
         let ptr = KBox::into_raw(proc_box).as_ptr() as *mut ();
         // SAFETY: `into_raw` yielded the single creation reference; adopt it.
         unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }
     };
 
-    // Spawn the parent's main thread, seeding `rdi` = its notification handle.
+    // Spawn the parent's main thread, seeding `rdi` = its notification handle and
+    // `rsi` = its root-namespace handle.
     if sched::spawn_user(
         proc_ref,
         info.entry_point.as_u64(),
         info.stack_top.as_u64(),
-        [notif_h.bits(), 0, 0],
+        [notif_h.bits(), ns_h.bits(), 0],
     )
     .is_err()
     {

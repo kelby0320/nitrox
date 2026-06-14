@@ -34,9 +34,10 @@ use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
+use crate::object::namespace::{NS_PATH_MAX, validate_path};
 use crate::object::{
-    BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, NotificationChannel, ObjectRef,
-    PendingOperation, Process, ReclaimedSend, RecvState, SendOutcome, StoredMsg,
+    BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace, NotificationChannel,
+    NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState, SendOutcome, StoredMsg,
     Timer as TimerObject, TransferRef,
 };
 
@@ -91,6 +92,14 @@ pub const SYS_THREAD_CREATE: u64 = 19;
 pub const SYS_THREAD_GET_REGISTERS: u64 = 20;
 /// `sys_exception_resume` — resume or terminate a thread suspended on a fault.
 pub const SYS_EXCEPTION_RESUME: u64 = 21;
+/// `sys_ns_create` — create an empty `Namespace`, return a full-rights handle.
+pub const SYS_NS_CREATE: u64 = 22;
+/// `sys_ns_lookup` — resolve a path in a namespace, return a `PendingOperation`.
+pub const SYS_NS_LOOKUP: u64 = 23;
+/// `sys_ns_bind` — bind a resource handle at a path in a namespace.
+pub const SYS_NS_BIND: u64 = 24;
+/// `sys_ns_unbind` — remove the binding at a path in a namespace.
+pub const SYS_NS_UNBIND: u64 = 25;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -130,6 +139,10 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_CREATE => encode(sys_thread_create(a0)),
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
+        SYS_NS_CREATE => encode(sys_ns_create()),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3)),
+        SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3)),
+        SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -785,6 +798,50 @@ fn pending_op_rights() -> Rights {
     Rights::WAIT | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
 }
 
+/// Rights a freshly-created `Namespace` handle carries: the full namespace
+/// principal set (`LOOKUP | BIND`), the `UNBIND` modifier, and the generic
+/// management band (duplicate / transfer / inspect). A `Namespace` is not a
+/// waitable, so no `WAIT`. (`UNBIND` is a modifier-band right, already
+/// allocatable on a `Namespace` — `handle/type_rights.rs`.)
+fn namespace_rights() -> Rights {
+    Rights::LOOKUP
+        | Rights::BIND
+        | Rights::UNBIND
+        | Rights::DUPLICATE
+        | Rights::TRANSFER
+        | Rights::INSPECT
+}
+
+/// Map a [`NsError`] to the user-facing [`KError`]. `AlreadyBound`/`InvalidPath`
+/// are caller errors (`InvalidArgument`); `NotBound` is `NotFound`.
+fn map_ns_err(e: NsError) -> KError {
+    match e {
+        NsError::InvalidPath | NsError::AlreadyBound => KError::InvalidArgument,
+        NsError::NotBound => KError::NotFound,
+        NsError::OutOfMemory => KError::OutOfMemory,
+    }
+}
+
+/// Copy a namespace path (`path_ptr`, `path_len`) from user memory into `buf`,
+/// returning the populated byte slice. `path_len` must be in `1..=NS_PATH_MAX`
+/// (`InvalidArgument` / `TooLarge` otherwise). Validation of the path *grammar*
+/// is the caller's job (via [`validate_path`] / `Namespace::bind`).
+fn copy_ns_path<'a>(
+    path_ptr: u64,
+    path_len: usize,
+    buf: &'a mut [u8; NS_PATH_MAX],
+) -> Result<&'a [u8], KError> {
+    if path_len == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    if path_len > NS_PATH_MAX {
+        return Err(KError::TooLarge);
+    }
+    let p = UserPtr::<u8>::new(path_ptr).map_err(from_user_access)?;
+    copy_slice_from_user(&mut buf[..path_len], p).map_err(from_user_access)?;
+    Ok(&buf[..path_len])
+}
+
 /// `sys_timer_create(flags)` — create an unarmed `Timer` and return a handle
 /// (with [`timer_rights`]). `flags` must be a valid [`TimerFlags`] (none defined
 /// yet → must be 0).
@@ -818,6 +875,153 @@ pub fn sys_timer_set(timer_h: u64, deadline_ns: u64, interval_ns: u64) -> SysRes
     crate::sched::timer_arm(ok.object.as_ptr(), deadline_ns, interval_ns)
         .map_err(|()| KError::OutOfMemory)?;
     Ok(0)
+}
+
+/// `sys_ns_create()` — create an empty [`Namespace`] kernel object and return a
+/// handle carrying [`namespace_rights`]. The `sys_timer_create` pattern.
+pub fn sys_ns_create() -> SysResult {
+    let obj = Namespace::try_new().map_err(|_| KError::OutOfMemory)?;
+    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
+    let pid = crate::sched::current_owner_pid();
+    match global::get().allocate(pid, ptr, KObjectType::Namespace, namespace_rights()) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // `allocate` did not adopt the creation reference; reclaim + drop it
+            // (running `Namespace::Drop`) outside the table call.
+            // SAFETY: `ptr` carries the single outstanding creation reference.
+            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::Namespace) });
+            Err(map_handle_err(e))
+        }
+    }
+}
+
+/// `sys_ns_bind(ns, path, path_len, resource)` — bind `resource` (a direct
+/// kernel-object handle in slice 1) at `path` in namespace `ns`. Requires the
+/// `BIND` right on `ns`. The binding takes a **clone** of the resource's
+/// reference (the caller's handle stays valid) and records the resource handle's
+/// current rights as the binding's rights cap. Returns 0.
+pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ns_ok = lookup_typed(ns_h, pid, Rights::BIND, KObjectType::Namespace)?;
+    let mut buf = [0u8; NS_PATH_MAX];
+    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
+    // Resolve the resource handle (any type; ownership is the authority). Clone
+    // its reference for the binding; the binding's rights are the handle's rights.
+    let res_ok = global::get()
+        .lookup(RawHandle(resource_h), pid, Rights::empty())
+        .map_err(map_handle_err)?;
+    let target = res_ok.object.clone();
+    let rights = res_ok.rights;
+    // SAFETY: `ns_ok.object` addresses a live `Namespace` — `lookup_typed`
+    // verified the type tag and the refcount pins it for this call.
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    match ns.bind(path, target, rights) {
+        Ok(()) => Ok(0),
+        Err((returned, e)) => {
+            // Drop the handed-back reference **outside** the namespace lock
+            // (`bind` released it before returning).
+            drop(returned);
+            Err(map_ns_err(e))
+        }
+    }
+    // `res_ok` / `ns_ok` drop here, releasing the lookup references outside any
+    // namespace lock (the caller's resource + namespace handles still pin them).
+}
+
+/// `sys_ns_unbind(ns, path, path_len)` — remove the binding at `path` in `ns`.
+/// Requires the `UNBIND` right on `ns`. `NotFound` if nothing is bound there.
+/// Returns 0.
+pub fn sys_ns_unbind(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ns_ok = lookup_typed(ns_h, pid, Rights::UNBIND, KObjectType::Namespace)?;
+    let mut buf = [0u8; NS_PATH_MAX];
+    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
+    // SAFETY: live `Namespace` (type verified by `lookup_typed`).
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    match ns.unbind(path) {
+        // Release the removed binding's target reference outside the lock
+        // (`unbind` returned it for exactly this).
+        Some(target) => {
+            drop(target);
+            Ok(0)
+        }
+        None => Err(KError::NotFound),
+    }
+}
+
+/// `sys_ns_lookup(ns, path, path_len, rights)` — resolve `path` in `ns`
+/// (longest-prefix match), requesting at most `rights`. Requires `LOOKUP` on
+/// `ns`. Returns a [`PendingOperation`] handle; the completion delivers the
+/// resolved resource handle in `IoResult.result` (rights = `requested ∩
+/// binding.rights`) with `status == 0`, or a `NotFound` `status`. A slice-1
+/// direct-handle binding resolves entirely in this syscall context, so the PO is
+/// **pre-signalled** and the caller's `sys_wait` returns immediately — the full
+/// async result path, exercised before any resource server exists.
+///
+/// Argument / permission / allocation failures return **synchronously** (a
+/// negative isize, no PO). Resolution failures (no covering binding, or a
+/// non-empty suffix on a direct-handle leaf) are delivered **through** the PO.
+pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    // --- synchronous validation (no PO created on these) ---
+    let requested = Rights::from_bits_truncate(rights_bits);
+    let ns_ok = lookup_typed(ns_h, pid, Rights::LOOKUP, KObjectType::Namespace)?;
+    let mut buf = [0u8; NS_PATH_MAX];
+    let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
+    validate_path(path).map_err(|_| KError::InvalidArgument)?;
+
+    // Create the PO and its handle FIRST, so every *resolution* outcome (success
+    // or not-found) is delivered through the PO; only the pre-PO failures above
+    // return synchronously.
+    let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
+    let po_ptr = KBox::into_raw(po).as_ptr() as *mut ();
+    let po_h = match global::get().allocate(
+        pid,
+        po_ptr,
+        KObjectType::PendingOperation,
+        pending_op_rights(),
+    ) {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: reclaim the PO creation reference; drop runs `PO::Drop`
+            // (no waiters yet, so its assert holds).
+            drop(unsafe { ObjectRef::from_raw(po_ptr, KObjectType::PendingOperation) });
+            return Err(map_handle_err(e));
+        }
+    };
+
+    // --- resolve + install (failures delivered via the PO) ---
+    // SAFETY: live `Namespace` (type verified by `lookup_typed`).
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    let (status, result): (i32, u64) = match ns.resolve(path) {
+        None => (KError::NotFound as i32, 0),
+        // Direct-handle leaf: a non-empty suffix has no sub-resource → not found.
+        // (Slice 1 binds only direct handles; resource-server suffix forwarding
+        // is slice 3.)
+        Some((target, _rights, suffix)) if !suffix.is_empty() => {
+            drop(target);
+            (KError::NotFound as i32, 0)
+        }
+        Some((target, binding_rights, _)) => {
+            let attenuated = requested & binding_rights;
+            // Install the cloned target into the caller's table with attenuated
+            // rights; hand `allocate` the reference via `into_raw`.
+            let (tptr, tty) = target.into_raw();
+            match global::get().allocate(pid, tptr, tty, attenuated) {
+                Ok(h) => (0, h.bits()),
+                Err(e) => {
+                    // SAFETY: `allocate` did not adopt the reference; reclaim it.
+                    drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+                    (map_handle_err(e) as i32, 0)
+                }
+            }
+        }
+    };
+    // Pre-signal the PO with the outcome (no waiters yet → just records it).
+    // `ns_ok` is still held here (a refcount, no lock), so this — which takes
+    // `SCHED` — performs no `ObjectRef` drop under the lock.
+    crate::sched::complete_pending_op(po_ptr, status, result);
+    Ok(po_h.bits() as isize)
 }
 
 /// `sys_wait(handles, count, results, deadline)` — block until ≥1 of
@@ -879,15 +1083,16 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
             let mut k = 0usize;
             for i in 0..count {
                 if bits[i] {
-                    // A `PendingOperation` reports its completion status; the
+                    // A `PendingOperation` reports its completion status and
+                    // result payload (a namespace lookup's resolved handle); the
                     // edge-style waitables (Timer/channel/notification) are an
-                    // unconditional "ready" (status 0). The handle still pins the
-                    // object, so reading the (one-shot, now-stable) status is sound.
+                    // unconditional "ready" (status 0, no payload). The handle
+                    // still pins the object, so reading the (one-shot, now-stable)
+                    // completion is sound.
                     out[k] = if types[i] == KObjectType::PendingOperation {
-                        IoResult::completed(
-                            handles[i],
-                            crate::sched::pending_op_status(objs[i] as *mut ()),
-                        )
+                        let (status, result) =
+                            crate::sched::pending_op_completion(objs[i] as *mut ());
+                        IoResult::completed_with_result(handles[i], status, result)
                     } else {
                         IoResult::ready(handles[i])
                     };
@@ -1380,6 +1585,50 @@ mod tests {
             .expect("WAIT + generic rights must be valid for a NotificationChannel");
         let co = t.close(h, 1).unwrap();
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    // --- Namespace syscalls --------------------------------------------------
+    //
+    // The full create → bind → lookup → wait round-trip needs the scheduler
+    // (`current_owner_pid`, PO completion, `sys_wait`) and the global handle
+    // table, so it is exercised by the QEMU `ns_demo` in `userspace/parent`, not
+    // here. The host-reachable parts are the rights-allocatability, the error
+    // map, and the path-length bounds that precede any pointer dereference.
+
+    #[test]
+    fn namespace_rights_are_allocatable_on_a_namespace() {
+        // The rights `sys_ns_create` mints (LOOKUP|BIND principals + UNBIND
+        // modifier + generic band) must be accepted by the handle table for a
+        // Namespace.
+        init_global_heap();
+        let t = HandleTable::try_new(0x1357_9BDF_0246_8ACE).unwrap();
+        let ns = Namespace::try_new().unwrap();
+        let ptr = KBox::into_raw(ns).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, ptr, KObjectType::Namespace, namespace_rights())
+            .expect("namespace_rights must be valid for a Namespace");
+        let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    #[test]
+    fn map_ns_err_maps_each_variant() {
+        assert_eq!(map_ns_err(NsError::InvalidPath), KError::InvalidArgument);
+        assert_eq!(map_ns_err(NsError::AlreadyBound), KError::InvalidArgument);
+        assert_eq!(map_ns_err(NsError::NotBound), KError::NotFound);
+        assert_eq!(map_ns_err(NsError::OutOfMemory), KError::OutOfMemory);
+    }
+
+    #[test]
+    fn copy_ns_path_rejects_zero_and_oversize_len() {
+        // The length bounds are checked before the user pointer is dereferenced,
+        // so a dummy pointer/buffer suffices (host-reachable).
+        let mut buf = [0u8; NS_PATH_MAX];
+        assert_eq!(copy_ns_path(0x1000, 0, &mut buf), Err(KError::InvalidArgument));
+        assert_eq!(
+            copy_ns_path(0x1000, NS_PATH_MAX + 1, &mut buf),
+            Err(KError::TooLarge),
+        );
     }
 
     #[test]

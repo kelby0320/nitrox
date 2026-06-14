@@ -68,17 +68,19 @@ const E_WOULD_BLOCK: i64 = -11;
 const E_TIMED_OUT: i64 = -12;
 const E_PEER_CLOSED: i64 = -13;
 
-/// `IoResult` mirror (`kernel/src/libkern/io_result.rs`): 16 bytes, 8-aligned.
+/// `IoResult` mirror (`kernel/src/libkern/io_result.rs`): 24 bytes, 8-aligned.
 #[repr(C, align(8))]
 struct IoResultBuf {
     handle: u64,
     status: i32,
     reserved: u32,
+    result: u64,
 }
 
 /// Out-buffer for one `sys_wait` result + a one-entry handles array, both in
 /// writable `.bss`.
-static mut WAIT_RESULTS: IoResultBuf = IoResultBuf { handle: 0, status: 0, reserved: 0 };
+static mut WAIT_RESULTS: IoResultBuf =
+    IoResultBuf { handle: 0, status: 0, reserved: 0, result: 0 };
 static mut WAIT_HANDLES: [u64; 1] = [0];
 
 /// Userspace mirror of the kernel `IpcMsg` (`kernel/src/libkern/ipc.rs`): one

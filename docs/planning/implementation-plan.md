@@ -866,12 +866,15 @@ pre-signalled PO carrying the resolved handle via `IoResult.result`.
   longest-prefix resolution, binding kinds, async-lookup contract, capability model,
   cache, kernel/userspace split, slice-1-vs-slice-3 scope. Spec: `sys_ns_*` numbers
   22–25 reserved + `IoResult.result` word noted.
-- [ ] **Part B** — `Namespace` kernel object + binding store + longest-prefix
-  resolution engine (host-tested; no syscalls).
-- [ ] **Part C** — `IoResult.result` + `PendingOperation` result payload; the four
-  `sys_ns_*` syscalls (lookup → pre-signalled PO; bind gated by the `BIND` handle
-  right, `BIND_NAMESPACE` syscap deferred to the syscap model); per-process
-  `Namespace` field; QEMU create→bind→lookup→wait→use demo.
+- [x] **Part B** (`phase-2/namespace-object`, PR #41) — `Namespace` kernel object +
+  binding store + longest-prefix resolution engine (host-tested; no syscalls).
+- [x] **Part C** (`phase-2/namespace-syscalls`) — `IoResult.result` (16→24 B) +
+  `PendingOperation` result payload; the four `sys_ns_*` syscalls (lookup →
+  pre-signalled PO carrying the resolved handle; resolution failures via the PO's
+  `NotFound` status, arg/permission/alloc failures synchronous; bind gated by the
+  `BIND` handle right, `BIND_NAMESPACE` syscap deferred to the syscap model);
+  `Process::namespace` field + boot-time root namespace for pid 1 (handle in `rsi`);
+  QEMU `ns_demo` create→bind→lookup→wait→use→unbind.
 - [ ] **Part D** — lookup cache + spawn/namespace inheritance (sandbox-by-construction).
 - *(slice 3)* `ResourceServer` trait, `OpStatus`, `ResourceServerRegistry`,
   IPC-forwarded lookup + cross-context handle install.

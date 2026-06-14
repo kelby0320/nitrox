@@ -173,7 +173,8 @@ Blocks until at least one handle in `handles[0..count]` signals, or until `deadl
 The per-process name-resolution substrate; full model in
 [`docs/architecture/namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md).
 Syscall numbers: `sys_ns_create = 22`, `sys_ns_lookup = 23`, `sys_ns_bind = 24`,
-`sys_ns_unbind = 25` (reserved; pre-stabilization). `path` is absolute,
+`sys_ns_unbind = 25` (**implemented** for direct-handle bindings as of Phase 2
+slice 1; resource-server forwarding is slice 3). `path` is absolute,
 `/`-separated, ≤ `NS_PATH_MAX` (1024) bytes, with no `.`/`..`/empty components.
 
 ```rust
@@ -187,11 +188,18 @@ fn sys_ns_lookup(
 Looks up `path` in namespace `ns` (longest-prefix match), requesting at most
 `rights`. Requires `LOOKUP` on `ns`. Returns a `PendingOperation` handle; the
 operation completes carrying either the resolved resource handle in
-`IoResult.result` (with rights = requested ∩ binding rights) or an error in
-`IoResult.status`. (A direct-handle binding completes the PO immediately,
-pre-signalled; a resource-server binding completes it after the IPC round-trip —
-slice 3.) The `IoResult.result` word is the result-carrying extension noted under
-`sys_wait`.
+`IoResult.result` (with rights = requested ∩ binding rights, `status == 0`) or a
+negative `KError` in `IoResult.status`. (A direct-handle binding completes the PO
+immediately, pre-signalled; a resource-server binding completes it after the IPC
+round-trip — slice 3.) The `IoResult.result` word is the result-carrying
+extension noted under `sys_wait`.
+
+**Error delivery.** *Resolution* failures — no covering binding, or a non-empty
+suffix on a direct-handle leaf — are delivered **through the PO** as a `NotFound`
+`status` (you are not told *why* a path does not resolve; it simply does not
+exist). *Argument*, *permission*, and *allocation* failures (a bad `ns` handle or
+missing `LOOKUP`, a malformed/oversize `path`, or PO/handle exhaustion) return
+**synchronously** as a negative isize, with **no** `PendingOperation` created.
 
 ```rust
 fn sys_ns_bind(
@@ -215,7 +223,9 @@ Removes the binding at `path` in `ns`. Requires `UNBIND` right on `ns`.
 ```rust
 fn sys_ns_create() -> isize
 ```
-Creates a new empty `Namespace` kernel object. Returns a handle with full rights.
+Creates a new empty `Namespace` kernel object, independent of the caller's root
+namespace. Returns a handle with full namespace rights (`LOOKUP | BIND | UNBIND`
+plus the generic duplicate/transfer/inspect band).
 
 ### Process and Thread
 

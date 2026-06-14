@@ -670,8 +670,16 @@ fn signal_ipc_endpoint(g: &mut SchedState, endpoint: *mut ()) {
 /// `SCHED`. No allocation, no blocking, no `ObjectRef` drop. Mirrors
 /// [`signal_ipc_endpoint`] but drains a `PendingOperation`'s waiter list.
 fn signal_pending_op(g: &mut SchedState, po: *mut (), status: i32) {
+    signal_pending_op_with_result(g, po, status, 0);
+}
+
+/// As [`signal_pending_op`], but the completion also carries a `result` payload
+/// (a namespace lookup's resolved handle). `signal_pending_op` is the
+/// `result = 0` wrapper for the status-only call sites (blocking IPC). Caller
+/// holds `SCHED`. No allocation, no blocking, no `ObjectRef` drop.
+fn signal_pending_op_with_result(g: &mut SchedState, po: *mut (), status: i32, result: u64) {
     // SAFETY: live PO, `SCHED` held. One-shot; a re-signal returns `false`.
-    if !unsafe { PendingOperation::signal(po, status) } {
+    if !unsafe { PendingOperation::signal_with_result(po, status, result) } {
         return; // already completed — its waiters were handled the first time
     }
     let mut buf = [core::ptr::null_mut(); PendingOperation::MAX_WAITERS];
@@ -689,15 +697,27 @@ fn signal_pending_op(g: &mut SchedState, po: *mut (), status: i32) {
     }
 }
 
-/// Read a completed [`PendingOperation`]'s status under `SCHED`. Called by
-/// `sys_wait` when building the `IoResult` for a signaled PO; the value is stable
-/// after the one-shot completion, but the lock is taken to honor the accessor
-/// contract. The caller's handle pins `po` for the duration.
-pub fn pending_op_status(po: *mut ()) -> i32 {
+/// Read a completed [`PendingOperation`]'s `(status, result)` under `SCHED`.
+/// Called by `sys_wait` when building the `IoResult` for a signaled PO; both
+/// values are stable after the one-shot completion, but the lock is taken to
+/// honor the accessor contract (and to read both under one hold). The caller's
+/// handle pins `po` for the duration.
+pub fn pending_op_completion(po: *mut ()) -> (i32, u64) {
     let _g = SCHED.lock();
     // SAFETY: `po` is a live `PendingOperation` pinned by the caller's handle;
-    // `SCHED` held.
-    unsafe { PendingOperation::status(po) }
+    // `SCHED` held — both reads see the same one-shot-stable completion.
+    unsafe { (PendingOperation::status(po), PendingOperation::result(po)) }
+}
+
+/// Complete a [`PendingOperation`] with `(status, result)` from **syscall
+/// context** (not a wakeup path), taking `SCHED` to do so. A namespace
+/// direct-handle lookup uses this to **pre-signal** the PO it is about to return:
+/// resolution finished synchronously, so the PO is completed in place. The PO has
+/// no waiters yet (it was just created), so the wake loop is a no-op; the caller's
+/// later `sys_wait` takes the already-signalled fast path. One-shot.
+pub fn complete_pending_op(po: *mut (), status: i32, result: u64) {
+    let mut g = SCHED.lock();
+    signal_pending_op_with_result(&mut g, po, status, result);
 }
 
 /// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,
