@@ -259,11 +259,12 @@ extern "C" fn syscall_entry() -> ! {
 
 // --- Ring-3 descent -------------------------------------------------------
 
-/// Descend to ring 3 at `entry` with user stack `user_sp`, seeding the three
-/// bootstrap argument registers `rdi = a0`, `rsi = a1`, `rdx = a2` (the spawn
-/// hand-off by which a process learns its initial handle values; all `0` for the
-/// boot/`hello` path). Never returns: the only way back to ring 0 is via the
-/// `syscall` entry stub (or a trap).
+/// Descend to ring 3 at `entry` with user stack `user_sp`, seeding the four
+/// bootstrap argument registers `rdi = a0`, `rsi = a1`, `rdx = a2`, `rcx = a3`
+/// (the spawn hand-off by which a process learns its initial handle values —
+/// notification channel, root namespace, first installed handle, `arg0`; all `0`
+/// for the boot/`hello` path). Never returns: the only way back to ring 0 is via
+/// the `syscall` entry stub (or a trap).
 ///
 /// Called from `thread_enter` on a user thread's first run. The page-table
 /// root (CR3) is already the process address space (loaded by the scheduler
@@ -277,10 +278,17 @@ extern "C" fn syscall_entry() -> ! {
 /// writable in the active address space; [`init_syscall_entry`] must have
 /// run; the active CR3 must be the process address space.
 #[unsafe(naked)]
-pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, a2: u64) -> ! {
-    // SAFETY: naked. SysV: rdi=entry, rsi=user_sp, rdx=a0, rcx=a1, r8=a2.
+pub unsafe extern "C" fn enter_user(
+    entry: u64,
+    user_sp: u64,
+    a0: u64,
+    a1: u64,
+    a2: u64,
+    a3: u64,
+) -> ! {
+    // SAFETY: naked. SysV: rdi=entry, rsi=user_sp, rdx=a0, rcx=a1, r8=a2, r9=a3.
     // Build the iretq frame (consuming rdi/rsi), then move the bootstrap args
-    // into the user's rdi/rsi/rdx and zero every other GPR so no kernel value
+    // into the user's rdi/rsi/rdx/rcx and zero every other GPR so no kernel value
     // leaks to userspace.
     naked_asm!(
         "push {user_ss}",           // SS
@@ -289,12 +297,13 @@ pub unsafe extern "C" fn enter_user(entry: u64, user_sp: u64, a0: u64, a1: u64, 
         "push {user_cs}",           // CS
         "push rdi",                 // RIP = entry
         // Seed the user's bootstrap argument registers BEFORE zeroing the rest.
+        // `rsi = rcx` must read `a1` from rcx before `rcx` is overwritten with a3.
         "mov rdi, rdx",             // user rdi = a0
         "mov rsi, rcx",             // user rsi = a1
         "mov rdx, r8",              // user rdx = a2
+        "mov rcx, r9",              // user rcx = a3
         "xor eax, eax",
         "xor ebx, ebx",
-        "xor ecx, ecx",
         "xor ebp, ebp",
         "xor r8d, r8d",
         "xor r9d, r9d",

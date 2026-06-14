@@ -109,13 +109,13 @@ pub struct Thread {
     /// **user** thread (run `entry` in ring 3 via the trampoline); `None`
     /// is a kernel thread (run `entry(arg)` in ring 0).
     user_entry: Option<(u64, u64)>,
-    /// Bootstrap argument registers (`rdi`, `rsi`, `rdx`) seeded at the user
-    /// thread's first ring-3 entry — the Phase-1 hand-off by which a spawned
-    /// process learns its initial handle *values* (notification channel,
-    /// installed endpoint) and a user data word. `[0; 3]` for kernel threads and
-    /// the boot/`hello` path. (Phase 2 replaces this with a stack-resident
-    /// bootstrap block / the real init handoff.)
-    user_boot_args: [u64; 3],
+    /// Bootstrap argument registers (`rdi`, `rsi`, `rdx`, `rcx`) seeded at the
+    /// user thread's first ring-3 entry — the Phase-1/2 hand-off by which a spawned
+    /// process learns its initial handle *values* (notification channel, root
+    /// namespace, installed endpoint) and a user data word (`arg0`). `[0; 4]` for
+    /// kernel threads and the boot/`hello` path. (A later phase replaces this with
+    /// a stack-resident bootstrap block / the real init handoff.)
+    user_boot_args: [u64; 4],
     /// Owning process, for a user thread. Holding this [`ObjectRef`] keeps
     /// the `Process` — and thus its `AddressSpace` — alive for as long as
     /// the thread exists; it is released when the thread is reaped, freeing
@@ -174,7 +174,7 @@ impl Thread {
             stack: None,
             addr_space_root: None,
             user_entry: None,
-            user_boot_args: [0; 3],
+            user_boot_args: [0; 4],
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -205,7 +205,7 @@ impl Thread {
             stack: None,
             addr_space_root: None,
             user_entry: None,
-            user_boot_args: [0; 3],
+            user_boot_args: [0; 4],
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -248,7 +248,7 @@ impl Thread {
             stack: Some(stack),
             addr_space_root: None,
             user_entry: None,
-            user_boot_args: [0; 3],
+            user_boot_args: [0; 4],
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -275,7 +275,7 @@ impl Thread {
         process: ObjectRef,
         entry: u64,
         user_sp: u64,
-        boot_args: [u64; 3],
+        boot_args: [u64; 4],
     ) -> Result<KBox<Self>, AllocError> {
         // Read the owning process's identity + address-space root through
         // the ObjectRef. SAFETY: `process` is a live Process kernel object
@@ -489,7 +489,7 @@ impl Thread {
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn user_boot_args(obj: *mut ()) -> [u64; 3] {
+    pub(crate) unsafe fn user_boot_args(obj: *mut ()) -> [u64; 4] {
         let p = obj as *mut Thread;
         unsafe { core::ptr::read(&raw const (*p).user_boot_args) }
     }
@@ -729,7 +729,7 @@ mod tests {
             stack: None,
             addr_space_root: Some(root),
             user_entry: Some((entry, user_sp)),
-            user_boot_args: [0; 3],
+            user_boot_args: [0; 4],
             process: Some(process),
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],

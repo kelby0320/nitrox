@@ -414,14 +414,16 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
 /// reference) so the caller can install a thread handle (`sys_thread_create`);
 /// the thread id is `Thread::tid` of the returned object. The `process`
 /// reference is moved into the thread (keeping its address space alive).
-/// `boot_args` are the `[rdi, rsi, rdx]` register values seeded at the thread's
-/// first ring-3 entry (the spawn hand-off; `[0; 3]` for the boot/`hello` path).
-/// The kernel stack + frame fabrication happen before the (brief) enqueue lock.
+/// `boot_args` are the `[rdi, rsi, rdx, rcx]` register values seeded at the
+/// thread's first ring-3 entry (the spawn hand-off — notification channel, root
+/// namespace, first installed handle, `arg0`; `[0; 4]` for the boot/`hello`
+/// path). The kernel stack + frame fabrication happen before the (brief) enqueue
+/// lock.
 pub fn spawn_user(
     process: ObjectRef,
     entry: u64,
     user_sp: u64,
-    boot_args: [u64; 3],
+    boot_args: [u64; 4],
 ) -> Result<ObjectRef, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
@@ -1681,7 +1683,7 @@ extern "C" fn idle_body(_arg: usize) {
 pub(crate) extern "C" fn thread_enter() -> ! {
     // Capture (under the lock) whether the current thread descends to ring 3
     // and, if so, its descent params + kernel-stack top.
-    let descent: Option<(u64, u64, u64, [u64; 3])> = {
+    let descent: Option<(u64, u64, u64, [u64; 4])> = {
         let g = SCHED.lock();
         let cur = g.current.as_ref().expect("current set when a thread runs");
         let obj = cur.as_ptr();
@@ -1712,8 +1714,9 @@ pub(crate) extern "C" fn thread_enter() -> ! {
             crate::arch::arm_user_entry_cpu_base();
             // SAFETY: `entry`/`user_sp` are canonical user VAs mapped X / W
             // in the active address space; the syscall fast-path is armed.
-            // `boot` seeds rdi/rsi/rdx — the spawn hand-off (handle values).
-            unsafe { crate::arch::enter_user(entry, user_sp, boot[0], boot[1], boot[2]) }
+            // `boot` seeds rdi/rsi/rdx/rcx — the spawn hand-off (notif, root
+            // namespace, installed endpoint, arg0).
+            unsafe { crate::arch::enter_user(entry, user_sp, boot[0], boot[1], boot[2], boot[3]) }
         }
         None => {
             // Kernel thread: run the body in ring 0, then exit cleanly. Kernel

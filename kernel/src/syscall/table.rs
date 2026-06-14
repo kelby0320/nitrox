@@ -171,9 +171,18 @@ fn sys_thread_exit(status: i32) -> ! {
 
 /// Close every child-side handle a partially-built spawn allocated, so a
 /// failure before the commit (the child thread enqueue) leaves no handles
-/// tagged to a process that will never run.
-fn spawn_rollback_child_handles(child_pid: u32, notif_h: RawHandle, installed: &[RawHandle]) {
+/// tagged to a process that will never run. `ns_h` is the child's namespace
+/// handle (`RawHandle::NULL` if none was installed).
+fn spawn_rollback_child_handles(
+    child_pid: u32,
+    notif_h: RawHandle,
+    ns_h: RawHandle,
+    installed: &[RawHandle],
+) {
     close_and_release(notif_h, child_pid);
+    if !ns_h.is_null() {
+        close_and_release(ns_h, child_pid);
+    }
     for &h in installed {
         if !h.is_null() {
             close_and_release(h, child_pid);
@@ -240,6 +249,44 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
         }
     };
 
+    // Determine the child's root namespace (sandbox-by-construction): an explicit
+    // `args.namespace` the parent holds a `LOOKUP`-righted handle to, else inherit
+    // the parent's own namespace. The child always gets a **LOOKUP-only** handle —
+    // it resolves names but cannot rebind its root. `None` ⇒ the parent has no
+    // namespace and supplied none (degenerate; pid 1 always has one).
+    let ns_source: Option<ObjectRef> = if !args.namespace.is_null() {
+        match lookup_typed(args.namespace.bits(), parent_pid, Rights::LOOKUP, KObjectType::Namespace)
+        {
+            Ok(ok) => Some(ok.object.clone()),
+            Err(e) => {
+                // SAFETY: reclaim the child's notif handle; `proc_box` drops the AS.
+                spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
+                return Err(e);
+            }
+        }
+    } else {
+        crate::sched::current_process().and_then(|p| {
+            // SAFETY: `p` pins a live Process; clone its namespace ref if any.
+            unsafe { &*(p.as_ptr() as *const Process) }.namespace_ref()
+        })
+    };
+    let child_ns_h = if let Some(ns_ref) = ns_source {
+        proc_box.set_namespace(ns_ref.clone()); // the child owns a reference
+        let (np, nt) = ns_ref.into_raw();
+        match global::get().allocate(child_pid, np, nt, Rights::LOOKUP) {
+            Ok(h) => h,
+            Err(e) => {
+                // SAFETY: reclaim the namespace-handle reference; `proc_box` drops
+                // its own clone + the AS. Roll back the notif handle too.
+                drop(unsafe { ObjectRef::from_raw(np, nt) });
+                spawn_rollback_child_handles(child_pid, notif_h, RawHandle::NULL, &[]);
+                return Err(map_handle_err(e));
+            }
+        }
+    } else {
+        RawHandle::NULL
+    };
+
     // Install the transferred handles into the child's table (clone the source
     // reference + allocate for the child; the parent's source handle is closed
     // only after the spawn commits, so a failure here doesn't lose it).
@@ -248,7 +295,7 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
         let ok = match global::get().lookup(args.handles[i], parent_pid, Rights::TRANSFER) {
             Ok(ok) => ok,
             Err(e) => {
-                spawn_rollback_child_handles(child_pid, notif_h, &installed[..i]);
+                spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
                 return Err(map_handle_err(e));
             }
         };
@@ -261,7 +308,7 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
             Err(e) => {
                 // SAFETY: reclaim the clone; `ok.object` drops at scope end.
                 drop(unsafe { ObjectRef::from_raw(op, ot) });
-                spawn_rollback_child_handles(child_pid, notif_h, &installed[..i]);
+                spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..i]);
                 return Err(map_handle_err(e));
             }
         }
@@ -276,16 +323,17 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
     };
     let proc_for_handle = proc_obj.clone();
 
-    // Commit: enqueue the child's main thread with the bootstrap registers.
+    // Commit: enqueue the child's main thread with the bootstrap registers
+    // (rdi=notif, rsi=namespace, rdx=installed[0], rcx=arg0).
     let endpoint_h = if count > 0 { installed[0].bits() } else { 0 };
-    let boot = [notif_h.bits(), endpoint_h, args.arg0];
+    let boot = [notif_h.bits(), child_ns_h.bits(), endpoint_h, args.arg0];
     if crate::sched::spawn_user(proc_obj, info.entry_point.as_u64(), info.stack_top.as_u64(), boot)
         .is_err()
     {
         // `spawn_user` consumed (and dropped) `proc_obj`; release the clone to
         // free the Process + AS, and roll back the child handles.
         drop(proc_for_handle);
-        spawn_rollback_child_handles(child_pid, notif_h, &installed[..count]);
+        spawn_rollback_child_handles(child_pid, notif_h, child_ns_h, &installed[..count]);
         return Err(KError::OutOfMemory);
     }
 
@@ -352,8 +400,9 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     let proc = crate::sched::current_process().ok_or(KError::InvalidArgument)?;
     let pid = crate::sched::current_owner_pid();
 
-    // Start the thread; the bootstrap delivers `arg0` in rdx (rdi/rsi unused).
-    let th = crate::sched::spawn_user(proc, args.entry, args.user_sp, [0, 0, args.arg0])
+    // Start the thread; the bootstrap delivers `arg0` in rcx (a new thread shares
+    // the process, so it gets no notif/namespace/endpoint handoff — rdi/rsi/rdx 0).
+    let th = crate::sched::spawn_user(proc, args.entry, args.user_sp, [0, 0, 0, args.arg0])
         .map_err(|_| KError::OutOfMemory)?;
 
     // Install a handle to it in the caller's table.

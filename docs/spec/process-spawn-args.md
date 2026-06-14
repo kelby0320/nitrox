@@ -4,9 +4,10 @@ This document specifies `SpawnArgs`, the `#[repr(C)]` block a parent passes to
 [`sys_process_spawn`](syscall-abi.md) by `UserPtr<SpawnArgs>` to describe a child
 process.
 
-**Status:** Pre-stabilization. Phase 1 implements the form below with the
-deferrals noted; the image selector and register bootstrap ABI change in Phase 2
-(filesystem + a real init handoff).
+**Status:** Pre-stabilization. The form below is implemented; the `namespace`
+field + the 4-register bootstrap landed with Phase 2 slice 1 (namespaces). The
+image selector and the register ABI change again later (filesystem + a real init
+handoff).
 
 ## Layout
 
@@ -20,10 +21,11 @@ pub struct SpawnArgs {
     pub arg0:         u64,            // offset 16 — opaque user data, delivered to the child
     pub handles:      [RawHandle; 4], // offset 24 — parent-side handles to install in the child
     pub rights:       [u64; 4],       // offset 56 — per-handle attenuation bound
+    pub namespace:    RawHandle,      // offset 88 — child's root namespace (0 = inherit)
 }
 ```
 
-Total size 88 bytes, 8-byte aligned. `SPAWN_MAX_HANDLES = 4`. The offsets are
+Total size 96 bytes, 8-byte aligned. `SPAWN_MAX_HANDLES = 4`. The offsets are
 pinned by compile-time asserts in `kernel/src/libkern/spawn.rs`.
 
 ## Fields
@@ -40,6 +42,14 @@ pinned by compile-time asserts in `kernel/src/libkern/spawn.rs`.
   must carry the `TRANSFER` right. Installed in the child with
   `source_rights & rights[i]`.
 - **`rights[i]`** — the attenuation bound for `handles[i]`.
+- **`namespace`** — the child's root namespace. `RawHandle::NULL` (`0`) ⇒
+  **inherit** a `LOOKUP`-only handle to the parent's namespace; non-null ⇒ a
+  namespace the parent holds a `LOOKUP`-righted handle to (typically a
+  more-restricted one it constructed) — the child receives a `LOOKUP`-only handle
+  to it. Either way the child can resolve names but cannot rebind its own root;
+  restriction is by namespace *contents*. See
+  [`namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md)
+  (sandbox-by-construction).
 
 ## Handle install semantics
 
@@ -57,18 +67,20 @@ closes).
 
 ## Bootstrap (how the child receives its handles)
 
-Phase 1 has no argc/argv/auxv. The kernel seeds three argument registers at the
-child's first ring-3 entry, read directly as the `extern "C"` parameters of the
-child's `_start`:
+Phase 1/2 has no argc/argv/auxv. The kernel seeds **four** argument registers at
+the child's first ring-3 entry, read directly as the `extern "C"` parameters of
+the child's `_start`. This is the uniform bootstrap convention across pid 1,
+`sys_process_spawn`, and `sys_thread_create`:
 
 | Register | Value |
 |---|---|
 | `rdi` | the child's notification-channel handle |
-| `rsi` | the child's first installed handle (`handles[0]`), or `0` if none |
-| `rdx` | `args.arg0` |
+| `rsi` | the child's **root-namespace** handle (`LOOKUP`-only), or `0` if none |
+| `rdx` | the child's first installed handle (`handles[0]`), or `0` if none |
+| `rcx` | `args.arg0` |
 
-(Phase 2 replaces this with a stack-resident bootstrap block carrying the full
-initial handle set, matching the real init handoff.)
+(A later phase replaces this with a stack-resident bootstrap block carrying the
+full initial handle set, matching the real init handoff.)
 
 ## ImageId
 
@@ -89,8 +101,7 @@ path / a `MemoryObject` handle holding the ELF.
 version-hash input (like `IpcMsg` / `Notification`). The hash is not yet computed
 in code, so nothing is enforced today — the compile-time asserts pin the offsets.
 
-## Deferred to Phase 2
+## Deferred
 
-- `args.namespace` (per-process namespaces are Phase 2) — not present yet.
 - Filesystem/`MemoryObject` image sourcing (replacing `ImageId`).
-- The stack-resident bootstrap block (replacing the register ABI).
+- The stack-resident bootstrap block (replacing the 4-register ABI).

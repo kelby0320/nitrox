@@ -3676,3 +3676,45 @@ so it is verified by the QEMU `ns_demo` in `userspace/parent` (host tests cover 
 rights-allocatability, the `NsError`→`KError` map, the path-length bounds, the PO result
 payload, and `Process::namespace` ownership/release). Branch `phase-2/namespace-syscalls`
 off `main` (includes merged PR #41). Next: Part D (lookup cache + spawn inheritance).
+
+## 2026-06-14 — Phase 2 slice 1: lookup cache + spawn inheritance (Part D — slice complete)
+
+Part D closes the namespace slice: the lookup cache, spawn-time namespace inheritance
+(sandbox-by-construction), and the boot banner now states **Phase 2**.
+
+**Decision — uniform 4-register bootstrap ABI.** A spawned child needs a handle to its
+root namespace, but the three bootstrap registers (`rdi`/`rsi`/`rdx`) were full. Rather
+than a `sys_ns_self()` query (mild ambient-authority flavor, not in the design), the
+hand-off grew to **four** registers with one consistent meaning across pid 1,
+`sys_process_spawn`, and `sys_thread_create`: `rdi`=notification channel, `rsi`=root
+namespace, `rdx`=first installed handle, `rcx`=`arg0`. This keeps the explicit-handoff
+(no-ambient-authority) model and matches Part C's pid-1 `rsi`=namespace. `enter_user`
+gained a 4th arg (seeds user `rcx` from kernel `r9`); `Thread::user_boot_args` and
+`spawn_user` are `[u64; 4]`. `child.rs` moved its endpoint read `rsi`→`rdx` and role
+`rdx`→`rcx`.
+
+**Decision — inheritance + `SpawnArgs.namespace` (sandbox-by-construction).** `SpawnArgs`
+gained a `namespace: RawHandle` (size 88→96): `0` ⇒ the child **inherits** a
+`LOOKUP`-only handle to the parent's namespace (shared object); non-null ⇒ a namespace
+the parent holds a `LOOKUP`-righted handle to (typically a more-restricted one it
+constructed) — the child gets a `LOOKUP`-only handle to *that*. The child resolves names
+but cannot rebind its own root; **restriction is by namespace contents**, chosen by the
+parent. `spawn_rollback_child_handles` extended to also close the child's namespace
+handle.
+
+**Decision — the lookup cache.** Each `Namespace` keeps a bounded (`NS_CACHE_MAX = 8`),
+pre-reserved cache of **positive** resolutions as `path → binding-index`. It holds **no**
+`ObjectRef` (so a flush — and round-robin eviction — is a byte-only `KVec` drop, never an
+`ObjectRef` drop under the rank-4 lock). The whole cache is flushed on every `bind`/
+`unbind`, so a cached index always refers to the same binding. Insertion is best-effort
+(skips on alloc failure). A pure optimization — no contract change.
+
+`SpawnArgs` grew by 8 bytes (boundary type; spec + asserts updated). The bootstrap
+register count grew 3→4 (a hand-off convention, not a hashed type). Verified by host
+tests (cache hit/flush/evict, `SpawnArgs` layout) + the QEMU demo: the parent builds a
+restricted `/store` namespace and hands it to both children, which resolve `/store`
+(inheritance) and get `NoAccess` on a bind (LOOKUP-only restriction). Branch
+`phase-2/namespace-inherit-cache` off `main` (includes merged PR #42).
+
+**Namespace foundation (Phase 2 slice 1) is complete.** Next: the resource-server
+protocol + the first filesystem (slice 3 machinery designed in Part A).

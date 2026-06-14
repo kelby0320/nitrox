@@ -67,15 +67,23 @@ pub struct SpawnArgs {
     /// Per-handle rights attenuation bound; the installed rights are
     /// `source_rights & rights[i]` (offset 24 + 8·N).
     pub rights: [u64; SPAWN_MAX_HANDLES],
+    /// The child's root namespace (offset 24 + 16·N). `RawHandle::NULL` (`0`) ⇒
+    /// **inherit** a `LOOKUP`-only handle to the parent's namespace; non-null ⇒ a
+    /// namespace the parent holds a `LOOKUP`-righted handle to (typically a
+    /// more-restricted one the parent constructed) — the child receives a
+    /// `LOOKUP`-only handle to it. See
+    /// `docs/architecture/namespace-and-resource-servers.md` (sandbox-by-construction).
+    pub namespace: RawHandle,
 }
 
-const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 24 + 16 * SPAWN_MAX_HANDLES);
+const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 24 + 16 * SPAWN_MAX_HANDLES + 8);
 const _: () = assert!(core::mem::align_of::<SpawnArgs>() == 8);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, image) == 0);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, handle_count) == 4);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, move_mask) == 8);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, arg0) == 16);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, handles) == 24);
+const _: () = assert!(core::mem::offset_of!(SpawnArgs, namespace) == 24 + 16 * SPAWN_MAX_HANDLES);
 
 #[cfg(test)]
 mod tests {
@@ -83,7 +91,7 @@ mod tests {
 
     #[test]
     fn spawn_args_layout_is_stable() {
-        assert_eq!(core::mem::size_of::<SpawnArgs>(), 24 + 16 * 4);
+        assert_eq!(core::mem::size_of::<SpawnArgs>(), 24 + 16 * 4 + 8);
         assert_eq!(core::mem::align_of::<SpawnArgs>(), 8);
         assert_eq!(core::mem::offset_of!(SpawnArgs, image), 0);
         assert_eq!(core::mem::offset_of!(SpawnArgs, handle_count), 4);
@@ -91,6 +99,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(SpawnArgs, arg0), 16);
         assert_eq!(core::mem::offset_of!(SpawnArgs, handles), 24);
         assert_eq!(core::mem::offset_of!(SpawnArgs, rights), 24 + 8 * 4);
+        assert_eq!(core::mem::offset_of!(SpawnArgs, namespace), 24 + 16 * 4);
     }
 
     #[test]

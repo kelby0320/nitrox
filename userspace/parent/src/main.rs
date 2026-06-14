@@ -111,6 +111,9 @@ struct SpawnArgs {
     arg0: u64,
     handles: [u64; 4],
     rights: [u64; 4],
+    /// Child's root namespace: 0 = inherit the parent's; non-null = a constructed
+    /// (restricted) namespace the child gets a LOOKUP-only handle to.
+    namespace: u64,
 }
 
 /// Mirror of the kernel `Notification` (`kernel/src/libkern/notification.rs`):
@@ -131,6 +134,7 @@ static mut SPAWN_A: SpawnArgs = SpawnArgs {
     arg0: 0, // role 0 = sender
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
+    namespace: 0, // set at runtime to the constructed child namespace
 };
 static mut SPAWN_B: SpawnArgs = SpawnArgs {
     image: IMAGE_CHILD,
@@ -140,6 +144,7 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
     arg0: 1, // role 1 = receiver
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
+    namespace: 0, // set at runtime to the constructed child namespace
 };
 static mut NOTIF: NotificationBuf = NotificationBuf { kind: 0, body: [0; 60] };
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
@@ -704,11 +709,34 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // SAFETY: the kernel wrote both endpoint handles.
     let (e0, e1) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
 
-    // 2. Spawn two children, moving one endpoint into each.
+    // 1b. Construct a *restricted* namespace for the children (sandbox-by-
+    //     construction): a fresh namespace with just `/store` bound to a
+    //     MemoryObject. The children inherit a LOOKUP-only handle to it.
+    let child_ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    let store_mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if child_ns >= 0 && store_mem >= 0 {
+        let sp = b"/store";
+        // SAFETY: valid path pointer + handles.
+        let br = unsafe {
+            syscall4(SYS_NS_BIND, child_ns as u64, sp.as_ptr() as u64, sp.len() as u64, store_mem as u64)
+        };
+        if br == 0 {
+            kprint(b"parent: built child namespace (/store)\n");
+        } else {
+            kprint(b"parent: child-namespace bind FAIL\n");
+        }
+    } else {
+        kprint(b"parent: child-namespace create FAIL\n");
+    }
+
+    // 2. Spawn two children, moving one endpoint into each, and handing each the
+    //    constructed namespace (a LOOKUP-only handle to it lands in the child).
     // SAFETY: SPAWN_A/SPAWN_B are valid writable arg blocks.
     unsafe {
         SPAWN_A.handles[0] = e0;
         SPAWN_B.handles[0] = e1;
+        SPAWN_A.namespace = child_ns as u64;
+        SPAWN_B.namespace = child_ns as u64;
     }
     // SAFETY: valid SpawnArgs pointer; returns a process handle or a neg error.
     let pa = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_A) as u64) };

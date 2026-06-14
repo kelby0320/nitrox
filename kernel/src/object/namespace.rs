@@ -32,6 +32,10 @@ use crate::object::header::KObjectHeader;
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
 pub const NS_PATH_MAX: usize = 1024;
 
+/// Capacity of each namespace's resolution cache (design doc § The lookup cache).
+/// Small and pre-reserved; resolution is a hot path, mutations are rare.
+const NS_CACHE_MAX: usize = 8;
+
 /// Why a namespace operation failed.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub enum NsError {
@@ -53,6 +57,15 @@ struct Binding {
     rights: Rights,
 }
 
+/// A cached positive resolution: a fully looked-up `path` and the index of the
+/// `bindings` entry it resolved to. Holds **no** `ObjectRef` (so a cache flush is
+/// a byte-only `KVec` drop — never an `ObjectRef` drop under the lock). The index
+/// is valid because every binding mutation flushes the whole cache.
+struct CacheEntry {
+    path: KVec<u8>,
+    binding_index: usize,
+}
+
 /// A per-process namespace kernel object.
 ///
 /// `#[repr(C)]` with [`KObjectHeader`] first — see [`crate::object::header`].
@@ -66,18 +79,24 @@ pub struct Namespace {
 
 struct Inner {
     bindings: KVec<Binding>,
+    /// Bounded resolution cache (pre-reserved to [`NS_CACHE_MAX`]); flushed whole
+    /// on any binding mutation. A pure optimization — no semantic effect.
+    cache: KVec<CacheEntry>,
 }
 
 impl Namespace {
     /// Sentinel written into [`Namespace::magic`] at construction.
     pub const MAGIC: u64 = 0x4e_61_6d_65_73_70_63_21; // "Namespc!"
 
-    /// Allocate an empty namespace with a refcount of one.
+    /// Allocate an empty namespace with a refcount of one. The resolution cache
+    /// is pre-reserved to [`NS_CACHE_MAX`] so cache inserts never need to grow it.
     pub fn try_new() -> Result<KBox<Self>, AllocError> {
+        let mut cache: KVec<CacheEntry> = KVec::new();
+        cache.try_reserve(NS_CACHE_MAX)?;
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Namespace),
             magic: Self::MAGIC,
-            inner: SpinLock::new(Inner { bindings: KVec::new() }),
+            inner: SpinLock::new(Inner { bindings: KVec::new(), cache }),
         })
     }
 
@@ -119,6 +138,9 @@ impl Namespace {
             .bindings
             .try_push(Binding { path: p, target, rights })
             .expect("slot reserved above");
+        // A mutation may change what any cached path resolves to; flush the whole
+        // cache (cheap: byte-only `KVec`s, no `ObjectRef` drops). Mutations are rare.
+        guard.cache.clear();
         Ok(())
     }
 
@@ -131,6 +153,9 @@ impl Namespace {
         // `target` into the return; the rest (`path` bytes, `rights`) drops here —
         // no `ObjectRef` among them, so the lock-held drop is harmless.
         let b = guard.bindings.remove(idx);
+        // Removing a binding shifts indices and changes resolutions; flush the
+        // whole cache (byte-only `KVec` drops, no `ObjectRef` drops).
+        guard.cache.clear();
         Some(b.target)
     }
 
@@ -143,8 +168,28 @@ impl Namespace {
     /// Pure resolution: the direct-handle leaf policy (a non-empty suffix on a
     /// direct handle is *not found*) and rights attenuation are the lookup
     /// syscall's job (Part C).
+    ///
+    /// Positive resolutions are cached (path → binding index); a repeat lookup of
+    /// the same path skips the longest-prefix scan. The cache is flushed on every
+    /// binding mutation, so a cached index always refers to the same binding.
     pub fn resolve<'p>(&self, path: &'p [u8]) -> Option<(ObjectRef, Rights, &'p [u8])> {
-        let guard = self.inner.lock();
+        let mut guard = self.inner.lock();
+
+        // Cache fast path: an exact prior lookup of this path. The cached index is
+        // valid (mutations flush the cache), so recompute the suffix and return.
+        if let Some(idx) = guard
+            .cache
+            .iter()
+            .find(|e| &e.path[..] == path)
+            .map(|e| e.binding_index)
+        {
+            let b = &guard.bindings[idx];
+            let off = match_suffix_offset(&b.path, path)
+                .expect("a cached binding still prefix-matches its cached path");
+            return Some((b.target.clone(), b.rights, &path[off..]));
+        }
+
+        // Cold path: longest-prefix scan over the bindings.
         let mut best: Option<(usize, usize)> = None; // (binding index, suffix offset)
         for (i, b) in guard.bindings.iter().enumerate() {
             let Some(off) = match_suffix_offset(&b.path, path) else {
@@ -157,8 +202,31 @@ impl Namespace {
             }
         }
         let (i, off) = best?;
-        let b = &guard.bindings[i];
-        Some((b.target.clone(), b.rights, &path[off..]))
+        let result = {
+            let b = &guard.bindings[i];
+            (b.target.clone(), b.rights, &path[off..])
+        };
+        // Insert into the cache (best-effort): copy the path, round-robin evict
+        // when full. A failed path copy just skips caching — no correctness effect.
+        // No `ObjectRef` is stored, so neither insert nor the evicting `remove(0)`
+        // drops one under the lock.
+        let mut entry_path: KVec<u8> = KVec::new();
+        if entry_path.try_extend_from_slice(path).is_ok() {
+            if guard.cache.len() == NS_CACHE_MAX {
+                guard.cache.remove(0);
+            }
+            guard
+                .cache
+                .try_push(CacheEntry { path: entry_path, binding_index: i })
+                .expect("cache pre-reserved to NS_CACHE_MAX; one slot freed above");
+        }
+        Some(result)
+    }
+
+    /// The number of live resolution-cache entries. Test-only observability.
+    #[cfg(test)]
+    pub(crate) fn cache_len(&self) -> usize {
+        self.inner.lock().cache.len()
     }
 }
 
@@ -296,6 +364,48 @@ mod tests {
         let (_, rights, suf) = n.resolve(b"/dev/log").unwrap();
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::LOOKUP | Rights::INSPECT);
+    }
+
+    #[test]
+    fn cache_populates_hits_and_flushes_on_mutation() {
+        let n = ns();
+        n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
+        n.bind(b"/dev/log", target(), Rights::LOOKUP | Rights::INSPECT).unwrap();
+        assert_eq!(n.cache_len(), 0, "bind leaves the cache empty");
+
+        // A cold resolve caches the path; a repeat is a cache hit (same result).
+        let (_, r0, s0) = n.resolve(b"/dev/log").unwrap();
+        assert_eq!(n.cache_len(), 1);
+        let (_, r1, s1) = n.resolve(b"/dev/log").unwrap();
+        assert_eq!(n.cache_len(), 1, "repeat lookup reuses the entry");
+        assert_eq!((r0, s0), (r1, s1), "cache hit matches the cold resolve");
+
+        // A prefix lookup caches a distinct entry.
+        let (_, _, suf) = n.resolve(b"/dev/tty0").unwrap();
+        assert_eq!(suf, b"tty0");
+        assert_eq!(n.cache_len(), 2);
+
+        // Any mutation flushes the whole cache.
+        n.bind(b"/store", target(), Rights::LOOKUP).unwrap();
+        assert_eq!(n.cache_len(), 0, "bind flushes the cache");
+        n.resolve(b"/store").unwrap();
+        assert_eq!(n.cache_len(), 1);
+        let t = n.unbind(b"/store").expect("bound");
+        drop(t);
+        assert_eq!(n.cache_len(), 0, "unbind flushes the cache");
+    }
+
+    #[test]
+    fn cache_evicts_at_capacity() {
+        let n = ns();
+        n.bind(b"/dev", target(), Rights::LOOKUP).unwrap();
+        // Resolve more distinct paths than the cache holds; it caps at NS_CACHE_MAX.
+        for i in 0..(NS_CACHE_MAX as u8 + 4) {
+            let path = [b'/', b'd', b'e', b'v', b'/', b'a' + i];
+            let (_, _, suf) = n.resolve(&path).unwrap();
+            assert_eq!(suf, &path[5..]); // single trailing component
+        }
+        assert_eq!(n.cache_len(), NS_CACHE_MAX, "cache is bounded");
     }
 
     #[test]
