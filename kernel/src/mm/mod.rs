@@ -9,6 +9,7 @@
 
 pub mod addr_space;
 pub mod buddy;
+pub mod dma;
 pub mod elf;
 pub mod heap;
 pub mod kstack;
@@ -16,6 +17,8 @@ pub mod kvmap;
 pub mod slab;
 pub mod user_access;
 pub mod vmm;
+
+pub use dma::DmaBuffer;
 
 #[cfg(test)]
 pub(crate) mod test_support;

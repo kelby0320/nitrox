@@ -837,10 +837,20 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   outside `SCHED` via **reclaim-on-recv** (swept on the next recv / at close).
   Proven by host tests + a parent demo (`blocking send timed out via
   PendingOperation`). See the decision log (2026-06-12).
-- [ ] **DMA-capable allocation** (page-multiple alignment / a `dma_alloc`
-  path; the `align > SLAB_SIZE` deferral). AHCI command lists / PRDTs need
-  physically-contiguous aligned buffers. Folded into the storage slice if not
-  landed earlier.
+- [x] **DMA-capable allocation** (page-multiple alignment / a `dma_alloc`
+  path; the `align > SLAB_SIZE` deferral). **Done** (`phase-2/dma-alloc`):
+  `mm::dma::DmaBuffer` — an RAII, zeroed, physically-contiguous, page-aligned
+  block from the buddy allocator (order-`k` blocks are `2^k × PAGE_SIZE`-aligned)
+  exposing both a CPU/HHDM pointer and its `phys()` address, for AHCI command
+  lists / FIS / PRDTs. DMA **zones** stay deferred (no address-constrained device
+  on the no-legacy baseline). Proven by host tests + a boot smoke test. See the
+  decision log (2026-06-12).
+
+> **The Phase 2 prerequisite band is complete.** All seven prerequisites —
+> drivers-and-IRPs doc, ACPI tables, IOAPIC, DPC queue, demand paging,
+> `PendingOperation`/async-I/O + IPC `Block`/`BlockBounded`, and DMA-capable
+> allocation — have landed. Phase 2 proper (the storage slice → fs-server → page
+> cache) can begin.
 
 #### 1. Namespace and resource server foundation
 

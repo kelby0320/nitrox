@@ -3545,3 +3545,45 @@ promote); `qemu` logs `parent: blocking send timed out via PendingOperation
 (BlockBounded)` alongside the existing `Block` line, and the rest of the
 parent/child demo runs unchanged. Branch `phase-2/block-bounded` off `main`
 (includes merged PRs #36, #37). Next: `phase-2/dma-alloc` (the last prereq).
+
+## 2026-06-12 — Phase 2 prereq: DMA-capable allocation (`DmaBuffer`)
+
+The **last** Phase-2 prerequisite (`phase-2/dma-alloc`). Bus-mastering devices (the
+coming AHCI storage driver) need physically-contiguous, aligned buffers and their
+**physical address** — none of which `KBox`/`kmalloc` exposes (the slab even
+rejects `align > SLAB_SIZE`). The buddy already provides contiguity + alignment
+(order-`k` blocks span `2^k × PAGE_SIZE` and are aligned to it); this slice adds a
+thin RAII wrapper over it.
+
+**`DmaBuffer`** (`mm/dma.rs`): `alloc(size)` rounds up to a power-of-two page block
+(`order ≤ MAX_ORDER`), `buddy_alloc`s it, zeroes it through the HHDM, and stores
+`{ virt, phys, order }`; `phys()` / `virt()` / `as_mut_slice()` / `len()`; `Drop`
+→ `buddy_free`. Page-aligned base, block-size-aligned for `order > 0` — enough for
+AHCI's 1 KiB cmd list / 256 B FIS / 128 B tables laid out within one buffer (no
+explicit `align` param; larger alignment = larger order). Arch-neutral (buddy +
+HHDM only).
+
+**Decisions.**
+- **No DMA zones.** A below-16 MiB / below-4 GiB zone only matters for a device
+  that can't do 64-bit DMA — excluded by the no-legacy ≈2014 / x86-64-v2 baseline
+  (modern AHCI sets `CAP.S64A`), and the dev loop's 256 MiB RAM is sub-4 GiB
+  anyway. `DmaBuffer` returns whatever block the buddy gives; a DMA-mask param +
+  zoned free-list land only if a constrained device ever appears. (deferred-
+  decisions updated.)
+- **No cache maintenance.** x86 DMA to/from write-back HHDM memory is
+  snoop-coherent. A non-coherent arch (aarch64) will add an `ArchDma`
+  clean/invalidate hook — deferred.
+
+ABI impact: none (internal allocation machinery; no syscall/boundary/`KObjectType`).
+Verified: `check-arch` clean (`dma.rs` is neutral `mm`); `build` clean (no
+warnings); `test` 414 host tests (+6: order rounding, page-aligned/zeroed alloc,
+multi-page contiguity + block-alignment, write-through-to-phys, oversize error,
+no-leak); `qemu` logs `dma: 2-page buffer @ phys 0x808000 (contiguous,
+page-aligned, zeroed)` (the active page tables translate `virt()` back to `phys()`)
+and the scheduler + userspace demos run unchanged. Branch `phase-2/dma-alloc` off
+`main` (includes merged PR #38).
+
+**The Phase-2 prerequisite band is complete** — all seven items (drivers-and-IRPs
+doc, ACPI, IOAPIC, DPC, demand paging, `PendingOperation`/async-I/O + IPC
+`Block`/`BlockBounded`, DMA allocation) have landed. Next: **Phase 2 proper** — the
+storage slice (AHCI/GPT) → fs-server → page cache.

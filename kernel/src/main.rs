@@ -215,6 +215,9 @@ fn kernel_main() {
     // is reserved lazily and faults in on first use).
     demand_paging_smoke_test();
 
+    // Prove the DMA-buffer allocation path (the storage slice's prerequisite).
+    dma_smoke_test();
+
     // Arm the syscall fast path and prove it end-to-end by dropping to
     // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
     // (Throwaway harness — replaced next slice by an ELF-loaded process.)
@@ -585,6 +588,53 @@ fn demand_paging_smoke_test() {
             after,
             r0,
             r1
+        );
+    }
+}
+
+/// DMA-buffer smoke test: prove `DmaBuffer` (the storage slice's allocation
+/// prerequisite) gives a physically-contiguous, page-aligned, zeroed block whose
+/// physical address is exactly what a device would see at its `virt()` mapping.
+/// Allocate a 2-page buffer, check it's zeroed + page-aligned, write a sentinel
+/// through the CPU view, and confirm the active page tables translate `virt()`
+/// back to `phys()` (the same bytes the device DMAs). Dropped at the end.
+fn dma_smoke_test() {
+    use nitrox_kernel::mm::DmaBuffer;
+
+    let mut buf = match DmaBuffer::alloc(2 * mm::PAGE_SIZE) {
+        Ok(b) => b,
+        Err(_) => {
+            kprintln!("dma: smoke test skipped (alloc failed)");
+            return;
+        }
+    };
+    let phys = buf.phys();
+    let zeroed = buf.as_slice().iter().all(|&b| b == 0);
+    // Write a sentinel at the first and last byte through the CPU (HHDM) view.
+    let len = buf.len();
+    buf.as_mut_slice()[0] = 0xD3;
+    buf.as_mut_slice()[len - 1] = 0xA7;
+
+    // The active page tables must translate the buffer's virtual base back to its
+    // physical base — i.e. a device programmed with `phys()` sees these bytes.
+    // SAFETY: read-only walk of the live top-level page table via the HHDM.
+    let mapped = unsafe {
+        arch::Paging::translate(arch::Paging::active_root(), mm::VirtAddr::new(buf.virt() as u64))
+    };
+
+    if zeroed && phys.is_page_aligned() && phys.as_u64() != 0 && mapped == Some(phys) {
+        kprintln!(
+            "dma: {}-page buffer @ phys {:#x} (contiguous, page-aligned, zeroed)",
+            len / mm::PAGE_SIZE,
+            phys.as_u64()
+        );
+    } else {
+        kprintln!(
+            "dma: smoke test FAILED (zeroed={} aligned={} mapped={:?} phys={:#x})",
+            zeroed,
+            phys.is_page_aligned(),
+            mapped,
+            phys.as_u64()
         );
     }
 }
