@@ -20,6 +20,8 @@ use core::arch::asm;
 const SYS_MEMORY_CREATE: u64 = 4;
 const SYS_MEMORY_MAP: u64 = 5;
 const SYS_WAIT: u64 = 10;
+const SYS_NS_LOOKUP: u64 = 23;
+const SYS_NS_BIND: u64 = 24;
 const SYS_CHANNEL_SEND: u64 = 13;
 const SYS_CHANNEL_RECV: u64 = 14;
 const SYS_PROCESS_EXIT: u64 = 16;
@@ -214,10 +216,63 @@ fn run_receiver(endpoint: u64) -> ! {
     }
 }
 
-/// `endpoint` (in `rsi`) is one end of the shared channel; `role` (in `rdx`)
-/// selects sender (0) or receiver (1). `notif` (in `rdi`) is unused here.
+/// Exercise the **inherited namespace** (sandbox-by-construction): resolve a path
+/// the parent bound into the child's namespace, and confirm the inherited handle
+/// is LOOKUP-only by attempting a bind and expecting `NoAccess`. `ns` is the
+/// child's root-namespace handle (`rsi`); `resource` is any handle to try binding.
+fn ns_inheritance_check(ns: u64, resource: u64) {
+    if ns == 0 {
+        kprint(b"child: no namespace inherited\n");
+        return;
+    }
+    let path = b"/store";
+    // Look up "/store" (requesting MAP_READ); wait for the pre-signalled PO.
+    // SAFETY: valid path pointer + handle.
+    let po = unsafe {
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
+    };
+    if po >= 0 {
+        // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = po as u64;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        let status = unsafe {
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+        };
+        if waited == 1 && status == 0 {
+            kprint(b"child: /store resolved in inherited namespace\n");
+        } else {
+            kprint(b"child: /store lookup in inherited namespace MISS\n");
+        }
+    } else {
+        kprint(b"child: ns_lookup FAIL\n");
+    }
+    // The inherited handle is LOOKUP-only: a bind must fail NoAccess (-2).
+    let foo = b"/foo";
+    // SAFETY: valid path pointer + handle.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, ns, foo.as_ptr() as u64, foo.len() as u64, resource)
+    };
+    if br == -2 {
+        kprint(b"child: bind into inherited namespace denied (LOOKUP-only)\n");
+    } else {
+        kprint(b"child: bind unexpectedly allowed/other error\n");
+    }
+}
+
+/// Bootstrap registers (`kernel/src/syscall/table.rs`): `rdi` = notification
+/// channel (unused here), `rsi` = inherited root namespace, `rdx` = the shared
+/// channel endpoint, `rcx` = `role` (0 = sender, 1 = receiver).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, endpoint: u64, role: u64) -> ! {
+pub extern "C" fn _start(_notif: u64, ns: u64, endpoint: u64, role: u64) -> ! {
+    ns_inheritance_check(ns, endpoint);
     if role == 0 {
         run_sender(endpoint);
     } else {

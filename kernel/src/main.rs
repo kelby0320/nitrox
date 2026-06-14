@@ -471,7 +471,7 @@ fn run_first_userspace() {
         proc_ref,
         info.entry_point.as_u64(),
         info.stack_top.as_u64(),
-        [notif_h.bits(), ns_h.bits(), 0],
+        [notif_h.bits(), ns_h.bits(), 0, 0],
     )
     .is_err()
     {
@@ -714,7 +714,7 @@ fn draw_nitrox_band(writer: &mut FbWriter) {
 
     // Phase indicator below the band, slightly dimmer so the eye reads
     // the tank decal first.
-    let status = b"PHASE 1: USERSPACE UP";
+    let status = b"PHASE 2: NAMESPACES UP";
     let status_scale = 2;
     let status_w = FbWriter::text_width(status, status_scale);
     let status_x = (width - status_w) / 2;

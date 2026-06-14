@@ -875,7 +875,12 @@ pre-signalled PO carrying the resolved handle via `IoResult.result`.
   `BIND` handle right, `BIND_NAMESPACE` syscap deferred to the syscap model);
   `Process::namespace` field + boot-time root namespace for pid 1 (handle in `rsi`);
   QEMU `ns_demo` create→bind→lookup→wait→use→unbind.
-- [ ] **Part D** — lookup cache + spawn/namespace inheritance (sandbox-by-construction).
+- [x] **Part D** (`phase-2/namespace-inherit-cache`) — per-`Namespace` lookup cache
+  (path→binding-index, flush-on-mutation); spawn-time namespace inheritance via a
+  4-register bootstrap ABI (`rdi`=notif, `rsi`=namespace, `rdx`=installed[0],
+  `rcx`=arg0) + a `SpawnArgs.namespace` field (`0`=inherit, else a constructed
+  restricted namespace; child gets a LOOKUP-only handle); boot banner → Phase 2.
+  **Namespace foundation (slice 1) complete.**
 - *(slice 3)* `ResourceServer` trait, `OpStatus`, `ResourceServerRegistry`,
   IPC-forwarded lookup + cross-context handle install.
 
