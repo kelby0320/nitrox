@@ -166,9 +166,15 @@ fn sys_wait(
 ```
 Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
 
-**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, and `PendingOperation` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly.
+**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, and `PendingOperation` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly. `IoResult` carries a `result: u64` payload word (added with the namespace slice, at a stable offset past `status`/`reserved`) for completions that return a value rather than just a status — e.g. a namespace lookup's resolved handle; edge-style waitables report `result = 0`.
 
 ### Namespace
+
+The per-process name-resolution substrate; full model in
+[`docs/architecture/namespace-and-resource-servers.md`](../architecture/namespace-and-resource-servers.md).
+Syscall numbers: `sys_ns_create = 22`, `sys_ns_lookup = 23`, `sys_ns_bind = 24`,
+`sys_ns_unbind = 25` (reserved; pre-stabilization). `path` is absolute,
+`/`-separated, ≤ `NS_PATH_MAX` (1024) bytes, with no `.`/`..`/empty components.
 
 ```rust
 fn sys_ns_lookup(
@@ -178,7 +184,14 @@ fn sys_ns_lookup(
     rights:   Rights,
 ) -> isize
 ```
-Looks up `path` in namespace `ns`, requesting at most `rights`. Returns a `PendingOperation` handle. The pending operation completes with either a handle to the resolved resource (with rights ≤ requested) or an error.
+Looks up `path` in namespace `ns` (longest-prefix match), requesting at most
+`rights`. Requires `LOOKUP` on `ns`. Returns a `PendingOperation` handle; the
+operation completes carrying either the resolved resource handle in
+`IoResult.result` (with rights = requested ∩ binding rights) or an error in
+`IoResult.status`. (A direct-handle binding completes the PO immediately,
+pre-signalled; a resource-server binding completes it after the IPC round-trip —
+slice 3.) The `IoResult.result` word is the result-carrying extension noted under
+`sys_wait`.
 
 ```rust
 fn sys_ns_bind(
@@ -188,7 +201,7 @@ fn sys_ns_bind(
     resource: RawHandle,
 ) -> isize
 ```
-Binds `resource` (typically an IPC channel endpoint or a kernel resource server registration) at `path` in `ns`. Requires `BIND` right on `ns` and `BIND_NAMESPACE` system capability. Returns `0` on success.
+Binds `resource` (a direct kernel-object handle in slice 1; an IPC resource-server endpoint in slice 3) at `path` in `ns`. Requires the `BIND` right on `ns` (the enforced gate); the `BIND_NAMESPACE` system capability is an additional required gate once the syscap/process-capability model lands. Returns `0` on success.
 
 ```rust
 fn sys_ns_unbind(
