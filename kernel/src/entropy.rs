@@ -23,7 +23,10 @@
 //! IRQ-context sampler ([`on_irq_sample`]) and the syscall/boot-context draw
 //! ([`fill`]) mutually safe on one CPU. See `kernel/docs/lock-ordering.md`.
 
-use crate::libkern::{ChaCha20Rng, IrqSpinLock};
+use core::sync::atomic::{AtomicBool, Ordering};
+
+use crate::libkern::{ChaCha20Rng, IrqSpinLock, KVec};
+use crate::object::ObjectRef;
 
 /// Pool size in bytes. Sized to one ChaCha key — the pool *is* the CSPRNG key
 /// material once conditioned by the key schedule.
@@ -53,6 +56,28 @@ const RESEED_BYTES: u32 = 1 << 20; // 1 MiB
 /// constant). Mixing only — cryptographic conditioning is ChaCha's key schedule.
 const ABSORB_MUL: u64 = 0x9E37_79B9_7F4A_7C15;
 
+/// Maximum `sys_entropy_read` callers that can simultaneously block on the pool
+/// becoming seeded. Only reachable on a CPU with no hardware RNG (otherwise the
+/// pool seeds at boot, before userspace), so a small cap suffices; an overflowing
+/// reader is told to retry rather than queued.
+pub const SEED_WAITERS_MAX: usize = 4;
+
+/// Outcome of registering a `PendingOperation` to be woken when the pool seeds.
+pub enum SeedWaitReg {
+    /// Queued; the timer-tick drain will complete it once the pool seeds.
+    Queued,
+    /// The pool was already seeded (a race after the caller's `is_seeded` check) —
+    /// the caller should complete the returned PO now so its wait returns at once.
+    AlreadySeeded(ObjectRef),
+    /// The waiter list was full; the caller should complete the returned PO with a
+    /// retry status. Pathological (> `SEED_WAITERS_MAX` concurrent unseeded reads).
+    Full(ObjectRef),
+}
+
+/// Set whenever the seed-waiter list is non-empty, so the timer tick can skip the
+/// lock entirely in the common (already-seeded, no-waiters) case.
+static SEED_WAKE_PENDING: AtomicBool = AtomicBool::new(false);
+
 /// The entropy subsystem's interior state (see the module docs).
 struct EntropyState {
     /// Entropy accumulator. Conditioned into the CSPRNG key by the key schedule.
@@ -71,6 +96,11 @@ struct EntropyState {
     csprng: ChaCha20Rng,
     /// CSPRNG output since the last reseed (drives [`RESEED_BYTES`]).
     bytes_since_reseed: u32,
+    /// `PendingOperation`s parked on the pool becoming seeded (the unseeded-read
+    /// path). Pre-reserved to [`SEED_WAITERS_MAX`] in [`init`]. The subsystem owns
+    /// these refs (mirroring the IPC `Block` pattern) until the timer-tick drain
+    /// moves them out to be signalled + dropped.
+    seed_waiters: KVec<ObjectRef>,
 }
 
 impl EntropyState {
@@ -85,6 +115,7 @@ impl EntropyState {
             seeded: false,
             csprng: ChaCha20Rng::from_seed([0; 32]),
             bytes_since_reseed: 0,
+            seed_waiters: KVec::new(),
         }
     }
 
@@ -139,6 +170,36 @@ impl EntropyState {
             self.bytes_since_reseed = 0;
         }
     }
+
+    /// Queue `po` to be woken on seeding, or hand it back (see [`SeedWaitReg`]).
+    /// Refs are *moved*, never dropped, here. The `seed_waiters` capacity is
+    /// reserved at [`init`], so `try_push` cannot allocate/fail.
+    fn register_waiter(&mut self, po: ObjectRef) -> SeedWaitReg {
+        if self.seeded {
+            SeedWaitReg::AlreadySeeded(po)
+        } else if self.seed_waiters.len() >= SEED_WAITERS_MAX {
+            SeedWaitReg::Full(po)
+        } else {
+            self.seed_waiters
+                .try_push(po)
+                .expect("within reserved seed-waiter capacity");
+            SeedWaitReg::Queued
+        }
+    }
+
+    /// If seeded, move up to `out.len()` queued waiter refs into `out` and return
+    /// the count; 0 (touching nothing) if not yet seeded. No `ObjectRef` drop here.
+    fn drain_waiters(&mut self, out: &mut [Option<ObjectRef>]) -> usize {
+        if !self.seeded {
+            return 0;
+        }
+        let mut n = 0;
+        while n < out.len() && !self.seed_waiters.is_empty() {
+            out[n] = Some(self.seed_waiters.remove(0));
+            n += 1;
+        }
+        n
+    }
 }
 
 /// The single global entropy state (a leaf `IrqSpinLock`; see the module docs).
@@ -159,6 +220,10 @@ pub fn init() {
     let source = crate::arch::Entropy::source();
     let mut hw = 0usize;
     let mut g = ENTROPY.lock();
+    // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates
+    // under the lock. Best-effort: a failed reserve just means no waiters can be
+    // queued (they'll be told to retry), which only matters on no-HW-RNG boots.
+    let _ = g.seed_waiters.try_reserve(SEED_WAITERS_MAX);
     // Hardware burst: each successful draw is absorbed and credited its full width.
     for _ in 0..HW_DRAWS {
         if let Some(v) = crate::arch::Entropy::try_seed_u64() {
@@ -215,6 +280,39 @@ pub fn seed_u64() -> u64 {
 /// keyed the CSPRNG, seeded or not.
 pub fn is_seeded() -> bool {
     ENTROPY.lock().seeded
+}
+
+/// Register `po` to be completed when the pool seeds (the unseeded `sys_entropy_read`
+/// path). On [`SeedWaitReg::Queued`] the subsystem takes ownership of `po` until the
+/// timer-tick drain ([`drain_seed_waiters`]) signals it; otherwise `po` is handed
+/// back for the caller to complete now (see [`SeedWaitReg`]). The TOCTOU re-check
+/// under the lock closes the seed-between-check-and-register race.
+pub fn register_seed_waiter(po: ObjectRef) -> SeedWaitReg {
+    let reg = ENTROPY.lock().register_waiter(po);
+    if matches!(reg, SeedWaitReg::Queued) {
+        SEED_WAKE_PENDING.store(true, Ordering::Release);
+    }
+    reg
+}
+
+/// `true` iff seed-waiters are queued — the cheap (lock-free) gate the timer tick
+/// checks before taking the lock in [`drain_seed_waiters`].
+pub fn seed_wake_pending() -> bool {
+    SEED_WAKE_PENDING.load(Ordering::Acquire)
+}
+
+/// If the pool is seeded, move up to `out.len()` queued waiter `PendingOperation`
+/// refs into `out` (returning the count) for the caller to signal + drop; clears
+/// [`seed_wake_pending`] once the list empties. Returns 0 (touching nothing) when
+/// the pool is not yet seeded. The refs are *moved* out — no `ObjectRef` drop
+/// happens under the entropy lock.
+pub fn drain_seed_waiters(out: &mut [Option<ObjectRef>]) -> usize {
+    let mut g = ENTROPY.lock();
+    let n = g.drain_waiters(out);
+    if g.seed_waiters.is_empty() {
+        SEED_WAKE_PENDING.store(false, Ordering::Release);
+    }
+    n
 }
 
 #[cfg(test)]
@@ -308,5 +406,57 @@ mod tests {
             s.bytes_since_reseed < RESEED_BYTES,
             "the byte-threshold reseed reset the counter",
         );
+    }
+
+    /// A live `PendingOperation`, adopted into an `ObjectRef`, as a seed-waiter.
+    fn po() -> ObjectRef {
+        use crate::libkern::KBox;
+        use crate::object::PendingOperation;
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(PendingOperation::try_new().unwrap()).as_ptr() as *mut (),
+                crate::libkern::handle::KObjectType::PendingOperation,
+            )
+        }
+    }
+
+    fn reserved_state() -> EntropyState {
+        crate::mm::test_support::init_global_heap();
+        let mut s = EntropyState::new();
+        s.seed_waiters.try_reserve(SEED_WAITERS_MAX).unwrap();
+        s
+    }
+
+    #[test]
+    fn register_returns_already_seeded_when_seeded() {
+        let mut s = reserved_state();
+        s.seeded = true;
+        assert!(matches!(s.register_waiter(po()), SeedWaitReg::AlreadySeeded(_)));
+        assert_eq!(s.seed_waiters.len(), 0, "no queuing when already seeded");
+    }
+
+    #[test]
+    fn register_queues_when_unseeded_then_full_at_capacity() {
+        let mut s = reserved_state();
+        for _ in 0..SEED_WAITERS_MAX {
+            assert!(matches!(s.register_waiter(po()), SeedWaitReg::Queued));
+        }
+        assert_eq!(s.seed_waiters.len(), SEED_WAITERS_MAX);
+        // One past capacity is handed back.
+        assert!(matches!(s.register_waiter(po()), SeedWaitReg::Full(_)));
+    }
+
+    #[test]
+    fn drain_yields_nothing_until_seeded_then_all_waiters() {
+        let mut s = reserved_state();
+        s.register_waiter(po());
+        s.register_waiter(po());
+        let mut out: [Option<ObjectRef>; SEED_WAITERS_MAX] = [const { None }; SEED_WAITERS_MAX];
+        assert_eq!(s.drain_waiters(&mut out), 0, "no drain while unseeded");
+        assert_eq!(s.seed_waiters.len(), 2);
+        s.seeded = true;
+        assert_eq!(s.drain_waiters(&mut out), 2, "drains all once seeded");
+        assert_eq!(s.seed_waiters.len(), 0);
     }
 }

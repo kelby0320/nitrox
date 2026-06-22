@@ -20,6 +20,7 @@
 //! objects, [`Process`] and [`Thread`]. The remaining object types land
 //! behind their respective Phase 1 slices.
 
+pub mod entropy_object;
 pub mod header;
 pub mod ipc_channel;
 pub mod memory_object;
@@ -30,6 +31,7 @@ pub mod process;
 pub mod thread;
 pub mod timer;
 
+pub use entropy_object::EntropyObject;
 pub use header::{KObjectHeader, ObjectRef};
 pub use ipc_channel::{
     BlockSendOutcome, IpcChannel, ReclaimedSend, RecvState, SendOutcome, StoredMsg, TransferRef,

@@ -44,6 +44,8 @@ const SYS_NS_CREATE: u64 = 22;
 const SYS_NS_LOOKUP: u64 = 23;
 const SYS_NS_BIND: u64 = 24;
 const SYS_NS_UNBIND: u64 = 25;
+const SYS_ENTROPY_CREATE: u64 = 26;
+const SYS_ENTROPY_READ: u64 = 27;
 const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 
 /// `SendMode` values (`kernel/src/libkern/ipc.rs`).
@@ -677,6 +679,52 @@ fn ns_demo(root_ns: u64) {
     kprint(b"parent: ns-demo done\n");
 }
 
+/// Entropy demo: create an `EntropyObject` token and read CSPRNG bytes from it.
+/// The pool seeds at boot (QEMU runs with `+rdrand,+rdseed`), so both reads return
+/// `0` (synchronous fill) and the two 32-byte draws differ (the CSPRNG advances).
+fn entropy_demo() {
+    kprint(b"parent: entropy-demo start\n");
+    // SAFETY: register-only syscall.
+    let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
+    if h < 0 {
+        kprint(b"parent: entropy_create FAIL\n");
+        return;
+    }
+    let h = h as u64;
+
+    let mut a = [0u8; 32];
+    let mut b = [0u8; 32];
+    // SAFETY: valid writable 32-byte buffers; `len` ≤ ENTROPY_READ_MAX.
+    let r1 = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut a) as u64, 32, 0) };
+    let r2 = unsafe { syscall4(SYS_ENTROPY_READ, h, (&raw mut b) as u64, 32, 0) };
+    if r1 != 0 || r2 != 0 {
+        // A positive return would mean "unseeded, wait on the PO" — not expected
+        // here (the pool seeds at boot). Report and bail.
+        kprint(b"parent: entropy read not synchronous (unseeded?)\n");
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        return;
+    }
+    // The two 32-byte draws must differ (the CSPRNG advances each read). A manual
+    // loop avoids emitting a `memcmp` intrinsic this freestanding binary lacks.
+    let mut differ = false;
+    for i in 0..32 {
+        if a[i] != b[i] {
+            differ = true;
+            break;
+        }
+    }
+    let first = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+    kprint(b"parent: entropy bytes[0..8]=");
+    kprint_hex(first);
+    if differ {
+        kprint(b" (two reads differ) entropy ok\n");
+    } else {
+        kprint(b" entropy-demo UNEXPECTED (reads identical)\n");
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -694,6 +742,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0c. Namespace demo: create / bind / lookup / wait / use / unbind against
     //     this process's root namespace (Process::namespace, in rsi).
     ns_demo(root_ns);
+
+    // 0d. Entropy demo: create an EntropyObject and read CSPRNG bytes.
+    entropy_demo();
 
     kprint(b"parent: creating a channel\n");
 

@@ -161,16 +161,20 @@ Returns a handle to the entropy source with `READ` + the generic management band
 `sys_timer_create`; it mints a fresh handle/token, not a new random stream.)
 
 ```
-fn sys_entropy_read(handle: RawHandle, buf: UserPtr<u8>, len: usize) -> isize  // syscall 27
+fn sys_entropy_read(handle: RawHandle, buf: UserMutPtr<u8>, len: usize) -> isize  // syscall 27
 ```
-Requires `READ` on `handle`. Fills `buf[0..len]` with CSPRNG output and returns the
-byte count. Bounded per call (a cap like the `sys_kprint` bounce buffer).
+Requires `READ` on `handle`. `len` is bounded per call (256 bytes — a cap like the
+`sys_kprint` bounce buffer; loop for more). The return value distinguishes the two
+outcomes (unambiguous because handle values are always ≥ 1):
 
-- **Seeded (the common case):** the syscall fills `buf` and returns `len`
-  synchronously.
-- **Unseeded (rare — only the no-HW-RNG, pre-jitter window):** returns a
-  `PendingOperation` handle that completes once the pool seeds; the caller
-  `sys_wait`s on it, then re-reads. This keeps the async-first contract
+- **Seeded (the common case) → returns `0`:** the syscall fills `buf[0..len]` with
+  CSPRNG output and returns synchronously. The kernel bounce buffer is wiped after
+  copy-out so no entropy lingers on the kernel stack.
+- **Unseeded (rare — only the no-HW-RNG, pre-jitter window) → returns a positive
+  `PendingOperation` handle:** the buffer is untouched. The PO completes once the
+  pool seeds (the seed-latch drains the waiter list on the next scheduler tick and
+  completes each); the caller `sys_wait`s on it, then **re-reads** (now seeded →
+  synchronous fill). This keeps the async-first contract
   (`docs/rationale/why-async-syscalls.md`) without ever blocking inside a syscall.
   In practice the pool is seeded before userspace runs, so this path is the safety
   net, not the norm.

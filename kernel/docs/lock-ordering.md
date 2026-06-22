@@ -124,7 +124,13 @@ makes mutually safe on one CPU:
 
 The seeded-latch's wake of any `PendingOperation` waiters (the userspace read
 contract) runs on the `PendingOperation` completion path under `SCHED`, **outside**
-this lock — so `ENTROPY` never nests with `SCHED`.
+this lock — so `ENTROPY` never nests with `SCHED`. Concretely, `on_timer_tick`'s
+`wake_entropy_seed_waiters` (`sched.rs`) *moves* the queued waiter `ObjectRef`s out
+of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern), then
+signals + **drops** them under `SCHED`. Dropping a `PendingOperation` ref under
+`SCHED` is sound — unlike a `Process`/`Thread` ref, a `PendingOperation`'s `Drop`
+touches only the allocator (rank 6), acquired *below* `SCHED` (rank 1) in the legal
+top-to-bottom direction; it never re-enters `SCHED`.
 
 ## The AddressSpace lock and the page-fault handler
 
