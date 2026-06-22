@@ -914,34 +914,80 @@ before userspace, so reads are synchronous in practice.
 
 #### 3. In-kernel resource servers
 
-- [ ] Initramfs resource server (parses Limine-loaded CPIO newc blob)
-- [ ] Device resource server stub (`/dev`)
-- [ ] Process resource server stub (`/proc`)
-- [ ] Kernel log resource server (`/dev/log`)
-- [ ] Entropy resource server (`/dev/entropy`) — consumes the entropy subsystem (slice 2)
-- [ ] Framebuffer resource server (`/dev/framebuffer`) — for pre-compositor era
-- [ ] Synthetic `/proc/self/*` resources
+**Scope (decided 2026-06-22 — see decision log).** Slice 3 builds the **in-kernel**
+resource-server framework and the servers with an immediate consumer/demo. In-kernel
+servers dispatch by **direct kernel function call** (no IPC); the kernel binds them
+into pid 1's root namespace at boot, so the whole slice is demoable via the existing
+parent process without init.
 
-#### 3b. Userspace-runtime + fault-diagnostics prerequisites (before Init)
+Deliberately deferred (build-when-consumed, to avoid large unexercised machinery):
 
-Two sharp edges surfaced by the Phase 2 slice 2 (entropy) QEMU demo
-(`decision-log` 2026-06-22). Both must land **before** the Init slice (4) so init's
-critical-path code isn't debugging blind. Today the entropy/IPC demos sidestep #1 by
-hand (manual byte loops, pointer-passing) and tolerate #2 because they run under a
-watching parent — init has neither luxury.
+- **Userspace-RS path** — IPC-forwarded lookup, cross-context handle install,
+  `librsproto`, and the Ready handshake → **slice 7** (the fs-server is the first
+  userspace-RS consumer).
+- **`/initramfs` + CPIO + `sys_release_initramfs`** → **slice 4** (Init, its only
+  consumer).
+- **`/dev/framebuffer`** → deferred (needs userspace framebuffer mapping, not built).
+- **The filtered/full process server** (`/proc/<pid>`, enumeration) → a later slice:
+  it needs a global process registry *and* is the ambient-authority-sensitive
+  surface (see the `/proc/self` note below). Slice 3 ships **only `/proc/self`**.
 
-- [ ] **Freestanding-userspace mem intrinsics.** A freestanding `#![no_std]`
-  userspace binary that compares/copies/zeroes a large array emits a `memcmp` /
-  `memcpy` / `memset` call the binary doesn't provide; today that links to a bad
-  address and faults at runtime (it bit the entropy demo's `[u8; 32]` compare).
-  Provide a small `memcpy`/`memset`/`memcmp`/`memmove` (as the kernel already does)
-  in the userspace runtime (`libkern` or a `librt` floor) so bulk array ops "just
-  work." Init does plenty of these (TOML parsing, handle-set marshalling).
+Broken into a prerequisites pass + docs-first + two code parts (mirrors slices 1/2):
+
+**Part 0 — userspace-runtime + fault-diagnostics prerequisites (do first).** Two
+sharp edges the slice-2 entropy demo surfaced (`decision-log` 2026-06-22), both
+independent of the RS work; landing them first makes all later slice-3/Init debugging
+tractable. Today the entropy/IPC demos sidestep #1 by hand (manual byte loops,
+pointer-passing) and tolerate #2 because they run under a watching parent — init has
+neither luxury.
+
+- [ ] **Freestanding-userspace mem intrinsics.** A freestanding `#![no_std]` binary
+  that compares/copies/zeroes a large array emits a `memcmp`/`memcpy`/`memset` call
+  the binary doesn't provide; today it links to a bad address and faults (it bit the
+  entropy demo's `[u8; 32]` compare). Provide `memcpy`/`memset`/`memcmp`/`memmove`
+  in the userspace runtime (`libkern`/`librt` floor). Init does many of these.
 - [ ] **Surface unhandled ring-3 faults.** A fault in a process with no supervisor
-  to receive its fault notification (notably **pid 1**) currently suspends the
-  thread silently — no diagnostic, indistinguishable from a hang. Emit a last-ditch
-  kernel `kprintln!` (faulting `rip`/`cr2`/vector/pid) when a ring-3 fault has no
-  supervisor to deliver to, so an init crash is a 5-second diagnosis, not a bisect.
+  to receive its fault notification (notably **pid 1**) currently suspends the thread
+  silently — indistinguishable from a hang. Emit a last-ditch kernel `kprintln!`
+  (faulting `rip`/`cr2`/vector/pid) so an init crash is a 5-second diagnosis.
+
+**Part A — design doc.** Formalize the in-kernel RS framework into the living docs
+(today only sketched in `os-design-v5.1.md`): the kernel-server dispatch model
+(`lookup(suffix, rights) -> OpStatus::{Completed(handle) | Rejected(err)}`; `Pending`
+reserved for slice 7), the `BindingTarget` enum (`DirectHandle` + `KernelServer`;
+`ResourceServer`/IPC + `SubNamespace`/`Rewrite` deferred), how lookup dispatches
+**synchronously** and reuses the slice-1 pre-signalled-PO delivery (`IoResult.result`),
+boot-time binding into pid 1's root namespace, the per-server content model (a lookup
+returns a handle to a kernel object), and the `/proc/self` authority model below.
+
+**Part B — the framework.** `BindingTarget` enum in `namespace.rs`; the `KernelServer`
+dispatch + a small registry; wire `sys_ns_lookup` to call a server synchronously →
+install the handle → pre-signal the PO; bind servers at boot. Host-tested with one
+trivial server.
+
+**Part C — the servers + demo.**
+
+- [ ] `/dev/entropy` — lookup returns an `EntropyObject` (reuses slice 2;
+  `sys_entropy_read` on the resolved handle).
+- [ ] `/proc/self/*` — **self-reference only**: `process`/`thread`/`namespace`
+  resolve to the **caller's own** objects (derived from the calling syscall context,
+  no pid parameter); `pid`/`tid` to small readable snapshots. Registry-free; no
+  cross-process access.
+- [ ] `/dev` directory stub (enumerable placeholder).
+- [ ] *(optional)* `/dev/log` — only if cheap; a readable kernel-log snapshot needs a
+  log ring buffer (new infra), so defer unless wanted.
+- [ ] QEMU demo: the parent looks these up and uses the results.
+
+> **`/proc/self` authority (no ambient authority).** Reachability is by **namespace
+> construction** — `/proc/self` resolves only if a supervisor bound it (a sandbox may
+> omit it; it is *not* a kernel-forced universal). What it returns is strictly the
+> **caller's own** resources, derived from the running context — there is **no pid
+> parameter to forge**, so it grants nothing about other processes (and returned
+> handles are still owner-pid-checked on use). Cross-process introspection
+> (`/proc/<pid>`, enumeration) is a **separate, narrowly-bound** capability
+> (init/admin namespaces) with its own registry — deferred, not built here. See
+> `os-design-v5.1.md` §"Synthetic /proc/self" + the namespace-composition examples
+> (standard user → filtered `/proc`; admin → full `/proc`; sandbox → none).
 
 #### 4. Init (PID 1) — bootstrapping form
 
@@ -950,13 +996,22 @@ parsing, reaping loop) on top of slices 1 and 3. Its full critical-path mount
 loop is not milestone-complete until the storage + fs-server slices (5–8)
 land; see the milestone note.
 
+The **initramfs substrate** lives here (moved from slice 3, 2026-06-22) — its only
+consumer is init reading `init.toml` + spawnable images, so it lands where it's used.
+It reuses the slice-3 in-kernel RS framework: `/initramfs` is just another in-kernel
+server, bound at boot.
+
 - [ ] `userspace/init/` crate, `libkern + alloc` only
 - [ ] Initial handle set reception from kernel
+- [ ] **Initramfs substrate**: Limine module request (`kernel/src/limine.rs`) +
+  CPIO-newc parser + the `/initramfs` in-kernel resource server (serves file content
+  from the Limine-loaded blob via the slice-3 framework)
 - [ ] Minimal TOML parser (just enough for init.toml schema)
 - [ ] init.toml parsing per [docs/spec/init-toml-schema.md]
 - [ ] Critical-path mount processing loop (topological sort by mount_point depth)
 - [ ] Reaping loop for `ChildExited` notifications
-- [ ] `sys_release_initramfs` syscall and init's call to it once boot is stable
+- [ ] `sys_release_initramfs` syscall (unbinds `/initramfs`, frees the blob's pages)
+  and init's call to it once boot is stable
 
 #### 5. Storage drivers
 
@@ -985,6 +1040,16 @@ either `PendingOperation`-backed requests or at least one blocking IPC
 direction (both from the prerequisite band) are needed for real request/reply
 under backpressure; `NoBlock` send + `sys_wait`-on-recv is the fallback.
 
+The **userspace-RS kernel path** lands here (moved from slice 3, 2026-06-22): the
+fs-server is the first userspace resource server, so the machinery it needs is built
+when it's first consumed rather than speculatively. This is the
+`BindingTarget::ResourceServer` kind + IPC-forwarded lookup + the cross-context
+handle install (the kernel installs the server's returned handle into the *original
+caller's* table, then signals the lookup's `PendingOperation` — the `Pending`
+`OpStatus` path the slice-3 framework reserved).
+
+- [ ] **Kernel**: `BindingTarget::ResourceServer` + IPC-forwarded lookup +
+  cross-context handle install (the `Pending` completion path)
 - [ ] `userspace/librsproto/` crate per [docs/spec/rsproto-wire-format.md]
 - [ ] Meta operations: Hello, Goodbye, QueryCaps, Ping, Ready
 - [ ] Version negotiation
