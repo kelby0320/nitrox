@@ -888,12 +888,25 @@ pre-signalled PO carrying the resolved handle via `IoResult.result`.
 
 Moved ahead of the in-kernel resource servers: the `/dev/entropy` server in
 the next slice depends on this subsystem (the original plan listed it in both
-places — a forward self-reference).
+places — a forward self-reference). Design:
+[`docs/architecture/entropy.md`]. Broken into a docs-first design pass + three
+code parts, each its own PR (mirroring the namespace slice). The read interface is
+async by contract (a `PendingOperation` when unseeded) but the pool seeds at boot,
+before userspace, so reads are synchronous in practice.
 
-- [ ] Hardware RNG access (RDSEED preferred, RDRAND fallback)
-- [ ] Software entropy mixing (TSC jitter at interrupt dispatch)
-- [ ] ChaCha20 CSPRNG with periodic reseed
-- [ ] `EntropyObject` handle, blocks until pool is seeded
+- [x] **Part A — design doc** (`phase-2/entropy-design`): sources (RDSEED/RDRAND +
+  TSC jitter), the pool + seeded gate, ChaCha20 + fast-key-erasure + reseed policy,
+  boot integration, the `EntropyObject` read contract, lock discipline, kernel/
+  userspace + slice-2/slice-3 scope. Spec: `sys_entropy_create = 26` /
+  `sys_entropy_read = 27` reserved.
+- [ ] **Part B** — hand-rolled ChaCha20 CSPRNG (RFC 8439 vectors) + arch HW-RNG
+  access (RDSEED preferred, RDRAND fallback; CPUID-detected). Host-tested.
+- [ ] **Part C** — entropy pool + boot seeding + TSC-jitter mixing at interrupt
+  dispatch + periodic reseed + the seeded gate; re-seed the handle-table (and later
+  ASLR) PRNGs from the CSPRNG.
+- [ ] **Part D** — `EntropyObject` kernel object + `sys_entropy_create` /
+  `sys_entropy_read` (synchronous when seeded; `PendingOperation` when not) + QEMU
+  demo.
 
 #### 3. In-kernel resource servers
 
