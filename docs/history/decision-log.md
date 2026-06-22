@@ -3792,3 +3792,40 @@ both paths verified. cargo xtask test: 453 passed; build + check-arch clean.
 Branch `phase-2/entropy-pool-seeding` off `main` (includes merged PR #45). Next:
 Part D (`EntropyObject` + `sys_entropy_create`/`sys_entropy_read` + the PO-waiter
 wake on a runtime seed latch).
+
+## 2026-06-22 — Phase 2 slice 2: EntropyObject + sys_entropy_* (Part D — slice complete)
+
+Part D exposes the entropy subsystem to userspace and closes the slice: the
+`EntropyObject` kobject (a stateless capability token onto the singleton CSPRNG),
+`sys_entropy_create`/`sys_entropy_read` (26/27), the true-blocking unseeded-read
+path, and a QEMU demo.
+
+**Decision — read returns `0` on synchronous fill, a positive `PendingOperation`
+handle when unseeded.** Part A said "returns len"; refined to `0` because a byte
+count would be ambiguous with a PO handle on the same `isize` (handles are always
+≥ 1, so `0` / `>0` / `<0` cleanly mean filled / wait-on-PO / error). A seeded read
+fills the user buffer and wipes the kernel bounce buffer; an unseeded read leaves
+the buffer untouched and hands back a PO to wait on, then the caller re-reads.
+
+**Decision — true-block unseeded path via a seed-waiter list (user choice).** The
+entropy subsystem owns a bounded `KVec<ObjectRef>` of parked PO refs (the IPC-`Block`
+pattern); `register_seed_waiter` queues them (or hands one back as `AlreadySeeded` /
+`Full`). `on_timer_tick` → `wake_entropy_seed_waiters`, gated by a lock-free
+`SEED_WAKE_PENDING` atomic, drains them once `is_seeded()` and signals each under
+`SCHED`. Dropping the spent PO refs under `SCHED` is sound: a `PendingOperation`'s
+`Drop` touches only the allocator (rank 6, the legal below-`SCHED` direction), never
+re-entering `SCHED` — documented in `lock-ordering.md`. In QEMU (`+rdrand,+rdseed`)
+the pool seeds at boot, so this path isn't exercised by the demo; it's covered by
+host tests of `register`/`drain`.
+
+**Bug found + fixed in the demo:** `a != b` on `[u8; 32]` in the freestanding parent
+emitted a `memcmp` intrinsic the binary doesn't provide → silent userspace hang. The
+demo now compares with a manual byte loop. (No kernel impact; a userspace-runtime
+note for future no_std demos.)
+
+cargo xtask test: 452 passed; build + check-arch clean; the QEMU demo prints two
+differing 32-byte reads + "entropy ok". Branch `phase-2/entropy-object-syscalls` off
+`main` (includes merged PR #46).
+
+**Entropy subsystem (Phase 2 slice 2) is complete.** Next: the in-kernel resource
+servers (slice 3), where `/dev/entropy` binds an `EntropyObject` into namespaces.

@@ -98,8 +98,8 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `23` | `sys_ns_lookup` |
 | `24` | `sys_ns_bind` |
 | `25` | `sys_ns_unbind` |
-| `26` | `sys_entropy_create` (reserved) |
-| `27` | `sys_entropy_read` (reserved) |
+| `26` | `sys_entropy_create` |
+| `27` | `sys_entropy_read` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -237,8 +237,7 @@ plus the generic duplicate/transfer/inspect band).
 
 The kernel CSPRNG, exposed as an `EntropyObject` handle. Full model in
 [`docs/architecture/entropy.md`](../architecture/entropy.md). Syscall numbers:
-`sys_entropy_create = 26`, `sys_entropy_read = 27` (reserved; pre-stabilization —
-land with Phase 2 slice 2).
+`sys_entropy_create = 26`, `sys_entropy_read = 27` (implemented in Phase 2 slice 2).
 
 ```rust
 fn sys_entropy_create() -> isize
@@ -248,15 +247,20 @@ plus the generic duplicate/transfer/inspect band. The source is shared; the hand
 is a capability token onto it (many handles, one generator).
 
 ```rust
-fn sys_entropy_read(handle: RawHandle, buf: UserPtr<u8>, len: usize) -> isize
+fn sys_entropy_read(handle: RawHandle, buf: UserMutPtr<u8>, len: usize) -> isize
 ```
-Requires `READ` on `handle`. Fills `buf[0..len]` with CSPRNG output (`len` capped
-per call) and returns the byte count. If the pool is **seeded** (the common case —
-it seeds at boot, before userspace), it fills and returns synchronously. If
-**unseeded** (only on hardware lacking `RDSEED`/`RDRAND`, before enough interrupt
-jitter has accumulated), it returns a `PendingOperation` handle that completes when
-the pool seeds — the caller `sys_wait`s on it, then re-reads. This preserves the
-async-first rule without blocking inside the syscall.
+Requires `READ` on `handle`. `len` is capped per call (256 bytes; loop for more).
+**Return contract:**
+- **`0`** — `buf[0..len]` was filled synchronously. This is the common case: the
+  pool seeds at boot, before userspace.
+- **a positive value** — a `PendingOperation` handle. The pool is not yet seeded
+  (only on hardware lacking `RDSEED`/`RDRAND`, before enough interrupt jitter has
+  accumulated); the buffer is **untouched**. The caller `sys_wait`s on the handle
+  (it completes when the pool seeds) and then **re-reads**. This preserves the
+  async-first rule without blocking inside the syscall.
+- **a negative value** — a `KError`.
+
+The split is unambiguous because handle values are always ≥ 1.
 
 ### Process and Thread
 

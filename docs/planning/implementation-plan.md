@@ -907,9 +907,10 @@ before userspace, so reads are synchronous in practice.
   256-bit seeded gate; the handle-table free-list PRNG now seeds from the CSPRNG
   (`PHASE1_SEED` removed). One `IrqSpinLock<EntropyState>` leaf. QEMU opts in
   `+rdrand,+rdseed`; boot shows `seeded=true`.
-- [ ] **Part D** — `EntropyObject` kernel object + `sys_entropy_create` /
-  `sys_entropy_read` (synchronous when seeded; `PendingOperation` when not) + QEMU
-  demo.
+- [x] **Part D** (`phase-2/entropy-object-syscalls`) — `EntropyObject` kernel object
+  + `sys_entropy_create` / `sys_entropy_read` (returns `0` on synchronous fill when
+  seeded; a `PendingOperation` when not, with the seed-latch waking PO waiters from
+  the timer tick) + QEMU demo. **Entropy subsystem (slice 2) complete.**
 
 #### 3. In-kernel resource servers
 
@@ -920,6 +921,27 @@ before userspace, so reads are synchronous in practice.
 - [ ] Entropy resource server (`/dev/entropy`) — consumes the entropy subsystem (slice 2)
 - [ ] Framebuffer resource server (`/dev/framebuffer`) — for pre-compositor era
 - [ ] Synthetic `/proc/self/*` resources
+
+#### 3b. Userspace-runtime + fault-diagnostics prerequisites (before Init)
+
+Two sharp edges surfaced by the Phase 2 slice 2 (entropy) QEMU demo
+(`decision-log` 2026-06-22). Both must land **before** the Init slice (4) so init's
+critical-path code isn't debugging blind. Today the entropy/IPC demos sidestep #1 by
+hand (manual byte loops, pointer-passing) and tolerate #2 because they run under a
+watching parent — init has neither luxury.
+
+- [ ] **Freestanding-userspace mem intrinsics.** A freestanding `#![no_std]`
+  userspace binary that compares/copies/zeroes a large array emits a `memcmp` /
+  `memcpy` / `memset` call the binary doesn't provide; today that links to a bad
+  address and faults at runtime (it bit the entropy demo's `[u8; 32]` compare).
+  Provide a small `memcpy`/`memset`/`memcmp`/`memmove` (as the kernel already does)
+  in the userspace runtime (`libkern` or a `librt` floor) so bulk array ops "just
+  work." Init does plenty of these (TOML parsing, handle-set marshalling).
+- [ ] **Surface unhandled ring-3 faults.** A fault in a process with no supervisor
+  to receive its fault notification (notably **pid 1**) currently suspends the
+  thread silently — no diagnostic, indistinguishable from a hang. Emit a last-ditch
+  kernel `kprintln!` (faulting `rip`/`cr2`/vector/pid) when a ring-3 fault has no
+  supervisor to deliver to, so an init crash is a 5-second diagnosis, not a bisect.
 
 #### 4. Init (PID 1) — bootstrapping form
 

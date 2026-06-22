@@ -36,9 +36,9 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::namespace::{NS_PATH_MAX, validate_path};
 use crate::object::{
-    BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace, NotificationChannel,
-    NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState, SendOutcome, StoredMsg,
-    Timer as TimerObject, TransferRef,
+    BlockSendOutcome, EntropyObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
+    NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState,
+    SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -100,6 +100,10 @@ pub const SYS_NS_LOOKUP: u64 = 23;
 pub const SYS_NS_BIND: u64 = 24;
 /// `sys_ns_unbind` — remove the binding at a path in a namespace.
 pub const SYS_NS_UNBIND: u64 = 25;
+/// `sys_entropy_create` — create an `EntropyObject` handle onto the kernel CSPRNG.
+pub const SYS_ENTROPY_CREATE: u64 = 26;
+/// `sys_entropy_read` — fill a buffer with CSPRNG output (or return a PO if unseeded).
+pub const SYS_ENTROPY_READ: u64 = 27;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -143,6 +147,8 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3)),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
+        SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
+        SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -998,6 +1004,104 @@ pub fn sys_ns_unbind(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
     }
 }
 
+/// Per-call cap on `sys_entropy_read`. Entropy reads are small (seeds, keys,
+/// nonces); userspace loops for more. Bounds the on-stack bounce buffer.
+const ENTROPY_READ_MAX: usize = 256;
+
+/// Rights minted on a fresh `EntropyObject` handle: `READ` (the principal right)
+/// plus the generic management band. Not waitable (the `PendingOperation` is the
+/// wait primitive for the unseeded path), so no `WAIT`.
+fn entropy_rights() -> Rights {
+    Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER
+}
+
+/// `sys_entropy_create()` — create an [`EntropyObject`] capability token onto the
+/// kernel CSPRNG and return a handle carrying [`entropy_rights`]. The source is the
+/// global singleton; every token reads from it. The `sys_ns_create` pattern.
+pub fn sys_entropy_create() -> SysResult {
+    let obj = EntropyObject::try_new().map_err(|_| KError::OutOfMemory)?;
+    let ptr = KBox::into_raw(obj).as_ptr() as *mut ();
+    let pid = crate::sched::current_owner_pid();
+    match global::get().allocate(pid, ptr, KObjectType::EntropyObject, entropy_rights()) {
+        Ok(h) => Ok(h.bits() as isize),
+        Err(e) => {
+            // `allocate` did not adopt the creation reference; reclaim + drop it.
+            // SAFETY: `ptr` carries the single outstanding creation reference.
+            drop(unsafe { ObjectRef::from_raw(ptr, KObjectType::EntropyObject) });
+            Err(map_handle_err(e))
+        }
+    }
+}
+
+/// `sys_entropy_read(ent, buf, len)` — fill `buf[0..len]` with CSPRNG output.
+/// Requires `READ` on `ent`. `len` is capped at [`ENTROPY_READ_MAX`].
+///
+/// **Return contract:** `0` = the buffer was filled synchronously (the common case
+/// — the pool seeds at boot, before userspace). A **positive** value is a
+/// [`PendingOperation`] handle: the pool is not yet seeded (only on hardware
+/// without `RDSEED`/`RDRAND`), so the caller `sys_wait`s on it and **re-reads** once
+/// it completes. A negative value is a [`KError`]. Unambiguous: handles are ≥ 1.
+pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
+    // Synchronous validation (no PO created on these).
+    if len == 0 {
+        return Ok(0);
+    }
+    if len > ENTROPY_READ_MAX {
+        return Err(KError::TooLarge);
+    }
+    let pid = crate::sched::current_owner_pid();
+    let _ent = lookup_typed(ent_h, pid, Rights::READ, KObjectType::EntropyObject)?;
+    let uptr = UserMutPtr::<u8>::new(buf_ptr).map_err(from_user_access)?;
+
+    if crate::entropy::is_seeded() {
+        // Fill from the CSPRNG, copy out, then wipe the bounce buffer so no entropy
+        // lingers on the kernel stack for a later frame to observe.
+        let mut buf = [0u8; ENTROPY_READ_MAX];
+        crate::entropy::fill(&mut buf[..len]);
+        let r = copy_slice_to_user(uptr, &buf[..len]).map_err(from_user_access);
+        buf.iter_mut().for_each(|b| *b = 0);
+        r?;
+        return Ok(0);
+    }
+
+    // Unseeded: hand back a PendingOperation completed when the pool seeds. Create
+    // the PO + handle (one ref to the handle, one cloned for the seed-waiter list).
+    let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
+    let po_ref = {
+        let ptr = KBox::into_raw(po).as_ptr() as *mut ();
+        // SAFETY: `into_raw` yielded the single creation reference; adopt it.
+        unsafe { ObjectRef::from_raw(ptr, KObjectType::PendingOperation) }
+    };
+    let waiter_ref = po_ref.clone();
+    let (pp, pt) = po_ref.into_raw();
+    let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it. Drop the
+            // clone too — both outside any lock.
+            drop(unsafe { ObjectRef::from_raw(pp, pt) });
+            drop(waiter_ref);
+            return Err(map_handle_err(e));
+        }
+    };
+    match crate::entropy::register_seed_waiter(waiter_ref) {
+        crate::entropy::SeedWaitReg::Queued => {}
+        crate::entropy::SeedWaitReg::AlreadySeeded(r) => {
+            // Seeded between the check and the register: complete now so the wait
+            // returns at once and the caller re-reads (→ synchronous fill).
+            crate::sched::complete_pending_op(r.as_ptr(), 0, 0);
+            drop(r);
+        }
+        crate::entropy::SeedWaitReg::Full(r) => {
+            // Too many concurrent unseeded readers (pathological): tell the caller
+            // to retry. `WouldBlock` is the negative status it reads from the PO.
+            crate::sched::complete_pending_op(r.as_ptr(), KError::WouldBlock as i32, 0);
+            drop(r);
+        }
+    }
+    Ok(po_h.bits() as isize)
+}
+
 /// `sys_ns_lookup(ns, path, path_len, rights)` — resolve `path` in `ns`
 /// (longest-prefix match), requesting at most `rights`. Requires `LOOKUP` on
 /// `ns`. Returns a [`PendingOperation`] handle; the completion delivers the
@@ -1658,6 +1762,32 @@ mod tests {
             .expect("namespace_rights must be valid for a Namespace");
         let co = t.close(h, 1).unwrap();
         drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    #[test]
+    fn entropy_rights_are_allocatable_on_an_entropy_object() {
+        // The rights `sys_entropy_create` mints (READ + generic band) must be
+        // accepted by the handle table for an EntropyObject.
+        init_global_heap();
+        let t = HandleTable::try_new(0x2468_ACE0_1357_9BDF).unwrap();
+        let e = EntropyObject::try_new().unwrap();
+        let ptr = KBox::into_raw(e).as_ptr() as *mut ();
+        let h = t
+            .allocate(1, ptr, KObjectType::EntropyObject, entropy_rights())
+            .expect("entropy_rights must be valid for an EntropyObject");
+        let co = t.close(h, 1).unwrap();
+        drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+    }
+
+    #[test]
+    fn entropy_read_rejects_zero_and_oversize_len() {
+        // The length bounds are checked before the handle lookup / pointer use, so
+        // these are host-reachable (no running thread needed).
+        assert_eq!(sys_entropy_read(0xDEAD, 0x1000, 0), Ok(0));
+        assert_eq!(
+            sys_entropy_read(0xDEAD, 0x1000, ENTROPY_READ_MAX + 1),
+            Err(KError::TooLarge),
+        );
     }
 
     #[test]

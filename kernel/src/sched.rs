@@ -477,12 +477,38 @@ pub fn on_timer_tick() {
     // path: no DPC, all under the one scheduler lock (see the module docs).
     let now = crate::arch::Timer::read_ns();
     fire_expired_deadlines(&mut g, now);
+    wake_entropy_seed_waiters(&mut g);
     let (new_quantum, reschedule) = tick_quantum(g.quantum, !g.ready.is_empty());
     g.quantum = new_quantum;
     if reschedule {
         switch_to_next(g); // consumes the guard; switches with IF masked
     }
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
+}
+
+/// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the
+/// unseeded `sys_entropy_read` path). Gated by a cheap lock-free check so the common
+/// already-seeded / no-waiters case costs one atomic load. Caller holds `SCHED`.
+///
+/// The entropy subsystem owns the waiter refs (the IPC-`Block` pattern); we move
+/// them out, signal each via its raw pointer, and let the local array drop them.
+/// Dropping a `PendingOperation` ref under `SCHED` is sound: its `Drop` touches only
+/// the allocator (acquired *below* `SCHED` in the lock order — the legal direction),
+/// never re-entering `SCHED`. See `kernel/docs/lock-ordering.md` § The entropy lock.
+fn wake_entropy_seed_waiters(g: &mut SchedState) {
+    if !crate::entropy::seed_wake_pending() {
+        return;
+    }
+    let mut buf: [Option<ObjectRef>; crate::entropy::SEED_WAITERS_MAX] =
+        [const { None }; crate::entropy::SEED_WAITERS_MAX];
+    let n = crate::entropy::drain_seed_waiters(&mut buf);
+    for slot in buf[..n].iter() {
+        if let Some(po) = slot {
+            signal_pending_op_with_result(g, po.as_ptr(), 0, 0);
+        }
+    }
+    // `buf` (the moved-out waiter refs) drops here — see the doc comment for why
+    // dropping a `PendingOperation` ref under `SCHED` is sound.
 }
 
 /// Drain every deadline at or before `now`, firing each: a timer entry signals
