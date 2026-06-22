@@ -3718,3 +3718,40 @@ restricted `/store` namespace and hands it to both children, which resolve `/sto
 
 **Namespace foundation (Phase 2 slice 1) is complete.** Next: the resource-server
 protocol + the first filesystem (slice 3 machinery designed in Part A).
+
+## 2026-06-15 — Phase 2 slice 2: entropy design (Part A)
+
+Started Phase 2 slice 2 (the kernel CSPRNG). Pulled ahead of the in-kernel resource
+servers because slice 3's `/dev/entropy` consumes it. Like the namespace slice, it's
+**docs-first + three code parts** (A: this design doc; B: ChaCha20 CSPRNG + arch
+HW-RNG; C: pool + boot seeding + interrupt-jitter mixing + reseed + kernel-PRNG
+re-seed; D: `EntropyObject` + the two syscalls + demo). This entry covers **Part A**,
+the design doc `docs/architecture/entropy.md`.
+
+**Decision — read is async by contract, but seeded before userspace.** `sys_entropy_read`
+returns bytes synchronously when the pool is seeded and a `PendingOperation` when it
+isn't (honoring async-first — no blocking inside a syscall). In practice `RDSEED`/
+`RDRAND` cross the 256-bit gate in microseconds at boot, well before pid 1 runs, so
+the blocking path is a never-hit-in-practice safety net for hardware lacking both HW
+RNG instructions (jitter-only seeding). Worth building correctly; rarely exercised.
+
+**Decision — ChaCha20, hand-rolled, mix-don't-trust.** The CSPRNG is ChaCha20 (RFC
+8439), built from scratch in `libkern` (no external crates), with fast-key-erasure
+for forward secrecy and periodic + byte-threshold reseed. ChaCha20 over AES-CTR
+because the kernel is soft-float and must not assume AES-NI (ChaCha is integer-only,
+no XSAVE state). Every source — HW RNG included — is **absorbed into the pool, never
+used as output directly**: a backdoored `RDSEED` can't weaken output below the jitter
+contribution.
+
+**Decision — `EntropyObject` is a capability token onto a kernel singleton.** The
+random source is one global CSPRNG; `sys_entropy_create` mints a `READ`-righted
+handle (a view), `sys_entropy_read` draws through it. Slice 3's `/dev/entropy` just
+binds such a handle into namespaces — no ABI change.
+
+Sources fixed: RDSEED preferred / RDRAND fallback (CPUID-detected) + TSC jitter at
+interrupt dispatch; HHDM/boot-params/deterministic-at-boot are explicit non-sources.
+Deferred (noted in the doc): fork/VM-snapshot reseed, aarch64 `RNDR`/SMCCC TRNG,
+depleting-estimate blocking semantics. Spec updated (`syscall-abi.md`: numbers 26/27
+reserved + the numbering table extended through 22–27) and the plan's Entropy slice
+re-expressed as A/B/C/D. No code — Part A is docs-only. Branch `phase-2/entropy-design`
+off `main` (includes merged PR #43). Next: Part B (ChaCha20 CSPRNG + arch HW-RNG).

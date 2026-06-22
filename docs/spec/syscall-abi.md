@@ -94,6 +94,12 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `19` | `sys_thread_create` |
 | `20` | `sys_thread_get_registers` |
 | `21` | `sys_exception_resume` |
+| `22` | `sys_ns_create` |
+| `23` | `sys_ns_lookup` |
+| `24` | `sys_ns_bind` |
+| `25` | `sys_ns_unbind` |
+| `26` | `sys_entropy_create` (reserved) |
+| `27` | `sys_entropy_read` (reserved) |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -226,6 +232,31 @@ fn sys_ns_create() -> isize
 Creates a new empty `Namespace` kernel object, independent of the caller's root
 namespace. Returns a handle with full namespace rights (`LOOKUP | BIND | UNBIND`
 plus the generic duplicate/transfer/inspect band).
+
+### Entropy
+
+The kernel CSPRNG, exposed as an `EntropyObject` handle. Full model in
+[`docs/architecture/entropy.md`](../architecture/entropy.md). Syscall numbers:
+`sys_entropy_create = 26`, `sys_entropy_read = 27` (reserved; pre-stabilization —
+land with Phase 2 slice 2).
+
+```rust
+fn sys_entropy_create() -> isize
+```
+Returns a handle to the kernel entropy source (the singleton CSPRNG) with `READ`
+plus the generic duplicate/transfer/inspect band. The source is shared; the handle
+is a capability token onto it (many handles, one generator).
+
+```rust
+fn sys_entropy_read(handle: RawHandle, buf: UserPtr<u8>, len: usize) -> isize
+```
+Requires `READ` on `handle`. Fills `buf[0..len]` with CSPRNG output (`len` capped
+per call) and returns the byte count. If the pool is **seeded** (the common case —
+it seeds at boot, before userspace), it fills and returns synchronously. If
+**unseeded** (only on hardware lacking `RDSEED`/`RDRAND`, before enough interrupt
+jitter has accumulated), it returns a `PendingOperation` handle that completes when
+the pool seeds — the caller `sys_wait`s on it, then re-reads. This preserves the
+async-first rule without blocking inside the syscall.
 
 ### Process and Thread
 
