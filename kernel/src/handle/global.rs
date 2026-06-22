@@ -42,18 +42,11 @@ static GLOBAL: GlobalTable = GlobalTable {
     slot: UnsafeCell::new(MaybeUninit::uninit()),
 };
 
-/// Fixed Phase 1 PRNG seed for the table's per-segment free-list shuffles.
-///
-/// TODO(entropy): seed from the timestamp counter at init, then from
-/// RDRAND/RDSEED once the entropy slice lands. A fixed seed is sound — it
-/// only affects free-list scan order, not correctness or the unforgeability
-/// of handle values (the per-slot generation counters provide that).
-const PHASE1_SEED: u64 = 0x9E37_79B9_7F4A_7C15;
-
 /// Initialise the global handle table exactly once. Must run **after the
-/// heap is up** (it eagerly allocates segment 0) and **before** any
-/// userspace can issue a handle syscall. Returns `Err` if the table
-/// allocation fails.
+/// heap is up** (it eagerly allocates segment 0), **after** the entropy
+/// subsystem is keyed ([`crate::entropy::init`] — the free-list shuffle seed is
+/// drawn from the CSPRNG), and **before** any userspace can issue a handle
+/// syscall. Returns `Err` if the table allocation fails.
 pub fn init() -> Result<(), HandleError> {
     // Single-CPU boot can't actually race, but a CAS makes the
     // initialise-once invariant explicit (and SMP-ready).
@@ -65,7 +58,11 @@ pub fn init() -> Result<(), HandleError> {
         debug_assert!(false, "handle::global::init called more than once");
         return Ok(());
     }
-    let table = HandleTable::try_new(PHASE1_SEED)?;
+    // Seed the per-segment free-list shuffle from the CSPRNG (keyed by
+    // `entropy::init`, which boot runs first). The seed only randomizes free-list
+    // scan order — defence-in-depth on handle-value unpredictability, atop the
+    // owner-PID check + per-slot generation counter that actually unforge handles.
+    let table = HandleTable::try_new(crate::entropy::seed_u64())?;
     // SAFETY: we won the `UNINIT -> INITIALISING` transition, so we have
     // exclusive access to the cell; no reader can be in `get` because `state`
     // is not yet `READY`.

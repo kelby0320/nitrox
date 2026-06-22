@@ -26,10 +26,11 @@ enforced by code review.
 | 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`, **`IrqSpinLock`**)    | live as of Phase 1 slice 4 (diagnostics) |
 | leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); a **leaf** — held alone, see § The DPC queue lock |
+| leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); a **leaf** — held alone, see § The entropy lock |
 
-`SCHED`, `SERIAL`, and `DPC_QUEUE` are [`IrqSpinLock`]s (they mask interrupts
-while held); every other lock is a plain `SpinLock`. See § Interrupt semantics
-for why these need it.
+`SCHED`, `SERIAL`, `DPC_QUEUE`, and `ENTROPY` are [`IrqSpinLock`]s (they mask
+interrupts while held); every other lock is a plain `SpinLock`. See § Interrupt
+semantics for why these need it.
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
@@ -106,6 +107,24 @@ Because it holds nothing, it ranks below every other lock: it is legal to
 higher-ranked `SCHED` inside a handler only after releasing `DPC_QUEUE`. Like the
 deadline heap and the per-object waiter lists, the queue is pre-reserved at boot
 (`dpc::init`) so `enqueue` never allocates in interrupt context.
+
+## The entropy lock is a leaf
+
+`ENTROPY` (`kernel/src/entropy.rs`) is an `IrqSpinLock` guarding the pool, the
+entropy estimate, and the CSPRNG. Like `DPC_QUEUE` it is a **leaf** — nothing is
+acquired while it is held, it never allocates (the pool and CSPRNG state are
+fixed-size), and it is taken from two contexts that the `IrqSpinLock`'s IF-masking
+makes mutually safe on one CPU:
+
+- **`on_irq_sample`** — interrupt context (the timer tick and device IRQs sample
+  cycle-counter jitter). Takes the lock, absorbs one sample, releases.
+- **`fill` / `seed_u64`** — syscall/boot context (a CSPRNG draw). Because the lock
+  masks interrupts while held, an IRQ cannot re-enter `on_irq_sample` mid-draw and
+  deadlock; the draw completes and releases.
+
+The seeded-latch's wake of any `PendingOperation` waiters (the userspace read
+contract) runs on the `PendingOperation` completion path under `SCHED`, **outside**
+this lock — so `ENTROPY` never nests with `SCHED`.
 
 ## The AddressSpace lock and the page-fault handler
 

@@ -3755,3 +3755,40 @@ depleting-estimate blocking semantics. Spec updated (`syscall-abi.md`: numbers 2
 reserved + the numbering table extended through 22–27) and the plan's Entropy slice
 re-expressed as A/B/C/D. No code — Part A is docs-only. Branch `phase-2/entropy-design`
 off `main` (includes merged PR #43). Next: Part B (ChaCha20 CSPRNG + arch HW-RNG).
+
+## 2026-06-22 — Phase 2 slice 2: entropy CSPRNG/HW-RNG (Part B) + pool/seeding (Part C)
+
+**Part B (PR #45)** landed the standalone primitives: `ChaCha20Rng` (`libkern/chacha.rs`,
+RFC 8439, fast key erasure) and the `arch::Entropy` HW source (RDSEED-preferred /
+RDRAND-fallback, CPUID-detected). Host-tested; no consumers yet (carried
+`TODO(entropy)` `#[allow(dead_code)]` markers).
+
+**Part C (this PR)** is the integration — `kernel/src/entropy.rs`, a global
+subsystem that seeds the CSPRNG at boot and keeps absorbing interrupt jitter,
+making the Part B primitives live (markers removed).
+
+**Decision — one `IrqSpinLock<EntropyState>` leaf for pool + CSPRNG.** Sampling runs
+in IRQ context (`on_irq_sample`, from the timer tick + device IRQs) and draws run in
+syscall/boot context (`fill`); a single `IrqSpinLock` (a leaf, like `DPC_QUEUE`)
+makes the two mutually safe via IF-masking, avoiding a two-lock order. No alloc, no
+nested locks; the seeded-latch PO-waiter wake (Part D) runs outside it under `SCHED`.
+
+**Decision — CSPRNG always keyed at boot; the gate only gates userspace.** `init`
+draws a hardware burst (8× `try_seed_u64`, 64 estimated bits each), mixes early
+clock jitter, and **always** keys the CSPRNG from the pool — so kernel draws (the
+handle-table shuffle) work even with no HW RNG. The 256-bit `seeded` latch only
+gates the userspace read contract (Part D). The pool absorb is a SplitMix-style
+diffusion (mixing only; ChaCha's key schedule is the cryptographic conditioning);
+jitter credits 1 bit / 8 samples; reseed folds fresh pool entropy into the key
+periodically (byte-threshold). The handle table's fixed `PHASE1_SEED` is gone — it
+now seeds from `entropy::seed_u64()` (only affects free-list scan order; handle
+unforgeability is still the owner-PID + generation counter).
+
+**Decision — QEMU opts in `+rdrand,+rdseed`.** Added to the xtask `-cpu` flags so the
+boot CSPRNG seeds from the hardware source (TCG emulates both); boot now logs
+`entropy: source RDSEED, 8 hw draws, seeded=true` before the handle table. Without
+the flags the kernel correctly falls back to jitter-only seeding (`seeded=false`) —
+both paths verified. cargo xtask test: 453 passed; build + check-arch clean.
+Branch `phase-2/entropy-pool-seeding` off `main` (includes merged PR #45). Next:
+Part D (`EntropyObject` + `sys_entropy_create`/`sys_entropy_read` + the PO-waiter
+wake on a runtime seed latch).

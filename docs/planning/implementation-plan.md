@@ -899,11 +899,14 @@ before userspace, so reads are synchronous in practice.
   boot integration, the `EntropyObject` read contract, lock discipline, kernel/
   userspace + slice-2/slice-3 scope. Spec: `sys_entropy_create = 26` /
   `sys_entropy_read = 27` reserved.
-- [ ] **Part B** — hand-rolled ChaCha20 CSPRNG (RFC 8439 vectors) + arch HW-RNG
-  access (RDSEED preferred, RDRAND fallback; CPUID-detected). Host-tested.
-- [ ] **Part C** — entropy pool + boot seeding + TSC-jitter mixing at interrupt
-  dispatch + periodic reseed + the seeded gate; re-seed the handle-table (and later
-  ASLR) PRNGs from the CSPRNG.
+- [x] **Part B** (`phase-2/entropy-csprng-hwrng`, PR #45) — hand-rolled ChaCha20
+  CSPRNG (RFC 8439 vectors) with fast key erasure + arch HW-RNG access
+  (`arch::Entropy`: RDSEED preferred, RDRAND fallback; CPUID-detected). Host-tested.
+- [x] **Part C** (`phase-2/entropy-pool-seeding`) — entropy pool + boot seeding +
+  TSC-jitter mixing at interrupt dispatch + periodic/byte-threshold reseed + the
+  256-bit seeded gate; the handle-table free-list PRNG now seeds from the CSPRNG
+  (`PHASE1_SEED` removed). One `IrqSpinLock<EntropyState>` leaf. QEMU opts in
+  `+rdrand,+rdseed`; boot shows `seeded=true`.
 - [ ] **Part D** — `EntropyObject` kernel object + `sys_entropy_create` /
   `sys_entropy_read` (synchronous when seeded; `PendingOperation` when not) + QEMU
   demo.

@@ -211,9 +211,12 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
         // path under this loop needs QEMU ≥ 9.0 (then `+x2apic`) or KVM
         // (`-enable-kvm -cpu host`, any modern QEMU); the pin is unchanged until
         // that work lands. Future slices add features as they need them (the
-        // `ArchTimer` slice wanted `+tsc-deadline`, etc.).
+        // `ArchTimer` slice wanted `+tsc-deadline`, etc.). The entropy slice opts
+        // in `+rdrand,+rdseed` so the boot CSPRNG seeds from the hardware source
+        // (TCG emulates both); without them the kernel falls back to jitter-only
+        // seeding, which is correct but leaves `seeded=false` at boot.
         .arg("-cpu")
-        .arg("qemu64,+smap,+smep")
+        .arg("qemu64,+smap,+smep,+rdrand,+rdseed")
         .arg("-m")
         .arg("256M")
         .arg("-drive")

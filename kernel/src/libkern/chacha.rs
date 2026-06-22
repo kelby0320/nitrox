@@ -14,12 +14,6 @@
 //! The pool that *seeds* this (hardware RNG + interrupt jitter) and the *policy*
 //! for when to [`reseed`](ChaCha20Rng::reseed) live in the entropy subsystem
 //! (Phase 2 slice 2, Part C); this module is the deterministic primitive.
-//!
-// TODO(entropy): Part B lands the primitive (host-tested against RFC 8439); the
-// kernel consumer — the entropy pool that seeds and draws from `ChaCha20Rng` —
-// lands in Part C. Until then the generator is exercised only by tests, so the
-// non-test build sees it as unused. Remove this `allow` when Part C lands.
-#![allow(dead_code)]
 
 /// The four ChaCha state constants — the ASCII of `"expand 32-byte k"` as
 /// little-endian `u32`s (RFC 8439 §2.3).
@@ -111,8 +105,9 @@ pub struct ChaCha20Rng {
 
 impl ChaCha20Rng {
     /// Construct a generator from a 32-byte seed (the seed becomes the initial
-    /// key). Deterministic: the same seed yields the same output sequence.
-    pub fn from_seed(seed: [u8; 32]) -> Self {
+    /// key). Deterministic: the same seed yields the same output sequence. `const`
+    /// so it can initialize a `static` (the entropy subsystem keys it at boot).
+    pub const fn from_seed(seed: [u8; 32]) -> Self {
         Self { key: seed }
     }
 
