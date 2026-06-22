@@ -111,6 +111,14 @@ impl Notification {
         (EXCEPTION_LO..EXCEPTION_HI).contains(&self.kind)
     }
 
+    /// The fault address — `addr` at body+4 — for an exception notification
+    /// (`seg_fault`/`illegal_insn`/`divide_by_zero` all store it there). For a
+    /// `#PF` this is the faulting linear address (CR2); for `#UD`/`#DE` the faulting
+    /// instruction pointer. Only meaningful when [`is_exception`](Self::is_exception).
+    pub fn fault_addr(&self) -> u64 {
+        u64::from_le_bytes(self.body[4..12].try_into().unwrap())
+    }
+
     /// `SegFault { thread, addr, kind }` — `thread` at body+0, `addr` at body+4,
     /// `kind` at body+12 (per the spec).
     pub fn seg_fault(thread: u32, addr: u64, fault: FaultKind) -> Self {

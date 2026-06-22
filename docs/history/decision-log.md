@@ -3829,3 +3829,53 @@ differing 32-byte reads + "entropy ok". Branch `phase-2/entropy-object-syscalls`
 
 **Entropy subsystem (Phase 2 slice 2) is complete.** Next: the in-kernel resource
 servers (slice 3), where `/dev/entropy` binds an `EntropyObject` into namespaces.
+
+## 2026-06-22 — Phase 2 slice 3, Part 0: ring-3 fault surfacing (+ two misdiagnoses corrected)
+
+Part 0 of slice 3 (the prerequisites the entropy demo's "hang" motivated). Going in,
+the plan named two pieces — (1) provide userspace mem intrinsics, (2) surface
+unhandled ring-3 faults. **Measuring before building overturned both premises**;
+the part shrank to one kernel change plus two documented findings.
+
+**Finding 1 — userspace mem intrinsics are NOT missing.** `compiler_builtins`
+already supplies `memcpy`/`memset`/`memcmp`/`memmove` on-demand for the
+`x86_64-unknown-none` target: the kernel ELF defines all four (`nm`: `t memcpy` …),
+and a parent build that references `memcmp` links it cleanly with **zero undefined
+symbols**. So init's future `memcpy`/`memset` (TOML parsing, marshalling) resolve
+automatically — **no intrinsics crate is needed**, and the planned Piece 2 was
+dropped. (The slice-3 plan's Part-0 "mem intrinsics" bullet is superseded by this
+entry; it'll be corrected when the scoping PR #48 lands.)
+
+**Finding 2 — the original `a != b` "hang" is a codegen quirk, not an intrinsics
+gap.** On this `-sse,+soft-float` target, inlined `[u8; N]` equality (`a != b`)
+compiles to code that **infinite-loops in userspace** — confirmed: it inlines (no
+`memcmp` call, no SSE in the binary) and the new fault diagnostic stays silent
+(it's a true loop, not a fault). **Decision: document as a known issue and keep the
+manual-byte-loop idiom** (`.iter().eq()` / explicit loop) in userspace until a real
+userspace runtime exists; root-causing the LLVM/target interaction is deep and
+low-value now. The entropy demo's manual loop carries a comment pointing here.
+
+**Finding 3 — the fault-surfacing condition had to change.** The initial idea
+("print when the faulting process has no notification channel") **misses the actual
+case**: pid 1 *has* a channel (created at boot for its children's `ChildExited` +
+its own faults), so `chan == None` never fires for it. Verified by faulting pid 1
+deliberately — no diagnostic. The real hang is "the fault notification lands in a
+channel that no *other* runnable thread will service," and the kernel has no clean
+signal for "will anyone resume this."
+
+**Decision — surface a fault via *scheduler-stranding*, not channel inspection.** In
+`sched::suspend_with_fault`, after delivering the notification, if dequeuing the next
+thread finds **nothing runnable** (falls through to the idle thread), the fault left
+no thread to resume it → emit a last-ditch diagnostic (`report_stranded_fault`):
+`*** unhandled ring-3 fault (no thread left to resume it): pid N tid M <kind> @ 0x… ***`
+via the unsynchronized emergency serial writer (lock-free, mirroring `dump_and_halt`;
+sound — a userspace fault never holds `SERIAL`, and `SCHED` is held so IF is masked).
+This fires **only** for genuinely-stranded faults: a serviced fault (the worker demo)
+wakes the supervisor's waiter via `signal_channel` *before* the dequeue, so the
+`Some` branch is taken and it stays silent — no per-fault noise. Reads only neutral
+data (pid/tid from the `Thread`, kind/addr from the `Notification` via a new
+`Notification::fault_addr` getter), staying out of the arch-private `ExceptionFrame`.
+Behavior is otherwise unchanged (the thread still suspends; a real supervisor still
+resumes/terminates). Verified: a deliberate pid-1 fault now prints the line instead
+of hanging; the worker-fault demo stays quiet. Branch
+`phase-2/slice3-userspace-rt-fault-diag` off `main`.

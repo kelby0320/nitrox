@@ -934,22 +934,27 @@ Deliberately deferred (build-when-consumed, to avoid large unexercised machinery
 
 Broken into a prerequisites pass + docs-first + two code parts (mirrors slices 1/2):
 
-**Part 0 — userspace-runtime + fault-diagnostics prerequisites (do first).** Two
-sharp edges the slice-2 entropy demo surfaced (`decision-log` 2026-06-22), both
-independent of the RS work; landing them first makes all later slice-3/Init debugging
-tractable. Today the entropy/IPC demos sidestep #1 by hand (manual byte loops,
-pointer-passing) and tolerate #2 because they run under a watching parent — init has
-neither luxury.
+**Part 0 — fault diagnostics prerequisite (done).** Motivated by the slice-2 entropy
+demo's "hang"; landing it first makes all later slice-3/Init debugging tractable.
+Measuring before building (see `decision-log` 2026-06-22, Part 0) corrected two of
+the planned premises:
 
-- [ ] **Freestanding-userspace mem intrinsics.** A freestanding `#![no_std]` binary
-  that compares/copies/zeroes a large array emits a `memcmp`/`memcpy`/`memset` call
-  the binary doesn't provide; today it links to a bad address and faults (it bit the
-  entropy demo's `[u8; 32]` compare). Provide `memcpy`/`memset`/`memcmp`/`memmove`
-  in the userspace runtime (`libkern`/`librt` floor). Init does many of these.
-- [ ] **Surface unhandled ring-3 faults.** A fault in a process with no supervisor
-  to receive its fault notification (notably **pid 1**) currently suspends the thread
-  silently — indistinguishable from a hang. Emit a last-ditch kernel `kprintln!`
-  (faulting `rip`/`cr2`/vector/pid) so an init crash is a 5-second diagnosis.
+- [x] **Surface unhandled ring-3 faults** (`phase-2/slice3-userspace-rt-fault-diag`).
+  A fault that leaves **no runnable thread** to service it (notably an init/pid-1
+  crash) suspended silently — a hang. `sched::suspend_with_fault` now detects the
+  *scheduler-stranded* case (the dequeue falls through to idle, so no thread remains
+  to receive the notification + `sys_exception_resume` it) and emits a last-ditch
+  diagnostic (`pid/tid/kind/addr`) via the emergency serial writer. Fires only for
+  genuinely-stranded faults — a serviced fault (the worker demo) wakes its supervisor
+  before the dequeue and stays silent. (The naïve "no notification channel" condition
+  was rejected: pid 1 *has* a channel — it services its own faults — so that check
+  never fires for it.)
+- ~~Freestanding-userspace mem intrinsics~~ — **dropped (not needed).** Measurement
+  showed `compiler_builtins` already supplies `memcpy`/`memset`/`memcmp`/`memmove`
+  on-demand for `x86_64-unknown-none` (the kernel defines all four; the parent links
+  `memcmp` with zero undefined symbols). The original `a != b` "hang" was a separate
+  inlined-`[u8; N]`-equality codegen quirk (infinite loop, no `memcmp` call), not an
+  intrinsics gap — documented as a known issue; userspace keeps the manual-loop idiom.
 
 **Part A — design doc.** Formalize the in-kernel RS framework into the living docs
 (today only sketched in `os-design-v5.1.md`): the kernel-server dispatch model

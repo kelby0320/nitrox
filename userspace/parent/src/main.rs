@@ -705,7 +705,8 @@ fn entropy_demo() {
         return;
     }
     // The two 32-byte draws must differ (the CSPRNG advances each read). A manual
-    // loop avoids emitting a `memcmp` intrinsic this freestanding binary lacks.
+    // loop avoids inlined `[u8; N]` equality, which mis-compiles to an infinite loop
+    // on this freestanding `-sse,+soft-float` target (see decision log 2026-06-22).
     let mut differ = false;
     for i in 0..32 {
         if a[i] != b[i] {

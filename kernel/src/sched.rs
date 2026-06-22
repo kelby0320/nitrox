@@ -1483,6 +1483,43 @@ pub fn exit_process(status: ExitStatus) -> ! {
 /// [`block_current_and_switch`], but parked for `sys_exception_resume` rather
 /// than a waker. Returns the [`ResumeDisposition`] the supervisor chose once the
 /// thread is made runnable again. Called from the exception dispatchers.
+/// Emit a last-ditch kernel diagnostic for a ring-3 fault that **stranded the
+/// scheduler** — one that left no runnable thread to receive the fault notification
+/// and call `sys_exception_resume`, so the system would idle forever. Without this
+/// it is a silent hang (notably an init/pid-1 crash). Called only from the
+/// no-runnable-thread branch of [`suspend_with_fault`], so a serviced fault (whose
+/// supervisor waiter was just made runnable) never reaches here.
+///
+/// Uses the unsynchronized emergency serial writer — lock-free, mirroring the
+/// ring-0 `dump_and_halt` path. Sound here: a userspace fault never holds `SERIAL`,
+/// and the caller holds `SCHED` so interrupts are masked. Reads only neutral data
+/// (pid/tid from the thread; kind/addr from the `Notification`), staying out of the
+/// arch-private `ExceptionFrame`.
+fn report_stranded_fault(me_obj: *mut (), notif: &Notification) {
+    use crate::libkern::notification::{
+        KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, KIND_STACK_OVERFLOW,
+    };
+    use core::fmt::Write;
+    // SAFETY: `me_obj` is the running (faulting) thread, pinned, `SCHED` held.
+    let th = unsafe { &*(me_obj as *const Thread) };
+    let kind = match notif.kind() {
+        KIND_SEG_FAULT => "segfault",
+        KIND_ILLEGAL_INSN => "illegal-instruction",
+        KIND_DIVIDE_BY_ZERO => "divide-by-zero",
+        KIND_STACK_OVERFLOW => "stack-overflow",
+        _ => "fault",
+    };
+    let mut w = crate::arch::serial::emergency_writer();
+    let _ = writeln!(
+        w,
+        "\n*** unhandled ring-3 fault (no thread left to resume it): pid {} tid {} {} @ {:#018x} ***",
+        th.owner_pid(),
+        th.tid(),
+        kind,
+        notif.fault_addr(),
+    );
+}
+
 pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDisposition {
     // Reclaim any earlier exited thread first (we may be the only scheduler
     // entry for a while if we suspend), off the rank-1 lock.
@@ -1525,9 +1562,18 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         g.suspended.try_push(me).expect("suspended list within reserve");
 
         // Switch to the next runnable thread (mirrors block_current_and_switch).
+        // If nothing is runnable, this fault **stranded the scheduler**: no thread
+        // remained to receive the notification and `sys_exception_resume` us, so the
+        // system would idle forever (a silent hang — notably an init/pid-1 crash).
+        // Emit a last-ditch diagnostic. A serviced fault (the supervisor's waiter
+        // was just woken by `signal_channel` above) takes the `Some` branch and
+        // stays quiet — so this fires only for genuinely-unhandled faults.
         let next = match dequeue_front(&mut g) {
             Some(n) => n,
-            None => g.idle.take().expect("idle thread exists after init"),
+            None => {
+                report_stranded_fault(me_obj, &notif);
+                g.idle.take().expect("idle thread exists after init")
+            }
         };
         let next_obj = next.as_ptr();
         // SAFETY: next is pinned, becoming current; lock held.
