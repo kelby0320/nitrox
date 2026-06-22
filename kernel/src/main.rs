@@ -195,6 +195,12 @@ fn kernel_main() {
         unsafe { arch::IrqRouter::self_test() };
     }
 
+    // Seed the entropy subsystem (CSPRNG). Runs after the timer is up (so the
+    // monotonic clock is live for jitter mixing) and before the handle table, so
+    // the table seeds its free-list shuffle from the CSPRNG rather than a fixed
+    // constant. On any CPU with RDSEED/RDRAND this latches `seeded` immediately.
+    nitrox_kernel::entropy::init();
+
     // Bring up the single global handle table. It eagerly allocates its
     // first segment, so the heap must be up (it is — `init_memory` ran); it
     // must be live before any userspace can issue a handle syscall.

@@ -424,6 +424,10 @@ extern "C" fn spurious_stub() {
 /// `*mut ExceptionFrame` matches the stub's `mov rdi, rsp`; the frame is read
 /// only for future use (frame patching) and is otherwise unused today.
 extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
+    // Sample interrupt-timing jitter into the entropy pool (the fine low bits of
+    // the cycle counter at IRQ-arrival time). Cheap and lock-bounded; see
+    // `crate::entropy`. Sampled first, before the EOI/DPC/tick work perturbs it.
+    crate::entropy::on_irq_sample(regs::rdtsc());
     // SAFETY: ring-0, only ever reached from the timer IRQ after `Irq::init`
     // mapped the local APIC; a single MMIO write acknowledges the interrupt.
     unsafe { crate::arch::Irq::eoi() };
@@ -460,6 +464,8 @@ static NEXT_DEVICE_SLOT: AtomicUsize = AtomicUsize::new(0);
 /// for now (the PIT bring-up source and the level-triggered IOAPIC-EOI path
 /// land with the first level-triggered device).
 extern "C" fn device_irq_dispatch(frame: *mut ExceptionFrame) {
+    // Sample interrupt-timing jitter into the entropy pool (see `timer_dispatch`).
+    crate::entropy::on_irq_sample(regs::rdtsc());
     // SAFETY: `frame` is the stub-built `ExceptionFrame` in RDI; `vector` is the
     // immediate the stub pushed, always in `DEVICE_IRQ_BASE..+COUNT`.
     let vector = unsafe { (*frame).vector } as usize;

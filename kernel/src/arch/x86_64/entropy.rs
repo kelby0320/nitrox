@@ -5,12 +5,6 @@
 //! single-instruction primitive ([`regs::rdseed_u64`] / [`regs::rdrand_u64`]) a
 //! bounded number of times before giving up (a hardware source can legitimately
 //! have no value ready). See `docs/architecture/entropy.md` § Sources.
-//!
-// TODO(entropy): Part B lands this source standalone; nothing draws from it until
-// Part C wires boot seeding (`Entropy::try_seed_u64`). Until that consumer exists,
-// the type and its helpers are unreachable from the kernel entry point. Remove
-// this module-level `allow` when Part C lands.
-#![allow(dead_code)]
 
 use core::sync::atomic::{AtomicU8, Ordering};
 

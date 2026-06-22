@@ -149,9 +149,6 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
 /// and should be retried a bounded number of times (see `arch::Entropy`). This is
 /// a single-instruction primitive; the retry/fallback policy lives in the entropy
 /// arch impl, not here.
-// TODO(entropy): the only caller (`X86Entropy`) is itself unreached until Part C
-// wires boot seeding; remove this `allow` then.
-#[allow(dead_code)]
 #[inline]
 pub fn rdrand_u64() -> Option<u64> {
     let val: u64;
@@ -180,8 +177,6 @@ pub fn rdrand_u64() -> Option<u64> {
 /// `#UD`. `None` is more frequent than for `RDRAND` (the source needs time to
 /// recondition) and should be retried a bounded number of times, falling back to
 /// `RDRAND`. Single-instruction primitive; policy lives in the entropy arch impl.
-// TODO(entropy): as `rdrand_u64` — remove this `allow` when Part C lands.
-#[allow(dead_code)]
 #[inline]
 pub fn rdseed_u64() -> Option<u64> {
     let val: u64;
