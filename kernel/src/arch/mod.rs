@@ -25,6 +25,7 @@
 //! [`Paging`].
 
 pub mod cpu;
+pub mod entropy;
 pub mod irq;
 pub mod irq_router;
 pub mod paging;
@@ -69,6 +70,10 @@ pub use x86_64::smp::X86Smp as Smp;
 pub use x86_64::timer::X86Timer as Timer;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::user_access::X86UserAccess as UserAccess;
+// Hardware-entropy source (the x86 impl uses RDSEED/RDRAND; aarch64 would use
+// RNDR / SMCCC TRNG). See `arch/entropy.rs`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::entropy::X86Entropy as Entropy;
 
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, thread_trampoline};

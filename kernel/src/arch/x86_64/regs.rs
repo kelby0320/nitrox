@@ -140,6 +140,66 @@ pub fn cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
     (eax, ebx, ecx, edx)
 }
 
+/// Execute one `RDRAND` and return the 64-bit value, or `None` if the CPU had no
+/// random value ready this attempt (CF=0).
+///
+/// `RDRAND` reads a hardware DRBG reseeded from the on-die entropy source. The
+/// caller **must** have confirmed CPUID advertises it (`CPUID.01H:ECX[30]`);
+/// executing it on a CPU without support is `#UD`. A `None` is normal under load
+/// and should be retried a bounded number of times (see `arch::Entropy`). This is
+/// a single-instruction primitive; the retry/fallback policy lives in the entropy
+/// arch impl, not here.
+// TODO(entropy): the only caller (`X86Entropy`) is itself unreached until Part C
+// wires boot seeding; remove this `allow` then.
+#[allow(dead_code)]
+#[inline]
+pub fn rdrand_u64() -> Option<u64> {
+    let val: u64;
+    let ok: u8;
+    // SAFETY: `rdrand r64` writes a general register and sets CF; no memory side
+    // effects. Valid in ring 0 when CPUID advertises RDRAND (caller's contract).
+    // `rdrand` modifies flags, so `preserves_flags` is *not* set.
+    unsafe {
+        asm!(
+            "rdrand {v}",
+            "setc {o}",
+            v = out(reg) val,
+            o = out(reg_byte) ok,
+            options(nomem, nostack),
+        );
+    }
+    if ok != 0 { Some(val) } else { None }
+}
+
+/// Execute one `RDSEED` and return the 64-bit value, or `None` if no
+/// freshly-conditioned seed was ready this attempt (CF=0).
+///
+/// `RDSEED` samples the conditioned entropy source directly — the right primitive
+/// for *seeding* a software CSPRNG (vs. `RDRAND`, a DRBG). The caller **must** have
+/// confirmed CPUID advertises it (`CPUID.07H:EBX[18]`); executing it unsupported is
+/// `#UD`. `None` is more frequent than for `RDRAND` (the source needs time to
+/// recondition) and should be retried a bounded number of times, falling back to
+/// `RDRAND`. Single-instruction primitive; policy lives in the entropy arch impl.
+// TODO(entropy): as `rdrand_u64` — remove this `allow` when Part C lands.
+#[allow(dead_code)]
+#[inline]
+pub fn rdseed_u64() -> Option<u64> {
+    let val: u64;
+    let ok: u8;
+    // SAFETY: as `rdrand_u64`, for `rdseed r64`. Valid in ring 0 when CPUID
+    // advertises RDSEED (caller's contract). Modifies flags → no `preserves_flags`.
+    unsafe {
+        asm!(
+            "rdseed {v}",
+            "setc {o}",
+            v = out(reg) val,
+            o = out(reg_byte) ok,
+            options(nomem, nostack),
+        );
+    }
+    if ok != 0 { Some(val) } else { None }
+}
+
 // `stac` and `clac` are deliberately not Rust-visible wrappers. They
 // would be `unsafe fn` callable from anywhere in the kernel, which
 // breaks the project's "only inside copy primitives" SMAP discipline
