@@ -274,7 +274,7 @@ pub enum KObjectType {
     IoRing = 10,
     EntropyObject = 11,
     DeviceNode = 12,
-    ResourceServerReg = 13,
+    UserspaceServerReg = 13,
 }
 
 impl KObjectType {
@@ -297,7 +297,7 @@ impl KObjectType {
             10 => Some(Self::IoRing),
             11 => Some(Self::EntropyObject),
             12 => Some(Self::DeviceNode),
-            13 => Some(Self::ResourceServerReg),
+            13 => Some(Self::UserspaceServerReg),
             _ => None,
         }
     }
@@ -480,7 +480,7 @@ mod tests {
         assert_eq!(KObjectType::Process as u32, 1);
         assert_eq!(KObjectType::Thread as u32, 2);
         assert_eq!(KObjectType::IoRing as u32, 10);
-        assert_eq!(KObjectType::ResourceServerReg as u32, 13);
+        assert_eq!(KObjectType::UserspaceServerReg as u32, 13);
     }
 
     #[test]

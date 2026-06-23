@@ -14,13 +14,19 @@ model that rides on it. It is the contract `docs/rationale/why-supervisor-regist
 `sys_ns_*` signatures, the rsproto wire format) live in `docs/spec/`; this is the
 *why* and the *shape*.
 
-> **Implementation phasing.** This doc designs the whole model, but it lands in two
-> waves. **Slice 1 (the namespace substrate)** builds the `Namespace` object,
+> **Implementation phasing.** This doc designs the whole model, but it lands in
+> three waves (the slice-3/slice-7 split was decided 2026-06-22 — see the decision
+> log). **Slice 1 (the namespace substrate)** builds the `Namespace` object,
 > resolution, the four `sys_ns_*` syscalls, and **direct-handle** bindings.
-> **Slice 3 (resource servers)** adds the `ResourceServer` trait, `OpStatus`, the
-> registry, and **IPC-forwarded** lookup. Each section below marks which wave it
-> belongs to. The async lookup *contract* is fixed in slice 1 (see "Lookup is
-> asynchronous") precisely so slice 3 needs no ABI change.
+> **Slice 3 (in-kernel resource servers)** adds the **in-kernel** server framework —
+> the `KernelServer` binding target, the synchronous `OpStatus` dispatch (no IPC),
+> the registry, and the first servers (`/dev/entropy`, `/proc/self`) bound at boot.
+> **Slice 7 (userspace resource servers, with the fs-server)** adds the
+> **IPC-forwarded** path — the `UserspaceServer` binding target, cross-context handle
+> install, `librsproto`, and the Ready handshake — built when the fs-server, the
+> first userspace RS, consumes it. Each section below marks which wave it belongs to.
+> The async lookup *contract* is fixed in slice 1 (see "Lookup is asynchronous")
+> precisely so slices 3 and 7 need no ABI change.
 
 ## The Namespace object
 
@@ -110,21 +116,26 @@ optimization if a namespace ever grows large enough to matter; the resolution
 
 ## Binding targets
 
-A binding's `target` is one of (the enum is fixed now; only `DirectHandle` is
-*implemented* in slice 1):
+A binding's `target` is one of:
 
 | Target | Meaning | Lands |
 |---|---|---|
 | **`DirectHandle`** | A bound kernel-object `ObjectRef` (a `MemoryObject`, an `IpcChannel` endpoint, …). Lookup returns the object directly. The leaf case. | **slice 1** |
-| **`ResourceServer`** | An IPC endpoint to a resource server. Lookup forwards the suffix over IPC; the server answers with a handle. | slice 3 |
-| **`SubNamespace`** | Another `Namespace`, overlaid at the prefix — composition. Lookup recurses into it with the suffix. | slice 3+ |
+| **`KernelServer`** | A **Kernel Server**: a dispatch id/function the kernel calls during lookup. The server *computes* a handle synchronously (no IPC). Backs `/proc/self`, `/dev/entropy`, … | **slice 3** |
+| **`UserspaceServer`** | An IPC endpoint to a **Userspace Server**. Lookup forwards the suffix over IPC; the server answers with a handle. | slice 7 |
+| **`SubNamespace`** | Another `Namespace`, overlaid at the prefix — composition. Lookup recurses into it with the suffix. | later |
 | **`Rewrite`** | Rewrite the prefix and re-resolve — aliasing/redirection. | later |
 
-Slice 1 binds **direct handles**: a supervisor binds, say, a `MemoryObject` at
-`/store` or a channel endpoint at `/dev/log`, and a client lookup returns that
-object (rights-attenuated). This is enough to exercise the entire create → bind →
-lookup → use path before any resource server exists, and it is exactly how
-in-kernel leaf resources (`/dev/null`, a framebuffer object) are exposed.
+Slice 1 implemented only `DirectHandle` (the `target` field was a bare `ObjectRef`).
+Slice 3 introduces the `BindingTarget` **enum** with the `KernelServer` variant
+(`DirectHandle` + `KernelServer`); `UserspaceServer` (IPC) lands in slice 7,
+`SubNamespace`/`Rewrite` later.
+
+A **direct handle** is a supervisor binding a concrete object — a `MemoryObject` at
+`/store`, a channel endpoint, an `EntropyObject` — that lookup returns
+(rights-attenuated). A **`KernelServer`** is the answer for resources that must be
+*computed per lookup* (e.g. `/proc/self/process`, which depends on *who* is asking)
+without spinning up a userspace process — see "In-kernel resource servers" below.
 
 ## Lookup is asynchronous
 
@@ -132,7 +143,7 @@ in-kernel leaf resources (`/dev/null`, a framebuffer object) are exposed.
 async-I/O primitive), not a handle directly. The completion delivers either the
 resolved resource handle or an error.
 
-This is because the *general* lookup blocks: resolving through a `ResourceServer`
+This is because the *general* lookup blocks: resolving through a `UserspaceServer`
 binding is `syscall → kernel resolves → IPC round-trip to the server → server
 returns a handle`. A blocking operation must return a `PendingOperation` and have
 the caller block in `sys_wait` — never block inside the syscall (the async-first
@@ -149,15 +160,16 @@ result: <the resolved handle> }`; on error, `status` is the negative `KError` an
 `result` is 0. Edge-style waitables (timers, channels) report `result = 0`.
 
 **Where the resolved handle is installed.**
-- **Slice 1 (direct handles):** the lookup resolves entirely in the caller's
-  syscall context (no IPC), installs the rights-attenuated handle into the caller's
-  table, and returns a **pre-signalled** PO whose `result` is that handle. The
-  caller's `sys_wait` returns immediately — the full async result path, exercised
-  without any resource-server machinery.
-- **Slice 3 (resource servers):** the lookup forwards over IPC and returns a
+- **Slice 1 (direct handles)** and **slice 3 (in-kernel servers):** the lookup
+  resolves entirely in the caller's syscall context (no IPC) — slice 1 returns the
+  bound `ObjectRef`; slice 3 calls the `KernelServer` to *compute* the handle — then
+  installs the rights-attenuated handle into the caller's table and returns a
+  **pre-signalled** PO whose `result` is that handle. The caller's `sys_wait` returns
+  immediately — the full async result path, synchronously, without IPC.
+- **Slice 7 (userspace servers):** the lookup forwards over IPC and returns a
   *pending* PO; when the server responds, the kernel installs the handle into the
   **original caller's** table (a cross-context install — a new mechanism that lands
-  with this wave) and signals the PO with the result.
+  with that wave) and signals the PO with the result.
 
 Either way the userspace contract is identical: `lookup → PO → sys_wait →
 IoResult.result`.
@@ -203,33 +215,125 @@ cache on any mutation — mutations are rare, lookups are frequent). The cache i
 optimization with no semantic effect; it is the last code part of slice 1 and can
 be added without changing the resolver's contract.
 
-## Resource servers (slice 3)
+## Resource servers
 
-*Designed here; implemented with the resource-server slice.*
+**Resource server** is the **umbrella** term: anything that owns a namespace subtree
+and answers lookups for it by returning an `OpStatus`:
 
-A **resource server** is a process (or in-kernel module) that owns a subtree of a
-namespace and answers lookups/operations for it. A binding of kind
-`ResourceServer` points at the server's IPC endpoint; the kernel routes resolved
-requests there.
+- **`Completed(handle)`** — the answer is ready now (a handle to the resolved
+  resource).
+- **`Rejected(error)`** — the request is refused.
+- **`Pending`** — the answer arrives asynchronously (slice 7; see below).
 
-- **The `ResourceServer` contract** (userspace, `librsproto`): a server handles
-  `lookup`, `submit`, `cancel` over the rsproto wire format
-  (`docs/spec/rsproto-wire-format.md`). It returns an `OpStatus`:
-  - **`Completed`** — answer is ready now (in-kernel servers, cache hits).
-  - **`Pending`** — answer comes asynchronously (the normal userspace case: the
-    IPC round-trip is inherently async).
-  - **`Rejected`** — the request is refused (with an error).
-- **The `ResourceServerRegistry`** (kernel): the flat set of bound server endpoints
-  the resolver routes to — effectively the `ResourceServer` bindings across
-  namespaces, indexed for dispatch.
-- **In-kernel resource servers** (`/proc`, `/dev`, `/initramfs`) implement the same
-  contract but are dispatched by a direct function call, bypassing IPC, and can
-  answer `Completed` synchronously.
+That umbrella has exactly **two kinds** (children), which share the contract above
+but differ in *where the server lives* and *how it is dispatched*:
 
-### Registration: the Ready handshake
+```
+            Resource Server            (umbrella: lookup → OpStatus)
+            /                \
+   Kernel Server        Userspace Server
+   (in-kernel,           (separate process,
+    direct dispatch,      over IPC,
+    binding target        binding target
+    `KernelServer`)       `UserspaceServer`)
+       slice 3                 slice 7
+```
 
-Resource servers **do not register themselves** (`why-supervisor-registration.md`).
-A supervisor:
+- A **Kernel Server** (**slice 3**) is a kernel module reached by a **direct function
+  call** during lookup. No IPC; answers `Completed`/`Rejected` synchronously. Bound
+  by the kernel at boot. Backs `/proc/self`, `/dev/entropy`, the `/dev` stub.
+- A **Userspace Server** (**slice 7**) is a separate process reached over **IPC**.
+  The normal case for filesystems/devices; inherently async (`Pending`). Bound by a
+  supervisor after the Ready handshake.
+
+The two binding-target variants (`KernelServer`, `UserspaceServer`) name the two
+children; "resource server" (lowercase) is the umbrella, never a binding kind.
+
+The umbrella earns its keep through **substitutability**: because both children
+answer the identical `lookup(suffix, rights) → OpStatus` contract, a path served by a
+Kernel Server today can be re-bound to a Userspace Server at the same path tomorrow
+with **zero client change** — the caller's `sys_ns_lookup` is unaffected by which kind
+sits behind the binding. This is how a facility can graduate from an in-kernel
+bring-up implementation to a userspace one (or be sandboxed by swapping in a
+restricted server) without touching any consumer.
+
+### Kernel Servers (slice 3)
+
+The slice-3 framework is small because it reuses the slice-1 lookup machinery
+end-to-end. A `KernelServer` binding holds a dispatch id into a small kernel
+**registry** of server functions:
+
+```
+fn lookup(suffix: &[u8], requested: Rights) -> OpStatus   // Completed(handle) | Rejected(err)
+```
+
+`sys_ns_lookup` resolves the path to the binding as in slice 1; for a `KernelServer`
+target it **calls the server function in the caller's syscall context**, gets a
+handle (or error), installs the rights-attenuated handle into the caller's table,
+and **pre-signals the lookup's `PendingOperation`** with the result — exactly the
+path slice-1 direct handles already take. So an in-kernel lookup is synchronous: the
+caller's `sys_wait` returns immediately with the handle in `IoResult.result`. No
+IPC, no cross-context install, no new ABI. (`OpStatus::Pending` is **reserved** for
+slice 7 — an in-kernel server never returns it.)
+
+**The content model: a lookup yields a handle to a kernel object.** An in-kernel
+server's job is to *produce the right handle* for `suffix`:
+
+- `/dev/entropy` → an `EntropyObject` handle (the caller then `sys_entropy_read`s it).
+- `/proc/self/process` → the caller's own `Process` handle; `/proc/self/status` → a
+  freshly-synthesized read-only `MemoryObject` snapshot; etc.
+
+**Registration is by the kernel at boot, not a handshake.** In-kernel servers are
+always present, so the kernel binds them into **pid 1's root namespace** during
+boot (a `KernelServer` binding per server) — no Ready handshake, no `BIND_NAMESPACE`
+holder needed (that machinery is for *userspace* servers, slice 7). Children inherit
+these bindings through the normal namespace inheritance (slice 1, Part D).
+
+### `/proc/self` — self-reference, not ambient authority
+
+`/proc/self/*` is an in-kernel server that resolves to the **caller's own**
+resources, derived from the calling syscall context:
+
+| Path | Resolves to |
+|---|---|
+| `/proc/self/process` | the caller's own `Process` handle |
+| `/proc/self/thread` | the calling `Thread` handle |
+| `/proc/self/namespace` | the caller's root-namespace handle |
+| `/proc/self/pid`, `/tid` | a small readable snapshot (u32) |
+
+This is **not** ambient authority, on two independent axes:
+
+1. **Reachability is by namespace construction.** `/proc/self` resolves only if a
+   supervisor bound it into your namespace; a sandbox may omit it. It is *not* a
+   kernel-forced universal — the kernel binds it into pid 1's root by default, and
+   normal supervisors propagate it, but a locked-down namespace need not.
+2. **It is strictly self-reference.** The server reads the *current* process/thread
+   from the calling context — there is **no pid parameter to forge**, so it grants
+   nothing about any other process (and returned handles are still owner-pid-checked
+   on use, per `handle-encoding.md`).
+
+**Cross-process introspection** (`/proc/<pid>`, enumeration) is a **separate,
+narrowly-bound** capability — a distinct server with its own global process registry,
+bound only into privileged (init/admin) namespaces, scoped (a "filtered" server sees
+only your subtree; a "full" server sees all). It is **deferred** (it needs the
+registry and is the ambient-authority-sensitive surface); slice 3 ships only
+`/proc/self`. See `os-design-v5.1.md` §"Synthetic /proc/self" + the
+namespace-composition examples (standard user → filtered `/proc`; admin → full
+`/proc`; sandbox → none).
+
+### Userspace Servers (slice 7)
+
+A Userspace Server is a process reached over IPC: a `UserspaceServer` binding points
+at its endpoint, lookup **forwards** the suffix over IPC, the server answers with a
+handle, and the kernel **installs it cross-context** into the original caller's table
+(the `Pending` path — the lookup's `PendingOperation` completes when the server
+replies). This is built with the **fs-server** (the first Userspace Server) and needs:
+the `UserspaceServer` binding target, IPC-forwarded lookup, the cross-context install,
+the `librsproto` codec (`docs/spec/rsproto-wire-format.md`), and the registration
+handshake below. Kernel Servers (slice 3) need **none** of it.
+
+**Registration: the Ready handshake.** Userspace servers **do not register
+themselves** (`why-supervisor-registration.md`). A supervisor:
 
 1. spawns the RS with what it needs (a block-device handle, a log channel, a
    minimal own-namespace, and a **control channel**) — but **not** `BIND_NAMESPACE`;
@@ -249,9 +353,11 @@ reload, health, swap-in-place).
 |---|---|
 | `Namespace` object: hold bindings, resolve, attenuate rights, cache | **kernel** (slice 1) |
 | `sys_ns_create/bind/unbind/lookup` | **kernel** (slice 1) |
-| Routing a resolved lookup to a server endpoint over IPC; the registry | **kernel** (slice 3) |
-| Cross-context handle install on RS response | **kernel** (slice 3) |
-| `ResourceServer` trait, `OpStatus`, the rsproto codec | **userspace** (`librsproto`, slice 3) |
+| `KernelServer` binding target + in-kernel dispatch registry | **kernel** (slice 3) |
+| In-kernel servers (`/proc/self`, `/dev/entropy`, `/dev` stub) + boot binding | **kernel** (slice 3) |
+| Routing a resolved lookup to a server endpoint over IPC; the registry | **kernel** (slice 7) |
+| Cross-context handle install on RS response | **kernel** (slice 7) |
+| Userspace Server impl: `OpStatus` codec + the rsproto wire format | **userspace** (`librsproto`, slice 7) |
 | Deciding *what* to bind *where* (system construction) | **userspace** supervisors (init/service-mgr) |
 
 The boundary is strict: the kernel never touches a server's internal state or
@@ -264,8 +370,9 @@ Full signatures and error space: `docs/spec/syscall-abi.md`. In brief:
 - **`sys_ns_create() -> handle`** — a fresh, empty `Namespace` with full namespace
   rights (`LOOKUP | BIND | UNBIND` + generic management).
 - **`sys_ns_bind(ns, path, path_len, resource) -> 0`** — bind `resource` (a direct
-  handle in slice 1; an endpoint in slice 3) at `path`. Needs `BIND` on `ns` (and,
-  later, the `BIND_NAMESPACE` syscap).
+  handle in slice 1; a userspace-server endpoint in slice 7) at `path`. Needs `BIND`
+  on `ns` (and, later, the `BIND_NAMESPACE` syscap). In-kernel `KernelServer`
+  bindings are made by the kernel at boot, not through this syscall.
 - **`sys_ns_unbind(ns, path, path_len) -> 0`** — remove the binding at `path`. Needs
   `UNBIND`.
 - **`sys_ns_lookup(ns, path, path_len, rights) -> PendingOperation`** — resolve
@@ -276,20 +383,24 @@ Numbers `22`–`25` (reserved in the spec; pre-stabilization).
 
 ## Scope summary
 
-| Item | Slice 1 (substrate) | Slice 3 (resource servers) |
-|---|---|---|
-| `Namespace` object + binding store | ✅ | |
-| Longest-prefix resolution + attenuation | ✅ | |
-| `DirectHandle` bindings | ✅ | |
-| `sys_ns_create/bind/unbind/lookup` | ✅ | |
-| Async lookup contract (`PO` + `IoResult.result`) | ✅ (pre-signalled) | (real forwarding) |
-| `BIND` handle-right gate | ✅ | |
-| `BIND_NAMESPACE` syscap gate | (deferred — syscap model) | |
-| Lookup cache | ✅ | |
-| Per-process `Namespace` + spawn inheritance | ✅ | |
-| `ResourceServer` / `OpStatus` / registry | | ✅ |
-| IPC-forwarded lookup + cross-context install | | ✅ |
-| `SubNamespace` / `Rewrite` targets | | (designed; later) |
+| Item | Slice 1 (substrate) | Slice 3 (in-kernel servers) | Slice 7 (userspace servers) |
+|---|---|---|---|
+| `Namespace` object + binding store | ✅ | | |
+| Longest-prefix resolution + attenuation | ✅ | | |
+| `DirectHandle` bindings | ✅ | | |
+| `sys_ns_create/bind/unbind/lookup` | ✅ | | |
+| Async lookup contract (`PO` + `IoResult.result`) | ✅ (pre-signalled) | (reused, synchronous) | (real forwarding) |
+| `BIND` handle-right gate | ✅ | | |
+| `BIND_NAMESPACE` syscap gate | (deferred — syscap model) | | |
+| Lookup cache | ✅ | | |
+| Per-process `Namespace` + spawn inheritance | ✅ | | |
+| `BindingTarget` enum + `KernelServer` dispatch + registry | | ✅ | |
+| In-kernel servers (`/dev/entropy`, `/proc/self`, `/dev` stub) + boot binding | | ✅ | |
+| `OpStatus` (`Completed`/`Rejected`; `Pending` reserved) | | ✅ | (`Pending`) |
+| `UserspaceServer` (IPC) target + forwarded lookup + cross-context install | | | ✅ |
+| `librsproto` codec + Ready handshake | | | ✅ |
+| Cross-process `/proc` (filtered/full) + process registry | | (deferred) | (deferred) |
+| `SubNamespace` / `Rewrite` targets | | | (designed; later) |
 
 ## Where to read more
 

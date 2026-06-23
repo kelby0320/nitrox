@@ -3879,3 +3879,59 @@ Behavior is otherwise unchanged (the thread still suspends; a real supervisor st
 resumes/terminates). Verified: a deliberate pid-1 fault now prints the line instead
 of hanging; the worker-fault demo stays quiet. Branch
 `phase-2/slice3-userspace-rt-fault-diag` off `main`.
+
+## 2026-06-22 — Phase 2 slice 3, Part A: in-kernel resource-server framework design
+
+Docs-only. Formalized the **in-kernel** resource-server framework that slice 3 builds,
+by extending the living RS doc (`docs/architecture/namespace-and-resource-servers.md`)
+in place rather than spawning a competing doc — it already holds the RS model, the
+binding-targets table, and the scope summary.
+
+**Naming convention (made explicit).** "**Resource server**" is the **umbrella**
+term (the `lookup → OpStatus` contract); it has exactly two children — a **Kernel
+Server** (binding target `KernelServer`, slice 3) and a **Userspace Server** (binding
+target `UserspaceServer`, slice 7). No binding kind is named `ResourceServer` — the
+earlier draft used that for the userspace child, colliding with the umbrella; renamed
+to `UserspaceServer` so the two variant names mirror the two children and neither
+shadows the parent. The doc shows the hierarchy as a tree. The convention is applied
+to the **code** names too: the reserved kobject `KObjectType::ResourceServerReg` (=13)
+→ `UserspaceServerReg` (it tags the userspace-server registration object, slice 7),
+and the slice-7 registry `ResourceServerRegistry` → `UserspaceServerRegistry`. The
+discriminant value (13) is unchanged, so **no ABI-hash impact** (the hash is over
+discriminant values + layout, not identifiers). The umbrella stays a prose term with
+no code entity of its own.
+
+**Decision — `KernelServer` binding target + synchronous dispatch.** An in-kernel
+server is a `lookup(suffix, rights) -> OpStatus::{Completed(handle) | Rejected(err)}`
+function in a small kernel registry; a `KernelServer` binding holds its dispatch id.
+`sys_ns_lookup` calls it **in the caller's syscall context**, installs the resolved
+handle, and **pre-signals the lookup's `PendingOperation`** — reusing the slice-1
+direct-handle delivery path verbatim. So in-kernel lookups are synchronous (no IPC,
+no cross-context install, no new ABI); `OpStatus::Pending` is **reserved** for the
+slice-7 userspace path. The `BindingTarget` enum (`DirectHandle` + `KernelServer`)
+replaces slice 1's bare `ObjectRef` target.
+
+**Decision — content model + boot binding.** A lookup yields a *handle to a kernel
+object* the server computes per call (`/dev/entropy` → an `EntropyObject`;
+`/proc/self/status` → a synthesized read-only `MemoryObject`). In-kernel servers are
+always present, so the **kernel binds them into pid 1's root namespace at boot** — no
+Ready handshake, no `BIND_NAMESPACE` holder (that's the userspace-server path);
+children inherit via slice-1 namespace inheritance.
+
+**Decision — `/proc/self` is self-reference, not ambient authority** (the design
+point raised in scoping). Reachability is by namespace construction (a sandbox may
+omit it; not a kernel-forced universal); the result is strictly the caller's own
+process/thread/namespace, derived from the running context, **with no pid parameter
+to forge**. Cross-process introspection (`/proc/<pid>`, enumeration) is a separate,
+narrowly-bound capability with its own process registry — **deferred** (it is the
+ambient-authority-sensitive surface); slice 3 ships only `/proc/self`.
+
+**Doc reconciliation.** Re-marked the slice split throughout: the **in-kernel**
+framework (`KernelServer`, dispatch registry, the servers, boot binding) is **slice
+3**; the **userspace** path (`UserspaceServer` IPC target, forwarded lookup,
+cross-context install, `librsproto`, Ready handshake) moved to **slice 7** (with the
+fs-server, its first consumer). Updated the phasing note, binding-targets table, the
+"Lookup is asynchronous" install cases, the kernel/userspace split, and the scope
+summary (now a slice-1 / slice-3 / slice-7 three-column table). No code, no ABI
+change. Branch `phase-2/slice3-rs-framework-design` off `main`. Next: Part B (the
+`BindingTarget` enum + `KernelServer` dispatch + lookup wiring + boot binding).

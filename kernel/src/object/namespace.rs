@@ -9,7 +9,7 @@
 //! This module is the slice-1 substrate: the object, the binding store, path
 //! validation, and the resolver. The `sys_ns_*` syscalls (Part C) and
 //! resource-server IPC-forwarding (slice 3) build on it. Slice-1 binding targets
-//! are **direct handles** (a bound `ObjectRef`); the `ResourceServer`/`SubNamespace`
+//! are **direct handles** (a bound `ObjectRef`); the `KernelServer`/`UserspaceServer`/`SubNamespace`
 //! target kinds — and a `BindingTarget` enum — arrive with slice 3.
 //!
 //! ## Mutation discipline
