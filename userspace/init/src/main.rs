@@ -47,6 +47,40 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handle0: u64, _arg0: u64) -> 
     kprint_u64(sum as u64);
     kprint(b")\n");
 
+    // Exercise the TOML parser on-target (the real consumer reads
+    // `/initramfs/etc/init.toml` in Part 5; here we parse an embedded sample to
+    // prove the parser + manifest validation + topo-sort run with the bump
+    // allocator). The sample is deliberately out of mount-point order.
+    const SAMPLE: &str = "\
+[[mount]]
+fs_server = \"fs-server-xfs\"
+device = \"gpt-partlabel:store\"
+mount_point = \"/store\"
+mode = \"ro\"
+required_for = \"boot\"
+[[mount]]
+fs_server = \"fs-server-ext4\"
+device = \"gpt-partlabel:root\"
+mount_point = \"/\"
+mode = \"rw\"
+required_for = \"boot\"
+";
+    match init::manifest::parse(SAMPLE) {
+        Ok(mounts) => {
+            kprint(b"init: parsed init.toml, ");
+            kprint_u64(mounts.len() as u64);
+            kprint(b" mounts (shallowest first):\n");
+            for m in &mounts {
+                kprint(b"init:   ");
+                kprint(m.mount_point.as_bytes());
+                kprint(b" <- ");
+                kprint(m.fs_server.as_bytes());
+                kprint(b"\n");
+            }
+        }
+        Err(_) => kprint(b"init: init.toml parse FAIL\n"),
+    }
+
     kprint(b"init: exiting\n");
     exit(0);
 }

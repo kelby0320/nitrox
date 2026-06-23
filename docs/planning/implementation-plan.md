@@ -1044,7 +1044,11 @@ initramfs defer to slice 7 (driven by fs-servers). Done as ordered PR parts:
   Surfaced + fixed two userspace-runtime bugs init's first `alloc` use hit: a mis-placed
   `compiler_builtins` `memcpy` (now strong `libkern::mem` intrinsics) and a `/DISCARD`-ed
   `.got` (now kept in all four `user.ld`). See the decision log (2026-06-23).
-- [ ] Minimal TOML parser + init.toml parsing per [docs/spec/init-toml-schema.md] (Part 4).
+- [x] **Part 4 — minimal TOML parser + init.toml manifest** (`phase-2/slice4-toml`):
+  `init::toml_lite` (the `[[mount]]` / `[mount.options]` / scalar subset) +
+  `init::manifest` (`MountSpec` validation + shallowest-first topo-sort), per
+  [docs/spec/init-toml-schema.md]. 15 host tests; an on-target smoke test parses an
+  embedded sample. The mount-processing loop stays Part 5 / slice 7.
 - [ ] init becomes PID 1 + reaping loop + bootstrap-flow skeleton (Part 5; mount loop
   stops before the Ready handshake — slice 7).
 - [ ] ~~`sys_release_initramfs`~~ — **deferred** to the general resource-server
