@@ -219,7 +219,7 @@ The kernel rejects allocations of handles with rights that are not meaningful fo
 | `IoRing` | `READ`, `WRITE` (for SQE/CQE access) |
 | `EntropyObject` | `READ` |
 | `DeviceNode` | `READ`, `INSPECT` |
-| `ResourceServerReg` | (internal; not user-accessible) |
+| `UserspaceServerReg` | (internal; not user-accessible) |
 
 Resource handles (returned by namespace lookups) receive principal rights (`READ`/`WRITE`/`EXECUTE`) per the resource server's metadata and the rights requested by the caller.
 

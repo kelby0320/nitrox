@@ -83,7 +83,7 @@ const WAIT_ONLY_PRINCIPALS: Rights = Rights::empty();
 /// Generic and modifier rights are accepted without check; only
 /// principal rights (bits 8-19) are matched against the spec's
 /// per-type allowlist. `KObjectType::Invalid` and
-/// `KObjectType::ResourceServerReg` are rejected outright — neither
+/// `KObjectType::UserspaceServerReg` are rejected outright — neither
 /// is a user-accessible type.
 pub(crate) fn is_rights_compatible(ty: KObjectType, rights: Rights) -> bool {
     let allowed_principal = match ty {
@@ -99,7 +99,7 @@ pub(crate) fn is_rights_compatible(ty: KObjectType, rights: Rights) -> bool {
         KObjectType::IoRing => IO_RING_PRINCIPALS,
         KObjectType::EntropyObject => ENTROPY_PRINCIPALS,
         KObjectType::DeviceNode => DEVICE_NODE_PRINCIPALS,
-        KObjectType::Invalid | KObjectType::ResourceServerReg => return false,
+        KObjectType::Invalid | KObjectType::UserspaceServerReg => return false,
     };
     let requested_principal = rights & PRINCIPAL_MASK;
     requested_principal.is_subset_of(allowed_principal)
@@ -127,10 +127,10 @@ mod tests {
     }
 
     #[test]
-    fn invalid_and_resource_server_reg_always_rejected() {
+    fn invalid_and_userspace_server_reg_always_rejected() {
         assert!(!is_rights_compatible(KObjectType::Invalid, Rights::empty()));
         assert!(!is_rights_compatible(
-            KObjectType::ResourceServerReg,
+            KObjectType::UserspaceServerReg,
             Rights::empty(),
         ));
     }

@@ -777,7 +777,7 @@ Author the two missing architecture docs first — slices 1 and 5 implement
   completion-routine / `InterruptObject` contract the storage slice implements)
   is **done** (`phase-2/drivers-irps-doc`). `docs/architecture/namespace-and-resource-servers.md`
   (the namespace data model + resolution + async-lookup contract + the
-  `ResourceServer`/`OpStatus`/registry model) is **done**
+  resource-server model — `KernelServer`/`UserspaceServer`/`OpStatus`/registry) is **done**
   (`phase-2/namespace-design`) — it gates slice 1.
 - [x] **ACPI table parser** (pure-Rust RSDP → XSDT/RSDT → MADT + MCFG; no AML).
   Enables IOAPIC (MADT) and PCI ECAM (MCFG). No external crate. Gates the
@@ -856,7 +856,7 @@ Author the two missing architecture docs first — slices 1 and 5 implement
 
 Design: [`docs/architecture/namespace-and-resource-servers.md`]. Broken into a
 docs-first design pass (**done**) + three code parts, each its own PR. The
-`ResourceServer` trait / `OpStatus` / registry / IPC-forwarded lookup are *designed*
+`UserspaceServer` trait / `OpStatus` / registry / IPC-forwarded lookup are *designed*
 here but **implemented with slice 3** (resource servers) — there are no servers to
 route to until then. Lookup is a `PendingOperation` from the start (a real lookup
 forwards over IPC → async); slice 1 binds **direct handles** and returns a
@@ -881,7 +881,7 @@ pre-signalled PO carrying the resolved handle via `IoResult.result`.
   `rcx`=arg0) + a `SpawnArgs.namespace` field (`0`=inherit, else a constructed
   restricted namespace; child gets a LOOKUP-only handle); boot banner → Phase 2.
   **Namespace foundation (slice 1) complete.**
-- *(slice 3)* `ResourceServer` trait, `OpStatus`, `ResourceServerRegistry`,
+- *(slice 3)* `UserspaceServer` trait, `OpStatus`, `UserspaceServerRegistry`,
   IPC-forwarded lookup + cross-context handle install.
 
 #### 2. Entropy
@@ -956,11 +956,12 @@ the planned premises:
   inlined-`[u8; N]`-equality codegen quirk (infinite loop, no `memcmp` call), not an
   intrinsics gap — documented as a known issue; userspace keeps the manual-loop idiom.
 
-**Part A — design doc.** Formalize the in-kernel RS framework into the living docs
-(today only sketched in `os-design-v5.1.md`): the kernel-server dispatch model
+**Part A — design doc (done, `phase-2/slice3-rs-framework-design`).** Formalized the
+in-kernel RS framework into `docs/architecture/namespace-and-resource-servers.md`
+(extended in place — it's the living RS doc): the kernel-server dispatch model
 (`lookup(suffix, rights) -> OpStatus::{Completed(handle) | Rejected(err)}`; `Pending`
 reserved for slice 7), the `BindingTarget` enum (`DirectHandle` + `KernelServer`;
-`ResourceServer`/IPC + `SubNamespace`/`Rewrite` deferred), how lookup dispatches
+`UserspaceServer`/IPC + `SubNamespace`/`Rewrite` deferred), how lookup dispatches
 **synchronously** and reuses the slice-1 pre-signalled-PO delivery (`IoResult.result`),
 boot-time binding into pid 1's root namespace, the per-server content model (a lookup
 returns a handle to a kernel object), and the `/proc/self` authority model below.
@@ -1048,12 +1049,12 @@ under backpressure; `NoBlock` send + `sys_wait`-on-recv is the fallback.
 The **userspace-RS kernel path** lands here (moved from slice 3, 2026-06-22): the
 fs-server is the first userspace resource server, so the machinery it needs is built
 when it's first consumed rather than speculatively. This is the
-`BindingTarget::ResourceServer` kind + IPC-forwarded lookup + the cross-context
+`BindingTarget::UserspaceServer` kind + IPC-forwarded lookup + the cross-context
 handle install (the kernel installs the server's returned handle into the *original
 caller's* table, then signals the lookup's `PendingOperation` — the `Pending`
 `OpStatus` path the slice-3 framework reserved).
 
-- [ ] **Kernel**: `BindingTarget::ResourceServer` + IPC-forwarded lookup +
+- [ ] **Kernel**: `BindingTarget::UserspaceServer` + IPC-forwarded lookup +
   cross-context handle install (the `Pending` completion path)
 - [ ] `userspace/librsproto/` crate per [docs/spec/rsproto-wire-format.md]
 - [ ] Meta operations: Hello, Goodbye, QueryCaps, Ping, Ready
