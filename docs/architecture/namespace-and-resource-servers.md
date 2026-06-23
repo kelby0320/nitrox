@@ -333,6 +333,67 @@ registry and is the ambient-authority-sensitive surface); slice 3 ships only
 namespace-composition examples (standard user → filtered `/proc`; admin → full
 `/proc`; sandbox → none).
 
+### Kernel Server shapes: singleton, self-reference, registry-backed
+
+Kernel Servers come in three shapes, distinguished by *how a lookup's suffix maps
+to an answer*:
+
+- **Singleton** (`/dev/entropy`) — one resource; the suffix is empty; every lookup
+  returns a handle to the same object.
+- **Self-reference** (`/proc/self/*`) — the answer is derived from the *calling
+  context*, not stored state; no pid/instance parameter exists to forge.
+- **Registry-backed (instance) server** (`/dev/blk`, the storage slice) — one
+  binding owns a **subtree**, and the suffix (`0`, `1`, …) indexes a **runtime
+  registry** of objects (`DeviceNode`s). This is the first server whose answer set
+  is *discovered at runtime*.
+
+The registry-backed shape is what reconciles two facts that look in tension:
+
+- **The set of Kernel Server *implementations* is static** — it is the
+  `KernelServerId` enum + `dispatch`, i.e. *kernel code*. A new server *kind* can
+  appear only by recompiling the kernel or (later) loading a Tier 2 module. This
+  is correct: it enumerates the servers compiled into *this* build.
+- **The set of *resources* and *binding points* is fully dynamic** — paths are a
+  runtime per-process tree, and a server *computes* its answer per lookup, free to
+  consult runtime state.
+
+A registry **bridges** the two: you cannot mint a new enum variant per discovered
+disk, so one static variant (`BlockDevice`) owns the `/dev/blk` subtree and
+resolves the suffix against a dynamic table. (The alternative — baking an instance
+key into each binding, one binding per disk — was rejected because block devices
+grow sub-paths: partitions, `/dev/disk/by-partuuid/*`. A server owning a *subtree*
+is the on-design match to the umbrella definition above.)
+
+### Liveness: what is "live", and what enables it
+
+Until the storage slice every Kernel Server is **unconditionally live** — bound
+into pid 1's root at boot, always. As hardware drivers arrive, only *some* servers
+matter on a given machine (an AHCI box needs no NVMe support). The enabling logic
+splits across three layers, and crucially **drivers, not servers, are what's
+conditional**:
+
+1. **Compile-time — Cargo features.** Whether driver/server code is in the binary
+   at all (Tier 1 features `ahci`, `nvme`, `gpt`; see `drivers-and-irps.md`).
+2. **Runtime, drivers — device matching.** A **driver** (AHCI, NVMe — *not* a
+   server; see `drivers-and-irps.md` § "Three concepts, kept distinct") goes live
+   when a matching `DeviceNode` appears during enumeration. On an AHCI-only box the
+   NVMe driver's match never fires and its code stays cold — **hardware presence
+   *is* the enable**; no flag is needed.
+3. **Runtime, servers — binding.** A server is "live" when a **supervisor** binds
+   it (servers never self-enable — `why-supervisor-registration.md`). Today that
+   supervisor is the kernel at boot.
+
+For a registry-backed instance server, layer 3 needs **no per-server enable
+switch**: bind `/dev/blk` *unconditionally* (uniform with `/dev/entropy`), and let
+the **registry carry liveness**. Whichever drivers matched hardware (layer 2)
+populate it; `/dev/blk0` resolves iff a disk is registered, else `NotFound`; if no
+block driver matched, the server is bound but inert — harmless. So in Phase 2 the
+*only* conditional thing is the driver match. End-state, layers 2–3 graduate to a
+userspace **device manager** + supervisors (driver-to-node policy, especially for
+Tier 2 where a driver *process* receives a `Handle<DeviceNode>`); substitutability
+lets `/dev/blk0` move from a kernel-served node to a Tier 2 userspace endpoint with
+zero client change.
+
 ### Userspace Servers (slice 7)
 
 A Userspace Server is a process reached over IPC: a `UserspaceServer` binding points

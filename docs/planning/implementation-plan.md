@@ -1062,17 +1062,42 @@ initramfs defer to slice 7 (driven by fs-servers). Done as ordered PR parts:
 
 #### 5. Storage drivers
 
-Depends on the prerequisite band: ACPI MCFG (ECAM), IOAPIC (device IRQs), the
-DPC queue (completion handling), `PendingOperation` (blocking reads), and DMA
-allocation (command lists / PRDTs).
+Depends on the prerequisite band (all complete): ACPI MCFG (ECAM), IOAPIC
+(device IRQs), the DPC queue (completion handling), `PendingOperation` (async
+reads), DMA allocation (`mm::dma::DmaBuffer` — command lists / PRDTs), and the
+uncached (`PageFlags::NO_CACHE`) mapping path for BAR access. Staged as ordered
+PR parts; the Part 0 design decisions are in the decision log (2026-06-23).
 
-- [ ] PCI/PCIe enumeration via ECAM (MCFG-based on x86_64)
-- [ ] DeviceNode kernel objects for discovered devices
-- [ ] AHCI driver (start here; simpler than NVMe)
-- [ ] IRP framework per [docs/architecture/drivers-and-irps.md]
-- [ ] InterruptObject kernel object for hardware IRQs
-- [ ] DMA buffer allocation (if not landed in the prerequisite band)
-- [ ] Block device resource server registration
+- [x] **Part 0 — specs & decisions** (docs only): the storage-slice ABI and
+  object contracts settled before the ABI hash bakes them in.
+  [`io-operation.md`](../spec/io-operation.md) (`IoOp`/`IoOpcode`),
+  [`irp-layout.md`](../spec/irp-layout.md) (`Irp` + sub-types),
+  [`device-node.md`](../spec/device-node.md) (the `DeviceNode` object, resource
+  descriptor, `/dev/blk` naming + registry); `syscall-abi.md` /
+  `abi-version-hash.md` / `deferred-decisions.md` updated. Key calls: block I/O
+  via the generic `sys_io_submit` (28) on a `DeviceNode` handle (no new
+  `KObjectType`); one `KernelServerId::BlockDevice` + a kernel registry for the
+  dynamic disks; `InterruptObject` built this slice; in-kernel MMIO (not
+  `sys_device_map_mmio`).
+- [ ] **Part 1 — PCI(e) enumeration + `DeviceNode`.** ECAM walk over
+  `arch::platform::pcie_ecam_regions()`; decode identity/class/BARs/interrupt;
+  `DeviceNode` kernel object (struct + dispatch/allocate/type-rights arms);
+  boot-time enumeration logs discovered devices. Host-tested against a fake
+  config space. No driver yet. (Per [io-operation], [irp-layout], [device-node].)
+- [ ] **Part 2 — IRP framework + `InterruptObject` + the I/O core, on a ramdisk.**
+  `Irp` type (offsets pinned by asserts), `InterruptObject` waitable (3 sched
+  dispatch arms + signal-from-DPC), `sys_io_submit`/`sys_io_cancel`, and a
+  RAM-backed test block `DeviceNode` as the first IRP producer — proving
+  initiate → DPC → PO → `sys_wait` → bytes-in-`MemoryObject` independently of
+  AHCI register/DMA bugs.
+- [ ] **AHCI driver (Part 3; start here vs NVMe).** Tier 1 driver: kernel
+  `ioremap` of the ABAR (uncached), HBA/port init, IDENTIFY, command list / FIS /
+  PRDT in `DmaBuffer`, READ DMA EXT, real IRQ (`arch::IrqRouter` → ISR → DPC →
+  complete IRP → signal `InterruptObject`); class-`0x010601` match table. Plus the
+  `xtask build-disk` + QEMU AHCI test-disk attach.
+- [ ] **Block device resource server registration (Part 4).** Register discovered
+  disks in the block registry; supervisor binds `/dev/blk` (read-only) into init's
+  root namespace at boot. A lookup of `/dev/blk0` + a read logs sector 0.
 
 #### 6. Partition handling
 
