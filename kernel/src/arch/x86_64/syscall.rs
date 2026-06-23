@@ -10,10 +10,22 @@
 //!
 //! ## GS model (Phase 1, single CPU)
 //!
-//! Ring 0 normally runs with `GS_BASE = 0` and `KERNEL_GS_BASE = &CPU0`.
-//! The only `gs:`-relative code is the entry stub, bracketed by a `swapgs`
-//! on entry and a matching `swapgs` before `sysretq` (or a manual one on
-//! the debug-exit path). Nothing else in the kernel uses `gs:`.
+//! `KERNEL_GS_BASE` is held at `&CPU0` **at all times** — in userspace, in the
+//! kernel body, and while a thread is blocked mid-syscall — and `GS_BASE = 0`
+//! (the userspace value) everywhere except the brief entry-stub window. The
+//! entry stub `swapgs`es in (so `gs:` reaches `&CPU0`), grabs the kernel stack,
+//! then `swapgs`es **back** before running the body; there is no `swapgs` before
+//! `sysretq`. The only `gs:`-relative code is that stub.
+//!
+//! This always-`&CPU0` invariant is what makes the entry robust across multiple
+//! threads: a thread that blocks mid-body (e.g. `sys_wait`) is switched away
+//! with `KERNEL_GS_BASE = &CPU0`, so a *sibling's* `syscall` `swapgs` still
+//! lands `GS_BASE = &CPU0` rather than the parked user GS. (An earlier model
+//! held `GS_BASE = &CPU0` across the body and parked the user GS in
+//! `KERNEL_GS_BASE`; a blocked thread then left `KERNEL_GS_BASE = 0`, and a
+//! sibling's entry `swapgs` faulted on `gs:[0]` — an intermittent `#DF`. Fixed
+//! 2026-06-23; see the decision log.) The IDT trap entries never touch `gs:` and
+//! never `swapgs`, so they are consistent with `GS_BASE = 0` in both rings.
 //!
 //! ## Throwaway ring-3 harness
 //!
@@ -202,7 +214,18 @@ extern "C" fn syscall_entry() -> ! {
         "mov gs:[{scratch}], rsp",  // stash user RSP
         "mov rsp, gs:[{kstack}]",   // switch to the kernel syscall stack
         // Build SyscallFrame: highest field (user_rsp) pushed first.
-        "push gs:[{scratch}]",      // user_rsp
+        "push gs:[{scratch}]",      // user_rsp (last `gs:` use — read before swap-back)
+        // Swap GS back so the *body* runs in the userspace GS state
+        // (`GS_BASE = 0`, `KERNEL_GS_BASE = &CPU0`). This is the invariant
+        // `enter_user` assumes and that every ring-3 entry (`syscall` here,
+        // traps via the IDT) needs: a thread that blocks mid-body is switched
+        // away with `KERNEL_GS_BASE = &CPU0` (not the parked user GS), so a
+        // sibling's `syscall` `swapgs` still lands `GS_BASE = &CPU0`. The body
+        // never touches `gs:` (only this stub does), so running it with
+        // `GS_BASE = 0` is fine. Matching swap is the one at entry above — there
+        // is deliberately **no** swap before `sysretq` (the body already holds
+        // the userspace GS state). See the module docs.
+        "swapgs",
         "push rax",                 // rax (number / return)
         "push rcx",                 // rcx = user RIP
         "push rdi",
@@ -248,7 +271,10 @@ extern "C" fn syscall_entry() -> ! {
         // restored argument registers and broke multi-syscall callers, while
         // leaking nothing — the popped values are the user's, not kernel
         // scratch. Removed; see the decision log.)
-        "swapgs",
+        // No `swapgs` here: the body already ran in the userspace GS state
+        // (`GS_BASE = 0`, `KERNEL_GS_BASE = &CPU0`) — the entry stub swapped
+        // back right after grabbing the kernel stack — so `sysretq` returns
+        // with GS already correct.
         "sysretq",
         scratch  = const OFF_SCRATCH,
         kstack   = const OFF_KSTACK,
