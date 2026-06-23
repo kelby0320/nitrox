@@ -312,6 +312,19 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&kernel_dir))?;
+
+    // Userspace `libkern` host tests. From the userspace workspace dir libkern
+    // builds for the host (it has no per-crate `.cargo/config.toml` pinning the
+    // bare target, unlike the demo bins); `-p libkern` skips those bins and the
+    // explicit host `--target` mirrors the kernel approach.
+    let userspace_dir = repo_root().join("userspace");
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libkern")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     Ok(())
 }
 

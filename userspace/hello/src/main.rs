@@ -27,212 +27,44 @@
 #![no_main]
 
 use core::arch::asm;
-
-// --- Syscall numbers (must match `kernel/src/syscall/table.rs`) ----------
-//
-// Stable handle/memory ops are sequential from 0; the debug syscalls live in
-// a high, non-ABI-stable range.
-const SYS_HANDLE_CLOSE: u64 = 0;
-const SYS_HANDLE_DUPLICATE: u64 = 1;
-const SYS_HANDLE_RESTRICT: u64 = 2;
-const SYS_HANDLE_STAT: u64 = 3;
-const SYS_MEMORY_CREATE: u64 = 4;
-const SYS_MEMORY_MAP: u64 = 5;
-const SYS_MEMORY_UNMAP: u64 = 6;
-const SYS_CLOCK_READ: u64 = 7;
-const SYS_TIMER_CREATE: u64 = 8;
-const SYS_TIMER_SET: u64 = 9;
-const SYS_WAIT: u64 = 10;
-const SYS_CHANNEL_CREATE: u64 = 12;
-const SYS_CHANNEL_SEND: u64 = 13;
-const SYS_CHANNEL_RECV: u64 = 14;
-const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
-const SYS_PROCESS_EXIT: u64 = 0xFFFF_0001;
-
-/// `SendMode::NoBlock` (`kernel/src/libkern/ipc.rs`).
-const SENDMODE_NOBLOCK: u64 = 1;
-
-// --- Rights bits (must match `kernel/src/libkern/handle.rs`) -------------
-const RIGHT_DUPLICATE: u64 = 1 << 0;
-const RIGHT_INSPECT: u64 = 1 << 2;
-const RIGHT_MAP_READ: u64 = 1 << 15;
-const RIGHT_MAP_WRITE: u64 = 1 << 16;
+use libkern::{
+    CLOCK_MONOTONIC, HandleInfo, IoResult, IpcMsg, KError, KOBJ_MEMORY_OBJECT, RIGHT_DUPLICATE,
+    RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE,
+    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_HANDLE_DUPLICATE,
+    SYS_HANDLE_RESTRICT, SYS_HANDLE_STAT, SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP,
+    SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint, syscall1, syscall2, syscall4, syscall5,
+};
 
 const PAGE: u64 = 4096;
 
-/// `ClockId::Monotonic` (`kernel/src/libkern/clock.rs`).
-const CLOCK_MONOTONIC: u64 = 0;
-
-/// Errors (`kernel/src/syscall/error.rs`), as returned (negated) in rax.
-const E_WOULD_BLOCK: i64 = -11;
-const E_TIMED_OUT: i64 = -12;
-const E_PEER_CLOSED: i64 = -13;
-
-/// `IoResult` mirror (`kernel/src/libkern/io_result.rs`): 24 bytes, 8-aligned.
-#[repr(C, align(8))]
-struct IoResultBuf {
-    handle: u64,
-    status: i32,
-    reserved: u32,
-    result: u64,
-}
+/// Errors (`KError`), as returned (negated) in rax — derived from `libkern`.
+const E_WOULD_BLOCK: i64 = KError::WouldBlock.as_i32() as i64;
+const E_TIMED_OUT: i64 = KError::TimedOut.as_i32() as i64;
+const E_PEER_CLOSED: i64 = KError::PeerClosed.as_i32() as i64;
 
 /// Out-buffer for one `sys_wait` result + a one-entry handles array, both in
 /// writable `.bss`.
-static mut WAIT_RESULTS: IoResultBuf =
-    IoResultBuf { handle: 0, status: 0, reserved: 0, result: 0 };
+static mut WAIT_RESULTS: IoResult = IoResult { handle: 0, status: 0, reserved: 0, result: 0 };
 static mut WAIT_HANDLES: [u64; 1] = [0];
-
-/// Userspace mirror of the kernel `IpcMsg` (`kernel/src/libkern/ipc.rs`): one
-/// page, `#[repr(C, align(4096))]`, header fields flat (offsets 0/4/8/10/16),
-/// then a 4008-byte payload and an 8-entry transfer-handle array.
-#[repr(C, align(4096))]
-struct IpcMsgBuf {
-    sender_pid: u32,
-    payload_len: u32,
-    handle_count: u8,
-    _pad1: u8,
-    flags: u16,
-    _pad2: [u8; 4],
-    timestamp: u64,
-    payload: [u8; 4008],
-    handles: [u64; 8],
-}
-
-impl IpcMsgBuf {
-    const ZEROED: IpcMsgBuf = IpcMsgBuf {
-        sender_pid: 0,
-        payload_len: 0,
-        handle_count: 0,
-        _pad1: 0,
-        flags: 0,
-        _pad2: [0; 4],
-        timestamp: 0,
-        payload: [0; 4008],
-        handles: [0; 8],
-    };
-}
 
 /// The channel endpoint handles `sys_channel_create` writes back. Writable `.bss`.
 static mut END0: u64 = 0;
 static mut END1: u64 = 0;
 /// Send/receive message buffers + the recv handle-count out-param.
-static mut SEND_MSG: IpcMsgBuf = IpcMsgBuf::ZEROED;
-static mut RECV_MSG: IpcMsgBuf = IpcMsgBuf::ZEROED;
+static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
+static mut RECV_MSG: IpcMsg = IpcMsg::ZEROED;
 static mut RECV_COUNT: usize = 0;
 
 /// The payload `hello` sends to itself over IPC.
 const IPC_PING: &[u8] = b"ipc: ping\n";
 
-/// Object-type discriminant for a `MemoryObject` (`KObjectType::MemoryObject`).
-const KOBJ_MEMORY_OBJECT: u32 = 4;
-
 const MSG: &[u8] = b"hello from ring 3 (pid 1)\n";
 
-/// Scratch buffer for `sys_handle_stat`'s `HandleInfo` out-parameter. Lives in
-/// the writable `.bss` segment (mapped R/W by the loader). Layout matches the
-/// kernel's `#[repr(C)] HandleInfo { rights: u64, object_type: u32,
-/// generation: u32 }`.
-#[repr(C, align(8))]
-struct HandleInfoBuf {
-    rights: u64,
-    object_type: u32,
-    generation: u32,
-}
-static mut STAT_BUF: HandleInfoBuf = HandleInfoBuf {
-    rights: 0,
-    object_type: 0,
-    generation: 0,
-};
+/// Scratch buffer for `sys_handle_stat`'s `HandleInfo` out-parameter (writable `.bss`).
+static mut STAT_BUF: HandleInfo = HandleInfo { rights: 0, object_type: 0, generation: 0 };
 
 /// Out-parameter for `sys_clock_read`. Writable `.bss`, naturally 8-aligned.
 static mut CLOCK_BUF: u64 = 0;
-
-/// Issue a syscall with up to four arguments. ABI: `rax` = number, args in
-/// `rdi`/`rsi`/`rdx`/`r10`; `syscall` clobbers `rcx`/`r11`; result in `rax`.
-///
-/// # Safety
-/// The caller must pass a valid syscall number and arguments; some syscalls
-/// (e.g. exit) never return — use the dedicated path for those.
-#[inline]
-unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let ret;
-    // SAFETY: a register-only syscall; the asm touches no memory we don't own
-    // and clobbers only the documented scratch registers.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            out("rcx") _,
-            out("r11") _,
-            lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
-    // SAFETY: see `syscall4`.
-    unsafe { syscall4(nr, a0, 0, 0, 0) }
-}
-
-#[inline]
-unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
-    // SAFETY: see `syscall4`.
-    unsafe { syscall4(nr, a0, a1, 0, 0) }
-}
-
-/// Issue a syscall with five arguments — the fifth in `r8` (`sys_channel_send`
-/// needs it for the `SendMode`).
-///
-/// # Safety
-/// As [`syscall4`].
-#[inline]
-unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
-    let ret;
-    // SAFETY: a register-only syscall; same clobber set as `syscall4` plus `r8`.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr,
-            in("rdi") a0,
-            in("rsi") a1,
-            in("rdx") a2,
-            in("r10") a3,
-            in("r8") a4,
-            out("rcx") _,
-            out("r11") _,
-            lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-/// Write `msg` to the kernel serial log via the debug syscall.
-fn kprint(msg: &[u8]) {
-    // SAFETY: passes a valid (ptr, len) the kernel copies from; returns a count.
-    unsafe {
-        syscall2(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64);
-    }
-}
-
-/// Exit the process. Never returns.
-fn exit(status: i64) -> ! {
-    // SAFETY: process exit diverges in the kernel; control never returns here.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") SYS_PROCESS_EXIT,
-            in("rdi") status,
-            options(noreturn, nostack),
-        );
-    }
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start() -> ! {
@@ -434,7 +266,7 @@ pub extern "C" fn _start() -> ! {
     // lands in end1's inbox.
     // SAFETY: SEND_MSG is a valid writable buffer in .bss.
     unsafe {
-        SEND_MSG.payload_len = IPC_PING.len() as u32;
+        SEND_MSG.header.payload_len = IPC_PING.len() as u32;
         let mut i = 0;
         while i < IPC_PING.len() {
             SEND_MSG.payload[i] = IPC_PING[i];
@@ -477,8 +309,12 @@ pub extern "C" fn _start() -> ! {
         syscall4(SYS_CHANNEL_RECV, e1, (&raw mut RECV_MSG) as u64, 0, (&raw mut RECV_COUNT) as u64)
     };
     // SAFETY: on success the kernel wrote a full message into RECV_MSG.
-    let (rsp, rlen) =
-        unsafe { ((&raw const RECV_MSG.sender_pid).read(), (&raw const RECV_MSG.payload_len).read()) };
+    let (rsp, rlen) = unsafe {
+        (
+            (&raw const RECV_MSG.header.sender_pid).read(),
+            (&raw const RECV_MSG.header.payload_len).read(),
+        )
+    };
     // SAFETY: RECV_MSG.payload is initialised; compare the echoed bytes.
     let payload_match = unsafe {
         let mut ok = rlen as usize == IPC_PING.len();
