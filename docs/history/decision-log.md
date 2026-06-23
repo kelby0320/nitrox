@@ -4150,3 +4150,57 @@ No kernel/ABI change (userspace-only). Verified: `cargo xtask build` (no warning
 `check-arch` / `test` (kernel 462; libkern 8; **init 18**) / `qemu` all clean. Branch
 `phase-2/slice4-toml` off `main`. Next: Part 5 (init becomes PID 1 + reaping loop +
 bootstrap-flow skeleton, reading the real init.toml).
+
+## 2026-06-23 — Fix: intermittent #DF from KERNEL_GS_BASE poisoning (syscall GS model)
+
+Bringing up init as PID 1 (Part 5) reliably exposed a pre-existing intermittent kernel
+double-fault. Root cause: the x86_64 syscall entry stub ran the **whole kernel body**
+with `GS_BASE = &CPU0` and the user GS parked in `KERNEL_GS_BASE` (one `swapgs` on
+entry, undone only by a matching `swapgs` before `sysretq`). A thread that **blocks
+mid-body** (`sys_wait`) is switched away with `KERNEL_GS_BASE = 0` (the parked user GS);
+a *sibling's* subsequent `syscall` entry `swapgs`es that `0` into `GS_BASE`, and the next
+instruction `mov gs:[scratch], rsp` writes through address 0 → `#PF` on the entry path →
+`#DF`. `enter_user` and the IDT traps already assumed `GS_BASE = 0` /
+`KERNEL_GS_BASE = &CPU0`; only the syscall body diverged. init-as-PID-1 added a third
+blocked-in-syscall process while parent's worker thread faulted — the interleaving that
+hit the window ~1/3 of boots.
+
+**Decision — hold `KERNEL_GS_BASE = &CPU0` at all times.** The entry stub now `swapgs`es
+**back** to the userspace GS state right after grabbing the kernel stack (reading the
+stashed user RSP before the swap-back), so the body runs with `GS_BASE = 0`,
+`KERNEL_GS_BASE = &CPU0` — the state userspace, `enter_user`, and the trap path expect.
+The exit `swapgs` before `sysretq` is dropped (the body already holds that state). A
+blocked thread can no longer leave `KERNEL_GS_BASE = 0` to poison a sibling's entry; the
+body never touches `gs:` (only the stub does), and the IDT entries never `swapgs`, so
+both rings are consistent at `GS_BASE = 0`. ~2 instructions + doc rewrite; no ABI change.
+Verified 10/10 clean `qemu` runs under the reproducer (was ~1/3 `#DF`). Branch
+`phase-2/gs-base-fix` (PR #57).
+
+## 2026-06-23 — Phase 2 slice 4, Part 5: init becomes PID 1 (reaping loop + bootstrap skeleton)
+
+The integration step: init is now the real first userspace process. The kernel boots it
+(`run_first_userspace` loads the embedded init ELF via `embedded_images::image_bytes(
+ImageId::Init)` instead of the parent ELF); init's root namespace carries the boot
+kernel-server bindings at full rights. init:
+1. reports its handle set;
+2. reads + parses the **real** `/initramfs/etc/init.toml` (namespace lookup → map the
+   read-only `MemoryObject` → trim the zero-padded tail → `manifest::parse`) and logs
+   the topo-sorted mount plan;
+3. spawns `parent` (now `ImageId::Parent`, embedded) as the slice-1/2/3 demo chain;
+4. enters the reaping loop (`sys_wait` → `ChildExited` → close the child handle).
+
+So the process tree is now **init (1) → parent (2) → child (3/4)**, the shape it should
+have. The mount *processing* (spawn fs-server → Ready → `sys_ns_bind`) stays slice 7 —
+there are no fs-servers or block devices yet, so init logs the plan + "deferred to slice
+7" rather than mounting; it does **not** drop to eshell. `parent`'s `ns_demo` was changed
+to bind into a **fresh** namespace it creates (its inherited root is now LOOKUP-only
+under init, so binding into root would be denied — a process binds into namespaces it
+owns); all other parent demos use root only via LOOKUP and are unaffected.
+
+`ImageId::Parent` (= 2) added (`spawn.rs` + `embedded_images.rs`; `IMAGE_PARENT` mirror
+in libkern) — a new enum value, not a layout change, so no ABI-hash impact. This part
+depends on the GS fix above (the multi-thread fault demo would otherwise `#DF`). Verified:
+`cargo xtask build` (no warnings) / `check-arch` / `test` (kernel 462; libkern 8; init
+18) / `qemu` (full `init → parent → child` transcript, init reaps parent, no `#DF` across
+repeated runs). Branch `phase-2/slice4-init-pid1` off `main`. Next: slice 5 (storage
+drivers) toward the milestone where init actually mounts a root fs.

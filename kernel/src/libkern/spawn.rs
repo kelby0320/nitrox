@@ -37,6 +37,8 @@ pub enum ImageId {
     Child = 0,
     /// The bootstrapping init (`userspace/init`).
     Init = 1,
+    /// The Phase-1 demo supervisor (`userspace/parent`); spawned by init.
+    Parent = 2,
 }
 
 impl ImageId {
@@ -45,6 +47,7 @@ impl ImageId {
         match v {
             0 => Some(Self::Child),
             1 => Some(Self::Init),
+            2 => Some(Self::Parent),
             _ => None,
         }
     }
@@ -109,8 +112,10 @@ mod tests {
     fn image_id_round_trips() {
         assert_eq!(ImageId::from_u32(0), Some(ImageId::Child));
         assert_eq!(ImageId::from_u32(1), Some(ImageId::Init));
-        assert_eq!(ImageId::from_u32(2), None);
+        assert_eq!(ImageId::from_u32(2), Some(ImageId::Parent));
+        assert_eq!(ImageId::from_u32(3), None);
         assert_eq!(ImageId::Child as u32, 0);
         assert_eq!(ImageId::Init as u32, 1);
+        assert_eq!(ImageId::Parent as u32, 2);
     }
 }

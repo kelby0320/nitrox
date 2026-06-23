@@ -15,15 +15,23 @@ static CHILD_ELF: &[u8] =
     include_bytes!("../../userspace/target/x86_64-unknown-none/release/child");
 
 /// The bootstrapping init (`userspace/init`), built by `xtask` before the kernel.
-/// Spawnable via [`ImageId::Init`] (slice 4 Part 3); becomes the boot pid-1 image
-/// in Part 5. The path-based-spawn / initramfs-relocation end state is slice 7.
+/// Spawnable via [`ImageId::Init`]; also the **boot pid-1 image** — the kernel
+/// loads it directly via [`image_bytes`] in `run_first_userspace` (slice 4 Part 5).
+/// The path-based-spawn / initramfs-relocation end state is slice 7.
 static INIT_ELF: &[u8] =
     include_bytes!("../../userspace/target/x86_64-unknown-none/release/init");
+
+/// The Phase-1 demo supervisor (`userspace/parent`), built by `xtask` before the
+/// kernel. Now spawned **by init** (via [`ImageId::Parent`]) as the slice-1/2/3
+/// regression chain, rather than being the boot pid-1 image.
+static PARENT_ELF: &[u8] =
+    include_bytes!("../../userspace/target/x86_64-unknown-none/release/parent");
 
 /// The embedded ELF bytes for an [`ImageId`].
 pub fn image_bytes(image: ImageId) -> &'static [u8] {
     match image {
         ImageId::Child => CHILD_ELF,
         ImageId::Init => INIT_ELF,
+        ImageId::Parent => PARENT_ELF,
     }
 }
