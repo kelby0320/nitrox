@@ -91,9 +91,19 @@ programming nor userspace driver hosting is built. Trigger: a userspace driver
 
 **IRP cancellation and the completion timeout.** The IRP framework lands without
 request cancellation or the 30-second force-complete timeout. Phase 2 stacks are
-shallow and the boot-path block driver completes promptly. Trigger: long-running
-or cancellable I/O (network, user-abortable operations) and Tier 2 module unload
-(which drains in-flight IRPs).
+shallow and the boot-path block driver completes promptly. `sys_io_cancel` is
+defined (number reserved) but returns `Unsupported` until this lands. Trigger:
+long-running or cancellable I/O (network, user-abortable operations) and Tier 2
+module unload (which drains in-flight IRPs).
+
+**Async-I/O surface subset.** The [`IoOp`](../spec/io-operation.md) descriptor
+ships with only `Read`/`Write` opcodes and no `flags` modifiers; `Flush`/`Trim`,
+force-unit-access / no-cache flags, and multi-buffer scatter/gather in one `IoOp`
+are deferred to their first consumer (RW filesystems, SSD trim). The block
+namespace ships **enumeration-order** whole-disk names (`/dev/blk0..`);
+content-stable `/dev/disk/by-partuuid/*` / `by-partlabel/*` names are slice 6
+(they need GPT metadata). The `/dev/blk` binding is **read-only** in Phase 2
+(RO `fs-server-ext4`); RW block access lands with RW filesystems (Phase 3).
 
 **Filter drivers.** Transparent insertion of a driver into a stack (encryption,
 compression, logging, LUKS, LVM) is part of the IRP design but unimplemented.
@@ -159,12 +169,14 @@ handle-vs-value ambiguity / footgun). Trigger: a real consumer of numeric pid/ti
 (e.g. logging infra), or the first synthesized read-only snapshot (`/proc/self/status`)
 that forces the primitive. See the decision log (2026-06-22).
 
-**`/dev` directory stub (enumerable placeholder).** `DeviceNode` is only a
-`KObjectType` discriminant — no kernel struct — and there is no enumeration syscall
-(`ENUMERATE` is defined but unused). A `/dev` Kernel Server that merely resolves `/dev`
-exact → a `DeviceNode` handle has no consumer (`/dev/entropy` resolves via its own
-binding regardless). Deferred until a device manager (slice 7) or a real enumeration
-surface exists. Trigger: either of those. See the decision log (2026-06-22).
+**`/dev` directory stub (enumerable placeholder).** Slice 5 gives `DeviceNode` a
+real kernel struct (PCI-discovered nodes; block disks resolve via
+`KernelServerId::BlockDevice` at `/dev/blk`), but there is still **no enumeration
+syscall** (`ENUMERATE` is defined but unused) and **no listable `/dev` directory**
+— lookups resolve a known path to a node; nothing enumerates the children of
+`/dev`. A directory-listing surface is deferred until a device manager (slice 7)
+or a real enumeration consumer exists. Trigger: either of those. See the decision
+log (2026-06-22, 2026-06-23).
 
 ### Runtime libraries
 

@@ -71,12 +71,15 @@ Every variant of `Notification` and its discriminant value, plus the byte offset
 ### IoOp and IoResult layouts
 
 Field offsets, types, and sizes of:
-- `IoOp`
+- `IoOp` — **40 bytes** (`opcode`/`flags`/`buffer`/`buf_offset`/`offset`/
+  `length`); normative layout in [`io-operation.md`](io-operation.md). Defined
+  with the storage slice (Phase 2 slice 5).
 - `IoResult` — **24 bytes** as of Phase 2 slice 1 (grew from 16: a `result: u64`
   payload word was appended at offset 16 for completions that return a value,
   e.g. a namespace lookup's resolved handle; the earlier `handle`/`status`/
   `reserved` offsets are unchanged). Any change to `IoResult` invalidates the hash.
-- `IoOpcode` enum
+- `IoOpcode` enum — `Read = 0`, `Write = 1` (Phase 2); see
+  [`io-operation.md`](io-operation.md).
 
 ### KError enum layout
 
@@ -92,7 +95,11 @@ Field offsets, types, sizes, and alignment.
 
 ### IRP layout
 
-Field offsets, types, sizes of `Irp` and its key sub-types (`IrpStack`, `IrpStatus`, etc.).
+Field offsets, types, sizes of `Irp` and its key sub-types (`IrpStack`,
+`IrpStackFrame`, `IrpBuffer`, and the `IrpOp`/`IrpStatus` enums); normative
+layout in [`irp-layout.md`](irp-layout.md). Defined with the storage slice
+(Phase 2 slice 5). An `Irp` is kernel-internal (userspace never sees one) but is
+crossed by Tier 2 loadable driver modules, so its layout is hashed.
 
 ### Architecture-specific types
 

@@ -100,6 +100,8 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `25` | `sys_ns_unbind` |
 | `26` | `sys_entropy_create` |
 | `27` | `sys_entropy_read` |
+| `28` | `sys_io_submit` |
+| `29` | `sys_io_cancel` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -152,15 +154,35 @@ pub struct HandleInfo {
 
 ### I/O Core
 
+The system's single generic asynchronous-I/O entry point; full descriptor and
+semantics in [`io-operation.md`](io-operation.md). Syscall numbers:
+`sys_io_submit = 28`, `sys_io_cancel = 29` (introduced with the storage slice,
+Phase 2 slice 5).
+
 ```rust
 fn sys_io_submit(resource: RawHandle, op: UserPtr<IoOp>) -> isize
 ```
-Submits an I/O operation. Returns a `PendingOperation` handle (positive value). The operation runs asynchronously; use `sys_wait` to wait for completion.
+Initiates the [`IoOp`](io-operation.md) `*op` against `resource` and returns a
+`PendingOperation` handle (positive value); it **never blocks**. In Phase 2
+`resource` is a block [`DeviceNode`](device-node.md) and the opcodes are
+`Read`/`Write`. The operation's outcome is delivered through the PO: `sys_wait`
+writes `IoResult.status` (`0` = success, negative `KError` on a device/medium
+error) and `IoResult.result` (bytes transferred). A zero-length or cache-hit
+request returns a **pre-signalled** PO, so callers have one code path.
+
+*Argument*, *permission*, and *allocation* failures (bad/under-righted
+`resource`, malformed/misaligned `IoOp`, an unusable `buffer`, PO/handle
+exhaustion) return a negative `KError` **synchronously**, with no PO created;
+*device/medium* failures are delivered **through the PO** — the same split as the
+namespace lookup. (Syscall number `28`.)
 
 ```rust
 fn sys_io_cancel(pending: RawHandle) -> isize
 ```
-Requests cancellation of an in-flight operation. The pending handle will signal with `Cancelled` status if cancellation succeeds, or with the natural completion if cancellation arrives too late.
+Requests cancellation of an in-flight operation. **Phase 2 returns
+`Unsupported`** — IRP cancellation is deferred (`deferred-decisions.md`
+§ "Drivers and interrupts"); the number is reserved now so the ABI is stable when
+cancellation lands. (Syscall number `29`.)
 
 ```rust
 fn sys_wait(
@@ -411,7 +433,7 @@ fn sys_device_map_mmio(
     flags:      MmioFlags,
 ) -> isize
 ```
-Returns a `MemoryObject` handle for the MMIO region indexed by `region_idx` in the device's resource descriptor. Requires appropriate rights on `device`. Subsequent `sys_memory_map` on the returned object installs MMIO PTEs.
+Returns a `MemoryObject` handle for the MMIO region indexed by `region_idx` in the device's resource descriptor (see [`device-node.md`](device-node.md)). Requires appropriate rights on `device`. Subsequent `sys_memory_map` on the returned object installs MMIO PTEs. **Deferred** — this is the *userspace*-driver path; Phase 2's Tier 1 drivers map their BARs in kernel space directly, so the syscall is unimplemented until userspace drivers + IOMMU land (`deferred-decisions.md`).
 
 ```rust
 fn sys_release_initramfs() -> isize
@@ -443,7 +465,8 @@ Argument types referenced above are defined in `libkern`:
 - `Rights`: a bitflags type, see [handle-encoding.md](handle-encoding.md)
 - `IoResult`: `#[repr(C)]` 16-byte record, 8-aligned, no padding: `handle: u64` (offset 0, the signaled handle), `status: i32` (offset 8, `0` = ready, negative = a `KError`), `reserved: u32` (offset 12, zeroed). Defined in `kernel/src/libkern/io_result.rs`. **Part of the ABI version hash** (`abi-version-hash.md` § "IoOp and IoResult layouts").
 - `TimerFlags`: `#[repr(transparent)]` bitflags over `u64`; no flags defined yet (must be 0). Defined in `kernel/src/libkern/timer_flags.rs`.
-- `IoOp`, `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents ([ThreadArgs](thread-args.md))
+- `IoOp`, `IoOpcode`: `#[repr(C)]` / `#[repr(u32)]`, see [io-operation.md](io-operation.md); an ABI-version-hash input.
+- `SpawnArgs`, `ThreadArgs`, `IpcMsg`, `Notification`: see relevant spec documents ([ThreadArgs](thread-args.md))
 - `ClockId`: `#[repr(u32)]` enum, `Monotonic = 0`, `Realtime = 1`, `ProcessCpu = 2`, `ThreadCpu = 3`; defined in `kernel/src/libkern/clock.rs`
 - `Disposition`, `SendMode`, `MemFlags`, `MmioFlags`, `RingFlags`: small `#[repr(u32)]` or bitflag enums; values stable, definitions in `libkern`. (`sys_exception_resume` currently takes the disposition as a raw `u64` — `0` Resume / `2` Terminate — pending the full `Disposition` enum in Phase 2.)
 
@@ -464,6 +487,7 @@ After v1.0, syscall numbers and the existing signatures become a stability commi
 - [Handle encoding](handle-encoding.md)
 - [IPC message format](ipc-message-format.md)
 - [Notification format](notification-format.md)
+- [IoOp](io-operation.md) / [IRP layout](irp-layout.md) / [DeviceNode](device-node.md)
 - `kernel/src/syscall/error.rs` — the `KError` enum (canonical error-code source)
 - [Process spawn args](process-spawn-args.md)
 - [Why async-first syscalls](../rationale/why-async-syscalls.md)

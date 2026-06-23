@@ -4204,3 +4204,76 @@ depends on the GS fix above (the multi-thread fault demo would otherwise `#DF`).
 18) / `qemu` (full `init → parent → child` transcript, init reaps parent, no `#DF` across
 repeated runs). Branch `phase-2/slice4-init-pid1` off `main`. Next: slice 5 (storage
 drivers) toward the milestone where init actually mounts a root fs.
+
+## 2026-06-23 — Phase 2 slice 5, Part 0: storage-slice specs & decisions
+
+The paper layer for the storage slice — the ABI and object contracts settled
+before any of it gets baked into the kernel ABI hash. New specs:
+[`docs/spec/io-operation.md`](../spec/io-operation.md) (`IoOp`/`IoOpcode`),
+[`docs/spec/irp-layout.md`](../spec/irp-layout.md) (`Irp` + sub-types), and
+[`docs/spec/device-node.md`](../spec/device-node.md) (the `DeviceNode` object,
+resource descriptor, and block-device naming). `syscall-abi.md`,
+`abi-version-hash.md`, and `deferred-decisions.md` updated to match. The
+consequential decisions:
+
+- **Block I/O goes through the existing generic `sys_io_submit(resource, &IoOp)`,
+  not a bespoke `sys_block_read`.** The async-I/O core (`sys_io_submit` /
+  `sys_io_cancel` / `IoOp` / `IoOpcode`) was already sketched in `syscall-abi.md`
+  and already named in the ABI hash; Part 0 makes it concrete rather than adding a
+  parallel surface. The future `IoRing` submits the same `IoOp`. Numbers assigned:
+  `sys_io_submit = 28`, `sys_io_cancel = 29` (the latter `Unsupported` in Phase 2
+  — cancellation is deferred).
+
+- **`sys_io_submit` targets a `DeviceNode` handle; there is no separate
+  "BlockDevice" `KObjectType`.** A block device *is* a `DeviceNode` (class
+  `Block`), whether a whole disk (AHCI) or — slice 6 — a partition (GPT, a second
+  IRP stack frame over the disk). This matches the plan's existing "Partition
+  DeviceNode registration" (slice 6) and avoids a new hashed `KObjectType`
+  (`DeviceNode = 12` already exists as a reserved tag). Rejected: a dedicated
+  `BlockDevice` object (proliferates types; partitions wouldn't be DeviceNodes).
+
+- **Dynamic disks resolve through one `KernelServerId::BlockDevice` backed by a
+  kernel block-device registry, keyed by lookup suffix.** The RS framework is a
+  static enum but devices are discovered at runtime; one binding at `/dev/blk`
+  resolves `/dev/blk0`, `/dev/blk1`, … by consulting an enumeration-time table.
+  Whole disks get **enumeration-order** names (`/dev/blkN`); content-stable
+  `/dev/disk/by-partuuid/*` names are slice 6 (they need GPT metadata and are
+  what `init.toml` references). The `/dev/blk` binding is **read-only** in
+  Phase 2 (RO `fs-server-ext4`).
+
+- **`Irp` is hashed though userspace never sees it** — Tier 2 driver modules walk
+  `&mut Irp`, so the layout is fixed now (`IRP_MAX_STACK = 4`: AHCI = 1 frame,
+  GPT-over-AHCI = 2). `IrpStatus` maps directly onto `IoResult.status` (0 /
+  negative `KError`), and `IrpOp` is kept numerically aligned with `IoOpcode`.
+
+- **In-kernel MMIO, not `sys_device_map_mmio`.** Phase 2's AHCI is Tier 1
+  (in-kernel), so it maps its ABAR in *kernel* space uncached via the existing
+  `PageFlags::NO_CACHE` paging path. `sys_device_map_mmio` (the userspace-driver
+  path) stays deferred with userspace drivers + IOMMU.
+
+- **`InterruptObject` is built in slice 5** (decided with the user): the waitable
+  mechanics + signal-from-DPC land in Part 2 (exercised by a synthetic DPC
+  signal), and the AHCI ISR signals a real `InterruptObject` in Part 3 — even
+  though a Tier 1 driver could complete IRPs purely via the DPC-completion-routine
+  pattern. Building it now completes the design and pre-builds the
+  userspace-driver (Tier 2) programming model.
+
+- **Kernel-server liveness model clarified** (in response to a design question).
+  The set of Kernel Server *implementations* stays a static enum (it is kernel
+  code); the set of *resources/binding points* is dynamic. `BlockDevice` is the
+  first **registry-backed instance server** — one static variant owning the
+  `/dev/blk` subtree, resolving the suffix against a runtime registry. `/dev/blk`
+  is bound **unconditionally** and the registry carries liveness (no per-server
+  enable switch). What is conditional is **drivers, not servers**: AHCI/NVMe are
+  *drivers* enabled by device *matching* (hardware presence = enable), feeding one
+  block server. End-state, driver-to-node matching and server binding graduate to a
+  userspace device manager + supervisors; substitutability makes the move
+  client-invisible. Documented in `namespace-and-resource-servers.md` §§ "Kernel
+  Server shapes" / "Liveness" and `device-node.md`.
+
+Implementation staging (also recorded in `implementation-plan.md`): Part 1 — PCI
+enumeration + `DeviceNode`; Part 2 — IRP framework + `InterruptObject` + the I/O
+core, proven on a RAM-backed test block device (de-risks the async spine before
+AHCI register work, decided with the user); Part 3 — AHCI Tier 1 driver + the
+QEMU AHCI test disk; Part 4 — block resource server + `/dev/blk` namespace
+binding. No code yet — Part 0 is docs only. Next: Part 1.
