@@ -62,6 +62,7 @@ const RIGHT_DUPLICATE: u64 = 1 << 0;
 const RIGHT_TRANSFER: u64 = 1 << 1;
 const RIGHT_INSPECT: u64 = 1 << 2;
 const RIGHT_WAIT: u64 = 1 << 3;
+const RIGHT_READ: u64 = 1 << 8;
 const RIGHT_SEND: u64 = 1 << 18;
 const RIGHT_RECV: u64 = 1 << 19;
 const ENDPOINT_RIGHTS: u64 =
@@ -726,6 +727,72 @@ fn entropy_demo() {
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 }
 
+/// Kernel-server demo: resolve `/dev/entropy` from the **root namespace** (`rsi`)
+/// the kernel bound at boot, and read from the handle it hands back. Unlike
+/// `entropy_demo` (which mints a token with `sys_entropy_create`), this obtains
+/// the `EntropyObject` purely through a namespace lookup that routes to an
+/// in-kernel resource server — proving boot-binding + `KernelServer` dispatch
+/// (`sys_ns_lookup` → server → installed handle → `IoResult.result`) end-to-end.
+fn dev_entropy_lookup_demo(root_ns: u64) {
+    kprint(b"parent: /dev/entropy lookup-demo start\n");
+    let path = b"/dev/entropy";
+    // sys_ns_lookup → PendingOperation; the resolved handle arrives in IoResult.
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe {
+        syscall4(SYS_NS_LOOKUP, root_ns, path.as_ptr() as u64, path.len() as u64, RIGHT_READ)
+    };
+    if po < 0 {
+        kprint(b"parent: /dev/entropy lookup FAIL\n");
+        return;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    // `IoResult`: status at bytes 8..12, result (resolved handle) at 16..24.
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    let resolved = unsafe {
+        u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ])
+    };
+    if waited != 1 || status != 0 || resolved == 0 {
+        kprint(b"parent: /dev/entropy lookup wait unexpected\n");
+        return;
+    }
+
+    // Use the resolved EntropyObject handle: read 32 CSPRNG bytes (0 = synchronous
+    // fill; the pool seeds at boot).
+    let mut a = [0u8; 32];
+    // SAFETY: valid writable 32-byte buffer; `len` ≤ ENTROPY_READ_MAX.
+    let r = unsafe { syscall4(SYS_ENTROPY_READ, resolved, (&raw mut a) as u64, 32, 0) };
+    if r != 0 {
+        kprint(b"parent: /dev/entropy read not synchronous\n");
+        unsafe { syscall1(SYS_HANDLE_CLOSE, resolved) };
+        return;
+    }
+    let first = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
+    kprint(b"parent: /dev/entropy resolved+read ok bytes[0..8]=");
+    kprint_hex(first);
+    kprint(b"\n");
+
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, resolved);
+        syscall1(SYS_HANDLE_CLOSE, po as u64);
+    }
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -746,6 +813,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 0d. Entropy demo: create an EntropyObject and read CSPRNG bytes.
     entropy_demo();
+
+    // 0e. Kernel-server demo: resolve /dev/entropy (boot-bound by the kernel) and
+    //     read from the handle the in-kernel server hands back.
+    dev_entropy_lookup_demo(root_ns);
 
     kprint(b"parent: creating a channel\n");
 

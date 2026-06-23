@@ -370,6 +370,7 @@ fn run_first_userspace() {
     use nitrox_kernel::handle::global;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
+    use nitrox_kernel::object::kernel_server::KernelServerId;
     use nitrox_kernel::object::{Namespace, NotificationChannel, ObjectRef, Process};
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
@@ -440,6 +441,24 @@ fn run_first_userspace() {
             return;
         }
     };
+
+    // Bind the in-kernel resource servers into pid 1's root namespace (the kernel
+    // is the "supervisor" at boot; userspace servers register via the Ready
+    // handshake instead — slice 7). Children inherit these via namespace
+    // inheritance. `/dev/entropy` is the first Kernel Server: a lookup mints an
+    // `EntropyObject` (see `object::kernel_server`). Its binding rights are the
+    // band `sys_entropy_create` mints (`entropy_rights`): `READ` + the generic
+    // management band, so a full-rights lookup yields exactly that.
+    let entropy_binding_rights =
+        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, entropy_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /dev/entropy failed");
+        return;
+    }
+
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).
