@@ -189,7 +189,15 @@ fn cmd_image() -> R<()> {
     cmd_build()?;
     let limine_root = cmd_fetch_limine()?;
     let bootx64 = find_bootx64(&limine_root)?;
-    assemble_image(&bootx64, &kernel_elf(), &limine_conf(), &image_path())?;
+    let initramfs = initramfs_path();
+    build_initramfs(&initramfs)?;
+    assemble_image(
+        &bootx64,
+        &kernel_elf(),
+        &limine_conf(),
+        &initramfs,
+        &image_path(),
+    )?;
     println!("xtask: image at {}", image_path().display());
     Ok(())
 }
@@ -451,10 +459,66 @@ fn walk_for(root: &Path, name: &str) -> R<Option<PathBuf>> {
     Ok(None)
 }
 
+/// The initramfs payload. Slice 4 ships a placeholder `etc/init.toml` (a single
+/// critical-path mount, processed once an fs-server exists in slice 5+);
+/// spawnable images move into the initramfs with the spawn-ABI work (slice 7).
+const INIT_TOML: &str = "\
+# Nitrox init manifest (Phase 2 slice 4 placeholder).\n\
+[[mount]]\n\
+fs_server = \"fs-server-ext4\"\n\
+device = \"gpt-partlabel:nitrox-root\"\n\
+mount_point = \"/\"\n\
+mode = \"rw\"\n\
+required_for = \"boot\"\n";
+
+/// Build path for the packed initramfs CPIO archive.
+fn initramfs_path() -> PathBuf {
+    build_cache().join("initramfs.cpio")
+}
+
+/// Append one CPIO `newc` entry (header + NUL-terminated name + data, each region
+/// NUL-padded to a 4-byte boundary) to `out`. Matches `kernel/src/initramfs.rs`.
+fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
+    let namesize = name.len() + 1; // includes the trailing NUL
+    out.extend_from_slice(b"070701");
+    // 13 eight-hex fields: ino, mode, uid, gid, nlink, mtime, filesize,
+    // devmajor, devminor, rdevmajor, rdevminor, namesize, check.
+    for f in [
+        ino, 0o100644, 0, 0, 1, 0, data.len() as u32, 0, 0, 0, 0, namesize as u32, 0,
+    ] {
+        out.extend_from_slice(format!("{f:08x}").as_bytes());
+    }
+    out.extend_from_slice(name.as_bytes());
+    out.push(0);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+    out.extend_from_slice(data);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
+/// Pack the initramfs CPIO `newc` archive at `out` (a placeholder `etc/init.toml`
+/// + the mandatory `TRAILER!!!`).
+fn build_initramfs(out: &Path) -> R<()> {
+    let mut buf = Vec::new();
+    cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
+    cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
+    fs::write(out, &buf)?;
+    println!(
+        "xtask: built initramfs ({} bytes) at {}",
+        buf.len(),
+        out.display()
+    );
+    Ok(())
+}
+
 fn assemble_image(
     bootx64: &Path,
     kernel: &Path,
     conf: &Path,
+    initramfs: &Path,
     out: &Path,
 ) -> R<()> {
     require_tool("sgdisk")?;
@@ -509,6 +573,11 @@ fn assemble_image(
         .arg("-i").arg(&part)
         .arg(kernel)
         .arg("::/boot/kernel"))?;
+
+    run(Command::new("mcopy")
+        .arg("-i").arg(&part)
+        .arg(initramfs)
+        .arg("::/boot/initramfs"))?;
 
     Ok(())
 }

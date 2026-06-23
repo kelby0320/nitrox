@@ -107,6 +107,35 @@ impl MemoryObject {
         })
     }
 
+    /// Allocate a memory object holding a copy of `bytes` (size rounded up to a
+    /// whole number of pages; any tail past `bytes.len()` stays zero). Refcount
+    /// one. The first **synthesised read-only `MemoryObject`** primitive: the
+    /// in-kernel `/initramfs` server uses it to hand userspace a readable,
+    /// mappable copy of a file's content. (See `docs/rationale/deferred-decisions.md`
+    /// § "Resource servers" / `/proc/self/status`.)
+    pub fn try_new_filled(bytes: &[u8]) -> Result<KBox<Self>, AllocError> {
+        let obj = Self::try_new(bytes.len().max(1))?;
+        // Copy `bytes` into the already-zeroed frames, page by page, via the HHDM.
+        let mut copied = 0usize;
+        for &f in obj.frames.iter() {
+            if copied >= bytes.len() {
+                break;
+            }
+            let n = core::cmp::min(PAGE_SIZE, bytes.len() - copied);
+            // SAFETY: `f` is a live, HHDM-reachable frame owned by `obj`, not
+            // aliased; we copy `n ≤ PAGE_SIZE` bytes into it from a valid source.
+            unsafe {
+                ptr::copy_nonoverlapping(
+                    bytes.as_ptr().add(copied),
+                    (f.as_u64() + heap::hhdm_offset()) as *mut u8,
+                    n,
+                );
+            }
+            copied += n;
+        }
+        Ok(obj)
+    }
+
     /// Page-rounded byte size.
     pub fn size(&self) -> usize {
         self.size
@@ -166,6 +195,33 @@ mod tests {
             let base = (f.as_u64() + heap::hhdm_offset()) as *const u8;
             for i in 0..PAGE_SIZE {
                 assert_eq!(unsafe { *base.add(i) }, 0, "frame byte {i} not zeroed");
+            }
+        }
+    }
+
+    #[test]
+    fn try_new_filled_copies_bytes_and_zeroes_tail() {
+        init_global_heap();
+        // A payload spanning into a second page; the tail past it must stay zero.
+        let mut data = [0u8; PAGE_SIZE + 10];
+        for (i, b) in data.iter_mut().enumerate() {
+            *b = (i % 251) as u8;
+        }
+        let m = MemoryObject::try_new_filled(&data).unwrap();
+        assert_eq!(m.npages(), 2);
+        let base0 = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;
+        let base1 = (m.frames()[1].as_u64() + heap::hhdm_offset()) as *const u8;
+        // SAFETY: live, HHDM-reachable frames; read-only checks.
+        unsafe {
+            for i in 0..PAGE_SIZE {
+                assert_eq!(*base0.add(i), data[i], "page0 byte {i}");
+            }
+            for i in 0..10 {
+                assert_eq!(*base1.add(i), data[PAGE_SIZE + i], "page1 byte {i}");
+            }
+            // Tail of page 1 past the payload is zero.
+            for i in 10..PAGE_SIZE {
+                assert_eq!(*base1.add(i), 0, "tail byte {i} not zero");
             }
         }
     }

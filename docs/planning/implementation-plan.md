@@ -1022,17 +1022,29 @@ consumer is init reading `init.toml` + spawnable images, so it lands where it's 
 It reuses the slice-3 in-kernel RS framework: `/initramfs` is just another in-kernel
 server, bound at boot.
 
-- [ ] `userspace/init/` crate, `libkern + alloc` only
-- [ ] Initial handle set reception from kernel
-- [ ] **Initramfs substrate**: Limine module request (`kernel/src/limine.rs`) +
-  CPIO-newc parser + the `/initramfs` in-kernel resource server (serves file content
-  from the Limine-loaded blob via the slice-3 framework)
-- [ ] Minimal TOML parser (just enough for init.toml schema)
-- [ ] init.toml parsing per [docs/spec/init-toml-schema.md]
-- [ ] Critical-path mount processing loop (topological sort by mount_point depth)
-- [ ] Reaping loop for `ChildExited` notifications
-- [ ] `sys_release_initramfs` syscall (unbinds `/initramfs`, frees the blob's pages)
-  and init's call to it once boot is stable
+Decided as the userspace library scope for this slice (2026-06-23): pull forward only a
+real **`libkern`** (init's mandated foundation); `libos`/`librt`/`libstream` stay
+Phase 3, `librsproto` slice 7. Path-based spawn + relocating the demos onto the
+initramfs defer to slice 7 (driven by fs-servers). Done as ordered PR parts:
+
+- [x] **Part 1 — real `libkern` + migrate the demos** (`phase-2/slice4-libkern`, PR #53):
+  the canonical userspace ABI mirror (`syscall`/`error`/`handle`/`abi`/`debug`);
+  parent/child/hello migrated off ~485 lines of triplication; host tests in
+  `cargo xtask test`.
+- [x] **Part 2 — initramfs substrate** (`phase-2/slice4-initramfs`): Limine module
+  request (`kernel/src/limine.rs`) + `boot/limine.conf` module + xtask CPIO-newc packer;
+  in-kernel CPIO-newc parser (`kernel/src/initramfs.rs`, host-tested); the `/initramfs`
+  `KernelServer` (first subtree server) returning a read-only `MemoryObject` copy via the
+  new `MemoryObject::try_new_filled`; bound into pid 1's root namespace at boot. Verified
+  by the parent demo resolving+mapping `/initramfs/etc/init.toml`.
+- [ ] `userspace/init/` crate (`libkern + alloc` only) + initial handle-set reception
+  (Part 3).
+- [ ] Minimal TOML parser + init.toml parsing per [docs/spec/init-toml-schema.md] (Part 4).
+- [ ] init becomes PID 1 + reaping loop + bootstrap-flow skeleton (Part 5; mount loop
+  stops before the Ready handshake — slice 7).
+- [ ] ~~`sys_release_initramfs`~~ — **deferred** to the general resource-server
+  lifecycle work (load/unload for kernel + userspace servers); the blob stays mapped
+  through bootstrapping. See `deferred-decisions.md`.
 
 #### 5. Storage drivers
 

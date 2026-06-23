@@ -4022,3 +4022,51 @@ stats `process`/`thread` to assert their types, and *uses* the namespace handle 
 resolve `/dev/entropy` through it. Verified: `cargo xtask build` / `check-arch` /
 `test` (457, +1) / `qemu` all clean (`/proc/self/{process,thread,namespace} ok`). Branch
 `phase-2/slice3-proc-self` off `main`. Next: slice 4 (Init).
+
+## 2026-06-23 — Phase 2 slice 4, Part 1: real `libkern` + demo migration
+
+Built the bottom userspace runtime layer for real (`userspace/libkern`: `syscall`,
+`error`, `handle`, `abi`, `debug` modules — the canonical userspace mirror of the
+kernel ABI, `#![no_std]`/no-alloc/core-only, `cfg_attr(not(test), no_std)` so the pure
+logic is host-testable). Migrated `parent`/`child`/`hello` onto it, deleting ~485 lines
+of triplicated syscall/ABI/debug boilerplate; fixed a latent `hello` bug
+(`SYS_PROCESS_EXIT` was `0xFFFF_0001`, kernel expects `16`). `cargo xtask test` now also
+runs libkern's host tests. No kernel ABI change (libkern mirrors it; compile-time
+`offset_of!`/`size_of` asserts pin both sides). `abi-sync-check` deferred. Pulled
+forward from Phase 3 because Init is libkern's first consumer (it's forbidden from the
+higher layers). Branch `phase-2/slice4-libkern` (PR #53).
+
+## 2026-06-23 — Phase 2 slice 4, Part 2: initramfs substrate (kernel)
+
+Greenfield initramfs plumbing — Limine module + in-kernel CPIO parser + an
+`/initramfs` resource server — so Init (and, here, the parent demo) can read
+`init.toml` and files from a boot blob. Kernel-only; reuses the slice-3 KernelServer
+framework.
+
+- **Limine module request** (`kernel/src/limine.rs`: `ModuleRequest`/`ModuleResponse`/
+  `LimineFile`) + a `module_path: boot():/boot/initramfs` line in `boot/limine.conf`;
+  xtask packs a **CPIO-newc** archive (a placeholder `etc/init.toml`) into the ESP via
+  a small in-Rust `newc` writer (`build_initramfs`/`cpio_entry`). The kernel records the
+  module at boot (`init_initramfs` → `initramfs::set_blob`; the module's `address` is an
+  HHDM-virtual pointer in never-reclaimed `MEMMAP_KERNEL_AND_MODULES` memory).
+- **CPIO-newc parser** (`kernel/src/initramfs.rs`): pure over a byte slice, host-tested;
+  `lookup(blob, path) -> Option<&[u8]>` (4-byte alignment, `./`-prefix normalisation,
+  trailer/garbage → `None`).
+- **`/initramfs` KernelServer** (`KernelServerId::Initramfs` + `initramfs_server`): the
+  first **subtree** server (uses the lookup suffix, unlike the entropy/`proc/self`
+  leaves) — resolves `suffix` in the blob and returns a fresh read-only `MemoryObject`
+  **copy** of the file bytes (the caller maps it `MAP_READ`). Bound into pid 1's root
+  namespace at boot with `MAP_READ` + generic rights.
+- **`MemoryObject::try_new_filled(bytes)`** — the first *synthesised read-only
+  MemoryObject* primitive (allocate → copy bytes into the zeroed frames via the HHDM →
+  hand back), which the deferred `/proc/self/status` will reuse. A **copy**, not an
+  alias of the blob's frames: CPIO-newc aligns file data to 4 bytes, not pages, so
+  frame-aliasing isn't possible; copy-per-lookup is fine for a bootstrapping init.
+
+Reclamation (`sys_release_initramfs`) intentionally **not** built — deferred to the
+general resource-server lifecycle work; the blob stays mapped. No new syscall; no ABI
+change (internal `KernelServerId` variant + Limine struct). Verified: `cargo xtask
+build` / `check-arch` / `test` (kernel 462 +4 initramfs +1 `try_new_filled`; libkern 8) /
+`qemu` all clean — the parent resolves+maps `/initramfs/etc/init.toml` and prints
+`"# Nitrox init ma..."`; all prior demos pass. Branch `phase-2/slice4-initramfs` off
+`main`. Next: Part 3 (init crate skeleton — bare target, allocator, handle reception).

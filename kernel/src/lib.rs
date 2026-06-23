@@ -19,6 +19,7 @@ pub mod entropy;
 pub mod font;
 pub mod framebuffer;
 pub mod handle;
+pub mod initramfs;
 pub mod libkern;
 pub mod limine;
 pub mod mm;

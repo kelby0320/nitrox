@@ -26,8 +26,8 @@ use nitrox_kernel::dpc;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
-    BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, RequestsEndMarker,
-    RequestsStartMarker,
+    BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
+    RequestsEndMarker, RequestsStartMarker,
 };
 use nitrox_kernel::mm;
 use nitrox_kernel::sched;
@@ -62,6 +62,13 @@ static mut MEMMAP_REQUEST: MemoryMapRequest = MemoryMapRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
+
+// The initramfs module (Limine loads `boot/initramfs`, tagged
+// `MEMMAP_KERNEL_AND_MODULES`, mapped in the HHDM). `static mut` for the same
+// reason as `MEMMAP_REQUEST`: Limine writes `response` after load.
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -118,6 +125,11 @@ fn kernel_main() {
     // from; it must run before any AS is constructed.
     paging_init();
     paging_smoke_test();
+
+    // Record the Limine-loaded initramfs module (if any) so the `/initramfs`
+    // resource server can serve it. Needs the HHDM (the module's `address` is an
+    // HHDM-virtual pointer); non-fatal if no module was configured.
+    init_initramfs();
 
     // Discover platform hardware from the firmware tables (ACPI on x86_64): the
     // PCIe ECAM window (for PCI enumeration) and the interrupt-routing topology
@@ -499,6 +511,19 @@ fn run_first_userspace() {
         }
     }
 
+    // `/initramfs/<path>` — a subtree server returning a read-only `MemoryObject`
+    // copy of a file from the boot CPIO blob. The caller maps it `MAP_READ`, so
+    // the binding grants `MAP_READ` + the generic management band.
+    let initramfs_binding_rights =
+        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(b"/initramfs", KernelServerId::Initramfs, initramfs_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /initramfs failed");
+        return;
+    }
+
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).
@@ -544,6 +569,36 @@ fn run_first_userspace() {
         return;
     }
     kprintln!("init: spawned parent (pid 1); handing off to userspace");
+}
+
+/// Record the Limine-loaded initramfs module (the first one) for the
+/// `/initramfs` resource server. Non-fatal if no module was configured.
+fn init_initramfs() {
+    // SAFETY: `MODULE_REQUEST` lives in `.limine_requests`; Limine wrote its
+    // `response` before `_start`. Read through a raw-pointer copy.
+    let resp = unsafe { (&raw const MODULE_REQUEST).read().response };
+    if resp.is_null() {
+        kprintln!("initramfs: no module loaded");
+        return;
+    }
+    // SAFETY: a non-null response is a valid Limine `ModuleResponse`.
+    let resp = unsafe { &*resp };
+    if resp.module_count == 0 || resp.modules.is_null() {
+        kprintln!("initramfs: no module loaded");
+        return;
+    }
+    // SAFETY: `modules` points at an array of `module_count` `*mut LimineFile`;
+    // we take the first (Nitrox configures exactly one module).
+    let file = unsafe { &**resp.modules };
+    let (addr, size) = (file.address, file.size as usize);
+    if addr.is_null() || size == 0 {
+        kprintln!("initramfs: module empty");
+        return;
+    }
+    // SAFETY: `addr` is an HHDM-virtual pointer to `size` live bytes (the module,
+    // in never-reclaimed `MEMMAP_KERNEL_AND_MODULES` memory).
+    unsafe { nitrox_kernel::initramfs::set_blob(addr, size) };
+    kprintln!("initramfs: loaded {} bytes", size);
 }
 
 /// Bring up the buddy allocator and the slab on top of it. Returns false
