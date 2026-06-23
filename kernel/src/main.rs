@@ -363,23 +363,19 @@ fn run_scheduler_demo() {
 // the scheduler — the thread is reaped on the next scheduler entry, freeing
 // the Process and its address space. This is the substrate-works milestone.
 
-/// The first userspace program (the spawn-demo **parent**), embedded at kernel
-/// build time. Built by `cargo xtask` (which builds `userspace/parent` before
-/// the kernel) as a static, non-PIE `ET_EXEC`. Spawn-able children are embedded
-/// in the kernel lib (`embedded_images`).
-static PARENT_ELF: &[u8] =
-    include_bytes!("../../userspace/target/x86_64-unknown-none/release/parent");
-
-/// Arm the syscall fast path, then load + launch the **parent** process (pid 1)
-/// with a handle to its own notification channel in the bootstrap register
-/// `rdi`. The parent then drives the demo entirely from userspace: it creates a
-/// channel, spawns two children over it, and reaps their `ChildExited`s. This
-/// boot thread hands off (via `sched::exit` in `kernel_main`) into the parent
-/// and then idles; the parent is the supervisor now (not the kernel).
+/// Arm the syscall fast path, then load + launch **init** as pid 1 with a handle
+/// to its own notification channel (`rdi`) and a full-rights root-namespace handle
+/// (`rsi`) carrying the boot kernel-server bindings. init reads its manifest from
+/// the initramfs, spawns the demo chain (`parent` → `child`), and runs the reaping
+/// loop. This boot thread hands off (via `sched::exit` in `kernel_main`) into init
+/// and then idles; init is the supervisor now (not the kernel). The init ELF is
+/// embedded in the kernel lib (`embedded_images`, [`ImageId::Init`]) along with the
+/// spawn-able `parent`/`child`.
 fn run_first_userspace() {
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;
     use nitrox_kernel::handle::global;
+    use nitrox_kernel::libkern::ImageId;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
     use nitrox_kernel::object::kernel_server::KernelServerId;
@@ -390,7 +386,7 @@ fn run_first_userspace() {
     arch::init_syscall_entry();
     kprintln!("syscall fast-path armed");
 
-    // Fresh address space (kernel half inherited → loadable), from the parent ELF.
+    // Fresh address space (kernel half inherited → loadable), from the init ELF.
     let aspace = match AddressSpace::new() {
         Ok(a) => a,
         Err(_) => {
@@ -398,7 +394,7 @@ fn run_first_userspace() {
             return;
         }
     };
-    let info = match load_elf(&aspace, PARENT_ELF) {
+    let info = match load_elf(&aspace, nitrox_kernel::embedded_images::image_bytes(ImageId::Init)) {
         Ok(i) => i,
         Err(e) => {
             kprintln!("init: ELF load failed: {:?}", e);
@@ -568,7 +564,7 @@ fn run_first_userspace() {
         kprintln!("init: spawn_user failed");
         return;
     }
-    kprintln!("init: spawned parent (pid 1); handing off to userspace");
+    kprintln!("init: spawned init (pid 1); handing off to userspace");
 }
 
 /// Record the Limine-loaded initramfs module (the first one) for the

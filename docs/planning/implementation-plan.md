@@ -1049,8 +1049,13 @@ initramfs defer to slice 7 (driven by fs-servers). Done as ordered PR parts:
   `init::manifest` (`MountSpec` validation + shallowest-first topo-sort), per
   [docs/spec/init-toml-schema.md]. 15 host tests; an on-target smoke test parses an
   embedded sample. The mount-processing loop stays Part 5 / slice 7.
-- [ ] init becomes PID 1 + reaping loop + bootstrap-flow skeleton (Part 5; mount loop
-  stops before the Ready handshake — slice 7).
+- [x] **Part 5 — init becomes PID 1 + reaping loop + bootstrap skeleton**
+  (`phase-2/slice4-init-pid1`): kernel boots init (`ImageId::Init`); init reads+parses
+  the real `/initramfs/etc/init.toml`, logs the topo-sorted mount plan, spawns `parent`
+  (`ImageId::Parent`) → `child`, and runs the reaping loop. Process tree is now
+  init (1) → parent (2) → child (3/4). The mount loop stops before the Ready handshake
+  (slice 7); `parent`'s `ns_demo` rebased onto a fresh namespace (its inherited root is
+  LOOKUP-only under init). Required + depends on the GS-base `#DF` fix (PR #57).
 - [ ] ~~`sys_release_initramfs`~~ — **deferred** to the general resource-server
   lifecycle work (load/unload for kernel + userspace servers); the blob stays mapped
   through bootstrapping. See `deferred-decisions.md`.
