@@ -35,6 +35,8 @@ pub const SPAWN_MAX_HANDLES: usize = 4;
 pub enum ImageId {
     /// The Phase-1 IPC demo child (`userspace/child`).
     Child = 0,
+    /// The bootstrapping init (`userspace/init`).
+    Init = 1,
 }
 
 impl ImageId {
@@ -42,6 +44,7 @@ impl ImageId {
     pub const fn from_u32(v: u32) -> Option<Self> {
         match v {
             0 => Some(Self::Child),
+            1 => Some(Self::Init),
             _ => None,
         }
     }
@@ -105,7 +108,9 @@ mod tests {
     #[test]
     fn image_id_round_trips() {
         assert_eq!(ImageId::from_u32(0), Some(ImageId::Child));
-        assert_eq!(ImageId::from_u32(1), None);
+        assert_eq!(ImageId::from_u32(1), Some(ImageId::Init));
+        assert_eq!(ImageId::from_u32(2), None);
         assert_eq!(ImageId::Child as u32, 0);
+        assert_eq!(ImageId::Init as u32, 1);
     }
 }

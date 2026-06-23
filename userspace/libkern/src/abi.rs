@@ -17,6 +17,8 @@ use core::mem::{align_of, offset_of, size_of};
 pub const SPAWN_MAX_HANDLES: usize = 4;
 /// `ImageId::Child` — the Phase-1 IPC demo child (kernel-embedded image selector).
 pub const IMAGE_CHILD: u32 = 0;
+/// `ImageId::Init` — the bootstrapping init (`userspace/init`), kernel-embedded.
+pub const IMAGE_INIT: u32 = 1;
 
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]

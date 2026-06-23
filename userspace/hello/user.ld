@@ -30,6 +30,12 @@ SECTIONS
 
     . = ALIGN(0x1000);
     .data : { *(.data .data.*) } :data
+    /* Keep the GOT in a loaded segment — precompiled code (e.g. alloc's
+     * `__rust_realloc` shim) may reference symbols like `memcpy` via `jmp *[GOT]`;
+     * discarding `.got` leaves those pointing at null. `.plt` stays discarded (a
+     * static non-PIE binary has no PLT). See `userspace/init/user.ld`. */
+    .got     : { *(.got) }     :data
+    .got.plt : { *(.got.plt) } :data
     .bss  : { *(.bss .bss.*) *(COMMON) } :data
 
     /DISCARD/ : {
@@ -38,6 +44,6 @@ SECTIONS
         *(.comment)
         *(.interp)
         *(.dynamic) *(.dynsym) *(.dynstr) *(.hash) *(.gnu.hash)
-        *(.got) *(.got.plt) *(.plt) *(.plt.*)
+        *(.plt) *(.plt.*)
     }
 }

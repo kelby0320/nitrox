@@ -4070,3 +4070,48 @@ build` / `check-arch` / `test` (kernel 462 +4 initramfs +1 `try_new_filled`; lib
 `qemu` all clean — the parent resolves+maps `/initramfs/etc/init.toml` and prints
 `"# Nitrox init ma..."`; all prior demos pass. Branch `phase-2/slice4-initramfs` off
 `main`. Next: Part 3 (init crate skeleton — bare target, allocator, handle reception).
+
+## 2026-06-23 — Phase 2 slice 4, Part 3: init crate skeleton (+ two userspace-runtime fixes)
+
+Converted `userspace/init` from a host stub to the bare-target PID-1 skeleton:
+`#![no_std]` + `alloc`, libkern-only. It's a **library + binary** crate — the lib
+(`src/lib.rs` + `src/heap.rs`) holds host-testable logic, the bin (`src/main.rs`) is the
+entry point. `_start` receives the bootstrap registers (notif, root namespace), reports
+the handle set, proves the allocator, and exits cleanly; the `#[panic_handler]` reports
++ spins (never a bare `panic!`, per `userspace/init/CLAUDE.md`).
+
+**Allocator: a fixed static-arena bump allocator** (`init::heap::BumpAlloc`,
+`#[global_allocator]`) over a 64 KiB arena; `dealloc` is a no-op (init's working set is
+bounded and freed wholesale on exit). The pure offset math (`bump`) is host-tested
+(`cargo xtask test` now runs `cargo test -p init --lib`). Arena size is the open
+question flagged in the plan — 64 KiB for now.
+
+**Demo + spawn:** `ImageId::Init` (=1) added to `spawn.rs` + `embedded_images.rs`
+(kernel embeds the init ELF; xtask builds it before the kernel); `IMAGE_INIT` mirror in
+libkern. The `parent` demo spawns init via `ImageId::Init` and reaps its `ChildExited`
+as a regression check (init becomes the real kernel-loaded PID 1 in Part 5).
+
+**Two real userspace-runtime bugs surfaced by init's first `alloc` use** (the long-
+flagged 2026-06-22 hazards, now hit for real):
+1. **Mis-placed `compiler_builtins` `memcpy`.** On this `x86_64-unknown-none`,
+   `-sse,+soft-float` target the `memcpy` symbol resolved into the *middle* of an
+   unrelated function — a call jumped into garbage (`mov 0x8(%rbx),…` → the `@0x8`
+   fault). Fix: **`libkern::mem`** provides strong `#[no_mangle]` `memcpy`/`memmove`/
+   `memset`/`memcmp` (volatile byte loops, so LLVM can't refold them into a self-call),
+   which override `compiler_builtins`' weak versions for every userspace bin. Gated
+   `#[cfg(not(test))]` so the host `std` build of libkern doesn't redefine libc's `mem*`.
+   This is the deferred Part-0 Piece-2 mem-intrinsics work, landed where its first
+   consumer needed it.
+2. **`/DISCARD/`-ed `.got`.** `alloc`'s `__rust_realloc` shim tail-calls `memcpy` via
+   `jmp *[GOT]`; `user.ld` discarded `.got`, so the indirect jump pointed at null (the
+   `@0x0` fault). Fix: **keep `.got`/`.got.plt` in a loaded segment** (the linker fills
+   them with absolute addresses for a static non-PIE binary); still discard `.plt`.
+   Applied to all four userspace `user.ld` (init + the three demos) for consistency,
+   though only init currently exercises the path.
+
+No kernel ABI hash impact: `ImageId::Init` is a new enum value (1 was previously
+rejected), not a layout/discriminant change to a hashed type. Verified: `cargo xtask
+build` / `check-arch` / `test` (kernel 462; libkern 8; **init 3**) / `qemu` all clean —
+parent spawns init → `init: alloc ok (sum…=140)` → `init exited pid=2 code=0`; all prior
+demos pass. Branch `phase-2/slice4-init-skeleton` off `main`. Next: Part 4 (minimal TOML
+parser + `init.toml` parsing).

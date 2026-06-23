@@ -61,6 +61,18 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
     namespace: 0, // set at runtime to the constructed child namespace
 };
+/// Spawn args for the `init` skeleton (ImageId::Init): no handles, inherit a
+/// LOOKUP-only handle to the parent's root namespace.
+static mut SPAWN_INIT: SpawnArgs = SpawnArgs {
+    image: IMAGE_INIT,
+    handle_count: 0,
+    move_mask: 0,
+    _pad: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+};
 static mut NOTIF: Notification = Notification::zeroed();
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
@@ -748,6 +760,59 @@ fn initramfs_demo(root_ns: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
 }
 
+/// Spawn the `init` skeleton (ImageId::Init) as a child to prove it stands up —
+/// handle-set reception + the static-arena allocator — then reap its
+/// `ChildExited`. In Part 5 init becomes the real PID 1 (kernel-loaded); here the
+/// parent drives it as a regression check. `notif` is this process's notification
+/// channel; init is spawned and reaped in full before the IPC children, so its
+/// exit never mixes into their reaping count.
+fn init_spawn_demo(notif: u64) {
+    kprint(b"parent: spawning init (ImageId::Init)\n");
+    // SAFETY: SPAWN_INIT is a valid writable arg block.
+    let pi = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_INIT) as u64) };
+    if pi < 0 {
+        kprint(b"parent: init spawn FAIL\n");
+        return;
+    }
+    // Reap init's ChildExited from our notification channel.
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            kprint(b"parent: init reap wait FAIL\n");
+            break;
+        }
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            continue; // WouldBlock: re-block on the channel
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let (kind, body) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        if kind == KIND_CHILD_EXITED {
+            let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
+            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            kprint(b"parent: init exited pid=");
+            kprint_u64(cpid as u64);
+            kprint(b" code=");
+            kprint_u64(code as u64);
+            kprint(b"\n");
+            break;
+        }
+    }
+    // SAFETY: closing our own handle to the init process.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, pi as u64) };
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -780,6 +845,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0g. Initramfs substrate: resolve + map /initramfs/etc/init.toml (the Limine
     //     module, served by the in-kernel CPIO server bound at boot).
     initramfs_demo(root_ns);
+
+    // 0h. Init skeleton: spawn the init bin (ImageId::Init) and reap it — proves
+    //     handle-set reception + the static-arena allocator stand up.
+    init_spawn_demo(notif);
 
     kprint(b"parent: creating a channel\n");
 

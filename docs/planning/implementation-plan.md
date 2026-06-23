@@ -1037,8 +1037,13 @@ initramfs defer to slice 7 (driven by fs-servers). Done as ordered PR parts:
   `KernelServer` (first subtree server) returning a read-only `MemoryObject` copy via the
   new `MemoryObject::try_new_filled`; bound into pid 1's root namespace at boot. Verified
   by the parent demo resolving+mapping `/initramfs/etc/init.toml`.
-- [ ] `userspace/init/` crate (`libkern + alloc` only) + initial handle-set reception
-  (Part 3).
+- [x] **Part 3 — init crate skeleton** (`phase-2/slice4-init-skeleton`):
+  `userspace/init` as a bare-target `#![no_std]`+`alloc` lib+bin (libkern only); static-
+  arena bump `#[global_allocator]` (host-tested); `_start` handle-set reception + alloc
+  proof + clean exit; spawnable via `ImageId::Init` and reaped by the parent demo.
+  Surfaced + fixed two userspace-runtime bugs init's first `alloc` use hit: a mis-placed
+  `compiler_builtins` `memcpy` (now strong `libkern::mem` intrinsics) and a `/DISCARD`-ed
+  `.got` (now kept in all four `user.ld`). See the decision log (2026-06-23).
 - [ ] Minimal TOML parser + init.toml parsing per [docs/spec/init-toml-schema.md] (Part 4).
 - [ ] init becomes PID 1 + reaping loop + bootstrap-flow skeleton (Part 5; mount loop
   stops before the Ready handshake — slice 7).
