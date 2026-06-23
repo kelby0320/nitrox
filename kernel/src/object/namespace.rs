@@ -28,6 +28,7 @@ use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
+use crate::object::kernel_server::KernelServerId;
 
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
 pub const NS_PATH_MAX: usize = 1024;
@@ -49,11 +50,37 @@ pub enum NsError {
     OutOfMemory,
 }
 
-/// One binding: the absolute path it owns, the resource it resolves to, and the
+/// What a binding resolves to. Either a **direct handle** (a bound `ObjectRef`,
+/// returned by a lookup directly) or a **Kernel Server** (an in-kernel resource
+/// server the lookup calls to *produce* a handle — see
+/// [`crate::object::kernel_server`]). The userspace-server target is slice 7.
+///
+/// Drop discipline (see "Mutation discipline"): `DirectHandle` owns an
+/// `ObjectRef` and must be dropped **outside** the namespace lock; `KernelServer`
+/// holds a `Copy` id and is drop-free.
+pub enum BindingTarget {
+    /// A directly-bound resource. A lookup returns a clone of this handle.
+    DirectHandle(ObjectRef),
+    /// An in-kernel resource server, identified by its dispatch id.
+    KernelServer(KernelServerId),
+}
+
+/// The result of [`Namespace::resolve`] for the matched binding: the same two
+/// kinds as [`BindingTarget`], but the direct-handle case carries a **cloned**
+/// `ObjectRef` (an atomic bump done under the lock) for the caller to own. The
+/// caller drops a `DirectHandle` **outside** the lock; `KernelServer` is drop-free.
+pub enum ResolvedTarget {
+    /// A cloned direct-handle resource, owned by the caller.
+    DirectHandle(ObjectRef),
+    /// An in-kernel resource server to dispatch to (id copied out).
+    KernelServer(KernelServerId),
+}
+
+/// One binding: the absolute path it owns, the target it resolves to, and the
 /// maximum rights a lookup through it may obtain.
 struct Binding {
     path: KVec<u8>,
-    target: ObjectRef,
+    target: BindingTarget,
     rights: Rights,
 }
 
@@ -136,7 +163,11 @@ impl Namespace {
         }
         guard
             .bindings
-            .try_push(Binding { path: p, target, rights })
+            .try_push(Binding {
+                path: p,
+                target: BindingTarget::DirectHandle(target),
+                rights,
+            })
             .expect("slot reserved above");
         // A mutation may change what any cached path resolves to; flush the whole
         // cache (cheap: byte-only `KVec`s, no `ObjectRef` drops). Mutations are rare.
@@ -144,9 +175,51 @@ impl Namespace {
         Ok(())
     }
 
+    /// Bind an in-kernel resource server (a [`KernelServerId`]) at `path` with
+    /// `rights` (the maximum a lookup through it may obtain). Like [`bind`], but
+    /// the target is a `Copy` dispatch id rather than a handle, so there is
+    /// nothing to hand back on error. Rejects an invalid path or a duplicate
+    /// exact path.
+    ///
+    /// [`bind`]: Namespace::bind
+    pub fn bind_kernel_server(
+        &self,
+        path: &[u8],
+        id: KernelServerId,
+        rights: Rights,
+    ) -> Result<(), NsError> {
+        validate_path(path)?;
+        let mut guard = self.inner.lock();
+        if guard.bindings.iter().any(|b| &b.path[..] == path) {
+            return Err(NsError::AlreadyBound);
+        }
+        // Reserve + copy the path before committing, so the `try_push` cannot fail
+        // (and so nothing is dropped under the lock — though a `KernelServer`
+        // binding holds no `ObjectRef` anyway).
+        if guard.bindings.try_reserve(1).is_err() {
+            return Err(NsError::OutOfMemory);
+        }
+        let mut p: KVec<u8> = KVec::new();
+        if p.try_extend_from_slice(path).is_err() {
+            return Err(NsError::OutOfMemory);
+        }
+        guard
+            .bindings
+            .try_push(Binding {
+                path: p,
+                target: BindingTarget::KernelServer(id),
+                rights,
+            })
+            .expect("slot reserved above");
+        guard.cache.clear();
+        Ok(())
+    }
+
     /// Remove the binding at the exact `path`, returning its `target` for the
     /// caller to drop **outside** the lock. `None` if nothing is bound there.
-    pub fn unbind(&self, path: &[u8]) -> Option<ObjectRef> {
+    /// (A returned `BindingTarget::DirectHandle` carries the `ObjectRef` to drop;
+    /// `KernelServer` is drop-free, but is still returned out for uniformity.)
+    pub fn unbind(&self, path: &[u8]) -> Option<BindingTarget> {
         let mut guard = self.inner.lock();
         let idx = guard.bindings.iter().position(|b| &b.path[..] == path)?;
         // `remove` moves the `Binding` out by value (no drop). We move its
@@ -159,20 +232,21 @@ impl Namespace {
         Some(b.target)
     }
 
-    /// Resolve `path` by **longest-prefix match**. Returns a **cloned** target
-    /// `ObjectRef` (an atomic refcount bump under the lock — keeps the resource
-    /// alive for the caller), the binding's `rights`, and the `suffix` of `path`
-    /// past the matched prefix (leading `/` stripped; empty on an exact match).
-    /// `None` if no binding covers `path`.
+    /// Resolve `path` by **longest-prefix match**. Returns the matched
+    /// [`ResolvedTarget`] (a **cloned** `ObjectRef` for a direct handle — an
+    /// atomic refcount bump under the lock — or the copied [`KernelServerId`] for
+    /// a kernel server), the binding's `rights`, and the `suffix` of `path` past
+    /// the matched prefix (leading `/` stripped; empty on an exact match). `None`
+    /// if no binding covers `path`.
     ///
     /// Pure resolution: the direct-handle leaf policy (a non-empty suffix on a
-    /// direct handle is *not found*) and rights attenuation are the lookup
-    /// syscall's job (Part C).
+    /// direct handle is *not found*), kernel-server dispatch, and rights
+    /// attenuation are the lookup syscall's job.
     ///
     /// Positive resolutions are cached (path → binding index); a repeat lookup of
     /// the same path skips the longest-prefix scan. The cache is flushed on every
     /// binding mutation, so a cached index always refers to the same binding.
-    pub fn resolve<'p>(&self, path: &'p [u8]) -> Option<(ObjectRef, Rights, &'p [u8])> {
+    pub fn resolve<'p>(&self, path: &'p [u8]) -> Option<(ResolvedTarget, Rights, &'p [u8])> {
         let mut guard = self.inner.lock();
 
         // Cache fast path: an exact prior lookup of this path. The cached index is
@@ -186,7 +260,7 @@ impl Namespace {
             let b = &guard.bindings[idx];
             let off = match_suffix_offset(&b.path, path)
                 .expect("a cached binding still prefix-matches its cached path");
-            return Some((b.target.clone(), b.rights, &path[off..]));
+            return Some((resolve_target(&b.target), b.rights, &path[off..]));
         }
 
         // Cold path: longest-prefix scan over the bindings.
@@ -204,7 +278,7 @@ impl Namespace {
         let (i, off) = best?;
         let result = {
             let b = &guard.bindings[i];
-            (b.target.clone(), b.rights, &path[off..])
+            (resolve_target(&b.target), b.rights, &path[off..])
         };
         // Insert into the cache (best-effort): copy the path, round-robin evict
         // when full. A failed path copy just skips caching — no correctness effect.
@@ -231,9 +305,11 @@ impl Namespace {
 }
 
 // No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock)
-// drops `inner` → the `bindings` `KVec` → each `Binding`'s `target` `ObjectRef`,
-// releasing every bound resource. (`Namespace` auto-derives `Send`/`Sync`: all
-// fields are — `ObjectRef` is `Send`/`Sync`, `SpinLock<T>: Sync` for `T: Send`.)
+// drops `inner` → the `bindings` `KVec` → each `Binding`'s `target`
+// `BindingTarget`, releasing every bound resource (a `DirectHandle`'s `ObjectRef`;
+// a `KernelServer` id is drop-free). (`Namespace` auto-derives `Send`/`Sync`: all
+// fields are — `ObjectRef`/`KernelServerId` are `Send`/`Sync`, `SpinLock<T>: Sync`
+// for `T: Send`.)
 
 /// Validate a namespace path: non-empty, absolute (`/`-prefixed), ≤
 /// [`NS_PATH_MAX`], and — except for root `/` — every `/`-separated component
@@ -255,6 +331,17 @@ pub fn validate_path(path: &[u8]) -> Result<(), NsError> {
         }
     }
     Ok(())
+}
+
+/// Project a stored [`BindingTarget`] into a [`ResolvedTarget`] for return from
+/// [`Namespace::resolve`], **under the namespace lock**: a direct handle is
+/// `clone`d (an atomic refcount bump — never a drop), a kernel server's id is
+/// copied. Neither operation drops an `ObjectRef`, so it is safe to hold the lock.
+fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
+    match t {
+        BindingTarget::DirectHandle(obj) => ResolvedTarget::DirectHandle(obj.clone()),
+        BindingTarget::KernelServer(id) => ResolvedTarget::KernelServer(*id),
+    }
 }
 
 /// If `binding` is a component-boundary prefix of the absolute `query`, return
@@ -488,5 +575,68 @@ mod tests {
         drop(r);
         assert_eq!(test_probe::namespace_destroys(), 1, "namespace destructor ran");
         assert_eq!(test_probe::timer_destroys(), 2, "bound targets cascaded");
+    }
+
+    #[test]
+    fn bind_kernel_server_resolves_to_the_id() {
+        let n = ns();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
+            .unwrap();
+        // Exact match → empty suffix, the kernel-server target, its rights.
+        let (target, rights, suf) = n.resolve(b"/dev/entropy").unwrap();
+        assert_eq!(suf, b"");
+        assert_eq!(rights, Rights::READ);
+        match target {
+            ResolvedTarget::KernelServer(KernelServerId::Entropy) => {}
+            ResolvedTarget::DirectHandle(_) => panic!("expected a kernel-server target"),
+        }
+        // A deeper path resolves to the same server with a non-empty suffix (the
+        // leaf-vs-subtree decision is the lookup syscall's, not resolve's).
+        let (target, _, suf) = n.resolve(b"/dev/entropy/x").unwrap();
+        assert_eq!(suf, b"x");
+        assert!(matches!(target, ResolvedTarget::KernelServer(_)));
+    }
+
+    #[test]
+    fn bind_kernel_server_rejects_invalid_and_duplicate() {
+        let n = ns();
+        assert_eq!(
+            n.bind_kernel_server(b"bad", KernelServerId::Entropy, Rights::READ),
+            Err(NsError::InvalidPath)
+        );
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
+            .unwrap();
+        assert_eq!(
+            n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ),
+            Err(NsError::AlreadyBound)
+        );
+    }
+
+    #[test]
+    fn direct_and_kernel_server_bindings_coexist() {
+        let n = ns();
+        n.bind(b"/dev/log", target(), Rights::LOOKUP).unwrap();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
+            .unwrap();
+        assert!(matches!(
+            n.resolve(b"/dev/log").unwrap().0,
+            ResolvedTarget::DirectHandle(_)
+        ));
+        assert!(matches!(
+            n.resolve(b"/dev/entropy").unwrap().0,
+            ResolvedTarget::KernelServer(_)
+        ));
+    }
+
+    #[test]
+    fn unbind_kernel_server_returns_drop_free_target() {
+        let n = ns();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
+            .unwrap();
+        match n.unbind(b"/dev/entropy").expect("was bound") {
+            BindingTarget::KernelServer(KernelServerId::Entropy) => {}
+            BindingTarget::DirectHandle(_) => panic!("expected a kernel-server target"),
+        }
+        assert!(n.unbind(b"/dev/entropy").is_none(), "already removed");
     }
 }

@@ -23,6 +23,7 @@
 pub mod entropy_object;
 pub mod header;
 pub mod ipc_channel;
+pub mod kernel_server;
 pub mod memory_object;
 pub mod namespace;
 pub mod notification_channel;
@@ -36,8 +37,9 @@ pub use header::{KObjectHeader, ObjectRef};
 pub use ipc_channel::{
     BlockSendOutcome, IpcChannel, ReclaimedSend, RecvState, SendOutcome, StoredMsg, TransferRef,
 };
+pub use kernel_server::{KernelServerId, OpStatus};
 pub use memory_object::MemoryObject;
-pub use namespace::{Namespace, NsError};
+pub use namespace::{BindingTarget, Namespace, NsError, ResolvedTarget};
 pub use notification_channel::NotificationChannel;
 pub use pending_op::PendingOperation;
 pub use process::Process;

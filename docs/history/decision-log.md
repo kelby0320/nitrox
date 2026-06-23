@@ -3935,3 +3935,48 @@ fs-server, its first consumer). Updated the phasing note, binding-targets table,
 summary (now a slice-1 / slice-3 / slice-7 three-column table). No code, no ABI
 change. Branch `phase-2/slice3-rs-framework-design` off `main`. Next: Part B (the
 `BindingTarget` enum + `KernelServer` dispatch + lookup wiring + boot binding).
+
+## 2026-06-22 — Phase 2 slice 3, Part B: in-kernel resource-server framework (code)
+
+Implemented the Part-A design. New module `kernel/src/object/kernel_server.rs` holds
+the registry: `KernelServerId` (a `Copy` dispatch id, `Entropy` to start), `OpStatus`
+(`Completed(ObjectRef)` | `Rejected(KError)`), and `dispatch(id, suffix, requested)`
+fanning out by `match` (the kobject dispatch-by-match idiom). `OpStatus::Pending` is
+**not** added yet — it is the userspace (slice-7) state; an in-kernel server answers
+synchronously, so representing it now would be an unconstructed variant.
+
+**`BindingTarget` replaces the bare `ObjectRef` binding target.** `namespace.rs`'s
+`Binding.target` is now `BindingTarget::{DirectHandle(ObjectRef) | KernelServer(id)}`.
+`bind` keeps its signature (wraps `DirectHandle` internally, still hands the
+`ObjectRef` back on error for outside-lock drop); new `bind_kernel_server` takes a
+`Copy` id (nothing to hand back). `unbind` now returns `Option<BindingTarget>` (the
+caller drops it outside the lock — a `KernelServer` drop is a no-op). `resolve`
+returns a `ResolvedTarget` (a **clone** of the `ObjectRef` for a direct handle, the
+**copied** id for a server) — both lock-safe (no `ObjectRef` drop under the lock,
+preserving the slice-1 mutation discipline).
+
+**`sys_ns_lookup` dispatch.** A resolved `KernelServer` calls
+`kernel_server::dispatch` *in the caller's syscall context*; `Completed(obj)` installs
+the handle with `requested ∩ binding.rights` (the same install path direct handles
+take, factored into a local `install` closure), `Rejected(err)` is delivered through
+the **pre-signalled `PendingOperation`**. Synchronous: no IPC, no cross-context
+install. The leaf-vs-subtree decision moved into the server (the entropy server
+rejects a non-empty suffix), so `resolve` no longer applies the direct-handle leaf
+policy to server targets.
+
+**`/dev/entropy` is the first Kernel Server** (the whole server, folded into Part B as
+the demonstrator — entropy is complete and it closes the loop that motivated landing
+entropy first; `/proc/self` + the `/dev` stub remain Part C). A lookup mints an
+`EntropyObject` (the object `sys_entropy_create` returns). The **kernel binds it into
+pid 1's root namespace at boot** (`main.rs`, rights = the `entropy_rights` band), and
+children inherit it via slice-1 namespace inheritance. The `parent` QEMU demo resolves
+`/dev/entropy` from `rsi` and reads from the handed-back handle — verified end-to-end
+(`/dev/entropy resolved+read ok`), distinct from the existing `sys_entropy_create`
+demo.
+
+**No ABI-hash impact:** `BindingTarget`/`ResolvedTarget`/`OpStatus`/`KernelServerId`
+are internal kernel types; `sys_ns_lookup`'s args + PO contract, `entropy_rights`, and
+the `KObjectType` set are unchanged. Verified: `cargo xtask build` / `check-arch` /
+`test` (456, +6) / `qemu` all clean. Branch `phase-2/slice3-kernel-server-framework` off
+`main`. Next: Part C (`/proc/self` self-reference servers + the `/dev` `DeviceNode`
+stub).

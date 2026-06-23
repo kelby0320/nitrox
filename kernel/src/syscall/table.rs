@@ -34,7 +34,8 @@ use crate::mm::vmm::{Protection, VAddrRange};
 use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
-use crate::object::namespace::{NS_PATH_MAX, validate_path};
+use crate::object::kernel_server::{self, OpStatus};
+use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, validate_path};
 use crate::object::{
     BlockSendOutcome, EntropyObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
     NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState,
@@ -994,8 +995,9 @@ pub fn sys_ns_unbind(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
     match ns.unbind(path) {
-        // Release the removed binding's target reference outside the lock
-        // (`unbind` returned it for exactly this).
+        // Drop the removed binding's target outside the lock (`unbind` returned it
+        // for exactly this): a `DirectHandle` releases its `ObjectRef` here; a
+        // `KernelServer` target is drop-free.
         Some(target) => {
             drop(target);
             Ok(0)
@@ -1146,27 +1148,42 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     // --- resolve + install (failures delivered via the PO) ---
     // SAFETY: live `Namespace` (type verified by `lookup_typed`).
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+
+    // Install an `obj` into the caller's table with `requested ∩ binding_rights`,
+    // returning the `(status, result)` pair the PO is signalled with. Shared by the
+    // direct-handle and kernel-server-`Completed` paths.
+    let install = |obj: ObjectRef, binding_rights: Rights| -> (i32, u64) {
+        let attenuated = requested & binding_rights;
+        // Hand `allocate` the reference via `into_raw`.
+        let (tptr, tty) = obj.into_raw();
+        match global::get().allocate(pid, tptr, tty, attenuated) {
+            Ok(h) => (0, h.bits()),
+            Err(e) => {
+                // SAFETY: `allocate` did not adopt the reference; reclaim it.
+                drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+                (map_handle_err(e) as i32, 0)
+            }
+        }
+    };
+
     let (status, result): (i32, u64) = match ns.resolve(path) {
         None => (KError::NotFound as i32, 0),
-        // Direct-handle leaf: a non-empty suffix has no sub-resource → not found.
-        // (Slice 1 binds only direct handles; resource-server suffix forwarding
-        // is slice 3.)
-        Some((target, _rights, suffix)) if !suffix.is_empty() => {
-            drop(target);
-            (KError::NotFound as i32, 0)
+        Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
+            if suffix.is_empty() {
+                install(target, binding_rights)
+            } else {
+                // Direct-handle leaf: a non-empty suffix has no sub-resource.
+                drop(target);
+                (KError::NotFound as i32, 0)
+            }
         }
-        Some((target, binding_rights, _)) => {
-            let attenuated = requested & binding_rights;
-            // Install the cloned target into the caller's table with attenuated
-            // rights; hand `allocate` the reference via `into_raw`.
-            let (tptr, tty) = target.into_raw();
-            match global::get().allocate(pid, tptr, tty, attenuated) {
-                Ok(h) => (0, h.bits()),
-                Err(e) => {
-                    // SAFETY: `allocate` did not adopt the reference; reclaim it.
-                    drop(unsafe { ObjectRef::from_raw(tptr, tty) });
-                    (map_handle_err(e) as i32, 0)
-                }
+        Some((ResolvedTarget::KernelServer(id), binding_rights, suffix)) => {
+            // Call the in-kernel server in this syscall context; it produces a
+            // handle (or rejects). Suffix interpretation (leaf vs. subtree) is the
+            // server's policy. The result still flows through the pre-signalled PO.
+            match kernel_server::dispatch(id, suffix, requested) {
+                OpStatus::Completed(obj) => install(obj, binding_rights),
+                OpStatus::Rejected(err) => (err as i32, 0),
             }
         }
     };

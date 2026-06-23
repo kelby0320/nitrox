@@ -966,15 +966,22 @@ reserved for slice 7), the `BindingTarget` enum (`DirectHandle` + `KernelServer`
 boot-time binding into pid 1's root namespace, the per-server content model (a lookup
 returns a handle to a kernel object), and the `/proc/self` authority model below.
 
-**Part B — the framework.** `BindingTarget` enum in `namespace.rs`; the `KernelServer`
-dispatch + a small registry; wire `sys_ns_lookup` to call a server synchronously →
-install the handle → pre-signal the PO; bind servers at boot. Host-tested with one
-trivial server.
+**Part B — the framework + `/dev/entropy` (done, `phase-2/slice3-kernel-server-framework`).**
+`object/kernel_server.rs` (`KernelServerId`, `OpStatus::{Completed|Rejected}`, the
+`dispatch` registry); `BindingTarget`/`ResolvedTarget` in `namespace.rs` (replacing the
+bare `ObjectRef` target; `bind_kernel_server`; `unbind`/`resolve` updated, drop
+discipline preserved); `sys_ns_lookup` calls a server synchronously → installs the
+rights-attenuated handle → pre-signals the PO. The **whole `/dev/entropy` server** was
+folded in as the demonstrator (entropy is complete; it closes the loop that motivated
+landing entropy first) — bound into pid 1's root namespace at boot (`main.rs`),
+inherited by children, exercised by a `parent` QEMU demo (resolve → read). Host-tested
+(`kernel_server` dispatch + `namespace` bind/resolve/unbind). No ABI-hash impact.
 
-**Part C — the servers + demo.**
+**Part C — the remaining servers + demo.**
 
-- [ ] `/dev/entropy` — lookup returns an `EntropyObject` (reuses slice 2;
-  `sys_entropy_read` on the resolved handle).
+- [x] `/dev/entropy` — lookup returns an `EntropyObject` (reuses slice 2;
+  `sys_entropy_read` on the resolved handle). **Landed in Part B** as the framework
+  demonstrator.
 - [ ] `/proc/self/*` — **self-reference only**: `process`/`thread`/`namespace`
   resolve to the **caller's own** objects (derived from the calling syscall context,
   no pid parameter); `pid`/`tid` to small readable snapshots. Registry-free; no
