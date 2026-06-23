@@ -587,7 +587,7 @@ mod tests {
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::READ);
         match target {
-            ResolvedTarget::KernelServer(KernelServerId::Entropy) => {}
+            ResolvedTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
             ResolvedTarget::DirectHandle(_) => panic!("expected a kernel-server target"),
         }
         // A deeper path resolves to the same server with a non-empty suffix (the
@@ -634,7 +634,7 @@ mod tests {
         n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
             .unwrap();
         match n.unbind(b"/dev/entropy").expect("was bound") {
-            BindingTarget::KernelServer(KernelServerId::Entropy) => {}
+            BindingTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
             BindingTarget::DirectHandle(_) => panic!("expected a kernel-server target"),
         }
         assert!(n.unbind(b"/dev/entropy").is_none(), "already removed");

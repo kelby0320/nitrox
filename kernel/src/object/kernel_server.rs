@@ -22,6 +22,7 @@ use crate::libkern::KBox;
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::object::EntropyObject;
 use crate::object::ObjectRef;
+use crate::object::Process;
 use crate::syscall::error::KError;
 
 /// Identifies one in-kernel resource server in the dispatch registry. A
@@ -34,7 +35,16 @@ use crate::syscall::error::KError;
 pub enum KernelServerId {
     /// `/dev/entropy` — the kernel CSPRNG (see [`entropy_server`]).
     Entropy,
-    // `/proc/self`, `/dev` — slice 3 Part C.
+    /// `/proc/self/process` — the caller's own [`Process`] (see [`proc_self_process`]).
+    ProcSelfProcess,
+    /// `/proc/self/thread` — the calling [`Thread`](crate::object::Thread)
+    /// (see [`proc_self_thread`]).
+    ProcSelfThread,
+    /// `/proc/self/namespace` — the caller's root
+    /// [`Namespace`](crate::object::Namespace) (see [`proc_self_namespace`]).
+    ProcSelfNamespace,
+    // `/proc/self/status` (numeric pid/tid) and the `/dev` stub are deferred —
+    // see `docs/rationale/deferred-decisions.md`.
 }
 
 /// The outcome of a resource-server lookup — the umbrella RS contract's return.
@@ -67,6 +77,9 @@ pub enum OpStatus {
 pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatus {
     match id {
         KernelServerId::Entropy => entropy_server(suffix, requested),
+        KernelServerId::ProcSelfProcess => proc_self_process(suffix, requested),
+        KernelServerId::ProcSelfThread => proc_self_thread(suffix, requested),
+        KernelServerId::ProcSelfNamespace => proc_self_namespace(suffix, requested),
     }
 }
 
@@ -89,6 +102,55 @@ fn entropy_server(suffix: &[u8], _requested: Rights) -> OpStatus {
             ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::EntropyObject)
         }),
         Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+    }
+}
+
+// --- /proc/self — self-reference servers (no ambient authority) -----------
+//
+// Each is a **leaf** (non-empty suffix → `NotFound`) that returns the **caller's
+// own** object, derived from the running syscall context — there is no pid
+// parameter to forge, and the facility is reachable only if a supervisor bound it
+// into the caller's namespace. See `docs/architecture/namespace-and-resource-servers.md`
+// § "`/proc/self`". The returned `ObjectRef` is a clone (an atomic refcount bump),
+// owned by the caller; rights attenuation to the binding's cap is the lookup
+// syscall's job. `None` (a kernel/boot thread with no process) → `NotFound`.
+
+/// `/proc/self/process` — the caller's own [`Process`] handle.
+fn proc_self_process(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    match crate::sched::current_process() {
+        Some(obj) => OpStatus::Completed(obj),
+        None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// `/proc/self/thread` — the calling [`Thread`](crate::object::Thread) handle.
+fn proc_self_thread(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    match crate::sched::current_thread() {
+        Some(obj) => OpStatus::Completed(obj),
+        None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// `/proc/self/namespace` — the caller's root [`Namespace`](crate::object::Namespace)
+/// handle (the same object `Process::namespace` resolves names against).
+fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    let ns = crate::sched::current_process().and_then(|p| {
+        // SAFETY: `current_process` returns a live `Process` ObjectRef; `p` pins it
+        // for this borrow. `namespace_ref` clones the stored namespace ObjectRef.
+        unsafe { &*(p.as_ptr() as *const Process) }.namespace_ref()
+    });
+    match ns {
+        Some(obj) => OpStatus::Completed(obj),
+        None => OpStatus::Rejected(KError::NotFound),
     }
 }
 
@@ -117,6 +179,25 @@ mod tests {
             OpStatus::Rejected(KError::NotFound) => {}
             OpStatus::Rejected(e) => panic!("expected NotFound, got {e:?}"),
             OpStatus::Completed(_) => panic!("a non-empty suffix must not resolve on a leaf"),
+        }
+    }
+
+    // The `/proc/self/*` leaves reject a non-empty suffix; that arm runs *before*
+    // any scheduler access, so it is reachable host-side. Their success arms need a
+    // running syscall context (`current_process`/`current_thread`) and are covered
+    // by the QEMU `proc_self_demo`, not host tests.
+    #[test]
+    fn proc_self_leaves_reject_non_empty_suffix() {
+        for id in [
+            KernelServerId::ProcSelfProcess,
+            KernelServerId::ProcSelfThread,
+            KernelServerId::ProcSelfNamespace,
+        ] {
+            match dispatch(id, b"sub", Rights::empty()) {
+                OpStatus::Rejected(KError::NotFound) => {}
+                OpStatus::Rejected(e) => panic!("{id:?}: expected NotFound, got {e:?}"),
+                OpStatus::Completed(_) => panic!("{id:?}: a non-empty suffix must not resolve"),
+            }
         }
     }
 }

@@ -459,6 +459,46 @@ fn run_first_userspace() {
         return;
     }
 
+    // `/proc/self/*` — self-reference servers. Each binding is just a dispatch id;
+    // the *answer* is the looking-up thread's OWN object, resolved per-caller from
+    // syscall context (no ambient authority — see `kernel_server`). One binding is
+    // therefore shared by all callers/descendants. Per-leaf bindings (not one
+    // `/proc/self` prefix) because the returned types — Process / Thread / Namespace
+    // — carry disjoint principal rights, so each needs its own type-correct cap.
+    let proc_self_principal_rights = Rights::SIGNAL
+        | Rights::TERMINATE
+        | Rights::DUPLICATE
+        | Rights::INSPECT
+        | Rights::TRANSFER;
+    // The namespace view is LOOKUP-only (a resolve view; self already holds a
+    // full-rights root-namespace handle via `rsi`). No BIND — granting self-bind
+    // ambiently would be a capability-escalation smell.
+    let proc_self_namespace_rights =
+        Rights::LOOKUP | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    let proc_self_binds = [
+        (
+            &b"/proc/self/process"[..],
+            KernelServerId::ProcSelfProcess,
+            proc_self_principal_rights,
+        ),
+        (
+            &b"/proc/self/thread"[..],
+            KernelServerId::ProcSelfThread,
+            proc_self_principal_rights,
+        ),
+        (
+            &b"/proc/self/namespace"[..],
+            KernelServerId::ProcSelfNamespace,
+            proc_self_namespace_rights,
+        ),
+    ];
+    for (path, id, rights) in proc_self_binds {
+        if ns.bind_kernel_server(path, id, rights).is_err() {
+            kprintln!("init: binding /proc/self/* failed");
+            return;
+        }
+    }
+
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).

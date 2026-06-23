@@ -1726,6 +1726,20 @@ pub fn current_process() -> Option<ObjectRef> {
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.process_ref()
 }
 
+/// The currently running [`Thread`](crate::object::Thread) object, cloned as an
+/// [`ObjectRef`](crate::object::ObjectRef) that outlives the lock. During a
+/// syscall this is the calling user thread — the `/proc/self/thread` kernel
+/// server uses it to hand the caller a handle to itself. Takes only the rank-1
+/// run-queue lock. `None` only before the first thread runs (never during a
+/// syscall). Unlike [`current_process`], `current` *is* the Thread `ObjectRef`,
+/// so it is cloned directly.
+pub fn current_thread() -> Option<ObjectRef> {
+    let g = SCHED.lock();
+    // SAFETY-equivalent note: `ObjectRef::clone` is an atomic refcount bump (no
+    // `&mut`, no drop), sound to perform under the run-queue lock.
+    g.current.clone()
+}
+
 /// The idle thread body: reap any exited thread, then `hlt` until the next
 /// interrupt. Runs with IF=1 (set by
 /// [`thread_trampoline`](crate::arch::thread_trampoline)), so the periodic
