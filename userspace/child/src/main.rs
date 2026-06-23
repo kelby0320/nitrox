@@ -16,111 +16,25 @@
 #![no_main]
 
 use core::arch::asm;
-
-const SYS_MEMORY_CREATE: u64 = 4;
-const SYS_MEMORY_MAP: u64 = 5;
-const SYS_WAIT: u64 = 10;
-const SYS_NS_LOOKUP: u64 = 23;
-const SYS_NS_BIND: u64 = 24;
-const SYS_CHANNEL_SEND: u64 = 13;
-const SYS_CHANNEL_RECV: u64 = 14;
-const SYS_PROCESS_EXIT: u64 = 16;
-const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
-
-/// `SendMode::NoBlock` (`kernel/src/libkern/ipc.rs`).
-const SENDMODE_NOBLOCK: u64 = 1;
-/// Rights bits (`kernel/src/libkern/handle.rs`).
-const RIGHT_MAP_READ: u64 = 1 << 15;
-const RIGHT_MAP_WRITE: u64 = 1 << 16;
+use libkern::{
+    IpcMsg, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_BIND, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2,
+    syscall4, syscall5,
+};
 
 const PAGE: u64 = 4096;
 /// The marker the sender writes into the transferred object; the receiver
 /// verifies it after mapping.
 const MARKER: u64 = 0x00C0_FFEE;
 
-/// Userspace mirror of the kernel `IpcMsg` (`kernel/src/libkern/ipc.rs`): one
-/// page; header fields flat, then a 4008-byte payload and an 8-entry handle array.
-#[repr(C, align(4096))]
-struct IpcMsgBuf {
-    sender_pid: u32,
-    payload_len: u32,
-    handle_count: u8,
-    _pad1: u8,
-    flags: u16,
-    _pad2: [u8; 4],
-    timestamp: u64,
-    payload: [u8; 4008],
-    handles: [u64; 8],
-}
-
-impl IpcMsgBuf {
-    const ZEROED: IpcMsgBuf = IpcMsgBuf {
-        sender_pid: 0,
-        payload_len: 0,
-        handle_count: 0,
-        _pad1: 0,
-        flags: 0,
-        _pad2: [0; 4],
-        timestamp: 0,
-        payload: [0; 4008],
-        handles: [0; 8],
-    };
-}
-
-static mut SEND_MSG: IpcMsgBuf = IpcMsgBuf::ZEROED;
-static mut RECV_MSG: IpcMsgBuf = IpcMsgBuf::ZEROED;
+static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
+static mut RECV_MSG: IpcMsg = IpcMsg::ZEROED;
 static mut RECV_COUNT: usize = 0;
 /// `sys_channel_send`/`recv` transferred-handle arrays.
 static mut SEND_HANDLES: [u64; 1] = [0];
 static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
-
-#[inline]
-unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let ret;
-    // SAFETY: register-only syscall; clobbers only the documented scratch regs.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
-            out("rcx") _, out("r11") _, lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall2(nr: u64, a0: u64, a1: u64) -> i64 {
-    // SAFETY: see `syscall4`.
-    unsafe { syscall4(nr, a0, a1, 0, 0) }
-}
-
-#[inline]
-unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
-    let ret;
-    // SAFETY: as `syscall4`, plus `r8` for the 5th argument.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4,
-            out("rcx") _, out("r11") _, lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-fn kprint(msg: &[u8]) {
-    // SAFETY: passes a valid (ptr, len) the kernel copies from.
-    unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
-}
-
-fn exit(status: i64) -> ! {
-    // SAFETY: process exit diverges in the kernel; control never returns.
-    unsafe {
-        asm!("syscall", in("rax") SYS_PROCESS_EXIT, in("rdi") status, options(noreturn, nostack));
-    }
-}
 
 /// Sender (role 0): create a MemoryObject, mark it, transfer the handle.
 fn run_sender(endpoint: u64) -> ! {
@@ -144,7 +58,7 @@ fn run_sender(endpoint: u64) -> ! {
     // Build a one-handle message and transfer the memory handle to the sibling.
     // SAFETY: SEND_MSG / SEND_HANDLES are valid writable .bss buffers.
     unsafe {
-        SEND_MSG.payload_len = 0;
+        SEND_MSG.header.payload_len = 0;
         SEND_HANDLES[0] = mem_h;
     }
     // SAFETY: valid endpoint + message + handles pointer; count 1, NoBlock.

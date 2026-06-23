@@ -25,115 +25,19 @@
 #![no_main]
 
 use core::arch::asm;
+use libkern::*;
 
-// --- Syscall numbers (must match `kernel/src/syscall/table.rs`) ----------
-const SYS_HANDLE_CLOSE: u64 = 0;
-const SYS_HANDLE_STAT: u64 = 3;
-const SYS_MEMORY_CREATE: u64 = 4;
-const SYS_MEMORY_MAP: u64 = 5;
-const SYS_WAIT: u64 = 10;
-const SYS_NOTIF_RECV: u64 = 11;
-const SYS_CHANNEL_CREATE: u64 = 12;
-const SYS_CHANNEL_SEND: u64 = 13;
-const SYS_CHANNEL_RECV: u64 = 14;
-const SYS_PROCESS_SPAWN: u64 = 15;
-const SYS_PROCESS_EXIT: u64 = 16;
-const SYS_THREAD_CREATE: u64 = 19;
-const SYS_THREAD_GET_REGISTERS: u64 = 20;
-const SYS_EXCEPTION_RESUME: u64 = 21;
-const SYS_NS_CREATE: u64 = 22;
-const SYS_NS_LOOKUP: u64 = 23;
-const SYS_NS_BIND: u64 = 24;
-const SYS_NS_UNBIND: u64 = 25;
-const SYS_ENTROPY_CREATE: u64 = 26;
-const SYS_ENTROPY_READ: u64 = 27;
-const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
+/// `KError::TimedOut` as an `IoResult.status` value (derived from `libkern`).
+const KERR_TIMED_OUT: i32 = KError::TimedOut.as_i32();
 
-/// `SendMode` values (`kernel/src/libkern/ipc.rs`).
-const SENDMODE_BLOCK: u64 = 0;
-const SENDMODE_NOBLOCK: u64 = 1;
-const SENDMODE_BLOCKBOUNDED: u64 = 2;
-
-/// `KError::TimedOut` (`kernel/src/syscall/error.rs`), as an `IoResult.status`.
-const KERR_TIMED_OUT: i32 = -12;
-
-/// Rights bits (`kernel/src/libkern/handle.rs`): the full set an endpoint
-/// carries, handed to each child.
-const RIGHT_DUPLICATE: u64 = 1 << 0;
-const RIGHT_TRANSFER: u64 = 1 << 1;
-const RIGHT_INSPECT: u64 = 1 << 2;
-const RIGHT_WAIT: u64 = 1 << 3;
-const RIGHT_READ: u64 = 1 << 8;
-const RIGHT_LOOKUP: u64 = 1 << 13;
-const RIGHT_SEND: u64 = 1 << 18;
-const RIGHT_RECV: u64 = 1 << 19;
-
-/// `KObjectType` discriminants (`kernel/src/libkern/handle.rs`), mirrored to
-/// verify resolved `/proc/self/*` handles via `sys_handle_stat`.
-const KOBJ_PROCESS: u32 = 1;
-const KOBJ_THREAD: u32 = 2;
-const KOBJ_NAMESPACE: u32 = 3;
+/// The full rights set an IPC endpoint carries, handed to each child.
 const ENDPOINT_RIGHTS: u64 =
     RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
-
-/// `MAP_*` rights bits (`kernel/src/libkern/handle.rs`) for mapping the worker
-/// stack read/write.
-const RIGHT_MAP_READ: u64 = 1 << 15;
-const RIGHT_MAP_WRITE: u64 = 1 << 16;
 
 /// One page; the worker thread's stack size.
 const PAGE: u64 = 4096;
 /// `sys_exception_resume` disposition: terminate the thread with a code.
 const DISPOSITION_TERMINATE: u64 = 2;
-
-/// `ImageId::Child` (`kernel/src/libkern/spawn.rs`).
-const IMAGE_CHILD: u32 = 0;
-/// `Notification::ChildExited` discriminant (`kernel/src/libkern/notification.rs`).
-const KIND_CHILD_EXITED: u32 = 0x0200;
-/// `Notification::SegFault` discriminant (`kernel/src/libkern/notification.rs`).
-const KIND_SEG_FAULT: u32 = 0x0100;
-
-/// Userspace mirror of the kernel `ThreadArgs` (`kernel/src/libkern/thread.rs`):
-/// a 64-byte block — `entry`, `user_sp`, `arg0`, then 40 reserved bytes.
-#[repr(C)]
-struct ThreadArgs {
-    entry: u64,
-    user_sp: u64,
-    arg0: u64,
-    reserved: [u8; 40],
-}
-
-/// Userspace mirror of the kernel `RegisterValues` (`kernel/src/libkern/thread.rs`):
-/// 18 `u64`s — the 16 GPRs (incl. `rsp`), then `rip` (index 16) and `rflags`.
-#[repr(C, align(8))]
-struct RegisterValues {
-    regs: [u64; 18],
-}
-/// Index of `rip` within [`RegisterValues::regs`].
-const REG_RIP: usize = 16;
-
-/// Userspace mirror of the kernel `SpawnArgs` (`kernel/src/libkern/spawn.rs`).
-#[repr(C)]
-struct SpawnArgs {
-    image: u32,
-    handle_count: u32,
-    move_mask: u32,
-    _pad: u32,
-    arg0: u64,
-    handles: [u64; 4],
-    rights: [u64; 4],
-    /// Child's root namespace: 0 = inherit the parent's; non-null = a constructed
-    /// (restricted) namespace the child gets a LOOKUP-only handle to.
-    namespace: u64,
-}
-
-/// Mirror of the kernel `Notification` (`kernel/src/libkern/notification.rs`):
-/// a 64-byte record, `u32` kind + 60-byte body.
-#[repr(C, align(8))]
-struct NotificationBuf {
-    kind: u32,
-    body: [u8; 60],
-}
 
 static mut END0: u64 = 0;
 static mut END1: u64 = 0;
@@ -157,7 +61,7 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
     namespace: 0, // set at runtime to the constructed child namespace
 };
-static mut NOTIF: NotificationBuf = NotificationBuf { kind: 0, body: [0; 60] };
+static mut NOTIF: Notification = Notification::zeroed();
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
@@ -167,7 +71,7 @@ static mut MSGBUF: [u8; 4096] = [0; 4096];
 static mut HBUF: [u64; 8] = [0; 8];
 /// Recv'd handle-count out-param.
 static mut RECV_COUNT: usize = 0;
-static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, reserved: [0; 40] };
+static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, _reserved: [0; 40] };
 static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
 
 /// The worker thread's entry point: write to a deliberately-unmapped address so
@@ -183,96 +87,6 @@ extern "C" fn worker_fault() -> ! {
         // SAFETY: `pause` is always valid in ring 3 and has no effects.
         unsafe { asm!("pause", options(nomem, nostack)) };
     }
-}
-
-#[inline]
-unsafe fn syscall4(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64) -> i64 {
-    let ret;
-    // SAFETY: register-only syscall; clobbers only the documented scratch regs.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3,
-            out("rcx") _, out("r11") _, lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall1(nr: u64, a0: u64) -> i64 {
-    // SAFETY: see `syscall4`.
-    unsafe { syscall4(nr, a0, 0, 0, 0) }
-}
-
-#[inline]
-unsafe fn syscall5(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64) -> i64 {
-    let ret;
-    // SAFETY: as `syscall4`, plus `r8` for the 5th argument.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4,
-            out("rcx") _, out("r11") _, lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-#[inline]
-unsafe fn syscall6(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -> i64 {
-    let ret;
-    // SAFETY: as `syscall5`, plus `r9` for the 6th argument.
-    unsafe {
-        asm!(
-            "syscall",
-            in("rax") nr, in("rdi") a0, in("rsi") a1, in("rdx") a2, in("r10") a3, in("r8") a4,
-            in("r9") a5,
-            out("rcx") _, out("r11") _, lateout("rax") ret,
-        );
-    }
-    ret
-}
-
-fn kprint(msg: &[u8]) {
-    // SAFETY: passes a valid (ptr, len) the kernel copies from.
-    unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
-}
-
-fn exit(status: i64) -> ! {
-    // SAFETY: process exit diverges in the kernel; control never returns.
-    unsafe {
-        asm!("syscall", in("rax") SYS_PROCESS_EXIT, in("rdi") status, options(noreturn, nostack));
-    }
-}
-
-/// Print a small unsigned decimal (for pids/codes), no allocation.
-fn kprint_u64(mut v: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    if v == 0 {
-        kprint(b"0");
-        return;
-    }
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    kprint(&buf[i..]);
-}
-
-/// Print a 64-bit value as `0x`-prefixed, 16-digit lowercase hex (for the
-/// faulting `rip`), no allocation.
-fn kprint_hex(v: u64) {
-    let mut buf = [0u8; 18];
-    buf[0] = b'0';
-    buf[1] = b'x';
-    for i in 0..16 {
-        let nib = ((v >> ((15 - i) * 4)) & 0xf) as u8;
-        buf[2 + i] = if nib < 10 { b'0' + nib } else { b'a' + (nib - 10) };
-    }
-    kprint(&buf);
 }
 
 /// The exception demo (step 0): create a second thread in this process that

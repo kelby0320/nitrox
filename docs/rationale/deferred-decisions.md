@@ -168,6 +168,16 @@ surface exists. Trigger: either of those. See the decision log (2026-06-22).
 
 ### Runtime libraries
 
+**`cargo xtask abi-sync-check`.** `userspace/libkern` is the canonical userspace
+mirror of the kernel ABI (syscall numbers, `#[repr(C)]` layouts, `Rights`/`KError`/
+`KObjectType` values). A checker that parses both sides and verifies they agree is
+deferred: the compile-time `offset_of!`/`size_of` asserts on both the kernel and
+`libkern` sides, plus a green `cargo xtask qemu` (the demos exercise nearly the whole
+syscall surface against the live kernel), give most of the protection for far less
+cost. Build the real checker when a second non-demo consumer (eshell, fs-server) makes
+drift likelier. Until then, changing an ABI type means editing both copies by hand.
+Trigger: that second consumer, or a drift bug.
+
 **TypedRecord support for enums.** The `#[derive(TypedRecord)]` macro initially supports primitive scalars, `String`, `Vec<T>` of TypedRecord, nested structs, `Option<T>`, and `RawHandle`. Enums (tagged unions) are deferred; they require wire-format extensions and more complex derive code. Trigger: a concrete need; not foreseen as urgent.
 
 **TypedRecord support for generics beyond `Vec<T>`.** Same reasoning. Deferred until a concrete need.
