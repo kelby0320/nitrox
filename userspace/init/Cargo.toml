@@ -4,3 +4,16 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+libkern = { path = "../libkern" }
+
+# A library + binary split: the library holds init's host-testable internals (the
+# bump-allocator math now; the `toml_lite` parser in Part 4), the binary is the
+# bare-target PID-1 entry point. `cargo xtask test` runs the lib tests on the host
+# (`--lib` skips the `#![no_main]` bin); `cargo xtask build` builds the bin bare.
+[lib]
+name = "init"
+path = "src/lib.rs"
+
+[[bin]]
+name = "init"
+path = "src/main.rs"

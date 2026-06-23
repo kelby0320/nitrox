@@ -126,6 +126,7 @@ fn cmd_build() -> R<()> {
     cmd_build_hello()?;
     build_userspace_bin("parent")?;
     build_userspace_bin("child")?;
+    build_userspace_bin("init")?;
 
     let kernel_dir = repo_root().join("kernel");
     run(Command::new("cargo").arg("build").current_dir(&kernel_dir))?;
@@ -330,6 +331,16 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libkern")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // init's library tests (the bump-allocator math; `toml_lite` in Part 4). `--lib`
+    // skips the `#![no_main]` bin, which can't build for the host.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("init")
+        .arg("--lib")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
