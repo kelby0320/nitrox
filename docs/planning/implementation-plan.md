@@ -982,14 +982,22 @@ inherited by children, exercised by a `parent` QEMU demo (resolve → read). Hos
 - [x] `/dev/entropy` — lookup returns an `EntropyObject` (reuses slice 2;
   `sys_entropy_read` on the resolved handle). **Landed in Part B** as the framework
   demonstrator.
-- [ ] `/proc/self/*` — **self-reference only**: `process`/`thread`/`namespace`
-  resolve to the **caller's own** objects (derived from the calling syscall context,
-  no pid parameter); `pid`/`tid` to small readable snapshots. Registry-free; no
-  cross-process access.
-- [ ] `/dev` directory stub (enumerable placeholder).
-- [ ] *(optional)* `/dev/log` — only if cheap; a readable kernel-log snapshot needs a
-  log ring buffer (new infra), so defer unless wanted.
-- [ ] QEMU demo: the parent looks these up and uses the results.
+- [x] `/proc/self/*` — **self-reference only**: `process`/`thread`/`namespace` resolve
+  to the **caller's own** objects (from the calling syscall context, no pid parameter).
+  **Done** (`phase-2/slice3-proc-self`): per-leaf `KernelServer` bindings with
+  type-correct rights (`process`/`thread` → `SIGNAL|TERMINATE`+generic; `namespace` →
+  `LOOKUP`+generic, no `BIND`); `sched::current_thread()` added; bound into pid 1's root
+  ns at boot; QEMU demo stats process/thread + resolves `/dev/entropy` through the
+  returned namespace handle. Registry-free; no cross-process access.
+- [ ] *(deferred)* `/proc/self/status` — numeric pid/tid snapshot. Needs a
+  `MemoryObject` synthesis primitive (or extended handle introspection); the scalar-via-
+  `IoResult.result` shortcut was rejected. See `deferred-decisions.md`.
+- [ ] *(deferred)* `/dev` directory stub — `DeviceNode` has no struct, no enumeration
+  syscall, no consumer; deferred to a device manager (slice 7) / enumeration. See
+  `deferred-decisions.md`.
+- [ ] *(deferred)* `/dev/log` — a readable kernel-log snapshot needs a log ring buffer
+  (new infra) + the same synthesis primitive.
+- [x] QEMU demo: the parent looks these up and uses the results.
 
 > **`/proc/self` authority (no ambient authority).** Reachability is by **namespace
 > construction** — `/proc/self` resolves only if a supervisor bound it (a sandbox may

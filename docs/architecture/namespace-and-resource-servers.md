@@ -294,12 +294,24 @@ these bindings through the normal namespace inheritance (slice 1, Part D).
 `/proc/self/*` is an in-kernel server that resolves to the **caller's own**
 resources, derived from the calling syscall context:
 
-| Path | Resolves to |
-|---|---|
-| `/proc/self/process` | the caller's own `Process` handle |
-| `/proc/self/thread` | the calling `Thread` handle |
-| `/proc/self/namespace` | the caller's root-namespace handle |
-| `/proc/self/pid`, `/tid` | a small readable snapshot (u32) |
+| Path | Resolves to | Status |
+|---|---|---|
+| `/proc/self/process` | the caller's own `Process` handle | **slice 3** |
+| `/proc/self/thread` | the calling `Thread` handle | **slice 3** |
+| `/proc/self/namespace` | the caller's root-namespace handle | **slice 3** |
+| `/proc/self/status` (numeric pid/tid) | a small readable snapshot | deferred |
+
+Each shipped leaf is its **own** `KernelServer` binding with **type-correct rights**
+(`process`/`thread` → `SIGNAL | TERMINATE` + generic band; `namespace` → `LOOKUP` +
+generic, no `BIND`) — not one `/proc/self` prefix binding, because the returned types
+carry disjoint principal rights and a lookup installs `requested ∩ binding.rights`,
+which must be valid for the resolved type. The binding is a dispatch id; the *answer*
+is the looking-up thread's own object, so one binding is shared by all callers.
+
+Numeric **pid/tid** retrieval (`/proc/self/status`) is **deferred** — pid/tid are
+attributes of the `Process`/`Thread` objects a caller now holds, so the eventual
+mechanism (a synthesized read-only `MemoryObject` snapshot vs. extending handle
+introspection) is itself an open choice; see `docs/rationale/deferred-decisions.md`.
 
 This is **not** ambient authority, on two independent axes:
 

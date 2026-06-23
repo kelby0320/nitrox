@@ -3980,3 +3980,45 @@ the `KObjectType` set are unchanged. Verified: `cargo xtask build` / `check-arch
 `test` (456, +6) / `qemu` all clean. Branch `phase-2/slice3-kernel-server-framework` off
 `main`. Next: Part C (`/proc/self` self-reference servers + the `/dev` `DeviceNode`
 stub).
+
+## 2026-06-22 — Phase 2 slice 3, Part C: `/proc/self` self-reference servers
+
+Shipped the `/proc/self/{process, thread, namespace}` Kernel Servers — a lookup returns
+a handle to the **caller's own** `Process` / `Thread` / root `Namespace`, derived from
+the running syscall context (no pid parameter to forge), reachable only if a supervisor
+bound `/proc/self/*` into the caller's namespace (withholdable — a sandbox omits it). No
+ambient authority.
+
+**Per-leaf bindings + per-leaf `KernelServerId` (not one `/proc/self` prefix).** Forced
+by the rights model: a lookup installs `requested ∩ binding.rights`, and `allocate`
+rejects rights not valid for the resolved type (`is_rights_compatible`); `Process`/
+`Thread`/`Namespace` carry **disjoint** principal rights, so no single prefix-binding
+rights set works. Each leaf is its own exact binding with type-correct rights —
+`process`/`thread` → `SIGNAL | TERMINATE` + generic band; `namespace` → `LOOKUP` +
+generic, **no `BIND`** (a resolve view; self already holds a full root-ns handle via
+`rsi`, and ambient self-`BIND` is an escalation smell) — and its own dispatch id so the
+empty-suffix server knows which object to mint. **Zero framework change** (Part B's
+`dispatch`/`OpStatus`/`install`/`BindingTarget` untouched). The servers return a
+**clone** of an existing `ObjectRef` (not a freshly-minted object like entropy);
+`None` (a kernel/boot thread with no process) → `Rejected(NotFound)`.
+
+Added `sched::current_thread() -> Option<ObjectRef>` (clones `SCHED.current` under the
+rank-1 lock; mirrors `current_process`). The three leaves are bound into pid 1's root
+namespace at boot (`main.rs`); descendants inherit them — the binding is a dispatch id,
+the *answer* is resolved per-caller, so one shared binding is correct.
+
+**Deferred — numeric pid/tid (`/proc/self/status`).** pid/tid are attributes of objects
+the caller now holds, so the mechanism is an open choice (synthesized read-only
+`MemoryObject` snapshot, needing a HHDM-write *synthesis primitive*, vs. extending
+`sys_handle_stat` which today returns only type/rights/generation). **Rejected**: a
+lookup-contract extension returning a scalar in `IoResult.result` (permanent per-path
+handle-vs-value ambiguity). **Deferred — the `/dev` `DeviceNode` stub** (no struct, no
+enumeration syscall, no consumer). Both recorded in `deferred-decisions.md`.
+
+**No ABI-hash impact:** `KernelServerId` is an internal enum; no boundary type, syscall,
+or `KObjectType` change. Host tests: per-server leaf-suffix rejection (the success arms
+need syscall context — covered by QEMU). The `parent` demo resolves all three leaves,
+stats `process`/`thread` to assert their types, and *uses* the namespace handle to
+resolve `/dev/entropy` through it. Verified: `cargo xtask build` / `check-arch` /
+`test` (457, +1) / `qemu` all clean (`/proc/self/{process,thread,namespace} ok`). Branch
+`phase-2/slice3-proc-self` off `main`. Next: slice 4 (Init).
