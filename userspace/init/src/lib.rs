@@ -8,4 +8,8 @@
 
 #![cfg_attr(not(test), no_std)]
 
+extern crate alloc;
+
 pub mod heap;
+pub mod manifest;
+pub mod toml_lite;

@@ -4115,3 +4115,38 @@ build` / `check-arch` / `test` (kernel 462; libkern 8; **init 3**) / `qemu` all 
 parent spawns init → `init: alloc ok (sum…=140)` → `init exited pid=2 code=0`; all prior
 demos pass. Branch `phase-2/slice4-init-skeleton` off `main`. Next: Part 4 (minimal TOML
 parser + `init.toml` parsing).
+
+## 2026-06-23 — Phase 2 slice 4, Part 4: minimal TOML parser + init.toml manifest
+
+Added init's hand-rolled config front end (lib-side, host-tested — per
+`userspace/init/CLAUDE.md`, init parses TOML itself rather than pulling an ecosystem
+crate):
+
+- **`init::toml_lite`** — a minimal, line-oriented TOML parser for exactly the subset
+  `docs/spec/init-toml-schema.md` uses: table arrays `[[name]]`, one-level subtables
+  `[name.sub]` (attached to the most recent `[[name]]` element), scalar values (basic
+  strings without escapes, decimal integers with `_` separators, booleans),
+  whole-line + trailing `#` comments (quote-aware), blank lines. Returns a `Document`
+  (`array(name) -> &[ArrayEntry]`, each with a `Table` + named subtables) or a
+  `ParseError` carrying the 1-based line number. Unsupported forms (bare `[table]`,
+  deeper nesting, arrays/inline-tables/multiline) are rejected with a clear error —
+  upgrade the parser if the schema ever needs them.
+- **`init::manifest`** — validates the `[[mount]]` entries into `Vec<MountSpec>`
+  (`fs_server`/`device`/`mount_point`/`mode`/`required_for` required; `mode` ∈
+  {ro, rw}; `required_for` == "boot"; `mount_point` absolute; `[mount.options]` kept
+  verbatim for the slice-7 Ready handshake) and **topologically sorts by mount-point
+  depth** (shallowest first, stable so equal depths keep file order). Typed
+  `ManifestError` variants (missing field, wrong type, bad mode, …) for the eventual
+  eshell diagnostics.
+
+The mount *processing* loop (spawn fs-server → Ready → `sys_ns_bind`) stays Part 5 /
+slice 7; this is the pure front half. Host tests are the deliverable: 15 new (`cargo
+xtask test` → init 18). A small on-target smoke test in init's bin parses an embedded
+out-of-order sample and prints the sorted mounts (`/` before `/store`), proving the
+parser + `String`/`Vec` run under the bump allocator. Reading the *real*
+`/initramfs/etc/init.toml` is Part 5.
+
+No kernel/ABI change (userspace-only). Verified: `cargo xtask build` (no warnings) /
+`check-arch` / `test` (kernel 462; libkern 8; **init 18**) / `qemu` all clean. Branch
+`phase-2/slice4-toml` off `main`. Next: Part 5 (init becomes PID 1 + reaping loop +
+bootstrap-flow skeleton, reading the real init.toml).
