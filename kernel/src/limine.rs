@@ -241,6 +241,57 @@ pub struct HhdmResponse {
     pub offset: u64,
 }
 
+// --- Module request ------------------------------------------------------
+//
+// Limine loads each configured `module_path` into memory (tagged
+// `MEMMAP_KERNEL_AND_MODULES`, mapped in the HHDM) and hands back an array of
+// `LimineFile` descriptors. Nitrox loads exactly one module — the initramfs
+// CPIO blob — which init reads via the in-kernel `/initramfs` resource server.
+
+const MODULE_ID_2: u64 = 0x3e7e279702be32af;
+const MODULE_ID_3: u64 = 0xca1c4f3bd1280cee;
+
+#[repr(C)]
+pub struct ModuleRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut ModuleResponse,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests —
+// written once by Limine before `_start`, read by single-threaded boot code.
+unsafe impl Sync for ModuleRequest {}
+
+impl ModuleRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, MODULE_ID_2, MODULE_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+        }
+    }
+}
+
+#[repr(C)]
+pub struct ModuleResponse {
+    pub revision: u64,
+    pub module_count: u64,
+    /// Pointer to an array of `module_count` `*mut LimineFile`.
+    pub modules: *mut *mut LimineFile,
+}
+
+/// A loaded module descriptor (`struct limine_file`). Only the leading fields
+/// the kernel reads are mirrored; the bootloader's struct has more trailing
+/// fields (cmdline, media type, partition UUIDs) we never touch. `address` is an
+/// HHDM-virtual pointer, directly dereferenceable.
+#[repr(C)]
+pub struct LimineFile {
+    pub revision: u64,
+    pub address: *mut u8,
+    pub size: u64,
+    pub path: *const u8,
+}
+
 // --- ACPI RSDP request ---------------------------------------------------
 //
 // Limine locates the ACPI Root System Description Pointer and hands back its

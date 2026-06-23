@@ -21,6 +21,7 @@
 use crate::libkern::KBox;
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::object::EntropyObject;
+use crate::object::MemoryObject;
 use crate::object::ObjectRef;
 use crate::object::Process;
 use crate::syscall::error::KError;
@@ -43,6 +44,9 @@ pub enum KernelServerId {
     /// `/proc/self/namespace` — the caller's root
     /// [`Namespace`](crate::object::Namespace) (see [`proc_self_namespace`]).
     ProcSelfNamespace,
+    /// `/initramfs/<path>` — a file from the boot CPIO blob, served as a
+    /// read-only [`MemoryObject`] copy (see [`initramfs_server`]).
+    Initramfs,
     // `/proc/self/status` (numeric pid/tid) and the `/dev` stub are deferred —
     // see `docs/rationale/deferred-decisions.md`.
 }
@@ -80,6 +84,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::ProcSelfProcess => proc_self_process(suffix, requested),
         KernelServerId::ProcSelfThread => proc_self_thread(suffix, requested),
         KernelServerId::ProcSelfNamespace => proc_self_namespace(suffix, requested),
+        KernelServerId::Initramfs => initramfs_server(suffix, requested),
     }
 }
 
@@ -151,6 +156,31 @@ fn proc_self_namespace(suffix: &[u8], _requested: Rights) -> OpStatus {
     match ns {
         Some(obj) => OpStatus::Completed(obj),
         None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// `/initramfs/<path>` — serve a file from the boot CPIO blob as a fresh
+/// read-only [`MemoryObject`] (a copy of the file's bytes; the caller maps it
+/// `MAP_READ`). The `suffix` is the path under `/initramfs` (no leading `/`); an
+/// empty suffix, no loaded initramfs, or an absent file is `NotFound`. Unlike the
+/// other in-kernel servers this is a **subtree** server: it uses the suffix.
+fn initramfs_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    let Some(blob) = crate::initramfs::blob() else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    let Some(data) = crate::initramfs::lookup(blob, suffix) else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    match MemoryObject::try_new_filled(data) {
+        // Adopt the creation reference into an `ObjectRef` for the caller.
+        // SAFETY: `into_raw` yields the one outstanding creation reference.
+        Ok(obj) => OpStatus::Completed(unsafe {
+            ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::MemoryObject)
+        }),
+        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
     }
 }
 

@@ -717,6 +717,37 @@ fn proc_self_demo(root_ns: u64) {
     kprint(b"parent: /proc/self/namespace ok (resolved /dev/entropy through it)\n");
 }
 
+/// Initramfs demo: resolve `/initramfs/etc/init.toml` from the root namespace
+/// (the kernel bound `/initramfs` at boot to the in-kernel CPIO server), map the
+/// returned read-only `MemoryObject`, and print its first bytes — proving the
+/// Limine module + CPIO parser + `/initramfs` server end-to-end, before Init
+/// exists. (This is Init's real job in slice 5+; here it's just a substrate check.)
+fn initramfs_demo(root_ns: u64) {
+    kprint(b"parent: /initramfs demo start\n");
+    let (st, mem) = ns_lookup_wait(root_ns, b"/initramfs/etc/init.toml", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        kprint(b"parent: /initramfs/etc/init.toml lookup FAIL\n");
+        return;
+    }
+    // Map the returned MemoryObject read-only and read its first bytes.
+    // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"parent: /initramfs map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return;
+    }
+    // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the file's bytes;
+    // read the first 16 in bounds (init.toml is far longer).
+    let head = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 16) };
+    kprint(b"parent: /initramfs/etc/init.toml -> \"");
+    kprint(head);
+    kprint(b"...\"\n");
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -745,6 +776,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0f. /proc/self self-reference servers: resolve our own process/thread/namespace
     //     from the root namespace and prove each handle.
     proc_self_demo(root_ns);
+
+    // 0g. Initramfs substrate: resolve + map /initramfs/etc/init.toml (the Limine
+    //     module, served by the in-kernel CPIO server bound at boot).
+    initramfs_demo(root_ns);
 
     kprint(b"parent: creating a channel\n");
 
