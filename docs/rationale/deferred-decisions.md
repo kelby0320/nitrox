@@ -143,6 +143,29 @@ writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
 
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a desire to port specific C software.
 
+### Resource servers (in-kernel)
+
+**Numeric `/proc/self/{pid,tid}` (`/proc/self/status`).** Slice 3 ships the
+`/proc/self/{process,thread,namespace}` Kernel Servers (handles to the caller's own
+objects) but **not** numeric pid/tid. pid/tid are *attributes* of the `Process`/`Thread`
+objects a caller now holds, so the eventual mechanism is itself an open choice — a
+**synthesized read-only `MemoryObject` snapshot** (`/proc/self/status`) vs. **extending
+handle introspection** (`sys_handle_stat` returns only type/rights/generation today).
+The MemoryObject route needs a *synthesis primitive* first (allocate a frame, write
+kernel bytes via the HHDM, hand back `MAP_READ`-only) — a reusable building block worth
+designing deliberately. **Rejected** alternative: extending the namespace-lookup
+contract to return a scalar in `IoResult.result` (a permanent per-path
+handle-vs-value ambiguity / footgun). Trigger: a real consumer of numeric pid/tid
+(e.g. logging infra), or the first synthesized read-only snapshot (`/proc/self/status`)
+that forces the primitive. See the decision log (2026-06-22).
+
+**`/dev` directory stub (enumerable placeholder).** `DeviceNode` is only a
+`KObjectType` discriminant — no kernel struct — and there is no enumeration syscall
+(`ENUMERATE` is defined but unused). A `/dev` Kernel Server that merely resolves `/dev`
+exact → a `DeviceNode` handle has no consumer (`/dev/entropy` resolves via its own
+binding regardless). Deferred until a device manager (slice 7) or a real enumeration
+surface exists. Trigger: either of those. See the decision log (2026-06-22).
+
 ### Runtime libraries
 
 **TypedRecord support for enums.** The `#[derive(TypedRecord)]` macro initially supports primitive scalars, `String`, `Vec<T>` of TypedRecord, nested structs, `Option<T>`, and `RawHandle`. Enums (tagged unions) are deferred; they require wire-format extensions and more complex derive code. Trigger: a concrete need; not foreseen as urgent.

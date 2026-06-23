@@ -28,6 +28,7 @@ use core::arch::asm;
 
 // --- Syscall numbers (must match `kernel/src/syscall/table.rs`) ----------
 const SYS_HANDLE_CLOSE: u64 = 0;
+const SYS_HANDLE_STAT: u64 = 3;
 const SYS_MEMORY_CREATE: u64 = 4;
 const SYS_MEMORY_MAP: u64 = 5;
 const SYS_WAIT: u64 = 10;
@@ -63,8 +64,15 @@ const RIGHT_TRANSFER: u64 = 1 << 1;
 const RIGHT_INSPECT: u64 = 1 << 2;
 const RIGHT_WAIT: u64 = 1 << 3;
 const RIGHT_READ: u64 = 1 << 8;
+const RIGHT_LOOKUP: u64 = 1 << 13;
 const RIGHT_SEND: u64 = 1 << 18;
 const RIGHT_RECV: u64 = 1 << 19;
+
+/// `KObjectType` discriminants (`kernel/src/libkern/handle.rs`), mirrored to
+/// verify resolved `/proc/self/*` handles via `sys_handle_stat`.
+const KOBJ_PROCESS: u32 = 1;
+const KOBJ_THREAD: u32 = 2;
+const KOBJ_NAMESPACE: u32 = 3;
 const ENDPOINT_RIGHTS: u64 =
     RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_DUPLICATE | RIGHT_INSPECT | RIGHT_TRANSFER;
 
@@ -793,6 +801,108 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
     }
 }
 
+/// Resolve `path` in namespace `ns` requesting `rights`, wait the PO, and return
+/// `(status, resolved_handle)` (`IoResult`: status at bytes 8..12, handle at
+/// 16..24). `status == 0` with a non-zero handle is success. Closes the PO; the
+/// caller owns `resolved_handle`.
+fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe {
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
+    };
+    if po < 0 {
+        return (po as i32, 0);
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    let resolved = unsafe {
+        u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ])
+    };
+    // SAFETY: closing our own PO handle (the resolved handle is separate).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+    if waited != 1 {
+        return (-1, 0);
+    }
+    (status, resolved)
+}
+
+/// `sys_handle_stat` the handle and return whether its object-type field equals
+/// `want` (`HandleInfo`: rights `u64` @0, object_type `u32` @8, generation @12).
+fn stat_is_type(h: u64, want: u32) -> bool {
+    let mut info = [0u8; 16];
+    // SAFETY: valid 16-byte writable `HandleInfo` out-param.
+    let r = unsafe { syscall4(SYS_HANDLE_STAT, h, (&raw mut info) as u64, 0, 0) };
+    if r != 0 {
+        return false;
+    }
+    u32::from_le_bytes([info[8], info[9], info[10], info[11]]) == want
+}
+
+/// `/proc/self` demo: resolve the caller's own resources from the **root
+/// namespace** (`rsi`) and prove each handle. No ambient authority — these resolve
+/// only because the kernel bound `/proc/self/*` into pid 1's root namespace, and
+/// each returns strictly *this* caller's own object (derived from syscall context).
+fn proc_self_demo(root_ns: u64) {
+    kprint(b"parent: /proc/self demo start\n");
+
+    // /proc/self/process — request INSPECT; stat the handle, assert it's a Process.
+    let (st, ph) = ns_lookup_wait(root_ns, b"/proc/self/process", RIGHT_INSPECT);
+    if st != 0 || ph == 0 || !stat_is_type(ph, KOBJ_PROCESS) {
+        kprint(b"parent: /proc/self/process FAIL\n");
+        return;
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ph) };
+    kprint(b"parent: /proc/self/process ok (own Process handle)\n");
+
+    // /proc/self/thread — likewise, assert it's a Thread.
+    let (st, th) = ns_lookup_wait(root_ns, b"/proc/self/thread", RIGHT_INSPECT);
+    if st != 0 || th == 0 || !stat_is_type(th, KOBJ_THREAD) {
+        kprint(b"parent: /proc/self/thread FAIL\n");
+        return;
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
+    kprint(b"parent: /proc/self/thread ok (own Thread handle)\n");
+
+    // /proc/self/namespace — request LOOKUP; assert it's a Namespace, then USE it:
+    // resolve /dev/entropy *through* the returned handle (proves a live,
+    // LOOKUP-capable namespace identical to our root).
+    let (st, nh) = ns_lookup_wait(root_ns, b"/proc/self/namespace", RIGHT_LOOKUP | RIGHT_INSPECT);
+    if st != 0 || nh == 0 || !stat_is_type(nh, KOBJ_NAMESPACE) {
+        kprint(b"parent: /proc/self/namespace FAIL\n");
+        return;
+    }
+    let (st2, eh) = ns_lookup_wait(nh, b"/dev/entropy", RIGHT_READ);
+    if st2 != 0 || eh == 0 {
+        kprint(b"parent: /proc/self/namespace lookup-through FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, nh) };
+        return;
+    }
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, eh);
+        syscall1(SYS_HANDLE_CLOSE, nh);
+    }
+    kprint(b"parent: /proc/self/namespace ok (resolved /dev/entropy through it)\n");
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -817,6 +927,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0e. Kernel-server demo: resolve /dev/entropy (boot-bound by the kernel) and
     //     read from the handle the in-kernel server hands back.
     dev_entropy_lookup_demo(root_ns);
+
+    // 0f. /proc/self self-reference servers: resolve our own process/thread/namespace
+    //     from the root namespace and prove each handle.
+    proc_self_demo(root_ns);
 
     kprint(b"parent: creating a channel\n");
 
