@@ -73,10 +73,13 @@ pub struct BarWindow {
 
 #[repr(C)]
 pub struct InterruptSpec {
-    pub gsi:      u32,           // global system interrupt (the IOAPIC input)
-    pub trigger:  u32,           // arch::TriggerMode
-    pub polarity: u32,           // arch::Polarity
-    pub present:  u32,           // 0 = no interrupt assigned
+    pub gsi:      u32,           // resolved global system interrupt (0 until routed)
+    pub trigger:  u32,           // arch::TriggerMode (filled at routing)
+    pub polarity: u32,           // arch::Polarity (filled at routing)
+    pub line:     u8,            // raw PCI interrupt line (config 0x3C)
+    pub pin:      u8,            // raw PCI interrupt pin: 1..=4 = INTA..D, 0 = none
+    pub present:  u8,            // 1 iff pin != 0
+    pub _pad:     u8,
 }
 
 #[repr(C)]

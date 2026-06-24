@@ -13,6 +13,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod arch;
+pub mod device;
 pub mod dpc;
 pub mod embedded_images;
 pub mod entropy;
@@ -24,5 +25,6 @@ pub mod libkern;
 pub mod limine;
 pub mod mm;
 pub mod object;
+pub mod pci;
 pub mod sched;
 pub mod syscall;

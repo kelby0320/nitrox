@@ -1079,11 +1079,17 @@ PR parts; the Part 0 design decisions are in the decision log (2026-06-23).
   `KObjectType`); one `KernelServerId::BlockDevice` + a kernel registry for the
   dynamic disks; `InterruptObject` built this slice; in-kernel MMIO (not
   `sys_device_map_mmio`).
-- [ ] **Part 1 — PCI(e) enumeration + `DeviceNode`.** ECAM walk over
-  `arch::platform::pcie_ecam_regions()`; decode identity/class/BARs/interrupt;
-  `DeviceNode` kernel object (struct + dispatch/allocate/type-rights arms);
-  boot-time enumeration logs discovered devices. Host-tested against a fake
-  config space. No driver yet. (Per [io-operation], [irp-layout], [device-node].)
+- [x] **Part 1 — PCI(e) enumeration + `DeviceNode`** (`phase-2/slice5-pci-enum`).
+  ECAM walk over `arch::platform::pcie_ecam_regions()` via a single repointed
+  uncached scan window (`mm::kvmap::remap_mmio_page`); decode identity/class,
+  size BARs (32/64-bit + I/O), read the interrupt line/pin; `DeviceNode` kernel
+  object (`object/device_node.rs` + the `dispatch_destroy`/type-rights arms);
+  boot-time `device::init()` enumerates into a global table and logs each
+  function. Host-tested against a synthetic config space (BAR sizing incl.
+  64-bit). No driver claims a node yet. QEMU: discovers the ICH9 AHCI controller
+  (`8086:2922` class `01.06.01`) + its ABAR (BAR5) and 5 other functions; boot
+  proceeds to init→parent→child cleanly. (Per [io-operation], [irp-layout],
+  [device-node].)
 - [ ] **Part 2 — IRP framework + `InterruptObject` + the I/O core, on a ramdisk.**
   `Irp` type (offsets pinned by asserts), `InterruptObject` waitable (3 sched
   dispatch arms + signal-from-DPC), `sys_io_submit`/`sys_io_cancel`, and a

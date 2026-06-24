@@ -222,6 +222,12 @@ fn kernel_main() {
     }
     kprintln!("global handle table up");
 
+    // Enumerate hardware into the device table. Runs after the allocators, the
+    // HHDM, the kvmap, and `Platform::init` (the ECAM regions) — all up by now.
+    // Phase 2 slice 5 Part 1: discovery + `DeviceNode`s only; no driver claims a
+    // node yet.
+    nitrox_kernel::device::init();
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and
