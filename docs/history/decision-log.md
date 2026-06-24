@@ -4277,3 +4277,51 @@ core, proven on a RAM-backed test block device (de-risks the async spine before
 AHCI register work, decided with the user); Part 3 — AHCI Tier 1 driver + the
 QEMU AHCI test disk; Part 4 — block resource server + `/dev/blk` namespace
 binding. No code yet — Part 0 is docs only. Next: Part 1.
+
+## 2026-06-23 — Phase 2 slice 5, Part 1: PCI(e) enumeration + DeviceNode
+
+The first code of the storage slice. The kernel now enumerates PCI(e) at boot and
+represents each function as a `DeviceNode` kernel object.
+
+- **`DeviceNode` object** (`kernel/src/object/device_node.rs`): header-first
+  `#[repr(C)]` object (`KObjectType::DeviceNode`, the previously-reserved tag =
+  12) holding a `DeviceClass` (`Other`/`Block`), a `ResourceDescriptor`
+  (`DeviceIdentity`, six `BarWindow`s, `InterruptSpec`, bus address), and
+  `BlockGeometry` (zeroed until a block driver claims it). Wired into
+  `dispatch_destroy` + the test-probe; the type-rights arm
+  (`DEVICE_NODE_PRINCIPALS = READ`) already existed.
+
+- **PCI enumerator** (`kernel/src/pci/mod.rs`, neutral — PCI config space is a
+  PCI-SIG standard): walks every bus/dev/func in each ECAM region, decodes
+  identity, sizes BARs (32-bit, 64-bit, and I/O, with decode disabled during
+  sizing), reads the legacy interrupt line/pin, and builds a `DeviceNode` per
+  present function. Multi-function devices are expanded via the header-type bit.
+  The decode/sizing logic is behind a `Cfg` trait so it is host-tested against a
+  synthetic config space that faithfully models the write-all-ones/read-back
+  sizing protocol (incl. a 64-bit prefetchable BAR).
+
+- **Config-space access**: each function's 4 KiB config space is 4 KiB-aligned
+  MMIO. Since the vmap bump allocator never reclaims VA, enumeration reserves
+  **one** vmap page and repoints it per function with the new
+  `mm::kvmap::remap_mmio_page` (uncached map + TLB flush) — rather than mapping
+  the multi-hundred-MiB ECAM window or leaking a reservation per function. This
+  is the reusable uncached-MMIO primitive AHCI's ABAR mapping builds on (Part 3).
+
+- **Device table** (`kernel/src/device.rs`): a neutral global `SpinLock<KVec<
+  ObjectRef>>` populated once at boot by `device::init()` (called after the
+  handle table); holds an owning reference per device (devices live for the
+  kernel's lifetime). Part 3 (driver matching) iterates it; Part 4 (block server)
+  resolves through it.
+
+`InterruptSpec` gained raw `line`/`pin` fields beyond the Part 0 sketch (they are
+the inputs to Part 3's interrupt routing); `device-node.md` updated to match
+(source wins — the descriptor is not an ABI-hash input). No ABI-hash impact (no
+new boundary layout; `DeviceNode`'s discriminant already existed).
+
+Verified: `cargo xtask build` (no warnings) / `check-arch` / `test` (kernel
+**471**, +9: 6 `pci` + 3 `device_node`; libkern 8; init 18). QEMU q35 boot logs
+the ICH9 AHCI controller (`8086:2922`, class `01.06.01`) with its ABAR (BAR5,
+`0x810c4000`), plus the host bridge, VGA, e1000, LPC and SMBus functions — 6
+nodes registered — and proceeds through init→parent→child cleanly (no `#DF`).
+Branch `phase-2/slice5-pci-enum`. Next: Part 2 (IRP framework + InterruptObject +
+the I/O core, on a ramdisk).

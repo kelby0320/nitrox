@@ -29,9 +29,9 @@
 //!    coordination.
 
 use crate::arch::Paging;
-use crate::arch::paging::ArchPaging;
+use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::libkern::{AllocError, SpinLock};
-use crate::mm::{PAGE_SIZE, VirtAddr};
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 
 /// Inclusive lower bound of the kernel vmap region per
 /// `docs/architecture/overview.md`.
@@ -96,6 +96,37 @@ pub fn vmap_alloc_pages(n_pages: u64) -> Result<VirtAddr, AllocError> {
     }
     *next = end;
     Ok(VirtAddr::new(start))
+}
+
+/// Point a single, already-reserved vmap page at the physical MMIO frame
+/// `phys`, mapped **uncached** and writable, flushing the stale TLB entry.
+///
+/// This is the repointing primitive behind a *reusable* MMIO scan window:
+/// the caller reserves one page once with [`vmap_alloc_pages`] and calls this
+/// per target frame, instead of leaking a fresh vmap reservation per access
+/// (the bump allocator never reclaims VA). `phys` must be page-aligned. The
+/// previous mapping of `virt`, if any, is dropped first.
+///
+/// # Safety
+/// - `virt` must be a page handed out by [`vmap_alloc_pages`] that the caller
+///   owns and is not concurrently using under another physical frame.
+/// - `phys` must be a real MMIO frame safe to map uncached (a device window).
+/// - Ring-0; mutates the active page tables. The vmap intermediate tables are
+///   shared kernel-half (see the module docs), so the change is visible to every
+///   address space.
+pub unsafe fn remap_mmio_page(virt: VirtAddr, phys: PhysAddr) -> Result<(), AllocError> {
+    let root = Paging::active_root();
+    // Drop any prior leaf at `virt` (the first call finds none — ignore that).
+    // SAFETY: `virt` is a caller-owned vmap page in the shared kernel half.
+    let _ = unsafe { Paging::unmap_page(root, virt) };
+    let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
+    // SAFETY: fresh leaf for a caller-owned vmap page; `phys` is a device frame
+    // mapped uncached; intermediates are the pre-allocated shared kernel PDPTs.
+    unsafe {
+        Paging::map_page(root, virt, phys, flags).map_err(|_| AllocError)?;
+        Paging::flush_tlb_page(virt);
+    }
+    Ok(())
 }
 
 #[cfg(test)]

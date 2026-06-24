@@ -20,6 +20,7 @@
 //! objects, [`Process`] and [`Thread`]. The remaining object types land
 //! behind their respective Phase 1 slices.
 
+pub mod device_node;
 pub mod entropy_object;
 pub mod header;
 pub mod ipc_channel;
@@ -32,6 +33,7 @@ pub mod process;
 pub mod thread;
 pub mod timer;
 
+pub use device_node::DeviceNode;
 pub use entropy_object::EntropyObject;
 pub use header::{KObjectHeader, ObjectRef};
 pub use ipc_channel::{
