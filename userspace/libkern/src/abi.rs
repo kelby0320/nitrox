@@ -21,6 +21,9 @@ pub const IMAGE_CHILD: u32 = 0;
 pub const IMAGE_INIT: u32 = 1;
 /// `ImageId::Parent` — the demo supervisor (`userspace/parent`), kernel-embedded.
 pub const IMAGE_PARENT: u32 = 2;
+/// `ImageId::FsServerExt4` — the ext4 filesystem server (`userspace/fs-server-ext4`),
+/// kernel-embedded; spawned by init (slice 7).
+pub const IMAGE_FS_SERVER_EXT4: u32 = 3;
 
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]

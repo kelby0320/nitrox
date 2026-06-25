@@ -18,8 +18,10 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod ext4;
+pub mod serve;
 
 pub use ext4::read_file;
+pub use serve::{Served, serve_resolve};
 
 /// Random-access read of the underlying block device, by byte offset. The reader
 /// translates filesystem structures (the superblock at byte 1024, blocks at
@@ -58,14 +60,16 @@ pub(crate) fn rd_u32(b: &[u8], off: usize) -> u32 {
     u32::from_le_bytes([b[off], b[off + 1], b[off + 2], b[off + 3]])
 }
 
+/// Host-test fixtures shared by the parser tests ([`ext4`]) and the server-loop
+/// tests ([`serve`]): an in-memory [`BlockReader`] over an `mke2fs`-built image.
 #[cfg(test)]
-mod tests {
-    use super::*;
+pub(crate) mod test_support {
+    use super::{BlockReader, FsError};
     use std::io::Write;
     use std::process::Command;
 
     /// A `BlockReader` over an in-memory image.
-    struct ImageReader(Vec<u8>);
+    pub(crate) struct ImageReader(pub Vec<u8>);
     impl BlockReader for ImageReader {
         fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
             let start = offset as usize;
@@ -83,7 +87,7 @@ mod tests {
     /// the slice-5/Part-5 disk so the reader's supported feature set is exercised
     /// against a real e2fsprogs image. Panics with a clear message if `mke2fs` is
     /// unavailable (e2fsprogs is a project dependency — see Part 5).
-    fn fixture(block_size: u32, content: &[u8]) -> Vec<u8> {
+    pub(crate) fn fixture(block_size: u32, content: &[u8]) -> Vec<u8> {
         // A unique dir per call (cargo runs tests in parallel threads) so they
         // never share / remove each other's staging tree.
         use std::sync::atomic::{AtomicU32, Ordering};
@@ -113,6 +117,12 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         bytes
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::test_support::{ImageReader, fixture};
 
     #[test]
     fn reads_current_generation_1k_blocks() {
