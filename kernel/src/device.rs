@@ -11,6 +11,7 @@
 
 use crate::libkern::{KVec, SpinLock};
 use crate::object::ObjectRef;
+use crate::object::device_node::{DeviceClass, DeviceNode};
 
 /// The discovered devices. Written once at boot by [`init`]; read thereafter.
 /// Lock rank: a leaf — never held across another lock.
@@ -53,4 +54,27 @@ pub fn register(node: ObjectRef) {
     if table.try_push(node).is_err() {
         crate::kprintln!("device: table full; dropping a registered node");
     }
+}
+
+/// The `index`-th [`DeviceClass::Block`] device in the table, as a cloned owning
+/// reference (the table keeps its own). This **is** the block-device registry the
+/// `/dev/blk` Kernel Server resolves against: block disks are indexed in the
+/// order drivers published them. `None` if fewer than `index + 1` block devices
+/// exist. The clone is an atomic refcount bump under the lock — no nested lock.
+///
+/// [`DeviceClass::Block`]: crate::object::device_node::DeviceClass::Block
+pub fn find_block_device(index: usize) -> Option<ObjectRef> {
+    let table = DEVICES.lock();
+    let mut seen = 0usize;
+    for node in table.iter() {
+        // SAFETY: every table entry pins a live `DeviceNode`.
+        let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
+        if dn.class() == DeviceClass::Block {
+            if seen == index {
+                return Some(node.clone());
+            }
+            seen += 1;
+        }
+    }
+    None
 }

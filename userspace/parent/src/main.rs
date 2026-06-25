@@ -755,6 +755,117 @@ fn initramfs_demo(root_ns: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
 }
 
+/// Wait on a single `PendingOperation` handle and return its completion
+/// `(status, result)` from the `IoResult` (status at bytes 8..12, result at
+/// 16..24). Closes `po`.
+fn po_wait(po: u64) -> (i32, u64) {
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    let result = unsafe {
+        u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ])
+    };
+    // SAFETY: closing our own PO handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
+    if waited != 1 { (-1, 0) } else { (status, result) }
+}
+
+/// Block-storage demo: resolve `/dev/blk/0` (the AHCI disk, boot-bound by the
+/// kernel), submit an async read of sector 0 into a mapped buffer via
+/// `sys_io_submit`, wait its completion, and verify the `0x55AA` boot signature.
+/// This is the full userspace block-I/O path the kernel self-tests stood in for.
+fn block_demo(root_ns: u64) {
+    kprint(b"parent: /dev/blk demo start\n");
+
+    // Resolve the first block device.
+    let (st, dev) = ns_lookup_wait(root_ns, b"/dev/blk/0", RIGHT_READ);
+    if st != 0 || dev == 0 {
+        kprint(b"parent: /dev/blk/0 lookup FAIL (no disk?)\n");
+        return;
+    }
+
+    // A 1-page buffer; the controller DMAs the sector into it, so it needs
+    // MAP_WRITE (and MAP_READ so we can verify the bytes).
+    // SAFETY: register-only syscall.
+    let buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if buf < 0 {
+        kprint(b"parent: /dev/blk buffer create FAIL\n");
+        unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
+        return;
+    }
+    // SAFETY: `buf` is a fresh MemoryObject handle with full MAP rights.
+    let addr = unsafe {
+        syscall4(SYS_MEMORY_MAP, buf as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
+    };
+    if addr < 0 {
+        kprint(b"parent: /dev/blk buffer map FAIL\n");
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, buf as u64);
+            syscall1(SYS_HANDLE_CLOSE, dev);
+        }
+        return;
+    }
+
+    // Submit a 512-byte read of LBA 0.
+    let op = IoOp {
+        opcode: IO_OPCODE_READ,
+        flags: 0,
+        buffer: buf as u64,
+        buf_offset: 0,
+        offset: 0,
+        length: 512,
+    };
+    // SAFETY: `dev` is a block DeviceNode handle with READ; `&op` is a valid IoOp.
+    let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
+    if po < 0 {
+        kprint(b"parent: /dev/blk sys_io_submit FAIL\n");
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, buf as u64);
+            syscall1(SYS_HANDLE_CLOSE, dev);
+        }
+        return;
+    }
+
+    let (status, result) = po_wait(po as u64);
+    if status != 0 || result != 512 {
+        kprint(b"parent: /dev/blk read FAIL (completion unexpected)\n");
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, buf as u64);
+            syscall1(SYS_HANDLE_CLOSE, dev);
+        }
+        return;
+    }
+
+    // Verify the boot signature (0xAA55 little-endian at offset 510).
+    // SAFETY: `addr` maps the 512 bytes the kernel DMAed into; 510..512 in bounds.
+    let sig = unsafe { ((addr as u64 + 510) as *const u16).read_unaligned() };
+    if sig == 0xAA55 {
+        kprint(b"parent: /dev/blk/0 read OK (sector 0 boot sig 0x55AA)\n");
+    } else {
+        kprint(b"parent: /dev/blk/0 read OK but no 0x55AA sig\n");
+    }
+
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, buf as u64);
+        syscall1(SYS_HANDLE_CLOSE, dev);
+    }
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -787,6 +898,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0g. Initramfs substrate: resolve + map /initramfs/etc/init.toml (the Limine
     //     module, served by the in-kernel CPIO server bound at boot).
     initramfs_demo(root_ns);
+
+    // 0h. Block storage: resolve /dev/blk/0 (the AHCI disk), submit an async read
+    //     of sector 0, and verify the boot signature — the full userspace
+    //     sys_io_submit path against real hardware.
+    block_demo(root_ns);
 
     kprint(b"parent: creating a channel\n");
 

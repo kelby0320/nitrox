@@ -142,13 +142,13 @@ enumeration — but the in-kernel resource-server registry
   mapping a device name to its `DeviceNode` — returning a handle to the matching
   node, or `NotFound`.
 - The supervisor (init, via `BIND_NAMESPACE`) binds `KernelServerId::BlockDevice`
-  at **`/dev/blk`** in the root namespace at boot. A lookup of `/dev/blk0`
+  at **`/dev/blk`** in the root namespace at boot. A lookup of `/dev/blk/0`
   resolves with suffix `0`; the server finds the disk registered under index `0`
   and hands back its node. (This reuses the existing `BindingTarget::KernelServer`
   longest-prefix resolution; one binding covers every disk.)
 - The `/dev/blk` binding is created **unconditionally** — uniform with
   `/dev/entropy` / `/initramfs` — and the **registry carries liveness**: there is
-  no per-server enable switch. `/dev/blk0` resolves iff a disk is registered there
+  no per-server enable switch. `/dev/blk/0` resolves iff a disk is registered there
   (a driver matched and populated it, below), else `NotFound`; if no block driver
   matched at all, the server is bound but inert. The only conditionally-live thing
   is the *driver*, enabled by device matching — see § "Discovery and driver
@@ -156,14 +156,16 @@ enumeration — but the in-kernel resource-server registry
 
 ### The naming scheme
 
-- **Whole disks: `/dev/blk0`, `/dev/blk1`, …** — enumeration-order indices.
-  Order is not stable across boots (it follows PCI/port discovery), so these are
-  *enumeration* names, not *identity* names — fine for Phase 2's single QEMU disk
-  and for low-level tools.
+- **Whole disks: `/dev/blk/0`, `/dev/blk/1`, …** — enumeration-order indices.
+  Namespace prefix matching is **component-boundary** (`/dev/blk` covers
+  `/dev/blk/0` with suffix `0`, *not* `/dev/blk0`), so the index is a path
+  component under the `/dev/blk` subtree. Order is not stable across boots (it
+  follows PCI/port discovery), so these are *enumeration* names, not *identity*
+  names — fine for Phase 2's single QEMU disk and for low-level tools.
 - **Content-stable names — `/dev/disk/by-partuuid/*`, `/dev/disk/by-partlabel/*`
   — are slice 6.** They are derived from GPT partition metadata, so they are
   order-independent and are what `init.toml` mount specs reference. The raw
-  `/dev/blkN` whole-disk nodes are not what a manifest should name.
+  `/dev/blk/N` whole-disk nodes are not what a manifest should name.
 
 `Char`/other device families get their own prefix and registry when they arrive;
 the `/dev/blk` registry is block-only.

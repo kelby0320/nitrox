@@ -538,6 +538,22 @@ fn run_first_userspace() {
         return;
     }
 
+    // `/dev/blk/<n>` — a subtree server resolving the n-th discovered block device
+    // to a `DeviceNode` handle (the caller `sys_io_submit`s reads on it). Bound
+    // **unconditionally**: the device-table registry carries liveness, so a
+    // lookup of `/dev/blk/0` is `NotFound` if no disk was discovered, harmless.
+    // Read-only in Phase 2 — the binding grants `READ` + the generic band, so a
+    // write IoOp is rejected at the lookup rights gate.
+    let block_binding_rights =
+        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(b"/dev/blk", KernelServerId::BlockDevice, block_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /dev/blk failed");
+        return;
+    }
+
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).

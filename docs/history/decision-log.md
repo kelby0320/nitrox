@@ -4444,3 +4444,50 @@ ready (131072 sectors, 64 MiB)`, `INTx GSI10 -> vec 0x31`, `read self-test OK
 (sector 0 boot sig 0x55AA, via IRQ)` — **4/4 clean boots**, completion via the
 real IRQ, boot proceeds through init→parent→child (no `#DF`). Branch
 `phase-2/slice5-ahci`. Next: Part 4 (block resource server + `/dev/blk`).
+
+## 2026-06-25 — Phase 2 slice 5, Part 4: block resource server + /dev/blk (slice complete)
+
+The slice's close-out: `sys_io_submit` wired to userspace through the namespace.
+
+- **`KernelServerId::BlockDevice`** + `block_device_server` (`object/kernel_server.rs`):
+  a **subtree** Kernel Server bound once at `/dev/blk`; the lookup suffix is a
+  decimal index (`/dev/blk/0` → `b"0"`, parsed by `parse_index`) resolving to the
+  n-th block-class `DeviceNode`. The registry is `device::find_block_device(n)` —
+  a query over the existing device table (block-class entries in
+  driver-publish order), not a separate structure. Returns the node handle via
+  `OpStatus::Completed`; out-of-range / non-numeric / empty suffix → `NotFound`.
+
+- **Boot binding** (`main.rs`): the supervisor binds `/dev/blk` →
+  `KernelServerId::BlockDevice` **read-only** (`READ` + generic band),
+  **unconditionally** — the device-table registry carries liveness (an empty
+  registry just yields `NotFound`), so there is no per-server enable switch. This
+  is the Part 0 design realised: one static enum variant owning a subtree backed
+  by a runtime registry.
+
+- **Naming correction.** Namespace prefix matching is **component-boundary**
+  (`match_suffix_offset`: the prefix must end on a `/`), so `/dev/blk` covers
+  `/dev/blk/0` (suffix `0`), **not** `/dev/blk0`. The disks therefore live at
+  `/dev/blk/0`, `/dev/blk/1`, … — corrected from the Part 0 spec's `/dev/blk0`
+  (source wins). `device-node.md` / `namespace-and-resource-servers.md` /
+  `deferred-decisions.md` updated; the historical Part 0 log entry is left as-is
+  (append-only).
+
+- **Userspace proof** (`userspace/parent`): a `block_demo` resolves `/dev/blk/0`
+  (`ns_lookup_wait`), creates + maps a page buffer (`MAP_READ | MAP_WRITE` — the
+  controller DMAs into it), builds an `IoOp` read of 512 bytes at LBA 0, calls
+  `sys_io_submit`, `sys_wait`s the returned PO (`po_wait`), and verifies the
+  `0x55AA` boot signature. This is the full userspace `sys_io_submit` path the
+  Part 2/3 kernel self-tests stood in for.
+
+**Slice 5 (storage drivers) is complete.** The end-to-end result: a userspace
+process resolves a block device through its namespace and reads real disk sectors
+asynchronously — PCI enumeration → `DeviceNode` → IRP/`InterruptObject`/I/O core →
+AHCI driver (real DMA + IRQ) → block resource server → `/dev/blk/0`. Read-only,
+single disk; GPT/partitions (slice 6) and the userspace fs-server (slice 7,
+with the dedicated ext4 test disk) are next.
+
+No ABI-hash impact (a new `KernelServerId` value, not a hashed layout — `dispatch`
+is internal). Verified: `cargo xtask build` (no warnings) / `check-arch` / `test`
+(kernel **482**, +1 `parse_index`; libkern 8; init 18). QEMU q35: `parent:
+/dev/blk/0 read OK (sector 0 boot sig 0x55AA)`, 4/4 clean boots, init→parent→child
+reaped (no `#DF`). Branch `phase-2/slice5-block-server`.

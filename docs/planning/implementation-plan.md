@@ -1060,13 +1060,15 @@ initramfs defer to slice 7 (driven by fs-servers). Done as ordered PR parts:
   lifecycle work (load/unload for kernel + userspace servers); the blob stays mapped
   through bootstrapping. See `deferred-decisions.md`.
 
-#### 5. Storage drivers
+#### 5. Storage drivers — **complete**
 
 Depends on the prerequisite band (all complete): ACPI MCFG (ECAM), IOAPIC
 (device IRQs), the DPC queue (completion handling), `PendingOperation` (async
 reads), DMA allocation (`mm::dma::DmaBuffer` — command lists / PRDTs), and the
 uncached (`PageFlags::NO_CACHE`) mapping path for BAR access. Staged as ordered
-PR parts; the Part 0 design decisions are in the decision log (2026-06-23).
+PR parts (all merged); the Part 0 design decisions are in the decision log
+(2026-06-23). End-to-end result: a userspace process resolves `/dev/blk/0` and
+reads disk sectors via `sys_io_submit` against the real AHCI controller.
 
 - [x] **Part 0 — specs & decisions** (docs only): the storage-slice ABI and
   object contracts settled before the ABI hash bakes them in.
@@ -1117,9 +1119,18 @@ PR parts; the Part 0 design decisions are in the decision log (2026-06-23).
   one outstanding command; multi-port/NCQ/MSI and ACPI `_PRT` routing deferred.
   The dedicated `xtask build-disk` + ext4 test disk move to Part 4/7 (fs-server).
   `KError::IoError` (-40) added (both libkerns) for device/medium errors.
-- [ ] **Block device resource server registration (Part 4).** Register discovered
-  disks in the block registry; supervisor binds `/dev/blk` (read-only) into init's
-  root namespace at boot. A lookup of `/dev/blk0` + a read logs sector 0.
+- [x] **Block device resource server registration (Part 4)**
+  (`phase-2/slice5-block-server`). `KernelServerId::BlockDevice` + the
+  `block_device_server` (parses the suffix as a decimal index → resolves the
+  n-th block-class `DeviceNode` via `device::find_block_device`, the device-table
+  registry). The supervisor binds `/dev/blk` (read-only) into init's root
+  namespace at boot, **unconditionally** (the registry carries liveness). Disks
+  resolve at **`/dev/blk/0`** (component-boundary matching — not `/dev/blk0`). The
+  `parent` userspace demo resolves `/dev/blk/0`, `sys_io_submit`s a 512-byte read,
+  `sys_wait`s, and verifies the `0x55AA` boot signature — the full userspace block
+  path the kernel self-tests stood in for. QEMU: `parent: /dev/blk/0 read OK
+  (sector 0 boot sig 0x55AA)`, 4/4 clean boots. (The dedicated `xtask build-disk`
+  + ext4 disk arrive with the fs-server, slice 7.)
 
 #### 6. Partition handling
 
