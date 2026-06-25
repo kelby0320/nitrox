@@ -25,7 +25,13 @@ const LIMINE_VERSION: &str = "v12.2.0";
 
 /// Disk image size in MiB. 64 is enough for the kernel + Limine UEFI
 /// loader several times over.
-const IMAGE_SIZE_MIB: u64 = 64;
+/// Total boot-disk size. Holds two GPT partitions: the EFI System Partition
+/// (FAT32, [`ESP_SIZE_MIB`]) and the ext4 `nitrox-root` filesystem (the rest).
+const IMAGE_SIZE_MIB: u64 = 128;
+/// The EFI System Partition size. Comfortably above the FAT32 minimum so
+/// `mformat -F` (forced FAT32) is always valid; the rest of the disk is the ext4
+/// `nitrox-root` partition.
+const ESP_SIZE_MIB: u64 = 48;
 
 type R<T> = Result<T, Box<dyn Error>>;
 
@@ -556,6 +562,7 @@ fn assemble_image(
     require_tool("mformat")?;
     require_tool("mcopy")?;
     require_tool("mmd")?;
+    require_tool("mke2fs")?;
 
     if out.exists() {
         fs::remove_file(out)?;
@@ -567,49 +574,109 @@ fn assemble_image(
         f.set_len(IMAGE_SIZE_MIB * 1024 * 1024)?;
     }
 
-    // 2. GPT layout with a single EFI System Partition starting at 1 MiB.
+    // 2. GPT: an EFI System Partition (FAT32, ESP_SIZE_MIB starting at 1 MiB) and
+    //    the ext4 `nitrox-root` filesystem filling the rest. The slice-6 GPT driver
+    //    enumerates every non-empty entry (no type-GUID filter) and binds
+    //    `/dev/disk/by-partlabel/nitrox-root` at boot — so the second partition
+    //    rides the existing boot disk; no separate QEMU drive is needed.
     run(Command::new("sgdisk")
         .arg("--clear")
-        .arg("-n").arg("1:2048")        // partition 1, start LBA 2048 (1 MiB)
-        .arg("-t").arg("1:ef00")        // EFI System
+        .arg("-n").arg(format!("1:2048:+{ESP_SIZE_MIB}M")) // ESP: LBA 2048 (1 MiB), bounded
+        .arg("-t").arg("1:ef00")                            // EFI System
         .arg("-c").arg("1:NITROX_ESP")
+        .arg("-n").arg("2:0:0")                             // nitrox-root: next aligned → end
+        .arg("-t").arg("2:8300")                            // Linux filesystem
+        .arg("-c").arg("2:nitrox-root")
         .arg(out))?;
 
-    // 3. FAT32 inside the partition (mformat's @@1M syntax = 1 MiB offset).
-    let part = format!("{}@@1M", out.display());
-    run(Command::new("mformat")
-        .arg("-i").arg(&part)
-        .arg("-F")
-        .arg("-v").arg("NITROX_ESP"))?;
+    // Query each partition's on-disk extent (robust to GPT's end-of-disk reserve).
+    let (esp_lba, esp_sectors) = partition_extent(out, 1)?;
+    let (root_lba, root_sectors) = partition_extent(out, 2)?;
 
-    // 4. Directory tree and file copies.
+    // A scratch dir for the per-partition images + the ext4 staging tree.
+    let work = out.with_extension("partbuild");
+    if work.exists() {
+        fs::remove_dir_all(&work)?;
+    }
+    fs::create_dir_all(&work)?;
+
+    // 3. Build the ESP as a separate, exactly-partition-sized FAT32 image (so the
+    //    FAT is bounded to the partition), then splice it in. mformat on a plain
+    //    file formats the whole file; no `@@offset` games.
+    let esp = work.join("esp.img");
+    {
+        let f = fs::File::create(&esp)?;
+        f.set_len(esp_sectors * 512)?;
+    }
+    let espf = esp.display().to_string();
+    run(Command::new("mformat").arg("-i").arg(&espf).arg("-F").arg("-v").arg("NITROX_ESP"))?;
     run(Command::new("mmd")
-        .arg("-i").arg(&part)
-        .arg("::/EFI")
-        .arg("::/EFI/BOOT")
-        .arg("::/boot")
-        .arg("::/boot/limine"))?;
+        .arg("-i").arg(&espf)
+        .arg("::/EFI").arg("::/EFI/BOOT").arg("::/boot").arg("::/boot/limine"))?;
+    run(Command::new("mcopy").arg("-i").arg(&espf).arg(bootx64).arg("::/EFI/BOOT/BOOTX64.EFI"))?;
+    run(Command::new("mcopy").arg("-i").arg(&espf).arg(conf).arg("::/boot/limine/limine.conf"))?;
+    run(Command::new("mcopy").arg("-i").arg(&espf).arg(kernel).arg("::/boot/kernel"))?;
+    run(Command::new("mcopy").arg("-i").arg(&espf).arg(initramfs).arg("::/boot/initramfs"))?;
+    splice_into(out, esp_lba * 512, &esp)?;
 
-    run(Command::new("mcopy")
-        .arg("-i").arg(&part)
-        .arg(bootx64)
-        .arg("::/EFI/BOOT/BOOTX64.EFI"))?;
+    // 4. Build the ext4 `nitrox-root` filesystem as a separate, partition-sized
+    //    image populated at creation (`mke2fs -d`, no root/mount), then splice it
+    //    in. The feature set matches the fs-server-ext4 reader's support (the
+    //    Part-2 fixture uses the same flags). The staging tree holds the milestone
+    //    file the Part-6 init loop reads.
+    let staging = work.join("rootfs");
+    fs::create_dir_all(staging.join("system"))?;
+    fs::write(
+        staging.join("system").join("current-generation"),
+        b"nitrox-rootfs generation 1\n",
+    )?;
+    let rootfs = work.join("rootfs.ext4");
+    let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
+    run(Command::new("mke2fs")
+        .arg("-q").arg("-F").arg("-t").arg("ext4")
+        .arg("-O").arg("^has_journal,^64bit,^metadata_csum,^resize_inode")
+        .arg("-b").arg("4096")
+        .arg("-d").arg(&staging)
+        .arg(&rootfs)
+        .arg(blocks.to_string()))?;
+    splice_into(out, root_lba * 512, &rootfs)?;
 
-    run(Command::new("mcopy")
-        .arg("-i").arg(&part)
-        .arg(conf)
-        .arg("::/boot/limine/limine.conf"))?;
+    // Leave `work/` in place for inspection; `cmd_image` rebuilds it each run.
+    Ok(())
+}
 
-    run(Command::new("mcopy")
-        .arg("-i").arg(&part)
-        .arg(kernel)
-        .arg("::/boot/kernel"))?;
+/// Parse `sgdisk -i <n> <disk>` for partition `n`'s first LBA and sector count.
+fn partition_extent(disk: &Path, n: u32) -> R<(u64, u64)> {
+    let out = Command::new("sgdisk")
+        .arg("-i").arg(n.to_string()).arg(disk)
+        .output()
+        .map_err(|e| format!("failed to run sgdisk -i {n}: {e}"))?;
+    if !out.status.success() {
+        return Err(format!("sgdisk -i {n} {} failed", disk.display()).into());
+    }
+    let text = String::from_utf8_lossy(&out.stdout);
+    let mut first = None;
+    let mut last = None;
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("First sector:") {
+            first = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok());
+        } else if let Some(rest) = line.strip_prefix("Last sector:") {
+            last = rest.split_whitespace().next().and_then(|s| s.parse::<u64>().ok());
+        }
+    }
+    let first = first.ok_or("sgdisk: missing 'First sector'")?;
+    let last = last.ok_or("sgdisk: missing 'Last sector'")?;
+    Ok((first, last - first + 1))
+}
 
-    run(Command::new("mcopy")
-        .arg("-i").arg(&part)
-        .arg(initramfs)
-        .arg("::/boot/initramfs"))?;
-
+/// Overwrite `dst` (in place, no truncation) with `src`'s bytes starting at byte
+/// `offset` — splice a partition image into the GPT disk.
+fn splice_into(dst: &Path, offset: u64, src: &Path) -> R<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let data = fs::read(src)?;
+    let mut f = fs::OpenOptions::new().write(true).open(dst)?;
+    f.seek(SeekFrom::Start(offset))?;
+    f.write_all(&data)?;
     Ok(())
 }
 
