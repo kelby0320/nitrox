@@ -1173,9 +1173,16 @@ caller's* table, then signals the lookup's `PendingOperation` — the `Pending`
 
 - [ ] **Kernel**: `BindingTarget::UserspaceServer` + IPC-forwarded lookup +
   cross-context handle install (the `Pending` completion path)
-- [ ] `userspace/librsproto/` crate per [docs/spec/rsproto-wire-format.md]
-- [ ] Meta operations: Hello, Goodbye, QueryCaps, Ping, Ready
-- [ ] Version negotiation
+- [x] `userspace/librsproto/` crate per [docs/spec/rsproto-wire-format.md]
+  (Part 1, `phase-2/slice7-librsproto`): the pure `no_std`, no-`alloc`, no-deps
+  wire codec — the `RsMsgHeader` envelope (`encode`/`decode`), explicit LE byte
+  serialization (no packed-field refs), and the `Namespace::Resolve` op spec
+  (`docs/spec/rsproto-namespace-ops.md`). 11 host round-trip tests. Server-side
+  helpers only; the sync `RsClient` is deferred to eshell (slice 9).
+- [x] Meta operations: Hello, Goodbye, QueryCaps, Ping, Ready *(codec — the
+  handshake **use** is Parts 4/6)*
+- [ ] Version negotiation *(Hello codec done; the negotiation logic is the
+  fs-server, Part 4)*
 - [ ] `userspace/fs-server-ext4/` crate
   - [ ] ext4 superblock parsing
   - [ ] Inode reading

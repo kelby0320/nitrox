@@ -344,6 +344,15 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `librsproto` host tests (the resource-server protocol wire codec). A plain
+    // lib (no bare-target bin), host-tested like `libkern`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("librsproto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     Ok(())
 }
 
