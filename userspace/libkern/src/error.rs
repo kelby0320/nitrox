@@ -31,6 +31,8 @@ pub enum KError {
     FaultFromUser = -31,
     /// A length/size exceeded the permitted maximum.
     TooLarge = -32,
+    /// A device or medium I/O error.
+    IoError = -40,
     /// The operation is not implemented.
     Unsupported = -52,
     /// Catch-all for an unexpected internal condition.

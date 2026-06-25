@@ -316,6 +316,39 @@ impl ArchIrqRouter for X86IoApic {
     }
 }
 
+/// Install a **PCI INTx** interrupt end-to-end for an in-kernel driver: register
+/// `handler` for a fresh device-interrupt vector, route `gsi` to it on the boot
+/// CPU **level-triggered, active-low** (the PCI INTx convention), and unmask the
+/// line. Returns the assigned IDT vector. Re-exported neutrally as
+/// [`crate::arch::install_pci_irq`].
+///
+/// This is a **free function**, not a method, on purpose: it is a *composite*
+/// over three concerns — the device-vector **handler registry** ([`idt`], which
+/// [`ArchIrqRouter`] deliberately keeps off itself), the **local controller**
+/// ([`crate::arch::Irq::id`], for the destination CPU), and the **router**
+/// ([`X86IoApic::route`], the resolved-`(line, vector)` primitive). It belongs to
+/// none of those single hardware abstractions.
+///
+/// **TODO(msi):** when the device-interrupt *family* grows — MSI/MSI-X install,
+/// shared-INTx chaining, IRQ teardown (Tier 2 module unload) — promote this and
+/// its siblings into a dedicated arch trait (e.g. `ArchIrqInstall`) for the
+/// device-interrupt installation facility, distinct from `ArchIrqRouter` (pure
+/// routing) and `ArchIrq` (the local controller). See
+/// `docs/rationale/deferred-decisions.md`.
+///
+/// # Safety
+/// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
+/// lifetime; the caller must be ready to receive `gsi` once interrupts are
+/// enabled.
+pub unsafe fn install_pci_irq(gsi: u32, handler: extern "C" fn()) -> u8 {
+    let bsp = crate::arch::Irq::id();
+    let vector = idt::register_device_handler(handler);
+    // SAFETY: forwarded from this fn's contract; the handler for `vector` was
+    // just registered, so the routed interrupt has somewhere to land.
+    unsafe { X86IoApic::route(gsi, vector, bsp, TriggerMode::Level, Polarity::ActiveLow) };
+    vector
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

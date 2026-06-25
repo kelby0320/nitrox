@@ -233,6 +233,13 @@ fn kernel_main() {
     // before any real driver exists. Needs the DPC queue + scheduler waitables.
     nitrox_kernel::io::self_test();
 
+    // Phase 2 slice 5 Part 3: match Tier 1 drivers against the enumerated
+    // devices (the AHCI controller) and bring up any disks, then read sector 0
+    // through the real driver to prove the IRP → controller DMA → IRQ → DPC → PO
+    // path against hardware.
+    nitrox_kernel::drivers::probe();
+    nitrox_kernel::drivers::self_test();
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and

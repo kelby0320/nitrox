@@ -76,6 +76,19 @@ the QEMU AHCI controller. MSI/MSI-X (and the per-vector affinity they enable)
 land when a device needs them. Trigger: NVMe, multi-queue NICs, or performance
 work on interrupt-heavy devices.
 
+**A dedicated arch trait for the device-interrupt *installation* facility.**
+`install_pci_irq` (the composite that registers a handler in the arch vector
+table + routes a GSI to it — Part 3) is currently a **neutral free function**
+(`crate::arch::install_pci_irq`), not a method on `ArchIrqRouter`: it spans three
+hardware abstractions (the handler registry, the local controller, and the
+router) and belongs to none. When the device-interrupt *family* grows a second
+member — **MSI/MSI-X install**, **shared-INTx chaining**, or **IRQ teardown**
+(Tier 2 module unload drains + unhooks an IRQ) — promote the family into its own
+arch trait (e.g. `ArchIrqInstall`), distinct from `ArchIrqRouter` (pure routing)
+and `ArchIrq` (the local controller). One method + one consumer today does not
+justify the trait (the project builds an abstraction at its second consumer); the
+`TODO(msi)` on the function marks the trigger.
+
 **Shared PCI INTx interrupt chaining.** The "chain of handlers, each returning
 *mine* / *not mine*" model for shared legacy interrupt lines is deferred; Phase 2
 assumes each handled GSI has one owner. MSI/MSI-X are never shared, so this only
@@ -113,6 +126,15 @@ the first filter use case (encrypted root / LVM, both already deferred under
 
 **NVMe.** Phase 2's first storage driver is AHCI (simpler than NVMe). The `nvme`
 Tier 1 feature follows. Trigger: NVMe hardware or a faster boot device matters.
+
+**AHCI driver scope.** The Phase 2 AHCI driver (Part 3) supports a **single
+controller, single SATA disk, one outstanding command** (slot 0). Multi-port /
+multi-disk, multiple controllers, NCQ (queued commands), and port multipliers are
+deferred to when a configuration needs them. It resolves the controller's GSI
+from the **PCI interrupt-line register** (firmware-programmed on QEMU); proper
+ACPI `_PRT` routing (which needs AML) is deferred — see `device-node.md`. The
+read self-test brings up against the existing AHCI boot disk; the dedicated
+`xtask build-disk` + ext4 test disk arrive with the fs-server (slice 7).
 
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).

@@ -53,6 +53,12 @@ pub use x86_64::apic::XApic as Irq;
 // distinct from `Irq`, the per-CPU local controller. See `arch/irq_router.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::ioapic::X86IoApic as IrqRouter;
+/// Install a PCI INTx interrupt (register an ISR + route a GSI) for an in-kernel
+/// driver — a composite helper, not a router method. See
+/// [`x86_64::ioapic::install_pci_irq`] (and the TODO there to promote the
+/// device-interrupt family into its own trait when MSI/teardown land).
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::ioapic::install_pci_irq;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::cpu::X86Cpu as Cpu;
 // Platform/firmware discovery (the x86 impl parses ACPI tables; aarch64 would
