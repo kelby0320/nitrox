@@ -4702,3 +4702,58 @@ fs-server-ext4 6, libkern 8, init 18. **QEMU milestone:** `parent` logs
 `forwarded lookup returned 'STUB' via fs-server ok`, and the rest of the boot chain
 (IPC children, reaping) stays clean — `init: reaped pid=2 code=0`, no `#DF`/panic.
 Branch `phase-2/slice7-fwd`. Next: Part 4 (the real `fs-server-ext4` process).
+
+## 2026-06-25 — Phase 2 slice 7, Part 4: the `fs-server-ext4` server process
+
+The first **userspace resource server**: the `fs-server-ext4` `[[bin]]` — the
+process the kernel forwards lookups to (Part 3). It wires the librsproto codec
+(Part 1) + the ext4 reader (Part 2) + a `BlockReader` over `sys_io_submit`.
+
+**Decision — alloc-free.** The CLAUDE.md left the server free to use `alloc` (init's
+static-arena `#[global_allocator]`). It turns out it needs none: librsproto and the
+ext4 reader are both no-alloc, and the serve loop's working set is fixed (a 4 KiB
+recv buffer, a 4 KiB reply buffer, a 64 KiB content buffer, a one-page device
+scratch). So the server is `#![no_std]` + `#![no_main]` with `.bss` statics and **no
+global allocator** — simpler, and it sidesteps sizing an arena against the 64 KiB
+read-model cap. (If a future feature needs `alloc`, init's `BumpAlloc` is the
+pattern to copy.)
+
+**Decision — host-test the request→reply seam, not the syscall loop.** `libkern`
+has no syscall mock (the CLAUDE.md "test mode" is still aspirational), so the syscall
+plumbing can only be integration-tested (Part 6, under QEMU). To keep the bulk of the
+logic verifiable now, the parse→read→reply core is a `serve_resolve` function in the
+**library** (generic over `BlockReader`, exactly like the parser), with the syscall
+plumbing confined to `main.rs`. Five host tests run it against the same `mke2fs`
+fixture Part 2 uses (extracted into a shared `test_support` module): success
+(MEMOBJ reply + content), missing path → NotFound, a directory → NotFound, a
+non-Resolve op → Unsupported, and a garbage request → InvalidArgument with a
+recovered `request_id` of 0. `serve_resolve` echoes the request's `request_id` so
+the kernel correlates the reply; `FsError` maps to a `KError` (`Io`/`Corrupt` →
+`IoError`, the rest pass through).
+
+**Decision — the bootstrap handle dance.** A spawned child learns only `installed[0]`'s
+handle *value* by register (`rdx`), so init installs exactly **one** handle at spawn —
+the **control channel** — and ships the **block-device** handle in a follow-up *setup
+message* over it (transferring `handles[0]`). The server then creates the **forwarding
+channel** pair itself, keeps the serving end, and returns the **kernel end** to init by
+**transferring it in the `Meta::Ready` message** — so init never has to mint the
+endpoint, and binds exactly what the server handed back. The `BlockReader` reads a
+sector at a time into a one-page scratch `MemoryObject` (`sys_io_submit` READ + wait);
+each served file is materialised into a fresh `MemoryObject` (create → map R/W → copy →
+`sys_memory_unmap` → `sys_handle_restrict` to `MAP_READ | TRANSFER`), so no mapping
+leaks across requests and the transferred handle is read-only content.
+
+**Decision — `ImageId::FsServerExt4 = 3` lands here (deferred from Part 3).** The Part-3
+proof was the inline `parent` demo, so the embedded server ELF had no consumer until
+now. Added: the kernel `ImageId` variant + `from_u32`, the libkern `IMAGE_FS_SERVER_EXT4`
+mirror, the `embedded_images.rs` `include_bytes!` + dispatch arm, and the xtask build
+step (the bin builds before the kernel embeds it). A new enum *value* on an existing
+`#[repr(u32)]` — no layout change, but the discriminant set is an ABI-hash input
+(`docs/spec/abi-version-hash.md`); pre-stabilization, so no version bump.
+
+**Not yet runnable end to end.** The server has no disk to read (Part 5) and nothing
+spawns/binds it (Part 6) — so there is no QEMU proof in this part; the embedded ELF
+rides along unused until Part 6. Verified: `cargo xtask build` (no warnings; the bin
+builds bare `x86_64-unknown-none` and the kernel embeds it) / `check-arch` / `test` —
+kernel **500**, **fs-server-ext4 11** (6 reader + 5 serve), librsproto 11, libkern 8,
+init 18. Branch `phase-2/slice7-fs-server`. Next: Part 5 (the ext4 test disk).

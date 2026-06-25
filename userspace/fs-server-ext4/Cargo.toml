@@ -13,4 +13,15 @@ edition = "2024"
 name = "fs_server_ext4"
 path = "src/lib.rs"
 
+# The server `[[bin]]` (Part 4): the bare-target `_start`, a `BlockReader` over
+# `sys_io_submit`, and the resource-server loop (recv `Namespace::Resolve`, read
+# the file, reply transferring a `MemoryObject`). Alloc-free — fixed buffers only.
+[[bin]]
+name = "fs-server-ext4"
+path = "src/main.rs"
+
 [dependencies]
+# The request→reply codec (`Namespace::Resolve` + `Meta::Ready`). no_std/no-alloc.
+librsproto = { path = "../librsproto" }
+# The raw syscall surface (used only by the `[[bin]]`; the reader lib needs none).
+libkern = { path = "../libkern" }

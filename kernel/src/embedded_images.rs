@@ -27,11 +27,18 @@ static INIT_ELF: &[u8] =
 static PARENT_ELF: &[u8] =
     include_bytes!("../../userspace/target/x86_64-unknown-none/release/parent");
 
+/// The ext4 filesystem server (`userspace/fs-server-ext4`), built by `xtask`
+/// before the kernel. Spawned by init (slice 7); the first userspace resource
+/// server. Path-based spawn from the initramfs (replacing this embed) is slice 8.
+static FS_SERVER_EXT4_ELF: &[u8] =
+    include_bytes!("../../userspace/target/x86_64-unknown-none/release/fs-server-ext4");
+
 /// The embedded ELF bytes for an [`ImageId`].
 pub fn image_bytes(image: ImageId) -> &'static [u8] {
     match image {
         ImageId::Child => CHILD_ELF,
         ImageId::Init => INIT_ELF,
         ImageId::Parent => PARENT_ELF,
+        ImageId::FsServerExt4 => FS_SERVER_EXT4_ELF,
     }
 }

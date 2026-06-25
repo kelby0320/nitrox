@@ -12,6 +12,10 @@ dependencies = [
 [[package]]
 name = "fs-server-ext4"
 version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
 
 [[package]]
 name = "hello"

@@ -18,10 +18,20 @@ userspace processes (`CLAUDE.md` core rule).
   an `mke2fs` fixture. `no_std`, **no `alloc`**: `read_file` reads into a
   caller-provided buffer; parsing uses bounded stack scratch (≤ one 4 KiB block).
   Do not pull in `alloc` here — the reader must stay buffer-based.
-- **`src/main.rs` — the server `[[bin]]`** (Part 4): the bare-target `_start`,
-  a `BlockReader` over `sys_io_submit`, and the `librsproto` server loop
-  (Hello/Ready + `Namespace::Resolve`). Reuses init's static-arena
-  `#[global_allocator]` pattern (the server may use `alloc`; the *reader* may not).
+- **`src/serve.rs` — the request→reply core.** `serve_resolve(reader, request,
+  content, reply)` parses a forwarded `Namespace::Resolve`, reads the file via the
+  `BlockReader`, and builds the reply (success names a `MemoryObject` of the
+  content; error carries a `KError`). Generic over `BlockReader`, so it is
+  **host-tested** against the same `mke2fs` fixture as the parser (see
+  `test_support`). Touches no syscalls.
+- **`src/main.rs` — the server `[[bin]]`.** The bare-target `_start` + the syscall
+  plumbing only: a `BlockReader` over `sys_io_submit` (sector-at-a-time into a
+  scratch `MemoryObject`), the bootstrap (recv the device handle via the setup
+  message; create the forwarding channel; send `Meta::Ready` transferring its
+  kernel end), and the serve loop calling `serve_resolve` + materialising/
+  transferring the result `MemoryObject` (`MAP_READ | TRANSFER`). **Alloc-free** —
+  fixed `.bss` buffers, no `#[global_allocator]`; the 64 KiB content cap lives in a
+  static. (If a future feature needs `alloc`, copy init's `BumpAlloc`.)
 
 ## Read-only, minimal (Phase 2)
 

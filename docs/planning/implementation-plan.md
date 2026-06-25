@@ -1207,14 +1207,20 @@ Phase 2).
   real consumer); a forwarded lookup's returned object takes rights `requested ∩
   the rights the server granted on the transfer` (the bound IPC endpoint's rights
   are not a meaningful content cap) — see `rsproto-namespace-ops.md`.
-- [ ] **Part 4 — the real `fs-server-ext4` process**: wires Part 1 (librsproto
-  server) + Part 2 (ext4 reader) + a `BlockReader` over `sys_io_submit`; the
-  Hello/Ready handshake + the `Namespace::Resolve` serve loop (suffix →
-  `ext4::read_file` → `MemoryObject` → reply transferring it). The control channel
-  + Ready handshake; init binds the endpoint via `sys_ns_bind` (Part 6). Adds
-  `ImageId::FsServerExt4 = 3` + the embedded server ELF (deferred here from Part 3,
-  since the inline `parent` demo proved the kernel mechanism without a separate
-  process).
+- [x] **Part 4 — the real `fs-server-ext4` process** (`phase-2/slice7-fs-server`):
+  the server `[[bin]]` wiring Part 1 (librsproto) + Part 2 (ext4 reader) + a
+  `BlockReader` over `sys_io_submit`. **Alloc-free** (fixed `.bss` buffers, no
+  global allocator). Bootstrap: receive the **control channel** in `rdx`; recv the
+  **setup message** transferring the read-only device handle; create the forwarding
+  channel pair, keep the serving end, send `Meta::Ready` on the control channel
+  **transferring the kernel end** (init binds it, Part 6); then the serve loop
+  (recv `Namespace::Resolve` → `serve_resolve` → fill + restrict + transfer a
+  `MemoryObject`). The request→reply logic (`serve` module, generic over
+  `BlockReader`) is **host-tested** against the `mke2fs` fixture (success +
+  NotFound + directory + wrong-op + garbage). Adds `ImageId::FsServerExt4 = 3`
+  (kernel enum + libkern `IMAGE_FS_SERVER_EXT4` mirror) + the embedded ELF + the
+  xtask build step. *(No QEMU yet — the server needs a disk (Part 5) and a
+  supervisor to spawn + bind it (Part 6); end-to-end boot is the Part 6 milestone.)*
 - [ ] **Part 5 — xtask ext4 test disk**: a 2nd GPT partition `nitrox-root`,
   ext4-formatted + populated via `mke2fs -d` (no root mount), spliced into the
   boot disk image; rides the existing QEMU drive (slice-6 driver enumerates it).
