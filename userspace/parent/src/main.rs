@@ -784,85 +784,79 @@ fn po_wait(po: u64) -> (i32, u64) {
     if waited != 1 { (-1, 0) } else { (status, result) }
 }
 
-/// Block-storage demo: resolve `/dev/blk/0` (the AHCI disk, boot-bound by the
-/// kernel), submit an async read of sector 0 into a mapped buffer via
-/// `sys_io_submit`, wait its completion, and verify the `0x55AA` boot signature.
-/// This is the full userspace block-I/O path the kernel self-tests stood in for.
-fn block_demo(root_ns: u64) {
-    kprint(b"parent: /dev/blk demo start\n");
-
-    // Resolve the first block device.
-    let (st, dev) = ns_lookup_wait(root_ns, b"/dev/blk/0", RIGHT_READ);
+/// Resolve `path` to a block device, `sys_io_submit` a 512-byte read of its
+/// sector 0 into a mapped buffer, wait, and return the 16-bit value at offset 510
+/// (the boot signature `0xAA55`), or `-1` on any failure. The full userspace
+/// block-I/O path: lookup → `sys_io_submit` → `sys_wait` → data.
+fn read_block_sector0(root_ns: u64, path: &[u8]) -> i32 {
+    let (st, dev) = ns_lookup_wait(root_ns, path, RIGHT_READ);
     if st != 0 || dev == 0 {
-        kprint(b"parent: /dev/blk/0 lookup FAIL (no disk?)\n");
-        return;
+        return -1;
     }
-
-    // A 1-page buffer; the controller DMAs the sector into it, so it needs
-    // MAP_WRITE (and MAP_READ so we can verify the bytes).
     // SAFETY: register-only syscall.
     let buf = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if buf < 0 {
-        kprint(b"parent: /dev/blk buffer create FAIL\n");
         unsafe { syscall1(SYS_HANDLE_CLOSE, dev) };
-        return;
+        return -1;
     }
+    // The controller DMAs the sector into the buffer (MAP_WRITE); MAP_READ to verify.
     // SAFETY: `buf` is a fresh MemoryObject handle with full MAP rights.
     let addr = unsafe {
         syscall4(SYS_MEMORY_MAP, buf as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
     };
-    if addr < 0 {
-        kprint(b"parent: /dev/blk buffer map FAIL\n");
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, buf as u64);
-            syscall1(SYS_HANDLE_CLOSE, dev);
+    let mut sig: i32 = -1;
+    if addr >= 0 {
+        let op = IoOp {
+            opcode: IO_OPCODE_READ,
+            flags: 0,
+            buffer: buf as u64,
+            buf_offset: 0,
+            offset: 0,
+            length: 512,
+        };
+        // SAFETY: `dev` is a block DeviceNode with READ; `&op` is a valid IoOp.
+        let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
+        if po >= 0 {
+            let (status, result) = po_wait(po as u64);
+            if status == 0 && result == 512 {
+                // SAFETY: `addr` maps the 512 DMAed bytes; 510..512 in bounds.
+                sig = unsafe { ((addr as u64 + 510) as *const u16).read_unaligned() } as i32;
+            }
         }
-        return;
     }
-
-    // Submit a 512-byte read of LBA 0.
-    let op = IoOp {
-        opcode: IO_OPCODE_READ,
-        flags: 0,
-        buffer: buf as u64,
-        buf_offset: 0,
-        offset: 0,
-        length: 512,
-    };
-    // SAFETY: `dev` is a block DeviceNode handle with READ; `&op` is a valid IoOp.
-    let po = unsafe { syscall2(SYS_IO_SUBMIT, dev, (&op as *const IoOp) as u64) };
-    if po < 0 {
-        kprint(b"parent: /dev/blk sys_io_submit FAIL\n");
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, buf as u64);
-            syscall1(SYS_HANDLE_CLOSE, dev);
-        }
-        return;
-    }
-
-    let (status, result) = po_wait(po as u64);
-    if status != 0 || result != 512 {
-        kprint(b"parent: /dev/blk read FAIL (completion unexpected)\n");
-        unsafe {
-            syscall1(SYS_HANDLE_CLOSE, buf as u64);
-            syscall1(SYS_HANDLE_CLOSE, dev);
-        }
-        return;
-    }
-
-    // Verify the boot signature (0xAA55 little-endian at offset 510).
-    // SAFETY: `addr` maps the 512 bytes the kernel DMAed into; 510..512 in bounds.
-    let sig = unsafe { ((addr as u64 + 510) as *const u16).read_unaligned() };
-    if sig == 0xAA55 {
-        kprint(b"parent: /dev/blk/0 read OK (sector 0 boot sig 0x55AA)\n");
-    } else {
-        kprint(b"parent: /dev/blk/0 read OK but no 0x55AA sig\n");
-    }
-
     // SAFETY: closing our own handles.
     unsafe {
         syscall1(SYS_HANDLE_CLOSE, buf as u64);
         syscall1(SYS_HANDLE_CLOSE, dev);
+    }
+    sig
+}
+
+/// Block-storage demo: read sector 0 of the whole disk (`/dev/blk/0`), of its
+/// first GPT partition (`/dev/blk/1`, proving the partition layer rebases the
+/// offset), and of the same partition under its stable `/dev/disk/by-partlabel`
+/// name. Each verifies the `0x55AA` boot signature.
+fn block_demo(root_ns: u64) {
+    kprint(b"parent: /dev/blk demo start\n");
+    report_block_read(root_ns, b"/dev/blk/0", b"parent: /dev/blk/0 (disk) read");
+    report_block_read(root_ns, b"/dev/blk/1", b"parent: /dev/blk/1 (partition) read");
+    report_block_read(
+        root_ns,
+        b"/dev/disk/by-partlabel/NITROX_ESP",
+        b"parent: /dev/disk/by-partlabel/NITROX_ESP read",
+    );
+}
+
+/// Read+verify one block path and log the outcome under `label`.
+fn report_block_read(root_ns: u64, path: &[u8], label: &[u8]) {
+    let sig = read_block_sector0(root_ns, path);
+    kprint(label);
+    if sig == 0xAA55 {
+        kprint(b" OK (sector 0 boot sig 0x55AA)\n");
+    } else if sig < 0 {
+        kprint(b" FAIL\n");
+    } else {
+        kprint(b" OK (no 0x55AA sig)\n");
     }
 }
 

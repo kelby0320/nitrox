@@ -4491,3 +4491,56 @@ is internal). Verified: `cargo xtask build` (no warnings) / `check-arch` / `test
 (kernel **482**, +1 `parse_index`; libkern 8; init 18). QEMU q35: `parent:
 /dev/blk/0 read OK (sector 0 boot sig 0x55AA)`, 4/4 clean boots, init→parent→child
 reaped (no `#DF`). Branch `phase-2/slice5-block-server`.
+
+## 2026-06-25 — Phase 2 slice 6: GPT partitions (the first two-layer block stack)
+
+Partition handling — the first **two-layer block IRP stack**.
+
+- **The partition layer** (`io::block::Partition`): a partition is a block
+  `DeviceNode` whose `BlockBackend::submit` (`partition_submit`) bounds-checks the
+  partition-relative request, **rebases** the offset to disk-absolute
+  (`partition_rebase`, pure + unit-tested), and forwards the IRP to the parent
+  disk's backend. The two layers are realised by **backend delegation** (partition
+  → disk), not formal `IrpStackFrame`/`stack_index` descent — simpler and correct
+  for Phase 2's shallow stacks; the formal stack machinery (with per-frame
+  completion routines) stays designed-ahead for filter drivers (encryption/LVM).
+  Completion flows back through the one IRP DPC unchanged. The Part 2 `BlockBackend`
+  seam made this a ~30-line addition.
+
+- **Synchronous boot read**: the GPT driver must read the disk during
+  `drivers::probe`, when interrupts are masked. Added `BlockBackend::poll` (AHCI
+  wraps its existing `poll_complete_inflight`; a partition delegates to the disk's;
+  the ramdisk drains its DPC) + `io::block::read_blocking(device, lba, count, dst)`
+  — submit a normal IRP, drive it to completion by polling, copy out. No new async
+  machinery.
+
+- **GPT driver** (`drivers/gpt.rs`, Tier 1, neutral): validates the `EFI PART`
+  signature + bounds (header/array CRC32 deferred), walks the entry array
+  sector-by-sector (bounded, no large buffers), and publishes each used partition.
+  Records `(node, by-partuuid path, by-partlabel path)` for the namespace bindings.
+
+- **Naming**: partitions appear at `/dev/blk/<n>` automatically (they are
+  block-class `DeviceNode`s in the device-table registry — the ESP at
+  `/dev/blk/1`). Plus stable content-derived **direct-handle** bindings created at
+  boot by `gpt::bind_partition_names`: `/dev/disk/by-partuuid/<uuid>` (GPT GUID
+  formatted mixed-endian — first three fields LE, last two BE) and
+  `/dev/disk/by-partlabel/<label>` (UTF-16 → ASCII). Read-only (`READ` + generic
+  band). DirectHandle, not a new Kernel Server: the partitions exist at boot, so
+  the supervisor binds them directly (snapshotting the registry first to avoid
+  holding it across the namespace lock).
+
+- **No new disk**: the existing GPT boot disk (`xtask image`: `sgdisk` ESP at LBA
+  2048, label `NITROX_ESP`) is parsed directly. The dedicated ext4 test disk stays
+  a slice-7 (fs-server) concern.
+
+Proof: QEMU logs `gpt: partition 0 lba 2048..131038 (128991 sectors)`; the `parent`
+demo reads sector 0 of `/dev/blk/0` (disk), `/dev/blk/1` (partition — proving the
+rebase, sector 0 of the partition is disk LBA 2048), and
+`/dev/disk/by-partlabel/NITROX_ESP`, all verifying `0x55AA`. `partition_rebase`
+unit-tested (LBA 0 → 2048 + bounds rejection).
+
+No ABI-hash impact (no hashed-layout change; `BlockBackend`/`Partition` are
+kernel-internal). Verified: `cargo xtask build` (no warnings) / `check-arch` (the
+GPT driver is neutral) / `test` (kernel **486**, +4: 3 `gpt` + 1 `partition_rebase`;
+libkern 8; init 18). QEMU q35: GPT parsed, three reads OK, init→parent→child
+reaped (no `#DF`). Branch `phase-2/slice6-gpt`. Next: slice 7 (userspace fs-server).

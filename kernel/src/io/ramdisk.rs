@@ -132,11 +132,18 @@ fn ramdisk_submit(irp: *mut Irp, ctx: *mut ()) {
     crate::dpc::enqueue(unsafe { &(*irp).dpc });
 }
 
+/// The ramdisk's [`BlockBackend::poll`]: its `submit` already queued the
+/// completion DPC, so a synchronous read just drains it.
+fn ramdisk_poll(_ctx: *mut ()) {
+    crate::dpc::run_pending();
+}
+
 /// Build a block [`DeviceNode`] for `rd`. `rd` must outlive every IRP submitted
 /// to it (it does — the ramdisk is leaked/'static).
 pub fn try_new_device(rd: &'static RamDisk) -> Result<KBox<DeviceNode>, AllocError> {
     let backend = BlockBackend {
         submit: ramdisk_submit,
+        poll: ramdisk_poll,
         ctx: rd as *const RamDisk as *mut (),
     };
     let geometry = BlockGeometry {

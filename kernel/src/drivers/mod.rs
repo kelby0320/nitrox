@@ -5,6 +5,7 @@
 //! `docs/architecture/drivers-and-irps.md` § "Module tiers".
 
 pub mod ahci;
+pub mod gpt;
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
@@ -30,6 +31,18 @@ pub fn probe() {
         let id = &dn.descriptor().identity;
         if (id.class, id.subclass, id.prog_if) == PCI_CLASS_AHCI {
             ahci::init(node);
+        }
+    }
+
+    // Controllers have published their disks; parse each disk's GPT and publish
+    // its partitions. Re-snapshot *now* so the (block-class) disks are visible but
+    // the partitions gpt::init creates are not re-scanned.
+    let disks = crate::device::snapshot();
+    for node in disks.iter() {
+        // SAFETY: each entry pins a live `DeviceNode`.
+        let dn: &DeviceNode = unsafe { &*(node.as_ptr() as *const DeviceNode) };
+        if dn.class() == DeviceClass::Block {
+            gpt::init(node);
         }
     }
 }

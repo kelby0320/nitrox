@@ -1132,11 +1132,29 @@ reads disk sectors via `sys_io_submit` against the real AHCI controller.
   (sector 0 boot sig 0x55AA)`, 4/4 clean boots. (The dedicated `xtask build-disk`
   + ext4 disk arrive with the fs-server, slice 7.)
 
-#### 6. Partition handling
+#### 6. Partition handling — **complete** (`phase-2/slice6-gpt`)
 
-- [ ] GPT driver (Tier 1)
-- [ ] Partition DeviceNode registration
-- [ ] `/dev/disk/by-partuuid/*` and `/dev/disk/by-partlabel/*` namespace entries
+The first **two-layer block IRP stack**: a partition `DeviceNode` rebases a
+partition-relative offset to disk-absolute and forwards to the disk (realised by
+`BlockBackend` delegation — `io::block::Partition`/`partition_rebase`, not formal
+`stack_index` descent; the latter stays designed-ahead for filter drivers).
+
+- [x] **GPT driver (Tier 1)** (`drivers/gpt.rs`): parses LBA 1 (`EFI PART` +
+  bounds; CRC deferred) and the entry array, reading the disk synchronously at
+  boot via the new `io::block::read_blocking` (a polled read using the new
+  `BlockBackend::poll`, since interrupts are masked at probe time).
+- [x] **Partition DeviceNode registration**: each used entry becomes a block
+  `DeviceNode` over an `io::block::Partition` window, registered in the device
+  table — so it also resolves at `/dev/blk/<n>` (the ESP at `/dev/blk/1`).
+- [x] **`/dev/disk/by-partuuid/*` + `/dev/disk/by-partlabel/*`**: stable
+  direct-handle bindings created at boot (`gpt::bind_partition_names`); the GUID
+  is formatted GPT mixed-endian, the label decoded from UTF-16. Read-only.
+
+Proven on the existing GPT boot disk (no new disk needed): QEMU logs `gpt:
+partition 0 lba 2048..131038`; the `parent` demo reads sector 0 of the disk
+(`/dev/blk/0`), the partition (`/dev/blk/1`), and the partition under
+`/dev/disk/by-partlabel/NITROX_ESP` — all verifying the `0x55AA` boot signature.
+`partition_rebase` is unit-tested (partition LBA 0 → disk LBA 2048 + bounds).
 
 #### 7. Filesystem in userspace
 
