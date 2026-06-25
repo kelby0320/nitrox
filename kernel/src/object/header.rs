@@ -36,8 +36,8 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
-    DeviceNode, EntropyObject, IpcChannel, MemoryObject, Namespace, NotificationChannel,
-    PendingOperation, Process, Thread, Timer,
+    DeviceNode, EntropyObject, InterruptObject, IpcChannel, MemoryObject, Namespace,
+    NotificationChannel, PendingOperation, Process, Thread, Timer,
 };
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
@@ -341,6 +341,16 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::DeviceNode);
         }
+        KObjectType::InterruptObject => {
+            // SAFETY: last ref to an `InterruptObject` produced by KBox::into_raw.
+            drop(unsafe {
+                KBox::<InterruptObject>::from_raw(NonNull::new_unchecked(
+                    ptr as *mut InterruptObject,
+                ))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::InterruptObject);
+        }
         // No other kernel object types are implemented yet; they land behind
         // their respective slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -370,6 +380,7 @@ pub(crate) mod test_probe {
         static NAMESPACE_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static ENTROPY_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static DEVICE_NODE_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static INTERRUPT_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -388,6 +399,9 @@ pub(crate) mod test_probe {
             KObjectType::Namespace => NAMESPACE_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::EntropyObject => ENTROPY_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::DeviceNode => DEVICE_NODE_DESTROYS.with(|c| c.set(c.get() + 1)),
+            KObjectType::InterruptObject => {
+                INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1))
+            }
             _ => {}
         }
     }
@@ -432,6 +446,10 @@ pub(crate) mod test_probe {
         DEVICE_NODE_DESTROYS.with(Cell::get)
     }
 
+    pub(crate) fn interrupt_object_destroys() -> usize {
+        INTERRUPT_OBJECT_DESTROYS.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PROCESS_DESTROYS.with(|c| c.set(0));
         THREAD_DESTROYS.with(|c| c.set(0));
@@ -443,6 +461,7 @@ pub(crate) mod test_probe {
         NAMESPACE_DESTROYS.with(|c| c.set(0));
         ENTROPY_OBJECT_DESTROYS.with(|c| c.set(0));
         DEVICE_NODE_DESTROYS.with(|c| c.set(0));
+        INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(0));
     }
 }
 

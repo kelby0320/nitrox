@@ -23,6 +23,7 @@
 pub mod device_node;
 pub mod entropy_object;
 pub mod header;
+pub mod interrupt_object;
 pub mod ipc_channel;
 pub mod kernel_server;
 pub mod memory_object;
@@ -36,6 +37,7 @@ pub mod timer;
 pub use device_node::DeviceNode;
 pub use entropy_object::EntropyObject;
 pub use header::{KObjectHeader, ObjectRef};
+pub use interrupt_object::InterruptObject;
 pub use ipc_channel::{
     BlockSendOutcome, IpcChannel, ReclaimedSend, RecvState, SendOutcome, StoredMsg, TransferRef,
 };

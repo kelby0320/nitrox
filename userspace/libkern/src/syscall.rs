@@ -71,6 +71,10 @@ pub const SYS_NS_UNBIND: u64 = 25;
 pub const SYS_ENTROPY_CREATE: u64 = 26;
 /// `sys_entropy_read` — fill a buffer with CSPRNG output (or a PO if unseeded).
 pub const SYS_ENTROPY_READ: u64 = 27;
+/// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
+pub const SYS_IO_SUBMIT: u64 = 28;
+/// `sys_io_cancel` — request cancellation (Phase 2: `Unsupported`).
+pub const SYS_IO_CANCEL: u64 = 29;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 

@@ -254,6 +254,41 @@ const _: () = assert!(offset_of!(IoResult, status) == 8);
 const _: () = assert!(offset_of!(IoResult, reserved) == 12);
 const _: () = assert!(offset_of!(IoResult, result) == 16);
 
+// --- sys_io_submit operation descriptor (docs/spec/io-operation.md) ---------
+
+/// `IoOpcode::Read` — device → buffer.
+pub const IO_OPCODE_READ: u32 = 0;
+/// `IoOpcode::Write` — buffer → device.
+pub const IO_OPCODE_WRITE: u32 = 1;
+
+/// The `sys_io_submit` operation descriptor — the userspace mirror of the
+/// kernel's `IoOp` (`docs/spec/io-operation.md`). 40 bytes, 8-byte aligned.
+#[repr(C)]
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct IoOp {
+    /// Operation selector ([`IO_OPCODE_READ`] / [`IO_OPCODE_WRITE`]) — offset 0.
+    pub opcode: u32,
+    /// Reserved; must be 0 — offset 4.
+    pub flags: u32,
+    /// `MemoryObject` handle providing the data buffer — offset 8.
+    pub buffer: u64,
+    /// Byte offset within `buffer` — offset 16.
+    pub buf_offset: u64,
+    /// Byte offset within the resource (the device) — offset 24.
+    pub offset: u64,
+    /// Bytes to transfer — offset 32.
+    pub length: u64,
+}
+
+const _: () = assert!(size_of::<IoOp>() == 40);
+const _: () = assert!(align_of::<IoOp>() == 8);
+const _: () = assert!(offset_of!(IoOp, opcode) == 0);
+const _: () = assert!(offset_of!(IoOp, flags) == 4);
+const _: () = assert!(offset_of!(IoOp, buffer) == 8);
+const _: () = assert!(offset_of!(IoOp, buf_offset) == 16);
+const _: () = assert!(offset_of!(IoOp, offset) == 24);
+const _: () = assert!(offset_of!(IoOp, length) == 32);
+
 // --- sys_handle_stat metadata ----------------------------------------------
 
 /// Handle metadata written by `sys_handle_stat`; 16 bytes.

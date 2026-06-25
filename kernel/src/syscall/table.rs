@@ -22,6 +22,7 @@ use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE
 use crate::libkern::spawn::{ImageId, SPAWN_MAX_HANDLES, SpawnArgs};
 use crate::arch::RegisterValues;
 use crate::arch::registers::ArchRegisters;
+use crate::libkern::io_op::{IoOp, IoOpcode};
 use crate::libkern::{
     ExitKind, ExitStatus, IoResult, KBox, MemFlags, Notification, SendMode, ThreadArgs, TimerFlags,
 };
@@ -105,6 +106,10 @@ pub const SYS_NS_UNBIND: u64 = 25;
 pub const SYS_ENTROPY_CREATE: u64 = 26;
 /// `sys_entropy_read` — fill a buffer with CSPRNG output (or return a PO if unseeded).
 pub const SYS_ENTROPY_READ: u64 = 27;
+/// `sys_io_submit` — initiate an async I/O operation, returning a `PendingOperation`.
+pub const SYS_IO_SUBMIT: u64 = 28;
+/// `sys_io_cancel` — request cancellation of an in-flight operation (Phase 2: `Unsupported`).
+pub const SYS_IO_CANCEL: u64 = 29;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -150,6 +155,8 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
+        SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
+        SYS_IO_CANCEL => encode(sys_io_cancel(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
@@ -1194,6 +1201,98 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
     Ok(po_h.bits() as isize)
 }
 
+/// `sys_io_submit(resource, op)` — initiate the [`IoOp`] `*op` against
+/// `resource` (a block [`DeviceNode`](crate::object::DeviceNode)) and return a
+/// `PendingOperation` handle. Never blocks: the operation completes
+/// asynchronously and its outcome (status + bytes transferred) is delivered
+/// through the PO. Argument / permission / allocation failures return a negative
+/// `KError` synchronously with no PO; device/medium failures arrive through the
+/// PO (see `docs/spec/io-operation.md`). (Syscall number `28`.)
+pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+
+    // Read + decode the descriptor (host-reachable failures, no PO).
+    let optr = UserPtr::<IoOp>::new(op_ptr).map_err(from_user_access)?;
+    let op = copy_from_user(optr).map_err(from_user_access)?;
+    if op.flags != 0 {
+        return Err(KError::InvalidArgument);
+    }
+    let opcode = IoOpcode::from_u32(op.opcode).ok_or(KError::InvalidArgument)?;
+
+    // Resolve the resource (a block device) and buffer with opcode-appropriate
+    // rights: a read writes into the buffer (needs MAP_WRITE) and reads the
+    // device (needs READ); a write is the mirror.
+    let (dev_right, buf_right) = match opcode {
+        IoOpcode::Read => (Rights::READ, Rights::MAP_WRITE),
+        IoOpcode::Write => (Rights::WRITE, Rights::MAP_READ),
+    };
+    let dev_ok = lookup_typed(resource_h, pid, dev_right, KObjectType::DeviceNode)?;
+    let buf_ok = lookup_typed(op.buffer, pid, buf_right, KObjectType::MemoryObject)?;
+
+    // Bounds-check the buffer range (sync error).
+    // SAFETY: `buf_ok` pins a live `MemoryObject`.
+    let buffer_size = unsafe { &*(buf_ok.object.as_ptr() as *const MemoryObject) }.size() as u64;
+    let buf_end = op
+        .buf_offset
+        .checked_add(op.length)
+        .ok_or(KError::InvalidArgument)?;
+    if buf_end > buffer_size {
+        return Err(KError::InvalidArgument);
+    }
+
+    // Create the PO + handle (mirrors `sys_ns_lookup`): keep one reference for
+    // the IRP dispatch, hand one to the caller's table.
+    let po_box = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: adopt the single creation reference.
+    let po_ref = unsafe {
+        ObjectRef::from_raw(
+            KBox::into_raw(po_box).as_ptr() as *mut (),
+            KObjectType::PendingOperation,
+        )
+    };
+    let (tptr, tty) = po_ref.clone().into_raw();
+    let po_h = match global::get().allocate(pid, tptr, tty, pending_op_rights()) {
+        Ok(h) => h,
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt this reference; reclaim it. Then
+            // `po_ref` drops at return, destroying the PO.
+            drop(unsafe { ObjectRef::from_raw(tptr, tty) });
+            return Err(map_handle_err(e));
+        }
+    };
+
+    // A zero-length request is a legal no-op: pre-signal the PO and return.
+    if op.length == 0 {
+        crate::sched::complete_pending_op(po_ref.as_ptr(), 0, 0);
+        return Ok(po_h.bits() as isize);
+    }
+
+    // Build + dispatch the IRP. On allocation/unsupported failure, roll back the
+    // PO handle (and `po_ref` drops at return → PO destroyed).
+    match crate::io::block::dispatch_block_irp(
+        &dev_ok.object,
+        &buf_ok.object,
+        &po_ref,
+        opcode,
+        op.offset,
+        op.buf_offset,
+        op.length,
+    ) {
+        Ok(()) => Ok(po_h.bits() as isize),
+        Err(e) => {
+            close_and_release(po_h, pid);
+            Err(e)
+        }
+    }
+}
+
+/// `sys_io_cancel(pending)` — request cancellation of an in-flight operation.
+/// **Phase 2: `Unsupported`** (IRP cancellation is deferred; the number is
+/// reserved). (Syscall number `29`.)
+pub fn sys_io_cancel(_pending_h: u64) -> SysResult {
+    Err(KError::Unsupported)
+}
+
 /// `sys_wait(handles, count, results, deadline)` — block until ≥1 of
 /// `handles[0..count]` signals or `deadline` (absolute monotonic ns; `0` =
 /// poll, `u64::MAX` = no timeout) elapses. Writes one [`IoResult`] per signaled
@@ -1232,7 +1331,8 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
             KObjectType::Timer
             | KObjectType::NotificationChannel
             | KObjectType::IpcChannel
-            | KObjectType::PendingOperation => {}
+            | KObjectType::PendingOperation
+            | KObjectType::InterruptObject => {}
             _ => return Err(KError::Unsupported),
         }
         types[i] = ok.object.object_type();
@@ -1264,6 +1364,13 @@ pub fn sys_wait(handles_ptr: u64, count: usize, results_ptr: u64, deadline_ns: u
                             crate::sched::pending_op_completion(objs[i] as *mut ());
                         IoResult::completed_with_result(handles[i], status, result)
                     } else {
+                        // An `InterruptObject` consumes one pending interrupt on
+                        // return, so a driver's wait→service→wait loop wakes once
+                        // per interrupt; the edge-style waitables are an
+                        // unconditional "ready".
+                        if types[i] == KObjectType::InterruptObject {
+                            crate::sched::interrupt_consume(objs[i] as *mut ());
+                        }
                         IoResult::ready(handles[i])
                     };
                     k += 1;
