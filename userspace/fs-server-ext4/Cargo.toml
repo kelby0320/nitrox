@@ -1,0 +1,16 @@
+[package]
+name = "fs-server-ext4"
+version = "0.1.0"
+edition = "2024"
+
+# Slice 7 Part 2 builds only the host-testable ext4 **reader library** (pure
+# parsing behind a `BlockReader` trait — no syscalls, no IPC). Part 4 adds the
+# `[[bin]]` server `_start` (bare target, libkern + librsproto deps). The reader
+# is no_std + no-alloc (reads into caller buffers + bounded stack scratch); under
+# `cargo test` it builds as host `std` so the parser is unit-tested against a
+# fixture image.
+[lib]
+name = "fs_server_ext4"
+path = "src/lib.rs"
+
+[dependencies]

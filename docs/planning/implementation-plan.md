@@ -1156,42 +1156,64 @@ partition 0 lba 2048..131038`; the `parent` demo reads sector 0 of the disk
 `/dev/disk/by-partlabel/NITROX_ESP` — all verifying the `0x55AA` boot signature.
 `partition_rebase` is unit-tested (partition LBA 0 → disk LBA 2048 + bounds).
 
-#### 7. Filesystem in userspace
+#### 7. Filesystem in userspace — **the first userspace resource server**
 
-Decide the transport explicitly: the rsproto client API is async-shaped, so
-either `PendingOperation`-backed requests or at least one blocking IPC
-direction (both from the prerequisite band) are needed for real request/reply
-under backpressure; `NoBlock` send + `sys_wait`-on-recv is the fallback.
+The Phase-2 init milestone: a userspace `fs-server-ext4` reads a read-only ext4
+root over the block device and serves it over IPC, reached **transparently
+through the namespace**; init mounts it at `/` via the Ready handshake and reads
+`/system/current-generation`. **Read model:** a forwarded `sys_ns_lookup` of a
+file returns a read-only `MemoryObject` of its content (reuses the `/initramfs`
+server pattern, so init's existing lookup→map→read code works verbatim; 64 KiB
+cap — slice 8's page cache makes it lazy). The **userspace-RS kernel path** lands
+here (moved from slice 3, 2026-06-22): `BindingTarget::UserspaceServer` +
+IPC-forwarded lookup + cross-context handle install (the `Pending` `OpStatus`
+path the slice-3 framework reserved). Staged as ordered PR parts; design +
+decisions in the decision log (2026-06-25). ext4 scope is **minimal** (single
+regular file via extents); `librsproto` is **codec + server-side only** (sync
+`RsClient` deferred to eshell, slice 9). The async-shaped transport uses
+`sys_channel_send` (Block/NoBlock) + `sys_wait`-on-recv (no async executor in
+Phase 2).
 
-The **userspace-RS kernel path** lands here (moved from slice 3, 2026-06-22): the
-fs-server is the first userspace resource server, so the machinery it needs is built
-when it's first consumed rather than speculatively. This is the
-`BindingTarget::UserspaceServer` kind + IPC-forwarded lookup + the cross-context
-handle install (the kernel installs the server's returned handle into the *original
-caller's* table, then signals the lookup's `PendingOperation` — the `Pending`
-`OpStatus` path the slice-3 framework reserved).
+- [x] **Part 1 — `librsproto` wire codec** (`phase-2/slice7-librsproto`): the
+  pure `no_std`/no-`alloc`/no-deps codec — `RsMsgHeader` envelope, explicit LE
+  byte serialization, the Meta bodies (Hello/Ping/Ready), and the new
+  `Namespace::Resolve` op (`docs/spec/rsproto-namespace-ops.md`,
+  `RESOLVE_FILE_AS_MEMOBJ` + 64 KiB cap). 11 host round-trip tests. *(Meta-op
+  codec done; the Hello version-negotiation **logic** is the fs-server, Part 4.)*
+- [x] **Part 2 — ext4 read-only reader** (host-testable library,
+  `phase-2/slice7-ext4-reader`): `userspace/fs-server-ext4/` (lib-only; the
+  `[[bin]]` is Part 4). A `BlockReader` trait (`read_at(offset, buf)`) so the
+  parser is `no_std`/no-`alloc` (reads into caller buffers + bounded stack
+  scratch) and 100% host-tested. Superblock (`0xEF53`, reject 64-bit / >4 KiB
+  blocks), group descriptors, inode location, the **extent tree** (`0xF30A`,
+  depth 0 + index levels), linear `ext4_dir_entry_2` walk, path resolve →
+  `read_file(path, out) -> size`. 6 host tests against **real `mke2fs` images**
+  (1 K + 4 K blocks). Skips journal/bigalloc/inline-data/htree-specific/64-bit/RW.
+- [ ] **Part 3 — kernel transparent-forwarding** (proven with a stub server):
+  `BindingTarget::UserspaceServer` + `ResolvedTarget` arm; `OpStatus::Pending`;
+  the per-binding pending-lookup table; `sys_ns_bind` `IpcChannel`→`UserspaceServer`
+  branch; `sys_ns_lookup` forwarding arm (originate via `ipc_send_push`, leave PO
+  pending); reply completion (inline-in-send preferred, DPC fallback) with
+  cross-context install + PO signal + race handling; the kernel hand-coded rsproto
+  Resolve mirror; `ImageId::FsServerExt4 = 3`. A tiny embedded **stub fs-server**
+  proves the whole forwarding loop before real ext4/disk exists.
+- [ ] **Part 4 — the real `fs-server-ext4` process**: wires Part 1 (librsproto
+  server) + Part 2 (ext4 reader) + a `BlockReader` over `sys_io_submit`; the
+  Hello/Ready handshake + the `Namespace::Resolve` serve loop (suffix →
+  `ext4::read_file` → `MemoryObject` → reply transferring it). The control channel
+  + Ready handshake; init binds the endpoint via `sys_ns_bind` (Part 6).
+- [ ] **Part 5 — xtask ext4 test disk**: a 2nd GPT partition `nitrox-root`,
+  ext4-formatted + populated via `mke2fs -d` (no root mount), spliced into the
+  boot disk image; rides the existing QEMU drive (slice-6 driver enumerates it).
+- [ ] **Part 6 — init mount loop + the milestone**: per `MountSpec` — resolve the
+  device handle, spawn `fs-server-ext4` (control channel via spawn; device handle
+  via a setup IPC message), wait for Ready, `sys_ns_bind` at the mount point; then
+  init looks up `/system/current-generation`, maps the returned MemoryObject, and
+  logs it. *(init never speaks librsproto — it hand-parses Ready; the kernel does
+  Resolve on its behalf.)*
 
-- [ ] **Kernel**: `BindingTarget::UserspaceServer` + IPC-forwarded lookup +
-  cross-context handle install (the `Pending` completion path)
-- [x] `userspace/librsproto/` crate per [docs/spec/rsproto-wire-format.md]
-  (Part 1, `phase-2/slice7-librsproto`): the pure `no_std`, no-`alloc`, no-deps
-  wire codec — the `RsMsgHeader` envelope (`encode`/`decode`), explicit LE byte
-  serialization (no packed-field refs), and the `Namespace::Resolve` op spec
-  (`docs/spec/rsproto-namespace-ops.md`). 11 host round-trip tests. Server-side
-  helpers only; the sync `RsClient` is deferred to eshell (slice 9).
-- [x] Meta operations: Hello, Goodbye, QueryCaps, Ping, Ready *(codec — the
-  handshake **use** is Parts 4/6)*
-- [ ] Version negotiation *(Hello codec done; the negotiation logic is the
-  fs-server, Part 4)*
-- [ ] `userspace/fs-server-ext4/` crate
-  - [ ] ext4 superblock parsing
-  - [ ] Inode reading
-  - [ ] Directory lookup
-  - [ ] File data reading via extents
-  - [ ] Read-only mode is the Phase 2 target; RW is Phase 3
-- [ ] Resource server startup protocol implementation
-  - [ ] Control channel + Ready handshake
-  - [ ] Init binds the endpoint via `sys_ns_bind`
+Read-only is the Phase-2 target; RW (and writeback) is Phase 3. Path-based spawn
+from the initramfs (replacing the embedded `ImageId`) defers to slice 8.
 
 #### 8. Page cache integration with fs-server
 

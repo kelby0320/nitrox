@@ -353,6 +353,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `fs-server-ext4` reader-library tests (the ext4 parser, against an `mke2fs`
+    // fixture). `--lib` skips the bare-target server `[[bin]]` (added in Part 4).
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("fs-server-ext4")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     Ok(())
 }
 
