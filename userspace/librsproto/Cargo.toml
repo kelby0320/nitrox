@@ -1,0 +1,11 @@
+[package]
+name = "librsproto"
+version = "0.1.0"
+edition = "2024"
+
+# A pure wire codec for the resource-server protocol (docs/spec/rsproto-*.md):
+# core-only, no_std, no `alloc`, no dependencies. It serialises/parses message
+# bytes in a caller-provided buffer (the IpcMsg payload); handles ride out-of-band
+# in IpcMsg.handles, managed by the caller. Under `cargo test` it builds as a host
+# `std` crate so the round-trip logic is unit-tested.
+[dependencies]

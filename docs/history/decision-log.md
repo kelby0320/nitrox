@@ -4544,3 +4544,38 @@ kernel-internal). Verified: `cargo xtask build` (no warnings) / `check-arch` (th
 GPT driver is neutral) / `test` (kernel **486**, +4: 3 `gpt` + 1 `partition_rebase`;
 libkern 8; init 18). QEMU q35: GPT parsed, three reads OK, init→parent→child
 reaped (no `#DF`). Branch `phase-2/slice6-gpt`. Next: slice 7 (userspace fs-server).
+
+## 2026-06-25 — Phase 2 slice 7, Part 1: librsproto wire codec
+
+The first piece of the first userspace resource server. `userspace/librsproto/`
+— the resource-server protocol wire codec — built as a **pure `no_std`, no-`alloc`,
+no-dependency** crate: it serialises/parses messages in a caller-provided buffer
+(the `IpcMsg.payload`); transferred handles ride out-of-band in `IpcMsg.handles[]`
+(the codec only tracks `handle_count`); `kerror` is a plain `i32`. So librsproto
+needs neither libkern nor alloc — it is a self-contained byte codec.
+
+- **Envelope** (`lib.rs`): the 28-byte `RsMsgHeader` (`encode`/`decode` with magic
+  + `body_len` validation), the op/flag constants, and `RsError`. Bodies are
+  serialised with **explicit little-endian byte helpers** (`put/get_u16/32/64`),
+  not `#[repr(C, packed)]` field references — robust regardless of alignment.
+- **Meta bodies** (`meta.rs`): Hello (request/reply), Ping, Ready. Goodbye/QueryCaps
+  are constants for now (no body codec until a consumer needs them).
+- **Namespace::Resolve** (`namespace.rs`) — the new op slice 7 defines (the
+  kernel-forwarded lookup): `ResolveRequest { requested_rights, flags, suffix }`
+  → `ResolveReply { object_kind, content_len }` with the resource handle in
+  `handles[0]`. Spec: `docs/spec/rsproto-namespace-ops.md` (fills the TBD the wire
+  spec reserved). `RESOLVE_FILE_AS_MEMOBJ` + a 64 KiB content cap are the Phase-2
+  mode (slice 8 lifts the cap with the lazy page cache).
+- **ErrorBody** (`error.rs`): the standard error reply (`kerror`/`server_code`/
+  optional message).
+
+This is a kernel↔server ABI (the kernel hand-codes Resolve in Part 3); librsproto
+is the userspace mirror the fs-server uses. No `RsClient` (sync client) — slice 7
+has no userspace client (the kernel forwards; init hand-parses Ready); eshell
+(slice 9) is its first consumer.
+
+No kernel changes, no ABI-hash impact. Verified: `cargo xtask build` (no warnings;
+librsproto also builds for the bare `x86_64-unknown-none` target) / `check-arch` /
+`test` — librsproto **11** host round-trip tests pass (kernel 486; libkern 8; init
+18 unchanged). Branch `phase-2/slice7-librsproto`. Next: Part 2 (ext4 read-only
+reader, host-testable).

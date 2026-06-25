@@ -28,6 +28,10 @@ name = "libkern"
 version = "0.1.0"
 
 [[package]]
+name = "librsproto"
+version = "0.1.0"
+
+[[package]]
 name = "parent"
 version = "0.1.0"
 dependencies = [
