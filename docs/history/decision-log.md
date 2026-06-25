@@ -4579,3 +4579,37 @@ librsproto also builds for the bare `x86_64-unknown-none` target) / `check-arch`
 `test` — librsproto **11** host round-trip tests pass (kernel 486; libkern 8; init
 18 unchanged). Branch `phase-2/slice7-librsproto`. Next: Part 2 (ext4 read-only
 reader, host-testable).
+
+## 2026-06-25 — Phase 2 slice 7, Part 2: ext4 read-only reader
+
+The filesystem parsing core, as a host-testable library. `userspace/fs-server-ext4/`
+(lib-only for now; the server `[[bin]]` is Part 4).
+
+- **`BlockReader` trait** (`read_at(offset, buf)`) is the seam: the parser is
+  written entirely against it, so 100% of the logic is host-tested against an
+  in-memory image; the real fs-server (Part 4) implements it over `sys_io_submit`.
+- **No `alloc`**: `read_file(path, out) -> size` reads into a caller-provided
+  buffer (the fs-server passes a bounded scratch ≤ 64 KiB = `ext4::MAX_FILE`, the
+  slice-7 read-model cap); parsing uses bounded stack scratch (≤ one 4 KiB block).
+  So the reader stays buffer-based like libkern/librsproto.
+- **Minimal RO ext4** (`ext4.rs`): superblock (`0xEF53`; reject 64-bit feature +
+  > 4 KiB blocks), block-group descriptors (inode-table location), inode fetch,
+  the **extent tree** (`0xF30A`, depth-0 leaves + index-node recursion), a linear
+  `ext4_dir_entry_2` directory walk, and path resolution from the root inode (2).
+  All structure reads are bounds-checked → a malformed image yields `FsError`,
+  never a panic/OOB. Skips: journal, bigalloc, inline-data (rejected), htree
+  (linear walk is backward-compatible), 64-bit blocks, RW, xattrs, checksums.
+
+**Tests run against real ext4.** The host tests build a fixture with **`mke2fs -d`**
+(populate-at-creation, no root/mount; features `^has_journal,^64bit,^metadata_csum,
+^resize_inode` mirroring the Part-5 disk) and parse it — validating the reader
+against e2fsprogs output, not just a self-consistent hand-built image. 6 tests:
+read `/system/current-generation` at 1 K and 4 K block sizes, missing-path /
+not-a-regular-file → `NotFound`, oversize buffer → `TooLarge`, non-ext4 →
+`Corrupt`. (`mke2fs` is a project dependency — also used by Part 5.)
+
+No kernel changes, no ABI impact. Verified: `cargo xtask build` (no warnings; the
+reader also builds bare `x86_64-unknown-none`) / `check-arch` / `test` —
+fs-server-ext4 **6**, librsproto 11, kernel 486, libkern 8, init 18. Branch
+`phase-2/slice7-ext4-reader`. Next: Part 3 (kernel transparent-forwarding, proven
+with a stub server) — the hard part.
