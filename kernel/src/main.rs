@@ -228,6 +228,11 @@ fn kernel_main() {
     // node yet.
     nitrox_kernel::device::init();
 
+    // Phase 2 slice 5 Part 2: prove the async I/O spine (IRP → DPC →
+    // PendingOperation) and InterruptObject signalling on a RAM-backed device,
+    // before any real driver exists. Needs the DPC queue + scheduler waitables.
+    nitrox_kernel::io::self_test();
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and

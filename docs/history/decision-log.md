@@ -4325,3 +4325,58 @@ the ICH9 AHCI controller (`8086:2922`, class `01.06.01`) with its ABAR (BAR5,
 nodes registered — and proceeds through init→parent→child cleanly (no `#DF`).
 Branch `phase-2/slice5-pci-enum`. Next: Part 2 (IRP framework + InterruptObject +
 the I/O core, on a ramdisk).
+
+## 2026-06-23 — Phase 2 slice 5, Part 2: IRP framework + InterruptObject + the I/O core
+
+The async I/O spine, proven on a RAM-backed device before any real driver.
+
+- **`Irp`** (`kernel/src/io/irp.rs`): the kernel-internal I/O request packet per
+  `docs/spec/irp-layout.md`, with the hashed leading-field offsets pinned by
+  compile-time asserts (`IrpOp`/`IrpStatus`/`IrpBuffer`/`IrpStackFrame`/`PhysFrag`).
+  Owning references (PO, buffer, device) live in a kernel-internal `#[repr(C)]`
+  `IrpBox` wrapper with `irp` first, so `*mut Irp == *mut IrpBox` and a Tier 2
+  module only ever sees the clean hashed `Irp`.
+
+- **`InterruptObject`** (`kernel/src/object/interrupt_object.rs`): a waitable IRQ
+  source (`KObjectType::InterruptObject`, the reserved tag = 8), modelled as a
+  **latching edge counter** mirroring `PendingOperation`'s scheduler-only pattern.
+  An ISR/DPC `signal`s it (latches a pending count, woken with no waiter is not
+  lost); a `sys_wait` return **consumes** one, so a driver's wait→service→wait
+  loop wakes once per interrupt. Added as the third waitable to the three sched
+  dispatch arms + `signal_interrupt` (DPC-callable, takes `SCHED`) + `interrupt_
+  consume` (called at `sys_wait` result-build). Built this slice per the earlier
+  decision, though Tier 1 AHCI could complete purely via the DPC routine.
+
+- **Block I/O core** (`kernel/src/io/block.rs`): a `BlockBackend` (a `submit` fn
+  pointer + ctx) installed on a block `DeviceNode`; `dispatch_block_irp` builds
+  the IRP (a PRDT-style `PhysFrag` list cut from the buffer `MemoryObject`'s
+  frames over `[buf_offset, +length)`), arms the inline completion DPC, and hands
+  it to the backend. The completion DPC signals the request's PO (result = bytes
+  transferred) and reclaims the box.
+
+- **Syscalls**: `sys_io_submit`(28) / `sys_io_cancel`(29) wired
+  (`docs/spec/io-operation.md`); submit mirrors `sys_ns_lookup`'s PO-create +
+  resolve + rollback, dispatching through `dispatch_block_irp` (zero-length is a
+  pre-signalled no-op); cancel is `Unsupported` (deferred). `IoOp`/`IoOpcode`
+  added to the kernel and userspace `libkern` mirrors (offsets asserted both
+  sides). `InterruptObject` added to `sys_wait`'s accepted types.
+
+- **Ramdisk** (`kernel/src/io/ramdisk.rs`): a RAM-backed block device whose
+  `submit` does the transfer (a `memcpy` across the frags via the HHDM) and queues
+  the completion DPC — standing in for a controller's DMA + completion ISR. Boot
+  bug found + fixed: building the backing as `KBox::<[u8; 64K]>::try_new([0; 64K])`
+  materialised a 64 KiB array on the kernel stack → stack overflow → boot hang;
+  rebuilt via a `KVec` push loop (no large stack temporary).
+
+Proof is a kernel boot self-test (`io::self_test`, called after `device::init`):
+a ramdisk read of 8 KiB completes through IRP→DPC→PO with the buffer content
+verified, and a DPC-signalled `InterruptObject` latches then consumes. The
+userspace `sys_io_submit` path is exercised once `/dev/blk` exists (Part 4).
+
+No ABI-hash impact in practice (no module loaded against the hash yet); `IoOp`
+(40 B) and the `Irp` layout are now concrete in code as the specs fixed them.
+Verified: `cargo xtask build` (no warnings) / `check-arch` / `test` (kernel
+**481**, +10: `io::irp` 3, `io::block` 2, `io_op` 1, `interrupt_object` 4; libkern
+8; init 18). QEMU q35: both self-tests print OK and boot proceeds through
+init→parent→child cleanly (no `#DF`). Branch `phase-2/slice5-irp-iocore`. Next:
+Part 3 (AHCI Tier 1 driver).

@@ -60,9 +60,9 @@ use crate::mm::PhysAddr;
 use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::object::{
-    BlockSendOutcome, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel, ObjectRef,
-    PendingOperation, ReclaimedSend, RecvState, SendOutcome, StoredMsg, Thread, ThreadEntry,
-    ThreadState, Timer, TransferRef,
+    BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel,
+    ObjectRef, PendingOperation, ReclaimedSend, RecvState, SendOutcome, StoredMsg, Thread,
+    ThreadEntry, ThreadState, Timer, TransferRef,
 };
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
@@ -625,6 +625,7 @@ unsafe fn obj_already_signaled(obj: *mut (), now: u64) -> bool {
         },
         KObjectType::IpcChannel => unsafe { IpcChannel::already_signaled(obj) },
         KObjectType::PendingOperation => unsafe { PendingOperation::already_signaled(obj) },
+        KObjectType::InterruptObject => unsafe { InterruptObject::already_signaled(obj) },
         _ => false,
     }
 }
@@ -637,6 +638,7 @@ unsafe fn obj_add_waiter(obj: *mut (), th: *mut ()) -> Result<(), ()> {
         KObjectType::NotificationChannel => unsafe { NotificationChannel::add_waiter(obj, th) },
         KObjectType::IpcChannel => unsafe { IpcChannel::add_waiter(obj, th) },
         KObjectType::PendingOperation => unsafe { PendingOperation::add_waiter(obj, th) },
+        KObjectType::InterruptObject => unsafe { InterruptObject::add_waiter(obj, th) },
         _ => Err(()),
     }
 }
@@ -649,6 +651,7 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
         KObjectType::NotificationChannel => unsafe { NotificationChannel::remove_waiter(obj, th) },
         KObjectType::IpcChannel => unsafe { IpcChannel::remove_waiter(obj, th) },
         KObjectType::PendingOperation => unsafe { PendingOperation::remove_waiter(obj, th) },
+        KObjectType::InterruptObject => unsafe { InterruptObject::remove_waiter(obj, th) },
         _ => {}
     }
 }
@@ -746,6 +749,49 @@ pub fn pending_op_completion(po: *mut ()) -> (i32, u64) {
 pub fn complete_pending_op(po: *mut (), status: i32, result: u64) {
     let mut g = SCHED.lock();
     signal_pending_op_with_result(&mut g, po, status, result);
+}
+
+/// Record an interrupt on `irq` (an [`InterruptObject`]) and wake every thread
+/// blocked on it. Latching: an interrupt with no current waiter increments the
+/// object's pending count and is delivered to the next waiter. Taking `SCHED`,
+/// so it is callable from a DPC handler (interrupt-dispatch tail) — the path a
+/// device ISR's completion takes. No allocation, no blocking, no `ObjectRef`
+/// drop. The caller's reference (or a registered handler) pins `irq`.
+pub fn signal_interrupt(irq: *mut ()) {
+    let mut g = SCHED.lock();
+    // SAFETY: live `InterruptObject`, `SCHED` held — latches a pending interrupt.
+    unsafe { InterruptObject::signal(irq) };
+    let mut buf = [core::ptr::null_mut(); InterruptObject::MAX_WAITERS];
+    // SAFETY: live object, `SCHED` held — drains its waiter list.
+    let n = unsafe { InterruptObject::take_waiters(irq, &mut buf) };
+    for &th in &buf[..n] {
+        // SAFETY: each waiter is a thread blocked in `wait_on`, pinned in
+        // `blocked`; `SCHED` held.
+        unsafe {
+            Thread::wait_mark_signaled(th, irq as usize);
+            if Thread::wait_try_wake(th) {
+                make_runnable(&mut g, th);
+            }
+        }
+    }
+}
+
+/// Consume one pending interrupt on `irq` — called by `sys_wait` when it returns
+/// for an [`InterruptObject`], so a driver's wait→service→wait loop wakes once
+/// per interrupt. Takes `SCHED` (the accessor contract). The caller's handle
+/// pins `irq`.
+pub fn interrupt_consume(irq: *mut ()) {
+    let _g = SCHED.lock();
+    // SAFETY: live `InterruptObject` pinned by the caller's handle; `SCHED` held.
+    unsafe { InterruptObject::consume(irq) };
+}
+
+/// `true` iff `irq` (an [`InterruptObject`]) has an unconsumed pending interrupt.
+/// Takes `SCHED` (the accessor contract). Used by the boot self-test.
+pub fn interrupt_pending(irq: *mut ()) -> bool {
+    let _g = SCHED.lock();
+    // SAFETY: live `InterruptObject` pinned by the caller's reference; `SCHED` held.
+    unsafe { InterruptObject::already_signaled(irq) }
 }
 
 /// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,

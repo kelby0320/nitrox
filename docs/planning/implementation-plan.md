@@ -1090,12 +1090,17 @@ PR parts; the Part 0 design decisions are in the decision log (2026-06-23).
   (`8086:2922` class `01.06.01`) + its ABAR (BAR5) and 5 other functions; boot
   proceeds to init→parent→child cleanly. (Per [io-operation], [irp-layout],
   [device-node].)
-- [ ] **Part 2 — IRP framework + `InterruptObject` + the I/O core, on a ramdisk.**
-  `Irp` type (offsets pinned by asserts), `InterruptObject` waitable (3 sched
-  dispatch arms + signal-from-DPC), `sys_io_submit`/`sys_io_cancel`, and a
-  RAM-backed test block `DeviceNode` as the first IRP producer — proving
-  initiate → DPC → PO → `sys_wait` → bytes-in-`MemoryObject` independently of
-  AHCI register/DMA bugs.
+- [x] **Part 2 — IRP framework + `InterruptObject` + the I/O core, on a ramdisk**
+  (`phase-2/slice5-irp-iocore`). `Irp` + sub-types (`io/irp.rs`, offsets pinned by
+  asserts); `InterruptObject` waitable (`object/interrupt_object.rs`, a latching
+  edge-counter; 3 sched dispatch arms + `signal_interrupt` from a DPC + consume at
+  `sys_wait`); the block I/O core (`io/block.rs`: a `BlockBackend` fn-pointer on
+  `DeviceNode` + `dispatch_block_irp` + the `IrpBox` owning wrapper + the
+  completion DPC); `sys_io_submit`(28)/`sys_io_cancel`(29, `Unsupported`);
+  `IoOp`/`IoOpcode` in both libkerns. Proven by a boot self-test (`io::self_test`)
+  on a RAM-backed device (`io/ramdisk.rs`): read 8 KiB → DPC → PO completes
+  (status 0, result = bytes) → buffer content verified; and a DPC signals an
+  `InterruptObject` → latch → consume. Independent of AHCI register/DMA work.
 - [ ] **AHCI driver (Part 3; start here vs NVMe).** Tier 1 driver: kernel
   `ioremap` of the ABAR (uncached), HBA/port init, IDENTIFY, command list / FIS /
   PRDT in `DmaBuffer`, READ DMA EXT, real IRQ (`arch::IrqRouter` → ISR → DPC →

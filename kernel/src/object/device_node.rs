@@ -14,6 +14,7 @@
 //! drivers read the descriptor directly. Normative shapes:
 //! `docs/spec/device-node.md`.
 
+use crate::io::block::BlockBackend;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
 use crate::object::header::KObjectHeader;
@@ -201,13 +202,17 @@ pub struct DeviceNode {
     descriptor: ResourceDescriptor,
     /// Block geometry (zeroed until a block driver claims the node).
     geometry: BlockGeometry,
+    /// The block I/O entry point, present iff this is a `Block` node a driver has
+    /// claimed (`sys_io_submit` dispatches through it).
+    block_backend: Option<BlockBackend>,
 }
 
 impl DeviceNode {
     /// Sentinel written into [`DeviceNode::magic`] at construction.
     pub const MAGIC: u64 = 0x4465_7669_6365_4e21; // "DeviceN!"
 
-    /// Allocate a device node with a refcount of one.
+    /// Allocate a device node with a refcount of one (no block backend — the
+    /// enumeration default; a driver claims it later).
     pub fn try_new(
         class: DeviceClass,
         descriptor: ResourceDescriptor,
@@ -219,6 +224,24 @@ impl DeviceNode {
             class,
             descriptor,
             geometry,
+            block_backend: None,
+        })
+    }
+
+    /// Allocate a [`DeviceClass::Block`] node backed by `backend`, with `geometry`.
+    /// Used by a block driver (the ramdisk; AHCI in Part 3) to publish a disk.
+    pub fn try_new_block(
+        descriptor: ResourceDescriptor,
+        geometry: BlockGeometry,
+        backend: BlockBackend,
+    ) -> Result<KBox<Self>, AllocError> {
+        KBox::try_new(Self {
+            header: KObjectHeader::new(KObjectType::DeviceNode),
+            magic: Self::MAGIC,
+            class: DeviceClass::Block,
+            descriptor,
+            geometry,
+            block_backend: Some(backend),
         })
     }
 
@@ -240,6 +263,11 @@ impl DeviceNode {
     /// The device's block geometry (zeroed for non-block nodes).
     pub fn geometry(&self) -> BlockGeometry {
         self.geometry
+    }
+
+    /// The block I/O backend, if this is a claimed block device.
+    pub fn block_backend(&self) -> Option<BlockBackend> {
+        self.block_backend
     }
 }
 
