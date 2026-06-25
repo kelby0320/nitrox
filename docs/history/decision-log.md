@@ -4757,3 +4757,44 @@ rides along unused until Part 6. Verified: `cargo xtask build` (no warnings; the
 builds bare `x86_64-unknown-none` and the kernel embeds it) / `check-arch` / `test` —
 kernel **500**, **fs-server-ext4 11** (6 reader + 5 serve), librsproto 11, libkern 8,
 init 18. Branch `phase-2/slice7-fs-server`. Next: Part 5 (the ext4 test disk).
+
+## 2026-06-25 — Phase 2 slice 7, Part 5: the ext4 test disk
+
+The boot disk gains a second GPT partition — `nitrox-root`, ext4 — so the
+fs-server has something real to read (Part 6 mounts it). Build-tooling only
+(`tools/xtask`); no kernel/userspace change.
+
+**Decision — splice separate partition-sized images, don't format in place.** The
+old single-partition image `mformat`s the FAT at `out@@1M` — mtools treats
+everything from the offset to EOF as the device, so the FAT spans the whole disk.
+With a second partition that is wrong: the FAT's total-sectors would exceed its
+GPT partition and overlap `nitrox-root`. Rather than fight mtools to bound the FAT
+in place, both partitions are now built as **separate files sized exactly to the
+partition** (`mformat` on a 48 MiB file → FAT bounded to 48 MiB; `mke2fs` on a
+file of partition-2's size) and **spliced** into the GPT disk at the byte offsets
+**queried from `sgdisk -i`** (robust to GPT's end-of-disk reserve, vs. hard-coding
+LBAs). The splice is a plain seek-and-write (no `dd` dependency).
+
+**Decision — sizes.** Disk 128 MiB; ESP 48 MiB (comfortably above the FAT32
+cluster-count floor, so `mformat -F` is always valid — a 32 MiB ESP risks
+degrading to FAT16); `nitrox-root` fills the rest (~79 MiB). The ext4 is built with
+`mke2fs -d` (populate-at-creation, no root/mount) with the **same feature flags the
+reader supports** (`^has_journal,^64bit,^metadata_csum,^resize_inode`, 4 KiB
+blocks — extent-based, matching the Part-2 fixture), staging
+`/system/current-generation` (the milestone file).
+
+**Confirmed — no separate QEMU drive needed (risk #3 resolved).** The slice-6 GPT
+driver enumerates *every* non-empty entry (it filters only the all-zero type GUID,
+not by type), decodes the UTF-16 partition name to an ASCII
+`/dev/disk/by-partlabel/<label>`, and binds it at boot. So `nitrox-root` rides the
+existing boot disk. Verified in QEMU: `gpt: 2 partition(s)` (ESP + nitrox-root both
+become block nodes), the 128 MiB disk comes up on AHCI, the smaller 48 MiB ESP
+still FAT32-boots through Limine/OVMF, and `/dev/disk/by-partlabel/NITROX_ESP`
+resolves in `parent`'s block demo (the same bind path serves `nitrox-root`). The
+ext4 image checks out under `debugfs`/`dumpe2fs`: `/system/current-generation`
+present, extent-based, no journal/64-bit/metadata_csum — exactly the reader's set.
+Boot stays clean (children reap, `init: reaped pid=2 code=0`, no `#DF`/panic).
+
+Branch `phase-2/slice7-ext4-disk`. Next: Part 6 (init mount loop + the milestone) —
+the slice's end-to-end payoff, where init spawns the fs-server against this disk,
+binds it, and logs `/system/current-generation`.

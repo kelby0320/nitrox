@@ -1221,9 +1221,21 @@ Phase 2).
   (kernel enum + libkern `IMAGE_FS_SERVER_EXT4` mirror) + the embedded ELF + the
   xtask build step. *(No QEMU yet — the server needs a disk (Part 5) and a
   supervisor to spawn + bind it (Part 6); end-to-end boot is the Part 6 milestone.)*
-- [ ] **Part 5 — xtask ext4 test disk**: a 2nd GPT partition `nitrox-root`,
-  ext4-formatted + populated via `mke2fs -d` (no root mount), spliced into the
-  boot disk image; rides the existing QEMU drive (slice-6 driver enumerates it).
+- [x] **Part 5 — xtask ext4 test disk** (`phase-2/slice7-ext4-disk`): the boot disk
+  grows to **128 MiB** with two GPT partitions — the FAT32 ESP (`NITROX_ESP`, 48 MiB)
+  and the ext4 `nitrox-root` (filling the rest). Both partitions are built as
+  separate, exactly-partition-sized images (so each filesystem is bounded to its
+  partition) and **spliced** into the GPT disk at the offsets queried from
+  `sgdisk -i`: the ESP via `mformat`/`mcopy`, the rootfs via `mke2fs -d` (populate-
+  at-creation, no root/mount; features `^has_journal,^64bit,^metadata_csum,
+  ^resize_inode`, 4 KiB blocks — the reader's supported set) staging
+  `/system/current-generation`. **Confirmed:** the slice-6 GPT driver enumerates
+  *every* non-empty entry (no type-GUID filter) and decodes the ASCII label, so
+  `nitrox-root` rides the existing boot disk (no separate QEMU drive); QEMU boots
+  clean (`gpt: 2 partition(s)`, the smaller ESP still FAT32-boots) and
+  `/dev/disk/by-partlabel/<label>` binds (proven via `NITROX_ESP` in `parent`'s
+  block demo). The Part-6 init loop resolves `gpt-partlabel:nitrox-root` → the
+  device handle.
 - [ ] **Part 6 — init mount loop + the milestone**: per `MountSpec` — resolve the
   device handle, spawn `fs-server-ext4` (control channel via spawn; device handle
   via a setup IPC message), wait for Ready, `sys_ns_bind` at the mount point; then
