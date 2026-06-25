@@ -1236,12 +1236,27 @@ Phase 2).
   `/dev/disk/by-partlabel/<label>` binds (proven via `NITROX_ESP` in `parent`'s
   block demo). The Part-6 init loop resolves `gpt-partlabel:nitrox-root` → the
   device handle.
-- [ ] **Part 6 — init mount loop + the milestone**: per `MountSpec` — resolve the
-  device handle, spawn `fs-server-ext4` (control channel via spawn; device handle
-  via a setup IPC message), wait for Ready, `sys_ns_bind` at the mount point; then
-  init looks up `/system/current-generation`, maps the returned MemoryObject, and
-  logs it. *(init never speaks librsproto — it hand-parses Ready; the kernel does
-  Resolve on its behalf.)*
+- [x] **Part 6 — init mount loop + the milestone** (`phase-2/slice7-mount-milestone`):
+  the slice's end-to-end payoff. `manifest::device_ns_path` maps
+  `gpt-partlabel:nitrox-root` → `/dev/disk/by-partlabel/nitrox-root`; per `MountSpec`
+  (topo order) init resolves the device handle (READ|TRANSFER), `sys_channel_create`s
+  a control channel, spawns `fs-server-ext4` (the control endpoint moved in via
+  spawn → `rdx`), sends a **setup message** transferring the device handle, awaits
+  **Ready** (bounded 30 s, hand-parsed — magic + op, init never speaks librsproto),
+  and `sys_ns_bind`s the forwarding endpoint at the mount point. Then the milestone:
+  `ns_lookup_wait("/system/current-generation", MAP_READ)` → map → log. **Proven in
+  QEMU:** `fs-server: ready` → `init: mounted fs-server-ext4 at /` →
+  `init: /system/current-generation = nitrox-rootfs generation 1` — the whole stack
+  (ext4 on disk → fs-server `sys_io_submit` → librsproto reply → kernel cross-context
+  install → init maps + logs), with the boot staying clean afterward (`parent` demos
+  + reaping, no `#DF`/panic). *(Fix found here: the `fs-server-ext4` crate was missing
+  the `.cargo/config.toml` + `build.rs` + `user.ld` that force static **ET_EXEC**
+  linking — it built as a PIE/`ET_DYN`, which `load_elf` rejects. Copied init's
+  lib+bin variant, `rustc-link-arg-bins`, so the fixed-address script reaches the bin
+  but not the host lib-test link.)*
+
+**Slice 7 is COMPLETE** — the first userspace resource server, reached transparently
+through the namespace, serving a real ext4 filesystem on disk.
 
 Read-only is the Phase-2 target; RW (and writeback) is Phase 3. Path-based spawn
 from the initramfs (replacing the embedded `ImageId`) defers to slice 8.

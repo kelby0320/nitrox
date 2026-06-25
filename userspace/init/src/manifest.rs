@@ -7,6 +7,7 @@
 //! fs-server → Ready handshake → `sys_ns_bind`) is slice-4 Part 5 / slice 7; this
 //! module is the pure, host-testable front half.
 
+use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::toml_lite::{self, Table};
@@ -112,6 +113,27 @@ fn required_str<'a>(
 /// `/store` is 1, `/store/data` is 2.
 fn depth(path: &str) -> usize {
     path.split('/').filter(|c| !c.is_empty()).count()
+}
+
+/// Map a `device = "<scheme>:<value>"` spec to the namespace path that resolves to
+/// its block device (`docs/spec/init-toml-schema.md`): `gpt-partlabel:<l>` →
+/// `/dev/disk/by-partlabel/<l>`, `gpt-partuuid:<u>` → `/dev/disk/by-partuuid/<u>`.
+/// `None` for an unknown scheme (init logs it and drops the mount). The kernel
+/// (slice 6 GPT driver) binds these paths to the partition's device node at boot.
+pub fn device_ns_path(device: &str) -> Option<String> {
+    let (prefix, value) = if let Some(v) = device.strip_prefix("gpt-partlabel:") {
+        ("/dev/disk/by-partlabel/", v)
+    } else if let Some(v) = device.strip_prefix("gpt-partuuid:") {
+        ("/dev/disk/by-partuuid/", v)
+    } else {
+        return None;
+    };
+    if value.is_empty() {
+        return None;
+    }
+    let mut p = String::from(prefix);
+    p.push_str(value);
+    Some(p)
 }
 
 #[cfg(test)]
@@ -247,6 +269,22 @@ required_for=\"boot\"
     #[test]
     fn empty_manifest_rejected() {
         assert_eq!(parse("# nothing here\n"), Err(ManifestError::NoMounts));
+    }
+
+    #[test]
+    fn device_ns_path_maps_schemes() {
+        assert_eq!(
+            device_ns_path("gpt-partlabel:nitrox-root").as_deref(),
+            Some("/dev/disk/by-partlabel/nitrox-root")
+        );
+        assert_eq!(
+            device_ns_path("gpt-partuuid:01234567-89ab").as_deref(),
+            Some("/dev/disk/by-partuuid/01234567-89ab")
+        );
+        // Unknown scheme / empty value → None.
+        assert_eq!(device_ns_path("sd:0"), None);
+        assert_eq!(device_ns_path("gpt-partlabel:"), None);
+        assert_eq!(device_ns_path("nitrox-root"), None);
     }
 
     #[test]
