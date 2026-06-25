@@ -153,9 +153,15 @@ struct Irp {
 Phase 2 stacks are shallow: AHCI is a single layer (request → hardware → done),
 and the GPT partition driver over the block device is the first real two-layer
 stack (GPT translates a partition-relative request into a disk-absolute one and
-forwards). **Deferred:** transparent **filter drivers** (encryption, compression,
-logging inserted into a stack), IRP **cancellation**, and the 30-second
-completion **timeout**.
+forwards). **As built** (slice 6), that two-layer stack is realised by
+**`BlockBackend` delegation** — a partition's backend rebases the IRP's offset and
+forwards to the disk's backend (`io::block::Partition`) — rather than by walking
+the `Irp`'s `stack_index`/`IrpStackFrame` array frame-by-frame. The frame array +
+per-frame completion routines remain part of the (hashed) `Irp` layout, designed
+ahead for the case that needs them. **Deferred:** transparent **filter drivers**
+(encryption, compression, logging inserted into a stack) — the first genuine user
+of formal multi-frame descent — IRP **cancellation**, and the 30-second completion
+**timeout**.
 
 ## Async completion and `sys_wait`
 

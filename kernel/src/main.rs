@@ -554,6 +554,11 @@ fn run_first_userspace() {
         return;
     }
 
+    // `/dev/disk/by-partuuid/<uuid>` + `/dev/disk/by-partlabel/<label>` — stable
+    // direct-handle bindings for each GPT partition the drivers discovered (the
+    // content-derived names `init.toml` mount specs reference). Read-only.
+    nitrox_kernel::drivers::gpt::bind_partition_names(&ns);
+
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone
     // one for the Process, install the other as a handle (refcount → 2).

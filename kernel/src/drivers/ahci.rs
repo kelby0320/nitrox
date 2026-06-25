@@ -404,6 +404,7 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, disk: *mut AhciDisk) -> bo
     let cdesc = unsafe { &*(controller.as_ptr() as *const DeviceNode) }.descriptor();
     let backend = BlockBackend {
         submit,
+        poll: ahci_poll,
         ctx: disk as *mut (),
     };
     let geometry = BlockGeometry {
@@ -515,6 +516,13 @@ extern "C" fn isr() {
     }
     // Exercise the signal-from-real-ISR path (no waiter in Phase 2).
     crate::dpc::enqueue(&AHCI_INTR_DPC);
+}
+
+/// [`BlockBackend::poll`] for the AHCI disk: drive the single in-flight command
+/// to completion by polling and run its DPC (the `read_blocking` boot path; `ctx`
+/// is unused — Phase 2 has one disk, tracked in [`AHCI`]).
+fn ahci_poll(_ctx: *mut ()) {
+    poll_complete_inflight();
 }
 
 /// DPC queued by [`isr`]: signal the controller's `InterruptObject`.

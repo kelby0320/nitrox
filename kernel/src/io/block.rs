@@ -25,7 +25,12 @@ use crate::syscall::error::KError;
 pub struct BlockBackend {
     /// Submit an IRP to the device.
     pub submit: fn(irp: *mut Irp, ctx: *mut ()),
-    /// Device context passed back to `submit` (e.g. the controller / ramdisk).
+    /// Drive the in-flight command to completion by **polling** (no interrupts),
+    /// then run its completion DPC — for synchronous kernel reads at boot, before
+    /// interrupts are enabled (see [`read_blocking`]). A partition delegates to
+    /// its disk's poll; the disk driver polls its hardware.
+    pub poll: fn(ctx: *mut ()),
+    /// Device context passed back to `submit`/`poll` (e.g. the controller).
     pub ctx: *mut (),
 }
 
@@ -173,9 +178,205 @@ fn irp_complete_dpc(ctx: *mut ()) {
     drop(unsafe { KBox::from_raw(core::ptr::NonNull::new_unchecked(bx_ptr)) });
 }
 
+/// Read `count` 512-byte sectors starting at `lba` from the block `device`
+/// **synchronously** into `dst`, by polling — for kernel-internal reads at boot,
+/// before interrupts are enabled (the GPT driver). Returns `false` on any
+/// failure (allocation, bad device, short `dst`, or a device error).
+///
+/// Submits a normal IRP, then drives it to completion via the device's
+/// [`BlockBackend::poll`] (no IRQ needed), and copies the result out.
+pub fn read_blocking(device: &ObjectRef, lba: u64, count: u64, dst: &mut [u8]) -> bool {
+    // SAFETY: `device` pins a live `DeviceNode`.
+    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
+    let Some(backend) = dn.block_backend() else {
+        return false;
+    };
+    let len = (count * 512) as usize;
+    if dst.len() < len {
+        return false;
+    }
+    let Ok(buf) = MemoryObject::try_new(len) else {
+        return false;
+    };
+    // SAFETY: adopt the creation references into owning `ObjectRef`s.
+    let buf_ref = unsafe {
+        ObjectRef::from_raw(KBox::into_raw(buf).as_ptr() as *mut (), crate::libkern::handle::KObjectType::MemoryObject)
+    };
+    let Ok(po) = crate::object::PendingOperation::try_new() else {
+        return false;
+    };
+    let po_ref = unsafe {
+        ObjectRef::from_raw(KBox::into_raw(po).as_ptr() as *mut (), crate::libkern::handle::KObjectType::PendingOperation)
+    };
+
+    if dispatch_block_irp(device, &buf_ref, &po_ref, IoOpcode::Read, lba * 512, 0, len as u64)
+        .is_err()
+    {
+        return false;
+    }
+    // Poll the in-flight command to completion + run its DPC (no interrupts).
+    (backend.poll)(backend.ctx);
+
+    let (status, _result) = crate::sched::pending_op_completion(po_ref.as_ptr());
+    if status != 0 {
+        return false;
+    }
+
+    // Copy the buffer's frames out through the HHDM.
+    // SAFETY: `buf_ref` pins the live `MemoryObject`.
+    let mo: &MemoryObject = unsafe { &*(buf_ref.as_ptr() as *const MemoryObject) };
+    let hhdm = crate::mm::heap::hhdm_offset();
+    let mut copied = 0usize;
+    for &frame in mo.frames() {
+        let n = PAGE_SIZE.min(len - copied);
+        let src = (frame.as_u64() + hhdm) as *const u8;
+        // SAFETY: `src..src+n` is an owned, HHDM-mapped buffer frame; `dst` fits.
+        unsafe { core::ptr::copy_nonoverlapping(src, dst.as_mut_ptr().add(copied), n) };
+        copied += n;
+        if copied >= len {
+            break;
+        }
+    }
+    true
+}
+
+// --- Partitions: the second IRP layer -----------------------------------------
+
+/// A block-device partition: a window `[start_lba, start_lba + block_count)` on a
+/// parent block device. Leaked to `'static` by its creator (a partition lives for
+/// the kernel's lifetime, like a disk).
+pub struct Partition {
+    /// The parent disk's backend — where rebased IRPs are forwarded.
+    disk: BlockBackend,
+    start_lba: u64,
+    block_count: u64,
+    sector_size: u64,
+}
+
+// SAFETY: a `Partition` is set up once and accessed only on the CPU servicing the
+// device; it holds no interior-mutable cross-context state.
+unsafe impl Send for Partition {}
+unsafe impl Sync for Partition {}
+
+/// [`BlockBackend::submit`] for a partition: bounds-check the partition-relative
+/// request, **rebase** the IRP's offset to disk-absolute, and forward it to the
+/// parent disk's backend. This is the two-layer block IRP stack (partition → disk)
+/// realised by backend delegation. `ctx` is the `*const Partition`.
+fn partition_submit(irp: *mut Irp, ctx: *mut ()) {
+    // SAFETY: `ctx` is the live `Partition`; `irp` is the in-flight request.
+    let p = unsafe { &*(ctx as *const Partition) };
+    let (offset, length) = unsafe { ((*irp).offset, (*irp).length) };
+    match partition_rebase(offset, length, p.start_lba, p.block_count, p.sector_size) {
+        Some(disk_offset) => {
+            // Rebase partition-relative → disk-absolute, then forward down a layer.
+            // SAFETY: `irp` is in flight and uniquely owned during submit.
+            unsafe {
+                (*irp).offset = disk_offset;
+                (p.disk.submit)(irp, p.disk.ctx);
+            }
+        }
+        None => {
+            // Out of the partition's bounds — complete the IRP with an error.
+            // SAFETY: `irp` is in flight; set its status and queue its completion.
+            unsafe {
+                (*irp).set_completion(KError::InvalidArgument as i32, 0);
+                crate::dpc::enqueue(&(*irp).dpc);
+            }
+        }
+    }
+}
+
+/// Translate a partition-relative byte `offset` (length `length`) into a
+/// disk-absolute offset, or `None` if the request falls outside the partition
+/// `[0, block_count * sector_size)`. The core of the two-layer block stack.
+fn partition_rebase(
+    offset: u64,
+    length: u64,
+    start_lba: u64,
+    block_count: u64,
+    sector_size: u64,
+) -> Option<u64> {
+    let span = block_count.checked_mul(sector_size)?;
+    let end = offset.checked_add(length)?;
+    if end > span {
+        return None;
+    }
+    offset.checked_add(start_lba.checked_mul(sector_size)?)
+}
+
+/// [`BlockBackend::poll`] for a partition: delegate to the parent disk's poll.
+fn partition_poll(ctx: *mut ()) {
+    // SAFETY: `ctx` is the live `Partition`.
+    let p = unsafe { &*(ctx as *const Partition) };
+    (p.disk.poll)(p.disk.ctx);
+}
+
+/// Build a [`BlockBackend`] for a partition window over `disk`. The returned
+/// backend borrows `partition` (which must outlive every IRP submitted to it —
+/// it is leaked `'static`).
+pub fn partition_backend(partition: &'static Partition) -> BlockBackend {
+    BlockBackend {
+        submit: partition_submit,
+        poll: partition_poll,
+        ctx: partition as *const Partition as *mut (),
+    }
+}
+
+impl Partition {
+    /// Create a partition window `[start_lba, start_lba + block_count)` over the
+    /// block device `disk` (a `DeviceNode` with a backend). Returns the leaked
+    /// `'static` partition + a backend over it, or `None` if `disk` is not a block
+    /// device. The caller publishes a block `DeviceNode` backed by the backend.
+    pub fn new(
+        disk: &ObjectRef,
+        start_lba: u64,
+        block_count: u64,
+        sector_size: u64,
+    ) -> Option<&'static Partition> {
+        // SAFETY: `disk` pins a live `DeviceNode`.
+        let dn: &DeviceNode = unsafe { &*(disk.as_ptr() as *const DeviceNode) };
+        let disk_backend = dn.block_backend()?;
+        let boxed = KBox::try_new(Partition {
+            disk: disk_backend,
+            start_lba,
+            block_count,
+            sector_size,
+        })
+        .ok()?;
+        // Leak: the partition persists for the kernel's lifetime.
+        // SAFETY: `into_raw` yields a stable, uniquely-owned pointer.
+        Some(unsafe { &*KBox::into_raw(boxed).as_ptr() })
+    }
+
+    /// Total sectors in the partition.
+    pub fn block_count(&self) -> u64 {
+        self.block_count
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn partition_rebase_maps_relative_to_absolute() {
+        // A partition starting at LBA 2048 (1 MiB), 1000 sectors, 512-byte blocks.
+        let start = 2048u64;
+        let count = 1000u64;
+        let ss = 512u64;
+        // Partition LBA 0 → disk LBA 2048.
+        assert_eq!(partition_rebase(0, 512, start, count, ss), Some(2048 * 512));
+        // Partition byte offset 8192 → disk (2048 * 512) + 8192.
+        assert_eq!(partition_rebase(8192, 512, start, count, ss), Some(2048 * 512 + 8192));
+        // The last sector is in bounds.
+        assert_eq!(
+            partition_rebase((count - 1) * ss, ss, start, count, ss),
+            Some((start + count - 1) * ss)
+        );
+        // One byte past the end is rejected.
+        assert_eq!(partition_rebase((count - 1) * ss, ss + 1, start, count, ss), None);
+        assert_eq!(partition_rebase(count * ss, ss, start, count, ss), None);
+    }
 
     #[test]
     fn frags_cover_aligned_range_one_per_page() {
