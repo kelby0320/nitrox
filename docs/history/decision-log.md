@@ -4613,3 +4613,92 @@ reader also builds bare `x86_64-unknown-none`) / `check-arch` / `test` —
 fs-server-ext4 **6**, librsproto 11, kernel 486, libkern 8, init 18. Branch
 `phase-2/slice7-ext4-reader`. Next: Part 3 (kernel transparent-forwarding, proven
 with a stub server) — the hard part.
+
+## 2026-06-25 — Phase 2 slice 7, Part 3: kernel transparent namespace forwarding
+
+The slice's hard core: a client's `sys_ns_lookup` of a path bound to a **Userspace
+Server** is forwarded by the kernel over IPC — the kernel becomes an async IPC
+*client* of the server, sending a `Namespace::Resolve` and later completing the
+lookup's `PendingOperation` from the reply. This realizes the `UserspaceServer`
+binding target + `OpStatus::Pending` the slice-3 framework reserved.
+
+**Decision — the `UserspaceServerReg` kobject (type 13) is the registration's
+home.** Type 13 was reserved at slice-3 design time "to tag the userspace-server
+registration object." It now exists (`kernel/src/object/userspace_server.rs`): an
+internal (never user-facing) kobject owning the kernel's IPC endpoint `ObjectRef`
+plus the **pending-lookup table** `{ request_id, po, owner_pid, requested }`. A
+`BindingTarget::UserspaceServer(ObjectRef)` holds it. The alternative — boxing the
+forwarding state onto every `IpcChannel::Inner` — was rejected: it bloats the
+common channel and contradicts the reserved tag. The only `IpcChannel` addition is
+a single `us_reg: *mut ()` back-pointer (null on ordinary channels) so a reply
+*reaching* the kernel endpoint can find its registration. The registration owns the
+endpoint's only reference, so the back-pointer is valid for the endpoint's whole
+life. Sized **N = 1** (one outstanding lookup per server) for slice 7 — trivial
+correlation; raising it is a localized change.
+
+**Decision — inline-in-send completion, not a reply DPC.** The biggest design call
+(flagged as risk #1). When the server replies (its `sys_channel_send` to the kernel
+endpoint), the kernel must drain the reply, cross-context-install the transferred
+`MemoryObject`, and complete the lookup PO. Two candidate sites; chosen by checking
+where `run_pending()` (the DPC drain) actually runs: **only at the interrupt-
+dispatch tail** (`arch/x86_64/idt.rs`), *not* on syscall return. So a reply DPC
+enqueued in the server's send syscall would not drain until the next device IRQ /
+timer tick — a latency hole. **Inline-in-send** instead: `sys_channel_send` detects
+(via `us_forward_reg_for_send`) that the send's peer is a kernel forwarding
+endpoint and completes the waiting PO right there — one code path, no deferral. The
+`SCHED`-discipline holds: take the pending entry under `SCHED`, then `allocate`
+cross-context + `complete_pending_op` + drop the PO ref **outside** `SCHED`.
+
+**Decision — rights = `requested ∩ (rights the server granted on the transfer)`,
+not `requested ∩ binding.rights`.** For a Kernel Server / direct handle the bound
+object's rights are a sensible cap; for a Userspace Server the bound object is the
+*IPC endpoint*, whose `SEND`/`RECV` rights are meaningless as a cap on a returned
+`MemoryObject` (AND-ing them would zero out `MAP_READ`). The trusted server
+attenuates the transferred handle to the content's rights; the binding's role —
+gating *whether* a client may resolve through the mount — is already enforced by the
+namespace handle's `LOOKUP` right. `rsproto-namespace-ops.md` updated to match
+(source-wins; the spec's earlier wording fit the in-kernel paths).
+
+**Decision — `ImageId::FsServerExt4` + an embedded stub server defer to Part 4.**
+The plan had Part 3 add an embedded stub fs-server *process* to prove the loop. But
+the loop needs no second process: a **single-process self-forwarding demo in
+`parent`** plays both client and server — bind an endpoint as a Userspace Server,
+look a path up through it, recv the kernel-forwarded `Resolve`, reply transferring a
+`MemoryObject::`-equivalent (`b"STUB\n"`), then `sys_wait` + map + verify. This
+isolates the highest-risk kernel mechanism behind a stub with *less* machinery, and
+defers `ImageId::FsServerExt4 = 3` + the embedded ELF to their first real consumer
+(Part 4). `parent` gains a `librsproto` dependency (it is not `init`, so this is
+allowed) — which also cross-checks the kernel's hand-coded rsproto mirror against
+the library codec.
+
+**Refinement — `OpStatus::Pending` is used, not just reserved.** The forwarding arm
+of `sys_ns_lookup` models a left-pending lookup as `OpStatus::Pending`; the lookup
+result became `Option<(status, result)>` (`None` ⇒ leave the PO pending). Kernel
+Servers still never produce `Pending` (debug-asserted).
+
+**Races handled.** Dead server mid-lookup: `ipc_endpoint_closing` now fails any
+pending forwarded lookup `PeerClosed` (checking both the closing endpoint and its
+peer for a registration), dropping the PO ref outside `SCHED`. Dead client: the
+cross-context `allocate` fails cleanly (no panic — the global handle table just
+stores `owner_pid`); the reply path drops the object + completes the PO with the
+error. Duplicate / stale reply: `take_pending_matching` correlates by `request_id`;
+an unmatched reply is dropped (transfer released, sender handles still closed).
+One-shot `complete_pending_op` covers any double-completion.
+
+**Kernel rsproto mirror.** `kernel/src/rsproto.rs` is a tiny hand-coded mirror of
+the `librsproto` wire codec (the kernel may not depend on a userspace crate): build
+the `Resolve` request (request_id stamped under `SCHED` once assigned), parse the
+reply. Host tests pin the documented offsets from the kernel side; `librsproto`'s
+own tests pin them from the other — the two cannot drift.
+
+**ABI.** No layout changes. New enum *variants* (`BindingTarget`/`ResolvedTarget`
+`::UserspaceServer`, `OpStatus::Pending`) are kernel-internal. `KObjectType` value
+13 (`UserspaceServerReg`) was already reserved → no hash impact. The rsproto Resolve
+wire format is a pre-stabilization kernel↔server ABI (`rsproto-namespace-ops.md`).
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**500** (rsproto 7, userspace_server 4, + namespace/ipc additions), librsproto 11,
+fs-server-ext4 6, libkern 8, init 18. **QEMU milestone:** `parent` logs
+`forwarded lookup returned 'STUB' via fs-server ok`, and the rest of the boot chain
+(IPC children, reaping) stays clean — `init: reaped pid=2 code=0`, no `#DF`/panic.
+Branch `phase-2/slice7-fwd`. Next: Part 4 (the real `fs-server-ext4` process).

@@ -28,5 +28,6 @@ pub mod limine;
 pub mod mm;
 pub mod object;
 pub mod pci;
+pub mod rsproto;
 pub mod sched;
 pub mod syscall;

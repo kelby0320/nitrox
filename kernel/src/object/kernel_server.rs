@@ -58,20 +58,25 @@ pub enum KernelServerId {
 
 /// The outcome of a resource-server lookup — the umbrella RS contract's return.
 ///
-/// A Kernel Server answers synchronously, so it returns only [`Completed`] or
-/// [`Rejected`]. The third state of the full contract, `Pending` (the lookup
-/// will complete later, via the PO), belongs to the **userspace** path and is
-/// introduced with slice 7; an in-kernel server never blocks, so it is not
-/// represented here yet.
+/// A **Kernel Server** answers synchronously, so it returns only [`Completed`] or
+/// [`Rejected`]. The third state, [`Pending`], belongs to the **userspace** path
+/// (slice 7): the kernel forwarded the lookup over IPC and the lookup's
+/// `PendingOperation` will be completed later, when the server replies. An
+/// in-kernel server never returns it (it never blocks).
 ///
 /// [`Completed`]: OpStatus::Completed
 /// [`Rejected`]: OpStatus::Rejected
+/// [`Pending`]: OpStatus::Pending
 pub enum OpStatus {
     /// The server produced a handle to a kernel object. The caller installs it
     /// (rights-attenuated) and pre-signals the lookup PO with status `0`.
     Completed(ObjectRef),
     /// The lookup failed; the caller delivers `err` through the lookup PO.
     Rejected(KError),
+    /// The lookup was forwarded to a Userspace Server; its `PendingOperation` is
+    /// left **uncompleted** and will be signalled when the server's reply arrives
+    /// (the `sys_ns_lookup` forwarding arm). Only the userspace path produces this.
+    Pending,
 }
 
 /// Call the in-kernel server identified by `id` with the lookup `suffix` (the
@@ -252,6 +257,7 @@ mod tests {
                 drop(obj);
             }
             OpStatus::Rejected(e) => panic!("expected Completed, got Rejected({e:?})"),
+            OpStatus::Pending => panic!("a kernel server never returns Pending"),
         }
     }
 
@@ -262,6 +268,7 @@ mod tests {
             OpStatus::Rejected(KError::NotFound) => {}
             OpStatus::Rejected(e) => panic!("expected NotFound, got {e:?}"),
             OpStatus::Completed(_) => panic!("a non-empty suffix must not resolve on a leaf"),
+            OpStatus::Pending => panic!("a kernel server never returns Pending"),
         }
     }
 
@@ -280,6 +287,7 @@ mod tests {
                 OpStatus::Rejected(KError::NotFound) => {}
                 OpStatus::Rejected(e) => panic!("{id:?}: expected NotFound, got {e:?}"),
                 OpStatus::Completed(_) => panic!("{id:?}: a non-empty suffix must not resolve"),
+                OpStatus::Pending => panic!("{id:?}: a kernel server never returns Pending"),
             }
         }
     }

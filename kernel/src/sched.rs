@@ -54,7 +54,7 @@ use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
 use crate::arch::{Cpu, Paging, context_switch};
-use crate::libkern::handle::KObjectType;
+use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
 use crate::libkern::{ExitKind, ExitStatus, Notification};
@@ -62,8 +62,9 @@ use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::object::{
     BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel,
     ObjectRef, PendingOperation, ReclaimedSend, RecvState, SendOutcome, StoredMsg, Thread,
-    ThreadEntry, ThreadState, Timer, TransferRef,
+    ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
+use crate::object::userspace_server::PendingLookup;
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -827,6 +828,124 @@ pub fn ipc_send_push(
     outcome
 }
 
+/// Outcome of [`us_forward_originate`] — how a forwarded `sys_ns_lookup` fared
+/// when the kernel tried to hand its `Namespace::Resolve` request to the server.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum ForwardOutcome {
+    /// The request was delivered; the lookup's `PendingOperation` is left
+    /// **pending** and will complete when the server replies.
+    Pending,
+    /// A forwarded lookup is already outstanding on this server (N = 1) — the
+    /// caller fails the new lookup (`WouldBlock`).
+    Busy,
+    /// The server's inbox ring is full — the caller fails the lookup
+    /// (`WouldBlock`).
+    Full,
+    /// The server endpoint has closed — the caller fails the lookup
+    /// (`PeerClosed`).
+    PeerClosed,
+}
+
+/// Originate a forwarded namespace lookup: under one `SCHED` hold, reserve the
+/// registration's (single) pending-lookup slot — assigning a `request_id` and
+/// recording the lookup `po` / `owner_pid` / requested `Rights` — stamp that id
+/// into the already-built `Namespace::Resolve` request `msg`, and push the request
+/// into the server's inbox (the peer of the registration's kernel endpoint),
+/// waking the server's blocked receivers. The lookup PO is left **uncompleted**
+/// (the server's reply completes it later, inline in its send — see
+/// [`us_forward_take_pending`]). On `Busy` nothing was reserved; on `Full` /
+/// `PeerClosed` the reserved slot is rolled back and its `po` clone dropped
+/// outside `SCHED`. `reg` is the [`UserspaceServerReg`] the lookup resolved to;
+/// the caller pins it (and `po`) for the call.
+pub fn us_forward_originate(
+    reg: *mut (),
+    msg: &mut StoredMsg,
+    po: &ObjectRef,
+    owner_pid: u32,
+    requested: Rights,
+) -> ForwardOutcome {
+    let mut g = SCHED.lock();
+    // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
+    // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
+    let request_id = match unsafe { UserspaceServerReg::begin(reg, po, owner_pid, requested) } {
+        Some(id) => id,
+        None => return ForwardOutcome::Busy,
+    };
+    // Stamp the assigned id into the request envelope (the body was built by the
+    // caller with a zero placeholder).
+    crate::rsproto::stamp_request_id(&mut msg.payload, request_id);
+    // SAFETY: `reg` live, `SCHED` held — the kernel endpoint is pinned by `reg`.
+    let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
+    let mut no_transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    // SAFETY: `endpoint` is the registration's live kernel endpoint; `SCHED` held.
+    let outcome = unsafe { IpcChannel::send_push(endpoint, msg, &mut no_transfers) };
+    match outcome {
+        SendOutcome::Sent { woke_edge } => {
+            if woke_edge {
+                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
+                let peer = unsafe { IpcChannel::peer_of(endpoint) };
+                if !peer.is_null() {
+                    signal_ipc_endpoint(&mut g, peer);
+                }
+            }
+            ForwardOutcome::Pending
+        }
+        SendOutcome::Full | SendOutcome::PeerClosed => {
+            // Roll back the reserved slot; drop its `po` clone **outside** `SCHED`.
+            // SAFETY: `reg` live, `SCHED` held.
+            let pl = unsafe { UserspaceServerReg::take_pending_any(reg) };
+            drop(g);
+            drop(pl);
+            if outcome == SendOutcome::Full {
+                ForwardOutcome::Full
+            } else {
+                ForwardOutcome::PeerClosed
+            }
+        }
+    }
+}
+
+/// If a send on `send_endpoint` targets the kernel's end of a Userspace Server
+/// channel — i.e. its **peer** carries a
+/// [`UserspaceServerReg`](crate::object::UserspaceServerReg) back-pointer — return
+/// that registration (the send is a forwarded-lookup *reply* the kernel completes
+/// inline). `None` for an ordinary channel send or a closed peer. Takes `SCHED`
+/// (the accessor contract). The caller pins `send_endpoint` (its send handle).
+pub fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
+    let _g = SCHED.lock();
+    // SAFETY: `send_endpoint` is pinned by the caller; `SCHED` held.
+    let peer = unsafe { IpcChannel::peer_of(send_endpoint) };
+    if peer.is_null() {
+        return None;
+    }
+    // SAFETY: `peer` is the surviving endpoint (the kernel end); `SCHED` held.
+    let reg = unsafe { IpcChannel::us_reg_of(peer) };
+    if reg.is_null() { None } else { Some(reg) }
+}
+
+/// Record the endpoint → registration back-pointer that makes `endpoint` the
+/// kernel's end of a Userspace Server channel: a reply sent to it (by the server,
+/// on its peer) is then completed inline rather than enqueued. Called by
+/// `sys_ns_bind` once the `UserspaceServer` binding owns the registration. Takes
+/// `SCHED` (the accessor contract). The caller pins `endpoint` (its bound handle).
+pub fn us_server_attach(endpoint: *mut (), reg: *mut ()) {
+    let _g = SCHED.lock();
+    // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
+    unsafe { IpcChannel::set_us_reg(endpoint, reg) };
+}
+
+/// Take the forwarded lookup outstanding on `reg` whose `request_id` matches a
+/// reply's, for the caller to complete (cross-context install + signal). `None`
+/// if the reply does not correlate (duplicate / stale). Takes `SCHED`; the
+/// returned [`PendingLookup`]'s `po` is dropped by the caller **outside** `SCHED`.
+/// The caller pins `reg` (via the send's endpoint peer, valid for the call).
+pub fn us_forward_take_pending(reg: *mut (), request_id: u64) -> Option<PendingLookup> {
+    let _g = SCHED.lock();
+    // SAFETY: `reg` is a live registration (pinned through the live peer endpoint);
+    // `SCHED` held.
+    unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) }
+}
+
 /// Blocking send (`Block` / `BlockBounded`): deliver `msg` into the peer's
 /// receive ring, or — if it is full — **hold** it in the peer's pending-send
 /// queue with a reference to the caller's `PendingOperation` `po`, to be
@@ -948,11 +1067,39 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     // SAFETY: `endpoint` is the object being dropped (still valid memory);
     // `SCHED` held.
     let peer = unsafe { IpcChannel::peer_of(endpoint) };
+    // A Userspace Server channel is losing its server: fail any forwarded lookup
+    // pending on the kernel-forwarding endpoint with `PeerClosed`. Two cases —
+    // **this** endpoint is the kernel end (its registration is being torn down),
+    // or its **peer** is (the server process just died). Each taken PO is signalled
+    // here; its reference is dropped **outside** `SCHED` (below).
+    let mut orphan_self: Option<ObjectRef> = None;
+    let mut orphan_peer: Option<ObjectRef> = None;
+    // SAFETY: `endpoint` is valid memory; `SCHED` held.
+    let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
+    if !reg_self.is_null() {
+        // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
+        // is being dropped *because* the registration is — `reg_self` is still
+        // valid memory mid-drop); `SCHED` held.
+        if let Some(pl) = unsafe { UserspaceServerReg::take_pending_any(reg_self) } {
+            signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
+            orphan_self = Some(pl.po);
+        }
+    }
     if !peer.is_null() {
         // SAFETY: `peer` is the surviving endpoint, kept alive by its own handle
         // / a waiter's `ObjectRef`; `SCHED` held.
         unsafe { IpcChannel::clear_peer(peer) };
         signal_ipc_endpoint(&mut g, peer);
+        // SAFETY: `peer` is the live surviving endpoint; `SCHED` held.
+        let reg_peer = unsafe { IpcChannel::us_reg_of(peer) };
+        if !reg_peer.is_null() {
+            // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
+            // `SCHED` held.
+            if let Some(pl) = unsafe { UserspaceServerReg::take_pending_any(reg_peer) } {
+                signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
+                orphan_peer = Some(pl.po);
+            }
+        }
     }
     // Complete every blocking sender held on THIS endpoint with `PeerClosed`:
     // our receive ring is gone, so their messages can never be delivered. We
@@ -970,6 +1117,11 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
         deadline::remove(&mut g.deadlines, po as usize, deadline::DeadlineKind::PendingSend);
         signal_pending_op(&mut g, po, crate::syscall::error::KError::PeerClosed as i32);
     }
+    // Release `SCHED` before dropping any orphaned forwarded-lookup PO references
+    // (an `ObjectRef` Drop must not run under the rank-1 lock).
+    drop(g);
+    drop(orphan_self);
+    drop(orphan_peer);
 }
 
 /// Point the ring-0 trap stack (`TSS.RSP0`) and the per-CPU syscall stack at

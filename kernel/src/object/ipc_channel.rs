@@ -299,6 +299,14 @@ struct Inner {
     pending_sends: KVec<PendingSend>,
     /// The other endpoint, or null once it has closed.
     peer: *mut IpcChannel,
+    /// Non-null iff this endpoint is the **kernel's** end of a Userspace Server
+    /// channel: a back-pointer (type-erased, non-owning) to the owning
+    /// [`UserspaceServerReg`](crate::object::UserspaceServerReg). A reply sent to
+    /// this endpoint (by the server, on its peer) is a forwarded-lookup reply the
+    /// kernel completes inline rather than enqueues. Null on every ordinary
+    /// channel. The registration *owns* this endpoint (the only reference), so the
+    /// back-pointer is valid for as long as the endpoint is alive.
+    us_reg: *mut (),
 }
 
 // SAFETY: identical reasoning to `Timer`/`NotificationChannel` — the header
@@ -359,6 +367,7 @@ impl IpcChannel {
                 recv_waiters,
                 pending_sends,
                 peer: core::ptr::null_mut(),
+                us_reg: core::ptr::null_mut(),
             }),
         })
     }
@@ -401,6 +410,27 @@ impl IpcChannel {
     /// See the accessor contract above.
     pub(crate) unsafe fn clear_peer(obj: *mut ()) {
         unsafe { Self::inner(obj) }.peer = core::ptr::null_mut();
+    }
+
+    /// Mark this endpoint as the kernel's end of a Userspace Server channel,
+    /// recording `reg` (the owning
+    /// [`UserspaceServerReg`](crate::object::UserspaceServerReg)). Set once, when a
+    /// supervisor binds the endpoint as a `UserspaceServer`.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_us_reg(obj: *mut (), reg: *mut ()) {
+        unsafe { Self::inner(obj) }.us_reg = reg;
+    }
+
+    /// The owning [`UserspaceServerReg`](crate::object::UserspaceServerReg)
+    /// back-pointer for this endpoint (type-erased), or null if this is an ordinary
+    /// channel endpoint.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn us_reg_of(obj: *mut ()) -> *mut () {
+        unsafe { Self::inner(obj) }.us_reg
     }
 
     /// Push `msg` (and **move** any `transfers` it carries) into the **peer**'s

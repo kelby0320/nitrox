@@ -40,7 +40,7 @@ use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, validate_path};
 use crate::object::{
     BlockSendOutcome, EntropyObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
     NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState,
-    SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
+    SendOutcome, StoredMsg, Timer as TimerObject, TransferRef, UserspaceServerReg,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -968,16 +968,52 @@ pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -
     let ns_ok = lookup_typed(ns_h, pid, Rights::BIND, KObjectType::Namespace)?;
     let mut buf = [0u8; NS_PATH_MAX];
     let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
-    // Resolve the resource handle (any type; ownership is the authority). Clone
-    // its reference for the binding; the binding's rights are the handle's rights.
+    // Resolve the resource handle (any type; ownership is the authority).
     let res_ok = global::get()
         .lookup(RawHandle(resource_h), pid, Rights::empty())
         .map_err(map_handle_err)?;
-    let target = res_ok.object.clone();
     let rights = res_ok.rights;
     // SAFETY: `ns_ok.object` addresses a live `Namespace` — `lookup_typed`
     // verified the type tag and the refcount pins it for this call.
     let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+
+    // An `IpcChannel` resource binds as a **Userspace Server**: the kernel adopts
+    // the endpoint into a registration it forwards lookups to (the supervisor gives
+    // the *peer* of this endpoint to the server process). Any other type binds as a
+    // direct handle (slice-1 behaviour). See
+    // `docs/architecture/namespace-and-resource-servers.md`.
+    if res_ok.object.object_type() == KObjectType::IpcChannel {
+        // Wrap a clone of the endpoint in a registration record.
+        let reg_box = UserspaceServerReg::try_new(res_ok.object.clone())
+            .map_err(|_| KError::OutOfMemory)?;
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        let reg_ref = unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(reg_box).as_ptr() as *mut (),
+                KObjectType::UserspaceServerReg,
+            )
+        };
+        let reg_ptr = reg_ref.as_ptr();
+        return match ns.bind_userspace_server(path, reg_ref, rights) {
+            Ok(()) => {
+                // Now that the binding owns the registration, record the endpoint →
+                // registration back-pointer so the server's reply reaches it. (Set
+                // only on success: on failure no back-pointer is left dangling.)
+                crate::sched::us_server_attach(res_ok.object.as_ptr(), reg_ptr);
+                Ok(0)
+            }
+            Err((returned, e)) => {
+                // Drop the handed-back registration **outside** the namespace lock;
+                // its `Drop` releases the endpoint clone (no back-pointer was set).
+                drop(returned);
+                Err(map_ns_err(e))
+            }
+        };
+    }
+
+    // Direct-handle bind: clone the resource for the binding; the binding's rights
+    // are the handle's rights.
+    let target = res_ok.object.clone();
     match ns.bind(path, target, rights) {
         Ok(()) => Ok(0),
         Err((returned, e)) => {
@@ -1134,20 +1170,25 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
 
     // Create the PO and its handle FIRST, so every *resolution* outcome (success
     // or not-found) is delivered through the PO; only the pre-PO failures above
-    // return synchronously.
+    // return synchronously. Keep a kernel-held `po_ref` (a clone of the handle's
+    // reference): the forwarding path needs it to pin the PO across the async gap
+    // until the server's reply completes it.
     let po = PendingOperation::try_new().map_err(|_| KError::OutOfMemory)?;
-    let po_ptr = KBox::into_raw(po).as_ptr() as *mut ();
-    let po_h = match global::get().allocate(
-        pid,
-        po_ptr,
-        KObjectType::PendingOperation,
-        pending_op_rights(),
-    ) {
+    // SAFETY: `into_raw` yields the single creation reference; adopt it.
+    let po_ref = unsafe {
+        ObjectRef::from_raw(
+            KBox::into_raw(po).as_ptr() as *mut (),
+            KObjectType::PendingOperation,
+        )
+    };
+    let po_ptr = po_ref.as_ptr();
+    let (pp, pt) = po_ref.clone().into_raw();
+    let po_h = match global::get().allocate(pid, pp, pt, pending_op_rights()) {
         Ok(h) => h,
         Err(e) => {
-            // SAFETY: reclaim the PO creation reference; drop runs `PO::Drop`
-            // (no waiters yet, so its assert holds).
-            drop(unsafe { ObjectRef::from_raw(po_ptr, KObjectType::PendingOperation) });
+            // SAFETY: `allocate` did not adopt the clone; reclaim it. `po_ref` then
+            // drops at return, destroying the PO (no waiters yet — its assert holds).
+            drop(unsafe { ObjectRef::from_raw(pp, pt) });
             return Err(map_handle_err(e));
         }
     };
@@ -1173,15 +1214,18 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
         }
     };
 
-    let (status, result): (i32, u64) = match ns.resolve(path) {
-        None => (KError::NotFound as i32, 0),
+    // The resolution outcome: `Some((status, result))` completes the PO now (the
+    // synchronous direct-handle / kernel-server paths); `None` leaves it **pending**
+    // (a forwarded userspace lookup — the server's reply completes it later).
+    let outcome: Option<(i32, u64)> = match ns.resolve(path) {
+        None => Some((KError::NotFound as i32, 0)),
         Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
             if suffix.is_empty() {
-                install(target, binding_rights)
+                Some(install(target, binding_rights))
             } else {
                 // Direct-handle leaf: a non-empty suffix has no sub-resource.
                 drop(target);
-                (KError::NotFound as i32, 0)
+                Some((KError::NotFound as i32, 0))
             }
         }
         Some((ResolvedTarget::KernelServer(id), binding_rights, suffix)) => {
@@ -1189,16 +1233,78 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
             // handle (or rejects). Suffix interpretation (leaf vs. subtree) is the
             // server's policy. The result still flows through the pre-signalled PO.
             match kernel_server::dispatch(id, suffix, requested) {
-                OpStatus::Completed(obj) => install(obj, binding_rights),
-                OpStatus::Rejected(err) => (err as i32, 0),
+                OpStatus::Completed(obj) => Some(install(obj, binding_rights)),
+                OpStatus::Rejected(err) => Some((err as i32, 0)),
+                OpStatus::Pending => {
+                    // A Kernel Server never forwards; treat the impossible as an
+                    // internal error rather than panicking a syscall.
+                    debug_assert!(false, "kernel-server dispatch returned Pending");
+                    Some((KError::KernelError as i32, 0))
+                }
             }
         }
+        Some((ResolvedTarget::UserspaceServer(reg), _binding_rights, suffix)) => {
+            // Forward the lookup to the userspace server over IPC and leave the PO
+            // pending (the reply completes it inline — see `sys_channel_send`). A
+            // synchronous failure (server busy / full / gone) completes it now.
+            forward_userspace_lookup(reg, &po_ref, pid, requested, suffix)
+        }
     };
-    // Pre-signal the PO with the outcome (no waiters yet → just records it).
-    // `ns_ok` is still held here (a refcount, no lock), so this — which takes
-    // `SCHED` — performs no `ObjectRef` drop under the lock.
-    crate::sched::complete_pending_op(po_ptr, status, result);
+    match outcome {
+        // Pre-signal the PO with the outcome (no waiters yet → just records it).
+        // `ns_ok` / `po_ref` are still held here (refcounts, no lock), so this —
+        // which takes `SCHED` — performs no `ObjectRef` drop under the lock.
+        Some((status, result)) => crate::sched::complete_pending_op(po_ptr, status, result),
+        // Left pending: the forwarded request was delivered; the server's reply
+        // completes the PO. `po_ref` drops at return (the forwarding path cloned
+        // its own reference into the registration's pending-lookup table).
+        None => {}
+    }
     Ok(po_h.bits() as isize)
+}
+
+/// Forward a namespace lookup that resolved to a [`UserspaceServer`] binding to
+/// its server process over IPC: build the `Namespace::Resolve` request, originate
+/// it (recording the lookup in the registration's pending table), and report
+/// whether the lookup PO was left **pending** (`None`) or must be completed now
+/// with an error (`Some((status, 0))`). `reg` is the resolved registration
+/// reference (dropped here, outside the namespace lock); `po_ref` pins the lookup
+/// PO; `suffix` is the path past the mount prefix.
+///
+/// [`UserspaceServer`]: crate::object::namespace::ResolvedTarget::UserspaceServer
+fn forward_userspace_lookup(
+    reg: ObjectRef,
+    po_ref: &ObjectRef,
+    pid: u32,
+    requested: Rights,
+    suffix: &[u8],
+) -> Option<(i32, u64)> {
+    // Build the request in a heap-bounced message (4 KiB — never on the stack).
+    let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
+        Ok(m) => m,
+        Err(_) => return Some((KError::OutOfMemory as i32, 0)),
+    };
+    let body_len = match crate::rsproto::build_resolve_request(
+        &mut msg.payload,
+        requested.bits(),
+        suffix,
+    ) {
+        Some(n) => n,
+        // The suffix is longer than the rsproto request can carry.
+        None => return Some((KError::TooLarge as i32, 0)),
+    };
+    msg.header.payload_len = body_len as u32;
+    msg.header.handle_count = 0;
+
+    // Originate (assigns the request id, records the pending lookup, sends).
+    match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested) {
+        crate::sched::ForwardOutcome::Pending => None,
+        crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => {
+            Some((KError::WouldBlock as i32, 0))
+        }
+        crate::sched::ForwardOutcome::PeerClosed => Some((KError::PeerClosed as i32, 0)),
+    }
+    // `reg` / `msg` drop here, outside the namespace lock.
 }
 
 /// `sys_io_submit(resource, op)` — initiate the [`IoOp`] `*op` against
@@ -1572,6 +1678,15 @@ pub fn sys_channel_send(
     bounce.header.handle_count = count as u8;
     bounce.handles = [0u64; IPC_HANDLE_MAX];
 
+    // If this send's peer is the kernel's end of a Userspace Server channel, the
+    // message is a forwarded-lookup **reply**: complete the waiting lookup inline
+    // (cross-context install + PO signal) rather than enqueuing it — nothing in the
+    // kernel receives that ring. The reply is consumed regardless of `send_mode`
+    // (servers reply `NoBlock`). See `docs/spec/rsproto-namespace-ops.md`.
+    if let Some(reg) = crate::sched::us_forward_reg_for_send(ok.object.as_ptr()) {
+        return complete_forwarded_reply(reg, &bounce, &mut transfers, &h_raw, count, pid);
+    }
+
     // `ok.object` (held here) pins the endpoint across the push.
     match send_mode {
         // Synchronous attempt: `Sent` commits the transfer move (close the
@@ -1651,6 +1766,94 @@ pub fn sys_channel_send(
             }
         }
     }
+}
+
+/// Complete a forwarded-lookup **reply** inline in the server's `sys_channel_send`
+/// (the [`us_forward_reg_for_send`](crate::sched::us_forward_reg_for_send) path):
+/// parse the rsproto reply, correlate it to the registration's pending lookup, and
+/// deliver its outcome through that lookup's `PendingOperation` — installing the
+/// transferred `MemoryObject` into the **original caller's** table (rights =
+/// `requested ∩ the rights the server granted`) on success, or completing the PO
+/// with the reply's `KError` on failure. The server's transferred handles are
+/// closed (the move is committed) and the send reports success (`Ok(0)`) — the
+/// reply was consumed. A reply that does not parse or does not correlate (a
+/// duplicate / stale reply) is dropped: its transfers are released and the sender's
+/// handles still closed (the capability is consumed), but no PO is touched.
+///
+/// `bounce` is the copied reply message; `transfers` its in-flight transferred
+/// references (`transfers[i]` ↔ the sender handle `h_raw[i]`, `count` of them);
+/// `pid` is the sending server. Runs in syscall context (no `SCHED` held): the
+/// cross-context `allocate` and the `ObjectRef` drops happen outside the lock.
+fn complete_forwarded_reply(
+    reg: *mut (),
+    bounce: &StoredMsg,
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    h_raw: &[u64; IPC_HANDLE_MAX],
+    count: usize,
+    pid: u32,
+) -> SysResult {
+    use crate::rsproto::{OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply};
+
+    // Parse the reply (recovers the `request_id` even on a malformed body).
+    let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
+    let reply = parse_reply(&bounce.payload[..payload_len]);
+
+    // Correlate to the outstanding lookup. A reply that doesn't parse, isn't a
+    // reply, or doesn't match the pending `request_id` has no lookup to complete.
+    let pl = match reply {
+        Some(r) => crate::sched::us_forward_take_pending(reg, r.request_id),
+        None => None,
+    };
+    let Some(pl) = pl else {
+        // Unmatched / stale: drop any transfers (on return) and close the sender's
+        // handles — the reply is consumed regardless.
+        for i in 0..count {
+            close_and_release(RawHandle(h_raw[i]), pid);
+        }
+        return Ok(0);
+    };
+    // `pl` was taken only when `reply` parsed.
+    let reply = reply.expect("pending taken ⇒ reply parsed");
+
+    let (status, result): (i32, u64) = match reply.kind {
+        ReplyKind::Error { kerror } => (kerror, 0),
+        ReplyKind::Malformed => (KError::KernelError as i32, 0),
+        ReplyKind::Success { object_kind, .. } if object_kind != OBJECT_KIND_MEMOBJ => {
+            (KError::Unsupported as i32, 0)
+        }
+        ReplyKind::Success { .. } => match transfers[0].take() {
+            None => (KError::InvalidArgument as i32, 0), // success but no handle
+            Some(tr) if tr.obj.object_type() != KObjectType::MemoryObject => {
+                drop(tr.obj);
+                (KError::Unsupported as i32, 0)
+            }
+            Some(tr) => {
+                // Install the resolved object into the original caller's table with
+                // `requested ∩ (the rights the server granted on the transfer)`.
+                let attenuated = pl.requested & tr.rights;
+                // SAFETY: `tr.obj` owns the in-flight reference; hand it to `allocate`.
+                let (op, ot) = tr.obj.into_raw();
+                match global::get().allocate(pl.owner_pid, op, ot, attenuated) {
+                    Ok(h) => (0, h.bits()),
+                    Err(e) => {
+                        // SAFETY: `allocate` did not adopt the reference; reclaim it.
+                        // (A dead caller pid takes this path — fails cleanly.)
+                        drop(unsafe { ObjectRef::from_raw(op, ot) });
+                        (map_handle_err(e) as i32, 0)
+                    }
+                }
+            }
+        },
+    };
+
+    // Complete the lookup PO (one-shot); release the kernel's PO clone outside
+    // `SCHED`; commit the transfer move by closing the sender's handles.
+    crate::sched::complete_pending_op(pl.po.as_ptr(), status, result);
+    drop(pl);
+    for i in 0..count {
+        close_and_release(RawHandle(h_raw[i]), pid);
+    }
+    Ok(0)
 }
 
 /// Close every handle a partial `sys_channel_recv` installed in the receiver's

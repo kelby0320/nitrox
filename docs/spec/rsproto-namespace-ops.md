@@ -91,9 +91,21 @@ discriminant (`NotFound` for a missing path, `TooLarge` past the cap,
 2. The server resolves the suffix, reads the file, and replies — transferring the
    `MemoryObject` in `handles[0]` (success) or an `ErrorBody` (failure).
 3. The kernel installs the transferred `MemoryObject` into the **original
-   caller's** table (rights = `requested ∩ binding.rights`) and signals the
-   lookup PO: `IoResult { status: 0, result: <the installed handle> }`, or
-   `status: <kerror>` on error. The client's `sys_wait` returns the handle.
+   caller's** table and signals the lookup PO: `IoResult { status: 0, result: <the
+   installed handle> }`, or `status: <kerror>` on error. The client's `sys_wait`
+   returns the handle.
+
+   **Installed rights = `requested ∩ (the rights the server granted on the
+   transferred handle)`.** Unlike a Kernel Server / direct-handle binding — whose
+   bound object's rights are a sensible cap on what a lookup yields — a Userspace
+   Server binding's bound object is the *IPC endpoint*, whose rights (`SEND`/`RECV`/
+   …) are not a meaningful cap on a returned `MemoryObject`. The meaningful cap is
+   what the (trusted) server granted on the object it transfers (read-only content
+   ⇒ `MAP_READ`); the binding's role is gating *whether* the client may resolve
+   through the mount, which the namespace handle's `LOOKUP` right already enforces.
+   The server is responsible for attenuating the transferred handle to the rights
+   the content should carry. *(Recorded in the decision log, 2026-06-25; refines the
+   earlier `requested ∩ binding.rights` wording, which fits the in-kernel paths.)*
 
 The client then `sys_memory_map`s the `MemoryObject` `MAP_READ` and reads — the
 identical flow it uses against the in-kernel `/initramfs` server today.
