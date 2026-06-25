@@ -6,9 +6,12 @@
 //! `/proc/self/*`). init:
 //!
 //! 1. reports the handle set it received;
-//! 2. reads + parses `/initramfs/etc/init.toml` and logs the topo-sorted mount
-//!    plan (the actual fs-server spawn → Ready handshake → `sys_ns_bind` is
-//!    deferred to slice 7 — there are no fs-servers or block devices yet);
+//! 2. reads + parses `/initramfs/etc/init.toml` and **processes its mounts** in
+//!    dependency order — for each, resolving the device, spawning an
+//!    `fs-server-ext4`, handing it the device, awaiting `Meta::Ready`, and
+//!    `sys_ns_bind`ing its forwarding endpoint at the mount point (the Resource
+//!    Server Startup Protocol); then reads `/system/current-generation` through the
+//!    freshly-mounted root (the slice-7 milestone — the whole stack end to end);
 //! 3. spawns `parent` (the slice-1/2/3 demo chain: `parent` → `child`);
 //! 4. enters the reaping loop, closing the process handle of each exited child.
 //!
@@ -20,9 +23,10 @@
 
 extern crate alloc;
 
+use alloc::vec::Vec;
 use core::arch::asm;
 use init::heap::BumpAlloc;
-use init::manifest::{self, Mode};
+use init::manifest::{self, Mode, MountSpec};
 use libkern::*;
 
 #[global_allocator]
@@ -31,9 +35,41 @@ static ALLOC: BumpAlloc = BumpAlloc;
 /// One page; init.toml is assumed to fit (true for the bootstrapping manifest).
 const PAGE: u64 = 4096;
 
+/// The resource-server protocol magic (`"RSMG"`) and the `Meta::Ready` op, so init
+/// can **hand-parse** the fs-server's Ready message without depending on
+/// `librsproto` (forbidden in init — see `userspace/init/CLAUDE.md`). The rsproto
+/// envelope sits in the `IpcMsg` payload (offset 24): magic @0, op @6.
+const RS_MAGIC: u32 = 0x5253_4D47;
+const RS_OP_READY: u16 = 0x0004;
+/// Bounded wait for an fs-server's Ready (the CLAUDE.md mount timeout): init must
+/// not wait forever for a server that never reports up.
+const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
+
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut NOTIF: Notification = Notification::zeroed();
+
+/// Control-channel endpoints for an fs-server handshake (init keeps `[0]`, the
+/// server gets `[1]`). Reused across mounts (processed one at a time).
+static mut CTRL0: u64 = 0;
+static mut CTRL1: u64 = 0;
+/// One IPC message + transferred-handle scratch for the setup send / Ready recv.
+static mut IPC_MSG: [u8; 4096] = [0; 4096];
+static mut IPC_HANDLES: [u64; 8] = [0; 8];
+static mut IPC_COUNT: usize = 0;
+/// Spawn args for an `fs-server-ext4`: one moved handle — the control channel — in
+/// `handles[0]` (delivered to the child in `rdx`); it inherits a LOOKUP-only handle
+/// to init's root namespace (it resolves nothing — it gets the device by IPC).
+static mut SPAWN_FS: SpawnArgs = SpawnArgs {
+    image: IMAGE_FS_SERVER_EXT4,
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    _pad: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+};
 /// Spawn args for the demo `parent`: no handles, inherit a LOOKUP-only handle to
 /// init's root namespace (so parent can resolve the kernel servers but not bind
 /// into init's root — it constructs its own namespaces for its children).
@@ -86,13 +122,15 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     (status, resolved)
 }
 
-/// Read + parse `/initramfs/etc/init.toml` and log the topo-sorted mount plan.
-/// Actual mounting (spawn fs-server → Ready → bind) is deferred to slice 7.
-fn read_manifest(root_ns: u64) {
+/// Read + parse `/initramfs/etc/init.toml`, log the topo-sorted mount plan, and
+/// return the mounts (shallowest-first) for [`mount_all`] to process. `None` on any
+/// failure (missing / unmappable / malformed manifest) — init would drop to the
+/// emergency shell (slice 9); for now it logs and skips mounting.
+fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
     let (st, mem) = ns_lookup_wait(root_ns, b"/initramfs/etc/init.toml", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
         kprint(b"init: /initramfs/etc/init.toml not found (would drop to eshell)\n");
-        return;
+        return None;
     }
     // Map the read-only MemoryObject the initramfs server handed back. init.toml
     // is text and fits in one page; the server zero-fills the tail, so we trim
@@ -103,12 +141,12 @@ fn read_manifest(root_ns: u64) {
         kprint(b"init: init.toml map FAIL\n");
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
-        return;
+        return None;
     }
     // SAFETY: `addr` is a MAP_READ page holding the file bytes + zero padding.
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
-    match core::str::from_utf8(&bytes[..len]) {
+    let result = match core::str::from_utf8(&bytes[..len]) {
         Ok(text) => match manifest::parse(text) {
             Ok(mounts) => {
                 kprint(b"init: init.toml OK, ");
@@ -126,15 +164,236 @@ fn read_manifest(root_ns: u64) {
                         Mode::Ro => b"ro" as &[u8],
                         Mode::Rw => b"rw",
                     });
-                    kprint(b") -- spawn/Ready/bind deferred to slice 7\n");
+                    kprint(b")\n");
                 }
+                Some(mounts)
             }
-            Err(_) => kprint(b"init: init.toml parse error (would drop to eshell)\n"),
+            Err(_) => {
+                kprint(b"init: init.toml parse error (would drop to eshell)\n");
+                None
+            }
         },
-        Err(_) => kprint(b"init: init.toml not UTF-8 (would drop to eshell)\n"),
-    }
+        Err(_) => {
+            kprint(b"init: init.toml not UTF-8 (would drop to eshell)\n");
+            None
+        }
+    };
     // SAFETY: closing our own handle; the mapping kept the object alive, and the
     // parsed mounts own their strings, so the mapped bytes are no longer needed.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    result
+}
+
+/// Process the manifest's mounts in order (shallowest-first): for each, resolve
+/// the device, spawn an `fs-server-ext4`, hand it the device, await Ready, and bind
+/// its endpoint at the mount point. A failed mount is logged and skipped (the
+/// eshell handoff is slice 9).
+fn mount_all(root_ns: u64, mounts: &[MountSpec]) {
+    for m in mounts {
+        if !mount_one(root_ns, m) {
+            kprint(b"init: mount FAILED for ");
+            kprint(m.mount_point.as_bytes());
+            kprint(b"\n");
+        }
+    }
+}
+
+/// Mount one `[[mount]]`: the Resource Server Startup Protocol from init's side.
+/// Returns `true` on success (the fs-server is bound at `m.mount_point`).
+fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
+    // Only `fs-server-ext4` exists in slice 7.
+    if m.fs_server != "fs-server-ext4" {
+        kprint(b"init: unknown fs_server '");
+        kprint(m.fs_server.as_bytes());
+        kprint(b"'\n");
+        return false;
+    }
+    // 1. Resolve the block-device handle: READ (for the server's `sys_io_submit`)
+    //    + TRANSFER (to hand it to the server).
+    let dev_path = match manifest::device_ns_path(&m.device) {
+        Some(p) => p,
+        None => {
+            kprint(b"init: unsupported device scheme '");
+            kprint(m.device.as_bytes());
+            kprint(b"'\n");
+            return false;
+        }
+    };
+    let (st, device) = ns_lookup_wait(root_ns, dev_path.as_bytes(), RIGHT_READ | RIGHT_TRANSFER);
+    if st != 0 || device == 0 {
+        kprint(b"init: device ");
+        kprint(dev_path.as_bytes());
+        kprint(b" not found\n");
+        return false;
+    }
+
+    // 2. Create the control channel (init keeps end 0, the server gets end 1).
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params.
+    let cr = unsafe { syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0) };
+    if cr != 0 {
+        unsafe { syscall1(SYS_HANDLE_CLOSE, device) };
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 3. Spawn the fs-server, moving the control endpoint into it (delivered in rdx).
+    // SAFETY: SPAWN_FS is a valid writable arg block.
+    let fs_h = unsafe {
+        SPAWN_FS.handles[0] = ctrl_srv;
+        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_FS) as u64)
+    };
+    if fs_h < 0 {
+        kprint(b"init: fs-server spawn FAIL\n");
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, device);
+            syscall1(SYS_HANDLE_CLOSE, ctrl_init);
+        }
+        return false;
+    }
+
+    // 4. Setup message: transfer the device handle to the server (an empty payload;
+    //    the server just takes handles[0]). NoBlock — the control ring is empty.
+    // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring one handle.
+    let sr = unsafe {
+        IPC_HANDLES[0] = device;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ctrl_init,
+            (&raw const IPC_MSG) as u64,
+            (&raw const IPC_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        kprint(b"init: device handoff FAIL\n");
+        // The device handle was not moved (send failed) — close it + the rest.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, device);
+            syscall1(SYS_HANDLE_CLOSE, ctrl_init);
+        }
+        return false;
+    }
+    // The device handle has moved to the server; init no longer owns it.
+
+    // 5. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: fs-server Ready timeout/invalid\n");
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // The handshake is done; the control channel is no longer needed.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // 6. Bind the forwarding endpoint at the mount point. The kernel sees an
+    //    IpcChannel and adopts it as a Userspace Server (slice-7 forwarding). The
+    //    binding takes its own reference, so init closes its endpoint handle after.
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe {
+        syscall4(
+            SYS_NS_BIND,
+            root_ns,
+            m.mount_point.as_ptr() as u64,
+            m.mount_point.len() as u64,
+            endpoint,
+        )
+    };
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: bind FAIL at ");
+        kprint(m.mount_point.as_bytes());
+        kprint(b"\n");
+        return false;
+    }
+
+    kprint(b"init: mounted fs-server-ext4 at ");
+    kprint(m.mount_point.as_bytes());
+    kprint(b"\n");
+    // init keeps `fs_h` (the long-lived server's process handle).
+    let _ = fs_h;
+    true
+}
+
+/// Wait (bounded) for an fs-server's `Meta::Ready` on `ctrl`, validate it
+/// (`"RSMG"` magic + `Ready` op, hand-parsed — init never speaks `librsproto`), and
+/// return the forwarding endpoint it transfers (`handles[0]`). `None` on timeout, a
+/// recv error, no transferred handle, or an unexpected message.
+fn wait_ready(ctrl: u64) -> Option<u64> {
+    // Absolute deadline = now + READY_TIMEOUT_NS (monotonic clock).
+    let mut now: u64 = 0;
+    // SAFETY: `&now` is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    let deadline = now.saturating_add(READY_TIMEOUT_NS);
+
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter, with deadline.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = ctrl;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            deadline,
+        )
+    };
+    if waited < 1 {
+        return None; // timed out / error
+    }
+    // SAFETY: valid recv out-params; on success the kernel installs handles[0].
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ctrl,
+            (&raw mut IPC_MSG) as u64,
+            (&raw mut IPC_HANDLES) as u64,
+            (&raw mut IPC_COUNT) as u64,
+        )
+    };
+    let count = unsafe { (&raw const IPC_COUNT).read() };
+    if rr != 0 || count < 1 {
+        return None;
+    }
+    // Hand-parse the rsproto envelope in the IpcMsg payload (offset 24): magic @0,
+    // op @6. Confirm it is a Meta::Ready before trusting handles[0].
+    let (magic, op, endpoint) = unsafe {
+        let magic = u32::from_le_bytes([IPC_MSG[24], IPC_MSG[25], IPC_MSG[26], IPC_MSG[27]]);
+        let op = u16::from_le_bytes([IPC_MSG[30], IPC_MSG[31]]);
+        (magic, op, (&raw const IPC_HANDLES[0]).read())
+    };
+    if magic != RS_MAGIC || op != RS_OP_READY {
+        // Not the message we expected — drop the transferred endpoint.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+        return None;
+    }
+    Some(endpoint)
+}
+
+/// The slice-7 milestone: look up `/system/current-generation` through the just-
+/// mounted root fs-server (the kernel forwards the lookup, the server reads the
+/// file and replies a `MemoryObject`), map it, and log its content — proving the
+/// whole stack end to end.
+fn read_current_generation(root_ns: u64) {
+    let (st, mem) = ns_lookup_wait(root_ns, b"/system/current-generation", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        kprint(b"init: /system/current-generation lookup FAIL\n");
+        return;
+    }
+    // SAFETY: `mem` is a read-only MemoryObject of the file content (zero-padded).
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"init: current-generation map FAIL\n");
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return;
+    }
+    // SAFETY: `addr` maps a page of the file bytes + zero padding; trim the tail.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
+    let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    kprint(b"init: /system/current-generation = ");
+    kprint(&bytes[..len]); // the file content ends in '\n'
+    // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
 }
 
@@ -211,7 +470,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     kprint_u64(root_ns);
     kprint(b")\n");
 
-    read_manifest(root_ns);
+    // Read the manifest, process its mounts (spawn fs-servers → Ready → bind), then
+    // prove the stack end to end by reading `/system/current-generation` through the
+    // freshly-mounted root filesystem.
+    if let Some(mounts) = read_manifest(root_ns) {
+        mount_all(root_ns, &mounts);
+        read_current_generation(root_ns);
+    }
+
     supervise(notif);
 }
 

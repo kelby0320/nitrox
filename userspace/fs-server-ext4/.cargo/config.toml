@@ -1,0 +1,22 @@
+# Build config for the `fs-server-ext4` userspace server.
+#
+# Read by cargo when the build is invoked from this directory (xtask runs
+# `cargo build` with cwd = userspace/fs-server-ext4), so it does not affect the other
+# userspace crates. A host `cargo test --lib` run from the workspace root does
+# not pick this up (it is below the cwd), so fs-server-ext4's lib tests build for the host.
+#
+# Static, non-PIE ELF (ET_EXEC) in the low half: the kernel ELF loader rejects
+# PIE/ET_DYN and dynamic interpreters. `user.ld` (via build.rs) fixes the load
+# address; these flags force static/non-PIE small-code-model output.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "code-model=small",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]

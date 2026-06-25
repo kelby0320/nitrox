@@ -4798,3 +4798,64 @@ Boot stays clean (children reap, `init: reaped pid=2 code=0`, no `#DF`/panic).
 Branch `phase-2/slice7-ext4-disk`. Next: Part 6 (init mount loop + the milestone) —
 the slice's end-to-end payoff, where init spawns the fs-server against this disk,
 binds it, and logs `/system/current-generation`.
+
+## 2026-06-25 — Phase 2 slice 7, Part 6: init mount loop + the milestone (slice complete)
+
+The payoff: init mounts the ext4 root and reads a file through it, exercising the
+whole stack — **ext4 on disk → fs-server `sys_io_submit` → librsproto reply →
+kernel cross-context handle install → init maps + logs**. This completes slice 7
+(the first userspace resource server, reached transparently through the namespace).
+
+**What init does** (`mount_one`, the Resource Server Startup Protocol from init's
+side): `manifest::device_ns_path` maps `gpt-partlabel:nitrox-root` →
+`/dev/disk/by-partlabel/nitrox-root`; per `MountSpec` (topo order) init resolves the
+device handle (`READ | TRANSFER`), `sys_channel_create`s a control channel, spawns
+`fs-server-ext4` (moving the control endpoint in via spawn → the child's `rdx`),
+sends a **setup message** transferring the device handle, awaits **Ready** (bounded
+30 s; hand-parsed `"RSMG"` magic + `Ready` op — init never speaks `librsproto`,
+per its CLAUDE.md), and `sys_ns_bind`s the forwarding endpoint at the mount point.
+The kernel sees an `IpcChannel` and adopts it as a Userspace Server (Part 3). Then
+the milestone: `ns_lookup_wait("/system/current-generation", MAP_READ)` — the kernel
+forwards the Resolve, the fs-server reads the file and replies a `MemoryObject`, the
+kernel installs it into init, init maps + logs it.
+
+**Decision — bind the root fs-server at `/`.** init's root namespace already holds
+the boot kernel-server bindings (`/dev`, `/initramfs`, `/proc/self`). Binding the
+fs-server at `/` is safe: namespace resolution is longest-prefix, so
+`/initramfs/...` still hits the (more specific) kernel server while
+`/system/current-generation` falls through to `/` → the fs-server. No exact-path
+collision (nothing is bound at `/` yet). The async forwarding makes the
+cross-process handoff work despite init being single-threaded: init blocks on the
+lookup PO while the scheduler runs the fs-server (which serves the request, then its
+own `sys_io_submit` blocks on the AHCI IRQ), and the fs-server's reply completes
+init's PO — no circular wait.
+
+**Bug found + fixed — the fs-server linked as a PIE.** The Part-4 spawn failed with
+`KernelError` (`load_elf` rejects `ET_DYN`). The `fs-server-ext4` crate was missing
+the `.cargo/config.toml` (`relocation-model=static`, `-no-pie`, `-static`) +
+`build.rs` + `user.ld` that the other userspace bins use to force a static
+**ET_EXEC** at a fixed low address. Because fs-server is a **lib + bin** crate (host
+lib tests), it needs init's variant: `build.rs` emits `rustc-link-arg-bins` (not
+`rustc-link-arg`), so the fixed-address linker script reaches the `[[bin]]` but
+**not** the host lib-test link (which would otherwise be corrupted). Lesson for the
+next bare-target bin: copy the linker-config trio up front.
+
+**Decision — mode is informational in slice 7.** The init.toml mount is `rw`, but
+the fs-server is read-only and the lookup requests `MAP_READ`, so the returned
+content is read-only regardless; `mode`-derived bind rights are a Phase-3 (RW)
+concern. Likewise the eshell handoff on a failed mount is slice 9 — for now a failed
+mount logs and is skipped.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**500**, **init 19** (+`device_ns_path`), fs-server-ext4 11, librsproto 11, libkern 8.
+**QEMU milestone:** `gpt: 2 partition(s)` → `fs-server: ready (ext4, read-only)` →
+`init: mounted fs-server-ext4 at /` →
+`init: /system/current-generation = nitrox-rootfs generation 1`, and boot stays
+clean afterward (`parent` demos + children reap, `init: reaped pid=3 code=0`, no
+`#DF`/panic). Branch `phase-2/slice7-mount-milestone`.
+
+**Slice 7 is complete.** Phase 2's namespace + resource-server story is real
+end to end: a userspace process reads a file from an on-disk ext4 filesystem,
+served by another userspace process, reached transparently through the namespace
+with the kernel forwarding the lookup and installing the result cross-context — no
+filesystem code in the kernel.
