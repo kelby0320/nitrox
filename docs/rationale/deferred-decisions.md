@@ -113,7 +113,7 @@ module unload (which drains in-flight IRPs).
 ships with only `Read`/`Write` opcodes and no `flags` modifiers; `Flush`/`Trim`,
 force-unit-access / no-cache flags, and multi-buffer scatter/gather in one `IoOp`
 are deferred to their first consumer (RW filesystems, SSD trim). The block
-namespace ships **enumeration-order** whole-disk names (`/dev/blk0..`);
+namespace ships **enumeration-order** whole-disk names (`/dev/blk/0..`);
 content-stable `/dev/disk/by-partuuid/*` / `by-partlabel/*` names are slice 6
 (they need GPT metadata). The `/dev/blk` binding is **read-only** in Phase 2
 (RO `fs-server-ext4`); RW block access lands with RW filesystems (Phase 3).

@@ -47,8 +47,13 @@ pub enum KernelServerId {
     /// `/initramfs/<path>` — a file from the boot CPIO blob, served as a
     /// read-only [`MemoryObject`] copy (see [`initramfs_server`]).
     Initramfs,
-    // `/proc/self/status` (numeric pid/tid) and the `/dev` stub are deferred —
-    // see `docs/rationale/deferred-decisions.md`.
+    /// `/dev/blk/<n>` — the `n`-th discovered block device, served as a
+    /// [`DeviceNode`](crate::object::DeviceNode) handle (see [`block_device_server`]).
+    /// One binding (at `/dev/blk`) owns the whole subtree; the suffix indexes the
+    /// device-table registry.
+    BlockDevice,
+    // `/proc/self/status` (numeric pid/tid) and the `/dev` directory listing are
+    // deferred — see `docs/rationale/deferred-decisions.md`.
 }
 
 /// The outcome of a resource-server lookup — the umbrella RS contract's return.
@@ -85,6 +90,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::ProcSelfThread => proc_self_thread(suffix, requested),
         KernelServerId::ProcSelfNamespace => proc_self_namespace(suffix, requested),
         KernelServerId::Initramfs => initramfs_server(suffix, requested),
+        KernelServerId::BlockDevice => block_device_server(suffix, requested),
     }
 }
 
@@ -184,10 +190,57 @@ fn initramfs_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     }
 }
 
+/// `/dev/blk/<n>` — a **subtree** server over the block-device registry. The
+/// `suffix` is a decimal index (`/dev/blk/0` ⇒ `b"0"`); it resolves to the
+/// `n`-th block [`DeviceNode`](crate::object::DeviceNode), on which the caller
+/// issues `sys_io_submit` reads. An empty or non-numeric suffix, or an index
+/// past the discovered disks, is *not found*. One binding (at `/dev/blk`) serves
+/// every disk; the binding is read-only in Phase 2, so the lookup attenuates the
+/// returned handle to `READ` (write IoOps are rejected at the rights gate).
+///
+/// `requested` is accepted to match the RS contract but ignored — the binding's
+/// rights cap what the caller obtains, applied by the lookup syscall.
+fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    let Some(index) = parse_index(suffix) else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    match crate::device::find_block_device(index) {
+        Some(node) => OpStatus::Completed(node),
+        None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// Parse `s` as a non-empty run of ASCII decimal digits into a `usize`, or
+/// `None` (empty, non-digit, or overflow).
+fn parse_index(s: &[u8]) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut n: usize = 0;
+    for &b in s {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((b - b'0') as usize)?;
+    }
+    Some(n)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::mm::test_support::init_global_heap;
+
+    #[test]
+    fn parse_index_accepts_decimal_rejects_junk() {
+        assert_eq!(parse_index(b"0"), Some(0));
+        assert_eq!(parse_index(b"7"), Some(7));
+        assert_eq!(parse_index(b"42"), Some(42));
+        assert_eq!(parse_index(b""), None); // empty (the /dev/blk exact match)
+        assert_eq!(parse_index(b"1a"), None); // trailing junk
+        assert_eq!(parse_index(b"sda"), None); // non-numeric
+        assert_eq!(parse_index(b"0/sub"), None); // a deeper path
+    }
 
     #[test]
     fn entropy_exact_match_yields_entropy_object() {

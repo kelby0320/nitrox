@@ -386,12 +386,12 @@ conditional**:
 For a registry-backed instance server, layer 3 needs **no per-server enable
 switch**: bind `/dev/blk` *unconditionally* (uniform with `/dev/entropy`), and let
 the **registry carry liveness**. Whichever drivers matched hardware (layer 2)
-populate it; `/dev/blk0` resolves iff a disk is registered, else `NotFound`; if no
+populate it; `/dev/blk/0` resolves iff a disk is registered, else `NotFound`; if no
 block driver matched, the server is bound but inert — harmless. So in Phase 2 the
 *only* conditional thing is the driver match. End-state, layers 2–3 graduate to a
 userspace **device manager** + supervisors (driver-to-node policy, especially for
 Tier 2 where a driver *process* receives a `Handle<DeviceNode>`); substitutability
-lets `/dev/blk0` move from a kernel-served node to a Tier 2 userspace endpoint with
+lets `/dev/blk/0` move from a kernel-served node to a Tier 2 userspace endpoint with
 zero client change.
 
 ### Userspace Servers (slice 7)
