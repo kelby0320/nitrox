@@ -139,6 +139,16 @@ read self-test brings up against the existing AHCI boot disk; the dedicated
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
 
+**Forwarded-lookup concurrency (N = 1).** A Userspace Server's
+`UserspaceServerReg` (slice 7 Part 3) holds a single pending-lookup slot: one
+forwarded `sys_ns_lookup` per server may be outstanding; a second returns
+`WouldBlock`. The milestone init path issues lookups serially, so N = 1 suffices.
+Raising it to a small fixed array (correlating replies by the already-present
+`request_id`) is a localized change — done when boot issues overlapping lookups
+(Part 4 if needed). The reply completion is **inline-in-send** (no DPC) because
+`run_pending` drains only at the interrupt-dispatch tail — see the decision log
+(2026-06-25, slice 7 Part 3).
+
 ### Networking
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.

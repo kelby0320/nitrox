@@ -50,30 +50,39 @@ pub enum NsError {
     OutOfMemory,
 }
 
-/// What a binding resolves to. Either a **direct handle** (a bound `ObjectRef`,
-/// returned by a lookup directly) or a **Kernel Server** (an in-kernel resource
-/// server the lookup calls to *produce* a handle — see
-/// [`crate::object::kernel_server`]). The userspace-server target is slice 7.
+/// What a binding resolves to. One of three kinds: a **direct handle** (a bound
+/// `ObjectRef`, returned by a lookup directly), a **Kernel Server** (an in-kernel
+/// resource server the lookup calls to *produce* a handle — see
+/// [`crate::object::kernel_server`]), or a **Userspace Server** (a process reached
+/// over IPC; the lookup is forwarded to it — see
+/// [`crate::object::UserspaceServerReg`]).
 ///
-/// Drop discipline (see "Mutation discipline"): `DirectHandle` owns an
-/// `ObjectRef` and must be dropped **outside** the namespace lock; `KernelServer`
-/// holds a `Copy` id and is drop-free.
+/// Drop discipline (see "Mutation discipline"): `DirectHandle` and
+/// `UserspaceServer` each own an `ObjectRef` and must be dropped **outside** the
+/// namespace lock; `KernelServer` holds a `Copy` id and is drop-free.
 pub enum BindingTarget {
     /// A directly-bound resource. A lookup returns a clone of this handle.
     DirectHandle(ObjectRef),
     /// An in-kernel resource server, identified by its dispatch id.
     KernelServer(KernelServerId),
+    /// A userspace resource server, via its kernel registration record (the
+    /// kernel forwards the lookup to it over IPC).
+    UserspaceServer(ObjectRef),
 }
 
-/// The result of [`Namespace::resolve`] for the matched binding: the same two
-/// kinds as [`BindingTarget`], but the direct-handle case carries a **cloned**
+/// The result of [`Namespace::resolve`] for the matched binding: the same three
+/// kinds as [`BindingTarget`], but the handle-owning cases carry a **cloned**
 /// `ObjectRef` (an atomic bump done under the lock) for the caller to own. The
-/// caller drops a `DirectHandle` **outside** the lock; `KernelServer` is drop-free.
+/// caller drops a `DirectHandle` / `UserspaceServer` **outside** the lock;
+/// `KernelServer` is drop-free.
 pub enum ResolvedTarget {
     /// A cloned direct-handle resource, owned by the caller.
     DirectHandle(ObjectRef),
     /// An in-kernel resource server to dispatch to (id copied out).
     KernelServer(KernelServerId),
+    /// A cloned reference to a userspace server's registration, owned by the
+    /// caller (which forwards the lookup to it).
+    UserspaceServer(ObjectRef),
 }
 
 /// One binding: the absolute path it owns, the target it resolves to, and the
@@ -215,10 +224,52 @@ impl Namespace {
         Ok(())
     }
 
+    /// Bind a userspace resource server (its kernel registration record `reg`, an
+    /// `ObjectRef` to a [`UserspaceServerReg`](crate::object::UserspaceServerReg))
+    /// at `path` with `rights`. Like [`bind`], but the target is a
+    /// `UserspaceServer`; on any error `reg` is **handed back** in the tuple for
+    /// the caller to drop outside the lock (never dropped here — see "Mutation
+    /// discipline"). Rejects an invalid path or a duplicate exact path.
+    ///
+    /// [`bind`]: Namespace::bind
+    pub fn bind_userspace_server(
+        &self,
+        path: &[u8],
+        reg: ObjectRef,
+        rights: Rights,
+    ) -> Result<(), (ObjectRef, NsError)> {
+        if let Err(e) = validate_path(path) {
+            return Err((reg, e));
+        }
+        let mut guard = self.inner.lock();
+        if guard.bindings.iter().any(|b| &b.path[..] == path) {
+            return Err((reg, NsError::AlreadyBound));
+        }
+        // Reserve + copy the path before committing, so the `try_push` cannot fail
+        // (and so the `reg` `ObjectRef` is never dropped under the lock).
+        if guard.bindings.try_reserve(1).is_err() {
+            return Err((reg, NsError::OutOfMemory));
+        }
+        let mut p: KVec<u8> = KVec::new();
+        if p.try_extend_from_slice(path).is_err() {
+            return Err((reg, NsError::OutOfMemory));
+        }
+        guard
+            .bindings
+            .try_push(Binding {
+                path: p,
+                target: BindingTarget::UserspaceServer(reg),
+                rights,
+            })
+            .expect("slot reserved above");
+        guard.cache.clear();
+        Ok(())
+    }
+
     /// Remove the binding at the exact `path`, returning its `target` for the
     /// caller to drop **outside** the lock. `None` if nothing is bound there.
-    /// (A returned `BindingTarget::DirectHandle` carries the `ObjectRef` to drop;
-    /// `KernelServer` is drop-free, but is still returned out for uniformity.)
+    /// (A returned `DirectHandle` / `UserspaceServer` carries an `ObjectRef` to
+    /// drop; `KernelServer` is drop-free, but is still returned out for uniformity.)
     pub fn unbind(&self, path: &[u8]) -> Option<BindingTarget> {
         let mut guard = self.inner.lock();
         let idx = guard.bindings.iter().position(|b| &b.path[..] == path)?;
@@ -341,6 +392,7 @@ fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
     match t {
         BindingTarget::DirectHandle(obj) => ResolvedTarget::DirectHandle(obj.clone()),
         BindingTarget::KernelServer(id) => ResolvedTarget::KernelServer(*id),
+        BindingTarget::UserspaceServer(reg) => ResolvedTarget::UserspaceServer(reg.clone()),
     }
 }
 
@@ -588,7 +640,9 @@ mod tests {
         assert_eq!(rights, Rights::READ);
         match target {
             ResolvedTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
-            ResolvedTarget::DirectHandle(_) => panic!("expected a kernel-server target"),
+            ResolvedTarget::DirectHandle(_) | ResolvedTarget::UserspaceServer(_) => {
+                panic!("expected a kernel-server target")
+            }
         }
         // A deeper path resolves to the same server with a non-empty suffix (the
         // leaf-vs-subtree decision is the lookup syscall's, not resolve's).
@@ -628,6 +682,83 @@ mod tests {
         ));
     }
 
+    /// A live `UserspaceServerReg` (owning a fresh IPC endpoint), adopted into an
+    /// `ObjectRef` — the form a `UserspaceServer` binding holds.
+    fn us_reg_target() -> ObjectRef {
+        use crate::object::{IpcChannel, UserspaceServerReg};
+        let (a, b) = IpcChannel::try_new_pair(4).unwrap();
+        // SAFETY: adopt the kernel endpoint's creation reference; drop the peer's.
+        let endpoint = unsafe {
+            ObjectRef::from_raw(KBox::into_raw(a).as_ptr() as *mut (), KObjectType::IpcChannel)
+        };
+        drop(unsafe {
+            ObjectRef::from_raw(KBox::into_raw(b).as_ptr() as *mut (), KObjectType::IpcChannel)
+        });
+        let reg = UserspaceServerReg::try_new(endpoint).unwrap();
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(reg).as_ptr() as *mut (),
+                KObjectType::UserspaceServerReg,
+            )
+        }
+    }
+
+    #[test]
+    fn bind_userspace_server_resolves_to_the_registration() {
+        let n = ns();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP | Rights::MAP_READ)
+            .unwrap();
+        // Exact match → empty suffix, the userspace-server target, its rights.
+        let (target, rights, suf) = n.resolve(b"/fs").unwrap();
+        assert_eq!(suf, b"");
+        assert_eq!(rights, Rights::LOOKUP | Rights::MAP_READ);
+        match target {
+            ResolvedTarget::UserspaceServer(reg) => {
+                assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+        // A deeper path resolves to the same server, carrying the suffix the kernel
+        // forwards (leaf-vs-subtree is the lookup syscall's concern, not resolve's).
+        let (target, _, suf) = n.resolve(b"/fs/system/current-generation").unwrap();
+        assert_eq!(suf, b"system/current-generation");
+        assert!(matches!(target, ResolvedTarget::UserspaceServer(_)));
+    }
+
+    #[test]
+    fn bind_userspace_server_hands_back_target_on_error() {
+        let n = ns();
+        // Invalid path: the registration ref is handed back to drop outside the lock.
+        let (t, e) = n
+            .bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP)
+            .unwrap_err();
+        assert_eq!(e, NsError::InvalidPath);
+        assert_eq!(t.object_type(), KObjectType::UserspaceServerReg);
+        drop(t);
+        // Duplicate exact path.
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP).unwrap();
+        let (t, e) = n
+            .bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP)
+            .unwrap_err();
+        assert_eq!(e, NsError::AlreadyBound);
+        drop(t);
+    }
+
+    #[test]
+    fn unbind_userspace_server_returns_the_registration_ref() {
+        let n = ns();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP).unwrap();
+        match n.unbind(b"/fs").expect("was bound") {
+            BindingTarget::UserspaceServer(reg) => {
+                assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
+                drop(reg); // released outside the lock
+            }
+            _ => panic!("expected a userspace-server target"),
+        }
+        assert!(n.unbind(b"/fs").is_none(), "already removed");
+    }
+
     #[test]
     fn unbind_kernel_server_returns_drop_free_target() {
         let n = ns();
@@ -635,7 +766,9 @@ mod tests {
             .unwrap();
         match n.unbind(b"/dev/entropy").expect("was bound") {
             BindingTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
-            BindingTarget::DirectHandle(_) => panic!("expected a kernel-server target"),
+            BindingTarget::DirectHandle(_) | BindingTarget::UserspaceServer(_) => {
+                panic!("expected a kernel-server target")
+            }
         }
         assert!(n.unbind(b"/dev/entropy").is_none(), "already removed");
     }

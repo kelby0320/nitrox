@@ -1189,19 +1189,32 @@ Phase 2).
   depth 0 + index levels), linear `ext4_dir_entry_2` walk, path resolve →
   `read_file(path, out) -> size`. 6 host tests against **real `mke2fs` images**
   (1 K + 4 K blocks). Skips journal/bigalloc/inline-data/htree-specific/64-bit/RW.
-- [ ] **Part 3 — kernel transparent-forwarding** (proven with a stub server):
+- [x] **Part 3 — kernel transparent-forwarding** (`phase-2/slice7-fwd`):
   `BindingTarget::UserspaceServer` + `ResolvedTarget` arm; `OpStatus::Pending`;
-  the per-binding pending-lookup table; `sys_ns_bind` `IpcChannel`→`UserspaceServer`
-  branch; `sys_ns_lookup` forwarding arm (originate via `ipc_send_push`, leave PO
-  pending); reply completion (inline-in-send preferred, DPC fallback) with
-  cross-context install + PO signal + race handling; the kernel hand-coded rsproto
-  Resolve mirror; `ImageId::FsServerExt4 = 3`. A tiny embedded **stub fs-server**
-  proves the whole forwarding loop before real ext4/disk exists.
+  the new `UserspaceServerReg` kobject (type 13) owning the kernel endpoint + the
+  N=1 pending-lookup table; `IpcChannel` `us_reg` back-pointer; `sys_ns_bind`
+  `IpcChannel`→`UserspaceServer` branch; `sys_ns_lookup` forwarding arm (originate
+  via `IpcChannel::send_push`, leave PO pending); **inline-in-send** reply
+  completion (`run_pending` runs only at the interrupt-dispatch tail, so a DPC
+  would add a tick of latency — see the decision log) with cross-context install +
+  PO signal; dead-server / dead-client / duplicate-reply race handling; the kernel
+  hand-coded rsproto Resolve mirror (`kernel/src/rsproto.rs`). **Proven in QEMU by a
+  single-process self-forwarding demo in `parent`** (bind a Userspace Server, look
+  a path up through it, serve the kernel-forwarded Resolve, map the returned
+  MemoryObject) — no second binary / disk needed. *Refinements vs. the original
+  plan:* the stub server is the inline `parent` demo (not an embedded ELF), so
+  `ImageId::FsServerExt4` + the embedded fs-server move to **Part 4** (their first
+  real consumer); a forwarded lookup's returned object takes rights `requested ∩
+  the rights the server granted on the transfer` (the bound IPC endpoint's rights
+  are not a meaningful content cap) — see `rsproto-namespace-ops.md`.
 - [ ] **Part 4 — the real `fs-server-ext4` process**: wires Part 1 (librsproto
   server) + Part 2 (ext4 reader) + a `BlockReader` over `sys_io_submit`; the
   Hello/Ready handshake + the `Namespace::Resolve` serve loop (suffix →
   `ext4::read_file` → `MemoryObject` → reply transferring it). The control channel
-  + Ready handshake; init binds the endpoint via `sys_ns_bind` (Part 6).
+  + Ready handshake; init binds the endpoint via `sys_ns_bind` (Part 6). Adds
+  `ImageId::FsServerExt4 = 3` + the embedded server ELF (deferred here from Part 3,
+  since the inline `parent` demo proved the kernel mechanism without a separate
+  process).
 - [ ] **Part 5 — xtask ext4 test disk**: a 2nd GPT partition `nitrox-root`,
   ext4-formatted + populated via `mke2fs -d` (no root mount), spliced into the
   boot disk image; rides the existing QEMU drive (slice-6 driver enumerates it).

@@ -33,6 +33,7 @@ pub mod pending_op;
 pub mod process;
 pub mod thread;
 pub mod timer;
+pub mod userspace_server;
 
 pub use device_node::DeviceNode;
 pub use entropy_object::EntropyObject;
@@ -49,3 +50,4 @@ pub use pending_op::PendingOperation;
 pub use process::Process;
 pub use thread::{MAX_WAIT_HANDLES, Thread, ThreadEntry, ThreadState, WaitPhase};
 pub use timer::Timer;
+pub use userspace_server::UserspaceServerReg;

@@ -37,7 +37,7 @@ use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
     DeviceNode, EntropyObject, InterruptObject, IpcChannel, MemoryObject, Namespace,
-    NotificationChannel, PendingOperation, Process, Thread, Timer,
+    NotificationChannel, PendingOperation, Process, Thread, Timer, UserspaceServerReg,
 };
 
 /// Upper bound on the refcount. Exceeding it means ~2^62 leaked
@@ -351,6 +351,18 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::InterruptObject);
         }
+        KObjectType::UserspaceServerReg => {
+            // SAFETY: last ref to a `UserspaceServerReg` produced by KBox::into_raw.
+            // Dropping the box releases its owned endpoint `ObjectRef` (whose
+            // `IpcChannel::drop` unlinks the peer) and any pending lookup's PO.
+            drop(unsafe {
+                KBox::<UserspaceServerReg>::from_raw(NonNull::new_unchecked(
+                    ptr as *mut UserspaceServerReg,
+                ))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::UserspaceServerReg);
+        }
         // No other kernel object types are implemented yet; they land behind
         // their respective slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -381,6 +393,7 @@ pub(crate) mod test_probe {
         static ENTROPY_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static DEVICE_NODE_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static INTERRUPT_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static USERSPACE_SERVER_REG_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -401,6 +414,9 @@ pub(crate) mod test_probe {
             KObjectType::DeviceNode => DEVICE_NODE_DESTROYS.with(|c| c.set(c.get() + 1)),
             KObjectType::InterruptObject => {
                 INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1))
+            }
+            KObjectType::UserspaceServerReg => {
+                USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(c.get() + 1))
             }
             _ => {}
         }
@@ -450,6 +466,10 @@ pub(crate) mod test_probe {
         INTERRUPT_OBJECT_DESTROYS.with(Cell::get)
     }
 
+    pub(crate) fn userspace_server_reg_destroys() -> usize {
+        USERSPACE_SERVER_REG_DESTROYS.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PROCESS_DESTROYS.with(|c| c.set(0));
         THREAD_DESTROYS.with(|c| c.set(0));
@@ -462,6 +482,7 @@ pub(crate) mod test_probe {
         ENTROPY_OBJECT_DESTROYS.with(|c| c.set(0));
         DEVICE_NODE_DESTROYS.with(|c| c.set(0));
         INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(0));
+        USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(0));
     }
 }
 

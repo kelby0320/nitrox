@@ -76,6 +76,19 @@ static mut RECV_COUNT: usize = 0;
 static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, _reserved: [0; 40] };
 static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
 
+// --- Userspace-server forwarding demo (slice 7 Part 3) ----------------------
+/// The kernel end of the forwarding channel (bound at `/fs` as a Userspace
+/// Server) and the server end (this process recvs requests + replies on it).
+static mut FWD_KEND: u64 = 0;
+static mut FWD_SEND: u64 = 0;
+/// Recv buffer for the kernel's forwarded `Namespace::Resolve` request.
+static mut FWD_REQ: [u8; 4096] = [0; 4096];
+static mut FWD_REQ_H: [u64; 8] = [0; 8];
+static mut FWD_REQ_COUNT: usize = 0;
+/// Reply message (rsproto reply in the IPC payload; the MemoryObject in handles).
+static mut FWD_REPLY: [u8; 4096] = [0; 4096];
+static mut FWD_REPLY_H: [u64; 8] = [0; 8];
+
 /// The worker thread's entry point: write to a deliberately-unmapped address so
 /// the very first access page-faults (`#PF`). The kernel suspends the thread,
 /// delivers a `SegFault` to this process, and (after the supervisor's
@@ -860,6 +873,208 @@ fn report_block_read(root_ns: u64, path: &[u8], label: &[u8]) {
     }
 }
 
+/// Userspace-server forwarding demo (slice 7 Part 3): prove the kernel's
+/// **transparent namespace forwarding** end to end, single-process. This process
+/// plays both roles — the lookup *client* and the resource *server* — so the whole
+/// loop is exercised without a second binary or a disk:
+///
+/// 1. create a channel pair; **bind one end at `/fs` as a Userspace Server** (the
+///    kernel adopts it as the kernel forwarding endpoint);
+/// 2. issue an async `sys_ns_lookup` of `/fs/hello` — the kernel forwards a
+///    `Namespace::Resolve` (suffix `hello`) into our *other* endpoint and leaves
+///    the lookup `PendingOperation` pending;
+/// 3. recv that request, parse it with `librsproto` (proving the kernel's
+///    hand-coded request matches the library codec), build a read-only
+///    `MemoryObject` of `b"STUB\n"`, and **reply transferring it** — the kernel
+///    completes the waiting lookup PO inline in our send;
+/// 4. `sys_wait` the PO, map the resolved `MemoryObject`, and verify the content.
+///
+/// This isolates the highest-risk Part-3 mechanism (the kernel as an async IPC
+/// client + cross-context handle install) behind a stub, before the real
+/// `fs-server-ext4` process / ext4 disk exist (Parts 4–6).
+fn forward_demo() {
+    kprint(b"parent: userspace-server forwarding demo start\n");
+    const CONTENT: &[u8] = b"STUB\n";
+
+    // 1. Channel pair: one end becomes the kernel forwarding endpoint, the other
+    //    is the end this process serves requests on.
+    // SAFETY: FWD_KEND/FWD_SEND are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut FWD_KEND) as u64, (&raw mut FWD_SEND) as u64, 4, 0)
+    };
+    if cr != 0 {
+        kprint(b"parent: fwd channel create FAIL\n");
+        return;
+    }
+    // SAFETY: the kernel wrote both endpoint handles.
+    let (kend, send_end) = unsafe { ((&raw const FWD_KEND).read(), (&raw const FWD_SEND).read()) };
+
+    // 2. Fresh namespace; bind the kernel end at /fs as a Userspace Server.
+    let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
+    if ns < 0 {
+        kprint(b"parent: fwd ns create FAIL\n");
+        return;
+    }
+    let ns = ns as u64;
+    let mount = b"/fs";
+    // SAFETY: valid path pointer + namespace/endpoint handles. Binding an
+    // `IpcChannel` makes the kernel adopt it as a Userspace Server.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, ns, mount.as_ptr() as u64, mount.len() as u64, kend)
+    };
+    if br != 0 {
+        kprint(b"parent: fwd bind FAIL\n");
+        return;
+    }
+
+    // 3. Async lookup of /fs/hello — the kernel forwards a Resolve to us.
+    let path = b"/fs/hello";
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe {
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
+    };
+    if po < 0 {
+        kprint(b"parent: fwd lookup submit FAIL\n");
+        return;
+    }
+    let po = po as u64;
+
+    // 4. Receive the forwarded Resolve request on the server end.
+    // SAFETY: valid endpoint + writable out-params.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            send_end,
+            (&raw mut FWD_REQ) as u64,
+            (&raw mut FWD_REQ_H) as u64,
+            (&raw mut FWD_REQ_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        kprint(b"parent: fwd recv request FAIL\n");
+        return;
+    }
+
+    // 5. Parse the request via librsproto (IpcMsg: payload_len @4, payload @24).
+    let payload_len = unsafe {
+        u32::from_le_bytes([FWD_REQ[4], FWD_REQ[5], FWD_REQ[6], FWD_REQ[7]]) as usize
+    };
+    // SAFETY: payload_len ≤ 4072; the slice stays within FWD_REQ.
+    let req_payload = unsafe { &FWD_REQ[24..24 + payload_len] };
+    let request = match librsproto::decode(req_payload) {
+        Ok(m) => m,
+        Err(_) => {
+            kprint(b"parent: fwd request decode FAIL\n");
+            return;
+        }
+    };
+    if request.op != librsproto::OP_NS_RESOLVE {
+        kprint(b"parent: fwd request op mismatch\n");
+        return;
+    }
+    let request_id = request.request_id;
+
+    // 6. Build a read-only MemoryObject holding the stub content.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
+    if mem < 0 {
+        kprint(b"parent: fwd memobj create FAIL\n");
+        return;
+    }
+    let mem = mem as u64;
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"parent: fwd memobj map FAIL\n");
+        return;
+    }
+    // SAFETY: `addr` is a page the kernel mapped R/W into our address space.
+    unsafe {
+        core::slice::from_raw_parts_mut(addr as u64 as *mut u8, CONTENT.len())
+            .copy_from_slice(CONTENT);
+    }
+
+    // 7. Build the rsproto reply (echo request_id; REPLY flag; ResolveReply body)
+    //    into the reply IpcMsg's payload, and stage the MemoryObject for transfer.
+    let mut body = [0u8; 16];
+    let body_len = match librsproto::namespace::resolve_reply(
+        &mut body,
+        librsproto::namespace::OBJECT_KIND_MEMOBJ,
+        CONTENT.len() as u32,
+    ) {
+        Some(n) => n,
+        None => {
+            kprint(b"parent: fwd reply body FAIL\n");
+            return;
+        }
+    };
+    // SAFETY: FWD_REPLY is a valid 4096-byte buffer; the rsproto reply goes in the
+    // IPC payload region (offset 24).
+    let rs_len = unsafe {
+        match librsproto::encode(
+            &mut FWD_REPLY[24..],
+            librsproto::OP_NS_RESOLVE,
+            request_id,
+            librsproto::RS_FLAG_REPLY,
+            &body[..body_len],
+            1,
+        ) {
+            Some(n) => n,
+            None => {
+                kprint(b"parent: fwd reply encode FAIL\n");
+                return;
+            }
+        }
+    };
+    // SAFETY: set the IpcMsg header's payload_len (@4) + handle_count (@8) and the
+    // transferred-handle slot.
+    unsafe {
+        FWD_REPLY[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        FWD_REPLY[8] = 1;
+        FWD_REPLY_H[0] = mem;
+    }
+
+    // 8. Send the reply, transferring the MemoryObject. The kernel detects that the
+    //    peer is its forwarding endpoint and completes the lookup PO inline.
+    // SAFETY: valid endpoint + message + 1-handle transfer array.
+    let sr = unsafe {
+        syscall5(
+            SYS_CHANNEL_SEND,
+            send_end,
+            (&raw const FWD_REPLY) as u64,
+            (&raw const FWD_REPLY_H) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        kprint(b"parent: fwd reply send FAIL\n");
+        return;
+    }
+
+    // 9. Wait the lookup PO (already completed by the inline reply) and read the
+    //    resolved handle.
+    let (st, resolved) = po_wait(po);
+    if st != 0 || resolved == 0 {
+        kprint(b"parent: fwd lookup result FAIL\n");
+        return;
+    }
+
+    // 10. Map the resolved MemoryObject and verify the content round-tripped.
+    let raddr = unsafe { syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ) };
+    if raddr < 0 {
+        kprint(b"parent: fwd map resolved FAIL\n");
+        return;
+    }
+    // SAFETY: `raddr` is the mapped, kernel-installed MemoryObject.
+    let matches = unsafe {
+        core::slice::from_raw_parts(raddr as u64 as *const u8, CONTENT.len()) == CONTENT
+    };
+    if matches {
+        kprint(b"parent: forwarded lookup returned 'STUB' via fs-server ok\n");
+    } else {
+        kprint(b"parent: fwd content mismatch\n");
+    }
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -897,6 +1112,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //     of sector 0, and verify the boot signature — the full userspace
     //     sys_io_submit path against real hardware.
     block_demo(root_ns);
+
+    // 0i. Userspace-server forwarding: bind an IPC endpoint as a Userspace Server,
+    //     look a path up through it, serve the kernel-forwarded Resolve, and map
+    //     the returned MemoryObject — the slice-7 transparent-forwarding proof.
+    forward_demo();
 
     kprint(b"parent: creating a channel\n");
 
