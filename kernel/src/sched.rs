@@ -794,6 +794,15 @@ pub fn interrupt_pending(irq: *mut ()) -> bool {
     unsafe { InterruptObject::already_signaled(irq) }
 }
 
+/// `true` iff `po` (a [`PendingOperation`]) has completed. Takes `SCHED` (the
+/// accessor contract); used by a boot self-test to poll for an async completion
+/// without a thread to `sys_wait`.
+pub fn pending_op_is_signaled(po: *mut ()) -> bool {
+    let _g = SCHED.lock();
+    // SAFETY: live `PendingOperation` pinned by the caller's reference; `SCHED` held.
+    unsafe { PendingOperation::already_signaled(po) }
+}
+
 /// Send `msg` from `endpoint` (into its peer's receive ring) under `SCHED`,
 /// **moving** any `transfers` it carries into the queued slot and waking the
 /// peer's blocked receivers if the ring went empty→non-empty. The caller has

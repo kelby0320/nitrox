@@ -15,6 +15,7 @@
 pub mod arch;
 pub mod device;
 pub mod dpc;
+pub mod drivers;
 pub mod embedded_images;
 pub mod entropy;
 pub mod font;

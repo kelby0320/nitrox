@@ -1101,11 +1101,22 @@ PR parts; the Part 0 design decisions are in the decision log (2026-06-23).
   on a RAM-backed device (`io/ramdisk.rs`): read 8 KiB → DPC → PO completes
   (status 0, result = bytes) → buffer content verified; and a DPC signals an
   `InterruptObject` → latch → consume. Independent of AHCI register/DMA work.
-- [ ] **AHCI driver (Part 3; start here vs NVMe).** Tier 1 driver: kernel
-  `ioremap` of the ABAR (uncached), HBA/port init, IDENTIFY, command list / FIS /
-  PRDT in `DmaBuffer`, READ DMA EXT, real IRQ (`arch::IrqRouter` → ISR → DPC →
-  complete IRP → signal `InterruptObject`); class-`0x010601` match table. Plus the
-  `xtask build-disk` + QEMU AHCI test-disk attach.
+- [x] **AHCI driver (Part 3)** (`phase-2/slice5-ahci`). Tier 1 driver
+  (`drivers/ahci.rs`): `mm::kvmap::map_mmio` of the ABAR (uncached), HBA/port
+  bring-up, polled `IDENTIFY DEVICE`, command list / FIS / command-table+PRDT in
+  `DmaBuffer`, `READ DMA EXT` issued against the IRP's buffer fragments (the
+  controller DMAs straight into the client's `MemoryObject` frames); real IRQ via
+  a neutral `arch::install_pci_irq` free function (GSI from the PCI interrupt-line register →
+  ISR → IRP completion DPC → PO; the ISR also signals the controller
+  `InterruptObject`). `drivers::probe` matches class-`01.06.01` and publishes the
+  disk as a block `DeviceNode`. Proven against the **existing AHCI boot disk** (no
+  new disk needed): `drivers::self_test` reads sector 0 and verifies the `0x55AA`
+  boot signature, mirroring the PIT self-test's brief interrupt window (with a
+  polled fallback). QEMU: HBA up, port 0 disk (64 MiB), `read self-test OK …
+  via IRQ`, 4/4 clean boots. Phase 2 scope: single controller/single SATA disk,
+  one outstanding command; multi-port/NCQ/MSI and ACPI `_PRT` routing deferred.
+  The dedicated `xtask build-disk` + ext4 test disk move to Part 4/7 (fs-server).
+  `KError::IoError` (-40) added (both libkerns) for device/medium errors.
 - [ ] **Block device resource server registration (Part 4).** Register discovered
   disks in the block registry; supervisor binds `/dev/blk` (read-only) into init's
   root namespace at boot. A lookup of `/dev/blk0` + a read logs sector 0.

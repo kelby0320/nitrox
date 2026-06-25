@@ -98,6 +98,36 @@ pub fn vmap_alloc_pages(n_pages: u64) -> Result<VirtAddr, AllocError> {
     Ok(VirtAddr::new(start))
 }
 
+/// Map `n_pages` of physical MMIO starting at `phys` into a fresh kernel-vmap
+/// range, **uncached** and writable, and return the virtual base. The mapping is
+/// **permanent** (the vmap bump allocator never reclaims VA) — for a device
+/// register window held for the kernel's lifetime (an AHCI ABAR, an xHCI cap
+/// region, …). `phys` should be page-aligned; sub-page offsets are added back by
+/// the caller.
+///
+/// # Safety
+/// - `phys .. phys + n_pages*PAGE` must be a real device MMIO range safe to map
+///   uncached, owned by the caller for the kernel's lifetime.
+/// - Ring-0; mutates the active page tables. The vmap intermediate tables are
+///   shared kernel-half (see the module docs), so the mapping is visible to every
+///   address space.
+pub unsafe fn map_mmio(phys: PhysAddr, n_pages: u64) -> Result<VirtAddr, AllocError> {
+    let base = vmap_alloc_pages(n_pages)?;
+    let root = Paging::active_root();
+    let flags = PageFlags::WRITABLE | PageFlags::NO_CACHE;
+    for i in 0..n_pages {
+        let v = VirtAddr::new(base.as_u64() + i * PAGE_SIZE as u64);
+        let p = PhysAddr(phys.as_u64() + i * PAGE_SIZE as u64);
+        // SAFETY: `v` is a fresh vmap page; `p` is a caller-owned device frame
+        // mapped uncached; intermediates are the pre-allocated shared kernel PDPTs.
+        unsafe {
+            Paging::map_page(root, v, p, flags).map_err(|_| AllocError)?;
+            Paging::flush_tlb_page(v);
+        }
+    }
+    Ok(base)
+}
+
 /// Point a single, already-reserved vmap page at the physical MMIO frame
 /// `phys`, mapped **uncached** and writable, flushing the stale TLB entry.
 ///

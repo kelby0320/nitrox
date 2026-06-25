@@ -29,3 +29,28 @@ pub fn init() {
 pub fn count() -> usize {
     DEVICES.lock().len()
 }
+
+/// A snapshot of the device table: a cloned owning reference per device. Taken
+/// under the lock and returned, so a caller (driver matching) can iterate and
+/// allocate **without** holding the device lock across a lock-ordering boundary.
+/// The table keeps its own references; the caller drops the snapshot when done.
+pub fn snapshot() -> KVec<ObjectRef> {
+    let table = DEVICES.lock();
+    let mut out: KVec<ObjectRef> = KVec::new();
+    if out.try_reserve(table.len()).is_err() {
+        return KVec::new();
+    }
+    for node in table.iter() {
+        out.try_push(node.clone()).expect("within reserved capacity");
+    }
+    out
+}
+
+/// Append an already-built device node (e.g. a disk a driver discovered) to the
+/// table. The table takes ownership of `node`.
+pub fn register(node: ObjectRef) {
+    let mut table = DEVICES.lock();
+    if table.try_push(node).is_err() {
+        crate::kprintln!("device: table full; dropping a registered node");
+    }
+}

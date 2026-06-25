@@ -4380,3 +4380,67 @@ Verified: `cargo xtask build` (no warnings) / `check-arch` / `test` (kernel
 8; init 18). QEMU q35: both self-tests print OK and boot proceeds through
 init→parent→child cleanly (no `#DF`). Branch `phase-2/slice5-irp-iocore`. Next:
 Part 3 (AHCI Tier 1 driver).
+
+## 2026-06-25 — Phase 2 slice 5, Part 3: AHCI Tier 1 driver
+
+The first real hardware driver — SATA reads through the Part 2 I/O spine.
+
+- **AHCI driver** (`kernel/src/drivers/ahci.rs`, neutral kernel code — PCI/AHCI
+  are standards): maps the controller's ABAR (BAR5) uncached via the new
+  `mm::kvmap::map_mmio`; enables AHCI mode; finds the first implemented port with
+  a SATA disk; brings the port up (stop → point PxCLB/PxFB at `DmaBuffer`s → clear
+  errors → start); runs `IDENTIFY DEVICE` **polled** (bring-up runs with
+  interrupts masked) for the LBA48 sector count; and publishes the disk as a
+  block `DeviceNode` (the Part 1 object) with an AHCI `BlockBackend` (the Part 2
+  seam). Reads issue `READ DMA EXT` with a PRDT built directly from the IRP's
+  buffer fragments — the controller DMAs straight into the client's
+  `MemoryObject` frames (no bounce buffer).
+
+- **Driver matching** (`kernel/src/drivers/mod.rs`): `probe` snapshots the device
+  table (`device::snapshot`, cloned refs so no lock is held across driver alloc)
+  and brings up class-`01.06.01` controllers. `drivers/` is the Tier 1 driver
+  home.
+
+- **Real IRQ path**: `crate::arch::install_pci_irq(gsi, handler)` — a **neutral
+  free function** (not a method) that composes three hardware abstractions the
+  arch traits intentionally keep separate: the device-vector **handler registry**
+  (the IDT on x86, which `ArchIrqRouter` keeps off itself), the **local
+  controller** (`ArchIrq::id` for the dest CPU), and the **router**
+  (`ArchIrqRouter::route`, the resolved-`(line, vector)` primitive). It routes
+  level-triggered/active-low INTx on the BSP. Belonging to none of those single
+  abstractions, it stays a composite helper rather than a method on any of them.
+  A `TODO(msi)` marks the trigger to promote the device-interrupt *family* (MSI
+  install, shared-INTx chaining, IRQ teardown) into a dedicated `ArchIrqInstall`
+  trait once it has a second member (see `deferred-decisions.md`). The AHCI ISR
+  acks the
+  controller, completes the in-flight IRP via its DPC (the Tier 1
+  DPC-completion-routine pattern), and queues a DPC that signals the controller's
+  `InterruptObject` (exercises the signal-from-real-ISR path; no waiter in
+  Phase 2). **GSI from the PCI interrupt-line register** (config 0x3C) —
+  firmware-programmed on QEMU (observed GSI 10); ACPI `_PRT` routing stays
+  deferred (needs AML).
+
+- **Proof**: rather than a new disk, read the **existing AHCI boot disk** (OVMF
+  booted Limine from it). `drivers::self_test` reads sector 0 and verifies the
+  `0x55AA` boot signature, mirroring the IOAPIC PIT self-test — issue the read,
+  briefly enable interrupts so the completion IRQ can fire, with a bounded polled
+  fallback (`ahci::poll_complete_inflight`) if the GSI is unrouted. The dedicated
+  `xtask build-disk` + ext4 disk move to Part 4/7, where the fs-server needs real
+  filesystem data.
+
+- **`KError::IoError` (-40)** added (kernel + userspace `libkern`) for
+  device/medium errors (the ATA task-file-error path), per `io-operation.md`. This
+  is a `KError`-layout change → an ABI-hash input, but no module is loaded against
+  the hash yet, so no practical impact (like the slice's other ABI additions).
+
+Phase 2 scope: single controller, single SATA disk, one outstanding command
+(slot 0). Multi-port/multi-disk, NCQ, port multipliers, and MSI/MSI-X are
+deferred (`deferred-decisions.md`).
+
+Verified: `cargo xtask build` (no warnings) / `check-arch` (the driver is neutral;
+MMIO/IRQ via `crate::arch` + `mm`) / `test` (kernel 481; libkern 8; init 18 — AHCI
+is hardware, exercised on-target not host). QEMU q35: `ahci: HBA up`, `port 0 disk
+ready (131072 sectors, 64 MiB)`, `INTx GSI10 -> vec 0x31`, `read self-test OK
+(sector 0 boot sig 0x55AA, via IRQ)` — **4/4 clean boots**, completion via the
+real IRQ, boot proceeds through init→parent→child (no `#DF`). Branch
+`phase-2/slice5-ahci`. Next: Part 4 (block resource server + `/dev/blk`).
