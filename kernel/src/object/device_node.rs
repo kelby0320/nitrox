@@ -17,7 +17,9 @@
 use crate::io::block::BlockBackend;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox};
+use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
+use crate::syscall::error::KError;
 
 /// What a device is, from its PCI configuration header.
 ///
@@ -144,6 +146,28 @@ pub struct ResourceDescriptor {
     pub _pad: [u8; 3],
 }
 
+impl ResourceDescriptor {
+    /// A synthetic, all-zero descriptor (vendor `0xFFFF` = "no PCI device") for a
+    /// node that is not a discovered PCI function — e.g. the serial console.
+    pub const ZERO: ResourceDescriptor = ResourceDescriptor {
+        identity: DeviceIdentity {
+            vendor: 0xFFFF,
+            device: 0,
+            class: 0,
+            subclass: 0,
+            prog_if: 0,
+            revision: 0,
+        },
+        bars: [BarWindow::ZERO; 6],
+        interrupt: InterruptSpec::NONE,
+        seg: 0,
+        bus: 0,
+        dev: 0,
+        func: 0,
+        _pad: [0; 3],
+    };
+}
+
 /// What a device node is and which operations it accepts.
 ///
 /// `#[repr(u32)]`. A `Block` node accepts block read/write through the I/O core;
@@ -156,6 +180,9 @@ pub enum DeviceClass {
     Other = 0,
     /// A block device: accepts block `Read`/`Write` I/O operations.
     Block = 1,
+    /// A character/stream device (the serial console): accepts byte-stream `Read`
+    /// I/O operations (no block alignment, no device offset).
+    Char = 2,
 }
 
 impl DeviceClass {
@@ -164,10 +191,33 @@ impl DeviceClass {
         match v {
             0 => Some(Self::Other),
             1 => Some(Self::Block),
+            2 => Some(Self::Char),
             _ => None,
         }
     }
 }
+
+/// A character device's I/O entry point, stored on its [`DeviceNode`] — the
+/// char-class analogue of [`BlockBackend`]. `submit_read` copies up to `max_len`
+/// available bytes into `buffer` at `buf_offset` and completes `po` (immediately if
+/// bytes are buffered, else when they arrive via the device's interrupt); it must
+/// **not** block. Returns `Err` only on a hard failure (e.g. a reader is already
+/// pending — the Phase-2 console is single-reader). `sys_io_submit`'s char path
+/// dispatches a `Read` through this.
+#[derive(Copy, Clone)]
+pub struct CharBackend {
+    /// Submit a stream read against the device.
+    pub submit_read:
+        fn(buffer: &ObjectRef, po: &ObjectRef, buf_offset: u64, max_len: u64, ctx: *mut ()) -> Result<(), KError>,
+    /// Device context passed back to `submit_read` (e.g. the console state).
+    pub ctx: *mut (),
+}
+
+// SAFETY: identical reasoning to `BlockBackend` — `ctx` points at a device
+// structure that lives for the kernel's lifetime, touched only on the CPU
+// servicing the device; these impls let a `DeviceNode` holding one be `Send`/`Sync`.
+unsafe impl Send for CharBackend {}
+unsafe impl Sync for CharBackend {}
 
 /// A block device's addressable geometry. Meaningful only for [`DeviceClass::Block`]
 /// nodes; zeroed otherwise. Set by the driver that claims the node.
@@ -205,6 +255,9 @@ pub struct DeviceNode {
     /// The block I/O entry point, present iff this is a `Block` node a driver has
     /// claimed (`sys_io_submit` dispatches through it).
     block_backend: Option<BlockBackend>,
+    /// The character I/O entry point, present iff this is a `Char` node (the
+    /// console). `sys_io_submit`'s char path dispatches a `Read` through it.
+    char_backend: Option<CharBackend>,
 }
 
 impl DeviceNode {
@@ -225,6 +278,25 @@ impl DeviceNode {
             descriptor,
             geometry,
             block_backend: None,
+            char_backend: None,
+        })
+    }
+
+    /// Allocate a [`DeviceClass::Char`] node backed by `backend` (the serial
+    /// console). `geometry` is zeroed (meaningless for a char device); the
+    /// descriptor is synthetic ([`ResourceDescriptor::ZERO`] is fine).
+    pub fn try_new_char(
+        descriptor: ResourceDescriptor,
+        backend: CharBackend,
+    ) -> Result<KBox<Self>, AllocError> {
+        KBox::try_new(Self {
+            header: KObjectHeader::new(KObjectType::DeviceNode),
+            magic: Self::MAGIC,
+            class: DeviceClass::Char,
+            descriptor,
+            geometry: BlockGeometry::ZERO,
+            block_backend: None,
+            char_backend: Some(backend),
         })
     }
 
@@ -242,6 +314,7 @@ impl DeviceNode {
             descriptor,
             geometry,
             block_backend: Some(backend),
+            char_backend: None,
         })
     }
 
@@ -268,6 +341,11 @@ impl DeviceNode {
     /// The block I/O backend, if this is a claimed block device.
     pub fn block_backend(&self) -> Option<BlockBackend> {
         self.block_backend
+    }
+
+    /// The character I/O backend, if this is a char device (the console).
+    pub fn char_backend(&self) -> Option<CharBackend> {
+        self.char_backend
     }
 }
 
@@ -317,7 +395,8 @@ mod tests {
     fn device_class_round_trips() {
         assert_eq!(DeviceClass::from_u32(0), Some(DeviceClass::Other));
         assert_eq!(DeviceClass::from_u32(1), Some(DeviceClass::Block));
-        assert_eq!(DeviceClass::from_u32(2), None);
+        assert_eq!(DeviceClass::from_u32(2), Some(DeviceClass::Char));
+        assert_eq!(DeviceClass::from_u32(3), None);
     }
 
     #[test]

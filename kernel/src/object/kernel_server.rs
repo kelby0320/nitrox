@@ -52,6 +52,9 @@ pub enum KernelServerId {
     /// One binding (at `/dev/blk`) owns the whole subtree; the suffix indexes the
     /// device-table registry.
     BlockDevice,
+    /// `/dev/console` — the serial console (a char [`DeviceNode`](crate::object::DeviceNode))
+    /// the caller reads with `sys_io_submit(Read)` (see [`console_server`]).
+    Console,
     // `/proc/self/status` (numeric pid/tid) and the `/dev` directory listing are
     // deferred — see `docs/rationale/deferred-decisions.md`.
 }
@@ -96,6 +99,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::ProcSelfNamespace => proc_self_namespace(suffix, requested),
         KernelServerId::Initramfs => initramfs_server(suffix, requested),
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
+        KernelServerId::Console => console_server(suffix, requested),
     }
 }
 
@@ -211,6 +215,24 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     };
     match crate::device::find_block_device(index) {
         Some(node) => OpStatus::Completed(node),
+        None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// `/dev/console` — a **leaf** server returning a counted reference to the serial
+/// console (a char [`DeviceNode`](crate::object::DeviceNode)). An exact match yields
+/// the console node, on which the caller issues `sys_io_submit(Read)` to read
+/// keyboard input; any non-empty `suffix`, or the console not yet up, is *not found*.
+/// The binding is read-only (input), so the lookup attenuates the handle to `READ`.
+///
+/// `requested` is accepted to match the RS contract but ignored — the binding's
+/// rights cap what the caller obtains, applied by the lookup syscall.
+fn console_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    match crate::drivers::console::device_ref() {
+        Some(obj) => OpStatus::Completed(obj),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }

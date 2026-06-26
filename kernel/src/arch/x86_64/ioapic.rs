@@ -349,6 +349,33 @@ pub unsafe fn install_pci_irq(gsi: u32, handler: extern "C" fn()) -> u8 {
     vector
 }
 
+/// Install a legacy **ISA** interrupt end-to-end for an in-kernel driver: resolve
+/// the ISA IRQ to its GSI + trigger/polarity (honouring ACPI interrupt source
+/// overrides — ISA defaults are edge/active-high), register `handler` for a fresh
+/// device-interrupt vector, route the GSI to it on the boot CPU, and leave the line
+/// unmasked. Returns the assigned IDT vector. The ISA sibling of [`install_pci_irq`]
+/// (COM1 IRQ 4, etc.).
+///
+/// **Arch-internal** (`pub(crate)`, not re-exported by `crate::arch`): "ISA" is an
+/// x86-only concept, so neutral kernel code must not name it. A fixed legacy device
+/// wires its interrupt through its own arch module — the serial console via
+/// [`super::serial::console_arm_rx`], which calls this. See
+/// `docs/conventions/arch-boundary.md` and `install_pci_irq`'s `TODO(msi)` on
+/// promoting the device-interrupt family into a trait.
+///
+/// # Safety
+/// Ring-0, after [`X86IoApic::init`]. `handler` must stay valid for the kernel's
+/// lifetime; the caller must be ready to receive the IRQ once interrupts are enabled.
+pub(crate) unsafe fn install_isa_irq(isa_irq: u8, handler: extern "C" fn()) -> u8 {
+    let bsp = crate::arch::Irq::id();
+    let (gsi, polarity, trigger) = resolve_isa_irq(isa_irq, acpi::source_overrides());
+    let vector = idt::register_device_handler(handler);
+    // SAFETY: forwarded from this fn's contract; the handler for `vector` was just
+    // registered, so the routed interrupt has somewhere to land.
+    unsafe { X86IoApic::route(gsi, vector, bsp, trigger, polarity) };
+    vector
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

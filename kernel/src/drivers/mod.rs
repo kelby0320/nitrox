@@ -5,6 +5,7 @@
 //! `docs/architecture/drivers-and-irps.md` § "Module tiers".
 
 pub mod ahci;
+pub mod console;
 pub mod gpt;
 
 use crate::arch::cpu::ArchCpu;

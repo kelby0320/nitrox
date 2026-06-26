@@ -27,6 +27,9 @@ use crate::libkern::IrqSpinLock;
 
 /// COM1 base I/O port. Fixed by the PC platform.
 const COM1_BASE: u16 = 0x3F8;
+/// COM1's legacy ISA interrupt line. A PC-platform fact (like [`COM1_BASE`]) that
+/// stays inside the arch layer — neutral code arms it via [`console_arm_rx`].
+const COM1_IRQ: u8 = 4;
 
 // 16550 register offsets from the base port. DATA and IER double as the
 // divisor-latch low/high bytes while the LCR's DLAB bit is set.
@@ -40,6 +43,15 @@ const REG_LSR: u16 = 5;
 /// Line-status bit: transmit-holding register empty — the UART can accept
 /// another byte.
 const LSR_THR_EMPTY: u8 = 0x20;
+/// Line-status bit: receive data available — a byte can be read from `REG_DATA`.
+const LSR_DATA_READY: u8 = 0x01;
+/// Interrupt-enable bit: received-data-available — raise IRQ when a byte arrives.
+const IER_RX_AVAIL: u8 = 0x01;
+/// Modem-control value for normal operation: DTR, RTS, OUT2 (OUT2 gates the UART's
+/// interrupt line through to the interrupt controller). Matches [`SerialPort::init`].
+const MCR_NORMAL: u8 = 0x0B;
+/// Modem-control bit: internal loopback (TX feeds RX) — used by the RX self-test.
+const MCR_LOOPBACK: u8 = 0x10;
 
 /// A 16550 UART addressed by its base I/O port.
 ///
@@ -96,6 +108,36 @@ impl SerialPort {
             regs::outb(self.base + REG_DATA, byte);
         }
     }
+
+    /// `true` iff the UART has a received byte ready in `REG_DATA`.
+    pub fn read_ready(&self) -> bool {
+        // SAFETY: `REG_LSR` is a 16550 register at this driver's COM1 base port.
+        unsafe { regs::inb(self.base + REG_LSR) & LSR_DATA_READY != 0 }
+    }
+
+    /// Read one received byte from `REG_DATA`. The caller must have observed
+    /// [`read_ready`](Self::read_ready); reading also clears the UART's
+    /// received-data-available interrupt condition.
+    pub fn read_byte(&self) -> u8 {
+        // SAFETY: `REG_DATA` is a 16550 register at this driver's COM1 base port.
+        unsafe { regs::inb(self.base + REG_DATA) }
+    }
+
+    /// Enable the received-data-available interrupt (the UART raises its IRQ when a
+    /// byte arrives). `OUT2` is already set by [`init`](Self::init), so the IRQ line
+    /// reaches the interrupt controller.
+    pub fn enable_rx_interrupt(&self) {
+        // SAFETY: `REG_IER` is a 16550 register at this driver's COM1 base port.
+        unsafe { regs::outb(self.base + REG_IER, IER_RX_AVAIL) };
+    }
+
+    /// Set or clear internal loopback (`MCR` bit 4) — TX feeds RX internally,
+    /// without touching the wire. Used by the RX self-test.
+    pub fn set_loopback(&self, on: bool) {
+        let mcr = if on { MCR_NORMAL | MCR_LOOPBACK } else { MCR_NORMAL };
+        // SAFETY: `REG_MCR` is a 16550 register at this driver's COM1 base port.
+        unsafe { regs::outb(self.base + REG_MCR, mcr) };
+    }
 }
 
 /// Writes bytes to the UART, translating `\n` into `\r\n` so the output
@@ -131,6 +173,68 @@ pub fn init() {
 /// under Phase 1's single-CPU, interrupts-masked model.
 pub fn emergency_writer() -> SerialPort {
     SerialPort::new(COM1_BASE)
+}
+
+// --- Console input (COM1 RX) — the neutral surface the console driver uses ----
+//
+// The console-input driver (`kernel/src/drivers/console.rs`) is neutral kernel
+// code; it reaches the COM1 UART only through these free functions (re-exported as
+// `crate::arch::serial::*`), never `arch::x86_64` internals.
+
+/// `true` iff COM1 has a received byte ready (the ISR's drain predicate).
+pub fn console_rx_ready() -> bool {
+    SerialPort::new(COM1_BASE).read_ready()
+}
+
+/// Read one received byte from COM1 (also clears the RX interrupt condition).
+pub fn console_rx_read() -> u8 {
+    SerialPort::new(COM1_BASE).read_byte()
+}
+
+/// Arm console receive interrupts: route the console UART's interrupt to `handler`
+/// and enable the UART's received-data-available interrupt. Returns the assigned IDT
+/// vector. The neutral "arm the console's RX interrupt" operation — it hides the
+/// platform wiring (here, COM1 ISA IRQ 4 through the IOAPIC); an aarch64 port would
+/// route its UART's GIC interrupt instead. Neutral code calls this rather than naming
+/// any ISA/IRQ specifics.
+///
+/// # Safety
+/// Ring-0, after the interrupt router is initialised; `handler` must stay valid for
+/// the kernel's lifetime; the caller must be ready to receive the IRQ once interrupts
+/// are enabled. Call **after** [`console_rx_loopback_selftest`] (which polls).
+pub unsafe fn console_arm_rx(handler: extern "C" fn()) -> u8 {
+    // SAFETY: forwarded from this fn's contract (ring-0, post-router-init; `handler`
+    // valid for the kernel's lifetime). `install_isa_irq` is the x86 IOAPIC routing
+    // primitive, kept inside the arch layer.
+    let vector = unsafe { super::ioapic::install_isa_irq(COM1_IRQ, handler) };
+    SerialPort::new(COM1_BASE).enable_rx_interrupt();
+    vector
+}
+
+/// Self-test the COM1 receive path with **internal loopback**: enable loopback,
+/// transmit a known byte (which loops back to RX without touching the wire), poll
+/// for it, and verify. Returns `true` on a match. Restores normal mode. Boot-only
+/// (single-CPU, interrupts masked, no concurrent UART user) — like
+/// [`emergency_writer`], it mints a throwaway port. Must run **before** RX
+/// interrupts are armed so the polled read, not an ISR, consumes the byte.
+pub fn console_rx_loopback_selftest() -> bool {
+    const TEST_BYTE: u8 = 0x5A;
+    let p = SerialPort::new(COM1_BASE);
+    p.set_loopback(true);
+    p.write_byte(TEST_BYTE);
+    let mut spins: u32 = 0;
+    let got = loop {
+        if p.read_ready() {
+            break Some(p.read_byte());
+        }
+        spins += 1;
+        if spins >= 1_000_000 {
+            break None;
+        }
+        core::hint::spin_loop();
+    };
+    p.set_loopback(false);
+    got == Some(TEST_BYTE)
 }
 
 /// Print formatted output to the kernel serial console, without a

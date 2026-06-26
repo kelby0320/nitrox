@@ -240,6 +240,11 @@ fn kernel_main() {
     nitrox_kernel::drivers::probe();
     nitrox_kernel::drivers::self_test();
 
+    // Phase 2 slice 9 Part 1: bring up serial console **input** (COM1 RX). Runs
+    // with interrupts masked (its RX self-test polls before RX IRQs are armed);
+    // publishes the console char `DeviceNode` for `/dev/console`.
+    nitrox_kernel::drivers::console::init();
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and
@@ -484,6 +489,20 @@ fn run_first_userspace() {
         .is_err()
     {
         kprintln!("init: binding /dev/entropy failed");
+        return;
+    }
+
+    // `/dev/console` — the serial console (a char `DeviceNode`); the caller reads
+    // keyboard input with `sys_io_submit(Read)`. Input-only in Phase 2, so the
+    // binding grants `READ` + the generic management band (DUPLICATE/INSPECT so a
+    // client can `stat` it; TRANSFER so init can hand it to eshell at spawn).
+    let console_binding_rights =
+        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(b"/dev/console", KernelServerId::Console, console_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /dev/console failed");
         return;
     }
 
