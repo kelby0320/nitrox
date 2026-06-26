@@ -4956,3 +4956,43 @@ Built as five Parts (implementation plan). Detailed contracts
 (`rsproto-file-ops.md`, the `FileObject` handle-encoding entry, the
 memory-management page-cache section) are written in their respective Parts, as in
 slice 7. No code yet.
+
+## 2026-06-25 — Phase 2 slice 8, Part 1: the FileObject kobject + its page cache
+
+The mechanical foundation: a new **`FileObject`** kernel object (type **14**) owning a
+sparse, per-page **page cache**. No fault path, no producer wiring — just the object
+and its cache data structure + lifecycle, fully host-tested.
+
+- **`FileObject` (`kernel/src/object/file_object.rs`)** holds `size` (exact file
+  bytes) + a `SpinLock<Inner>` over a `KVec<CachePage>` — each `CachePage` is
+  `{ index, frame, state: Loading | Ready }` and **owns** its frame (freed in `Drop`,
+  like `MemoryObject`). The cache is its own rank-4 object lock (not the `SCHED` cell
+  pattern) because it is shared across every mapping of the object, in potentially
+  several address spaces; the fault path (Parts 2–3) takes it *after* dropping the AS
+  lock (both rank 4, never nested) and never blocks under it.
+- **API the fault path will use, built + tested now:** `reserve(index)` →
+  `Ready(frame)` (hit) / `Loading(frame)` (a fill is in flight) / `New(frame)` (a
+  fresh **zeroed** Loading frame the caller fills — zeroing guarantees a partial tail
+  page's padding is zero) / `Oom`; `mark_ready(index)` (Loading→Ready after the fill);
+  `lookup(index)`. Linear-scan lookup (O(n) in resident pages) — fine for slice-8 file
+  sizes; a sorted/tree index is a later optimization.
+- **Deviation from the scope's field list (deliberate):** the `FileObject` does *not*
+  yet hold the producer reference (fs-server endpoint + path suffix) the scope names —
+  those are added in **Part 3** (the fill), their first consumer, so Part 1 ships no
+  unused fields. `try_new(size)` grows to take the producer there.
+- **Wiring:** `KObjectType::FileObject = 14` (kernel + libkern mirror + `from_u32` +
+  `KOBJ_FILE_OBJECT`); `type_rights` allows the `MAP_*` band (mapped like a
+  `MemoryObject`; `MAP_WRITE` in the *type* mask for the Phase-3 RW path, attenuated
+  to read-only at resolve); `dispatch_destroy` + `test_probe` arms; `object/mod`
+  export; `handle-encoding.md` rights table + the architecture overview's fixed
+  object list.
+
+**ABI.** A **new `KObjectType` discriminant (14)** — an ABI-version-hash input
+(`docs/spec/abi-version-hash.md`); pre-stabilization, the hash is not yet computed in
+code, so nothing is enforced, but record the impact. No layout change.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**506** (+6 `file_object` tests: size/round-up, reserve→mark_ready lifecycle, distinct
+frames, no-op mark, **drop frees frames no-leak**, dispatch_destroy arm). Branch
+`phase-2/slice8-file-object`. Next: Part 2 (the lazy `FileBacked` mmap + the async
+fault path — the hard part).

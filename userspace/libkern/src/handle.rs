@@ -166,6 +166,7 @@ pub enum KObjectType {
     EntropyObject = 11,
     DeviceNode = 12,
     UserspaceServerReg = 13,
+    FileObject = 14,
 }
 
 // --- `u32` object-type aliases (for raw `sys_handle_stat` decoding) ---------
@@ -178,6 +179,7 @@ pub const KOBJ_NOTIFICATION_CHANNEL: u32 = KObjectType::NotificationChannel as u
 pub const KOBJ_TIMER: u32 = KObjectType::Timer as u32;
 pub const KOBJ_PENDING_OPERATION: u32 = KObjectType::PendingOperation as u32;
 pub const KOBJ_ENTROPY_OBJECT: u32 = KObjectType::EntropyObject as u32;
+pub const KOBJ_FILE_OBJECT: u32 = KObjectType::FileObject as u32;
 
 #[cfg(test)]
 mod tests {

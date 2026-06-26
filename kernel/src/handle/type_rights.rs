@@ -54,6 +54,12 @@ const MEMORY_OBJECT_PRINCIPALS: Rights = Rights::from_bits_truncate(
     Rights::MAP_READ.bits() | Rights::MAP_WRITE.bits() | Rights::MAP_EXEC.bits(),
 );
 
+/// Principal rights valid on [`KObjectType::FileObject`] handles. A mapped file is
+/// mappable like a `MemoryObject` (the `MAP_*` band); the actual grant is attenuated
+/// at resolve time (read-only content in Phase 2). `MAP_WRITE` is in the *type* mask
+/// for the Phase-3 read-write path, not because a Phase-2 file grants it.
+const FILE_OBJECT_PRINCIPALS: Rights = MEMORY_OBJECT_PRINCIPALS;
+
 /// Principal rights valid on [`KObjectType::IpcChannel`] handles.
 const IPC_CHANNEL_PRINCIPALS: Rights =
     Rights::from_bits_truncate(Rights::SEND.bits() | Rights::RECV.bits());
@@ -91,6 +97,7 @@ pub(crate) fn is_rights_compatible(ty: KObjectType, rights: Rights) -> bool {
         KObjectType::Thread => THREAD_PRINCIPALS,
         KObjectType::Namespace => NAMESPACE_PRINCIPALS,
         KObjectType::MemoryObject => MEMORY_OBJECT_PRINCIPALS,
+        KObjectType::FileObject => FILE_OBJECT_PRINCIPALS,
         KObjectType::IpcChannel => IPC_CHANNEL_PRINCIPALS,
         KObjectType::NotificationChannel
         | KObjectType::Timer

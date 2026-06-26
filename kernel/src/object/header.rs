@@ -36,7 +36,7 @@ use core::sync::atomic::{AtomicUsize, Ordering, fence};
 use crate::libkern::KBox;
 use crate::libkern::handle::KObjectType;
 use crate::object::{
-    DeviceNode, EntropyObject, InterruptObject, IpcChannel, MemoryObject, Namespace,
+    DeviceNode, EntropyObject, FileObject, InterruptObject, IpcChannel, MemoryObject, Namespace,
     NotificationChannel, PendingOperation, Process, Thread, Timer, UserspaceServerReg,
 };
 
@@ -363,6 +363,15 @@ unsafe fn dispatch_destroy(ptr: *mut (), ty: KObjectType) {
             #[cfg(test)]
             test_probe::note(KObjectType::UserspaceServerReg);
         }
+        KObjectType::FileObject => {
+            // SAFETY: last ref to a `FileObject` produced by KBox::into_raw.
+            // Dropping the box runs `FileObject::Drop`, freeing its cached frames.
+            drop(unsafe {
+                KBox::<FileObject>::from_raw(NonNull::new_unchecked(ptr as *mut FileObject))
+            });
+            #[cfg(test)]
+            test_probe::note(KObjectType::FileObject);
+        }
         // No other kernel object types are implemented yet; they land behind
         // their respective slices.
         _ => debug_assert!(false, "dispatch_destroy on unimplemented kobject type {ty:?}"),
@@ -394,6 +403,7 @@ pub(crate) mod test_probe {
         static DEVICE_NODE_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static INTERRUPT_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
         static USERSPACE_SERVER_REG_DESTROYS: Cell<usize> = const { Cell::new(0) };
+        static FILE_OBJECT_DESTROYS: Cell<usize> = const { Cell::new(0) };
     }
 
     pub(crate) fn note(ty: KObjectType) {
@@ -418,6 +428,7 @@ pub(crate) mod test_probe {
             KObjectType::UserspaceServerReg => {
                 USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(c.get() + 1))
             }
+            KObjectType::FileObject => FILE_OBJECT_DESTROYS.with(|c| c.set(c.get() + 1)),
             _ => {}
         }
     }
@@ -470,6 +481,10 @@ pub(crate) mod test_probe {
         USERSPACE_SERVER_REG_DESTROYS.with(Cell::get)
     }
 
+    pub(crate) fn file_object_destroys() -> usize {
+        FILE_OBJECT_DESTROYS.with(Cell::get)
+    }
+
     pub(crate) fn reset() {
         PROCESS_DESTROYS.with(|c| c.set(0));
         THREAD_DESTROYS.with(|c| c.set(0));
@@ -483,6 +498,7 @@ pub(crate) mod test_probe {
         DEVICE_NODE_DESTROYS.with(|c| c.set(0));
         INTERRUPT_OBJECT_DESTROYS.with(|c| c.set(0));
         USERSPACE_SERVER_REG_DESTROYS.with(|c| c.set(0));
+        FILE_OBJECT_DESTROYS.with(|c| c.set(0));
     }
 }
 

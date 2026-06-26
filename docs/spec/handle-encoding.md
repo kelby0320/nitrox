@@ -211,6 +211,7 @@ The kernel rejects allocations of handles with rights that are not meaningful fo
 | `Thread` | `SIGNAL`, `TERMINATE` |
 | `Namespace` | `LOOKUP`, `BIND` |
 | `MemoryObject` | `MAP_READ`, `MAP_WRITE`, `MAP_EXEC` |
+| `FileObject` | `MAP_READ`, `MAP_WRITE`, `MAP_EXEC` (a mapped file; `MAP_WRITE` reserved for the Phase-3 RW path) |
 | `IpcChannel` | `SEND`, `RECV` |
 | `NotificationChannel` | `WAIT` (receive end only) |
 | `Timer` | `WAIT` |

@@ -275,6 +275,7 @@ pub enum KObjectType {
     EntropyObject = 11,
     DeviceNode = 12,
     UserspaceServerReg = 13,
+    FileObject = 14,
 }
 
 impl KObjectType {
@@ -298,6 +299,7 @@ impl KObjectType {
             11 => Some(Self::EntropyObject),
             12 => Some(Self::DeviceNode),
             13 => Some(Self::UserspaceServerReg),
+            14 => Some(Self::FileObject),
             _ => None,
         }
     }
@@ -481,6 +483,10 @@ mod tests {
         assert_eq!(KObjectType::Thread as u32, 2);
         assert_eq!(KObjectType::IoRing as u32, 10);
         assert_eq!(KObjectType::UserspaceServerReg as u32, 13);
+        assert_eq!(KObjectType::FileObject as u32, 14);
+        // Round-trip the newest discriminant; one past it is unknown.
+        assert_eq!(KObjectType::from_u32(14), Some(KObjectType::FileObject));
+        assert_eq!(KObjectType::from_u32(15), None);
     }
 
     #[test]

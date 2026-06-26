@@ -22,6 +22,7 @@
 
 pub mod device_node;
 pub mod entropy_object;
+pub mod file_object;
 pub mod header;
 pub mod interrupt_object;
 pub mod ipc_channel;
@@ -37,6 +38,7 @@ pub mod userspace_server;
 
 pub use device_node::DeviceNode;
 pub use entropy_object::EntropyObject;
+pub use file_object::{FileObject, PageState, Reserve};
 pub use header::{KObjectHeader, ObjectRef};
 pub use interrupt_object::InterruptObject;
 pub use ipc_channel::{
