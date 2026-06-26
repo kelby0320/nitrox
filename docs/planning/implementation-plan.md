@@ -1263,13 +1263,67 @@ from the initramfs (replacing the embedded `ImageId`) defers to slice 8.
 
 #### 8. Page cache integration with fs-server
 
-Depends on the demand-paging `#PF` handler + `MappingKind::FileBacked` from the
-prerequisite band — the fault-in path is what makes "reads files" real.
+Makes file-backed mappings **lazy**: a `sys_memory_map` of a file reserves the range
+and faults pages in on demand through a kernel **page cache**, replacing slice 7's
+eager whole-file `MemoryObject` copy (and lifting its 64 KiB cap). Depends on the
+demand-paging `#PF` handler + `MappingKind::FileBacked` from the prerequisite band —
+the fault-in path is what makes "reads files" real.
 
-- [ ] Page cache for file-backed memory in kernel
-- [ ] `sys_memory_map` on file handles asks fs-server for extents
-- [ ] Kernel reads blocks into page cache pages, maps into client address space
-- [ ] Writeback (deferred to Phase 3 along with fs-server-ext4 RW)
+The page cache, the lazy `FileBacked` VMA, the lazy `sys_memory_map`, and the
+**async fault path** (the hard part — a file fault submits the read, **parks** the
+faulting thread, and resumes it at the faulting instruction on completion, so the
+`#PF` handler never blocks) are built behind a **fill-producer seam** ("fill
+page-cache page for file F, offset X") so the fill mechanism is swappable.
+
+Slice 8 uses the **range-read fill (Model B)**: on a miss the kernel asks the
+fs-server for the *bytes* of a range (a new rsproto op), reusing the slice-7
+fs-server's `BlockReader`/ext4 reader; the kernel copies them into a page-cache page
+and maps it. This is the general fill (works for any fs-server, block-backed or not)
+and a small delta over slice 7. The **extent fill (Model A)** — fs-server returns
+LBA extents and the kernel reads blocks **zero-copy** into cache pages — is the
+optimized path for block filesystems and is deferred to Phase 3, where writeback
+forces the same extent machinery (see Phase 3 § "fs-server-ext4 read-write"). See the
+decision log (2026-06-25 — page-cache fill model).
+
+Built as ordered Parts (each independently provable), mirroring slice 7. The
+detailed contracts (`rsproto-file-ops.md`, the `FileObject` handle-encoding entry,
+the memory-management page-cache section) are written in their Parts, as in slice 7
+— not front-loaded. See the decision log (2026-06-25 — slice 8 fill model + scope).
+
+- [ ] **Part 1 — `FileObject` kobject + the page cache.** The new kobject (next free
+  type, **14**) holds `(fs-server endpoint, path suffix, size)` + a **sparse per-page
+  cache** (offset → frame + state: empty / loading / ready) behind a **fill-producer
+  seam** ("fill page-cache page for offset X"). Host-tested data structure + lifecycle
+  (frames freed on drop). No fault path yet.
+- [ ] **Part 2 — lazy `FileBacked` mmap + the async fault path** (the hard part).
+  `sys_memory_map` on a `FileObject` → a `FileBacked` VMA (no eager PTEs);
+  `MappingKind::FileBacked` gains its payload. `fault_in` (under the rank-4 AS lock)
+  returns `NeedFill { offset }` on a miss **without blocking**; `pf_dispatch` (a
+  blockable user-thread context) **drops the AS lock**, submits the fill, **blocks the
+  faulting thread** on the fill PO (SCHED is rank-1 → acquired outside the AS lock),
+  and **re-validates** `fault_in` on wake (the VMA may be gone on process exit) before
+  the instruction retries. Proven by a boot self-test with a **stub async producer** (a
+  `FileObject` whose fill completes via a timer DPC, so the thread genuinely parks +
+  resumes) — no fs-server/IPC, isolating the fault-path risk.
+- [ ] **Part 3 — the `File::ReadRange` op** (the Model-B fill protocol). A new `File`
+  rsproto category (`docs/spec/rsproto-file-ops.md`): `File::ReadRange(suffix, offset,
+  len) → bytes`. librsproto codec + the kernel mirror; the fault fill seam wired to a
+  real range-read IPC to the fs-server endpoint (reusing the slice-7 Part-3 forwarding
+  machinery), completing the fill PO inline-in-send.
+- [ ] **Part 4 — the fs-server side.** A `RESOLVE_FILE_LAZY` resolve mode → the reply
+  is a `FileObject`-class handle (the kernel builds the `FileObject`) instead of an
+  eager `MemoryObject`; serve `File::ReadRange` (suffix → `ext4` extent walk → read the
+  range → reply the bytes). **Stateless** — re-resolves the suffix per range, no
+  open-file table.
+- [ ] **Part 5 — disk + the milestone.** Add a **large (> 64 KiB) file** to the ext4
+  image (xtask); init maps it lazily, reads it across many faults, and logs a proof
+  (size + a rolling checksum / sampled bytes). The 64 KiB cap is gone; multi-page
+  demand faulting proven end to end. The existing `/system/current-generation` read
+  still works (now lazy).
+
+Deferred to Phase 3: the **Model A extent fill** (block-fs zero-copy fast path, added
+*alongside* `ReadRange` which stays the general fallback) + writeback (with
+fs-server-ext4 RW) — see Phase 3 § "fs-server-ext4 read-write".
 
 #### 9. Emergency shell
 
@@ -1413,10 +1467,27 @@ slices land (it can spawn fs-server-ext4, wait for Ready, and bind `/`).
 - [ ] Per-user namespace construction (overlay layers, subtree handles)
 - [ ] User shell spawn with constructed namespace
 
-#### fs-server-ext4 read-write
+#### fs-server-ext4 read-write + the extent page-cache data path (Model A)
 
+The v5.1 "pure" data path (`os-design-v5.1.md` § File-Backed Memory): the fs-server
+becomes a metadata / extent / block-allocation oracle that **never touches file
+data**, and the kernel owns the data path end to end. Writeback forces this — to
+flush a dirty page the kernel must know its LBAs, which *is* the extent map — so
+reads and writes share one extent-based path here, replacing slice 8's Model-B
+range-read fill with the **zero-copy extent fill** behind the page cache's
+fill-producer seam. (Model B stays the general fallback for non-block / network /
+transforming fs-servers, which have no LBA mapping.) See the decision log
+(2026-06-25 — page-cache fill model).
+
+- [ ] **Model A extent read fill**: a `File::MapExtents`-style rsproto op (the
+  fs-server returns LBA extents for a range, referencing the block device); the
+  kernel reads those blocks **zero-copy** into page-cache pages via its own internal
+  block-read path (`read_blocking`/IRP), with the device capability wired to the
+  kernel at mount. Slots into the slice-8 fill seam — no page-cache redesign.
 - [ ] Write path: block allocation, extent updates, journal interaction
-- [ ] Writeback from kernel page cache (dirty page flushing)
+- [ ] Writeback from kernel page cache (dirty page flushing) — the kernel writes
+  dirty pages to their LBAs via write IRPs; the fs-server allocates blocks but never
+  touches the page cache
 - [ ] Filesystem consistency on power loss (journal replay on mount)
 
 ### Milestone
