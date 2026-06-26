@@ -5392,3 +5392,46 @@ console would gate or retire the `parent` demo — a follow-up decision.
 **516**, libkern `image_id_round_trips` updated for `Eshell`. QEMU: a full interactive
 session over serial. Branch `phase-2/slice9-eshell-crate`. Next: Part 3 (`cat` +
 `HandleInfo.size`).
+
+## 2026-06-27 — Phase 2 slice 9, Part 3: `cat` + `HandleInfo.size` (+ retire the concurrent demo)
+
+eshell `cat`, and the file-**size discovery** it needs — closing the slice-8
+deferral. Plus a real bug the interactive shell exposed.
+
+**`HandleInfo.size`.** `HandleInfo` gains a `size: u64` (16 → 24 bytes; both the
+kernel `libkern/handle.rs` and the userspace `libkern/abi.rs` copy, layout asserts
+updated; **not** in the ABI hash). `stat_on` does one `INSPECT` lookup and reads the
+per-type byte size from the object — a `MemoryObject`'s page-rounded size, a
+`FileObject`'s exact file size — keeping the object-type logic in the syscall layer,
+not the type-agnostic handle table. The lazy resolve (`build_and_install_file`) now
+grants `INSPECT` alongside the requested rights (a generic right, benign on a file
+the client already maps) so a client can `stat` the size before mapping. This is the
+fix the slice-8 deferral named ("a `size` field on `HandleInfo`, first consumer eshell
+`cat`").
+
+**`cat`** (eshell): lookup (`MAP_READ | INSPECT`) → `sys_handle_stat` (size) →
+`sys_memory_map(size)` → write the bytes (a `FileObject` demand-faults its pages from
+the fs-server here — the slice-8 lazy page cache). Trailing NULs are trimmed (a
+`MemoryObject` snapshot's page-rounded size leaves padding past the content). Generic
+over any mappable, sized resource — so it reads both lazy files and eager memobjs
+(e.g. Part 5's `/dev/log`).
+
+**Decision — the `parent` demo now runs to completion *before* eshell, not
+concurrently.** The interactive shell exposed a real concurrency bug: `parent`'s demo
+chain and eshell both do disk I/O, and the AHCI driver is **single-outstanding-command**
+(Phase 2). Overlapping `parent`'s block reads with the fs-server's ext4 reads (driven
+by eshell `cat`) corrupted the fs-server's reads → intermittent `NotFound` on
+`cat /system/current-generation`. So init now spawns `parent`, waits for it to exit
+(in the reap loop), and *then* launches eshell — sequential, so eshell has the disk
+and console to itself. This both fixes the flakiness and gives a **clean console** (no
+demo output interleaving the prompt), resolving the Part-2 cosmetic follow-up. The
+underlying AHCI single-command limitation is recorded as deferred (proper IRP queuing
+/ NCQ — `deferred-decisions.md`).
+
+**Proof (QEMU).** After `parent` reaps, eshell launches on a clean console:
+`cat /system/current-generation` → `nitrox-rootfs generation 1` (reliably, twice),
+`help` / `lsblk` unaffected, boot clean.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**516** (HandleInfo layout/round-trip tests updated on both sides). Branch
+`phase-2/slice9-cat`. Next: Part 4 (`mounts` + `sys_ns_enumerate`).

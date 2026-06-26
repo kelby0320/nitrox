@@ -1398,9 +1398,13 @@ the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.
   backspace, CR/LF); `help` / `echo` / `lsblk`; `ImageId::Eshell = 4`; init spawns it
   as the persistent interactive console. **Proven by a scripted serial session** —
   real typed input through the Part-1 ISR path end to end.
-- [ ] **Part 3 — `cat` + `HandleInfo.size`**: add a `size` field to `HandleInfo` (via
-  `sys_handle_stat`), the lazy resolve grants `INSPECT`, and eshell `cat <path>`
-  (lookup → stat → map → print). Closes the slice-8 size-discovery deferral.
+- [x] **Part 3 — `cat` + `HandleInfo.size`** (`phase-2/slice9-cat`): added `size: u64`
+  to `HandleInfo` (kernel + libkern; `stat_on` reads the per-type size; the lazy resolve
+  grants `INSPECT`), and eshell `cat <path>` (lookup → stat → map → demand-fault → print,
+  NUL-trimmed). Closes the slice-8 size-discovery deferral. Also **retired the concurrent
+  `parent` demo**: it now runs to completion *before* eshell (the shared
+  single-outstanding-command disk was corrupting the fs-server's reads → flaky `cat`),
+  giving a clean console — resolving the Part-2 follow-up.
 - [ ] **Part 4 — `mounts` + `sys_ns_enumerate`**: a namespace-binding enumerate syscall
   (lists mount points + kernel resources, **not** fs `readdir`); eshell `mounts`.
 - [ ] **Part 5 — kernel log ring + `/dev/log`**: a `klog` ring (tee `kprint`) + a
@@ -1408,9 +1412,6 @@ the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.
   `dmesg` command).
 - [ ] **Part 6 — init failure → eshell**: implement the documented critical-path-failure
   drop to eshell.
-
-Open follow-up: the `parent` demo and eshell's prompt interleave on the shared console
-(cosmetic) — gate or retire the `parent` demo for a clean interactive console.
 
 #### 10. FAT for completeness (RO is fine for now)
 

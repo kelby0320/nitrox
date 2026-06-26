@@ -137,6 +137,7 @@ fn dispatch(line: &[u8], root_ns: u64) {
             kprint(b"\r\n");
         }
         b"lsblk" => cmd_lsblk(root_ns),
+        b"cat" => cmd_cat(root_ns, trim(args)),
         _ => {
             kprint(b"eshell: unknown command: ");
             kprint(cmd);
@@ -148,8 +149,68 @@ fn dispatch(line: &[u8], root_ns: u64) {
 fn cmd_help() {
     kprint(
         b"commands:\r\n  help          this list\r\n  echo <text>   print text\r\n  \
-          lsblk         list block devices\r\n",
+          lsblk         list block devices\r\n  cat <path>    print a file\r\n",
     );
+}
+
+/// Print a file (or any mappable, sized resource): resolve the path, `stat` it for
+/// its size, map it read-only, and write its bytes. A `FileObject` faults its pages
+/// in from the fs-server as they're read (the slice-8 lazy page cache).
+fn cmd_cat(root_ns: u64, path: &[u8]) {
+    if path.is_empty() {
+        kprint(b"cat: usage: cat <path>\r\n");
+        return;
+    }
+    // Need MAP_READ (map+read) and INSPECT (stat for the size).
+    let (st, h) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ | RIGHT_INSPECT);
+    if st != 0 || h == 0 {
+        kprint(b"cat: cannot open: ");
+        kprint(path);
+        kprint(b"\r\n");
+        return;
+    }
+    // Stat for the byte size (the slice-9 `HandleInfo.size`).
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `&mut info` is a valid 24-byte HandleInfo out-param.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, h, (&mut info as *mut HandleInfo) as u64) };
+    if sr < 0 {
+        kprint(b"cat: stat failed\r\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        return;
+    }
+    let size = info.size;
+    if size == 0 {
+        // SAFETY: closing our own handle (empty resource — nothing to print).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        return;
+    }
+    // Map read-only (the syscall rounds the length up to whole pages).
+    // SAFETY: `h` is a mappable resource handle with MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, h, 0, size, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"cat: map failed\r\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        return;
+    }
+    // Write the bytes (a FileObject demand-faults its pages here). Trim a
+    // zero-padded tail: a `MemoryObject`'s `size` is page-rounded, so a snapshot
+    // resource (e.g. an initramfs file) has trailing NULs past its content.
+    // SAFETY: `addr..addr+size` maps `size` valid bytes of the resource.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, size as usize) };
+    let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    if len > 0 {
+        kprint(&bytes[..len]);
+        if bytes[len - 1] != b'\n' {
+            kprint(b"\r\n"); // ensure the prompt starts on a fresh line
+        }
+    }
+    // SAFETY: unmap our mapping + close our handle (eshell runs forever — don't leak).
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+        syscall1(SYS_HANDLE_CLOSE, h);
+    }
 }
 
 /// List block devices by probing `/dev/blk/0..` until one is not found.

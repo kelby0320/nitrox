@@ -150,21 +150,26 @@ spin) — is deferred. Trigger: a multi-threaded process (or shared `FileObject`
 faults the same page concurrently. Until then the yield-retry is correct, just
 not elegant.
 
-**File-size discovery via `sys_handle_stat` (slice 8 Part 5).** A client holding a
-lazily-resolved `FileObject` handle has no way to ask its size: `sys_handle_stat`'s
-`HandleInfo` reports rights/type/generation only, and the lazy `Namespace::Resolve`
-consumes the file size (`content_len`) to build the `FileObject` rather than returning
-it to the client. The Part-5 milestone bridges this with a shared `LARGE_FILE_BYTES`
-constant between the xtask fixture generator and init's verifier (like the hardcoded
-`current-generation` path). The fix is to add a **`size` field to `HandleInfo`**,
-populated per-type in `stat_on` (`FileObject.size`, `MemoryObject.size`; `0`/sentinel
-otherwise) — the size is kernel-local metadata, so this is synchronous, no fs-server
-round-trip. `HandleInfo` is not in the ABI version hash, so the 16 → 24-byte growth is
-cheap; the lazy resolve must also grant `INSPECT` (it grants only `MAP_READ` today, and
-`stat` requires `INSPECT`). Deferred to its first real consumer — **eshell `cat`
-(slice 9)**, the first userspace reader that maps a file of unknown size. Not a `Stat`
-IoOpcode (none planned; `io_submit` targets block devices) nor the rsproto `File::Stat`
-(wrong layer for kernel-held metadata). See the decision log, 2026-06-26.
+**File-size discovery via `sys_handle_stat` — RESOLVED (slice 9 Part 3).** Slice 8
+deferred this: a client holding a lazily-resolved `FileObject` had no way to ask its
+size (`HandleInfo` reported only rights/type/generation, and the lazy resolve consumed
+`content_len`). **Done in slice 9 Part 3** (the named consumer, eshell `cat`):
+`HandleInfo` gained a `size: u64` (16 → 24 bytes, not in the ABI hash), `stat_on` reads
+the per-type size (`FileObject.size`, `MemoryObject.size`, else `0`), and the lazy
+resolve grants `INSPECT`. See the decision log, 2026-06-27. (The slice-8 large-file
+milestone's shared `LARGE_FILE_BYTES` constant remains as a now-unnecessary bridge; a
+future cleanup could switch init's verifier to `stat`.)
+
+**AHCI single-outstanding-command contention (slice 9 Part 3).** The AHCI driver runs
+**one command at a time** (Phase 2; `inflight: AtomicPtr<Irp>`). Two processes issuing
+disk reads concurrently (e.g. the demo `parent`'s block reads + the fs-server's ext4
+reads driven by eshell `cat`) race the single command slot and corrupt each other's
+reads. Slice 9 Part 3 sidesteps it by **sequencing** init's children (the demo runs to
+completion before eshell launches), so only one disk consumer is live. The proper fix —
+queue IRPs in the driver (a software command queue, or AHCI NCQ with multiple slots) so
+concurrent submissions serialise correctly instead of clobbering — is deferred to the
+storage hardening in Phase 3 (RW + writeback already pull on the driver). Trigger: any
+two processes doing concurrent block I/O.
 
 **Stateless `File::ReadRange` fill (slice 8 Part 3).** A page-cache fill names its
 file by re-sending the path `suffix` on every `ReadRange` (the same suffix the lazy
