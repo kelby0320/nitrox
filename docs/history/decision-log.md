@@ -4996,3 +4996,42 @@ code, so nothing is enforced, but record the impact. No layout change.
 frames, no-op mark, **drop frees frames no-leak**, dispatch_destroy arm). Branch
 `phase-2/slice8-file-object`. Next: Part 2 (the lazy `FileBacked` mmap + the async
 fault path — the hard part).
+
+## 2026-06-25 — Phase 2 slice 8, Part 2a: the FileBacked VMA + fault wiring
+
+**Decision — split Part 2.** Investigating the async fault path confirmed it is sound
+but intricate, so Part 2 is split: **2a** (this entry) is the mechanical, fully
+host-testable half — the lazy mapping + the fault *signal* + installing a resident
+page — and **2b** is the scary async half (block the faulting thread on the fill,
+proven with a stub). Splitting isolates 2b for a focused review.
+
+- **`sys_memory_map` now branches on object type.** It looks the handle up
+  generically (a non-mappable type lacks the `MAP_*` right and fails the lookup),
+  then: a `MemoryObject` maps eagerly (`map_object`); a `FileObject` maps **lazily**
+  (`map_file` — a `MappingKind::FileBacked` VMA holding the object, **no PTEs**).
+- **`fault_in` does not touch the file cache.** Its FileBacked arm returns the unit
+  signal `FaultIn::FileBacked` (renamed from the `NoPageCache` stub). The decisive
+  reason: the `FileObject`'s cache lock is **rank 4, the same as the AS lock**, and the
+  two must never nest. So `fault_in` only signals; the caller fetches the backing and
+  fills **outside** the AS lock. `FaultIn` stays an all-unit, `Eq` enum (the fill data
+  is fetched separately), so the existing fault tests are unchanged.
+- **Two helper entry points, each a fresh AS-lock acquisition** (never nested with the
+  cache lock): `file_backing(addr) → (FileObject ref, page index)` (the index is
+  `(page_base − vma.start)/PAGE`; the mapping covers the file from offset 0), and
+  `map_file_page(addr, &object, frame) → bool` — install the leaf PTE for a now-
+  resident cache frame, **re-validating** under the lock that a FileBacked VMA for the
+  *same* object still covers `addr` (the fault may have raced an unmap while it blocked
+  in 2b). A racing `AlreadyMapped` counts as success (the page is present). The frame
+  is owned by the `FileObject`, so `unmap` removes the PTE without freeing it (the
+  existing `free_vma_pages` FileBacked arm already does this).
+
+**Reachability.** Nothing constructs a FileBacked VMA in QEMU yet (a `FileObject` only
+comes from a lazy resolve — Part 4), and a file fault is still fatal until 2b wires the
+fill — so 2a is host-tested-but-unreachable infrastructure, exactly like the
+demand-paging prereq that added the stubbed `FileBacked` variant. No ABI change.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**511** (+5 `addr_space` file-backed tests: lazy-no-PTEs, fault signal + `file_backing`
+index, `map_file_page` installs/idempotent, rejects wrong-object/unmapped, unmap keeps
+the object's frames). Branch `phase-2/slice8-fault-path`. Next: Part 2b (the async fill
++ block-on-fault + the stub proof).

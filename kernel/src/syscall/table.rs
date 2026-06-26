@@ -38,9 +38,9 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 use crate::object::kernel_server::{self, OpStatus};
 use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, validate_path};
 use crate::object::{
-    BlockSendOutcome, EntropyObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject, Namespace,
-    NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend, RecvState,
-    SendOutcome, StoredMsg, Timer as TimerObject, TransferRef, UserspaceServerReg,
+    BlockSendOutcome, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject,
+    Namespace, NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend,
+    RecvState, SendOutcome, StoredMsg, Timer as TimerObject, TransferRef, UserspaceServerReg,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -740,14 +740,29 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
     let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
     let asp = current_address_space(&proc_ref).ok_or(KError::KernelError)?;
 
-    let ok = lookup_typed(obj_h, pid, required, KObjectType::MemoryObject)?;
-    // SAFETY: `object_type` confirms a live `MemoryObject`; `lookup` pinned it.
-    // The borrow is from a raw pointer, so it does not block moving `ok.object`
-    // into `map_object` below (it is unused after `size()` is read).
-    let mobj = unsafe { &*(ok.object.as_ptr() as *const MemoryObject) };
+    // A mappable handle is either an (eager) `MemoryObject` or a (lazy, demand-
+    // paged) `FileObject`; both accept the `MAP_*` rights band. Look the handle up
+    // generically — a non-mappable type lacks the `MAP_*` right `required`, so it
+    // fails here — then branch on the object type for the size cap + the mapping.
+    let ok = global::get()
+        .lookup(RawHandle(obj_h), pid, required)
+        .map_err(map_handle_err)?;
+    let obj_ty = ok.object.object_type();
+    // The object's mappable extent in bytes (page-rounded). The size requested
+    // must not exceed it.
+    let max_bytes = match obj_ty {
+        // SAFETY: type-confirmed live object pinned by `lookup`; read its size.
+        KObjectType::MemoryObject => unsafe { &*(ok.object.as_ptr() as *const MemoryObject) }.size(),
+        KObjectType::FileObject => {
+            unsafe { &*(ok.object.as_ptr() as *const FileObject) }.npages() * PAGE_SIZE
+        }
+        // Not a mappable object (and it should not have reached here without a
+        // `MAP_*` right, which only Memory/File objects carry).
+        _ => return Err(KError::InvalidHandle),
+    };
 
     let size = round_up_page(size);
-    if size == 0 || size as usize > mobj.size() {
+    if size == 0 || size as usize > max_bytes {
         return Err(KError::InvalidArgument);
     }
 
@@ -775,11 +790,19 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
         prot = prot | Protection::EXEC;
     }
 
-    // Move the looked-up reference into the mapping. `map_object` installs only
-    // `range.pages()` PTEs; `size <= obj.size()` guarantees enough frames.
-    match asp.map_object(range, prot, ok.object) {
+    // Move the looked-up reference into the mapping. A `MemoryObject` maps eagerly
+    // (`map_object` installs `range.pages()` PTEs against the object's frames); a
+    // `FileObject` maps **lazily** (`map_file` reserves the range with no PTEs —
+    // `fault_in` pages each in from the file's cache on first touch).
+    let result = match obj_ty {
+        KObjectType::FileObject => asp.map_file(range, prot, ok.object),
+        // MemoryObject (the only other type that reached here).
+        _ => asp.map_object(range, prot, ok.object),
+    };
+    match result {
         Ok(()) => {
-            // The calling process's AS is active; make the new PTEs visible.
+            // The calling process's AS is active; make any new PTEs visible. (For a
+            // FileBacked map there are none yet, but flushing is harmless + uniform.)
             // SAFETY: ring-0 TLB flush; reloads the active root with itself.
             unsafe { Paging::flush_tlb_all() };
             Ok(range.start().as_u64() as isize)
