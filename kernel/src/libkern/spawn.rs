@@ -42,6 +42,9 @@ pub enum ImageId {
     /// The ext4 filesystem server (`userspace/fs-server-ext4`); spawned by init
     /// (slice 7). The first userspace resource server.
     FsServerExt4 = 3,
+    /// The emergency shell (`userspace/eshell`); spawned by init (slice 9) as the
+    /// interactive console and on critical-path failure.
+    Eshell = 4,
 }
 
 impl ImageId {
@@ -52,6 +55,7 @@ impl ImageId {
             1 => Some(Self::Init),
             2 => Some(Self::Parent),
             3 => Some(Self::FsServerExt4),
+            4 => Some(Self::Eshell),
             _ => None,
         }
     }
@@ -118,10 +122,12 @@ mod tests {
         assert_eq!(ImageId::from_u32(1), Some(ImageId::Init));
         assert_eq!(ImageId::from_u32(2), Some(ImageId::Parent));
         assert_eq!(ImageId::from_u32(3), Some(ImageId::FsServerExt4));
-        assert_eq!(ImageId::from_u32(4), None);
+        assert_eq!(ImageId::from_u32(4), Some(ImageId::Eshell));
+        assert_eq!(ImageId::from_u32(5), None);
         assert_eq!(ImageId::Child as u32, 0);
         assert_eq!(ImageId::Init as u32, 1);
         assert_eq!(ImageId::Parent as u32, 2);
         assert_eq!(ImageId::FsServerExt4 as u32, 3);
+        assert_eq!(ImageId::Eshell as u32, 4);
     }
 }

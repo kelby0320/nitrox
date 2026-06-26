@@ -10,6 +10,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "eshell"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
 name = "fs-server-ext4"
 version = "0.1.0"
 dependencies = [

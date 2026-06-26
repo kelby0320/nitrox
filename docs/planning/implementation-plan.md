@@ -1375,15 +1375,42 @@ Deferred to Phase 3: the **Model A extent fill** (block-fs zero-copy fast path, 
 *alongside* `ReadRange` which stays the general fallback) + writeback (with
 fs-server-ext4 RW) — see Phase 3 § "fs-server-ext4 read-write".
 
-#### 9. Emergency shell
+#### 9. Emergency shell — `eshell` + the first user input
 
-Floats after init (slice 4); its read-kernel-log feature depends on `/dev/log`
-(slice 3).
+The first **interactivity**: a serial command shell + the **keyboard/serial input**
+subsystem behind it. Input is read through the **universal device interface**
+(`sys_io_submit` + `sys_wait`) — the console is a char-class `DeviceNode`, not a
+console-specific syscall. **Deferred** (decided with the user): `reboot` (needs an
+`ArchPower` interface) and `edit` (needs filesystem write + an editor); the userspace
+console/tty server (cooked line discipline) layers on the raw char device later. See
+the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.md`
+(`console_arm_rx`) + `docs/spec/io-operation.md` (the char read path).
 
-- [ ] `userspace/eshell/` crate
-- [ ] Minimal command interface over serial console
-- [ ] Inspect mounts, list block devices, read kernel log, edit initramfs files, reboot
-- [ ] Init invokes eshell on critical-path failure
+- [x] **Part 1 — console input subsystem (kernel)** (`phase-2/slice9-eshell`, PR #78):
+  interrupt-driven COM1 RX driver (`drivers/console.rs`: ring + parked-read slot +
+  ISR→DPC), `DeviceClass::Char` + `CharBackend`, the `sys_io_submit` char branch (a
+  stream read completing a PO), `/dev/console` (`KernelServerId::Console`). `install_isa_irq`
+  kept arch-internal; the console arms RX via the neutral `arch::serial::console_arm_rx`.
+  Proven by a boot loopback self-test.
+- [x] **Part 2 — the eshell crate + line editor + interactive launch**
+  (`phase-2/slice9-eshell-crate`, PR #79): `userspace/eshell` (new, `no_std`+no-alloc,
+  libkern only); a line editor over `/dev/console` via `io_submit`+`wait` (echo,
+  backspace, CR/LF); `help` / `echo` / `lsblk`; `ImageId::Eshell = 4`; init spawns it
+  as the persistent interactive console. **Proven by a scripted serial session** —
+  real typed input through the Part-1 ISR path end to end.
+- [ ] **Part 3 — `cat` + `HandleInfo.size`**: add a `size` field to `HandleInfo` (via
+  `sys_handle_stat`), the lazy resolve grants `INSPECT`, and eshell `cat <path>`
+  (lookup → stat → map → print). Closes the slice-8 size-discovery deferral.
+- [ ] **Part 4 — `mounts` + `sys_ns_enumerate`**: a namespace-binding enumerate syscall
+  (lists mount points + kernel resources, **not** fs `readdir`); eshell `mounts`.
+- [ ] **Part 5 — kernel log ring + `/dev/log`**: a `klog` ring (tee `kprint`) + a
+  `/dev/log` resource (a `MemoryObject` snapshot). Read with `cat /dev/log` (no bespoke
+  `dmesg` command).
+- [ ] **Part 6 — init failure → eshell**: implement the documented critical-path-failure
+  drop to eshell.
+
+Open follow-up: the `parent` demo and eshell's prompt interleave on the shared console
+(cosmetic) — gate or retire the `parent` demo for a clean interactive console.
 
 #### 10. FAT for completeness (RO is fine for now)
 

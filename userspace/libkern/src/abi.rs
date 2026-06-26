@@ -24,6 +24,9 @@ pub const IMAGE_PARENT: u32 = 2;
 /// `ImageId::FsServerExt4` — the ext4 filesystem server (`userspace/fs-server-ext4`),
 /// kernel-embedded; spawned by init (slice 7).
 pub const IMAGE_FS_SERVER_EXT4: u32 = 3;
+/// `ImageId::Eshell` — the emergency shell (`userspace/eshell`), kernel-embedded;
+/// spawned by init (slice 9).
+pub const IMAGE_ESHELL: u32 = 4;
 
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]
