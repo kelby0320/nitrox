@@ -4859,3 +4859,100 @@ end to end: a userspace process reads a file from an on-disk ext4 filesystem,
 served by another userspace process, reached transparently through the namespace
 with the kernel forwarding the lookup and installing the result cross-context — no
 filesystem code in the kernel.
+
+## 2026-06-25 — Phase 2 slice 8 design: page-cache fill model (Model B now, Model A → Phase 3)
+
+Docs-only. Scoping slice 8 (the page cache). The v5.1 design specifies the
+**extent** data path (the fs-server returns LBA extents; the kernel reads blocks into
+page-cache pages; the fs-server never touches file data — call it **Model A**).
+Slice 7's interim model has the fs-server read the whole file (≤ 64 KiB) and return
+a populated `MemoryObject`.
+
+**Key realization — the fork is only the page-fill leaf.** The page cache, the lazy
+`FileBacked` VMA, the lazy `sys_memory_map`, and the async fault path are *identical*
+no matter how a missing page is filled — both candidates end at "fill page-cache page
+for file F, offset X." So slice 8 builds those behind a **fill-producer seam**, and
+the A-vs-B choice is just which fill to implement (and is swappable later).
+
+**The two fills.**
+- **Model A (extent):** the fs-server returns LBA extents; the kernel reads blocks
+  **zero-copy** straight into cache pages (DMA target = cache page = client page);
+  faults stay in-kernel (no per-fault userspace round-trip); the block layer sees
+  disk layout (merge / readahead). Block-filesystems only — it assumes "file =
+  sequence of device LBAs."
+- **Model B (range-read):** the fs-server reads the bytes itself (its slice-7
+  `sys_io_submit` path) and returns them; the kernel copies into a cache page. Costs
+  +1 copy and an IPC round-trip per miss, but works for **any** fs-server (network /
+  synthetic / transforming filesystems have no LBA map) and is a tiny delta over the
+  slice-7 fs-server.
+
+Note both models trust the fs-server's **device handle** equally — a compromised
+fs-server can read any block on its device either way (mis-return bytes in B, or
+mis-direct the kernel to wrong LBAs in A). v5.1's "fs-server never holds mappable
+memory" is about keeping it out of the *memory-manager* role, not data secrecy.
+
+**Decision — Model B for slice 8; Model A deferred to Phase 3.** Model A is the
+correct long-term **primary** for block filesystems (zero-copy, in-kernel faults,
+I/O-scheduling visibility, and — decisively — writeback symmetry: Phase-3 RW *forces*
+the extent machinery, since the kernel must know a dirty page's LBAs to flush it). It
+is **not** dropped. But it is not exclusive: Model B is the necessary general fallback
+for non-block fs-servers, and a mature OS keeps both (cf. Linux `iomap`/direct-I/O vs
+`readpage`/`readahead`). For slice 8, Model B de-risks the genuinely-hard part (the
+async fault path) with a trivial fill, reuses the fs-server we just built, and ships
+the slice milestone (lazy reads + the 64 KiB cap lift).
+
+**Placement of Model A — Phase 3, with `fs-server-ext4` read-write.** Writeback
+already needs the extent machinery (kernel-knows-LBAs) and the write path already
+needs extent updates, so the extent infrastructure gets built there for writes
+regardless; converting reads to it (Model A) is then a small, symmetric addition.
+And no Phase-2 milestone consumes Model A's performance, so building it in Phase 2
+would be a producer-less optimization — against the project's discipline (the
+`FileBacked` variant itself was added stubbed for exactly this reason). The slice-8
+page cache must keep the fill-producer seam clean so Model A slots in without a
+redesign. Implementation-plan slice 8 + Phase-3 § "fs-server-ext4 read-write" updated;
+no code yet.
+
+## 2026-06-25 — Phase 2 slice 8 scope: FileObject, stateless ReadRange, the async fault path
+
+Builds on the fill-model entry above. The slice-8 build decisions, settled in scoping:
+
+- **A new `FileObject` kobject** (next free type, **14**) for a mapped file —
+  deliberately distinct from `MemoryObject`. The line is *who owns the frames and when
+  they appear*: `MemoryObject` is anonymous/shared RAM the kernel commits **eagerly**
+  (buffers, shared memory, IPC-transfer/DMA targets — used broadly); `FileObject` is a
+  file's content **paged in on demand** from a producer, frames owned by the page
+  cache. Both map, but `sys_memory_map` branches: `MemoryObject` → an `Object` VMA
+  (frames present), `FileObject` → a `FileBacked` VMA (lazy). `FileObject` holds
+  `(fs-server endpoint, path suffix, size)` + a sparse per-page cache. Resolve returns
+  a `FileObject` **universally** (every file map is lazy, like Linux), retiring the
+  eager `MemoryObject` fill and the 64 KiB cap.
+- **Stateless fill protocol — `File::ReadRange(suffix, offset, len) → bytes`** (a new
+  `File` rsproto category). The `FileObject` re-sends the suffix per fault; the
+  fs-server re-resolves suffix→inode (cacheable) and reads the range — **no open-file
+  table, no close op, no lifecycle**. A stateful `file_id` handle is a later
+  optimization (tracked in `deferred-decisions.md`).
+- **`File::ReadRange` is not throwaway when Model A lands.** Model A (Phase 3) *adds*
+  `File::MapExtents` (return LBA extents; kernel reads blocks zero-copy) as the
+  block-fs fast path **alongside** `ReadRange`, which **survives as the general
+  fallback** for non-block / network / transforming fs-servers (no extents to hand
+  back). The `FileObject`, page cache, lazy VMA, and async fault path are all reused —
+  Model A swaps only the fill leaf — so slice-8 Model-B work is the general data path,
+  not a detour.
+- **The async fault path** (the hard part): `fault_in` (under the rank-4 AS lock)
+  returns `NeedFill` on a `FileBacked` miss **without blocking**; `pf_dispatch` (a
+  blockable user-thread context — a ring-3 fault holds no kernel locks) **drops the AS
+  lock**, submits the fill, **blocks the faulting thread** on the fill PO exactly as
+  `sys_wait` does (SCHED is rank-1, so it must be acquired *outside* the rank-4 AS
+  lock — blocking while holding it would invert the order), and **re-validates**
+  `fault_in` on wake (the VMA may have been torn down on process exit) before the
+  instruction retries. Not host-testable (needs a live thread + scheduler + a real
+  fault); verified by a boot self-test with a stub *async* producer (timer-DPC fill) so
+  the thread genuinely parks + resumes.
+- **Per-file cache, no eviction** in slice 8 (grows to the mapped extent; freed on
+  unmap / `FileObject` drop). Global inode-keyed sharing + the clock-reclaim daemon are
+  deferred (`deferred-decisions.md`).
+
+Built as five Parts (implementation plan). Detailed contracts
+(`rsproto-file-ops.md`, the `FileObject` handle-encoding entry, the
+memory-management page-cache section) are written in their respective Parts, as in
+slice 7. No code yet.

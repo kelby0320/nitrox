@@ -139,6 +139,23 @@ read self-test brings up against the existing AHCI boot disk; the dedicated
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
 
+**Page-cache scope (slice 8).** The first file page cache (slice 8, the **Model-B**
+range-read fill — see the decision log, 2026-06-25) is deliberately minimal on three
+axes. **(1) Per-file, not global.** Each `FileObject` owns a sparse page table; two
+processes that independently resolve the same path get separate caches. Global,
+inode-keyed sharing (one physical page shared across every mapping of a file) needs a
+stable file identity the fs-server exposes and is deferred — trigger: a workload that
+maps the same file hot from many processes. **(2) No eviction/reclaim.** The cache
+grows to the mapped extent and is freed only on unmap / `FileObject` drop; the
+clock-algorithm reclaim daemon + `Notification::MemoryPressure` is Phase 3+ — trigger:
+caches that can grow past comfortable bounds (large files, many mappings). **(3)
+Stateless fill protocol.** `File::ReadRange(suffix, …)` re-sends the path suffix per
+range and the fs-server re-resolves suffix→inode each time (cacheable internally); a
+stateful `file_id` / open-file table + a `close` op is a later optimization — trigger:
+per-fault re-resolution showing up in profiles. The page cache is built behind a
+**fill-producer seam** so the **Model-A** extent fill (Phase 3, zero-copy block reads)
+slots in *alongside* `ReadRange` without a redesign.
+
 **Forwarded-lookup concurrency (N = 1).** A Userspace Server's
 `UserspaceServerReg` (slice 7 Part 3) holds a single pending-lookup slot: one
 forwarded `sys_ns_lookup` per server may be outstanding; a second returns
