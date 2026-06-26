@@ -83,6 +83,20 @@ static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
     rights: [0; 4],
     namespace: 0,
 };
+/// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
+/// inherit a LOOKUP-only handle to init's root namespace (so it resolves
+/// `/dev/console` for input and `/dev/blk/*` for `lsblk`). It runs as the
+/// persistent interactive console.
+static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
+    image: IMAGE_ESHELL,
+    handle_count: 0,
+    move_mask: 0,
+    _pad: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+};
 
 /// Resolve `path` in namespace `ns` requesting `rights`, wait the PO, and return
 /// `(status, resolved_handle)` (`IoResult`: status at bytes 8..12, handle 16..24).
@@ -466,6 +480,18 @@ fn supervise(notif: u64) -> ! {
     if parent_h < 0 {
         kprint(b"init: parent spawn FAIL\n");
         parent_h = 0;
+    }
+
+    // Spawn the interactive emergency shell as the persistent serial console. It
+    // runs forever (no reaping needed); init keeps no handle to it.
+    kprint(b"init: starting interactive console (eshell)\n");
+    // SAFETY: SPAWN_ESHELL is a valid writable arg block.
+    let eshell_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_ESHELL) as u64) };
+    if eshell_h < 0 {
+        kprint(b"init: eshell spawn FAIL\n");
+    } else {
+        // SAFETY: closing init's reference; eshell runs independently.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, eshell_h as u64) };
     }
 
     kprint(b"init: entering reaping loop\n");

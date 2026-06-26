@@ -134,6 +134,7 @@ fn cmd_build() -> R<()> {
     build_userspace_bin("child")?;
     build_userspace_bin("init")?;
     build_userspace_bin("fs-server-ext4")?;
+    build_userspace_bin("eshell")?;
 
     let kernel_dir = repo_root().join("kernel");
     run(Command::new("cargo").arg("build").current_dir(&kernel_dir))?;

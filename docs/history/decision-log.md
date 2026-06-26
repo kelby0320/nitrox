@@ -5348,3 +5348,47 @@ input). Boot stays clean (AHCI, current-generation, large.bin all still pass, no
 **516** (`DeviceClass::Char` added to the round-trip test; the driver + io_submit char
 path are QEMU-proven, like AHCI, not host-tested). Branch `phase-2/slice9-eshell`.
 Next: Part 2 (the eshell crate + line editor + interactive launch).
+
+## 2026-06-27 — Phase 2 slice 9, Part 2: the eshell crate + the first interactive shell
+
+**The first interactive userspace program** — a serial command shell, proving the
+Part-1 console-input path end to end with real typed input.
+
+**The crate** (`userspace/eshell`, a new workspace member): bin-only, bare target,
+mirroring `userspace/parent`'s build (`.cargo/config.toml` static/non-PIE,
+`build.rs` → `user.ld`). `#![no_std]` + `#![no_main]`, **no `alloc`** (fixed `.bss`
+buffers — a 128-byte line buffer, a one-page read buffer), **`libkern` only** (no
+rsproto/libos/librt) — the init family's rules. `ImageId::Eshell = 4` (+ `from_u32`,
+the `IMAGE_ESHELL` libkern mirror, the embedded ELF, the xtask build step).
+
+**I/O is the universal path.** eshell reads input by looking up `/dev/console`
+through its **inherited root namespace** and looping `sys_io_submit(console, {Read,
+buf, 256})` → `sys_wait(po)` → process the raw bytes (echo, backspace, CR/LF → end
+of line) → dispatch. Output is `sys_kprint`. Commands: `help`, `echo`, `lsblk`
+(probes `/dev/blk/0..` until `NotFound`).
+
+**Decision — eshell resolves `/dev/console` itself, not handed by init.** The plan
+had init pass the console handle via spawn; instead eshell looks it up through the
+inherited namespace (which already grants the `/dev/console` binding). Simpler, more
+capability-clean (no handle threading), and matches how `parent` resolves `/dev/blk`
+etc. So init's spawn is minimal: `SPAWN_ESHELL` with `handle_count = 0`,
+`namespace = 0` (inherit). init spawns it in `supervise` after `parent`, as the
+persistent interactive console (it never exits; init keeps no handle).
+
+**Proof (QEMU, scripted serial input).** `-serial stdio` is bidirectional, so piping
+CR-terminated commands to the QEMU process stdin (after a delay so eshell is ready)
+drives real input: COM1 RX IRQ → the Part-1 ISR → ring → eshell's `io_submit` read
+completes. The captured session shows the prompt, echoed input, and correct output
+for `help` / `echo hello-from-eshell` / `lsblk` (→ `/dev/blk/0,1,2`) / an unknown
+command. The Part-1 ISR→ring→PO path is now proven with real input; the slice-8
+milestones and console self-test still pass, no faults.
+
+**Note — parent demo / eshell console interleaving (cosmetic).** init still spawns
+the Phase-1/2 `parent` demo (regression value); its output and eshell's prompt
+interleave on the shared serial console. Functionally fine; a clean interactive
+console would gate or retire the `parent` demo — a follow-up decision.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**516**, libkern `image_id_round_trips` updated for `Eshell`. QEMU: a full interactive
+session over serial. Branch `phase-2/slice9-eshell-crate`. Next: Part 3 (`cat` +
+`HandleInfo.size`).

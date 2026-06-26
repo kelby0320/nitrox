@@ -33,6 +33,11 @@ static PARENT_ELF: &[u8] =
 static FS_SERVER_EXT4_ELF: &[u8] =
     include_bytes!("../../userspace/target/x86_64-unknown-none/release/fs-server-ext4");
 
+/// The emergency shell (`userspace/eshell`), built by `xtask` before the kernel.
+/// Spawned by init (slice 9) as the interactive console and on critical-path failure.
+static ESHELL_ELF: &[u8] =
+    include_bytes!("../../userspace/target/x86_64-unknown-none/release/eshell");
+
 /// The embedded ELF bytes for an [`ImageId`].
 pub fn image_bytes(image: ImageId) -> &'static [u8] {
     match image {
@@ -40,5 +45,6 @@ pub fn image_bytes(image: ImageId) -> &'static [u8] {
         ImageId::Init => INIT_ELF,
         ImageId::Parent => PARENT_ELF,
         ImageId::FsServerExt4 => FS_SERVER_EXT4_ELF,
+        ImageId::Eshell => ESHELL_ELF,
     }
 }
