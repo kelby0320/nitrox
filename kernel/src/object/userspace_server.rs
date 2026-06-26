@@ -43,8 +43,17 @@ use core::cell::UnsafeCell;
 
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::{AllocError, KBox};
+use crate::mm::PhysAddr;
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
+
+/// Largest lookup suffix a [`PendingLookup`] stores inline (so a lazy `File`
+/// resolve can name the file in its page-cache producer without allocating under
+/// `SCHED`). A longer suffix is recorded with its true `suffix_len` but a
+/// truncated buffer — harmless for an eager `MEMOBJ` reply (the suffix is unused),
+/// but a `FILE` reply for such a path fails `TooLarge` (see the completion path).
+/// 256 bytes covers every milestone path; a heap-backed suffix is a later concern.
+pub const LOOKUP_SUFFIX_MAX: usize = 256;
 
 /// One outstanding forwarded lookup: everything needed to complete its
 /// `PendingOperation` when the server's reply arrives. Moved out of the table by
@@ -63,14 +72,60 @@ pub struct PendingLookup {
     /// The `Rights` the lookup requested; the installed handle's rights are
     /// `requested ∩ (the rights the server granted on the transferred object)`.
     pub(crate) requested: Rights,
+    /// The lookup's path suffix, stored inline (`suffix[..suffix_len.min(MAX)]`).
+    /// A `FILE` reply uses it to name the file in the page-cache producer; an eager
+    /// `MEMOBJ` reply ignores it. `suffix_len` is the *true* length even if it
+    /// exceeds [`LOOKUP_SUFFIX_MAX`] (then the buffer is truncated and a `FILE`
+    /// reply fails `TooLarge`).
+    pub(crate) suffix: [u8; LOOKUP_SUFFIX_MAX],
+    pub(crate) suffix_len: u16,
+}
+
+impl PendingLookup {
+    /// The stored suffix bytes, or `None` if the true length overran
+    /// [`LOOKUP_SUFFIX_MAX`] (the inline buffer is then incomplete — a `FILE` reply
+    /// for it cannot recover the path).
+    pub(crate) fn suffix(&self) -> Option<&[u8]> {
+        let n = self.suffix_len as usize;
+        if n > LOOKUP_SUFFIX_MAX {
+            None
+        } else {
+            Some(&self.suffix[..n])
+        }
+    }
+}
+
+/// One outstanding forwarded **page-cache fill** (`File::ReadRange`): everything the
+/// reply needs to land the page and wake the faulting thread. Parallels
+/// [`PendingLookup`] but for the fill seam — the kernel originates the range-read
+/// when a `FileObject` page faults, parks the faulter on `po`, and the reply copies
+/// the bytes into `frame`, marks the page ready, and completes `po`. Moved out by
+/// [`take_pending_fill_matching`](UserspaceServerReg::take_pending_fill_matching);
+/// its `po` / `file_obj` are dropped by the caller **outside** `SCHED`.
+pub struct PendingFill {
+    /// The `request_id` stamped on the `ReadRange` request; the reply echoes it.
+    pub(crate) request_id: u64,
+    /// The fill's `PendingOperation` (the faulting thread blocks on it).
+    pub(crate) po: ObjectRef,
+    /// The `FileObject` being filled (pins it; the reply marks its page ready).
+    pub(crate) file_obj: ObjectRef,
+    /// The cache frame to copy the replied bytes into.
+    pub(crate) frame: PhysAddr,
+    /// The page index within the file.
+    pub(crate) index: usize,
 }
 
 struct Inner {
     /// The kernel's IPC endpoint; its peer is the endpoint the server services.
     endpoint: ObjectRef,
-    /// The single outstanding forwarded lookup (slice 7 N = 1), or `None` when idle.
+    /// The single outstanding forwarded lookup (N = 1), or `None` when idle.
     pending: Option<PendingLookup>,
-    /// Monotonic `request_id` stamp.
+    /// The single outstanding forwarded page-cache fill (N = 1), or `None`. Separate
+    /// from `pending` — a lookup and a fill correlate by distinct `request_id`s and
+    /// route by reply op; the milestone never overlaps them, but the slots are
+    /// independent so it would be correct if it did.
+    pending_fill: Option<PendingFill>,
+    /// Monotonic `request_id` stamp (shared across lookups and fills).
     next_id: u64,
 }
 
@@ -105,7 +160,12 @@ impl UserspaceServerReg {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::UserspaceServerReg),
             magic: Self::MAGIC,
-            inner: UnsafeCell::new(Inner { endpoint, pending: None, next_id: 1 }),
+            inner: UnsafeCell::new(Inner {
+                endpoint,
+                pending: None,
+                pending_fill: None,
+                next_id: 1,
+            }),
         })
     }
 
@@ -155,6 +215,7 @@ impl UserspaceServerReg {
         po: &ObjectRef,
         owner_pid: u32,
         requested: Rights,
+        suffix: &[u8],
     ) -> Option<u64> {
         let inner = unsafe { Self::inner(reg) };
         if inner.pending.is_some() {
@@ -162,13 +223,79 @@ impl UserspaceServerReg {
         }
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
+        // Copy the suffix inline (a memcpy, no allocation — sound under `SCHED`);
+        // record the *true* length so an overrun is detectable later.
+        let mut sbuf = [0u8; LOOKUP_SUFFIX_MAX];
+        let n = suffix.len().min(LOOKUP_SUFFIX_MAX);
+        sbuf[..n].copy_from_slice(&suffix[..n]);
         inner.pending = Some(PendingLookup {
             request_id,
             po: po.clone(),
             owner_pid,
             requested,
+            suffix: sbuf,
+            suffix_len: suffix.len() as u16,
         });
         Some(request_id)
+    }
+
+    /// Reserve the (single) pending-**fill** slot for a new forwarded
+    /// `File::ReadRange`, assigning and returning its `request_id`; `None` if a fill
+    /// is already outstanding (N = 1). Stores clones of `po` and `file_obj` (atomic
+    /// bumps, sound under `SCHED`) so the reply can land the page even if the
+    /// faulting thread's references changed.
+    ///
+    /// # Safety
+    /// See the accessor contract above; `po` / `file_obj` reference live objects.
+    pub(crate) unsafe fn begin_fill(
+        reg: *mut (),
+        po: &ObjectRef,
+        file_obj: &ObjectRef,
+        frame: PhysAddr,
+        index: usize,
+    ) -> Option<u64> {
+        let inner = unsafe { Self::inner(reg) };
+        if inner.pending_fill.is_some() {
+            return None; // already busy (N = 1)
+        }
+        let request_id = inner.next_id;
+        inner.next_id = inner.next_id.wrapping_add(1);
+        inner.pending_fill = Some(PendingFill {
+            request_id,
+            po: po.clone(),
+            file_obj: file_obj.clone(),
+            frame,
+            index,
+        });
+        Some(request_id)
+    }
+
+    /// Take the outstanding pending fill **iff** its `request_id` matches (a
+    /// `ReadRange` reply's echoed id); `None` on a mismatch or an empty slot. The
+    /// returned [`PendingFill`]'s `po` / `file_obj` are dropped by the caller
+    /// **outside** `SCHED`.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn take_pending_fill_matching(
+        reg: *mut (),
+        request_id: u64,
+    ) -> Option<PendingFill> {
+        let inner = unsafe { Self::inner(reg) };
+        match &inner.pending_fill {
+            Some(p) if p.request_id == request_id => inner.pending_fill.take(),
+            _ => None,
+        }
+    }
+
+    /// Take the outstanding pending fill unconditionally (origination rollback /
+    /// dead-peer fail). `None` if empty. The returned references drop **outside**
+    /// `SCHED`.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn take_pending_fill_any(reg: *mut ()) -> Option<PendingFill> {
+        unsafe { Self::inner(reg) }.pending_fill.take()
     }
 
     /// Take the outstanding pending lookup **iff** its `request_id` matches
@@ -203,8 +330,9 @@ impl UserspaceServerReg {
 // No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock)
 // drops `inner` → the owned `endpoint` `ObjectRef` (releasing the kernel endpoint,
 // whose `IpcChannel::drop` unlinks its peer under `SCHED` — sound because this
-// runs outside `SCHED`) and any pending `po`. A lookup still pending at teardown
-// simply never completes (the binding is going away — typically with its client).
+// runs outside `SCHED`), any pending lookup `po`, and any pending fill's `po` /
+// `file_obj`. A lookup or fill still pending at teardown simply never completes
+// (the binding is going away — typically with its client).
 
 #[cfg(test)]
 mod tests {
@@ -258,16 +386,16 @@ mod tests {
         let r = reg();
         let po = make_po();
         // First begin succeeds with an id.
-        let id0 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ) };
+        let id0 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(id0, Some(1));
         // Second begin while one is outstanding → busy (N = 1).
-        let id1 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ) };
+        let id1 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(id1, None);
         // Take it; the next begin gets the next id.
         let taken = unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) };
         assert_eq!(taken.as_ref().map(|p| p.request_id), Some(1));
         drop(taken);
-        let id2 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 9, Rights::MAP_READ) };
+        let id2 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 9, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(id2, Some(2));
         // Clean up the outstanding entry before dropping.
         drop(unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) });
@@ -280,7 +408,7 @@ mod tests {
         init_global_heap();
         let r = reg();
         let po = make_po();
-        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 7, Rights::MAP_READ) }.unwrap();
+        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 7, Rights::MAP_READ, b"sys/gen") }.unwrap();
         // A mismatched id leaves the entry in place.
         assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id ^ 0xFF) }.is_none());
         // The matching id takes it, carrying the recorded fields.
@@ -291,6 +419,64 @@ mod tests {
         // Now empty: a second take (matching or not) is None.
         assert!(unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), id) }.is_none());
         drop(taken);
+        drop(po);
+        drop(r);
+    }
+
+    /// A `FileObject` adopted into an `ObjectRef` (the form a `PendingFill` holds).
+    fn file_obj() -> ObjectRef {
+        use crate::object::{FileObject, Producer};
+        let f = FileObject::try_new(4096, Producer::Stub { base: 0 }).unwrap();
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject)
+        }
+    }
+
+    #[test]
+    fn begin_records_the_lookup_suffix() {
+        init_global_heap();
+        let r = reg();
+        let po = make_po();
+        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 3, Rights::MAP_READ, b"a/b/c") };
+        let taken = unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) }.unwrap();
+        assert_eq!(taken.suffix(), Some(&b"a/b/c"[..]));
+        drop(taken);
+        drop(po);
+        drop(r);
+    }
+
+    #[test]
+    fn fill_slot_is_independent_and_correlates_by_id() {
+        init_global_heap();
+        let r = reg();
+        let po = make_po();
+        let fo = file_obj();
+        let frame = PhysAddr::new(0x5000);
+        // A lookup and a fill can coexist (separate slots, shared id counter).
+        let lid = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"x") }
+            .unwrap();
+        let fid =
+            unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
+        assert_ne!(lid, fid); // distinct request ids
+        // A second fill while one is outstanding → busy (N = 1).
+        assert!(unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 3) }.is_none());
+        // A mismatched id leaves the fill in place; the matching id takes it.
+        assert!(
+            unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid ^ 0xFF) }
+                .is_none()
+        );
+        let pf =
+            unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid) }.unwrap();
+        assert_eq!(pf.request_id, fid);
+        assert_eq!(pf.frame, frame);
+        assert_eq!(pf.index, 2);
+        // The lookup slot is untouched by fill operations.
+        let pl = unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) }.unwrap();
+        assert_eq!(pl.request_id, lid);
+        drop(pf);
+        drop(pl);
+        drop(fo);
         drop(po);
         drop(r);
     }
@@ -318,7 +504,7 @@ mod tests {
         let r = reg();
         let po = make_po();
         // Leave a lookup outstanding, then drop the registration.
-        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ) };
+        unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"sys/gen") };
         assert_eq!(test_probe::pending_op_destroys(), 0);
         drop(r); // releases the pending entry's PO clone
         assert_eq!(test_probe::pending_op_destroys(), 0, "creation ref still held by `po`");

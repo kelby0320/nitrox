@@ -64,7 +64,7 @@ use crate::object::{
     ObjectRef, PendingOperation, ReclaimedSend, RecvState, SendOutcome, StoredMsg, Thread,
     ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
-use crate::object::userspace_server::PendingLookup;
+use crate::object::userspace_server::{PendingFill, PendingLookup};
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -863,12 +863,14 @@ pub fn us_forward_originate(
     po: &ObjectRef,
     owner_pid: u32,
     requested: Rights,
+    suffix: &[u8],
 ) -> ForwardOutcome {
     let mut g = SCHED.lock();
     // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
     // held. Reserve the pending slot + assign a request id (None ⇒ already busy).
-    let request_id = match unsafe { UserspaceServerReg::begin(reg, po, owner_pid, requested) } {
-        Some(id) => id,
+    let request_id =
+        match unsafe { UserspaceServerReg::begin(reg, po, owner_pid, requested, suffix) } {
+            Some(id) => id,
         None => return ForwardOutcome::Busy,
     };
     // Stamp the assigned id into the request envelope (the body was built by the
@@ -903,6 +905,77 @@ pub fn us_forward_originate(
             }
         }
     }
+}
+
+/// Originate a forwarded page-cache **fill**: the page-fault sibling of
+/// [`us_forward_originate`]. Under one `SCHED` hold, reserve the registration's
+/// (single) pending-fill slot — recording the fill `po` / `file_obj` / `frame` /
+/// page `index` and assigning a `request_id` — stamp that id into the already-built
+/// `File::ReadRange` request `msg`, and push it into the server's inbox. The fill
+/// PO is left **uncompleted** (the server's `ReadRange` reply completes it inline in
+/// its send — see [`us_forward_take_pending_fill`]). On `Busy` nothing is reserved;
+/// on `Full` / `PeerClosed` the reserved slot is rolled back and its references
+/// dropped outside `SCHED`. `reg` is the [`UserspaceServerReg`] the faulted
+/// `FileObject`'s producer points at; the caller pins it (and `po` / `file_obj`).
+pub fn us_forward_originate_fill(
+    reg: *mut (),
+    msg: &mut StoredMsg,
+    po: &ObjectRef,
+    file_obj: &ObjectRef,
+    frame: crate::mm::PhysAddr,
+    index: usize,
+) -> ForwardOutcome {
+    let mut g = SCHED.lock();
+    // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED`
+    // held. Reserve the pending-fill slot + assign a request id (None ⇒ busy).
+    let request_id =
+        match unsafe { UserspaceServerReg::begin_fill(reg, po, file_obj, frame, index) } {
+            Some(id) => id,
+            None => return ForwardOutcome::Busy,
+        };
+    crate::rsproto::stamp_request_id(&mut msg.payload, request_id);
+    // SAFETY: `reg` live, `SCHED` held — the kernel endpoint is pinned by `reg`.
+    let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
+    let mut no_transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    // SAFETY: `endpoint` is the registration's live kernel endpoint; `SCHED` held.
+    let outcome = unsafe { IpcChannel::send_push(endpoint, msg, &mut no_transfers) };
+    match outcome {
+        SendOutcome::Sent { woke_edge } => {
+            if woke_edge {
+                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
+                let peer = unsafe { IpcChannel::peer_of(endpoint) };
+                if !peer.is_null() {
+                    signal_ipc_endpoint(&mut g, peer);
+                }
+            }
+            ForwardOutcome::Pending
+        }
+        SendOutcome::Full | SendOutcome::PeerClosed => {
+            // Roll back; drop the fill's `po` / `file_obj` clones **outside** `SCHED`.
+            // SAFETY: `reg` live, `SCHED` held.
+            let pf = unsafe { UserspaceServerReg::take_pending_fill_any(reg) };
+            drop(g);
+            drop(pf);
+            if outcome == SendOutcome::Full {
+                ForwardOutcome::Full
+            } else {
+                ForwardOutcome::PeerClosed
+            }
+        }
+    }
+}
+
+/// Take the forwarded **fill** outstanding on `reg` whose `request_id` matches a
+/// `File::ReadRange` reply's, for the caller to land (copy the bytes into the
+/// frame, mark the page ready, complete the PO). `None` if it does not correlate
+/// (duplicate / stale). Takes `SCHED`; the returned [`PendingFill`]'s `po` /
+/// `file_obj` are dropped by the caller **outside** `SCHED`. The caller pins `reg`
+/// (via the send's endpoint peer, valid for the call).
+pub fn us_forward_take_pending_fill(reg: *mut (), request_id: u64) -> Option<PendingFill> {
+    let _g = SCHED.lock();
+    // SAFETY: `reg` is a live registration (pinned through the live peer endpoint);
+    // `SCHED` held.
+    unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) }
 }
 
 /// If a send on `send_endpoint` targets the kernel's end of a Userspace Server

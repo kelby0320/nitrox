@@ -5140,3 +5140,53 @@ milestone.
 **514** (+3 ReadRange codec tests), librsproto `file::` round-trips green. No QEMU
 (pure codec). Branch `phase-2/slice8-readrange`. Next: Part 4 (the kernel send-side +
 the fs-server, end to end).
+
+## 2026-06-26 — Phase 2 slice 8, Part 4a: the kernel send-side + lazy-resolve plumbing (dormant)
+
+The kernel half of the real Model-B fill: build the page-cache object on a lazy
+resolve and fill its pages over IPC. Split out from the fs-server half (4b) so each
+is independently reviewable.
+
+**Decision — split Part 4 into 4a (kernel) + 4b (fs-server) around faulter-vs-filler.**
+A page fault blocks the faulting thread, so only the fs-server can serve a fill —
+the kernel send-side can't be QEMU-proven without it. Rather than build throwaway
+two-process scaffolding, 4a lands the kernel machinery in a **dormant, runtime-safe**
+state and 4b activates + proves it. 4a flips the kernel to request `RESOLVE_FILE_LAZY`,
+but the **unchanged fs-server ignores the flag and still replies `MEMOBJ`**, so boot
+stays on the eager slice-7 path (the kernel handles both reply kinds permanently).
+QEMU regression confirms: the eager milestone and the Part-2b stub demo both still
+work, no faults.
+
+**The machinery.** (1) `FileObject` gains `Producer::FsServer { reg, suffix }` (the
+field Part 1 reserved) — it pins the server's `UserspaceServerReg` and names the file;
+`start_fill` builds a `File::ReadRange` for the faulted page's byte range and
+originates it over the forwarding endpoint, leaving the fault parked (the reply
+completes it). (2) `UserspaceServerReg` gains a second N=1 slot, `pending_fill`
+(`PendingFill { po, file_obj, frame, index }`), independent of the lookup slot and
+correlated by its own `request_id`; `PendingLookup` gains the lookup's **suffix**
+stored **inline** (`[u8; 256]`, not a `KString` — `begin` runs under `SCHED`, where
+heap alloc/free is a lock-order violation; a memcpy is not), so a `FILE` reply can
+name the file. (3) `sched::us_forward_originate_fill` / `us_forward_take_pending_fill`
+mirror the lookup originate/take. (4) The reply-completion path now **routes by op**
+(`rsproto::reply_op`): a `Resolve` reply runs `complete_resolve_reply` — and on
+`OBJECT_KIND_FILE` *builds a `FileObject`* (no transferred handle; `content_len` is
+the file size; producer points back at the reg + suffix) and installs it instead of a
+`MemoryObject`; a `ReadRange` reply runs `complete_read_range_reply` — copies the
+transferred ≤1-page `MemoryObject` into the cache frame (zeroed tail stays padding),
+marks the page ready, completes the fill PO.
+
+**Decision — the fill is stateless; the suffix lives kernel-side.** The fill re-sends
+the path `suffix` on every `ReadRange` (stored on the `FsServer` producer at build
+time, copied from the lookup's inline suffix), so no server-side open-file cookie is
+needed (deferred — see `deferred-decisions.md`). A suffix longer than the 256-byte
+inline buffer is recorded with its true length but a truncated buffer: an eager
+`MEMOBJ` reply (suffix unused) is unaffected, but a `FILE` reply for such a path fails
+`TooLarge` — no milestone path is near the cap; a heap-backed suffix is a later
+concern.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**516** (+2: `begin_records_the_lookup_suffix`, `fill_slot_is_independent_and_correlates_by_id`).
+QEMU regression clean (eager milestone + stub demo both work, no `#DF`/panic). Branch
+`phase-2/slice8-fill-integration`. Next: Part 4b (the fs-server serves
+`RESOLVE_FILE_LAZY` + `File::ReadRange`; the lazy path activates and is proven by the
+milestone going lazy — retiring the Part-2b stub fixture).

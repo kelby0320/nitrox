@@ -18,8 +18,10 @@
 //! fill (asynchronous), and **parks the faulting thread** on the fill's
 //! `PendingOperation` until it completes — called from the `#PF` handler *after* the
 //! address-space lock is released, so it blocks without holding any AS/cache lock.
-//! Slice 8 ships only the self-test [`Producer::Stub`]; the real `FsServer` producer
-//! (an IPC range-read) is Part 3.
+//! The real producer is [`Producer::FsServer`]: it sends a `File::ReadRange` over the
+//! resource server's forwarding endpoint, and the reply (landed by the kernel's
+//! reply-completion path) copies the bytes into the frame, marks it ready, and
+//! completes the fill PO. [`Producer::Stub`] is a self-test producer for host tests.
 //!
 //! ## Mutation discipline
 //!
@@ -35,21 +37,28 @@ use core::ptr::NonNull;
 
 use crate::dpc::Dpc;
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, KVec, SpinLock};
+use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::KObjectHeader;
-use crate::object::{ObjectRef, PendingOperation};
+use crate::object::{ObjectRef, PendingOperation, StoredMsg};
 
 /// How a [`FileObject`] **fills** a cache page on a fault — the producer behind the
-/// page cache's fill seam. Slice 8 ships only the self-test [`Stub`](Producer::Stub);
-/// the real fs-server producer (`FsServer { endpoint, suffix }`, an IPC range-read)
-/// lands in Part 3.
+/// page cache's fill seam. The real producer is [`FsServer`](Producer::FsServer)
+/// (an IPC `File::ReadRange` to the resource server); [`Stub`](Producer::Stub) is a
+/// self-test producer retained for host tests.
 pub enum Producer {
     /// Self-test producer: fills page `i` with the byte `base + i`, **asynchronously**
     /// — it enqueues a DPC (drained at the next interrupt-dispatch tail) so the
-    /// faulting thread genuinely parks and resumes. Backs the page-cache fault
-    /// self-test fixture; no fs-server / IPC.
+    /// faulting thread genuinely parks and resumes. No fs-server / IPC.
     Stub { base: u8 },
+    /// The real producer: fill a page by sending a `File::ReadRange` over the
+    /// resource server's forwarding endpoint (the same [`UserspaceServerReg`] the
+    /// namespace binding uses) and copying the replied bytes into the cache frame.
+    /// `reg` pins the registration (so it outlives the file); `suffix` names the
+    /// file under the mount (the fill is stateless — re-sent on every range).
+    ///
+    /// [`UserspaceServerReg`]: crate::object::UserspaceServerReg
+    FsServer { reg: ObjectRef, suffix: KString },
 }
 
 /// Fill state of a cached page.
@@ -287,9 +296,52 @@ impl FileObject {
         frame: PhysAddr,
         po: &ObjectRef,
     ) -> bool {
-        match self.producer {
-            Producer::Stub { base } => stub_start_fill(file_obj, index, frame, po, base),
+        match &self.producer {
+            Producer::Stub { base } => stub_start_fill(file_obj, index, frame, po, *base),
+            Producer::FsServer { reg, suffix } => {
+                self.fs_server_start_fill(file_obj, index, frame, po, reg, suffix)
+            }
         }
+    }
+
+    /// Start a real fs-server fill: send a `File::ReadRange` for page `index`'s byte
+    /// range over the server's forwarding endpoint (`reg`) and leave the fill
+    /// **pending** — the `ReadRange` reply (in the server's send) copies the bytes
+    /// into `frame`, marks the page ready, and completes `po` (waking the parked
+    /// faulter). `false` if the request could not be built/sent (the caller rolls
+    /// the page back). The range is `[index·PAGE, min(PAGE, size − offset))`; a
+    /// short tail at end-of-file leaves the rest of the (zeroed) frame as padding.
+    fn fs_server_start_fill(
+        &self,
+        file_obj: &ObjectRef,
+        index: usize,
+        frame: PhysAddr,
+        po: &ObjectRef,
+        reg: &ObjectRef,
+        suffix: &KString,
+    ) -> bool {
+        let offset = (index * PAGE_SIZE) as u64;
+        let remaining = self.size.saturating_sub(index * PAGE_SIZE);
+        let len = remaining.min(PAGE_SIZE) as u32;
+        // Build the ReadRange request in a heap-bounced message (4 KiB — never on
+        // the kernel stack), exactly as the forwarded lookup does.
+        let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
+            Ok(m) => m,
+            Err(_) => return false,
+        };
+        let body_len =
+            match crate::rsproto::build_read_range_request(&mut msg.payload, offset, len, suffix.as_bytes()) {
+                Some(n) => n,
+                None => return false,
+            };
+        msg.header.payload_len = body_len as u32;
+        msg.header.handle_count = 0;
+        // Originate: records the pending fill on `reg` and pushes the request. The
+        // reply completes `po`; `Busy`/`Full`/`PeerClosed` fail this fault.
+        matches!(
+            crate::sched::us_forward_originate_fill(reg.as_ptr(), &mut msg, po, file_obj, frame, index),
+            crate::sched::ForwardOutcome::Pending
+        )
     }
 }
 
