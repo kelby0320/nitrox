@@ -91,8 +91,11 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
 /// the total byte length, or `None` if `out` is too small or `suffix` is longer
 /// than `u16::MAX`. The `request_id` is written as `0`; the caller stamps the real
 /// id with [`stamp_request_id`] once it has been assigned. `requested_rights` is
-/// the lookup's requested `Rights` bits; `RESOLVE_FILE_AS_MEMOBJ` is always set
-/// (the only Phase-2 mode). `handle_count = 0` (the request carries no handles).
+/// the lookup's requested `Rights` bits; `RESOLVE_FILE_LAZY` is always set (slice 8
+/// — files resolve to a demand-filled page-cache object). A server that does not
+/// honour the flag replies the eager `OBJECT_KIND_MEMOBJ` instead, which the kernel
+/// still installs (the slice-7 path); a server that does honour it replies
+/// `OBJECT_KIND_FILE`. `handle_count = 0` (the request carries no handles).
 pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;
@@ -114,7 +117,7 @@ pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8
     // Body: ResolveRequest.
     let b = RS_HEADER_LEN;
     put_u64(out, b, requested_rights);
-    put_u32(out, b + 8, RESOLVE_FILE_AS_MEMOBJ);
+    put_u32(out, b + 8, RESOLVE_FILE_LAZY);
     put_u16(out, b + 12, suffix.len() as u16);
     put_u16(out, b + 14, 0); // _reserved
     out[b + RESOLVE_REQUEST_PREFIX_LEN..total].copy_from_slice(suffix);
@@ -328,7 +331,7 @@ mod tests {
         // Body.
         let b = RS_HEADER_LEN;
         assert_eq!(get_u64(&buf, b), 0x8000); // requested_rights
-        assert_eq!(get_u32(&buf, b + 8), RESOLVE_FILE_AS_MEMOBJ);
+        assert_eq!(get_u32(&buf, b + 8), RESOLVE_FILE_LAZY);
         assert_eq!(get_u16(&buf, b + 12), 25); // suffix_len
         assert_eq!(&buf[b + 16..n], b"system/current-generation");
     }

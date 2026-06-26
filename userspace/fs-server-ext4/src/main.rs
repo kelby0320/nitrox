@@ -29,7 +29,7 @@
 #![no_main]
 
 use core::arch::asm;
-use fs_server_ext4::serve::{Served, encode_error, serve_resolve};
+use fs_server_ext4::serve::{Served, encode_error, serve};
 use fs_server_ext4::{BlockReader, FsError, ext4};
 use libkern::*;
 
@@ -353,6 +353,7 @@ fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
         // SAFETY: `payload_len` is bounded to the payload region; the three slices
         // address disjoint statics, so no aliasing `&`/`&mut` is formed.
         let request_id;
+        let served_op;
         let served = unsafe {
             let payload_len = u32::from_le_bytes([
                 RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7],
@@ -370,14 +371,17 @@ fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
                 ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
                 MSG_LEN - PAYLOAD_OFF,
             );
-            serve_resolve(reader, req, content, reply)
+            let op = librsproto::decode(req).map(|m| m.op).unwrap_or(0);
+            served_op = op;
+            serve(reader, req, content, reply)
         };
 
         let count = match served {
             Served::File { reply_len, content_len } => match make_content_memobj(content_len) {
                 Some(mem) => stage_reply(reply_len, Some(mem)),
-                // Resolved the file but couldn't materialise the object (OOM):
-                // turn the reply into an error so the lookup completes cleanly.
+                // Resolved the file but couldn't materialise the object (OOM): turn
+                // the reply into an error (carrying the request's op so the kernel
+                // routes it to the right pending operation) so it completes cleanly.
                 None => {
                     // SAFETY: disjoint static; reply region as above.
                     let elen = unsafe {
@@ -385,11 +389,13 @@ fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
                             ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
                             MSG_LEN - PAYLOAD_OFF,
                         );
-                        encode_error(reply, request_id, KError::OutOfMemory.as_i32())
+                        encode_error(reply, request_id, KError::OutOfMemory.as_i32(), served_op)
                     };
                     stage_reply(elen, None)
                 }
             },
+            // A lazy resolve: a complete reply, no transferred handle.
+            Served::Lazy { reply_len } => stage_reply(reply_len, None),
             Served::Error { reply_len } => stage_reply(reply_len, None),
         };
         send_reply(serve_end, count);

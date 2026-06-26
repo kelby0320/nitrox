@@ -187,16 +187,15 @@ fn resolve_path<R: BlockReader>(
     Ok(inode)
 }
 
-/// Resolve `path` (absolute) to a **regular file** and read its content into
-/// `out`, returning the file size. The file's content occupies `out[..size]`;
-/// the caller (the fs-server) sizes its `MemoryObject` to `size`. Errors:
-/// `NotFound` (missing path / not a regular file), `Unsupported` (non-extent or
-/// inline-data inode), `TooLarge` (file > [`MAX_FILE`] or > `out`), `Corrupt` /
-/// `Io`.
-pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
-    let sb = read_superblock(r)?;
-    let inode = resolve_path(r, &sb, path)?;
-
+/// Resolve `path` (absolute) to a **regular extent file**, returning its inode
+/// bytes and exact size. Errors: `NotFound` (missing path / not a regular file),
+/// `Unsupported` (non-extent or inline-data inode), `Corrupt` / `Io`.
+fn resolve_regular_file<R: BlockReader>(
+    r: &R,
+    sb: &Superblock,
+    path: &[u8],
+) -> Result<([u8; 256], usize), FsError> {
+    let inode = resolve_path(r, sb, path)?;
     if rd_u16(&inode, 0) & S_IFMT != S_IFREG {
         return Err(FsError::NotFound);
     }
@@ -206,6 +205,66 @@ pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<u
     }
     let size_hi = if sb.inode_size > 128 { rd_u32(&inode, 108) as u64 } else { 0 };
     let size = ((rd_u32(&inode, 4) as u64) | (size_hi << 32)) as usize;
+    Ok((inode, size))
+}
+
+/// Resolve `path` (absolute) to a regular file and return its **size** without
+/// reading any content — the size the kernel's lazy resolve needs to build the
+/// page-cache object. No [`MAX_FILE`] cap (lazy faulting handles large files).
+/// Errors as [`resolve_regular_file`].
+pub fn stat_file<R: BlockReader>(r: &R, path: &[u8]) -> Result<usize, FsError> {
+    let sb = read_superblock(r)?;
+    let (_, size) = resolve_regular_file(r, &sb, path)?;
+    Ok(size)
+}
+
+/// Read the byte range `[offset, offset + len)` of the regular file at `path` into
+/// `out`, returning the number of bytes read — the page-cache fill (`File::ReadRange`)
+/// primitive. The range is clamped to the file size and `out.len()`; a request past
+/// end-of-file returns `0`. No [`MAX_FILE`] cap (the caller bounds `len` to a page).
+/// Sparse holes read as zero. Errors as [`resolve_regular_file`] / `Io` / `Corrupt`.
+pub fn read_file_range<R: BlockReader>(
+    r: &R,
+    path: &[u8],
+    offset: u64,
+    len: usize,
+    out: &mut [u8],
+) -> Result<usize, FsError> {
+    let sb = read_superblock(r)?;
+    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    if offset >= size as u64 {
+        return Ok(0);
+    }
+    let avail = (size as u64 - offset) as usize;
+    let want = len.min(avail).min(out.len());
+    let bs = sb.block_size as usize;
+    let mut buf = [0u8; MAX_BLOCK];
+    let mut done = 0;
+    while done < want {
+        let pos = offset as usize + done; // absolute file byte position
+        let lb = (pos / bs) as u64; // logical block
+        let in_block = pos % bs; // byte offset within that block
+        let n = (bs - in_block).min(want - done);
+        let phys = extent_find(r, &sb, &inode[40..100], lb)?;
+        if phys == 0 {
+            out[done..done + n].fill(0); // sparse hole
+        } else {
+            r.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+            out[done..done + n].copy_from_slice(&buf[in_block..in_block + n]);
+        }
+        done += n;
+    }
+    Ok(want)
+}
+
+/// Resolve `path` (absolute) to a **regular file** and read its content into
+/// `out`, returning the file size. The file's content occupies `out[..size]`;
+/// the caller (the fs-server) sizes its `MemoryObject` to `size`. The eager
+/// slice-7 path — kept for an `AS_MEMOBJ` resolve. Errors: as
+/// [`resolve_regular_file`], plus `TooLarge` (file > [`MAX_FILE`] or > `out`).
+pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<usize, FsError> {
+    let sb = read_superblock(r)?;
+    let (inode, size) = resolve_regular_file(r, &sb, path)?;
     if size > MAX_FILE || size > out.len() {
         return Err(FsError::TooLarge);
     }

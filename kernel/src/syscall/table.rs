@@ -1319,8 +1319,11 @@ fn forward_userspace_lookup(
     msg.header.payload_len = body_len as u32;
     msg.header.handle_count = 0;
 
-    // Originate (assigns the request id, records the pending lookup, sends).
-    match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested) {
+    // Originate (assigns the request id, records the pending lookup + its suffix,
+    // sends). The suffix is stored so a lazy `FILE` reply can name the file in the
+    // page-cache producer.
+    match crate::sched::us_forward_originate(reg.as_ptr(), &mut msg, po_ref, pid, requested, suffix)
+    {
         crate::sched::ForwardOutcome::Pending => None,
         crate::sched::ForwardOutcome::Busy | crate::sched::ForwardOutcome::Full => {
             Some((KError::WouldBlock as i32, 0))
@@ -1791,17 +1794,13 @@ pub fn sys_channel_send(
     }
 }
 
-/// Complete a forwarded-lookup **reply** inline in the server's `sys_channel_send`
-/// (the [`us_forward_reg_for_send`](crate::sched::us_forward_reg_for_send) path):
-/// parse the rsproto reply, correlate it to the registration's pending lookup, and
-/// deliver its outcome through that lookup's `PendingOperation` — installing the
-/// transferred `MemoryObject` into the **original caller's** table (rights =
-/// `requested ∩ the rights the server granted`) on success, or completing the PO
-/// with the reply's `KError` on failure. The server's transferred handles are
-/// closed (the move is committed) and the send reports success (`Ok(0)`) — the
-/// reply was consumed. A reply that does not parse or does not correlate (a
-/// duplicate / stale reply) is dropped: its transfers are released and the sender's
-/// handles still closed (the capability is consumed), but no PO is touched.
+/// Complete a forwarded **reply** inline in the server's `sys_channel_send` (the
+/// [`us_forward_reg_for_send`](crate::sched::us_forward_reg_for_send) path). The
+/// kernel forwards two request kinds on a Userspace Server endpoint — a
+/// `Namespace::Resolve` (a lookup) and a `File::ReadRange` (a page-cache fill) — so
+/// this routes the reply by its op to the matching completion. A reply whose op is
+/// neither (or that is too short to read an op) is consumed: its transfers drop on
+/// return and the sender's handles are closed (the capability is consumed).
 ///
 /// `bounce` is the copied reply message; `transfers` its in-flight transferred
 /// references (`transfers[i]` ↔ the sender handle `h_raw[i]`, `count` of them);
@@ -1815,32 +1814,66 @@ fn complete_forwarded_reply(
     count: usize,
     pid: u32,
 ) -> SysResult {
-    use crate::rsproto::{OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply};
+    let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
+    match crate::rsproto::reply_op(&bounce.payload[..payload_len]) {
+        Some(crate::rsproto::RESOLVE_OP) => {
+            complete_resolve_reply(reg, bounce, transfers, h_raw, count, pid, payload_len)
+        }
+        Some(crate::rsproto::READ_RANGE_OP) => {
+            complete_read_range_reply(reg, bounce, transfers, h_raw, count, pid, payload_len)
+        }
+        // Not a reply we forwarded (or unreadable): consume it.
+        _ => {
+            for i in 0..count {
+                close_and_release(RawHandle(h_raw[i]), pid);
+            }
+            Ok(0)
+        }
+    }
+}
+
+/// Complete a forwarded `Namespace::Resolve` reply: correlate it to the
+/// registration's pending lookup and deliver its outcome through that lookup's
+/// `PendingOperation`. An `OBJECT_KIND_MEMOBJ` reply installs the transferred
+/// `MemoryObject` into the **original caller's** table (rights = `requested ∩ the
+/// rights the server granted`); an `OBJECT_KIND_FILE` reply builds a lazy
+/// [`FileObject`] page-cache object (no transferred handle — `content_len` is the
+/// file size) pointed back at this server and installs *that*; an error/other kind
+/// completes the PO with a `KError`. A reply that does not correlate (duplicate /
+/// stale) is dropped, its transfers released and the sender's handles closed.
+fn complete_resolve_reply(
+    reg: *mut (),
+    bounce: &StoredMsg,
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    h_raw: &[u64; IPC_HANDLE_MAX],
+    count: usize,
+    pid: u32,
+    payload_len: usize,
+) -> SysResult {
+    use crate::rsproto::{OBJECT_KIND_FILE, OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply};
 
     // Parse the reply (recovers the `request_id` even on a malformed body).
-    let payload_len = (bounce.header.payload_len as usize).min(IPC_PAYLOAD_SIZE);
     let reply = parse_reply(&bounce.payload[..payload_len]);
-
-    // Correlate to the outstanding lookup. A reply that doesn't parse, isn't a
-    // reply, or doesn't match the pending `request_id` has no lookup to complete.
     let pl = match reply {
         Some(r) => crate::sched::us_forward_take_pending(reg, r.request_id),
         None => None,
     };
     let Some(pl) = pl else {
-        // Unmatched / stale: drop any transfers (on return) and close the sender's
-        // handles — the reply is consumed regardless.
         for i in 0..count {
             close_and_release(RawHandle(h_raw[i]), pid);
         }
         return Ok(0);
     };
-    // `pl` was taken only when `reply` parsed.
     let reply = reply.expect("pending taken ⇒ reply parsed");
 
     let (status, result): (i32, u64) = match reply.kind {
         ReplyKind::Error { kerror } => (kerror, 0),
         ReplyKind::Malformed => (KError::KernelError as i32, 0),
+        // A lazy file: build the page-cache object (no transferred handle) and
+        // install it. `content_len` is the total file size.
+        ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
+            build_and_install_file(reg, &pl, content_len)
+        }
         ReplyKind::Success { object_kind, .. } if object_kind != OBJECT_KIND_MEMOBJ => {
             (KError::Unsupported as i32, 0)
         }
@@ -1877,6 +1910,147 @@ fn complete_forwarded_reply(
         close_and_release(RawHandle(h_raw[i]), pid);
     }
     Ok(0)
+}
+
+/// Build a lazy [`FileObject`] for an `OBJECT_KIND_FILE` resolve reply and install
+/// it into the caller's table; returns the `(status, handle)` the lookup PO
+/// completes with. The object's producer points back at this registration (`reg`)
+/// and names the file by the lookup's stored suffix, so a later page fault fills it
+/// via `File::ReadRange`. Fails `TooLarge` if the suffix overran the inline buffer
+/// (the path can't be recovered), or `OutOfMemory` on allocation failure.
+fn build_and_install_file(
+    reg: *mut (),
+    pl: &crate::object::userspace_server::PendingLookup,
+    content_len: u32,
+) -> (i32, u64) {
+    use crate::libkern::KString;
+    use crate::object::{FileObject, Producer};
+
+    let Some(suffix) = pl.suffix() else {
+        return (KError::TooLarge as i32, 0);
+    };
+    let Ok(s) = core::str::from_utf8(suffix) else {
+        return (KError::InvalidArgument as i32, 0);
+    };
+    let kstr = match KString::try_from_str(s) {
+        Ok(k) => k,
+        Err(_) => return (KError::OutOfMemory as i32, 0),
+    };
+    // Pin the registration in the producer (so it outlives the file). The reg is
+    // live — we reached it through the send's endpoint peer.
+    // SAFETY: `reg` addresses the live `UserspaceServerReg` for this send.
+    let reg_ref = match unsafe {
+        ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg)
+    } {
+        Some(r) => r,
+        None => return (KError::KernelError as i32, 0),
+    };
+    let fobj = match FileObject::try_new(
+        content_len as usize,
+        Producer::FsServer { reg: reg_ref, suffix: kstr },
+    ) {
+        Ok(f) => f,
+        Err(_) => return (KError::OutOfMemory as i32, 0),
+    };
+    // SAFETY: `into_raw` yields the single creation reference; adopt it.
+    let fref = unsafe {
+        ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject)
+    };
+    let (op, ot) = fref.into_raw();
+    match global::get().allocate(pl.owner_pid, op, ot, pl.requested) {
+        Ok(h) => (0, h.bits()),
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it.
+            drop(unsafe { ObjectRef::from_raw(op, ot) });
+            (map_handle_err(e) as i32, 0)
+        }
+    }
+}
+
+/// Complete a forwarded `File::ReadRange` reply: correlate it to the registration's
+/// pending fill, copy the replied bytes (a transferred ≤1-page `MemoryObject`) into
+/// the cache frame, mark the page ready, and complete the fill PO (waking the parked
+/// faulter). An error/malformed reply completes the PO with a `KError` (failing the
+/// fault). A reply that does not correlate is dropped (transfers released, handles
+/// closed).
+fn complete_read_range_reply(
+    reg: *mut (),
+    bounce: &StoredMsg,
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+    h_raw: &[u64; IPC_HANDLE_MAX],
+    count: usize,
+    pid: u32,
+    payload_len: usize,
+) -> SysResult {
+    use crate::rsproto::{RangeReplyKind, parse_read_range_reply};
+
+    let reply = parse_read_range_reply(&bounce.payload[..payload_len]);
+    let pf = match reply {
+        Some(r) => crate::sched::us_forward_take_pending_fill(reg, r.request_id),
+        None => None,
+    };
+    let Some(pf) = pf else {
+        for i in 0..count {
+            close_and_release(RawHandle(h_raw[i]), pid);
+        }
+        return Ok(0);
+    };
+    let reply = reply.expect("pending taken ⇒ reply parsed");
+
+    let status: i32 = match reply.kind {
+        RangeReplyKind::Error { kerror } => kerror,
+        RangeReplyKind::Malformed => KError::KernelError as i32,
+        RangeReplyKind::Success { content_len } => match transfers[0].take() {
+            None => KError::InvalidArgument as i32, // success but no bytes
+            Some(tr) if tr.obj.object_type() != KObjectType::MemoryObject => {
+                drop(tr.obj);
+                KError::Unsupported as i32
+            }
+            Some(tr) => {
+                // Copy the file bytes into the cache frame (the frame was zeroed at
+                // reserve, so a short tail stays zero-padded), then mark the page
+                // ready so the faulter maps it on wake.
+                copy_fill_into_frame(&tr.obj, pf.frame, content_len as usize);
+                // SAFETY: `pf.file_obj` pins the live `FileObject` (header at 0).
+                let fo: &crate::object::FileObject =
+                    unsafe { &*(pf.file_obj.as_ptr() as *const crate::object::FileObject) };
+                fo.mark_ready(pf.index);
+                drop(tr.obj);
+                0
+            }
+        },
+    };
+
+    // Complete the fill PO (one-shot); release the kernel's clones outside `SCHED`;
+    // commit the transfer move by closing the sender's handles.
+    crate::sched::complete_pending_op(pf.po.as_ptr(), status, 0);
+    drop(pf);
+    for i in 0..count {
+        close_and_release(RawHandle(h_raw[i]), pid);
+    }
+    Ok(0)
+}
+
+/// Copy `n` bytes (clamped to one page) from the first frame of the transferred
+/// fill `MemoryObject` `src` into the cache frame `dst`, both via the HHDM. A
+/// no-op if `src` has no frames or `n == 0`.
+fn copy_fill_into_frame(src: &ObjectRef, dst: crate::mm::PhysAddr, n: usize) {
+    use crate::mm::{PAGE_SIZE, heap};
+    // SAFETY: `src` pins the live `MemoryObject` (header at offset 0).
+    let mo: &crate::object::MemoryObject =
+        unsafe { &*(src.as_ptr() as *const crate::object::MemoryObject) };
+    let frames = mo.frames();
+    let n = n.min(PAGE_SIZE);
+    if frames.is_empty() || n == 0 {
+        return;
+    }
+    let src_va = (frames[0].as_u64() + heap::hhdm_offset()) as *const u8;
+    let dst_va = (dst.as_u64() + heap::hhdm_offset()) as *mut u8;
+    // SAFETY: both frames are page-aligned, HHDM-mapped, and distinct (one is the
+    // server's just-transferred object, the other the cache frame); `n ≤ PAGE`.
+    unsafe {
+        core::ptr::copy_nonoverlapping(src_va, dst_va, n);
+    }
 }
 
 /// Close every handle a partial `sys_channel_recv` installed in the receiver's
