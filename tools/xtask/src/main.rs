@@ -630,6 +630,18 @@ fn assemble_image(
         staging.join("system").join("current-generation"),
         b"nitrox-rootfs generation 1\n",
     )?;
+    // `system/large.bin` — the slice-8 Part-5 large-file milestone fixture: a file
+    // well past the old 64 KiB eager cap, spanning many pages, with **position-
+    // sensitive** content so init's verifier catches a mis-faulted page. Each byte
+    // `i` is `((i >> 12) ^ i) as u8` (the page index in the high part XOR the low
+    // offset byte). This generator MUST match init's `fill_byte` /
+    // `LARGE_FILE_BYTES` (`userspace/init/src/main.rs`).
+    const LARGE_FILE_BYTES: usize = 256 * 1024; // 64 pages
+    let mut large = vec![0u8; LARGE_FILE_BYTES];
+    for (i, b) in large.iter_mut().enumerate() {
+        *b = (((i >> 12) ^ i) & 0xFF) as u8;
+    }
+    fs::write(staging.join("system").join("large.bin"), &large)?;
     let rootfs = work.join("rootfs.ext4");
     let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
     run(Command::new("mke2fs")

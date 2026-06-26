@@ -397,6 +397,66 @@ fn read_current_generation(root_ns: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
 }
 
+/// Size of the Part-5 large-file fixture (`/system/large.bin`). MUST match the
+/// xtask generator (`tools/xtask/src/main.rs`). 256 KiB = 64 pages — well past the
+/// old 64 KiB eager read cap, so reading it proves the page cache lifts the cap.
+const LARGE_FILE_BYTES: usize = 256 * 1024;
+
+/// The expected byte at file offset `i` of `/system/large.bin` — position-sensitive
+/// (the page index `i >> 12` in the high part) so a mis-faulted page is detected.
+/// MUST match the xtask generator.
+fn fill_byte(i: usize) -> u8 {
+    (((i >> 12) ^ i) & 0xFF) as u8
+}
+
+/// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
+/// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
+/// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
+/// the position-sensitive content (so a mis-filled / mis-ordered page is caught) and
+/// log the result. Proves **multi-page demand faulting** past the old 64 KiB cap.
+fn read_large_file(root_ns: u64) {
+    let (st, fh) = ns_lookup_wait(root_ns, b"/system/large.bin", RIGHT_MAP_READ);
+    if st != 0 || fh == 0 {
+        kprint(b"init: /system/large.bin lookup FAIL\n");
+        return;
+    }
+    // Map the whole file lazily (a FileBacked VMA — no frames until faulted).
+    let addr =
+        unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, LARGE_FILE_BYTES as u64, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"init: large.bin map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return;
+    }
+    let base = addr as u64;
+    let mut mismatches = 0u64;
+    let mut i = 0usize;
+    while i < LARGE_FILE_BYTES {
+        // First touch of each page faults; the kernel demand-fills it from the
+        // fs-server. Subsequent bytes in the page are plain (already-resident) reads.
+        // SAFETY: `base + i` is within the mapped [0, LARGE_FILE_BYTES) file range.
+        let got = unsafe { ((base + i as u64) as *const u8).read_volatile() };
+        if got != fill_byte(i) {
+            mismatches += 1;
+        }
+        i += 1;
+    }
+    if mismatches == 0 {
+        kprint(b"init: large.bin verified ");
+        kprint_u64(LARGE_FILE_BYTES as u64);
+        kprint(b" bytes across ");
+        kprint_u64(LARGE_FILE_BYTES as u64 / PAGE);
+        kprint(b" demand-faulted pages ok\n");
+    } else {
+        kprint(b"init: large.bin MISMATCH count=");
+        kprint_u64(mismatches);
+        kprint(b"\n");
+    }
+    // SAFETY: closing our own handle (the mapping keeps the object alive meanwhile).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+}
+
 /// Spawn the demo `parent`, then reap exited children forever. As PID 1, init is
 /// the eventual parent of every orphan; here its only child is `parent`.
 fn supervise(notif: u64) -> ! {
@@ -476,6 +536,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     if let Some(mounts) = read_manifest(root_ns) {
         mount_all(root_ns, &mounts);
         read_current_generation(root_ns);
+        // Slice-8 Part-5 milestone: a large file read entirely through the page
+        // cache — many demand faults, each a `File::ReadRange` to the fs-server.
+        read_large_file(root_ns);
     }
 
     supervise(notif);

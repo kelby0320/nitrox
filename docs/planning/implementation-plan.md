@@ -1358,10 +1358,18 @@ the memory-management page-cache section) are written in their Parts, as in slic
   `ReadRange` from the real fs-server (`init: /system/current-generation = nitrox-rootfs
   generation 1`, boot clean). Retired the Part-2b stub fixture + parent demo
   (`Producer::Stub` stays for host tests). **Slice 8's Model-B core is complete.**
-- [ ] **Part 5 — disk + the large-file milestone.** Add a **large (> 64 KiB,
-  multi-extent) file** to the ext4 image (xtask); init maps it lazily, reads it across
-  many faults, and logs a proof (size + a rolling checksum / sampled bytes). The 64 KiB
-  cap is gone; multi-page, multi-extent demand faulting proven end to end.
+- [x] **Part 5 — disk + the large-file milestone** (`phase-2/slice8-large-file`).
+  xtask stages `system/large.bin` (256 KiB / 64 pages) with position-sensitive content
+  (`byte[i] = ((i >> 12) ^ i) as u8`); init maps it lazily and reads **every** byte
+  (`read_large_file`), each first page-touch a demand fault served by a `File::ReadRange`
+  to the fs-server, verifying against the shared `fill_byte`. QEMU: `init: large.bin
+  verified 262144 bytes across 64 demand-faulted pages ok` — the 64 KiB cap is gone,
+  **multi-page demand faulting proven end to end**. (Multi-page, not multi-extent: a
+  256 KiB file is laid contiguously as a single extent; the extent tree's interior-node
+  path stays host-tested. init learns the size from a shared `LARGE_FILE_BYTES`
+  constant — a temporary bridge; proper discovery (a `HandleInfo.size` field via
+  `sys_handle_stat`) is deferred to its first real consumer, eshell `cat` in slice 9.)
+  **Phase 2 slice 8 (the kernel page cache) is complete.**
 
 Deferred to Phase 3: the **Model A extent fill** (block-fs zero-copy fast path, added
 *alongside* `ReadRange` which stays the general fallback) + writeback (with

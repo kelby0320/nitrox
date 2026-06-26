@@ -150,6 +150,22 @@ spin) — is deferred. Trigger: a multi-threaded process (or shared `FileObject`
 faults the same page concurrently. Until then the yield-retry is correct, just
 not elegant.
 
+**File-size discovery via `sys_handle_stat` (slice 8 Part 5).** A client holding a
+lazily-resolved `FileObject` handle has no way to ask its size: `sys_handle_stat`'s
+`HandleInfo` reports rights/type/generation only, and the lazy `Namespace::Resolve`
+consumes the file size (`content_len`) to build the `FileObject` rather than returning
+it to the client. The Part-5 milestone bridges this with a shared `LARGE_FILE_BYTES`
+constant between the xtask fixture generator and init's verifier (like the hardcoded
+`current-generation` path). The fix is to add a **`size` field to `HandleInfo`**,
+populated per-type in `stat_on` (`FileObject.size`, `MemoryObject.size`; `0`/sentinel
+otherwise) — the size is kernel-local metadata, so this is synchronous, no fs-server
+round-trip. `HandleInfo` is not in the ABI version hash, so the 16 → 24-byte growth is
+cheap; the lazy resolve must also grant `INSPECT` (it grants only `MAP_READ` today, and
+`stat` requires `INSPECT`). Deferred to its first real consumer — **eshell `cat`
+(slice 9)**, the first userspace reader that maps a file of unknown size. Not a `Stat`
+IoOpcode (none planned; `io_submit` targets block devices) nor the rsproto `File::Stat`
+(wrong layer for kernel-held metadata). See the decision log, 2026-06-26.
+
 **Stateless `File::ReadRange` fill (slice 8 Part 3).** A page-cache fill names its
 file by re-sending the path `suffix` on every `ReadRange` (the same suffix the lazy
 `Resolve` used), so the fs-server re-resolves the path per fill rather than handing
