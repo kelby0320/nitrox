@@ -1014,7 +1014,7 @@ mod tests {
 
     // --- File-backed mappings (slice 8 Part 2a) --------------------------
 
-    use crate::object::{FileObject, Reserve};
+    use crate::object::{FileObject, Producer, Reserve};
 
     /// Adopt a `FileObject`'s creation reference into an `ObjectRef`.
     fn into_file(f: KBox<FileObject>) -> ObjectRef {
@@ -1028,7 +1028,7 @@ mod tests {
     fn map_file_reserves_lazily_with_no_ptes() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        let obj = into_file(FileObject::try_new(3 * PAGE as usize).unwrap());
+        let obj = into_file(FileObject::try_new(3 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
         asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj)
             .expect("map_file must succeed");
         assert_eq!(asp.len(), 1, "the VMA is reserved");
@@ -1042,7 +1042,7 @@ mod tests {
     fn fault_in_file_backed_signals_and_file_backing_resolves() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        let obj = into_file(FileObject::try_new(4 * PAGE as usize).unwrap());
+        let obj = into_file(FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap());
         let obj_ptr = obj.as_ptr();
         asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj).unwrap();
 
@@ -1066,7 +1066,7 @@ mod tests {
     fn map_file_page_installs_pte_for_a_ready_frame() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        let f = FileObject::try_new(4 * PAGE as usize).unwrap();
+        let f = FileObject::try_new(4 * PAGE as usize, Producer::Stub { base: 0 }).unwrap();
         // Reserve + ready file page 1, mimicking a completed fill.
         let frame = match f.reserve(1) {
             Reserve::New(frame) => frame,
@@ -1089,7 +1089,7 @@ mod tests {
     fn map_file_page_rejects_wrong_object_or_unmapped() {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
-        let f = FileObject::try_new(PAGE as usize).unwrap();
+        let f = FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap();
         let frame = match f.reserve(0) {
             Reserve::New(frame) => frame,
             other => panic!("{other:?}"),
@@ -1099,7 +1099,7 @@ mod tests {
         asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
 
         // A different object is rejected (the VMA backs `obj`, not `other`).
-        let other = into_file(FileObject::try_new(PAGE as usize).unwrap());
+        let other = into_file(FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap());
         assert!(!asp.map_file_page(va(PAGE * 4), &other, frame));
         // An address outside any VMA is rejected.
         assert!(!asp.map_file_page(va(PAGE * 99), &obj, frame));
@@ -1112,7 +1112,7 @@ mod tests {
         init_global_heap();
         test_probe::reset();
         let asp = AddressSpace::new().unwrap();
-        let f = FileObject::try_new(PAGE as usize).unwrap();
+        let f = FileObject::try_new(PAGE as usize, Producer::Stub { base: 0 }).unwrap();
         let frame = match f.reserve(0) {
             Reserve::New(frame) => frame,
             other => panic!("{other:?}"),

@@ -1305,15 +1305,19 @@ the memory-management page-cache section) are written in their Parts, as in slic
     (re-fetch the object + page index outside the AS lock) + `map_file_page` (install
     the PTE for a resident cache frame, re-validating the VMA). Fully host-tested (5
     tests); no async, no producer — a file fault is still fatal until 2b.
-  - [ ] **Part 2b — the async fill + block-on-fault + the stub proof.** `fault_in`
-    FileBacked → `file_backing` → `page_cache::ensure_ready` (reserve; create a fill
-    PO; start the producer; **block the faulting thread** on the PO via the internal
-    `wait_on` primitive — proven sound: the `#PF` handler holds no user locks and the
-    block switches to another thread) → `map_file_page` on wake. The `FileObject`
-    gains a `Producer` (Part-2b `Stub` variant; Part-3 adds `FsServer`). Proven by a
-    boot fixture (a stub `FileObject` bound in pid-1's namespace, filled via a
-    timer-tick DPC) + a `parent` demo that maps it and reads it — a **real user fault**
-    that genuinely parks + resumes, no fs-server/IPC.
+  - [x] **Part 2b — the async fill + block-on-fault + the stub proof**
+    (`phase-2/slice8-fault-fill`). `try_fault_in` (the `#PF` handler) on
+    `FaultIn::FileBacked` → `AddressSpace::file_backing` → `FileObject::fault_in_page`
+    (reserve; create a fill PO; `start_fill`; **block the faulting thread** on the PO
+    via the scheduler's `wait_on` — sound: the ring-3 fault holds no kernel locks, and
+    the block switches to another thread while the timer keeps the DPC draining) →
+    `map_file_page` on wake. The `FileObject` gained a `Producer` (`Stub { base }`;
+    Part 3 adds `FsServer`); the stub fill enqueues a DPC that writes the page +
+    `mark_ready` + completes the PO. **Proven in QEMU** by a boot fixture (a stub
+    `FileObject` bound at `/dev/test/pagecache` in pid-1's namespace) + a `parent`
+    demo that maps it and reads one byte from each of 3 pages — a **real user fault**
+    that parks + resumes: `page-cache demand-faulted 3 pages ok (0xA0,0xA1,0xA2)`,
+    boot clean (no `#DF`/panic). No fs-server/IPC.
 - [ ] **Part 3 — the `File::ReadRange` op** (the Model-B fill protocol). A new `File`
   rsproto category (`docs/spec/rsproto-file-ops.md`): `File::ReadRange(suffix, offset,
   len) → bytes`. librsproto codec + the kernel mirror; the fault fill seam wired to a

@@ -5035,3 +5035,60 @@ demand-paging prereq that added the stubbed `FileBacked` variant. No ABI change.
 index, `map_file_page` installs/idempotent, rejects wrong-object/unmapped, unmap keeps
 the object's frames). Branch `phase-2/slice8-fault-path`. Next: Part 2b (the async fill
 + block-on-fault + the stub proof).
+
+## 2026-06-25 — Phase 2 slice 8, Part 2b: the async fault path (block-on-fault, proven)
+
+The hard part: a file page fault **blocks the faulting thread** on an asynchronous
+fill and resumes it when the page arrives — demand paging, the async-first way.
+Proven in QEMU with a real user fault.
+
+**The flow.** `try_fault_in` (the `#PF` handler) on `FaultIn::FileBacked` →
+`AddressSpace::file_backing(addr)` (the object + page index, a fresh AS-lock
+acquisition) → `FileObject::fault_in_page(&obj, index)` → `AddressSpace::map_file_page`
+on wake. `fault_in_page` loops over `reserve`: a hit returns the frame; a miss
+(`New`) creates a fill `PendingOperation`, calls `start_fill` (the producer), and
+**parks the thread** on the PO via the scheduler's `wait_on` primitive; on wake it
+loops → the page is now `Ready` → returns the frame.
+
+**Decision — the `#PF` handler may block (confirmed sound).** The concern was
+blocking inside an interrupt-gate (`IF=0`) fault handler. It is fine: a ring-3 fault
+holds **no kernel locks** (the thread was in user mode), `wait_on` →
+`block_current_and_switch` **switches to another thread** (which runs with its own
+`IF`), and the timer keeps ticking → the fill DPC drains at the interrupt-dispatch
+tail → `complete_pending_op` wakes the faulting thread. The faulting thread's kernel
+stack (the `pf_dispatch` frame) is preserved across the switch exactly as a syscall's
+is across `sys_wait`; on resume it returns up to `pf_dispatch`, and the stub `iretq`s
+into the user instruction (which retries with the page now present). No new
+`pf_dispatch` return path is needed — `try_fault_in` just takes longer. Lock
+discipline: the fill touches only the FileObject cache lock (rank 4), released before
+`wait_on` takes `SCHED` (rank 1) — never nested, and the AS lock is already released
+(`file_backing` returned) before the block.
+
+**Decision — the producer lives on the `FileObject` (`Producer::Stub`).** This is the
+field Part 1 deferred; Part 2b is its first consumer. `Stub { base }` fills page `i`
+with the byte `base + i` **asynchronously** — `start_fill` heap-boxes a `StubFillBox`
+(owning clones of the object + PO so they outlive the deferred fill), arms its `Dpc`
+at the box, and enqueues it; the DPC writes the frame, `mark_ready`s the page,
+`complete_pending_op`s the PO, and frees the box. Part 3 adds `Producer::FsServer`
+(the real IPC range-read). The timer-tick latency of the stub (~10 ms/fault) is a
+self-test artifact, not the real path.
+
+**Decision — concurrent same-page faults yield (deferred proper wait).** On a single
+CPU with the milestone (one faulter per object), a `Reserve::Loading` (another fault
+filling the same page) cannot arise; it is handled by `yield_now` + retry so the
+in-flight fill's DPC can run. A proper "block on the in-flight fill's PO" needs a
+per-page fill PO in the cache and is deferred (`deferred-decisions.md`). An OOM while
+*starting* a fill rolls the reserved page back (`cancel_reserve`) so a retry is clean.
+
+**The proof.** A boot fixture binds a stub `FileObject` (3 pages, `base 0xA0`) at
+`/dev/test/pagecache` in pid-1's namespace; `parent` resolves it, maps it read-only
+(a lazy `FileBacked` VMA), and reads one byte from each page — three **real user
+faults** that park + resume. QEMU: `parent: page-cache demand-faulted 3 pages ok
+(0xA0,0xA1,0xA2)`, boot clean afterward (children reap, `init: reaped pid=3 code=0`,
+no `#DF`/panic). The `FileObject::try_new` signature gained the `producer` argument
+(Part-1/2a test call sites updated).
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**511** (the new fault path is QEMU-proven, not host-testable — it needs a live
+thread + scheduler + a real fault). Branch `phase-2/slice8-fault-fill`. Next: Part 3
+(the `File::ReadRange` op — the real Model-B fill producer).
