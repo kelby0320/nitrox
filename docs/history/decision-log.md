@@ -5232,3 +5232,55 @@ range / EOF / error-op serve tests (4)). QEMU: the milestone runs via the lazy f
 no stub demo, clean. Branch `phase-2/slice8-fill-integration`. **Slice 8's core
 (Model-B page cache, end to end) is complete**; Part 5 (the large multi-extent file +
 the > 64 KiB milestone) remains.
+
+## 2026-06-26 — Phase 2 slice 8, Part 5: the large-file milestone (slice 8 complete)
+
+The capstone: a file **well past the old 64 KiB eager cap**, read entirely through the
+page cache across many demand faults. Closes slice 8.
+
+**The fixture + proof.** xtask stages `system/large.bin` in the ext4 image — **256 KiB
+(64 pages)**, with **position-sensitive** content (`byte[i] = ((i >> 12) ^ i) as u8`,
+folding the page index into each byte) so a mis-faulted or mis-ordered page is caught,
+not just a wrong byte value. init maps the whole file lazily and reads **every** byte
+(`read_large_file`), verifying each against the same `fill_byte`; the first touch of
+each page is a demand fault the kernel serves by a `File::ReadRange` to the fs-server.
+QEMU: `init: large.bin verified 262144 bytes across 64 demand-faulted pages ok`, boot
+clean (current-gen still reads, children reap, no `#DF`/panic). The 64 KiB cap is gone
+for the lazy path (`stat_file` / `read_file_range` carry no cap; only the unused eager
+`read_file` keeps it).
+
+**Decision — a shared fixture constant now; size discovery via `sys_handle_stat`
+deferred to eshell `cat`.** init needs the file size to map + verify the right extent.
+`sys_handle_stat`'s `HandleInfo` carries no size today (rights/type/generation only),
+and the lazy resolve consumes `content_len` to build the `FileObject` — so init does
+not learn the size from the lookup. For this milestone init and the xtask generator
+share a `LARGE_FILE_BYTES` constant + `fill_byte` (kept in sync by comment, exactly as
+the `current-generation` path is hardcoded) — a deliberate **temporary bridge**.
+
+The clean fix is **`sys_handle_stat` + a `HandleInfo.size` field**: the size is already
+kernel-local metadata (`FileObject.size`, set from the resolve; `MemoryObject.size`),
+so discovery is synchronous and needs no fs-server round-trip. `HandleInfo` is **not in
+the ABI version hash** (`abi-version-hash.md`), so growing it 16 → 24 bytes is cheap;
+the lazy resolve would additionally grant `INSPECT` (today it grants only `MAP_READ`,
+and `stat` requires `INSPECT`). Rejected alternatives: a `Stat` **IoOpcode** (none is
+planned — `io-operation.md` reserves only `Flush`/`Trim`/control — and `io_submit`
+targets block devices, not `FileObject`s; it would be a pre-signalled PO doing no I/O,
+overkill for local metadata) and the rsproto **`File::Stat`** (wrong layer — a
+client↔fs-server op, and a needless round-trip for a size the kernel already holds).
+Deferred to its first real consumer, **eshell `cat` (slice 9)**, which is the natural
+place to wire `HandleInfo.size`. Recorded in `deferred-decisions.md`.
+
+**Scope honesty — multi-page, not provably multi-extent.** The win is **multi-page**
+demand faulting (64 distinct logical blocks, each faulted + read via the extent walk
++ an IPC round-trip). `mke2fs -d` lays a 256 KiB file contiguously (a single extent),
+so this fixture does not exercise the extent tree's **interior-node** path on disk —
+that path (depth > 0 recursion in `extent_find`, block-boundary spans in
+`read_file_range`) stays covered by the fs-server host tests. Forcing a multi-extent
+on-disk layout needs fragmentation `mke2fs` won't deterministically produce; not worth
+contriving for this milestone.
+
+**Verified.** `cargo xtask build` (no warnings) / `image` / `check-arch` / `test` —
+kernel **516**, fs-server-ext4 **18** (unchanged; Part 5 is fixture + init demo). QEMU:
+the 64-page large file verifies end to end. Branch `phase-2/slice8-large-file`.
+**Phase 2 slice 8 (the kernel page cache) is complete** — file-backed mappings are
+lazy and demand-paged from a userspace fs-server over IPC, at scale.
