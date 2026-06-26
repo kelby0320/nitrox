@@ -40,10 +40,12 @@ pub struct ResolveRequest {
 
 | Flag | Value | Meaning |
 |---|---|---|
-| `RESOLVE_FILE_AS_MEMOBJ` | `1 << 0` | Phase-2 mode: a regular file resolves to a read-only `MemoryObject` holding its content. The only mode slice 7 defines. |
+| `RESOLVE_FILE_AS_MEMOBJ` | `1 << 0` | Slice-7 mode: a regular file resolves to a read-only `MemoryObject` holding its content, materialised eagerly. |
+| `RESOLVE_FILE_LAZY` | `1 << 1` | Slice-8 mode: a regular file resolves to a lazily page-cache-filled `File` (`OBJECT_KIND_FILE`); the reply carries the file **size**, not its bytes, and the kernel fills pages on demand via `File::ReadRange` ([rsproto-file-ops.md](rsproto-file-ops.md)). |
 
-A future flag selects the lazy/page-cache-backed resolution (slice 8); without it
-the server must materialise the content eagerly.
+With `RESOLVE_FILE_LAZY` the server reports the file size and does not materialise
+content up front; pages are pulled later by `File::ReadRange`. Without it the
+server must materialise the content eagerly.
 
 ### Reply body (success)
 
@@ -68,6 +70,7 @@ Body length = 8.
 | `MEMOBJ` | `1` | a read-only `MemoryObject` of the file content | ✅ |
 | `DIRECTORY` | `2` | (a directory resource) | deferred |
 | `SUBNAMESPACE` | `3` | (a nested namespace) | deferred |
+| `FILE` | `4` | **none** — `content_len` is the total file size; the kernel builds a page-cache object filled via `File::ReadRange`. Paired with `RESOLVE_FILE_LAZY`. | ✅ (slice 8) |
 
 `content_len` is the exact byte length, so the client can trim the
 `MemoryObject`'s zero-padded tail precisely. Phase 2 caps the content at **64

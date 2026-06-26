@@ -150,6 +150,15 @@ spin) — is deferred. Trigger: a multi-threaded process (or shared `FileObject`
 faults the same page concurrently. Until then the yield-retry is correct, just
 not elegant.
 
+**Stateless `File::ReadRange` fill (slice 8 Part 3).** A page-cache fill names its
+file by re-sending the path `suffix` on every `ReadRange` (the same suffix the lazy
+`Resolve` used), so the fs-server re-resolves the path per fill rather than handing
+back an open-file cookie at resolve time. Simple and correct for the milestone; the
+re-resolve cost hides behind the IPC round-trip. A server-side open-file handle
+(resolve returns a cookie; `ReadRange` carries it) is the obvious Phase-3
+optimization — defer until a profiling case or a stateful fs (RW, where the open
+handle anchors writeback) forces it. See `docs/spec/rsproto-file-ops.md`.
+
 **Page-cache scope (slice 8).** The first file page cache (slice 8, the **Model-B**
 range-read fill — see the decision log, 2026-06-25) is deliberately minimal on three
 axes. **(1) Per-file, not global.** Each `FileObject` owns a sparse page table; two

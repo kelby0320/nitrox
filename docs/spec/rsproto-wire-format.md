@@ -64,7 +64,8 @@ The 16-bit `op` field decomposes:
 | `Block` | `0x03xx` | Extent query, block allocate (filesystem-specific) |
 | `Control` | `0x04xx` | Ioctl-style, opaque to the protocol |
 | `Power` | `0x05xx` | Suspend, resume, device power |
-| (reserved) | `0x06xx` – `0xFExx` | Future categories |
+| `File` | `0x06xx` | Positioned, stateless file-content reads (page-cache fill) |
+| (reserved) | `0x07xx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 A resource server must implement at least the Meta category. Each server declares which other categories it supports via `Meta::QueryCaps`.
@@ -176,11 +177,13 @@ Encoding rules:
 - Optional fields: indicator byte (0 = absent, 1 = present) followed by the value if present
 
 Each operation's body is documented per category. See:
-- [Namespace operations spec](rsproto-namespace-ops.md) (TBD when implemented)
+- [Namespace operations spec](rsproto-namespace-ops.md)
+- [File operations spec](rsproto-file-ops.md)
 - [Stream operations spec](rsproto-stream-ops.md) (TBD when implemented)
 - [Block operations spec](rsproto-block-ops.md) (TBD when implemented)
 
-For now, only Meta operations are fully specified.
+The Meta, Namespace, and File operations are specified; the rest land with their
+consumers.
 
 ## Bulk data transfer
 

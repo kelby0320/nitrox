@@ -6,8 +6,14 @@ use crate::{get_u16, get_u32, get_u64, put_u16, put_u32, put_u64};
 // --- Resolve flags ----------------------------------------------------------
 
 /// `RESOLVE_FILE_AS_MEMOBJ` — resolve a regular file to a read-only `MemoryObject`
-/// of its content (the Phase-2 mode).
+/// of its content, eagerly (slice 7; the whole file is read up front).
 pub const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
+/// `RESOLVE_FILE_LAZY` — resolve a regular file to a `File` resource
+/// ([`OBJECT_KIND_FILE`]) whose pages are filled on demand via
+/// [`File::ReadRange`](crate::file) (slice 8). The reply carries the file size,
+/// not its bytes; no handle rides in `handles[0]` — the kernel builds the
+/// page-cache object itself, pointed back at this server.
+pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 
 // --- object_kind values (reply) ---------------------------------------------
 
@@ -17,6 +23,10 @@ pub const OBJECT_KIND_MEMOBJ: u16 = 1;
 pub const OBJECT_KIND_DIRECTORY: u16 = 2;
 /// A nested namespace (deferred).
 pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;
+/// A lazily-filled file: `content_len` is the **total file size**; the kernel
+/// builds a page-cache object filled on demand via `File::ReadRange`. No handle
+/// rides in `handles[0]`. Paired with [`RESOLVE_FILE_LAZY`].
+pub const OBJECT_KIND_FILE: u16 = 4;
 
 // --- Resolve request --------------------------------------------------------
 

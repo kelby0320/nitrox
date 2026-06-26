@@ -1318,21 +1318,38 @@ the memory-management page-cache section) are written in their Parts, as in slic
     demo that maps it and reads one byte from each of 3 pages — a **real user fault**
     that parks + resumes: `page-cache demand-faulted 3 pages ok (0xA0,0xA1,0xA2)`,
     boot clean (no `#DF`/panic). No fs-server/IPC.
-- [ ] **Part 3 — the `File::ReadRange` op** (the Model-B fill protocol). A new `File`
-  rsproto category (`docs/spec/rsproto-file-ops.md`): `File::ReadRange(suffix, offset,
-  len) → bytes`. librsproto codec + the kernel mirror; the fault fill seam wired to a
-  real range-read IPC to the fs-server endpoint (reusing the slice-7 Part-3 forwarding
-  machinery), completing the fill PO inline-in-send.
-- [ ] **Part 4 — the fs-server side.** A `RESOLVE_FILE_LAZY` resolve mode → the reply
-  is a `FileObject`-class handle (the kernel builds the `FileObject`) instead of an
-  eager `MemoryObject`; serve `File::ReadRange` (suffix → `ext4` extent walk → read the
-  range → reply the bytes). **Stateless** — re-resolves the suffix per range, no
-  open-file table.
-- [ ] **Part 5 — disk + the milestone.** Add a **large (> 64 KiB) file** to the ext4
-  image (xtask); init maps it lazily, reads it across many faults, and logs a proof
-  (size + a rolling checksum / sampled bytes). The 64 KiB cap is gone; multi-page
-  demand faulting proven end to end. The existing `/system/current-generation` read
-  still works (now lazy).
+- [x] **Part 3 — the `File::ReadRange` wire op** (the Model-B fill contract;
+  `phase-2/slice8-readrange`). A new **`File` category at `0x06`**
+  (`docs/spec/rsproto-file-ops.md`): `File::ReadRange(offset, len, suffix) → bytes`
+  (the bytes ride in `handles[0]` as a ≤1-page `MemoryObject`; `content_len` covers
+  the short EOF tail). librsproto codec (`file.rs`) + the kernel mirror
+  (`build_read_range_request` / `parse_read_range_reply` / `reply_op` router) + the
+  paired `Namespace` additions (`RESOLVE_FILE_LAZY` flag, `OBJECT_KIND_FILE`). `File`
+  is kept distinct from `Stream` (`0x02`, cursor I/O) and `Block` (`0x03`, Model A's
+  future extent home). Host round-trip tests pin the offsets both sides. **Wire
+  contract only** — the kernel send-side + the fault wiring land in Part 4 (a page
+  fault blocks the faulting thread, so the *filler* must be a separate process — the
+  real fs-server — which arrives in Part 4; isolating the send-side would need
+  throwaway two-process scaffolding).
+- [ ] **Part 4 — the kernel send-side + the fs-server, end to end.** The kernel
+  integration: the `FileObject` gains a `Producer::FsServer { reg, suffix }`;
+  `start_fill` originates a `File::ReadRange` over the slice-7 forwarding endpoint
+  (a pending-**fill** slot on `UserspaceServerReg` alongside the pending-lookup slot),
+  and the reply (routed by `reply_op`) copies `handles[0]` into the cache frame +
+  completes the fill PO. The resolve path learns `RESOLVE_FILE_LAZY`: a
+  `OBJECT_KIND_FILE` reply makes the kernel **build the `FileObject`** (pointed at the
+  server reg + suffix) instead of installing an eager `MemoryObject`. The fs-server
+  side: serve `RESOLVE_FILE_LAZY` (reply size + `OBJECT_KIND_FILE`, no handle) and
+  `File::ReadRange` (suffix → `ext4` extent walk → read the range → reply the bytes,
+  **stateless**, re-resolving per range). **Proven by the existing slice-7 milestone
+  going lazy** — init's `/system/current-generation` lookup now returns a `FileObject`
+  and faults in via `ReadRange` from the real fs-server (init faults, fs-server fills —
+  two processes, no scaffolding). The stub `Producer` + boot fixture from Part 2b are
+  removed.
+- [ ] **Part 5 — disk + the large-file milestone.** Add a **large (> 64 KiB,
+  multi-extent) file** to the ext4 image (xtask); init maps it lazily, reads it across
+  many faults, and logs a proof (size + a rolling checksum / sampled bytes). The 64 KiB
+  cap is gone; multi-page, multi-extent demand faulting proven end to end.
 
 Deferred to Phase 3: the **Model A extent fill** (block-fs zero-copy fast path, added
 *alongside* `ReadRange` which stays the general fallback) + writeback (with
