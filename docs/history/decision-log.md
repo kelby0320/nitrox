@@ -5092,3 +5092,51 @@ no `#DF`/panic). The `FileObject::try_new` signature gained the `producer` argum
 **511** (the new fault path is QEMU-proven, not host-testable — it needs a live
 thread + scheduler + a real fault). Branch `phase-2/slice8-fault-fill`. Next: Part 3
 (the `File::ReadRange` op — the real Model-B fill producer).
+
+## 2026-06-26 — Phase 2 slice 8, Part 3: the `File::ReadRange` wire op + a Part 3/4 re-split
+
+The Model-B fill protocol's **wire contract** — the bytes a demand fault asks the
+fs-server for. Codec only this part; the kernel send-side moves to Part 4 (below).
+
+**Decision — a new `File` category at `0x06`, not `Stream`/`Block`.** The
+wire-format category table (`rsproto-wire-format.md`) already partitions `Stream`
+(`0x02`, cursor-based read/write/seek) and `Block` (`0x03`, extent/block-level,
+fs-specific). A page-cache fill is a **positioned, stateless byte read** — it fits
+neither cleanly: `Stream` implies a cursor we don't have, and `Block` is where
+**Model A**'s extent query will live (Phase 3). So `File::ReadRange` takes the first
+"Future categories" slot, `0x06`, grouping file-content access (`ReadRange` now;
+`stat`/`readdir` later) without contaminating `Stream`'s cursor semantics. Recorded
+in `docs/spec/rsproto-file-ops.md`; the category table's reserved range shrinks to
+`0x07–0xFE`.
+
+**The contract.** `File::ReadRange(offset, len, suffix) → bytes`: a 16-byte request
+prefix (offset `u64`, len `u32`, suffix_len `u16`, pad) + the path suffix; an 8-byte
+success reply (`content_len u32`, pad) with the filled bytes riding in `handles[0]`
+as a ≤1-page read-only `MemoryObject`. `content_len < len` is a short EOF tail (the
+page-cache frame starts zeroed, so the tail needs no padding on the wire). The fill
+is **stateless** — each `ReadRange` re-identifies its file by the same `suffix` the
+lazy `Resolve` used (no server-side open-file cookie; a possible Phase-3
+optimization). Paired `Namespace` additions: the `RESOLVE_FILE_LAZY` flag (`1 << 1`)
+and `OBJECT_KIND_FILE` (`4`) reply kind — a lazy resolve returns the file **size**
+and no handle, and the kernel builds the page-cache object itself. Mirrored in
+`librsproto` (`file.rs`) and the kernel (`rsproto.rs`); host tests pin the offsets
+on both sides. A `reply_op` router lets the (Part-4) completion path send a reply to
+the right parser (`Resolve` vs `ReadRange`) since the two reply bodies differ.
+
+**Decision — re-split Parts 3/4 around the faulter-vs-filler constraint.** The plan
+had Part 3 = "the op + wire the fault fill to IPC" and Part 4 = "the fs-server side."
+But a page fault **blocks the faulting thread**, so the thread that faults cannot
+also serve its own fill — the *filler* must be a **separate process**, and the only
+real one is the fs-server (Part 4). Proving the kernel send-side in isolation would
+need throwaway two-process scaffolding. So Part 3 is now the **wire contract only**
+(this entry), and Part 4 absorbs the kernel send-side (`Producer::FsServer` +
+`start_fill` over the slice-7 forwarding endpoint + the reply→frame copy + the
+`RESOLVE_FILE_LAZY`→build-`FileObject` path) **and** the fs-server side, proven by the
+existing slice-7 `/system/current-generation` lookup **going lazy** (init faults, the
+real fs-server fills — two processes, no scaffolding). Part 5 stays the large-file
+milestone.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**514** (+3 ReadRange codec tests), librsproto `file::` round-trips green. No QEMU
+(pure codec). Branch `phase-2/slice8-readrange`. Next: Part 4 (the kernel send-side +
+the fs-server, end to end).

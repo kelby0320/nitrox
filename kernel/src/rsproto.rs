@@ -32,13 +32,24 @@ const RS_FLAG_ERROR: u32 = 1 << 1;
 
 /// `Namespace::Resolve` operation discriminant (`category 0x01 << 8 | 0x00`).
 const OP_NS_RESOLVE: u16 = 0x0100;
+/// `File::ReadRange` operation discriminant (`category 0x06 << 8 | 0x00`) — the
+/// Model-B page-cache fill (`docs/spec/rsproto-file-ops.md`).
+const OP_FILE_READ_RANGE: u16 = 0x0600;
 
 /// `RESOLVE_FILE_AS_MEMOBJ` — resolve a regular file to a read-only `MemoryObject`
-/// of its content (the only Phase-2 mode).
+/// of its content, eagerly (slice 7).
 const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
+/// `RESOLVE_FILE_LAZY` — resolve a regular file to a lazily page-cache-filled
+/// `File` resource ([`OBJECT_KIND_FILE`]); the reply carries the file size and
+/// the kernel builds the page-cache object (slice 8). See `build_resolve_request`.
+pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 
 /// Reply `object_kind`: `handles[0]` is a read-only `MemoryObject` of file content.
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
+/// Reply `object_kind`: a lazily-filled file — `content_len` is the total file
+/// size and `handles[0]` is empty; the kernel builds the page-cache object,
+/// pointed back at the server, and fills it on demand via `build_read_range_request`.
+pub const OBJECT_KIND_FILE: u16 = 4;
 
 /// Fixed prefix of a `ResolveRequest` body (before the suffix bytes).
 const RESOLVE_REQUEST_PREFIX_LEN: usize = 16;
@@ -176,6 +187,123 @@ pub fn parse_reply(buf: &[u8]) -> Option<ReplyView> {
     Some(ReplyView { request_id, kind })
 }
 
+// --- File::ReadRange (the Model-B page-cache fill) --------------------------
+
+/// Fixed prefix of a `ReadRangeRequest` body (before the suffix bytes).
+const READ_RANGE_REQUEST_PREFIX_LEN: usize = 16;
+/// Wire length of a success `ReadRangeReply` body.
+const READ_RANGE_REPLY_LEN: usize = 8;
+
+/// Build a `File::ReadRange` request (envelope + body) into `out`, returning the
+/// total byte length, or `None` if `out` is too small or `suffix` exceeds
+/// `u16::MAX`. The kernel sends this to fill one page of a lazily-resolved file:
+/// `offset` is the (page-aligned) file offset, `len` the byte count (at most one
+/// page), `suffix` the path naming the file (the fill is stateless). The
+/// `request_id` is written `0`; the caller stamps it with [`stamp_request_id`].
+/// The filled bytes come back in the reply's `handles[0]` (a `MemoryObject`).
+pub fn build_read_range_request(
+    out: &mut [u8],
+    offset: u64,
+    len: u32,
+    suffix: &[u8],
+) -> Option<usize> {
+    if suffix.len() > u16::MAX as usize {
+        return None;
+    }
+    let body_len = READ_RANGE_REQUEST_PREFIX_LEN + suffix.len();
+    let total = RS_HEADER_LEN + body_len;
+    if out.len() < total {
+        return None;
+    }
+    // Envelope.
+    put_u32(out, 0, RS_MAGIC);
+    put_u16(out, 4, RS_VERSION);
+    put_u16(out, 6, OP_FILE_READ_RANGE);
+    put_u64(out, REQUEST_ID_OFFSET, 0); // stamped later
+    put_u32(out, 16, 0); // flags: a request
+    put_u32(out, 20, body_len as u32);
+    put_u16(out, 24, 0); // handle_count
+    put_u16(out, 26, 0); // _reserved
+    // Body: ReadRangeRequest.
+    let b = RS_HEADER_LEN;
+    put_u64(out, b, offset);
+    put_u32(out, b + 8, len);
+    put_u16(out, b + 12, suffix.len() as u16);
+    put_u16(out, b + 14, 0); // _reserved
+    out[b + READ_RANGE_REQUEST_PREFIX_LEN..total].copy_from_slice(suffix);
+    Some(total)
+}
+
+/// A parsed `File::ReadRange` reply: the correlating `request_id` and outcome.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct RangeReplyView {
+    /// Echoes the request's `request_id`.
+    pub request_id: u64,
+    /// The reply outcome.
+    pub kind: RangeReplyKind,
+}
+
+/// The outcome carried by a [`RangeReplyView`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum RangeReplyKind {
+    /// Success: the filled bytes ride in `IpcMsg.handles[0]`; `content_len` is the
+    /// valid byte count (a short tail at end-of-file is the caller's to zero-pad).
+    Success { content_len: u32 },
+    /// Error: the body was an `ErrorBody`; `kerror` is a `KError` discriminant.
+    Error { kerror: i32 },
+    /// A well-formed reply envelope whose body did not parse.
+    Malformed,
+}
+
+/// Parse a `File::ReadRange` **reply** (`buf` = the IPC payload). Like
+/// [`parse_reply`] but for the `ReadRange` body shape; the envelope's `request_id`
+/// is recovered even from a malformed body.
+pub fn parse_read_range_reply(buf: &[u8]) -> Option<RangeReplyView> {
+    if buf.len() < RS_HEADER_LEN || get_u32(buf, 0) != RS_MAGIC {
+        return None;
+    }
+    let flags = get_u32(buf, 16);
+    if flags & RS_FLAG_REPLY == 0 {
+        return None;
+    }
+    let request_id = get_u64(buf, REQUEST_ID_OFFSET);
+    let body_len = get_u32(buf, 20) as usize;
+    let end = RS_HEADER_LEN.checked_add(body_len)?;
+    if buf.len() < end {
+        return None;
+    }
+    let body = &buf[RS_HEADER_LEN..end];
+
+    let kind = if flags & RS_FLAG_ERROR != 0 {
+        if body.len() < ERROR_BODY_LEN {
+            RangeReplyKind::Malformed
+        } else {
+            RangeReplyKind::Error { kerror: get_u32(body, 0) as i32 }
+        }
+    } else if body.len() < READ_RANGE_REPLY_LEN {
+        RangeReplyKind::Malformed
+    } else {
+        RangeReplyKind::Success { content_len: get_u32(body, 0) }
+    };
+    Some(RangeReplyView { request_id, kind })
+}
+
+/// The operation discriminant of a well-formed reply envelope, or `None` if `buf`
+/// is too short / not `RS_MAGIC`. The forwarding completion path uses it to route
+/// a reply to the right parser ([`parse_reply`] for `Resolve`,
+/// [`parse_read_range_reply`] for `ReadRange`).
+pub fn reply_op(buf: &[u8]) -> Option<u16> {
+    if buf.len() < RS_HEADER_LEN || get_u32(buf, 0) != RS_MAGIC {
+        return None;
+    }
+    Some(get_u16(buf, 6))
+}
+
+/// `File::ReadRange` op discriminant, exported for the completion router.
+pub const READ_RANGE_OP: u16 = OP_FILE_READ_RANGE;
+/// `Namespace::Resolve` op discriminant, exported for the completion router.
+pub const RESOLVE_OP: u16 = OP_NS_RESOLVE;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -274,5 +402,55 @@ mod tests {
         let r = parse_reply(&buf[..RS_HEADER_LEN + 2]).unwrap();
         assert_eq!(r.request_id, 99);
         assert_eq!(r.kind, ReplyKind::Malformed);
+    }
+
+    #[test]
+    fn read_range_request_has_documented_layout() {
+        let mut buf = [0u8; 128];
+        let n = build_read_range_request(&mut buf, 0x2000, 4096, b"system/big-file").unwrap();
+        assert_eq!(n, RS_HEADER_LEN + READ_RANGE_REQUEST_PREFIX_LEN + 15);
+        // Envelope.
+        assert_eq!(get_u32(&buf, 0), RS_MAGIC);
+        assert_eq!(get_u16(&buf, 6), OP_FILE_READ_RANGE);
+        assert_eq!(get_u64(&buf, REQUEST_ID_OFFSET), 0);
+        assert_eq!(get_u32(&buf, 16), 0); // a request
+        assert_eq!(get_u32(&buf, 20) as usize, READ_RANGE_REQUEST_PREFIX_LEN + 15);
+        // Body.
+        let b = RS_HEADER_LEN;
+        assert_eq!(get_u64(&buf, b), 0x2000); // offset
+        assert_eq!(get_u32(&buf, b + 8), 4096); // len
+        assert_eq!(get_u16(&buf, b + 12), 15); // suffix_len
+        assert_eq!(&buf[b + 16..n], b"system/big-file");
+        // The request_id stamps the same field as Resolve.
+        stamp_request_id(&mut buf, 0x55);
+        assert_eq!(get_u64(&buf, REQUEST_ID_OFFSET), 0x55);
+    }
+
+    #[test]
+    fn parse_read_range_success_and_error() {
+        let mut body = [0u8; READ_RANGE_REPLY_LEN];
+        put_u32(&mut body, 0, 100);
+        let mut buf = make_reply(3, RS_FLAG_REPLY, &body);
+        // make_reply stamps OP_NS_RESOLVE in the op field; rewrite to ReadRange.
+        put_u16(&mut buf, 6, OP_FILE_READ_RANGE);
+        let r = parse_read_range_reply(&buf[..RS_HEADER_LEN + READ_RANGE_REPLY_LEN]).unwrap();
+        assert_eq!(r, RangeReplyView { request_id: 3, kind: RangeReplyKind::Success { content_len: 100 } });
+
+        let mut ebody = [0u8; ERROR_BODY_LEN];
+        put_u32(&mut ebody, 0, (-10i32) as u32);
+        let mut ebuf = make_reply(4, RS_FLAG_REPLY | RS_FLAG_ERROR, &ebody);
+        put_u16(&mut ebuf, 6, OP_FILE_READ_RANGE);
+        let e = parse_read_range_reply(&ebuf[..RS_HEADER_LEN + ERROR_BODY_LEN]).unwrap();
+        assert_eq!(e.kind, RangeReplyKind::Error { kerror: -10 });
+    }
+
+    #[test]
+    fn reply_op_routes_resolve_vs_read_range() {
+        let mut req = [0u8; 64];
+        build_resolve_request(&mut req, 0, b"x").unwrap();
+        assert_eq!(reply_op(&req), Some(RESOLVE_OP));
+        build_read_range_request(&mut req, 0, 0, b"x").unwrap();
+        assert_eq!(reply_op(&req), Some(READ_RANGE_OP));
+        assert_eq!(reply_op(&[0u8; 4]), None); // too short
     }
 }

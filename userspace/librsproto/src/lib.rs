@@ -20,6 +20,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod error;
+pub mod file;
 pub mod meta;
 pub mod namespace;
 
@@ -52,6 +53,9 @@ pub const OP_PING: u16 = 0x0003;
 pub const OP_READY: u16 = 0x0004;
 /// `Namespace::Resolve` — resolve a path suffix to a resource handle.
 pub const OP_NS_RESOLVE: u16 = 0x0100;
+/// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
+/// page-cache fill). See [`file`].
+pub const OP_FILE_READ_RANGE: u16 = 0x0600;
 
 /// A decoding/validation failure.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
