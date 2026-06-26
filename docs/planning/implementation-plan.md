@@ -1290,21 +1290,30 @@ detailed contracts (`rsproto-file-ops.md`, the `FileObject` handle-encoding entr
 the memory-management page-cache section) are written in their Parts, as in slice 7
 — not front-loaded. See the decision log (2026-06-25 — slice 8 fill model + scope).
 
-- [ ] **Part 1 — `FileObject` kobject + the page cache.** The new kobject (next free
-  type, **14**) holds `(fs-server endpoint, path suffix, size)` + a **sparse per-page
-  cache** (offset → frame + state: empty / loading / ready) behind a **fill-producer
-  seam** ("fill page-cache page for offset X"). Host-tested data structure + lifecycle
-  (frames freed on drop). No fault path yet.
-- [ ] **Part 2 — lazy `FileBacked` mmap + the async fault path** (the hard part).
-  `sys_memory_map` on a `FileObject` → a `FileBacked` VMA (no eager PTEs);
-  `MappingKind::FileBacked` gains its payload. `fault_in` (under the rank-4 AS lock)
-  returns `NeedFill { offset }` on a miss **without blocking**; `pf_dispatch` (a
-  blockable user-thread context) **drops the AS lock**, submits the fill, **blocks the
-  faulting thread** on the fill PO (SCHED is rank-1 → acquired outside the AS lock),
-  and **re-validates** `fault_in` on wake (the VMA may be gone on process exit) before
-  the instruction retries. Proven by a boot self-test with a **stub async producer** (a
-  `FileObject` whose fill completes via a timer DPC, so the thread genuinely parks +
-  resumes) — no fs-server/IPC, isolating the fault-path risk.
+- [x] **Part 1 — `FileObject` kobject + the page cache** (`phase-2/slice8-file-object`,
+  PR #72). The new kobject (type **14**) owns a **sparse per-page cache**
+  (`reserve`/`mark_ready`/`lookup`; frames freed on drop) behind the fill-producer
+  seam. Host-tested; no fault path. *(The producer fields — fs-server endpoint +
+  suffix — deferred to Part 3, their first consumer.)*
+- **Part 2 — lazy `FileBacked` mmap + the async fault path** (the hard part), split
+  into two for a focused review of the scary async half:
+  - [x] **Part 2a — the FileBacked VMA + fault wiring** (`phase-2/slice8-fault-path`):
+    `sys_memory_map` on a `FileObject` → `AddressSpace::map_file` (a lazy
+    `MappingKind::FileBacked` VMA holding the object, **no PTEs**); `fault_in`'s
+    FileBacked arm → `FaultIn::FileBacked` (a signal — it does **not** touch the file
+    cache, whose lock is rank 4 like the AS lock and must never nest); `file_backing`
+    (re-fetch the object + page index outside the AS lock) + `map_file_page` (install
+    the PTE for a resident cache frame, re-validating the VMA). Fully host-tested (5
+    tests); no async, no producer — a file fault is still fatal until 2b.
+  - [ ] **Part 2b — the async fill + block-on-fault + the stub proof.** `fault_in`
+    FileBacked → `file_backing` → `page_cache::ensure_ready` (reserve; create a fill
+    PO; start the producer; **block the faulting thread** on the PO via the internal
+    `wait_on` primitive — proven sound: the `#PF` handler holds no user locks and the
+    block switches to another thread) → `map_file_page` on wake. The `FileObject`
+    gains a `Producer` (Part-2b `Stub` variant; Part-3 adds `FsServer`). Proven by a
+    boot fixture (a stub `FileObject` bound in pid-1's namespace, filled via a
+    timer-tick DPC) + a `parent` demo that maps it and reads it — a **real user fault**
+    that genuinely parks + resumes, no fs-server/IPC.
 - [ ] **Part 3 — the `File::ReadRange` op** (the Model-B fill protocol). A new `File`
   rsproto category (`docs/spec/rsproto-file-ops.md`): `File::ReadRange(suffix, offset,
   len) → bytes`. librsproto codec + the kernel mirror; the fault fill seam wired to a

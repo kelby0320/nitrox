@@ -104,10 +104,16 @@ pub enum FaultIn {
     /// A VMA covers the address and permits the access, but a backing frame
     /// could not be allocated.
     Oom,
-    /// The address falls in a [`FileBacked`](MappingKind::FileBacked) mapping,
-    /// which has no page cache to serve it yet (no producer exists). Fatal
-    /// until the page-cache slice lands.
-    NoPageCache,
+    /// The address falls in a [`FileBacked`](MappingKind::FileBacked) mapping: a
+    /// **not-present file fault** the caller must service through the page cache —
+    /// fetch the backing ([`file_backing`](AddressSpace::file_backing)), ensure the
+    /// page is resident (blocking on the producer if needed), and install the PTE
+    /// ([`map_file_page`](AddressSpace::map_file_page)). `fault_in` itself does *not*
+    /// touch the file's page cache (its lock is rank-4, like this AS lock — they are
+    /// never nested), so this arm only *signals*; the fill happens outside the AS
+    /// lock. Until the fault path wires that up (slice 8 Part 2b) a file fault stays
+    /// fatal.
+    FileBacked,
 }
 
 /// A per-process virtual address space.
@@ -394,11 +400,12 @@ impl AddressSpace {
             // not-present fault on one is a bug or a torn-down race — treat it
             // as an access to nothing.
             MappingKind::Object => FaultIn::NoVma,
-            // TODO(phase-2 page cache): page the file's content in from the
-            // cache. No producer constructs a FileBacked VMA yet, so this arm
-            // is currently unreachable; until the page cache lands a fault here
-            // is fatal. See docs/rationale/deferred-decisions.md.
-            MappingKind::FileBacked => FaultIn::NoPageCache,
+            // A file-backed not-present fault: signal the caller to page it in
+            // from the file's cache. We do NOT touch that cache here — its lock is
+            // rank 4, same as this AS lock, and the two must never nest — so the
+            // caller fetches the backing + fills + installs the PTE outside this
+            // lock (`file_backing` → fill → `map_file_page`). See slice 8 Part 2.
+            MappingKind::FileBacked => FaultIn::FileBacked,
         }
     }
 
@@ -499,6 +506,116 @@ impl AddressSpace {
                     .take()
                     .expect("object-backed VMA carries its ObjectRef");
                 Err((object, MapError::Overlap))
+            }
+        }
+    }
+
+    /// Reserve `range` as a **lazy file-backed** mapping of `object` (a
+    /// [`FileObject`](crate::object::FileObject)) — like [`map_vma_lazy`], but
+    /// `MappingKind::FileBacked` with the object held in the VMA, and **no PTEs**.
+    /// Each page is faulted in from the file's page cache on first touch
+    /// (`fault_in` → [`FaultIn::FileBacked`] → fill → [`map_file_page`]). The VMA
+    /// keeps `object` alive, so its cache frames outlive the mapping; `unmap`
+    /// removes the PTEs but never frees them (the object owns them). On any
+    /// rejection `object` is handed back untouched.
+    ///
+    /// [`map_vma_lazy`]: AddressSpace::map_vma_lazy
+    /// [`map_file_page`]: AddressSpace::map_file_page
+    pub fn map_file(
+        &self,
+        range: VAddrRange,
+        prot: Protection,
+        object: ObjectRef,
+    ) -> Result<(), (ObjectRef, MapError)> {
+        debug_assert_eq!(object.object_type(), KObjectType::FileObject);
+        // Canonicality / user-half checks before consuming `object`.
+        let last_byte = VirtAddr::new(range.end().as_u64() - 1);
+        if !range.start().is_canonical() || !last_byte.is_canonical() {
+            return Err((object, MapError::NotCanonical));
+        }
+        if range.end().as_u64() > USER_VIRT_END {
+            return Err((object, MapError::NotUserHalf));
+        }
+        // Build the VMA box (no object yet) before the lock (no alloc under it).
+        let mut boxed = match KBox::try_new(Vma::new(range, prot, MappingKind::FileBacked)) {
+            Ok(b) => b,
+            Err(_) => return Err((object, MapError::OutOfMemory)),
+        };
+        let mut guard = self.inner.lock();
+        if guard.vma_tree.find_first_overlapping(range).is_some() {
+            return Err((object, MapError::Overlap));
+        }
+        boxed.object = Some(object);
+        // No PTEs — `fault_in` backs each page on demand from the page cache.
+        match guard.vma_tree.insert(boxed) {
+            Ok(()) => Ok(()),
+            Err(mut b) => {
+                let object = b
+                    .object
+                    .take()
+                    .expect("file-backed VMA carries its ObjectRef");
+                Err((object, MapError::Overlap))
+            }
+        }
+    }
+
+    /// For a `FileBacked` fault at `addr` (signalled by [`FaultIn::FileBacked`]),
+    /// return the backing [`FileObject`](crate::object::FileObject) (a **cloned**
+    /// `ObjectRef`, owned by the caller) and the **page index** within the file
+    /// (`(page_base − vma.start) / PAGE`; the mapping covers the file from offset 0).
+    /// `None` if no VMA covers `addr` or it is not file-backed (a teardown race).
+    /// A separate, fresh lock acquisition from `fault_in` — so the file's page cache
+    /// is reached only **outside** this AS lock, never nested under it.
+    pub fn file_backing(&self, addr: VirtAddr) -> Option<(ObjectRef, usize)> {
+        let guard = self.inner.lock();
+        let vma = guard.vma_tree.find_covering(addr)?;
+        if vma.mapping != MappingKind::FileBacked {
+            return None;
+        }
+        let object = vma.object.as_ref()?.clone();
+        let page_base = addr.as_u64() & !(PAGE_SIZE as u64 - 1);
+        let index = ((page_base - vma.range.start().as_u64()) / PAGE_SIZE as u64) as usize;
+        Some((object, index))
+    }
+
+    /// Install the leaf PTE for the file-backed page containing `addr`, pointing at
+    /// `frame` (a now-resident cache frame the producer filled), with the covering
+    /// VMA's protection. Re-validates under the AS lock that a `FileBacked` VMA for
+    /// the **same** `object` still covers `addr` (the fault may have raced an unmap /
+    /// process exit while it blocked on the fill). Returns `true` if the page is now
+    /// present (installed here, or already mapped by a racing fault) — the
+    /// instruction may retry; `false` if the VMA is gone/changed (fatal) or a
+    /// page-table allocation failed. The frame is **not** owned by the VMA (the
+    /// object owns it), so `unmap` will remove this PTE without freeing it.
+    pub fn map_file_page(&self, addr: VirtAddr, object: &ObjectRef, frame: PhysAddr) -> bool {
+        let guard = self.inner.lock();
+        let Some(vma) = guard.vma_tree.find_covering(addr) else {
+            return false;
+        };
+        if vma.mapping != MappingKind::FileBacked
+            || vma.object.as_ref().map(|o| o.as_ptr()) != Some(object.as_ptr())
+        {
+            return false;
+        }
+        let flags = protection_to_page_flags(vma.prot);
+        let root = guard.root;
+        let page_base = VirtAddr::new(addr.as_u64() & !(PAGE_SIZE as u64 - 1));
+        // SAFETY: `root` is this AS's PML4; `frame` is a live, resident cache frame
+        // the file object owns and keeps alive (the VMA holds its `ObjectRef`);
+        // `page_base` is page-aligned and in the validated user-half VMA range.
+        match unsafe { Paging::map_page(root, page_base, frame, flags) } {
+            // Installed, or a concurrent fault already mapped it — either way the
+            // page is present and the instruction may retry.
+            Ok(()) | Err(ArchMapError::AlreadyMapped) => {
+                // SAFETY: ring-0 `invlpg` evicting the not-present entry cached on
+                // the fault we are servicing.
+                unsafe { Paging::flush_tlb_page(page_base) };
+                true
+            }
+            Err(ArchMapError::OutOfMemory) => false,
+            // Impossible: `page_base` is page-aligned by construction.
+            Err(ArchMapError::Misaligned) => {
+                unreachable!("map_file_page: Misaligned for a page-aligned address")
             }
         }
     }
@@ -893,6 +1010,129 @@ mod tests {
         let r = asp.find_free_range(PAGE).expect("empty AS has room");
         assert_eq!(r.start().as_u64(), MMAP_BASE);
         assert_eq!(r.len(), PAGE);
+    }
+
+    // --- File-backed mappings (slice 8 Part 2a) --------------------------
+
+    use crate::object::{FileObject, Reserve};
+
+    /// Adopt a `FileObject`'s creation reference into an `ObjectRef`.
+    fn into_file(f: KBox<FileObject>) -> ObjectRef {
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        unsafe {
+            ObjectRef::from_raw(KBox::into_raw(f).as_ptr() as *mut (), KObjectType::FileObject)
+        }
+    }
+
+    #[test]
+    fn map_file_reserves_lazily_with_no_ptes() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let obj = into_file(FileObject::try_new(3 * PAGE as usize).unwrap());
+        asp.map_file(range(PAGE * 4, PAGE * 7), uprot(), obj)
+            .expect("map_file must succeed");
+        assert_eq!(asp.len(), 1, "the VMA is reserved");
+        // No frame is backed yet — every page is lazy.
+        for i in 0..3u64 {
+            assert!(!is_mapped(&asp, va(PAGE * (4 + i))), "page {i} must be lazy");
+        }
+    }
+
+    #[test]
+    fn fault_in_file_backed_signals_and_file_backing_resolves() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let obj = into_file(FileObject::try_new(4 * PAGE as usize).unwrap());
+        let obj_ptr = obj.as_ptr();
+        asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj).unwrap();
+
+        // A not-present fault in the mapping signals FileBacked (no fill here).
+        assert_eq!(asp.fault_in(va(PAGE * 5), FaultAccess::Read), FaultIn::FileBacked);
+
+        // file_backing returns the same object + the page index within the file
+        // (the VMA maps the file from offset 0, so VMA page i == file page i).
+        for (vma_page, want_index) in [(4u64, 0usize), (5, 1), (7, 3)] {
+            let (got_obj, index) = asp
+                .file_backing(va(PAGE * vma_page))
+                .expect("covered by the file mapping");
+            assert_eq!(got_obj.as_ptr(), obj_ptr, "same backing object");
+            assert_eq!(index, want_index, "page index for vma page {vma_page}");
+        }
+        // Outside the mapping, no backing.
+        assert!(asp.file_backing(va(PAGE * 2)).is_none());
+    }
+
+    #[test]
+    fn map_file_page_installs_pte_for_a_ready_frame() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let f = FileObject::try_new(4 * PAGE as usize).unwrap();
+        // Reserve + ready file page 1, mimicking a completed fill.
+        let frame = match f.reserve(1) {
+            Reserve::New(frame) => frame,
+            other => panic!("expected New, got {other:?}"),
+        };
+        f.mark_ready(1);
+        let obj = into_file(f);
+        asp.map_file(range(PAGE * 4, PAGE * 8), uprot(), obj.clone()).unwrap();
+
+        // File page 1 lives at VMA page 5 (range starts at page 4). Map it.
+        assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
+        let phys = unsafe { Paging::translate(asp.root(), va(PAGE * 5)) }
+            .expect("page must now be mapped");
+        assert_eq!(phys, frame, "PTE points at the cache frame");
+        // Idempotent: a racing re-map of the same page still reports present.
+        assert!(asp.map_file_page(va(PAGE * 5), &obj, frame));
+    }
+
+    #[test]
+    fn map_file_page_rejects_wrong_object_or_unmapped() {
+        init_global_heap();
+        let asp = AddressSpace::new().unwrap();
+        let f = FileObject::try_new(PAGE as usize).unwrap();
+        let frame = match f.reserve(0) {
+            Reserve::New(frame) => frame,
+            other => panic!("{other:?}"),
+        };
+        f.mark_ready(0);
+        let obj = into_file(f);
+        asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj.clone()).unwrap();
+
+        // A different object is rejected (the VMA backs `obj`, not `other`).
+        let other = into_file(FileObject::try_new(PAGE as usize).unwrap());
+        assert!(!asp.map_file_page(va(PAGE * 4), &other, frame));
+        // An address outside any VMA is rejected.
+        assert!(!asp.map_file_page(va(PAGE * 99), &obj, frame));
+        // The legitimate mapping still works.
+        assert!(asp.map_file_page(va(PAGE * 4), &obj, frame));
+    }
+
+    #[test]
+    fn unmap_file_mapping_keeps_the_objects_frames() {
+        init_global_heap();
+        test_probe::reset();
+        let asp = AddressSpace::new().unwrap();
+        let f = FileObject::try_new(PAGE as usize).unwrap();
+        let frame = match f.reserve(0) {
+            Reserve::New(frame) => frame,
+            other => panic!("{other:?}"),
+        };
+        f.mark_ready(0);
+        let obj = into_file(f);
+        let keep = obj.clone();
+        asp.map_file(range(PAGE * 4, PAGE * 5), uprot(), obj).unwrap();
+        asp.map_file_page(va(PAGE * 4), &keep, frame);
+        assert!(is_mapped(&asp, va(PAGE * 4)));
+
+        // Unmap: the PTE goes, but the cache frame is owned by the FileObject —
+        // the FileBacked teardown arm removes the PTE without freeing it.
+        let removed = asp.unmap_covering(va(PAGE * 4)).expect("covering vma");
+        assert!(!is_mapped(&asp, va(PAGE * 4)), "PTE removed");
+        drop(removed);
+        assert_eq!(test_probe::file_object_destroys(), 0, "object still referenced");
+        // The last reference drops → the object is destroyed and frees its frames.
+        drop(keep);
+        assert_eq!(test_probe::file_object_destroys(), 1);
     }
 
     // --- Demand paging: lazy reservation + on-fault backing --------------
