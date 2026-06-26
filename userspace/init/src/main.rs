@@ -473,25 +473,34 @@ fn read_large_file(root_ns: u64) {
 
 /// Spawn the demo `parent`, then reap exited children forever. As PID 1, init is
 /// the eventual parent of every orphan; here its only child is `parent`.
+/// Spawn the interactive emergency shell as the persistent serial console (it runs
+/// forever; init keeps no handle). Launched once the demo chain has exited, so the
+/// shell has the disk and console to itself.
+fn spawn_eshell() {
+    kprint(b"init: starting interactive console (eshell)\n");
+    // SAFETY: SPAWN_ESHELL is a valid writable arg block.
+    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_ESHELL) as u64) };
+    if h < 0 {
+        kprint(b"init: eshell spawn FAIL\n");
+    } else {
+        // SAFETY: closing init's reference; eshell runs independently.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+    }
+}
+
 fn supervise(notif: u64) -> ! {
+    // Run the Phase-1/2 demo chain (`parent`) to completion FIRST, *then* launch
+    // the interactive shell. They share the single-outstanding-command disk and the
+    // serial console, so overlapping them corrupts the fs-server's reads (eshell
+    // `cat` fails intermittently) and clutters the console. eshell is launched once
+    // `parent` exits (in the reap loop below) — clean console, exclusive disk.
     kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
     // SAFETY: SPAWN_PARENT is a valid writable arg block.
     let mut parent_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_PARENT) as u64) };
     if parent_h < 0 {
         kprint(b"init: parent spawn FAIL\n");
         parent_h = 0;
-    }
-
-    // Spawn the interactive emergency shell as the persistent serial console. It
-    // runs forever (no reaping needed); init keeps no handle to it.
-    kprint(b"init: starting interactive console (eshell)\n");
-    // SAFETY: SPAWN_ESHELL is a valid writable arg block.
-    let eshell_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_ESHELL) as u64) };
-    if eshell_h < 0 {
-        kprint(b"init: eshell spawn FAIL\n");
-    } else {
-        // SAFETY: closing init's reference; eshell runs independently.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, eshell_h as u64) };
+        spawn_eshell(); // no demo to wait for — launch the console now
     }
 
     kprint(b"init: entering reaping loop\n");
@@ -528,13 +537,15 @@ fn supervise(notif: u64) -> ! {
                 kprint(b" code=");
                 kprint_u64(code as u64);
                 kprint(b"\n");
-                // Release init's reference to the exited child (its only child is
-                // `parent`). Reparented orphans have no handle here — the kernel
-                // tears them down; init just observes their exit.
+                // Release init's reference to the exited child. The demo `parent`
+                // is the only child that exits (eshell runs forever); when it does,
+                // launch the interactive console. Reparented orphans have no handle
+                // here — the kernel tears them down; init just observes their exit.
                 if parent_h != 0 {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
                     parent_h = 0;
+                    spawn_eshell();
                 }
             }
         }

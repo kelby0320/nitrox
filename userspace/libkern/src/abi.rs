@@ -297,7 +297,7 @@ const _: () = assert!(offset_of!(IoOp, length) == 32);
 
 // --- sys_handle_stat metadata ----------------------------------------------
 
-/// Handle metadata written by `sys_handle_stat`; 16 bytes.
+/// Handle metadata written by `sys_handle_stat`; 24 bytes.
 #[repr(C)]
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
 pub struct HandleInfo {
@@ -307,9 +307,12 @@ pub struct HandleInfo {
     pub object_type: u32,
     /// The handle's generation counter (offset 12).
     pub generation: u32,
+    /// The referenced object's byte size for sized resources (a `MemoryObject`'s
+    /// page-rounded size, a `FileObject`'s exact file size), else `0` (offset 16).
+    pub size: u64,
 }
 
-const _: () = assert!(size_of::<HandleInfo>() == 16);
+const _: () = assert!(size_of::<HandleInfo>() == 24);
 const _: () = assert!(align_of::<HandleInfo>() == 8);
 const _: () = assert!(offset_of!(HandleInfo, rights) == 0);
 const _: () = assert!(offset_of!(HandleInfo, object_type) == 8);

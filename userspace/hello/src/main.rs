@@ -61,7 +61,7 @@ const IPC_PING: &[u8] = b"ipc: ping\n";
 const MSG: &[u8] = b"hello from ring 3 (pid 1)\n";
 
 /// Scratch buffer for `sys_handle_stat`'s `HandleInfo` out-parameter (writable `.bss`).
-static mut STAT_BUF: HandleInfo = HandleInfo { rights: 0, object_type: 0, generation: 0 };
+static mut STAT_BUF: HandleInfo = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
 
 /// Out-parameter for `sys_clock_read`. Writable `.bss`, naturally 8-aligned.
 static mut CLOCK_BUF: u64 = 0;

@@ -601,10 +601,29 @@ fn restrict_on(t: &HandleTable, h: RawHandle, pid: u32, new_rights: Rights) -> S
 }
 
 /// Core of `sys_handle_stat`: build the user-facing `HandleInfo` for `h`.
-/// Separated from the user copy-out so the metadata logic is host-testable.
+/// Separated from the user copy-out so the metadata logic is host-testable. One
+/// `INSPECT` lookup yields type/rights + the object, from which the per-type byte
+/// `size` is read (object-aware logic stays here, not in the type-agnostic handle
+/// table); the generation comes from the handle bits.
 fn stat_on(t: &HandleTable, h: RawHandle, pid: u32) -> Result<HandleInfo, KError> {
-    let s = t.stat(h, pid).map_err(map_handle_err)?;
-    Ok(HandleInfo::from_stat(s.object_type, s.rights, s.generation))
+    let ok = t.lookup(h, pid, Rights::INSPECT).map_err(map_handle_err)?;
+    let object_type = ok.object.object_type();
+    let (_, _, generation) = h.decode();
+    let size = object_byte_size(object_type, &ok.object);
+    Ok(HandleInfo::from_stat(object_type, ok.rights, generation, size))
+}
+
+/// The byte size reported in `HandleInfo.size` for a sized resource, else `0`. A
+/// `MemoryObject`'s page-rounded size; a `FileObject`'s exact file size.
+fn object_byte_size(ty: KObjectType, obj: &ObjectRef) -> u64 {
+    match ty {
+        // SAFETY: `obj` pins a live object of the matched type.
+        KObjectType::MemoryObject => {
+            unsafe { &*(obj.as_ptr() as *const MemoryObject) }.size() as u64
+        }
+        KObjectType::FileObject => unsafe { &*(obj.as_ptr() as *const FileObject) }.size() as u64,
+        _ => 0,
+    }
 }
 
 /// `sys_handle_close(h)` — release the caller's reference to `h`. After this
@@ -1978,7 +1997,11 @@ fn build_and_install_file(
         ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject)
     };
     let (op, ot) = fref.into_raw();
-    match global::get().allocate(pl.owner_pid, op, ot, pl.requested) {
+    // Grant `INSPECT` alongside the requested rights so a client can `sys_handle_stat`
+    // the lazy file for its size before mapping (e.g. eshell `cat`) — `INSPECT` is a
+    // generic right, benign on a handle the client already maps.
+    let rights = pl.requested | Rights::INSPECT;
+    match global::get().allocate(pl.owner_pid, op, ot, rights) {
         Ok(h) => (0, h.bits()),
         Err(e) => {
             // SAFETY: `allocate` did not adopt the reference; reclaim it.
