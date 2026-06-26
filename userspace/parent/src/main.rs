@@ -1075,6 +1075,46 @@ fn forward_demo() {
     }
 }
 
+/// Page-cache demand-fault demo (slice 8 Part 2b): resolve the kernel's stub
+/// `FileObject` at `/dev/test/pagecache`, map it read-only, and read one byte from
+/// each of its pages. Each **first touch** of a page is a not-present fault on a
+/// lazy file mapping — the kernel pages it in by parking this thread on the (stub)
+/// fill and resuming it once a DPC completes it. Page `i` fills with the byte
+/// `0xA0 + i`, so the reads verify the demand-fault path end to end (no fs-server).
+fn pagecache_demo(root_ns: u64) {
+    kprint(b"parent: page-cache demo start\n");
+    const NPAGES: u64 = 3;
+    let (st, fh) = ns_lookup_wait(root_ns, b"/dev/test/pagecache", RIGHT_MAP_READ);
+    if st != 0 || fh == 0 {
+        kprint(b"parent: page-cache lookup FAIL\n");
+        return;
+    }
+    // Map it lazily (a FileBacked VMA — no frames are backed until faulted).
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, NPAGES * PAGE, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"parent: page-cache map FAIL\n");
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return;
+    }
+    let base = addr as u64;
+    let mut ok = true;
+    for i in 0..NPAGES {
+        // First touch of page `i` faults; the kernel demand-fills it from the cache.
+        // SAFETY: `base + i*PAGE` is the start of a mapped (lazy) file page.
+        let got = unsafe { ((base + i * PAGE) as *const u8).read_volatile() };
+        if got != 0xA0u8.wrapping_add(i as u8) {
+            ok = false;
+        }
+    }
+    if ok {
+        kprint(b"parent: page-cache demand-faulted 3 pages ok (0xA0,0xA1,0xA2)\n");
+    } else {
+        kprint(b"parent: page-cache content mismatch\n");
+    }
+    // SAFETY: closing our own handle (the mapping keeps the object alive meanwhile).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+}
+
 /// `notif` (in `rdi`) is this process's notification-channel handle and
 /// `root_ns` (in `rsi`) its root-namespace handle, both seeded by the kernel at
 /// spawn. The third bootstrap register is unused here.
@@ -1117,6 +1157,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //     look a path up through it, serve the kernel-forwarded Resolve, and map
     //     the returned MemoryObject — the slice-7 transparent-forwarding proof.
     forward_demo();
+
+    // 0j. Page-cache demand faulting: map the kernel's stub FileObject and read a
+    //     byte from each page — each first touch is a demand fault the kernel
+    //     services by parking this thread on the fill and resuming it (slice 8).
+    pagecache_demo(root_ns);
 
     kprint(b"parent: creating a channel\n");
 

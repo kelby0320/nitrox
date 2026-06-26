@@ -139,6 +139,17 @@ read self-test brings up against the existing AHCI boot disk; the dedicated
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
 
+**Concurrent same-page faults (slice 8 Part 2b).** When a file page fault misses, the
+fault path reserves the frame (`Loading`), starts the producer fill, and parks the
+thread on a per-*fault* `PendingOperation`. A *second* thread faulting the **same**
+page (`Reserve::Loading`) has no handle on that in-flight fill's PO, so it `yield_now`s
+and retries until the page is `Ready`. This cannot occur in the milestone (single CPU,
+one faulter per `FileObject`), so the yield path is never taken; the proper fix —
+store the fill PO in the cache page so a second faulter blocks on it (one wakeup, no
+spin) — is deferred. Trigger: a multi-threaded process (or shared `FileObject`) that
+faults the same page concurrently. Until then the yield-retry is correct, just
+not elegant.
+
 **Page-cache scope (slice 8).** The first file page cache (slice 8, the **Model-B**
 range-read fill — see the decision log, 2026-06-25) is deliberately minimal on three
 axes. **(1) Per-file, not global.** Each `FileObject` owns a sparse page table; two

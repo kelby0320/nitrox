@@ -362,7 +362,25 @@ fn try_fault_in(cr2: u64, error_code: u64) -> bool {
     let Some(asp) = proc.address_space() else {
         return false;
     };
-    asp.fault_in(crate::mm::VirtAddr::new(cr2), access) == crate::mm::addr_space::FaultIn::Mapped
+    let addr = crate::mm::VirtAddr::new(cr2);
+    match asp.fault_in(addr, access) {
+        crate::mm::addr_space::FaultIn::Mapped => true,
+        // A file-backed not-present fault: fetch the backing (a fresh AS-lock
+        // acquisition — never nested with the file cache), **page it in** (this may
+        // park the faulting thread on the producer's fill — `proc_ref`/`asp` stay
+        // live across the block), then install the PTE. `false` if the file is gone
+        // or the fill failed → a fatal fault (SegFault), like any other miss.
+        crate::mm::addr_space::FaultIn::FileBacked => {
+            let Some((file_obj, index)) = asp.file_backing(addr) else {
+                return false;
+            };
+            match crate::object::FileObject::fault_in_page(&file_obj, index) {
+                Some(frame) => asp.map_file_page(addr, &file_obj, frame),
+                None => false,
+            }
+        }
+        _ => false,
+    }
 }
 
 // --- Timer IRQ stub (vector 0x20) ---------------------------------------
