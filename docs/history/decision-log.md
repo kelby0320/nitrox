@@ -5190,3 +5190,45 @@ QEMU regression clean (eager milestone + stub demo both work, no `#DF`/panic). B
 `phase-2/slice8-fill-integration`. Next: Part 4b (the fs-server serves
 `RESOLVE_FILE_LAZY` + `File::ReadRange`; the lazy path activates and is proven by the
 milestone going lazy — retiring the Part-2b stub fixture).
+
+## 2026-06-26 — Phase 2 slice 8, Part 4b: the fs-server serves the lazy path (Model B proven end to end)
+
+The fs-server half that activates 4a's dormant kernel machinery: serve the lazy
+resolve and the page-cache fill. The whole Model-B path now runs end to end.
+
+**The fs-server side.** (1) The ext4 reader gains two functions beside the eager
+`read_file`: `stat_file` (resolve a regular file → its size, **no content read, no
+`MAX_FILE` cap** — lazy faulting is what lifts the 64 KiB cap) and `read_file_range`
+(read `[offset, offset+len)` into a buffer, clamped to the file size, walking extents
+per block — the fill primitive). Both share a new `resolve_regular_file` helper
+factored out of `read_file`. (2) `serve` now **dispatches by op**: a
+`Namespace::Resolve` with `RESOLVE_FILE_LAZY` replies `OBJECT_KIND_FILE` + the file
+size and **no handle** (`serve_resolve`'s lazy branch; the eager `AS_MEMOBJ` path
+stays for a non-lazy client); a `File::ReadRange` reads the range and replies a
+`MemoryObject` of the bytes (`serve_read_range`). (3) `main.rs`'s serve loop calls
+`serve` and stages the new `Served::Lazy` (a reply with no transferred handle).
+
+**Decision — an error reply carries its request's op.** `encode_error` /
+`error_reply` gained an `op` parameter: a `ReadRange` failure must reply with the
+`ReadRange` op so the kernel's `reply_op` router sends it to the pending **fill**
+(not a lookup). With the slice-7 hard-coded `OP_NS_RESOLVE`, a failed fill would
+route to `complete_resolve_reply`, find no matching lookup, drop silently — and the
+**faulting thread would hang forever**. A host test pins this
+(`read_range_error_carries_the_read_range_op`).
+
+**Proven end to end (QEMU).** The kernel sends `RESOLVE_FILE_LAZY`; the fs-server
+replies `OBJECT_KIND_FILE` + size; the kernel builds the `FileObject`; init maps it
+and **faults**; the kernel sends `File::ReadRange`; the fs-server range-reads ext4 and
+replies the bytes; the kernel lands them in the cache frame and resumes init — which
+logs `init: /system/current-generation = nitrox-rootfs generation 1`, now entirely via
+the lazy fill (init faults, the real fs-server fills — two processes, no scaffolding).
+Boot clean (children reap, no `#DF`/panic). The **Part-2b stub fixture** (the kernel's
+`/dev/test/pagecache` `FileObject` + `parent`'s `pagecache_demo`) is **removed** — the
+real milestone supersedes it; `Producer::Stub` stays for host tests.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**516**, fs-server-ext4 **18** (+7: `stat_file` / `read_file_range` (3) + the lazy /
+range / EOF / error-op serve tests (4)). QEMU: the milestone runs via the lazy fill,
+no stub demo, clean. Branch `phase-2/slice8-fill-integration`. **Slice 8's core
+(Model-B page cache, end to end) is complete**; Part 5 (the large multi-extent file +
+the > 64 KiB milestone) remains.

@@ -1345,14 +1345,19 @@ the memory-management page-cache section) are written in their Parts, as in slic
   still replies `MEMOBJ` — **boot stays eager** (the kernel handles both kinds). Host
   tests for the reg's fill slot + stored suffix; QEMU regression = eager milestone +
   stub demo still work.
-- [ ] **Part 4b — the fs-server side (activates + proves the lazy path).** Serve
-  `RESOLVE_FILE_LAZY` (reply size + `OBJECT_KIND_FILE`, no handle) and `File::ReadRange`
-  (suffix → `ext4` extent walk → read the range → reply the bytes, **stateless**,
-  re-resolving per range; needs `ext4` stat + positioned-range reads). **Proven by the
-  existing slice-7 milestone going lazy** — init's `/system/current-generation` lookup
-  now returns a `FileObject` and faults in via `ReadRange` from the real fs-server
-  (init faults, fs-server fills — two processes, no scaffolding). Retires the Part-2b
-  stub `Producer` boot fixture + parent demo.
+- [x] **Part 4b — the fs-server side (activates + proves the lazy path)**
+  (`phase-2/slice8-fill-integration`). The ext4 reader gained `stat_file` (size, no
+  content, no `MAX_FILE` cap) + `read_file_range` (positioned per-block extent read),
+  sharing a `resolve_regular_file` helper. `serve` dispatches by op: a
+  `RESOLVE_FILE_LAZY` resolve replies `OBJECT_KIND_FILE` + size, no handle; a
+  `File::ReadRange` reads the range → replies a `MemoryObject` of the bytes
+  (**stateless**, re-resolving per range). Error replies carry the request's op so the
+  kernel routes a failed fill to the pending fill (not a lookup) — else the faulter
+  hangs. **Proven by the slice-7 milestone going lazy** — init's
+  `/system/current-generation` lookup returns a `FileObject` and faults in via
+  `ReadRange` from the real fs-server (`init: /system/current-generation = nitrox-rootfs
+  generation 1`, boot clean). Retired the Part-2b stub fixture + parent demo
+  (`Producer::Stub` stays for host tests). **Slice 8's Model-B core is complete.**
 - [ ] **Part 5 — disk + the large-file milestone.** Add a **large (> 64 KiB,
   multi-extent) file** to the ext4 image (xtask); init maps it lazily, reads it across
   many faults, and logs a proof (size + a rolling checksum / sampled bytes). The 64 KiB

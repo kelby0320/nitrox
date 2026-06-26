@@ -396,10 +396,9 @@ fn run_first_userspace() {
     use nitrox_kernel::libkern::ImageId;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
-    use nitrox_kernel::mm::PAGE_SIZE;
     use nitrox_kernel::object::kernel_server::KernelServerId;
     use nitrox_kernel::object::{
-        FileObject, Namespace, NotificationChannel, ObjectRef, Process, Producer,
+        Namespace, NotificationChannel, ObjectRef, Process,
     };
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
@@ -561,25 +560,6 @@ fn run_first_userspace() {
     // direct-handle bindings for each GPT partition the drivers discovered (the
     // content-derived names `init.toml` mount specs reference). Read-only.
     nitrox_kernel::drivers::gpt::bind_partition_names(&ns);
-
-    // `/dev/test/pagecache` — the slice-8 page-cache self-test fixture: a small
-    // file-backed object whose pages are filled by a deterministic **stub** producer
-    // (page `i` ← the byte `0xA0 + i`, asynchronously via a DPC). `parent` maps it
-    // read-only and reads each page, taking a **real demand fault** that parks the
-    // thread on the fill and resumes — proving the async fault path with no fs-server
-    // (the real producer is slice 8 Part 3). Read-only (`MAP_READ`).
-    if let Ok(stub) = FileObject::try_new(3 * PAGE_SIZE, Producer::Stub { base: 0xA0 }) {
-        // SAFETY: `into_raw` yields the single creation reference; adopt it.
-        let stub_ref = unsafe {
-            ObjectRef::from_raw(KBox::into_raw(stub).as_ptr() as *mut (), KObjectType::FileObject)
-        };
-        let stub_rights =
-            Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
-        if let Err((returned, _)) = ns.bind(b"/dev/test/pagecache", stub_ref, stub_rights) {
-            drop(returned);
-            kprintln!("init: binding /dev/test/pagecache failed");
-        }
-    }
 
     let ns_ptr = KBox::into_raw(ns).as_ptr() as *mut ();
     // SAFETY: `into_raw` yielded the single creation reference; adopt it, clone

@@ -168,4 +168,47 @@ mod tests {
         let mut out = [0u8; 256];
         assert_eq!(read_file(&r, b"/x", &mut out), Err(FsError::Corrupt));
     }
+
+    #[test]
+    fn stat_returns_size_without_reading_content() {
+        let r = ImageReader(fixture(1024, b"nitrox-gen-0001\n")); // 16 bytes
+        assert_eq!(ext4::stat_file(&r, b"/system/current-generation"), Ok(16));
+        assert_eq!(ext4::stat_file(&r, b"/system/nope"), Err(FsError::NotFound));
+        assert_eq!(ext4::stat_file(&r, b"/system"), Err(FsError::NotFound)); // a dir
+    }
+
+    #[test]
+    fn read_range_covers_offsets_tails_and_eof() {
+        let content = b"0123456789ABCDEF\n"; // 17 bytes
+        let r = ImageReader(fixture(1024, content));
+        let mut out = [0u8; 32];
+        // A mid-file window.
+        let n = ext4::read_file_range(&r, b"/system/current-generation", 4, 6, &mut out).unwrap();
+        assert_eq!(&out[..n], b"456789");
+        // A tail clamped to the file size (ask 100 from offset 10 → 7 bytes).
+        let n = ext4::read_file_range(&r, b"/system/current-generation", 10, 100, &mut out).unwrap();
+        assert_eq!(&out[..n], b"ABCDEF\n");
+        // The whole file from 0.
+        let n = ext4::read_file_range(&r, b"/system/current-generation", 0, 17, &mut out).unwrap();
+        assert_eq!(&out[..n], content);
+        // Past end-of-file → zero bytes.
+        assert_eq!(ext4::read_file_range(&r, b"/system/current-generation", 17, 8, &mut out), Ok(0));
+    }
+
+    #[test]
+    fn read_range_spans_block_boundaries() {
+        // A multi-block file (5000 bytes > one 1 KiB block) so a range crosses
+        // block boundaries and exercises per-block extent lookup.
+        let mut content = std::vec::Vec::new();
+        for i in 0..5000u32 {
+            content.push((i & 0xFF) as u8);
+        }
+        let r = ImageReader(fixture(1024, &content));
+        let mut out = [0u8; 2048];
+        // A 2000-byte window starting at 1500 spans blocks 1..4 (1 KiB blocks).
+        let n = ext4::read_file_range(&r, b"/system/current-generation", 1500, 2000, &mut out)
+            .unwrap();
+        assert_eq!(n, 2000);
+        assert_eq!(&out[..n], &content[1500..3500]);
+    }
 }
