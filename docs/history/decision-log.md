@@ -5284,3 +5284,67 @@ kernel **516**, fs-server-ext4 **18** (unchanged; Part 5 is fixture + init demo)
 the 64-page large file verifies end to end. Branch `phase-2/slice8-large-file`.
 **Phase 2 slice 8 (the kernel page cache) is complete** — file-backed mappings are
 lazy and demand-paged from a userspace fs-server over IPC, at scale.
+
+## 2026-06-27 — Phase 2 slice 9, Part 1: serial console input (the universal char-device path)
+
+The first **user input**: COM1 receive, reached through the **universal device
+interface** (`sys_io_submit` + `sys_wait`), not a console-specific syscall.
+
+**Decision — the console is a char-class `DeviceNode` read via `sys_io_submit`.**
+Per the user's direction, input must use the same device interface as block I/O, not
+a bespoke `sys_console_read`. So `DeviceClass` gains `Char`, `DeviceNode` gains a
+`CharBackend` (the char analogue of `BlockBackend`), and `sys_io_submit` branches on
+device class: **Block** → the IRP path (today); **Char** → a stream read (no block
+alignment, `offset` ignored, `length` = max bytes) dispatched through the backend.
+The read returns a `PendingOperation` completed the same way a block read is — one
+waitable, one completion, identical to the model the rest of userspace already
+speaks. `sys_io_submit(Read)` on the console is the whole userspace surface. (The
+long-term userspace **console/tty server** — cooked line discipline, multiplexing —
+layers on this raw char device; deferred. Line editing/echo live in eshell; the
+kernel delivers raw bytes.)
+
+**Decision — no internal `InterruptObject`.** The read's PO *is* the wait target, so
+the RX DPC completes it directly (mirroring `irp_complete_dpc`) — no separate
+latching interrupt object is needed (the earlier design sketch's one is dropped).
+
+**The driver** (`kernel/src/drivers/console.rs`, neutral): a 256-byte RX ring + a
+single parked-read slot, behind one `IrqSpinLock`. The ISR (`console_isr`) drains
+the UART FIFO into the ring (via `crate::arch::serial::console_rx_*`, the neutral
+surface) and queues a DPC; the DPC copies the ring into the parked read's
+`MemoryObject` (HHDM — kernel memory, sound from a DPC) and completes its PO.
+`submit_read` satisfies immediately from the ring (pre-signalling) or parks
+(single-reader → `WouldBlock` if busy). The lock is released before the memobj copy
+or `complete_pending_op` (rank-1 `SCHED`) — never nested. The console `DeviceNode` is
+leaked `'static`; `/dev/console` (a new `KernelServerId::Console`, `READ` rights)
+hands out counted references.
+
+**arch boundary.** RX register access + `MCR` loopback + COM1 IRQ4 routing stay in
+`arch/x86_64`; the neutral driver reaches them only through `crate::arch::serial::*`.
+
+*Decision — `install_isa_irq` is arch-internal, not a neutral name.* "ISA" is an
+x86-only concept (ARM has no ISA IRQs — a UART there is a DTB device on a GIC SPI), so
+exposing `crate::arch::install_isa_irq` would leak arch jargon (the boundary convention
+forbids it). Instead, a **fixed legacy device wires its own interrupt inside the arch
+layer** — exactly as the PIT does (`resolve_isa_irq`, never neutral). The serial
+console arms its RX interrupt through a **console-named** neutral function,
+`arch::serial::console_arm_rx(handler) -> vector`, which internally calls the now
+`pub(crate)` `ioapic::install_isa_irq(COM1_IRQ=4, …)`. The neutral concept is "arm the
+console's RX interrupt" — *more* neutral than a generic installer, since the console
+driver need not know its own IRQ number; an aarch64 port maps the same call onto its
+UART's GIC interrupt. (`install_pci_irq` is left as-is: PCI is cross-arch, and its
+`TODO(msi)` already plans promoting the device-interrupt family into an
+`ArchIrqInstall` trait taking a neutral `InterruptSpec` when MSI/teardown land — the
+home for a generic spec-driven installer later.) `check-arch` clean.
+
+**Proof.** A boot self-test exercises the RX register path deterministically via the
+UART's **internal loopback** (transmit a byte, poll it back) — `console: RX loopback
+self-test OK` — then arms the IRQ: `console: RX armed (COM1 IRQ4→vec0x32)`. Runs with
+interrupts masked, before RX IRQs are armed, so the polled read (not an ISR) consumes
+the test byte. The ISR firing on real input is proven in Part 2 (scripted serial
+input). Boot stays clean (AHCI, current-generation, large.bin all still pass, no
+`#DF`).
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**516** (`DeviceClass::Char` added to the round-trip test; the driver + io_submit char
+path are QEMU-proven, like AHCI, not host-tested). Branch `phase-2/slice9-eshell`.
+Next: Part 2 (the eshell crate + line editor + interactive launch).

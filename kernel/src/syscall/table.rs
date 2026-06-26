@@ -37,10 +37,12 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::kernel_server::{self, OpStatus};
 use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, validate_path};
+use crate::object::device_node::DeviceClass;
 use crate::object::{
-    BlockSendOutcome, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES, MemoryObject,
-    Namespace, NotificationChannel, NsError, ObjectRef, PendingOperation, Process, ReclaimedSend,
-    RecvState, SendOutcome, StoredMsg, Timer as TimerObject, TransferRef, UserspaceServerReg,
+    BlockSendOutcome, DeviceNode, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES,
+    MemoryObject, Namespace, NotificationChannel, NsError, ObjectRef, PendingOperation, Process,
+    ReclaimedSend, RecvState, SendOutcome, StoredMsg, Timer as TimerObject, TransferRef,
+    UserspaceServerReg,
 };
 
 // --- Stable ABI syscall numbers -----------------------------------------
@@ -1399,17 +1401,36 @@ pub fn sys_io_submit(resource_h: u64, op_ptr: u64) -> SysResult {
         return Ok(po_h.bits() as isize);
     }
 
-    // Build + dispatch the IRP. On allocation/unsupported failure, roll back the
-    // PO handle (and `po_ref` drops at return → PO destroyed).
-    match crate::io::block::dispatch_block_irp(
-        &dev_ok.object,
-        &buf_ok.object,
-        &po_ref,
-        opcode,
-        op.offset,
-        op.buf_offset,
-        op.length,
-    ) {
+    // Dispatch by device class. A block device goes through the IRP path; the
+    // console (a char device) goes through its stream-read backend (no block
+    // alignment, no device offset). On failure, roll back the PO handle (and
+    // `po_ref` drops at return → PO destroyed).
+    // SAFETY: `dev_ok.object` pins a live `DeviceNode` (type-checked above).
+    let dn: &DeviceNode = unsafe { &*(dev_ok.object.as_ptr() as *const DeviceNode) };
+    let dispatched: Result<(), KError> = match dn.class() {
+        DeviceClass::Block => crate::io::block::dispatch_block_irp(
+            &dev_ok.object,
+            &buf_ok.object,
+            &po_ref,
+            opcode,
+            op.offset,
+            op.buf_offset,
+            op.length,
+        ),
+        // The console: stream Read only (input). Write/Other are not supported yet.
+        DeviceClass::Char if opcode == IoOpcode::Read => match dn.char_backend() {
+            Some(backend) => (backend.submit_read)(
+                &buf_ok.object,
+                &po_ref,
+                op.buf_offset,
+                op.length,
+                backend.ctx,
+            ),
+            None => Err(KError::Unsupported),
+        },
+        DeviceClass::Char | DeviceClass::Other => Err(KError::Unsupported),
+    };
+    match dispatched {
         Ok(()) => Ok(po_h.bits() as isize),
         Err(e) => {
             close_and_release(po_h, pid);

@@ -96,6 +96,25 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
   readiness/rights cheaply). The per-call ceiling is `MAX_USER_COPY_SIZE`
   (16 MiB), matching the rest of the syscall surface.
 
+## Device classes (block vs. char)
+
+`sys_io_submit` dispatches on the resource's **device class**
+([`device-node.md`](device-node.md)):
+
+- **Block** devices (disks, partitions) follow the rules above: `offset`/`length`
+  are logical-block multiples, translated into an [`Irp`](#relationship-to-the-irp).
+- **Char/stream** devices (the **serial console**, `/dev/console`) accept a `Read`
+  only (input). The block-alignment rules **do not apply**: `offset` is ignored
+  (a stream has no addressable position), and `length` is the **maximum** bytes to
+  read — the PO completes with `result` = the bytes actually delivered (≥ 1, ≤
+  `length`), which arrive when the device's RX interrupt fires (or immediately, if
+  bytes are already buffered). The bytes land in `buffer` exactly as for a block
+  read. `Write` to a char device is `Unsupported` in Phase 2 (output stays on the
+  kernel log path; symmetric console write is deferred). The `buffer` is still a
+  `MemoryObject` with `MAP_WRITE`, and `buf_offset + length <= buffer.size()` still
+  holds. The completion is delivered through the same `PendingOperation`; no
+  device-specific syscall exists.
+
 ## IoOpcode
 
 ```rust

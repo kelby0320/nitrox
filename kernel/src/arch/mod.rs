@@ -59,6 +59,12 @@ pub use x86_64::ioapic::X86IoApic as IrqRouter;
 /// device-interrupt family into its own trait when MSI/teardown land).
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::ioapic::install_pci_irq;
+// Legacy *ISA* interrupt installation is **not** re-exported neutrally: "ISA" is an
+// x86-only concept (ARM has no ISA IRQs), so surfacing it here would leak arch
+// jargon (`docs/conventions/arch-boundary.md`). A fixed legacy platform device wires
+// its own interrupt inside the arch layer — the PIT does (via `resolve_isa_irq`), and
+// the serial console does via `arch::serial::console_arm_rx`. The neutral concept is
+// "arm the console's RX interrupt", not "install ISA IRQ 4".
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::cpu::X86Cpu as Cpu;
 // Platform/firmware discovery (the x86 impl parses ACPI tables; aarch64 would
