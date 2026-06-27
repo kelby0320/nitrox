@@ -5510,3 +5510,60 @@ rendering — a bonus beyond `/dev/log`. eshell's explicit `\r\n` becomes a harm
 **Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
 **517** (the klog ring + `/dev/log` are QEMU-proven, like the console driver, not
 host-tested). Branch `phase-2/slice9-klog`. Next: Part 6 (init failure → eshell).
+
+## 2026-06-27 — Phase 2 slice 9, Part 6: init failure → eshell (slice 9 complete)
+
+Implement the path `userspace/init/CLAUDE.md` has documented since slice 4 but never
+had: on a critical-path failure, init drops to the emergency shell instead of running
+the boot milestones. Until now a failed required mount was logged but init soldiered
+on into the `parent` demo regardless — exactly the "soldier on past a misconfiguration"
+the CLAUDE.md forbids.
+
+**The change** (`userspace/init/src/main.rs`). `mount_all` now returns `bool` (a failed
+`required_for = "boot"` mount is critical-path → `false`). `_start` computes
+`booted = match read_manifest(root_ns) { Some(m) => mount_all(.., &m), None => false }`
+and branches: `!booted` → `emergency(notif)`; otherwise the existing milestones
+(`read_current_generation`, `read_large_file`) + `supervise(notif)`. `supervise` was
+factored into three functions sharing one reaping loop:
+- `supervise(notif)` — healthy: spawn `parent`, then `reap_loop(notif, parent_h)`
+  (and if the `parent` spawn itself fails, fall through to `spawn_eshell` + `reap_loop`).
+- `emergency(notif)` — failure: log `init: critical-path failure -- dropping to
+  emergency shell`, `spawn_eshell()`, `reap_loop(notif, 0)`. No demo, no milestones.
+- `reap_loop(notif, mut parent_h)` — the shared wait/drain/reap loop; when `parent_h`
+  is non-zero and that child exits (the demo finished), it closes the handle and
+  `spawn_eshell()` (the existing healthy-path hand-off to the interactive shell).
+
+So both paths converge on the *same* eshell + reaping loop; the only difference is
+whether the boot milestones and `parent` demo run first. The emergency shell is a
+fully-capable inspector — it gets the same console + root namespace, so `mounts`,
+`lsblk`, and `cat /dev/log` all work for diagnosing why the boot failed.
+
+**Decision — emergency drops *before* the milestones, not after a degraded boot.**
+A required-mount failure means `/` is absent; running `read_current_generation` /
+`read_large_file` (which read through the root fs) would just produce more failures
+before reaching the shell. The operator wants the prompt and the log, immediately.
+The non-required-mount story (degraded-but-continue) doesn't exist yet — every mount
+in the manifest is `required_for = "boot"` — so "any mount failed → emergency" is
+correct today; per-mount `required` gating is a later refinement when optional mounts
+appear.
+
+**Proof (QEMU, both paths).** Temporarily forcing the manifest device to
+`gpt-partlabel:does-not-exist`: the boot logs `device /dev/disk/by-partlabel/
+does-not-exist not found` → `mount FAILED for /` → `init: critical-path failure --
+dropping to emergency shell` → `init: starting interactive console (eshell)` → a live
+`eshell>` prompt, with **no** `parent` demo and **no** milestone lines; `mounts` from
+the emergency shell lists every binding *except* `/` (correct — it never mounted), and
+`cat /dev/log` dumps the boot log including the failure. The forced label was then
+reverted; the healthy boot is unchanged (milestones → `parent` → `reaped pid=3` →
+eshell). No faults either way.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**517**, all suites green (Part 6 is init-only; the behaviour is QEMU-proven, not
+host-tested). Branch `phase-2/slice9-init-failure`.
+
+**Slice 9 (emergency shell + the first user input) is complete.** The system now boots
+to a live `eshell>` over the serial console; the operator can run `help`, `echo`,
+`lsblk`, `cat <path>` (lazy page-cache reads), `mounts` (`sys_ns_enumerate`), and
+`cat /dev/log` (dmesg); and a critical-path boot failure drops to the same shell for
+recovery. Input flows through the universal `sys_io_submit(Read)` + `sys_wait` char-
+device path, not a bespoke syscall. Next: slice 10 (FAT read-only for completeness).

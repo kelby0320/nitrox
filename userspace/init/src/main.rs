@@ -202,14 +202,20 @@ fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
 /// the device, spawn an `fs-server-ext4`, hand it the device, await Ready, and bind
 /// its endpoint at the mount point. A failed mount is logged and skipped (the
 /// eshell handoff is slice 9).
-fn mount_all(root_ns: u64, mounts: &[MountSpec]) {
+/// Mount every manifest entry; returns `true` iff all succeeded. A failure is
+/// critical-path (the entries are all `required_for = boot`) and routes init to the
+/// emergency shell.
+fn mount_all(root_ns: u64, mounts: &[MountSpec]) -> bool {
+    let mut ok = true;
     for m in mounts {
         if !mount_one(root_ns, m) {
             kprint(b"init: mount FAILED for ");
             kprint(m.mount_point.as_bytes());
             kprint(b"\n");
+            ok = false;
         }
     }
+    ok
 }
 
 /// Mount one `[[mount]]`: the Resource Server Startup Protocol from init's side.
@@ -488,21 +494,40 @@ fn spawn_eshell() {
     }
 }
 
+/// The **healthy** supervise path: run the Phase-1/2 demo chain (`parent`) to
+/// completion FIRST, *then* launch the interactive shell. They share the
+/// single-outstanding-command disk and the serial console, so overlapping them
+/// corrupts the fs-server's reads (eshell `cat` fails intermittently) and clutters
+/// the console. eshell is launched once `parent` exits (in [`reap_loop`]) — clean
+/// console, exclusive disk.
 fn supervise(notif: u64) -> ! {
-    // Run the Phase-1/2 demo chain (`parent`) to completion FIRST, *then* launch
-    // the interactive shell. They share the single-outstanding-command disk and the
-    // serial console, so overlapping them corrupts the fs-server's reads (eshell
-    // `cat` fails intermittently) and clutters the console. eshell is launched once
-    // `parent` exits (in the reap loop below) — clean console, exclusive disk.
     kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
     // SAFETY: SPAWN_PARENT is a valid writable arg block.
-    let mut parent_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_PARENT) as u64) };
+    let parent_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_PARENT) as u64) };
     if parent_h < 0 {
         kprint(b"init: parent spawn FAIL\n");
-        parent_h = 0;
         spawn_eshell(); // no demo to wait for — launch the console now
+        reap_loop(notif, 0);
     }
+    // `reap_loop` launches eshell once `parent` (the only exiting child) reaps.
+    reap_loop(notif, parent_h);
+}
 
+/// The **emergency** path: a critical-path boot failure (bad manifest, failed
+/// mount). Drop straight to the interactive shell so the operator can inspect the
+/// broken system (`cat /dev/log`, `mounts`, `lsblk`) — no demo chain, no milestones.
+/// See `userspace/init/CLAUDE.md` § "Failure → eshell".
+fn emergency(notif: u64) -> ! {
+    kprint(b"init: critical-path failure -- dropping to emergency shell\n");
+    spawn_eshell();
+    reap_loop(notif, 0);
+}
+
+/// Reap exited children forever (init is the eventual parent of every orphan).
+/// `parent_h` is the demo `parent`'s handle, or `0` if none is pending; when it
+/// reaps (the only child that exits — eshell runs forever), the interactive console
+/// is launched.
+fn reap_loop(notif: u64, mut parent_h: i64) -> ! {
     kprint(b"init: entering reaping loop\n");
     loop {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
@@ -537,10 +562,9 @@ fn supervise(notif: u64) -> ! {
                 kprint(b" code=");
                 kprint_u64(code as u64);
                 kprint(b"\n");
-                // Release init's reference to the exited child. The demo `parent`
-                // is the only child that exits (eshell runs forever); when it does,
-                // launch the interactive console. Reparented orphans have no handle
-                // here — the kernel tears them down; init just observes their exit.
+                // Release init's reference to the exited child. When the demo
+                // `parent` reaps, launch the interactive console. Reparented orphans
+                // have no handle here — the kernel tears them down; init observes.
                 if parent_h != 0 {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
@@ -567,17 +591,26 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     kprint_u64(root_ns);
     kprint(b")\n");
 
-    // Read the manifest, process its mounts (spawn fs-servers → Ready → bind), then
-    // prove the stack end to end by reading `/system/current-generation` through the
-    // freshly-mounted root filesystem.
-    if let Some(mounts) = read_manifest(root_ns) {
-        mount_all(root_ns, &mounts);
-        read_current_generation(root_ns);
-        // Slice-8 Part-5 milestone: a large file read entirely through the page
-        // cache — many demand faults, each a `File::ReadRange` to the fs-server.
-        read_large_file(root_ns);
+    // Read the manifest and process its mounts (spawn fs-servers → Ready → bind). A
+    // missing/invalid manifest or a failed required mount is a **critical-path
+    // failure** → drop to the emergency shell (the operator inspects the broken
+    // system). On success, prove the stack end to end (the slice-7/8 milestones) and
+    // enter the normal supervise path.
+    let booted = match read_manifest(root_ns) {
+        Some(mounts) => mount_all(root_ns, &mounts),
+        None => {
+            kprint(b"init: no usable boot manifest\n");
+            false
+        }
+    };
+    if !booted {
+        emergency(notif);
     }
 
+    read_current_generation(root_ns);
+    // Slice-8 Part-5 milestone: a large file read entirely through the page cache —
+    // many demand faults, each a `File::ReadRange` to the fs-server.
+    read_large_file(root_ns);
     supervise(notif);
 }
 
