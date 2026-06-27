@@ -360,6 +360,49 @@ impl HandleInfo {
     }
 }
 
+/// Longest binding path [`NsEntry`] carries inline; a longer path is truncated
+/// (its true length is still reported in `path_len`). Every real mount/resource
+/// path is far shorter.
+pub const NS_ENTRY_PATH_MAX: usize = 256;
+
+/// [`NsEntry::kind`]: a directly-bound resource handle.
+pub const NS_KIND_DIRECT: u32 = 0;
+/// [`NsEntry::kind`]: an in-kernel resource server (`/dev/blk`, `/dev/entropy`, …).
+pub const NS_KIND_KERNEL: u32 = 1;
+/// [`NsEntry::kind`]: a userspace resource server — a **mount** (`/` → fs-server).
+pub const NS_KIND_MOUNT: u32 = 2;
+
+/// One namespace binding, written by `sys_ns_enumerate` — the path it owns, what
+/// kind of target it resolves to, and the maximum rights a lookup through it may
+/// obtain. Lets a client list a namespace's mount points + kernel resources (e.g.
+/// eshell `mounts`); it is **not** a filesystem `readdir` (listing files inside a
+/// mount is an fs-server operation).
+///
+/// `#[repr(C)]` boundary type (`docs/spec/syscall-abi.md`); not in the ABI hash.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct NsEntry {
+    /// The binding path's **true** byte length (may exceed [`NS_ENTRY_PATH_MAX`],
+    /// in which case `path` is truncated).
+    pub path_len: u32,
+    /// One of `NS_KIND_*` — the target kind.
+    pub kind: u32,
+    /// The binding's maximum rights (`Rights::bits()`).
+    pub rights: u64,
+    /// The binding path bytes (`path[..min(path_len, NS_ENTRY_PATH_MAX)]`).
+    pub path: [u8; NS_ENTRY_PATH_MAX],
+}
+
+const _: () = assert!(core::mem::size_of::<NsEntry>() == 16 + NS_ENTRY_PATH_MAX);
+const _: () = assert!(core::mem::align_of::<NsEntry>() == 8);
+
+impl NsEntry {
+    /// An all-zero entry (the kernel fills it before copy-out).
+    pub const fn zeroed() -> Self {
+        Self { path_len: 0, kind: 0, rights: 0, path: [0; NS_ENTRY_PATH_MAX] }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

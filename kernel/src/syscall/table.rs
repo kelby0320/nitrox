@@ -17,7 +17,7 @@ use crate::arch::timer::ArchTimer;
 use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
-use crate::libkern::handle::{HandleInfo, KObjectType, RawHandle, Rights};
+use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{ImageId, SPAWN_MAX_HANDLES, SpawnArgs};
 use crate::arch::RegisterValues;
@@ -112,6 +112,8 @@ pub const SYS_ENTROPY_READ: u64 = 27;
 pub const SYS_IO_SUBMIT: u64 = 28;
 /// `sys_io_cancel` — request cancellation of an in-flight operation (Phase 2: `Unsupported`).
 pub const SYS_IO_CANCEL: u64 = 29;
+/// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
+pub const SYS_NS_ENUMERATE: u64 = 30;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -155,6 +157,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3)),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
+        SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
         SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
@@ -1091,6 +1094,28 @@ pub fn sys_ns_unbind(ns_h: u64, path_ptr: u64, path_len: usize) -> SysResult {
         }
         None => Err(KError::NotFound),
     }
+}
+
+/// `sys_ns_enumerate(ns, index, out)` — write the `index`-th binding of namespace
+/// `ns` (insertion order) to the user [`NsEntry`] at `out`: its path, target kind
+/// (`NS_KIND_*`), and rights. Requires `LOOKUP` on `ns`. Returns `0`, or `NotFound`
+/// when `index` is past the binding count (the iteration terminator). Lists a
+/// namespace's **bindings** (mount points + kernel resources) — not filesystem
+/// `readdir`. (Syscall number `30`.)
+pub fn sys_ns_enumerate(ns_h: u64, index: u64, out: u64) -> SysResult {
+    // Validate the user pointer first (cheap, side-effect-free).
+    let uptr = UserMutPtr::<NsEntry>::new(out).map_err(from_user_access)?;
+    let pid = crate::sched::current_owner_pid();
+    let ns_ok = lookup_typed(ns_h, pid, Rights::LOOKUP, KObjectType::Namespace)?;
+    // SAFETY: live `Namespace` (type verified by `lookup_typed`).
+    let ns: &Namespace = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+    let mut entry = NsEntry::zeroed();
+    // Fill the entry under the namespace lock; copy out below, outside it.
+    if !ns.enumerate(index as usize, &mut entry) {
+        return Err(KError::NotFound);
+    }
+    copy_to_user(uptr, &entry).map_err(from_user_access)?;
+    Ok(0)
 }
 
 /// Per-call cap on `sys_entropy_read`. Entropy reads are small (seeds, keys,

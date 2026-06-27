@@ -102,6 +102,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `27` | `sys_entropy_read` |
 | `28` | `sys_io_submit` |
 | `29` | `sys_io_cancel` |
+| `30` | `sys_ns_enumerate` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -183,6 +184,19 @@ Requests cancellation of an in-flight operation. **Phase 2 returns
 `Unsupported`** — IRP cancellation is deferred (`deferred-decisions.md`
 § "Drivers and interrupts"); the number is reserved now so the ABI is stable when
 cancellation lands. (Syscall number `29`.)
+
+```rust
+fn sys_ns_enumerate(ns: RawHandle, index: u64, out: UserMutPtr<NsEntry>) -> isize
+```
+Writes the `index`-th binding (insertion order) of namespace `ns` to `out`, or
+returns `NotFound` once `index` is past the binding count (the iteration
+terminator). Requires `LOOKUP` on `ns`. `NsEntry` (`#[repr(C)]`, `16 +
+NS_ENTRY_PATH_MAX` bytes) carries `path_len` (the binding path's true length),
+`kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights` (the binding's max rights), and
+the path inline (truncated to `NS_ENTRY_PATH_MAX = 256`). This **lists a namespace's
+bindings** — mount points + kernel resources — not the files inside a mounted
+filesystem (that is an fs-server `readdir`, deferred). Synchronous (the kernel holds
+the bindings). (Syscall number `30`.)
 
 ```rust
 fn sys_wait(

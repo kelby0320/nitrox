@@ -5435,3 +5435,36 @@ underlying AHCI single-command limitation is recorded as deferred (proper IRP qu
 **Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
 **516** (HandleInfo layout/round-trip tests updated on both sides). Branch
 `phase-2/slice9-cat`. Next: Part 4 (`mounts` + `sys_ns_enumerate`).
+
+## 2026-06-27 — Phase 2 slice 9, Part 4: `sys_ns_enumerate` + `mounts`
+
+A namespace can be **looked up** but not **listed** — `sys_ns_enumerate` fills that
+gap, and eshell `mounts` is its first consumer.
+
+**Decision — `sys_ns_enumerate` is the right shape (a namespace-family syscall).**
+Namespaces already have `sys_ns_lookup` / `sys_ns_bind` / `sys_ns_unbind`;
+`enumerate` (`= 30`) is the missing sibling — it operates on a `Namespace` handle
+(requires `LOOKUP`), synchronously (the kernel holds the bindings; no forwarding).
+It is **not** in tension with the "device I/O goes through `io_submit`" rule (that's
+the *device* family; namespaces are their own). `sys_ns_enumerate(ns, index, out)`
+writes the `index`-th binding (insertion order) to a user `NsEntry`, returning
+`NotFound` past the end (the iteration terminator). `NsEntry` (`#[repr(C)]`, kernel
+`libkern/handle.rs` + userspace `libkern/abi.rs`, not in the ABI hash): `path_len`,
+`kind` (`NS_KIND_DIRECT`/`KERNEL`/`MOUNT`), `rights`, and the path inline
+(`[u8; 256]`, truncated past that — every real path is far shorter).
+
+**Scope — bindings, not `readdir`.** `enumerate` lists the namespace's own bindings
+(mount points + kernel resources), **not** the files inside a mounted filesystem
+(that is an fs-server `readdir`, deferred). `Namespace::enumerate` fills the `NsEntry`
+under the binding lock with **no allocation** (a fixed-buffer path copy + a target
+`match`); the user copy-out happens in the syscall, outside the lock.
+
+**Proof (QEMU).** `mounts` lists the inherited root namespace: `/dev/entropy`,
+`/dev/console`, `/proc/self/*`, `/initramfs`, `/dev/blk` (kernel resources);
+`/dev/disk/by-*` (direct handles); and `/` (mount). The kind classification is
+correct, and it confirms eshell's inherited namespace *does* carry init's `/` mount
+(the Part-3 `cat` flakiness was disk contention, not a missing binding).
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**517** (+1: `enumerate_lists_bindings_in_order_with_kind`). Branch
+`phase-2/slice9-mounts`. Next: Part 5 (kernel log ring + `/dev/log`).
