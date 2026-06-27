@@ -144,6 +144,11 @@ impl SerialPort {
 /// renders correctly on a terminal.
 impl fmt::Write for SerialPort {
     fn write_str(&mut self, s: &str) -> fmt::Result {
+        // Tee the raw bytes into the kernel log ring (`cat /dev/log` / dmesg). This
+        // is the `kprint!` path *and* the panic/exception emergency writer; `push`
+        // uses `try_lock`, so it can never deadlock the panic path. Newlines stay
+        // bare `\n` here (the log reader's `sys_kprint` translates for the terminal).
+        crate::klog::push(s.as_bytes());
         for &byte in s.as_bytes() {
             if byte == b'\n' {
                 self.write_byte(b'\r');

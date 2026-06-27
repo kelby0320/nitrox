@@ -1410,9 +1410,12 @@ the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.
   `NsEntry { path, path_len, kind, rights }`, requires `LOOKUP`, `NotFound` past the
   end), listing mount points + kernel resources (**not** fs `readdir`). eshell `mounts`
   lists them with kind tags (kernel resource / direct / mount). Proven in QEMU.
-- [ ] **Part 5 — kernel log ring + `/dev/log`**: a `klog` ring (tee `kprint`) + a
-  `/dev/log` resource (a `MemoryObject` snapshot). Read with `cat /dev/log` (no bespoke
-  `dmesg` command).
+- [x] **Part 5 — kernel log ring + `/dev/log`** (`phase-2/slice9-klog`): `kernel/src/klog.rs`
+  (a 16 KiB append buffer teed from the serial `write_str` path — `kprint!` + the panic
+  writer; `IrqSpinLock::try_lock` keeps the tee panic-safe) + a `/dev/log` resource
+  (`KernelServerId::Log`, a `MemoryObject` snapshot). Read with `cat /dev/log` (no bespoke
+  `dmesg`). Bonus: `sys_kprint` now translates `\n`→`\r\n`, fixing all userspace terminal
+  rendering. Proven in QEMU (the kernel boot log dumps correctly).
 - [ ] **Part 6 — init failure → eshell**: implement the documented critical-path-failure
   drop to eshell.
 

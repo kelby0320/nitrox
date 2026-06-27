@@ -514,9 +514,14 @@ pub fn sys_kprint(ptr: u64, len: usize) -> SysResult {
     // `UserAccessError::Fault` (→ `FaultFromUser`), never a kernel halt.
     copy_slice_from_user(dst, uptr).map_err(from_user_access)?;
 
-    // SERIAL is rank 7 (lowest); no other lock is held here.
+    // SERIAL is rank 7 (lowest); no other lock is held here. Translate `\n` → `\r\n`
+    // (the terminal convention, as the kernel's own `kprint!` does) so userspace
+    // output — eshell, `cat`, init — renders correctly on a real serial terminal.
     let serial = crate::arch::serial::SERIAL.lock();
     for &b in dst.iter() {
+        if b == b'\n' {
+            serial.write_byte(b'\r');
+        }
         serial.write_byte(b);
     }
     Ok(len as isize)

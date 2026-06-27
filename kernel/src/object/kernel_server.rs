@@ -55,6 +55,9 @@ pub enum KernelServerId {
     /// `/dev/console` — the serial console (a char [`DeviceNode`](crate::object::DeviceNode))
     /// the caller reads with `sys_io_submit(Read)` (see [`console_server`]).
     Console,
+    /// `/dev/log` — the kernel log ring, served as a read-only [`MemoryObject`]
+    /// snapshot the caller maps + reads (`cat /dev/log` = dmesg; see [`log_server`]).
+    Log,
     // `/proc/self/status` (numeric pid/tid) and the `/dev` directory listing are
     // deferred — see `docs/rationale/deferred-decisions.md`.
 }
@@ -100,6 +103,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::Initramfs => initramfs_server(suffix, requested),
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
         KernelServerId::Console => console_server(suffix, requested),
+        KernelServerId::Log => log_server(suffix, requested),
     }
 }
 
@@ -217,6 +221,33 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
         Some(node) => OpStatus::Completed(node),
         None => OpStatus::Rejected(KError::NotFound),
     }
+}
+
+/// `/dev/log` — a **leaf** server returning the kernel log ring as a fresh
+/// read-only [`MemoryObject`] snapshot (the caller maps it `MAP_READ` and reads —
+/// `cat /dev/log`, the system `dmesg`). The object is sized to the bytes logged so
+/// far; a partial last page is zero-padded (the reader trims). Any non-empty
+/// `suffix` is *not found*.
+///
+/// `requested` is accepted to match the RS contract but ignored — the binding's
+/// rights cap what the caller obtains, applied by the lookup syscall.
+fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    let len = crate::klog::len();
+    let memobj = match MemoryObject::try_new(len.max(1)) {
+        Ok(m) => m,
+        Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
+    };
+    // Copy the log into the object's frames (under the ring lock, in the object's
+    // creation reference before adopting it).
+    crate::klog::copy_into_frames(memobj.frames());
+    // Adopt the creation reference into an `ObjectRef` for the caller.
+    // SAFETY: `into_raw` yields the one outstanding creation reference.
+    OpStatus::Completed(unsafe {
+        ObjectRef::from_raw(KBox::into_raw(memobj).as_ptr() as *mut (), KObjectType::MemoryObject)
+    })
 }
 
 /// `/dev/console` — a **leaf** server returning a counted reference to the serial

@@ -212,6 +212,26 @@ impl<T> IrqSpinLock<T> {
         }
     }
 
+    /// Try to acquire the lock **without spinning**. Masks interrupts first (like
+    /// [`lock`](Self::lock)); on success returns the guard, on contention restores
+    /// the prior interrupt state and returns `None`. Used by `klog::push` so teeing
+    /// kernel output into the log ring can never deadlock against a fault that
+    /// strikes while the ring lock is held (the panic/exception path tees too).
+    pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
+        let prev_if = irq_backend::disable();
+        if self
+            .locked
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_ok()
+        {
+            Some(IrqSpinLockGuard { lock: self, prev_if })
+        } else {
+            // Contended: restore the interrupt state we masked above and give up.
+            irq_backend::restore(prev_if);
+            None
+        }
+    }
+
     /// Release the lock. Called from the guard's `Drop` and from
     /// [`release_keeping_irqs_masked`](IrqSpinLockGuard::release_keeping_irqs_masked).
     fn release(&self) {
