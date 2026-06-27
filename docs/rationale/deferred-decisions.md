@@ -208,6 +208,33 @@ per-fault re-resolution showing up in profiles. The page cache is built behind a
 **fill-producer seam** so the **Model-A** extent fill (Phase 3, zero-copy block reads)
 slots in *alongside* `ReadRange` without a redesign.
 
+**Demand-fault fill latency — single-page fills, no read-ahead (slice 8; measured
+slice 9).** The kernel fills **exactly one 4 KiB page per fault**
+(`FileObject::fault_in_page` reserves a single index), and each fill is a full
+stateless round-trip: park the faulter → `File::ReadRange` IPC → the fs-server
+re-reads the superblock, re-resolves the path, and re-walks the extent tree from
+disk (~6–8 emulated AHCI reads) → reply → fill → resume. Measured under QEMU at
+**~325 ms per page**; the 64-page `large.bin` milestone fixture made boot a ~20 s
+silent wait. Two independent Phase-3 levers close this, and they compose:
+- **Kernel read-ahead (clustered fill)** — on a `FileBacked` fault, fill a cluster
+  of pages in **one** `ReadRange` (e.g. the rest of the file capped at N pages),
+  turning *pages* round-trips into *⌈pages/N⌉*. The single biggest lever; it is the
+  natural completion of the slice-8 page cache and needs only the fault path +
+  `reserve`/`start_fill` to span a page range (the wire op already carries
+  `offset`/`len`).
+- **fs-server open-file cookie** — the stateless-fill entry above; makes each
+  `ReadRange` O(1) instead of a full re-resolve.
+
+Deferred to Phase 3 rather than pulled forward: both are optimizations of a path
+that is *correct* today, and the milestone only needs to **prove** multi-page
+demand-faulting, not do it fast. As a stopgap the fixture was trimmed **64 → 8
+pages** (still spans 8 position-sensitive pages; boot ~2.8 s instead of ~20 s) — see
+the decision log (2026-06-26, Phase 2 close). Trigger to implement: the first
+workload that demand-pages a genuinely large file on the boot path, or this latency
+showing up in a profile. (Note: read-ahead also multiplies the per-fill disk I/O,
+which interacts with the AHCI single-command limit above — both want the same
+Phase-3 storage-hardening pass.)
+
 **Forwarded-lookup concurrency (N = 1).** A Userspace Server's
 `UserspaceServerReg` (slice 7 Part 3) holds a single pending-lookup slot: one
 forwarded `sys_ns_lookup` per server may be outstanding; a second returns

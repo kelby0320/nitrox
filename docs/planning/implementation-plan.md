@@ -729,9 +729,19 @@ Two userspace processes communicate via IPC. Both are spawned by a third (parent
 
 ---
 
-## Phase 2: Filesystem and namespace
+## Phase 2: Filesystem and namespace — **COMPLETE (2026-06-26)**
 
 **Goal:** the namespace subsystem, the resource server protocol, the first real filesystem. Init runs, processes its bootstrap manifest, mounts ext4, reads files.
+
+> **Status: complete.** The prerequisite band + slices 1–9 are all done and the
+> milestone below is met and QEMU-proven (Limine → kernel/PCI → init from
+> initramfs → spawn fs-server-ext4 → mount ext4 `/` → read `/system/current-generation`
+> → reaping loop, now also dropping to `eshell` on a critical-path failure).
+> **Slice 10 (FAT, read-only) is deferred to Phase 3** — parity-only, not on the
+> boot path. The one quality issue surfaced at close (single-page demand-fault
+> latency, ~325 ms/page) is a documented Phase-3 optimization, mitigated for now
+> by trimming the `large.bin` fixture 64 → 8 pages. See the decision log
+> (2026-06-26, Phase 2 close).
 
 ### Tasks (in suggested execution order)
 
@@ -1429,16 +1439,18 @@ the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.
   system (`mounts` lists every binding *except* the failed `/`, `lsblk`, `cat /dev/log`);
   the healthy boot is unchanged (milestones → `parent` → reap → eshell). **Slice 9 complete.**
 
-#### 10. FAT for completeness (RO is fine for now)
+#### 10. FAT for completeness (RO is fine for now) — **deferred to Phase 3**
 
-Kept last (or a candidate to defer to Phase 3): **no Phase 2 milestone clause
-consumes `fs-server-fat`.** The ESP's FAT32 is read by UEFI firmware and
-Limine, *not* by Nitrox — booting never requires Nitrox to read its own ESP.
-This server exists for parity/completeness, not for boot.
+**No Phase 2 milestone clause consumes `fs-server-fat`,** so this slice is
+**deferred to Phase 3** (decided 2026-06-26 at Phase 2 close). The ESP's FAT32
+is read by UEFI firmware and Limine, *not* by Nitrox — booting never requires
+Nitrox to read its own ESP. This server exists for parity/completeness, not for
+boot, and ext4 already proves the userspace-filesystem path end to end. Pick it
+up when an in-OS FAT consumer appears (e.g. updating the ESP from within the OS).
 
-- [ ] `userspace/fs-server-fat/` crate (FAT32/FAT16/FAT12 read-only)
+- [ ] `userspace/fs-server-fat/` crate (FAT32/FAT16/FAT12 read-only) — *Phase 3*
 - [ ] Needed only for in-OS access to FAT volumes (e.g. updating the ESP from
-  within the OS), not for booting
+  within the OS), not for booting — *Phase 3*
 
 ### Milestone
 

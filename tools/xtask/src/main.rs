@@ -632,12 +632,19 @@ fn assemble_image(
         b"nitrox-rootfs generation 1\n",
     )?;
     // `system/large.bin` — the slice-8 Part-5 large-file milestone fixture: a file
-    // well past the old 64 KiB eager cap, spanning many pages, with **position-
+    // past the old 64 KiB eager cap, spanning several pages, with **position-
     // sensitive** content so init's verifier catches a mis-faulted page. Each byte
     // `i` is `((i >> 12) ^ i) as u8` (the page index in the high part XOR the low
     // offset byte). This generator MUST match init's `fill_byte` /
     // `LARGE_FILE_BYTES` (`userspace/init/src/main.rs`).
-    const LARGE_FILE_BYTES: usize = 256 * 1024; // 64 pages
+    //
+    // Sized at 8 pages (was 64): each demand-fault round-trips through the
+    // *stateless* fs-server fill (full path/extent re-resolve per page), which
+    // costs ~325 ms/page under QEMU's emulated AHCI — 64 pages made boot a ~20 s
+    // silent wait. 8 pages still proves multi-page demand-faulting; the per-page
+    // cost (kernel read-ahead + an fs-server open-file cookie) is a Phase-3 item.
+    // See docs/rationale/deferred-decisions.md.
+    const LARGE_FILE_BYTES: usize = 32 * 1024; // 8 pages
     let mut large = vec![0u8; LARGE_FILE_BYTES];
     for (i, b) in large.iter_mut().enumerate() {
         *b = (((i >> 12) ^ i) & 0xFF) as u8;
