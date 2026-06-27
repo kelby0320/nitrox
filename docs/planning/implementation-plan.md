@@ -1405,8 +1405,11 @@ the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.
   `parent` demo**: it now runs to completion *before* eshell (the shared
   single-outstanding-command disk was corrupting the fs-server's reads → flaky `cat`),
   giving a clean console — resolving the Part-2 follow-up.
-- [ ] **Part 4 — `mounts` + `sys_ns_enumerate`**: a namespace-binding enumerate syscall
-  (lists mount points + kernel resources, **not** fs `readdir`); eshell `mounts`.
+- [x] **Part 4 — `mounts` + `sys_ns_enumerate`** (`phase-2/slice9-mounts`): a
+  namespace-binding enumerate syscall (`= 30`; `sys_ns_enumerate(ns, index, out)` →
+  `NsEntry { path, path_len, kind, rights }`, requires `LOOKUP`, `NotFound` past the
+  end), listing mount points + kernel resources (**not** fs `readdir`). eshell `mounts`
+  lists them with kind tags (kernel resource / direct / mount). Proven in QEMU.
 - [ ] **Part 5 — kernel log ring + `/dev/log`**: a `klog` ring (tee `kprint`) + a
   `/dev/log` resource (a `MemoryObject` snapshot). Read with `cat /dev/log` (no bespoke
   `dmesg` command).

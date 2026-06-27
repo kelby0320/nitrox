@@ -24,7 +24,9 @@
 //! endpoint closing takes `SCHED`): bind/unbind hand refs back to the caller to
 //! drop outside the lock; resolve clones (an atomic bump, never a drop).
 
-use crate::libkern::handle::{KObjectType, Rights};
+use crate::libkern::handle::{
+    KObjectType, NS_ENTRY_PATH_MAX, NS_KIND_DIRECT, NS_KIND_KERNEL, NS_KIND_MOUNT, NsEntry, Rights,
+};
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
@@ -353,6 +355,32 @@ impl Namespace {
     pub(crate) fn cache_len(&self) -> usize {
         self.inner.lock().cache.len()
     }
+
+    /// Fill `out` with the `index`-th binding (insertion order): its path (truncated
+    /// to [`NS_ENTRY_PATH_MAX`], true length in `path_len`), target `kind`, and
+    /// `rights`. Returns `false` if `index` is past the binding count. Used by
+    /// `sys_ns_enumerate` to **list** a namespace's bindings (mount points + kernel
+    /// resources) — not a filesystem `readdir`. Snapshot-per-call: the result
+    /// reflects the bindings at the moment of the lock (stable post-boot). No
+    /// allocation under the lock (a fixed-buffer copy); the copy-out to user memory
+    /// happens in the caller, outside the lock.
+    pub fn enumerate(&self, index: usize, out: &mut NsEntry) -> bool {
+        let g = self.inner.lock();
+        let Some(b) = g.bindings.get(index) else {
+            return false;
+        };
+        let true_len = b.path.len();
+        let n = true_len.min(NS_ENTRY_PATH_MAX);
+        out.path[..n].copy_from_slice(&b.path[..n]);
+        out.path_len = true_len as u32;
+        out.kind = match &b.target {
+            BindingTarget::DirectHandle(_) => NS_KIND_DIRECT,
+            BindingTarget::KernelServer(_) => NS_KIND_KERNEL,
+            BindingTarget::UserspaceServer(_) => NS_KIND_MOUNT,
+        };
+        out.rights = b.rights.bits();
+        true
+    }
 }
 
 // No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock)
@@ -439,6 +467,29 @@ mod tests {
     fn ns() -> KBox<Namespace> {
         init_global_heap();
         Namespace::try_new().unwrap()
+    }
+
+    #[test]
+    fn enumerate_lists_bindings_in_order_with_kind() {
+        use crate::object::kernel_server::KernelServerId;
+        let n = ns();
+        // A DirectHandle binding, then a KernelServer binding (insertion order).
+        n.bind(b"/store", target(), Rights::LOOKUP | Rights::INSPECT).unwrap();
+        n.bind_kernel_server(b"/dev/entropy", KernelServerId::Entropy, Rights::READ)
+            .unwrap();
+
+        let mut e = NsEntry::zeroed();
+        assert!(n.enumerate(0, &mut e));
+        assert_eq!(&e.path[..e.path_len as usize], b"/store");
+        assert_eq!(e.kind, NS_KIND_DIRECT);
+        assert_eq!(e.rights, (Rights::LOOKUP | Rights::INSPECT).bits());
+
+        assert!(n.enumerate(1, &mut e));
+        assert_eq!(&e.path[..e.path_len as usize], b"/dev/entropy");
+        assert_eq!(e.kind, NS_KIND_KERNEL);
+
+        // Past the last binding → false (the iteration terminator).
+        assert!(!n.enumerate(2, &mut e));
     }
 
     #[test]

@@ -138,6 +138,7 @@ fn dispatch(line: &[u8], root_ns: u64) {
         }
         b"lsblk" => cmd_lsblk(root_ns),
         b"cat" => cmd_cat(root_ns, trim(args)),
+        b"mounts" => cmd_mounts(root_ns),
         _ => {
             kprint(b"eshell: unknown command: ");
             kprint(cmd);
@@ -149,8 +150,33 @@ fn dispatch(line: &[u8], root_ns: u64) {
 fn cmd_help() {
     kprint(
         b"commands:\r\n  help          this list\r\n  echo <text>   print text\r\n  \
-          lsblk         list block devices\r\n  cat <path>    print a file\r\n",
+          lsblk         list block devices\r\n  cat <path>    print a file\r\n  \
+          mounts        list namespace bindings\r\n",
     );
+}
+
+/// List the bindings of the (inherited) root namespace — mount points + kernel
+/// resources — via `sys_ns_enumerate`. This lists the namespace's bindings, not the
+/// files inside a mounted filesystem (that would be an fs-server `readdir`).
+fn cmd_mounts(root_ns: u64) {
+    let mut i: u64 = 0;
+    loop {
+        let mut e = NsEntry::zeroed();
+        // SAFETY: `&mut e` is a valid NsEntry out-param.
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, root_ns, i, (&mut e as *mut NsEntry) as u64) };
+        if r != 0 {
+            break; // NotFound: past the last binding
+        }
+        let n = (e.path_len as usize).min(NS_ENTRY_PATH_MAX);
+        kprint(&e.path[..n]);
+        kprint(match e.kind {
+            NS_KIND_KERNEL => b"  (kernel resource)".as_slice(),
+            NS_KIND_MOUNT => b"  (mount)".as_slice(),
+            _ => b"  (direct)".as_slice(),
+        });
+        kprint(b"\r\n");
+        i += 1;
+    }
 }
 
 /// Print a file (or any mappable, sized resource): resolve the path, `stat` it for

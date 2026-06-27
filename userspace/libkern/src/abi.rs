@@ -314,6 +314,46 @@ pub struct HandleInfo {
 
 const _: () = assert!(size_of::<HandleInfo>() == 24);
 const _: () = assert!(align_of::<HandleInfo>() == 8);
+
+// --- sys_ns_enumerate ------------------------------------------------------
+
+/// Longest binding path an [`NsEntry`] carries inline; a longer path is truncated
+/// (its true length is still reported in `path_len`).
+pub const NS_ENTRY_PATH_MAX: usize = 256;
+
+/// [`NsEntry::kind`]: a directly-bound resource handle.
+pub const NS_KIND_DIRECT: u32 = 0;
+/// [`NsEntry::kind`]: an in-kernel resource server (`/dev/blk`, `/dev/entropy`, …).
+pub const NS_KIND_KERNEL: u32 = 1;
+/// [`NsEntry::kind`]: a userspace resource server — a **mount** (`/` → fs-server).
+pub const NS_KIND_MOUNT: u32 = 2;
+
+/// One namespace binding, written by `sys_ns_enumerate`: its path, target kind
+/// (`NS_KIND_*`), and max rights. Lists a namespace's mount points + kernel
+/// resources (eshell `mounts`) — not a filesystem `readdir`. `16 + NS_ENTRY_PATH_MAX`
+/// bytes.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub struct NsEntry {
+    /// The binding path's true byte length (may exceed `NS_ENTRY_PATH_MAX`).
+    pub path_len: u32,
+    /// One of `NS_KIND_*`.
+    pub kind: u32,
+    /// The binding's maximum rights (`Rights::bits()`).
+    pub rights: u64,
+    /// The binding path bytes (`path[..min(path_len, NS_ENTRY_PATH_MAX)]`).
+    pub path: [u8; NS_ENTRY_PATH_MAX],
+}
+
+const _: () = assert!(size_of::<NsEntry>() == 16 + NS_ENTRY_PATH_MAX);
+const _: () = assert!(align_of::<NsEntry>() == 8);
+
+impl NsEntry {
+    /// An all-zero entry (the kernel fills it).
+    pub const fn zeroed() -> Self {
+        Self { path_len: 0, kind: 0, rights: 0, path: [0; NS_ENTRY_PATH_MAX] }
+    }
+}
 const _: () = assert!(offset_of!(HandleInfo, rights) == 0);
 const _: () = assert!(offset_of!(HandleInfo, object_type) == 8);
 const _: () = assert!(offset_of!(HandleInfo, generation) == 12);
