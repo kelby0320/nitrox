@@ -1416,8 +1416,18 @@ the decision log (2026-06-27) and the design in `docs/conventions/arch-boundary.
   (`KernelServerId::Log`, a `MemoryObject` snapshot). Read with `cat /dev/log` (no bespoke
   `dmesg`). Bonus: `sys_kprint` now translates `\n`→`\r\n`, fixing all userspace terminal
   rendering. Proven in QEMU (the kernel boot log dumps correctly).
-- [ ] **Part 6 — init failure → eshell**: implement the documented critical-path-failure
-  drop to eshell.
+- [x] **Part 6 — init failure → eshell** (`phase-2/slice9-init-failure`): implement the
+  documented critical-path-failure drop to eshell (`userspace/init/CLAUDE.md` §"Failure →
+  eshell"). `mount_all` now returns `bool` (a failed required mount is critical-path);
+  `_start` computes `booted` from `read_manifest` + `mount_all` and, when `!booted`, calls
+  `emergency(notif)` (logs `init: critical-path failure -- dropping to emergency shell`,
+  spawns eshell, enters the reaping loop) instead of running the boot milestones + `parent`
+  demo. `supervise` was split into `supervise` (healthy: parent → `reap_loop`), `emergency`
+  (failure: log + `spawn_eshell` + `reap_loop`), and a shared `reap_loop(notif, parent_h)`.
+  Proven in QEMU both ways: a forced bad device label (`gpt-partlabel:does-not-exist`) drops
+  straight to an `eshell>` prompt with no demo, and the operator can still inspect the broken
+  system (`mounts` lists every binding *except* the failed `/`, `lsblk`, `cat /dev/log`);
+  the healthy boot is unchanged (milestones → `parent` → reap → eshell). **Slice 9 complete.**
 
 #### 10. FAT for completeness (RO is fine for now)
 
