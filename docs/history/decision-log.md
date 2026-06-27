@@ -5468,3 +5468,45 @@ correct, and it confirms eshell's inherited namespace *does* carry init's `/` mo
 **Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
 **517** (+1: `enumerate_lists_bindings_in_order_with_kind`). Branch
 `phase-2/slice9-mounts`. Next: Part 5 (kernel log ring + `/dev/log`).
+
+## 2026-06-27 — Phase 2 slice 9, Part 5: kernel log ring + `/dev/log` (dmesg)
+
+The kernel's `dmesg`: capture `kprint!` output into a ring and serve it as a
+resource, read with `cat /dev/log` — no bespoke command (Part-3 `cat` is generic
+over mappable resources).
+
+**The ring** (`kernel/src/klog.rs`): a 16 KiB linear append buffer behind an
+`IrqSpinLock`, teed from the serial `write_str` path (the `kprint!`/`kprintln!`
+macros **and** the panic/exception emergency writer — so a panic is captured too).
+It captures **kernel** diagnostics (boot: `acpi`/`ioapic`/`ahci`/`gpt`/`console`/
+`sched`/panic), *not* userspace `sys_kprint` output (that is userspace stdout, not
+the kernel log — correct dmesg semantics). Linear (keep-early, drop-when-full): an
+emergency inspection wants the boot/failure context, and 16 KiB holds a full boot
+log; a keep-recent ring is a later refinement (`deferred-decisions.md`).
+
+**Decision — `IrqSpinLock::try_lock`, and `push` uses it.** The tee runs from
+`write_str`, which the panic/exception path also uses, so a fault striking while the
+ring lock is held would re-enter and deadlock. `push` takes the ring lock with a new
+`try_lock` (skip the line if contended) — logging is best-effort and must never
+deadlock the panic path. The reader (`len` / `copy_into_frames`) is syscall context
+and blocks normally.
+
+**`/dev/log`** (`KernelServerId::Log`, `MAP_READ` binding): a leaf server that mints
+a fresh read-only `MemoryObject` sized to the bytes logged so far and copies the ring
+into its frames (under the ring lock, via the HHDM — no allocation under the lock; the
+memobj is allocated outside it). `cat /dev/log` reads it (sized by `stat`, NUL-trims
+the page tail).
+
+**Decision — `sys_kprint` now translates `\n` → `\r\n`.** It wrote raw bytes, so
+userspace output (init, eshell, and now the raw-`\n` kernel log via `cat /dev/log`)
+staircased on a real serial terminal. `sys_kprint` now translates (the terminal
+convention, as the kernel's own `kprint!` already does), fixing *all* userspace
+rendering — a bonus beyond `/dev/log`. eshell's explicit `\r\n` becomes a harmless
+`\r\r\n`; left as-is (it works).
+
+**Proof (QEMU).** `cat /dev/log` dumps the kernel boot log — `acpi`/`ioapic`/`ahci`/
+`gpt`/`console`/`sched` lines, each correctly on its own line — no faults.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — kernel
+**517** (the klog ring + `/dev/log` are QEMU-proven, like the console driver, not
+host-tested). Branch `phase-2/slice9-klog`. Next: Part 6 (init failure → eshell).

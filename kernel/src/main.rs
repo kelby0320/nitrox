@@ -506,6 +506,19 @@ fn run_first_userspace() {
         return;
     }
 
+    // `/dev/log` — the kernel log ring, served as a read-only `MemoryObject`
+    // snapshot (`cat /dev/log` = dmesg). The caller maps + stats it, so the binding
+    // grants `MAP_READ` + the generic management band (INSPECT for `stat`).
+    let log_binding_rights =
+        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(b"/dev/log", KernelServerId::Log, log_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /dev/log failed");
+        return;
+    }
+
     // `/proc/self/*` — self-reference servers. Each binding is just a dispatch id;
     // the *answer* is the looking-up thread's OWN object, resolved per-caller from
     // syscall context (no ambient authority — see `kernel_server`). One binding is

@@ -23,6 +23,7 @@ pub mod framebuffer;
 pub mod handle;
 pub mod initramfs;
 pub mod io;
+pub mod klog;
 pub mod libkern;
 pub mod limine;
 pub mod mm;

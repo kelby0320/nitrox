@@ -160,6 +160,17 @@ resolve grants `INSPECT`. See the decision log, 2026-06-27. (The slice-8 large-f
 milestone's shared `LARGE_FILE_BYTES` constant remains as a now-unnecessary bridge; a
 future cleanup could switch init's verifier to `stat`.)
 
+**Kernel log buffer is keep-early, not keep-recent (slice 9 Part 5).** `klog`
+(`/dev/log`) is a **linear append** buffer: it captures kernel `kprint!` output from
+boot until its 16 KiB fills, then drops later output. This keeps the early boot /
+failure context (what an emergency inspection wants) and comfortably holds a full
+boot log. The trade-off: on a long-running or verbose system it stops capturing
+recent messages — the opposite of what `dmesg` usually wants for "what just happened."
+A keep-recent **ring** (overwrite-oldest, linearised on snapshot) is the refinement;
+deferred until the system runs long enough to overflow 16 KiB (eshell/services beyond
+boot). The snapshot fill (`copy_into_frames`) already handles the segmented copy a
+ring would need.
+
 **AHCI single-outstanding-command contention (slice 9 Part 3).** The AHCI driver runs
 **one command at a time** (Phase 2; `inflight: AtomicPtr<Irp>`). Two processes issuing
 disk reads concurrently (e.g. the demo `parent`'s block reads + the fs-server's ext4
