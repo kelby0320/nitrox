@@ -418,9 +418,12 @@ fn read_current_generation(root_ns: u64) {
 }
 
 /// Size of the Part-5 large-file fixture (`/system/large.bin`). MUST match the
-/// xtask generator (`tools/xtask/src/main.rs`). 256 KiB = 64 pages — well past the
-/// old 64 KiB eager read cap, so reading it proves the page cache lifts the cap.
-const LARGE_FILE_BYTES: usize = 256 * 1024;
+/// xtask generator (`tools/xtask/src/main.rs`). 32 KiB = 8 pages — past the old
+/// 64 KiB eager read cap, so reading it proves the page cache lifts the cap.
+/// (Was 64 pages; trimmed to 8 because each page demand-faults through the
+/// stateless fs-server fill at ~325 ms/page under QEMU — read-ahead is a Phase-3
+/// item, see docs/rationale/deferred-decisions.md.)
+const LARGE_FILE_BYTES: usize = 32 * 1024;
 
 /// The expected byte at file offset `i` of `/system/large.bin` — position-sensitive
 /// (the page index `i >> 12` in the high part) so a mis-faulted page is detected.

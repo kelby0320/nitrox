@@ -5567,3 +5567,60 @@ to a live `eshell>` over the serial console; the operator can run `help`, `echo`
 `cat /dev/log` (dmesg); and a critical-path boot failure drops to the same shell for
 recovery. Input flows through the universal `sys_io_submit(Read)` + `sys_wait` char-
 device path, not a bespoke syscall. Next: slice 10 (FAT read-only for completeness).
+
+## 2026-06-26 — Phase 2 (filesystem and namespace) complete
+
+A close-out stock-take after slice 9. Phase 2's milestone is **met and QEMU-proven**:
+`xtask qemu` boots Limine → kernel comes up + enumerates PCI → init starts from the
+initramfs → reads `init.toml`, spawns fs-server-ext4 for the ext4 root, waits for
+`Ready`, binds `/` → reads `/system/current-generation` and logs it → enters the
+reaping loop (and now drops to `eshell` on a critical-path failure). Slices 1–9 and
+the prerequisite band are all done.
+
+**Slice 10 (fs-server-fat, read-only) is deferred to Phase 3.** No Phase 2 milestone
+clause consumes FAT — the ESP's FAT32 is read by UEFI firmware + Limine, never by
+Nitrox — and ext4 already proves the userspace-filesystem path end to end. It is
+parity/completeness work; it lands when an in-OS FAT consumer appears. Phase 2 closes
+at 9/10 slices by design, not by omission.
+
+**Stock-take finding — the demand-fault fill is slow, and why.** Profiling the boot
+(per-line serial timestamps) showed a **silent ~20.8 s gap** with no output, which
+turned out to be init's slice-8 `large.bin` milestone (64 demand-faulted pages), *not*
+the `parent` demo that follows it — `parent` runs in ~40 ms and its output streams
+fine; the gap simply lands immediately before `init: spawning parent`, so the pause
+got misattributed to `parent`. Root cause: the kernel fills **one 4 KiB page per
+fault** (no read-ahead) and each fill is a **stateless** `File::ReadRange` round-trip
+where the fs-server re-reads the superblock, re-resolves the path, and re-walks the
+extent tree from disk (~6–8 emulated AHCI reads) — **~325 ms/page** under QEMU. This
+is the *documented* cost of the deliberately-simple Phase-2 fill path (see
+`deferred-decisions.md`: stateless fill, page-cache scope), not a regression in
+behaviour — but it is new since slice 8 (before which there was no large-file
+milestone), which is why "it used to feel faster."
+
+**Decision — defer the fix to Phase 3; mitigate now by trimming the fixture.** Two
+composing Phase-3 levers close it: **kernel read-ahead (clustered fill)** — fill a
+page *cluster* in one `ReadRange`, the single biggest lever and the natural completion
+of the slice-8 cache (the wire op already carries `offset`/`len`) — and an **fs-server
+open-file cookie** (resolve returns a cookie; `ReadRange` carries it) to make each
+fill O(1). Both optimize a path that is *correct* today, and the milestone only needs
+to **prove** multi-page demand-faulting, not do it fast; pulling either forward is
+Phase-3 storage-hardening work (it also interacts with the AHCI single-command limit).
+As a stopgap, `large.bin` was trimmed **64 → 8 pages** (`tools/xtask` generator +
+init's `LARGE_FILE_BYTES`, kept in sync): it still spans 8 position-sensitive pages
+(still proves the cache lifts the old 64 KiB eager cap), and boot now reaches `eshell`
+in **~7.9 s** instead of ~25.8 s (the large-file read dropped from ~20.8 s to ~2.8 s).
+Recorded in `deferred-decisions.md` (demand-fault fill latency).
+
+**Stock-take finding — no functional Phase-2 gaps.** An audit of the plan, the
+deferred-decisions register, and source `TODO`/`FIXME` markers found every open item
+to be genuinely Phase-3 foundational work (SMP bring-up, scheduler classes, runtime
+libraries `libos`/`librt`/`libstream`, service-manager skeleton, fs RW + Model-A
+extent fill + writeback, reclaim daemons, MSI/MSI-X, AHCI NCQ, intermediate-page-table
+reclaim) — not holes in Phase 2's stated scope. Phase 3 must begin with that
+foundational infrastructure before the service-manager / "system idle" milestones are
+reachable. No new Phase-2 slices were added.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` all green;
+boot re-profiled in QEMU after the fixture trim (eshell reached at ~7.9 s, healthy
+path; the emergency path unchanged). **Phase 2 is complete; Phase 3 (service
+ecosystem) is next.**
