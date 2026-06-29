@@ -135,14 +135,16 @@ pub(crate) fn release_refcount(obj: *mut (), ty: KObjectType) {
 
 /// Return the calling context's id for the [`grace::GraceTracker`].
 ///
-/// Phase 1 (single CPU, no preemption, no IRQs, no `Process` yet):
-/// every operation runs in context 0. SMP will switch this to
-/// `arch::cpu_id()`; the Process slice will switch it to
-/// `Process::current().ctx_id()`. Tests override via a thread-local
-/// counter so each `std::thread` gets a distinct id.
+/// One quiescent domain per CPU: this is the running CPU's dense id
+/// ([`arch::Smp::current_cpu`](crate::arch::Smp)), which is a valid context since
+/// `MAX_CPUS <= grace::MAX_CTX`. Slice 0 has one live CPU, so it is `0`, but it is
+/// read from the hardware so it stays correct once APs run (slice 1). The Process
+/// slice will switch this to `Process::current().ctx_id()`. Tests override via a
+/// thread-local counter so each `std::thread` gets a distinct id.
 #[cfg(not(test))]
 pub(crate) fn current_ctx_id() -> u32 {
-    0
+    use crate::arch::smp::ArchSmp;
+    crate::arch::Smp::current_cpu()
 }
 
 #[cfg(test)]

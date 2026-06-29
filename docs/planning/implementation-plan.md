@@ -1508,15 +1508,19 @@ TLB flush). The spinlocks are already SMP-correct (atomic CAS). Rollout is
 per-CPU runqueues are a later refactor (slice 3), so AP bring-up and load-balancing
 are bisectable in isolation.
 
-- [ ] **Slice 0 — Per-CPU foundation + scheduler/SMP design doc.** Write
-  `docs/architecture/scheduler.md` (+ SMP / per-CPU), settling the open decisions
-  (scheduler-class scope, TimeShared algorithm fidelity, x2APIC now-or-later,
-  `MAX_CPUS`, per-CPU data layout, IPI vector assignment, TLB-shootdown algorithm).
-  Then build the per-CPU data substrate — a GS-based per-CPU area, `CPU0`→`CPUs[N]`,
-  a real `cpu_id()` — and convert the single-CPU stand-ins (the scheduler's single
-  `current`, the handle-table grace-period ctx-0 shim, per-CPU page-table-root
-  tracking) to a per-CPU shape. **Still single-CPU; no APs yet.** *Verify:* boots
-  exactly as today; host tests for the per-CPU structures.
+- [x] **Slice 0 — Per-CPU foundation + scheduler/SMP design doc**
+  (`phase-3/slice0-percpu-foundation`): wrote `docs/architecture/scheduler.md` (the
+  three-class + vruntime + x2APIC + incremental-SMP design) and built the per-CPU
+  substrate, still single-CPU. **Per-CPU access is arch-abstracted** — neutral
+  `arch::Smp::current_cpu()` (a dense index), implemented x86-side via `RDTSCP` /
+  `IA32_TSC_AUX` (`init_this_cpu` sets it; dev loop opts in `+rdtscp`); `MAX_CPUS=8`.
+  The arch `CpuLocal` GS block became `CPUS[MAX_CPUS]`; the scheduler's `current`/
+  `idle`/`idle_addr` became per-CPU arrays behind `cur_slot`/`idle_slot` accessors
+  (single global `ready` + `SCHED` lock retained); `handle::current_ctx_id()` now
+  keys on `current_cpu()`. Page-table-root / `active_cpus` tracking was **refined to
+  slice 1** (no slice-0 consumer). *Verified:* build clean / check-arch / 8 host test
+  suites green; boots identically to today (full `parent` demo → `eshell`), no faults.
+  See the decision log (2026-06-26, Phase 3 slice 0).
 - [ ] **Slice 1 — SMP bring-up (APs on the shared runqueue).** Wire Limine's SMP
   request + AP startup; per-CPU GDT/TSS/IDT, GS base, and APIC timer; a real
   `send_ipi` (LAPIC ICR); **TLB shootdown via IPI** with an `active_cpus` mask

@@ -335,6 +335,25 @@ pub fn rdtsc() -> u64 {
     ((high as u64) << 32) | (low as u64)
 }
 
+/// Read `IA32_TSC_AUX` (the per-CPU logical id the kernel programs there) via
+/// `RDTSCP`, discarding the timestamp. `RDTSCP` (`CPUID.80000001H:EDX[27]`) is
+/// present on every CPU in the project's ≈2014 hardware baseline; note it is *not*
+/// in the bare `qemu64` model's defaults, so the dev loop opts it in with `+rdtscp`
+/// (a missing feature `#UD`s here). This is the architecture's "which CPU am I"
+/// primitive — see `docs/architecture/scheduler.md` §Per-CPU access.
+#[inline]
+pub fn rdtscp_aux() -> u32 {
+    let aux: u32;
+    // SAFETY: `rdtscp` writes the TSC to edx:eax and IA32_TSC_AUX to ecx; we
+    // keep only ecx (the logical CPU id). No memory side effects, no arithmetic
+    // flags touched; valid in ring 0.
+    unsafe {
+        asm!("rdtscp", out("eax") _, out("edx") _, out("ecx") aux,
+             options(nomem, nostack, preserves_flags));
+    }
+    aux
+}
+
 /// Read model-specific register `msr`.
 ///
 /// # Safety

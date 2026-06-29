@@ -8,21 +8,22 @@
 //! architecture-neutral dispatcher, then restores and `sysretq`s. See
 //! `docs/spec/syscall-abi.md` and the decision log (2026-05-29).
 //!
-//! ## GS model (Phase 1, single CPU)
+//! ## GS model
 //!
-//! `KERNEL_GS_BASE` is held at `&CPU0` **at all times** — in userspace, in the
-//! kernel body, and while a thread is blocked mid-syscall — and `GS_BASE = 0`
-//! (the userspace value) everywhere except the brief entry-stub window. The
-//! entry stub `swapgs`es in (so `gs:` reaches `&CPU0`), grabs the kernel stack,
-//! then `swapgs`es **back** before running the body; there is no `swapgs` before
-//! `sysretq`. The only `gs:`-relative code is that stub.
+//! On each CPU, `KERNEL_GS_BASE` is held at **that CPU's [`CpuLocal`] block** (its
+//! [`CPUS`] slot) **at all times** — in userspace, in the kernel body, and while a
+//! thread is blocked mid-syscall — and `GS_BASE = 0` (the userspace value)
+//! everywhere except the brief entry-stub window. The entry stub `swapgs`es in (so
+//! `gs:` reaches this CPU's block), grabs the kernel stack, then `swapgs`es **back**
+//! before running the body; there is no `swapgs` before `sysretq`. The only
+//! `gs:`-relative code is that stub.
 //!
-//! This always-`&CPU0` invariant is what makes the entry robust across multiple
-//! threads: a thread that blocks mid-body (e.g. `sys_wait`) is switched away
-//! with `KERNEL_GS_BASE = &CPU0`, so a *sibling's* `syscall` `swapgs` still
-//! lands `GS_BASE = &CPU0` rather than the parked user GS. (An earlier model
-//! held `GS_BASE = &CPU0` across the body and parked the user GS in
-//! `KERNEL_GS_BASE`; a blocked thread then left `KERNEL_GS_BASE = 0`, and a
+//! This always-points-at-this-CPU's-block invariant is what makes the entry robust
+//! across multiple threads on a CPU: a thread that blocks mid-body (e.g. `sys_wait`)
+//! is switched away with `KERNEL_GS_BASE` still at this CPU's block, so a *sibling's*
+//! `syscall` `swapgs` still lands `GS_BASE` on it rather than the parked user GS. (An
+//! earlier model held `GS_BASE` at the block across the body and parked the user GS
+//! in `KERNEL_GS_BASE`; a blocked thread then left `KERNEL_GS_BASE = 0`, and a
 //! sibling's entry `swapgs` faulted on `gs:[0]` — an intermittent `#DF`. Fixed
 //! 2026-06-23; see the decision log.) The IDT trap entries never touch `gs:` and
 //! never `swapgs`, so they are consistent with `GS_BASE = 0` in both rings.
@@ -60,8 +61,8 @@ const SFMASK_VALUE: u64 = RFLAGS_IF | RFLAGS_DF | RFLAGS_AC;
 
 // --- Per-CPU block --------------------------------------------------------
 
-/// Per-CPU kernel data reached via `IA32_KERNEL_GS_BASE` + `swapgs`. Single
-/// instance for Phase 1's single CPU; becomes one-per-CPU under SMP.
+/// Per-CPU kernel data reached via `IA32_KERNEL_GS_BASE` + `swapgs`. One per CPU
+/// (the [`CPUS`] array); each CPU's `KERNEL_GS_BASE` points at its own slot.
 #[repr(C)]
 pub struct CpuLocal {
     /// `gs:[0]` — scratch the entry stub stashes the user RSP into.
@@ -72,14 +73,37 @@ pub struct CpuLocal {
     kstack_top: u64,
 }
 
-static mut CPU0: CpuLocal = CpuLocal {
+/// Zeroed initial block. Named so the `[CONST; N]` array initialiser below works
+/// without requiring `CpuLocal: Copy`.
+const CPU_LOCAL_INIT: CpuLocal = CpuLocal {
     rsp_scratch: 0,
     kstack_top: 0,
 };
 
+/// One [`CpuLocal`] per CPU, indexed by the dense `current_cpu()` id; each CPU
+/// programs its `KERNEL_GS_BASE` to its own slot (see [`this_cpu_block`]). Only
+/// slot 0 is live until APs start (slice 1).
+static mut CPUS: [CpuLocal; crate::arch::smp::MAX_CPUS] =
+    [CPU_LOCAL_INIT; crate::arch::smp::MAX_CPUS];
+
 const OFF_SCRATCH: usize = offset_of!(CpuLocal, rsp_scratch);
 const OFF_KSTACK: usize = offset_of!(CpuLocal, kstack_top);
 const _: () = assert!(OFF_SCRATCH == 0 && OFF_KSTACK == 8);
+
+/// Raw pointer to the running CPU's [`CpuLocal`] slot — its [`CPUS`] entry, indexed
+/// by the dense CPU id read via `RDTSCP` (the same source as
+/// [`X86Smp::current_cpu`](super::smp::X86Smp), reached one layer down to avoid a
+/// trait import in the entry path). Used to program `KERNEL_GS_BASE` and to set the
+/// per-thread syscall kernel stack, always on the CPU whose slot it is.
+fn this_cpu_block() -> *mut CpuLocal {
+    let idx = regs::rdtscp_aux() as usize;
+    debug_assert!(idx < crate::arch::smp::MAX_CPUS, "cpu index out of range");
+    // SAFETY: `idx < MAX_CPUS` — `current_cpu()` returns a dense id in
+    // `0..cpu_count()` and `cpu_count() <= MAX_CPUS`. Pointer arithmetic within the
+    // static array (no bounds-check panic in this entry path, no reference formed);
+    // each CPU addresses only its own slot.
+    unsafe { (&raw mut CPUS).cast::<CpuLocal>().add(idx) }
+}
 
 // --- Initialisation -------------------------------------------------------
 
@@ -93,14 +117,14 @@ const _: () = assert!(OFF_SCRATCH == 0 && OFF_KSTACK == 8);
 /// programs the `EFER.SCE`/`STAR`/`LSTAR`/`SFMASK`/`KERNEL_GS_BASE` MSRs;
 /// that is the architecture's implementation detail.)
 pub fn init_syscall_entry() {
-    let cpu0_addr = &raw const CPU0 as u64;
+    let gs_base = this_cpu_block() as u64;
     let star = gdt::STAR_VALUE;
     let lstar = syscall_entry as *const () as u64;
     // SAFETY: all four MSRs are architectural on every long-mode CPU. We
     // OR `SCE` into EFER without disturbing LME/LMA/NXE. STAR encodes the
     // GDT selectors loaded by `gdt::init`; LSTAR is the entry stub.
     unsafe {
-        regs::wrmsr(MSR_KERNEL_GS_BASE, cpu0_addr);
+        regs::wrmsr(MSR_KERNEL_GS_BASE, gs_base);
         regs::wrmsr(MSR_STAR, star);
         regs::wrmsr(MSR_LSTAR, lstar);
         regs::wrmsr(MSR_SFMASK, SFMASK_VALUE);
@@ -109,24 +133,25 @@ pub fn init_syscall_entry() {
     }
 }
 
-/// Re-assert `KERNEL_GS_BASE = &CPU0` before a thread's **first** ring-3 descent.
+/// Re-assert `KERNEL_GS_BASE =` this CPU's block before a thread's **first** ring-3
+/// descent.
 ///
 /// `enter_user` does no `swapgs` — it assumes the kernel reached it in the boot
-/// GS state (`GS_BASE = 0`, `KERNEL_GS_BASE = &CPU0`). That holds only if the
-/// path here never crossed a `swapgs`. But a thread that **blocks mid-syscall**
+/// GS state (`GS_BASE = 0`, `KERNEL_GS_BASE =` this CPU's block). That holds only if
+/// the path here never crossed a `swapgs`. But a thread that **blocks mid-syscall**
 /// (e.g. `sys_wait`) is switched away with the entry `swapgs` still in effect:
-/// `GS_BASE = &CPU0`, `KERNEL_GS_BASE =` the blocked thread's (user) GS. If the
-/// scheduler then descends a *different* thread to ring 3 for the first time via
-/// `enter_user`, that thread's first `syscall`'s `swapgs` would load the stale
-/// `KERNEL_GS_BASE` (often `0`) into `GS_BASE`, and the entry stub's `gs:`
-/// access faults (→ `#PF` → `#DF`). Writing `&CPU0` here makes the first
-/// `syscall`'s `swapgs` correct regardless of the incoming GS state; the
-/// entry/exit `swapgs` pair keeps it correct thereafter.
+/// `GS_BASE =` this CPU's block, `KERNEL_GS_BASE =` the blocked thread's (user) GS.
+/// If the scheduler then descends a *different* thread to ring 3 for the first time
+/// via `enter_user`, that thread's first `syscall`'s `swapgs` would load the stale
+/// `KERNEL_GS_BASE` (often `0`) into `GS_BASE`, and the entry stub's `gs:` access
+/// faults (→ `#PF` → `#DF`). Writing this CPU's block here makes the first
+/// `syscall`'s `swapgs` correct regardless of the incoming GS state; the entry/exit
+/// `swapgs` pair keeps it correct thereafter.
 pub fn arm_user_entry_cpu_base() {
-    let cpu0_addr = &raw const CPU0 as u64;
-    // SAFETY: architectural MSR; `&CPU0` is the per-CPU block the entry stub
-    // reaches through `gs:` after `swapgs`.
-    unsafe { regs::wrmsr(MSR_KERNEL_GS_BASE, cpu0_addr) };
+    let gs_base = this_cpu_block() as u64;
+    // SAFETY: architectural MSR; this CPU's `CpuLocal` slot is the block the entry
+    // stub reaches through `gs:` after `swapgs`.
+    unsafe { regs::wrmsr(MSR_KERNEL_GS_BASE, gs_base) };
 }
 
 /// Set the per-CPU kernel stack the `syscall` entry stub switches to. The
@@ -134,11 +159,11 @@ pub fn arm_user_entry_cpu_base() {
 /// stack top before descending to ring 3, so a syscall lands on the right
 /// stack.
 pub fn set_syscall_kernel_stack(top: u64) {
-    // SAFETY: single-CPU; `CPU0` is exclusively owned. We're in ring 0 about
-    // to descend to ring 3, so no `syscall` can be reading `kstack_top`
-    // concurrently.
+    // SAFETY: writes only the running CPU's slot. We're in ring 0 about to descend
+    // to ring 3 on this CPU, so no `syscall` on this CPU can be reading `kstack_top`
+    // concurrently, and other CPUs touch only their own slots.
     unsafe {
-        (&raw mut (*(&raw mut CPU0)).kstack_top).write(top);
+        (&raw mut (*this_cpu_block()).kstack_top).write(top);
     }
 }
 

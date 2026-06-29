@@ -53,7 +53,7 @@ use core::sync::atomic::{AtomicU64, Ordering};
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
 use crate::arch::timer::ArchTimer;
-use crate::arch::{Cpu, Paging, context_switch};
+use crate::arch::{Cpu, MAX_CPUS, Paging, context_switch};
 use crate::libkern::handle::{KObjectType, Rights};
 use crate::libkern::{AllocError, IrqSpinLock, IrqSpinLockGuard, KBox, KVec};
 use crate::mm::PhysAddr;
@@ -256,8 +256,11 @@ struct SchedState {
     /// Ready threads in round-robin order; each holds one refcount on its
     /// `Thread`, keeping it (and its kernel stack) alive while queued.
     ready: KVec<ObjectRef>,
-    /// The currently running thread. `None` only before [`init`].
-    current: Option<ObjectRef>,
+    /// The currently running thread, **per CPU** (indexed by `current_cpu()` via
+    /// [`cur_slot`](SchedState::cur_slot)). A CPU's slot is `None` only before
+    /// [`init`]. Slice 0 has one live CPU (index 0); APs get their own slot in
+    /// slice 1. The single global `ready` queue is still shared under `SCHED`.
+    current: [Option<ObjectRef>; MAX_CPUS],
     /// Exited threads awaiting reclamation. Dropped — freeing their kernel
     /// stacks — by the next scheduler entry, never by a thread itself (it is
     /// still running on its stack at exit time). A **list** (not one slot) so a
@@ -279,14 +282,16 @@ struct SchedState {
     /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
     /// here rather than on `Thread` (no `Thread` layout/ABI change).
     quantum: u32,
-    /// The idle thread, parked here whenever it is **not** the current thread.
-    /// Kept out of `ready`/`reap`; runs (`hlt`) only when nothing else is
-    /// ready. `None` only before [`init`] or while idle is current.
-    idle: Option<ObjectRef>,
-    /// The idle thread's object address — its stable identity (the `idle` slot
-    /// is empty while idle runs). Stored as `usize` (not a raw pointer) so
+    /// The idle thread, **per CPU** (indexed by `current_cpu()` via
+    /// [`idle_slot`](SchedState::idle_slot)), parked here whenever it is **not**
+    /// this CPU's current thread. Kept out of `ready`/`reap`; runs (`hlt`) only
+    /// when nothing else is ready on that CPU. `None` before [`init`] or while
+    /// idle is current.
+    idle: [Option<ObjectRef>; MAX_CPUS],
+    /// Each CPU's idle-thread object address — its stable identity (the `idle`
+    /// slot is empty while idle runs). Stored as `usize` (not a raw pointer) so
     /// `SchedState` stays `Send`. `0` before [`init`].
-    idle_addr: usize,
+    idle_addr: [usize; MAX_CPUS],
     /// Threads blocked in `sys_wait`, parked off the run queue. Each holds one
     /// refcount on its `Thread` (keeping it and its kernel stack alive); a
     /// waker moves it back to `ready`. Pre-reserved (see [`BLOCKED_RESERVE`]).
@@ -298,17 +303,59 @@ struct SchedState {
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     ready: KVec::new(),
-    current: None,
+    current: [const { None }; MAX_CPUS],
     reap: KVec::new(),
     suspended: KVec::new(),
     next_tid: 1,
     next_pid: 2,
     quantum: QUANTUM_TICKS,
-    idle: None,
-    idle_addr: 0,
+    idle: [const { None }; MAX_CPUS],
+    idle_addr: [0; MAX_CPUS],
     blocked: KVec::new(),
     deadlines: KVec::new(),
 });
+
+impl SchedState {
+    /// Dense index of the running CPU's per-CPU scheduler slots (`current`/`idle`/
+    /// `idle_addr`). Reads the neutral `current_cpu()` (arch-internal RDTSCP); `0`
+    /// on the single live CPU until APs start (slice 1).
+    #[inline]
+    fn this_cpu() -> usize {
+        use crate::arch::smp::ArchSmp;
+        crate::arch::Smp::current_cpu() as usize
+    }
+
+    /// This CPU's `current`-thread slot (mutable).
+    #[inline]
+    fn cur_slot(&mut self) -> &mut Option<ObjectRef> {
+        &mut self.current[Self::this_cpu()]
+    }
+
+    /// This CPU's `current`-thread slot (shared).
+    #[inline]
+    fn cur_ref(&self) -> &Option<ObjectRef> {
+        &self.current[Self::this_cpu()]
+    }
+
+    /// This CPU's idle-thread parking slot (mutable).
+    #[inline]
+    fn idle_slot(&mut self) -> &mut Option<ObjectRef> {
+        &mut self.idle[Self::this_cpu()]
+    }
+
+    /// This CPU's idle-thread stable address.
+    #[inline]
+    fn idle_addr(&self) -> usize {
+        self.idle_addr[Self::this_cpu()]
+    }
+
+    /// Set this CPU's idle-thread stable address.
+    #[inline]
+    fn set_idle_addr(&mut self, addr: usize) {
+        let cpu = Self::this_cpu();
+        self.idle_addr[cpu] = addr;
+    }
+}
 
 /// Allocate the next process id (monotonic; no reuse in Phase 1). Takes only
 /// the rank-1 lock briefly — `sys_process_spawn` calls this before touching the
@@ -368,9 +415,9 @@ pub fn init() -> Result<(), AllocError> {
     g.suspended = suspended;
     g.reap = reap;
     g.deadlines = deadlines;
-    g.current = Some(boot_ref);
-    g.idle = Some(idle_ref);
-    g.idle_addr = idle_addr;
+    *g.cur_slot() = Some(boot_ref);
+    *g.idle_slot() = Some(idle_ref);
+    g.set_idle_addr(idle_addr);
     g.quantum = QUANTUM_TICKS;
     Ok(())
 }
@@ -1285,9 +1332,9 @@ unsafe fn switch_into(
 fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     let next = match dequeue_front(&mut g) {
         Some(n) => n,
-        None => g.idle.take().expect("idle thread exists after init"),
+        None => g.idle_slot().take().expect("idle thread exists after init"),
     };
-    let prev = g.current.take().expect("current set");
+    let prev = g.cur_slot().take().expect("current set");
     let prev_obj = prev.as_ptr();
     let next_obj = next.as_ptr();
     // SAFETY: both pinned (prev parked in `blocked`, next becoming current);
@@ -1302,7 +1349,7 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     // Park prev in `blocked` (NOT ready/idle) — its `ObjectRef` keeps it alive.
     debug_assert!(g.blocked.len() < g.blocked.capacity());
     g.blocked.try_push(prev).expect("blocked list within reserve");
-    g.current = Some(next);
+    *g.cur_slot() = Some(next);
 
     // Switch into `next`; we resume here (lock-free) when a waker moves us back
     // to `ready` and the scheduler later picks us.
@@ -1350,7 +1397,7 @@ pub fn wait_on(objs: &[usize], deadline_ns: u64, now: u64) -> WaitResult {
     let me_ptr;
     {
         let mut g = SCHED.lock();
-        me_ptr = g.current.as_ref().expect("current set when a thread runs").as_ptr();
+        me_ptr = g.cur_ref().as_ref().expect("current set when a thread runs").as_ptr();
 
         // Fast path: any object already signaled?
         let mut signaled = [false; MAX_WAIT_HANDLES];
@@ -1517,9 +1564,9 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
         Some(n) => n,
         // Only reachable if a caller violates the precondition; idle is the
         // safe fallback when it is parked (i.e. not the current thread).
-        None => g.idle.take().expect("a runnable thread (ready or idle)"),
+        None => g.idle_slot().take().expect("a runnable thread (ready or idle)"),
     };
-    let prev = g.current.take().expect("current set after init");
+    let prev = g.cur_slot().take().expect("current set after init");
     let prev_obj = prev.as_ptr();
     let next_obj = next.as_ptr();
     // SAFETY: both pinned alive (prev re-homed, next becoming current) and we
@@ -1532,14 +1579,14 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
 
     // Re-home prev: the idle thread parks in its slot (never in `ready`);
     // every other thread re-enqueues at the tail.
-    if g.idle_addr == prev_obj as usize {
-        debug_assert!(g.idle.is_none());
-        g.idle = Some(prev);
+    if g.idle_addr() == prev_obj as usize {
+        debug_assert!(g.idle_slot().is_none());
+        *g.idle_slot() = Some(prev);
     } else {
         debug_assert!(g.ready.len() < g.ready.capacity());
         g.ready.try_push(prev).expect("run queue within reserve");
     }
-    g.current = Some(next);
+    *g.cur_slot() = Some(next);
 
     // SAFETY: `prev_slot` is the re-homed outgoing (now-`Ready`, pinned)
     // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
@@ -1671,12 +1718,12 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     // exists post-init and is parked here, since `me` was current, not idle).
     let next = match dequeue_front(&mut g) {
         Some(n) => n,
-        None => g.idle.take().expect("idle thread exists after init"),
+        None => g.idle_slot().take().expect("idle thread exists after init"),
     };
     let next_obj = next.as_ptr();
     // SAFETY: next is pinned, becoming current; lock held.
     unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-    g.current = Some(next);
+    *g.cur_slot() = Some(next);
 
     // Switch away forever. `switch_into` loads the incoming root before the
     // stack swap, so when the last user thread exits CR3 is restored to the
@@ -1704,7 +1751,7 @@ pub fn exit_thread(status: ExitStatus) -> ! {
     reap_pending();
 
     let mut g = SCHED.lock();
-    let me = g.current.take().expect("current set");
+    let me = g.cur_slot().take().expect("current set");
     let me_obj = me.as_ptr();
 
     // SAFETY: `me` is the running thread, pinned, lock held.
@@ -1733,7 +1780,7 @@ pub fn exit_process(status: ExitStatus) -> ! {
     reap_pending();
 
     let mut g = SCHED.lock();
-    let me = g.current.take().expect("current set");
+    let me = g.cur_slot().take().expect("current set");
     let me_obj = me.as_ptr();
 
     // SAFETY: `me` is the running thread, pinned, lock held.
@@ -1808,7 +1855,7 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
     let me_obj;
     {
         let mut g = SCHED.lock();
-        let me = g.current.take().expect("current set");
+        let me = g.cur_slot().take().expect("current set");
         me_obj = me.as_ptr();
 
         // Deliver the fault notification to the faulting process's channel
@@ -1852,13 +1899,13 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
             Some(n) => n,
             None => {
                 report_stranded_fault(me_obj, &notif);
-                g.idle.take().expect("idle thread exists after init")
+                g.idle_slot().take().expect("idle thread exists after init")
             }
         };
         let next_obj = next.as_ptr();
         // SAFETY: next is pinned, becoming current; lock held.
         unsafe { Thread::set_state(next_obj, ThreadState::Running) };
-        g.current = Some(next);
+        *g.cur_slot() = Some(next);
 
         // Switch into `next`; we resume here when `sys_exception_resume` moves
         // us `suspended`→`ready` and the scheduler switches us in.
@@ -1948,7 +1995,7 @@ fn dequeue_front(g: &mut SchedState) -> Option<ObjectRef> {
 /// [`thread_enter`] when a freshly scheduled thread first runs.
 fn current_entry() -> (ThreadEntry, usize) {
     let g = SCHED.lock();
-    let cur = g.current.as_ref().expect("current set when a thread runs");
+    let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
     // SAFETY: `current` is pinned alive and we hold the lock.
     unsafe { Thread::entry_and_arg(cur.as_ptr()) }
 }
@@ -1962,7 +2009,7 @@ fn current_entry() -> (ThreadEntry, usize) {
 /// rank-3 handle-table lock, never nesting the two.
 pub fn current_owner_pid() -> u32 {
     let g = SCHED.lock();
-    let cur = g.current.as_ref().expect("current set when a thread runs");
+    let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
     // SAFETY: `current` is pinned alive (it holds a refcount on the `Thread`)
     // and we hold the run-queue lock, which — single-CPU — serialises all
     // access to the `Thread`. Forming a shared `&Thread` to read `owner_pid`
@@ -1974,7 +2021,7 @@ pub fn current_owner_pid() -> u32 {
 /// the `thread` field of a fault notification. Takes only the rank-1 lock.
 pub fn current_tid() -> u32 {
     let g = SCHED.lock();
-    let cur = g.current.as_ref().expect("current set when a thread runs");
+    let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
     // SAFETY: `current` is pinned alive and the run-queue lock serialises
     // Thread access; a shared `&Thread` read of `tid` is sound.
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.tid()
@@ -1999,7 +2046,7 @@ pub fn notif_try_recv(channel: *mut ()) -> Option<Notification> {
 /// nesting upward.
 pub fn current_process() -> Option<ObjectRef> {
     let g = SCHED.lock();
-    let cur = g.current.as_ref().expect("current set when a thread runs");
+    let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
     // SAFETY: as `current_owner_pid` — `current` is pinned and the run-queue
     // lock serialises Thread access; `process_ref` clones the stored
     // `ObjectRef` (bumping the process refcount) under the lock.
@@ -2017,7 +2064,7 @@ pub fn current_thread() -> Option<ObjectRef> {
     let g = SCHED.lock();
     // SAFETY-equivalent note: `ObjectRef::clone` is an atomic refcount bump (no
     // `&mut`, no drop), sound to perform under the run-queue lock.
-    g.current.clone()
+    g.cur_ref().clone()
 }
 
 /// The idle thread body: reap any exited thread, then `hlt` until the next
@@ -2051,7 +2098,7 @@ pub(crate) extern "C" fn thread_enter() -> ! {
     // and, if so, its descent params + kernel-stack top.
     let descent: Option<(u64, u64, u64, [u64; 4])> = {
         let g = SCHED.lock();
-        let cur = g.current.as_ref().expect("current set when a thread runs");
+        let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
         let obj = cur.as_ptr();
         // SAFETY: `current` is pinned alive and we hold the lock.
         match unsafe { Thread::user_entry(obj) } {
@@ -2119,14 +2166,14 @@ mod tests {
     fn test_state() -> SchedState {
         SchedState {
             ready: KVec::new(),
-            current: None,
+            current: [const { None }; MAX_CPUS],
             reap: KVec::new(),
             suspended: KVec::new(),
             next_tid: 1,
             next_pid: 2,
             quantum: QUANTUM_TICKS,
-            idle: None,
-            idle_addr: 0,
+            idle: [const { None }; MAX_CPUS],
+            idle_addr: [0; MAX_CPUS],
             blocked: KVec::new(),
             deadlines: KVec::new(),
         }
@@ -2286,7 +2333,7 @@ mod tests {
             for tid in 1..=4 {
                 st.ready.try_push(inert_ref(tid)).unwrap();
             }
-            st.current = Some(inert_ref(5));
+            *st.cur_slot() = Some(inert_ref(5));
             st.reap.try_reserve(REAP_RESERVE).unwrap();
             st.reap.try_push(inert_ref(6)).unwrap();
             st.reap.try_push(inert_ref(7)).unwrap();
