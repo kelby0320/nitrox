@@ -406,6 +406,20 @@ fn run_first_userspace() {
         Namespace, NotificationChannel, ObjectRef, Process,
     };
 
+    // Establish the BSP's per-CPU identity (logical index 0) so
+    // `arch::Smp::current_cpu()` reports it; each AP does the same at SMP
+    // bring-up (slice 1). See docs/architecture/scheduler.md §Per-CPU access.
+    {
+        use arch::smp::ArchSmp;
+        arch::Smp::init_this_cpu(0);
+        kprintln!(
+            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
+            arch::Smp::current_cpu(),
+            arch::Smp::cpu_count(),
+            arch::MAX_CPUS,
+        );
+    }
+
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
     // per-thread (by the scheduler's `thread_enter`), not here.
     arch::init_syscall_entry();
@@ -903,7 +917,7 @@ fn draw_nitrox_band(writer: &mut FbWriter) {
 
     // Phase indicator below the band, slightly dimmer so the eye reads
     // the tank decal first.
-    let status = b"PHASE 2: NAMESPACES UP";
+    let status = b"PHASE 3: SERVICE ECOSYSTEM";
     let status_scale = 2;
     let status_w = FbWriter::text_width(status, status_scale);
     let status_x = (width - status_w) / 2;

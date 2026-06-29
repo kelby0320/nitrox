@@ -5681,3 +5681,50 @@ into one un-bisectable slice); a docs-only slice 0 (would bloat slice 1 with the
 per-CPU substrate). The userspace backlog stays unsequenced for now and is sliced
 as we reach it. No code written yet — slice 0 begins with the design doc, whose open
 decisions are the next pause point.
+
+## 2026-06-26 — Phase 3 slice 0: per-CPU foundation + scheduler/SMP design doc
+
+The first kernel-first Phase-3 slice. Wrote `docs/architecture/scheduler.md` (the
+design contract: three classes — RealTime fixed-priority FIFO + TimeShared vruntime +
+Idle; x2APIC; incremental SMP) and built the per-CPU substrate that the rest stands
+on, **all still single-CPU** (no APs). Decisions settled while writing the doc:
+RealTime+TimeShared+Idle all in the first cut; TimeShared = vruntime fairness on the
+existing deadline min-heap pattern (no rbtree); x2APIC-only adopted in slice 1 (dev
+loop → QEMU ≥ 9.0 + `+x2apic`); incremental SMP (APs on the shared runqueue first).
+
+**Decision — per-CPU access is arch-abstracted (`current_cpu()` + RDTSCP/`TSC_AUX`).**
+The doc had not pinned *how* kernel code identifies its CPU, and the kernel runs with
+`GS_BASE = 0` (the per-CPU `CpuLocal` is only reachable via `KERNEL_GS_BASE` inside the
+syscall stub), so a mechanism had to be chosen. Per the arch-boundary rule, neutral
+code calls **`arch::Smp::current_cpu() -> u32`** (a dense index) and indexes
+`CPUS[current_cpu()]`; the x86 mechanism is internal: `current_cpu()` reads a dense
+index from `IA32_TSC_AUX` via **`RDTSCP`** (one instruction, no map, GS-convention-
+neutral), set per CPU by a new `ArchSmp::init_this_cpu(index)`. The mechanism is
+swappable behind the abstraction (x86 could later go GS-relative; aarch64 uses
+`MPIDR_EL1`/`TPIDR_EL1`). Rejected: LAPIC-id + an id→index map (MMIO read + sparse-id
+table). `RDTSCP` is universal on the ≈2014 baseline but **not** in `qemu64`'s default
+feature set — it `#UD`'d until the dev loop opted in `+rdtscp`. Under `cargo test`,
+`current_cpu()` returns `0` (host RDTSCP would yield the unbounded host id and overflow
+the per-CPU arrays).
+
+**What landed.** `MAX_CPUS = 8` (neutral, sizes both per-CPU arrays). The arch
+`CpuLocal` GS block became `CPUS: [CpuLocal; MAX_CPUS]`, each CPU's `KERNEL_GS_BASE`
+pointing at its own slot (`this_cpu_block()`); the syscall/`swapgs` invariant is now
+stated per-CPU. The scheduler's `current`/`idle`/`idle_addr` became per-CPU arrays
+behind small `cur_slot`/`idle_slot`/`idle_addr` accessors (~27 sites), keeping the
+**single global `ready` queue + one `SCHED` lock** (per-CPU runqueues are slice 3).
+`handle::current_ctx_id()` now returns `current_cpu()` (one grace-tracker context per
+CPU; `MAX_CPUS ≤ MAX_CTX`). The BSP calls `init_this_cpu(0)` at boot and logs a `smp:`
+line.
+
+**Decision — page-table-root / `active_cpus` tracking refined to slice 1.** Originally
+listed in slice 0, it has no slice-0 consumer (only the TLB shootdown reads it) and
+adds context-switch bookkeeping best landed *with* the shootdown that exercises it, so
+it moves to slice 1 alongside AP bring-up.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` — all 8 host
+suites green (the per-CPU current/idle paths run host-side at cpu 0; the RDTSCP/`wrmsr`
+ops are QEMU-proven, not host-testable). Boots identically to today — `smp: cpu 0
+online`, the full `parent` demo (threads created/switched/blocked/woken/exited/reaped),
+and the `eshell` prompt — no `#DF`/`#GP`/panic. Branch
+`phase-3/slice0-percpu-foundation`. Next: slice 1 (SMP bring-up).

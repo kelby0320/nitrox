@@ -75,6 +75,8 @@ pub use x86_64::cpu::X86Cpu as Cpu;
 pub use x86_64::acpi::X86Platform as Platform;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::smp::X86Smp as Smp;
+// `MAX_CPUS` (neutral) sizes the per-CPU arrays; re-exported as `crate::arch::MAX_CPUS`.
+pub use smp::MAX_CPUS;
 // `Timer` here is the *hardware* timer (monotonic time + the per-CPU countdown
 // timer); distinct from the future `crate::object::Timer` waitable kernel
 // object. See `arch/timer.rs`.

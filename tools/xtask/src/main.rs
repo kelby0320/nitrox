@@ -231,9 +231,13 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
         // `ArchTimer` slice wanted `+tsc-deadline`, etc.). The entropy slice opts
         // in `+rdrand,+rdseed` so the boot CSPRNG seeds from the hardware source
         // (TCG emulates both); without them the kernel falls back to jitter-only
-        // seeding, which is correct but leaves `seeded=false` at boot.
+        // seeding, which is correct but leaves `seeded=false` at boot. The Phase-3
+        // per-CPU substrate opts in `+rdtscp`: `current_cpu()` reads the logical
+        // CPU id from `IA32_TSC_AUX` via `RDTSCP`. RDTSCP is universal on the
+        // project's ≈2014 hardware baseline but is not in the `qemu64` model's
+        // default feature set, so `qemu64` `#UD`s on it without this flag.
         .arg("-cpu")
-        .arg("qemu64,+smap,+smep,+rdrand,+rdseed")
+        .arg("qemu64,+smap,+smep,+rdrand,+rdseed,+rdtscp")
         .arg("-m")
         .arg("256M");
     // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a
