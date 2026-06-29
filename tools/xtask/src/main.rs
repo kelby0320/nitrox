@@ -220,24 +220,20 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
         // CPU model = "the features the kernel actually requires,
         // nothing more". Base `qemu64` brings long mode, NX, and basic
         // SSE; the `+smap,+smep` opt-ins give us the user-access
-        // protections `arch::init_protections` asserts on. The local
-        // APIC is brought up in **xAPIC** (MMIO) mode — the on-chip APIC
-        // (CPUID.01H:EDX.9) is present in `qemu64` by default, so no extra CPU
-        // flag is needed. x2APIC is deferred (see the decision log, 2026-06-11):
-        // TCG only emulates it from **QEMU 9.0**, so testing the future x2APIC
-        // path under this loop needs QEMU ≥ 9.0 (then `+x2apic`) or KVM
-        // (`-enable-kvm -cpu host`, any modern QEMU); the pin is unchanged until
-        // that work lands. Future slices add features as they need them (the
-        // `ArchTimer` slice wanted `+tsc-deadline`, etc.). The entropy slice opts
-        // in `+rdrand,+rdseed` so the boot CSPRNG seeds from the hardware source
-        // (TCG emulates both); without them the kernel falls back to jitter-only
-        // seeding, which is correct but leaves `seeded=false` at boot. The Phase-3
-        // per-CPU substrate opts in `+rdtscp`: `current_cpu()` reads the logical
-        // CPU id from `IA32_TSC_AUX` via `RDTSCP`. RDTSCP is universal on the
-        // project's ≈2014 hardware baseline but is not in the `qemu64` model's
-        // default feature set, so `qemu64` `#UD`s on it without this flag.
+        // protections `arch::init_protections` asserts on. The on-chip APIC
+        // (CPUID.01H:EDX.9) is present in `qemu64` by default. The entropy slice
+        // opts in `+rdrand,+rdseed` so the boot CSPRNG seeds from the hardware
+        // source (TCG emulates both); without them the kernel falls back to
+        // jitter-only seeding, which is correct but leaves `seeded=false` at boot.
+        // The Phase-3 per-CPU substrate opts in `+rdtscp`: `current_cpu()` reads
+        // the logical CPU id from `IA32_TSC_AUX` via `RDTSCP`. The Phase-3 SMP slice
+        // brings the local APIC up in **x2APIC** mode and opts in `+x2apic`; TCG
+        // only emulates x2APIC from **QEMU 9.0**, so the dev-loop QEMU floor is now
+        // ≥ 9.0. Both RDTSCP and x2APIC are universal on the project's ≈2014
+        // hardware baseline but are not in the bare `qemu64` model's defaults — the
+        // kernel `#UD`s / `#GP`s on them without these flags. SMP runs `-smp N`.
         .arg("-cpu")
-        .arg("qemu64,+smap,+smep,+rdrand,+rdseed,+rdtscp")
+        .arg("qemu64,+smap,+smep,+rdrand,+rdseed,+rdtscp,+x2apic")
         .arg("-m")
         .arg("256M");
     // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a

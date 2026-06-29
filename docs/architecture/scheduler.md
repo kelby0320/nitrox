@@ -226,9 +226,9 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 | Slice | Delivers | Verify |
 |-------|----------|--------|
 | **0** | This doc + the **per-CPU substrate**: `CPU0`→`CPUS[N]`, GS-based per-CPU block, neutral `current_cpu()` (RDTSCP), per-CPU scheduler `current`/`idle`, and lifting the ctx-0 handle grace-period shim. **Still single-CPU; no APs, no x2APIC, no IPIs.** | Boots exactly as today on the current QEMU; host tests for the per-CPU structures. |
-| **1** | **SMP bring-up**: Limine AP startup; per-CPU GDT/TSS/IDT/GS/timer; **x2APIC** (enable + MSR accessors + single-`WRMSR` IPI); per-CPU **page-table-root / `active_cpus` tracking** + **TLB shootdown** via IPI. APs run a per-CPU idle thread and pull from the **shared** global runqueue. | `-smp 4` (QEMU ≥ 9.0, `+x2apic`): N CPUs visibly executing; a thread runs on an AP; clean shutdown. |
+| **1** ✅ | **SMP bring-up** *(landed; correctness items → slice 3)*: Limine AP startup; per-CPU GDT/TSS + shared IDT; **x2APIC** (MSR accessors + single-`WRMSR` IPI); per-CPU timer; APs run a per-CPU idle thread and pull from the **shared** global runqueue. Fixed a per-CPU `reap` UAF. **Deferred to slice 3:** TLB shootdown + `active_cpus`, and **user-thread-migration safety**. | `-smp 4`: 4 CPUs online, APs executing, full userspace boot clean 6/6. |
 | **2** | **Scheduler classes**: RealTime/TimeShared/Idle dispatch; the `Thread`/`ThreadArgs` fields; vruntime fairness; the `REAL_TIME` gate. | A RealTime thread preempts TimeShared; vruntime fairness across TimeShared threads. |
-| **3** | **Per-CPU runqueues + work stealing + affinity**; functional `sys_thread_set_affinity`. | Load balances across CPUs; a pinned thread stays on its CPU. |
+| **3** | **Per-CPU runqueues + work stealing + affinity** + **SMP-correctness hardening** (TLB shootdown + `active_cpus`; user-thread-migration safety — per-CPU runqueues remove the cross-CPU churn that triggers the `syscall_entry` kstack UAF; fix `has_live_siblings`/`exit_process`; audit single-CPU assumptions); functional `sys_thread_set_affinity`. | Load balances; pinned thread stays put; aggressive cross-CPU thread-churn stress test runs clean. |
 
 ### Slice 0 in detail
 

@@ -5728,3 +5728,64 @@ ops are QEMU-proven, not host-testable). Boots identically to today — `smp: cp
 online`, the full `parent` demo (threads created/switched/blocked/woken/exited/reaped),
 and the `eshell` prompt — no `#DF`/`#GP`/panic. Branch
 `phase-3/slice0-percpu-foundation`. Next: slice 1 (SMP bring-up).
+
+## 2026-06-26 — Phase 3 slice 1: SMP bring-up (APs online; correctness hardening deferred to slice 3)
+
+The application processors come up and run kernel code; the full userspace system
+boots **reliably on `-smp 4`**. Sequenced as four chunks — A) x2APIC, B) per-CPU
+GDT/TSS, C) AP bring-up, D) TLB shootdown — of which A–C landed and D (plus the
+broader SMP-correctness hardening) is deferred to slice 3.
+
+**A — x2APIC (committed).** Rewrote `apic.rs` from xAPIC MMIO to **x2APIC** (MSR
+accessors at `0x800 + reg>>4`; 32-bit id; EXTD-enable via the SDM enabled→x2APIC
+two-step, guarded so an already-x2APIC CPU isn't driven through the illegal `11→10`
+transition; `send_ipi` as a single 64-bit ICR `WRMSR`). The dev loop opts in
+`+x2apic` (TCG needs QEMU ≥ 9.0). x2APIC-only, no xAPIC fallback (the ≈2014 baseline
+guarantees it).
+
+**B — per-CPU GDT/TSS.** `GDT`/`TSS`/`#DF`-stack became `[…; MAX_CPUS]`; each CPU loads
+its own (the TSS holds per-CPU stacks). The IDT stays a single shared table — only the
+`lidt` is per-CPU (`idt::load`).
+
+**C — AP bring-up.** Wired Limine's MP request (magic verified against the protocol).
+Limine starts + parks the APs; the kernel launches each by an **atomic write to
+`goto_address`** (no INIT/SIPI, no real-mode trampoline) — the AP jumps to an ordinary
+`extern "C"` entry with its `MpInfo*` in RDI. The BSP assigns **dense** logical indices
+(0 = BSP; APs 1…) via `extra_argument` (robust to sparse ACPI ids). Each AP:
+`init_this_cpu(idx)` → `arch::ap_cpu_init` (per-CPU GDT/TSS, shared IDT, NX/SMEP/SMAP,
+x2APIC enable, syscall MSRs) → arm its LAPIC timer → `sched::ap_run`, which creates that
+CPU's boot+idle threads and retires the boot thread into the scheduler — the AP then
+pulls runnable threads from the **shared** global runqueue. *Verified `-smp 4`:* `smp: 4
+CPU(s) online (1 BSP + 3 AP)`, each AP logs `cpu N online (AP)` from its own entry, and
+the full userspace boot (init → ext4 mount → parent demo → eshell) is clean **6/6
+runs**; `-smp 1` unchanged.
+
+**Two real SMP bugs found + fixed during C:**
+1. **Reap use-after-free (cross-CPU).** `finish_exit` parked a dying thread in a
+   **shared** `reap` list and then `switch_into`'d off its own stack; another CPU's
+   `reap_pending` could free that kernel stack mid-switch. Fix: `reap` is now **per-CPU**
+   (`reap[MAX_CPUS]`) — a thread is reclaimed only by the CPU it died on, after its
+   switch completed (so the stack is provably off-CPU). Host-tested.
+2. **Stale `KERNEL_GS_BASE` defense.** Re-assert this CPU's `KERNEL_GS_BASE` on every
+   user-thread switch-in (`arm_kernel_stack_for`), so a migrated thread's next syscall
+   `swapgs`es into the CPU it now runs on.
+
+**Decision — chunk D (TLB shootdown) + user-thread-migration safety deferred to slice 3
+(option B, chosen with the user).** An aggressive stress test (8 kernel threads exiting
+simultaneously across CPUs + a busy-wait barrier) exposed, *after* the per-CPU-reap fix,
+a second hazard: a kernel-stack UAF surfacing as a `#DF` **inside `syscall_entry`** when
+a **user thread is forced to bounce between CPUs**. Ruled out as causes: an idle-thread
+leak into `ready` (instrumented, never fired) and a wrong `KERNEL_GS_BASE`. This is the
+shared-runqueue model's intrinsic cross-CPU **migration** hazard — exactly what the plan
+defers by putting **per-CPU runqueues in slice 3** (which keep threads on one CPU,
+removing the churn) — so chasing the last UAF in a model slice 3 reworks is poor
+sequencing. The *real* workload does not trigger it (no pathological migration); the
+stress test was removed and `-smp 4` is reliable. Slice 3 gains explicit entry criteria:
+TLB shootdown + `active_cpus`; user-thread-migration safety (re-add the churn stress
+test as the gate); fix `has_live_siblings`/`exit_process` to see siblings on other CPUs'
+`current[]`; and audit the remaining "single-CPU" assumptions in `sched.rs`.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` (8 host suites);
+`-smp 4` 6/6 clean full boots; `-smp 1` unchanged. Dev-loop default stays `-smp 1`
+(deterministic); `-smp N` exercises SMP. Branch `phase-3/slice1-smp-bringup`. Next:
+slice 2 (scheduler classes), then slice 3 (per-CPU runqueues + the SMP hardening above).

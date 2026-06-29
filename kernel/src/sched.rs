@@ -261,12 +261,16 @@ struct SchedState {
     /// [`init`]. Slice 0 has one live CPU (index 0); APs get their own slot in
     /// slice 1. The single global `ready` queue is still shared under `SCHED`.
     current: [Option<ObjectRef>; MAX_CPUS],
-    /// Exited threads awaiting reclamation. Dropped — freeing their kernel
-    /// stacks — by the next scheduler entry, never by a thread itself (it is
-    /// still running on its stack at exit time). A **list** (not one slot) so a
-    /// process exit can reap its torn-down sibling threads alongside the caller.
-    /// Pre-reserved (see [`REAP_RESERVE`]).
-    reap: KVec<ObjectRef>,
+    /// Exited threads awaiting reclamation, **per CPU** (indexed by `current_cpu()`
+    /// via [`reap_slot`](SchedState::reap_slot)). Dropped — freeing their kernel
+    /// stacks — by the next scheduler entry **on the same CPU**, never by a thread
+    /// itself (it is still running on its stack at exit time) and never cross-CPU:
+    /// a thread parks itself here and then `switch_into`s off its stack, so freeing
+    /// it from another CPU mid-switch would be a use-after-free. Same-CPU reaping
+    /// guarantees the switch has completed (the thread is off-CPU) first. A **list**
+    /// (not one slot) so a process exit can reap its torn-down siblings alongside
+    /// the caller. Pre-reserved per CPU (see [`REAP_RESERVE`]).
+    reap: [KVec<ObjectRef>; MAX_CPUS],
     /// Threads suspended after a ring-3 fault, parked off the run queue with
     /// their `ExceptionFrame` preserved on their kernel stacks. A supervisor's
     /// `sys_exception_resume` moves one back to `ready` (resume) or marks it for
@@ -304,7 +308,7 @@ struct SchedState {
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     ready: KVec::new(),
     current: [const { None }; MAX_CPUS],
-    reap: KVec::new(),
+    reap: [const { KVec::new() }; MAX_CPUS],
     suspended: KVec::new(),
     next_tid: 1,
     next_pid: 2,
@@ -341,6 +345,13 @@ impl SchedState {
     #[inline]
     fn idle_slot(&mut self) -> &mut Option<ObjectRef> {
         &mut self.idle[Self::this_cpu()]
+    }
+
+    /// This CPU's reap list (mutable). Per-CPU so a dying thread is reclaimed only
+    /// by the CPU it died on — after its `switch_into` completed (off-stack).
+    #[inline]
+    fn reap_slot(&mut self) -> &mut KVec<ObjectRef> {
+        &mut self.reap[Self::this_cpu()]
     }
 
     /// This CPU's idle-thread stable address.
@@ -413,12 +424,68 @@ pub fn init() -> Result<(), AllocError> {
     g.ready = ready;
     g.blocked = blocked;
     g.suspended = suspended;
-    g.reap = reap;
+    g.reap[0] = reap; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
     g.deadlines = deadlines;
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
     g.quantum = QUANTUM_TICKS;
+    Ok(())
+}
+
+/// Bring an application processor into the scheduler. Run on the AP itself after
+/// its architecture bring-up ([`crate::arch::ap_cpu_init`]) and timer arming.
+/// Creates this CPU's **boot thread** (adopting the running Limine context) and
+/// its **idle thread**, installs them in this CPU's `current`/`idle` slots, enables
+/// preemption, and retires the boot thread — leaving the AP running idle and
+/// pulling runnable threads from the **shared** `ready` queue. Diverges.
+///
+/// The global run/blocked/reap/deadline structures are *not* (re)built here —
+/// [`init`] did that once on the BSP; an AP only adds its own per-CPU slots.
+pub fn ap_run() -> ! {
+    if ap_init().is_err() {
+        // Out of memory building this CPU's scheduler context — park the AP
+        // rather than corrupt the run queue.
+        crate::kprintln!("smp: AP scheduler init FAILED — parking CPU");
+        Cpu::halt_loop();
+    }
+    // SAFETY: this CPU's `current` (boot) and `idle` slots are set, so a timer
+    // tick can schedule. Arm preemption, then retire the boot thread into the
+    // run loop (the AP continues as its idle thread until `ready` has work).
+    unsafe { Cpu::interrupts_enable() };
+    exit_thread(ExitStatus {
+        kind: ExitKind::Normal as u32,
+        code: 0,
+    });
+}
+
+/// Per-CPU scheduler-context setup for an AP: a boot thread (adopting the running
+/// context) as `current`, plus this CPU's idle thread. Mirrors the per-CPU half of
+/// [`init`] without the one-time global reserves.
+fn ap_init() -> Result<(), AllocError> {
+    // A fresh tid for this AP's (transient) boot thread; the idle thread reuses
+    // `IDLE_TID` (idle identity is its object address, via `idle_addr`).
+    let boot_tid = {
+        let mut g = SCHED.lock();
+        let t = g.next_tid;
+        g.next_tid = g.next_tid.wrapping_add(1);
+        t
+    };
+    let boot = Thread::try_new_boot(boot_tid, 0)?;
+    let boot_ref = into_objref(boot);
+    let idle = Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?;
+    let idle_ref = into_objref(idle);
+    let idle_addr = idle_ref.as_ptr() as usize;
+    // This CPU's own reap list — reserved outside the lock so `finish_exit`'s push
+    // never allocates under `SCHED`. Threads dying on this CPU park here.
+    let mut reap: KVec<ObjectRef> = KVec::new();
+    reap.try_reserve(REAP_RESERVE)?;
+
+    let mut g = SCHED.lock();
+    *g.cur_slot() = Some(boot_ref);
+    *g.idle_slot() = Some(idle_ref);
+    g.set_idle_addr(idle_addr);
+    *g.reap_slot() = reap;
     Ok(())
 }
 
@@ -1258,6 +1325,11 @@ unsafe fn arm_kernel_stack_for(obj: *mut ()) {
     if let Some(ktop) = unsafe { Thread::kstack_top(obj) } {
         Cpu::set_kernel_stack(ktop);
         crate::arch::set_syscall_kernel_stack(ktop);
+        // Re-assert this CPU's `KERNEL_GS_BASE`. A user thread that **migrated**
+        // here must `swapgs` into *this* CPU's block on its next syscall (so the
+        // entry stub reads this CPU's freshly-armed `kstack_top`); without this a
+        // migrated thread can syscall onto a stale block → `#DF` in `syscall_entry`.
+        crate::arch::arm_user_entry_cpu_base();
     }
 }
 
@@ -1544,6 +1616,7 @@ fn tick_quantum(quantum: u32, ready_nonempty: bool) -> (u32, bool) {
     }
 }
 
+
 /// The shared switch core used by [`yield_now`] and [`on_timer_tick`]: the
 /// outgoing `current` is re-homed (re-enqueued, or re-parked if it is the idle
 /// thread) and the next thread (front of `ready`, else the idle thread) becomes
@@ -1712,7 +1785,7 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
     // Park self for deferred reclamation.
-    g.reap.try_push(me).expect("reap within reserve");
+    g.reap_slot().try_push(me).expect("reap within reserve");
 
     // Switch to the next ready thread, else the idle thread (which always
     // exists post-init and is parked here, since `me` was current, not idle).
@@ -1791,10 +1864,13 @@ pub fn exit_process(status: ExitStatus) -> ! {
         // Reborrow the guard once as `&mut SchedState` so the field borrows
         // below are disjoint (through the guard's `Deref` each `&mut g.field`
         // would borrow the whole guard, conflicting in one call).
+        let cpu = SchedState::this_cpu();
         let st: &mut SchedState = &mut g;
-        reap_matching(&mut st.ready, &mut st.reap, me_pid);
-        reap_matching(&mut st.suspended, &mut st.reap, me_pid);
-        reap_blocked_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap, me_pid);
+        // Torn-down siblings are parked (off-CPU), so reaping them into this CPU's
+        // reap list is safe; the index is precomputed for disjoint field borrows.
+        reap_matching(&mut st.ready, &mut st.reap[cpu], me_pid);
+        reap_matching(&mut st.suspended, &mut st.reap[cpu], me_pid);
+        reap_blocked_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap[cpu], me_pid);
         // The process is ending: always deliver ChildExited (we are now its
         // last thread).
         deliver_child_exited(st, me_obj, status);
@@ -1971,7 +2047,9 @@ pub fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
 pub fn reap_pending() {
     let reaped = {
         let mut g = SCHED.lock();
-        core::mem::take(&mut g.reap)
+        // Only this CPU's reap list — a thread is reclaimed by the CPU it died on,
+        // after its `switch_into` completed (so its stack is no longer in use).
+        core::mem::take(g.reap_slot())
     };
     drop(reaped);
 }
@@ -2167,7 +2245,7 @@ mod tests {
         SchedState {
             ready: KVec::new(),
             current: [const { None }; MAX_CPUS],
-            reap: KVec::new(),
+            reap: [const { KVec::new() }; MAX_CPUS],
             suspended: KVec::new(),
             next_tid: 1,
             next_pid: 2,
@@ -2334,9 +2412,9 @@ mod tests {
                 st.ready.try_push(inert_ref(tid)).unwrap();
             }
             *st.cur_slot() = Some(inert_ref(5));
-            st.reap.try_reserve(REAP_RESERVE).unwrap();
-            st.reap.try_push(inert_ref(6)).unwrap();
-            st.reap.try_push(inert_ref(7)).unwrap();
+            st.reap[0].try_reserve(REAP_RESERVE).unwrap();
+            st.reap[0].try_push(inert_ref(6)).unwrap();
+            st.reap[0].try_push(inert_ref(7)).unwrap();
             // No destroys while the refs are held.
             assert_eq!(test_probe::thread_destroys(), 0);
         } // st dropped here — every ObjectRef drops its one reference.
@@ -2414,13 +2492,13 @@ mod tests {
         {
             let mut st = test_state();
             st.ready.try_reserve(READY_RESERVE).unwrap();
-            st.reap.try_reserve(REAP_RESERVE).unwrap();
+            st.reap[0].try_reserve(REAP_RESERVE).unwrap();
             st.ready.try_push(inert_user_ref(1, 1)).unwrap();
             st.ready.try_push(inert_user_ref(2, 2)).unwrap();
             st.ready.try_push(inert_user_ref(3, 1)).unwrap();
 
-            reap_matching(&mut st.ready, &mut st.reap, 1);
-            assert_eq!(st.reap.len(), 2, "both pid-1 threads reaped");
+            reap_matching(&mut st.ready, &mut st.reap[0], 1);
+            assert_eq!(st.reap[0].len(), 2, "both pid-1 threads reaped");
             assert_eq!(st.ready.len(), 1, "the pid-2 thread stays");
             // SAFETY: pinned, single-threaded.
             let left = unsafe { &*(st.ready.iter().next().unwrap().as_ptr() as *const Thread) };

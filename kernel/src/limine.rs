@@ -18,6 +18,7 @@
 #![allow(dead_code)]
 
 use core::ptr;
+use core::sync::atomic::AtomicU64;
 
 /// First two ID `u64`s shared by every Limine request.
 pub const COMMON_MAGIC_0: u64 = 0xc7b1dd30df4c8b88;
@@ -290,6 +291,72 @@ pub struct LimineFile {
     pub address: *mut u8,
     pub size: u64,
     pub path: *const u8,
+}
+
+// --- SMP / MP (multiprocessor) request -----------------------------------
+//
+// Limine starts every application processor (AP) for us and parks each one
+// spinning until the kernel writes its `goto_address`. An atomic write to that
+// field makes the parked AP jump to the address — in 64-bit long mode, on a
+// Limine-provided stack, with a `*const SmpInfo` (its own entry) in `RDI`. So
+// there is no INIT/SIPI sequencing and no real-mode trampoline; an AP entry is
+// an ordinary `extern "C"` function. We leave the request `flags` clear (do not
+// ask Limine to enable x2APIC) so every CPU hands off in xAPIC mode and the
+// kernel performs the x2APIC transition itself, uniformly (see `apic.rs`).
+
+const SMP_ID_2: u64 = 0x95a67b819a1b857e;
+const SMP_ID_3: u64 = 0xa0b61b723b6a73e0;
+
+#[repr(C)]
+pub struct SmpRequest {
+    pub id: [u64; 4],
+    pub revision: u64,
+    pub response: *mut SmpResponse,
+    /// Bit 0: ask Limine to enable x2APIC. Left clear — the kernel does it.
+    pub flags: u64,
+}
+
+// SAFETY: same single-writer, static-lifetime reasoning as the other requests —
+// Limine writes `response` once before `_start`; the kernel then reads it.
+unsafe impl Sync for SmpRequest {}
+
+impl SmpRequest {
+    pub const fn new() -> Self {
+        Self {
+            id: [COMMON_MAGIC_0, COMMON_MAGIC_1, SMP_ID_2, SMP_ID_3],
+            revision: 0,
+            response: ptr::null_mut(),
+            flags: 0,
+        }
+    }
+}
+
+/// `struct limine_mp_response` (x86_64).
+#[repr(C)]
+pub struct SmpResponse {
+    pub revision: u64,
+    /// Bit 0 (`LIMINE_MP_RESPONSE_X86_64_X2APIC`): x2APIC was enabled by Limine.
+    pub flags: u32,
+    /// The boot processor's local-APIC id.
+    pub bsp_lapic_id: u32,
+    pub cpu_count: u64,
+    /// Array of `cpu_count` `*mut SmpInfo` (including the BSP's entry).
+    pub cpus: *mut *mut SmpInfo,
+}
+
+/// `struct limine_mp_info` (x86_64) — one per logical CPU.
+#[repr(C)]
+pub struct SmpInfo {
+    /// The dense ACPI processor id (the logical CPU index Nitrox uses).
+    pub processor_id: u32,
+    /// The CPU's local-APIC id (its IPI destination).
+    pub lapic_id: u32,
+    pub reserved: u64,
+    /// The kernel writes the AP's entry-point address here (an atomic write);
+    /// the parked AP then jumps to it with this `SmpInfo*` in `RDI`. `0` parks.
+    pub goto_address: AtomicU64,
+    /// Free for the kernel; passed through untouched by Limine.
+    pub extra_argument: u64,
 }
 
 // --- ACPI RSDP request ---------------------------------------------------

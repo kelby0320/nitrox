@@ -27,10 +27,12 @@ use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
     BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
-    RequestsEndMarker, RequestsStartMarker,
+    RequestsEndMarker, RequestsStartMarker, SmpInfo, SmpRequest,
 };
 use nitrox_kernel::mm;
 use nitrox_kernel::sched;
+
+use core::sync::atomic::{AtomicU32, Ordering};
 
 // --- Limine request statics ---------------------------------------------
 //
@@ -69,6 +71,12 @@ static mut HHDM_REQUEST: HhdmRequest = HhdmRequest::new();
 #[used]
 #[unsafe(link_section = ".limine_requests")]
 static mut MODULE_REQUEST: ModuleRequest = ModuleRequest::new();
+
+// SMP: Limine starts the APs and parks them; the kernel launches each by writing
+// its `goto_address` (see `bring_up_aps`). `static mut` — Limine writes `response`.
+#[used]
+#[unsafe(link_section = ".limine_requests")]
+static mut SMP_REQUEST: SmpRequest = SmpRequest::new();
 
 #[used]
 #[unsafe(link_section = ".limine_requests_start")]
@@ -157,7 +165,7 @@ fn kernel_main() {
             kprintln!("local APIC bring-up failed — halting");
             return;
         }
-        kprintln!("local APIC up (xAPIC, id {})", arch::Irq::id());
+        kprintln!("local APIC up (x2APIC, id {})", arch::Irq::id());
     }
 
     // Calibrate the monotonic time source (TSC) and the per-CPU timer (LAPIC
@@ -259,6 +267,12 @@ fn kernel_main() {
     // Prove the DMA-buffer allocation path (the storage slice's prerequisite).
     dma_smoke_test();
 
+    // Bring up the application processors (Limine started + parked them). After
+    // this, runnable threads can be scheduled on any CPU; the BSP spawns init
+    // below, and any online CPU may pick it up. Each AP logs `cpu N online (AP)`
+    // from its own entry, proving it executes kernel code on the AP.
+    bring_up_aps();
+
     // Arm the syscall fast path and prove it end-to-end by dropping to
     // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
     // (Throwaway harness — replaced next slice by an ELF-loaded process.)
@@ -275,6 +289,105 @@ fn kernel_main() {
         kind: nitrox_kernel::libkern::ExitKind::Normal as u32,
         code: 0,
     });
+}
+
+/// Count of application processors that have finished bring-up (each AP bumps
+/// this near the end of [`ap_entry`]); the BSP waits on it in [`bring_up_aps`].
+static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
+
+/// Entry point for an application processor. Limine jumps each parked AP here
+/// (with a `*const SmpInfo` in `RDI`) once [`bring_up_aps`] writes its
+/// `goto_address`. Runs entirely on the AP: it reads the dense CPU index the BSP
+/// stored in `extra_argument`, brings up its per-CPU arch state + timer, then
+/// retires into the scheduler. Never returns.
+extern "C" fn ap_entry(info: *const SmpInfo) -> ! {
+    // SAFETY: Limine passes a valid 'static `SmpInfo` for this CPU; the BSP wrote
+    // `extra_argument` (our dense index) before the release store that launched us.
+    let idx = unsafe { (*info).extra_argument as u32 };
+
+    // 1. Identity first — the per-CPU GDT/TSS, syscall block, and scheduler slots
+    //    all index off `current_cpu()`.
+    {
+        use arch::smp::ArchSmp;
+        arch::Smp::init_this_cpu(idx);
+    }
+    // 2. Per-CPU arch bring-up: GDT/TSS, the shared IDT, NX/SMEP/SMAP, x2APIC, the
+    //    syscall MSRs (`KERNEL_GS_BASE` → this CPU's block).
+    arch::ap_cpu_init();
+    // 3. Arm this CPU's periodic tick (the BSP-calibrated frequency; IF still 0).
+    // SAFETY: ring 0; this CPU's x2APIC + IDT are now live.
+    unsafe {
+        use arch::timer::ArchTimer;
+        arch::Timer::start_periodic(sched::TICK_NS);
+    }
+    AP_ONLINE.fetch_add(1, Ordering::Release);
+    kprintln!("smp: cpu {} online (AP)", idx);
+
+    // 4. Retire into the scheduler (enables interrupts; diverges).
+    sched::ap_run();
+}
+
+/// Start every application processor Limine reports, assigning each a **dense**
+/// logical index (BSP = 0; APs 1, 2, …, capped at `MAX_CPUS`) passed via
+/// `extra_argument`, then waiting until all are online. No-op if Limine reports no
+/// SMP support. The BSP must already have the scheduler, IDT, APIC, and timer up.
+fn bring_up_aps() {
+    // SAFETY: `static mut` Limine request; Limine wrote `response` before `_start`,
+    // and we read it single-threaded here (no AP is running yet).
+    let resp = unsafe { SMP_REQUEST.response };
+    if resp.is_null() {
+        kprintln!("smp: no Limine SMP response — staying single-CPU");
+        return;
+    }
+    // SAFETY: non-null Limine response, valid for 'static.
+    let resp = unsafe { &*resp };
+    let total = resp.cpu_count;
+    let bsp = resp.bsp_lapic_id;
+    let cap = arch::MAX_CPUS as u32;
+
+    let mut next_idx: u32 = 1; // 0 is the BSP (already index 0 via TSC_AUX).
+    for i in 0..total {
+        // SAFETY: `cpus` points at `cpu_count` valid `*mut SmpInfo`.
+        let info_ptr: *mut SmpInfo = unsafe { *resp.cpus.add(i as usize) };
+        // SAFETY: a valid Limine `SmpInfo` for the lifetime of the kernel.
+        let info = unsafe { &*info_ptr };
+        if info.lapic_id == bsp {
+            continue; // the boot processor is already running.
+        }
+        if next_idx >= cap {
+            kprintln!("smp: more CPUs than MAX_CPUS={} — leaving extras parked", cap);
+            break;
+        }
+        let idx = next_idx;
+        next_idx += 1;
+        // Hand the AP its dense index, then launch it: the release store to
+        // `goto_address` publishes both `extra_argument` and makes the parked AP
+        // jump to `ap_entry`.
+        // SAFETY: `extra_argument` is the kernel's to set; `info_ptr` is valid.
+        unsafe { (&raw mut (*info_ptr).extra_argument).write(idx as u64) };
+        info.goto_address
+            .store(ap_entry as *const () as u64, Ordering::Release);
+    }
+
+    let launched = next_idx - 1;
+    if launched == 0 {
+        return;
+    }
+    // Spin (bounded) until every launched AP reports online.
+    let mut spins: u64 = 0;
+    while AP_ONLINE.load(Ordering::Acquire) < launched {
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 2_000_000_000 {
+            kprintln!(
+                "smp: WARNING — only {}/{} APs online after wait cap",
+                AP_ONLINE.load(Ordering::Acquire),
+                launched
+            );
+            return;
+        }
+    }
+    kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);
 }
 
 /// Draw the boot screen to Limine's framebuffer, if one is present. Best-effort:
@@ -319,6 +432,10 @@ fn draw_boot_screen() {
 /// would finish all its rounds before worker 2 ever printed. The interleaved
 /// output is the proof of preemption. Returns when done (the trampoline calls
 /// [`sched::exit`]).
+/// Spawn a batch of short kernel threads that each report which CPU they ran on,
+/// then drain them. With the shared run queue and the APs online, the reports span
+/// multiple CPUs — proving runnable work executes on the APs. (Phase-3 throwaway
+/// proof; superseded by scheduler stats via `/proc` later.)
 extern "C" fn busy_worker(arg: usize) {
     for round in 0..3 {
         // Enough work to span several 10 ms ticks so preemption is visible.

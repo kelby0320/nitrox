@@ -42,14 +42,30 @@ impl ArchSmp for X86Smp {
         unsafe { regs::wrmsr(MSR_TSC_AUX, index as u64) };
     }
 
-    unsafe fn send_ipi(_target: u32, _vector: u8) {
-        // Phase 1 is single-CPU: no second CPU exists to target, so an IPI
-        // is unreachable by construction — a logic error, not a recoverable
-        // condition. The real implementation (the local-APIC Interrupt
-        // Command Register) lands with Phase-3 SMP bring-up.
-        // TODO(phase-3-smp): implement via the local-APIC ICR.
-        unimplemented!("send_ipi: SMP is Phase 3 (see docs/planning/implementation-plan.md)");
+    unsafe fn send_ipi(target: u32, vector: u8) {
+        // Fixed-delivery IPI via the local APIC's ICR (a single 64-bit x2APIC MSR
+        // write). `target` is the destination CPU's x2APIC id.
+        // SAFETY: ring-0; x2APIC is enabled on the calling CPU by the boot/AP
+        // bring-up path before any IPI is sent.
+        unsafe { crate::arch::x86_64::apic::send_ipi(target, vector) };
     }
+}
+
+/// Per-CPU architecture bring-up for an application processor, run on the AP
+/// itself at the start of its entry. [`X86Smp::init_this_cpu`] must already have
+/// established this CPU's logical index (so `current_cpu()` is correct for the
+/// per-CPU GDT/TSS, syscall block, etc.). Loads this CPU's GDT/TSS, the shared
+/// IDT, the memory protections (NX/SMEP/SMAP), enters x2APIC, and arms the syscall
+/// MSRs (`KERNEL_GS_BASE` → this CPU's block). Leaves interrupts masked.
+pub fn ap_cpu_init() {
+    use crate::arch::cpu::ArchCpu;
+    super::gdt::init();
+    super::idt::load();
+    super::cpu::X86Cpu::init_protections();
+    // SAFETY: ring-0 AP bring-up path; the CPU advertises x2APIC (asserted inside
+    // `enable_this_cpu`), and this runs before the AP touches the local APIC.
+    unsafe { super::apic::enable_this_cpu() };
+    super::syscall::init_syscall_entry();
 }
 
 #[cfg(test)]
