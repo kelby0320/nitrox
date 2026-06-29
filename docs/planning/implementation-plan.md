@@ -1485,23 +1485,52 @@ slices land (it can spawn fs-server-ext4, wait for Ready, and bind `/`).
 
 **Goal:** the userspace ecosystem. Service manager, profile servers, runtime libraries, the standard services. Scheduler matures. SMP works.
 
-### Tasks (rough order; many can proceed in parallel)
+### Tasks
 
-#### Scheduler maturation
+Unlike Phase 2's flat list, the **kernel-first** work (scheduler + SMP) is sequenced
+into slices 0–3 below. The userspace workstreams that follow (service manager,
+runtime libraries, content store, the standard services, auth/session, fs-server RW)
+remain an **unsequenced backlog** — most have no design doc yet (see the
+2026-06-26 Phase 3 scope analysis in the decision log) and are sliced + given their
+missing architecture docs **just-in-time** as we reach them, the same way Phase 2's
+slices were defined.
 
-- [ ] Three scheduler classes: RealTime, TimeShared, Idle
-- [ ] Per-CPU runqueues
-- [ ] Work stealing
-- [ ] Affinity placement on wake
-- [ ] `sys_thread_set_affinity` fully functional
+#### Kernel-first slices (sequenced)
 
-#### SMP
+The design is committed in `os-design-v5.1.md` §Scheduling (three classes —
+RealTime fixed-priority FIFO, TimeShared CFS-like vruntime, Idle) and staged in the
+decision log (2026-05-29, "Step 3 = SMP"). Today the kernel is single-CPU
+**preemptive** with a **single global `SCHED` lock + flat round-robin runqueue**
+(`sched.rs:299,258,474`) and a **stub SMP layer** (`cpu_count→1`,
+`send_ipi→unimplemented!`, Limine SMP request unwired, shared GDT/TSS, local-only
+TLB flush). The spinlocks are already SMP-correct (atomic CAS). Rollout is
+**incremental**: APs first run against the existing global runqueue (slice 1);
+per-CPU runqueues are a later refactor (slice 3), so AP bring-up and load-balancing
+are bisectable in isolation.
 
-- [ ] Full SMP bring-up via Limine
-- [ ] Per-CPU initialization (GS base, per-CPU data structures)
-- [ ] Per-CPU scheduler instances
-- [ ] Per-CPU APIC timers
-- [ ] TLB shootdown via IPI with active_cpus mask
+- [ ] **Slice 0 — Per-CPU foundation + scheduler/SMP design doc.** Write
+  `docs/architecture/scheduler.md` (+ SMP / per-CPU), settling the open decisions
+  (scheduler-class scope, TimeShared algorithm fidelity, x2APIC now-or-later,
+  `MAX_CPUS`, per-CPU data layout, IPI vector assignment, TLB-shootdown algorithm).
+  Then build the per-CPU data substrate — a GS-based per-CPU area, `CPU0`→`CPUs[N]`,
+  a real `cpu_id()` — and convert the single-CPU stand-ins (the scheduler's single
+  `current`, the handle-table grace-period ctx-0 shim, per-CPU page-table-root
+  tracking) to a per-CPU shape. **Still single-CPU; no APs yet.** *Verify:* boots
+  exactly as today; host tests for the per-CPU structures.
+- [ ] **Slice 1 — SMP bring-up (APs on the shared runqueue).** Wire Limine's SMP
+  request + AP startup; per-CPU GDT/TSS/IDT, GS base, and APIC timer; a real
+  `send_ipi` (LAPIC ICR); **TLB shootdown via IPI** with an `active_cpus` mask
+  (mandatory once two CPUs share an address space). APs run a per-CPU idle thread and
+  pull runnable threads from the **existing single global runqueue**. *Verify:* N
+  CPUs visibly executing in QEMU (`-smp N`); a thread observably runs on an AP; clean.
+- [ ] **Slice 2 — Scheduler classes.** RealTime / TimeShared / Idle dispatch; a
+  `class` field on the thread; per-class queue discipline (`ThreadArgs` already
+  carries class + affinity per `thread-args.md`); the `REAL_TIME` syscap gate.
+  *Verify:* a RealTime thread preempts TimeShared; vruntime fairness across TimeShared.
+- [ ] **Slice 3 — Per-CPU runqueues + work stealing + affinity.** Split the global
+  runqueue into per-CPU instances; work-stealing when a CPU goes idle; affinity
+  placement on wake; `sys_thread_set_affinity` functional (replaces the `table.rs:384`
+  no-op). *Verify:* load balances across CPUs; a pinned thread stays on its CPU.
 
 #### Service manager
 
@@ -1606,7 +1635,18 @@ transforming fs-servers, which have no LBA mapping.) See the decision log
 
 ### Notes / deviations
 
-(Add notes here.)
+- **2026-06-26 — Phase 3 scope analysis + kernel-first sequencing.** Stock-take at
+  the start of Phase 3. Phase 3's workstreams sort into three readiness tiers:
+  *ready to build* (libstream — `typed-stream-format.md`; service-mgr schema —
+  `service-toml-schema.md`), *partially sketched* (scheduler, SMP, libos, profile
+  server, content store, fs-server RW/Model-A, auth+session), and *just a checkbox*
+  (librt fiber scheduler, logging, audit, OOM/mount/crash-reporter/namespace-mgr/
+  device-mgr daemons). ~8 architecture docs referenced by `overview.md` don't exist
+  yet; they're written per-workstream as we reach each. The **kernel-first** work
+  (scheduler + SMP) was sequenced into slices 0–3 (above), adding the missing
+  **slice 0** (per-CPU foundation + the scheduler/SMP design doc) and choosing an
+  **incremental SMP rollout** (APs on the shared runqueue first; per-CPU runqueues in
+  slice 3). Full analysis in the decision log entry of 2026-06-26.
 
 ---
 
