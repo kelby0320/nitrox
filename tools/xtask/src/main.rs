@@ -235,10 +235,13 @@ fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
         .arg("-cpu")
         .arg("qemu64,+smap,+smep,+rdrand,+rdseed")
         .arg("-m")
-        .arg("256M")
-        .arg("-drive")
-        .arg(format!("if=pflash,format=raw,readonly=on,file={}", ovmf.display()))
-        .arg("-drive")
+        .arg("256M");
+    // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a
+    // single combined image on legacy setups (see `locate_ovmf`).
+    for a in firmware_pflash_args(&ovmf)? {
+        qemu.arg(a);
+    }
+    qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-serial")
         .arg("stdio")
@@ -700,26 +703,106 @@ fn splice_into(dst: &Path, offset: u64, src: &Path) -> R<()> {
     Ok(())
 }
 
-fn locate_ovmf() -> R<PathBuf> {
-    if let Ok(p) = env::var("NITROX_OVMF") {
-        let path = PathBuf::from(p);
-        if path.exists() {
-            return Ok(path);
+/// UEFI firmware for the QEMU pflash. Modern QEMU ships **split** firmware — a
+/// read-only CODE image plus a writable VARS (NVRAM) store — and a CODE-only
+/// pflash will not boot (the firmware needs its variable region). Older setups
+/// shipped a single combined image used as one read-only pflash.
+enum Firmware {
+    /// Legacy single combined image (e.g. `OVMF.fd`): one read-only pflash.
+    Single(PathBuf),
+    /// Split firmware: a read-only CODE image plus a VARS *template* that is
+    /// copied to a writable per-run store before boot.
+    Split { code: PathBuf, vars_template: PathBuf },
+}
+
+/// Locate UEFI firmware, preferring the modern split (CODE+VARS) layout that
+/// QEMU bundles under its data dir. `NITROX_OVMF` overrides the CODE/combined
+/// image; pair it with `NITROX_OVMF_VARS` to force the split layout.
+fn locate_ovmf() -> R<Firmware> {
+    if let Ok(code) = env::var("NITROX_OVMF") {
+        let code = PathBuf::from(code);
+        if code.exists() {
+            if let Ok(vars) = env::var("NITROX_OVMF_VARS") {
+                let vars = PathBuf::from(vars);
+                if vars.exists() {
+                    return Ok(Firmware::Split { code, vars_template: vars });
+                }
+            }
+            return Ok(Firmware::Single(code));
         }
     }
-    let candidates = [
+    // Split CODE+VARS pairs. QEMU's x86_64 CODE pairs with the (historically
+    // i386-named) VARS template; the `/usr/local` paths are a from-source/tarball
+    // QEMU install's bundled edk2 firmware.
+    let split = [
+        (
+            "/usr/local/share/qemu/edk2-x86_64-code.fd",
+            "/usr/local/share/qemu/edk2-i386-vars.fd",
+        ),
+        (
+            "/usr/share/qemu/edk2-x86_64-code.fd",
+            "/usr/share/qemu/edk2-i386-vars.fd",
+        ),
+        (
+            "/usr/share/OVMF/OVMF_CODE.fd",
+            "/usr/share/OVMF/OVMF_VARS.fd",
+        ),
+        (
+            "/usr/share/edk2-ovmf/x64/OVMF_CODE.fd",
+            "/usr/share/edk2-ovmf/x64/OVMF_VARS.fd",
+        ),
+    ];
+    for (code, vars) in split {
+        if Path::new(code).exists() && Path::new(vars).exists() {
+            return Ok(Firmware::Split {
+                code: PathBuf::from(code),
+                vars_template: PathBuf::from(vars),
+            });
+        }
+    }
+    // Legacy single combined image.
+    let single = [
         "/usr/share/ovmf/OVMF.fd",
-        "/usr/share/OVMF/OVMF_CODE.fd",
         "/usr/share/qemu/OVMF.fd",
         "/usr/share/edk2-ovmf/x64/OVMF.fd",
     ];
-    for c in candidates {
-        let p = PathBuf::from(c);
-        if p.exists() {
-            return Ok(p);
+    for c in single {
+        if Path::new(c).exists() {
+            return Ok(Firmware::Single(PathBuf::from(c)));
         }
     }
-    Err("could not locate an OVMF firmware image; set NITROX_OVMF=/path/to/OVMF.fd".into())
+    Err("could not locate UEFI firmware; set NITROX_OVMF=/path/to/CODE.fd \
+         (and NITROX_OVMF_VARS=/path/to/VARS.fd for split firmware)"
+        .into())
+}
+
+/// The `-drive if=pflash,…` argument(s) for `firmware`. For split firmware the
+/// read-only VARS template is copied to a fresh writable per-run store under
+/// build-cache (UEFI needs a writable NVRAM region; the shared template is
+/// read-only), emitted as `unit=0` CODE (ro) + `unit=1` VARS (rw).
+fn firmware_pflash_args(firmware: &Firmware) -> R<Vec<String>> {
+    match firmware {
+        Firmware::Single(code) => Ok(vec![
+            "-drive".into(),
+            format!("if=pflash,format=raw,readonly=on,file={}", code.display()),
+        ]),
+        Firmware::Split { code, vars_template } => {
+            let vars = build_cache().join("ovmf-vars.fd");
+            fs::copy(vars_template, &vars).map_err(|e| {
+                format!(
+                    "copy OVMF vars {} -> {}: {e}",
+                    vars_template.display(),
+                    vars.display()
+                )
+            })?;
+            Ok(vec![
+                "-drive".into(),
+                format!("if=pflash,unit=0,format=raw,readonly=on,file={}", code.display()),
+                "-drive".into(),
+                format!("if=pflash,unit=1,format=raw,file={}", vars.display()),
+            ])
+        }
+    }
 }
 
 // --- Helpers ------------------------------------------------------------
