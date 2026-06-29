@@ -5624,3 +5624,60 @@ reachable. No new Phase-2 slices were added.
 boot re-profiled in QEMU after the fixture trim (eshell reached at ~7.9 s, healthy
 path; the emergency path unchanged). **Phase 2 is complete; Phase 3 (service
 ecosystem) is next.**
+
+## 2026-06-26 — Phase 3 scope analysis + kernel-first sequencing
+
+Opening stock-take of Phase 3 ("service ecosystem"), which is much larger and less
+defined than Phase 2. The plan's Phase 3 section was a **flat checklist grouped into
+~12 categories with no slice sequencing and no prerequisite band** — the structural
+gap that made it not-startable as written (Phase 2 only worked once it was
+re-sequenced into ordered slices). Two parallel investigations mapped (a) the current
+kernel scheduler/SMP state and (b) the design-doc coverage of every Phase 3
+workstream.
+
+**Readiness tiers.** Workstreams sort into: *ready to build* — a spec already
+exists: libstream (`typed-stream-format.md`), service-mgr schema
+(`service-toml-schema.md`); *partially sketched* — concept committed but details
+open: scheduler classes, SMP, libos `Handle<T,M>`/executor, profile server, content
+store, fs-server RW + Model-A extent fill, auth+session; *just a checkbox* — no
+design at all: librt fiber scheduler, logging service, audit subsystem, and the
+OOM / mount / crash-reporter / namespace-manager / device-manager daemons. ~8
+architecture docs referenced by `overview.md` (`scheduler.md`, `userspace-runtime.md`,
+`content-addressed-store.md`, `init-and-services.md`, logging/audit/session docs, …)
+**do not exist**; they are written per-workstream, just-in-time, as each is reached —
+not all upfront. These are the Phase-3 "pause points."
+
+**Kernel-first state (verified in source).** Preemption is wired (`sched.rs:474`
+timer-tick reschedule), but the scheduler is a **single global `SCHED` lock + flat
+round-robin runqueue** (`sched.rs:299,258`) with **no classes / priorities / per-CPU
+anything**. SMP is a **complete stub**: `cpu_count→1`, `current_cpu→0`,
+`send_ipi→unimplemented!` (`arch/x86_64/smp.rs`), Limine's SMP request **unwired**
+(`limine.rs`), shared GDT/TSS/IST, one `CPU0` per-CPU block, xAPIC-only shared APIC
+MMIO, local-only `flush_tlb_*` (no IPI shootdown), `sys_thread_set_affinity` a
+validating no-op (`table.rs:384`). The good news: the spinlocks are already
+SMP-correct (atomic CAS, `spinlock.rs:72`), so the locking substrate holds; the
+single-CPU stand-ins to convert are the scheduler's single `current`, the
+handle-table grace-period ctx-0 shim, and the absence of per-CPU page-table-root
+tracking. The committed design (`os-design-v5.1.md:922-953`: RealTime fixed-priority
+FIFO, TimeShared CFS-like vruntime, Idle; per-CPU runqueues; work stealing;
+affinity-on-wake) and the 3-step staging (decision log 2026-05-29) are intact.
+
+**Decision — sequence the kernel-first work into slices 0–3, add the missing
+slice 0, and roll SMP out incrementally** (chosen with the user):
+- **Slice 0 — per-CPU foundation + `docs/architecture/scheduler.md`.** A design slice:
+  write the doc (settling the open decisions — class scope, TimeShared fidelity,
+  x2APIC now-or-later, `MAX_CPUS`, per-CPU layout, IPI vectors, shootdown algorithm)
+  *and* build the per-CPU substrate (`CPU0`→`CPUs[N]`, GS-based per-CPU area,
+  `cpu_id()`) + convert the single-CPU stand-ins, **still on one CPU**. Foundational
+  code and its design land together and stay verifiable (boots as today).
+- **Slice 1 — SMP bring-up**, APs pulling from the **existing single global
+  runqueue** (incremental: AP startup is proven against a scheduler we already
+  trust). Includes IPI + TLB shootdown (mandatory the moment two CPUs share an AS).
+- **Slice 2 — scheduler classes** (RealTime/TimeShared/Idle).
+- **Slice 3 — per-CPU runqueues + work stealing + affinity**; `sys_thread_set_affinity`
+  made functional.
+Rejected: per-CPU runqueues from the start (couples AP bring-up with load-balancing
+into one un-bisectable slice); a docs-only slice 0 (would bloat slice 1 with the
+per-CPU substrate). The userspace backlog stays unsequenced for now and is sliced
+as we reach it. No code written yet — slice 0 begins with the design doc, whose open
+decisions are the next pause point.
