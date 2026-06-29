@@ -8,12 +8,30 @@
 //! owns. So the GDT, the TSS, and the IST double-fault stack are brought
 //! up together by [`init`].
 //!
-//! Layout of [`GDT`]: null, 64-bit kernel code (`0x08`), kernel data
-//! (`0x10`), and a 16-byte TSS descriptor occupying two slots (`0x18`).
-//! User-mode selectors are deliberately omitted — there is no userspace
-//! yet, and they must be ordered for `syscall`/`sysret` when it lands.
+//! **Per-CPU.** Each CPU has its own GDT, TSS, and `#DF` stack (the [`GDTS`],
+//! [`TSSES`], [`DF_STACKS`] arrays, indexed by [`this_cpu`]), because a TSS holds
+//! per-CPU stacks (IST1 and RSP0). [`init`] runs once per CPU — the BSP at boot,
+//! each AP during its own bring-up — and loads that CPU's tables.
+//!
+//! Layout of each GDT: null, 64-bit kernel code (`0x08`), kernel data (`0x10`),
+//! ring-3 data (`0x18`), ring-3 code (`0x20`), then a 16-byte TSS descriptor
+//! occupying two slots (`0x28`). The user-selector order is fixed by
+//! `syscall`/`sysret` (see [`STAR_VALUE`]).
 
 use core::arch::asm;
+
+use crate::arch::smp::MAX_CPUS;
+use crate::arch::x86_64::regs;
+
+/// Dense index of the running CPU (its per-CPU GDT/TSS slot), read via `RDTSCP`
+/// — the same source as `X86Smp::current_cpu`. Valid from the first instruction
+/// (`IA32_TSC_AUX` resets to 0, so the BSP reads 0 even before `init_this_cpu`);
+/// an AP sets its index (via `init_this_cpu`) *before* calling [`init`].
+fn this_cpu() -> usize {
+    let cpu = regs::rdtscp_aux() as usize;
+    debug_assert!(cpu < MAX_CPUS, "cpu index out of range");
+    cpu
+}
 
 /// Selector for the 64-bit kernel code segment (GDT index 1). The IDT's
 /// gates reference this; see `idt.rs`.
@@ -57,17 +75,18 @@ const GDT_LEN: usize = 7;
 /// Size of the per-CPU double-fault IST stack.
 const DF_STACK_SIZE: usize = 16 * 1024;
 
-/// The Global Descriptor Table. Populated by [`init`]; `static mut`
-/// because the TSS descriptor's base is the runtime address of [`TSS`].
-static mut GDT: [u64; GDT_LEN] = [0; GDT_LEN];
+/// One Global Descriptor Table **per CPU**, indexed by [`this_cpu`]; each CPU
+/// loads its own (the TSS descriptor's base is the runtime address of that CPU's
+/// [`TSSES`] slot). Populated by [`init`]. Only slot 0 is live until APs start.
+static mut GDTS: [[u64; GDT_LEN]; MAX_CPUS] = [[0; GDT_LEN]; MAX_CPUS];
 
-/// The 64-bit Task State Segment. Phase 1 uses only `ist[0]` (IST1), the
-/// stack the double-fault handler runs on.
-static mut TSS: Tss = Tss::new(0);
+/// One 64-bit Task State Segment **per CPU**. Each CPU's `ist[0]` (IST1) points
+/// at its own `#DF` stack, and `rsp[0]` at its current thread's kernel stack.
+static mut TSSES: [Tss; MAX_CPUS] = [const { Tss::new(0) }; MAX_CPUS];
 
-/// Backing storage for the double-fault IST stack. The CPU loads RSP
+/// Backing storage for the per-CPU double-fault IST stacks. The CPU loads RSP
 /// directly from IST1 on a `#DF`, so 16-byte alignment is baked in.
-static mut DF_STACK: DfStack = DfStack([0; DF_STACK_SIZE]);
+static mut DF_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
 
 /// A 16-byte-aligned block of bytes used as an exception stack.
 #[repr(C, align(16))]
@@ -138,19 +157,31 @@ fn tss_descriptor(base: u64, limit: u32) -> [u64; 2] {
 /// Install the kernel's GDT, load the TSS, and switch to kernel
 /// selectors. Call once, early in boot, before [`crate::arch::x86_64::idt::init`].
 pub fn init() {
-    // 1. Point IST1 at the top of the double-fault stack (stacks grow
+    let cpu = this_cpu();
+    // Raw element pointers into this CPU's per-CPU statics — no bounds-check
+    // panic in the boot path, and each CPU touches only its own slots.
+    // SAFETY: `cpu < MAX_CPUS` (a dense id from `this_cpu`); `add(cpu)` stays in
+    // bounds. No references into the `static mut`s are formed.
+    let (df_ptr, tss_ptr, gdt_ptr) = unsafe {
+        (
+            (&raw const DF_STACKS).cast::<DfStack>().add(cpu),
+            (&raw mut TSSES).cast::<Tss>().add(cpu),
+            (&raw mut GDTS).cast::<[u64; GDT_LEN]>().add(cpu),
+        )
+    };
+
+    // 1. Point IST1 at the top of this CPU's double-fault stack (stacks grow
     //    down) and write the completed TSS.
-    let df_top = (&raw const DF_STACK as usize as u64) + DF_STACK_SIZE as u64;
+    let df_top = (df_ptr as usize as u64) + DF_STACK_SIZE as u64;
     let tss = Tss::new(df_top);
-    // SAFETY: boot is single-threaded; `TSS` is a 'static this module
-    // owns exclusively, and no reference into it is outstanding. The
-    // pointer is to a live, correctly-sized `Tss`.
+    // SAFETY: `tss_ptr` is this CPU's live, correctly-sized `Tss` slot, owned
+    // exclusively by this CPU with no outstanding reference.
     unsafe {
-        (&raw mut TSS).write(tss);
+        tss_ptr.write(tss);
     }
 
-    // 2. Build the GDT with a TSS descriptor for the TSS just written.
-    let tss_addr = &raw const TSS as usize as u64;
+    // 2. Build this CPU's GDT with a TSS descriptor for the TSS just written.
+    let tss_addr = tss_ptr as usize as u64;
     let tss_desc = tss_descriptor(tss_addr, (size_of::<Tss>() - 1) as u32);
     // Order is fixed by `sysretq`: user data (0x18) then user code (0x20),
     // with the TSS pushed to 0x28. See `STAR_VALUE`.
@@ -163,20 +194,20 @@ pub fn init() {
         tss_desc[0], // 0x28 (low)
         tss_desc[1], // 0x28 (high)
     ];
-    // SAFETY: as above — `GDT` is an exclusively-owned 'static with no
-    // outstanding reference.
+    // SAFETY: `gdt_ptr` is this CPU's exclusively-owned GDT slot, no outstanding
+    // reference.
     unsafe {
-        (&raw mut GDT).write(gdt);
+        gdt_ptr.write(gdt);
     }
 
-    // 3. Load the GDT, reload the segment registers, load the TSS.
+    // 3. Load this CPU's GDT, reload the segment registers, load its TSS.
     let ptr = GdtPointer {
         limit: (size_of::<[u64; GDT_LEN]>() - 1) as u16,
-        base: &raw const GDT as usize as u64,
+        base: gdt_ptr as usize as u64,
     };
-    // SAFETY: `ptr` describes the GDT just populated; the selector
-    // constants match the table indices; `TSS_SELECTOR` indexes the TSS
-    // descriptor written in step 2.
+    // SAFETY: `ptr` describes the GDT just populated; the selector constants
+    // match the table indices; `TSS_SELECTOR` indexes the TSS descriptor written
+    // in step 2.
     unsafe {
         load_gdt(&ptr);
         reload_segments();
@@ -246,12 +277,14 @@ unsafe fn load_tss() {
 /// switch stacks at all — the syscall entry stub loads the kernel stack
 /// itself via the per-CPU block); RSP0 covers a fault/IRQ taken in ring 3.
 pub fn set_kernel_stack(top: u64) {
-    // SAFETY: single-CPU boot; `TSS` is exclusively owned by this module
-    // with no outstanding reference. `rsp[0]` is a `u64` at a 4-aligned
-    // offset in a `#[repr(C, packed)]` TSS, so write it unaligned to avoid
-    // forming a misaligned reference.
+    let cpu = this_cpu();
+    // SAFETY: writes only the running CPU's TSS slot (`cpu < MAX_CPUS`), which it
+    // owns exclusively with no outstanding reference. `rsp[0]` is a `u64` at a
+    // 4-aligned offset in a `#[repr(C, packed)]` TSS, so write it unaligned to
+    // avoid forming a misaligned reference.
     unsafe {
-        let rsp0 = &raw mut (*(&raw mut TSS)).rsp[0];
+        let tss_ptr = (&raw mut TSSES).cast::<Tss>().add(cpu);
+        let rsp0 = &raw mut (*tss_ptr).rsp[0];
         rsp0.write_unaligned(top);
     }
 }

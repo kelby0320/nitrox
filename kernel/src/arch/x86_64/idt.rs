@@ -774,9 +774,6 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
 /// code selector, and `#DF` uses the TSS's IST1). Does not enable
 /// interrupts.
 pub fn init() {
-    let base = &raw const IDT as usize as u64;
-    let limit = (size_of::<[IdtEntry; 256]>() - 1) as u16;
-
     // SAFETY: boot is single-threaded and no other reference to `IDT`
     // exists. Forming the `&mut` through a raw pointer is the sanctioned
     // way to reach a `static mut`.
@@ -806,9 +803,19 @@ pub fn init() {
         idt[DEVICE_IRQ_BASE as usize + i].set_handler(stub as usize as u64, 0);
     }
 
+    // Gates installed; load IDTR. The table is shared across CPUs — only the
+    // `lidt` is per-CPU, so APs call [`load`] directly.
+    load();
+}
+
+/// Load the (already-built) shared IDT into IDTR on the running CPU. [`init`]
+/// builds the table once (BSP); APs only need this `lidt`.
+pub fn load() {
+    let base = &raw const IDT as usize as u64;
+    let limit = (size_of::<[IdtEntry; 256]>() - 1) as u16;
     let ptr = IdtPointer { limit, base };
-    // SAFETY: `ptr` describes the fully-populated IDT. Interrupts are
-    // masked, so no handler can fire while IDTR is being updated.
+    // SAFETY: `ptr` describes the IDT built by `init`. With interrupts masked no
+    // handler can fire while IDTR is being updated.
     unsafe {
         load_idt(&ptr);
     }

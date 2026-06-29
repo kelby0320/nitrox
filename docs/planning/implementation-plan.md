@@ -1521,20 +1521,39 @@ are bisectable in isolation.
   slice 1** (no slice-0 consumer). *Verified:* build clean / check-arch / 8 host test
   suites green; boots identically to today (full `parent` demo → `eshell`), no faults.
   See the decision log (2026-06-26, Phase 3 slice 0).
-- [ ] **Slice 1 — SMP bring-up (APs on the shared runqueue).** Wire Limine's SMP
-  request + AP startup; per-CPU GDT/TSS/IDT, GS base, and APIC timer; a real
-  `send_ipi` (LAPIC ICR); **TLB shootdown via IPI** with an `active_cpus` mask
-  (mandatory once two CPUs share an address space). APs run a per-CPU idle thread and
-  pull runnable threads from the **existing single global runqueue**. *Verify:* N
-  CPUs visibly executing in QEMU (`-smp N`); a thread observably runs on an AP; clean.
+- [x] **Slice 1 — SMP bring-up (APs on the shared runqueue)** (`phase-3/slice1-smp-bringup`):
+  Limine's SMP request + AP startup (atomic `goto_address`, no INIT/SIPI); **x2APIC**
+  (committed; MSR accessors, EXTD enable, single-`WRMSR` ICR `send_ipi`); per-CPU
+  **GDT/TSS** + the shared IDT loaded per-CPU; per-CPU APIC timer; AP entry
+  (`init_this_cpu` → `ap_cpu_init` → arm timer → `sched::ap_run`) creating a per-CPU
+  boot+idle and pulling from the **shared** runqueue. Fixed an SMP reap
+  use-after-free (per-CPU `reap` lists) + re-assert `KERNEL_GS_BASE` on user-thread
+  switch-in. *Verified:* `-smp 4` boots the full userspace (init → ext4 mount → parent
+  demo → eshell) **reliably** (6/6), 4 CPUs online, APs executing kernel code; `-smp 1`
+  unchanged; check-arch + 8 host suites green. **Two pieces deferred to slice 3's SMP
+  hardening** (below): **TLB shootdown + `active_cpus`** (not yet triggered by the
+  read-only workload, but required for concurrent cross-CPU unmaps), and **user-thread
+  migration safety** — a kernel-stack UAF in `syscall_entry` when a user thread is
+  forced to bounce between CPUs under pathological churn (the shared-runqueue model's
+  cross-CPU hazard; per-CPU runqueues remove the churn). Also unfixed:
+  `has_live_siblings`/`exit_process` only scan parked lists, not other CPUs' `current[]`.
+  See the decision log (2026-06-26, Phase 3 slice 1).
 - [ ] **Slice 2 — Scheduler classes.** RealTime / TimeShared / Idle dispatch; a
   `class` field on the thread; per-class queue discipline (`ThreadArgs` already
   carries class + affinity per `thread-args.md`); the `REAL_TIME` syscap gate.
   *Verify:* a RealTime thread preempts TimeShared; vruntime fairness across TimeShared.
-- [ ] **Slice 3 — Per-CPU runqueues + work stealing + affinity.** Split the global
-  runqueue into per-CPU instances; work-stealing when a CPU goes idle; affinity
-  placement on wake; `sys_thread_set_affinity` functional (replaces the `table.rs:384`
-  no-op). *Verify:* load balances across CPUs; a pinned thread stays on its CPU.
+- [ ] **Slice 3 — Per-CPU runqueues + work stealing + affinity (+ SMP-correctness
+  hardening).** Split the global runqueue into per-CPU instances; work-stealing when a
+  CPU goes idle; affinity placement on wake; `sys_thread_set_affinity` functional
+  (replaces the `table.rs:384` no-op). **Entry criteria — the SMP-correctness items
+  deferred from slice 1, which per-CPU runqueues make natural:** (a) **TLB shootdown**
+  via IPI + per-`AddressSpace` `active_cpus`; (b) **user-thread migration safety** (the
+  `syscall_entry` kstack hazard — per-CPU runqueues keep threads on one CPU, removing
+  the cross-CPU migration that triggers it; verify by re-introducing an aggressive
+  cross-CPU thread-churn stress test that previously `#DF`'d); (c) fix
+  `has_live_siblings`/`exit_process` to account for siblings running on other CPUs;
+  (d) audit every "single-CPU" assumption in `sched.rs`. *Verify:* load balances across
+  CPUs; a pinned thread stays on its CPU; the aggressive churn stress test runs clean.
 
 #### Service manager
 
