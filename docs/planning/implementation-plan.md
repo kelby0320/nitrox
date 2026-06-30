@@ -1551,18 +1551,30 @@ are bisectable in isolation.
   syscap gate and the user-facing **`ThreadArgs` class/nice/affinity ABI** — user
   threads default to TimeShared; kernel threads set class directly for now. See the
   decision log (2026-06-29, Phase 3 slice 2).
-- [ ] **Slice 3 — Per-CPU runqueues + work stealing + affinity (+ SMP-correctness
-  hardening).** Split the global runqueue into per-CPU instances; work-stealing when a
-  CPU goes idle; affinity placement on wake; `sys_thread_set_affinity` functional
-  (replaces the `table.rs:384` no-op). **Entry criteria — the SMP-correctness items
-  deferred from slice 1, which per-CPU runqueues make natural:** (a) **TLB shootdown**
-  via IPI + per-`AddressSpace` `active_cpus`; (b) **user-thread migration safety** (the
-  `syscall_entry` kstack hazard — per-CPU runqueues keep threads on one CPU, removing
-  the cross-CPU migration that triggers it; verify by re-introducing an aggressive
-  cross-CPU thread-churn stress test that previously `#DF`'d); (c) fix
-  `has_live_siblings`/`exit_process` to account for siblings running on other CPUs;
-  (d) audit every "single-CPU" assumption in `sched.rs`. *Verify:* load balances across
-  CPUs; a pinned thread stays on its CPU; the aggressive churn stress test runs clean.
+- [x] **Slice 3 — Per-CPU runqueues + work stealing + affinity** (`phase-3/slice3-percpu-runqueues`):
+  `ready`/`min_vruntime` split per-CPU (mirroring `current`/`idle`/`reap`), one `SCHED`
+  lock; a `place_thread` policy (kernel threads → least-loaded CPU; waking thread → its
+  `last_cpu` home); **work stealing** (idle CPU steals from the busiest peer; routed via
+  `pick_next` + an idle-tick trigger); **affinity** (`cpu_mask` on `Thread` honoured by
+  placement/steal; `sys_thread_set_affinity` functional, `SIGNAL`-gated — no SysCaps);
+  `has_live_siblings` now scans other CPUs' `current[]`. Fixed a placement bug — online
+  CPUs are tracked by a `cpu_online[]` **mask** (APs run `ap_init` in arbitrary order, so
+  they aren't a dense `0..n` prefix). *Verified:* distribution demo → all APs (`0b1111`);
+  affinity demo → each worker on its pinned CPU; `-smp 4` **12/12** clean full boots;
+  `-smp 1` unchanged; +6 host tests (524); check-arch green. **Migration decision (option
+  B):** the slice-1 `syscall_entry` user-thread-migration UAF reappeared once placement/
+  stealing moved user threads, so slice 3 **prevents user-thread migration entirely** —
+  user threads stay on their creating CPU (re-home/wake home, never stolen); kernel
+  threads distribute. Cost: userspace runs on the BSP for now. **Deferred to slice 3b:**
+  TLB shootdown + `active_cpus`; the cross-CPU deschedule IPI (`exit_process` can't yet
+  terminate a sibling *running* on another CPU); root-causing the `syscall_entry` hazard
+  so user threads can use the APs. See the decision log (2026-06-29, Phase 3 slice 3).
+- [ ] **Slice 3b — SMP correctness completion.** TLB shootdown via IPI + per-`AddressSpace`
+  `active_cpus` (set/cleared at the CR3 load in `switch_into`; broadcast from the unmap
+  sites); a cross-CPU **deschedule IPI** so `exit_process`/kill can stop a sibling running
+  on another CPU; root-cause the `syscall_entry` per-CPU-stack hazard so **user threads may
+  migrate** (use the APs) safely. *Verify:* concurrent cross-CPU unmap stays coherent; a
+  multi-threaded user process runs across CPUs and an aggressive churn stress test is clean.
 
 #### Service manager
 

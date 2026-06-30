@@ -381,12 +381,19 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
     Ok(parent_handle.bits() as isize)
 }
 
-/// `sys_thread_set_affinity(thread, cpu_mask)` — restrict which CPUs a thread
-/// may run on. **No-op until SMP (Phase 3):** validates the handle carries
-/// `SIGNAL` and is a `Thread`, then accepts and ignores `cpu_mask`.
-pub fn sys_thread_set_affinity(thread_h: u64, _cpu_mask: u64) -> SysResult {
+/// `sys_thread_set_affinity(thread, cpu_mask)` — restrict which CPUs a thread may
+/// run on (bit `c` ⇒ may run on CPU `c`). Requires `SIGNAL` on the `Thread` handle.
+/// Bits above `MAX_CPUS` are ignored; at least one valid CPU bit must be set (an
+/// empty mask — a thread that could never be scheduled — is `InvalidArgument`).
+/// Takes effect at the thread's next placement/steal/wake.
+pub fn sys_thread_set_affinity(thread_h: u64, cpu_mask: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
-    lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
+    let ok = lookup_typed(thread_h, pid, Rights::SIGNAL, KObjectType::Thread)?;
+    let mask = (cpu_mask & ((1u64 << crate::arch::MAX_CPUS) - 1)) as u8;
+    if mask == 0 {
+        return Err(KError::InvalidArgument);
+    }
+    crate::sched::set_thread_affinity(ok.object.as_ptr(), mask);
     Ok(0)
 }
 
