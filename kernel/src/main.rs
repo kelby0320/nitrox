@@ -259,6 +259,10 @@ fn kernel_main() {
     // returns here. See `docs/architecture/overview.md` § Scheduling.
     run_scheduler_demo();
 
+    // Prove the scheduler classes: a RealTime thread preempts TimeShared, and two
+    // TimeShared threads with different nice get proportional CPU (vruntime).
+    sched_class_demo();
+
     // Prove the demand-paging on-fault path in the live kernel before handing
     // off — the first userspace process then exercises it for real (its stack
     // is reserved lazily and faults in on first use).
@@ -447,6 +451,76 @@ extern "C" fn busy_worker(arg: usize) {
         kprintln!("worker {} round {}", arg, round);
     }
     kprintln!("worker {} exiting", arg);
+}
+
+/// Completion counter for [`sched_class_demo`]'s three workers (count-based
+/// barrier — race-free even when the workers run on different CPUs).
+static SCHED_DEMO_DONE: AtomicU32 = AtomicU32::new(0);
+
+/// Demonstrate the scheduler classes (Phase 3 slice 2): a **RealTime** worker
+/// preempts the **TimeShared** workers, and two TimeShared workers with different
+/// `nice` get proportional CPU — the lower-`nice` one finishes first. Single-CPU on
+/// the default `-smp 1`; on `-smp N` the kernel threads distribute (the class
+/// ordering still holds). Mirrors `run_scheduler_demo`'s count-barrier drain.
+fn sched_class_demo() {
+    use nitrox_kernel::object::SchedClass;
+
+    kprintln!("sched: class demo — RealTime preempts TimeShared; TimeShared nice-fairness");
+    // A RealTime worker (priority 5): runs ahead of every TimeShared thread.
+    if sched::spawn_with_class(rt_demo_worker, 5, SchedClass::RealTime, 5, 0).is_err() {
+        kprintln!("sched: RT demo spawn failed");
+    }
+    // Two TimeShared workers, equal work, different nice. Lower nice ⇒ slower
+    // vruntime accrual ⇒ more CPU ⇒ finishes first.
+    for nice in [0i8, 10] {
+        if sched::spawn_with_class(ts_demo_worker, nice as usize, SchedClass::TimeShared, 0, nice)
+            .is_err()
+        {
+            kprintln!("sched: TS demo spawn (nice {}) failed", nice);
+        }
+    }
+    // Barrier: wait for all three to finish (count-based, race-free under SMP),
+    // reaping exited workers throughout. The boot thread is preempted meanwhile.
+    let mut spins: u64 = 0;
+    while SCHED_DEMO_DONE.load(Ordering::Acquire) < 3 {
+        sched::reap_pending();
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 20_000_000_000 {
+            kprintln!("sched: class demo barrier timed out");
+            break;
+        }
+    }
+    sched::reap_pending();
+    kprintln!("sched: class demo complete");
+}
+
+/// A RealTime [`sched_class_demo`] worker: a little work, then report. As RealTime
+/// it runs to completion before any TimeShared thread gets the CPU.
+extern "C" fn rt_demo_worker(prio: usize) {
+    let mut acc: u64 = 0;
+    for i in 0..4_000_000u64 {
+        acc = acc.wrapping_add(i);
+    }
+    core::hint::black_box(acc);
+    kprintln!("sched:   RealTime worker (prio {}) finished", prio);
+    SCHED_DEMO_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// A TimeShared [`sched_class_demo`] worker: fixed total work in rounds. With
+/// vruntime fairness the lower-`nice` worker makes faster progress and finishes
+/// earlier — visible in the interleaving and the `DONE` order.
+extern "C" fn ts_demo_worker(nice: usize) {
+    for round in 0..3 {
+        let mut acc: u64 = 0;
+        for i in 0..16_000_000u64 {
+            acc = acc.wrapping_add(i ^ nice as u64);
+        }
+        core::hint::black_box(acc);
+        kprintln!("sched:   TimeShared nice={} round {}/3", nice, round + 1);
+    }
+    kprintln!("sched:   TimeShared nice={} DONE", nice);
+    SCHED_DEMO_DONE.fetch_add(1, Ordering::Release);
 }
 
 /// Initialise the scheduler, **arm preemption** (periodic timer + IF=1), spawn

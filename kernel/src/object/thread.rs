@@ -60,6 +60,22 @@ pub enum ThreadState {
     Exited,
 }
 
+/// A thread's **scheduling class**, in strict dispatch precedence: a runnable
+/// `RealTime` thread always preempts `TimeShared`, which preempts `Idle` (the
+/// per-CPU fallback). See `docs/architecture/scheduler.md` §Scheduling classes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[repr(u8)]
+pub enum SchedClass {
+    /// Fixed-priority FIFO (priority `0..=99`, `0` highest). Not fair-scheduled;
+    /// does not accrue vruntime. Creating one is `REAL_TIME`-gated (deferred
+    /// until the syscap system lands; kernel threads set it directly for now).
+    RealTime = 0,
+    /// CFS-like vruntime-fair scheduling — the default for every thread.
+    TimeShared = 1,
+    /// The per-CPU idle thread (`hlt`); never enqueued in `ready`.
+    Idle = 2,
+}
+
 /// The wait wake-handshake state, stored as an [`AtomicU8`] on each [`Thread`]
 /// so a waker (the timer-tick fire path, under `SCHED`) and the blocking thread
 /// agree on a single source of truth for "was I claimed for wakeup?".
@@ -148,6 +164,18 @@ pub struct Thread {
     /// carries the terminate exit code.
     disp_tag: u8,
     disp_code: i32,
+    /// Scheduling class (RealTime / TimeShared / Idle). The scheduler reads it
+    /// (and the fields below) under `SCHED`. Default `TimeShared`.
+    class: SchedClass,
+    /// RealTime fixed priority `0..=99` (`0` = highest); meaningful only when
+    /// `class == RealTime`. `0` otherwise.
+    rt_priority: u8,
+    /// TimeShared niceness `-20..=19` (lower = more CPU); `0` = default. Scales
+    /// the per-tick `vruntime` increment via the nice-weight table.
+    nice: i8,
+    /// TimeShared virtual runtime (ns-scaled): runtime accrued, inversely
+    /// weighted by `nice`. The scheduler runs the smallest-`vruntime` thread.
+    vruntime: u64,
     // Deferred to later slices:
     //   fpu_context  — kernel is soft-float; lands with userspace threads.
     //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
@@ -184,6 +212,10 @@ impl Thread {
             exception_frame: 0,
             disp_tag: 0,
             disp_code: 0,
+            class: SchedClass::TimeShared,
+            rt_priority: 0,
+            nice: 0,
+            vruntime: 0,
         })
     }
 
@@ -215,6 +247,10 @@ impl Thread {
             exception_frame: 0,
             disp_tag: 0,
             disp_code: 0,
+            class: SchedClass::TimeShared,
+            rt_priority: 0,
+            nice: 0,
+            vruntime: 0,
         })
     }
 
@@ -258,6 +294,10 @@ impl Thread {
             exception_frame: 0,
             disp_tag: 0,
             disp_code: 0,
+            class: SchedClass::TimeShared,
+            rt_priority: 0,
+            nice: 0,
+            vruntime: 0,
         })
     }
 
@@ -316,6 +356,10 @@ impl Thread {
             exception_frame: 0,
             disp_tag: 0,
             disp_code: 0,
+            class: SchedClass::TimeShared,
+            rt_priority: 0,
+            nice: 0,
+            vruntime: 0,
         })
     }
 
@@ -364,6 +408,64 @@ impl Thread {
     pub(crate) unsafe fn set_state(obj: *mut (), s: ThreadState) {
         let p = obj as *mut Thread;
         unsafe { core::ptr::write(&raw mut (*p).state, s) }
+    }
+
+    /// The thread's scheduling class.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn sched_class(obj: *mut ()) -> SchedClass {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).class) }
+    }
+
+    /// RealTime fixed priority (`0` highest); meaningful only for `RealTime`.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn rt_priority(obj: *mut ()) -> u8 {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).rt_priority) }
+    }
+
+    /// TimeShared niceness (`-20..=19`).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn nice(obj: *mut ()) -> i8 {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).nice) }
+    }
+
+    /// TimeShared virtual runtime.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn vruntime(obj: *mut ()) -> u64 {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).vruntime) }
+    }
+
+    /// Set the TimeShared virtual runtime.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_vruntime(obj: *mut (), v: u64) {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::write(&raw mut (*p).vruntime, v) }
+    }
+
+    /// Set the scheduling class and its parameters (the `spawn`-with-class path).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_sched(obj: *mut (), class: SchedClass, rt_priority: u8, nice: i8) {
+        let p = obj as *mut Thread;
+        unsafe {
+            core::ptr::write(&raw mut (*p).class, class);
+            core::ptr::write(&raw mut (*p).rt_priority, rt_priority);
+            core::ptr::write(&raw mut (*p).nice, nice);
+        }
     }
 
     /// Read the scheduler lifecycle state (production-reachable for the
@@ -739,6 +841,10 @@ mod tests {
             exception_frame: 0,
             disp_tag: 0,
             disp_code: 0,
+            class: SchedClass::TimeShared,
+            rt_priority: 0,
+            nice: 0,
+            vruntime: 0,
         })
         .unwrap()
     }

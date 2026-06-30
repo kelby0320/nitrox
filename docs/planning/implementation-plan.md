@@ -1538,10 +1538,19 @@ are bisectable in isolation.
   cross-CPU hazard; per-CPU runqueues remove the churn). Also unfixed:
   `has_live_siblings`/`exit_process` only scan parked lists, not other CPUs' `current[]`.
   See the decision log (2026-06-26, Phase 3 slice 1).
-- [ ] **Slice 2 — Scheduler classes.** RealTime / TimeShared / Idle dispatch; a
-  `class` field on the thread; per-class queue discipline (`ThreadArgs` already
-  carries class + affinity per `thread-args.md`); the `REAL_TIME` syscap gate.
-  *Verify:* a RealTime thread preempts TimeShared; vruntime fairness across TimeShared.
+- [x] **Slice 2 — Scheduler classes** (`phase-3/slice2-scheduler-classes`): `SchedClass`
+  (RealTime / TimeShared / Idle) + `rt_priority` / `nice` / `vruntime` on `Thread`;
+  class-aware `dequeue_front` (RealTime by `rt_priority` FIFO → TimeShared by smallest
+  `vruntime`; O(n) scan over the shared `ready`); CFS-like vruntime accrual per tick
+  (Linux nice-weight table) with a `min_vruntime` floor + wake latency-boost; a
+  kernel-thread `spawn_with_class`. *Verified:* a `sched_class_demo` shows the RealTime
+  worker finishing **before any** TimeShared round, and the nice-0 worker completing all
+  rounds while nice-10 is still on round 1 (vruntime fairness); `-smp 1` + `-smp 4`
+  (2/2) clean to eshell, 0 faults; +4 host tests (521 total), check-arch green.
+  **Deferred to the SysCaps slice** (no capability system exists yet): the `REAL_TIME`
+  syscap gate and the user-facing **`ThreadArgs` class/nice/affinity ABI** — user
+  threads default to TimeShared; kernel threads set class directly for now. See the
+  decision log (2026-06-29, Phase 3 slice 2).
 - [ ] **Slice 3 — Per-CPU runqueues + work stealing + affinity (+ SMP-correctness
   hardening).** Split the global runqueue into per-CPU instances; work-stealing when a
   CPU goes idle; affinity placement on wake; `sys_thread_set_affinity` functional

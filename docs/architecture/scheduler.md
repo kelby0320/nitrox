@@ -71,6 +71,13 @@ The per-CPU pick is therefore: *if any RealTime runnable → highest-priority FI
 else if any TimeShared runnable → min-vruntime; else the idle thread.* This collapses
 to today's behavior when every thread is TimeShared with equal weight.
 
+> **Status (slice 2):** the dispatch above is implemented; the **`REAL_TIME` gate is
+> not yet** — it needs the `SysCaps` capability system, which doesn't exist. Until that
+> lands, *user* threads are always TimeShared and only trusted *kernel* threads enter
+> RealTime (via `sched::spawn_with_class`). The gate and the user-facing `ThreadArgs`
+> class/nice/affinity ABI land with the capability system. See the decision log
+> (2026-06-29).
+
 ### TimeShared: virtual-runtime fairness
 
 Each TimeShared thread carries a `vruntime` (virtual runtime, nanoseconds-scaled).
@@ -79,13 +86,15 @@ lower-priority (higher-nice) threads accrue faster and thus get picked less ofte
 fairness is "everyone advances their vruntime at a rate inversely proportional to
 weight." The scheduler always runs the **smallest** vruntime.
 
-- **Structure:** a **binary min-heap keyed on vruntime**, reusing the
-  `mod deadline` heap pattern (`sched.rs:107`) — *not* a red-black tree. libkern has
-  no ordered tree, and at our thread counts a heap's O(log n) insert / extract-min is
-  ample; Linux uses an rbtree only because it also needs efficient arbitrary removal,
-  which we handle by lazy invalidation (a blocked thread is skipped, not eagerly
-  removed). If profiles ever show heap churn dominating, an rbtree is a drop-in
-  behind the same "pick min vruntime" interface.
+- **Structure (as shipped, slice 2):** the single shared `ready` list, with
+  `dequeue_front` **scanning** it for the smallest-key thread (`(class_rank,
+  rt_priority, vruntime)`) — an O(n) pick that needs no new data structure and leaves
+  enqueue and every other `ready` site untouched. Ample at our thread counts.
+  **Deferred optimization:** a **binary min-heap keyed on vruntime** (reusing the
+  `mod deadline` heap pattern, `sched.rs:107`) + a RealTime priority array, behind the
+  same "pick best" interface — a drop-in if profiles ever show the scan dominating.
+  (Not a red-black tree: libkern has no ordered tree, and we get efficient arbitrary
+  removal via lazy invalidation — a blocked thread is skipped, not eagerly removed.)
 - **New-thread / wake vruntime:** a thread joining (or re-joining after blocking)
   is seeded to `max(its vruntime, min_vruntime - slice)` so it can't hoard CPU by
   having slept with a tiny vruntime, nor be starved by a stale-large one. `min_vruntime`
@@ -227,7 +236,7 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 |-------|----------|--------|
 | **0** | This doc + the **per-CPU substrate**: `CPU0`→`CPUS[N]`, GS-based per-CPU block, neutral `current_cpu()` (RDTSCP), per-CPU scheduler `current`/`idle`, and lifting the ctx-0 handle grace-period shim. **Still single-CPU; no APs, no x2APIC, no IPIs.** | Boots exactly as today on the current QEMU; host tests for the per-CPU structures. |
 | **1** ✅ | **SMP bring-up** *(landed; correctness items → slice 3)*: Limine AP startup; per-CPU GDT/TSS + shared IDT; **x2APIC** (MSR accessors + single-`WRMSR` IPI); per-CPU timer; APs run a per-CPU idle thread and pull from the **shared** global runqueue. Fixed a per-CPU `reap` UAF. **Deferred to slice 3:** TLB shootdown + `active_cpus`, and **user-thread-migration safety**. | `-smp 4`: 4 CPUs online, APs executing, full userspace boot clean 6/6. |
-| **2** | **Scheduler classes**: RealTime/TimeShared/Idle dispatch; the `Thread`/`ThreadArgs` fields; vruntime fairness; the `REAL_TIME` gate. | A RealTime thread preempts TimeShared; vruntime fairness across TimeShared threads. |
+| **2** ✅ | **Scheduler classes** *(landed)*: `SchedClass` RealTime/TimeShared/Idle + `rt_priority`/`nice`/`vruntime` on `Thread`; class-aware `dequeue_front` (policy scan over the shared `ready`); CFS-like vruntime (nice-weight table + `min_vruntime` floor/wake-boost); kernel-thread `spawn_with_class`. **Deferred to the SysCaps slice:** the `REAL_TIME` gate + the user-facing `ThreadArgs` class/nice/affinity ABI (no capability system exists yet). | `sched_class_demo`: RealTime finishes before any TimeShared round; nice-0 outpaces nice-10. |
 | **3** | **Per-CPU runqueues + work stealing + affinity** + **SMP-correctness hardening** (TLB shootdown + `active_cpus`; user-thread-migration safety — per-CPU runqueues remove the cross-CPU churn that triggers the `syscall_entry` kstack UAF; fix `has_live_siblings`/`exit_process`; audit single-CPU assumptions); functional `sys_thread_set_affinity`. | Load balances; pinned thread stays put; aggressive cross-CPU thread-churn stress test runs clean. |
 
 ### Slice 0 in detail
