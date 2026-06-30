@@ -253,13 +253,23 @@ unsafe fn resolve_root(obj: *mut ()) -> PhysAddr {
 
 /// Scheduler state behind the rank-1 run-queue lock.
 struct SchedState {
-    /// Ready threads in round-robin order; each holds one refcount on its
-    /// `Thread`, keeping it (and its kernel stack) alive while queued.
-    ready: KVec<ObjectRef>,
+    /// **Per-CPU** ready run queues (indexed by `current_cpu()` via
+    /// [`ready_slot`](SchedState::ready_slot)); each entry holds one refcount on its
+    /// `Thread`, keeping it (and its kernel stack) alive while queued. A preempted
+    /// thread re-homes to **its own** CPU's queue, so threads do not freely migrate;
+    /// movement happens only via explicit placement (spawn/wake) and work stealing.
+    /// Pre-reserved per CPU (see [`READY_RESERVE`]). The whole array is still guarded
+    /// by the one `SCHED` lock — per-CPU *queues*, not per-CPU *locks* (slice 3).
+    ready: [KVec<ObjectRef>; MAX_CPUS],
+    /// Which CPUs' scheduler state is initialized (and whose `ready`/`reap` queues are
+    /// reserved). The BSP sets bit 0 in [`init`]; each AP sets its own bit in [`ap_init`]
+    /// (in the same critical section that reserves its queues). Placement and work
+    /// stealing only ever target a CPU whose flag is set. A **mask** (not a count) —
+    /// APs run `ap_init` in arbitrary order, so the online set is not a dense prefix.
+    cpu_online: [bool; MAX_CPUS],
     /// The currently running thread, **per CPU** (indexed by `current_cpu()` via
     /// [`cur_slot`](SchedState::cur_slot)). A CPU's slot is `None` only before
-    /// [`init`]. Slice 0 has one live CPU (index 0); APs get their own slot in
-    /// slice 1. The single global `ready` queue is still shared under `SCHED`.
+    /// that CPU's init. Each CPU pulls from its own [`ready`] queue.
     current: [Option<ObjectRef>; MAX_CPUS],
     /// Exited threads awaiting reclamation, **per CPU** (indexed by `current_cpu()`
     /// via [`reap_slot`](SchedState::reap_slot)). Dropped — freeing their kernel
@@ -286,11 +296,12 @@ struct SchedState {
     /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
     /// here rather than on `Thread` (no `Thread` layout/ABI change).
     quantum: u32,
-    /// Monotonic TimeShared vruntime floor (≈ the run queue's smallest vruntime),
-    /// advanced to the picked thread's vruntime on each dequeue. New TimeShared
-    /// threads are seeded to it (so a `vruntime == 0` newcomer can't hoard the
-    /// CPU); a waking thread is boosted to `min_vruntime - slice` for latency.
-    min_vruntime: u64,
+    /// **Per-CPU** monotonic TimeShared vruntime floor (≈ that CPU's run queue's
+    /// smallest vruntime), advanced to the picked thread's vruntime on each dequeue.
+    /// A thread placed on CPU `c` is seeded against `min_vruntime[c]` (new → the
+    /// floor; waking → `floor - slice` for latency), so vruntime comparisons stay
+    /// meaningful within a queue even though each CPU advances its floor independently.
+    min_vruntime: [u64; MAX_CPUS],
     /// The idle thread, **per CPU** (indexed by `current_cpu()` via
     /// [`idle_slot`](SchedState::idle_slot)), parked here whenever it is **not**
     /// this CPU's current thread. Kept out of `ready`/`reap`; runs (`hlt`) only
@@ -311,14 +322,15 @@ struct SchedState {
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
-    ready: KVec::new(),
+    ready: [const { KVec::new() }; MAX_CPUS],
+    cpu_online: [false; MAX_CPUS],
     current: [const { None }; MAX_CPUS],
     reap: [const { KVec::new() }; MAX_CPUS],
     suspended: KVec::new(),
     next_tid: 1,
     next_pid: 2,
     quantum: QUANTUM_TICKS,
-    min_vruntime: 0,
+    min_vruntime: [0; MAX_CPUS],
     idle: [const { None }; MAX_CPUS],
     idle_addr: [0; MAX_CPUS],
     blocked: KVec::new(),
@@ -358,6 +370,13 @@ impl SchedState {
     #[inline]
     fn reap_slot(&mut self) -> &mut KVec<ObjectRef> {
         &mut self.reap[Self::this_cpu()]
+    }
+
+    /// This CPU's ready run queue (mutable). A preempted thread re-homes here, so it
+    /// stays on the CPU it ran on (no free migration).
+    #[inline]
+    fn ready_slot(&mut self) -> &mut KVec<ObjectRef> {
+        &mut self.ready[Self::this_cpu()]
     }
 
     /// This CPU's idle-thread stable address.
@@ -427,10 +446,11 @@ pub fn init() -> Result<(), AllocError> {
     let idle_addr = idle_ref.as_ptr() as usize;
 
     let mut g = SCHED.lock();
-    g.ready = ready;
+    g.ready[0] = ready; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
+    g.cpu_online[0] = true; // the BSP; each AP sets its own bit in `ap_init`.
     g.blocked = blocked;
     g.suspended = suspended;
-    g.reap[0] = reap; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
+    g.reap[0] = reap;
     g.deadlines = deadlines;
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
@@ -482,16 +502,23 @@ fn ap_init() -> Result<(), AllocError> {
     let idle = Thread::try_new_runnable(IDLE_TID, 0, idle_body, 0)?;
     let idle_ref = into_objref(idle);
     let idle_addr = idle_ref.as_ptr() as usize;
-    // This CPU's own reap list — reserved outside the lock so `finish_exit`'s push
-    // never allocates under `SCHED`. Threads dying on this CPU park here.
+    // This CPU's own reap list + ready queue — reserved outside the lock so neither
+    // `finish_exit`'s reap push nor a placement onto this CPU allocates under `SCHED`.
     let mut reap: KVec<ObjectRef> = KVec::new();
     reap.try_reserve(REAP_RESERVE)?;
+    let mut ready: KVec<ObjectRef> = KVec::new();
+    ready.try_reserve(READY_RESERVE)?;
 
     let mut g = SCHED.lock();
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
     *g.reap_slot() = reap;
+    *g.ready_slot() = ready;
+    // This AP is now schedulable — mark *its* bit (set in the same critical section
+    // that reserved its queues, so no placement targets it before it is reserved).
+    let cpu = SchedState::this_cpu();
+    g.cpu_online[cpu] = true;
     Ok(())
 }
 
@@ -499,6 +526,28 @@ fn ap_init() -> Result<(), AllocError> {
 /// **TimeShared** class and enqueue it. Returns the new thread id.
 pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
     spawn_with_class(entry, arg, SchedClass::TimeShared, 0, 0)
+}
+
+/// The number of CPUs whose scheduler state is online (BSP + initialized APs).
+pub fn online_cpus() -> usize {
+    SCHED.lock().cpu_online.iter().filter(|&&o| o).count()
+}
+
+/// Set a thread's CPU **affinity** mask (`sys_thread_set_affinity`). Takes effect at
+/// the thread's next placement / steal / wake; a thread already running on a now-
+/// excluded CPU finishes its slice there and moves on its next reschedule (affinity is
+/// advisory for the in-flight slice). The caller pins `thread` via a held handle ref.
+pub fn set_thread_affinity(thread: *mut (), mask: u8) {
+    let _g = SCHED.lock();
+    // SAFETY: `thread` pins a live Thread (caller holds a handle ref); `SCHED` held.
+    unsafe { Thread::set_cpu_mask(thread, mask) };
+}
+
+/// As [`spawn`] but pinned to the CPUs in `cpu_mask` (bit `c` ⇒ may run on CPU `c`).
+/// Kernel-internal helper for affinity demos/tests; user threads use
+/// `sys_thread_set_affinity`.
+pub fn spawn_with_affinity(entry: ThreadEntry, arg: usize, cpu_mask: u8) -> Result<u32, AllocError> {
+    spawn_inner(entry, arg, SchedClass::TimeShared, 0, 0, cpu_mask)
 }
 
 /// As [`spawn`], but in scheduling `class` with `rt_priority` (RealTime) / `nice`
@@ -511,6 +560,20 @@ pub fn spawn_with_class(
     class: SchedClass,
     rt_priority: u8,
     nice: i8,
+) -> Result<u32, AllocError> {
+    spawn_inner(entry, arg, class, rt_priority, nice, u8::MAX)
+}
+
+/// The shared body of every kernel-thread spawn: fabricate the thread, set its
+/// scheduling parameters + affinity, and place it on a CPU's run queue. `cpu_mask`
+/// `u8::MAX` means no affinity restriction.
+fn spawn_inner(
+    entry: ThreadEntry,
+    arg: usize,
+    class: SchedClass,
+    rt_priority: u8,
+    nice: i8,
+    cpu_mask: u8,
 ) -> Result<u32, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
@@ -525,28 +588,24 @@ pub fn spawn_with_class(
     // SAFETY: `obj` is the new thread, exclusively owned via `r` and not yet
     // enqueued — no other context can observe it, so setting its scheduling
     // parameters here (before the lock) is sound.
-    unsafe { Thread::set_sched(obj, class, rt_priority, nice) };
-
-    {
-        let mut g = SCHED.lock();
-        // Refuse rather than grow the queue under the rank-1 lock: growth
-        // would allocate, and a failed `try_push` would drop `r` (running
-        // `KernelStack`'s rank-6 reclamation) here, under the lock. Bail
-        // first so `r` drops below, lock-free.
-        if g.ready.len() < g.ready.capacity() {
-            // A new TimeShared thread joins at the current vruntime floor (so a
-            // `vruntime == 0` newcomer cannot hoard the CPU); no-op otherwise.
-            seed_vruntime(&g, obj, false);
-            // Within the reserve: this push cannot grow and cannot fail.
-            g.ready
-                .try_push(r)
-                .expect("push within reserved capacity is infallible");
-            return Ok(tid);
-        }
-        // else: fall through with the lock dropped at the block's end.
+    unsafe {
+        Thread::set_sched(obj, class, rt_priority, nice);
+        Thread::set_cpu_mask(obj, cpu_mask);
     }
-    // Over capacity: `r` drops here (lock released), releasing the thread's
-    // last reference and freeing its kernel stack off the rank-1 lock.
+
+    let leftover = {
+        let mut g = SCHED.lock();
+        // Place on the least-loaded CPU's queue (seeding vruntime at its floor).
+        // `place_thread` refuses rather than grow under the rank-1 lock, handing `r`
+        // back so it drops below, lock-free (its `KernelStack` is rank-6 reclaimed).
+        match place_thread(&mut g, r, false) {
+            Ok(()) => return Ok(tid),
+            Err(returned) => returned, // carry out of the locked block
+        }
+    };
+    // Lock released: `leftover` drops here, releasing the thread's last reference and
+    // freeing its kernel stack off the rank-1 lock.
+    drop(leftover);
     Err(AllocError)
 }
 
@@ -579,17 +638,17 @@ pub fn spawn_user(
     // Clone the caller's handle before the enqueue moves `r` into `ready`.
     let handle = r.clone();
 
-    {
+    let leftover = {
         let mut g = SCHED.lock();
-        if g.ready.len() < g.ready.capacity() {
-            g.ready
-                .try_push(r)
-                .expect("push within reserved capacity is infallible");
-            return Ok(handle);
+        match place_thread(&mut g, r, false) {
+            Ok(()) => return Ok(handle),
+            Err(returned) => returned, // carry out of the locked block
         }
-    }
-    // Over capacity: `r` and `handle` drop here (lock released) — releasing the
-    // thread's references, freeing its kernel stack, and releasing the Process.
+    };
+    // Over capacity: lock released; `leftover` (the thread ref) and `handle` drop
+    // here — releasing the thread's references, freeing its kernel stack, and
+    // releasing the Process off the rank-1 lock.
+    drop(leftover);
     Err(AllocError)
 }
 
@@ -602,8 +661,8 @@ pub fn yield_now() {
     reap_pending();
 
     let g = SCHED.lock();
-    if g.ready.is_empty() {
-        return; // nothing else ready — keep running (guard drops, IF restored)
+    if g.ready[SchedState::this_cpu()].is_empty() {
+        return; // nothing else ready on this CPU — keep running (guard drops, IF restored)
     }
     switch_to_next(g);
 }
@@ -623,12 +682,30 @@ pub fn on_timer_tick() {
     // Charge this CPU's running TimeShared thread a tick of virtual runtime
     // (nice-weighted) before deciding whether to reschedule.
     accrue_vruntime(&mut g);
-    let (new_quantum, reschedule) = tick_quantum(g.quantum, !g.ready.is_empty());
+    let me = SchedState::this_cpu();
+    let ready_here = !g.ready[me].is_empty();
+    let (new_quantum, reschedule) = tick_quantum(g.quantum, ready_here);
     g.quantum = new_quantum;
     if reschedule {
         switch_to_next(g); // consumes the guard; switches with IF masked
+        return;
+    }
+    // Idle-CPU work stealing: if this CPU is running its idle thread while a busier
+    // CPU holds a thread we may run, switch — `pick_next` (empty local queue) steals
+    // it. Gated on `current_is_idle` so a busy thread isn't preempted to steal.
+    if !ready_here && current_is_idle(&g) && steal_available(&g, me) {
+        switch_to_next(g);
+        return;
     }
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
+}
+
+/// `true` if this CPU's current thread is its idle thread (its object address equals
+/// this CPU's `idle_addr`). Caller holds `SCHED`.
+fn current_is_idle(g: &SchedState) -> bool {
+    g.cur_ref()
+        .as_ref()
+        .is_some_and(|c| c.as_ptr() as usize == g.idle_addr())
 }
 
 /// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the
@@ -1401,6 +1478,10 @@ unsafe fn switch_into(
     // here, satisfying the Thread accessor contract for these reads.
     let next_sp = unsafe { Thread::saved_sp(next_obj) };
     let next_root = unsafe { resolve_root(next_obj) };
+    // Record the CPU this thread is about to run on, so a later wake re-homes it here
+    // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
+    // still held.
+    unsafe { Thread::set_last_cpu(next_obj, SchedState::this_cpu() as u8) };
     // Drop the lock but keep interrupts masked across the switch. `saved_if`
     // is this thread's prior interrupt state, restored when it next resumes.
     let saved_if = g.release_keeping_irqs_masked();
@@ -1432,7 +1513,7 @@ unsafe fn switch_into(
 /// here (lock-free) when a waker calls [`make_runnable`] and the scheduler
 /// later picks this thread. Consumes the guard.
 fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
-    let next = match dequeue_front(&mut g) {
+    let next = match pick_next(&mut g) {
         Some(n) => n,
         None => g.idle_slot().take().expect("idle thread exists after init"),
     };
@@ -1471,10 +1552,12 @@ fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     let r = g.blocked.remove(i);
     // SAFETY: `r` pins `thread`; `SCHED` held.
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
-    // A waking TimeShared thread re-joins near the vruntime floor (latency boost).
-    seed_vruntime(g, thread, true);
-    debug_assert!(g.ready.len() < g.ready.capacity());
-    g.ready.try_push(r).expect("ready within reserve");
+    // Re-home onto its CPU (cache-warm), seeding its vruntime near that CPU's floor
+    // with a latency boost. Within the per-CPU reserve, so this cannot fail; a full
+    // queue would be a reserve-exhaustion bug (treated as fatal, as the old `expect`).
+    if place_thread(g, r, true).is_err() {
+        panic!("wake placement exceeded the per-CPU ready reserve");
+    }
     true
 }
 
@@ -1665,7 +1748,7 @@ fn tick_quantum(quantum: u32, ready_nonempty: bool) -> (u32, bool) {
 /// switch parks, so on resume it returns up into the timer-stub epilogue, which
 /// `iretq`s the original context back.
 fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
-    let next = match dequeue_front(&mut g) {
+    let next = match pick_next(&mut g) {
         Some(n) => n,
         // Only reachable if a caller violates the precondition; idle is the
         // safe fallback when it is parked (i.e. not the current thread).
@@ -1682,14 +1765,17 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     }
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
 
-    // Re-home prev: the idle thread parks in its slot (never in `ready`);
-    // every other thread re-enqueues at the tail.
+    // Re-home prev: the idle thread parks in its slot (never in `ready`); every
+    // other thread re-enqueues on **this CPU's** queue (it stays where it ran — no
+    // free migration; movement happens only via placement/stealing).
     if g.idle_addr() == prev_obj as usize {
         debug_assert!(g.idle_slot().is_none());
         *g.idle_slot() = Some(prev);
     } else {
-        debug_assert!(g.ready.len() < g.ready.capacity());
-        g.ready.try_push(prev).expect("run queue within reserve");
+        debug_assert!(g.ready_slot().len() < g.ready_slot().capacity());
+        g.ready_slot()
+            .try_push(prev)
+            .expect("run queue within reserve");
     }
     *g.cur_slot() = Some(next);
 
@@ -1739,15 +1825,21 @@ fn deliver_child_exited(g: &mut SchedState, me_obj: *mut (), status: ExitStatus)
     }
 }
 
-/// `true` if any thread in `ready`/`blocked`/`suspended` belongs to process
-/// `my_pid`. Caller holds `SCHED`. The exiting thread has already been taken
-/// out of `current`, and single-CPU only one thread is `current`, so a `false`
-/// here means the caller is genuinely the process's last live thread.
+/// `true` if any thread belonging to process `my_pid` is still live anywhere the
+/// scheduler tracks: a per-CPU `ready` queue, `blocked`, `suspended`, **or running
+/// as another CPU's `current`**. Caller holds `SCHED`. The exiting thread has been
+/// taken out of its own CPU's `current`; under SMP a sibling may be `current` on
+/// another CPU, so the `current[]` scan is required (else a `false` here would
+/// wrongly declare the caller the last live thread and tear the process down out
+/// from under a running sibling).
 fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
     // SAFETY: each entry pins a live Thread; `SCHED` held — a shared read of
     // `owner_pid` is sound (no `&mut` taken).
     let same = |r: &ObjectRef| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid;
-    g.ready.iter().any(same) || g.blocked.iter().any(same) || g.suspended.iter().any(same)
+    g.ready.iter().any(|q| q.iter().any(same))
+        || g.blocked.iter().any(same)
+        || g.suspended.iter().any(same)
+        || g.current.iter().flatten().any(same)
 }
 
 /// Reap every thread of process `my_pid` parked in `list` (a `ready` or
@@ -1821,7 +1913,7 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
 
     // Switch to the next ready thread, else the idle thread (which always
     // exists post-init and is parked here, since `me` was current, not idle).
-    let next = match dequeue_front(&mut g) {
+    let next = match pick_next(&mut g) {
         Some(n) => n,
         None => g.idle_slot().take().expect("idle thread exists after init"),
     };
@@ -1875,11 +1967,14 @@ pub fn exit_thread(status: ExitStatus) -> ! {
 /// `owner_pid`, unregistering blocked siblings from their waits first), then
 /// exit the current thread **with** a `ChildExited`. Used by `sys_process_exit`.
 ///
-/// The per-process thread list that would let an external killer find these
-/// threads without a scan lands in Phase 2; the `owner_pid` scan is correct for
-/// self-exit now (single-CPU, all sibling threads are parked off the run queue
-/// while this one runs). A kernel/boot thread (no process) degrades to a plain
-/// [`exit_thread`]-style exit (no siblings, no notification).
+/// The per-process thread list that would let an external killer find these threads
+/// without a scan lands later; the `owner_pid` scan reaps siblings parked on any CPU's
+/// `ready` queue, `suspended`, or `blocked`. **SMP gap (deferred):** a sibling that is
+/// *running* as another CPU's `current` is not reaped here — terminating it needs a
+/// cross-CPU deschedule IPI (the same machinery as TLB shootdown, slice 3b). Not
+/// triggered by today's workloads (multi-threaded processes don't `sys_process_exit`
+/// with a sibling live on another CPU). A kernel/boot thread (no process) degrades to a
+/// plain [`exit_thread`]-style exit (no siblings, no notification).
 pub fn exit_process(status: ExitStatus) -> ! {
     // Reclaim any earlier exited thread first, so `reap` has room.
     reap_pending();
@@ -1898,9 +1993,13 @@ pub fn exit_process(status: ExitStatus) -> ! {
         // would borrow the whole guard, conflicting in one call).
         let cpu = SchedState::this_cpu();
         let st: &mut SchedState = &mut g;
-        // Torn-down siblings are parked (off-CPU), so reaping them into this CPU's
-        // reap list is safe; the index is precomputed for disjoint field borrows.
-        reap_matching(&mut st.ready, &mut st.reap[cpu], me_pid);
+        // Torn-down siblings are parked (off-CPU) on *some* CPU's ready queue, in
+        // `suspended`, or `blocked`; reaping them into this CPU's reap list is safe
+        // (they are not on any CPU's stack). Sweep every per-CPU ready queue. The
+        // `reap[cpu]` index is precomputed for disjoint field borrows.
+        for c in 0..MAX_CPUS {
+            reap_matching(&mut st.ready[c], &mut st.reap[cpu], me_pid);
+        }
         reap_matching(&mut st.suspended, &mut st.reap[cpu], me_pid);
         reap_blocked_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap[cpu], me_pid);
         // The process is ending: always deliver ChildExited (we are now its
@@ -2003,7 +2102,7 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         // Emit a last-ditch diagnostic. A serviced fault (the supervisor's waiter
         // was just woken by `signal_channel` above) takes the `Some` branch and
         // stays quiet — so this fires only for genuinely-unhandled faults.
-        let next = match dequeue_front(&mut g) {
+        let next = match pick_next(&mut g) {
             Some(n) => n,
             None => {
                 report_stranded_fault(me_obj, &notif);
@@ -2051,8 +2150,10 @@ pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
         Thread::set_disposition(thread, disp_tag, disp_code);
         Thread::set_state(thread, ThreadState::Ready);
     }
-    debug_assert!(g.ready.len() < g.ready.capacity());
-    g.ready.try_push(r).expect("ready within reserve");
+    // Re-home on its CPU (a wake): within the per-CPU reserve, so it cannot fail.
+    if place_thread(&mut g, r, true).is_err() {
+        panic!("resume placement exceeded the per-CPU ready reserve");
+    }
     true
 }
 
@@ -2088,7 +2189,8 @@ pub fn reap_pending() {
 
 /// `true` when no thread other than the current one is ready to run.
 pub fn ready_is_empty() -> bool {
-    SCHED.lock().ready.is_empty()
+    // Globally empty: no CPU has a runnable thread queued. Used by the boot drainers.
+    SCHED.lock().ready.iter().all(|q| q.is_empty())
 }
 
 /// `NICE_0_WEIGHT` and the Linux-style nice→weight table (nice `-20..=19`).
@@ -2139,27 +2241,155 @@ unsafe fn sched_key(obj: *mut ()) -> (u8, u8, u64) {
 /// thread counts; per-class heaps/buckets are a later optimization
 /// (`docs/architecture/scheduler.md`). Caller holds the run-queue lock.
 fn dequeue_front(g: &mut SchedState) -> Option<ObjectRef> {
-    let n = g.ready.len();
+    let cpu = SchedState::this_cpu();
+    let n = g.ready[cpu].len();
     if n == 0 {
         return None;
     }
     let mut best_i = 0usize;
     // SAFETY: each `ready` entry pins a live Thread; `SCHED` held.
-    let mut best_key = unsafe { sched_key(g.ready[0].as_ptr()) };
+    let mut best_key = unsafe { sched_key(g.ready[cpu][0].as_ptr()) };
     for i in 1..n {
         // SAFETY: as above. `<` (strict) keeps the earliest entry on ties (FIFO).
-        let key = unsafe { sched_key(g.ready[i].as_ptr()) };
+        let key = unsafe { sched_key(g.ready[cpu][i].as_ptr()) };
         if key < best_key {
             best_i = i;
             best_key = key;
         }
     }
-    // Advance the monotonic TimeShared floor to the picked thread (the smallest
-    // vruntime), so `min_vruntime` tracks the run queue's leftmost.
+    // Advance this CPU's monotonic TimeShared floor to the picked thread (the
+    // smallest vruntime on this queue), so `min_vruntime[cpu]` tracks its leftmost.
     if best_key.0 == 1 {
-        g.min_vruntime = g.min_vruntime.max(best_key.2);
+        g.min_vruntime[cpu] = g.min_vruntime[cpu].max(best_key.2);
     }
-    Some(g.ready.remove(best_i))
+    Some(g.ready[cpu].remove(best_i))
+}
+
+/// The least-loaded online CPU (fewest `ready` entries) that `obj`'s affinity
+/// permits — the placement target for a new thread. Falls back to CPU 0 if affinity
+/// somehow excludes every online CPU (defensive; `set_affinity` rejects that). Caller
+/// holds `SCHED`.
+fn pick_target_cpu(g: &SchedState, obj: *mut ()) -> usize {
+    // SAFETY: `obj` is a pinned Thread; `SCHED` held.
+    let mask = unsafe { Thread::cpu_mask(obj) };
+    let mut best = usize::MAX;
+    let mut best_len = usize::MAX;
+    for c in 0..MAX_CPUS {
+        if !g.cpu_online[c] || mask & (1 << c) == 0 {
+            continue;
+        }
+        let len = g.ready[c].len();
+        if len < best_len {
+            best_len = len;
+            best = c;
+        }
+    }
+    if best == usize::MAX { 0 } else { best }
+}
+
+/// The CPU to place a **waking** thread on: its home CPU (`last_cpu`) when that CPU
+/// is online and affinity-permitted (cache-warm, and avoids needless migration),
+/// otherwise the least-loaded permitted CPU. Caller holds `SCHED`.
+fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
+    // SAFETY: `obj` is a pinned Thread; `SCHED` held.
+    let home = unsafe { Thread::last_cpu(obj) } as usize;
+    let mask = unsafe { Thread::cpu_mask(obj) };
+    if home < MAX_CPUS && g.cpu_online[home] && mask & (1 << home) != 0 {
+        return home;
+    }
+    pick_target_cpu(g, obj)
+}
+
+/// Enqueue a runnable thread `r` on a chosen CPU's run queue, seeding its vruntime
+/// against that CPU's floor. `wake` selects the placement policy (home CPU vs
+/// least-loaded) and the seeding (latency boost vs plain floor). Returns `Err(r)` —
+/// handing the ref back so the caller can drop it **outside** the lock — if the
+/// chosen queue is at its reserved capacity. Caller holds `SCHED`.
+fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), ObjectRef> {
+    let obj = r.as_ptr();
+    // SAFETY: `obj` is a pinned Thread; `SCHED` held.
+    let user = unsafe { Thread::is_user(obj) };
+    let cpu = if wake {
+        // A wake re-homes to the thread's home CPU (a user thread's home is the CPU it
+        // has always run on, so it never migrates; see below).
+        pick_wake_cpu(g, obj)
+    } else if user {
+        // A **new user thread** is placed on its creating CPU and stays there: user
+        // threads never migrate between CPUs (the unresolved `syscall_entry` per-CPU
+        // stack hazard — deferred). Re-home keeps them put, wake returns them home,
+        // and stealing skips them. Kernel threads still distribute (least-loaded).
+        SchedState::this_cpu()
+    } else {
+        pick_target_cpu(g, obj)
+    };
+    if g.ready[cpu].len() >= g.ready[cpu].capacity() {
+        return Err(r);
+    }
+    seed_vruntime(g, obj, cpu, wake);
+    g.ready[cpu]
+        .try_push(r)
+        .expect("push within reserved capacity is infallible");
+    Ok(())
+}
+
+/// Steal one runnable thread from the **busiest other** online CPU's queue — one
+/// whose affinity permits *this* CPU — so an otherwise-idle CPU picks up slack. The
+/// thread is removed from the victim's queue and returned. `None` if no other CPU has
+/// a thread this CPU may run. Caller holds `SCHED`.
+fn steal_one(g: &mut SchedState) -> Option<ObjectRef> {
+    let me = SchedState::this_cpu();
+    let mut victim = usize::MAX;
+    let mut best = 0usize;
+    for c in 0..MAX_CPUS {
+        if c != me && g.cpu_online[c] && g.ready[c].len() > best {
+            best = g.ready[c].len();
+            victim = c;
+        }
+    }
+    if victim == usize::MAX {
+        return None;
+    }
+    // The first thread on the victim that is stealable to this CPU.
+    let n = g.ready[victim].len();
+    // SAFETY: each entry pins a live Thread; `SCHED` held.
+    let pos = (0..n).find(|&i| unsafe { stealable_to(g.ready[victim][i].as_ptr(), me) })?;
+    Some(g.ready[victim].remove(pos))
+}
+
+/// `true` if some other online CPU holds a thread this CPU (`me`) may run — the cheap
+/// precondition the idle-tick path checks before triggering a steal. Caller holds `SCHED`.
+fn steal_available(g: &SchedState, me: usize) -> bool {
+    (0..MAX_CPUS).any(|c| {
+        c != me
+            && g.cpu_online[c]
+            // SAFETY: each entry pins a live Thread; `SCHED` held.
+            && g.ready[c].iter().any(|r| unsafe { stealable_to(r.as_ptr(), me) })
+    })
+}
+
+/// `true` if the thread `obj` may be **stolen** to CPU `me`: its affinity includes
+/// `me` **and** it is a kernel thread. User threads are excluded — migrating an
+/// already-running user thread between CPUs is not yet safe (the `syscall_entry`
+/// per-CPU-stack hazard; see [`Thread::is_user`]), so they stay on their CPU and
+/// move only via spawn/wake placement, never by stealing.
+///
+/// # Safety
+/// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
+unsafe fn stealable_to(obj: *mut (), me: usize) -> bool {
+    unsafe { !Thread::is_user(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
+}
+
+/// Pick the next thread to run on this CPU: its own queue first, else **steal** from
+/// the busiest peer. A stolen thread is re-seeded against this CPU's vruntime floor
+/// (its vruntime referenced the victim's) so it is neither favored nor starved. `None`
+/// only when no CPU has runnable work. Caller holds `SCHED`.
+fn pick_next(g: &mut SchedState) -> Option<ObjectRef> {
+    if let Some(t) = dequeue_front(g) {
+        return Some(t);
+    }
+    let stolen = steal_one(g)?;
+    seed_vruntime(g, stolen.as_ptr(), SchedState::this_cpu(), true);
+    Some(stolen)
 }
 
 /// Charge the running thread (on this CPU) one tick of virtual runtime, scaled by
@@ -2184,15 +2414,16 @@ fn accrue_vruntime(g: &mut SchedState) {
 /// `new` (spawned) → the current floor; `woken` → `min_vruntime - slice` (a small
 /// latency boost) but never below its own accrued vruntime. No-op for non-TS or a
 /// thread already at/above the floor. Caller holds `SCHED`.
-fn seed_vruntime(g: &SchedState, obj: *mut (), woken: bool) {
+fn seed_vruntime(g: &SchedState, obj: *mut (), cpu: usize, woken: bool) {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     if unsafe { Thread::sched_class(obj) } != SchedClass::TimeShared {
         return;
     }
+    let base = g.min_vruntime[cpu];
     let floor = if woken {
-        g.min_vruntime.saturating_sub(TICK_NS)
+        base.saturating_sub(TICK_NS)
     } else {
-        g.min_vruntime
+        base
     };
     // SAFETY: as above. A spawned thread (vruntime 0) jumps to the floor; a waker
     // keeps its (higher) accrued vruntime if already ahead of the boosted floor.
@@ -2223,7 +2454,7 @@ pub fn current_owner_pid() -> u32 {
     let g = SCHED.lock();
     let cur = g.cur_ref().as_ref().expect("current set when a thread runs");
     // SAFETY: `current` is pinned alive (it holds a refcount on the `Thread`)
-    // and we hold the run-queue lock, which — single-CPU — serialises all
+    // and we hold the run-queue lock, which — the one global `SCHED` lock — serialises all
     // access to the `Thread`. Forming a shared `&Thread` to read `owner_pid`
     // is sound; no `&mut` is taken anywhere under this lock.
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.owner_pid()
@@ -2377,14 +2608,19 @@ mod tests {
     /// paging needed since the refs are inert).
     fn test_state() -> SchedState {
         SchedState {
-            ready: KVec::new(),
+            ready: [const { KVec::new() }; MAX_CPUS],
+            cpu_online: {
+                let mut o = [false; MAX_CPUS];
+                o[0] = true;
+                o
+            },
             current: [const { None }; MAX_CPUS],
             reap: [const { KVec::new() }; MAX_CPUS],
             suspended: KVec::new(),
             next_tid: 1,
             next_pid: 2,
             quantum: QUANTUM_TICKS,
-    min_vruntime: 0,
+            min_vruntime: [0; MAX_CPUS],
             idle: [const { None }; MAX_CPUS],
             idle_addr: [0; MAX_CPUS],
             blocked: KVec::new(),
@@ -2396,20 +2632,20 @@ mod tests {
     fn dequeue_front_is_round_robin() {
         init_global_heap();
         let mut st = test_state();
-        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.ready[0].try_reserve(READY_RESERVE).unwrap();
         for tid in 1..=3 {
-            st.ready.try_push(inert_ref(tid)).unwrap();
+            st.ready[0].try_push(inert_ref(tid)).unwrap();
         }
         // Dequeue front, re-enqueue at back: classic round-robin rotation.
         let a = dequeue_front(&mut st).unwrap();
         // SAFETY: pinned, single-threaded test.
         let a_tid = unsafe { &*(a.as_ptr() as *const Thread) }.tid();
         assert_eq!(a_tid, 1);
-        st.ready.try_push(a).unwrap();
+        st.ready[0].try_push(a).unwrap();
         let b = dequeue_front(&mut st).unwrap();
         let b_tid = unsafe { &*(b.as_ptr() as *const Thread) }.tid();
         assert_eq!(b_tid, 2, "round-robin must pick the next, not repeat");
-        st.ready.try_push(b).unwrap();
+        st.ready[0].try_push(b).unwrap();
     }
 
     #[test]
@@ -2442,7 +2678,7 @@ mod tests {
     fn dequeue_prefers_realtime_by_priority_then_timeshared() {
         init_global_heap();
         let mut st = test_state();
-        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.ready[0].try_reserve(READY_RESERVE).unwrap();
         let ts = inert_ref(1); // TimeShared (default), vruntime 0
         let rt_lo = inert_ref(2); // RealTime, priority 20
         let rt_hi = inert_ref(3); // RealTime, priority 5 (higher)
@@ -2451,9 +2687,9 @@ mod tests {
             Thread::set_sched(rt_lo.as_ptr(), SchedClass::RealTime, 20, 0);
             Thread::set_sched(rt_hi.as_ptr(), SchedClass::RealTime, 5, 0);
         }
-        st.ready.try_push(ts).unwrap();
-        st.ready.try_push(rt_lo).unwrap();
-        st.ready.try_push(rt_hi).unwrap();
+        st.ready[0].try_push(ts).unwrap();
+        st.ready[0].try_push(rt_lo).unwrap();
+        st.ready[0].try_push(rt_hi).unwrap();
         // RealTime beats TimeShared; lower rt_priority value wins within RealTime.
         assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "RealTime prio 5 first");
         assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "RealTime prio 20 next");
@@ -2464,7 +2700,7 @@ mod tests {
     fn dequeue_timeshared_picks_min_vruntime_and_advances_floor() {
         init_global_heap();
         let mut st = test_state();
-        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.ready[0].try_reserve(READY_RESERVE).unwrap();
         let a = inert_ref(1);
         let b = inert_ref(2);
         let c = inert_ref(3);
@@ -2474,13 +2710,13 @@ mod tests {
             Thread::set_vruntime(b.as_ptr(), 100); // smallest
             Thread::set_vruntime(c.as_ptr(), 300);
         }
-        st.ready.try_push(a).unwrap();
-        st.ready.try_push(b).unwrap();
-        st.ready.try_push(c).unwrap();
+        st.ready[0].try_push(a).unwrap();
+        st.ready[0].try_push(b).unwrap();
+        st.ready[0].try_push(c).unwrap();
         assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "smallest vruntime first");
-        assert_eq!(st.min_vruntime, 100, "floor advanced to the picked vruntime");
+        assert_eq!(st.min_vruntime[0], 100, "floor advanced to the picked vruntime");
         assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "next-smallest vruntime");
-        assert_eq!(st.min_vruntime, 300);
+        assert_eq!(st.min_vruntime[0], 300);
     }
 
     #[test]
@@ -2488,21 +2724,77 @@ mod tests {
         init_global_heap();
         let mut st = test_state();
         let base = 2 * TICK_NS;
-        st.min_vruntime = base;
+        st.min_vruntime[0] = base;
         // A new TimeShared thread (vruntime 0) jumps up to the floor.
         let n = inert_ref(1);
-        seed_vruntime(&st, n.as_ptr(), false);
+        seed_vruntime(&st, n.as_ptr(), 0, false);
         // SAFETY: pinned, single-threaded test.
         assert_eq!(unsafe { Thread::vruntime(n.as_ptr()) }, base);
         // A waking thread is boosted to `floor - slice` (latency), not the bare floor.
         let w = inert_ref(2);
-        seed_vruntime(&st, w.as_ptr(), true);
+        seed_vruntime(&st, w.as_ptr(), 0, true);
         assert_eq!(unsafe { Thread::vruntime(w.as_ptr()) }, base - TICK_NS);
         // A thread already ahead of the floor keeps its (larger) vruntime.
         let ahead = inert_ref(3);
         unsafe { Thread::set_vruntime(ahead.as_ptr(), 3 * TICK_NS) };
-        seed_vruntime(&st, ahead.as_ptr(), false);
+        seed_vruntime(&st, ahead.as_ptr(), 0, false);
         assert_eq!(unsafe { Thread::vruntime(ahead.as_ptr()) }, 3 * TICK_NS);
+    }
+
+    /// Bring `n` CPUs online (0..n) with reserved ready queues, for placement tests.
+    fn online_n(st: &mut SchedState, n: usize) {
+        for c in 0..n {
+            st.cpu_online[c] = true;
+            st.ready[c].try_reserve(READY_RESERVE).unwrap();
+        }
+    }
+
+    #[test]
+    fn placement_least_loaded_and_respects_affinity() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 4);
+        // No affinity → least-loaded. With all queues empty, CPU 0 (first min) wins.
+        let a = inert_ref(1);
+        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 0);
+        // Load CPU 0 and 1; the least-loaded becomes CPU 2.
+        st.ready[0].try_push(inert_ref(10)).unwrap();
+        st.ready[1].try_push(inert_ref(11)).unwrap();
+        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 2);
+        // Pinned to CPU 3 → must target CPU 3 regardless of load.
+        unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
+        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 3);
+        // Pinned to an offline CPU (5) → defensive fallback to CPU 0.
+        unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
+        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 0);
+    }
+
+    #[test]
+    fn wake_placement_prefers_home_cpu() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 4);
+        let t = inert_ref(1);
+        // Home CPU 2 (last ran there) + affinity allows it → wake returns CPU 2.
+        unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 2);
+        // Affinity now excludes the home → falls back to least-loaded (CPU 0).
+        unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 0) };
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 0);
+    }
+
+    #[test]
+    fn stealable_respects_affinity() {
+        init_global_heap();
+        let t = inert_ref(1); // kernel thread (no user_entry), default mask = all
+        unsafe {
+            assert!(stealable_to(t.as_ptr(), 0));
+            assert!(stealable_to(t.as_ptr(), 3));
+            // Pin to CPU 0 only: stealable to 0, not to 1.
+            Thread::set_cpu_mask(t.as_ptr(), 1 << 0);
+            assert!(stealable_to(t.as_ptr(), 0));
+            assert!(!stealable_to(t.as_ptr(), 1));
+        }
     }
 
     // --- Deadline min-heap (pure) -------------------------------------
@@ -2628,9 +2920,9 @@ mod tests {
         test_probe::reset();
         {
             let mut st = test_state();
-            st.ready.try_reserve(READY_RESERVE).unwrap();
+            st.ready[0].try_reserve(READY_RESERVE).unwrap();
             for tid in 1..=4 {
-                st.ready.try_push(inert_ref(tid)).unwrap();
+                st.ready[0].try_push(inert_ref(tid)).unwrap();
             }
             *st.cur_slot() = Some(inert_ref(5));
             st.reap[0].try_reserve(REAP_RESERVE).unwrap();
@@ -2657,7 +2949,7 @@ mod tests {
     fn resume_suspended_moves_to_ready_and_sets_disposition() {
         init_global_heap();
         let mut st = test_state();
-        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.ready[0].try_reserve(READY_RESERVE).unwrap();
         st.suspended.try_reserve(BLOCKED_RESERVE).unwrap();
         let th = inert_user_ref(1, 1);
         let obj = th.as_ptr();
@@ -2677,10 +2969,10 @@ mod tests {
             Thread::set_disposition(obj, 2, 7);
             Thread::set_state(obj, ThreadState::Ready);
         }
-        st.ready.try_push(r).unwrap();
+        st.ready[0].try_push(r).unwrap();
 
         assert!(st.suspended.is_empty());
-        assert_eq!(st.ready.len(), 1);
+        assert_eq!(st.ready[0].len(), 1);
         // SAFETY: pinned. take_disposition reads (tag, code) and clears the frame.
         let (tag, code) = unsafe { Thread::take_disposition(obj) };
         assert_eq!((tag, code), (2, 7));
@@ -2692,12 +2984,12 @@ mod tests {
     fn has_live_siblings_scans_all_parked_lists() {
         init_global_heap();
         let mut st = test_state();
-        st.ready.try_reserve(READY_RESERVE).unwrap();
+        st.ready[0].try_reserve(READY_RESERVE).unwrap();
         st.blocked.try_reserve(BLOCKED_RESERVE).unwrap();
         st.suspended.try_reserve(BLOCKED_RESERVE).unwrap();
 
         // pid 1 has a sibling parked in `suspended`; pid 2 has none anywhere.
-        st.ready.try_push(inert_user_ref(1, 1)).unwrap();
+        st.ready[0].try_push(inert_user_ref(1, 1)).unwrap();
         st.suspended.try_push(inert_user_ref(2, 1)).unwrap();
         st.blocked.try_push(inert_user_ref(3, 3)).unwrap();
 
@@ -2712,17 +3004,17 @@ mod tests {
         test_probe::reset();
         {
             let mut st = test_state();
-            st.ready.try_reserve(READY_RESERVE).unwrap();
+            st.ready[0].try_reserve(READY_RESERVE).unwrap();
             st.reap[0].try_reserve(REAP_RESERVE).unwrap();
-            st.ready.try_push(inert_user_ref(1, 1)).unwrap();
-            st.ready.try_push(inert_user_ref(2, 2)).unwrap();
-            st.ready.try_push(inert_user_ref(3, 1)).unwrap();
+            st.ready[0].try_push(inert_user_ref(1, 1)).unwrap();
+            st.ready[0].try_push(inert_user_ref(2, 2)).unwrap();
+            st.ready[0].try_push(inert_user_ref(3, 1)).unwrap();
 
-            reap_matching(&mut st.ready, &mut st.reap[0], 1);
+            reap_matching(&mut st.ready[0], &mut st.reap[0], 1);
             assert_eq!(st.reap[0].len(), 2, "both pid-1 threads reaped");
-            assert_eq!(st.ready.len(), 1, "the pid-2 thread stays");
+            assert_eq!(st.ready[0].len(), 1, "the pid-2 thread stays");
             // SAFETY: pinned, single-threaded.
-            let left = unsafe { &*(st.ready.iter().next().unwrap().as_ptr() as *const Thread) };
+            let left = unsafe { &*(st.ready[0].iter().next().unwrap().as_ptr() as *const Thread) };
             assert_eq!(left.owner_pid(), 2);
             // No destroys yet — the refs are alive in `reap`.
             assert_eq!(test_probe::thread_destroys(), 0);

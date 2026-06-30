@@ -176,6 +176,14 @@ pub struct Thread {
     /// TimeShared virtual runtime (ns-scaled): runtime accrued, inversely
     /// weighted by `nice`. The scheduler runs the smallest-`vruntime` thread.
     vruntime: u64,
+    /// The dense index of the CPU this thread **last ran on** (recorded on every
+    /// switch-in). Per-CPU runqueues use it to re-place a waking thread on its
+    /// home CPU (cache-warm, and minimizes cross-CPU migration). `0` until first run.
+    last_cpu: u8,
+    /// CPU **affinity** bitmask (bit `c` set ⇒ may run on CPU `c`); `MAX_CPUS ≤ 8`,
+    /// so a `u8` suffices. Default all-ones (no restriction). Placement and work
+    /// stealing honour it; `sys_thread_set_affinity` writes it.
+    cpu_mask: u8,
     // Deferred to later slices:
     //   fpu_context  — kernel is soft-float; lands with userspace threads.
     //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
@@ -216,6 +224,8 @@ impl Thread {
             rt_priority: 0,
             nice: 0,
             vruntime: 0,
+            last_cpu: 0,
+            cpu_mask: u8::MAX,
         })
     }
 
@@ -251,6 +261,8 @@ impl Thread {
             rt_priority: 0,
             nice: 0,
             vruntime: 0,
+            last_cpu: 0,
+            cpu_mask: u8::MAX,
         })
     }
 
@@ -298,6 +310,8 @@ impl Thread {
             rt_priority: 0,
             nice: 0,
             vruntime: 0,
+            last_cpu: 0,
+            cpu_mask: u8::MAX,
         })
     }
 
@@ -360,6 +374,8 @@ impl Thread {
             rt_priority: 0,
             nice: 0,
             vruntime: 0,
+            last_cpu: 0,
+            cpu_mask: u8::MAX,
         })
     }
 
@@ -466,6 +482,55 @@ impl Thread {
             core::ptr::write(&raw mut (*p).rt_priority, rt_priority);
             core::ptr::write(&raw mut (*p).nice, nice);
         }
+    }
+
+    /// The dense index of the CPU this thread last ran on.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn last_cpu(obj: *mut ()) -> u8 {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).last_cpu) }
+    }
+
+    /// Record the CPU this thread is (about to be) running on.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_last_cpu(obj: *mut (), cpu: u8) {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::write(&raw mut (*p).last_cpu, cpu) }
+    }
+
+    /// The CPU affinity bitmask (bit `c` ⇒ may run on CPU `c`).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn cpu_mask(obj: *mut ()) -> u8 {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).cpu_mask) }
+    }
+
+    /// Set the CPU affinity bitmask (`sys_thread_set_affinity`).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_cpu_mask(obj: *mut (), mask: u8) {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::write(&raw mut (*p).cpu_mask, mask) }
+    }
+
+    /// `true` for a **user** thread (one that descends to ring 3), `false` for a
+    /// kernel thread. The scheduler uses this to keep user threads off the
+    /// work-stealing path: migrating an already-running user thread between CPUs is
+    /// not yet safe (the `syscall_entry` per-CPU-stack hazard), whereas kernel
+    /// threads migrate freely.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn is_user(obj: *mut ()) -> bool {
+        let p = obj as *const Thread;
+        unsafe { (*p).user_entry.is_some() }
     }
 
     /// Read the scheduler lifecycle state (production-reachable for the
@@ -845,6 +910,8 @@ mod tests {
             rt_priority: 0,
             nice: 0,
             vruntime: 0,
+            last_cpu: 0,
+            cpu_mask: u8::MAX,
         })
         .unwrap()
     }

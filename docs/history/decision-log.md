@@ -5834,3 +5834,62 @@ RealTime-preempts-TimeShared and vruntime fairness, both visible in the serial t
 `-smp 1` and `-smp 4` (2/2) boot clean to eshell with the demo, 0 faults. Branch
 `phase-3/slice2-scheduler-classes`. Next: slice 3 (per-CPU runqueues + work stealing +
 affinity + the SMP-correctness hardening deferred from slice 1).
+
+## 2026-06-29 — Phase 3 slice 3: per-CPU runqueues + work stealing + affinity (TLB shootdown → 3b)
+
+The single shared run queue becomes **per-CPU** (`ready: [KVec; MAX_CPUS]`, mirroring the
+existing `current`/`idle`/`reap` arrays), guarded by the one `SCHED` lock (per-CPU
+*queues*, not per-CPU *locks* — that's a later step). This both delivers the headline
+feature and is the structural fix for the slice-1 user-thread-migration hazard. Built as
+four chunks (A–D); TLB shootdown (chunk E) was split to **slice 3b** (option B, chosen
+with the user) since it is orthogonal page-table-coherence work not triggered by today's
+workload.
+
+**A — Per-CPU runqueues + placement.** `dequeue_front` picks from *this* CPU's queue; a
+preempted thread re-homes to **its own** CPU (it no longer lands on a shared queue any CPU
+can drain). A `place_thread` policy chooses a target at spawn/wake: kernel threads go to the
+**least-loaded** CPU, a waking thread to its **home** CPU (`last_cpu`, recorded each
+switch-in). `min_vruntime` is now per-CPU (a placed thread is seeded against the target
+CPU's floor). `ready_is_empty`/`reap_matching`/`has_live_siblings` sweep all CPUs. A
+boot-time demo distributes 8 kernel workers and reports a CPU mask of `0b1111` — work runs
+on every AP.
+
+**Bug found + fixed (placement).** The first cut tracked online CPUs as a count `n_online`
+and assumed CPUs `0..n_online` were a dense initialized prefix. But **APs run `ap_init` in
+arbitrary order**, so the online set can be `{0,3}` while `n_online == 2`; placement then
+targeted an uninitialized CPU whose `ready` queue had capacity 0, and `spawn` failed
+intermittently. Fixed by tracking a **`cpu_online: [bool; MAX_CPUS]` mask** (each CPU sets
+its own bit in the same critical section that reserves its queues), scanned by every
+placement/steal site.
+
+**B — Work stealing.** When a CPU's queue is empty it **steals** from the busiest peer
+rather than idling: the block/exit/suspend switch paths route through `pick_next`
+(local-queue → steal), and an idle CPU's timer tick triggers a steal when a busier CPU has
+runnable work. A stolen thread is re-seeded against the stealer's vruntime floor.
+
+**C — Affinity.** A `cpu_mask: u8` on `Thread` (default all-ones) is honoured by placement
+and stealing; `sys_thread_set_affinity` (a no-op before) now writes it (gated by `SIGNAL`
+on the handle — **no SysCaps needed**; affinity-at-creation via `ThreadArgs` stays with the
+capability work). A demo pins one worker per CPU and confirms each runs on exactly its
+pinned CPU. (Affinity-at-creation for *user* threads is moot today — see below.)
+
+**D — SMP-correctness hardening + the migration decision.** `has_live_siblings` now also
+scans other CPUs' `current[]` (a sibling running elsewhere must keep the process alive).
+The slice-1 `#DF`/illegal-instruction **user-thread-migration UAF** (a running user thread
+corrupting after moving CPUs; the `syscall_entry` per-CPU-stack hazard, never fully
+root-caused) reappeared once stealing/placement moved user threads — at ~1/10 vs the old
+~1/4. Rather than chase a hazard we couldn't pin, **slice 3 prevents user-thread migration
+entirely** (chosen with the user): a new user thread is placed on its **creating CPU**, a
+preempted user thread re-homes there, a wake returns it home, and stealing **skips user
+threads** (kernel-only). User threads therefore never change CPU, structurally avoiding the
+hazard. **Result: 12/12 clean `-smp 4` full boots** (was intermittent). The cost — userspace
+currently runs on the BSP; letting user threads use the APs needs the `syscall_entry`
+hazard root-caused (deferred, with TLB shootdown, to slice 3b). Also noted: `exit_process`
+does not terminate a sibling *running* on another CPU (needs a cross-CPU deschedule IPI —
+slice 3b); not triggered by today's single-threaded-`process_exit` workloads.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` (8 host suites, +6
+new = 524); `-smp 4` **12/12** clean full boots (class + distribution + affinity demos →
+init → ext4 mount → parent demo → eshell, 0 faults); `-smp 1` unchanged. Branch
+`phase-3/slice3-percpu-runqueues`. Next: slice 3b (TLB shootdown + `active_cpus`; the
+cross-CPU deschedule IPI; root-cause user-thread migration so userspace can use the APs).

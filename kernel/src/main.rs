@@ -277,6 +277,13 @@ fn kernel_main() {
     // from its own entry, proving it executes kernel code on the AP.
     bring_up_aps();
 
+    // Prove per-CPU runqueues distribute work onto the APs (placement spreads new
+    // threads across CPUs; each AP picks up its own queue at the next tick).
+    smp_distribution_demo();
+
+    // Prove CPU affinity: a thread pinned to CPU i runs only on CPU i.
+    smp_affinity_demo();
+
     // Arm the syscall fast path and prove it end-to-end by dropping to
     // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
     // (Throwaway harness — replaced next slice by an ELF-loaded process.)
@@ -521,6 +528,115 @@ extern "C" fn ts_demo_worker(nice: usize) {
     }
     kprintln!("sched:   TimeShared nice={} DONE", nice);
     SCHED_DEMO_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// Workers finished / bitmask of CPUs that ran one, for [`smp_distribution_demo`].
+static DIST_DONE: AtomicU32 = AtomicU32::new(0);
+static DIST_CPU_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Prove the **per-CPU runqueues** spread work onto the APs: spawn more kernel
+/// workers than CPUs, then report how many distinct CPUs actually ran one. Runs
+/// after AP bring-up, so every CPU is online to receive placement; each AP picks up
+/// its own queue at its next timer tick. Count-based barrier (race-free under SMP).
+fn smp_distribution_demo() {
+    const N: u32 = 8;
+    for i in 0..N {
+        if sched::spawn(dist_worker, i as usize).is_err() {
+            kprintln!("smp: distribution spawn {} failed", i);
+        }
+    }
+    let mut spins: u64 = 0;
+    while DIST_DONE.load(Ordering::Acquire) < N {
+        sched::reap_pending();
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 20_000_000_000 {
+            kprintln!("smp: distribution demo timed out");
+            break;
+        }
+    }
+    sched::reap_pending();
+    let mask = DIST_CPU_MASK.load(Ordering::Relaxed);
+    kprintln!(
+        "smp: distribution demo complete — {} of {} workers' CPUs distinct (cpu mask {:#06b})",
+        mask.count_ones(),
+        N,
+        mask,
+    );
+}
+
+/// A short [`smp_distribution_demo`] worker: spin briefly, record the CPU it ran on,
+/// then signal done.
+extern "C" fn dist_worker(arg: usize) {
+    use arch::smp::ArchSmp;
+    let mut acc: u64 = 0;
+    for i in 0..3_000_000u64 {
+        acc = acc.wrapping_add(i ^ arg as u64);
+    }
+    core::hint::black_box(acc);
+    let cpu = arch::Smp::current_cpu();
+    DIST_CPU_MASK.fetch_or(1 << cpu, Ordering::Relaxed);
+    DIST_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// Workers finished / the CPU each affinity worker actually ran on, for
+/// [`smp_affinity_demo`] (worker `i` is pinned to CPU `i`).
+static AFFINITY_DONE: AtomicU32 = AtomicU32::new(0);
+static AFFINITY_RAN_ON: [AtomicU32; arch::MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; arch::MAX_CPUS];
+
+/// Prove **CPU affinity**: spawn one worker per online CPU, each pinned to a distinct
+/// CPU, and confirm every worker ran on exactly the CPU it was pinned to (placement
+/// honours `cpu_mask`, and work stealing can't pull a pinned thread to a CPU outside
+/// its mask).
+fn smp_affinity_demo() {
+    let n = sched::online_cpus().min(arch::MAX_CPUS);
+    for i in 0..n {
+        // Pin worker i to CPU i (mask with only bit i set).
+        if sched::spawn_with_affinity(affinity_worker, i, 1u8 << i).is_err() {
+            kprintln!("smp: affinity spawn {} failed", i);
+        }
+    }
+    let mut spins: u64 = 0;
+    while (AFFINITY_DONE.load(Ordering::Acquire) as usize) < n {
+        sched::reap_pending();
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 20_000_000_000 {
+            kprintln!("smp: affinity demo timed out");
+            break;
+        }
+    }
+    sched::reap_pending();
+    let mut all_pinned = true;
+    for i in 0..n {
+        let ran = AFFINITY_RAN_ON[i].load(Ordering::Relaxed);
+        if ran != i as u32 {
+            all_pinned = false;
+            kprintln!("smp: affinity worker {} (pinned cpu {}) ran on cpu {}", i, i, ran);
+        }
+    }
+    kprintln!(
+        "smp: affinity demo complete — {} worker(s), {}",
+        n,
+        if all_pinned {
+            "each ran on its pinned CPU"
+        } else {
+            "MISMATCH (see above)"
+        }
+    );
+}
+
+/// An [`smp_affinity_demo`] worker pinned to CPU `id`: spin briefly, then record which
+/// CPU it actually ran on (must equal `id`).
+extern "C" fn affinity_worker(id: usize) {
+    use arch::smp::ArchSmp;
+    let mut acc: u64 = 0;
+    for i in 0..3_000_000u64 {
+        acc = acc.wrapping_add(i);
+    }
+    core::hint::black_box(acc);
+    AFFINITY_RAN_ON[id].store(arch::Smp::current_cpu(), Ordering::Relaxed);
+    AFFINITY_DONE.fetch_add(1, Ordering::Release);
 }
 
 /// Initialise the scheduler, **arm preemption** (periodic timer + IF=1), spawn
