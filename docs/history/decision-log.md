@@ -5789,3 +5789,48 @@ test as the gate); fix `has_live_siblings`/`exit_process` to see siblings on oth
 `-smp 4` 6/6 clean full boots; `-smp 1` unchanged. Dev-loop default stays `-smp 1`
 (deterministic); `-smp N` exercises SMP. Branch `phase-3/slice1-smp-bringup`. Next:
 slice 2 (scheduler classes), then slice 3 (per-CPU runqueues + the SMP hardening above).
+
+## 2026-06-29 — Phase 3 slice 2: scheduler classes (RealTime / TimeShared / Idle + vruntime)
+
+The flat round-robin run queue becomes **class-aware**. Each `Thread` gains a
+`SchedClass` (`RealTime` / `TimeShared` / `Idle`) plus `rt_priority` (`0..=99`, RealTime),
+`nice` (`-20..=19`, TimeShared) and `vruntime`. The dispatch precedence is strict:
+any runnable RealTime thread preempts any TimeShared, which preempts Idle (the per-CPU
+fallback). Defaults are behaviour-preserving — every thread is `TimeShared`/`nice 0`,
+so the existing workload schedules exactly as before.
+
+**Pick by policy, not per-class structures.** Rather than split `ready` into priority
+buckets + a vruntime tree, `dequeue_front` keeps the single shared `ready` list and
+**scans it for the best thread by key** `(class_rank, rt_priority, vruntime)` — RealTime
+(rank 0, lowest priority value, FIFO within a priority via a strict `<`) ahead of
+TimeShared (rank 1, smallest vruntime). An O(n) scan is ample at our thread counts and
+keeps enqueue + every other `ready` site untouched; per-class heaps/buckets are a later
+optimization, noted in `scheduler.md`.
+
+**TimeShared fairness = CFS-lite.** A running TimeShared thread accrues vruntime each
+10 ms tick, scaled by the Linux nice-weight table (`slice * 1024 / weight(nice)`), so a
+lower nice accrues slower and is picked more often. A monotonic `min_vruntime` floor (set
+to each picked thread's vruntime) seeds newcomers (a spawned thread jumps to the floor so
+a `vruntime == 0` newcomer can't hoard the CPU) and boosts wakers (`floor - slice`, a
+latency credit) — both clamped so a thread already ahead keeps its own vruntime. RealTime
+threads do not accrue; Idle never enqueues.
+
+**Decision — defer the `REAL_TIME` syscap gate + the user-facing `ThreadArgs` class/nice/
+affinity ABI to the SysCaps slice (option B, chosen with the user).** The slice-0 design
+put a `REAL_TIME` syscap gate in slice 2, but **`SysCaps` is documented only** (service-
+toml-schema, supervisor-registration) — there is no capability bitmask on `Process` yet,
+and building one is a service-mgr/auth concern, not a scheduler one. So slice 2 delivers
+the *dispatch* (demonstrated with trusted kernel threads via `spawn_with_class`); user
+threads default to TimeShared; and the gate + the user ABI (relaxing `ThreadArgs._reserved`
+to carry class/nice/affinity per `thread-args.md`'s deferred "richer attributes form")
+land when the capability system is built. Avoids pulling the cap system into the scheduler
+slice.
+
+**Verified.** A boot-time `sched_class_demo` (a RealTime worker + two TimeShared workers,
+nice 0 and nice 10) prints the RealTime worker finishing *before any* TimeShared round,
+then the nice-0 worker completing all three rounds while nice-10 is still on round 1 —
+RealTime-preempts-TimeShared and vruntime fairness, both visible in the serial trace.
+`cargo xtask build` (no warnings) / `check-arch` / `test` (8 host suites, +4 new = 521);
+`-smp 1` and `-smp 4` (2/2) boot clean to eshell with the demo, 0 faults. Branch
+`phase-3/slice2-scheduler-classes`. Next: slice 3 (per-CPU runqueues + work stealing +
+affinity + the SMP-correctness hardening deferred from slice 1).

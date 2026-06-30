@@ -50,6 +50,6 @@ pub use namespace::{BindingTarget, Namespace, NsError, ResolvedTarget};
 pub use notification_channel::NotificationChannel;
 pub use pending_op::PendingOperation;
 pub use process::Process;
-pub use thread::{MAX_WAIT_HANDLES, Thread, ThreadEntry, ThreadState, WaitPhase};
+pub use thread::{MAX_WAIT_HANDLES, SchedClass, Thread, ThreadEntry, ThreadState, WaitPhase};
 pub use timer::Timer;
 pub use userspace_server::UserspaceServerReg;

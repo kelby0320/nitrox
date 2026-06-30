@@ -61,8 +61,8 @@ use crate::libkern::{ExitKind, ExitStatus, Notification};
 use crate::libkern::ipc::IPC_HANDLE_MAX;
 use crate::object::{
     BlockSendOutcome, InterruptObject, IpcChannel, MAX_WAIT_HANDLES, NotificationChannel,
-    ObjectRef, PendingOperation, ReclaimedSend, RecvState, SendOutcome, StoredMsg, Thread,
-    ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
+    ObjectRef, PendingOperation, ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg,
+    Thread, ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
 use crate::object::userspace_server::{PendingFill, PendingLookup};
 
@@ -286,6 +286,11 @@ struct SchedState {
     /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
     /// here rather than on `Thread` (no `Thread` layout/ABI change).
     quantum: u32,
+    /// Monotonic TimeShared vruntime floor (≈ the run queue's smallest vruntime),
+    /// advanced to the picked thread's vruntime on each dequeue. New TimeShared
+    /// threads are seeded to it (so a `vruntime == 0` newcomer can't hoard the
+    /// CPU); a waking thread is boosted to `min_vruntime - slice` for latency.
+    min_vruntime: u64,
     /// The idle thread, **per CPU** (indexed by `current_cpu()` via
     /// [`idle_slot`](SchedState::idle_slot)), parked here whenever it is **not**
     /// this CPU's current thread. Kept out of `ready`/`reap`; runs (`hlt`) only
@@ -313,6 +318,7 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     next_tid: 1,
     next_pid: 2,
     quantum: QUANTUM_TICKS,
+    min_vruntime: 0,
     idle: [const { None }; MAX_CPUS],
     idle_addr: [0; MAX_CPUS],
     blocked: KVec::new(),
@@ -489,10 +495,23 @@ fn ap_init() -> Result<(), AllocError> {
     Ok(())
 }
 
-/// Create a runnable kernel thread that will run `entry(arg)` and enqueue
-/// it. Returns the new thread id. The stack allocation and frame
-/// fabrication happen before the (brief) enqueue lock is taken.
+/// Create a runnable kernel thread that will run `entry(arg)` in the default
+/// **TimeShared** class and enqueue it. Returns the new thread id.
 pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
+    spawn_with_class(entry, arg, SchedClass::TimeShared, 0, 0)
+}
+
+/// As [`spawn`], but in scheduling `class` with `rt_priority` (RealTime) / `nice`
+/// (TimeShared). Kernel-internal: trusted callers set the class directly (the
+/// `REAL_TIME` syscap gate for *user* threads lands with the capability system).
+/// The stack allocation + frame fabrication happen before the (brief) enqueue lock.
+pub fn spawn_with_class(
+    entry: ThreadEntry,
+    arg: usize,
+    class: SchedClass,
+    rt_priority: u8,
+    nice: i8,
+) -> Result<u32, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
         let t = g.next_tid;
@@ -502,6 +521,11 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
     // Heavy work outside the lock.
     let thread = Thread::try_new_runnable(tid, 0, entry, arg)?;
     let r = into_objref(thread);
+    let obj = r.as_ptr();
+    // SAFETY: `obj` is the new thread, exclusively owned via `r` and not yet
+    // enqueued — no other context can observe it, so setting its scheduling
+    // parameters here (before the lock) is sound.
+    unsafe { Thread::set_sched(obj, class, rt_priority, nice) };
 
     {
         let mut g = SCHED.lock();
@@ -510,6 +534,9 @@ pub fn spawn(entry: ThreadEntry, arg: usize) -> Result<u32, AllocError> {
         // `KernelStack`'s rank-6 reclamation) here, under the lock. Bail
         // first so `r` drops below, lock-free.
         if g.ready.len() < g.ready.capacity() {
+            // A new TimeShared thread joins at the current vruntime floor (so a
+            // `vruntime == 0` newcomer cannot hoard the CPU); no-op otherwise.
+            seed_vruntime(&g, obj, false);
             // Within the reserve: this push cannot grow and cannot fail.
             g.ready
                 .try_push(r)
@@ -593,6 +620,9 @@ pub fn on_timer_tick() {
     let now = crate::arch::Timer::read_ns();
     fire_expired_deadlines(&mut g, now);
     wake_entropy_seed_waiters(&mut g);
+    // Charge this CPU's running TimeShared thread a tick of virtual runtime
+    // (nice-weighted) before deciding whether to reschedule.
+    accrue_vruntime(&mut g);
     let (new_quantum, reschedule) = tick_quantum(g.quantum, !g.ready.is_empty());
     g.quantum = new_quantum;
     if reschedule {
@@ -1441,6 +1471,8 @@ fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     let r = g.blocked.remove(i);
     // SAFETY: `r` pins `thread`; `SCHED` held.
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
+    // A waking TimeShared thread re-joins near the vruntime floor (latency boost).
+    seed_vruntime(g, thread, true);
     debug_assert!(g.ready.len() < g.ready.capacity());
     g.ready.try_push(r).expect("ready within reserve");
     true
@@ -2059,13 +2091,115 @@ pub fn ready_is_empty() -> bool {
     SCHED.lock().ready.is_empty()
 }
 
-/// Pop the front of the ready queue (round-robin order), or `None` if
-/// empty. Caller holds the run-queue lock.
+/// `NICE_0_WEIGHT` and the Linux-style nice→weight table (nice `-20..=19`).
+/// TimeShared vruntime accrues as `slice * NICE_0_WEIGHT / weight(nice)`, so a
+/// lower (heavier-weighted) nice accrues *slower* and is picked more often.
+const NICE_0_WEIGHT: u64 = 1024;
+#[rustfmt::skip]
+const NICE_WEIGHTS: [u64; 40] = [
+    /* -20..-16 */ 88761, 71755, 56483, 46273, 36291,
+    /* -15..-11 */ 29154, 23254, 18705, 14949, 11916,
+    /* -10..-6  */  9548,  7620,  6100,  4904,  3906,
+    /*  -5..-1  */  3121,  2501,  1991,  1586,  1277,
+    /*   0..4   */  1024,   820,   655,   526,   423,
+    /*   5..9   */   335,   272,   215,   172,   137,
+    /*  10..14  */   110,    87,    70,    56,    45,
+    /*  15..19  */    36,    29,    23,    18,    15,
+];
+
+/// The nice→weight table entry for `nice` (clamped to `-20..=19`).
+#[inline]
+fn nice_weight(nice: i8) -> u64 {
+    NICE_WEIGHTS[(nice as i32 + 20).clamp(0, 39) as usize]
+}
+
+/// The per-tick virtual-runtime increment for a TimeShared thread with `nice`.
+#[inline]
+fn vruntime_delta(nice: i8) -> u64 {
+    TICK_NS * NICE_0_WEIGHT / nice_weight(nice)
+}
+
+/// The scheduler's pick key for a runnable thread — **lower sorts first**:
+/// `(class_rank, rt_priority, vruntime)`. RealTime (rank 0, by priority) precedes
+/// TimeShared (rank 1, by vruntime); Idle (rank 2) never appears in `ready`.
+///
+/// # Safety
+/// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
+unsafe fn sched_key(obj: *mut ()) -> (u8, u8, u64) {
+    match unsafe { Thread::sched_class(obj) } {
+        SchedClass::RealTime => (0, unsafe { Thread::rt_priority(obj) }, 0),
+        SchedClass::TimeShared => (1, 0, unsafe { Thread::vruntime(obj) }),
+        SchedClass::Idle => (2, 0, u64::MAX),
+    }
+}
+
+/// Pick the next thread by **scheduling-class precedence** and remove it from
+/// `ready`, or `None` if empty. RealTime (lowest `rt_priority`, FIFO within a
+/// priority) beats TimeShared (smallest `vruntime`). An O(n) scan — ample at our
+/// thread counts; per-class heaps/buckets are a later optimization
+/// (`docs/architecture/scheduler.md`). Caller holds the run-queue lock.
 fn dequeue_front(g: &mut SchedState) -> Option<ObjectRef> {
-    if g.ready.is_empty() {
-        None
+    let n = g.ready.len();
+    if n == 0 {
+        return None;
+    }
+    let mut best_i = 0usize;
+    // SAFETY: each `ready` entry pins a live Thread; `SCHED` held.
+    let mut best_key = unsafe { sched_key(g.ready[0].as_ptr()) };
+    for i in 1..n {
+        // SAFETY: as above. `<` (strict) keeps the earliest entry on ties (FIFO).
+        let key = unsafe { sched_key(g.ready[i].as_ptr()) };
+        if key < best_key {
+            best_i = i;
+            best_key = key;
+        }
+    }
+    // Advance the monotonic TimeShared floor to the picked thread (the smallest
+    // vruntime), so `min_vruntime` tracks the run queue's leftmost.
+    if best_key.0 == 1 {
+        g.min_vruntime = g.min_vruntime.max(best_key.2);
+    }
+    Some(g.ready.remove(best_i))
+}
+
+/// Charge the running thread (on this CPU) one tick of virtual runtime, scaled by
+/// its nice weight — but only if it is **TimeShared** (RealTime is fixed-priority,
+/// not fair-scheduled; Idle never accrues). Caller holds `SCHED`.
+fn accrue_vruntime(g: &mut SchedState) {
+    let obj = match g.cur_ref().as_ref() {
+        Some(c) => c.as_ptr(),
+        None => return,
+    };
+    // SAFETY: `obj` is the running thread (pinned), `SCHED` held — the accessor
+    // contract for these field reads/writes.
+    unsafe {
+        if Thread::sched_class(obj) == SchedClass::TimeShared {
+            let v = Thread::vruntime(obj).saturating_add(vruntime_delta(Thread::nice(obj)));
+            Thread::set_vruntime(obj, v);
+        }
+    }
+}
+
+/// Seed a freshly-runnable TimeShared thread's vruntime so it joins fairly:
+/// `new` (spawned) → the current floor; `woken` → `min_vruntime - slice` (a small
+/// latency boost) but never below its own accrued vruntime. No-op for non-TS or a
+/// thread already at/above the floor. Caller holds `SCHED`.
+fn seed_vruntime(g: &SchedState, obj: *mut (), woken: bool) {
+    // SAFETY: `obj` is a pinned Thread; `SCHED` held.
+    if unsafe { Thread::sched_class(obj) } != SchedClass::TimeShared {
+        return;
+    }
+    let floor = if woken {
+        g.min_vruntime.saturating_sub(TICK_NS)
     } else {
-        Some(g.ready.remove(0))
+        g.min_vruntime
+    };
+    // SAFETY: as above. A spawned thread (vruntime 0) jumps to the floor; a waker
+    // keeps its (higher) accrued vruntime if already ahead of the boosted floor.
+    unsafe {
+        if Thread::vruntime(obj) < floor {
+            Thread::set_vruntime(obj, floor);
+        }
     }
 }
 
@@ -2250,6 +2384,7 @@ mod tests {
             next_tid: 1,
             next_pid: 2,
             quantum: QUANTUM_TICKS,
+    min_vruntime: 0,
             idle: [const { None }; MAX_CPUS],
             idle_addr: [0; MAX_CPUS],
             blocked: KVec::new(),
@@ -2282,6 +2417,92 @@ mod tests {
         init_global_heap();
         let mut st = test_state();
         assert!(dequeue_front(&mut st).is_none());
+    }
+
+    fn tid_of(r: &ObjectRef) -> u32 {
+        // SAFETY: pinned, single-threaded test.
+        unsafe { &*(r.as_ptr() as *const Thread) }.tid()
+    }
+
+    #[test]
+    fn nice_weight_and_delta_are_sane() {
+        assert_eq!(nice_weight(0), NICE_0_WEIGHT);
+        assert!(nice_weight(-20) > nice_weight(0));
+        assert!(nice_weight(19) < nice_weight(0));
+        // Out-of-range nice clamps to the table ends.
+        assert_eq!(nice_weight(-128), nice_weight(-20));
+        assert_eq!(nice_weight(127), nice_weight(19));
+        // nice 0 accrues exactly one slice per tick; lower nice accrues slower.
+        assert_eq!(vruntime_delta(0), TICK_NS);
+        assert!(vruntime_delta(-20) < vruntime_delta(0));
+        assert!(vruntime_delta(19) > vruntime_delta(0));
+    }
+
+    #[test]
+    fn dequeue_prefers_realtime_by_priority_then_timeshared() {
+        init_global_heap();
+        let mut st = test_state();
+        st.ready.try_reserve(READY_RESERVE).unwrap();
+        let ts = inert_ref(1); // TimeShared (default), vruntime 0
+        let rt_lo = inert_ref(2); // RealTime, priority 20
+        let rt_hi = inert_ref(3); // RealTime, priority 5 (higher)
+        // SAFETY: pinned, single-threaded test.
+        unsafe {
+            Thread::set_sched(rt_lo.as_ptr(), SchedClass::RealTime, 20, 0);
+            Thread::set_sched(rt_hi.as_ptr(), SchedClass::RealTime, 5, 0);
+        }
+        st.ready.try_push(ts).unwrap();
+        st.ready.try_push(rt_lo).unwrap();
+        st.ready.try_push(rt_hi).unwrap();
+        // RealTime beats TimeShared; lower rt_priority value wins within RealTime.
+        assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "RealTime prio 5 first");
+        assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "RealTime prio 20 next");
+        assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 1, "TimeShared last");
+    }
+
+    #[test]
+    fn dequeue_timeshared_picks_min_vruntime_and_advances_floor() {
+        init_global_heap();
+        let mut st = test_state();
+        st.ready.try_reserve(READY_RESERVE).unwrap();
+        let a = inert_ref(1);
+        let b = inert_ref(2);
+        let c = inert_ref(3);
+        // SAFETY: pinned, single-threaded test.
+        unsafe {
+            Thread::set_vruntime(a.as_ptr(), 500);
+            Thread::set_vruntime(b.as_ptr(), 100); // smallest
+            Thread::set_vruntime(c.as_ptr(), 300);
+        }
+        st.ready.try_push(a).unwrap();
+        st.ready.try_push(b).unwrap();
+        st.ready.try_push(c).unwrap();
+        assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 2, "smallest vruntime first");
+        assert_eq!(st.min_vruntime, 100, "floor advanced to the picked vruntime");
+        assert_eq!(tid_of(&dequeue_front(&mut st).unwrap()), 3, "next-smallest vruntime");
+        assert_eq!(st.min_vruntime, 300);
+    }
+
+    #[test]
+    fn seed_vruntime_floors_new_and_boosts_woken() {
+        init_global_heap();
+        let mut st = test_state();
+        let base = 2 * TICK_NS;
+        st.min_vruntime = base;
+        // A new TimeShared thread (vruntime 0) jumps up to the floor.
+        let n = inert_ref(1);
+        seed_vruntime(&st, n.as_ptr(), false);
+        // SAFETY: pinned, single-threaded test.
+        assert_eq!(unsafe { Thread::vruntime(n.as_ptr()) }, base);
+        // A waking thread is boosted to `floor - slice` (latency), not the bare floor.
+        let w = inert_ref(2);
+        seed_vruntime(&st, w.as_ptr(), true);
+        assert_eq!(unsafe { Thread::vruntime(w.as_ptr()) }, base - TICK_NS);
+        // A thread already ahead of the floor keeps its (larger) vruntime.
+        let ahead = inert_ref(3);
+        unsafe { Thread::set_vruntime(ahead.as_ptr(), 3 * TICK_NS) };
+        seed_vruntime(&st, ahead.as_ptr(), false);
+        assert_eq!(unsafe { Thread::vruntime(ahead.as_ptr()) }, 3 * TICK_NS);
     }
 
     // --- Deadline min-heap (pure) -------------------------------------
