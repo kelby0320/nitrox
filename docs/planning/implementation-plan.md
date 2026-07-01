@@ -1575,6 +1575,17 @@ are bisectable in isolation.
   on another CPU; root-cause the `syscall_entry` per-CPU-stack hazard so **user threads may
   migrate** (use the APs) safely. *Verify:* concurrent cross-CPU unmap stays coherent; a
   multi-threaded user process runs across CPUs and an aggressive churn stress test is clean.
+  - [x] **Hazard root-caused + two fixes landed** (2026-07-01): the migration hazard is a
+    bring-up timing race — a user thread running on a not-yet-fully-initialised CPU. Fixed
+    (a) **syscall MSRs re-armed at ring-3 descent** (`arm_user_entry_cpu_base`, the SCE
+    `#UD`), and (b) **dense CPU indices derived from the hardware APIC id**
+    (`bind_cpu_identity` / `adopt_dense_index`) so they're unique by construction (no
+    GDT/TSS/scheduler-slot collision). See the decision log (2026-07-01). User threads
+    **stay pinned to the BSP** until the shootdown below lands.
+  - [ ] **TLB shootdown** (broadcast IPI + synchronous ack; machinery drafted this session)
+    — closes the residual: a migrated thread's first exception can land on a kstack whose
+    translation is stale on the running CPU. Re-enabling user-thread distribution rides on it.
+  - [ ] Cross-CPU **deschedule IPI**; per-`AddressSpace` `active_cpus`.
 
 #### Service manager
 

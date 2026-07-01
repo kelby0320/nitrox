@@ -5893,3 +5893,49 @@ new = 524); `-smp 4` **12/12** clean full boots (class + distribution + affinity
 init → ext4 mount → parent demo → eshell, 0 faults); `-smp 1` unchanged. Branch
 `phase-3/slice3-percpu-runqueues`. Next: slice 3b (TLB shootdown + `active_cpus`; the
 cross-CPU deschedule IPI; root-cause user-thread migration so userspace can use the APs).
+
+### 2026-07-01 — Phase 3 slice 3b (in progress): user-thread migration hazard root-caused; SCE-arm + APIC-id-index fixes
+
+The slice-1/3 "`syscall_entry` per-CPU-stack hazard" that forced userspace onto the BSP was
+run down (largely) via extensive **KVM** reproduction — the hazard is a **bring-up timing
+race** so sensitive that any in-path instrumentation suppresses it, so it was observed with
+fault-path-only probes, `-d cpu_reset`, and non-perturbing atomics. It is not one bug but a
+family of **per-CPU-state hazards that bite when a user thread runs on a CPU that isn't yet
+fully/correctly initialised**; the symptom cascade is `#UD` (EFER.SCE=0) → or `#DF` (fault
+delivered onto a bad kernel stack) → triple-fault → **VM reboot** (which can loop). Two
+distinct causes were fixed:
+
+1. **Syscall MSRs not armed at descent.** A CPU could reach a ring-3 descent before its
+   bring-up `init_syscall_entry` was in effect → the thread's first `syscall` `#UD`s
+   (`EFER.SCE=0`). Fix: `arm_user_entry_cpu_base` (already re-asserts `KERNEL_GS_BASE` on
+   every descent for migration) now also **ensures the syscall MSRs are armed** — a cheap
+   `rdmsr(EFER)` gate every descent, with the full re-arm only in the (should-never-happen)
+   unarmed case, so no steady-state cost.
+
+2. **Dense-index collision.** The dense CPU index was handed to APs via Limine
+   `extra_argument` and relied on `IA32_TSC_AUX`'s reset-default 0 for the BSP — a racy
+   scheme where a core could run with a **colliding** index and thus share another core's
+   per-CPU **GDT/TSS/scheduler slots** (loading the wrong TSS → exception delivery onto a
+   shared `RSP0` → `#DF`). Fix: dense indices are now derived from the **hardware APIC id**
+   (`smp::bind_cpu_identity` / `adopt_dense_index`, re-exported neutrally) — unique **by
+   construction**; a core whose APIC id was never bound **parks** rather than colliding.
+   The `extra_argument` channel is no longer used for identity.
+
+**Residual — the dominant one, a cross-CPU kernel-vmap coherence gap (no TLB shootdown
+yet).** A thread's *first exception* can be delivered onto a kernel stack whose translation
+is **stale on the running CPU**: an AP mutating the **shared kernel-vmap** page tables for
+its own kstacks leaves other cores' cached paging structures stale, so init's `RSP0` push
+faults → `#DF`. **This is pre-existing (since slice 1) and NOT migration-specific** — it
+reproduces even with user threads pinned to the BSP, because APs churn kstacks in the shared
+vmap regardless. **Correction to the slice-3 log:** the "12/12 clean `-smp 4`" claim was
+TCG / few-boots; under heavy **KVM** boot-looping the pinned config fails ~**33%** with this
+`#DF`. The two fixes above cut that to ~**15%** (they close the SCE and dense-index causes;
+the coherence cause remains). Closing it is the **next 3b step** — the TLB-shootdown
+machinery (broadcast IPI + synchronous ack) drafted this session, re-aimed at the kernel-vmap
+*mutation* sites (kstack map/unmap); re-enabling user-thread distribution rides on it.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` (18 host suites)
+green. `-smp 4` KVM boot-loop: **~33% → ~15%** init `#DF` vs HEAD (a strict improvement, not
+a regression — HEAD was never KVM-clean); `-smp 1` unaffected. Committing this partial
+progress by explicit decision (fixes are correct and independently valuable); the coherence
+residual is tracked as the immediate next step. Branch `phase-3/slice3b-tlb-shootdown`.

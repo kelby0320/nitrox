@@ -2314,10 +2314,15 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
         // has always run on, so it never migrates; see below).
         pick_wake_cpu(g, obj)
     } else if user {
-        // A **new user thread** is placed on its creating CPU and stays there: user
-        // threads never migrate between CPUs (the unresolved `syscall_entry` per-CPU
-        // stack hazard — deferred). Re-home keeps them put, wake returns them home,
-        // and stealing skips them. Kernel threads still distribute (least-loaded).
+        // A **new user thread** is placed on its creating CPU and stays there.
+        // Two per-CPU-state hazards for a migrated user thread are now fixed —
+        // syscall-entry MSRs are re-armed at descent (`arm_user_entry_cpu_base`)
+        // and dense indices are unique by construction (`arch::adopt_dense_index`).
+        // A residual remains: a migrated thread's first exception can be delivered
+        // onto a kernel stack whose translation is stale on the running CPU,
+        // because kernel-vmap page-table mutations are not yet shot down across
+        // CPUs. Until that TLB-shootdown lands (slice 3b), user threads stay on
+        // their creating CPU; kernel threads still distribute (least-loaded).
         SchedState::this_cpu()
     } else {
         pick_target_cpu(g, obj)
