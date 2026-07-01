@@ -253,6 +253,26 @@ fn kernel_main() {
     // publishes the console char `DeviceNode` for `/dev/console`.
     nitrox_kernel::drivers::console::init();
 
+    // Establish the BSP's per-CPU identity (dense logical index 0) **before**
+    // the scheduler starts using `current_cpu()` and — critically — before any
+    // AP is online (`bring_up_aps`), so this runs while the boot thread is still
+    // pinned to the BSP. Doing it later (e.g. from `run_first_userspace`, after
+    // AP bring-up) is unsound: by then the boot thread can migrate onto an AP,
+    // and this `wrmsr(IA32_TSC_AUX, 0)` would overwrite *that* CPU's dense index
+    // with 0, aliasing it onto the BSP's per-CPU scheduler slots (`current[0]` /
+    // `idle[0]`) — a slot-sharing collision. Each AP sets its own index from
+    // hardware in `arch::adopt_dense_index` at bring-up.
+    {
+        use arch::smp::ArchSmp;
+        arch::Smp::init_this_cpu(0);
+        kprintln!(
+            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
+            arch::Smp::current_cpu(),
+            arch::Smp::cpu_count(),
+            arch::MAX_CPUS,
+        );
+    }
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and
@@ -727,20 +747,6 @@ fn run_first_userspace() {
     use nitrox_kernel::object::{
         Namespace, NotificationChannel, ObjectRef, Process,
     };
-
-    // Establish the BSP's per-CPU identity (logical index 0) so
-    // `arch::Smp::current_cpu()` reports it; each AP does the same at SMP
-    // bring-up (slice 1). See docs/architecture/scheduler.md §Per-CPU access.
-    {
-        use arch::smp::ArchSmp;
-        arch::Smp::init_this_cpu(0);
-        kprintln!(
-            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
-            arch::Smp::current_cpu(),
-            arch::Smp::cpu_count(),
-            arch::MAX_CPUS,
-        );
-    }
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
     // per-thread (by the scheduler's `thread_enter`), not here.

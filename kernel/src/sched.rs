@@ -1488,6 +1488,7 @@ unsafe fn arm_kernel_stack_for(obj: *mut ()) {
 unsafe fn switch_into(
     g: IrqSpinLockGuard<'_, SchedState>,
     out_slot: *mut u64,
+    out_obj: *mut (),
     next_obj: *mut (),
 ) {
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
@@ -1498,6 +1499,16 @@ unsafe fn switch_into(
     // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
     // still held.
     unsafe { Thread::set_last_cpu(next_obj, SchedState::this_cpu() as u8) };
+    // Raise the outgoing thread's mid-switch-out guard **while still holding
+    // `SCHED`** (so it is set before the lock release makes any `ready` entry
+    // for `out_obj` visible to a stealer). `context_switch` clears it after it
+    // commits `out_obj`'s `saved_sp`, at which point the parked context is valid
+    // to resume elsewhere. Prevents a cross-CPU steal from loading a not-yet-
+    // written `saved_sp` and double-running the thread (the SMP `on_cpu`
+    // invariant; see `Thread::on_cpu` and `steal_one`).
+    // SAFETY: `out_obj` is the pinned outgoing thread; `SCHED` still held.
+    unsafe { Thread::set_on_cpu(out_obj, true) };
+    let out_on_cpu = unsafe { Thread::on_cpu_ptr(out_obj) };
     // Drop the lock but keep interrupts masked across the switch. `saved_if`
     // is this thread's prior interrupt state, restored when it next resumes.
     let saved_if = g.release_keeping_irqs_masked();
@@ -1510,9 +1521,10 @@ unsafe fn switch_into(
     // before it is reaped (its `AddressSpace::Drop` may free the old PML4).
     unsafe { Paging::set_page_table(next_root) };
     // SAFETY: lock released; interrupts masked; `out_slot` points into the
-    // re-homed outgoing thread (pinned) and `next_sp` is the saved RSP of the
-    // now-current thread (pinned). Single-CPU: nothing else touches either.
-    unsafe { context_switch(out_slot, next_sp) };
+    // outgoing thread (pinned) and `next_sp` is the saved RSP of the now-current
+    // thread (pinned). `out_on_cpu` is the outgoing thread's guard byte, cleared
+    // by the switch once `out_slot` is committed.
+    unsafe { context_switch(out_slot, next_sp, out_on_cpu) };
     // Resumed (cooperative path): restore the interrupt state this thread had
     // on entry. On the preemptive path the resume returns into the timer-stub
     // epilogue (which `iretq`s IF back) and `saved_if` is false → no-op. A
@@ -1553,8 +1565,9 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     // Switch into `next`; we resume here (lock-free) when a waker moves us back
     // to `ready` and the scheduler later picks us.
     // SAFETY: `prev_slot` is the outgoing (now-`Blocked`, pinned-in-`blocked`)
-    // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
-    unsafe { switch_into(g, prev_slot, next_obj) };
+    // thread's saved-SP slot; `prev_obj`/`next_obj` are the pinned outgoing /
+    // incoming threads.
+    unsafe { switch_into(g, prev_slot, prev_obj, next_obj) };
 }
 
 /// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller
@@ -1796,8 +1809,9 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     *g.cur_slot() = Some(next);
 
     // SAFETY: `prev_slot` is the re-homed outgoing (now-`Ready`, pinned)
-    // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
-    unsafe { switch_into(g, prev_slot, next_obj) };
+    // thread's saved-SP slot; `prev_obj`/`next_obj` are the pinned outgoing /
+    // incoming threads.
+    unsafe { switch_into(g, prev_slot, prev_obj, next_obj) };
 }
 
 /// The action a supervisor's `sys_exception_resume` requests for a thread
@@ -1951,10 +1965,10 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     // boot root before this (parked-in-`reap`) thread is reaped — its
     // `AddressSpace::Drop` frees the PML4 CR3 would otherwise still reference.
     // SAFETY: `me_slot` is our own (now-`Exited`, pinned-in-`reap`) saved-SP
-    // slot — written by the switch and never read again; `next_obj` is the
+    // slot — written by the switch and never read again; `me_obj`/`next_obj` is the
     // pinned incoming thread. We never resume, so the restore inside
     // `switch_into` is never reached.
-    unsafe { switch_into(g, me_slot, next_obj) };
+    unsafe { switch_into(g, me_slot, me_obj, next_obj) };
     unreachable!("switched away from an exited thread");
 }
 
@@ -2141,8 +2155,9 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         // Switch into `next`; we resume here when `sys_exception_resume` moves
         // us `suspended`→`ready` and the scheduler switches us in.
         // SAFETY: `me_slot` is our own (now-`Suspended`, pinned-in-`suspended`)
-        // saved-SP slot; `next_obj` is the pinned incoming thread.
-        unsafe { switch_into(g, me_slot, next_obj) };
+        // saved-SP slot; `me_obj`/`next_obj` are the pinned outgoing / incoming
+        // threads.
+        unsafe { switch_into(g, me_slot, me_obj, next_obj) };
     }
 
     // Read (and clear) the disposition the resume stored on us.
@@ -2405,7 +2420,16 @@ fn steal_available(g: &SchedState, me: usize) -> bool {
 /// # Safety
 /// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
 unsafe fn stealable_to(obj: *mut (), me: usize) -> bool {
-    unsafe { !Thread::is_user(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
+    // Skip a thread still mid-switch-out on another CPU (`on_cpu` set): its
+    // parked `saved_sp` is not yet committed, so resuming it here would load a
+    // stale/garbage frame and double-run it. It stays on the victim's queue and
+    // becomes stealable on the next round once the switch completes (the SMP
+    // `on_cpu` invariant; see `Thread::on_cpu` / `switch_into`).
+    unsafe {
+        !Thread::is_user(obj)
+            && !Thread::is_on_cpu(obj)
+            && Thread::cpu_mask(obj) & (1 << me) != 0
+    }
 }
 
 /// Pick the next thread to run on this CPU: its own queue first, else **steal** from

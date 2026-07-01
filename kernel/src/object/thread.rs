@@ -18,7 +18,7 @@
 //! fields through raw pointers — never forming a `&mut Thread` that would
 //! alias the atomically-accessed [`KObjectHeader`].
 
-use core::sync::atomic::{AtomicU8, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
 use crate::arch::{ArchThreadContext, fabricate_frame, thread_trampoline};
 use crate::libkern::handle::KObjectType;
@@ -184,6 +184,16 @@ pub struct Thread {
     /// so a `u8` suffices. Default all-ones (no restriction). Placement and work
     /// stealing honour it; `sys_thread_set_affinity` writes it.
     cpu_mask: u8,
+    /// **Mid-switch-out guard** (the SMP `on_cpu` invariant, after Linux's
+    /// `task_struct::on_cpu`). Set `true` under `SCHED` just before a switch
+    /// releases the run-queue lock, and cleared by
+    /// [`context_switch`](crate::arch::context_switch) **after** it commits this
+    /// thread's `saved_sp`. While it is `true`, the thread's parked context is
+    /// **not yet valid to resume**: another CPU must not steal and run it (it
+    /// would load a stale `saved_sp` and double-run the thread). Work-stealing
+    /// skips threads with this set. Cleared by the arch switch, so an
+    /// [`AtomicBool`] whose storage the asm pokes as a raw `u8`.
+    on_cpu: AtomicBool,
     // Deferred to later slices:
     //   fpu_context  — kernel is soft-float; lands with userspace threads.
     //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
@@ -226,6 +236,7 @@ impl Thread {
             vruntime: 0,
             last_cpu: 0,
             cpu_mask: u8::MAX,
+            on_cpu: AtomicBool::new(false),
         })
     }
 
@@ -263,6 +274,7 @@ impl Thread {
             vruntime: 0,
             last_cpu: 0,
             cpu_mask: u8::MAX,
+            on_cpu: AtomicBool::new(false),
         })
     }
 
@@ -312,6 +324,7 @@ impl Thread {
             vruntime: 0,
             last_cpu: 0,
             cpu_mask: u8::MAX,
+            on_cpu: AtomicBool::new(false),
         })
     }
 
@@ -376,6 +389,7 @@ impl Thread {
             vruntime: 0,
             last_cpu: 0,
             cpu_mask: u8::MAX,
+            on_cpu: AtomicBool::new(false),
         })
     }
 
@@ -615,6 +629,48 @@ impl Thread {
         let p = obj as *mut Thread;
         // SAFETY: as `saved_sp`; the arch layer yields the slot pointer.
         unsafe { ArchThreadContext::sp_slot(&raw mut (*p).arch) }
+    }
+
+    /// Set the mid-switch-out guard (`on_cpu`; see the field docs). The
+    /// scheduler sets `true` under `SCHED` immediately before releasing the
+    /// run-queue lock for a switch; [`context_switch`](crate::arch::context_switch)
+    /// clears it after committing `saved_sp`.
+    ///
+    /// # Safety
+    /// See the accessor contract above (`obj` is a live, pinned `Thread`).
+    pub(crate) unsafe fn set_on_cpu(obj: *mut (), val: bool) {
+        let p = obj as *mut Thread;
+        // SAFETY: `obj` is a live Thread; `on_cpu` is an `AtomicBool` valid for
+        // the thread's lifetime. `Release` so a prior `saved_sp` publish is
+        // ordered before a `true`→visible transition seen by a stealer's acquire.
+        unsafe { (*p).on_cpu.store(val, Ordering::Release) };
+    }
+
+    /// Read the mid-switch-out guard. A stealer must treat `true` as "not yet
+    /// resumable" and leave the thread on its queue.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn is_on_cpu(obj: *mut ()) -> bool {
+        let p = obj as *mut Thread;
+        // SAFETY: as `set_on_cpu`. `Acquire` pairs with the arch switch's
+        // release-store clearing the flag (so the committed `saved_sp` is
+        // visible once we observe `false`).
+        unsafe { (*p).on_cpu.load(Ordering::Acquire) }
+    }
+
+    /// Raw `*mut u8` to the `on_cpu` guard's storage, for the arch
+    /// [`context_switch`](crate::arch::context_switch) to clear (an
+    /// `AtomicBool` is `repr(transparent)` over `u8`). The pointee outlives the
+    /// call: the `Thread` is refcount-pinned for the switch's duration.
+    ///
+    /// # Safety
+    /// See the accessor contract above; the returned pointer is only for the
+    /// switch's single relaxed byte store on this CPU.
+    pub(crate) unsafe fn on_cpu_ptr(obj: *mut ()) -> *mut u8 {
+        let p = obj as *mut Thread;
+        // SAFETY: `on_cpu` is an `AtomicBool` (a single `u8`); expose its byte.
+        unsafe { (&raw mut (*p).on_cpu) as *mut u8 }
     }
 
     /// Read the entry point and its argument.
@@ -912,6 +968,7 @@ mod tests {
             vruntime: 0,
             last_cpu: 0,
             cpu_mask: u8::MAX,
+            on_cpu: AtomicBool::new(false),
         })
         .unwrap()
     }

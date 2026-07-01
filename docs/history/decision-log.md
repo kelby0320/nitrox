@@ -5939,3 +5939,56 @@ green. `-smp 4` KVM boot-loop: **~33% → ~15%** init `#DF` vs HEAD (a strict im
 a regression — HEAD was never KVM-clean); `-smp 1` unaffected. Committing this partial
 progress by explicit decision (fixes are correct and independently valuable); the coherence
 residual is tracked as the immediate next step. Branch `phase-3/slice3b-tlb-shootdown`.
+
+### 2026-07-01 — Phase 3 slice 3b: migration hazard fully root-caused + fixed (KVM 0/150)
+
+Continuing the 3b investigation above, the remaining hazard was root-caused to **two
+independent bugs** and both fixed; `-smp 4` under **KVM** now boots **0 failures / 150** (was
+~13% at the previous 3b checkpoint, ~33% at slice-3 HEAD). Work-stealing stays enabled.
+
+**Bug A — the switch-out race (a stolen thread resumed from a not-yet-committed context).**
+In `sched::switch_to_next`, the outgoing thread `prev` is enqueued into its CPU's `ready`
+queue and the `SCHED` lock is released (inside `switch_into`) **before** `context_switch`
+commits `prev`'s `saved_sp`. Another CPU could `steal_one` `prev` in that window and resume
+it from a **stale `saved_sp`** → the thread runs on two CPUs → `current[]` desyncs from the
+actually-running thread. Observed end effect: the boot thread's `exit_thread` reaping **CPU
+0's idle thread** (because `current[0]` had been left pointing at idle), freeing the live
+idle kernel stack → `#DF` on the idle thread's next interrupt. Fix (Linux `task::on_cpu`
+model): a per-`Thread` `on_cpu` `AtomicBool`, **set** under `SCHED` in `switch_into` before
+the lock release and **cleared by `context_switch`** (arch asm, new `prev_on_cpu: *mut u8`
+param) immediately **after** it commits `saved_sp`; `stealable_to` skips a thread whose
+`on_cpu` is set. x86-TSO orders the sp-commit store before the flag-clear store, so a stealer
+that observes the clear also sees the final `saved_sp` — no fence needed.
+
+**Bug B — a dense-index collision from a mis-placed BSP-identity call.** `init_this_cpu(0)`
+(hard-codes dense index 0 via `wrmsr(IA32_TSC_AUX, 0)`) lived inside `run_first_userspace()`,
+which `kernel_main` calls **after** `bring_up_aps()`. Once APs are online the (stealable) boot
+thread can migrate onto an AP; running `init_this_cpu(0)` there overwrites **that AP's**
+TSC_AUX with 0, so the AP's `current_cpu()` (RDTSCP) returns 0 and it **aliases dense 0**,
+sharing the BSP's per-CPU `current[0]` / `idle[0]` scheduler slots. This is the same
+slot-sharing class as the slice-3 dense-index collision, re-introduced by call placement.
+Fix: moved the BSP-identity block to **before** `bring_up_aps()` (and before the scheduler
+first reads `current_cpu()`), where the boot thread is still pinned to the BSP; each AP still
+derives its own index from hardware in `adopt_dense_index`.
+
+**Method.** KVM (`-accel kvm`) reproduces; TCG hides/perturbs it. It is a bring-up timing
+heisenbug — hot-path instrumentation (reading `CPUID`/APIC-id every switch, logging every
+ring-3 descent) suppresses it. It was pinned with fault-path-only probes: a non-perturbing
+kernel-stack **drop-ring**, a `#[track_caller]` reap marker (showed the reaper was the boot
+thread's `main.rs` exit), a per-switch **trace ring** (showed the boot thread migrating), and
+finally a marker printing `this_cpu()` **vs** the true hardware APIC id (`cpu=0` but
+`hw_apic=3` — the TSC_AUX desync, proving Bug B). All diagnostics were removed after the fix.
+
+**Also fixed (pre-existing, same slice).** `KernelStack::Drop` → `tlb::shootdown_all()` →
+`Paging::flush_tlb_*` executed privileged `invlpg` / `mov cr3`, which `#GP` (SIGSEGV) under
+host `cargo test`; `mm::kstack::tests::drop_unmaps_stack_pages` had been crashing the suite
+since the TLB-shootdown commit. The two flush primitives now have `#[cfg(test)]` no-op stubs
+(mirroring `smp.rs`'s `current_cpu`/`init_this_cpu`), since host tests exercise the page-table
+*memory* edits (via HHDM) and have no TLB.
+
+**Verified.** `cargo xtask build` (no warnings) / `check-arch` / `test` (all host suites,
+incl. the previously-crashing kstack tests) green. `-smp 4` KVM boot-loop **0/150**; `-smp 1`
+unaffected. User-thread *migration* is still disabled (`stealable_to` excludes `is_user`;
+`place_thread` pins new user threads to their creating CPU) — the hazards that blocked it are
+now all resolved, so re-enabling it is the next 3b step. Branch
+`phase-3/slice3b-tlb-shootdown`.

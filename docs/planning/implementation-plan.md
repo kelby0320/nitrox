@@ -1580,11 +1580,21 @@ are bisectable in isolation.
     (a) **syscall MSRs re-armed at ring-3 descent** (`arm_user_entry_cpu_base`, the SCE
     `#UD`), and (b) **dense CPU indices derived from the hardware APIC id**
     (`bind_cpu_identity` / `adopt_dense_index`) so they're unique by construction (no
-    GDT/TSS/scheduler-slot collision). See the decision log (2026-07-01). User threads
-    **stay pinned to the BSP** until the shootdown below lands.
-  - [ ] **TLB shootdown** (broadcast IPI + synchronous ack; machinery drafted this session)
-    — closes the residual: a migrated thread's first exception can land on a kstack whose
-    translation is stale on the running CPU. Re-enabling user-thread distribution rides on it.
+    GDT/TSS/scheduler-slot collision). See the decision log (2026-07-01).
+  - [x] **TLB shootdown** (broadcast IPI + synchronous ack) — cross-CPU invalidation for the
+    shared kernel vmap, wired at the kstack free site (`KernelStack::Drop`). `crate::tlb`
+    (neutral coordinator) + `arch::send_shootdown_ipi` (transport, vector 0x40).
+  - [x] **Migration hazard fully fixed — KVM 0/150** (2026-07-01): two further root causes.
+    (a) **Switch-out race** — a stolen thread could resume from a not-yet-committed
+    `saved_sp`; fixed with a Linux-style `Thread::on_cpu` guard (set under `SCHED` in
+    `switch_into`, cleared by `context_switch` after committing `saved_sp`; `stealable_to`
+    skips guarded threads). (b) **Dense-index collision** — `init_this_cpu(0)` ran *after*
+    `bring_up_aps()` on the migratable boot thread, zeroing a migrated AP's TSC_AUX → dense-0
+    aliasing; moved before AP bring-up. Also fixed a pre-existing host-test SIGSEGV
+    (`flush_tlb_*` privileged ops now `#[cfg(test)]` no-ops). See the decision log.
+  - [ ] **Re-enable user-thread migration** — the blockers (SCE re-arm, unique dense index,
+    TLB shootdown, switch-out race) are all resolved; drop the `is_user` exclusion in
+    `stealable_to` and the creating-CPU pin in `place_thread`, then stress-verify.
   - [ ] Cross-CPU **deschedule IPI**; per-`AddressSpace` `active_cpus`.
 
 #### Service manager
