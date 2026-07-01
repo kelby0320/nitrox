@@ -239,6 +239,20 @@ mod deadline {
 /// can be freed safely (CR3 is the boot root before the reap).
 static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// Lock-free bitmask of online CPUs (dense index → bit), a duplicate of the
+/// `SCHED`-guarded `cpu_online[]` kept purely so subsystems that must not take the
+/// top-rank `SCHED` lock can read the online set without a lock — notably TLB
+/// shootdown ([`crate::tlb`]), which fires from the mm layer under lower locks.
+/// Each CPU sets its own bit as it comes online; bits are never cleared (no
+/// CPU hot-unplug).
+static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
+/// Used by [`crate::tlb`] to pick TLB-shootdown IPI targets without taking `SCHED`.
+pub fn online_mask() -> u64 {
+    ONLINE_MASK.load(Ordering::Acquire)
+}
+
 /// The page-table root a thread should run under: its own process root if it
 /// has one, else the boot root. Caller holds the run-queue lock.
 ///
@@ -448,6 +462,7 @@ pub fn init() -> Result<(), AllocError> {
     let mut g = SCHED.lock();
     g.ready[0] = ready; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
     g.cpu_online[0] = true; // the BSP; each AP sets its own bit in `ap_init`.
+    ONLINE_MASK.fetch_or(1, Ordering::Release); // lock-free mirror (BSP = bit 0)
     g.blocked = blocked;
     g.suspended = suspended;
     g.reap[0] = reap;
@@ -519,6 +534,7 @@ fn ap_init() -> Result<(), AllocError> {
     // that reserved its queues, so no placement targets it before it is reserved).
     let cpu = SchedState::this_cpu();
     g.cpu_online[cpu] = true;
+    ONLINE_MASK.fetch_or(1 << cpu, Ordering::Release); // lock-free mirror
     Ok(())
 }
 

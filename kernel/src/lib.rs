@@ -32,3 +32,4 @@ pub mod pci;
 pub mod rsproto;
 pub mod sched;
 pub mod syscall;
+pub mod tlb;

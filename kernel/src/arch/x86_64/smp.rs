@@ -61,6 +61,20 @@ pub fn adopt_dense_index() -> Option<u32> {
     None
 }
 
+/// The x2APIC id bound to dense index `cpu`, or `None` if out of range / unbound.
+/// Used by the TLB-shootdown transport ([`super::tlb::send_shootdown_ipi`]) to
+/// target a CPU by its dense index — reusing the same hardware-identity map that
+/// [`bind_cpu_identity`] populated at bring-up.
+pub(crate) fn apic_of_dense(cpu: usize) -> Option<u32> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    match DENSE_TO_APIC[cpu].load(Ordering::Acquire) {
+        APIC_UNSET => None,
+        apic => Some(apic),
+    }
+}
+
 /// The x86_64 [`ArchSmp`] implementation. Re-exported as `crate::arch::Smp`.
 pub struct X86Smp;
 
