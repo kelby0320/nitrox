@@ -1863,10 +1863,16 @@ fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
 /// and move its `ObjectRef` into `reap`. Caller holds `SCHED`.
 fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid: u32) {
     // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
-    while let Some(i) = list
-        .iter()
-        .position(|r| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid)
-    {
+    while let Some(i) = list.iter().position(|r| {
+        // SAFETY: `r` pins a live Thread; `SCHED` held.
+        let th = unsafe { &*(r.as_ptr() as *const Thread) };
+        // Never reap a per-CPU **idle** thread: it is scheduler infrastructure, not
+        // a sibling of the exiting process, and it may be *running right now* on
+        // another CPU (or this one) — reclaiming it frees a live kernel stack (a
+        // use-after-free `#DF`). Idle threads carry `owner_pid()==0`, so a `pid==0`
+        // exit would otherwise sweep them all up.
+        th.owner_pid() == my_pid && th.tid() != IDLE_TID
+    }) {
         let r = list.remove(i);
         // SAFETY: `r` pins the thread; `SCHED` held.
         unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
@@ -1884,10 +1890,12 @@ fn reap_blocked_matching(
     my_pid: u32,
 ) {
     // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
-    while let Some(i) = blocked
-        .iter()
-        .position(|r| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid)
-    {
+    while let Some(i) = blocked.iter().position(|r| {
+        // SAFETY: `r` pins a live Thread; `SCHED` held.
+        let th = unsafe { &*(r.as_ptr() as *const Thread) };
+        // Never reap an idle thread (see `reap_matching`).
+        th.owner_pid() == my_pid && th.tid() != IDLE_TID
+    }) {
         let r = blocked.remove(i);
         let obj = r.as_ptr();
         // Unregister from every object this thread was waiting on, mirroring
