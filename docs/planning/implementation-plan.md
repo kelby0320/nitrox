@@ -1592,10 +1592,17 @@ are bisectable in isolation.
     `bring_up_aps()` on the migratable boot thread, zeroing a migrated AP's TSC_AUX → dense-0
     aliasing; moved before AP bring-up. Also fixed a pre-existing host-test SIGSEGV
     (`flush_tlb_*` privileged ops now `#[cfg(test)]` no-ops). See the decision log.
-  - [ ] **Re-enable user-thread migration** — the blockers (SCE re-arm, unique dense index,
-    TLB shootdown, switch-out race) are all resolved; drop the `is_user` exclusion in
-    `stealable_to` and the creating-CPU pin in `place_thread`, then stress-verify.
-  - [ ] Cross-CPU **deschedule IPI**; per-`AddressSpace` `active_cpus`.
+  - [x] **User-thread migration enabled** (2026-07-01): dropped the `is_user` exclusion in
+    `stealable_to` and the creating-CPU pin in `place_thread` — user threads now distribute
+    across the APs (least-loaded placement) and are work-stealable, relying on the per-switch
+    re-arm of CR3 + TSS.RSP0/syscall-stack/`KERNEL_GS_BASE` (`switch_into` →
+    `arm_kernel_stack_for`). *Verified:* `-smp 4` KVM boot-loop **0/150**; scripted `eshell`
+    interaction (`help`/`lsblk`/`mounts`/`cat …`) clean across a 50-boot stress batch with
+    userspace running on the APs. `Thread::is_user` removed (last consumer gone).
+  - [ ] Cross-CPU **deschedule IPI** + per-`AddressSpace` `active_cpus`. Not yet triggered:
+    every userspace process today is single-threaded, so `exit_process` never has a sibling
+    running on another CPU, and TLB shootdown broadcasts to all online CPUs (correct, if
+    unoptimised). Lands with the first multi-threaded user process.
 
 #### Service manager
 

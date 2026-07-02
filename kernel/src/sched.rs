@@ -2346,24 +2346,20 @@ fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
 /// chosen queue is at its reserved capacity. Caller holds `SCHED`.
 fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), ObjectRef> {
     let obj = r.as_ptr();
-    // SAFETY: `obj` is a pinned Thread; `SCHED` held.
-    let user = unsafe { Thread::is_user(obj) };
     let cpu = if wake {
-        // A wake re-homes to the thread's home CPU (a user thread's home is the CPU it
-        // has always run on, so it never migrates; see below).
+        // A wake re-homes to the thread's home CPU (`last_cpu`) when possible —
+        // cache-warm, and it avoids a needless migration.
         pick_wake_cpu(g, obj)
-    } else if user {
-        // A **new user thread** is placed on its creating CPU and stays there.
-        // Two per-CPU-state hazards for a migrated user thread are now fixed —
-        // syscall-entry MSRs are re-armed at descent (`arm_user_entry_cpu_base`)
-        // and dense indices are unique by construction (`arch::adopt_dense_index`).
-        // A residual remains: a migrated thread's first exception can be delivered
-        // onto a kernel stack whose translation is stale on the running CPU,
-        // because kernel-vmap page-table mutations are not yet shot down across
-        // CPUs. Until that TLB-shootdown lands (slice 3b), user threads stay on
-        // their creating CPU; kernel threads still distribute (least-loaded).
-        SchedState::this_cpu()
     } else {
+        // A newly spawned thread — **user or kernel** — is placed on the
+        // least-loaded permitted CPU, so userspace uses the APs from the start.
+        // Migrating an already-running user thread is now safe: its CR3 and
+        // per-CPU kernel-stack arming (TSS.RSP0 / syscall stack / `KERNEL_GS_BASE`)
+        // are re-established on every switch-in (`switch_into` → `resolve_root` +
+        // `arm_kernel_stack_for`), the syscall MSRs are re-armed at each ring-3
+        // descent, dense CPU indices are unique by construction, the shared
+        // kernel-vmap is kept coherent by TLB shootdown, and the switch-out race
+        // is closed by the `on_cpu` guard. See the decision log (2026-07-01).
         pick_target_cpu(g, obj)
     };
     if g.ready[cpu].len() >= g.ready[cpu].capacity() {
@@ -2412,10 +2408,10 @@ fn steal_available(g: &SchedState, me: usize) -> bool {
 }
 
 /// `true` if the thread `obj` may be **stolen** to CPU `me`: its affinity includes
-/// `me` **and** it is a kernel thread. User threads are excluded — migrating an
-/// already-running user thread between CPUs is not yet safe (the `syscall_entry`
-/// per-CPU-stack hazard; see [`Thread::is_user`]), so they stay on their CPU and
-/// move only via spawn/wake placement, never by stealing.
+/// `me` and it is not still mid-switch-out. **User and kernel threads alike** are
+/// stealable — migrating an already-running user thread is safe now that its CR3 and
+/// per-CPU kernel-stack state are re-armed on every switch-in and the switch-out race
+/// is closed (see [`place_thread`] and the 3b fixes).
 ///
 /// # Safety
 /// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
@@ -2425,11 +2421,7 @@ unsafe fn stealable_to(obj: *mut (), me: usize) -> bool {
     // stale/garbage frame and double-run it. It stays on the victim's queue and
     // becomes stealable on the next round once the switch completes (the SMP
     // `on_cpu` invariant; see `Thread::on_cpu` / `switch_into`).
-    unsafe {
-        !Thread::is_user(obj)
-            && !Thread::is_on_cpu(obj)
-            && Thread::cpu_mask(obj) & (1 << me) != 0
-    }
+    unsafe { !Thread::is_on_cpu(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
 }
 
 /// Pick the next thread to run on this CPU: its own queue first, else **steal** from

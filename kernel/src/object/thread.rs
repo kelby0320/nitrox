@@ -534,19 +534,6 @@ impl Thread {
         unsafe { core::ptr::write(&raw mut (*p).cpu_mask, mask) }
     }
 
-    /// `true` for a **user** thread (one that descends to ring 3), `false` for a
-    /// kernel thread. The scheduler uses this to keep user threads off the
-    /// work-stealing path: migrating an already-running user thread between CPUs is
-    /// not yet safe (the `syscall_entry` per-CPU-stack hazard), whereas kernel
-    /// threads migrate freely.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn is_user(obj: *mut ()) -> bool {
-        let p = obj as *const Thread;
-        unsafe { (*p).user_entry.is_some() }
-    }
-
     /// Read the scheduler lifecycle state (production-reachable for the
     /// process-teardown sibling scan and the suspend/resume checks).
     ///

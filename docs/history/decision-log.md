@@ -5992,3 +5992,25 @@ unaffected. User-thread *migration* is still disabled (`stealable_to` excludes `
 `place_thread` pins new user threads to their creating CPU) — the hazards that blocked it are
 now all resolved, so re-enabling it is the next 3b step. Branch
 `phase-3/slice3b-tlb-shootdown`.
+
+### 2026-07-01 — Phase 3 slice 3b: user-thread migration enabled
+
+With the migration hazard fixed (above), user threads are now allowed to distribute across
+and migrate between CPUs. Two scheduler changes: `place_thread` places a newly spawned user
+thread on the least-loaded permitted CPU (`pick_target_cpu`) instead of pinning it to its
+creating CPU; `stealable_to` no longer excludes user threads (the `is_user` guard is gone, and
+`Thread::is_user` was removed as its last consumer). Correctness rests on the per-switch
+re-arm already present in `switch_into`: `resolve_root` (CR3) and `arm_kernel_stack_for`
+(TSS.RSP0 + syscall stack + KERNEL_GS_BASE) run for the incoming thread on every switch, so a
+user thread resuming on a different CPU always has that CPU's kernel-entry state pointed at its
+own stack; syscall MSRs are additionally re-armed at each ring-3 descent.
+
+Verified: -smp 4 KVM boot-loop 0/150 with userspace on the APs; a 50-boot scripted eshell
+stress (help / lsblk / mounts / cat /system/current-generation / cat /dev/log) 50/50 clean —
+user threads doing console + fs syscalls while migratable. -smp 1 unaffected; host
+test/check-arch green.
+
+Remaining for slice 3b: a cross-CPU deschedule IPI (so exit_process/kill can stop a sibling
+running on another CPU) and per-AddressSpace active_cpus (targeted shootdown). Neither is
+exercised yet — every userspace process is single-threaded — so they land with the first
+multi-threaded user process rather than as consumer-less infrastructure.
