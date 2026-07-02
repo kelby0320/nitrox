@@ -9,7 +9,10 @@ decision log (2026-05-29).
 Scope: the scheduling *policy* (classes, fairness), the *per-CPU* execution model,
 and the *SMP* primitives scheduling depends on (per-CPU data, IPIs, TLB shootdown).
 The mechanical AP-startup sequence is elaborated in the slice-1 work; this doc fixes
-the model it targets.
+the model it targets. For the **runtime SMP mechanics as built** — the exact
+boot-to-userspace sequence, the context switch, cross-CPU migration, work-stealing,
+the correctness invariants, and a postmortem of every bug the bring-up hit — see
+[smp.md](smp.md).
 
 ## Current state (single-CPU, pre-Phase-3)
 
@@ -237,8 +240,8 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 | **0** | This doc + the **per-CPU substrate**: `CPU0`→`CPUS[N]`, GS-based per-CPU block, neutral `current_cpu()` (RDTSCP), per-CPU scheduler `current`/`idle`, and lifting the ctx-0 handle grace-period shim. **Still single-CPU; no APs, no x2APIC, no IPIs.** | Boots exactly as today on the current QEMU; host tests for the per-CPU structures. |
 | **1** ✅ | **SMP bring-up** *(landed; correctness items → slice 3)*: Limine AP startup; per-CPU GDT/TSS + shared IDT; **x2APIC** (MSR accessors + single-`WRMSR` IPI); per-CPU timer; APs run a per-CPU idle thread and pull from the **shared** global runqueue. Fixed a per-CPU `reap` UAF. **Deferred to slice 3:** TLB shootdown + `active_cpus`, and **user-thread-migration safety**. | `-smp 4`: 4 CPUs online, APs executing, full userspace boot clean 6/6. |
 | **2** ✅ | **Scheduler classes** *(landed)*: `SchedClass` RealTime/TimeShared/Idle + `rt_priority`/`nice`/`vruntime` on `Thread`; class-aware `dequeue_front` (policy scan over the shared `ready`); CFS-like vruntime (nice-weight table + `min_vruntime` floor/wake-boost); kernel-thread `spawn_with_class`. **Deferred to the SysCaps slice:** the `REAL_TIME` gate + the user-facing `ThreadArgs` class/nice/affinity ABI (no capability system exists yet). | `sched_class_demo`: RealTime finishes before any TimeShared round; nice-0 outpaces nice-10. |
-| **3** ✅ | **Per-CPU runqueues + work stealing + affinity** *(landed)*: `ready`/`min_vruntime` per-CPU (one `SCHED` lock); placement (kernel → least-loaded, wake → home CPU); idle-CPU work stealing; `cpu_mask` affinity + functional `sys_thread_set_affinity`; online CPUs tracked by a `cpu_online[]` mask; `has_live_siblings` scans other CPUs' `current[]`. **User threads pinned to their creating CPU (never migrate)** — structurally avoids the `syscall_entry` UAF; kernel threads distribute. | distribution demo → all APs (`0b1111`); affinity demo → each worker on its pinned CPU; `-smp 4` 12/12 clean. |
-| **3b** | **SMP correctness completion**: TLB shootdown + per-`AddressSpace` `active_cpus`; cross-CPU deschedule IPI (so `exit_process` can stop a sibling running elsewhere); root-cause the `syscall_entry` per-CPU-stack hazard so **user threads may use the APs**. | Concurrent cross-CPU unmap stays coherent; a multi-threaded user process runs across CPUs under churn, clean. |
+| **3** ✅ | **Per-CPU runqueues + work stealing + affinity** *(landed)*: `ready`/`min_vruntime` per-CPU (one `SCHED` lock); placement (kernel → least-loaded, wake → home CPU); idle-CPU work stealing; `cpu_mask` affinity + functional `sys_thread_set_affinity`; online CPUs tracked by a `cpu_online[]` mask; `has_live_siblings` scans other CPUs' `current[]`. **User threads were pinned to their creating CPU here** (structurally dodging the migration hazards) — lifted in 3b. | distribution demo → all APs (`0b1111`); affinity demo → each worker on its pinned CPU; `-smp 4` 12/12 clean. |
+| **3b** ✅ | **SMP correctness completion** *(landed 2026-07-01)*: TLB shootdown (broadcast IPI + synchronous ack) for the shared kernel vmap; the migration hazards root-caused and fixed (SCE re-arm at descent, APIC-id dense index, the **`on_cpu` switch-out-race guard**, and the misplaced-`init_this_cpu` dense-index collision), so **user threads distribute across and migrate between CPUs**. See [smp.md](smp.md) for the full mechanics + bug postmortem. **Deferred** (no consumer yet): cross-CPU deschedule IPI + per-`AddressSpace` `active_cpus`, which land with the first multi-threaded user process. | `-smp 4` KVM boot-loop 0/150 with userspace on the APs; scripted `eshell` stress 50/50 clean. |
 
 ### Slice 0 in detail
 
@@ -306,7 +309,9 @@ shootdown that exercises it, so it moves to slice 1.
   spawn (e.g. a shell `renice`, a supervisor retuning a service, a thread self-elevating
   to RealTime) is a real but non-urgent case — added when a consumer needs it.
 
-See also: [overview.md](overview.md#scheduling),
+See also: [smp.md](smp.md) (runtime SMP mechanics + bug postmortem),
+[overview.md](overview.md#scheduling),
 [memory-management.md](memory-management.md) (TLB / address spaces),
 [deferred-decisions.md](../rationale/deferred-decisions.md) (x2APIC, TLB shootdown),
-decision log 2026-05-29 (scheduler staging) and 2026-06-26 (Phase 3 sequencing).
+decision log 2026-05-29 (scheduler staging), 2026-06-26 (Phase 3 sequencing), and
+2026-07-01 (slice 3b: migration hazard fixes + user-thread migration).
