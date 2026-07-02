@@ -1575,6 +1575,34 @@ are bisectable in isolation.
   on another CPU; root-cause the `syscall_entry` per-CPU-stack hazard so **user threads may
   migrate** (use the APs) safely. *Verify:* concurrent cross-CPU unmap stays coherent; a
   multi-threaded user process runs across CPUs and an aggressive churn stress test is clean.
+  - [x] **Hazard root-caused + two fixes landed** (2026-07-01): the migration hazard is a
+    bring-up timing race — a user thread running on a not-yet-fully-initialised CPU. Fixed
+    (a) **syscall MSRs re-armed at ring-3 descent** (`arm_user_entry_cpu_base`, the SCE
+    `#UD`), and (b) **dense CPU indices derived from the hardware APIC id**
+    (`bind_cpu_identity` / `adopt_dense_index`) so they're unique by construction (no
+    GDT/TSS/scheduler-slot collision). See the decision log (2026-07-01).
+  - [x] **TLB shootdown** (broadcast IPI + synchronous ack) — cross-CPU invalidation for the
+    shared kernel vmap, wired at the kstack free site (`KernelStack::Drop`). `crate::tlb`
+    (neutral coordinator) + `arch::send_shootdown_ipi` (transport, vector 0x40).
+  - [x] **Migration hazard fully fixed — KVM 0/150** (2026-07-01): two further root causes.
+    (a) **Switch-out race** — a stolen thread could resume from a not-yet-committed
+    `saved_sp`; fixed with a Linux-style `Thread::on_cpu` guard (set under `SCHED` in
+    `switch_into`, cleared by `context_switch` after committing `saved_sp`; `stealable_to`
+    skips guarded threads). (b) **Dense-index collision** — `init_this_cpu(0)` ran *after*
+    `bring_up_aps()` on the migratable boot thread, zeroing a migrated AP's TSC_AUX → dense-0
+    aliasing; moved before AP bring-up. Also fixed a pre-existing host-test SIGSEGV
+    (`flush_tlb_*` privileged ops now `#[cfg(test)]` no-ops). See the decision log.
+  - [x] **User-thread migration enabled** (2026-07-01): dropped the `is_user` exclusion in
+    `stealable_to` and the creating-CPU pin in `place_thread` — user threads now distribute
+    across the APs (least-loaded placement) and are work-stealable, relying on the per-switch
+    re-arm of CR3 + TSS.RSP0/syscall-stack/`KERNEL_GS_BASE` (`switch_into` →
+    `arm_kernel_stack_for`). *Verified:* `-smp 4` KVM boot-loop **0/150**; scripted `eshell`
+    interaction (`help`/`lsblk`/`mounts`/`cat …`) clean across a 50-boot stress batch with
+    userspace running on the APs. `Thread::is_user` removed (last consumer gone).
+  - [ ] Cross-CPU **deschedule IPI** + per-`AddressSpace` `active_cpus`. Not yet triggered:
+    every userspace process today is single-threaded, so `exit_process` never has a sibling
+    running on another CPU, and TLB shootdown broadcasts to all online CPUs (correct, if
+    unoptimised). Lands with the first multi-threaded user process.
 
 #### Service manager
 

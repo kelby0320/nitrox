@@ -16,6 +16,7 @@ pub mod serial;
 pub mod smp;
 pub mod syscall;
 pub mod timer;
+pub mod tlb;
 pub mod user_access;
 
 // CPU control (init_tables / init_protections / set_kernel_stack / halt_loop)

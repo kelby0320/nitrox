@@ -239,6 +239,20 @@ mod deadline {
 /// can be freed safely (CR3 is the boot root before the reap).
 static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 
+/// Lock-free bitmask of online CPUs (dense index → bit), a duplicate of the
+/// `SCHED`-guarded `cpu_online[]` kept purely so subsystems that must not take the
+/// top-rank `SCHED` lock can read the online set without a lock — notably TLB
+/// shootdown ([`crate::tlb`]), which fires from the mm layer under lower locks.
+/// Each CPU sets its own bit as it comes online; bits are never cleared (no
+/// CPU hot-unplug).
+static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+
+/// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
+/// Used by [`crate::tlb`] to pick TLB-shootdown IPI targets without taking `SCHED`.
+pub fn online_mask() -> u64 {
+    ONLINE_MASK.load(Ordering::Acquire)
+}
+
 /// The page-table root a thread should run under: its own process root if it
 /// has one, else the boot root. Caller holds the run-queue lock.
 ///
@@ -448,6 +462,7 @@ pub fn init() -> Result<(), AllocError> {
     let mut g = SCHED.lock();
     g.ready[0] = ready; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
     g.cpu_online[0] = true; // the BSP; each AP sets its own bit in `ap_init`.
+    ONLINE_MASK.fetch_or(1, Ordering::Release); // lock-free mirror (BSP = bit 0)
     g.blocked = blocked;
     g.suspended = suspended;
     g.reap[0] = reap;
@@ -519,6 +534,7 @@ fn ap_init() -> Result<(), AllocError> {
     // that reserved its queues, so no placement targets it before it is reserved).
     let cpu = SchedState::this_cpu();
     g.cpu_online[cpu] = true;
+    ONLINE_MASK.fetch_or(1 << cpu, Ordering::Release); // lock-free mirror
     Ok(())
 }
 
@@ -1472,6 +1488,7 @@ unsafe fn arm_kernel_stack_for(obj: *mut ()) {
 unsafe fn switch_into(
     g: IrqSpinLockGuard<'_, SchedState>,
     out_slot: *mut u64,
+    out_obj: *mut (),
     next_obj: *mut (),
 ) {
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
@@ -1482,6 +1499,16 @@ unsafe fn switch_into(
     // (cache-warm, minimal migration). SAFETY: `next_obj` pinned (now current); `SCHED`
     // still held.
     unsafe { Thread::set_last_cpu(next_obj, SchedState::this_cpu() as u8) };
+    // Raise the outgoing thread's mid-switch-out guard **while still holding
+    // `SCHED`** (so it is set before the lock release makes any `ready` entry
+    // for `out_obj` visible to a stealer). `context_switch` clears it after it
+    // commits `out_obj`'s `saved_sp`, at which point the parked context is valid
+    // to resume elsewhere. Prevents a cross-CPU steal from loading a not-yet-
+    // written `saved_sp` and double-running the thread (the SMP `on_cpu`
+    // invariant; see `Thread::on_cpu` and `steal_one`).
+    // SAFETY: `out_obj` is the pinned outgoing thread; `SCHED` still held.
+    unsafe { Thread::set_on_cpu(out_obj, true) };
+    let out_on_cpu = unsafe { Thread::on_cpu_ptr(out_obj) };
     // Drop the lock but keep interrupts masked across the switch. `saved_if`
     // is this thread's prior interrupt state, restored when it next resumes.
     let saved_if = g.release_keeping_irqs_masked();
@@ -1494,9 +1521,10 @@ unsafe fn switch_into(
     // before it is reaped (its `AddressSpace::Drop` may free the old PML4).
     unsafe { Paging::set_page_table(next_root) };
     // SAFETY: lock released; interrupts masked; `out_slot` points into the
-    // re-homed outgoing thread (pinned) and `next_sp` is the saved RSP of the
-    // now-current thread (pinned). Single-CPU: nothing else touches either.
-    unsafe { context_switch(out_slot, next_sp) };
+    // outgoing thread (pinned) and `next_sp` is the saved RSP of the now-current
+    // thread (pinned). `out_on_cpu` is the outgoing thread's guard byte, cleared
+    // by the switch once `out_slot` is committed.
+    unsafe { context_switch(out_slot, next_sp, out_on_cpu) };
     // Resumed (cooperative path): restore the interrupt state this thread had
     // on entry. On the preemptive path the resume returns into the timer-stub
     // epilogue (which `iretq`s IF back) and `saved_if` is false → no-op. A
@@ -1537,8 +1565,9 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     // Switch into `next`; we resume here (lock-free) when a waker moves us back
     // to `ready` and the scheduler later picks us.
     // SAFETY: `prev_slot` is the outgoing (now-`Blocked`, pinned-in-`blocked`)
-    // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
-    unsafe { switch_into(g, prev_slot, next_obj) };
+    // thread's saved-SP slot; `prev_obj`/`next_obj` are the pinned outgoing /
+    // incoming threads.
+    unsafe { switch_into(g, prev_slot, prev_obj, next_obj) };
 }
 
 /// Move a `Blocked` thread from `blocked` to `ready` (state `Ready`). Caller
@@ -1780,8 +1809,9 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
     *g.cur_slot() = Some(next);
 
     // SAFETY: `prev_slot` is the re-homed outgoing (now-`Ready`, pinned)
-    // thread's saved-SP slot; `next_obj` is the pinned incoming thread.
-    unsafe { switch_into(g, prev_slot, next_obj) };
+    // thread's saved-SP slot; `prev_obj`/`next_obj` are the pinned outgoing /
+    // incoming threads.
+    unsafe { switch_into(g, prev_slot, prev_obj, next_obj) };
 }
 
 /// The action a supervisor's `sys_exception_resume` requests for a thread
@@ -1847,10 +1877,16 @@ fn has_live_siblings(g: &SchedState, my_pid: u32) -> bool {
 /// and move its `ObjectRef` into `reap`. Caller holds `SCHED`.
 fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid: u32) {
     // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
-    while let Some(i) = list
-        .iter()
-        .position(|r| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid)
-    {
+    while let Some(i) = list.iter().position(|r| {
+        // SAFETY: `r` pins a live Thread; `SCHED` held.
+        let th = unsafe { &*(r.as_ptr() as *const Thread) };
+        // Never reap a per-CPU **idle** thread: it is scheduler infrastructure, not
+        // a sibling of the exiting process, and it may be *running right now* on
+        // another CPU (or this one) — reclaiming it frees a live kernel stack (a
+        // use-after-free `#DF`). Idle threads carry `owner_pid()==0`, so a `pid==0`
+        // exit would otherwise sweep them all up.
+        th.owner_pid() == my_pid && th.tid() != IDLE_TID
+    }) {
         let r = list.remove(i);
         // SAFETY: `r` pins the thread; `SCHED` held.
         unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
@@ -1868,10 +1904,12 @@ fn reap_blocked_matching(
     my_pid: u32,
 ) {
     // SAFETY (loop): each entry pins a live Thread; `SCHED` held.
-    while let Some(i) = blocked
-        .iter()
-        .position(|r| unsafe { &*(r.as_ptr() as *const Thread) }.owner_pid() == my_pid)
-    {
+    while let Some(i) = blocked.iter().position(|r| {
+        // SAFETY: `r` pins a live Thread; `SCHED` held.
+        let th = unsafe { &*(r.as_ptr() as *const Thread) };
+        // Never reap an idle thread (see `reap_matching`).
+        th.owner_pid() == my_pid && th.tid() != IDLE_TID
+    }) {
         let r = blocked.remove(i);
         let obj = r.as_ptr();
         // Unregister from every object this thread was waiting on, mirroring
@@ -1927,10 +1965,10 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     // boot root before this (parked-in-`reap`) thread is reaped — its
     // `AddressSpace::Drop` frees the PML4 CR3 would otherwise still reference.
     // SAFETY: `me_slot` is our own (now-`Exited`, pinned-in-`reap`) saved-SP
-    // slot — written by the switch and never read again; `next_obj` is the
+    // slot — written by the switch and never read again; `me_obj`/`next_obj` is the
     // pinned incoming thread. We never resume, so the restore inside
     // `switch_into` is never reached.
-    unsafe { switch_into(g, me_slot, next_obj) };
+    unsafe { switch_into(g, me_slot, me_obj, next_obj) };
     unreachable!("switched away from an exited thread");
 }
 
@@ -2117,8 +2155,9 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
         // Switch into `next`; we resume here when `sys_exception_resume` moves
         // us `suspended`→`ready` and the scheduler switches us in.
         // SAFETY: `me_slot` is our own (now-`Suspended`, pinned-in-`suspended`)
-        // saved-SP slot; `next_obj` is the pinned incoming thread.
-        unsafe { switch_into(g, me_slot, next_obj) };
+        // saved-SP slot; `me_obj`/`next_obj` are the pinned outgoing / incoming
+        // threads.
+        unsafe { switch_into(g, me_slot, me_obj, next_obj) };
     }
 
     // Read (and clear) the disposition the resume stored on us.
@@ -2307,19 +2346,20 @@ fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
 /// chosen queue is at its reserved capacity. Caller holds `SCHED`.
 fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), ObjectRef> {
     let obj = r.as_ptr();
-    // SAFETY: `obj` is a pinned Thread; `SCHED` held.
-    let user = unsafe { Thread::is_user(obj) };
     let cpu = if wake {
-        // A wake re-homes to the thread's home CPU (a user thread's home is the CPU it
-        // has always run on, so it never migrates; see below).
+        // A wake re-homes to the thread's home CPU (`last_cpu`) when possible —
+        // cache-warm, and it avoids a needless migration.
         pick_wake_cpu(g, obj)
-    } else if user {
-        // A **new user thread** is placed on its creating CPU and stays there: user
-        // threads never migrate between CPUs (the unresolved `syscall_entry` per-CPU
-        // stack hazard — deferred). Re-home keeps them put, wake returns them home,
-        // and stealing skips them. Kernel threads still distribute (least-loaded).
-        SchedState::this_cpu()
     } else {
+        // A newly spawned thread — **user or kernel** — is placed on the
+        // least-loaded permitted CPU, so userspace uses the APs from the start.
+        // Migrating an already-running user thread is now safe: its CR3 and
+        // per-CPU kernel-stack arming (TSS.RSP0 / syscall stack / `KERNEL_GS_BASE`)
+        // are re-established on every switch-in (`switch_into` → `resolve_root` +
+        // `arm_kernel_stack_for`), the syscall MSRs are re-armed at each ring-3
+        // descent, dense CPU indices are unique by construction, the shared
+        // kernel-vmap is kept coherent by TLB shootdown, and the switch-out race
+        // is closed by the `on_cpu` guard. See the decision log (2026-07-01).
         pick_target_cpu(g, obj)
     };
     if g.ready[cpu].len() >= g.ready[cpu].capacity() {
@@ -2368,15 +2408,20 @@ fn steal_available(g: &SchedState, me: usize) -> bool {
 }
 
 /// `true` if the thread `obj` may be **stolen** to CPU `me`: its affinity includes
-/// `me` **and** it is a kernel thread. User threads are excluded — migrating an
-/// already-running user thread between CPUs is not yet safe (the `syscall_entry`
-/// per-CPU-stack hazard; see [`Thread::is_user`]), so they stay on their CPU and
-/// move only via spawn/wake placement, never by stealing.
+/// `me` and it is not still mid-switch-out. **User and kernel threads alike** are
+/// stealable — migrating an already-running user thread is safe now that its CR3 and
+/// per-CPU kernel-stack state are re-armed on every switch-in and the switch-out race
+/// is closed (see [`place_thread`] and the 3b fixes).
 ///
 /// # Safety
 /// `obj` is a live, pinned `Thread`; the caller holds `SCHED`.
 unsafe fn stealable_to(obj: *mut (), me: usize) -> bool {
-    unsafe { !Thread::is_user(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
+    // Skip a thread still mid-switch-out on another CPU (`on_cpu` set): its
+    // parked `saved_sp` is not yet committed, so resuming it here would load a
+    // stale/garbage frame and double-run it. It stays on the victim's queue and
+    // becomes stealable on the next round once the switch completes (the SMP
+    // `on_cpu` invariant; see `Thread::on_cpu` / `switch_into`).
+    unsafe { !Thread::is_on_cpu(obj) && Thread::cpu_mask(obj) & (1 << me) != 0 }
 }
 
 /// Pick the next thread to run on this CPU: its own queue first, else **steal** from

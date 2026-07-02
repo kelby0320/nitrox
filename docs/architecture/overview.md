@@ -137,11 +137,11 @@ See: [IPC architecture](ipc.md), [notification format spec](../spec/notification
 
 ### Scheduling
 
-Three scheduling classes: RealTime (fixed priority, FIFO within priority, requires a syscap to use), TimeShared (CFS-like virtual-runtime fair scheduling, the default), Idle (per-CPU placeholder running `hlt`). Per-CPU runqueues with work stealing. Affinity placement on wake.
+Three scheduling classes: RealTime (fixed priority, FIFO within priority, requires a syscap to use), TimeShared (CFS-like virtual-runtime fair scheduling, the default), Idle (per-CPU placeholder running `hlt`). Per-CPU runqueues with work stealing and cross-CPU thread migration (user and kernel threads alike). Affinity placement on wake.
 
 The unified blocking primitive is `sys_wait` over a list of waitable handles. Threads do not block "inside" syscalls — every syscall that could block returns a `PendingOperation` handle, and the thread blocks on `sys_wait` of that (and possibly other) handles. This is the same primitive used for "wait for IPC message," "wait for child exit," "wait for timer," "wait for I/O completion." There is no `read(2)` that blocks.
 
-See: [scheduler architecture](scheduler.md), [why async-first syscalls](../rationale/why-async-syscalls.md).
+See: [scheduler architecture](scheduler.md), [SMP mechanics + migration/work-stealing](smp.md), [why async-first syscalls](../rationale/why-async-syscalls.md).
 
 ### Drivers and IRPs
 

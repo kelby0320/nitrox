@@ -152,6 +152,18 @@ pub fn arm_user_entry_cpu_base() {
     // SAFETY: architectural MSR; this CPU's `CpuLocal` slot is the block the entry
     // stub reaches through `gs:` after `swapgs`.
     unsafe { regs::wrmsr(MSR_KERNEL_GS_BASE, gs_base) };
+
+    // Guarantee this CPU's `syscall` fast-path MSRs are armed before it descends
+    // to ring 3. `init_syscall_entry` normally arms them once during bring-up, but
+    // under SMP a CPU could reach a user descent before its bring-up
+    // `init_syscall_entry` has taken effect (an AP running a user thread while not
+    // yet fully initialised); its first `syscall` would then `#UD` (`EFER.SCE=0`).
+    // The `rdmsr` is cheap and runs every descent; the full re-arm runs only in the
+    // (should-never-happen) unarmed case, so there is no steady-state cost.
+    // SAFETY: `rdmsr(EFER)` is architectural in ring 0.
+    if unsafe { regs::rdmsr(MSR_EFER) } & EFER_SCE == 0 {
+        init_syscall_entry();
+    }
 }
 
 /// Set the per-CPU kernel stack the `syscall` entry stub switches to. The

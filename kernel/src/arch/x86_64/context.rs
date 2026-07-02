@@ -107,20 +107,38 @@ const fn fabricated_sp(top: u64) -> u64 {
 /// [`fabricate_frame`] for a never-run thread). Returns to the caller only
 /// when some later switch selects the outgoing thread again.
 ///
-/// SysV AMD64: `rdi = prev_sp_slot`, `rsi = next_sp`.
+/// `prev_on_cpu` is a `*mut u8` at the outgoing thread's `on_cpu` guard (see
+/// [`Thread::on_cpu`](crate::object::Thread)). After the outgoing resume RSP is
+/// committed — and *only* then — this routine clears the guard to `0`,
+/// publishing "my parked context is now valid to resume". A stealer on another
+/// CPU spins/skips while the guard is set, so it can never load a half-written
+/// `saved_sp`. On x86's TSO the plain store ordering (sp-commit store, then
+/// guard-clear store) is a release with respect to the stealer's load, so no
+/// explicit fence is needed. `prev_on_cpu` may be null to skip the clear (a
+/// path whose outgoing thread is not re-enqueued anywhere a stealer can see —
+/// e.g. a thread parked in `blocked`/`reap`); today all callers pass it.
+///
+/// SysV AMD64: `rdi = prev_sp_slot`, `rsi = next_sp`, `rdx = prev_on_cpu`.
 ///
 /// # Safety
 /// `prev_sp_slot` must be a valid, writable `*mut u64` (the outgoing
-/// thread's `arch.rsp`), and `next_sp` must be the saved RSP of a thread
-/// whose stack holds a matching parked or fabricated frame. Passing
-/// anything else corrupts the stack and is undefined behaviour.
+/// thread's `arch.rsp`), `next_sp` must be the saved RSP of a thread
+/// whose stack holds a matching parked or fabricated frame, and
+/// `prev_on_cpu` must be null or a valid `*mut u8` at the outgoing thread's
+/// `on_cpu` byte. Passing anything else corrupts the stack and is undefined
+/// behaviour.
 #[unsafe(naked)]
-pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64) {
+pub unsafe extern "C" fn context_switch(
+    prev_sp_slot: *mut u64,
+    next_sp: u64,
+    prev_on_cpu: *mut u8,
+) {
     // SAFETY: naked — no prologue/epilogue; every register effect is
     // written explicitly. Reached only via a normal `call` from
     // `sched::yield_now`/`exit`, so on entry SysV holds: rdi is a live,
-    // writable `*mut u64` into the outgoing thread's `arch.rsp`, and rsi is
-    // the saved RSP of a live, refcount-pinned incoming thread. Caller-
+    // writable `*mut u64` into the outgoing thread's `arch.rsp`, rsi is
+    // the saved RSP of a live, refcount-pinned incoming thread, and rdx is
+    // null or a live `*mut u8` at the outgoing thread's `on_cpu` byte. Caller-
     // saved registers are already dead per the ABI; we preserve exactly the
     // six callee-saved registers by parking them on the outgoing stack and
     // restoring them from the incoming stack. The push order here MUST
@@ -135,6 +153,14 @@ pub unsafe extern "C" fn context_switch(prev_sp_slot: *mut u64, next_sp: u64) {
         "push r15",
         // Record the outgoing thread's resume RSP.
         "mov [rdi], rsp", // *prev_sp_slot = rsp
+        // Publish "parked context valid": clear the outgoing thread's on_cpu
+        // guard *after* the resume RSP is committed (TSO orders these stores),
+        // so a stealer that observes the clear also sees the final `saved_sp`.
+        // Skip if null.
+        "test rdx, rdx",
+        "jz 2f",
+        "mov byte ptr [rdx], 0", // *prev_on_cpu = 0
+        "2:",
         // Switch to the incoming thread's stack.
         "mov rsp, rsi", // rsp = next_sp
         // Restore the incoming thread's callee-saved registers (mirror of

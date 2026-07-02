@@ -78,6 +78,16 @@ pub use x86_64::smp::X86Smp as Smp;
 /// Per-CPU architecture bring-up for an application processor (run on the AP).
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::smp::ap_cpu_init;
+/// APIC-id-based dense-index assignment: the BSP binds each dense index to a
+/// hardware APIC id ([`bind_cpu_identity`]); each core adopts its own index by
+/// matching its APIC id ([`adopt_dense_index`]), so indices are unique by
+/// construction (no reliance on a handed-off value that could be stale/colliding).
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::smp::{adopt_dense_index, bind_cpu_identity};
+// TLB-shootdown transport: send the shootdown IPI to a dense CPU index, and the
+// vector it uses. The architecture-neutral coordinator lives in `crate::tlb`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::tlb::{TLB_SHOOTDOWN_VECTOR, send_shootdown_ipi};
 // `MAX_CPUS` (neutral) sizes the per-CPU arrays; re-exported as `crate::arch::MAX_CPUS`.
 pub use smp::MAX_CPUS;
 // `Timer` here is the *hardware* timer (monotonic time + the per-CPU countdown

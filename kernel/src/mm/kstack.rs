@@ -120,6 +120,11 @@ impl KernelStack {
             }
         }
 
+        // No shootdown on *install*: adding a mapping (not-present → present) needs
+        // no cross-CPU invalidation on x86 — the vmap VA is freshly allocated (no
+        // CPU has a cached translation for it), and the PD/PT are installed into
+        // the shared-by-reference vmap hierarchy, so every address space sees them.
+        // (Matches Linux, which shoots down only on unmap / permission-restrict.)
         Ok(KernelStack {
             top,
             base,
@@ -151,11 +156,20 @@ impl KernelStack {
 
 impl Drop for KernelStack {
     fn drop(&mut self) {
+        // Clear the PTEs first (do **not** free the frames yet).
         for i in 0..KERNEL_STACK_PAGES {
             let virt = VirtAddr::new(self.base.as_u64() + (i as u64) * (PAGE_SIZE as u64));
             // SAFETY: every page was mapped by `new` and lives in the
             // shared kernel vmap; unmap reverses the install.
             let _ = unsafe { Paging::unmap_page(self.root, virt) };
+        }
+        // Publish the cleared mappings to every CPU before the backing frames
+        // return to the allocator: these pages live in the **shared** kernel vmap,
+        // so another CPU could still hold a cached translation for them — it must
+        // drop it before the frame is recycled (else it would read/write, or
+        // deliver an exception onto, memory that now belongs to someone else).
+        crate::tlb::shootdown_all();
+        for i in 0..KERNEL_STACK_PAGES {
             heap::buddy_free(self.frames[i], 0);
         }
         // The vmap region (KERNEL_STACK_PAGES + 1 pages) is not

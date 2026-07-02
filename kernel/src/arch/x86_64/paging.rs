@@ -362,6 +362,7 @@ impl ArchPaging for X86Paging {
         }
     }
 
+    #[cfg(not(test))]
     unsafe fn flush_tlb_page(virt: VirtAddr) {
         // SAFETY: `invlpg` is a ring-0 instruction — the only ring the
         // kernel runs in. The caller owns the page-table change this
@@ -371,6 +372,14 @@ impl ArchPaging for X86Paging {
         }
     }
 
+    // Host tests run in ring 3, where `invlpg` `#GP`s; the page-table *memory*
+    // edits are what the tests exercise (via HHDM), and there is no TLB to flush
+    // under `cargo test`. Mirrors the `current_cpu`/`init_this_cpu` cfg(test)
+    // stubs in `smp.rs`.
+    #[cfg(test)]
+    unsafe fn flush_tlb_page(_virt: VirtAddr) {}
+
+    #[cfg(not(test))]
     unsafe fn flush_tlb_all() {
         // SAFETY: reloading CR3 with the value it already holds is sound
         // in ring 0; it leaves the active address space unchanged while
@@ -379,6 +388,10 @@ impl ArchPaging for X86Paging {
             regs::write_cr3(regs::read_cr3());
         }
     }
+
+    // Host-test stub: `mov cr3` is privileged (see `flush_tlb_page`).
+    #[cfg(test)]
+    unsafe fn flush_tlb_all() {}
 
     unsafe fn set_page_table(root: PhysAddr) {
         // SAFETY: forwarded to the caller — per `ArchPaging::set_page_table`

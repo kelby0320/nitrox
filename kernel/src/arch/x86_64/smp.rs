@@ -3,12 +3,77 @@
 //! per-CPU substrate is correct the moment APs run (slice 1). AP bring-up and the
 //! real IPI (the local-APIC ICR) land in slice 1.
 
-use crate::arch::smp::ArchSmp;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use crate::arch::smp::{ArchSmp, MAX_CPUS};
 use crate::arch::x86_64::regs;
 
 /// `IA32_TSC_AUX` — the CPU programs its dense logical index here at init;
 /// `RDTSCP`/`RDPID` read it back. Writing it does not affect the TSC.
 const MSR_TSC_AUX: u32 = 0xC000_0103;
+
+/// Sentinel for an unbound dense slot in [`DENSE_TO_APIC`].
+const APIC_UNSET: u32 = u32::MAX;
+
+/// Dense-index → hardware-APIC-id map. The BSP fills this once, before launching
+/// any AP, from Limine's CPU list ([`bind_cpu_identity`]); each core then adopts
+/// **its own** dense index by matching its hardware APIC id ([`adopt_dense_index`])
+/// rather than trusting a value handed to it. This makes dense indices unique and
+/// stable by construction — a core can never end up sharing another core's index
+/// (and thus its per-CPU GDT/TSS/scheduler slots), which is the failure mode a
+/// racy `extra_argument` / reset-default-0 scheme allowed.
+static DENSE_TO_APIC: [AtomicU32; MAX_CPUS] =
+    [const { AtomicU32::new(APIC_UNSET) }; MAX_CPUS];
+
+/// This core's hardware APIC id, read from `CPUID.01H:EBX[31:24]` (the initial
+/// xAPIC id). Available on every core from its first instruction — before x2APIC
+/// is enabled or `IA32_TSC_AUX` is set — and unique per core. Sufficient while
+/// `MAX_CPUS <= 255` (APIC ids fit in 8 bits); a >255-CPU system would read the
+/// 32-bit x2APIC id from `CPUID.0BH` instead.
+fn hw_apic_id() -> u32 {
+    let (_, ebx, _, _) = regs::cpuid(1, 0);
+    ebx >> 24
+}
+
+/// Bind dense index `dense` to hardware APIC id `apic`. Called by the BSP for every
+/// CPU (itself + each AP) **before** any AP is launched, so the map is fully
+/// populated when APs adopt their indices.
+pub fn bind_cpu_identity(dense: u32, apic: u32) {
+    if (dense as usize) < MAX_CPUS {
+        DENSE_TO_APIC[dense as usize].store(apic, Ordering::Release);
+    }
+}
+
+/// Set the running core's dense index in `IA32_TSC_AUX` by looking up its hardware
+/// APIC id in [`DENSE_TO_APIC`]. Returns the dense index, or `None` if this core's
+/// APIC id was never bound (a bring-up bug) — the caller must **not** run with a
+/// default/guessed index in that case, as it would collide with another core.
+pub fn adopt_dense_index() -> Option<u32> {
+    let apic = hw_apic_id();
+    for i in 0..MAX_CPUS {
+        if DENSE_TO_APIC[i].load(Ordering::Acquire) == apic {
+            // SAFETY: `IA32_TSC_AUX` is architectural; writing this core's dense
+            // index only sets what RDTSCP/RDPID return. Ring-0 wrmsr.
+            unsafe { regs::wrmsr(MSR_TSC_AUX, i as u64) };
+            return Some(i as u32);
+        }
+    }
+    None
+}
+
+/// The x2APIC id bound to dense index `cpu`, or `None` if out of range / unbound.
+/// Used by the TLB-shootdown transport ([`super::tlb::send_shootdown_ipi`]) to
+/// target a CPU by its dense index — reusing the same hardware-identity map that
+/// [`bind_cpu_identity`] populated at bring-up.
+pub(crate) fn apic_of_dense(cpu: usize) -> Option<u32> {
+    if cpu >= MAX_CPUS {
+        return None;
+    }
+    match DENSE_TO_APIC[cpu].load(Ordering::Acquire) {
+        APIC_UNSET => None,
+        apic => Some(apic),
+    }
+}
 
 /// The x86_64 [`ArchSmp`] implementation. Re-exported as `crate::arch::Smp`.
 pub struct X86Smp;

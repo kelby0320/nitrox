@@ -253,6 +253,26 @@ fn kernel_main() {
     // publishes the console char `DeviceNode` for `/dev/console`.
     nitrox_kernel::drivers::console::init();
 
+    // Establish the BSP's per-CPU identity (dense logical index 0) **before**
+    // the scheduler starts using `current_cpu()` and — critically — before any
+    // AP is online (`bring_up_aps`), so this runs while the boot thread is still
+    // pinned to the BSP. Doing it later (e.g. from `run_first_userspace`, after
+    // AP bring-up) is unsound: by then the boot thread can migrate onto an AP,
+    // and this `wrmsr(IA32_TSC_AUX, 0)` would overwrite *that* CPU's dense index
+    // with 0, aliasing it onto the BSP's per-CPU scheduler slots (`current[0]` /
+    // `idle[0]`) — a slot-sharing collision. Each AP sets its own index from
+    // hardware in `arch::adopt_dense_index` at bring-up.
+    {
+        use arch::smp::ArchSmp;
+        arch::Smp::init_this_cpu(0);
+        kprintln!(
+            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
+            arch::Smp::current_cpu(),
+            arch::Smp::cpu_count(),
+            arch::MAX_CPUS,
+        );
+    }
+
     // Bring up the cooperative scheduler and run a few kernel threads to
     // prove the context switch end-to-end: each worker prints and yields
     // round-robin, then exits; the boot thread drains the queue and
@@ -308,20 +328,28 @@ static AP_ONLINE: AtomicU32 = AtomicU32::new(0);
 
 /// Entry point for an application processor. Limine jumps each parked AP here
 /// (with a `*const SmpInfo` in `RDI`) once [`bring_up_aps`] writes its
-/// `goto_address`. Runs entirely on the AP: it reads the dense CPU index the BSP
-/// stored in `extra_argument`, brings up its per-CPU arch state + timer, then
+/// `goto_address`. Runs entirely on the AP: it adopts its dense CPU index by
+/// matching its hardware APIC id against the map the BSP built
+/// ([`arch::adopt_dense_index`]), brings up its per-CPU arch state + timer, then
 /// retires into the scheduler. Never returns.
-extern "C" fn ap_entry(info: *const SmpInfo) -> ! {
-    // SAFETY: Limine passes a valid 'static `SmpInfo` for this CPU; the BSP wrote
-    // `extra_argument` (our dense index) before the release store that launched us.
-    let idx = unsafe { (*info).extra_argument as u32 };
-
+extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
     // 1. Identity first — the per-CPU GDT/TSS, syscall block, and scheduler slots
-    //    all index off `current_cpu()`.
-    {
-        use arch::smp::ArchSmp;
-        arch::Smp::init_this_cpu(idx);
-    }
+    //    all index off `current_cpu()`. Adopt our dense index by matching our own
+    //    hardware APIC id against the map the BSP populated before launching us
+    //    (not a handed-off value that could be stale/colliding). Unique by
+    //    construction: only the BSP's APIC id maps to 0, and each AP to its own
+    //    non-zero index — so no core can share another's per-CPU slots.
+    let idx = match arch::adopt_dense_index() {
+        Some(i) => i,
+        None => {
+            // Our APIC id was never bound — a bring-up bug. Running with a
+            // default/guessed index would collide with another core's GDT/TSS/
+            // scheduler slots (the migration hazard). Park this core safely
+            // instead; the rest of the system continues without it.
+            use arch::cpu::ArchCpu;
+            arch::Cpu::halt_loop();
+        }
+    };
     // 2. Per-CPU arch bring-up: GDT/TSS, the shared IDT, NX/SMEP/SMAP, x2APIC, the
     //    syscall MSRs (`KERNEL_GS_BASE` → this CPU's block).
     arch::ap_cpu_init();
@@ -356,7 +384,13 @@ fn bring_up_aps() {
     let bsp = resp.bsp_lapic_id;
     let cap = arch::MAX_CPUS as u32;
 
-    let mut next_idx: u32 = 1; // 0 is the BSP (already index 0 via TSC_AUX).
+    // Bind the BSP's own dense index (0) to its APIC id so the map is complete and
+    // no AP can be assigned index 0. Each core later adopts *its own* index by
+    // matching its hardware APIC id (`arch::adopt_dense_index`), so indices are
+    // unique by construction — a core can never share another's per-CPU slots.
+    arch::bind_cpu_identity(0, bsp);
+
+    let mut next_idx: u32 = 1; // 0 is the BSP.
     for i in 0..total {
         // SAFETY: `cpus` points at `cpu_count` valid `*mut SmpInfo`.
         let info_ptr: *mut SmpInfo = unsafe { *resp.cpus.add(i as usize) };
@@ -371,11 +405,12 @@ fn bring_up_aps() {
         }
         let idx = next_idx;
         next_idx += 1;
-        // Hand the AP its dense index, then launch it: the release store to
-        // `goto_address` publishes both `extra_argument` and makes the parked AP
-        // jump to `ap_entry`.
-        // SAFETY: `extra_argument` is the kernel's to set; `info_ptr` is valid.
-        unsafe { (&raw mut (*info_ptr).extra_argument).write(idx as u64) };
+        // Bind this AP's dense index to its APIC id *before* launching it, so the
+        // AP finds its (own) entry when it adopts its index. The AP no longer
+        // trusts a handed-off `extra_argument`; it derives its index from hardware.
+        arch::bind_cpu_identity(idx, info.lapic_id);
+        // Launch the parked AP: the release store to `goto_address` makes it jump
+        // to `ap_entry` (and pairs with the AP's acquire of the identity map).
         info.goto_address
             .store(ap_entry as *const () as u64, Ordering::Release);
     }
@@ -712,20 +747,6 @@ fn run_first_userspace() {
     use nitrox_kernel::object::{
         Namespace, NotificationChannel, ObjectRef, Process,
     };
-
-    // Establish the BSP's per-CPU identity (logical index 0) so
-    // `arch::Smp::current_cpu()` reports it; each AP does the same at SMP
-    // bring-up (slice 1). See docs/architecture/scheduler.md §Per-CPU access.
-    {
-        use arch::smp::ArchSmp;
-        arch::Smp::init_this_cpu(0);
-        kprintln!(
-            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
-            arch::Smp::current_cpu(),
-            arch::Smp::cpu_count(),
-            arch::MAX_CPUS,
-        );
-    }
 
     // Arm the `syscall` entry MSRs once. The per-CPU kernel stack is set
     // per-thread (by the scheduler's `thread_enter`), not here.
