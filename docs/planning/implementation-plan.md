@@ -59,8 +59,16 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   `sys_thread_create` + supervised exception suspend/resume — closing the Phase 1
   milestone. Next: Phase 2 (ACPI, SMP, the filesystem + a real init/service
   manager, namespaces, and the async-I/O ring).
-- **Phase 2 (Filesystem and namespace):** not started
-- **Phase 3 (Service ecosystem):** not started
+- **Phase 2 (Filesystem and namespace):** **complete (2026-06-26)** — the
+  prerequisite band + slices 1–9 shipped; boots Limine → kernel/PCI → init → ext4
+  mount (userspace fs-server) → demand-paged reads → a live `eshell>`. Slice 10 (FAT,
+  read-only) deferred to Phase 3.
+- **Phase 3 (Service ecosystem):** **in progress** — the kernel-first band (slices
+  0–3b: per-CPU foundation, SMP bring-up, scheduler classes, per-CPU runqueues +
+  work-stealing + migration, TLB shootdown) is **done**, bar the cross-CPU deschedule
+  IPI (gated on the first multi-threaded user process). Next: the sequenced
+  **userspace-runtime band (slices 4–7)** — allocator → libos/libstream → SysCaps →
+  libos authority surface — then the service backlog. std deferred to Phase 4+.
 - **Phase 4+ (Shell, display, networking):** not started
 
 ---
@@ -1604,6 +1612,142 @@ are bisectable in isolation.
     running on another CPU, and TLB shootdown broadcasts to all online CPUs (correct, if
     unoptimised). Lands with the first multi-threaded user process.
 
+#### Userspace-runtime slices (sequenced)
+
+With the kernel-first band done, the next sequenced work is the **userspace
+runtime foundation** the services are built on. Sequencing rationale (decided
+2026-07-13 — see the decision log):
+
+- **Defer a real `std` port** (Phase 4+, unchanged). std is POSIX-shaped —
+  ambient-authority `fs`/`net`, synchronous blocking `io`, errno, signals,
+  `thread_local!` — none of which map onto Nitrox's capability + async-first +
+  no-signals model without either lying (reintroducing the Unix patterns the OS
+  rejects) or stubbing out half the surface. Its payoff (building *unmodified*
+  crates.io crates) isn't needed yet, and it sits on the syscall ABI, which is
+  explicitly pre-stabilization. Revisit once the ABI is stabilizing (v0.1+) and a
+  concrete external crate justifies it.
+- **Invest instead in Nitrox-native runtime libraries** (`libheap`/`libos`/
+  `libstream`, on `libkern`) that give services standard-Rust ergonomics (`alloc`
+  collections, `async` over `sys_wait`, typed streams) without the POSIX baggage.
+  Design their APIs std-shaped where it's free (e.g. an `io::Error`-shaped error
+  type) so a later std port is mostly re-exports over these libs, not a rewrite.
+  **No `librt` crate** — the Go-style fiber scheduler and a standalone sync-wrapper
+  crate were both cut (2026-07-13 decision log): in-process concurrency is `async`
+  tasks on the libos executor, and a fiber runtime would be a second, non-standard
+  concurrency model that fights a future `std` (`thread_local!`, `std::sync`) with no
+  capability upside; a sync-wrapper crate is just `std::io` and would be deprecated by
+  the port. The residual blocking convenience (`block_on`) folds into libos.
+- **Order by ABI coupling.** The syscall surface these libs wrap is mostly *solid*
+  today (handles, memory, `wait`, IPC, notifications, ns, `io_submit`, entropy);
+  the parts that will still move are **SysCaps** (unimplemented) and the
+  **`SpawnArgs`/`ThreadArgs`** growth (class/nice/affinity + syscap inheritance).
+  So wrap the solid core first, and hold the thread-spawn/authority-facing wrappers
+  until SysCaps + those ABIs finalize — the same ABI-stability discipline that
+  deferred std, applied one level down.
+- **Dogfood via init/eshell.** Each library's *first consumer* is init (and eshell)
+  — converting them de-hacks the existing critical-path code, validates the lib
+  against real code before any service depends on it, and honours the "no code
+  without a consumer" rule. Constraint: init is critical-path (no `panic!`/
+  `unwrap`); every conversion rides behind the existing gate — still boots to a
+  live `eshell>` and passes the scripted `help`/`lsblk`/`mounts`/`cat` stress.
+
+Net order: **allocator → libos core + libstream → SysCaps → the SysCaps-coupled
+libos authority surface → services.**
+
+- [x] **Slice 4 — Userspace allocator (freeing heap)** (2026-07-13). Replaced init's
+  bump-arena `#[global_allocator]` (which never frees) with a real freeing userspace
+  heap. Independent of the syscall-ABI churn ahead (it only consumes
+  `sys_memory_create`/`sys_memory_map`/`sys_memory_unmap`), so it led.
+  - [x] `userspace/libheap/` crate — a `GlobalAlloc` over `MemoryObject` backing
+    (grows on demand by mapping 64 KiB arenas, vs init's fixed arena): segregated
+    size-class freelists (16–2048 B, no coalescing) + a dedicated-mapping large path
+    (unmap + close on free). `#![no_std]` + core; the [`HeapEngine`] is generic over
+    an `ArenaSource` so the logic is host-tested (9 tests) with a `std`-backed source.
+  - [x] **Design doc** `docs/architecture/libheap.md` (done 2026-07-13) — backing
+    model (multi-arena over `MemoryObject`s), size-class-over-slabs structure, the
+    engine/registration split (std-port seam), reclamation policy, init cutover.
+  - [x] Freelist guarded by a userspace spinlock (single-threaded per process today,
+    but a real lock so future std OS-threads are correct without a redesign). No
+    FPU/TLS dependency.
+  - [x] **First (and only) consumer:** init drops its bump `#[global_allocator]` and
+    uses `libheap`; its `heap.rs` is retired. (eshell needs **no** allocator — it's
+    `no_std` without `alloc`, fixed buffers — so there was nothing to migrate there.)
+  - *Verified:* 9 libheap host tests (alloc/free/realloc-via-default/alignment/reuse/
+    multi-arena grow/large path); full host suite + check-arch green; bare build clean;
+    QEMU boots init's allocation-heavy bootstrap on libheap → ext4 mount → parent demo
+    chain → `eshell`, with scripted `help`/`lsblk`/`mounts`/`cat` all correct; `-smp 4`
+    clean (4 CPUs, no faults). See the decision log (2026-07-13).
+
+- [ ] **Slice 5 — `libos` core + `libstream` (the SysCaps-independent runtime).**
+  Wraps only the *solid* syscall surface; explicitly excludes the thread-spawn /
+  authority pieces (slices 6–7).
+  - [ ] **Design docs** `docs/architecture/libos.md` + `libstream.md` (new) —
+    written at slice start; std-shaped API surface (`io::Error`-shaped errors,
+    `std::io`-shaped byte traits) so a future std facade re-exports rather than
+    adapts; the centralized-thin-entry glue (the std `lang_start` cutover seam).
+  - [ ] `userspace/libos/` (core): `Handle<T, M>` typestate wrappers over handles,
+    memory, notifications, IPC channels, namespace, entropy, and `io_submit`; an
+    **async executor over `sys_wait`** (single-threaded, poll-based; a
+    `PendingOperation` is the core future). Error type shaped like `std::io::Error`
+    for a cheap future std facade.
+  - [ ] Minimal **blocking convenience** in libos: a `block_on(future)` + a few
+    blocking helper methods, for sequential callers (init-style bootstrap) that don't
+    want an executor. Explicitly a **pre-std ergonomic superseded by `std::io`** once
+    std lands — kept small and self-contained, not a separate crate. (This is the
+    residue of the cut librt crate — see the 2026-07-13 decision log.)
+  - [ ] `userspace/libstream/`: `TableWriter`/`TableReader`, `record_read`,
+    `#[derive(TypedRecord)]`, initial types per
+    [docs/spec/typed-stream-format.md](../spec/typed-stream-format.md).
+  - [ ] **First consumers:** migrate init + eshell onto the libos handle wrappers +
+    executor; eshell's `io_submit` line-editor loop becomes a libstream/libos client.
+  - **Scope boundary:** no `thread_create`/`process_spawn` wrappers and no syscap-gated
+    calls — those wrap ABIs that finalize in slices 6–7.
+  - *Verify:* host tests for the executor + typed-stream codec; init/eshell boot +
+    scripted stress green on the new stack.
+
+- [ ] **Slice 6 — SysCaps (process-level capabilities).** **Scope stub now; full
+    design doc written at slice start** (after slice 5 — building libos/libstream
+    surfaces which authorities the services actually need, so the syscap set isn't
+    guessed). The kernel's *defining* feature still missing: authority currently
+    faked with handle `Rights` stand-ins (`SIGNAL` for affinity, `BIND` for ns-bind).
+  - [ ] `docs/architecture/syscaps.md` (new) — the capability model: the syscap set
+    + numbering, storage/encoding on `Process`, the grant/attenuate-on-spawn model
+    (no ambient authority — a process holds exactly what it was granted; children get
+    a subset), and the syscall-entry check points.
+  - [ ] Kernel `SysCaps` type on `Process`, checked at the gates that today fake it:
+    `BIND_NAMESPACE` (ns_bind), `REAL_TIME` (RT scheduling class + priority),
+    affinity, `AUDIT_CONTROL`, and spawn-time capability inheritance.
+  - [ ] **Finalize the deferred `ThreadArgs` ABI** (class/nice/affinity + the
+    `REAL_TIME` gate — deferred *to this slice* by slice 2) and the **`SpawnArgs`**
+    syscap-inheritance fields. **ABI-hash affecting** (`SpawnArgs`/`ThreadArgs`
+    layouts) — a deliberate bump.
+  - [ ] Supervisor (init/service-mgr) distributes syscaps at spawn.
+  - *Verify:* gates enforced (no `BIND_NAMESPACE` → ns_bind rejected; RT class
+    rejected without `REAL_TIME`); boots to `eshell`; host tests for grant/attenuate.
+
+- [ ] **Slice 7 — the SysCaps-coupled libos surface.** The libos pieces held back
+    from slice 5, now that SysCaps + `ThreadArgs`/`SpawnArgs` are settled. (No `librt`
+    crate — the fiber scheduler and the sync-convenience crate were cut; see the
+    2026-07-13 decision log. In-process concurrency is `async` tasks on the libos
+    executor; blocking convenience is the small `block_on` in libos, slice 5.)
+  - [ ] libos thread/spawn/authority wrappers: `thread_create` with the finalized
+    `ThreadArgs`, `process_spawn` with syscap grants, affinity, the syscap-gated calls
+    — extends the libos design doc (slice 5) rather than a new crate/doc.
+  - [ ] **First consumers:** init/service-mgr use the libos spawn + syscap-grant API.
+  - **Kernel dependency:** true kernel-thread-backed parallelism (real `std::thread`
+    semantics, multicore *within* a process) needs the deferred **TLS (`FS_BASE` /
+    `sys_thread_set_tls`) + FPU `XSAVE`** kernel work (Phase 1 deferrals, still
+    consumer-gated). Not needed here: `async` tasks on the single-threaded executor
+    cover in-process concurrency, so schedule that kernel slice only when a service
+    genuinely needs OS-thread parallelism or hard-float.
+  - *Verify:* host tests for the spawn/authority wrappers; init spawns a child with
+    attenuated syscaps.
+
+The **service backlog below** (service-mgr, profile server, content store, logging,
+audit, other daemons, auth/session, fs-server RW) stays **unsequenced** and is sliced
+just-in-time as before — but service-mgr and everything after now depend on slices
+4–7. Auth/session in particular must not precede SysCaps (slice 6).
+
 #### Service manager
 
 - [ ] `userspace/service-mgr/` crate
@@ -1616,18 +1760,14 @@ are bisectable in isolation.
 
 #### Runtime libraries (full versions)
 
-- [ ] `userspace/libos/` crate
-  - [ ] `Handle<T, M>` with typestate
-  - [ ] Async executor over `sys_wait`
-  - [ ] All kernel object types wrapped
-- [ ] `userspace/librt/` crate
-  - [ ] Synchronous wrappers
-  - [ ] Fiber scheduler (Go-style)
-- [ ] `userspace/libstream/` crate
-  - [ ] `TableWriter`, `TableReader`
-  - [ ] `record_read`
-  - [ ] `#[derive(TypedRecord)]` proc macro
-  - [ ] Initial supported types per [docs/spec/typed-stream-format.md]
+> **Sequenced above.** `libheap`/`libos`/`libstream` are now the sequenced **slices
+> 4, 5, and 7** (see "Userspace-runtime slices"). The split: `libheap` (slice 4) +
+> libos core & libstream (slice 5, SysCaps-independent) land before SysCaps; the
+> thread-spawn/authority-facing libos surface (slice 7) lands after. **`librt` was
+> cut** — no fiber scheduler (async tasks on the libos executor cover in-process
+> concurrency) and no standalone sync-wrapper crate (that's `std::io`, deprecated by
+> the eventual std port); see the 2026-07-13 decision log. The checklists live in
+> those slices; this section is retained only as the map entry `overview.md` links to.
 
 #### Profile server
 
@@ -1772,6 +1912,16 @@ transforming fs-servers, which have no LBA mapping.) See the decision log
 - [ ] First aarch64 target system identified
 
 ### std port
+
+> **Affirmatively deferred (2026-07-13).** Reconsidered at the start of the Phase 3
+> userspace-runtime work and kept here, not pulled forward. std is POSIX-shaped
+> (ambient-authority `fs`/`net`, synchronous blocking `io`, errno, signals,
+> `thread_local!`) and sits on the syscall ABI, which is pre-stabilization; a
+> faithful port would either reintroduce the Unix patterns Nitrox rejects or stub
+> half its surface. The near-term ergonomic win comes from the Nitrox-native runtime
+> libraries (Phase 3 slices 4–7) instead. Revisit once the ABI is stabilizing and a
+> concrete unmodified external crate justifies the cost. See the decision log
+> (2026-07-13).
 
 - [ ] Syscall ABI stable enough to commit to
 - [ ] `std::fs`, `std::thread`, `std::net`, `std::sync`, `std::io` implementations

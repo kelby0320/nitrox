@@ -19,7 +19,8 @@ Init is deliberately minimal. It is the most critical-path code in the system. A
 ## Build environment
 
 - **`#![no_std]` + `alloc`** — same as other userspace
-- **Uses `libkern` + `alloc` directly. Does NOT depend on `libos`, `librt`, `libstream`, or `librsproto`.**
+- **Uses `libkern` + `alloc` directly. Does NOT depend on `libos`, `libstream`, or `librsproto`.** (`librt` no longer exists.)
+- **Depends on `libheap`** for its `#[global_allocator]` (the freeing heap; slice 4). This is the one runtime library init uses — it's a foundation alongside `libkern` (no_std, no services, no unbounded behavior), so it's compatible with init's critical-path rules. init's former fixed bump arena (`heap.rs`) is retired.
 - **Stable Rust only.**
 
 The "no libos/librt" rule is unusual and important. Init runs before the rest of the runtime ecosystem is functional. It can't depend on anything that might want to allocate during initialization, register handlers, or rely on services that haven't started yet. It works directly with the syscall surface.
@@ -113,7 +114,7 @@ Don't add complex testing scaffolding to init itself. Keep it minimal.
 
 ## Forbidden patterns
 
-- Depending on `libos`, `librt`, `libstream`, or `librsproto`
+- Depending on `libos`, `libstream`, or `librsproto` (but `libheap`, the allocator, is fine)
 - `panic!()` outside of explicitly-unrecoverable error paths
 - `unwrap()` without `// unwrap: <reason>`
 - Unbounded loops, unbounded allocation, unbounded waiting

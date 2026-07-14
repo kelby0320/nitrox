@@ -40,7 +40,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │   Resource servers (fs-servers, netstack, etc.)                 │
 │   Init (PID 1)                                                  │
 │                                                                 │
-│   Runtime libraries: libos, librt, libstream, librsproto        │
+│   Runtime libraries: libheap, libos, libstream, librsproto      │
 │   Raw syscall layer:  libkern                                   │
 └────────────────────────────────────┬────────────────────────────┘
                                      │ syscall boundary (~30 syscalls)
@@ -65,7 +65,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 
 The kernel is small — it provides mechanism, not policy. Filesystems, network stacks, package management, the display system, and the shell are all userspace. The kernel's job is to implement handles, namespaces, memory, IPC, scheduling, and the IRP-based driver framework, plus enough in-kernel resource servers to bootstrap userspace. Beyond that, everything is a process.
 
-The userspace side has its own structure. Init is minimal — it bootstraps the system from the initramfs and hands off to the service manager. The service manager supervises the running services. Resource servers (filesystem drivers, network stack, device-specific servers) are ordinary userspace processes that speak a standard protocol. Applications use a layered runtime: `libkern` for raw syscalls, `libos` for typed handles and async I/O, `librt` for synchronous wrappers, `libstream` for typed structured I/O, `librsproto` for the resource server protocol.
+The userspace side has its own structure. Init is minimal — it bootstraps the system from the initramfs and hands off to the service manager. The service manager supervises the running services. Resource servers (filesystem drivers, network stack, device-specific servers) are ordinary userspace processes that speak a standard protocol. Applications use a layered runtime: `libkern` for raw syscalls, `libheap` for the heap allocator, `libos` for typed handles and async I/O (with a small `block_on` for sequential callers), `libstream` for typed structured I/O, `librsproto` for the resource server protocol.
 
 ## The major kernel concepts
 
@@ -193,15 +193,18 @@ See: [init and service management architecture](init-and-services.md), [service.
 
 ### Runtime libraries
 
-Five crates, layered:
+Five crates, layered. Each has (or will have) a design doc under `docs/architecture/`,
+sliced in just-in-time as the crate is built:
 
 - **libkern**: raw syscall wrappers, `#![no_std]`, no `alloc`. ABI types and unsafe `extern` declarations. Used directly by early services (init, fs-servers, eshell).
-- **libos**: typed `Handle<T, M>`, async executor built on `sys_wait`. Provides the type-system enforcement of access modes.
-- **librt**: synchronous and fiber-based wrappers for code that prefers blocking semantics. Built on libos.
+- **libheap**: the freeing userspace heap — the `#[global_allocator]` backing `alloc`. `#![no_std]`, no `alloc` (it provides it). See [libheap.md](libheap.md).
+- **libos**: typed `Handle<T, M>`, async executor built on `sys_wait`, and the type-system enforcement of access modes. In-process concurrency is `async` tasks on the single-threaded executor; a small `block_on` covers sequential callers. (Real OS threads — `std::thread` semantics — wait on the deferred kernel TLS/FPU work and land only when a workload needs multicore *within* a process.)
 - **libstream**: typed structured I/O, `#[derive(TypedRecord)]` procedural macro for automatic schema derivation, table reading and writing.
 - **librsproto**: the resource server wire protocol — message envelope, version negotiation, operation dispatch.
 
-A future `std` port will eventually provide `std::fs`, `std::thread`, `std::net` over the native handle-based interface, enabling the broader Rust ecosystem.
+There is deliberately **no `librt` / green-thread crate.** A Go-style fiber scheduler was considered and rejected: it adds no concurrency the `async` executor doesn't already provide (both multiplex over `sys_wait`), only a blocking-style syntax, while introducing a second non-standard concurrency runtime that fights a future `std` the same way `async` does (`thread_local!`, `std::sync`) with no upside — and Rust itself removed green threads pre-1.0 for these reasons. See the decision log (2026-07-13).
+
+A future `std` port will eventually provide `std::fs`, `std::thread`, `std::net` over the native handle-based interface, enabling the broader Rust ecosystem — deferred until the syscall ABI is stabilizing (see the implementation plan's Phase 4+ std-port note). It is built **on top of** these libraries, not as a separate reimplementation: only std's per-OS platform layer (`std::sys`) is written for Nitrox, and it forwards to the native stack. The libraries sort by how they relate to that port — some **feed the pal** (survive *below* std: libkern's syscall floor, libheap's allocator engine, libos's wait/notification plumbing), and some **provide what std never will** (survive *beside* std: libos's async runtime, libstream's typed I/O, librsproto). A crate that does neither — that std simply supersedes — is a stopgap and is not built as a durable library (this is why there is no standalone sync-wrapper crate: that role is `std::io`). Beyond the POSIX-semantics mismatch (ambient authority, synchronous I/O, signals), the port's main structural task is that `std` wants to *own* the process singletons — the global allocator, the entry point, the panic runtime, and TLS — which the native libraries also provide; the libraries are therefore built so those singletons are **swappable engines `std::sys` can adopt** rather than hard-wired statics (e.g. libheap's engine/registration split). The panic strategy stays `panic = "abort"` across the port.
 
 See: [userspace runtime architecture](userspace-runtime.md).
 

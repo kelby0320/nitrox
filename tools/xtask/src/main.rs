@@ -345,8 +345,18 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
-    // init's library tests (the bump-allocator math; `toml_lite` in Part 4). `--lib`
-    // skips the `#![no_main]` bin, which can't build for the host.
+    // `libheap` host tests (the freeing allocator engine, exercised through a
+    // `std`-backed arena source). A plain lib (no bare-target bin), host-tested like
+    // `libkern`; the target `SyscallSource` is `cfg`'d out under `test`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libheap")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // init's library tests (the `manifest` + `toml_lite` parsers). `--lib` skips the
+    // `#![no_main]` bin, which can't build for the host.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")

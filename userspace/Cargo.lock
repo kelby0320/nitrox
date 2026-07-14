@@ -35,6 +35,14 @@ dependencies = [
 name = "init"
 version = "0.1.0"
 dependencies = [
+ "libheap",
+ "libkern",
+]
+
+[[package]]
+name = "libheap"
+version = "0.1.0"
+dependencies = [
  "libkern",
 ]
 

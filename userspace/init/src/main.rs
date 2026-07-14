@@ -25,12 +25,14 @@ extern crate alloc;
 
 use alloc::vec::Vec;
 use core::arch::asm;
-use init::heap::BumpAlloc;
 use init::manifest::{self, Mode, MountSpec};
 use libkern::*;
 
+// The freeing userspace heap (slice 4). Replaces init's former fixed bump arena,
+// which never freed — fine for init's one-shot bootstrap, but init is now the first
+// consumer of the real allocator (`docs/architecture/libheap.md`).
 #[global_allocator]
-static ALLOC: BumpAlloc = BumpAlloc;
+static ALLOC: libheap::Heap = libheap::Heap;
 
 /// One page; init.toml is assumed to fit (true for the bootstrapping manifest).
 const PAGE: u64 = 4096;
