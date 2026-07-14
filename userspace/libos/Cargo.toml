@@ -1,0 +1,12 @@
+[package]
+name = "libos"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The raw syscall surface + ABI types. libos is the typed/async layer over it.
+libkern = { path = "../libkern" }
+
+[lib]
+name = "libos"
+path = "src/lib.rs"

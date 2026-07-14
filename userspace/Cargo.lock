@@ -51,6 +51,13 @@ name = "libkern"
 version = "0.1.0"
 
 [[package]]
+name = "libos"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
 name = "librsproto"
 version = "0.1.0"
 
