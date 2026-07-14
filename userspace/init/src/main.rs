@@ -78,6 +78,7 @@ static mut SPAWN_FS: SpawnArgs = SpawnArgs {
 /// init's root namespace (so parent can resolve the kernel servers but not bind
 /// into init's root — it constructs its own namespaces for its children, which is
 /// why init grants it `BIND_NAMESPACE`).
+#[cfg(feature = "selftest")]
 static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
     image: IMAGE_PARENT,
     handle_count: 0,
@@ -443,11 +444,13 @@ fn read_current_generation(root_ns: u64) {
 /// (Was 64 pages; trimmed to 8 because each page demand-faults through the
 /// stateless fs-server fill at ~325 ms/page under QEMU — read-ahead is a Phase-3
 /// item, see docs/rationale/deferred-decisions.md.)
+#[cfg(feature = "selftest")]
 const LARGE_FILE_BYTES: usize = 32 * 1024;
 
 /// The expected byte at file offset `i` of `/system/large.bin` — position-sensitive
 /// (the page index `i >> 12` in the high part) so a mis-faulted page is detected.
 /// MUST match the xtask generator.
+#[cfg(feature = "selftest")]
 fn fill_byte(i: usize) -> u8 {
     (((i >> 12) ^ i) & 0xFF) as u8
 }
@@ -457,6 +460,7 @@ fn fill_byte(i: usize) -> u8 {
 /// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
 /// the position-sensitive content (so a mis-filled / mis-ordered page is caught) and
 /// log the result. Proves **multi-page demand faulting** past the old 64 KiB cap.
+#[cfg(feature = "selftest")]
 fn read_large_file(root_ns: u64) {
     let (st, fh) = ns_lookup_wait(root_ns, b"/system/large.bin", RIGHT_MAP_READ);
     if st != 0 || fh == 0 {
@@ -517,23 +521,27 @@ fn spawn_eshell() {
     }
 }
 
-/// The **healthy** supervise path: run the Phase-1/2 demo chain (`parent`) to
-/// completion FIRST, *then* launch the interactive shell. They share the
-/// single-outstanding-command disk and the serial console, so overlapping them
-/// corrupts the fs-server's reads (eshell `cat` fails intermittently) and clutters
-/// the console. eshell is launched once `parent` exits (in [`reap_loop`]) — clean
-/// console, exclusive disk.
+/// The healthy supervise path. **Under `selftest`**, run the Phase-1/2 demo chain
+/// (`parent`) to completion FIRST, then launch the interactive shell — they share the
+/// single-outstanding-command disk and the serial console, so overlapping them corrupts
+/// the fs-server's reads and clutters the console; eshell is launched once `parent`
+/// reaps (in [`reap_loop`]). **Normally**, launch the interactive console directly.
+/// (When the service manager lands, the normal path spawns *it* here instead.)
 fn supervise(notif: u64) -> ! {
-    kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
-    // SAFETY: SPAWN_PARENT is a valid writable arg block.
-    let parent_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_PARENT) as u64) };
-    if parent_h < 0 {
+    #[cfg(feature = "selftest")]
+    {
+        kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
+        // SAFETY: SPAWN_PARENT is a valid writable arg block.
+        let parent_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_PARENT) as u64) };
+        if parent_h >= 0 {
+            // reap_loop launches eshell once `parent` (the only exiting child) reaps.
+            reap_loop(notif, parent_h);
+        }
         kprint(b"init: parent spawn FAIL\n");
-        spawn_eshell(); // no demo to wait for — launch the console now
-        reap_loop(notif, 0);
     }
-    // `reap_loop` launches eshell once `parent` (the only exiting child) reaps.
-    reap_loop(notif, parent_h);
+    // Normal boot (and the selftest parent-spawn-failure fallback): the console now.
+    spawn_eshell();
+    reap_loop(notif, 0);
 }
 
 /// The **emergency** path: a critical-path boot failure (bad manifest, failed
@@ -631,8 +639,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     }
 
     read_current_generation(root_ns);
-    // Slice-8 Part-5 milestone: a large file read entirely through the page cache —
-    // many demand faults, each a `File::ReadRange` to the fs-server.
+    // Slice-8 Part-5 milestone (selftest): a large file read entirely through the page
+    // cache — many demand faults, each a `File::ReadRange` to the fs-server.
+    #[cfg(feature = "selftest")]
     read_large_file(root_ns);
     supervise(notif);
 }

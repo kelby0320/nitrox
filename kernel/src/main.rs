@@ -20,8 +20,17 @@
 use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
+// The arch abstraction's traits are brought into scope module-wide: their methods
+// (`arch::Irq::init()`, `arch::Timer::start_periodic()`, …) are called across the boot
+// functions here (`kernel_main`, `sched_bringup`, `ap_entry`). Method resolution is by
+// receiver type, so importing them together is unambiguous.
 use nitrox_kernel::arch::cpu::ArchCpu;
+use nitrox_kernel::arch::irq::ArchIrq;
+use nitrox_kernel::arch::irq_router::ArchIrqRouter;
 use nitrox_kernel::arch::paging::ArchPaging;
+use nitrox_kernel::arch::platform::ArchPlatform;
+use nitrox_kernel::arch::smp::ArchSmp;
+use nitrox_kernel::arch::timer::ArchTimer;
 use nitrox_kernel::dpc;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::kprintln;
@@ -33,6 +42,11 @@ use nitrox_kernel::mm;
 use nitrox_kernel::sched;
 
 use core::sync::atomic::{AtomicU32, Ordering};
+
+/// Boot-time self-tests and demos — compiled only under the `selftest` feature. A
+/// normal `cargo xtask qemu` boots straight to userspace; `--selftest` runs them.
+#[cfg(feature = "selftest")]
+mod boot_selftest;
 
 // --- Limine request statics ---------------------------------------------
 //
@@ -132,7 +146,8 @@ fn kernel_main() {
     // PML4 template every future `AddressSpace::new` will inherit
     // from; it must run before any AS is constructed.
     paging_init();
-    paging_smoke_test();
+    #[cfg(feature = "selftest")]
+    boot_selftest::paging();
 
     // Record the Limine-loaded initramfs module (if any) so the `/initramfs`
     // resource server can serve it. Needs the HHDM (the module's `address` is an
@@ -145,28 +160,22 @@ fn kernel_main() {
     // runs after the allocator/HHDM are up; before the local controller so the
     // future IOAPIC step can consume the cached routing facts. Missing or
     // malformed tables are logged, not fatal, and the parser logs its summary.
-    {
-        use arch::platform::ArchPlatform;
-        // SAFETY: ring 0, single CPU, called once during boot after the HHDM is
-        // available; reads firmware-owned physical memory, no allocation.
-        let _ = unsafe { arch::Platform::init() };
-    }
+    // SAFETY: ring 0, single CPU, called once during boot after the HHDM is
+    // available; reads firmware-owned physical memory, no allocation.
+    let _ = unsafe { arch::Platform::init() };
 
     // Bring up this CPU's local interrupt controller (xAPIC). Interrupts
     // stay masked (IF=0) for this whole slice — nothing is delivered yet; the
     // timer source lands with the Timers slice and the spurious/timer IDT
     // stubs + IF=1 with the preemptive-scheduling slice.
-    {
-        use arch::irq::ArchIrq;
-        // SAFETY: ring 0, single CPU, called once during boot after CPU
-        // feature enablement and after the kernel-vmap allocator is up; IF is
-        // 0, so software-enabling the controller delivers nothing.
-        if unsafe { arch::Irq::init() }.is_err() {
-            kprintln!("local APIC bring-up failed — halting");
-            return;
-        }
-        kprintln!("local APIC up (x2APIC, id {})", arch::Irq::id());
+    // SAFETY: ring 0, single CPU, called once during boot after CPU
+    // feature enablement and after the kernel-vmap allocator is up; IF is
+    // 0, so software-enabling the controller delivers nothing.
+    if unsafe { arch::Irq::init() }.is_err() {
+        kprintln!("local APIC bring-up failed — halting");
+        return;
     }
+    kprintln!("local APIC up (x2APIC, id {})", arch::Irq::id());
 
     // Calibrate the monotonic time source (TSC) and the per-CPU timer (LAPIC
     // timer) against the legacy PIT. Must follow Irq::init — the local
@@ -174,18 +183,15 @@ fn kernel_main() {
     // Interrupts stay masked (IF=0): the timer is calibrated and armable, but
     // fires nothing this slice (the periodic tick lands with preemptive
     // scheduling, one-shot deadlines with wait queues).
-    {
-        use arch::timer::ArchTimer;
-        // SAFETY: ring 0, single CPU, called once during boot after Irq::init
-        // mapped the local-controller MMIO; IF=0, so arming delivers nothing.
-        unsafe { arch::Timer::init() };
-        kprintln!(
-            "timer up: monotonic {} MHz, per-CPU timer {} MHz (clock t0={} ns)",
-            arch::Timer::monotonic_hz() / 1_000_000,
-            arch::Timer::timer_hz() / 1_000_000,
-            arch::Timer::read_ns(),
-        );
-    }
+    // SAFETY: ring 0, single CPU, called once during boot after Irq::init
+    // mapped the local-controller MMIO; IF=0, so arming delivers nothing.
+    unsafe { arch::Timer::init() };
+    kprintln!(
+        "timer up: monotonic {} MHz, per-CPU timer {} MHz (clock t0={} ns)",
+        arch::Timer::monotonic_hz() / 1_000_000,
+        arch::Timer::timer_hz() / 1_000_000,
+        arch::Timer::read_ns(),
+    );
 
     // Reserve the DPC (deferred-procedure-call) queue before any interrupt can
     // enqueue onto it — the IOAPIC self-test below routes the PIT, whose ISR
@@ -202,18 +208,14 @@ fn kernel_main() {
     // scheduler is not yet running, so the self-test's short interrupt-enabled
     // window fires only the source it routes (the legacy PIT). The router needs
     // the local controller (Irq::init) up — routed interrupts land on a LAPIC.
-    {
-        use arch::irq_router::ArchIrqRouter;
-        // SAFETY: ring 0, single CPU, once during boot after Irq/Timer init; the
-        // ACPI MADT facts are cached (Platform::init ran).
-        if unsafe { arch::IrqRouter::init() }.is_err() {
-            kprintln!("interrupt router bring-up failed — halting");
-            return;
-        }
-        // SAFETY: ring 0, after the router is up and before the scheduler arms
-        // its periodic timer; briefly enables interrupts for the routed source.
-        unsafe { arch::IrqRouter::self_test() };
+    // SAFETY: ring 0, single CPU, once during boot after Irq/Timer init; the
+    // ACPI MADT facts are cached (Platform::init ran).
+    if unsafe { arch::IrqRouter::init() }.is_err() {
+        kprintln!("interrupt router bring-up failed — halting");
+        return;
     }
+    #[cfg(feature = "selftest")]
+    boot_selftest::irq_routing();
 
     // Seed the entropy subsystem (CSPRNG). Runs after the timer is up (so the
     // monotonic clock is live for jitter mixing) and before the handle table, so
@@ -239,14 +241,16 @@ fn kernel_main() {
     // Phase 2 slice 5 Part 2: prove the async I/O spine (IRP → DPC →
     // PendingOperation) and InterruptObject signalling on a RAM-backed device,
     // before any real driver exists. Needs the DPC queue + scheduler waitables.
-    nitrox_kernel::io::self_test();
+    #[cfg(feature = "selftest")]
+    boot_selftest::irp_spine();
 
     // Phase 2 slice 5 Part 3: match Tier 1 drivers against the enumerated
     // devices (the AHCI controller) and bring up any disks, then read sector 0
     // through the real driver to prove the IRP → controller DMA → IRQ → DPC → PO
     // path against hardware.
     nitrox_kernel::drivers::probe();
-    nitrox_kernel::drivers::self_test();
+    #[cfg(feature = "selftest")]
+    boot_selftest::storage();
 
     // Phase 2 slice 9 Part 1: bring up serial console **input** (COM1 RX). Runs
     // with interrupts masked (its RX self-test polls before RX IRQs are armed);
@@ -262,34 +266,22 @@ fn kernel_main() {
     // with 0, aliasing it onto the BSP's per-CPU scheduler slots (`current[0]` /
     // `idle[0]`) — a slot-sharing collision. Each AP sets its own index from
     // hardware in `arch::adopt_dense_index` at bring-up.
-    {
-        use arch::smp::ArchSmp;
-        arch::Smp::init_this_cpu(0);
-        kprintln!(
-            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
-            arch::Smp::current_cpu(),
-            arch::Smp::cpu_count(),
-            arch::MAX_CPUS,
-        );
-    }
+    arch::Smp::init_this_cpu(0);
+    kprintln!(
+        "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
+        arch::Smp::current_cpu(),
+        arch::Smp::cpu_count(),
+        arch::MAX_CPUS,
+    );
 
-    // Bring up the cooperative scheduler and run a few kernel threads to
-    // prove the context switch end-to-end: each worker prints and yields
-    // round-robin, then exits; the boot thread drains the queue and
-    // returns here. See `docs/architecture/overview.md` § Scheduling.
-    run_scheduler_demo();
+    // Bring up the preemptive scheduler: initialise it and arm preemption (periodic
+    // timer + IF=1). Must precede AP bring-up (APs pull from the runqueue) and any
+    // userspace thread. See `docs/architecture/overview.md` § Scheduling.
+    sched_bringup();
 
-    // Prove the scheduler classes: a RealTime thread preempts TimeShared, and two
-    // TimeShared threads with different nice get proportional CPU (vruntime).
-    sched_class_demo();
-
-    // Prove the demand-paging on-fault path in the live kernel before handing
-    // off — the first userspace process then exercises it for real (its stack
-    // is reserved lazily and faults in on first use).
-    demand_paging_smoke_test();
-
-    // Prove the DMA-buffer allocation path (the storage slice's prerequisite).
-    dma_smoke_test();
+    // Boot self-tests (pre-SMP): scheduler round-robin + classes, demand paging, DMA.
+    #[cfg(feature = "selftest")]
+    boot_selftest::pre_smp();
 
     // Bring up the application processors (Limine started + parked them). After
     // this, runnable threads can be scheduled on any CPU; the BSP spawns init
@@ -297,12 +289,9 @@ fn kernel_main() {
     // from its own entry, proving it executes kernel code on the AP.
     bring_up_aps();
 
-    // Prove per-CPU runqueues distribute work onto the APs (placement spreads new
-    // threads across CPUs; each AP picks up its own queue at the next tick).
-    smp_distribution_demo();
-
-    // Prove CPU affinity: a thread pinned to CPU i runs only on CPU i.
-    smp_affinity_demo();
+    // Boot self-tests (post-SMP): work distribution across the APs + CPU affinity.
+    #[cfg(feature = "selftest")]
+    boot_selftest::post_smp();
 
     // Arm the syscall fast path and prove it end-to-end by dropping to
     // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
@@ -320,6 +309,28 @@ fn kernel_main() {
         kind: nitrox_kernel::libkern::ExitKind::Normal as u32,
         code: 0,
     });
+}
+
+/// Bring up the preemptive scheduler: initialise it, then arm preemption (program the
+/// periodic tick and raise IF). Order matters — the period is set before delivery is
+/// enabled; the IDT timer stub (`Cpu::init_tables`) and the calibrated timer
+/// (`Timer::init`) are already live. Must run before `bring_up_aps` (the APs pull from
+/// the runqueue) and before any userspace thread. (The former `run_scheduler_demo`
+/// folded a busy-worker demo into this; that demo now lives in `boot_selftest`.)
+fn sched_bringup() {
+    if sched::init().is_err() {
+        kprintln!("sched: init failed — halting");
+        return;
+    }
+    // SAFETY: ring 0, single CPU, once; the IDT + calibrated timer are live.
+    unsafe {
+        arch::Timer::start_periodic(sched::TICK_NS);
+        arch::Cpu::interrupts_enable();
+    }
+    kprintln!(
+        "preemption armed (IF=1, {} Hz tick)",
+        1_000_000_000 / sched::TICK_NS
+    );
 }
 
 /// Count of application processors that have finished bring-up (each AP bumps
@@ -346,7 +357,6 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
             // default/guessed index would collide with another core's GDT/TSS/
             // scheduler slots (the migration hazard). Park this core safely
             // instead; the rest of the system continues without it.
-            use arch::cpu::ArchCpu;
             arch::Cpu::halt_loop();
         }
     };
@@ -356,7 +366,6 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
     // 3. Arm this CPU's periodic tick (the BSP-calibrated frequency; IF still 0).
     // SAFETY: ring 0; this CPU's x2APIC + IDT are now live.
     unsafe {
-        use arch::timer::ArchTimer;
         arch::Timer::start_periodic(sched::TICK_NS);
     }
     AP_ONLINE.fetch_add(1, Ordering::Release);
@@ -472,253 +481,6 @@ fn draw_boot_screen() {
     draw_nitrox_band(&mut writer);
 }
 
-/// A CPU-bound demo kernel thread that **never yields**: each round spins on a
-/// bounded busy loop, then prints. Under preemption the periodic timer forces
-/// the workers (and the boot thread) to interleave — cooperatively, worker 1
-/// would finish all its rounds before worker 2 ever printed. The interleaved
-/// output is the proof of preemption. Returns when done (the trampoline calls
-/// [`sched::exit`]).
-/// Spawn a batch of short kernel threads that each report which CPU they ran on,
-/// then drain them. With the shared run queue and the APs online, the reports span
-/// multiple CPUs — proving runnable work executes on the APs. (Phase-3 throwaway
-/// proof; superseded by scheduler stats via `/proc` later.)
-extern "C" fn busy_worker(arg: usize) {
-    for round in 0..3 {
-        // Enough work to span several 10 ms ticks so preemption is visible.
-        let mut acc: u64 = 0;
-        for i in 0..20_000_000u64 {
-            acc = acc.wrapping_add(i ^ arg as u64);
-        }
-        core::hint::black_box(acc);
-        kprintln!("worker {} round {}", arg, round);
-    }
-    kprintln!("worker {} exiting", arg);
-}
-
-/// Completion counter for [`sched_class_demo`]'s three workers (count-based
-/// barrier — race-free even when the workers run on different CPUs).
-static SCHED_DEMO_DONE: AtomicU32 = AtomicU32::new(0);
-
-/// Demonstrate the scheduler classes (Phase 3 slice 2): a **RealTime** worker
-/// preempts the **TimeShared** workers, and two TimeShared workers with different
-/// `nice` get proportional CPU — the lower-`nice` one finishes first. Single-CPU on
-/// the default `-smp 1`; on `-smp N` the kernel threads distribute (the class
-/// ordering still holds). Mirrors `run_scheduler_demo`'s count-barrier drain.
-fn sched_class_demo() {
-    use nitrox_kernel::object::SchedClass;
-
-    kprintln!("sched: class demo — RealTime preempts TimeShared; TimeShared nice-fairness");
-    // A RealTime worker (priority 5): runs ahead of every TimeShared thread.
-    if sched::spawn_with_class(rt_demo_worker, 5, SchedClass::RealTime, 5, 0).is_err() {
-        kprintln!("sched: RT demo spawn failed");
-    }
-    // Two TimeShared workers, equal work, different nice. Lower nice ⇒ slower
-    // vruntime accrual ⇒ more CPU ⇒ finishes first.
-    for nice in [0i8, 10] {
-        if sched::spawn_with_class(ts_demo_worker, nice as usize, SchedClass::TimeShared, 0, nice)
-            .is_err()
-        {
-            kprintln!("sched: TS demo spawn (nice {}) failed", nice);
-        }
-    }
-    // Barrier: wait for all three to finish (count-based, race-free under SMP),
-    // reaping exited workers throughout. The boot thread is preempted meanwhile.
-    let mut spins: u64 = 0;
-    while SCHED_DEMO_DONE.load(Ordering::Acquire) < 3 {
-        sched::reap_pending();
-        core::hint::spin_loop();
-        spins += 1;
-        if spins > 20_000_000_000 {
-            kprintln!("sched: class demo barrier timed out");
-            break;
-        }
-    }
-    sched::reap_pending();
-    kprintln!("sched: class demo complete");
-}
-
-/// A RealTime [`sched_class_demo`] worker: a little work, then report. As RealTime
-/// it runs to completion before any TimeShared thread gets the CPU.
-extern "C" fn rt_demo_worker(prio: usize) {
-    let mut acc: u64 = 0;
-    for i in 0..4_000_000u64 {
-        acc = acc.wrapping_add(i);
-    }
-    core::hint::black_box(acc);
-    kprintln!("sched:   RealTime worker (prio {}) finished", prio);
-    SCHED_DEMO_DONE.fetch_add(1, Ordering::Release);
-}
-
-/// A TimeShared [`sched_class_demo`] worker: fixed total work in rounds. With
-/// vruntime fairness the lower-`nice` worker makes faster progress and finishes
-/// earlier — visible in the interleaving and the `DONE` order.
-extern "C" fn ts_demo_worker(nice: usize) {
-    for round in 0..3 {
-        let mut acc: u64 = 0;
-        for i in 0..16_000_000u64 {
-            acc = acc.wrapping_add(i ^ nice as u64);
-        }
-        core::hint::black_box(acc);
-        kprintln!("sched:   TimeShared nice={} round {}/3", nice, round + 1);
-    }
-    kprintln!("sched:   TimeShared nice={} DONE", nice);
-    SCHED_DEMO_DONE.fetch_add(1, Ordering::Release);
-}
-
-/// Workers finished / bitmask of CPUs that ran one, for [`smp_distribution_demo`].
-static DIST_DONE: AtomicU32 = AtomicU32::new(0);
-static DIST_CPU_MASK: AtomicU32 = AtomicU32::new(0);
-
-/// Prove the **per-CPU runqueues** spread work onto the APs: spawn more kernel
-/// workers than CPUs, then report how many distinct CPUs actually ran one. Runs
-/// after AP bring-up, so every CPU is online to receive placement; each AP picks up
-/// its own queue at its next timer tick. Count-based barrier (race-free under SMP).
-fn smp_distribution_demo() {
-    const N: u32 = 8;
-    for i in 0..N {
-        if sched::spawn(dist_worker, i as usize).is_err() {
-            kprintln!("smp: distribution spawn {} failed", i);
-        }
-    }
-    let mut spins: u64 = 0;
-    while DIST_DONE.load(Ordering::Acquire) < N {
-        sched::reap_pending();
-        core::hint::spin_loop();
-        spins += 1;
-        if spins > 20_000_000_000 {
-            kprintln!("smp: distribution demo timed out");
-            break;
-        }
-    }
-    sched::reap_pending();
-    let mask = DIST_CPU_MASK.load(Ordering::Relaxed);
-    kprintln!(
-        "smp: distribution demo complete — {} of {} workers' CPUs distinct (cpu mask {:#06b})",
-        mask.count_ones(),
-        N,
-        mask,
-    );
-}
-
-/// A short [`smp_distribution_demo`] worker: spin briefly, record the CPU it ran on,
-/// then signal done.
-extern "C" fn dist_worker(arg: usize) {
-    use arch::smp::ArchSmp;
-    let mut acc: u64 = 0;
-    for i in 0..3_000_000u64 {
-        acc = acc.wrapping_add(i ^ arg as u64);
-    }
-    core::hint::black_box(acc);
-    let cpu = arch::Smp::current_cpu();
-    DIST_CPU_MASK.fetch_or(1 << cpu, Ordering::Relaxed);
-    DIST_DONE.fetch_add(1, Ordering::Release);
-}
-
-/// Workers finished / the CPU each affinity worker actually ran on, for
-/// [`smp_affinity_demo`] (worker `i` is pinned to CPU `i`).
-static AFFINITY_DONE: AtomicU32 = AtomicU32::new(0);
-static AFFINITY_RAN_ON: [AtomicU32; arch::MAX_CPUS] = [const { AtomicU32::new(u32::MAX) }; arch::MAX_CPUS];
-
-/// Prove **CPU affinity**: spawn one worker per online CPU, each pinned to a distinct
-/// CPU, and confirm every worker ran on exactly the CPU it was pinned to (placement
-/// honours `cpu_mask`, and work stealing can't pull a pinned thread to a CPU outside
-/// its mask).
-fn smp_affinity_demo() {
-    let n = sched::online_cpus().min(arch::MAX_CPUS);
-    for i in 0..n {
-        // Pin worker i to CPU i (mask with only bit i set).
-        if sched::spawn_with_affinity(affinity_worker, i, 1u8 << i).is_err() {
-            kprintln!("smp: affinity spawn {} failed", i);
-        }
-    }
-    let mut spins: u64 = 0;
-    while (AFFINITY_DONE.load(Ordering::Acquire) as usize) < n {
-        sched::reap_pending();
-        core::hint::spin_loop();
-        spins += 1;
-        if spins > 20_000_000_000 {
-            kprintln!("smp: affinity demo timed out");
-            break;
-        }
-    }
-    sched::reap_pending();
-    let mut all_pinned = true;
-    for i in 0..n {
-        let ran = AFFINITY_RAN_ON[i].load(Ordering::Relaxed);
-        if ran != i as u32 {
-            all_pinned = false;
-            kprintln!("smp: affinity worker {} (pinned cpu {}) ran on cpu {}", i, i, ran);
-        }
-    }
-    kprintln!(
-        "smp: affinity demo complete — {} worker(s), {}",
-        n,
-        if all_pinned {
-            "each ran on its pinned CPU"
-        } else {
-            "MISMATCH (see above)"
-        }
-    );
-}
-
-/// An [`smp_affinity_demo`] worker pinned to CPU `id`: spin briefly, then record which
-/// CPU it actually ran on (must equal `id`).
-extern "C" fn affinity_worker(id: usize) {
-    use arch::smp::ArchSmp;
-    let mut acc: u64 = 0;
-    for i in 0..3_000_000u64 {
-        acc = acc.wrapping_add(i);
-    }
-    core::hint::black_box(acc);
-    AFFINITY_RAN_ON[id].store(arch::Smp::current_cpu(), Ordering::Relaxed);
-    AFFINITY_DONE.fetch_add(1, Ordering::Release);
-}
-
-/// Initialise the scheduler, **arm preemption** (periodic timer + IF=1), spawn
-/// three CPU-bound workers that never yield, and let the timer interleave them.
-/// Proves switch-in, the timer-IRQ-driven preemptive switch, round-robin
-/// rotation, clean exit, and stack reclamation. The boot thread itself is
-/// preempted while it busy-waits for the queue to drain.
-fn run_scheduler_demo() {
-    use arch::cpu::ArchCpu;
-    use arch::timer::ArchTimer;
-
-    if sched::init().is_err() {
-        kprintln!("sched: init failed — skipping demo");
-        return;
-    }
-
-    // Arm the periodic tick, then raise IF. Order matters: program the timer's
-    // period before enabling delivery. The IDT timer stub (installed by
-    // `Cpu::init_tables`) and the calibrated timer (`Timer::init`) are already
-    // in place.
-    // SAFETY: ring 0, single CPU, once; the IDT + calibrated timer are live.
-    unsafe {
-        arch::Timer::start_periodic(sched::TICK_NS);
-        arch::Cpu::interrupts_enable();
-    }
-    kprintln!(
-        "preemption armed (IF=1, {} Hz tick)",
-        1_000_000_000 / sched::TICK_NS
-    );
-
-    for id in 1..=3 {
-        if sched::spawn(busy_worker, id).is_err() {
-            kprintln!("sched: spawn {} failed", id);
-        }
-    }
-    // Busy-wait (no cooperative yield) until every worker has run to completion;
-    // the timer preempts the boot thread too. `reap_pending` reclaims each
-    // exited worker's stack.
-    loop {
-        sched::reap_pending();
-        if sched::ready_is_empty() {
-            break;
-        }
-        core::hint::spin_loop();
-    }
-    kprintln!("sched: all workers done (preemptively interleaved)");
-}
 
 // --- First userspace process --------------------------------------------
 //
@@ -1069,144 +831,6 @@ fn paging_init() {
     unsafe {
         mm::kvmap::init();
         arch::Paging::init_kernel_template(arch::Paging::active_root());
-    }
-}
-
-/// Smoke-test the paging arch layer: walk Limine's live page tables
-/// with [`arch::translate`] to confirm the kernel's table-walk agrees
-/// with the hardware.
-///
-/// Read-only — it never installs or switches a mapping. Exercises the
-/// real address space and real HHDM offset (host tests run with an
-/// HHDM offset of 0).
-fn paging_smoke_test() {
-    // Limine's top-level page table is whatever the CPU runs on now.
-    let root = arch::Paging::active_root();
-
-    // This function's own code is certainly mapped; resolve its address.
-    let probe = mm::VirtAddr::new(paging_smoke_test as fn() as usize as u64);
-    // SAFETY: `root` is the live top-level page table the CPU is using,
-    // reachable through the HHDM. `translate` only reads page-table
-    // memory — it installs and switches nothing.
-    match unsafe { arch::Paging::translate(root, probe) } {
-        Some(phys) => kprintln!(
-            "paging: NX enabled; translate {:#x} -> {:#x}",
-            probe.as_u64(),
-            phys.as_u64()
-        ),
-        None => kprintln!(
-            "paging: translate {:#x} -> UNMAPPED — walk disagrees with hardware",
-            probe.as_u64()
-        ),
-    }
-}
-
-/// Demand-paging smoke test: exercise the on-fault path end-to-end in the live
-/// kernel. Reserve a lazy anonymous range (`map_vma_lazy` — no frames), confirm
-/// it is genuinely unbacked (the hardware walk finds no translation), fault each
-/// page in via `AddressSpace::fault_in`, and confirm the pages are now mapped.
-/// The throwaway address space is torn down on drop. The first userspace process
-/// additionally exercises this path for real: its stack is reserved lazily and
-/// faults in on use.
-fn demand_paging_smoke_test() {
-    use nitrox_kernel::libkern::KBox;
-    use nitrox_kernel::mm::addr_space::{AddressSpace, FaultIn};
-    use nitrox_kernel::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma};
-
-    let page = mm::PAGE_SIZE as u64;
-    let Ok(asp) = AddressSpace::new() else {
-        kprintln!("demand-paging: smoke test skipped (AS alloc failed)");
-        return;
-    };
-    // Arbitrary page-aligned user-half address for the reservation.
-    let base = 0x4000_0000u64;
-    let range = VAddrRange::new(mm::VirtAddr::new(base), mm::VirtAddr::new(base + 2 * page))
-        .expect("smoke-test range is valid by construction");
-    let Ok(vma) = KBox::try_new(Vma::new(
-        range,
-        Protection::WRITE | Protection::USER,
-        MappingKind::Anonymous,
-    )) else {
-        kprintln!("demand-paging: smoke test skipped (VMA alloc failed)");
-        return;
-    };
-    if asp.map_vma_lazy(vma).is_err() {
-        kprintln!("demand-paging: smoke test skipped (lazy reserve failed)");
-        return;
-    }
-
-    // Reserved but unbacked: the hardware walk must find no translation yet.
-    // SAFETY: `translate` only reads this AS's own page-table memory via the
-    // HHDM; it installs and switches nothing.
-    let before = unsafe { arch::Paging::translate(asp.root(), mm::VirtAddr::new(base)) };
-
-    // Fault each page in — a write to page 0, a read to page 1.
-    let r0 = asp.fault_in(mm::VirtAddr::new(base), FaultAccess::Write);
-    let r1 = asp.fault_in(mm::VirtAddr::new(base + page), FaultAccess::Read);
-
-    // SAFETY: as above — page 0 should now resolve.
-    let after = unsafe { arch::Paging::translate(asp.root(), mm::VirtAddr::new(base)) };
-
-    if before.is_none() && after.is_some() && r0 == FaultIn::Mapped && r1 == FaultIn::Mapped {
-        kprintln!(
-            "demand-paging: on-fault path OK — 2 anonymous pages backed lazily ({} faulted in since boot)",
-            mm::demand_fault_count()
-        );
-    } else {
-        kprintln!(
-            "demand-paging: smoke test FAILED (before={:?} after={:?} r0={:?} r1={:?})",
-            before,
-            after,
-            r0,
-            r1
-        );
-    }
-}
-
-/// DMA-buffer smoke test: prove `DmaBuffer` (the storage slice's allocation
-/// prerequisite) gives a physically-contiguous, page-aligned, zeroed block whose
-/// physical address is exactly what a device would see at its `virt()` mapping.
-/// Allocate a 2-page buffer, check it's zeroed + page-aligned, write a sentinel
-/// through the CPU view, and confirm the active page tables translate `virt()`
-/// back to `phys()` (the same bytes the device DMAs). Dropped at the end.
-fn dma_smoke_test() {
-    use nitrox_kernel::mm::DmaBuffer;
-
-    let mut buf = match DmaBuffer::alloc(2 * mm::PAGE_SIZE) {
-        Ok(b) => b,
-        Err(_) => {
-            kprintln!("dma: smoke test skipped (alloc failed)");
-            return;
-        }
-    };
-    let phys = buf.phys();
-    let zeroed = buf.as_slice().iter().all(|&b| b == 0);
-    // Write a sentinel at the first and last byte through the CPU (HHDM) view.
-    let len = buf.len();
-    buf.as_mut_slice()[0] = 0xD3;
-    buf.as_mut_slice()[len - 1] = 0xA7;
-
-    // The active page tables must translate the buffer's virtual base back to its
-    // physical base — i.e. a device programmed with `phys()` sees these bytes.
-    // SAFETY: read-only walk of the live top-level page table via the HHDM.
-    let mapped = unsafe {
-        arch::Paging::translate(arch::Paging::active_root(), mm::VirtAddr::new(buf.virt() as u64))
-    };
-
-    if zeroed && phys.is_page_aligned() && phys.as_u64() != 0 && mapped == Some(phys) {
-        kprintln!(
-            "dma: {}-page buffer @ phys {:#x} (contiguous, page-aligned, zeroed)",
-            len / mm::PAGE_SIZE,
-            phys.as_u64()
-        );
-    } else {
-        kprintln!(
-            "dma: smoke test FAILED (zeroed={} aligned={} mapped={:?} phys={:#x})",
-            zeroed,
-            phys.is_page_aligned(),
-            mapped,
-            phys.as_u64()
-        );
     }
 }
 
