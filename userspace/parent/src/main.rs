@@ -52,6 +52,7 @@ static mut SPAWN_A: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
     namespace: 0, // set at runtime to the constructed child namespace
+    syscaps: 0,   // children hold no ambient capabilities
 };
 static mut SPAWN_B: SpawnArgs = SpawnArgs {
     image: IMAGE_CHILD,
@@ -62,6 +63,7 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
     namespace: 0, // set at runtime to the constructed child namespace
+    syscaps: 0,   // children hold no ambient capabilities
 };
 static mut NOTIF: Notification = Notification::zeroed();
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
@@ -73,7 +75,16 @@ static mut MSGBUF: [u8; 4096] = [0; 4096];
 static mut HBUF: [u64; 8] = [0; 8];
 /// Recv'd handle-count out-param.
 static mut RECV_COUNT: usize = 0;
-static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, _reserved: [0; 40] };
+static mut WORKER_ARGS: ThreadArgs = ThreadArgs {
+    entry: 0,
+    user_sp: 0,
+    arg0: 0,
+    class: 0, // TimeShared
+    rt_priority: 0,
+    nice: 0,
+    cpu_affinity: 0, // no restriction
+    _reserved: [0; 36],
+};
 static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
 
 // --- Userspace-server forwarding demo (slice 7 Part 3) ----------------------

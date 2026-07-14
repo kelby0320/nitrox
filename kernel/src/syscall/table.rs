@@ -237,9 +237,23 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
         .map_err(|_| KError::KernelError)?; // a bad embedded image is our bug
     let child_pid = crate::sched::alloc_pid();
 
+    // Attenuate the requested syscaps against the parent's: a parent can never grant a
+    // capability it does not hold (`child = parent & requested`). No current process
+    // (a spawn with no owning Process) yields an unprivileged child.
+    // (docs/architecture/syscaps.md)
+    let child_syscaps = {
+        let requested = crate::libkern::SysCaps::from_bits_truncate(args.syscaps);
+        match crate::sched::current_process() {
+            // SAFETY: pins a live Process; read its immutable syscap set.
+            Some(pp) => unsafe { &*(pp.as_ptr() as *const Process) }.syscaps() & requested,
+            None => crate::libkern::SysCaps::empty(),
+        }
+    };
+
     // Build the child Process (owns the AS); record the parent's notification
     // channel as its `ChildExited` target.
-    let mut proc_box = Process::try_new_user(child_pid, asp).map_err(|_| KError::OutOfMemory)?;
+    let mut proc_box =
+        Process::try_new_user(child_pid, asp, child_syscaps).map_err(|_| KError::OutOfMemory)?;
     if let Some(parent_proc) = crate::sched::current_process() {
         // SAFETY: `parent_proc` pins a live Process; clone its channel ref.
         if let Some(c) =
@@ -412,7 +426,7 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     let aptr = UserPtr::<ThreadArgs>::new(args_ptr).map_err(from_user_access)?;
     let args = copy_from_user(aptr).map_err(from_user_access)?;
     // Reserved bytes must be zero (forward-compat).
-    if args._reserved != [0u8; 40] {
+    if args._reserved != [0u8; 36] {
         return Err(KError::InvalidArgument);
     }
     // Reject null / kernel-half entry or stack before touching the scheduler.
@@ -422,14 +436,56 @@ pub fn sys_thread_create(args_ptr: u64) -> SysResult {
     UserPtr::<u8>::new(args.entry).map_err(|_| KError::InvalidArgument)?;
     UserPtr::<u8>::new(args.user_sp).map_err(|_| KError::InvalidArgument)?;
 
+    // Parse + validate the scheduling parameters. A zeroed block is TimeShared / nice 0
+    // / no affinity — the historical default. The RealTime class is REAL_TIME-syscap-
+    // gated; `nice`/affinity are ungated (renicing/pinning your own thread isn't
+    // privileged). See docs/architecture/syscaps.md.
+    use crate::libkern::thread::{THREAD_CLASS_REALTIME, THREAD_CLASS_TIMESHARED};
+    use crate::object::thread::SchedClass;
+    let class = match args.class {
+        THREAD_CLASS_TIMESHARED => SchedClass::TimeShared,
+        THREAD_CLASS_REALTIME => {
+            require_syscap(crate::libkern::SysCaps::REAL_TIME)?;
+            if args.rt_priority > 99 {
+                return Err(KError::InvalidArgument);
+            }
+            SchedClass::RealTime
+        }
+        _ => return Err(KError::InvalidArgument),
+    };
+    if args.nice < -20 || args.nice > 19 {
+        return Err(KError::InvalidArgument);
+    }
+    // Affinity: `0` ⇒ no restriction; else the mask trimmed to valid CPU bits (must be
+    // non-empty after trimming).
+    let cpu_mask = if args.cpu_affinity == 0 {
+        u8::MAX
+    } else {
+        let valid = ((1u16 << crate::arch::MAX_CPUS) - 1) as u8;
+        let m = args.cpu_affinity & valid;
+        if m == 0 {
+            return Err(KError::InvalidArgument);
+        }
+        m
+    };
+
     // Require a user process (a kernel/boot thread cannot create user threads).
     let proc = crate::sched::current_process().ok_or(KError::InvalidArgument)?;
     let pid = crate::sched::current_owner_pid();
 
     // Start the thread; the bootstrap delivers `arg0` in rcx (a new thread shares
     // the process, so it gets no notif/namespace/endpoint handoff — rdi/rsi/rdx 0).
-    let th = crate::sched::spawn_user(proc, args.entry, args.user_sp, [0, 0, 0, args.arg0])
-        .map_err(|_| KError::OutOfMemory)?;
+    let th = crate::sched::spawn_user_sched(
+        proc,
+        args.entry,
+        args.user_sp,
+        [0, 0, 0, args.arg0],
+        class,
+        args.rt_priority,
+        args.nice,
+        cpu_mask,
+    )
+    .map_err(|_| KError::OutOfMemory)?;
 
     // Install a handle to it in the caller's table.
     let (tp, tt) = th.into_raw();
@@ -1022,7 +1078,25 @@ pub fn sys_ns_create() -> SysResult {
 /// `BIND` right on `ns`. The binding takes a **clone** of the resource's
 /// reference (the caller's handle stays valid) and records the resource handle's
 /// current rights as the binding's rights cap. Returns 0.
+/// Require the calling process to hold system capability `cap`, else [`KError::NoAccess`].
+/// The process-level authority gate (`docs/architecture/syscaps.md`) — checked after the
+/// caller's `Process` is resolved, alongside (not instead of) any per-handle `Rights`.
+fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
+    let proc = crate::sched::current_process().ok_or(KError::KernelError)?;
+    // SAFETY: `proc` pins a live `Process`; read its immutable syscap set.
+    let held = unsafe { &*(proc.as_ptr() as *const Process) }.syscaps();
+    if held.contains(cap) {
+        Ok(())
+    } else {
+        Err(KError::NoAccess)
+    }
+}
+
 pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -> SysResult {
+    // Namespace construction is a supervisor-only privilege: BIND_NAMESPACE is an
+    // *additional* gate atop the `BIND` handle right below (a process cannot bind even
+    // into a namespace it created without it). See docs/architecture/syscaps.md.
+    require_syscap(crate::libkern::SysCaps::BIND_NAMESPACE)?;
     let pid = crate::sched::current_owner_pid();
     let ns_ok = lookup_typed(ns_h, pid, Rights::BIND, KObjectType::Namespace)?;
     let mut buf = [0u8; NS_PATH_MAX];

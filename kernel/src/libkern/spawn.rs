@@ -88,9 +88,14 @@ pub struct SpawnArgs {
     /// `LOOKUP`-only handle to it. See
     /// `docs/architecture/namespace-and-resource-servers.md` (sandbox-by-construction).
     pub namespace: RawHandle,
+    /// The ambient [`SysCaps`](crate::libkern::SysCaps) to grant the child, as a raw
+    /// bit pattern (offset 24 + 16·N + 8). The kernel installs
+    /// `parent.syscaps & syscaps` — a parent can never grant a capability it does not
+    /// hold. `0` ⇒ an unprivileged child. See `docs/architecture/syscaps.md`.
+    pub syscaps: u64,
 }
 
-const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 24 + 16 * SPAWN_MAX_HANDLES + 8);
+const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 24 + 16 * SPAWN_MAX_HANDLES + 16);
 const _: () = assert!(core::mem::align_of::<SpawnArgs>() == 8);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, image) == 0);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, handle_count) == 4);
@@ -98,6 +103,7 @@ const _: () = assert!(core::mem::offset_of!(SpawnArgs, move_mask) == 8);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, arg0) == 16);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, handles) == 24);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, namespace) == 24 + 16 * SPAWN_MAX_HANDLES);
+const _: () = assert!(core::mem::offset_of!(SpawnArgs, syscaps) == 24 + 16 * SPAWN_MAX_HANDLES + 8);
 
 #[cfg(test)]
 mod tests {
@@ -105,7 +111,7 @@ mod tests {
 
     #[test]
     fn spawn_args_layout_is_stable() {
-        assert_eq!(core::mem::size_of::<SpawnArgs>(), 24 + 16 * 4 + 8);
+        assert_eq!(core::mem::size_of::<SpawnArgs>(), 24 + 16 * 4 + 16);
         assert_eq!(core::mem::align_of::<SpawnArgs>(), 8);
         assert_eq!(core::mem::offset_of!(SpawnArgs, image), 0);
         assert_eq!(core::mem::offset_of!(SpawnArgs, handle_count), 4);
@@ -114,6 +120,7 @@ mod tests {
         assert_eq!(core::mem::offset_of!(SpawnArgs, handles), 24);
         assert_eq!(core::mem::offset_of!(SpawnArgs, rights), 24 + 8 * 4);
         assert_eq!(core::mem::offset_of!(SpawnArgs, namespace), 24 + 16 * 4);
+        assert_eq!(core::mem::offset_of!(SpawnArgs, syscaps), 24 + 16 * 4 + 8);
     }
 
     #[test]

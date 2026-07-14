@@ -16,7 +16,7 @@
 //! already-populated [`AddressSpace`] (the ELF loader fills it first).
 
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox};
+use crate::libkern::{AllocError, KBox, SysCaps};
 use crate::mm::PhysAddr;
 use crate::mm::addr_space::AddressSpace;
 use crate::object::ObjectRef;
@@ -59,6 +59,12 @@ pub struct Process {
     /// at pid-1 construction; a child's is derived from its parent's at spawn —
     /// Part D). No cycle: the namespace does not back-reference the `Process`.
     namespace: Option<ObjectRef>,
+    /// This process's **ambient system capabilities** — the second axis of authority
+    /// (`docs/architecture/syscaps.md`), distinct from per-handle `Rights`. Granted at
+    /// spawn (`child = parent & args.syscaps`, never amplified) and **immutable**
+    /// thereafter; init boots with the full set. Checked at the syscall boundary
+    /// (`require_syscap`).
+    syscaps: SysCaps,
 }
 
 impl Process {
@@ -76,14 +82,18 @@ impl Process {
             notification_channel: None,
             parent_notif: None,
             namespace: None,
+            syscaps: SysCaps::empty(),
         })
     }
 
     /// Allocate a userspace process around an already-populated address
-    /// space (the ELF loader fills it before this is called). Refcount one.
+    /// space (the ELF loader fills it before this is called), holding the ambient
+    /// `syscaps`. Refcount one. init is created with [`SysCaps::all`] (the boot grant);
+    /// a spawned child with `parent.syscaps & args.syscaps`.
     pub fn try_new_user(
         pid: u32,
         address_space: AddressSpace,
+        syscaps: SysCaps,
     ) -> Result<KBox<Self>, AllocError> {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Process),
@@ -93,7 +103,13 @@ impl Process {
             notification_channel: None,
             parent_notif: None,
             namespace: None,
+            syscaps,
         })
+    }
+
+    /// This process's ambient system capabilities. Immutable after construction.
+    pub fn syscaps(&self) -> SysCaps {
+        self.syscaps
     }
 
     /// The process identifier.
@@ -205,7 +221,7 @@ mod tests {
         init_global_heap();
         let asp = AddressSpace::new().unwrap();
         let root = asp.root();
-        let p = Process::try_new_user(1, asp).unwrap();
+        let p = Process::try_new_user(1, asp, crate::libkern::SysCaps::empty()).unwrap();
         assert_eq!(p.pid(), 1);
         assert!(p.magic_ok());
         assert_eq!(p.address_space_root(), Some(root));
@@ -262,7 +278,7 @@ mod tests {
         init_global_heap();
         for pid in 0..16u32 {
             let asp = AddressSpace::new().unwrap();
-            let _ = Process::try_new_user(pid, asp).unwrap();
+            let _ = Process::try_new_user(pid, asp, crate::libkern::SysCaps::empty()).unwrap();
             // Process (and its AddressSpace) dropped at end of iteration.
         }
     }

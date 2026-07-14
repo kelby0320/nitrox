@@ -49,9 +49,13 @@ pub struct SpawnArgs {
     /// Child's root namespace; `0` ⇒ inherit a LOOKUP-only handle to the parent's
     /// namespace, non-null ⇒ a (restricted) namespace the parent holds (offset 88).
     pub namespace: u64,
+    /// Ambient [`SysCaps`](crate::syscaps::SysCaps) to grant the child, raw bits
+    /// (offset 96). The kernel installs `parent.syscaps & syscaps` (⊆-parent). `0` ⇒
+    /// unprivileged. See `docs/architecture/syscaps.md`.
+    pub syscaps: u64,
 }
 
-const _: () = assert!(size_of::<SpawnArgs>() == 96);
+const _: () = assert!(size_of::<SpawnArgs>() == 104);
 const _: () = assert!(align_of::<SpawnArgs>() == 8);
 const _: () = assert!(offset_of!(SpawnArgs, image) == 0);
 const _: () = assert!(offset_of!(SpawnArgs, handle_count) == 4);
@@ -60,6 +64,7 @@ const _: () = assert!(offset_of!(SpawnArgs, arg0) == 16);
 const _: () = assert!(offset_of!(SpawnArgs, handles) == 24);
 const _: () = assert!(offset_of!(SpawnArgs, rights) == 56);
 const _: () = assert!(offset_of!(SpawnArgs, namespace) == 88);
+const _: () = assert!(offset_of!(SpawnArgs, syscaps) == 96);
 
 // --- sys_thread_create / sys_thread_get_registers --------------------------
 
@@ -73,15 +78,31 @@ pub struct ThreadArgs {
     pub user_sp: u64,
     /// Opaque bootstrap word, delivered to the thread in `rdx` (offset 16).
     pub arg0: u64,
-    /// Reserved; must be zero (offset 24).
-    pub _reserved: [u8; 40],
+    /// Scheduling class: `THREAD_CLASS_TIMESHARED` (`0`, default) or
+    /// `THREAD_CLASS_REALTIME` (`1`; requires the `REAL_TIME` syscap) (offset 24).
+    pub class: u8,
+    /// RealTime fixed priority `0..=99`; ignored for TimeShared (offset 25).
+    pub rt_priority: u8,
+    /// TimeShared `nice` `-20..=19`; ignored for RealTime (offset 26).
+    pub nice: i8,
+    /// CPU affinity mask; `0` ⇒ no restriction (offset 27).
+    pub cpu_affinity: u8,
+    /// Reserved; must be zero (offset 28).
+    pub _reserved: [u8; 36],
 }
+
+/// `ThreadArgs::class` — the default fair/cooperative class (a zeroed block).
+pub const THREAD_CLASS_TIMESHARED: u8 = 0;
+/// `ThreadArgs::class` — fixed-priority real-time (requires the `REAL_TIME` syscap).
+pub const THREAD_CLASS_REALTIME: u8 = 1;
 
 const _: () = assert!(size_of::<ThreadArgs>() == 64);
 const _: () = assert!(align_of::<ThreadArgs>() == 8);
 const _: () = assert!(offset_of!(ThreadArgs, entry) == 0);
 const _: () = assert!(offset_of!(ThreadArgs, user_sp) == 8);
 const _: () = assert!(offset_of!(ThreadArgs, arg0) == 16);
+const _: () = assert!(offset_of!(ThreadArgs, class) == 24);
+const _: () = assert!(offset_of!(ThreadArgs, cpu_affinity) == 27);
 
 /// The faulted-register snapshot `sys_thread_get_registers` writes: the 16 GPRs
 /// (incl. `rsp`), then `rip` (index 16) and `rflags` (index 17).

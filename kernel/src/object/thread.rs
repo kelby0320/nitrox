@@ -909,7 +909,7 @@ mod tests {
         use crate::mm::addr_space::AddressSpace;
         let asp = AddressSpace::new().unwrap();
         let root = asp.root();
-        let p = Process::try_new_user(pid, asp).unwrap();
+        let p = Process::try_new_user(pid, asp, crate::libkern::SysCaps::empty()).unwrap();
         let ptr = KBox::into_raw(p).as_ptr() as *mut ();
         // SAFETY: into_raw yielded the single creation ref; adopt it.
         (unsafe { ObjectRef::from_raw(ptr, KObjectType::Process) }, root)

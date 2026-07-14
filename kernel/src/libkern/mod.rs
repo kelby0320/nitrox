@@ -30,12 +30,14 @@ pub mod memory;
 pub mod notification;
 pub mod spawn;
 pub mod spinlock;
+pub mod syscaps;
 pub mod thread;
 pub mod timer_flags;
 
 pub use chacha::ChaCha20Rng;
 pub use clock::ClockId;
 pub use handle::{KObjectType, RawHandle, Rights};
+pub use syscaps::SysCaps;
 pub use io_op::{IoOp, IoOpcode};
 pub use io_result::IoResult;
 pub use ipc::{IpcMsg, IpcMsgHeader, SendMode};

@@ -28,6 +28,7 @@ pub mod debug;
 pub mod error;
 pub mod handle;
 pub mod syscall;
+pub mod syscaps;
 
 // Freestanding `mem*` intrinsics — only for the bare build; under `cargo test`
 // libkern is a host `std` crate and must not redefine libc's `mem*`.
@@ -39,3 +40,4 @@ pub use debug::{exit, kprint, kprint_hex, kprint_u64};
 pub use error::{KError, from_raw};
 pub use handle::*;
 pub use syscall::*;
+pub use syscaps::{SYSCAP_BIND_NAMESPACE, SYSCAP_REAL_TIME, SysCaps};

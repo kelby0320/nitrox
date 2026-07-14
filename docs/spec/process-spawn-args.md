@@ -22,10 +22,11 @@ pub struct SpawnArgs {
     pub handles:      [RawHandle; 4], // offset 24 — parent-side handles to install in the child
     pub rights:       [u64; 4],       // offset 56 — per-handle attenuation bound
     pub namespace:    RawHandle,      // offset 88 — child's root namespace (0 = inherit)
+    pub syscaps:      u64,            // offset 96 — ambient SysCaps to grant (& parent's)
 }
 ```
 
-Total size 96 bytes, 8-byte aligned. `SPAWN_MAX_HANDLES = 4`. The offsets are
+Total size 104 bytes, 8-byte aligned. `SPAWN_MAX_HANDLES = 4`. The offsets are
 pinned by compile-time asserts in `kernel/src/libkern/spawn.rs`.
 
 ## Fields
@@ -42,6 +43,10 @@ pinned by compile-time asserts in `kernel/src/libkern/spawn.rs`.
   must carry the `TRANSFER` right. Installed in the child with
   `source_rights & rights[i]`.
 - **`rights[i]`** — the attenuation bound for `handles[i]`.
+- **`syscaps`** — the ambient [`SysCaps`](../architecture/syscaps.md) to grant the
+  child, as raw bits. The kernel installs `parent.syscaps & syscaps` (⊆-parent — a
+  parent can never grant a capability it lacks). `0` ⇒ an unprivileged child. Added
+  with the SysCaps slice (grew the block 96 → 104).
 - **`namespace`** — the child's root namespace. `RawHandle::NULL` (`0`) ⇒
   **inherit** a `LOOKUP`-only handle to the parent's namespace; non-null ⇒ a
   namespace the parent holds a `LOOKUP`-righted handle to (typically a
