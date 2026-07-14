@@ -1,0 +1,14 @@
+[package]
+name = "libheap"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# The raw syscall surface. Used only by the target `SyscallSource` (the arena
+# backing); under `cargo test` libheap is a host `std` crate and the syscall path
+# is `cfg`'d out, so this dependency is inert in tests.
+libkern = { path = "../libkern" }
+
+[lib]
+name = "libheap"
+path = "src/lib.rs"

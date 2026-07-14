@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["init","libkern","librsproto","fs-server-ext4","hello","parent","child","eshell"]
+members = ["init","libkern","libheap","librsproto","fs-server-ext4","hello","parent","child","eshell"]
 
 # `hello` is a freestanding no_std bin with no unwinder; abort on panic.
 # Harmless for the std `init`/`libkern` members (xtask never builds them for

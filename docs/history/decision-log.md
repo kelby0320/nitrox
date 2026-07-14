@@ -6014,3 +6014,138 @@ Remaining for slice 3b: a cross-CPU deschedule IPI (so exit_process/kill can sto
 running on another CPU) and per-AddressSpace active_cpus (targeted shootdown). Neither is
 exercised yet — every userspace process is single-threaded — so they land with the first
 multi-threaded user process rather than as consumer-less infrastructure.
+
+## 2026-07-13 — Phase 3 userspace-runtime sequencing (allocator → libs → SysCaps → librt) + std deferred
+
+Stock-take at the start of the Phase 3 userspace work, after the kernel-first band (slices
+0–3b) closed. Two decisions.
+
+**1. Defer a real `std` port; invest in Nitrox-native runtime libraries instead.** The
+services want standard-Rust ergonomics, and the tempting move is to bring up a partial `std`.
+Rejected for now on two grounds. (a) **ABI coupling** — `std` sits on the syscall ABI, which
+is explicitly pre-stabilization (`docs/spec/syscall-abi.md` § Stability; syscall numbers
+aren't even in the ABI hash). Forking rust-std against a moving ABI is the same anti-pattern
+we avoid elsewhere. (b) **Philosophical mismatch** — `std::fs`/`net` assume *ambient
+authority* (path-based open), `std::io` is *synchronous blocking*, and `std` carries errno,
+signals, and `thread_local!`; all of these contradict Nitrox's capability + async-first +
+no-signals model. A faithful port would either reintroduce the Unix patterns the OS rejects
+or stub half its surface. The parts that *do* map (`core`, `alloc`, `collections`, most of
+`sync`, `fmt`) come nearly free via `alloc` + a native runtime; the parts that don't are
+exactly `fs`/`net`/`io`/`thread`/`process`/`env` — the POSIX core. `std`'s real payoff is
+building *unmodified* crates.io crates, which we don't need yet. Kept in Phase 4+, gated on a
+stabilizing ABI + a concrete external crate that justifies it. Design the runtime libs
+std-shaped where free (an `io::Error`-shaped error type) so the eventual port is re-exports,
+not a rewrite.
+
+**2. Sequence the userspace-runtime band by ABI coupling: allocator → libos core + libstream
+→ SysCaps → librt + authority wrappers → services** (Phase 3 slices 4–7 in the impl plan). The
+syscall surface these libs wrap is mostly *solid* today (handles, memory, `sys_wait`, IPC,
+notifications, ns, `io_submit`, entropy). The parts that will still move are **SysCaps**
+(unimplemented — no type exists in the kernel; authority is faked with handle `Rights`
+stand-ins) and the **`SpawnArgs`/`ThreadArgs`** growth (class/nice/affinity + syscap
+inheritance, deferred *to* the SysCaps slice by slice 2). So: **(4)** a freeing userspace heap
+(`libheap`) replaces init's bump arena — ABI-independent, leads; **(5)** libos core + libstream
+wrap only the solid surface; **(6)** SysCaps lands the capability model + finalizes
+`ThreadArgs`/`SpawnArgs` (ABI-hash bump); **(7)** librt (Go-style fibers over the libos
+executor) + the thread-spawn/authority wrappers held back from slice 5. This is the same
+ABI-stability discipline that deferred std, applied one level down — wrap the solid core first,
+hold the authority-facing wrappers until their ABI settles.
+
+**SysCaps: scope stub now, full design after slice 5.** Its architecture doc
+(`docs/architecture/syscaps.md`) is written at slice-6 start rather than now, because building
+libos/libstream first surfaces which authorities the services actually gate on — so the syscap
+set is derived, not guessed. Placed **before** the service backlog (service-mgr, auth/session,
+audit all assume it), so services are built capability-correct rather than retrofitted.
+
+**Dogfood via init/eshell.** Each library's first consumer is init (then eshell): converting
+them de-hacks the existing critical-path code, validates the lib against real code before any
+service depends on it, and honours "no code without a consumer." Constraint: init is
+critical-path (no `panic!`/`unwrap`), so every conversion rides behind the existing gate —
+still boots to a live `eshell>` and passes the scripted `help`/`lsblk`/`mounts`/`cat` stress.
+
+Also refreshed the impl plan's stale "Current status" block (Phase 2 was still marked "not
+started" despite completing 2026-06-26; Phase 3 now reflects the kernel-first band done +
+the userspace band next). No code changes in this entry — planning only.
+
+## 2026-07-13 — Cut `librt`: no green-thread crate, no standalone sync-wrapper crate
+
+Follow-on to the userspace-runtime sequencing (above). The planned `librt` crate had two
+jobs — a Go-style **fiber (green-thread) scheduler** and **synchronous/blocking wrappers**.
+Both are cut; there is no `librt` crate. The runtime library set is **five**: libkern,
+libheap, libos, libstream, librsproto.
+
+**Fibers rejected.** A stackful fiber scheduler adds no *concurrency capability* the libos
+async executor doesn't already provide — a single-threaded executor multiplexes many `async`
+tasks over `sys_wait`, which already covers "N concurrent clients on one OS thread." Fibers
+only add a blocking-*style* syntax (dodging async's function-colouring). Against that thin
+ergonomic win: a second, non-standard cooperative-scheduling runtime over the same primitive;
+the same composition hazards with a future `std` that `async` has (`thread_local!` is
+per-OS-thread, `std::sync::Mutex` blocks the OS thread) but in a form crates aren't written to
+tolerate; stackful cost (per-fiber stacks, context-switch asm, awkward FFI); and swimming
+against Rust's own history (green threads / `libgreen` were removed pre-1.0, RFC 230, for
+exactly these reasons). Nitrox's async-first syscall ABI makes `async`/`await` the
+grain-aligned model, not fibers. If a genuine "synchronous code that must yield" need ever
+appears (e.g. ported non-async code), it can be an optional higher-level crate then — not a
+base system library.
+
+**The standalone sync-wrapper crate rejected — it fails the std-port durability test.** The
+test (from the sequencing entry): a runtime library earns its place if it either **feeds
+std's platform layer** (survives *below* std) or **provides what std never will** (survives
+*beside* std). A sync-wrapper crate does neither. std's pal implements a blocking `File::read`
+directly as `io_submit` + `sys_wait` (raw plumbing in libkern/libos-low-level), *not* via a
+`block_on`-over-futures convenience — so sync wrappers don't feed the pal. And the synchronous
+blocking API *is* `std::io`/`std::thread` — so a sync-wrapper crate is precisely what the port
+supersedes, and it would be deprecated the day std lands. Running the test across the set:
+libkern / libheap engine / libos plumbing feed the pal; libos async runtime / libstream /
+librsproto are things std never provides; a sync-wrapper crate is the only stopgap → cut.
+
+**What we keep.** The *capability* to write blocking-style code before std exists is a trivial
+`block_on(future)` + a few blocking helper methods, folded into **libos** as a small,
+clearly-marked pre-std corner (superseded by `std::io`), not a separate crate — and largely
+optional, since init/eshell already do direct submit+wait. Phase 3 **slice 7** survives, minus
+librt: it becomes "the SysCaps-coupled libos surface" (the `thread_create`/`process_spawn`/
+authority wrappers held back from slice 5, wrapping the SysCaps-finalized `ThreadArgs`/
+`SpawnArgs`). In-process concurrency until real OS threads exist is `async` tasks on the libos
+executor, which also cleanly defers the kernel TLS (`FS_BASE`) / FPU (`XSAVE`) work until a
+workload genuinely needs multicore parallelism within a process.
+
+Docs updated: `overview.md` (five crates; the no-librt rationale; the feeds-pal / beside-std /
+stopgap framing of the std port), the impl plan (slice 5 gains the libos `block_on` note;
+slice 7 reframed; the band preamble + net-order + back-reference de-librt'd). Planning only —
+no code changes.
+
+## 2026-07-13 — Phase 3 slice 4: `libheap`, the freeing userspace heap
+
+First userspace-runtime slice built. `userspace/libheap` replaces init's fixed bump arena
+(`init/src/heap.rs`, a 64 KiB static that never freed) with a real freeing `#[global_allocator]`.
+
+**Design (matches `docs/architecture/libheap.md`).** A segregated size-class allocator over
+multiple discontiguous **arenas**, each a mapped `MemoryObject` — the SLUB-over-buddy split
+re-expressed for userspace. Small requests (≤ 2048 B) round up to a size class (16/32/…/2048)
+and are carved from arenas; freed slots return to a per-class LIFO freelist (no coalescing —
+the jemalloc/tcmalloc/SLUB family, not dlmalloc's coalescing arena). Large requests get a
+dedicated mapping, unmapped **and the object closed** on free (real reclamation). `GlobalAlloc`
+hands the `Layout` back to `dealloc`, so the small path needs no per-slot size header; the
+large path stores a small header just below the returned pointer to recover the mapping.
+
+**The engine/registration split (std-port seam).** `HeapEngine<S: ArenaSource>` is the reusable
+allocator; `Heap` is the thin `GlobalAlloc` newtype forwarding to a process-global engine. A
+future std port's `std::sys::alloc` forwards to the same engine rather than fighting for the
+single `#[global_allocator]` slot. `ArenaSource` (the map/unmap provider) is the seam that also
+makes the engine host-testable: the target `SyscallSource` (create+map a `MemoryObject`) is
+`cfg(not(test))`; under `cargo test` a `std::alloc`-backed source runs the same logic with no
+kernel (9 tests). Arenas are 64 KiB (modest because `MemoryObject` frames are **eager** —
+allocated+zeroed up front); a real CAS spinlock guards the shared state (uncontended today,
+but correct for future std OS-threads); `panic = "abort"`, OOM → null (no panic), honoring
+init's critical-path rules.
+
+**Consumer.** init is the sole heap consumer and now runs on libheap (its `heap.rs` deleted;
+the bump-math tests moved into libheap's suite). **eshell needs no allocator** — it is `no_std`
+*without* `alloc` (fixed buffers), so the plan's "eshell follows" was moot; nothing to migrate.
+
+**Verified.** 9 libheap host tests; full host suite (libkern/libheap/init/librsproto/
+fs-server-ext4) + `check-arch` green; bare build clean (no warnings). QEMU: init's
+allocation-heavy bootstrap (init.toml parse → `Vec<MountSpec>` + TOML strings) runs on libheap,
+mounts ext4, drives the full parent demo chain, reaps, and reaches a live `eshell>`; scripted
+`help`/`lsblk`/`mounts`/`cat /system/current-generation` all correct; `-smp 4` boots clean
+(4 CPUs online, no faults). Not committed pending review.

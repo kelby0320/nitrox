@@ -18,18 +18,18 @@ Application                              ← user code
   ↓
 libstream  librsproto                    ← typed I/O, RS protocol
   ↓
-librt                                    ← sync wrappers, fiber scheduler
+libos                                    ← typed Handle<T, M>, async executor, block_on
   ↓
-libos                                    ← typed Handle<T, M>, async executor
-  ↓
-libkern                                  ← raw syscall wrappers
+libkern    libheap                       ← raw syscall wrappers; the #[global_allocator]
   ↓
 syscall instruction
 ```
 
-A crate can depend on anything below it but not above. `libstream` can use `libos`; `libos` cannot use `libstream`. Cyclic dependencies are not allowed and are caught by Cargo.
+A crate can depend on anything below it but not above. `libstream` can use `libos`; `libos` cannot use `libstream`. Cyclic dependencies are not allowed and are caught by Cargo. `libheap` (the freeing heap that backs `alloc`) is a foundation alongside `libkern`: it depends only on `libkern` + `core`, and the top-level binary registers it as the `#[global_allocator]`.
 
-Application code typically uses `librt` for sync ergonomics or `libos` directly for async work. Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
+There is **no `librt` crate** — the Go-style fiber scheduler and a standalone sync-wrapper crate were cut (see the 2026-07-13 decision log). In-process concurrency is `async` tasks on the libos executor; blocking convenience for sequential callers is a small `block_on` in libos.
+
+Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
 
 ## Async-first
 
@@ -38,7 +38,7 @@ Every potentially-blocking syscall returns a `PendingOperation` handle. The thre
 In practice:
 
 - `libos::read()` is `async fn`, internally `sys_io_submit` → executor `await` on `sys_wait`
-- `librt::read()` is the sync wrapper: same internal mechanism, but the thread blocks on `sys_wait` for a single handle
+- `libos::block_on(fut)` drives one future to completion for sequential callers: same internal mechanism, but the thread blocks on `sys_wait` for a single handle
 - Code at the syscall-wrapper level in `libkern` exposes the raw `sys_io_submit` + `sys_wait` directly
 
 Don't write code that calls a syscall and "expects to block." That's the Unix model and it's not how this system works. If your code looks like `let result = some_syscall(); /* assumes blocking */`, you've misunderstood the model.
@@ -56,6 +56,7 @@ The kernel enforces capabilities. Userspace code should be capability-correct in
 Each crate has its own `CLAUDE.md` for crate-specific guidance:
 
 - `userspace/libkern/CLAUDE.md` — the syscall layer, no_alloc
+- `userspace/libheap/CLAUDE.md` — the freeing heap / `#[global_allocator]`
 - `userspace/init/CLAUDE.md` — PID 1, critical-path constraints
 - `userspace/eshell/CLAUDE.md` — emergency shell constraints (similar to init)
 - `userspace/fs-server-ext4/CLAUDE.md` — filesystem driver
