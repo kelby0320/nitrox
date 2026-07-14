@@ -1721,13 +1721,19 @@ libos authority surface → services.**
     surfaces which authorities the services actually need, so the syscap set isn't
     guessed). The kernel's *defining* feature still missing: authority currently
     faked with handle `Rights` stand-ins (`SIGNAL` for affinity, `BIND` for ns-bind).
-  - [ ] `docs/architecture/syscaps.md` (new) — the capability model: the syscap set
-    + numbering, storage/encoding on `Process`, the grant/attenuate-on-spawn model
-    (no ambient authority — a process holds exactly what it was granted; children get
-    a subset), and the syscall-entry check points.
-  - [ ] Kernel `SysCaps` type on `Process`, checked at the gates that today fake it:
-    `BIND_NAMESPACE` (ns_bind), `REAL_TIME` (RT scheduling class + priority),
-    affinity, `AUDIT_CONTROL`, and spawn-time capability inheritance.
+  - [x] **Design doc** `docs/architecture/syscaps.md` (Part A, 2026-07-14) — the
+    6-cap model (from v5.1), storage on `Process`, grant/attenuate-on-spawn
+    (`child = parent & args.syscaps`), the `require_syscap` check point, and the ABI
+    growth. **Two corrections vs the stub:** affinity stays a **handle right** (not a
+    syscap); and — the consumer discipline — **all 6 caps are defined but only 2 gates
+    are wired now** (`BIND_NAMESPACE`, `REAL_TIME`), the other four (`LOAD_MODULE`/
+    `PHYSICAL_MEMORY`/`SYSTEM_CLOCK`/`AUDIT_CONTROL`) gated by the slice that builds
+    their operation.
+  - [ ] Kernel `SysCaps` type (+ userspace mirror) + the `Process.syscaps` field;
+    checked at the two wired gates: `BIND_NAMESPACE` (an *additional* gate on `ns_bind`
+    atop the `BIND` handle right — makes namespace construction supervisor-only) and
+    `REAL_TIME` (the RT scheduling class); plus spawn-time inheritance + the init boot
+    grant (full set).
   - [ ] **Finalize the deferred `ThreadArgs` ABI** (class/nice/affinity + the
     `REAL_TIME` gate — deferred *to this slice* by slice 2) and the **`SpawnArgs`**
     syscap-inheritance fields. **ABI-hash affecting** (`SpawnArgs`/`ThreadArgs`
