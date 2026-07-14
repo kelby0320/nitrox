@@ -509,6 +509,26 @@ fn read_large_file(root_ns: u64) {
 /// Spawn the interactive emergency shell as the persistent serial console (it runs
 /// forever; init keeps no handle). Launched once the demo chain has exited, so the
 /// shell has the disk and console to itself.
+/// Integration-test build only: report the run's verdict to the `xtask test-qemu`
+/// runner via `SYS_TEST_EXIT` — which, under the kernel's `test-harness` feature,
+/// writes `isa-debug-exit` and terminates QEMU. `ok` selects PASS/FAIL. Modelled as
+/// returning `()` rather than `!`: the syscall does not return in practice, but
+/// letting callers fall through means a missing exit device degrades to a normal
+/// boot instead of a hang. See `docs/conventions/qemu-integration-tests.md`.
+#[cfg(feature = "test-harness")]
+fn test_exit(ok: bool) {
+    let code = if ok { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
+    kprint(if ok {
+        b"init: test-harness verdict PASS\n"
+    } else {
+        b"init: test-harness verdict FAIL\n"
+    });
+    // SAFETY: SYS_TEST_EXIT takes the verdict code in a0; under the kernel's
+    // test-harness build it writes `isa-debug-exit` and QEMU terminates (so in
+    // practice this syscall does not return).
+    unsafe { syscall1(SYS_TEST_EXIT, code as u64) };
+}
+
 fn spawn_eshell() {
     kprint(b"init: starting interactive console (eshell)\n");
     // SAFETY: SPAWN_ESHELL is a valid writable arg block.
@@ -538,6 +558,9 @@ fn supervise(notif: u64) -> ! {
             reap_loop(notif, parent_h);
         }
         kprint(b"init: parent spawn FAIL\n");
+        // Test-harness: couldn't even launch the demo chain — fail the run.
+        #[cfg(feature = "test-harness")]
+        test_exit(false);
     }
     // Normal boot (and the selftest parent-spawn-failure fallback): the console now.
     spawn_eshell();
@@ -550,6 +573,9 @@ fn supervise(notif: u64) -> ! {
 /// See `userspace/init/CLAUDE.md` § "Failure → eshell".
 fn emergency(notif: u64) -> ! {
     kprint(b"init: critical-path failure -- dropping to emergency shell\n");
+    // Test-harness: a critical-path boot failure is a failed test run.
+    #[cfg(feature = "test-harness")]
+    test_exit(false);
     spawn_eshell();
     reap_loop(notif, 0);
 }
@@ -600,6 +626,11 @@ fn reap_loop(notif: u64, mut parent_h: i64) -> ! {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
                     parent_h = 0;
+                    // Test-harness: `parent` reaping ends the self-test chain — report
+                    // the verdict (PASS iff it exited cleanly), which terminates QEMU.
+                    // If it doesn't (no exit device), fall through to the console.
+                    #[cfg(feature = "test-harness")]
+                    test_exit(code == 0);
                     spawn_eshell();
                 }
             }

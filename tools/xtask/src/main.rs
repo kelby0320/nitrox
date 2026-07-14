@@ -6,6 +6,7 @@
 //!   qemu            build + launch QEMU with OVMF
 //!   qemu-debug      build + launch QEMU paused for GDB on :1234
 //!   test            host-side unit tests (kernel lib + tools workspace)
+//!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
@@ -16,6 +17,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitCode};
 
@@ -35,6 +37,30 @@ const ESP_SIZE_MIB: u64 = 48;
 
 type R<T> = Result<T, Box<dyn Error>>;
 
+/// What to compile into the kernel + `init`. Selects the cargo feature the two
+/// crates are built with; the other userspace binaries are always feature-less.
+#[derive(Clone, Copy, PartialEq)]
+enum BuildMode {
+    /// Production boot: straight to userspace, no demos.
+    Normal,
+    /// `--selftest`: compile + run the boot self-tests / demos, then drop to eshell.
+    Selftest,
+    /// `test-qemu`: everything `Selftest` runs, plus the `isa-debug-exit` verdict path
+    /// so the run self-adjudicates headlessly (`test-harness` feature).
+    TestHarness,
+}
+
+impl BuildMode {
+    /// The cargo `--features` value for the kernel + `init` builds (`None` = no flag).
+    fn features(self) -> Option<&'static str> {
+        match self {
+            BuildMode::Normal => None,
+            BuildMode::Selftest => Some("selftest"),
+            BuildMode::TestHarness => Some("test-harness"),
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let mut args = env::args().skip(1);
     let cmd = args.next();
@@ -45,13 +71,19 @@ fn main() -> ExitCode {
     // to userspace. Strip it out before forwarding the rest to QEMU.
     let selftest = rest.iter().any(|a| a == "--selftest");
     let qargs: Vec<String> = rest.iter().filter(|a| *a != "--selftest").cloned().collect();
+    let mode = if selftest {
+        BuildMode::Selftest
+    } else {
+        BuildMode::Normal
+    };
 
     let result = match cmd.as_deref() {
-        Some("build") => cmd_build(selftest),
-        Some("image") => cmd_image(selftest),
-        Some("qemu") => cmd_qemu(false, selftest, &qargs),
-        Some("qemu-debug") => cmd_qemu(true, selftest, &qargs),
+        Some("build") => cmd_build(mode),
+        Some("image") => cmd_image(mode),
+        Some("qemu") => cmd_qemu(false, mode, &qargs),
+        Some("qemu-debug") => cmd_qemu(true, mode, &qargs),
         Some("test") => cmd_test(),
+        Some("test-qemu") => cmd_test_qemu(),
         Some("check-arch") => cmd_check_arch(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
@@ -83,6 +115,7 @@ fn print_help() {
            qemu          build + launch QEMU with OVMF\n  \
            qemu-debug    build + launch QEMU paused for GDB on :1234\n  \
            test          host-side unit tests (kernel lib + tools)\n  \
+           test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
@@ -133,22 +166,22 @@ fn limine_conf() -> PathBuf {
 
 // --- Subcommands --------------------------------------------------------
 
-fn cmd_build(selftest: bool) -> R<()> {
+fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
-    // time. Only `init` (and the kernel) carry a `selftest` feature.
+    // time. Only `init` (and the kernel) carry the selftest / test-harness feature.
     cmd_build_hello()?;
-    build_userspace_bin("parent", false)?;
-    build_userspace_bin("child", false)?;
-    build_userspace_bin("init", selftest)?;
-    build_userspace_bin("fs-server-ext4", false)?;
-    build_userspace_bin("eshell", false)?;
+    build_userspace_bin("parent", None)?;
+    build_userspace_bin("child", None)?;
+    build_userspace_bin("init", mode.features())?;
+    build_userspace_bin("fs-server-ext4", None)?;
+    build_userspace_bin("eshell", None)?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
     k.arg("build");
-    if selftest {
-        k.arg("--features").arg("selftest");
+    if let Some(f) = mode.features() {
+        k.arg("--features").arg(f);
     }
     run(k.current_dir(&kernel_dir))?;
     let elf = kernel_elf();
@@ -189,15 +222,15 @@ fn cmd_build_hello() -> R<()> {
 /// target (run from its own crate dir so its `.cargo/config.toml` applies). The
 /// kernel embeds the result via `include_bytes!`. Generalises `cmd_build_hello`
 /// for the spawn-demo binaries (`parent`, `child`).
-fn build_userspace_bin(name: &str, selftest: bool) -> R<()> {
+fn build_userspace_bin(name: &str, features: Option<&str>) -> R<()> {
     let dir = repo_root().join("userspace").join(name);
     let mut c = Command::new("cargo");
     c.arg("build")
         .arg("--release")
         .arg("--target")
         .arg("x86_64-unknown-none");
-    if selftest {
-        c.arg("--features").arg("selftest");
+    if let Some(f) = features {
+        c.arg("--features").arg(f);
     }
     run(c.current_dir(&dir))?;
     let elf = repo_root()
@@ -210,8 +243,8 @@ fn build_userspace_bin(name: &str, selftest: bool) -> R<()> {
     Ok(())
 }
 
-fn cmd_image(selftest: bool) -> R<()> {
-    cmd_build(selftest)?;
+fn cmd_image(mode: BuildMode) -> R<()> {
+    cmd_build(mode)?;
     let limine_root = cmd_fetch_limine()?;
     let bootx64 = find_bootx64(&limine_root)?;
     let initramfs = initramfs_path();
@@ -227,10 +260,9 @@ fn cmd_image(selftest: bool) -> R<()> {
     Ok(())
 }
 
-fn cmd_qemu(debug: bool, selftest: bool, extra_args: &[String]) -> R<()> {
-    cmd_image(selftest)?;
-    let ovmf = locate_ovmf()?;
-    let mut qemu = Command::new("qemu-system-x86_64");
+/// Append the machine / CPU / memory / UEFI-firmware flags shared by every QEMU
+/// launch (`qemu`, `qemu-debug`, `test-qemu`) to `qemu`.
+fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
     qemu.arg("-M")
         .arg("q35")
         // CPU model = "the features the kernel actually requires,
@@ -254,9 +286,17 @@ fn cmd_qemu(debug: bool, selftest: bool, extra_args: &[String]) -> R<()> {
         .arg("256M");
     // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a
     // single combined image on legacy setups (see `locate_ovmf`).
-    for a in firmware_pflash_args(&ovmf)? {
+    for a in firmware_pflash_args(ovmf)? {
         qemu.arg(a);
     }
+    Ok(())
+}
+
+fn cmd_qemu(debug: bool, mode: BuildMode, extra_args: &[String]) -> R<()> {
+    cmd_image(mode)?;
+    let ovmf = locate_ovmf()?;
+    let mut qemu = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut qemu, &ovmf)?;
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-serial")
@@ -271,6 +311,66 @@ fn cmd_qemu(debug: bool, selftest: bool, extra_args: &[String]) -> R<()> {
         qemu.arg(a);
     }
     run(&mut qemu)
+}
+
+/// Integration-test runner: build the `test-harness` image, boot it headless, and
+/// adjudicate the run from QEMU's exit code. The guest ends the run by writing a
+/// verdict to the `isa-debug-exit` device (init on success/failure, or the kernel
+/// panic handler); QEMU then exits `(verdict << 1) | 1`. A hung boot is caught by a
+/// wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
+fn cmd_test_qemu() -> R<()> {
+    cmd_image(BuildMode::TestHarness)?;
+    let ovmf = locate_ovmf()?;
+
+    // Wall-clock ceiling: a hung boot must fail the run, not block CI forever. The
+    // healthy self-test boot completes in a few seconds under TCG; 90 s is generous
+    // (the demand-paging demo does many emulated-AHCI faults).
+    const TIMEOUT_SECS: u32 = 90;
+    // isa-debug-exit maps a guest port write `v` to host exit `(v << 1) | 1`: init's
+    // PASS verdict (0x10) → 33; FAIL (0x11) → 35; the `timeout` tool uses 124.
+    const PASS_EXIT: i32 = (0x10 << 1) | 1; // 33
+
+    let mut cmd = Command::new("timeout");
+    // `--foreground` so QEMU still receives the terminate signal when the timeout
+    // fires from outside its process group.
+    cmd.arg("--foreground").arg(TIMEOUT_SECS.to_string());
+    cmd.arg("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        // The guest ends the run by writing its verdict to this port.
+        .arg("-device")
+        .arg("isa-debug-exit,iobase=0xf4,iosize=0x04")
+        // Headless: serial to our captured stdout, no display; `-smp 4` so the SMP
+        // distribution/affinity self-tests are meaningful; never reboot on triple-fault.
+        .arg("-display")
+        .arg("none")
+        .arg("-serial")
+        .arg("stdio")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot");
+
+    println!("xtask: running integration tests under QEMU (timeout {TIMEOUT_SECS}s)…\n");
+    let output = cmd.output()?;
+    // Echo the captured serial log so the operator sees the boot + self-test output.
+    std::io::stdout().write_all(&output.stdout)?;
+    std::io::stderr().write_all(&output.stderr)?;
+
+    match output.status.code() {
+        Some(code) if code == PASS_EXIT => {
+            println!("\nxtask: integration tests PASSED (qemu exit {code})");
+            Ok(())
+        }
+        Some(124) => Err(format!(
+            "integration tests TIMED OUT after {TIMEOUT_SECS}s — no verdict (likely a hang)"
+        )
+        .into()),
+        Some(code) => {
+            Err(format!("integration tests FAILED (qemu exit {code}; expected {PASS_EXIT})").into())
+        }
+        None => Err("qemu terminated by a signal with no exit code".into()),
+    }
 }
 
 fn cmd_fetch_limine() -> R<PathBuf> {

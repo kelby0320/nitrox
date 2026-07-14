@@ -44,6 +44,13 @@ mod x86_64;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{abi, serial};
 
+/// Terminate the emulator with a harness verdict (QEMU `isa-debug-exit`). Only
+/// under the `test-harness` feature — the integration-test build (`cargo xtask
+/// test-qemu`); absent from production kernels. The neutral concept is "end the
+/// test run with this verdict"; aarch64 would map it to semihosting/PSCI.
+#[cfg(all(target_arch = "x86_64", feature = "test-harness"))]
+pub use x86_64::qemu::debug_exit;
+
 // Architecture-trait implementations, re-exported under neutral names (see
 // `docs/conventions/arch-boundary.md`): one trait per divergent behavioural
 // subsystem, mirroring `paging::ArchPaging` → `Paging`.

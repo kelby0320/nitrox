@@ -6376,3 +6376,43 @@ workers + classes, demand paging, DMA, SMP distribution + affinity, large.bin, t
 chain) then reaches `eshell`; `-smp 4 --selftest` distributes correctly. Next: `xtask test-qemu`
 (the CI harness that boots a `--selftest` build headless and adjudicates pass/fail via
 `isa-debug-exit`), then service-mgr.
+
+## 2026-07-14 — `cargo xtask test-qemu`: headless integration harness
+
+Built the QEMU integration harness that was deferred since Phase 0. It boots the
+self-test build **headless** and adjudicates the whole boot (kernel → init → mount →
+userspace demo chain) from QEMU's exit code — so a regression fails CI instead of
+needing a human to read the serial log. (Motivation: the slice-3b SMP migration
+hazard was caught by a boot loop, not a unit test; that class of bug wants an
+automated boot assertion.)
+
+**Mechanism.** QEMU's `isa-debug-exit` device maps a guest port-`0xf4` write `v` to
+host exit `(v << 1) | 1`. The guest writes a **verdict**; the runner maps exit `33`
+(guest wrote `0x10`) → pass, anything else → fail. Since userspace can't touch I/O
+ports, the write goes through a new gated syscall `SYS_TEST_EXIT` (`0xFFFF_0002`) →
+`arch::debug_exit` — which lets the PASS verdict come from **init**, after the whole
+userspace boot, not just from `kernel_main`.
+
+**A distinct `test-harness` cargo feature** (`= ["selftest"]`) on the kernel + init,
+separate from `selftest` because it changes *terminal* behavior: after the demos,
+fire PASS + exit (vs. drop to eshell); on a kernel panic, fire FAIL + exit (vs. print
++ halt for GDB). Verdict sources: init on a clean/crashed demo reap, on spawn/
+critical-path failure (`supervise`/`emergency`); the kernel panic handler; a triple-
+fault via `-no-reboot`; a hang via the runner's `timeout(1)` (90 s). Everything under
+`test-harness` — `SYS_TEST_EXIT`, `arch::debug_exit` (new `arch/x86_64/qemu.rs`), the
+panic-handler exit — is **compiled out of production**: no emulator-exit backdoor in a
+shipping kernel, no ABI-hash impact.
+
+**xtask.** New `test-qemu` subcommand; the `selftest: bool` flags through
+`cmd_build`/`cmd_image`/`cmd_qemu` became a `BuildMode` enum {Normal, Selftest,
+TestHarness}; extracted a shared `qemu_base_args`. `test-qemu` runs `-smp 4 -display
+none -serial stdio -no-reboot` + the `isa-debug-exit` device under `timeout`, echoes
+the captured serial, and maps the exit code.
+
+Verified: `test-qemu` PASSES (init verdict → exit 33) on a healthy boot; a deliberately
+injected kernel `panic!` (test-harness only) correctly FAILS (panic handler → exit 35);
+`--selftest` still drops to eshell with **no** verdict (test-harness ≠ selftest); default
+boot quiet; host suite (12) + check-arch green. Docs: new
+`docs/conventions/qemu-integration-tests.md`; retired the deferred-decisions entry;
+updated the root + kernel `CLAUDE.md`. Next: service-mgr. A per-case framework under
+`tests/qemu-tests/` + an `-smp` matrix + CI wiring remain deferred.
