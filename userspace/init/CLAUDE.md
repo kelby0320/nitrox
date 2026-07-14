@@ -19,17 +19,15 @@ Init is deliberately minimal. It is the most critical-path code in the system. A
 ## Build environment
 
 - **`#![no_std]` + `alloc`** — same as other userspace
-- **Uses `libkern` + `alloc` directly. Does NOT depend on `libos`, `libstream`, or `librsproto`.** (`librt` no longer exists.)
-- **Depends on `libheap`** for its `#[global_allocator]` (the freeing heap; slice 4). This is the one runtime library init uses — it's a foundation alongside `libkern` (no_std, no services, no unbounded behavior), so it's compatible with init's critical-path rules. init's former fixed bump arena (`heap.rs`) is retired.
+- **Uses `libkern`, `libheap` (its `#[global_allocator]`, slice 4), and `libos`** (the alloc-free typed/async core — `Handle<T,M>` + `block_on`, slice 5). init runs close to the syscall surface, but libos-*core* is fair game: it's `no_std` + no-`alloc` with **no runtime bootstrap** (stack-only handles/futures, no allocator or executor to spin up), so it can't be in a bad state during early boot. **Trajectory: full `std` eventually** — PID 1 on Linux universally links a full libc (systemd + dozens of shared libs; even SysV/BusyBox init link libc), so init is *not* meant to stay minimal. What init still avoids is the *stateful/protocol* runtime (`libstream`, `librsproto`) and anything depending on services that haven't started.
 - **Stable Rust only.**
 
-The "no libos/librt" rule is unusual and important. Init runs before the rest of the runtime ecosystem is functional. It can't depend on anything that might want to allocate during initialization, register handlers, or rely on services that haven't started yet. It works directly with the syscall surface.
+The line init draws is about **runtime state and started services**, not about staying at the raw syscall surface. Init runs before the service ecosystem is up, so it can't depend on anything that registers handlers or relies on services that haven't started. But the alloc-free, bootstrap-free layers (`libkern`, `libheap`, `libos`-core) are fine.
 
 This means:
-- Use `RawHandle` directly, not `Handle<T, M>`
-- Use raw `sys_io_submit` + `sys_wait` for I/O, not async/await
-- Use `IpcMsg` directly for messages, not librsproto
-- Parse TOML manually (init has its own minimal TOML parser, since the standard parser likely depends on things init doesn't have access to)
+- `libos` `Handle<T,M>` + `block_on` for typed, async-shaped I/O is fine (init uses it — e.g. `read_current_generation`). Raw `sys_io_submit`/`sys_wait` + `RawHandle` are still available where mixing is simpler.
+- Use `IpcMsg` directly for the fs-server handshake, not `librsproto` — a *pragmatic current choice* (init hand-parses the tiny Ready envelope), not because init couldn't; librsproto is a stateful protocol layer init has no need to pull in yet.
+- Parse TOML manually (init has its own minimal TOML parser, since a full parser pulls in more than init needs).
 
 ## Critical-path discipline
 
@@ -114,7 +112,7 @@ Don't add complex testing scaffolding to init itself. Keep it minimal.
 
 ## Forbidden patterns
 
-- Depending on `libos`, `libstream`, or `librsproto` (but `libheap`, the allocator, is fine)
+- Pulling in the *stateful* runtime (`libstream`, `librsproto`) or anything depending on not-yet-started services (`libkern`/`libheap`/`libos`-core are fine; full `std` is the eventual target)
 - `panic!()` outside of explicitly-unrecoverable error paths
 - `unwrap()` without `// unwrap: <reason>`
 - Unbounded loops, unbounded allocation, unbounded waiting

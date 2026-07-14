@@ -27,6 +27,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use init::manifest::{self, Mode, MountSpec};
 use libkern::*;
+use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
 
 // The freeing userspace heap (slice 4). Replaces init's former fixed bump arena,
 // which never freed — fine for init's one-shot bootstrap, but init is now the first
@@ -398,25 +399,38 @@ fn wait_ready(ctrl: u64) -> Option<u64> {
 /// file and replies a `MemoryObject`), map it, and log its content — proving the
 /// whole stack end to end.
 fn read_current_generation(root_ns: u64) {
-    let (st, mem) = ns_lookup_wait(root_ns, b"/system/current-generation", RIGHT_MAP_READ);
-    if st != 0 || mem == 0 {
-        kprint(b"init: /system/current-generation lookup FAIL\n");
-        return;
-    }
-    // SAFETY: `mem` is a read-only MemoryObject of the file content (zero-padded).
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
-    if addr < 0 {
-        kprint(b"init: current-generation map FAIL\n");
-        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
-        return;
-    }
+    // libos path (the init dogfood for slice 5): borrow the process-owned root
+    // namespace, then `lookup(...).block_on()` + `map()` — replacing the hand-rolled
+    // `ns_lookup_wait` (submit → sys_wait → byte-offset decode → close). The resolved
+    // handle is an owning libos `Handle` that closes itself on drop, so the two manual
+    // `sys_handle_close`s go away.
+    // SAFETY: `root_ns` is init's live root namespace, owned for its whole run; a
+    // borrowed Handle is a non-owning view and never closes it.
+    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+    // SAFETY: the path resolves to a read-mappable file object (asserted by the
+    // `Memory, MapRead` type arguments).
+    let mem = match block_on(unsafe {
+        ns.lookup::<Memory, MapRead>("/system/current-generation", Rights::MAP_READ)
+    }) {
+        Ok(m) => m,
+        Err(_) => {
+            kprint(b"init: /system/current-generation lookup FAIL\n");
+            return;
+        }
+    };
+    let addr = match mem.map(PAGE as usize) {
+        Ok(a) => a,
+        Err(_) => {
+            kprint(b"init: current-generation map FAIL\n");
+            return; // `mem` drops here → closes the resolved handle
+        }
+    };
     // SAFETY: `addr` maps a page of the file bytes + zero padding; trim the tail.
-    let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, PAGE as usize) };
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     kprint(b"init: /system/current-generation = ");
     kprint(&bytes[..len]); // the file content ends in '\n'
-    // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    // `mem` drops at end of scope → closes the resolved handle.
 }
 
 /// Size of the Part-5 large-file fixture (`/system/large.bin`). MUST match the

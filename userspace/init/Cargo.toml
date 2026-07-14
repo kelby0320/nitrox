@@ -6,6 +6,7 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
+libos = { path = "../libos" }
 
 # A library + binary split: the library holds init's host-testable internals (the
 # bump-allocator math now; the `toml_lite` parser in Part 4), the binary is the

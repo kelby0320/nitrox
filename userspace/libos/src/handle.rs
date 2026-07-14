@@ -107,26 +107,50 @@ impl MemMode for MapExec {
 
 // --- the handle -----------------------------------------------------------
 
-/// A typed, owning capability handle. Closes its capability on drop.
+/// A typed capability handle. An **owning** handle (from [`from_raw`](Handle::from_raw))
+/// closes its capability on drop; a **borrowed** one (from [`borrow`](Handle::borrow))
+/// does not — a non-owning view of a handle owned elsewhere (e.g. the bootstrap
+/// `root_ns`, which the process holds for its whole life).
 pub struct Handle<T, M> {
     raw: RawHandle,
     extra: Rights,
+    owned: bool,
     _t: PhantomData<T>,
     _m: PhantomData<M>,
 }
 
 impl<T, M> Handle<T, M> {
-    /// Wrap a raw handle as a typed `Handle`, taking ownership (it will be closed on
-    /// drop). `extra` is the generic + modifier rights band.
+    /// Wrap a raw handle as a typed **owning** `Handle` (closed on drop). `extra` is
+    /// the generic + modifier rights band.
     ///
     /// # Safety
     /// The caller asserts that `raw` names a live object of type `T` carrying at
-    /// least mode `M`'s principal rights. libos cannot check `M` statically; where
-    /// cheap, callers should confirm the object type via `sys_handle_stat` first.
+    /// least mode `M`'s principal rights, and transfers ownership of it. libos cannot
+    /// check `M` statically; where cheap, callers should confirm the object type via
+    /// `sys_handle_stat` first.
     pub unsafe fn from_raw(raw: RawHandle, extra: Rights) -> Self {
         Handle {
             raw,
             extra,
+            owned: true,
+            _t: PhantomData,
+            _m: PhantomData,
+        }
+    }
+
+    /// Wrap a raw handle as a typed **borrowed** `Handle` — a non-owning view that is
+    /// **not** closed on drop. For handles owned elsewhere (the bootstrap `root_ns`,
+    /// a handle whose lifetime the caller manages).
+    ///
+    /// # Safety
+    /// As [`from_raw`](Handle::from_raw), except ownership is **not** transferred: the
+    /// caller must keep `raw` live for at least as long as the returned borrow, and
+    /// must not attenuate it (that would mutate the owner's capability in place).
+    pub unsafe fn borrow(raw: RawHandle, extra: Rights) -> Self {
+        Handle {
+            raw,
+            extra,
+            owned: false,
             _t: PhantomData,
             _m: PhantomData,
         }
@@ -160,10 +184,12 @@ impl<T, M> Handle<T, M> {
         }
         let raw = self.raw;
         let extra = Rights::from_bits(self.extra.bits() & mask);
+        let owned = self.owned;
         core::mem::forget(self); // keep the (now-restricted) capability alive under M2
         Ok(Handle {
             raw,
             extra,
+            owned,
             _t: PhantomData,
             _m: PhantomData,
         })
@@ -192,7 +218,9 @@ impl Handle<Memory, MapReadWrite> {
 
 impl<T, M> Drop for Handle<T, M> {
     fn drop(&mut self) {
-        sys::handle_close(self.raw.0);
+        if self.owned {
+            sys::handle_close(self.raw.0);
+        }
     }
 }
 
@@ -209,6 +237,17 @@ mod tests {
         } // dropped here
         let (_s, _w, closes) = sys::counts();
         assert_eq!(closes, 1, "Handle::drop must close the raw handle");
+    }
+
+    #[test]
+    fn borrowed_handle_does_not_close_on_drop() {
+        sys::reset();
+        {
+            // SAFETY: test handle; borrow does not take ownership.
+            let _h = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(3), Rights::LOOKUP) };
+        } // dropped here — must NOT close
+        let (_s, _w, closes) = sys::counts();
+        assert_eq!(closes, 0, "a borrowed Handle must not close on drop");
     }
 
     #[test]

@@ -18,10 +18,15 @@ rules:
 
 - **`#![no_std]` + `#![no_main]`.** Bare-target `_start`; a `#[panic_handler]` that
   cannot escalate.
-- **`libkern` only.** Does **not** depend on `libos`, `librt`, `libstream`, or
-  `librsproto` — like init, it works directly on the raw syscall surface. (It speaks
-  no rsproto: it reads/maps resources via `sys_ns_lookup` + `sys_io_submit` +
-  `sys_memory_map`.)
+- **`libkern` only.** Does **not** depend on `libos`, `libstream`, or `librsproto`.
+  This is deliberate and *stronger* than init's rule (init now uses `libos`-core):
+  eshell is the **recovery surface** — the shell init drops to on failure — so it
+  follows the statically-linked-`busybox` / `sash` ethos: minimize the layers between
+  the recovery tool and the syscall, so there are the fewest ways for it to fail to
+  come up. libos-*core* (alloc-free, stateless, no bootstrap) would be the one
+  defensible exception, but we keep eshell at the raw surface on purpose. (It
+  reads/maps resources via `sys_ns_lookup` + `sys_io_submit` + `sys_memory_map`; it
+  speaks no rsproto.)
 - **No `alloc`.** Fixed `.bss` buffers (the line buffer, the read buffer handle); no
   `#[global_allocator]`. If a future command needs `alloc`, copy init's `BumpAlloc`.
 - **No `panic!()` / `unwrap()`** in normal operation. Every error case logs and
