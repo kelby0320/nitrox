@@ -6149,3 +6149,40 @@ allocation-heavy bootstrap (init.toml parse → `Vec<MountSpec>` + TOML strings)
 mounts ext4, drives the full parent demo chain, reaps, and reaches a live `eshell>`; scripted
 `help`/`lsblk`/`mounts`/`cat /system/current-generation` all correct; `-smp 4` boots clean
 (4 CPUs online, no faults). Not committed pending review.
+
+## 2026-07-13 — Phase 3 slice 5 scoped down: libos core only (defer libstream + the multi-task executor)
+
+Slice-5 kickoff. A survey of current userspace (init/eshell/parent/fs-server all call raw
+`libkern`; the `po_wait` submit→`sys_wait`→decode→close idiom is copy-pasted into every binary;
+`Handle<T,M>` has an authoritative paper design in `os-design-v5.1.md`; eshell/parent/fs-server
+are all `alloc`-free) drove two scope cuts, both the same "build what has a consumer" discipline
+applied to librt/libstream/std.
+
+**1. Cut `libstream` from slice 5.** It's typed *pipeline* I/O (the `TSM1` wire format,
+`TableWriter`/`TableReader`, `#[derive(TypedRecord)]`) and has **no consumer now**: init does
+sequential bootstrap (no typed records), and eshell's line editor is *byte* I/O (raw console
+bytes + text), not typed streams — the plan's "eshell becomes a libstream client" conflated the
+two. libstream's first real consumer is the shell/pipeline era or the service-mgr milestone
+("a test program produces typed TableWriter output to its log channel"). It also drags in a
+`#[derive(TypedRecord)]` proc-macro (first userspace external-crate decision, or a hand-rolled
+one). Deferred to a just-in-time slice with its first consumer — and flagged for a **dedicated
+design pass on the `TSM1` wire protocol + streaming model** before implementation.
+
+**2. Scope libos to an alloc-free core + `block_on`; defer the multi-task executor.** Neither
+current consumer needs multi-task concurrency: init is sequential (mount→mount→reaping loop),
+eshell is a single read loop. Both need only `block_on` (drive one future). A multi-task
+`spawn`/run-loop executor needs `alloc` (heterogeneous task storage) *and* has no concurrent
+consumer (today's fs-server is also sequential) — it lands with the first concurrency-heavy
+service. So slice 5 builds: `Handle<T,M>` typestate wrappers (from the v5.1 design — `T` object
+marker, `M` mode marker, `extra: Rights` runtime band, sealed `CanRead`/`CanWrite` op gating,
+attenuation-consumes-self via `sys_handle_restrict`); the `Op` future over `sys_wait`;
+single-op async methods; `block_on`; an `io::Error`-shaped error. All **`#![no_std]`, no
+`alloc`** — the reach that matters: the alloc-free binaries (eshell/parent/fs-server) can adopt
+`Handle` + `block_on` too, not just init. The multi-task executor, when built, is an
+`alloc`-gated addition, not a core change. `Op` is a real `core::future::Future` (so
+`async`/`await` and a later executor drive it); `block_on` is the degenerate single-task driver.
+
+Design captured in `docs/architecture/libos.md` (slice-5 Part A). Plan reframed: slice 5 is
+"libos core," libstream is a separate deferred entry. Next: implement libos (Part B: the `Op`
+future + `block_on` + error over a mock syscall seam; Part C: the `Handle<T,M>` wrappers;
+Part D: dogfood init + eshell). Planning + design doc only in this entry — no code yet.

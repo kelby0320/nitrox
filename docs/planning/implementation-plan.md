@@ -1678,32 +1678,43 @@ libos authority surface → services.**
     chain → `eshell`, with scripted `help`/`lsblk`/`mounts`/`cat` all correct; `-smp 4`
     clean (4 CPUs, no faults). See the decision log (2026-07-13).
 
-- [ ] **Slice 5 — `libos` core + `libstream` (the SysCaps-independent runtime).**
-  Wraps only the *solid* syscall surface; explicitly excludes the thread-spawn /
-  authority pieces (slices 6–7).
-  - [ ] **Design docs** `docs/architecture/libos.md` + `libstream.md` (new) —
-    written at slice start; std-shaped API surface (`io::Error`-shaped errors,
-    `std::io`-shaped byte traits) so a future std facade re-exports rather than
-    adapts; the centralized-thin-entry glue (the std `lang_start` cutover seam).
-  - [ ] `userspace/libos/` (core): `Handle<T, M>` typestate wrappers over handles,
-    memory, notifications, IPC channels, namespace, entropy, and `io_submit`; an
-    **async executor over `sys_wait`** (single-threaded, poll-based; a
-    `PendingOperation` is the core future). Error type shaped like `std::io::Error`
-    for a cheap future std facade.
-  - [ ] Minimal **blocking convenience** in libos: a `block_on(future)` + a few
-    blocking helper methods, for sequential callers (init-style bootstrap) that don't
-    want an executor. Explicitly a **pre-std ergonomic superseded by `std::io`** once
-    std lands — kept small and self-contained, not a separate crate. (This is the
-    residue of the cut librt crate — see the 2026-07-13 decision log.)
-  - [ ] `userspace/libstream/`: `TableWriter`/`TableReader`, `record_read`,
-    `#[derive(TypedRecord)]`, initial types per
-    [docs/spec/typed-stream-format.md](../spec/typed-stream-format.md).
-  - [ ] **First consumers:** migrate init + eshell onto the libos handle wrappers +
-    executor; eshell's `io_submit` line-editor loop becomes a libstream/libos client.
+- [ ] **Slice 5 — `libos` core (the SysCaps-independent runtime).** The typed +
+  async face of the *solid* syscall surface. **Scoped down (2026-07-13):** `libstream`
+  and the *multi-task* executor were **cut from this slice** — both are consumer-less
+  now (see the decision log), so slice 5 is libos core only.
+  - [ ] **Design doc** `docs/architecture/libos.md` (new; written at slice start) —
+    the `Handle<T, M>` typestate model (from `os-design-v5.1.md`), the `Op` future
+    over `sys_wait`, `block_on`, the `io::Error`-shaped error, the host-test syscall
+    seam, and the centralized-thin-entry seam (future std `lang_start` cutover).
+  - [ ] `userspace/libos/` — **`#![no_std]`, no `alloc`** (so the alloc-free binaries,
+    eshell/parent/fs-server, can use it too): `Handle<T, M>` typestate wrappers (T =
+    object type, M = mode marker; `extra: Rights` for generic/modifier rights,
+    runtime-checked; sealed `CanRead`/`CanWrite`/… gate ops) over the solid objects —
+    Memory, IpcChannel, Namespace, NotificationChannel, Entropy, PendingOperation; the
+    `Op` future (wraps a PO; polls via `sys_wait`); single-op async methods
+    (`read`/`write` via `io_submit`, `ns_lookup`, …); and **`block_on`** (drives one
+    future to completion, no heap — collapses the `po_wait` idiom copy-pasted into
+    every binary today). `io::Error`-shaped error over `KError`.
+  - [ ] **First consumers:** migrate init onto libos (`Handle<T,M>` + `block_on` for
+    its sequential bootstrap + reaping loop) and eshell's console read loop onto
+    libos byte I/O (eshell stays alloc-free).
   - **Scope boundary:** no `thread_create`/`process_spawn` wrappers and no syscap-gated
-    calls — those wrap ABIs that finalize in slices 6–7.
-  - *Verify:* host tests for the executor + typed-stream codec; init/eshell boot +
-    scripted stress green on the new stack.
+    calls (slices 6–7); **no multi-task `spawn`/run-loop executor** — deferred (needs
+    `alloc`, and init/eshell are sequential/single-loop; lands with the first
+    concurrent service). `libstream` deferred (below).
+  - *Verify:* host tests for the `Op` future + `block_on` + error mapping against a
+    mock syscall seam; init/eshell boot + scripted `help`/`lsblk`/`mounts`/`cat` stress
+    green on the new stack; `-smp 1` + `-smp 4` clean.
+
+- [ ] **`libstream` (deferred out of slice 5).** Typed structured I/O
+  (`TableWriter`/`TableReader`, `record_read`, `#[derive(TypedRecord)]`) per
+  [docs/spec/typed-stream-format.md](../spec/typed-stream-format.md). **No consumer
+  until the shell/pipeline era or the service-mgr milestone** (*"a test program
+  produces typed TableWriter output to its log channel"*), and it drags in a derive
+  proc-macro (first userspace external-crate decision, or a hand-rolled one). Lands
+  just-in-time with its first consumer — and wants a **dedicated design pass on the
+  `TSM1` wire protocol + streaming model** before implementation. See the decision log
+  (2026-07-13).
 
 - [ ] **Slice 6 — SysCaps (process-level capabilities).** **Scope stub now; full
     design doc written at slice start** (after slice 5 — building libos/libstream
