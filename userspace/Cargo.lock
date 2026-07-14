@@ -37,6 +37,7 @@ version = "0.1.0"
 dependencies = [
  "libheap",
  "libkern",
+ "libos",
 ]
 
 [[package]]
@@ -49,6 +50,13 @@ dependencies = [
 [[package]]
 name = "libkern"
 version = "0.1.0"
+
+[[package]]
+name = "libos"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
 
 [[package]]
 name = "librsproto"

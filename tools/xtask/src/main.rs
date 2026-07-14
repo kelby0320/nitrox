@@ -355,6 +355,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libos` host tests (the async core — the `Op` future + `block_on` + error
+    // mapping, against a mock syscall seam). A plain lib; the target syscall path is
+    // `cfg`'d out under `test`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libos")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // init's library tests (the `manifest` + `toml_lite` parsers). `--lib` skips the
     // `#![no_main]` bin, which can't build for the host.
     run(Command::new("cargo")

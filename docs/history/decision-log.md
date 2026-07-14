@@ -6149,3 +6149,78 @@ allocation-heavy bootstrap (init.toml parse → `Vec<MountSpec>` + TOML strings)
 mounts ext4, drives the full parent demo chain, reaps, and reaches a live `eshell>`; scripted
 `help`/`lsblk`/`mounts`/`cat /system/current-generation` all correct; `-smp 4` boots clean
 (4 CPUs online, no faults). Not committed pending review.
+
+## 2026-07-13 — Phase 3 slice 5 scoped down: libos core only (defer libstream + the multi-task executor)
+
+Slice-5 kickoff. A survey of current userspace (init/eshell/parent/fs-server all call raw
+`libkern`; the `po_wait` submit→`sys_wait`→decode→close idiom is copy-pasted into every binary;
+`Handle<T,M>` has an authoritative paper design in `os-design-v5.1.md`; eshell/parent/fs-server
+are all `alloc`-free) drove two scope cuts, both the same "build what has a consumer" discipline
+applied to librt/libstream/std.
+
+**1. Cut `libstream` from slice 5.** It's typed *pipeline* I/O (the `TSM1` wire format,
+`TableWriter`/`TableReader`, `#[derive(TypedRecord)]`) and has **no consumer now**: init does
+sequential bootstrap (no typed records), and eshell's line editor is *byte* I/O (raw console
+bytes + text), not typed streams — the plan's "eshell becomes a libstream client" conflated the
+two. libstream's first real consumer is the shell/pipeline era or the service-mgr milestone
+("a test program produces typed TableWriter output to its log channel"). It also drags in a
+`#[derive(TypedRecord)]` proc-macro (first userspace external-crate decision, or a hand-rolled
+one). Deferred to a just-in-time slice with its first consumer — and flagged for a **dedicated
+design pass on the `TSM1` wire protocol + streaming model** before implementation.
+
+**2. Scope libos to an alloc-free core + `block_on`; defer the multi-task executor.** Neither
+current consumer needs multi-task concurrency: init is sequential (mount→mount→reaping loop),
+eshell is a single read loop. Both need only `block_on` (drive one future). A multi-task
+`spawn`/run-loop executor needs `alloc` (heterogeneous task storage) *and* has no concurrent
+consumer (today's fs-server is also sequential) — it lands with the first concurrency-heavy
+service. So slice 5 builds: `Handle<T,M>` typestate wrappers (from the v5.1 design — `T` object
+marker, `M` mode marker, `extra: Rights` runtime band, sealed `CanRead`/`CanWrite` op gating,
+attenuation-consumes-self via `sys_handle_restrict`); the `Op` future over `sys_wait`;
+single-op async methods; `block_on`; an `io::Error`-shaped error. All **`#![no_std]`, no
+`alloc`** — the reach that matters: the alloc-free binaries (eshell/parent/fs-server) can adopt
+`Handle` + `block_on` too, not just init. The multi-task executor, when built, is an
+`alloc`-gated addition, not a core change. `Op` is a real `core::future::Future` (so
+`async`/`await` and a later executor drive it); `block_on` is the degenerate single-task driver.
+
+Design captured in `docs/architecture/libos.md` (slice-5 Part A). Plan reframed: slice 5 is
+"libos core," libstream is a separate deferred entry. Next: implement libos (Part B: the `Op`
+future + `block_on` + error over a mock syscall seam; Part C: the `Handle<T,M>` wrappers;
+Part D: dogfood init + eshell). Planning + design doc only in this entry — no code yet.
+
+## 2026-07-13 — Phase 3 slice 5 complete: libos core (+ the recovery-shell dependency line)
+
+libos core landed in four commits (Parts A–D). B: the `Op` future + `block_on` (single-task
+driver, alloc-free) + `io::Error`-shaped error, over a mock syscall seam (6 tests). C: the
+`Handle<T,M>` typestate wrappers — sealed `CanRead`/`CanWrite`/… op-gating (misuse is a compile
+error), RAII close, attenuation-consumes-self; async `Namespace::lookup`/`Resource::read,write`,
+`Memory::create/map`, `Notify::recv` (+7 tests). D: dogfood + a borrowed (non-owning) `Handle`.
+`#![no_std]`, no `alloc` throughout; 15 host tests; bare-build clean.
+
+**The dogfood surfaced a governance question worth recording: should the recovery shell take a
+runtime-library dependency?** Both init and eshell `CLAUDE.md` had *forbidden* `libos` — a rule
+predating the alloc-free libos-core. Resolved by looking at Linux precedent, and the two land
+differently:
+
+- **init → uses libos** (and, later, full `std`). PID 1 on Linux *universally* links a full
+  libc — systemd pulls in glibc + dozens of shared libraries; even minimal inits (SysV,
+  BusyBox, runit, s6) link libc. Nobody writes PID 1 against raw syscalls. So init is not meant
+  to stay minimal: its `CLAUDE.md` now permits libkern/libheap/libos-core (the line it draws is
+  *stateful runtime* + *unstarted services*, e.g. libstream/librsproto, not the syscall
+  surface), with full `std` as the trajectory. init's `read_current_generation` is the first
+  consumer (`ns.lookup(...).block_on()` + `map()`).
+
+- **eshell → stays `libkern`-only, deliberately.** It's the *recovery surface* (the shell init
+  drops to on failure), so it follows the statically-linked-`busybox` / `sash` ethos: a rescue
+  tool minimizes the layers between itself and the syscall so there are the fewest ways for it
+  to fail to come up (a dynamically-linked shell won't even start if libc is broken). eshell
+  recovers from *init* failure — the kernel/syscalls are fine — so libos-core (stateless,
+  alloc-free, no bootstrap) would be a *defensible* exception, but we keep eshell at the raw
+  surface on purpose. Its drafted libos migration was reverted; `CLAUDE.md` now states the *why*.
+
+The distinction: libos-core is safe for critical-path use because it has **no runtime
+bootstrap** (stack-only handles/futures — nothing to initialize or corrupt); the recovery-shell
+restriction is a *minimize-surface* choice, not a correctness one.
+
+Verified: full host suite + check-arch green; QEMU — init reads current-generation through
+libos ("nitrox-rootfs generation 1"), boots to `eshell`, scripted `help`/`lsblk`/`mounts`/`cat`
+correct; `-smp 1` + `-smp 4` clean, no faults. Slice 5 done; next is slice 6 (SysCaps).
