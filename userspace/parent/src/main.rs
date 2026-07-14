@@ -75,7 +75,16 @@ static mut MSGBUF: [u8; 4096] = [0; 4096];
 static mut HBUF: [u64; 8] = [0; 8];
 /// Recv'd handle-count out-param.
 static mut RECV_COUNT: usize = 0;
-static mut WORKER_ARGS: ThreadArgs = ThreadArgs { entry: 0, user_sp: 0, arg0: 0, _reserved: [0; 40] };
+static mut WORKER_ARGS: ThreadArgs = ThreadArgs {
+    entry: 0,
+    user_sp: 0,
+    arg0: 0,
+    class: 0, // TimeShared
+    rt_priority: 0,
+    nice: 0,
+    cpu_affinity: 0, // no restriction
+    _reserved: [0; 36],
+};
 static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
 
 // --- Userspace-server forwarding demo (slice 7 Part 3) ----------------------

@@ -642,6 +642,36 @@ pub fn spawn_user(
     user_sp: u64,
     boot_args: [u64; 4],
 ) -> Result<ObjectRef, AllocError> {
+    // Default scheduling: TimeShared, nice 0, no affinity restriction — the behavior
+    // every caller had before scheduling params were exposed via `ThreadArgs`.
+    spawn_user_sched(
+        process,
+        entry,
+        user_sp,
+        boot_args,
+        SchedClass::TimeShared,
+        0,
+        0,
+        u8::MAX,
+    )
+}
+
+/// As [`spawn_user`], but with explicit scheduling parameters (from a user thread's
+/// `ThreadArgs`). The `RealTime` class is `REAL_TIME`-gated by the caller
+/// (`sys_thread_create`); this sets `class`/`rt_priority`/`nice`/`cpu_mask` on the
+/// fresh thread **before** it is enqueued, so it never runs a scheduler tick under the
+/// wrong class. `cpu_mask` `u8::MAX` ⇒ no affinity restriction.
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_user_sched(
+    process: ObjectRef,
+    entry: u64,
+    user_sp: u64,
+    boot_args: [u64; 4],
+    class: SchedClass,
+    rt_priority: u8,
+    nice: i8,
+    cpu_mask: u8,
+) -> Result<ObjectRef, AllocError> {
     let tid = {
         let mut g = SCHED.lock();
         let t = g.next_tid;
@@ -651,6 +681,14 @@ pub fn spawn_user(
     // Heavy work outside the lock (consumes `process` on success).
     let thread = Thread::try_new_user(tid, process, entry, user_sp, boot_args)?;
     let r = into_objref(thread);
+    let obj = r.as_ptr();
+    // SAFETY: `obj` is the new thread, exclusively owned via `r` and not yet enqueued —
+    // no other context can observe it, so setting its scheduling parameters here
+    // (before the enqueue lock) is sound. Mirrors `spawn_inner`.
+    unsafe {
+        Thread::set_sched(obj, class, rt_priority, nice);
+        Thread::set_cpu_mask(obj, cpu_mask);
+    }
     // Clone the caller's handle before the enqueue moves `r` into `ready`.
     let handle = r.clone();
 

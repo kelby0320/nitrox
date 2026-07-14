@@ -1,6 +1,10 @@
 # System capabilities (SysCaps)
 
-**Status:** Design (pre-implementation). Target: Phase 3 slice 6. Living document.
+**Status:** Implemented (Phase 3 slice 6, 2026-07-14). Living document. The type,
+the `Process.syscaps` field, spawn inheritance, the init boot grant, and the two wired
+gates (`BIND_NAMESPACE` on `sys_ns_bind`, `REAL_TIME` on the RT scheduling class) are
+in; the other four caps are defined and inherited, their gates deferred to their
+operations' slices.
 
 **SysCaps** are the kernel's second axis of authority: **ambient, per-process
 capabilities** for privileged *operations*, distinct from per-handle

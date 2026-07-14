@@ -6262,3 +6262,49 @@ Three decisions worth recording:
 Committed as Part A (design doc only). Next: Part B — the `SysCaps` type + `Process` field +
 inheritance + boot grant; Part C — wire the two gates + the `ThreadArgs`/`SpawnArgs` ABI +
 dogfood the demos.
+
+## 2026-07-14 — Phase 3 slice 6 complete: SysCaps enforced
+
+SysCaps landed in three commits (Parts A–C). The kernel now has its second, defining axis of
+authority — ambient per-process capabilities — enforced at the syscall boundary.
+
+**Part B (plumbing, behavior-neutral):** `SysCaps(u64)` hand-rolled bitmask (kernel
+`libkern/syscaps.rs` + userspace mirror, like `Rights`); immutable `Process.syscaps`; `SpawnArgs`
+grown 96→104 with a `syscaps: u64`; `sys_process_spawn` attenuates `child = parent &
+args.syscaps`; init's boot grant is `SysCaps::all()`. No gate enforced yet, so the system booted
+identically — verified.
+
+**Part C (enforcement):** `require_syscap(cap)` (resolve `current_process` → `contains` →
+`NoAccess`). Two gates wired:
+- **`BIND_NAMESPACE` on `sys_ns_bind`** — an *additional* gate atop the existing `BIND` handle
+  right, so namespace *construction* is supervisor-only: a process cannot bind even into a
+  namespace it created without the cap. Proven both ways under QEMU: parent *with* the grant →
+  `ns_bind /store ok`; parent *without* → `ns_create ok` (creating the object is ungated) but
+  `ns_bind FAIL`.
+- **`REAL_TIME` on the RT scheduling class** — closes the slice-2 deferral. `ThreadArgs`'
+  reserved block became `class`/`rt_priority`/`nice`/`cpu_affinity` (size unchanged, 64; a
+  zeroed block = the historical TimeShared/nice-0/no-affinity default). `sys_thread_create`
+  parses them, gates `RealTime` on `REAL_TIME` (`NoAccess`), and applies class/nice/affinity via
+  a new `spawn_user_sched` (set before enqueue, mirroring `spawn_inner`). `nice`/affinity are
+  ungated (renicing/pinning your own thread isn't privileged); affinity-at-runtime stays the
+  `SIGNAL` handle-right gate. No userspace requests RT today — the gate is defensive but the
+  mechanism is now reachable.
+
+Grants: init (full set) grants `parent` `BIND_NAMESPACE` (its ns-demo constructs namespaces);
+fs-server/eshell/child get none.
+
+**ABI reconciliation.** `SpawnArgs`/`ThreadArgs` are *syscall*-ABI (passed by `UserPtr`,
+self-pinned by `size_of`/`offset_of` asserts + the spec docs), **not** Tier-2 module-boundary
+types — so growing them is a pre-v1 syscall-ABI change, not a module-ABI-hash bump. The source
+comments that called them "ABI-hash inputs like IpcMsg" were corrected to say so; they are not
+added to `abi-version-hash.md`.
+
+**Deferred (defined, not gated):** `LOAD_MODULE`, `PHYSICAL_MEMORY`, `SYSTEM_CLOCK`,
+`AUDIT_CONTROL` — no operation to gate yet; each gets its `require_syscap` when its slice builds
+the operation. This doc's cap table is the registry.
+
+Verified: SysCaps + layout host tests; full host suite (528 kernel) + check-arch green; bare
+build clean; QEMU gate-allows + gate-bites as above; boots to `eshell`; `-smp 1` + `-smp 4`
+clean, no faults. Docs updated (syscaps.md → implemented; scheduler.md's REAL_TIME gate now
+wired; process-spawn-args.md/thread-args.md specs grown). Slice 6 done; next is slice 7 (the
+SysCaps-coupled libos surface). Then the PR.

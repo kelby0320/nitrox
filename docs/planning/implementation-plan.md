@@ -1716,11 +1716,9 @@ libos authority surface → services.**
   `TSM1` wire protocol + streaming model** before implementation. See the decision log
   (2026-07-13).
 
-- [ ] **Slice 6 — SysCaps (process-level capabilities).** **Scope stub now; full
-    design doc written at slice start** (after slice 5 — building libos/libstream
-    surfaces which authorities the services actually need, so the syscap set isn't
-    guessed). The kernel's *defining* feature still missing: authority currently
-    faked with handle `Rights` stand-ins (`SIGNAL` for affinity, `BIND` for ns-bind).
+- [x] **Slice 6 — SysCaps (process-level capabilities)** (2026-07-14). The kernel's
+    defining feature — ambient per-process authority — is now real; the handle-`Rights`
+    stand-ins are backed by actual syscaps. Built in parts A–C (one commit each).
   - [x] **Design doc** `docs/architecture/syscaps.md` (Part A, 2026-07-14) — the
     6-cap model (from v5.1), storage on `Process`, grant/attenuate-on-spawn
     (`child = parent & args.syscaps`), the `require_syscap` check point, and the ABI
@@ -1729,18 +1727,21 @@ libos authority surface → services.**
     are wired now** (`BIND_NAMESPACE`, `REAL_TIME`), the other four (`LOAD_MODULE`/
     `PHYSICAL_MEMORY`/`SYSTEM_CLOCK`/`AUDIT_CONTROL`) gated by the slice that builds
     their operation.
-  - [ ] Kernel `SysCaps` type (+ userspace mirror) + the `Process.syscaps` field;
-    checked at the two wired gates: `BIND_NAMESPACE` (an *additional* gate on `ns_bind`
-    atop the `BIND` handle right — makes namespace construction supervisor-only) and
-    `REAL_TIME` (the RT scheduling class); plus spawn-time inheritance + the init boot
-    grant (full set).
-  - [ ] **Finalize the deferred `ThreadArgs` ABI** (class/nice/affinity + the
-    `REAL_TIME` gate — deferred *to this slice* by slice 2) and the **`SpawnArgs`**
-    syscap-inheritance fields. **ABI-hash affecting** (`SpawnArgs`/`ThreadArgs`
-    layouts) — a deliberate bump.
-  - [ ] Supervisor (init/service-mgr) distributes syscaps at spawn.
-  - *Verify:* gates enforced (no `BIND_NAMESPACE` → ns_bind rejected; RT class
-    rejected without `REAL_TIME`); boots to `eshell`; host tests for grant/attenuate.
+  - [x] **Part B (plumbing)** — `SysCaps(u64)` type (kernel + userspace mirror,
+    host-tested); the immutable `Process.syscaps` field; `SpawnArgs` grown 96→104;
+    `sys_process_spawn` inheritance (`child = parent & args.syscaps`); the init boot
+    grant (`SysCaps::all()`). Behavior-neutral — no gate enforced.
+  - [x] **Part C (enforcement)** — `require_syscap`; the **`BIND_NAMESPACE`** gate on
+    `sys_ns_bind` (additional to the `BIND` right → namespace construction is
+    supervisor-only); the **`REAL_TIME`** gate + the finalized **`ThreadArgs`**
+    class/nice/affinity ABI (into its `_reserved`, size unchanged; RealTime gated, the
+    rest ungated); init grants `parent` `BIND_NAMESPACE`. **ABI:** syscall-ABI change
+    (self-pinned by asserts + specs), *not* the module hash — source comments corrected.
+  - *Verified:* SysCaps + layout host tests; full suite (528 kernel) + check-arch green;
+    bare build clean. QEMU — **gate allows** (init mounts fs-server, parent `ns_bind
+    /store ok` via its grant) and **gate bites** (parent without the cap: `ns_create ok`
+    but `ns_bind FAIL`, even on its own namespace); boots to `eshell`; `-smp 1` + `-smp
+    4` clean.
 
 - [ ] **Slice 7 — the SysCaps-coupled libos surface.** The libos pieces held back
     from slice 5, now that SysCaps + `ThreadArgs`/`SpawnArgs` are settled. (No `librt`
