@@ -914,5 +914,11 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = writeln!(w, "  at {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
     let _ = writeln!(w, "  {}", info.message());
+    // Under the integration-test build, a kernel panic is a test failure: end the
+    // QEMU run with the fail verdict so the runner reports it (instead of hanging
+    // until the wall-clock timeout). `0x11` → QEMU exit 35 → the runner maps to fail.
+    #[cfg(feature = "test-harness")]
+    arch::debug_exit(0x11);
+    #[cfg(not(feature = "test-harness"))]
     arch::Cpu::halt_loop()
 }

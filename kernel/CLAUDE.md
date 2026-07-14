@@ -74,7 +74,7 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
 ## Testing
 
 - Unit tests for any logic that doesn't need the kernel runtime go in standard `#[cfg(test)]` modules; run via `cargo xtask test`. The handle table, the namespace resolution algorithm, ABI type encoding/decoding are all testable host-side.
-- Integration tests will run in QEMU via `xtask test-qemu` using the `isa-debug-exit` device, with the harness under `tests/qemu-tests/`. Both are planned — neither the `test-qemu` subcommand nor the `tests/qemu-tests/` directory exists yet (see `docs/rationale/deferred-decisions.md`).
+- Integration tests run in QEMU via `cargo xtask test-qemu`: it boots the `test-harness` build headless and adjudicates the whole boot (kernel → init → mount → userspace demos) from QEMU's `isa-debug-exit` exit code. Today the self-test payload (`src/boot_selftest.rs` + init's demo chain, `selftest` feature) *is* the test suite; a per-case framework under `tests/qemu-tests/` remains deferred (see `docs/conventions/qemu-integration-tests.md`). A kernel `panic!` fails the run (the panic handler writes the fail verdict under `test-harness`).
 - Add a test for any non-trivial bug fix.
 - Don't write tests that depend on QEMU-specific behavior (memory layout details, timing) unless absolutely necessary.
 

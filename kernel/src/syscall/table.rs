@@ -118,6 +118,14 @@ pub const SYS_NS_ENUMERATE: u64 = 30;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 
+/// Integration-test only (`test-harness` feature): terminate the emulator with a
+/// harness verdict (the low byte, via QEMU `isa-debug-exit`). The self-test build
+/// calls this to report the run's pass/fail from userspace after the boot chain
+/// completes. Absent from production kernels — not in the ABI hash, no backdoor.
+/// (`0xFFFF_0001` was the retired process-exit `sys_debug_exit`; this is distinct.)
+#[cfg(feature = "test-harness")]
+pub const SYS_TEST_EXIT: u64 = 0xFFFF_0002;
+
 /// Largest buffer `sys_kprint` will copy in one call. Bounds the on-stack
 /// kernel buffer; well under `MAX_USER_COPY_SIZE`.
 const KPRINT_MAX: usize = 4096;
@@ -163,6 +171,10 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
         SYS_IO_CANCEL => encode(sys_io_cancel(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
+        // Integration-test build only: end the QEMU run with the caller's verdict.
+        // Diverges (QEMU exits); never returns to dispatch/sysret.
+        #[cfg(feature = "test-harness")]
+        SYS_TEST_EXIT => crate::arch::debug_exit(a0 as u32),
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
         SYS_THREAD_EXIT => sys_thread_exit(a0 as i32),

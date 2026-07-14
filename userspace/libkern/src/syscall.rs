@@ -79,6 +79,20 @@ pub const SYS_IO_CANCEL: u64 = 29;
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
+/// Integration-test only: end the QEMU run with a harness verdict (the argument's
+/// low byte, via `isa-debug-exit`). Implemented by the kernel **only** under its
+/// `test-harness` feature (`cargo xtask test-qemu`); a production kernel returns
+/// `Unsupported`. Not ABI-stable. (`0xFFFF_0001` was the long-retired process-exit
+/// `sys_debug_exit`; this is a distinct syscall at the next number.) See
+/// `docs/conventions/qemu-integration-tests.md`.
+pub const SYS_TEST_EXIT: u64 = 0xFFFF_0002;
+
+/// `SYS_TEST_EXIT` verdict: the integration-test run passed. QEMU exits `(0x10 <<
+/// 1) | 1 = 33`, which the xtask runner maps to success.
+pub const TEST_EXIT_SUCCESS: u32 = 0x10;
+/// `SYS_TEST_EXIT` verdict: the integration-test run failed. QEMU exits `(0x11 <<
+/// 1) | 1 = 35`, which the xtask runner maps to failure.
+pub const TEST_EXIT_FAILURE: u32 = 0x11;
 
 // --- Raw `syscall`-instruction wrappers ------------------------------------
 

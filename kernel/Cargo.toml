@@ -17,6 +17,12 @@ path = "src/main.rs"
 # during boot. Off by default: a normal boot goes straight to userspace. Enabled by
 # `cargo xtask qemu --selftest` (and the future `xtask test-qemu` for CI).
 selftest = []
+# Integration-test build (`cargo xtask test-qemu`): everything `selftest` runs,
+# plus the `isa-debug-exit` primitive + `SYS_DEBUG_EXIT` gated syscall, and boot
+# failures/panics terminate QEMU with a fail verdict instead of dropping to eshell
+# or halting. Never in a production kernel. See
+# `docs/conventions/qemu-integration-tests.md`.
+test-harness = ["selftest"]
 
 [dependencies]
 

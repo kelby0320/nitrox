@@ -10,6 +10,9 @@ pub mod gdt;
 pub mod idt;
 pub mod ioapic;
 pub mod paging;
+/// QEMU integration-test exit primitive — only under the `test-harness` feature.
+#[cfg(feature = "test-harness")]
+pub mod qemu;
 pub mod registers;
 pub mod regs;
 pub mod serial;

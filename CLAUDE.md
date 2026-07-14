@@ -35,13 +35,17 @@ Standard development loop:
 cargo xtask build          # build the kernel ELF
 cargo xtask image          # build + assemble the UEFI-bootable disk image
 cargo xtask qemu           # build, assemble the image, and launch under QEMU
+cargo xtask qemu --selftest # …with the boot self-tests / demos compiled in
 cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
 cargo xtask test           # host-side unit tests
+cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
 ```
 
-`cargo xtask test-qemu` (QEMU integration tests via the `isa-debug-exit`
-device) is planned but not yet implemented — see
-`docs/rationale/deferred-decisions.md`.
+`cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
+headless and adjudicates the whole boot (kernel → init → mount → userspace demos)
+from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
+(init on success, the kernel panic handler on failure), a hang is caught by a
+wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
 Don't run kernel code on the host. Don't run `cargo build` directly in the kernel workspace without the custom target — it will fail.
 

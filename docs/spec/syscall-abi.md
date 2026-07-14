@@ -113,8 +113,9 @@ Syscall numbers are **not** part of the kernel ABI version hash (`docs/spec/abi-
 A small set of **debug-only** syscalls exists to bootstrap and exercise the kernel before the stable syscall surface lands. They occupy a deliberately high, non-stable number range (`0xFFFF_0000+`) so they never shadow the stable sequential numbers, and they are **excluded from the v1.0 ABI freeze** — they may change or be removed without notice.
 
 - `sys_debug_kprint(ptr: UserPtr<u8>, len: usize) -> isize` (`0xFFFF_0000`) — copy `len` user bytes (bounded) and write them to the kernel serial log; returns the byte count. The non-async exception to the async-first rule (it completes immediately).
+- `sys_test_exit(verdict: u32) -> !` (`0xFFFF_0002`) — **integration-test builds only.** Terminate the emulator with a harness verdict (the low byte, via QEMU `isa-debug-exit`). Compiled into the kernel **only** under its `test-harness` feature (`cargo xtask test-qemu`); a production kernel returns `Unsupported` for this number. Used by the self-test build to report the run's pass/fail from userspace after the full boot chain completes. See `docs/conventions/qemu-integration-tests.md`.
 
-(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (17).)
+(The earlier `sys_debug_exit` (`0xFFFF_0001`) has been **retired** in favour of the stable `sys_process_exit` (16) / `sys_thread_exit` (17); its number is left vacant — `sys_test_exit` deliberately takes the next one to avoid conflation.)
 
 ## The complete syscall set
 

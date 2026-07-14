@@ -8,6 +8,12 @@ edition = "2024"
 # chain (else init boots straight to the interactive console). Enabled together with
 # the kernel's `selftest` feature by `cargo xtask qemu --selftest`.
 selftest = []
+# Integration-test build (`cargo xtask test-qemu`): run the `selftest` chain, then
+# report the verdict to the runner via `SYS_TEST_EXIT` (PASS when the demo chain
+# reaps cleanly; FAIL on a crashed child, a failed spawn, or a critical-path boot
+# failure) instead of dropping to the interactive console. See
+# `docs/conventions/qemu-integration-tests.md`.
+test-harness = ["selftest"]
 
 [dependencies]
 libkern = { path = "../libkern" }
