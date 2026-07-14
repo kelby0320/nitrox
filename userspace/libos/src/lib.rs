@@ -28,7 +28,13 @@
 
 mod error;
 mod exec;
+mod handle;
+mod objects;
 mod sys;
 
 pub use error::{Error, ErrorKind, Result};
 pub use exec::{Op, block_on};
+pub use handle::{
+    CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Handle, MapExec, MapRead, MapReadWrite,
+    Memory, Namespace, Notify, NsMutable, NsReadOnly, Only, ReadOnly, ReadWrite, Resource, WriteOnly,
+};

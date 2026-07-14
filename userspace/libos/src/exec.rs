@@ -120,10 +120,14 @@ impl Op {
         if po < 0 {
             return Err(Error::from_status(po as i32));
         }
-        Ok(Op {
-            po: po as u64,
-            done: false,
-        })
+        Ok(Op::from_po(po as u64))
+    }
+
+    /// Wrap an already-submitted `PendingOperation` handle as a future. Used by
+    /// syscalls that return a PO directly (e.g. `sys_ns_lookup`) rather than via
+    /// `io_submit`.
+    pub(crate) fn from_po(po: u64) -> Op {
+        Op { po, done: false }
     }
 }
 
