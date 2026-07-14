@@ -99,12 +99,34 @@ pub fn notif_recv(queue: u64, out: u64) -> i64 {
     unsafe { libkern::syscall2(libkern::SYS_NOTIF_RECV, queue, out) }
 }
 
+/// `sys_ns_bind(ns, path, path_len, resource)` — bind `resource` at `path` in `ns`.
+/// Gated kernel-side by the `BIND` handle right *and* the `BIND_NAMESPACE` syscap.
+#[cfg(not(test))]
+pub fn ns_bind(ns: u64, path: u64, path_len: u64, resource: u64) -> i64 {
+    // SAFETY: `path`/`path_len` name a live buffer; `ns`/`resource` are live handles.
+    unsafe { libkern::syscall4(libkern::SYS_NS_BIND, ns, path, path_len, resource) }
+}
+
+/// `sys_process_spawn(&args)` — spawn a child process; returns a `Process` handle.
+#[cfg(not(test))]
+pub fn process_spawn(args: &libkern::SpawnArgs) -> i64 {
+    // SAFETY: `args` is a live `SpawnArgs`; the kernel copies it in.
+    unsafe { libkern::syscall1(libkern::SYS_PROCESS_SPAWN, args as *const _ as u64) }
+}
+
+/// `sys_thread_create(&args)` — start a thread in this process; returns a `Thread` handle.
+#[cfg(not(test))]
+pub fn thread_create(args: &libkern::ThreadArgs) -> i64 {
+    // SAFETY: `args` is a live `ThreadArgs`; the kernel copies it in.
+    unsafe { libkern::syscall1(libkern::SYS_THREAD_CREATE, args as *const _ as u64) }
+}
+
 // --- host tests: a scriptable mock kernel ---------------------------------
 
 #[cfg(test)]
 pub use mock::{
-    handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, ns_enumerate,
-    ns_lookup, notif_recv, wait,
+    handle_close, handle_restrict, io_submit, memory_create, memory_map, memory_unmap, ns_bind,
+    ns_enumerate, ns_lookup, notif_recv, process_spawn, thread_create, wait,
 };
 
 #[cfg(test)]
@@ -128,6 +150,8 @@ mod mock {
         script: VecDeque<(i32, u64, bool)>,
         /// A one-shot forced `io_submit` failure (negative status).
         fail_submit: Option<i32>,
+        /// A one-shot forced `ns_bind` failure (negative status).
+        bind_err: Option<i32>,
         submits: u32,
         waits: u32,
         closes: u32,
@@ -256,6 +280,34 @@ mod mock {
         -11 // KError::WouldBlock (empty)
     }
 
+    pub fn ns_bind(_ns: u64, _path: u64, _plen: u64, _resource: u64) -> i64 {
+        MOCK.with(|m| {
+            let mut m = m.borrow_mut();
+            match m.bind_err.take() {
+                Some(status) => status as i64,
+                None => 0, // success
+            }
+        })
+    }
+
+    pub fn process_spawn(_args: &libkern::SpawnArgs) -> i64 {
+        mint_handle()
+    }
+
+    pub fn thread_create(_args: &libkern::ThreadArgs) -> i64 {
+        mint_handle()
+    }
+
+    /// A fresh fake handle (for spawn/thread mocks), tracked so `handle_close` counts.
+    fn mint_handle() -> i64 {
+        MOCK.with(|m| {
+            let mut m = m.borrow_mut();
+            let h = m.next_handle;
+            m.next_handle += 1;
+            h as i64
+        })
+    }
+
     /// Test controls.
     pub fn reset() {
         MOCK.with(|m| *m.borrow_mut() = fresh());
@@ -272,6 +324,11 @@ mod mock {
         MOCK.with(|m| m.borrow_mut().fail_submit = Some(status));
     }
 
+    /// Force the next `ns_bind` to fail with `status` (e.g. `-2` = NoAccess).
+    pub fn fail_next_bind(status: i32) {
+        MOCK.with(|m| m.borrow_mut().bind_err = Some(status));
+    }
+
     /// `(submits, waits, closes)` issued since the last `reset`.
     pub fn counts() -> (u32, u32, u32) {
         MOCK.with(|m| {
@@ -282,4 +339,4 @@ mod mock {
 }
 
 #[cfg(test)]
-pub use mock::{counts, fail_next_submit, reset, script_next};
+pub use mock::{counts, fail_next_bind, fail_next_submit, reset, script_next};

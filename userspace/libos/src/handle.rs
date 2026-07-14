@@ -24,6 +24,10 @@ pub struct Namespace;
 pub struct Notify;
 /// A readable/writable resource (device or file) driven by `io_submit`.
 pub struct Resource;
+/// A child `Process` (from [`spawn`](crate::spawn)); reaped by closing the handle.
+pub struct Process;
+/// A `Thread` in this process (from [`thread_create`](crate::thread_create)).
+pub struct Thread;
 
 // --- mode markers (M) — principal rights as types -------------------------
 
@@ -83,6 +87,11 @@ impl CanMapWrite for MapReadWrite {}
 pub trait CanLookup: Sealed {}
 impl CanLookup for NsReadOnly {}
 impl CanLookup for NsMutable {}
+
+/// A namespace mode that permits `bind` (also runtime-gated by the `BIND_NAMESPACE`
+/// syscap, enforced kernel-side).
+pub trait CanBind: Sealed {}
+impl CanBind for NsMutable {}
 
 /// A memory mode's `MAP_*` rights, used when mapping.
 pub trait MemMode: Sealed {

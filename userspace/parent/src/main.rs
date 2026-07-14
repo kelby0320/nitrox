@@ -28,6 +28,7 @@
 
 use core::arch::asm;
 use libkern::*;
+use libos::{Handle, Namespace, NsMutable, spawn, thread_create};
 
 /// `KError::TimedOut` as an `IoResult.status` value (derived from `libkern`).
 const KERR_TIMED_OUT: i32 = KError::TimedOut.as_i32();
@@ -140,16 +141,22 @@ fn worker_exception_demo(notif: u64) {
     // 2. Create the worker thread (entry = worker_fault, sp = stack top).
     // SAFETY: WORKER_ARGS is a valid writable arg block; the pointer is read by
     // the kernel.
-    let worker = unsafe {
+    // libos::thread_create returns an owning Handle<Thread> (closed on drop at the end
+    // of this function, replacing the explicit close below).
+    // SAFETY: WORKER_ARGS is our static; we exclusively initialize it, then hand a
+    // shared reference to the wrapper.
+    let worker = match unsafe {
         WORKER_ARGS.entry = worker_fault as *const () as usize as u64;
         WORKER_ARGS.user_sp = stack_top;
         WORKER_ARGS.arg0 = 0;
-        syscall1(SYS_THREAD_CREATE, (&raw const WORKER_ARGS) as u64)
+        thread_create(&*(&raw const WORKER_ARGS))
+    } {
+        Ok(w) => w,
+        Err(_) => {
+            kprint(b"parent: thread_create FAIL\n");
+            exit(1);
+        }
     };
-    if worker < 0 {
-        kprint(b"parent: thread_create FAIL\n");
-        exit(1);
-    }
     kprint(b"parent: created worker thread; awaiting its fault\n");
 
     // 3. Block on our notification channel until the worker's SegFault arrives.
@@ -185,7 +192,7 @@ fn worker_exception_demo(notif: u64) {
     // 4. Read the faulting thread's registers and report the faulting rip.
     // SAFETY: WORKER_REGS is a valid writable RegisterValues out-param.
     let gr = unsafe {
-        syscall4(SYS_THREAD_GET_REGISTERS, worker as u64, (&raw mut WORKER_REGS) as u64, 0, 0)
+        syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0)
     };
     if gr != 0 {
         kprint(b"parent: get_registers FAIL\n");
@@ -200,7 +207,7 @@ fn worker_exception_demo(notif: u64) {
     // 5. Terminate the worker (resume with the Terminate disposition, code 7).
     // SAFETY: register-only syscall.
     let er = unsafe {
-        syscall4(SYS_EXCEPTION_RESUME, worker as u64, DISPOSITION_TERMINATE, 7, 0)
+        syscall4(SYS_EXCEPTION_RESUME, worker.raw().0, DISPOSITION_TERMINATE, 7, 0)
     };
     if er != 0 {
         kprint(b"parent: exception_resume FAIL\n");
@@ -209,7 +216,7 @@ fn worker_exception_demo(notif: u64) {
     // The worker is not this process's last thread (we are still running), so
     // its termination produces no `ChildExited`. Drop our handle to it.
     // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, worker as u64) };
+    // (worker Handle<Thread> closes on drop at function end — no explicit close)
     kprint(b"parent: worker terminated\n");
 }
 
@@ -411,13 +418,14 @@ fn ns_demo() {
     }
     let mem = mem as u64;
 
-    // (c) sys_ns_bind: bind the MemoryObject at "/store" in the fresh namespace.
-    // SAFETY: PATH is a valid readable byte slice; valid handles.
+    // (c) bind the MemoryObject at "/store" in the fresh namespace — via libos's typed
+    // Namespace::bind. Gated by the BIND handle right (below) *and* the BIND_NAMESPACE
+    // syscap (kernel-side); parent holds both (init grants it BIND_NAMESPACE). The raw
+    // `path` byte slice is still used by the lookup/unbind steps below.
     let path = b"/store";
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem)
-    };
-    if br != 0 {
+    // SAFETY: `ns` is parent's live namespace handle; borrow is non-owning (won't close it).
+    let ns_h = unsafe { Handle::<Namespace, NsMutable>::borrow(RawHandle(ns), Rights::BIND) };
+    if ns_h.bind("/store", RawHandle(mem)).is_err() {
         kprint(b"parent: ns_bind FAIL\n");
         return;
     }
@@ -1173,12 +1181,19 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         SPAWN_B.namespace = child_ns as u64;
     }
     // SAFETY: valid SpawnArgs pointer; returns a process handle or a neg error.
-    let pa = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_A) as u64) };
-    let pb = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_B) as u64) };
-    if pa < 0 || pb < 0 {
-        kprint(b"parent: spawn FAIL\n");
-        exit(1);
-    }
+    // libos::spawn returns owning Handle<Process> handles — held until the end of this
+    // function (past the reap-count below), then dropped to reap the children (their
+    // handles were previously leaked until process exit).
+    // SAFETY: SPAWN_A/SPAWN_B are our statics, exclusively read here.
+    let (_pa, _pb) = match unsafe { (spawn(&*(&raw const SPAWN_A)), spawn(&*(&raw const SPAWN_B))) } {
+        (Ok(a), Ok(b)) => (a, b),
+        _ => {
+            kprint(b"parent: spawn FAIL\n");
+            exit(1);
+        }
+    };
+    // `_pa`/`_pb` are owning Handle<Process> — they reap the children by closing on drop
+    // at the end of this function (see below).
     kprint(b"parent: spawned two children sharing a channel\n");
 
     // 3. Drain two ChildExited notifications, blocking on our channel.
@@ -1221,12 +1236,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
-    // 4. Tidy up the child process handles and exit.
-    // SAFETY: closing our own handles.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, pa as u64);
-        syscall1(SYS_HANDLE_CLOSE, pb as u64);
-    }
+    // 4. Exit. The child process handles (`_pa`/`_pb`, owning libos Handles) reap on
+    // drop as this function returns into the exit below.
     kprint(b"parent: both children reaped; exiting\n");
     exit(0);
 }
