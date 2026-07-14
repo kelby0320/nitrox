@@ -5,13 +5,16 @@
 //! (`create`/`map`, `enumerate`, `recv`) return directly. Op availability is gated by
 //! the sealed capability traits in [`crate::handle`], so misuse is a compile error.
 
-use libkern::{IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, NsEntry, Notification, RawHandle, Rights};
+use libkern::{
+    IO_OPCODE_READ, IO_OPCODE_WRITE, IoOp, NsEntry, Notification, RawHandle, Rights, SpawnArgs,
+    ThreadArgs,
+};
 
 use crate::error::{Error, ErrorKind, Result};
 use crate::exec::Op;
 use crate::handle::{
-    CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Handle, MapReadWrite, MemMode, Memory,
-    Namespace, Notify, Only, Resource,
+    CanBind, CanLookup, CanMapRead, CanMapWrite, CanRead, CanWrite, Handle, MapReadWrite, MemMode,
+    Memory, Namespace, Notify, Only, Process, Resource, Thread,
 };
 use crate::sys;
 
@@ -160,11 +163,119 @@ impl Handle<Notify, Only> {
     }
 }
 
+impl<M: CanBind> Handle<Namespace, M> {
+    /// Bind `resource` at `path` in this namespace. Requires the `BIND` handle right
+    /// (this method's `CanBind` bound) **and**, at runtime, the `BIND_NAMESPACE` syscap
+    /// — a caller without it gets `Err` with [`ErrorKind::PermissionDenied`]. See
+    /// `docs/architecture/syscaps.md`.
+    pub fn bind(&self, path: &str, resource: RawHandle) -> Result<()> {
+        let r = sys::ns_bind(
+            self.raw().0,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            resource.0,
+        );
+        if r < 0 {
+            return Err(Error::from_status(r as i32));
+        }
+        Ok(())
+    }
+}
+
+// --- Process / thread spawning --------------------------------------------
+
+/// Spawn a child process from `args` (a libkern [`SpawnArgs`]), returning an **owning**
+/// handle — dropping it reaps the child (closes the process handle). The kernel grants
+/// the parent `SIGNAL | TERMINATE` on the child.
+pub fn spawn(args: &SpawnArgs) -> Result<Handle<Process, Only>> {
+    let h = sys::process_spawn(args);
+    if h < 0 {
+        return Err(Error::from_status(h as i32));
+    }
+    // SAFETY: `sys_process_spawn` returned a fresh child-process handle we own.
+    Ok(unsafe { Handle::from_raw(RawHandle(h as u64), Rights::SIGNAL | Rights::TERMINATE) })
+}
+
+/// Start a thread in this process from `args` (a libkern [`ThreadArgs`]), returning an
+/// owning handle. The `RealTime` class in `args` requires the `REAL_TIME` syscap
+/// (else `Err`). The kernel grants `SIGNAL | TERMINATE | INSPECT | DUPLICATE`.
+pub fn thread_create(args: &ThreadArgs) -> Result<Handle<Thread, Only>> {
+    let h = sys::thread_create(args);
+    if h < 0 {
+        return Err(Error::from_status(h as i32));
+    }
+    // SAFETY: `sys_thread_create` returned a fresh thread handle we own.
+    Ok(unsafe {
+        Handle::from_raw(
+            RawHandle(h as u64),
+            Rights::SIGNAL | Rights::TERMINATE | Rights::INSPECT | Rights::DUPLICATE,
+        )
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::block_on;
-    use crate::handle::{MapReadWrite, ReadOnly};
+    use crate::handle::{MapReadWrite, NsMutable, ReadOnly};
+
+    fn zeroed_spawn() -> SpawnArgs {
+        SpawnArgs {
+            image: 0,
+            handle_count: 0,
+            move_mask: 0,
+            _pad: 0,
+            arg0: 0,
+            handles: [0; 4],
+            rights: [0; 4],
+            namespace: 0,
+            syscaps: 0,
+        }
+    }
+
+    fn zeroed_thread() -> ThreadArgs {
+        ThreadArgs {
+            entry: 0,
+            user_sp: 0,
+            arg0: 0,
+            class: 0,
+            rt_priority: 0,
+            nice: 0,
+            cpu_affinity: 0,
+            _reserved: [0; 36],
+        }
+    }
+
+    #[test]
+    fn spawn_returns_an_owning_process_handle() {
+        sys::reset();
+        let p = spawn(&zeroed_spawn()).unwrap();
+        assert!(p.extra_rights().contains(Rights::TERMINATE));
+        drop(p);
+        let (_s, _w, closes) = sys::counts();
+        assert_eq!(closes, 1, "dropping the Process handle reaps (closes) it");
+    }
+
+    #[test]
+    fn thread_create_returns_an_owning_handle() {
+        sys::reset();
+        let t = thread_create(&zeroed_thread()).unwrap();
+        drop(t);
+        let (_s, _w, closes) = sys::counts();
+        assert_eq!(closes, 1);
+    }
+
+    #[test]
+    fn ns_bind_succeeds_and_denial_maps_to_permission_denied() {
+        sys::reset();
+        // SAFETY: test handle; borrow does not own it.
+        let ns = unsafe { Handle::<Namespace, NsMutable>::borrow(RawHandle(1), Rights::BIND) };
+        ns.bind("/store", RawHandle(9)).unwrap(); // mock: success
+
+        sys::fail_next_bind(-2); // KError::NoAccess
+        let e = ns.bind("/store", RawHandle(9)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+    }
 
     #[test]
     fn memory_create_and_map_return_handle_and_address() {
