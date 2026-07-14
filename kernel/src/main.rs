@@ -20,8 +20,17 @@
 use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
+// The arch abstraction's traits are brought into scope module-wide: their methods
+// (`arch::Irq::init()`, `arch::Timer::start_periodic()`, …) are called across the boot
+// functions here (`kernel_main`, `sched_bringup`, `ap_entry`). Method resolution is by
+// receiver type, so importing them together is unambiguous.
 use nitrox_kernel::arch::cpu::ArchCpu;
+use nitrox_kernel::arch::irq::ArchIrq;
+use nitrox_kernel::arch::irq_router::ArchIrqRouter;
 use nitrox_kernel::arch::paging::ArchPaging;
+use nitrox_kernel::arch::platform::ArchPlatform;
+use nitrox_kernel::arch::smp::ArchSmp;
+use nitrox_kernel::arch::timer::ArchTimer;
 use nitrox_kernel::dpc;
 use nitrox_kernel::framebuffer::{FbWriter, Rgb};
 use nitrox_kernel::kprintln;
@@ -151,28 +160,22 @@ fn kernel_main() {
     // runs after the allocator/HHDM are up; before the local controller so the
     // future IOAPIC step can consume the cached routing facts. Missing or
     // malformed tables are logged, not fatal, and the parser logs its summary.
-    {
-        use arch::platform::ArchPlatform;
-        // SAFETY: ring 0, single CPU, called once during boot after the HHDM is
-        // available; reads firmware-owned physical memory, no allocation.
-        let _ = unsafe { arch::Platform::init() };
-    }
+    // SAFETY: ring 0, single CPU, called once during boot after the HHDM is
+    // available; reads firmware-owned physical memory, no allocation.
+    let _ = unsafe { arch::Platform::init() };
 
     // Bring up this CPU's local interrupt controller (xAPIC). Interrupts
     // stay masked (IF=0) for this whole slice — nothing is delivered yet; the
     // timer source lands with the Timers slice and the spurious/timer IDT
     // stubs + IF=1 with the preemptive-scheduling slice.
-    {
-        use arch::irq::ArchIrq;
-        // SAFETY: ring 0, single CPU, called once during boot after CPU
-        // feature enablement and after the kernel-vmap allocator is up; IF is
-        // 0, so software-enabling the controller delivers nothing.
-        if unsafe { arch::Irq::init() }.is_err() {
-            kprintln!("local APIC bring-up failed — halting");
-            return;
-        }
-        kprintln!("local APIC up (x2APIC, id {})", arch::Irq::id());
+    // SAFETY: ring 0, single CPU, called once during boot after CPU
+    // feature enablement and after the kernel-vmap allocator is up; IF is
+    // 0, so software-enabling the controller delivers nothing.
+    if unsafe { arch::Irq::init() }.is_err() {
+        kprintln!("local APIC bring-up failed — halting");
+        return;
     }
+    kprintln!("local APIC up (x2APIC, id {})", arch::Irq::id());
 
     // Calibrate the monotonic time source (TSC) and the per-CPU timer (LAPIC
     // timer) against the legacy PIT. Must follow Irq::init — the local
@@ -180,18 +183,15 @@ fn kernel_main() {
     // Interrupts stay masked (IF=0): the timer is calibrated and armable, but
     // fires nothing this slice (the periodic tick lands with preemptive
     // scheduling, one-shot deadlines with wait queues).
-    {
-        use arch::timer::ArchTimer;
-        // SAFETY: ring 0, single CPU, called once during boot after Irq::init
-        // mapped the local-controller MMIO; IF=0, so arming delivers nothing.
-        unsafe { arch::Timer::init() };
-        kprintln!(
-            "timer up: monotonic {} MHz, per-CPU timer {} MHz (clock t0={} ns)",
-            arch::Timer::monotonic_hz() / 1_000_000,
-            arch::Timer::timer_hz() / 1_000_000,
-            arch::Timer::read_ns(),
-        );
-    }
+    // SAFETY: ring 0, single CPU, called once during boot after Irq::init
+    // mapped the local-controller MMIO; IF=0, so arming delivers nothing.
+    unsafe { arch::Timer::init() };
+    kprintln!(
+        "timer up: monotonic {} MHz, per-CPU timer {} MHz (clock t0={} ns)",
+        arch::Timer::monotonic_hz() / 1_000_000,
+        arch::Timer::timer_hz() / 1_000_000,
+        arch::Timer::read_ns(),
+    );
 
     // Reserve the DPC (deferred-procedure-call) queue before any interrupt can
     // enqueue onto it — the IOAPIC self-test below routes the PIT, whose ISR
@@ -208,17 +208,14 @@ fn kernel_main() {
     // scheduler is not yet running, so the self-test's short interrupt-enabled
     // window fires only the source it routes (the legacy PIT). The router needs
     // the local controller (Irq::init) up — routed interrupts land on a LAPIC.
-    {
-        use arch::irq_router::ArchIrqRouter;
-        // SAFETY: ring 0, single CPU, once during boot after Irq/Timer init; the
-        // ACPI MADT facts are cached (Platform::init ran).
-        if unsafe { arch::IrqRouter::init() }.is_err() {
-            kprintln!("interrupt router bring-up failed — halting");
-            return;
-        }
-        #[cfg(feature = "selftest")]
-        boot_selftest::irq_routing();
+    // SAFETY: ring 0, single CPU, once during boot after Irq/Timer init; the
+    // ACPI MADT facts are cached (Platform::init ran).
+    if unsafe { arch::IrqRouter::init() }.is_err() {
+        kprintln!("interrupt router bring-up failed — halting");
+        return;
     }
+    #[cfg(feature = "selftest")]
+    boot_selftest::irq_routing();
 
     // Seed the entropy subsystem (CSPRNG). Runs after the timer is up (so the
     // monotonic clock is live for jitter mixing) and before the handle table, so
@@ -269,16 +266,13 @@ fn kernel_main() {
     // with 0, aliasing it onto the BSP's per-CPU scheduler slots (`current[0]` /
     // `idle[0]`) — a slot-sharing collision. Each AP sets its own index from
     // hardware in `arch::adopt_dense_index` at bring-up.
-    {
-        use arch::smp::ArchSmp;
-        arch::Smp::init_this_cpu(0);
-        kprintln!(
-            "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
-            arch::Smp::current_cpu(),
-            arch::Smp::cpu_count(),
-            arch::MAX_CPUS,
-        );
-    }
+    arch::Smp::init_this_cpu(0);
+    kprintln!(
+        "smp: cpu {} online (RDTSCP/TSC_AUX), {} of max {}",
+        arch::Smp::current_cpu(),
+        arch::Smp::cpu_count(),
+        arch::MAX_CPUS,
+    );
 
     // Bring up the preemptive scheduler: initialise it and arm preemption (periodic
     // timer + IF=1). Must precede AP bring-up (APs pull from the runqueue) and any
@@ -324,9 +318,6 @@ fn kernel_main() {
 /// the runqueue) and before any userspace thread. (The former `run_scheduler_demo`
 /// folded a busy-worker demo into this; that demo now lives in `boot_selftest`.)
 fn sched_bringup() {
-    use arch::cpu::ArchCpu;
-    use arch::timer::ArchTimer;
-
     if sched::init().is_err() {
         kprintln!("sched: init failed — halting");
         return;
@@ -366,7 +357,6 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
             // default/guessed index would collide with another core's GDT/TSS/
             // scheduler slots (the migration hazard). Park this core safely
             // instead; the rest of the system continues without it.
-            use arch::cpu::ArchCpu;
             arch::Cpu::halt_loop();
         }
     };
@@ -376,7 +366,6 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
     // 3. Arm this CPU's periodic tick (the BSP-calibrated frequency; IF still 0).
     // SAFETY: ring 0; this CPU's x2APIC + IDT are now live.
     unsafe {
-        use arch::timer::ArchTimer;
         arch::Timer::start_periodic(sched::TICK_NS);
     }
     AP_ONLINE.fetch_add(1, Ordering::Release);
