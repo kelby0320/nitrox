@@ -52,6 +52,7 @@ static mut SPAWN_A: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
     namespace: 0, // set at runtime to the constructed child namespace
+    syscaps: 0,   // children hold no ambient capabilities
 };
 static mut SPAWN_B: SpawnArgs = SpawnArgs {
     image: IMAGE_CHILD,
@@ -62,6 +63,7 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
     namespace: 0, // set at runtime to the constructed child namespace
+    syscaps: 0,   // children hold no ambient capabilities
 };
 static mut NOTIF: Notification = Notification::zeroed();
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];

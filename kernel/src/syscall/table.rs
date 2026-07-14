@@ -237,9 +237,23 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
         .map_err(|_| KError::KernelError)?; // a bad embedded image is our bug
     let child_pid = crate::sched::alloc_pid();
 
+    // Attenuate the requested syscaps against the parent's: a parent can never grant a
+    // capability it does not hold (`child = parent & requested`). No current process
+    // (a spawn with no owning Process) yields an unprivileged child.
+    // (docs/architecture/syscaps.md)
+    let child_syscaps = {
+        let requested = crate::libkern::SysCaps::from_bits_truncate(args.syscaps);
+        match crate::sched::current_process() {
+            // SAFETY: pins a live Process; read its immutable syscap set.
+            Some(pp) => unsafe { &*(pp.as_ptr() as *const Process) }.syscaps() & requested,
+            None => crate::libkern::SysCaps::empty(),
+        }
+    };
+
     // Build the child Process (owns the AS); record the parent's notification
     // channel as its `ChildExited` target.
-    let mut proc_box = Process::try_new_user(child_pid, asp).map_err(|_| KError::OutOfMemory)?;
+    let mut proc_box =
+        Process::try_new_user(child_pid, asp, child_syscaps).map_err(|_| KError::OutOfMemory)?;
     if let Some(parent_proc) = crate::sched::current_process() {
         // SAFETY: `parent_proc` pins a live Process; clone its channel ref.
         if let Some(c) =

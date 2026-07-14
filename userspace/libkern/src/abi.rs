@@ -49,9 +49,13 @@ pub struct SpawnArgs {
     /// Child's root namespace; `0` ⇒ inherit a LOOKUP-only handle to the parent's
     /// namespace, non-null ⇒ a (restricted) namespace the parent holds (offset 88).
     pub namespace: u64,
+    /// Ambient [`SysCaps`](crate::syscaps::SysCaps) to grant the child, raw bits
+    /// (offset 96). The kernel installs `parent.syscaps & syscaps` (⊆-parent). `0` ⇒
+    /// unprivileged. See `docs/architecture/syscaps.md`.
+    pub syscaps: u64,
 }
 
-const _: () = assert!(size_of::<SpawnArgs>() == 96);
+const _: () = assert!(size_of::<SpawnArgs>() == 104);
 const _: () = assert!(align_of::<SpawnArgs>() == 8);
 const _: () = assert!(offset_of!(SpawnArgs, image) == 0);
 const _: () = assert!(offset_of!(SpawnArgs, handle_count) == 4);
@@ -60,6 +64,7 @@ const _: () = assert!(offset_of!(SpawnArgs, arg0) == 16);
 const _: () = assert!(offset_of!(SpawnArgs, handles) == 24);
 const _: () = assert!(offset_of!(SpawnArgs, rights) == 56);
 const _: () = assert!(offset_of!(SpawnArgs, namespace) == 88);
+const _: () = assert!(offset_of!(SpawnArgs, syscaps) == 96);
 
 // --- sys_thread_create / sys_thread_get_registers --------------------------
 

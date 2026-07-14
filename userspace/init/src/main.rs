@@ -72,10 +72,12 @@ static mut SPAWN_FS: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
     namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
 };
 /// Spawn args for the demo `parent`: no handles, inherit a LOOKUP-only handle to
 /// init's root namespace (so parent can resolve the kernel servers but not bind
-/// into init's root — it constructs its own namespaces for its children).
+/// into init's root — it constructs its own namespaces for its children, which is
+/// why init grants it `BIND_NAMESPACE`).
 static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
     image: IMAGE_PARENT,
     handle_count: 0,
@@ -85,6 +87,7 @@ static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [0; 4],
     namespace: 0,
+    syscaps: SYSCAP_BIND_NAMESPACE, // parent constructs namespaces for its children
 };
 /// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
 /// inherit a LOOKUP-only handle to init's root namespace (so it resolves
@@ -99,6 +102,7 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
     handles: [0; 4],
     rights: [0; 4],
     namespace: 0,
+    syscaps: 0, // the recovery shell needs no ambient capabilities
 };
 
 /// Resolve `path` in namespace `ns` requesting `rights`, wait the PO, and return

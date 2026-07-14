@@ -769,8 +769,11 @@ fn run_first_userspace() {
         }
     };
 
-    // Build the parent process (pid 1; it is the root — no `parent_notif`).
-    let mut proc_box = match Process::try_new_user(1, aspace) {
+    // Build the parent process (pid 1 = init; it is the root — no `parent_notif`).
+    // The **capability bootstrap**: init holds the full syscap set, and all authority
+    // in the system traces to this initial kernel grant (docs/architecture/syscaps.md).
+    let mut proc_box = match Process::try_new_user(1, aspace, nitrox_kernel::libkern::SysCaps::all())
+    {
         Ok(p) => p,
         Err(_) => {
             kprintln!("init: process alloc failed");
