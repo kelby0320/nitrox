@@ -6186,3 +6186,41 @@ Design captured in `docs/architecture/libos.md` (slice-5 Part A). Plan reframed:
 "libos core," libstream is a separate deferred entry. Next: implement libos (Part B: the `Op`
 future + `block_on` + error over a mock syscall seam; Part C: the `Handle<T,M>` wrappers;
 Part D: dogfood init + eshell). Planning + design doc only in this entry — no code yet.
+
+## 2026-07-13 — Phase 3 slice 5 complete: libos core (+ the recovery-shell dependency line)
+
+libos core landed in four commits (Parts A–D). B: the `Op` future + `block_on` (single-task
+driver, alloc-free) + `io::Error`-shaped error, over a mock syscall seam (6 tests). C: the
+`Handle<T,M>` typestate wrappers — sealed `CanRead`/`CanWrite`/… op-gating (misuse is a compile
+error), RAII close, attenuation-consumes-self; async `Namespace::lookup`/`Resource::read,write`,
+`Memory::create/map`, `Notify::recv` (+7 tests). D: dogfood + a borrowed (non-owning) `Handle`.
+`#![no_std]`, no `alloc` throughout; 15 host tests; bare-build clean.
+
+**The dogfood surfaced a governance question worth recording: should the recovery shell take a
+runtime-library dependency?** Both init and eshell `CLAUDE.md` had *forbidden* `libos` — a rule
+predating the alloc-free libos-core. Resolved by looking at Linux precedent, and the two land
+differently:
+
+- **init → uses libos** (and, later, full `std`). PID 1 on Linux *universally* links a full
+  libc — systemd pulls in glibc + dozens of shared libraries; even minimal inits (SysV,
+  BusyBox, runit, s6) link libc. Nobody writes PID 1 against raw syscalls. So init is not meant
+  to stay minimal: its `CLAUDE.md` now permits libkern/libheap/libos-core (the line it draws is
+  *stateful runtime* + *unstarted services*, e.g. libstream/librsproto, not the syscall
+  surface), with full `std` as the trajectory. init's `read_current_generation` is the first
+  consumer (`ns.lookup(...).block_on()` + `map()`).
+
+- **eshell → stays `libkern`-only, deliberately.** It's the *recovery surface* (the shell init
+  drops to on failure), so it follows the statically-linked-`busybox` / `sash` ethos: a rescue
+  tool minimizes the layers between itself and the syscall so there are the fewest ways for it
+  to fail to come up (a dynamically-linked shell won't even start if libc is broken). eshell
+  recovers from *init* failure — the kernel/syscalls are fine — so libos-core (stateless,
+  alloc-free, no bootstrap) would be a *defensible* exception, but we keep eshell at the raw
+  surface on purpose. Its drafted libos migration was reverted; `CLAUDE.md` now states the *why*.
+
+The distinction: libos-core is safe for critical-path use because it has **no runtime
+bootstrap** (stack-only handles/futures — nothing to initialize or corrupt); the recovery-shell
+restriction is a *minimize-surface* choice, not a correctness one.
+
+Verified: full host suite + check-arch green; QEMU — init reads current-generation through
+libos ("nitrox-rootfs generation 1"), boots to `eshell`, scripted `help`/`lsblk`/`mounts`/`cat`
+correct; `-smp 1` + `-smp 4` clean, no faults. Slice 5 done; next is slice 6 (SysCaps).
