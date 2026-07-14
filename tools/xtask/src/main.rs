@@ -40,11 +40,17 @@ fn main() -> ExitCode {
     let cmd = args.next();
     let rest: Vec<String> = args.collect();
 
+    // `--selftest` (anywhere in the args) compiles + runs the boot self-tests / demos
+    // (kernel `boot_selftest` + init's demo chain); without it the build boots straight
+    // to userspace. Strip it out before forwarding the rest to QEMU.
+    let selftest = rest.iter().any(|a| a == "--selftest");
+    let qargs: Vec<String> = rest.iter().filter(|a| *a != "--selftest").cloned().collect();
+
     let result = match cmd.as_deref() {
-        Some("build") => cmd_build(),
-        Some("image") => cmd_image(),
-        Some("qemu") => cmd_qemu(false, &rest),
-        Some("qemu-debug") => cmd_qemu(true, &rest),
+        Some("build") => cmd_build(selftest),
+        Some("image") => cmd_image(selftest),
+        Some("qemu") => cmd_qemu(false, selftest, &qargs),
+        Some("qemu-debug") => cmd_qemu(true, selftest, &qargs),
         Some("test") => cmd_test(),
         Some("check-arch") => cmd_check_arch(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -82,7 +88,9 @@ fn print_help() {
            clean         remove build outputs and caches\n  \
            help          show this message\n\
          \n\
-         Any args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
+         `--selftest` (build/image/qemu) compiles + runs the boot self-tests / demos;\n         \
+         without it the build boots straight to userspace.\n         \
+         Other args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
     );
 }
 
@@ -125,19 +133,24 @@ fn limine_conf() -> PathBuf {
 
 // --- Subcommands --------------------------------------------------------
 
-fn cmd_build() -> R<()> {
+fn cmd_build(selftest: bool) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
-    // time.
+    // time. Only `init` (and the kernel) carry a `selftest` feature.
     cmd_build_hello()?;
-    build_userspace_bin("parent")?;
-    build_userspace_bin("child")?;
-    build_userspace_bin("init")?;
-    build_userspace_bin("fs-server-ext4")?;
-    build_userspace_bin("eshell")?;
+    build_userspace_bin("parent", false)?;
+    build_userspace_bin("child", false)?;
+    build_userspace_bin("init", selftest)?;
+    build_userspace_bin("fs-server-ext4", false)?;
+    build_userspace_bin("eshell", false)?;
 
     let kernel_dir = repo_root().join("kernel");
-    run(Command::new("cargo").arg("build").current_dir(&kernel_dir))?;
+    let mut k = Command::new("cargo");
+    k.arg("build");
+    if selftest {
+        k.arg("--features").arg("selftest");
+    }
+    run(k.current_dir(&kernel_dir))?;
     let elf = kernel_elf();
     if !elf.exists() {
         return Err(format!("kernel ELF missing after build: {}", elf.display()).into());
@@ -176,14 +189,17 @@ fn cmd_build_hello() -> R<()> {
 /// target (run from its own crate dir so its `.cargo/config.toml` applies). The
 /// kernel embeds the result via `include_bytes!`. Generalises `cmd_build_hello`
 /// for the spawn-demo binaries (`parent`, `child`).
-fn build_userspace_bin(name: &str) -> R<()> {
+fn build_userspace_bin(name: &str, selftest: bool) -> R<()> {
     let dir = repo_root().join("userspace").join(name);
-    run(Command::new("cargo")
-        .arg("build")
+    let mut c = Command::new("cargo");
+    c.arg("build")
         .arg("--release")
         .arg("--target")
-        .arg("x86_64-unknown-none")
-        .current_dir(&dir))?;
+        .arg("x86_64-unknown-none");
+    if selftest {
+        c.arg("--features").arg("selftest");
+    }
+    run(c.current_dir(&dir))?;
     let elf = repo_root()
         .join("userspace/target/x86_64-unknown-none/release")
         .join(name);
@@ -194,8 +210,8 @@ fn build_userspace_bin(name: &str) -> R<()> {
     Ok(())
 }
 
-fn cmd_image() -> R<()> {
-    cmd_build()?;
+fn cmd_image(selftest: bool) -> R<()> {
+    cmd_build(selftest)?;
     let limine_root = cmd_fetch_limine()?;
     let bootx64 = find_bootx64(&limine_root)?;
     let initramfs = initramfs_path();
@@ -211,8 +227,8 @@ fn cmd_image() -> R<()> {
     Ok(())
 }
 
-fn cmd_qemu(debug: bool, extra_args: &[String]) -> R<()> {
-    cmd_image()?;
+fn cmd_qemu(debug: bool, selftest: bool, extra_args: &[String]) -> R<()> {
+    cmd_image(selftest)?;
     let ovmf = locate_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
     qemu.arg("-M")

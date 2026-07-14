@@ -12,6 +12,12 @@ path = "src/lib.rs"
 name = "nitrox-kernel"
 path = "src/main.rs"
 
+[features]
+# Compile in the boot-time self-tests / demos (`src/boot_selftest.rs`) and run them
+# during boot. Off by default: a normal boot goes straight to userspace. Enabled by
+# `cargo xtask qemu --selftest` (and the future `xtask test-qemu` for CI).
+selftest = []
+
 [dependencies]
 
 [profile.dev]

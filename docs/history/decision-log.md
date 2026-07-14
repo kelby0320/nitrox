@@ -6340,3 +6340,39 @@ check-arch green. QEMU — the full parent demo chain runs through the wrappers 
 thread` / `worker terminated`, `ns_bind /store ok`, `spawned two children` / `both children
 reaped`); boots to `eshell`; `-smp 1` + `-smp 4` clean, no faults. Slice 7 done — the userspace
 runtime band (slices 4–7) is complete; next is the service backlog (service-mgr et al.).
+
+## 2026-07-14 — Boot normalization: the `selftest` feature + a clean happy path
+
+Before starting the service backlog, retired the boot-time demo/self-test parade from the
+*default* boot so the kernel evolves toward a normal bring-up (kernel → init → mount →
+service-mgr → …), while **preserving** the regression coverage those demos give (the SMP
+migration hazard was caught by a boot loop, not a unit test).
+
+**Mechanism: a `selftest` cargo feature** (on the kernel and `init` crates), **off by
+default**. `cargo xtask qemu` boots straight to userspace; `cargo xtask qemu --selftest`
+compiles the demos in and runs them (the `--selftest` flag threads `--features selftest` to
+the kernel + init builds through `cmd_build`/`build_userspace_bin`).
+
+**Kernel cleanup (`main.rs` clean-up the user asked for).** Moved the in-`main.rs` demos —
+`run_scheduler_demo`'s busy-worker part, the scheduler-class demo, the SMP distribution +
+affinity demos, and the paging / demand-paging / DMA smoke tests, plus their workers/statics
+— into a new **`kernel/src/boot_selftest.rs`** (whole module `#[cfg(feature="selftest")]`,
+exposing phase entry points `paging`/`irq_routing`/`irp_spine`/`storage`/`pre_smp`/`post_smp`).
+`main.rs` dropped ~360 lines (1294 → ~930); each self-test call in `kernel_main` is now a
+one-line `#[cfg(feature="selftest")] boot_selftest::…()`. **Critical split:** the old
+`run_scheduler_demo` also did `sched::init()` + armed preemption — that bring-up stays in
+`main.rs::sched_bringup` (happy path); only the busy-worker demo moved.
+
+**init.** The `parent` demo chain + the `large.bin` page-cache read are gated behind init's
+`selftest` feature. The default `supervise` now launches the interactive console directly
+(instead of spawning `parent` and launching eshell only after it reaps) — decoupling eshell
+from the demo. **When service-mgr lands, the normal `supervise` path spawns *it* here instead
+of eshell.**
+
+Verified: both configs build clean (no warnings); host suite + check-arch green. QEMU —
+**default boot is quiet** (zero demo lines: kernel → init → ext4 mount → current-generation →
+`eshell`, `cat` works, no faults); **`--selftest`** runs the full suite (paging NX, scheduler
+workers + classes, demand paging, DMA, SMP distribution + affinity, large.bin, the parent/child
+chain) then reaches `eshell`; `-smp 4 --selftest` distributes correctly. Next: `xtask test-qemu`
+(the CI harness that boots a `--selftest` build headless and adjudicates pass/fail via
+`isa-debug-exit`), then service-mgr.

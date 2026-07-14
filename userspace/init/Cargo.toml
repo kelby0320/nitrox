@@ -3,6 +3,12 @@ name = "init"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+# Run init's boot-time demos: the `large.bin` page-cache read + the `parent` demo
+# chain (else init boots straight to the interactive console). Enabled together with
+# the kernel's `selftest` feature by `cargo xtask qemu --selftest`.
+selftest = []
+
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
