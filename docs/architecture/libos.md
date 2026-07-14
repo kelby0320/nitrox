@@ -42,11 +42,12 @@ Namespace, NotificationChannel, Entropy, PendingOperation); the `Op` future over
   concurrency-heavy service. `block_on` (drive *one* future) covers every current
   caller. The design below is shaped so the multi-task executor is a clean addition,
   not a rewrite.
-- **`Handle<Process>` / `Handle<Thread>` and syscap-gated calls** (thread/process
-  spawn, affinity) — those wrap ABIs (`ThreadArgs`/`SpawnArgs` + SysCaps) that finalize
-  in slices 6–7.
 - **`libstream`** (typed structured I/O) — consumer-less until the shell/service-mgr
   era; wants its own wire-protocol/streaming design pass.
+
+`Handle<Process>` / `Handle<Thread>` and the authority-gated `ns_bind` were deferred
+here in slice 5 (their ABIs finalized in slice 6, SysCaps) and land in **slice 7**
+below.
 
 ## The `Handle<T, M>` typestate model
 
@@ -223,6 +224,56 @@ must preserve.)
   rules (no panic/unwrap); libos surfaces errors as `Result`, never panics.
 - **eshell**'s console read loop moves onto libos byte I/O + `block_on`, staying
   alloc-free.
+
+## Process, thread, and authority spawning (slice 7)
+
+The pieces held back from slice 5, now that `SpawnArgs`/`ThreadArgs` + SysCaps are
+settled (slice 6). Two new object markers — **`Process`**, **`Thread`** — each with the
+`Only` mode (their granted rights live in `extra`; the v5.1 `ProcObserve`/`Control`/
+`Terminate` mode lattice is a later refinement, no consumer distinguishes them yet).
+
+**Typed spawn/create wrappers** — thin over the raw syscalls, returning **owning**
+handles (so a child Process or Thread handle closes on drop — init's reaping loop
+becomes "drop the handle", and a spawned child auto-reaps):
+
+```rust
+// process.rs
+pub fn spawn(args: &SpawnArgs) -> Result<Handle<Process, Only>>;   // sys_process_spawn
+// thread.rs
+pub fn create(args: &ThreadArgs) -> Result<Handle<Thread, Only>>;  // sys_thread_create
+```
+
+`SpawnArgs`/`ThreadArgs` are the libkern ABI structs (the caller fills `image`,
+handles/rights, `namespace`, `syscaps`, or the scheduling fields). The wrapper is
+deliberately thin — it types the *return* (an owning `Handle`) and maps errors; it does
+**not** hide the ABI struct. A fluent builder (`Spawn::new(image).syscaps(…).spawn()`)
+is an ergonomic layer we add if a consumer wants it; the raw-args wrapper is the
+consumer-minimal core that de-hacks the `syscall1(SYS_PROCESS_SPAWN, &args)` +
+raw-`u64`-handle + manual-close pattern in init/parent today.
+
+**The authority-gated `ns_bind`** — completes the Namespace surface (deferred in slice
+5). Gated by a sealed `CanBind` trait (only `NsMutable`), *and*, at runtime, by the
+`BIND_NAMESPACE` syscap the kernel now enforces (slice 6):
+
+```rust
+impl<M: CanBind> Handle<Namespace, M> {
+    pub fn bind(&self, path: &str, resource: RawHandle) -> Result<()>;  // sys_ns_bind
+}
+```
+
+The wrapper just issues `sys_ns_bind`; the syscap check lives in the kernel, so a caller
+without `BIND_NAMESPACE` gets `Err(NoAccess)` — surfaced as a normal `Result`.
+
+**Not in scope (still consumer-less):** a runtime `set_affinity` wrapper (affinity is
+set at creation via `ThreadArgs`; no user re-pins a running thread); the `Process` mode
+lattice; a `terminate` wrapper (no cross-process terminate syscall — reaping is
+handle-close on `ChildExited`). The `Sys` seam grows `process_spawn`/`thread_create`/
+`ns_bind` (real + mock), like slice 5.
+
+**Dogfood:** `parent` exercises all three (it spawns children, creates a worker thread,
+and `ns_create` + `ns_bind`s) and is a demo (lower-risk than init) — so it adopts the
+wrappers (staying alloc-free; the wrappers need no heap). init's spawns/reaping migrate
+where the change stays surgical.
 
 ## Open questions / deferred
 

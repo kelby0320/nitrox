@@ -1748,10 +1748,19 @@ libos authority surface → services.**
     crate — the fiber scheduler and the sync-convenience crate were cut; see the
     2026-07-13 decision log. In-process concurrency is `async` tasks on the libos
     executor; blocking convenience is the small `block_on` in libos, slice 5.)
-  - [ ] libos thread/spawn/authority wrappers: `thread_create` with the finalized
-    `ThreadArgs`, `process_spawn` with syscap grants, affinity, the syscap-gated calls
-    — extends the libos design doc (slice 5) rather than a new crate/doc.
-  - [ ] **First consumers:** init/service-mgr use the libos spawn + syscap-grant API.
+  - [x] **Design** (Part A, 2026-07-14) — extended `docs/architecture/libos.md` with the
+    slice-7 surface. **Thin typed wrappers over the ABI structs, not a fluent builder**
+    (consumer-minimal; a builder is a later ergonomic layer, and thin wrappers map
+    cleanly onto a future `std::process`/`std::thread` pal): `process::spawn(&SpawnArgs)
+    → Handle<Process,Only>`, `thread::create(&ThreadArgs) → Handle<Thread,Only>` (owning
+    → RAII close = reaping), and the `BIND_NAMESPACE`-gated `Handle<Namespace,NsMutable>
+    ::bind`. Out (consumer-less): runtime `set_affinity`, `terminate`, the Process mode
+    lattice.
+  - [ ] libos wrappers: the two new `Process`/`Thread` markers (`Only` mode); the
+    spawn/create wrappers; `Namespace::bind` + the sealed `CanBind` trait; the `Sys`
+    seam grows `process_spawn`/`thread_create`/`ns_bind` (real + mock). Host-tested.
+  - [ ] **First consumer:** `parent` (a demo, lower-risk than init) adopts all three
+    wrappers, staying alloc-free; init's spawns/reaping migrate where surgical.
   - **Kernel dependency:** true kernel-thread-backed parallelism (real `std::thread`
     semantics, multicore *within* a process) needs the deferred **TLS (`FS_BASE` /
     `sys_thread_set_tls`) + FPU `XSAVE`** kernel work (Phase 1 deferrals, still
