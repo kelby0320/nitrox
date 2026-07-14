@@ -6308,3 +6308,35 @@ build clean; QEMU gate-allows + gate-bites as above; boots to `eshell`; `-smp 1`
 clean, no faults. Docs updated (syscaps.md → implemented; scheduler.md's REAL_TIME gate now
 wired; process-spawn-args.md/thread-args.md specs grown). Slice 6 done; next is slice 7 (the
 SysCaps-coupled libos surface). Then the PR.
+
+## 2026-07-14 — Phase 3 slice 7 complete: the SysCaps-coupled libos surface
+
+The libos pieces deferred from slice 5 (their ABIs finalized by SysCaps in slice 6) landed in
+three commits. Design (Part A) extended `docs/architecture/libos.md` rather than adding a doc.
+
+**Thin wrappers, not a builder.** `libos::spawn(&SpawnArgs) → Handle<Process,Only>` and
+`libos::thread_create(&ThreadArgs) → Handle<Thread,Only>` are thin over the libkern ABI structs
+— the caller still fills the struct; the wrapper types the *return* (an **owning** Handle, so a
+child Process or Thread handle reaps/closes on drop) and maps errors. A fluent builder was
+rejected as premature surface; thin wrappers also map cleanly onto a future `std::process`/
+`std::thread` pal (the eventual `std::sys` layer forwards to them). Plus `Handle<Namespace,
+M: CanBind>::bind` — the `BIND_NAMESPACE`-gated `ns_bind` (denial → `ErrorKind::PermissionDenied`),
+completing the Namespace surface. New `Process`/`Thread` object markers use the `Only` mode; the
+v5.1 `ProcObserve`/`Control`/`Terminate` lattice is deferred (no consumer distinguishes them).
+
+**Out (consumer-less):** a runtime `set_affinity` wrapper (affinity is creation-time via
+`ThreadArgs`), a `terminate` wrapper (no cross-process terminate syscall — reaping is
+handle-close on `ChildExited`), the Process mode lattice.
+
+**Dogfood: `parent`** (a demo, lower-risk than init, and alloc-free — the wrappers need no heap)
+adopts all three: its worker thread via `thread_create` (the Handle's drop retires the explicit
+close), its ns-demo `ns_bind` via `Namespace::bind`, and its two child spawns via `spawn` (owning
+handles reap on drop — previously the child handles were leaked until process exit). init's
+spawns stay raw (surgical scope; init's fs-server handshake is IPC-tangled).
+
+Verified: +3 libos host tests (owning Process/Thread handles close on drop; ns_bind success +
+denial → PermissionDenied) for 17 total; libos bare-builds (no_std, no alloc); full host suite +
+check-arch green. QEMU — the full parent demo chain runs through the wrappers (`created worker
+thread` / `worker terminated`, `ns_bind /store ok`, `spawned two children` / `both children
+reaped`); boots to `eshell`; `-smp 1` + `-smp 4` clean, no faults. Slice 7 done — the userspace
+runtime band (slices 4–7) is complete; next is the service backlog (service-mgr et al.).

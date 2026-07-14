@@ -1743,11 +1743,10 @@ libos authority surface → services.**
     but `ns_bind FAIL`, even on its own namespace); boots to `eshell`; `-smp 1` + `-smp
     4` clean.
 
-- [ ] **Slice 7 — the SysCaps-coupled libos surface.** The libos pieces held back
-    from slice 5, now that SysCaps + `ThreadArgs`/`SpawnArgs` are settled. (No `librt`
-    crate — the fiber scheduler and the sync-convenience crate were cut; see the
-    2026-07-13 decision log. In-process concurrency is `async` tasks on the libos
-    executor; blocking convenience is the small `block_on` in libos, slice 5.)
+- [x] **Slice 7 — the SysCaps-coupled libos surface** (2026-07-14). The libos pieces
+    held back from slice 5, now that SysCaps + `ThreadArgs`/`SpawnArgs` are settled.
+    Built in parts A–C (one commit each). (No `librt` crate — cut; see the 2026-07-13
+    decision log.)
   - [x] **Design** (Part A, 2026-07-14) — extended `docs/architecture/libos.md` with the
     slice-7 surface. **Thin typed wrappers over the ABI structs, not a fluent builder**
     (consumer-minimal; a builder is a later ergonomic layer, and thin wrappers map
@@ -1756,11 +1755,18 @@ libos authority surface → services.**
     → RAII close = reaping), and the `BIND_NAMESPACE`-gated `Handle<Namespace,NsMutable>
     ::bind`. Out (consumer-less): runtime `set_affinity`, `terminate`, the Process mode
     lattice.
-  - [ ] libos wrappers: the two new `Process`/`Thread` markers (`Only` mode); the
-    spawn/create wrappers; `Namespace::bind` + the sealed `CanBind` trait; the `Sys`
-    seam grows `process_spawn`/`thread_create`/`ns_bind` (real + mock). Host-tested.
-  - [ ] **First consumer:** `parent` (a demo, lower-risk than init) adopts all three
-    wrappers, staying alloc-free; init's spawns/reaping migrate where surgical.
+  - [x] **Part B (wrappers)** — the `Process`/`Thread` markers (`Only` mode);
+    `libos::spawn`/`thread_create` (owning handles → RAII reaping); `Handle<Namespace,
+    M: CanBind>::bind` (the `BIND_NAMESPACE`-gated call; denial → `PermissionDenied`);
+    the `Sys` seam grows `process_spawn`/`thread_create`/`ns_bind` (real + mock).
+    `#![no_std]`, no `alloc`. +3 host tests (17 total).
+  - [x] **Part C (dogfood)** — `parent` (alloc-free, a demo) adopts all three: its
+    worker via `thread_create` (Handle drops → closes, retiring the explicit close), its
+    ns-demo bind via `Namespace::bind`, its child spawns via `spawn` (owning handles reap
+    on drop, replacing a handle leak). *Verified:* the full parent demo chain runs
+    through the wrappers under QEMU (`created worker thread`/`worker terminated`,
+    `ns_bind /store ok`, `both children reaped`); boots to `eshell`; `-smp 1`/`-smp 4`
+    clean, no faults. init's spawns left raw (surgical scope; its handshake is tangled).
   - **Kernel dependency:** true kernel-thread-backed parallelism (real `std::thread`
     semantics, multicore *within* a process) needs the deferred **TLS (`FS_BASE` /
     `sys_thread_set_tls`) + FPU `XSAVE`** kernel work (Phase 1 deferrals, still
