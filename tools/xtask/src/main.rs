@@ -705,12 +705,24 @@ fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
     }
 }
 
-/// Pack the initramfs CPIO `newc` archive at `out` (a placeholder `etc/init.toml`
-/// + the mandatory `TRAILER!!!`).
+/// The release path of a built userspace binary (bare target).
+fn userspace_bin_path(name: &str) -> PathBuf {
+    repo_root()
+        .join("userspace/target/x86_64-unknown-none/release")
+        .join(name)
+}
+
+/// Pack the initramfs CPIO `newc` archive at `out`: the config manifests, the `init`
+/// ELF (the kernel boot-loads `/sbin/init` from here — retiring the embedded copy),
+/// and the mandatory `TRAILER!!!`. Built by `cmd_build` before this runs.
 fn build_initramfs(out: &Path) -> R<()> {
     let mut buf = Vec::new();
     cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
     cpio_entry(&mut buf, 2, "etc/services/heartbeat.toml", HEARTBEAT_TOML.as_bytes());
+    let init_elf = userspace_bin_path("init");
+    let init_bytes = fs::read(&init_elf)
+        .map_err(|e| format!("read init ELF {}: {e}", init_elf.display()))?;
+    cpio_entry(&mut buf, 3, "sbin/init", &init_bytes);
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
     fs::write(out, &buf)?;
     println!(
