@@ -3,12 +3,13 @@
 //! Spawned by init once critical-path boot is stable, it starts, supervises, and
 //! restarts the system's services. See `docs/architecture/service-manager.md`.
 //!
-//! **Slice A, Part D (this file):** supervision with **restart policy + backoff**. On
-//! a supervised service's exit, service-mgr consults the parsed policy
-//! (`never`/`on-failure`/`always`), and — if a restart is due and `max_attempts` is
-//! not exhausted — waits the backoff (a one-shot monotonic timer) and respawns.
-//! Declaration parsing is Part C (`service_toml`); per-service control channels are
-//! Part E. The parser lives in the crate library (`lib.rs`) so it is host-tested.
+//! **Slice A (this file):** the supervision spine — parse a declaration from the
+//! initramfs (`service_toml`, Part C), start the service, and on its exit apply the
+//! restart policy + backoff (Part D). **Part E** adds a per-service **control
+//! channel**: service-mgr keeps one end, moves the other to the service at spawn, and
+//! can send lifecycle commands — here, a graceful `CTRL_OP_SHUTDOWN`. A supervisor-
+//! requested shutdown is distinguished from an unexpected exit, so it is *not*
+//! restarted even under `policy = always`.
 //!
 //! `#![no_std]` + `#![no_main]`. Slice A uses `libkern` (raw syscalls) + `libheap`
 //! (the `#[global_allocator]`); the design's `librsproto`/`libos` surface arrives with
@@ -30,15 +31,22 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 /// One page; a service declaration is assumed to fit (true for the slice-A demo).
 const PAGE: u64 = 4096;
+/// Slice-A demo: how long to let the service run before requesting a graceful
+/// shutdown over its control channel (exercises the control path end to end).
+const DEMO_RUN_NS: u64 = 1_100_000_000; // ~1.1s (a few heartbeat beats)
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut NOTIF: Notification = Notification::zeroed();
 static mut CLOCK_BUF: u64 = 0;
+static mut CTRL_OUT0: u64 = 0;
+static mut CTRL_OUT1: u64 = 0;
+static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
+static mut SEND_HANDLES: [u64; 8] = [0; 8];
 
-/// Spawn args for the service being started/restarted. The `image` field is filled
-/// from the parsed declaration before each spawn; a leaf service inherits a
-/// LOOKUP-only handle to service-mgr's namespace and holds no ambient capabilities.
+/// Spawn args for the service being started/restarted. `image` and the control-channel
+/// handle are filled per spawn; a leaf service inherits a LOOKUP-only handle to
+/// service-mgr's namespace and holds no ambient capabilities.
 static mut SPAWN_SERVICE: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 0,
@@ -85,8 +93,7 @@ fn restart_name(p: RestartPolicy) -> &'static [u8] {
 }
 
 /// Resolve a declared `executable` path to a kernel-embedded `ImageId`. The slice-A
-/// stand-in for a path-based ELF loader: known executables map to their embedded
-/// image. Goes away when spawning from a real filesystem path lands.
+/// stand-in for a path-based ELF loader; goes away when spawning from a real path lands.
 fn image_for_executable(exe: &str) -> Option<u32> {
     match exe {
         "/sbin/heartbeat" => Some(IMAGE_HEARTBEAT),
@@ -99,7 +106,6 @@ fn compute_backoff(cfg: &RestartConfig, attempts: u32) -> u64 {
     match cfg.backoff {
         Backoff::None => 0,
         Backoff::Linear => cfg.initial_ns,
-        // initial << attempts, saturating, capped at max.
         Backoff::Exponential => cfg
             .initial_ns
             .checked_shl(attempts)
@@ -117,22 +123,24 @@ fn should_restart(policy: RestartPolicy, code: i32) -> bool {
     }
 }
 
+/// Read the monotonic clock (ns).
+fn now_ns() -> u64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: on success the kernel wrote the ns count into CLOCK_BUF.
+    unsafe { (&raw const CLOCK_BUF).read() }
+}
+
 /// Block for `duration_ns` on a one-shot monotonic timer (`timer_h`, reused across
-/// backoffs). Best-effort: a create/arm/wait failure returns promptly.
+/// backoffs). Best-effort; a `0` handle or duration returns promptly.
 fn sleep_ns(timer_h: u64, duration_ns: u64) {
     if timer_h == 0 || duration_ns == 0 {
         return;
     }
-    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
-    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
-    // SAFETY: on success the kernel wrote the ns count into CLOCK_BUF.
-    let now = unsafe { (&raw const CLOCK_BUF).read() };
-    let fire_at = now.saturating_add(duration_ns);
+    let fire_at = now_ns().saturating_add(duration_ns);
     // SAFETY: arming our own timer (absolute monotonic deadline, one-shot).
     unsafe { syscall4(SYS_TIMER_SET, timer_h, fire_at, 0, 0) };
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter. A
-    // generous overall deadline past `fire_at` ensures the timer, not the wait
-    // deadline, wakes us.
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     unsafe {
         WAIT_HANDLES[0] = timer_h;
         syscall4(
@@ -145,9 +153,44 @@ fn sleep_ns(timer_h: u64, duration_ns: u64) {
     }
 }
 
+/// Create a connected control-channel pair (depth 4). Returns `(smgr_end, svc_end)`:
+/// service-mgr keeps `smgr_end`, the service receives `svc_end`. `None` on failure.
+fn create_control_channel() -> Option<(u64, u64)> {
+    // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return None;
+    }
+    // SAFETY: on success the kernel wrote both endpoint handles.
+    let (a, b) = unsafe { ((&raw const CTRL_OUT0).read(), (&raw const CTRL_OUT1).read()) };
+    Some((a, b))
+}
+
+/// Send a control opcode to a service over its control endpoint (`ctrl`). No handles,
+/// non-blocking (the control ring is otherwise idle).
+fn send_control(ctrl: u64, op: u8) {
+    if ctrl == 0 {
+        return;
+    }
+    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; write the 1-byte control payload.
+    unsafe {
+        (&raw mut SEND_MSG.header.payload_len).write(1);
+        (&raw mut SEND_MSG.payload[0]).write(op);
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ctrl,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        );
+    }
+}
+
 /// Resolve `path` in namespace `ns`, map the returned read-only `MemoryObject`, and
-/// return its trimmed UTF-8 contents (the initramfs zero-fills the tail of the page).
-/// Mirrors init's manifest read. `None` on any failure.
+/// return its trimmed UTF-8 contents. Mirrors init's manifest read. `None` on failure.
 fn read_file(ns: u64, path: &[u8]) -> Option<String> {
     // SAFETY: valid path pointer + namespace handle.
     let po = unsafe {
@@ -193,15 +236,13 @@ fn read_file(ns: u64, path: &[u8]) -> Option<String> {
     let bytes = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
     let len = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
     let text = core::str::from_utf8(&bytes[..len]).ok().map(String::from);
-    // Copied into an owned String; release service-mgr's handle to the object (the
-    // page mapping persists via its own reference — slice A does not unmap).
-    // SAFETY: closing our own handle.
+    // SAFETY: closing our own handle (the page mapping persists via its own reference).
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
     text
 }
 
 /// Read + parse the slice-A service declaration and resolve its executable to an
-/// embedded image. `None` (with a logged reason) if it is absent/malformed/unknown.
+/// embedded image. `None` (with a logged reason) if absent/malformed/unknown.
 fn load_declaration(root_ns: u64) -> Option<(ServiceDecl, u32)> {
     let text = match read_file(root_ns, b"/initramfs/etc/services/heartbeat.toml") {
         Some(t) => t,
@@ -238,21 +279,49 @@ fn load_declaration(root_ns: u64) -> Option<(ServiceDecl, u32)> {
     }
 }
 
-/// Spawn the service `decl` names (image already resolved). Returns the process
-/// handle, or a negative error.
-fn spawn_service(decl: &ServiceDecl, image: u32) -> i64 {
+/// Spawn the service `decl` names (image already resolved), with a fresh control
+/// channel whose service end is moved to the child. Returns `(proc_handle,
+/// control_end)`; `control_end` is `0` if the channel couldn't be created.
+fn spawn_service(decl: &ServiceDecl, image: u32) -> (i64, u64) {
+    let (smgr_end, svc_end) = match create_control_channel() {
+        Some(pair) => pair,
+        None => {
+            kprint(b"service-mgr: control channel create FAIL (spawning without control)\n");
+            (0, 0)
+        }
+    };
     kprint(b"service-mgr: starting service '");
     kprint(decl.name.as_bytes());
     kprint(b"'\n");
-    // SAFETY: SPAWN_SERVICE is a valid writable arg block; set the resolved image.
+    // SAFETY: SPAWN_SERVICE is a valid writable arg block. Move the control endpoint
+    // into the child (RECV + WAIT only — it receives commands, doesn't send).
     let h = unsafe {
         SPAWN_SERVICE.image = image;
+        if svc_end != 0 {
+            SPAWN_SERVICE.handles[0] = svc_end;
+            SPAWN_SERVICE.handle_count = 1;
+            SPAWN_SERVICE.move_mask = 1;
+            SPAWN_SERVICE.rights[0] = RIGHT_RECV | RIGHT_WAIT;
+        } else {
+            SPAWN_SERVICE.handle_count = 0;
+            SPAWN_SERVICE.move_mask = 0;
+        }
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SERVICE) as u64)
     };
     if h < 0 {
         kprint(b"service-mgr: spawn FAIL\n");
+        // The service endpoint was not moved (spawn failed) — close both ends.
+        if smgr_end != 0 {
+            // SAFETY: closing our own handles.
+            unsafe {
+                syscall1(SYS_HANDLE_CLOSE, smgr_end);
+                syscall1(SYS_HANDLE_CLOSE, svc_end);
+            }
+        }
+        return (h, 0);
     }
-    h
+    // `svc_end` has moved to the child; retain `smgr_end` as the control endpoint.
+    (h, smgr_end)
 }
 
 /// Bootstrap registers (see init's `_start`): `rdi` = notification channel, `rsi` =
@@ -262,8 +331,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     kprint(b"service-mgr: up\n");
     match load_declaration(root_ns) {
         Some((decl, image)) => {
-            let h = spawn_service(&decl, image);
-            supervise(notif, decl, image, h);
+            let (h, ctrl) = spawn_service(&decl, image);
+            supervise(notif, decl, image, h, ctrl);
         }
         None => {
             kprint(b"service-mgr: no services to start; idling\n");
@@ -273,9 +342,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
 }
 
 /// Supervise the single slice-A service: on its exit, apply the restart policy +
-/// backoff, bounded by `max_attempts`. (Part E adds the control channel; a later
-/// slice generalises this to a table of services.)
-fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64) -> ! {
+/// backoff (Part D), bounded by `max_attempts`. **Part E:** after `DEMO_RUN_NS`,
+/// request a graceful shutdown over the control channel; a requested shutdown is not
+/// restarted, even under `policy = always`. (A later slice generalises this to a table
+/// of services and a real shutdown trigger.)
+fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64, mut ctrl: u64) -> ! {
     // A reusable one-shot timer for backoff sleeps.
     let timer_h = {
         // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
@@ -289,11 +360,21 @@ fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64) -> !
     };
     let mut attempts: u32 = 0;
     let mut running = service_h > 0;
+    let mut requested_shutdown = false;
+    // Demo: schedule the graceful-shutdown request.
+    let shutdown_at = now_ns().saturating_add(DEMO_RUN_NS);
     kprint(b"service-mgr: supervising '");
     kprint(decl.name.as_bytes());
     kprint(b"'\n");
 
     loop {
+        // Wait on the notification channel; while the service runs and no shutdown has
+        // been requested, wake at `shutdown_at` to send it.
+        let deadline = if running && !requested_shutdown {
+            shutdown_at
+        } else {
+            u64::MAX
+        };
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
@@ -302,10 +383,18 @@ fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64) -> !
                 (&raw const WAIT_HANDLES) as u64,
                 1,
                 (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
+                deadline,
             )
         };
         if waited < 1 {
+            // Deadline reached with the service still running: request shutdown once.
+            if running && !requested_shutdown {
+                kprint(b"service-mgr: requesting graceful shutdown of '");
+                kprint(decl.name.as_bytes());
+                kprint(b"'\n");
+                send_control(ctrl, CTRL_OP_SHUTDOWN);
+                requested_shutdown = true;
+            }
             continue;
         }
         // Drain every queued notification this wake delivered.
@@ -323,9 +412,15 @@ fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64) -> !
             }
             let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
             let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-            // SAFETY: closing our own process handle (reaping).
-            unsafe { syscall1(SYS_HANDLE_CLOSE, service_h as u64) };
+            // SAFETY: closing our own process + control handles (reaping).
+            unsafe {
+                syscall1(SYS_HANDLE_CLOSE, service_h as u64);
+                if ctrl != 0 {
+                    syscall1(SYS_HANDLE_CLOSE, ctrl);
+                }
+            }
             service_h = 0;
+            ctrl = 0;
             running = false;
             kprint(b"service-mgr: '");
             kprint(decl.name.as_bytes());
@@ -335,6 +430,18 @@ fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64) -> !
             kprint_u64(code as u64);
             kprint(b"\n");
 
+            // A supervisor-requested shutdown is intentional — never restart it, even
+            // under `policy = always`.
+            if requested_shutdown {
+                kprint(b"service-mgr: '");
+                kprint(decl.name.as_bytes());
+                kprint(b"' stopped as requested (policy=");
+                kprint(restart_name(decl.restart.policy));
+                kprint(b" overridden -- not restarting)\n");
+                continue;
+            }
+
+            // Unexpected exit — apply the restart policy + backoff (Part D).
             if !should_restart(decl.restart.policy, code) {
                 kprint(b"service-mgr: '");
                 kprint(decl.name.as_bytes());
@@ -364,9 +471,10 @@ fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64) -> !
             kprint_u64(backoff / 1_000_000);
             kprint(b"ms backoff\n");
             sleep_ns(timer_h, backoff);
-            let h = spawn_service(&decl, image);
+            let (h, new_ctrl) = spawn_service(&decl, image);
             if h > 0 {
                 service_h = h;
+                ctrl = new_ctrl;
                 running = true;
                 attempts += 1;
             }

@@ -190,6 +190,18 @@ pub const SENDMODE_NOBLOCK: u64 = 1;
 /// `SendMode::BlockBounded` — block with a deadline (6th `sys_channel_send` arg).
 pub const SENDMODE_BLOCKBOUNDED: u64 = 2;
 
+// --- Service control-channel protocol --------------------------------------
+//
+// The opcode a supervisor (service-mgr) sends to a service over its per-service
+// **control channel** (`[service.<name>.handles].control` in the service schema). A
+// slice-A seed of a userspace convention (not a kernel ABI): the opcode is the first
+// payload byte of an `IpcMsg`. It will grow (health-check, config reload) and may move
+// to a dedicated control-protocol module. See `docs/architecture/service-manager.md`.
+
+/// Control opcode: shut down gracefully and exit. The service should stop its work
+/// and call `sys_process_exit(0)`.
+pub const CTRL_OP_SHUTDOWN: u8 = 1;
+
 /// The fixed 24-byte IPC message header. `sender_pid`/`timestamp` are stamped by
 /// the kernel at send and cannot be forged.
 #[repr(C)]
