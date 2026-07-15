@@ -59,7 +59,7 @@ Init holds the kitchen sink at startup. It uses these capabilities for legitimat
 - `PHYSICAL_MEMORY` — only used in extreme recovery scenarios
 - `SYSTEM_CLOCK` — delegated to time-sync service
 
-When spawning the service manager, init delegates the subset of capabilities the service manager needs. The service manager doesn't get `PHYSICAL_MEMORY`, for example.
+When spawning the service manager, init delegates the subset of capabilities the service manager needs (via `SpawnArgs.syscaps`; the kernel computes `child = parent & args`, so a child can never be granted a cap init lacks). The service manager doesn't get `PHYSICAL_MEMORY`, for example. Note init cannot *drop* a syscap from **itself** — syscaps are immutable after spawn (`docs/architecture/syscaps.md`); init only attenuates what it passes to children. So init retains its full cap set (including `BIND_NAMESPACE`) for life; that is accepted (init is tiny and critical-path). See `docs/architecture/service-manager.md` § Capability posture.
 
 When spawning fs-servers, init grants only the device handles, log channel, and minimal namespace each fs-server needs. fs-servers do NOT get `BIND_NAMESPACE` — init does the binding on their behalf via the Resource Server Startup Protocol.
 
@@ -117,7 +117,7 @@ Don't add complex testing scaffolding to init itself. Keep it minimal.
 - `unwrap()` without `// unwrap: <reason>`
 - Unbounded loops, unbounded allocation, unbounded waiting
 - Doing work that should be the service manager's job (supervision, dependency-ordered startup of non-critical services, etc.)
-- Holding `BIND_NAMESPACE` or other potent caps longer than necessary — delegate and drop
+- Holding **handles** with more rights than necessary, or longer than necessary — attenuate before granting, and close (drop) once done. (This "delegate and drop" discipline is about *handles*; syscaps can't be self-dropped — they're fixed at spawn.)
 
 ## Useful pointers
 

@@ -38,6 +38,16 @@ static FS_SERVER_EXT4_ELF: &[u8] =
 static ESHELL_ELF: &[u8] =
     include_bytes!("../../userspace/target/x86_64-unknown-none/release/eshell");
 
+/// The service manager (`userspace/service-mgr`), built by `xtask` before the
+/// kernel. Spawned by init at the service-handoff point (Phase 3).
+static SERVICE_MGR_ELF: &[u8] =
+    include_bytes!("../../userspace/target/x86_64-unknown-none/release/service-mgr");
+
+/// The demo `heartbeat` service (`userspace/heartbeat`), built by `xtask` before the
+/// kernel. Spawned by service-mgr as its slice-A supervision subject.
+static HEARTBEAT_ELF: &[u8] =
+    include_bytes!("../../userspace/target/x86_64-unknown-none/release/heartbeat");
+
 /// The embedded ELF bytes for an [`ImageId`].
 pub fn image_bytes(image: ImageId) -> &'static [u8] {
     match image {
@@ -46,5 +56,7 @@ pub fn image_bytes(image: ImageId) -> &'static [u8] {
         ImageId::Parent => PARENT_ELF,
         ImageId::FsServerExt4 => FS_SERVER_EXT4_ELF,
         ImageId::Eshell => ESHELL_ELF,
+        ImageId::ServiceMgr => SERVICE_MGR_ELF,
+        ImageId::Heartbeat => HEARTBEAT_ELF,
     }
 }

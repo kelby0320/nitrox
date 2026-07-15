@@ -1783,13 +1783,16 @@ just-in-time as before — but service-mgr and everything after now depend on sl
 
 #### Service manager
 
-- [ ] `userspace/service-mgr/` crate
-- [ ] TOML parser for service declarations per [docs/spec/service-toml-schema.md]
-- [ ] Dependency graph + topological startup
-- [ ] Process supervision with restart policies (never, on-failure, always)
-- [ ] Exponential backoff for restarts
-- [ ] Resource Server Startup Protocol for spawned RS-style services
-- [ ] Lifecycle control via per-service control channels
+- [x] `userspace/service-mgr/` crate (slice A)
+- [x] TOML parser for service declarations per [docs/spec/service-toml-schema.md]
+      — slice A parses the single-service subset (`[service.<name>]` + `executable` +
+      the `[restart]` table); arrays/`[handles]`/multiple services are later slices
+- [ ] Dependency graph + topological startup (deferred — a later slice)
+- [x] Process supervision with restart policies (never, on-failure, always) (slice A)
+- [x] Exponential backoff for restarts (slice A — none/linear/exponential + max_attempts)
+- [ ] Resource Server Startup Protocol for spawned RS-style services (deferred — slice B)
+- [x] Lifecycle control via per-service control channels (slice A — `CTRL_OP_SHUTDOWN`;
+      the protocol grows with health-check/reload)
 
 #### Runtime libraries (full versions)
 

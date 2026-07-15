@@ -27,6 +27,12 @@ pub const IMAGE_FS_SERVER_EXT4: u32 = 3;
 /// `ImageId::Eshell` — the emergency shell (`userspace/eshell`), kernel-embedded;
 /// spawned by init (slice 9).
 pub const IMAGE_ESHELL: u32 = 4;
+/// `ImageId::ServiceMgr` — the service manager (`userspace/service-mgr`),
+/// kernel-embedded; spawned by init at the service-handoff point (Phase 3).
+pub const IMAGE_SERVICE_MGR: u32 = 5;
+/// `ImageId::Heartbeat` — the demo `heartbeat` service (`userspace/heartbeat`),
+/// kernel-embedded; spawned by service-mgr as its slice-A supervision subject.
+pub const IMAGE_HEARTBEAT: u32 = 6;
 
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]
@@ -183,6 +189,18 @@ pub const SENDMODE_BLOCK: u64 = 0;
 pub const SENDMODE_NOBLOCK: u64 = 1;
 /// `SendMode::BlockBounded` — block with a deadline (6th `sys_channel_send` arg).
 pub const SENDMODE_BLOCKBOUNDED: u64 = 2;
+
+// --- Service control-channel protocol --------------------------------------
+//
+// The opcode a supervisor (service-mgr) sends to a service over its per-service
+// **control channel** (`[service.<name>.handles].control` in the service schema). A
+// slice-A seed of a userspace convention (not a kernel ABI): the opcode is the first
+// payload byte of an `IpcMsg`. It will grow (health-check, config reload) and may move
+// to a dedicated control-protocol module. See `docs/architecture/service-manager.md`.
+
+/// Control opcode: shut down gracefully and exit. The service should stop its work
+/// and call `sys_process_exit(0)`.
+pub const CTRL_OP_SHUTDOWN: u8 = 1;
 
 /// The fixed 24-byte IPC message header. `sender_pid`/`timestamp` are stamped by
 /// the kernel at send and cannot be forged.

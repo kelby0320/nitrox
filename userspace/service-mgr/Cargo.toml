@@ -1,0 +1,20 @@
+[package]
+name = "service-mgr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+
+# A library + binary split (mirroring init): the library holds the host-testable
+# internals (the service-declaration parser), the binary is the bare-target
+# supervisor entry point. `cargo xtask test` runs `cargo test -p service-mgr --lib`
+# (the `#![no_main]` bin can't build on host); `cargo xtask build` builds the bin bare.
+[lib]
+name = "service_mgr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "service-mgr"
+path = "src/main.rs"

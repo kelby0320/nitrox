@@ -1,0 +1,22 @@
+# Build config for the `hello` userspace program.
+#
+# Read by cargo when the build is invoked from this directory (xtask runs
+# `cargo build` with cwd = userspace/hello), so it does not affect the other
+# userspace crates (`init`, `libkern`) which still build for the host.
+#
+# The goal is a static, non-PIE ELF (ET_EXEC) in the low half: the kernel ELF
+# loader rejects PIE/ET_DYN and dynamic interpreters. `user.ld` (passed via
+# build.rs) fixes the load address; these flags force the static/non-PIE
+# small-code-model output.
+
+[build]
+target = "x86_64-unknown-none"
+
+[target.x86_64-unknown-none]
+rustflags = [
+    "-C", "code-model=small",
+    "-C", "relocation-model=static",
+    "-C", "link-arg=-no-pie",
+    "-C", "link-arg=-static",
+    "-C", "link-arg=-zmax-page-size=0x1000",
+]

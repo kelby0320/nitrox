@@ -301,6 +301,6 @@ Start-time failures (path doesn't resolve, executable not found, spawn fails) ca
 
 ## Where to read more
 
-- [Init and service management architecture](../architecture/init-and-services.md)
+- [Service manager design](../architecture/service-manager.md)
 - [Why supervisor-mediated registration](../rationale/why-supervisor-registration.md)
 - [Why capabilities](../rationale/why-capabilities.md) — the structural enforcement of handle grants

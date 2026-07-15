@@ -6416,3 +6416,43 @@ boot quiet; host suite (12) + check-arch green. Docs: new
 `docs/conventions/qemu-integration-tests.md`; retired the deferred-decisions entry;
 updated the root + kernel `CLAUDE.md`. Next: service-mgr. A per-case framework under
 `tests/qemu-tests/` + an `-smp` matrix + CI wiring remain deferred.
+
+## 2026-07-15 — service-mgr slice A: the minimal supervisor
+
+First slice of the service manager (`docs/architecture/service-manager.md`). init now
+hands off to `service-mgr` on a normal boot (instead of eshell, which becomes emergency
++ selftest only), and service-mgr supervises a demo `heartbeat` service end to end.
+Committed in parts (A design → B spine → C parse → D restart → E control channel):
+
+- **Handoff.** init's normal (non-`selftest`) `supervise()` spawns `service-mgr`
+  (`ImageId::ServiceMgr = 5`) with `BIND_NAMESPACE`, and supervises it via reap_loop; if
+  service-mgr exits (a critical fault) init drops to the emergency console (interim, per
+  the design's recovery decision — no respawn). Default boot therefore no longer reaches
+  an interactive prompt (the console returns with session-mgr); `--selftest` still gives
+  eshell.
+- **Declarations.** service-mgr reads `/initramfs/etc/services/heartbeat.toml`
+  (initramfs, sidestepping the profile-server bootstrap), parses it with a focused,
+  host-tested section-tracking parser (two-level `[service.<name>.restart]` nesting,
+  which init's `toml_lite` doesn't do), and resolves `executable = "/sbin/heartbeat"` to
+  the embedded `ImageId::Heartbeat` (the stand-in until a path-based ELF loader exists).
+- **Supervision.** On the service's exit: restart policy (never / on-failure / always) +
+  backoff (none / linear / exponential, `initial << attempt` capped at `backoff_max`),
+  bounded by `max_attempts`, via a one-shot monotonic timer.
+- **Control channel.** A per-service control IPC channel — service-mgr creates the pair,
+  moves the service end in at spawn (RECV+WAIT), keeps the supervisor end, and sends
+  `CTRL_OP_SHUTDOWN` (new shared opcode in libkern). heartbeat is a daemon that beats on
+  a wait deadline and listens on the control endpoint on the same `sys_wait`. A
+  supervisor-requested shutdown is distinguished from an unexpected exit and is not
+  restarted, even under `policy = always`.
+
+New crates `userspace/service-mgr/` (lib+bin split, host-tested parser; libkern +
+libheap) and `userspace/heartbeat/`; two embedded `ImageId`s; the demo declaration in
+the initramfs. Deferred to later slices: the dependency graph + topological startup, and
+the Resource Server Startup Protocol (slice B — service-mgr adopting fs-server-style RS
+registration via `librsproto`). Also corrected init's CLAUDE.md "delegate and drop"
+(handles, not syscaps — syscaps are immutable after spawn) and fixed a dangling
+schema-doc link.
+
+Verified per part: default boot exercises the full lifecycle (parse → start → daemon →
+graceful shutdown, and the restart loop under Part D); host suite + check-arch green;
+`--selftest` and `test-qemu` unaffected (service-mgr is off the selftest path).

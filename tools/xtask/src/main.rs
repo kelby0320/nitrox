@@ -176,6 +176,8 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
     build_userspace_bin("eshell", None)?;
+    build_userspace_bin("service-mgr", None)?;
+    build_userspace_bin("heartbeat", None)?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -500,6 +502,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // service-mgr's library tests (the service-declaration parser). `--lib` skips the
+    // `#![no_main]` supervisor bin, which can't build for the host.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("service-mgr")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `fs-server-ext4` reader-library tests (the ext4 parser, against an `mke2fs`
     // fixture). `--lib` skips the bare-target server `[[bin]]` (added in Part 4).
     run(Command::new("cargo")
@@ -648,6 +660,23 @@ mount_point = \"/\"\n\
 mode = \"rw\"\n\
 required_for = \"boot\"\n";
 
+/// A service declaration for the `heartbeat` demo service, read by `service-mgr` from
+/// the initramfs (`/initramfs/etc/services/heartbeat.toml`) in slice A. `executable`
+/// is a path per `docs/spec/service-toml-schema.md`; until a path-based ELF loader
+/// exists, service-mgr maps known executables to kernel-embedded `ImageId`s.
+const HEARTBEAT_TOML: &str = "\
+# Nitrox service declaration (service-mgr slice A demo).\n\
+[service.heartbeat]\n\
+executable = \"/sbin/heartbeat\"\n\
+description = \"Demo supervised service (slice A)\"\n\
+\n\
+[service.heartbeat.restart]\n\
+policy = \"always\"\n\
+max_attempts = 3\n\
+backoff = \"exponential\"\n\
+backoff_initial = \"200ms\"\n\
+backoff_max = \"2s\"\n";
+
 /// Build path for the packed initramfs CPIO archive.
 fn initramfs_path() -> PathBuf {
     build_cache().join("initramfs.cpio")
@@ -681,6 +710,7 @@ fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
 fn build_initramfs(out: &Path) -> R<()> {
     let mut buf = Vec::new();
     cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
+    cpio_entry(&mut buf, 2, "etc/services/heartbeat.toml", HEARTBEAT_TOML.as_bytes());
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
     fs::write(out, &buf)?;
     println!(
