@@ -671,7 +671,11 @@ executable = \"/sbin/heartbeat\"\n\
 description = \"Demo supervised service (slice A)\"\n\
 \n\
 [service.heartbeat.restart]\n\
-policy = \"always\"\n";
+policy = \"always\"\n\
+max_attempts = 3\n\
+backoff = \"exponential\"\n\
+backoff_initial = \"200ms\"\n\
+backoff_max = \"2s\"\n";
 
 /// Build path for the packed initramfs CPIO archive.
 fn initramfs_path() -> PathBuf {
