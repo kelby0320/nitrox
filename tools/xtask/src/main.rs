@@ -178,6 +178,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
     build_userspace_bin("heartbeat", None)?;
+    build_userspace_bin("profile-server", None)?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -512,6 +513,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // profile-server's library tests (the profile-manifest parser). `--lib` skips the
+    // `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("profile-server")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `fs-server-ext4` reader-library tests (the ext4 parser, against an `mke2fs`
     // fixture). `--lib` skips the bare-target server `[[bin]]` (added in Part 4).
     run(Command::new("cargo")
@@ -662,12 +673,13 @@ required_for = \"boot\"\n";
 
 /// A service declaration for the `heartbeat` demo service, read by `service-mgr` from
 /// the initramfs (`/initramfs/etc/services/heartbeat.toml`) in slice A. `executable`
-/// is a path per `docs/spec/service-toml-schema.md`; until a path-based ELF loader
-/// exists, service-mgr maps known executables to kernel-embedded `ImageId`s.
+/// is a path per `docs/spec/service-toml-schema.md`, resolved through service-mgr's
+/// namespace: `/bin/heartbeat` is projected from the content-addressed store by the
+/// profile server (the real userspace path), not the initramfs `/sbin` staging.
 const HEARTBEAT_TOML: &str = "\
 # Nitrox service declaration (service-mgr slice A demo).\n\
 [service.heartbeat]\n\
-executable = \"/initramfs/sbin/heartbeat\"\n\
+executable = \"/bin/heartbeat\"\n\
 description = \"Demo supervised service (slice A)\"\n\
 \n\
 [service.heartbeat.restart]\n\
@@ -712,6 +724,28 @@ fn userspace_bin_path(name: &str) -> PathBuf {
         .join(name)
 }
 
+/// FNV-1a content hash of `bytes` as the store path's opaque `<hash>` (12 hex chars).
+/// A non-cryptographic content hash — sufficient as a unique, deterministic directory
+/// name for now; the Nix-style build-input hash arrives with the build system. See
+/// `docs/architecture/content-addressed-store.md`.
+fn store_hash(bytes: &[u8]) -> String {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in bytes {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    format!("{h:016x}")[..12].to_string()
+}
+
+/// The store path `/store/<hash>-<name>-<version>` for a built program `bin`, keyed on
+/// its ELF's content hash. A pure function of the ELF, so the ext4 store build and the
+/// initramfs profile manifest derive the same path independently — no value threaded.
+fn store_path_for(bin: &str, name: &str, version: &str) -> R<String> {
+    let bytes = fs::read(userspace_bin_path(bin))
+        .map_err(|e| format!("read {bin} ELF for store hash: {e}"))?;
+    Ok(format!("/store/{}-{}-{}", store_hash(&bytes), name, version))
+}
+
 /// Pack the initramfs CPIO `newc` archive at `out`: the config manifests, the `init`
 /// ELF (the kernel boot-loads `/sbin/init` from here — retiring the embedded copy),
 /// and the mandatory `TRAILER!!!`. Built by `cmd_build` before this runs.
@@ -730,6 +764,7 @@ fn build_initramfs(out: &Path) -> R<()> {
         "eshell",
         "parent",
         "child",
+        "profile-server",
     ];
     let mut ino = 3u32;
     for name in programs {
@@ -739,6 +774,23 @@ fn build_initramfs(out: &Path) -> R<()> {
         cpio_entry(&mut buf, ino, &format!("sbin/{name}"), &bytes);
         ino += 1;
     }
+    // The system profile manifest — the profile server reads it and projects the listed
+    // packages' `bin/` into `/bin`. Generated (not a static const) because it references
+    // the store path, whose hash is content-derived at build time (must match the ext4
+    // store dir). See `docs/architecture/profiles-and-namespace-projection.md`.
+    let hb_store = store_path_for("heartbeat", "heartbeat", "0.1.0")?;
+    let system_profile = format!(
+        "# System profile manifest (generation 1).\n\
+         [profile]\n\
+         name = \"system\"\n\
+         generation = 1\n\
+         \n\
+         [[package]]\n\
+         name = \"heartbeat\"\n\
+         version = \"0.1.0\"\n\
+         path = \"{hb_store}\"\n"
+    );
+    cpio_entry(&mut buf, ino, "etc/profiles/system.toml", system_profile.as_bytes());
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
     fs::write(out, &buf)?;
     println!(
@@ -847,6 +899,16 @@ fn assemble_image(
         *b = (((i >> 12) ^ i) & 0xFF) as u8;
     }
     fs::write(staging.join("system").join("large.bin"), &large)?;
+    // The content-addressed store, pre-built read-only into the ext4 root. Each package
+    // lives at /store/<hash>-<name>-<version>/bin/<prog> — a demand-paged file the profile
+    // server projects into /bin. heartbeat is the first package. The store path (hash) is
+    // derived from the ELF, matching the initramfs profile manifest. See
+    // `docs/architecture/content-addressed-store.md`.
+    let hb_store = store_path_for("heartbeat", "heartbeat", "0.1.0")?;
+    let hb_bin = staging.join(hb_store.trim_start_matches('/')).join("bin");
+    fs::create_dir_all(&hb_bin)?;
+    fs::copy(userspace_bin_path("heartbeat"), hb_bin.join("heartbeat"))?;
+    println!("xtask: store package {hb_store}/bin/heartbeat");
     let rootfs = work.join("rootfs.ext4");
     let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
     run(Command::new("mke2fs")

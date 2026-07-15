@@ -1,0 +1,21 @@
+[package]
+name = "profile-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+
+# A library + binary split (mirroring init/service-mgr): the library holds the
+# host-testable profile-manifest parser; the binary is the bare-target resource
+# server. `cargo xtask test` runs `cargo test -p profile-server --lib`; the
+# `#![no_main]` bin can't build on host.
+[lib]
+name = "profile_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "profile-server"
+path = "src/main.rs"

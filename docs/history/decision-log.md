@@ -6490,3 +6490,61 @@ moved together. Specs updated (`process-spawn-args.md`, `syscall-abi.md`,
 fs-server/service-mgr/heartbeat by path (full slice-A lifecycle, 0 faults); `--selftest`
 runs the parent→child chain (children spawned by path) to eshell; host suite + check-arch
 green; test-qemu PASSED. Next in the backlog: profile server + content store.
+
+## 2026-07-16 — Content-addressed store + profile server: /bin projected from the store
+
+Built the first NixOS/Guix-inspired layer: an immutable **content-addressed store** on
+the ext4 root and a userspace **profile server** that projects it into `/bin`. Programs
+now live on disk at `/store/<hash>-<name>-<version>/bin/<prog>` and resolve through a
+manifest, not the initramfs `/sbin` staging. See
+`docs/architecture/content-addressed-store.md` and
+`docs/architecture/profiles-and-namespace-projection.md`.
+
+- **Store location — ext4, not initramfs (Part A/C).** The store lives on the real
+  ext4 root and programs load as demand-paged `FileObject`s, the real userspace path.
+  Chosen over an initramfs detour because the FileObject-spawn change was small
+  (`FileObject::fault_in_page` already gives a blocking synchronous fill), so ext4
+  buys the real flow with no tech debt to pay off later. Immutability is enforced by
+  **namespace rights** (the root fs is bound read-only), not an fs flag — future-proof
+  for an RW store where the package manager gets a separate write route. For slice 1 it
+  holds trivially (the fs-server is read-only).
+
+- **Manifest = ordered package list; resolve-by-probe (Part A).** A profile manifest is
+  a `[[package]]` table array (store `path` + name/version); the profile server projects
+  each package's `bin/` into `/bin` by **probing** `<pkg>/bin/<name>` in manifest order,
+  first match wins — no `readdir` (the fs-server has none yet). Two collision axes:
+  manifest order within a profile, layer order across profiles (user overrides system).
+  **Deferred to the package manager:** build-time collision *detection* + explicit
+  priorities (the Nix model) — see `docs/rationale/deferred-decisions.md`.
+
+- **ELF loader accepts FileObjects (Part B).** `sys_process_spawn`'s image load handles
+  both a `MemoryObject` (initramfs, eager) and a `FileObject` (fs-server, demand-paged):
+  `FileObject::read_to_kvec` faults each page in through the producer and copies it out.
+  (Demand-paged file-backed ELF *mapping* — shared text + CoW data — stays deferred to
+  Phase 4 with the shell + core-utils; today's spawn still copies.)
+
+- **Profile server = thin re-exporting indirection (Part D).** A forwarding resource
+  server bound at `/bin` answers a forwarded `Namespace::Resolve` by probing the store
+  and **re-exporting the resolved `FileObject` handle** — pure name resolution, out of
+  the data path (faults on the returned handle go straight to the fs-server). Rejected
+  eager-copy (defeats demand paging) and proxy-every-read (puts the server in the data
+  path). The one kernel change this required: `complete_resolve_reply` accepted only a
+  `MemoryObject` as a resolve result; relaxed to also accept a re-exported `FileObject`
+  (both install identically). General channel transfer was already type-agnostic — the
+  restriction lived solely in the resolve-result check. The onward store lookup requests
+  `requested_rights | TRANSFER`; the read-only root binding grants TRANSFER, so the
+  re-export succeeds with no binding change (verified empirically).
+
+- **The stack composes (Part E).** service-mgr's `heartbeat.toml` `executable` is now
+  `/bin/heartbeat` (was `/initramfs/sbin/heartbeat`): service-mgr resolves it through
+  its namespace → the kernel forwards to the profile server → probe the store →
+  re-export the `FileObject` → service-mgr spawns from it. The real userspace path,
+  end to end.
+
+Verified: default boot brings up the profile server (`manifest loaded`, `serving /bin
+over the store`), init binds it at `/bin`, and service-mgr starts `heartbeat` via
+`/bin/heartbeat` (full slice-A lifecycle: start → daemon → graceful shutdown, 0 faults).
+Host suite + check-arch green; `--selftest` and `test-qemu` PASS (the profile server
+binds `/bin` cleanly on every boot; the selftest demo chain is unaffected). init hand-
+parses the profile server's `Meta::Ready` exactly as it does an fs-server's (no
+`librsproto` in init).

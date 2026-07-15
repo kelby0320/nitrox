@@ -73,6 +73,22 @@ static mut SPAWN_FS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
+/// Spawn args for the system `profile-server` (slice: store + profiles): one moved
+/// handle — the control channel — in `handles[0]` (delivered in `rdx`); it inherits a
+/// LOOKUP-only handle to init's root namespace. Unlike an fs-server it gets **no**
+/// device by IPC: it uses its inherited namespace to read its manifest from
+/// `/initramfs/...` and to resolve packages under `/store/...`, then re-exports the
+/// resolved store handle as the reply to a forwarded `/bin/...` resolve.
+static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/profile-server
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
 /// Spawn args for the demo `parent`: no handles, inherit a LOOKUP-only handle to
 /// init's root namespace (so parent can resolve the kernel servers but not bind
 /// into init's root — it constructs its own namespaces for its children, which is
@@ -441,6 +457,73 @@ fn wait_ready(ctrl: u64) -> Option<u64> {
     Some(endpoint)
 }
 
+/// Spawn the system profile server and bind its forwarding endpoint at `/bin`. This is
+/// the Resource Server Startup Protocol from init's side (mirrors [`mount_one`]) minus
+/// the device handoff: the profile server needs no device — it resolves its manifest
+/// and the store through the LOOKUP-only root namespace it inherits, and answers
+/// forwarded `/bin/<prog>` resolves by re-exporting the matching `/store/.../bin/<prog>`
+/// handle. Returns `true` once bound at `/bin`. A failure is critical-path: without
+/// `/bin`, no program resolves for the services init is about to launch.
+fn bind_profile_server(root_ns: u64) -> bool {
+    // 1. Create the control channel (init keeps end 0, the server gets end 1).
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 2. Spawn the profile server, moving the control endpoint into it (in rdx). No
+    //    setup message follows — it uses its inherited namespace, not a handed device.
+    // SAFETY: SPAWN_PROFILE is a valid writable arg block; spawn_program resolves the
+    // ELF image from the initramfs, stamps it, spawns, and closes the image handle.
+    let ps_h = unsafe {
+        SPAWN_PROFILE.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/initramfs/sbin/profile-server", &raw mut SPAWN_PROFILE)
+    };
+    if ps_h < 0 {
+        kprint(b"init: profile-server spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: profile-server Ready timeout/invalid\n");
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // The handshake is done; the control channel is no longer needed.
+    // SAFETY: closing our own control endpoint.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // 4. Bind the forwarding endpoint at `/bin`. The kernel adopts the IpcChannel as a
+    //    Userspace Server; the binding takes its own reference, so init closes its
+    //    endpoint handle after.
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe {
+        syscall4(SYS_NS_BIND, root_ns, b"/bin".as_ptr() as u64, 4, endpoint)
+    };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: profile-server bind FAIL at /bin\n");
+        return false;
+    }
+
+    kprint(b"init: profile server bound at /bin\n");
+    // init keeps `ps_h` (the long-lived server's process handle).
+    let _ = ps_h;
+    true
+}
+
 /// The slice-7 milestone: look up `/system/current-generation` through the just-
 /// mounted root fs-server (the kernel forwards the lookup, the server reads the
 /// file and replies a `MemoryObject`), map it, and log its content — proving the
@@ -743,6 +826,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // cache — many demand faults, each a `File::ReadRange` to the fs-server.
     #[cfg(feature = "selftest")]
     read_large_file(root_ns);
+
+    // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
+    // Critical-path: without `/bin`, no program resolves for the services init launches.
+    if !bind_profile_server(root_ns) {
+        emergency(notif, root_ns);
+    }
+
     supervise(notif, root_ns);
 }
 

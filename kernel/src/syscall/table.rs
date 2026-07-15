@@ -242,22 +242,28 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
     }
     let parent_pid = crate::sched::current_owner_pid();
 
-    // Resolve the image handle → a `MemoryObject` holding the ELF. The spawner resolved
-    // the executable path in userspace (`sys_ns_lookup` → a readable object); the kernel
-    // just reads the bytes. Requires the caller hold it with `MAP_READ`.
-    let img = lookup_typed(
-        args.image.bits(),
-        parent_pid,
-        Rights::MAP_READ,
-        KObjectType::MemoryObject,
-    )?;
-    // The ELF loader needs one contiguous slice, but a `MemoryObject`'s frames are
-    // per-page and physically discontiguous — copy them into a contiguous buffer.
-    // (Deferred: map the frames into a temporary kernel VMA instead of copying.)
-    // SAFETY: `lookup_typed` verified the type is `MemoryObject`; `img.object` pins it live.
-    let img_bytes = unsafe { &*(img.object.as_ptr() as *const crate::object::MemoryObject) }
-        .copy_to_kvec()
-        .map_err(|_| KError::OutOfMemory)?;
+    // Resolve the image handle → a readable object holding the ELF (the spawner resolved
+    // the executable path in userspace). Requires the caller hold it with `MAP_READ`.
+    // Accept a `MemoryObject` (eager — e.g. an initramfs file) or a `FileObject` (a
+    // demand-paged file on the fs-server — e.g. a program in the content-addressed store).
+    let img = global::get()
+        .lookup(RawHandle(args.image.bits()), parent_pid, Rights::MAP_READ)
+        .map_err(map_handle_err)?;
+    // The ELF loader needs one contiguous slice; materialize the image's bytes into one.
+    // (A `MemoryObject`'s frames are page-fragmented; a `FileObject`'s pages are filled
+    // on demand. Deferred: map the frames into a temporary kernel VMA instead of copying.)
+    let img_bytes = match img.object.object_type() {
+        // SAFETY: type checked above; `img.object` pins it live.
+        KObjectType::MemoryObject => unsafe { &*(img.object.as_ptr() as *const MemoryObject) }
+            .copy_to_kvec()
+            .map_err(|_| KError::OutOfMemory)?,
+        // Drives the fs-server producer per page, blocking on each fill — sound here on
+        // the syscall thread (holds no AS/cache lock).
+        KObjectType::FileObject => {
+            FileObject::read_to_kvec(&img.object).map_err(|_| KError::OutOfMemory)?
+        }
+        _ => return Err(KError::InvalidArgument),
+    };
 
     // Build the child address space from the image. Unlike a trusted kernel-embedded
     // image, a spawner-supplied ELF is untrusted userspace input, so a malformed one is
@@ -2061,7 +2067,17 @@ fn complete_resolve_reply(
         }
         ReplyKind::Success { .. } => match transfers[0].take() {
             None => (KError::InvalidArgument as i32, 0), // success but no handle
-            Some(tr) if tr.obj.object_type() != KObjectType::MemoryObject => {
+            // The resolved object must be a readable file object. A `MemoryObject` is
+            // the fs-server's eager reply; a `FileObject` is a **re-exported** handle —
+            // an indirection server (e.g. the profile server) resolves a path onward
+            // and passes the resulting store `FileObject` straight through. Both install
+            // identically below; other object types are not valid resolve results.
+            Some(tr)
+                if !matches!(
+                    tr.obj.object_type(),
+                    KObjectType::MemoryObject | KObjectType::FileObject
+                ) =>
+            {
                 drop(tr.obj);
                 (KError::Unsupported as i32, 0)
             }
