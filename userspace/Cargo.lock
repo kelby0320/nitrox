@@ -79,6 +79,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "profile-server"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
 name = "service-mgr"
 version = "0.1.0"
 dependencies = [

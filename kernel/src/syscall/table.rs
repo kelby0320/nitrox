@@ -2067,7 +2067,17 @@ fn complete_resolve_reply(
         }
         ReplyKind::Success { .. } => match transfers[0].take() {
             None => (KError::InvalidArgument as i32, 0), // success but no handle
-            Some(tr) if tr.obj.object_type() != KObjectType::MemoryObject => {
+            // The resolved object must be a readable file object. A `MemoryObject` is
+            // the fs-server's eager reply; a `FileObject` is a **re-exported** handle —
+            // an indirection server (e.g. the profile server) resolves a path onward
+            // and passes the resulting store `FileObject` straight through. Both install
+            // identically below; other object types are not valid resolve results.
+            Some(tr)
+                if !matches!(
+                    tr.obj.object_type(),
+                    KObjectType::MemoryObject | KObjectType::FileObject
+                ) =>
+            {
                 drop(tr.obj);
                 (KError::Unsupported as i32, 0)
             }

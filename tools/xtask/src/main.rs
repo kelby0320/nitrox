@@ -178,6 +178,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
     build_userspace_bin("heartbeat", None)?;
+    build_userspace_bin("profile-server", None)?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -512,6 +513,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // profile-server's library tests (the profile-manifest parser). `--lib` skips the
+    // `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("profile-server")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `fs-server-ext4` reader-library tests (the ext4 parser, against an `mke2fs`
     // fixture). `--lib` skips the bare-target server `[[bin]]` (added in Part 4).
     run(Command::new("cargo")
@@ -752,6 +763,7 @@ fn build_initramfs(out: &Path) -> R<()> {
         "eshell",
         "parent",
         "child",
+        "profile-server",
     ];
     let mut ino = 3u32;
     for name in programs {
