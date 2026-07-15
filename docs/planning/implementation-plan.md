@@ -1815,7 +1815,7 @@ runtime slices 4–7.
 
 #### Path-based spawn / userspace ELF loader
 
-**The next slice.** Retire the kernel-embedded `ImageId` shim entirely and load every
+**Done (2026-07-16).** Retire the kernel-embedded `ImageId` shim entirely and load every
 program from the **initramfs** — the real-OS model (the bootloader hands the kernel an
 initramfs; the kernel loads init from it and every subsequent program from a path). Both
 halves already exist: the in-kernel initramfs reader (`kernel/src/initramfs.rs`, already
@@ -1823,20 +1823,20 @@ serving files) and the ELF loader (`kernel/src/mm/elf.rs::load_elf`). What's mis
 the **image-source abstraction** — today `SpawnArgs.image` is an enum selecting embedded
 bytes; it becomes a handle to the program's bytes.
 
-- [ ] **Boot:** the kernel loads `/sbin/init` from the initramfs (initramfs reader →
+- [x] **Boot:** the kernel loads `/sbin/init` from the initramfs (initramfs reader →
       `load_elf`) instead of from embedded bytes. Removes the `INIT_ELF` embed.
-- [ ] **Spawn ABI:** `SpawnArgs.image` becomes a **`MemoryObject` handle** carrying the
+- [x] **Spawn ABI:** `SpawnArgs.image` becomes a **`MemoryObject` handle** carrying the
       ELF (not an `ImageId`). The **spawner** resolves the program path in userspace
       (`ns_lookup(path, MAP_READ) → MemoryObject` — exactly how init/service-mgr already
       read `init.toml`/`heartbeat.toml`) and passes it to spawn; the kernel maps the ELF
       from the object's pages (via HHDM) and runs `load_elf`. **No filesystem code enters
       the kernel** — the spawner does path resolution.
-- [ ] **Retire `ImageId` + `kernel/src/embedded_images.rs`** entirely; the libkern
+- [x] **Retire `ImageId` + `kernel/src/embedded_images.rs`** entirely; the libkern
       `IMAGE_*` mirrors go away.
-- [ ] **xtask:** pack all program ELFs into the initramfs (`/sbin/init`, `/sbin/service-mgr`,
+- [x] **xtask:** pack all program ELFs into the initramfs (`/sbin/init`, `/sbin/service-mgr`,
       `/sbin/heartbeat`, `/sbin/fs-server-ext4`, `/sbin/eshell`, + the selftest demos)
       instead of `include_bytes!`-ing them into the kernel.
-- [ ] **Path resolution for `executable`:** service.toml's `/sbin/heartbeat` resolves
+- [x] **Path resolution for `executable`:** service.toml's `/sbin/heartbeat` resolves
       against the initramfs (a `/sbin` binding, or a documented `/initramfs` prefix) —
       retiring service-mgr's slice-A `image_for_executable` stopgap. `/bin`, `/store`
       resolution arrives with the profile server + store.
