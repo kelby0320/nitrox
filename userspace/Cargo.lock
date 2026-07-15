@@ -25,6 +25,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "heartbeat"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+]
+
+[[package]]
 name = "hello"
 version = "0.1.0"
 dependencies = [
@@ -69,4 +76,11 @@ dependencies = [
  "libkern",
  "libos",
  "librsproto",
+]
+
+[[package]]
+name = "service-mgr"
+version = "0.1.0"
+dependencies = [
+ "libkern",
 ]

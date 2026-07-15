@@ -176,6 +176,8 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
     build_userspace_bin("eshell", None)?;
+    build_userspace_bin("service-mgr", None)?;
+    build_userspace_bin("heartbeat", None)?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");

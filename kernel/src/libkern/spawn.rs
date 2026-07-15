@@ -45,6 +45,12 @@ pub enum ImageId {
     /// The emergency shell (`userspace/eshell`); spawned by init (slice 9) as the
     /// interactive console and on critical-path failure.
     Eshell = 4,
+    /// The service manager (`userspace/service-mgr`); spawned by init at the
+    /// service-handoff point (Phase 3). The userspace supervisor.
+    ServiceMgr = 5,
+    /// The demo `heartbeat` service (`userspace/heartbeat`); spawned by service-mgr
+    /// as its slice-A supervision subject.
+    Heartbeat = 6,
 }
 
 impl ImageId {
@@ -56,6 +62,8 @@ impl ImageId {
             2 => Some(Self::Parent),
             3 => Some(Self::FsServerExt4),
             4 => Some(Self::Eshell),
+            5 => Some(Self::ServiceMgr),
+            6 => Some(Self::Heartbeat),
             _ => None,
         }
     }
@@ -130,11 +138,15 @@ mod tests {
         assert_eq!(ImageId::from_u32(2), Some(ImageId::Parent));
         assert_eq!(ImageId::from_u32(3), Some(ImageId::FsServerExt4));
         assert_eq!(ImageId::from_u32(4), Some(ImageId::Eshell));
-        assert_eq!(ImageId::from_u32(5), None);
+        assert_eq!(ImageId::from_u32(5), Some(ImageId::ServiceMgr));
+        assert_eq!(ImageId::from_u32(6), Some(ImageId::Heartbeat));
+        assert_eq!(ImageId::from_u32(7), None);
         assert_eq!(ImageId::Child as u32, 0);
         assert_eq!(ImageId::Init as u32, 1);
         assert_eq!(ImageId::Parent as u32, 2);
         assert_eq!(ImageId::FsServerExt4 as u32, 3);
         assert_eq!(ImageId::Eshell as u32, 4);
+        assert_eq!(ImageId::ServiceMgr as u32, 5);
+        assert_eq!(ImageId::Heartbeat as u32, 6);
     }
 }

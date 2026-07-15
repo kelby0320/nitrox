@@ -27,6 +27,12 @@ pub const IMAGE_FS_SERVER_EXT4: u32 = 3;
 /// `ImageId::Eshell` — the emergency shell (`userspace/eshell`), kernel-embedded;
 /// spawned by init (slice 9).
 pub const IMAGE_ESHELL: u32 = 4;
+/// `ImageId::ServiceMgr` — the service manager (`userspace/service-mgr`),
+/// kernel-embedded; spawned by init at the service-handoff point (Phase 3).
+pub const IMAGE_SERVICE_MGR: u32 = 5;
+/// `ImageId::Heartbeat` — the demo `heartbeat` service (`userspace/heartbeat`),
+/// kernel-embedded; spawned by service-mgr as its slice-A supervision subject.
+pub const IMAGE_HEARTBEAT: u32 = 6;
 
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]

@@ -105,6 +105,27 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // the recovery shell needs no ambient capabilities
 };
+/// Spawn args for the service manager (the normal handoff). It inherits a LOOKUP-only
+/// handle to init's root namespace and holds `BIND_NAMESPACE` — its defining
+/// supervisor capability (registering service endpoints, re-delegating to
+/// session-mgr). See `docs/architecture/service-manager.md` § Capability posture. In
+/// slice A it supervises a leaf service and binds nothing yet; the bind-righted
+/// namespace handle (the second gate) and the `LOAD_MODULE`/`SYSTEM_CLOCK`
+/// pass-through caps arrive with the RS protocol + those services (slice B onward).
+/// Only in a non-`selftest` build: a selftest boot runs the demo chain instead of
+/// handing off to service-mgr.
+#[cfg(not(feature = "selftest"))]
+static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
+    image: IMAGE_SERVICE_MGR,
+    handle_count: 0,
+    move_mask: 0,
+    _pad: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+    syscaps: SYSCAP_BIND_NAMESPACE,
+};
 
 /// Resolve `path` in namespace `ns` requesting `rights`, wait the PO, and return
 /// `(status, resolved_handle)` (`IoResult`: status at bytes 8..12, handle 16..24).
@@ -541,12 +562,29 @@ fn spawn_eshell() {
     }
 }
 
-/// The healthy supervise path. **Under `selftest`**, run the Phase-1/2 demo chain
-/// (`parent`) to completion FIRST, then launch the interactive shell — they share the
-/// single-outstanding-command disk and the serial console, so overlapping them corrupts
-/// the fs-server's reads and clutters the console; eshell is launched once `parent`
-/// reaps (in [`reap_loop`]). **Normally**, launch the interactive console directly.
-/// (When the service manager lands, the normal path spawns *it* here instead.)
+/// Spawn the service manager — the normal boot handoff. init keeps a handle to it (it
+/// is init's child; service-mgr's death is a critical fault init must observe). Unlike
+/// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
+/// `ChildExited` for it. Returns the process handle, or a negative error.
+#[cfg(not(feature = "selftest"))]
+fn spawn_service_mgr() -> i64 {
+    kprint(b"init: handing off to service manager\n");
+    // SAFETY: SPAWN_SERVICE_MGR is a valid writable arg block.
+    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SERVICE_MGR) as u64) };
+    if h < 0 {
+        kprint(b"init: service-mgr spawn FAIL\n");
+    }
+    h
+}
+
+/// The healthy supervise path. **Normally**, hand off to the service manager: spawn
+/// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
+/// reap_loop drops to the emergency console as the interim recovery, until a reboot
+/// path exists; see `docs/architecture/service-manager.md` § Recovery). **Under
+/// `selftest`**, run the Phase-1/2 demo chain (`parent`) to completion FIRST, then
+/// launch the interactive shell — they share the single-outstanding-command disk and
+/// the serial console, so overlapping them corrupts the fs-server's reads; eshell is
+/// launched once `parent` reaps (in [`reap_loop`]).
 fn supervise(notif: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
@@ -561,10 +599,16 @@ fn supervise(notif: u64) -> ! {
         // Test-harness: couldn't even launch the demo chain — fail the run.
         #[cfg(feature = "test-harness")]
         test_exit(false);
+        // Selftest parent-spawn-failure fallback: the console.
+        spawn_eshell();
+        reap_loop(notif, 0);
     }
-    // Normal boot (and the selftest parent-spawn-failure fallback): the console now.
-    spawn_eshell();
-    reap_loop(notif, 0);
+    // Normal boot: hand off to the service manager and supervise it.
+    #[cfg(not(feature = "selftest"))]
+    {
+        let service_mgr_h = spawn_service_mgr();
+        reap_loop(notif, service_mgr_h);
+    }
 }
 
 /// The **emergency** path: a critical-path boot failure (bad manifest, failed
@@ -581,9 +625,11 @@ fn emergency(notif: u64) -> ! {
 }
 
 /// Reap exited children forever (init is the eventual parent of every orphan).
-/// `parent_h` is the demo `parent`'s handle, or `0` if none is pending; when it
-/// reaps (the only child that exits — eshell runs forever), the interactive console
-/// is launched.
+/// `parent_h` is the handle of the one child whose exit init reacts to — the demo
+/// `parent` under `selftest`, or `service-mgr` on a normal boot — or `0` if none is
+/// pending. When it reaps, init hands off to the interactive console: the demo-done
+/// handoff under selftest, or the emergency-recovery fallback if service-mgr died
+/// (interim, until a reboot path exists). All other orphans are logged and released.
 fn reap_loop(notif: u64, mut parent_h: i64) -> ! {
     kprint(b"init: entering reaping loop\n");
     loop {
