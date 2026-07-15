@@ -284,6 +284,41 @@ impl FileObject {
         }
     }
 
+    /// Materialize the whole file into a fresh contiguous heap buffer (page-rounded
+    /// [`size`](Self::size) bytes; the tail past the real data stays zero). Drives the
+    /// producer via [`fault_in_page`](Self::fault_in_page) page by page — **blocking on
+    /// each fill** — so it must run where blocking is allowed (a syscall thread, not a
+    /// DPC/IRQ). `sys_process_spawn` uses it to load an ELF whose image is a store
+    /// `FileObject` (a demand-paged file on the fs-server), mirroring
+    /// [`MemoryObject::copy_to_kvec`](crate::object::MemoryObject::copy_to_kvec).
+    /// `file_obj` is the caller's reference to *this* object. `AllocError` on a
+    /// buffer-allocation or fill failure.
+    pub fn read_to_kvec(file_obj: &ObjectRef) -> Result<KVec<u8>, AllocError> {
+        debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
+        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        let size = fo.size();
+        let mut buf = KVec::new();
+        buf.try_reserve(size)?;
+        let mut remaining = size;
+        for i in 0..fo.npages() {
+            if remaining == 0 {
+                break;
+            }
+            // Blocks on the producer until page `i` is resident.
+            let frame = FileObject::fault_in_page(file_obj, i).ok_or(AllocError)?;
+            let n = core::cmp::min(PAGE_SIZE, remaining);
+            // SAFETY: `fault_in_page` returned a resident, HHDM-reachable frame for page
+            // `i`; reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
+            let page = unsafe {
+                core::slice::from_raw_parts((frame.as_u64() + heap::hhdm_offset()) as *const u8, n)
+            };
+            buf.try_extend_from_slice(page)?;
+            remaining -= n;
+        }
+        Ok(buf)
+    }
+
     /// Start an asynchronous fill of `frame` for page `index`, completing `po` when
     /// done (the producer also marks the page `Ready`). Dispatches on the object's
     /// [`Producer`]. `file_obj` is this object's reference (the deferred fill clones
