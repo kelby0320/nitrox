@@ -42,7 +42,7 @@ pub use io_op::{IoOp, IoOpcode};
 pub use io_result::IoResult;
 pub use ipc::{IpcMsg, IpcMsgHeader, SendMode};
 pub use notification::{ExitKind, ExitStatus, FaultKind, Notification};
-pub use spawn::{ImageId, SpawnArgs, SPAWN_MAX_HANDLES};
+pub use spawn::{SpawnArgs, SPAWN_MAX_HANDLES};
 pub use thread::ThreadArgs;
 pub use kbox::KBox;
 pub use memory::MemFlags;

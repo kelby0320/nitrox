@@ -19,7 +19,7 @@ use crate::handle::table::{HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
-use crate::libkern::spawn::{ImageId, SPAWN_MAX_HANDLES, SpawnArgs};
+use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
 use crate::arch::RegisterValues;
 use crate::arch::registers::ArchRegisters;
 use crate::libkern::io_op::{IoOp, IoOpcode};
@@ -240,13 +240,32 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
     if count > SPAWN_MAX_HANDLES {
         return Err(KError::TooLarge);
     }
-    let image = ImageId::from_u32(args.image).ok_or(KError::InvalidArgument)?;
     let parent_pid = crate::sched::current_owner_pid();
 
-    // Build the child address space from the embedded image.
+    // Resolve the image handle → a `MemoryObject` holding the ELF. The spawner resolved
+    // the executable path in userspace (`sys_ns_lookup` → a readable object); the kernel
+    // just reads the bytes. Requires the caller hold it with `MAP_READ`.
+    let img = lookup_typed(
+        args.image.bits(),
+        parent_pid,
+        Rights::MAP_READ,
+        KObjectType::MemoryObject,
+    )?;
+    // The ELF loader needs one contiguous slice, but a `MemoryObject`'s frames are
+    // per-page and physically discontiguous — copy them into a contiguous buffer.
+    // (Deferred: map the frames into a temporary kernel VMA instead of copying.)
+    // SAFETY: `lookup_typed` verified the type is `MemoryObject`; `img.object` pins it live.
+    let img_bytes = unsafe { &*(img.object.as_ptr() as *const crate::object::MemoryObject) }
+        .copy_to_kvec()
+        .map_err(|_| KError::OutOfMemory)?;
+
+    // Build the child address space from the image. Unlike a trusted kernel-embedded
+    // image, a spawner-supplied ELF is untrusted userspace input, so a malformed one is
+    // `InvalidArgument` (the loader bounds-checks all offsets → memory-safe on garbage).
     let asp = AddressSpace::new().map_err(|_| KError::OutOfMemory)?;
-    let info = load_elf(&asp, crate::embedded_images::image_bytes(image))
-        .map_err(|_| KError::KernelError)?; // a bad embedded image is our bug
+    let info = load_elf(&asp, &img_bytes).map_err(|_| KError::InvalidArgument)?;
+    // The image object is no longer needed once its bytes are copied + loaded.
+    drop(img);
     let child_pid = crate::sched::alloc_pid();
 
     // Attenuate the requested syscaps against the parent's: a parent can never grant a

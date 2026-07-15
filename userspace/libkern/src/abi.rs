@@ -15,37 +15,19 @@ use core::mem::{align_of, offset_of, size_of};
 
 /// Maximum initial handles a parent can install in a child at spawn.
 pub const SPAWN_MAX_HANDLES: usize = 4;
-/// `ImageId::Child` — the Phase-1 IPC demo child (kernel-embedded image selector).
-pub const IMAGE_CHILD: u32 = 0;
-/// `ImageId::Init` — the bootstrapping init (`userspace/init`), kernel-embedded.
-pub const IMAGE_INIT: u32 = 1;
-/// `ImageId::Parent` — the demo supervisor (`userspace/parent`), kernel-embedded.
-pub const IMAGE_PARENT: u32 = 2;
-/// `ImageId::FsServerExt4` — the ext4 filesystem server (`userspace/fs-server-ext4`),
-/// kernel-embedded; spawned by init (slice 7).
-pub const IMAGE_FS_SERVER_EXT4: u32 = 3;
-/// `ImageId::Eshell` — the emergency shell (`userspace/eshell`), kernel-embedded;
-/// spawned by init (slice 9).
-pub const IMAGE_ESHELL: u32 = 4;
-/// `ImageId::ServiceMgr` — the service manager (`userspace/service-mgr`),
-/// kernel-embedded; spawned by init at the service-handoff point (Phase 3).
-pub const IMAGE_SERVICE_MGR: u32 = 5;
-/// `ImageId::Heartbeat` — the demo `heartbeat` service (`userspace/heartbeat`),
-/// kernel-embedded; spawned by service-mgr as its slice-A supervision subject.
-pub const IMAGE_HEARTBEAT: u32 = 6;
 
 /// The spawn argument block, passed by pointer to `sys_process_spawn`.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SpawnArgs {
-    /// Executable image selector (`ImageId`) (offset 0).
-    pub image: u32,
-    /// Valid entries in `handles`/`rights`; `≤ SPAWN_MAX_HANDLES` (offset 4).
+    /// A `MemoryObject` handle holding the program's ELF image (offset 0). The spawner
+    /// resolves the executable path (`sys_ns_lookup` → a readable object) and passes the
+    /// handle, which `sys_process_spawn` reads (requires `MAP_READ`) and loads.
+    pub image: u64,
+    /// Valid entries in `handles`/`rights`; `≤ SPAWN_MAX_HANDLES` (offset 8).
     pub handle_count: u32,
-    /// Bit `i` set ⇒ **move** `handles[i]` to the child; clear ⇒ duplicate (offset 8).
+    /// Bit `i` set ⇒ **move** `handles[i]` to the child; clear ⇒ duplicate (offset 12).
     pub move_mask: u32,
-    /// Padding to 8-byte-align `arg0` (offset 12).
-    pub _pad: u32,
     /// Opaque user data handed to the child at entry (in `rcx`) (offset 16).
     pub arg0: u64,
     /// Parent-side handles to install in the child's table (offset 24).
@@ -64,8 +46,8 @@ pub struct SpawnArgs {
 const _: () = assert!(size_of::<SpawnArgs>() == 104);
 const _: () = assert!(align_of::<SpawnArgs>() == 8);
 const _: () = assert!(offset_of!(SpawnArgs, image) == 0);
-const _: () = assert!(offset_of!(SpawnArgs, handle_count) == 4);
-const _: () = assert!(offset_of!(SpawnArgs, move_mask) == 8);
+const _: () = assert!(offset_of!(SpawnArgs, handle_count) == 8);
+const _: () = assert!(offset_of!(SpawnArgs, move_mask) == 12);
 const _: () = assert!(offset_of!(SpawnArgs, arg0) == 16);
 const _: () = assert!(offset_of!(SpawnArgs, handles) == 24);
 const _: () = assert!(offset_of!(SpawnArgs, rights) == 56);

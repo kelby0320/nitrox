@@ -6,18 +6,17 @@ process.
 
 **Status:** Pre-stabilization. The form below is implemented; the `namespace`
 field + the 4-register bootstrap landed with Phase 2 slice 1 (namespaces). The
-image selector and the register ABI change again later (filesystem + a real init
-handoff).
+**`image` field became a `MemoryObject` handle** (path-based spawn, Phase 3) — the
+register ABI still changes later (a real stack-resident init handoff).
 
 ## Layout
 
 ```rust
 #[repr(C)]
 pub struct SpawnArgs {
-    pub image:        u32,            // offset 0  — ImageId selector
-    pub handle_count: u32,            // offset 4  — valid entries in handles/rights (≤ 4)
-    pub move_mask:    u32,            // offset 8  — bit i: move (1) vs duplicate (0) handle i
-    pub _pad:         u32,            // offset 12
+    pub image:        RawHandle,      // offset 0  — MemoryObject handle holding the ELF
+    pub handle_count: u32,            // offset 8  — valid entries in handles/rights (≤ 4)
+    pub move_mask:    u32,            // offset 12 — bit i: move (1) vs duplicate (0) handle i
     pub arg0:         u64,            // offset 16 — opaque user data, delivered to the child
     pub handles:      [RawHandle; 4], // offset 24 — parent-side handles to install in the child
     pub rights:       [u64; 4],       // offset 56 — per-handle attenuation bound
@@ -27,12 +26,20 @@ pub struct SpawnArgs {
 ```
 
 Total size 104 bytes, 8-byte aligned. `SPAWN_MAX_HANDLES = 4`. The offsets are
-pinned by compile-time asserts in `kernel/src/libkern/spawn.rs`.
+pinned by compile-time asserts in `kernel/src/libkern/spawn.rs`. (The former `u32`
+`image` selector + `u32 _pad` were merged into the 8-byte `image` handle; every
+later field kept its offset.)
 
 ## Fields
 
-- **`image`** — an [`ImageId`](#imageid) selecting which executable the child
-  runs. Phase 1: kernel-embedded; an unrecognised value returns `InvalidArgument`.
+- **`image`** — a [`MemoryObject`](handle-encoding.md) handle holding the child's
+  ELF image. The spawner resolves the executable path in userspace (`sys_ns_lookup`
+  → a readable object; e.g. `/initramfs/sbin/<name>`, later `/bin`, `/store`) and
+  passes the handle. The kernel requires the caller hold it with `MAP_READ`, reads
+  its bytes, and loads the ELF (a static `ET_EXEC`); a malformed ELF or wrong handle
+  type returns `InvalidArgument`. The image handle is **read, not consumed** — the
+  spawner closes it after spawn. (init itself is loaded from the initramfs by the
+  kernel at boot, before any userspace, so it needs no spawner.)
 - **`handle_count`** — number of valid `handles`/`rights` entries (`≤ 4`; larger
   returns `TooLarge`).
 - **`move_mask`** — for each `i < handle_count`, bit `i` selects **move** (the
@@ -87,18 +94,20 @@ the child's `_start`. This is the uniform bootstrap convention across pid 1,
 (A later phase replaces this with a stack-resident bootstrap block carrying the
 full initial handle set, matching the real init handoff.)
 
-## ImageId
+## Image loading
 
-```rust
-#[repr(u32)]
-pub enum ImageId {
-    Child = 0,   // userspace/child — the Phase-1 IPC-demo worker
-}
-```
+The `image` handle names a `MemoryObject` holding the program's ELF. The **spawner
+resolves the executable path in userspace** (`sys_ns_lookup` → a readable object —
+today from the initramfs at `/initramfs/sbin/<name>`; later `/bin`, `/store`) and
+passes the resulting handle. `sys_process_spawn` reads the object's bytes and runs
+the in-kernel ELF loader (`kernel/src/mm/elf.rs`, static `ET_EXEC` only). **No
+filesystem code enters the kernel** — path resolution is the spawner's.
 
-A Phase-1 stand-in for a filesystem path: the kernel `include_bytes!`s the
-spawn-able images and selects one by id. Phase 2 replaces this with an initramfs
-path / a `MemoryObject` handle holding the ELF.
+This retired the earlier `ImageId` `#[repr(u32)]` enum (a Phase-1 stand-in that
+selected a kernel-embedded, `include_bytes!`'d image). init is loaded from
+`/sbin/init` in the initramfs by the kernel at boot; every other program is spawned
+from a path. See the decision log (2026-07-16) and
+`docs/planning/implementation-plan.md` (path-based spawn slice).
 
 ## ABI
 

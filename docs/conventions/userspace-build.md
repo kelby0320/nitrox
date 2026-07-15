@@ -29,12 +29,18 @@ Rust's `x86_64-unknown-none` defaults toward PIE, so the crate forces:
 Verify the output: `readelf -h <elf>` → `Type: EXEC`; `readelf -l <elf>` →
 no `INTERP`, each `LOAD` has `VirtAddr % 0x1000 == Offset % 0x1000`.
 
-## Build ordering and embedding
+## Build ordering and the initramfs
 
-The kernel embeds the program with `include_bytes!`, so the artifact must
-exist when the kernel compiles. `cargo xtask build` builds the userspace
-program **before** the kernel (run from the program's crate dir, with
-`--target x86_64-unknown-none`, so its `.cargo/config.toml` applies).
-`kernel/build.rs` adds `cargo::rerun-if-changed` on the artifact path as
-belt-and-braces. Build via `cargo xtask`, not a bare `cargo build` in
-`kernel/` (which would fail the `include_bytes!` on a fresh tree).
+Programs are **packed into the initramfs** at `sbin/<name>`, not embedded in the
+kernel. `cargo xtask build` builds each userspace program (run from its crate dir,
+with `--target x86_64-unknown-none`, so its `.cargo/config.toml` applies); `cargo
+xtask image` then packs the built ELFs into the initramfs CPIO
+(`build_initramfs`). The kernel boot-loads `/sbin/init` from the initramfs, and
+each spawner resolves its children by path (`/initramfs/sbin/<name>` → a readable
+`MemoryObject` → `sys_process_spawn`; see the SpawnArgs spec). Because the kernel no
+longer `include_bytes!`s userspace artifacts, its compile no longer depends on them
+— but always build via `cargo xtask` so the ELFs exist before the image is
+assembled.
+
+To make a new program spawnable: add it to the `programs` list in `build_initramfs`
+(`tools/xtask`), and have its spawner resolve `/initramfs/sbin/<name>`.

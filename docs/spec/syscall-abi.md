@@ -306,10 +306,10 @@ fn sys_process_spawn(args: UserPtr<SpawnArgs>) -> isize
 ```
 Spawns a new process per the `SpawnArgs` struct (see [SpawnArgs spec](process-spawn-args.md)) and returns a handle to it (`SIGNAL | TERMINATE`). The child's initial handle table is populated from `args.handles` (each installed with `source_rights & args.rights[i]`; `args.move_mask` chooses move vs. duplicate per handle), plus a fresh notification channel. (Syscall number `15`.)
 
-**Phase-1 forms (deferred to Phase 2):**
-- The image is selected by a **kernel-embedded `ImageId`** (`args.image`), not a filesystem path / `MemoryObject` handle — there is no filesystem yet.
-- The child learns its installed handle *values* through a **register bootstrap ABI** seeded at entry: `rdi` = its notification-channel handle, `rsi` = its first installed handle, `rdx` = `args.arg0`. (Phase 2 replaces this with a stack-resident bootstrap block / the init handoff.)
-- `args.namespace` is **not** yet honoured (namespaces are Phase 2).
+The image (`args.image`) is a **`MemoryObject` handle** holding the child's ELF: the spawner resolves the executable path in userspace (`sys_ns_lookup` → a readable object) and passes the handle, which the kernel reads (requires `MAP_READ`) and loads. No filesystem code enters the kernel. (This retired the Phase-1 kernel-embedded `ImageId` selector; see [SpawnArgs spec](process-spawn-args.md) § Image loading.)
+
+**Remaining Phase-1 form (deferred):**
+- The child learns its installed handle *values* through a **register bootstrap ABI** seeded at entry: `rdi` = its notification-channel handle, `rsi` = its root-namespace handle, `rdx` = its first installed handle, `rcx` = `args.arg0`. A later phase replaces this with a stack-resident bootstrap block / the real init handoff.
 
 ```rust
 fn sys_thread_create(args: UserPtr<ThreadArgs>) -> isize

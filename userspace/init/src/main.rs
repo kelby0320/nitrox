@@ -64,10 +64,9 @@ static mut IPC_COUNT: usize = 0;
 /// `handles[0]` (delivered to the child in `rdx`); it inherits a LOOKUP-only handle
 /// to init's root namespace (it resolves nothing — it gets the device by IPC).
 static mut SPAWN_FS: SpawnArgs = SpawnArgs {
-    image: IMAGE_FS_SERVER_EXT4,
+    image: 0, // resolved at spawn from /initramfs/sbin/fs-server-ext4
     handle_count: 1,
     move_mask: 1, // move handle 0 (the control endpoint) to the child
-    _pad: 0,
     arg0: 0,
     handles: [0; 4],
     rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
@@ -80,10 +79,9 @@ static mut SPAWN_FS: SpawnArgs = SpawnArgs {
 /// why init grants it `BIND_NAMESPACE`).
 #[cfg(feature = "selftest")]
 static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
-    image: IMAGE_PARENT,
+    image: 0, // resolved at spawn from /initramfs/sbin/parent
     handle_count: 0,
     move_mask: 0,
-    _pad: 0,
     arg0: 0,
     handles: [0; 4],
     rights: [0; 4],
@@ -95,10 +93,9 @@ static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
 /// `/dev/console` for input and `/dev/blk/*` for `lsblk`). It runs as the
 /// persistent interactive console.
 static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
-    image: IMAGE_ESHELL,
+    image: 0, // resolved at spawn from /initramfs/sbin/eshell
     handle_count: 0,
     move_mask: 0,
-    _pad: 0,
     arg0: 0,
     handles: [0; 4],
     rights: [0; 4],
@@ -116,10 +113,9 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// handing off to service-mgr.
 #[cfg(not(feature = "selftest"))]
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
-    image: IMAGE_SERVICE_MGR,
+    image: 0, // resolved at spawn from /initramfs/sbin/service-mgr
     handle_count: 0,
     move_mask: 0,
-    _pad: 0,
     arg0: 0,
     handles: [0; 4],
     rights: [0; 4],
@@ -163,6 +159,30 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
         return (-1, 0);
     }
     (status, resolved)
+}
+
+/// Resolve a program `path` to its ELF `MemoryObject` (via the namespace, MAP_READ),
+/// stamp the handle into `args.image`, spawn, and close init's handle to the image
+/// (the kernel copies the ELF during spawn). Returns the child process handle, or a
+/// negative error (`-1` if the image can't be resolved). This is the path-based spawn
+/// that replaced the kernel-embedded `ImageId` selector.
+///
+/// # Safety
+/// `args` must point to a valid, writable `SpawnArgs` (its `image` field is overwritten).
+unsafe fn spawn_program(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> i64 {
+    let (st, img) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        kprint(b"init: image not found: ");
+        kprint(path);
+        kprint(b"\n");
+        return -1;
+    }
+    // SAFETY: caller guarantees `args` is a valid writable SpawnArgs.
+    unsafe { (*args).image = img };
+    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, args as u64) };
+    // SAFETY: closing our own handle to the image object (the child has its own copy).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
+    h
 }
 
 /// Read + parse `/initramfs/etc/init.toml`, log the topo-sorted mount plan, and
@@ -286,10 +306,11 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
     let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
 
     // 3. Spawn the fs-server, moving the control endpoint into it (delivered in rdx).
-    // SAFETY: SPAWN_FS is a valid writable arg block.
+    // SAFETY: SPAWN_FS is a valid writable arg block; spawn_program resolves the ELF
+    // image from the initramfs, stamps it, spawns, and closes the image handle.
     let fs_h = unsafe {
         SPAWN_FS.handles[0] = ctrl_srv;
-        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_FS) as u64)
+        spawn_program(root_ns, b"/initramfs/sbin/fs-server-ext4", &raw mut SPAWN_FS)
     };
     if fs_h < 0 {
         kprint(b"init: fs-server spawn FAIL\n");
@@ -550,10 +571,10 @@ fn test_exit(ok: bool) {
     unsafe { syscall1(SYS_TEST_EXIT, code as u64) };
 }
 
-fn spawn_eshell() {
+fn spawn_eshell(root_ns: u64) {
     kprint(b"init: starting interactive console (eshell)\n");
     // SAFETY: SPAWN_ESHELL is a valid writable arg block.
-    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_ESHELL) as u64) };
+    let h = unsafe { spawn_program(root_ns, b"/initramfs/sbin/eshell", &raw mut SPAWN_ESHELL) };
     if h < 0 {
         kprint(b"init: eshell spawn FAIL\n");
     } else {
@@ -567,10 +588,11 @@ fn spawn_eshell() {
 /// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
 /// `ChildExited` for it. Returns the process handle, or a negative error.
 #[cfg(not(feature = "selftest"))]
-fn spawn_service_mgr() -> i64 {
+fn spawn_service_mgr(root_ns: u64) -> i64 {
     kprint(b"init: handing off to service manager\n");
     // SAFETY: SPAWN_SERVICE_MGR is a valid writable arg block.
-    let h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SERVICE_MGR) as u64) };
+    let h =
+        unsafe { spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR) };
     if h < 0 {
         kprint(b"init: service-mgr spawn FAIL\n");
     }
@@ -585,29 +607,30 @@ fn spawn_service_mgr() -> i64 {
 /// launch the interactive shell — they share the single-outstanding-command disk and
 /// the serial console, so overlapping them corrupts the fs-server's reads; eshell is
 /// launched once `parent` reaps (in [`reap_loop`]).
-fn supervise(notif: u64) -> ! {
+fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
         kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
         // SAFETY: SPAWN_PARENT is a valid writable arg block.
-        let parent_h = unsafe { syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_PARENT) as u64) };
+        let parent_h =
+            unsafe { spawn_program(root_ns, b"/initramfs/sbin/parent", &raw mut SPAWN_PARENT) };
         if parent_h >= 0 {
             // reap_loop launches eshell once `parent` (the only exiting child) reaps.
-            reap_loop(notif, parent_h);
+            reap_loop(notif, root_ns, parent_h);
         }
         kprint(b"init: parent spawn FAIL\n");
         // Test-harness: couldn't even launch the demo chain — fail the run.
         #[cfg(feature = "test-harness")]
         test_exit(false);
         // Selftest parent-spawn-failure fallback: the console.
-        spawn_eshell();
-        reap_loop(notif, 0);
+        spawn_eshell(root_ns);
+        reap_loop(notif, root_ns, 0);
     }
     // Normal boot: hand off to the service manager and supervise it.
     #[cfg(not(feature = "selftest"))]
     {
-        let service_mgr_h = spawn_service_mgr();
-        reap_loop(notif, service_mgr_h);
+        let service_mgr_h = spawn_service_mgr(root_ns);
+        reap_loop(notif, root_ns, service_mgr_h);
     }
 }
 
@@ -615,13 +638,13 @@ fn supervise(notif: u64) -> ! {
 /// mount). Drop straight to the interactive shell so the operator can inspect the
 /// broken system (`cat /dev/log`, `mounts`, `lsblk`) — no demo chain, no milestones.
 /// See `userspace/init/CLAUDE.md` § "Failure → eshell".
-fn emergency(notif: u64) -> ! {
+fn emergency(notif: u64, root_ns: u64) -> ! {
     kprint(b"init: critical-path failure -- dropping to emergency shell\n");
     // Test-harness: a critical-path boot failure is a failed test run.
     #[cfg(feature = "test-harness")]
     test_exit(false);
-    spawn_eshell();
-    reap_loop(notif, 0);
+    spawn_eshell(root_ns);
+    reap_loop(notif, root_ns, 0);
 }
 
 /// Reap exited children forever (init is the eventual parent of every orphan).
@@ -630,7 +653,7 @@ fn emergency(notif: u64) -> ! {
 /// pending. When it reaps, init hands off to the interactive console: the demo-done
 /// handoff under selftest, or the emergency-recovery fallback if service-mgr died
 /// (interim, until a reboot path exists). All other orphans are logged and released.
-fn reap_loop(notif: u64, mut parent_h: i64) -> ! {
+fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
     kprint(b"init: entering reaping loop\n");
     loop {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
@@ -677,7 +700,7 @@ fn reap_loop(notif: u64, mut parent_h: i64) -> ! {
                     // If it doesn't (no exit device), fall through to the console.
                     #[cfg(feature = "test-harness")]
                     test_exit(code == 0);
-                    spawn_eshell();
+                    spawn_eshell(root_ns);
                 }
             }
         }
@@ -712,7 +735,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
         }
     };
     if !booted {
-        emergency(notif);
+        emergency(notif, root_ns);
     }
 
     read_current_generation(root_ns);
@@ -720,7 +743,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // cache — many demand faults, each a `File::ReadRange` to the fs-server.
     #[cfg(feature = "selftest")]
     read_large_file(root_ns);
-    supervise(notif);
+    supervise(notif, root_ns);
 }
 
 #[panic_handler]

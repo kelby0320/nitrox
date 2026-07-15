@@ -6456,3 +6456,37 @@ schema-doc link.
 Verified per part: default boot exercises the full lifecycle (parse → start → daemon →
 graceful shutdown, and the restart loop under Part D); host suite + check-arch green;
 `--selftest` and `test-qemu` unaffected (service-mgr is off the selftest path).
+
+## 2026-07-16 — Path-based spawn / userspace ELF loader: `ImageId` retired
+
+Retired the kernel-embedded `ImageId` image selector entirely and moved to loading every
+program from the **initramfs** — the real-OS model (the bootloader hands the kernel an
+initramfs; the kernel loads init from it, every later program from a path). Both halves
+already existed: the in-kernel initramfs reader (`kernel/src/initramfs.rs`) and the ELF
+loader (`kernel/src/mm/elf.rs::load_elf`). What was missing was the **image-source
+abstraction** — `SpawnArgs.image` was a `u32` enum selecting `include_bytes!`'d bytes; it
+became a handle to the program's bytes.
+
+- **Part B — boot.** `run_first_userspace` loads `/sbin/init` from the initramfs
+  (`initramfs::lookup` → contiguous `&[u8]` → `load_elf`) instead of the embed.
+- **Part C — spawn ABI.** `SpawnArgs.image`: `u32 ImageId` → `u64` `MemoryObject` handle
+  (absorbing the old `_pad`; every later field kept its offset). The **spawner** resolves
+  the executable path in userspace (`sys_ns_lookup` → a readable object — init/service-mgr
+  already did this for their `.toml`s) and passes the handle; `sys_process_spawn` requires
+  `MAP_READ`, copies the object's (page-fragmented) bytes into a contiguous buffer
+  (`MemoryObject::copy_to_kvec` — the kernel-VMA-map alternative is deferred, see
+  deferred-decisions), and runs `load_elf`. A malformed ELF is now untrusted userspace
+  input → `InvalidArgument` (was `KernelError` for a trusted embed). Removed `ImageId`,
+  `kernel/src/embedded_images.rs`, and the libkern `IMAGE_*` mirrors. All spawners (init,
+  service-mgr, parent) resolve `/initramfs/sbin/<name>`; service.toml's `executable` is now
+  a real resolvable path (`/initramfs/sbin/heartbeat`), retiring service-mgr's
+  `image_for_executable` stopgap. xtask packs every program ELF into the initramfs.
+
+Nice side effect: the kernel no longer `include_bytes!`s userspace artifacts, so its
+compile no longer depends on them. ABI note: `SpawnArgs` layout changed — not in the
+computed ABI hash today (aspirational), but the compile-time offset asserts + the spec
+moved together. Specs updated (`process-spawn-args.md`, `syscall-abi.md`,
+`userspace-build.md`). Verified: default boot loads init from the initramfs and spawns
+fs-server/service-mgr/heartbeat by path (full slice-A lifecycle, 0 faults); `--selftest`
+runs the parent→child chain (children spawned by path) to eshell; host suite + check-arch
+green; test-qemu PASSED. Next in the backlog: profile server + content store.

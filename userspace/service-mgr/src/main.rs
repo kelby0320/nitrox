@@ -51,7 +51,6 @@ static mut SPAWN_SERVICE: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 0,
     move_mask: 0,
-    _pad: 0,
     arg0: 0,
     handles: [0; 4],
     rights: [0; 4],
@@ -92,12 +91,45 @@ fn restart_name(p: RestartPolicy) -> &'static [u8] {
     }
 }
 
-/// Resolve a declared `executable` path to a kernel-embedded `ImageId`. The slice-A
-/// stand-in for a path-based ELF loader; goes away when spawning from a real path lands.
-fn image_for_executable(exe: &str) -> Option<u32> {
-    match exe {
-        "/sbin/heartbeat" => Some(IMAGE_HEARTBEAT),
-        _ => None,
+/// Resolve `path` in namespace `ns` (MAP_READ) and return the resolved handle, or `0`
+/// on failure. The `PendingOperation` is waited + closed; the resolved handle is the
+/// caller's to close. Used both to resolve config files (mapped by `read_file`) and
+/// program-image `MemoryObject`s (passed to spawn as `SpawnArgs.image`).
+fn ns_lookup(ns: u64, path: &[u8]) -> u64 {
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe {
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
+    };
+    if po < 0 {
+        return 0;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    // IoResult: status at bytes 8..12, resolved handle at 16..24.
+    let (status, handle) = unsafe {
+        (
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
+            u64::from_le_bytes([
+                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            ]),
+        )
+    };
+    // SAFETY: closing our own PO handle (the resolved handle is separate).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+    if waited != 1 || status != 0 {
+        0
+    } else {
+        handle
     }
 }
 
@@ -192,37 +224,8 @@ fn send_control(ctrl: u64, op: u8) {
 /// Resolve `path` in namespace `ns`, map the returned read-only `MemoryObject`, and
 /// return its trimmed UTF-8 contents. Mirrors init's manifest read. `None` on failure.
 fn read_file(ns: u64, path: &[u8]) -> Option<String> {
-    // SAFETY: valid path pointer + namespace handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
-    };
-    if po < 0 {
-        return None;
-    }
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = po as u64;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
-    };
-    // IoResult: status at bytes 8..12, resolved handle at 16..24.
-    let (status, mem) = unsafe {
-        (
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
-            u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
-            ]),
-        )
-    };
-    // SAFETY: closing our own PO handle (the resolved handle is separate).
-    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-    if waited != 1 || status != 0 || mem == 0 {
+    let mem = ns_lookup(ns, path);
+    if mem == 0 {
         return None;
     }
     // SAFETY: `mem` is a MemoryObject handle with MAP_READ.
@@ -241,9 +244,9 @@ fn read_file(ns: u64, path: &[u8]) -> Option<String> {
     text
 }
 
-/// Read + parse the slice-A service declaration and resolve its executable to an
-/// embedded image. `None` (with a logged reason) if absent/malformed/unknown.
-fn load_declaration(root_ns: u64) -> Option<(ServiceDecl, u32)> {
+/// Read + parse the slice-A service declaration. `None` (with a logged reason) if
+/// absent or malformed. The executable is resolved to a `MemoryObject` at spawn time.
+fn load_declaration(root_ns: u64) -> Option<ServiceDecl> {
     let text = match read_file(root_ns, b"/initramfs/etc/services/heartbeat.toml") {
         Some(t) => t,
         None => {
@@ -267,22 +270,21 @@ fn load_declaration(root_ns: u64) -> Option<(ServiceDecl, u32)> {
     kprint(b", max_attempts=");
     kprint_u64(decl.restart.max_attempts as u64);
     kprint(b")\n");
-
-    match image_for_executable(&decl.executable) {
-        Some(image) => Some((decl, image)),
-        None => {
-            kprint(b"service-mgr: unknown executable '");
-            kprint(decl.executable.as_bytes());
-            kprint(b"'\n");
-            None
-        }
-    }
+    Some(decl)
 }
 
 /// Spawn the service `decl` names (image already resolved), with a fresh control
 /// channel whose service end is moved to the child. Returns `(proc_handle,
 /// control_end)`; `control_end` is `0` if the channel couldn't be created.
-fn spawn_service(decl: &ServiceDecl, image: u32) -> (i64, u64) {
+fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
+    // Resolve the declared executable to its ELF `MemoryObject` (path-based spawn).
+    let image = ns_lookup(root_ns, decl.executable.as_bytes());
+    if image == 0 {
+        kprint(b"service-mgr: image not found: ");
+        kprint(decl.executable.as_bytes());
+        kprint(b"\n");
+        return (-1, 0);
+    }
     let (smgr_end, svc_end) = match create_control_channel() {
         Some(pair) => pair,
         None => {
@@ -308,6 +310,9 @@ fn spawn_service(decl: &ServiceDecl, image: u32) -> (i64, u64) {
         }
         syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SERVICE) as u64)
     };
+    // The kernel copied the ELF during spawn; close service-mgr's image handle.
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
         kprint(b"service-mgr: spawn FAIL\n");
         // The service endpoint was not moved (spawn failed) — close both ends.
@@ -330,9 +335,9 @@ fn spawn_service(decl: &ServiceDecl, image: u32) -> (i64, u64) {
 pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) -> ! {
     kprint(b"service-mgr: up\n");
     match load_declaration(root_ns) {
-        Some((decl, image)) => {
-            let (h, ctrl) = spawn_service(&decl, image);
-            supervise(notif, decl, image, h, ctrl);
+        Some(decl) => {
+            let (h, ctrl) = spawn_service(root_ns, &decl);
+            supervise(notif, root_ns, decl, h, ctrl);
         }
         None => {
             kprint(b"service-mgr: no services to start; idling\n");
@@ -346,7 +351,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
 /// request a graceful shutdown over the control channel; a requested shutdown is not
 /// restarted, even under `policy = always`. (A later slice generalises this to a table
 /// of services and a real shutdown trigger.)
-fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64, mut ctrl: u64) -> ! {
+fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mut ctrl: u64) -> ! {
     // A reusable one-shot timer for backoff sleeps.
     let timer_h = {
         // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
@@ -471,7 +476,7 @@ fn supervise(notif: u64, decl: ServiceDecl, image: u32, mut service_h: i64, mut 
             kprint_u64(backoff / 1_000_000);
             kprint(b"ms backoff\n");
             sleep_ns(timer_h, backoff);
-            let (h, new_ctrl) = spawn_service(&decl, image);
+            let (h, new_ctrl) = spawn_service(root_ns, &decl);
             if h > 0 {
                 service_h = h;
                 ctrl = new_ctrl;
