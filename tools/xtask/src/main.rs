@@ -673,12 +673,13 @@ required_for = \"boot\"\n";
 
 /// A service declaration for the `heartbeat` demo service, read by `service-mgr` from
 /// the initramfs (`/initramfs/etc/services/heartbeat.toml`) in slice A. `executable`
-/// is a path per `docs/spec/service-toml-schema.md`; until a path-based ELF loader
-/// exists, service-mgr maps known executables to kernel-embedded `ImageId`s.
+/// is a path per `docs/spec/service-toml-schema.md`, resolved through service-mgr's
+/// namespace: `/bin/heartbeat` is projected from the content-addressed store by the
+/// profile server (the real userspace path), not the initramfs `/sbin` staging.
 const HEARTBEAT_TOML: &str = "\
 # Nitrox service declaration (service-mgr slice A demo).\n\
 [service.heartbeat]\n\
-executable = \"/initramfs/sbin/heartbeat\"\n\
+executable = \"/bin/heartbeat\"\n\
 description = \"Demo supervised service (slice A)\"\n\
 \n\
 [service.heartbeat.restart]\n\

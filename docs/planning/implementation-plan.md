@@ -1861,17 +1861,21 @@ bytes; it becomes a handle to the program's bytes.
 
 #### Profile server
 
-- [ ] Generic profile server binary
-- [ ] Profile manifest format (TOML in store)
-- [ ] System profile manifest in initramfs (transitional) and store (post-bootstrap)
-- [ ] Init or service manager binds profile server at `/bin`, `/lib`
+- [x] Generic profile server binary (`userspace/profile-server/`; forwarding RS,
+  resolve-by-probe, re-exports the store `FileObject`) — store/profile Part D
+- [x] Profile manifest format (`[[package]]` table array; host-tested parser) — Part A/D
+- [x] System profile manifest in initramfs (transitional) — Part C; store-resident
+  manifest (post-bootstrap) still to come with the package manager
+- [x] Init binds profile server at `/bin` (RS startup minus device handoff) — Part D.
+  `/lib` projection deferred (only `/bin` is exercised this slice)
 
 #### Content-addressed store
 
-- [ ] Store layout convention on the ext4 root: `/store/<hash>-<name>-<version>/`
-- [ ] Read-only namespace bindings for `/store` (rights enforce immutability)
+- [x] Store layout convention on the ext4 root: `/store/<hash>-<name>-<version>/` — Part C
+- [x] Read-only namespace bindings (rights enforce immutability; the root fs is bound
+  RO — holds trivially while the fs-server is read-only) — Part A/C
 - [ ] Package manager daemon (basic: list, add, remove store paths; manage generations)
-- [ ] Generation manifests
+- [ ] Generation manifests (only `/system/current-generation` exists today)
 - [ ] GC (mark reachable store paths, sweep unreachable)
 
 #### Logging service
