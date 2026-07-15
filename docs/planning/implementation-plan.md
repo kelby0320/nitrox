@@ -1776,10 +1776,29 @@ libos authority surface → services.**
   - *Verify:* host tests for the spawn/authority wrappers; init spawns a child with
     attenuated syscaps.
 
-The **service backlog below** (service-mgr, profile server, content store, logging,
-audit, other daemons, auth/session, fs-server RW) stays **unsequenced** and is sliced
-just-in-time as before — but service-mgr and everything after now depend on slices
-4–7. Auth/session in particular must not precede SysCaps (slice 6).
+The **service backlog below** was originally left **unsequenced** ("slice just-in-time").
+After service-mgr (slice A, done 2026-07-15) a real **dependency spine** emerged — most
+of the backlog assumes programs are loaded from **paths**, not the kernel-embedded
+`ImageId` shim — so the backlog now carries a **recommended ordering** (below), while
+still being *sliced* just-in-time within it. The spine, toward the Phase 3 milestone
+(services supervised · typed log output · login + per-user namespace + home writes):
+
+1. **Path-based spawn / userspace ELF loader** (next) — retire `ImageId`; load init and
+   every program from the **initramfs** (later `/bin`, `/store`). The enabler for
+   everything path-based; makes service.toml's `executable` real.
+2. **Profile server + content store** — `/bin`, `/lib`, `/store` projection; programs on
+   disk. A **read-only** store pre-built into the ext4 image decouples this from
+   fs-server RW.
+3. **Logging service** — the milestone's "typed log output"; service-mgr's `log` seam
+   becomes real.
+4. **fs-server-ext4 RW + Model-A page-cache** — the write path ("write files to home").
+5. **Auth + session-mgr** — login, per-user namespaces, user-shell spawn. (Must not
+   precede SysCaps, slice 6 — done.)
+6. **Independent daemons** (device-mgr, audit, namespace-mgr, OOM, mount, crash-reporter)
+   — slotted just-in-time as consumers appear.
+
+Global constraint unchanged: service-mgr and everything after depend on the userspace-
+runtime slices 4–7.
 
 #### Service manager
 
@@ -1793,6 +1812,41 @@ just-in-time as before — but service-mgr and everything after now depend on sl
 - [ ] Resource Server Startup Protocol for spawned RS-style services (deferred — slice B)
 - [x] Lifecycle control via per-service control channels (slice A — `CTRL_OP_SHUTDOWN`;
       the protocol grows with health-check/reload)
+
+#### Path-based spawn / userspace ELF loader
+
+**The next slice.** Retire the kernel-embedded `ImageId` shim entirely and load every
+program from the **initramfs** — the real-OS model (the bootloader hands the kernel an
+initramfs; the kernel loads init from it and every subsequent program from a path). Both
+halves already exist: the in-kernel initramfs reader (`kernel/src/initramfs.rs`, already
+serving files) and the ELF loader (`kernel/src/mm/elf.rs::load_elf`). What's missing is
+the **image-source abstraction** — today `SpawnArgs.image` is an enum selecting embedded
+bytes; it becomes a handle to the program's bytes.
+
+- [ ] **Boot:** the kernel loads `/sbin/init` from the initramfs (initramfs reader →
+      `load_elf`) instead of from embedded bytes. Removes the `INIT_ELF` embed.
+- [ ] **Spawn ABI:** `SpawnArgs.image` becomes a **`MemoryObject` handle** carrying the
+      ELF (not an `ImageId`). The **spawner** resolves the program path in userspace
+      (`ns_lookup(path, MAP_READ) → MemoryObject` — exactly how init/service-mgr already
+      read `init.toml`/`heartbeat.toml`) and passes it to spawn; the kernel maps the ELF
+      from the object's pages (via HHDM) and runs `load_elf`. **No filesystem code enters
+      the kernel** — the spawner does path resolution.
+- [ ] **Retire `ImageId` + `kernel/src/embedded_images.rs`** entirely; the libkern
+      `IMAGE_*` mirrors go away.
+- [ ] **xtask:** pack all program ELFs into the initramfs (`/sbin/init`, `/sbin/service-mgr`,
+      `/sbin/heartbeat`, `/sbin/fs-server-ext4`, `/sbin/eshell`, + the selftest demos)
+      instead of `include_bytes!`-ing them into the kernel.
+- [ ] **Path resolution for `executable`:** service.toml's `/sbin/heartbeat` resolves
+      against the initramfs (a `/sbin` binding, or a documented `/initramfs` prefix) —
+      retiring service-mgr's slice-A `image_for_executable` stopgap. `/bin`, `/store`
+      resolution arrives with the profile server + store.
+- **ABI note:** `SpawnArgs` layout changes (`image` enum → handle) — invalidates the
+  spawn-args contract; update `docs/spec/process-spawn-args.md` + `syscall-abi.md` (fix
+  its stale "there is no filesystem yet" — untrue since slice 8) and the ABI hash.
+- **Verify:** boot with no embedded images — kernel loads init from initramfs; init and
+  service-mgr spawn their children from `/sbin/*`; the full slice-A lifecycle still runs;
+  `--selftest` + `test-qemu` green. Bounds: the ELF still must be a static `ET_EXEC`
+  (the loader's existing constraint); real stacks/argv/guard-pages stay deferred.
 
 #### Runtime libraries (full versions)
 
