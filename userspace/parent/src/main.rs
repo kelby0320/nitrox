@@ -45,10 +45,9 @@ const DISPOSITION_TERMINATE: u64 = 2;
 static mut END0: u64 = 0;
 static mut END1: u64 = 0;
 static mut SPAWN_A: SpawnArgs = SpawnArgs {
-    image: IMAGE_CHILD,
+    image: 0, // resolved at spawn from /initramfs/sbin/child
     handle_count: 1,
     move_mask: 1, // move handle 0 to the child
-    _pad: 0,
     arg0: 0, // role 0 = sender
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
@@ -56,10 +55,9 @@ static mut SPAWN_A: SpawnArgs = SpawnArgs {
     syscaps: 0,   // children hold no ambient capabilities
 };
 static mut SPAWN_B: SpawnArgs = SpawnArgs {
-    image: IMAGE_CHILD,
+    image: 0, // resolved at spawn from /initramfs/sbin/child
     handle_count: 1,
     move_mask: 1,
-    _pad: 0,
     arg0: 1, // role 1 = receiver
     handles: [0; 4],
     rights: [ENDPOINT_RIGHTS, 0, 0, 0],
@@ -1173,8 +1171,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 2. Spawn two children, moving one endpoint into each, and handing each the
     //    constructed namespace (a LOOKUP-only handle to it lands in the child).
+    // Resolve the child program image from the initramfs (path-based spawn).
+    let (cst, child_img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    if cst != 0 || child_img == 0 {
+        kprint(b"parent: child image not found\n");
+        exit(1);
+    }
     // SAFETY: SPAWN_A/SPAWN_B are valid writable arg blocks.
     unsafe {
+        SPAWN_A.image = child_img;
+        SPAWN_B.image = child_img;
         SPAWN_A.handles[0] = e0;
         SPAWN_B.handles[0] = e1;
         SPAWN_A.namespace = child_ns as u64;
@@ -1192,6 +1198,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             exit(1);
         }
     };
+    // The kernel copied the child ELF at each spawn; close parent's image handle.
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, child_img) };
     // `_pa`/`_pb` are owning Handle<Process> — they reap the children by closing on drop
     // at the end of this function (see below).
     kprint(b"parent: spawned two children sharing a channel\n");

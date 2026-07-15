@@ -151,6 +151,35 @@ impl MemoryObject {
         &self.frames
     }
 
+    /// Copy the object's contents into a fresh contiguous heap buffer (page-rounded
+    /// [`size`](Self::size) bytes; the tail past the real data stays zero). The reverse
+    /// of [`try_new_filled`](Self::try_new_filled): `sys_process_spawn` uses it to hand a
+    /// spawner-supplied ELF image to the ELF loader, which needs one contiguous slice
+    /// (this object's frames are one-per-page and physically discontiguous).
+    ///
+    /// Deferred optimization (the preferred long-term approach): map the frames into a
+    /// temporary contiguous kernel VMA and load from that, avoiding the copy — see
+    /// `docs/rationale/deferred-decisions.md`.
+    pub fn copy_to_kvec(&self) -> Result<KVec<u8>, AllocError> {
+        let mut buf = KVec::new();
+        buf.try_reserve(self.size)?;
+        let mut remaining = self.size;
+        for &f in self.frames.iter() {
+            if remaining == 0 {
+                break;
+            }
+            let n = core::cmp::min(PAGE_SIZE, remaining);
+            // SAFETY: `f` is a live, HHDM-reachable frame owned by `self`, not aliased;
+            // reading `n <= PAGE_SIZE` bytes from its HHDM mapping is sound.
+            let page = unsafe {
+                core::slice::from_raw_parts((f.as_u64() + heap::hhdm_offset()) as *const u8, n)
+            };
+            buf.try_extend_from_slice(page)?;
+            remaining -= n;
+        }
+        Ok(buf)
+    }
+
     /// `true` iff the self-check sentinel is intact.
     pub fn magic_ok(&self) -> bool {
         self.magic == Self::MAGIC

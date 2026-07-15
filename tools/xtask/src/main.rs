@@ -667,7 +667,7 @@ required_for = \"boot\"\n";
 const HEARTBEAT_TOML: &str = "\
 # Nitrox service declaration (service-mgr slice A demo).\n\
 [service.heartbeat]\n\
-executable = \"/sbin/heartbeat\"\n\
+executable = \"/initramfs/sbin/heartbeat\"\n\
 description = \"Demo supervised service (slice A)\"\n\
 \n\
 [service.heartbeat.restart]\n\
@@ -705,12 +705,40 @@ fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
     }
 }
 
-/// Pack the initramfs CPIO `newc` archive at `out` (a placeholder `etc/init.toml`
-/// + the mandatory `TRAILER!!!`).
+/// The release path of a built userspace binary (bare target).
+fn userspace_bin_path(name: &str) -> PathBuf {
+    repo_root()
+        .join("userspace/target/x86_64-unknown-none/release")
+        .join(name)
+}
+
+/// Pack the initramfs CPIO `newc` archive at `out`: the config manifests, the `init`
+/// ELF (the kernel boot-loads `/sbin/init` from here — retiring the embedded copy),
+/// and the mandatory `TRAILER!!!`. Built by `cmd_build` before this runs.
 fn build_initramfs(out: &Path) -> R<()> {
     let mut buf = Vec::new();
     cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
     cpio_entry(&mut buf, 2, "etc/services/heartbeat.toml", HEARTBEAT_TOML.as_bytes());
+    // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and
+    // the spawners resolve their children by path (`/initramfs/sbin/<name>`), retiring
+    // the kernel-embedded `ImageId` images. Built by `cmd_build` before this runs.
+    let programs = [
+        "init",
+        "service-mgr",
+        "heartbeat",
+        "fs-server-ext4",
+        "eshell",
+        "parent",
+        "child",
+    ];
+    let mut ino = 3u32;
+    for name in programs {
+        let elf = userspace_bin_path(name);
+        let bytes =
+            fs::read(&elf).map_err(|e| format!("read {name} ELF {}: {e}", elf.display()))?;
+        cpio_entry(&mut buf, ino, &format!("sbin/{name}"), &bytes);
+        ino += 1;
+    }
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
     fs::write(out, &buf)?;
     println!(

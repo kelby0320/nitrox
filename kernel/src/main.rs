@@ -496,13 +496,14 @@ fn draw_boot_screen() {
 /// the initramfs, spawns the demo chain (`parent` → `child`), and runs the reaping
 /// loop. This boot thread hands off (via `sched::exit` in `kernel_main`) into init
 /// and then idles; init is the supervisor now (not the kernel). The init ELF is
-/// embedded in the kernel lib (`embedded_images`, [`ImageId::Init`]) along with the
-/// spawn-able `parent`/`child`.
+/// loaded from the **initramfs** (`/sbin/init`) — the real-OS model (the bootloader
+/// hands the kernel an initramfs; the kernel loads init from it), retiring the former
+/// kernel-embedded copy. Every later program is spawned from a path (see the
+/// path-based-spawn slice).
 fn run_first_userspace() {
     use mm::addr_space::AddressSpace;
     use mm::elf::load_elf;
     use nitrox_kernel::handle::global;
-    use nitrox_kernel::libkern::ImageId;
     use nitrox_kernel::libkern::KBox;
     use nitrox_kernel::libkern::handle::{KObjectType, Rights};
     use nitrox_kernel::object::kernel_server::KernelServerId;
@@ -523,7 +524,18 @@ fn run_first_userspace() {
             return;
         }
     };
-    let info = match load_elf(&aspace, nitrox_kernel::embedded_images::image_bytes(ImageId::Init)) {
+    // Load `/sbin/init` from the initramfs CPIO (a contiguous `&[u8]` into the
+    // HHDM-mapped Limine module — `init_initramfs` ran in `kmain` before this).
+    let init_bytes = match nitrox_kernel::initramfs::blob()
+        .and_then(|blob| nitrox_kernel::initramfs::lookup(blob, b"sbin/init"))
+    {
+        Some(bytes) => bytes,
+        None => {
+            kprintln!("init: /sbin/init not found in initramfs — halting");
+            return;
+        }
+    };
+    let info = match load_elf(&aspace, init_bytes) {
         Ok(i) => i,
         Err(e) => {
             kprintln!("init: ELF load failed: {:?}", e);

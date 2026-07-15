@@ -6,11 +6,14 @@
 //! move-or-duplicate choice). `docs/spec/process-spawn-args.md` is the normative
 //! source; this module is its in-kernel embodiment (the value type only).
 //!
-//! ## Phase 1 limitations (deferred to Phase 2)
+//! ## Image source
 //!
-//! - **Image selection is a kernel-embedded enum** ([`ImageId`]), not a
-//!   filesystem path / `MemoryObject` handle — there is no filesystem yet. The
-//!   kernel `include_bytes!`s the child ELF; the selector picks it.
+//! - **The image is a [`MemoryObject`](crate::object::MemoryObject) handle**
+//!   (`image`) holding the program's ELF bytes. The spawner resolves the executable
+//!   path in userspace (`sys_ns_lookup` → a readable `MemoryObject`) and passes the
+//!   handle; `sys_process_spawn` reads its bytes and loads the ELF. No filesystem
+//!   code enters the kernel. (init itself is loaded from the initramfs by the kernel
+//!   at boot — see `run_first_userspace`.)
 //! - The child receives its installed handle *values* via a register bootstrap
 //!   ABI (see `sys_process_spawn`), not a stack-resident handle block.
 //!
@@ -27,61 +30,19 @@ use crate::libkern::handle::RawHandle;
 /// Maximum initial handles a parent can install in a child at spawn.
 pub const SPAWN_MAX_HANDLES: usize = 4;
 
-/// Which kernel-embedded executable image to run (Phase 1 stand-in for a
-/// filesystem path). The kernel maps each variant to an embedded ELF; an
-/// unrecognised selector is rejected with `InvalidArgument`.
-#[repr(u32)]
-#[derive(Copy, Clone, PartialEq, Eq, Debug)]
-pub enum ImageId {
-    /// The Phase-1 IPC demo child (`userspace/child`).
-    Child = 0,
-    /// The bootstrapping init (`userspace/init`).
-    Init = 1,
-    /// The Phase-1 demo supervisor (`userspace/parent`); spawned by init.
-    Parent = 2,
-    /// The ext4 filesystem server (`userspace/fs-server-ext4`); spawned by init
-    /// (slice 7). The first userspace resource server.
-    FsServerExt4 = 3,
-    /// The emergency shell (`userspace/eshell`); spawned by init (slice 9) as the
-    /// interactive console and on critical-path failure.
-    Eshell = 4,
-    /// The service manager (`userspace/service-mgr`); spawned by init at the
-    /// service-handoff point (Phase 3). The userspace supervisor.
-    ServiceMgr = 5,
-    /// The demo `heartbeat` service (`userspace/heartbeat`); spawned by service-mgr
-    /// as its slice-A supervision subject.
-    Heartbeat = 6,
-}
-
-impl ImageId {
-    /// Decode an image selector, or `None` if unrecognised.
-    pub const fn from_u32(v: u32) -> Option<Self> {
-        match v {
-            0 => Some(Self::Child),
-            1 => Some(Self::Init),
-            2 => Some(Self::Parent),
-            3 => Some(Self::FsServerExt4),
-            4 => Some(Self::Eshell),
-            5 => Some(Self::ServiceMgr),
-            6 => Some(Self::Heartbeat),
-            _ => None,
-        }
-    }
-}
-
 /// The spawn argument block, passed by `UserPtr<SpawnArgs>`.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct SpawnArgs {
-    /// Executable image selector ([`ImageId`]) (offset 0).
-    pub image: u32,
-    /// Number of valid entries in `handles`/`rights`; `≤ SPAWN_MAX_HANDLES` (offset 4).
+    /// A [`MemoryObject`](crate::object::MemoryObject) handle holding the program's
+    /// ELF image; the spawner resolves the executable path (userspace) and passes the
+    /// handle, which `sys_process_spawn` reads (requires `MAP_READ`) and loads (offset 0).
+    pub image: RawHandle,
+    /// Number of valid entries in `handles`/`rights`; `≤ SPAWN_MAX_HANDLES` (offset 8).
     pub handle_count: u32,
     /// Bit `i` set ⇒ **move** `handles[i]` to the child (the parent loses it);
-    /// clear ⇒ **duplicate** (the parent keeps its handle) (offset 8).
+    /// clear ⇒ **duplicate** (the parent keeps its handle) (offset 12).
     pub move_mask: u32,
-    /// Padding to 8-byte-align `arg0` (offset 12).
-    pub _pad: u32,
     /// Opaque user data handed to the child at entry (in `rdx`) (offset 16).
     pub arg0: u64,
     /// Parent-side handles to install in the child's table (offset 24).
@@ -106,8 +67,8 @@ pub struct SpawnArgs {
 const _: () = assert!(core::mem::size_of::<SpawnArgs>() == 24 + 16 * SPAWN_MAX_HANDLES + 16);
 const _: () = assert!(core::mem::align_of::<SpawnArgs>() == 8);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, image) == 0);
-const _: () = assert!(core::mem::offset_of!(SpawnArgs, handle_count) == 4);
-const _: () = assert!(core::mem::offset_of!(SpawnArgs, move_mask) == 8);
+const _: () = assert!(core::mem::offset_of!(SpawnArgs, handle_count) == 8);
+const _: () = assert!(core::mem::offset_of!(SpawnArgs, move_mask) == 12);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, arg0) == 16);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, handles) == 24);
 const _: () = assert!(core::mem::offset_of!(SpawnArgs, namespace) == 24 + 16 * SPAWN_MAX_HANDLES);
@@ -122,31 +83,12 @@ mod tests {
         assert_eq!(core::mem::size_of::<SpawnArgs>(), 24 + 16 * 4 + 16);
         assert_eq!(core::mem::align_of::<SpawnArgs>(), 8);
         assert_eq!(core::mem::offset_of!(SpawnArgs, image), 0);
-        assert_eq!(core::mem::offset_of!(SpawnArgs, handle_count), 4);
-        assert_eq!(core::mem::offset_of!(SpawnArgs, move_mask), 8);
+        assert_eq!(core::mem::offset_of!(SpawnArgs, handle_count), 8);
+        assert_eq!(core::mem::offset_of!(SpawnArgs, move_mask), 12);
         assert_eq!(core::mem::offset_of!(SpawnArgs, arg0), 16);
         assert_eq!(core::mem::offset_of!(SpawnArgs, handles), 24);
         assert_eq!(core::mem::offset_of!(SpawnArgs, rights), 24 + 8 * 4);
         assert_eq!(core::mem::offset_of!(SpawnArgs, namespace), 24 + 16 * 4);
         assert_eq!(core::mem::offset_of!(SpawnArgs, syscaps), 24 + 16 * 4 + 8);
-    }
-
-    #[test]
-    fn image_id_round_trips() {
-        assert_eq!(ImageId::from_u32(0), Some(ImageId::Child));
-        assert_eq!(ImageId::from_u32(1), Some(ImageId::Init));
-        assert_eq!(ImageId::from_u32(2), Some(ImageId::Parent));
-        assert_eq!(ImageId::from_u32(3), Some(ImageId::FsServerExt4));
-        assert_eq!(ImageId::from_u32(4), Some(ImageId::Eshell));
-        assert_eq!(ImageId::from_u32(5), Some(ImageId::ServiceMgr));
-        assert_eq!(ImageId::from_u32(6), Some(ImageId::Heartbeat));
-        assert_eq!(ImageId::from_u32(7), None);
-        assert_eq!(ImageId::Child as u32, 0);
-        assert_eq!(ImageId::Init as u32, 1);
-        assert_eq!(ImageId::Parent as u32, 2);
-        assert_eq!(ImageId::FsServerExt4 as u32, 3);
-        assert_eq!(ImageId::Eshell as u32, 4);
-        assert_eq!(ImageId::ServiceMgr as u32, 5);
-        assert_eq!(ImageId::Heartbeat as u32, 6);
     }
 }

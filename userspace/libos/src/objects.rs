@@ -224,7 +224,6 @@ mod tests {
             image: 0,
             handle_count: 0,
             move_mask: 0,
-            _pad: 0,
             arg0: 0,
             handles: [0; 4],
             rights: [0; 4],
