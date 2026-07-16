@@ -131,7 +131,15 @@ Same as above but conventionally for device nodes. Identical mechanism.
 channel = "foo"
 ```
 
-A log channel handle. The service manager constructs (or reuses) a log channel for the named log subsystem (`"foo"` here). The channel has `WRITE` right; the service manager retains the read end and forwards records to the logging service.
+A log channel handle. At spawn the service manager resolves `system/<principal>` under the
+logging service (a capability its own namespace permits) and binds the returned channel as
+this handle — the service then logs **directly** to the logging service, which stamps
+trusted provenance (`principal`/`tier`/`timestamp`/`sequence`) from the channel the record
+arrived on. The service manager is not in the log data path: it establishes the channel at
+namespace-construction time and steps out. (Earlier drafts had the service manager retain
+the read end and *forward* records; that relay was dropped — see
+`docs/architecture/logging.md` § Identity is capability-derived.) The `"foo"` here names the
+log subsystem / `principal`.
 
 ```toml
 [service.foo.handles.control]

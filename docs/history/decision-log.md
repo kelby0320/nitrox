@@ -6548,3 +6548,54 @@ Host suite + check-arch green; `--selftest` and `test-qemu` PASS (the profile se
 binds `/bin` cleanly on every boot; the selftest demo chain is unaffected). init hand-
 parses the profile server's `Meta::Ready` exactly as it does an fs-server's (no
 `librsproto` in init).
+
+## 2026-07-16 — Logging service: design pass (capability-derived identity, generic transport)
+
+Design pass for the userspace logging service (Phase-3 spine item 3, before fs-server RW).
+New doc `docs/architecture/logging.md`. Three design questions, resolved with the user:
+
+- **service-mgr out of the data path.** The v5.1 sketch (and `service-toml-schema.md`) had
+  service-mgr retain the read end of each service's log channel and *forward* every record
+  to the logging service. Rejected: it puts the supervisor in the data path for all log
+  traffic (bottleneck + SPOF) for no gain. service-mgr's role is namespace construction
+  only.
+
+- **Universal self-registration with capability-derived identity** (do we even need a
+  broker/vouch path?). No — everything self-registers. But identity must not be
+  *self-asserted* (forgeable — process Y claims to be `auth-service`); it is derived from
+  **which logging endpoint the record arrived on**, a capability tagged `(principal, tier)`
+  that the emitter's spawner established during namespace construction. The "vouch"
+  dissolves into ordinary namespace construction — no separate broker step. This is
+  journald's trusted-vs-claimed split (its `_`-prefixed fields, derived from kernel socket
+  credentials), re-expressed with *capabilities* because Nitrox rejects kernel-level ambient
+  identity (no UID to attest). Tiers (Kernel / System / Application; `Security` = the
+  separate audit subsystem) are enforced by namespace attenuation: only service-mgr/init
+  hold a binding permitting the `system/*` subtree, so an app cannot resolve
+  `system/auth-service`. Windows Event Viewer corroborates the tiering — its Security
+  channel is privilege-gated (`SeAuditPrivilege`), not self-asserted.
+
+- **No bespoke logging protocol** (special wire ops vs. piggyback on generics). Piggyback.
+  *Connecting* = `sys_ns_lookup` of a path under the logging service (the path is the
+  identity; authority is namespace attenuation); the logging service answers the forwarded
+  resolve by minting a channel pair, keeping the read end tagged with the principal, and
+  transferring the write end — like the profile server, but returning a live connection
+  instead of a file. *Appending* = raw `sys_channel_send` of a `LogRecord` body on that
+  dedicated channel — **no `op`, no envelope, no reply** (the channel's identity is the op).
+  The only new kernel surface is a small, general relaxation: a resolve reply may transfer a
+  **channel-endpoint** capability, not just `MemoryObject`/`FileObject` (same shape as the
+  profile-server `FileObject` relaxation) — the general "resolve a service path → get a
+  channel to it" primitive, of which logging is the first consumer. The former
+  `OP_LOG_MINT`/`OPEN`/`APPEND` trio collapses to zero ops; the `Log` (`0x07xx`) rsproto
+  category is reserved for the future *reply-bearing* read-back/query path.
+
+Record: v5.1's `service` becomes trusted `principal` + `tier` (capability-derived) plus an
+optional emitter-declared `source` sub-label; trusted (`principal`/`tier`/`timestamp`/
+`sequence`) vs claimed (everything else). Slice-1 sinks: serial + in-memory ring; disk-DB
+(needs fs-server RW) and network (needs netstack) deferred behind one `Sink` trait —
+sequencing logging before fs-server RW is deliberate (serial + ring need no write). Specs
+updated: `rsproto-wire-format.md` (the `LogRecord` body + `Log` category), `service-toml-
+schema.md` (relay → capability-derived). Slice plan: A design (this) · B `LogRecord` codec +
+the resolve-reply channel-endpoint relaxation · C the logging service (resolve→tagged
+channel, ingest, stamp, `Sink` + serial + ring) · D service-mgr resolves a per-service
+`system/<principal>` endpoint, routes stdio/log to it (retires the `sys_kprint` stub) · E
+client + self-registration demo.
