@@ -1912,6 +1912,17 @@ bytes; it becomes a handle to the program's bytes.
 - [ ] Per-user namespace construction (overlay layers, subtree handles)
 - [ ] User shell spawn with constructed namespace
 
+Scope notes (decided 2026-07-17, for when this slice runs):
+- **Proper password hashing, if scope allows.** Prefer storing a **password hash** (a hand-
+  rolled KDF over a hand-rolled hash — no external crates) rather than the raw password. Beyond
+  what's needed to prove the login path, so fold in only if the added scope stays modest; a
+  plaintext/trivially-hashed file is the fallback. Note: **audit's chained records need a
+  cryptographic hash too** (`2026-07-16` audit design) — a shared hand-written hash primitive
+  (SHA-256 / BLAKE2, userspace `no_std`) would serve both; consider building it once.
+- **Minimal throwaway user shell.** The real user shell is Phase 4; this slice needs only a
+  *very* minimal shell to prove login → per-user namespace → shell → write a file to home.
+  Treat it as disposable (reuse/trim `eshell` or a tiny bespoke one) — do not invest in it.
+
 #### fs-server-ext4 read-write + the extent page-cache data path (Model A)
 
 The v5.1 "pure" data path (`os-design-v5.1.md` § File-Backed Memory): the fs-server
