@@ -14,6 +14,10 @@ pub const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
 /// not its bytes; no handle rides in `handles[0]` — the kernel builds the
 /// page-cache object itself, pointed back at this server.
 pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
+/// `RESOLVE_GROW` — grow the file to the `new_size` appended after the suffix (a `u32`)
+/// before replying its map. Combined with `RESOLVE_FILE_LAZY`. See
+/// [`parse_resolve_grow_size`]. `docs/architecture/ext4-fs-server-rw.md`.
+pub const RESOLVE_GROW: u32 = 1 << 2;
 
 // --- object_kind values (reply) ---------------------------------------------
 
@@ -31,6 +35,11 @@ pub const OBJECT_KIND_FILE: u16 = 4;
 /// resolving server, not a file. Used by connect-style servers (the logging service
 /// resolves a log path to a per-principal write channel). `content_len` is unused.
 pub const OBJECT_KIND_CHANNEL: u16 = 5;
+/// A **Model A** (block-filesystem) lazy file: `content_len` is the file size, `handles[0]`
+/// transfers the block device, and the reply body carries the filesystem block size + the
+/// file's `BlockRun` map (see `docs/spec/rsproto-block-ops.md`). The kernel fills each page
+/// zero-copy from the device.
+pub const OBJECT_KIND_FILE_BLOCKS: u16 = 6;
 
 // --- Resolve request --------------------------------------------------------
 
@@ -83,6 +92,20 @@ pub fn parse_resolve_request(body: &[u8]) -> Option<ResolveRequest<'_>> {
         flags: get_u32(body, 8),
         suffix: &body[RESOLVE_REQUEST_PREFIX_LEN..end],
     })
+}
+
+/// For a `RESOLVE_GROW` request, the target `new_size` (a `u32` appended after the suffix),
+/// or `None` if the body is too short. See [`RESOLVE_GROW`].
+pub fn parse_resolve_grow_size(body: &[u8]) -> Option<u32> {
+    if body.len() < RESOLVE_REQUEST_PREFIX_LEN {
+        return None;
+    }
+    let suffix_len = get_u16(body, 12) as usize;
+    let off = RESOLVE_REQUEST_PREFIX_LEN.checked_add(suffix_len)?;
+    if body.len() < off + 4 {
+        return None;
+    }
+    Some(get_u32(body, off))
 }
 
 // --- Resolve reply (success) ------------------------------------------------

@@ -55,6 +55,50 @@ pub const OBJECT_KIND_FILE: u16 = 4;
 /// to it" case (the logging service's first use); the kernel installs the transferred
 /// endpoint like any other resolved handle. `content_len` is unused.
 pub const OBJECT_KIND_CHANNEL: u16 = 5;
+/// Reply `object_kind`: a **Model A** (block-filesystem) lazy file. `content_len` is the
+/// file size; `handles[0]` transfers the block **`DeviceNode`**; the reply body carries the
+/// filesystem block size + the file's initial `BlockRun` map (below). The kernel builds a
+/// page-cache object that fills each page zero-copy from the device via a block IRP. See
+/// `docs/architecture/filesystem-data-path.md`, `docs/spec/rsproto-block-ops.md`.
+pub const OBJECT_KIND_FILE_BLOCKS: u16 = 6;
+
+/// Model A resolve-reply body prefix: `ResolveReply` (8) + `block_size` (4) + `run_count`
+/// (4). The `run_count` `BlockRun`s follow, 24 bytes each.
+const FILE_BLOCKS_PREFIX_LEN: usize = 16;
+/// Wire length of one `BlockRun` in a Model A resolve reply.
+const BLOCK_RUN_WIRE_LEN: usize = 24;
+
+/// The body (after the envelope header) of a reply message `msg`, or `None` if short.
+pub fn reply_body(msg: &[u8]) -> Option<&[u8]> {
+    if msg.len() < RS_HEADER_LEN {
+        return None;
+    }
+    let body_len = get_u32(msg, 20) as usize;
+    let end = RS_HEADER_LEN.checked_add(body_len)?;
+    if msg.len() < end {
+        return None;
+    }
+    Some(&msg[RS_HEADER_LEN..end])
+}
+
+/// Parse a Model A resolve reply body's header: `(block_size, run_count)`, or `None` if
+/// short. `body` is the rsproto message body (after the envelope header).
+pub fn file_blocks_reply_header(body: &[u8]) -> Option<(u32, u32)> {
+    if body.len() < FILE_BLOCKS_PREFIX_LEN {
+        return None;
+    }
+    Some((get_u32(body, 8), get_u32(body, 12)))
+}
+
+/// Read the `i`-th `BlockRun` from a Model A resolve reply body as
+/// `(file_block, device_lba, length, flags)`, or `None` if it would run past `body`.
+pub fn file_blocks_run(body: &[u8], i: usize) -> Option<(u64, u64, u32, u32)> {
+    let off = FILE_BLOCKS_PREFIX_LEN + i * BLOCK_RUN_WIRE_LEN;
+    if body.len() < off + BLOCK_RUN_WIRE_LEN {
+        return None;
+    }
+    Some((get_u64(body, off), get_u64(body, off + 8), get_u32(body, off + 16), get_u32(body, off + 20)))
+}
 
 /// Fixed prefix of a `ResolveRequest` body (before the suffix bytes).
 const RESOLVE_REQUEST_PREFIX_LEN: usize = 16;
@@ -101,6 +145,47 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
 /// honour the flag replies the eager `OBJECT_KIND_MEMOBJ` instead, which the kernel
 /// still installs (the slice-7 path); a server that does honour it replies
 /// `OBJECT_KIND_FILE`. `handle_count = 0` (the request carries no handles).
+/// `RESOLVE_GROW` — grow the resolved file to the `new_size` appended after the suffix
+/// (allocate blocks + extend its extent tree) **before** replying its Model A map. Combined
+/// with `RESOLVE_FILE_LAZY`. For `sys_file_grow`. See `docs/architecture/ext4-fs-server-rw.md`.
+pub const RESOLVE_GROW: u32 = 1 << 2;
+
+/// Like [`build_resolve_request`] but sets `RESOLVE_GROW` and appends `new_size` (a `u32`
+/// after the suffix): the server grows the file to `new_size` before replying its Model A
+/// map. `handle_count = 0`.
+pub fn build_resolve_request_grow(
+    out: &mut [u8],
+    requested_rights: u64,
+    suffix: &[u8],
+    new_size: u32,
+) -> Option<usize> {
+    if suffix.len() > u16::MAX as usize {
+        return None;
+    }
+    let body_len = RESOLVE_REQUEST_PREFIX_LEN + suffix.len() + 4;
+    let total = RS_HEADER_LEN + body_len;
+    if out.len() < total {
+        return None;
+    }
+    put_u32(out, 0, RS_MAGIC);
+    put_u16(out, 4, RS_VERSION);
+    put_u16(out, 6, OP_NS_RESOLVE);
+    put_u64(out, REQUEST_ID_OFFSET, 0);
+    put_u32(out, 16, 0);
+    put_u32(out, 20, body_len as u32);
+    put_u16(out, 24, 0);
+    put_u16(out, 26, 0);
+    let b = RS_HEADER_LEN;
+    put_u64(out, b, requested_rights);
+    put_u32(out, b + 8, RESOLVE_FILE_LAZY | RESOLVE_GROW);
+    put_u16(out, b + 12, suffix.len() as u16);
+    put_u16(out, b + 14, 0);
+    let s = b + RESOLVE_REQUEST_PREFIX_LEN;
+    out[s..s + suffix.len()].copy_from_slice(suffix);
+    put_u32(out, s + suffix.len(), new_size);
+    Some(total)
+}
+
 pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;

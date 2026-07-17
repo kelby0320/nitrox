@@ -61,7 +61,7 @@ The 16-bit `op` field decomposes:
 | `Meta` | `0x00xx` | Version handshake, capability query, lifecycle |
 | `Namespace` | `0x01xx` | Lookup, enumerate, bind-forward |
 | `Stream` | `0x02xx` | Read, write, seek (for streamable resources) |
-| `Block` | `0x03xx` | Extent query, block allocate (filesystem-specific) |
+| `Block` | `0x03xx` | Device block-run mapping + allocation (Model A block-fs data path) |
 | `Control` | `0x04xx` | Ioctl-style, opaque to the protocol |
 | `Power` | `0x05xx` | Suspend, resume, device power |
 | `File` | `0x06xx` | Positioned, stateless file-content reads (page-cache fill) |
@@ -181,7 +181,7 @@ Each operation's body is documented per category. See:
 - [Namespace operations spec](rsproto-namespace-ops.md)
 - [File operations spec](rsproto-file-ops.md)
 - [Stream operations spec](rsproto-stream-ops.md) (TBD when implemented)
-- [Block operations spec](rsproto-block-ops.md) (TBD when implemented)
+- [Block operations spec](rsproto-block-ops.md) (`MapRange`/`AllocRange` — Model A)
 
 The Meta, Namespace, and File operations are specified; the rest land with their
 consumers.

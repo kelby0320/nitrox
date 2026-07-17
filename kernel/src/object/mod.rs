@@ -38,7 +38,7 @@ pub mod userspace_server;
 
 pub use device_node::DeviceNode;
 pub use entropy_object::EntropyObject;
-pub use file_object::{FileObject, PageState, Producer, Reserve};
+pub use file_object::{BlockRun, FileObject, PageState, Producer, Reserve};
 pub use header::{KObjectHeader, ObjectRef};
 pub use interrupt_object::InterruptObject;
 pub use ipc_channel::{

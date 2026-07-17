@@ -29,8 +29,10 @@
 #![no_main]
 
 use core::arch::asm;
-use fs_server_ext4::serve::{Served, encode_error, serve};
-use fs_server_ext4::{BlockReader, FsError, ext4};
+use fs_server_ext4::serve::{MAX_SUFFIX, Served, encode_error, serve};
+use fs_server_ext4::{BlockReader, BlockWriter, FsError, ext4};
+use librsproto::OP_NS_RESOLVE;
+use librsproto::namespace::{RESOLVE_GROW, parse_resolve_grow_size, parse_resolve_request};
 use libkern::*;
 
 /// One page; the scratch buffer + memory-object granularity.
@@ -146,6 +148,59 @@ impl BlockReader for DiskReader {
                 )
             };
             buf[done..done + n].copy_from_slice(src);
+            done += n;
+        }
+        Ok(())
+    }
+}
+
+impl DiskReader {
+    /// Write the scratch object's sector-0 (512 bytes) to device `sector`; `Io` on failure.
+    fn write_sector(&self, sector: u64) -> Result<(), FsError> {
+        let op = IoOp {
+            opcode: IO_OPCODE_WRITE,
+            flags: 0,
+            buffer: self.scratch,
+            buf_offset: 0,
+            offset: sector * SECTOR as u64,
+            length: SECTOR as u64,
+        };
+        // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
+        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
+        if po < 0 {
+            return Err(FsError::Io);
+        }
+        let (status, result) = po_wait(po as u64);
+        if status != 0 || result != SECTOR as u64 {
+            return Err(FsError::Io);
+        }
+        Ok(())
+    }
+}
+
+impl BlockWriter for DiskReader {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+        let mut done = 0usize;
+        while done < buf.len() {
+            let cur = offset + done as u64;
+            let sector = cur / SECTOR as u64;
+            let in_sector = (cur % SECTOR as u64) as usize;
+            let n = core::cmp::min(SECTOR - in_sector, buf.len() - done);
+            // Read-modify-write for a partial sector: read it into scratch first so the
+            // untouched bytes are preserved. A full-sector write skips the read.
+            if n != SECTOR {
+                self.read_sector(sector)?;
+            }
+            // SAFETY: `scratch_addr` maps a full page R/W; `[in_sector, in_sector + n)` is
+            // within the sector-0 region `[0, 512)`.
+            let dst = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (self.scratch_addr as usize + in_sector) as *mut u8,
+                    n,
+                )
+            };
+            dst.copy_from_slice(&buf[done..done + n]);
+            self.write_sector(sector)?;
             done += n;
         }
         Ok(())
@@ -316,7 +371,32 @@ fn send_reply(serve_end: u64, count: usize) {
 
 /// The serve loop: block for a forwarded `Namespace::Resolve`, resolve it, and
 /// reply. Never returns (the server runs until torn down).
-fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
+/// If `req` is a `RESOLVE_GROW` resolve, grow the named file to the requested size (the
+/// write path's ext4 metadata mutation). Best-effort — any parse / grow error is ignored and
+/// the subsequent `serve` maps the file at its current size (the reply reflects that).
+fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
+    let Ok(m) = librsproto::decode(req) else {
+        return;
+    };
+    if m.op != OP_NS_RESOLVE {
+        return;
+    }
+    let Some(r) = parse_resolve_request(m.body) else {
+        return;
+    };
+    if r.flags & RESOLVE_GROW == 0 || r.suffix.len() > MAX_SUFFIX {
+        return;
+    }
+    let Some(new_size) = parse_resolve_grow_size(m.body) else {
+        return;
+    };
+    let mut path = [0u8; MAX_SUFFIX + 1];
+    path[0] = b'/';
+    path[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
+    let _ = ext4::grow_file(reader, &path[..1 + r.suffix.len()], new_size as usize);
+}
+
+fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: u64) -> ! {
     loop {
         // Block until a forwarded request lands in our inbox.
         // SAFETY: one waiter on the serving endpoint.
@@ -373,6 +453,11 @@ fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
             );
             let op = librsproto::decode(req).map(|m| m.op).unwrap_or(0);
             served_op = op;
+            // Model A grow-on-resolve: a RESOLVE_GROW request grows the file first
+            // (allocate blocks + extend the extent tree), so the map `serve` then builds
+            // covers the new size. A grow failure falls through — `serve` maps the current
+            // size and the reply reflects it.
+            maybe_grow(reader, req);
             serve(reader, req, content, reply)
         };
 
@@ -394,8 +479,28 @@ fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
                     stage_reply(elen, None)
                 }
             },
-            // A lazy resolve: a complete reply, no transferred handle.
-            Served::Lazy { reply_len } => stage_reply(reply_len, None),
+            // A Model A lazy resolve: transfer a READ|TRANSFER duplicate of the device
+            // handle (the kernel does the file-data I/O); keep our own for metadata reads.
+            Served::LazyBlocks { reply_len } => {
+                // SAFETY: `device` is our block-device handle (READ | TRANSFER | DUPLICATE).
+                let dup = unsafe {
+                    syscall2(SYS_HANDLE_DUPLICATE, device, RIGHT_READ | RIGHT_TRANSFER)
+                };
+                if dup < 0 {
+                    // Can't share the device — degrade to an error reply.
+                    // SAFETY: disjoint static; reply region as above.
+                    let elen = unsafe {
+                        let reply = core::slice::from_raw_parts_mut(
+                            ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+                            MSG_LEN - PAYLOAD_OFF,
+                        );
+                        encode_error(reply, request_id, KError::KernelError.as_i32(), served_op)
+                    };
+                    stage_reply(elen, None)
+                } else {
+                    stage_reply(reply_len, Some(dup as u64))
+                }
+            }
             Served::Error { reply_len } => stage_reply(reply_len, None),
         };
         send_reply(serve_end, count);
@@ -437,10 +542,10 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     if !send_ready(control, kernel_end) {
         fail(b"fs-server: ready send failed\n");
     }
-    kprint(b"fs-server: ready (ext4, read-only)\n");
+    kprint(b"fs-server: ready (ext4, read-write)\n");
 
     // 5. Serve forwarded Resolve requests forever.
-    serve_loop(&reader, serve_end);
+    serve_loop(&reader, serve_end, device);
 }
 
 #[panic_handler]

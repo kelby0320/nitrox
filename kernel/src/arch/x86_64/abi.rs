@@ -26,8 +26,8 @@ pub const USER_VIRT_END: u64 = 0x0000_8000_0000_0000;
 /// well below [`USER_VIRT_END`].
 pub const DEFAULT_USER_STACK_TOP: u64 = 0x0000_7FFF_FFFF_0000;
 
-/// Default initial user stack size (4 pages = 16 KiB). The first
-/// userspace process can grow it later via an explicit
-/// `sys_memory_map` once syscalls exist; today this is the only
-/// stack a process gets.
-pub const DEFAULT_USER_STACK_SIZE: u64 = 4 * (PAGE_SIZE as u64);
+/// Default initial user stack size (8 pages = 32 KiB). Bumped from 4 pages for the
+/// read-write fs-server, whose metadata mutation legitimately nests several 4 KiB block
+/// buffers (bitmap, superblock, directory, extent scratch) on the stack. A process can
+/// grow it later via an explicit `sys_memory_map`; today this is the only stack it gets.
+pub const DEFAULT_USER_STACK_SIZE: u64 = 8 * (PAGE_SIZE as u64);

@@ -911,6 +911,15 @@ fn assemble_image(
         *b = (((i >> 12) ^ i) & 0xFF) as u8;
     }
     fs::write(staging.join("system").join("large.bin"), &large)?;
+    // `system/rwtest` — a one-block (4 KiB) writable fixture for the Model A overwrite
+    // test (fs-server-rw Part C). Initial content is `byte[i] = i & 0xFF`; init's selftest
+    // maps it `MAP_WRITE`, overwrites a marker, `sys_file_sync`s, then re-resolves + reads
+    // to confirm the write reached disk.
+    let mut rwtest = vec![0u8; 4096];
+    for (i, b) in rwtest.iter_mut().enumerate() {
+        *b = (i & 0xFF) as u8;
+    }
+    fs::write(staging.join("system").join("rwtest"), &rwtest)?;
     // The content-addressed store, pre-built read-only into the ext4 root. Each package
     // lives at /store/<hash>-<name>-<version>/bin/<prog> — a demand-paged file the profile
     // server projects into /bin. heartbeat is the first package. The store path (hash) is

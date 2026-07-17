@@ -73,9 +73,10 @@ const IO_RING_PRINCIPALS: Rights =
 /// Principal rights valid on [`KObjectType::EntropyObject`] handles.
 const ENTROPY_PRINCIPALS: Rights = Rights::READ;
 
-/// Principal rights valid on [`KObjectType::DeviceNode`] handles.
-/// `INSPECT` is a generic right; it has no place on the principal mask.
-const DEVICE_NODE_PRINCIPALS: Rights = Rights::READ;
+/// Principal rights valid on [`KObjectType::DeviceNode`] handles — `READ` + `WRITE`
+/// (a block device is written via `sys_io_submit` writes: the RW fs-server's metadata,
+/// and the writeback data path). `INSPECT` is a generic right; not on the principal mask.
+const DEVICE_NODE_PRINCIPALS: Rights = Rights::READ.union(Rights::WRITE);
 
 /// Wait-only types — [`KObjectType::NotificationChannel`],
 /// [`KObjectType::Timer`], [`KObjectType::InterruptObject`],

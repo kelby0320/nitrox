@@ -51,14 +51,31 @@ pub enum Producer {
     /// — it enqueues a DPC (drained at the next interrupt-dispatch tail) so the
     /// faulting thread genuinely parks and resumes. No fs-server / IPC.
     Stub { base: u8 },
-    /// The real producer: fill a page by sending a `File::ReadRange` over the
-    /// resource server's forwarding endpoint (the same [`UserspaceServerReg`] the
-    /// namespace binding uses) and copying the replied bytes into the cache frame.
+    /// Model B — a **non-block** filesystem: fill a page by sending a `File::ReadRange`
+    /// over the resource server's forwarding endpoint (the same [`UserspaceServerReg`]
+    /// the namespace binding uses) and copying the replied bytes into the cache frame.
     /// `reg` pins the registration (so it outlives the file); `suffix` names the
     /// file under the mount (the fill is stateless — re-sent on every range).
     ///
     /// [`UserspaceServerReg`]: crate::object::UserspaceServerReg
     FsServer { reg: ObjectRef, suffix: KString },
+    /// Model A — a **block** filesystem: the kernel owns the file-data path. `runs` maps
+    /// the file's blocks to device LBAs (delivered by the fs-server at resolve); a fault
+    /// reads the page's block **zero-copy** straight from `device` into the cache frame via
+    /// a block IRP. `device` pins the block `DeviceNode`. `block_size` is the filesystem
+    /// block size. See `docs/architecture/filesystem-data-path.md`.
+    FsServerBlocks { device: ObjectRef, runs: KVec<BlockRun>, block_size: u32 },
+}
+
+/// One contiguous mapping from a file's blocks to the device (the kernel-side mirror of
+/// the wire `BlockRun`, `docs/spec/rsproto-block-ops.md`). `device_lba` is a filesystem
+/// block number (`0` = a hole → reads as zero).
+#[derive(Copy, Clone)]
+pub struct BlockRun {
+    pub file_block: u64,
+    pub device_lba: u64,
+    pub length: u32,
+    pub flags: u32,
 }
 
 /// Fill state of a cached page.
@@ -273,6 +290,12 @@ impl FileObject {
                     if !block_on_po(&po) {
                         return None; // fill reported failure / could not register
                     }
+                    // A Model A block fill completes its PO from the generic IRP DPC, which
+                    // does not touch page state — mark the page ready here now its bytes are
+                    // in the frame. (Model B / stub producers self-mark in their completion.)
+                    if fo.fill_needs_ready_mark() {
+                        fo.mark_ready(index);
+                    }
                     // Loop: the page is now `Ready` → return its frame.
                 }
                 Reserve::Loading(_) => {
@@ -282,6 +305,76 @@ impl FileObject {
                 Reserve::Oom => return None,
             }
         }
+    }
+
+    /// Flush every resident, block-backed page to the device (the **Model A** overwrite
+    /// writeback). For each `Ready` cache page, translate its block via the producer's run
+    /// map and issue a block **write** IRP from the frame to that LBA, blocking on each.
+    /// Pages over a hole (`device_lba == 0`, unallocated) are skipped — growing a file is
+    /// Part D. `file_obj` is this object's reference (pins the frames across the IRPs). Runs
+    /// in a syscall thread (it blocks). Returns `true` iff every write succeeded; `false`
+    /// for a non-block producer or an I/O/allocation failure.
+    pub fn writeback(file_obj: &ObjectRef) -> bool {
+        debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
+        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        // The producer is immutable; borrow its device + run map for the whole flush.
+        let (device, runs, block_size) = match &fo.producer {
+            Producer::FsServerBlocks { device, runs, block_size } => (device.clone(), runs, *block_size),
+            _ => return false,
+        };
+        // Snapshot the resident pages `(index, frame)` under the lock; do I/O unlocked.
+        let mut pages: KVec<(usize, PhysAddr)> = KVec::new();
+        {
+            let inner = fo.inner.lock();
+            if pages.try_reserve(inner.pages.len()).is_err() {
+                return false;
+            }
+            for p in inner.pages.iter() {
+                if p.state == PageState::Ready {
+                    let _ = pages.try_push((p.index, p.frame));
+                }
+            }
+        }
+        for (index, frame) in pages.iter().copied() {
+            let file_block = (index * PAGE_SIZE) as u64 / block_size as u64;
+            let dev_block = runs.iter().find_map(|r| {
+                if file_block >= r.file_block && file_block < r.file_block + r.length as u64 {
+                    Some(if r.device_lba == 0 { 0 } else { r.device_lba + (file_block - r.file_block) })
+                } else {
+                    None
+                }
+            });
+            let dev_block = match dev_block {
+                Some(b) if b != 0 => b,
+                _ => continue, // hole / unmapped: allocation is Part D
+            };
+            let po = match PendingOperation::try_new() {
+                // SAFETY: adopt the single creation reference.
+                Ok(p) => unsafe {
+                    ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
+                },
+                Err(_) => return false,
+            };
+            let dev_offset = dev_block * block_size as u64;
+            if crate::io::block::dispatch_block_irp_into_frame(
+                &device,
+                frame,
+                file_obj.clone(),
+                &po,
+                crate::libkern::io_op::IoOpcode::Write,
+                dev_offset,
+                PAGE_SIZE as u64,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            if !block_on_po(&po) {
+                return false;
+            }
+        }
+        true
     }
 
     /// Materialize the whole file into a fresh contiguous heap buffer (page-rounded
@@ -335,6 +428,68 @@ impl FileObject {
             Producer::Stub { base } => stub_start_fill(file_obj, index, frame, po, *base),
             Producer::FsServer { reg, suffix } => {
                 self.fs_server_start_fill(file_obj, index, frame, po, reg, suffix)
+            }
+            Producer::FsServerBlocks { device, runs, block_size } => {
+                self.model_a_start_fill(file_obj, index, frame, po, device, runs, *block_size)
+            }
+        }
+    }
+
+    /// Whether this object's producer completes a fill's `PendingOperation` *without*
+    /// marking the page `Ready` — true for [`Producer::FsServerBlocks`], whose fill is a
+    /// generic block IRP whose DPC knows nothing about the page. The fault path marks the
+    /// page ready itself after the wait (the Model B / stub producers self-mark).
+    fn fill_needs_ready_mark(&self) -> bool {
+        matches!(self.producer, Producer::FsServerBlocks { .. })
+    }
+
+    /// Model A fill: read page `index`'s device block **zero-copy** into `frame` via a block
+    /// IRP (completing `po`), or — for a hole / block past the map — complete `po` at once
+    /// (the reserved frame is already zeroed). `false` only on an allocation failure. The
+    /// page is marked `Ready` by the fault path after the wait.
+    fn model_a_start_fill(
+        &self,
+        file_obj: &ObjectRef,
+        index: usize,
+        frame: PhysAddr,
+        po: &ObjectRef,
+        device: &ObjectRef,
+        runs: &KVec<BlockRun>,
+        block_size: u32,
+    ) -> bool {
+        // The page's first filesystem block (block_size == PAGE_SIZE for slice-1 fixtures,
+        // so this is `index`; the general form handles bs | PAGE where a page's blocks are
+        // contiguous within one run).
+        let file_block = (index * PAGE_SIZE) as u64 / block_size as u64;
+        // Locate the run covering `file_block` → its device block (0 = hole).
+        let dev_block = runs.iter().find_map(|r| {
+            if file_block >= r.file_block && file_block < r.file_block + r.length as u64 {
+                Some(if r.device_lba == 0 { 0 } else { r.device_lba + (file_block - r.file_block) })
+            } else {
+                None
+            }
+        });
+        match dev_block {
+            None | Some(0) => {
+                // Hole or unmapped: the zeroed frame is already correct. Complete the PO
+                // synchronously so the parked faulter wakes at once (no IRP).
+                crate::sched::complete_pending_op(po.as_ptr(), 0, 0);
+                true
+            }
+            Some(dev_block) => {
+                let dev_offset = dev_block * block_size as u64;
+                // One page of data (one block when block_size == PAGE). `file_obj` pins the
+                // FileObject (hence the frame) for the IRP's lifetime.
+                crate::io::block::dispatch_block_irp_into_frame(
+                    device,
+                    frame,
+                    file_obj.clone(),
+                    po,
+                    crate::libkern::io_op::IoOpcode::Read,
+                    dev_offset,
+                    PAGE_SIZE as u64,
+                )
+                .is_ok()
             }
         }
     }

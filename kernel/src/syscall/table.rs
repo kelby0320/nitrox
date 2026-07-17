@@ -114,6 +114,10 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
+/// `sys_file_sync` — flush a writable file mapping's dirty pages to the device.
+pub const SYS_FILE_SYNC: u64 = 31;
+/// `sys_file_grow` — resolve a file, growing it to a target size first (a5 = new size).
+pub const SYS_FILE_GROW: u64 = 32;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -162,7 +166,8 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_NS_CREATE => encode(sys_ns_create()),
-        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3)),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None)),
+        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some(a4 as u32))),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
@@ -170,6 +175,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
         SYS_IO_CANCEL => encode(sys_io_cancel(a0)),
+        SYS_FILE_SYNC => encode(sys_file_sync(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Integration-test build only: end the QEMU run with the caller's verdict.
         // Diverges (QEMU exits); never returns to dispatch/sysret.
@@ -1351,7 +1357,13 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
 /// Argument / permission / allocation failures return **synchronously** (a
 /// negative isize, no PO). Resolution failures (no covering binding, or a
 /// non-empty suffix on a direct-handle leaf) are delivered **through** the PO.
-pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64) -> SysResult {
+pub fn sys_ns_lookup(
+    ns_h: u64,
+    path_ptr: u64,
+    path_len: usize,
+    rights_bits: u64,
+    grow_size: Option<u32>,
+) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     // --- synchronous validation (no PO created on these) ---
     let requested = Rights::from_bits_truncate(rights_bits);
@@ -1439,7 +1451,7 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
             // Forward the lookup to the userspace server over IPC and leave the PO
             // pending (the reply completes it inline — see `sys_channel_send`). A
             // synchronous failure (server busy / full / gone) completes it now.
-            forward_userspace_lookup(reg, &po_ref, pid, requested, suffix)
+            forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, grow_size)
         }
     };
     match outcome {
@@ -1470,17 +1482,25 @@ fn forward_userspace_lookup(
     pid: u32,
     requested: Rights,
     suffix: &[u8],
+    grow_size: Option<u32>,
 ) -> Option<(i32, u64)> {
-    // Build the request in a heap-bounced message (4 KiB — never on the stack).
+    // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
+    // request (`sys_file_grow`) additionally carries the target size + the `RESOLVE_GROW`
+    // flag so the server grows the file before replying its map.
     let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
-    let body_len = match crate::rsproto::build_resolve_request(
-        &mut msg.payload,
-        requested.bits(),
-        suffix,
-    ) {
+    let built = match grow_size {
+        Some(new_size) => crate::rsproto::build_resolve_request_grow(
+            &mut msg.payload,
+            requested.bits(),
+            suffix,
+            new_size,
+        ),
+        None => crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix),
+    };
+    let body_len = match built {
         Some(n) => n,
         // The suffix is longer than the rsproto request can carry.
         None => return Some((KError::TooLarge as i32, 0)),
@@ -2039,7 +2059,8 @@ fn complete_resolve_reply(
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{
-        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply,
+        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ,
+        ReplyKind, parse_reply,
     };
 
     // Parse the reply (recovers the `request_id` even on a malformed body).
@@ -2063,6 +2084,14 @@ fn complete_resolve_reply(
         // install it. `content_len` is the total file size.
         ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
             build_and_install_file(reg, &pl, content_len)
+        }
+        // A Model A (block-fs) lazy file: `handles[0]` is the device, and the body carries
+        // the block size + the initial `BlockRun` map. Build a page-cache object the kernel
+        // fills zero-copy from the device.
+        ReplyKind::Success { object_kind, content_len }
+            if object_kind == OBJECT_KIND_FILE_BLOCKS =>
+        {
+            build_and_install_file_blocks(&pl, content_len, &bounce.payload[..payload_len], transfers)
         }
         ReplyKind::Success { object_kind, .. }
             if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
@@ -2122,6 +2151,20 @@ fn complete_resolve_reply(
 /// and names the file by the lookup's stored suffix, so a later page fault fills it
 /// via `File::ReadRange`. Fails `TooLarge` if the suffix overran the inline buffer
 /// (the path can't be recovered), or `OutOfMemory` on allocation failure.
+/// `sys_file_sync(handle)` — flush a writable file mapping's resident pages to the device
+/// (Model A overwrite writeback). Requires `MAP_WRITE` on the `FileObject` handle. Blocks on
+/// the write IRPs (a syscall thread; async-first-exempt like `sys_process_spawn`'s fills).
+/// `0` on success, else a `KError`.
+fn sys_file_sync(handle: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ok = lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)?;
+    if crate::object::FileObject::writeback(&ok.object) {
+        Ok(0)
+    } else {
+        Err(KError::IoError)
+    }
+}
+
 fn build_and_install_file(
     reg: *mut (),
     pl: &crate::object::userspace_server::PendingLookup,
@@ -2164,6 +2207,73 @@ fn build_and_install_file(
     // Grant `INSPECT` alongside the requested rights so a client can `sys_handle_stat`
     // the lazy file for its size before mapping (e.g. eshell `cat`) — `INSPECT` is a
     // generic right, benign on a handle the client already maps.
+    let rights = pl.requested | Rights::INSPECT;
+    match global::get().allocate(pl.owner_pid, op, ot, rights) {
+        Ok(h) => (0, h.bits()),
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it.
+            drop(unsafe { ObjectRef::from_raw(op, ot) });
+            (map_handle_err(e) as i32, 0)
+        }
+    }
+}
+
+/// Build + install a **Model A** (block-fs) lazy file from a resolve reply: adopt the
+/// transferred block `DeviceNode` (`handles[0]`), parse the block size + `BlockRun` map from
+/// the reply body, and construct a `FileObject` whose `FsServerBlocks` producer fills each
+/// page zero-copy from the device. `content_len` is the file size; `reply_msg` is the rsproto
+/// reply message (envelope + body). Returns `(0, handle)` or `(kerror, 0)`.
+fn build_and_install_file_blocks(
+    pl: &crate::object::userspace_server::PendingLookup,
+    content_len: u32,
+    reply_msg: &[u8],
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+) -> (i32, u64) {
+    use crate::libkern::KVec;
+    use crate::object::{BlockRun, FileObject, Producer};
+    use crate::rsproto::{file_blocks_reply_header, file_blocks_run, reply_body};
+
+    // The block device rides in handles[0].
+    let device = match transfers[0].take() {
+        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => tr.obj,
+        Some(tr) => {
+            drop(tr.obj);
+            return (KError::Unsupported as i32, 0);
+        }
+        None => return (KError::InvalidArgument as i32, 0), // success but no device
+    };
+    // Parse the block size + BlockRun map from the reply body.
+    let Some(body) = reply_body(reply_msg) else {
+        return (KError::KernelError as i32, 0);
+    };
+    let Some((block_size, run_count)) = file_blocks_reply_header(body) else {
+        return (KError::KernelError as i32, 0);
+    };
+    let mut runs: KVec<BlockRun> = KVec::new();
+    if runs.try_reserve(run_count as usize).is_err() {
+        return (KError::OutOfMemory as i32, 0);
+    }
+    for i in 0..run_count as usize {
+        let Some((file_block, device_lba, length, flags)) = file_blocks_run(body, i) else {
+            return (KError::KernelError as i32, 0);
+        };
+        // `try_reserve` above guarantees this push does not allocate.
+        let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
+    }
+
+    let fobj = match FileObject::try_new(
+        content_len as usize,
+        Producer::FsServerBlocks { device, runs, block_size },
+    ) {
+        Ok(f) => f,
+        Err(_) => return (KError::OutOfMemory as i32, 0),
+    };
+    // SAFETY: `into_raw` yields the single creation reference; adopt it.
+    let fref = unsafe {
+        ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject)
+    };
+    let (op, ot) = fref.into_raw();
+    // Grant `INSPECT` alongside the requested rights (a `sys_handle_stat` before mapping).
     let rights = pl.requested | Rights::INSPECT;
     match global::get().allocate(pl.owner_pid, op, ot, rights) {
         Ok(h) => (0, h.bits()),
