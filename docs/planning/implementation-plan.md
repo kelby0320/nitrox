@@ -1912,6 +1912,17 @@ bytes; it becomes a handle to the program's bytes.
 - [ ] Per-user namespace construction (overlay layers, subtree handles)
 - [ ] User shell spawn with constructed namespace
 
+Scope notes (decided 2026-07-17, for when this slice runs):
+- **Proper password hashing, if scope allows.** Prefer storing a **password hash** (a hand-
+  rolled KDF over a hand-rolled hash — no external crates) rather than the raw password. Beyond
+  what's needed to prove the login path, so fold in only if the added scope stays modest; a
+  plaintext/trivially-hashed file is the fallback. Note: **audit's chained records need a
+  cryptographic hash too** (`2026-07-16` audit design) — a shared hand-written hash primitive
+  (SHA-256 / BLAKE2, userspace `no_std`) would serve both; consider building it once.
+- **Minimal throwaway user shell.** The real user shell is Phase 4; this slice needs only a
+  *very* minimal shell to prove login → per-user namespace → shell → write a file to home.
+  Treat it as disposable (reuse/trim `eshell` or a tiny bespoke one) — do not invest in it.
+
 #### fs-server-ext4 read-write + the extent page-cache data path (Model A)
 
 The v5.1 "pure" data path (`os-design-v5.1.md` § File-Backed Memory): the fs-server
@@ -1938,8 +1949,12 @@ transforming fs-servers, which have no LBA mapping.) See the decision log
   (on growth) but never touches file data.
 - [ ] Filesystem consistency on power loss (journal replay on mount) — deferred to its own
   slice (the fixtures are `^has_journal`; crash consistency is best-effort ordering today).
-- [ ] File creation (inode allocation + directory-entry insertion), extent-tree splitting,
-  truncate / delete / rename — deferred (Part E and beyond).
+- [x] File creation (inode allocation + directory-entry insertion) — Part E,
+  `ext4::create_file`, `e2fsck`-verified; triggered by create-on-resolve
+  (`RESOLVE_CREATE | RESOLVE_GROW` + `sys_file_create` = 33). Group 0 only; new-dir-block
+  growth on a full parent directory deferred.
+- [ ] Cross-group inode/block allocation, extent-tree splitting / index nodes,
+  truncate / delete / rename — deferred (beyond Part E).
 
 ### Milestone
 

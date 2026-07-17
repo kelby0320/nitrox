@@ -103,6 +103,9 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `28` | `sys_io_submit` |
 | `29` | `sys_io_cancel` |
 | `30` | `sys_ns_enumerate` |
+| `31` | `sys_file_sync` |
+| `32` | `sys_file_grow` |
+| `33` | `sys_file_create` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 

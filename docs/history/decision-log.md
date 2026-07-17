@@ -6661,3 +6661,29 @@ Deferred: file creation (Part E), extent-tree splitting / index nodes, cross-gro
 allocation, truncate/delete/rename, jbd2 journaling + replay (fixtures are `^has_journal`;
 crash consistency is best-effort data-before-metadata ordering), `metadata_csum`, the
 standalone `MapRange`/`AllocRange` ops, per-page dirty tracking, read-ahead.
+
+## 2026-07-17 — fs-server-ext4 read-write, Part E: file creation
+
+Closes the fs-RW slice's last piece: creating a brand-new file. `ext4::create_file`
+(inode allocation from the **inode bitmap** + free-inode-count updates, then
+`ext4_dir_entry_2` insertion into the parent directory by splitting an existing entry's
+`rec_len` slack, then inode init as an empty extents regular file) — built as a
+self-contained **`e2fsck -fn`-clean** host test *before* any kernel wiring, same discipline
+as Part D (corruption-risk metadata mutation is proven offline first). Idempotent: creating
+an existing name returns its inode, so a re-resolve is harmless.
+
+Trigger: **create-on-resolve**, reusing the grow-on-resolve plumbing. A new
+`sys_file_create` (33) forwards a resolve carrying `RESOLVE_CREATE | RESOLVE_GROW` + the
+target size; the fs-server's `maybe_grow` splits the absolute path into parent-dir + leaf
+name, calls `create_file`, then grows to size and replies its map — so create + grow +
+resolve are one syscall, and the client then maps/writes/syncs via the existing B/C paths.
+No new async op, no `FileObject` change. Verified end-to-end in the selftest boot
+(`init: create new file + persisted + verified ok`): a path that did not exist is created,
+written, synced, and then resolves via a **plain** `sys_ns_lookup` — proving the directory
+entry reached disk.
+
+Scope: **group 0 only** (cross-group inode/block allocation deferred), and directory growth
+(a new dir block when the parent's last block has no slack) is deferred — a full parent
+directory returns `TooLarge`. Remaining deferrals from the Parts A–D entry stand
+(cross-group allocation, extent splitting / index nodes, truncate/delete/rename, journaling,
+`metadata_csum`, standalone `MapRange`/`AllocRange`, per-page dirty tracking, read-ahead).

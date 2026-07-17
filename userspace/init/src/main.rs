@@ -821,6 +821,103 @@ fn grow_test(root_ns: u64) {
     }
 }
 
+/// fs-server-rw Part E milestone (selftest): **create** a brand-new file via
+/// `sys_file_create` (the fs-server allocates an inode + inserts a directory entry in the
+/// parent, then grows it to the target size), write into it, `sys_file_sync`, then
+/// re-resolve with a plain lookup and confirm both that the new path now resolves and that
+/// its data persisted — proving inode allocation + directory-entry insertion end to end.
+#[cfg(feature = "selftest")]
+fn create_test(root_ns: u64) {
+    let path = b"/system/created";
+    let marker = [0xABu8, 0xCD, 0xEFu8, 0x42];
+    let new_size: u64 = 4096; // fresh file → 1 block.
+
+    // 1. Create-resolve: the fs-server creates the file, grows it, then replies its map.
+    let po = unsafe {
+        syscall5(
+            SYS_FILE_CREATE,
+            root_ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+            new_size,
+        )
+    };
+    if po < 0 {
+        kprint(b"init: create submit FAIL\n");
+        return;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    let (st, fh) = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        let w = syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        );
+        let status =
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
+        let handle = u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ]);
+        syscall1(SYS_HANDLE_CLOSE, po as u64);
+        if w != 1 { (-1, 0) } else { (status, handle) }
+    };
+    if st != 0 || fh == 0 {
+        kprint(b"init: create FAIL\n");
+        return;
+    }
+
+    // 2. Map the new file; write a marker at the start.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, new_size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"init: create map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return;
+    }
+    let base = addr as u64;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: offset `i` is within the mapped first page.
+        unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
+    }
+    // SAFETY: `fh` is our writable handle.
+    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+        kprint(b"init: create sync FAIL\n");
+    }
+
+    // 3. Re-resolve with a **plain** lookup (proves the directory entry is on disk: a path
+    //    that did not exist before now resolves) and verify the data.
+    let (st2, fh2) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+    if st2 != 0 || fh2 == 0 {
+        kprint(b"init: create re-read FAIL\n");
+        return;
+    }
+    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, new_size, RIGHT_MAP_READ) };
+    if addr2 < 0 {
+        kprint(b"init: create re-read map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
+        return;
+    }
+    let base2 = addr2 as u64;
+    let mut ok = true;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: within the mapped first page.
+        if unsafe { ((base2 + i as u64) as *const u8).read_volatile() } != *m {
+            ok = false;
+        }
+    }
+    if ok {
+        kprint(b"init: create new file + persisted + verified ok\n");
+    } else {
+        kprint(b"init: create MISMATCH\n");
+    }
+}
+
 /// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
 /// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
 /// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
@@ -1073,6 +1170,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // fs-server-rw Part D: grow a file past EOF and confirm the appended data persists.
     #[cfg(feature = "selftest")]
     grow_test(root_ns);
+    // fs-server-rw Part E: create a brand-new file and confirm inode + dir entry persist.
+    #[cfg(feature = "selftest")]
+    create_test(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.
