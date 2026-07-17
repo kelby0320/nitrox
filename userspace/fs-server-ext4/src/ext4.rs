@@ -5,7 +5,7 @@
 //! inode-table block; file/directory data located via the inode's **extent
 //! tree**; directories scanned as a linear list of `ext4_dir_entry_2`.
 
-use crate::{BlockReader, FsError, rd_u16, rd_u32};
+use crate::{BlockReader, BlockWriter, FsError, rd_u16, rd_u32};
 
 /// Phase-2 cap on a served file's size (the read model's 64 KiB limit).
 pub const MAX_FILE: usize = 64 * 1024;
@@ -23,7 +23,7 @@ const S_IFMT: u16 = 0xF000;
 const S_IFREG: u16 = 0x8000;
 const S_IFDIR: u16 = 0x4000;
 
-/// The parsed superblock facts the reader needs.
+/// The parsed superblock facts the reader (and the write path) need.
 struct Superblock {
     block_size: u32,
     inodes_per_group: u32,
@@ -31,6 +31,10 @@ struct Superblock {
     desc_size: u32,
     /// First block of the group-descriptor table.
     first_gdt_block: u64,
+    /// Blocks per block group (for locating a block's group + its bitmap).
+    blocks_per_group: u32,
+    /// The first data block (`1` for 1 KiB blocks, else `0`) — block numbering origin.
+    first_data_block: u32,
 }
 
 fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
@@ -56,12 +60,19 @@ fn read_superblock<R: BlockReader>(r: &R) -> Result<Superblock, FsError> {
         0 => 32,
         d => d,
     };
+    let blocks_per_group = rd_u32(&sb, 32);
+    let first_data_block = rd_u32(&sb, 20);
+    if blocks_per_group == 0 {
+        return Err(FsError::Corrupt);
+    }
     Ok(Superblock {
         block_size,
         inodes_per_group,
         inode_size,
         desc_size,
         first_gdt_block: if block_size == 1024 { 2 } else { 1 },
+        blocks_per_group,
+        first_data_block,
     })
 }
 
@@ -333,6 +344,185 @@ pub fn map_file<R: BlockReader>(
         lb += len;
     }
     Ok((size, bs, n))
+}
+
+// --- write path: block allocation + file growth (Part D) --------------------
+
+/// A bitmap bit is clear (the block/inode is free).
+fn bit_clear(map: &[u8], i: usize) -> bool {
+    map[i / 8] & (1 << (i % 8)) == 0
+}
+/// Set a bitmap bit (mark allocated).
+fn bit_set(map: &mut [u8], i: usize) {
+    map[i / 8] |= 1 << (i % 8);
+}
+
+/// Resolve a path to `(inode_number, inode_bytes)` — like [`resolve_path`] but keeps the
+/// number (the write path needs it to locate the inode on disk for write-back).
+fn resolve_path_ino<R: BlockReader>(
+    r: &R,
+    sb: &Superblock,
+    path: &[u8],
+) -> Result<(u32, [u8; 256]), FsError> {
+    let mut ino = ROOT_INO;
+    let mut inode = read_inode(r, sb, ino)?;
+    for comp in path.split(|&c| c == b'/').filter(|c| !c.is_empty()) {
+        if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
+            return Err(FsError::NotFound);
+        }
+        ino = dir_lookup(r, sb, &inode, comp)?;
+        inode = read_inode(r, sb, ino)?;
+    }
+    Ok((ino, inode))
+}
+
+/// The absolute device byte offset of inode `ino` (for writing it back).
+fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<u64, FsError> {
+    let group = (ino - 1) / sb.inodes_per_group;
+    let index = (ino - 1) % sb.inodes_per_group;
+    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let mut gd = [0u8; 32];
+    r.read_at(gd_off, &mut gd)?;
+    let inode_table = rd_u32(&gd, 8) as u64;
+    Ok(inode_table * sb.block_size as u64 + index as u64 * sb.inode_size as u64)
+}
+
+/// Allocate one free filesystem block, preferring `goal` (for contiguity). Reads the goal
+/// block's group bitmap, sets a free bit (goal if free, else the first free bit in that
+/// group), and updates the group-descriptor + superblock free-block counts. Returns the
+/// allocated block number. `TooLarge` if the group is full (cross-group allocation is a
+/// later refinement). `metadata_csum` is off (fixtures), so no bitmap/desc checksums.
+fn alloc_block<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    goal: u64,
+) -> Result<u64, FsError> {
+    let bs = sb.block_size as usize;
+    let group = ((goal - sb.first_data_block as u64) / sb.blocks_per_group as u64) as u32;
+    let group_start = sb.first_data_block as u64 + group as u64 * sb.blocks_per_group as u64;
+    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let mut gd = [0u8; 64];
+    let dsz = (sb.desc_size as usize).min(64);
+    rw.read_at(gd_off, &mut gd[..dsz])?;
+    let bitmap_block = rd_u32(&gd, 0) as u64; // bg_block_bitmap_lo
+
+    let mut bitmap = [0u8; MAX_BLOCK];
+    rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+
+    let goal_idx = (goal - group_start) as usize;
+    let idx = if goal_idx < sb.blocks_per_group as usize && bit_clear(&bitmap, goal_idx) {
+        goal_idx
+    } else {
+        (0..sb.blocks_per_group as usize)
+            .find(|&i| bit_clear(&bitmap, i))
+            .ok_or(FsError::TooLarge)?
+    };
+    bit_set(&mut bitmap, idx);
+    rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+
+    // Decrement free-block counts: group descriptor (bg_free_blocks_count_lo @12, u16) and
+    // superblock (s_free_blocks_count_lo @12, u32).
+    let gfree = rd_u16(&gd, 12).wrapping_sub(1);
+    gd[12..14].copy_from_slice(&gfree.to_le_bytes());
+    rw.write_at(gd_off, &gd[..dsz])?;
+    let mut sbbuf = [0u8; 1024];
+    rw.read_at(1024, &mut sbbuf)?;
+    let sfree = rd_u32(&sbbuf, 12).wrapping_sub(1);
+    sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
+    rw.write_at(1024, &sbbuf)?;
+
+    Ok(group_start + idx as u64)
+}
+
+/// Grow the regular file at `path` to `new_size` bytes by allocating blocks and extending
+/// its extent tree in place, updating the inode size + block count. Only **grows** (a
+/// `new_size <= cur_size` is a no-op). Depth-0 extent trees only (small files); a new extent
+/// is added only if the inline `i_block` header has room — otherwise `Unsupported` (extent-
+/// tree splitting / index nodes are deferred). Returns the new size. Metadata is written via
+/// the `BlockWriter`. See `docs/architecture/ext4-fs-server-rw.md`.
+pub fn grow_file<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    path: &[u8],
+    new_size: usize,
+) -> Result<usize, FsError> {
+    let sb = read_superblock(rw)?;
+    let bs = sb.block_size as usize;
+    let (ino, mut inode) = resolve_path_ino(rw, &sb, path)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFREG {
+        return Err(FsError::NotFound);
+    }
+    let flags = rd_u32(&inode, 32);
+    if flags & EXTENTS_FL == 0 || flags & INLINE_DATA_FL != 0 {
+        return Err(FsError::Unsupported);
+    }
+    let size_hi = if sb.inode_size > 128 { rd_u32(&inode, 108) as u64 } else { 0 };
+    let cur_size = ((rd_u32(&inode, 4) as u64) | (size_hi << 32)) as usize;
+    if new_size <= cur_size {
+        return Ok(cur_size);
+    }
+    let cur_blocks = cur_size.div_ceil(bs);
+    let new_blocks = new_size.div_ceil(bs);
+
+    // Parse the depth-0 extent header + leaf entries from `i_block` (inode[40..100]).
+    let eh = 40; // extent header offset in the inode
+    if rd_u16(&inode, eh) != EXTENT_MAGIC {
+        return Err(FsError::Corrupt);
+    }
+    if rd_u16(&inode, eh + 6) != 0 {
+        return Err(FsError::Unsupported); // index nodes (depth > 0) are deferred
+    }
+    let mut entries = rd_u16(&inode, eh + 2) as usize;
+    let max_entries = rd_u16(&inode, eh + 4) as usize;
+    // Last extent (highest ee_block) — the append point. Empty file → no extents yet.
+    let ent = |i: usize| eh + 12 + i * 12; // i-th leaf entry offset
+    let (mut last_log_end, mut last_phys_end) = if entries == 0 {
+        (0u64, 0u64)
+    } else {
+        let e = ent(entries - 1);
+        let ee_block = rd_u32(&inode, e) as u64;
+        let ee_len = (rd_u16(&inode, e + 4) & 0x7FFF) as u64;
+        let phys = rd_u32(&inode, e + 8) as u64 | ((rd_u16(&inode, e + 6) as u64) << 32);
+        (ee_block + ee_len, phys + ee_len)
+    };
+
+    for lb in cur_blocks..new_blocks {
+        let goal = if last_phys_end != 0 { last_phys_end } else { sb.first_data_block as u64 };
+        let phys = alloc_block(rw, &sb, goal)?;
+        let contiguous = entries > 0 && lb as u64 == last_log_end && phys == last_phys_end;
+        if contiguous {
+            // Extend the last extent: bump its ee_len.
+            let e = ent(entries - 1);
+            let new_len = (rd_u16(&inode, e + 4) & 0x7FFF) + 1;
+            inode[e + 4..e + 6].copy_from_slice(&new_len.to_le_bytes());
+        } else {
+            // Add a new leaf extent, if the inline header has room.
+            if entries >= max_entries {
+                return Err(FsError::Unsupported); // needs a tree split (deferred)
+            }
+            let e = ent(entries);
+            inode[e..e + 4].copy_from_slice(&(lb as u32).to_le_bytes()); // ee_block
+            inode[e + 4..e + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len
+            inode[e + 6..e + 8].copy_from_slice(&((phys >> 32) as u16).to_le_bytes()); // start_hi
+            inode[e + 8..e + 12].copy_from_slice(&(phys as u32).to_le_bytes()); // start_lo
+            entries += 1;
+            inode[eh + 2..eh + 4].copy_from_slice(&(entries as u16).to_le_bytes()); // eh_entries
+        }
+        last_log_end = lb as u64 + 1;
+        last_phys_end = phys + 1;
+    }
+
+    // Update inode size (i_size_lo @4, hi @108) + block count (i_blocks_lo @28, 512-B units).
+    inode[4..8].copy_from_slice(&(new_size as u32).to_le_bytes());
+    if sb.inode_size > 128 {
+        inode[108..112].copy_from_slice(&((new_size as u64 >> 32) as u32).to_le_bytes());
+    }
+    let added_sectors = ((new_blocks - cur_blocks) * bs / 512) as u32;
+    let i_blocks = rd_u32(&inode, 28).wrapping_add(added_sectors);
+    inode[28..32].copy_from_slice(&i_blocks.to_le_bytes());
+
+    let off = inode_offset(rw, &sb, ino)?;
+    rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
+    Ok(new_size)
 }
 
 /// Resolve `path` (absolute) to a **regular file** and read its content into

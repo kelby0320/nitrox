@@ -51,6 +51,15 @@ pub enum FsError {
     TooLarge,
 }
 
+/// A block-device **writer** — the read-write counterpart of [`BlockReader`], for the
+/// metadata mutation the write path needs (block/inode bitmaps, extent tree, inode,
+/// superblock). `write_at` writes `buf` at absolute byte `offset` (device-block aligned in
+/// practice). Read-only builds never require this; the RW server implements it over
+/// `sys_io_submit` writes.
+pub trait BlockWriter {
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError>;
+}
+
 /// One contiguous mapping from a file's blocks to the device, for the **Model A** data
 /// path (`docs/architecture/filesystem-data-path.md`). `device_lba` is a **filesystem
 /// block** number (`0` = a hole → reads as zero); the kernel scales it to a byte offset by
@@ -76,9 +85,38 @@ pub(crate) fn rd_u32(b: &[u8], off: usize) -> u32 {
 /// tests ([`serve`]): an in-memory [`BlockReader`] over an `mke2fs`-built image.
 #[cfg(test)]
 pub(crate) mod test_support {
-    use super::{BlockReader, FsError};
+    use super::{BlockReader, BlockWriter, FsError};
+    use std::cell::RefCell;
     use std::io::Write;
     use std::process::Command;
+
+    /// A read-write in-memory image (`BlockReader` + `BlockWriter`) for the write-path
+    /// tests. Interior mutability (`RefCell`) so `write_at(&self, …)` matches the traits.
+    pub(crate) struct RwImage(pub RefCell<Vec<u8>>);
+    impl BlockReader for RwImage {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<(), FsError> {
+            let v = self.0.borrow();
+            let start = offset as usize;
+            let end = start.checked_add(buf.len()).ok_or(FsError::Io)?;
+            if end > v.len() {
+                return Err(FsError::Io);
+            }
+            buf.copy_from_slice(&v[start..end]);
+            Ok(())
+        }
+    }
+    impl BlockWriter for RwImage {
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<(), FsError> {
+            let mut v = self.0.borrow_mut();
+            let start = offset as usize;
+            let end = start.checked_add(buf.len()).ok_or(FsError::Io)?;
+            if end > v.len() {
+                return Err(FsError::Io);
+            }
+            v[start..end].copy_from_slice(buf);
+            Ok(())
+        }
+    }
 
     /// A `BlockReader` over an in-memory image.
     pub(crate) struct ImageReader(pub Vec<u8>);
@@ -134,7 +172,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ImageReader, fixture};
+    use crate::test_support::{ImageReader, RwImage, fixture};
 
     #[test]
     fn reads_current_generation_1k_blocks() {
@@ -262,5 +300,45 @@ mod tests {
                 assert_eq!(&dev[..got], &want[..got], "file block {fb} device data mismatch");
             }
         }
+    }
+
+    #[test]
+    fn grow_file_appends_blocks_and_stays_e2fsck_clean() {
+        use crate::BlockRun;
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n"))); // 5-byte file → 1 block
+        let path = b"/system/current-generation";
+
+        // Grow 5 → 5000 bytes (1 → 2 blocks): allocate + extend the extent tree + inode.
+        assert_eq!(ext4::grow_file(&rw, path, 5000), Ok(5000));
+        assert_eq!(ext4::stat_file(&rw, path), Ok(5000));
+
+        // The block map now covers 2 blocks, none sparse.
+        let mut runs = [BlockRun::default(); 8];
+        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        assert_eq!(size, 5000);
+        let covered: u64 = runs[..n].iter().map(|r| r.length as u64).sum();
+        assert_eq!(covered, 2);
+        for r in &runs[..n] {
+            assert_ne!(r.device_lba, 0);
+        }
+
+        // e2fsck the mutated image: the metadata (extent tree, bitmap, free counts, inode)
+        // must be fully consistent. `-fn` makes no changes and exits non-zero on any error.
+        let img = rw.0.into_inner();
+        let dir = std::env::temp_dir().join(std::format!("nitrox-grow-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, &img).unwrap();
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "e2fsck reported errors:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
     }
 }
