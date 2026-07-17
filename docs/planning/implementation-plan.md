@@ -1924,16 +1924,22 @@ fill-producer seam. (Model B stays the general fallback for non-block / network 
 transforming fs-servers, which have no LBA mapping.) See the decision log
 (2026-06-25 — page-cache fill model).
 
-- [ ] **Model A extent read fill**: a `File::MapExtents`-style rsproto op (the
-  fs-server returns LBA extents for a range, referencing the block device); the
-  kernel reads those blocks **zero-copy** into page-cache pages via its own internal
-  block-read path (`read_blocking`/IRP), with the device capability wired to the
-  kernel at mount. Slots into the slice-8 fill seam — no page-cache redesign.
-- [ ] Write path: block allocation, extent updates, journal interaction
-- [ ] Writeback from kernel page cache (dirty page flushing) — the kernel writes
-  dirty pages to their LBAs via write IRPs; the fs-server allocates blocks but never
-  touches the page cache
-- [ ] Filesystem consistency on power loss (journal replay on mount)
+- [x] **Model A block read fill** (Part B): the fs-server returns the file's `BlockRun`
+  map (delivered inline in the `OBJECT_KIND_FILE_BLOCKS` lazy resolve reply, which also
+  transfers the device); the kernel reads each page's block **zero-copy** into the cache
+  frame via an async block IRP (`dispatch_block_irp_into_frame`). `MapRange`/`AllocRange`
+  are specced (`rsproto-block-ops.md`) as the standalone re-map ops; the initial map rides
+  in the resolve reply. Named `BlockRun`, not "extents" — the contract is fs-neutral.
+- [x] Write path: block allocation + extent-tree extension + inode update (Part D,
+  `ext4::grow_file`, `e2fsck`-verified). Journal interaction deferred (journalless fixtures).
+  Overwrite (Part C) is data-only, no metadata write.
+- [x] Writeback from kernel page cache (Part C, `FileObject::writeback` + `sys_file_sync`):
+  the kernel writes dirty pages to their LBAs via write IRPs; the fs-server allocates blocks
+  (on growth) but never touches file data.
+- [ ] Filesystem consistency on power loss (journal replay on mount) — deferred to its own
+  slice (the fixtures are `^has_journal`; crash consistency is best-effort ordering today).
+- [ ] File creation (inode allocation + directory-entry insertion), extent-tree splitting,
+  truncate / delete / rename — deferred (Part E and beyond).
 
 ### Milestone
 

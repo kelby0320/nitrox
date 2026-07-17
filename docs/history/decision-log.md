@@ -6627,3 +6627,37 @@ Small *synthetic* content (`/dev/log`, `current-generation`) is served as an eag
 `MemoryObject` snapshot on resolve — a third, separate path, unaffected. Documented in
 `docs/architecture/filesystem-data-path.md` (both paths, framed by class) and
 `docs/architecture/ext4-fs-server-rw.md` (ext4's Model A realization).
+
+## 2026-07-17 — fs-server-ext4 read-write (Model A data path), Parts A–D
+
+The filesystem is writable. Realized the decided **Model A** data path: the kernel owns
+file-data I/O (reads + writes) zero-copy against the block device via the fs-server's
+`BlockRun` map; the fs-server is a metadata / block-allocation oracle that never touches
+file data. Docs: `filesystem-data-path.md` (generic contract), `ext4-fs-server-rw.md`
+(ext4 realization), `rsproto-block-ops.md` (the neutral `Block`-category ops).
+
+- **A — design.** Layered generic (fs-neutral: `BlockRun`, `MapRange`/`AllocRange`, the
+  `FileObject` producer) vs ext4-specific (extents, bitmaps, journal). Protocol carries
+  device *block runs*, no "extents" — FAT32 or any block fs speaks it.
+- **B — Model A read fill.** `OBJECT_KIND_FILE_BLOCKS` lazy resolve reply carries the file's
+  block map inline + transfers a `DUPLICATE`d device handle; a page fault reads the block
+  zero-copy into the cache frame (`dispatch_block_irp_into_frame`). Converts ext4 reads off
+  the per-page `ReadRange` IPC. Verified by the existing read tests (now zero-copy).
+- **C — overwrite-in-place.** `MAP_WRITE` + `sys_file_sync` → `FileObject::writeback` writes
+  resident pages to their existing LBAs via write IRPs. The fs-server stays read-only (an
+  overwrite changes no metadata). Discovered writing back *all resident* pages is correct for
+  overwrite — per-page dirty tracking is a deferred optimization.
+- **D — file growth.** `ext4::grow_file` (block-bitmap alloc + extent-tree extension + inode
+  update), **`e2fsck`-verified** as a self-contained host test before wiring. Trigger:
+  **grow-on-resolve** (`RESOLVE_GROW` + `sys_file_grow`) — the server grows the file then
+  replies its new map, reusing the B/C paths (no FileObject mutation, no async alloc op).
+
+Kernel surface: `sys_file_sync` (31), `sys_file_grow` (32); `DeviceNode` type-rights gained
+`WRITE` (a block device is written via `sys_io_submit`) and the `/dev/blk` + GPT partition
+bindings grant it; the default user stack went 4→8 pages (the RW server nests 4 KiB block
+buffers). The `File::ReadRange` (Model B) path stays for a future non-block fs-server.
+
+Deferred: file creation (Part E), extent-tree splitting / index nodes, cross-group
+allocation, truncate/delete/rename, jbd2 journaling + replay (fixtures are `^has_journal`;
+crash consistency is best-effort data-before-metadata ordering), `metadata_csum`, the
+standalone `MapRange`/`AllocRange` ops, per-page dirty tracking, read-ahead.

@@ -68,25 +68,30 @@ ext4-server concern, which is why it lives here and not in the data-path contrac
 
 Each part builds on proven machinery and is independently verifiable.
 
-- **Part A — design** (this doc + `filesystem-data-path.md` + spec updates to
-  a new `rsproto-block-ops.md` for `MapRange`/`AllocRange`; a decision-log entry).
-- **Part B — Model A read fill (no writes).** Move the `FileObject` read path from Model B
-  (`ReadRange` IPC) to Model A: the `MapRange` op (ext4 extent walk) + the device wired to the
-  kernel + the kernel block-read-into-cache-page path. **Verified by the existing read tests**
-  (files still read correctly, now zero-copy) — de-risks the hardest new machinery (kernel
-  block I/O + block map + device wiring) before any write correctness is at stake.
-- **Part C — overwrite-in-place.** `MAP_WRITE` + `Dirty` `CachePage` + `sys_file_sync` +
-  writeback-on-unmap + kernel write IRPs to **existing** LBAs (`MapRange` only, no allocation).
-  Milestone: overwrite a file's bytes → persists.
-- **Part D — file growth.** `AllocRange` (block bitmap + extent insertion) + inode size/mtime.
-  Milestone: append past EOF → persists.
-- **Part E — file creation.** Inode allocation (inode bitmap) + directory entry insertion.
-  Milestone: create a new file and write it.
+- **Part A — design** ✅ (this doc + `filesystem-data-path.md` + `rsproto-block-ops.md`; a
+  decision-log entry).
+- **Part B — Model A read fill (no writes)** ✅. The `FileObject` read path is Model A: the
+  file's `BlockRun` map is delivered inline in the lazy resolve reply (`OBJECT_KIND_FILE_BLOCKS`,
+  which also transfers the device); a fault reads the page's block zero-copy from the device
+  into the cache frame. **Verified by the existing read tests** (`current-generation`, the
+  8-page `large.bin`) — the hardest new machinery de-risked before any write correctness.
+  (The standalone `MapRange` op is deferred; the resolve reply carries the initial map.)
+- **Part C — overwrite-in-place** ✅. `MAP_WRITE` mappings + `sys_file_sync` + kernel write
+  IRPs to **existing** LBAs (`FileObject::writeback`). The fs-server stays read-only (an
+  overwrite changes no metadata). Writing back all resident pages is correct for overwrite;
+  per-page dirty tracking is deferred.
+- **Part D — file growth** ✅. `grow_file` (block-bitmap allocation + extent-tree extension +
+  inode size/block-count) — **`e2fsck`-verified**. Triggered by grow-on-resolve
+  (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the
+  client writes the new region + syncs. The fs-server now holds a read-write device handle.
+- **Part E — file creation** — inode allocation (inode bitmap) + directory-entry insertion.
+  Not yet built.
 
-**Deferred**: jbd2 journaling + replay-on-mount (needs `has_journal` fixtures); `metadata_csum`
-checksums; a periodic writeback daemon; sub-page dirty ranges; truncate / delete / rename;
-read-ahead / clustered fill; the fs-server open-file cookie (a stateful handle anchoring
-writeback, retiring the stateless per-range re-send).
+**Deferred**: file creation (Part E); extent-tree splitting / index nodes (depth > 0);
+cross-group allocation; jbd2 journaling + replay-on-mount (needs `has_journal` fixtures);
+`metadata_csum` checksums; a periodic writeback daemon; per-page dirty tracking;
+truncate / delete / rename; read-ahead / clustered fill; the standalone `MapRange`/`AllocRange`
+ops (the resolve reply carries the map today); the fs-server open-file cookie.
 
 ## Verification
 
