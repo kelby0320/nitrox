@@ -89,6 +89,20 @@ static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
+/// Spawn args for the system `logging-service` (slice: logging): one moved handle — the
+/// control channel — in `handles[0]` (delivered in `rdx`). It resolves nothing (clients
+/// bring their own log endpoint), so its inherited LOOKUP-only namespace is unused; it
+/// answers forwarded `/log/...` resolves by minting per-principal log channels.
+static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/logging-service
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
 /// Spawn args for the demo `parent`: no handles, inherit a LOOKUP-only handle to
 /// init's root namespace (so parent can resolve the kernel servers but not bind
 /// into init's root — it constructs its own namespaces for its children, which is
@@ -524,6 +538,65 @@ fn bind_profile_server(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the system logging service and bind its forwarding endpoint at `/log` (the RS
+/// startup protocol, minus a device — it needs none). Clients then resolve
+/// `/log/<tier>/<principal>` to obtain a per-principal log channel. Bound before the
+/// service manager starts so services can log from launch. Returns `true` once bound.
+fn bind_logging_service(root_ns: u64) -> bool {
+    // 1. Create the control channel (init keeps end 0, the server gets end 1).
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; mounts + profile bind
+    // already completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 2. Spawn the logging service, moving the control endpoint into it (in rdx).
+    // SAFETY: SPAWN_LOGGING is a valid writable arg block; spawn_program resolves the ELF
+    // image from the initramfs, stamps it, spawns, and closes the image handle.
+    let ls_h = unsafe {
+        SPAWN_LOGGING.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/initramfs/sbin/logging-service", &raw mut SPAWN_LOGGING)
+    };
+    if ls_h < 0 {
+        kprint(b"init: logging-service spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: logging-service Ready timeout/invalid\n");
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // 4. Bind the forwarding endpoint at `/log`.
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/log".as_ptr() as u64, 4, endpoint) };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: logging-service bind FAIL at /log\n");
+        return false;
+    }
+
+    kprint(b"init: logging service bound at /log\n");
+    // init keeps `ls_h` (the long-lived server's process handle).
+    let _ = ls_h;
+    true
+}
+
 /// The slice-7 milestone: look up `/system/current-generation` through the just-
 /// mounted root fs-server (the kernel forwards the lookup, the server reads the
 /// file and replies a `MemoryObject`), map it, and log its content — proving the
@@ -830,6 +903,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.
     if !bind_profile_server(root_ns) {
+        emergency(notif, root_ns);
+    }
+
+    // Spawn the system logging service and bind it at `/log`, before the service manager,
+    // so services can resolve `/log/<tier>/<principal>` and log from launch. Critical-path.
+    if !bind_logging_service(root_ns) {
         emergency(notif, root_ns);
     }
 
