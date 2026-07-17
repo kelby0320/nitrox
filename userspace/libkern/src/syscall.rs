@@ -77,6 +77,8 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
+/// `sys_file_sync` — flush a writable file mapping's pages to the device.
+pub const SYS_FILE_SYNC: u64 = 31;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: end the QEMU run with a harness verdict (the argument's

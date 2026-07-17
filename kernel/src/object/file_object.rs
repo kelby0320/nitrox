@@ -307,6 +307,76 @@ impl FileObject {
         }
     }
 
+    /// Flush every resident, block-backed page to the device (the **Model A** overwrite
+    /// writeback). For each `Ready` cache page, translate its block via the producer's run
+    /// map and issue a block **write** IRP from the frame to that LBA, blocking on each.
+    /// Pages over a hole (`device_lba == 0`, unallocated) are skipped — growing a file is
+    /// Part D. `file_obj` is this object's reference (pins the frames across the IRPs). Runs
+    /// in a syscall thread (it blocks). Returns `true` iff every write succeeded; `false`
+    /// for a non-block producer or an I/O/allocation failure.
+    pub fn writeback(file_obj: &ObjectRef) -> bool {
+        debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
+        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        // The producer is immutable; borrow its device + run map for the whole flush.
+        let (device, runs, block_size) = match &fo.producer {
+            Producer::FsServerBlocks { device, runs, block_size } => (device.clone(), runs, *block_size),
+            _ => return false,
+        };
+        // Snapshot the resident pages `(index, frame)` under the lock; do I/O unlocked.
+        let mut pages: KVec<(usize, PhysAddr)> = KVec::new();
+        {
+            let inner = fo.inner.lock();
+            if pages.try_reserve(inner.pages.len()).is_err() {
+                return false;
+            }
+            for p in inner.pages.iter() {
+                if p.state == PageState::Ready {
+                    let _ = pages.try_push((p.index, p.frame));
+                }
+            }
+        }
+        for (index, frame) in pages.iter().copied() {
+            let file_block = (index * PAGE_SIZE) as u64 / block_size as u64;
+            let dev_block = runs.iter().find_map(|r| {
+                if file_block >= r.file_block && file_block < r.file_block + r.length as u64 {
+                    Some(if r.device_lba == 0 { 0 } else { r.device_lba + (file_block - r.file_block) })
+                } else {
+                    None
+                }
+            });
+            let dev_block = match dev_block {
+                Some(b) if b != 0 => b,
+                _ => continue, // hole / unmapped: allocation is Part D
+            };
+            let po = match PendingOperation::try_new() {
+                // SAFETY: adopt the single creation reference.
+                Ok(p) => unsafe {
+                    ObjectRef::from_raw(KBox::into_raw(p).as_ptr() as *mut (), KObjectType::PendingOperation)
+                },
+                Err(_) => return false,
+            };
+            let dev_offset = dev_block * block_size as u64;
+            if crate::io::block::dispatch_block_irp_into_frame(
+                &device,
+                frame,
+                file_obj.clone(),
+                &po,
+                crate::libkern::io_op::IoOpcode::Write,
+                dev_offset,
+                PAGE_SIZE as u64,
+            )
+            .is_err()
+            {
+                return false;
+            }
+            if !block_on_po(&po) {
+                return false;
+            }
+        }
+        true
+    }
+
     /// Materialize the whole file into a fresh contiguous heap buffer (page-rounded
     /// [`size`](Self::size) bytes; the tail past the real data stays zero). Drives the
     /// producer via [`fault_in_page`](Self::fault_in_page) page by page — **blocking on

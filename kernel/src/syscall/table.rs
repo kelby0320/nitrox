@@ -114,6 +114,8 @@ pub const SYS_IO_SUBMIT: u64 = 28;
 pub const SYS_IO_CANCEL: u64 = 29;
 /// `sys_ns_enumerate` — list a namespace's bindings (mount points + kernel resources).
 pub const SYS_NS_ENUMERATE: u64 = 30;
+/// `sys_file_sync` — flush a writable file mapping's dirty pages to the device.
+pub const SYS_FILE_SYNC: u64 = 31;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -170,6 +172,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_ENTROPY_READ => encode(sys_entropy_read(a0, a1, a2 as usize)),
         SYS_IO_SUBMIT => encode(sys_io_submit(a0, a1)),
         SYS_IO_CANCEL => encode(sys_io_cancel(a0)),
+        SYS_FILE_SYNC => encode(sys_file_sync(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Integration-test build only: end the QEMU run with the caller's verdict.
         // Diverges (QEMU exits); never returns to dispatch/sysret.
@@ -2131,6 +2134,20 @@ fn complete_resolve_reply(
 /// and names the file by the lookup's stored suffix, so a later page fault fills it
 /// via `File::ReadRange`. Fails `TooLarge` if the suffix overran the inline buffer
 /// (the path can't be recovered), or `OutOfMemory` on allocation failure.
+/// `sys_file_sync(handle)` — flush a writable file mapping's resident pages to the device
+/// (Model A overwrite writeback). Requires `MAP_WRITE` on the `FileObject` handle. Blocks on
+/// the write IRPs (a syscall thread; async-first-exempt like `sys_process_spawn`'s fills).
+/// `0` on success, else a `KError`.
+fn sys_file_sync(handle: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ok = lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)?;
+    if crate::object::FileObject::writeback(&ok.object) {
+        Ok(0)
+    } else {
+        Err(KError::IoError)
+    }
+}
+
 fn build_and_install_file(
     reg: *mut (),
     pl: &crate::object::userspace_server::PendingLookup,

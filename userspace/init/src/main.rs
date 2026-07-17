@@ -659,6 +659,72 @@ fn fill_byte(i: usize) -> u8 {
     (((i >> 12) ^ i) & 0xFF) as u8
 }
 
+/// fs-server-rw Part C milestone (selftest): **overwrite** an existing file in place through
+/// a `MAP_WRITE` mapping, `sys_file_sync`, then re-resolve (a fresh `FileObject` that reads
+/// the block from disk) and verify the change persisted — proving the Model A write data path
+/// (dirty pages → write IRPs → device) with no fs-server metadata write.
+#[cfg(feature = "selftest")]
+fn overwrite_test(root_ns: u64) {
+    let path = b"/system/rwtest";
+    let marker = [0xDEu8, 0xAD, 0xBE, 0xEF];
+
+    // 1. Map MAP_READ | MAP_WRITE; note an untouched byte, then overwrite bytes 0..4.
+    let (st, fh) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
+    if st != 0 || fh == 0 {
+        kprint(b"init: rwtest lookup FAIL\n");
+        return;
+    }
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"init: rwtest map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return;
+    }
+    let base = addr as u64;
+    // SAFETY: byte 8 is within the mapped page; read the original (== 8) to compare later.
+    let orig8 = unsafe { ((base + 8) as *const u8).read_volatile() };
+    // SAFETY: bytes 0..4 are within the writable mapping — the write dirties the page.
+    for (i, m) in marker.iter().enumerate() {
+        unsafe { ((base + i as u64) as *mut u8).write_volatile(*m) };
+    }
+    // 2. Flush the mapping's pages to disk (Model A write IRPs to the existing LBAs).
+    // SAFETY: `fh` is our writable FileObject handle.
+    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+        kprint(b"init: rwtest sync FAIL\n");
+    }
+
+    // 3. Re-resolve (a fresh FileObject reads from disk) and verify the overwrite persisted
+    //    and the untouched byte is unchanged.
+    let (st2, fh2) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+    if st2 != 0 || fh2 == 0 {
+        kprint(b"init: rwtest re-read lookup FAIL\n");
+        return;
+    }
+    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, PAGE, RIGHT_MAP_READ) };
+    if addr2 < 0 {
+        kprint(b"init: rwtest re-read map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
+        return;
+    }
+    let base2 = addr2 as u64;
+    let mut ok = true;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: within the mapped page.
+        if unsafe { ((base2 + i as u64) as *const u8).read_volatile() } != *m {
+            ok = false;
+        }
+    }
+    // SAFETY: byte 8 within the page — must be unchanged.
+    let reread8 = unsafe { ((base2 + 8) as *const u8).read_volatile() };
+    if ok && reread8 == orig8 {
+        kprint(b"init: rwtest overwrite persisted + verified ok\n");
+    } else {
+        kprint(b"init: rwtest overwrite MISMATCH\n");
+    }
+}
+
 /// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
 /// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
 /// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
@@ -905,6 +971,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // cache — many demand faults, each a `File::ReadRange` to the fs-server.
     #[cfg(feature = "selftest")]
     read_large_file(root_ns);
+    // fs-server-rw Part C: overwrite an existing file in place and confirm it persists.
+    #[cfg(feature = "selftest")]
+    overwrite_test(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.
