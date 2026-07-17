@@ -27,6 +27,10 @@ pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;
 /// builds a page-cache object filled on demand via `File::ReadRange`. No handle
 /// rides in `handles[0]`. Paired with [`RESOLVE_FILE_LAZY`].
 pub const OBJECT_KIND_FILE: u16 = 4;
+/// The reply's `handles[0]` is a live **`IpcChannel`** endpoint — a connection to the
+/// resolving server, not a file. Used by connect-style servers (the logging service
+/// resolves a log path to a per-principal write channel). `content_len` is unused.
+pub const OBJECT_KIND_CHANNEL: u16 = 5;
 
 // --- Resolve request --------------------------------------------------------
 

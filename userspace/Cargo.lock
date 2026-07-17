@@ -29,6 +29,7 @@ name = "heartbeat"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "liblog",
 ]
 
 [[package]]
@@ -59,6 +60,14 @@ name = "libkern"
 version = "0.1.0"
 
 [[package]]
+name = "liblog"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
 name = "libos"
 version = "0.1.0"
 dependencies = [
@@ -68,6 +77,15 @@ dependencies = [
 [[package]]
 name = "librsproto"
 version = "0.1.0"
+
+[[package]]
+name = "logging-service"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "librsproto",
+]
 
 [[package]]
 name = "parent"

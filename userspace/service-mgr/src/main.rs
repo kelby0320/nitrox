@@ -20,6 +20,7 @@
 
 extern crate alloc;
 
+use alloc::format;
 use alloc::string::String;
 
 use libkern::*;
@@ -95,10 +96,10 @@ fn restart_name(p: RestartPolicy) -> &'static [u8] {
 /// on failure. The `PendingOperation` is waited + closed; the resolved handle is the
 /// caller's to close. Used both to resolve config files (mapped by `read_file`) and
 /// program-image `MemoryObject`s (passed to spawn as `SpawnArgs.image`).
-fn ns_lookup(ns: u64, path: &[u8]) -> u64 {
+fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
     // SAFETY: valid path pointer + namespace handle.
     let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
     };
     if po < 0 {
         return 0;
@@ -131,6 +132,19 @@ fn ns_lookup(ns: u64, path: &[u8]) -> u64 {
     } else {
         handle
     }
+}
+
+/// Resolve the service's System-tier log endpoint — `/log/<name>` under the logging
+/// service, at the `system/` subtree (only a supervisor's namespace permits it). Returns
+/// a `SEND`-righted channel handle (the service's `log`), or `0` if the logging service
+/// is unavailable (spawn then proceeds without structured logging — non-fatal). The
+/// logging service stamps the trusted `principal = <name>` / `tier = system` from *this*
+/// channel; the service never names itself. See `docs/architecture/logging.md`.
+fn resolve_log_endpoint(root_ns: u64, name: &str) -> u64 {
+    let path = format!("/log/system/{name}");
+    // `TRANSFER` so service-mgr can move the endpoint into the child at spawn; the child
+    // itself receives it attenuated to `SEND` (the spawn grant mask, below).
+    ns_lookup(root_ns, path.as_bytes(), RIGHT_SEND | RIGHT_TRANSFER)
 }
 
 /// The backoff wait (ns) for the `attempts`-th restart (0-based) under `cfg`.
@@ -200,6 +214,31 @@ fn create_control_channel() -> Option<(u64, u64)> {
     Some((a, b))
 }
 
+/// Hand the resolved log endpoint to a service over its control endpoint, **transferring**
+/// it (the service receives it as its first control message — a message with one moved
+/// handle and no payload). After this, `log_ep` has moved to the service, or is closed if
+/// the transfer failed.
+fn send_log_handoff(ctrl: u64, log_ep: u64) {
+    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; transfer one handle, empty payload.
+    let sr = unsafe {
+        (&raw mut SEND_MSG.header.payload_len).write(0);
+        SEND_HANDLES[0] = log_ep;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ctrl,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        // The transfer failed; the handle did not move — reclaim it.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
+    }
+}
+
 /// Send a control opcode to a service over its control endpoint (`ctrl`). No handles,
 /// non-blocking (the control ring is otherwise idle).
 fn send_control(ctrl: u64, op: u8) {
@@ -224,7 +263,7 @@ fn send_control(ctrl: u64, op: u8) {
 /// Resolve `path` in namespace `ns`, map the returned read-only `MemoryObject`, and
 /// return its trimmed UTF-8 contents. Mirrors init's manifest read. `None` on failure.
 fn read_file(ns: u64, path: &[u8]) -> Option<String> {
-    let mem = ns_lookup(ns, path);
+    let mem = ns_lookup(ns, path, RIGHT_MAP_READ);
     if mem == 0 {
         return None;
     }
@@ -278,7 +317,7 @@ fn load_declaration(root_ns: u64) -> Option<ServiceDecl> {
 /// control_end)`; `control_end` is `0` if the channel couldn't be created.
 fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     // Resolve the declared executable to its ELF `MemoryObject` (path-based spawn).
-    let image = ns_lookup(root_ns, decl.executable.as_bytes());
+    let image = ns_lookup(root_ns, decl.executable.as_bytes(), RIGHT_MAP_READ);
     if image == 0 {
         kprint(b"service-mgr: image not found: ");
         kprint(decl.executable.as_bytes());
@@ -292,11 +331,19 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
             (0, 0)
         }
     };
+    // Resolve the service's System-tier log endpoint (the `log` handle + stdout/stderr
+    // routing). Non-fatal: a service without it just has no structured logging.
+    let log_ep = resolve_log_endpoint(root_ns, &decl.name);
+    if log_ep == 0 {
+        kprint(b"service-mgr: log endpoint resolve FAIL (spawning without logging)\n");
+    }
     kprint(b"service-mgr: starting service '");
     kprint(decl.name.as_bytes());
     kprint(b"'\n");
-    // SAFETY: SPAWN_SERVICE is a valid writable arg block. Move the control endpoint
-    // into the child (RECV + WAIT only — it receives commands, doesn't send).
+    // SAFETY: SPAWN_SERVICE is a valid writable arg block. Move the control endpoint into
+    // the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
+    // register, so the log endpoint is handed over the control channel after spawn (below),
+    // mirroring init's device handoff to an fs-server.
     let h = unsafe {
         SPAWN_SERVICE.image = image;
         if svc_end != 0 {
@@ -315,15 +362,30 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
         kprint(b"service-mgr: spawn FAIL\n");
-        // The service endpoint was not moved (spawn failed) — close both ends.
-        if smgr_end != 0 {
-            // SAFETY: closing our own handles.
-            unsafe {
+        // Nothing was moved (spawn failed) — close the control ends + the log endpoint.
+        // SAFETY: closing our own handles (0 is ignored by the kernel).
+        unsafe {
+            if smgr_end != 0 {
                 syscall1(SYS_HANDLE_CLOSE, smgr_end);
                 syscall1(SYS_HANDLE_CLOSE, svc_end);
             }
+            if log_ep != 0 {
+                syscall1(SYS_HANDLE_CLOSE, log_ep);
+            }
         }
         return (h, 0);
+    }
+    // Hand the log endpoint to the service over its control channel (an IPC transfer —
+    // the child receives it as its first control message). service-mgr thus vouches the
+    // identity (it resolved `system/<name>`) without the child ever naming itself.
+    if log_ep != 0 {
+        if smgr_end != 0 {
+            send_log_handoff(smgr_end, log_ep);
+        } else {
+            // No control channel to hand it over — drop it.
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
+        }
     }
     // `svc_end` has moved to the child; retain `smgr_end` as the control endpoint.
     (h, smgr_end)

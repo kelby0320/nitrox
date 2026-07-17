@@ -1880,10 +1880,14 @@ bytes; it becomes a handle to the program's bytes.
 
 #### Logging service
 
-- [ ] Log channel handle creation (capability-gated)
-- [ ] `LogRecord` structure per architecture doc
-- [ ] Logging service collects, indexes, persists records
-- [ ] Multiple sinks: persistent DB, serial, in-memory ring
+- [x] Log channel handle creation (capability-gated) — a client resolves a log path and
+  the service mints a per-principal channel; identity is capability-derived (the channel),
+  not a SysCap. `docs/architecture/logging.md`, `userspace/logging-service/`
+- [x] `LogRecord` structure per architecture doc (`librsproto::log`; trusted/claimed split)
+- [x] Logging service collects + stamps records (trusted `principal`/`tier`/`timestamp`/
+  `sequence`); indexing + persistence deferred (persistence needs fs-server RW)
+- [x] Sinks: serial + in-memory ring (behind one `Sink` trait). Persistent DB (fs-server
+  RW) + network (netstack) deferred behind the same trait; ring read-back deferred
 
 #### Audit subsystem
 

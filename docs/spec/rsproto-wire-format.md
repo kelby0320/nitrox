@@ -65,7 +65,8 @@ The 16-bit `op` field decomposes:
 | `Control` | `0x04xx` | Ioctl-style, opaque to the protocol |
 | `Power` | `0x05xx` | Suspend, resume, device power |
 | `File` | `0x06xx` | Positioned, stateless file-content reads (page-cache fill) |
-| (reserved) | `0x07xx` – `0xFExx` | Future categories |
+| `Log` | `0x07xx` | Reserved for *reply-bearing* logging ops (read-back/query). The hot append path uses **no** op — see [Log records](#log-records). |
+| (reserved) | `0x08xx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 A resource server must implement at least the Meta category. Each server declares which other categories it supports via `Meta::QueryCaps`.
@@ -184,6 +185,39 @@ Each operation's body is documented per category. See:
 
 The Meta, Namespace, and File operations are specified; the rest land with their
 consumers.
+
+## Log records
+
+A **log append is not an operation** — it carries no envelope and no `op`. The logging
+service hands each emitter a dedicated log channel (obtained by resolving a path under the
+logging service; see `docs/architecture/logging.md`), and appending a record is a raw
+`sys_channel_send` of a `LogRecord` body on that channel. The channel's identity is the
+"op": every message on it is a log record. Append is fire-and-forget — no `request_id`, no
+reply — so a slow sink never blocks the emitter beyond channel backpressure.
+
+The body carries only the emitter's **claimed** fields. The logging service supplies the
+**trusted** fields (`principal`, `tier`, `timestamp`, `sequence`) from the channel the
+record arrived on — they are absent from the wire (an emitter cannot set them):
+
+```rust
+#[repr(C, packed)]
+pub struct LogAppendHeader {
+    pub level:       u8,     // Trace=0 Debug=1 Info=2 Warn=3 Error=4 Critical=5
+    pub flags:       u8,     // bit0 has_span, bit1 has_trace, bit2 has_source
+    pub field_count: u16,    // structured k/v pairs (0 until typed-I/O lands)
+    pub message_len: u32,
+    pub span_id:     u64,    // 0 if !has_span
+    pub trace_id:    u64,    // 0 if !has_trace
+    // Followed by: message (UTF-8, message_len bytes);
+    //   if has_source: source_len (u16) + source (UTF-8);
+    //   field_count × (key, Value) pairs (absent until typed-I/O lands).
+}
+```
+
+Encoding follows the [body encoding rules](#body-encoding-rules) (little-endian,
+length-prefixed UTF-8). Reply-bearing logging operations (the `journalctl`-style read-back
+/ query path) are deferred; when introduced they take real `op`s in the `Log` (`0x07xx`)
+category and use the normal enveloped request/reply.
 
 ## Bulk data transfer
 

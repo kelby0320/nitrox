@@ -1,0 +1,21 @@
+[package]
+name = "logging-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+
+# A library + binary split (mirroring profile-server): the library holds the
+# host-testable log-path classifier; the binary is the bare-target resource
+# server. `cargo xtask test` runs `cargo test -p logging-service --lib`; the
+# `#![no_main]` bin can't build on host.
+[lib]
+name = "logging_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "logging-service"
+path = "src/main.rs"
