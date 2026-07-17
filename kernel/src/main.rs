@@ -695,10 +695,10 @@ fn run_first_userspace() {
     // to a `DeviceNode` handle (the caller `sys_io_submit`s reads on it). Bound
     // **unconditionally**: the device-table registry carries liveness, so a
     // lookup of `/dev/blk/0` is `NotFound` if no disk was discovered, harmless.
-    // Read-only in Phase 2 — the binding grants `READ` + the generic band, so a
-    // write IoOp is rejected at the lookup rights gate.
+    // The binding grants `READ` + `WRITE` (the RW fs-server writes filesystem metadata via
+    // `sys_io_submit` writes; the Model A data path is the kernel's) plus the generic band.
     let block_binding_rights =
-        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+        Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns
         .bind_kernel_server(b"/dev/blk", KernelServerId::BlockDevice, block_binding_rights)
         .is_err()

@@ -116,6 +116,8 @@ pub const SYS_IO_CANCEL: u64 = 29;
 pub const SYS_NS_ENUMERATE: u64 = 30;
 /// `sys_file_sync` — flush a writable file mapping's dirty pages to the device.
 pub const SYS_FILE_SYNC: u64 = 31;
+/// `sys_file_grow` — resolve a file, growing it to a target size first (a5 = new size).
+pub const SYS_FILE_GROW: u64 = 32;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -164,7 +166,8 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_NS_CREATE => encode(sys_ns_create()),
-        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3)),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None)),
+        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some(a4 as u32))),
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
@@ -1354,7 +1357,13 @@ pub fn sys_entropy_read(ent_h: u64, buf_ptr: u64, len: usize) -> SysResult {
 /// Argument / permission / allocation failures return **synchronously** (a
 /// negative isize, no PO). Resolution failures (no covering binding, or a
 /// non-empty suffix on a direct-handle leaf) are delivered **through** the PO.
-pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64) -> SysResult {
+pub fn sys_ns_lookup(
+    ns_h: u64,
+    path_ptr: u64,
+    path_len: usize,
+    rights_bits: u64,
+    grow_size: Option<u32>,
+) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     // --- synchronous validation (no PO created on these) ---
     let requested = Rights::from_bits_truncate(rights_bits);
@@ -1442,7 +1451,7 @@ pub fn sys_ns_lookup(ns_h: u64, path_ptr: u64, path_len: usize, rights_bits: u64
             // Forward the lookup to the userspace server over IPC and leave the PO
             // pending (the reply completes it inline — see `sys_channel_send`). A
             // synchronous failure (server busy / full / gone) completes it now.
-            forward_userspace_lookup(reg, &po_ref, pid, requested, suffix)
+            forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, grow_size)
         }
     };
     match outcome {
@@ -1473,17 +1482,25 @@ fn forward_userspace_lookup(
     pid: u32,
     requested: Rights,
     suffix: &[u8],
+    grow_size: Option<u32>,
 ) -> Option<(i32, u64)> {
-    // Build the request in a heap-bounced message (4 KiB — never on the stack).
+    // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
+    // request (`sys_file_grow`) additionally carries the target size + the `RESOLVE_GROW`
+    // flag so the server grows the file before replying its map.
     let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
-    let body_len = match crate::rsproto::build_resolve_request(
-        &mut msg.payload,
-        requested.bits(),
-        suffix,
-    ) {
+    let built = match grow_size {
+        Some(new_size) => crate::rsproto::build_resolve_request_grow(
+            &mut msg.payload,
+            requested.bits(),
+            suffix,
+            new_size,
+        ),
+        None => crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix),
+    };
+    let body_len = match built {
         Some(n) => n,
         // The suffix is longer than the rsproto request can carry.
         None => return Some((KError::TooLarge as i32, 0)),

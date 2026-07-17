@@ -145,6 +145,47 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
 /// honour the flag replies the eager `OBJECT_KIND_MEMOBJ` instead, which the kernel
 /// still installs (the slice-7 path); a server that does honour it replies
 /// `OBJECT_KIND_FILE`. `handle_count = 0` (the request carries no handles).
+/// `RESOLVE_GROW` — grow the resolved file to the `new_size` appended after the suffix
+/// (allocate blocks + extend its extent tree) **before** replying its Model A map. Combined
+/// with `RESOLVE_FILE_LAZY`. For `sys_file_grow`. See `docs/architecture/ext4-fs-server-rw.md`.
+pub const RESOLVE_GROW: u32 = 1 << 2;
+
+/// Like [`build_resolve_request`] but sets `RESOLVE_GROW` and appends `new_size` (a `u32`
+/// after the suffix): the server grows the file to `new_size` before replying its Model A
+/// map. `handle_count = 0`.
+pub fn build_resolve_request_grow(
+    out: &mut [u8],
+    requested_rights: u64,
+    suffix: &[u8],
+    new_size: u32,
+) -> Option<usize> {
+    if suffix.len() > u16::MAX as usize {
+        return None;
+    }
+    let body_len = RESOLVE_REQUEST_PREFIX_LEN + suffix.len() + 4;
+    let total = RS_HEADER_LEN + body_len;
+    if out.len() < total {
+        return None;
+    }
+    put_u32(out, 0, RS_MAGIC);
+    put_u16(out, 4, RS_VERSION);
+    put_u16(out, 6, OP_NS_RESOLVE);
+    put_u64(out, REQUEST_ID_OFFSET, 0);
+    put_u32(out, 16, 0);
+    put_u32(out, 20, body_len as u32);
+    put_u16(out, 24, 0);
+    put_u16(out, 26, 0);
+    let b = RS_HEADER_LEN;
+    put_u64(out, b, requested_rights);
+    put_u32(out, b + 8, RESOLVE_FILE_LAZY | RESOLVE_GROW);
+    put_u16(out, b + 12, suffix.len() as u16);
+    put_u16(out, b + 14, 0);
+    let s = b + RESOLVE_REQUEST_PREFIX_LEN;
+    out[s..s + suffix.len()].copy_from_slice(suffix);
+    put_u32(out, s + suffix.len(), new_size);
+    Some(total)
+}
+
 pub fn build_resolve_request(out: &mut [u8], requested_rights: u64, suffix: &[u8]) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;

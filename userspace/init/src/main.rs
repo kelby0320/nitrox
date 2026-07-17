@@ -318,12 +318,12 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             return false;
         }
     };
-    // DUPLICATE so the fs-server can hand a device handle to the kernel for the Model A
-    // data path (zero-copy file-data IRPs) while keeping its own for metadata reads.
+    // READ+WRITE (the RW fs-server writes filesystem metadata) + TRANSFER (hand it to the
+    // server) + DUPLICATE (the server hands a copy to the kernel for the Model A data path).
     let (st, device) = ns_lookup_wait(
         root_ns,
         dev_path.as_bytes(),
-        RIGHT_READ | RIGHT_TRANSFER | RIGHT_DUPLICATE,
+        RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER | RIGHT_DUPLICATE,
     );
     if st != 0 || device == 0 {
         kprint(b"init: device ");
@@ -725,6 +725,102 @@ fn overwrite_test(root_ns: u64) {
     }
 }
 
+/// fs-server-rw Part D milestone (selftest): **grow** a file past EOF via `sys_file_grow`
+/// (the fs-server allocates a block + extends its extent tree + updates the inode), write
+/// into the newly-allocated region, `sys_file_sync`, then re-resolve and confirm the
+/// appended data persisted — proving the write path's metadata mutation end to end.
+#[cfg(feature = "selftest")]
+fn grow_test(root_ns: u64) {
+    let path = b"/system/rwtest";
+    let marker = [0xC0u8, 0xFF, 0xEEu8, 0x11];
+    let new_size: u64 = 8000; // 4096 (1 block) → 8000 (2 blocks)
+
+    // 1. Grow-resolve: the fs-server grows the file, then replies its (2-block) map. The
+    //    lookup returns a PO; wait for the handle.
+    let po = unsafe {
+        syscall5(
+            SYS_FILE_GROW,
+            root_ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+            new_size,
+        )
+    };
+    if po < 0 {
+        kprint(b"init: grow submit FAIL\n");
+        return;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers; one waiter.
+    let (st, fh) = unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        let w = syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        );
+        let status =
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]);
+        let handle = u64::from_le_bytes([
+            WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+            WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+        ]);
+        syscall1(SYS_HANDLE_CLOSE, po as u64);
+        if w != 1 { (-1, 0) } else { (status, handle) }
+    };
+    if st != 0 || fh == 0 {
+        kprint(b"init: grow FAIL\n");
+        return;
+    }
+
+    // 2. Map the grown file; write a marker in the **new** region (the appended 2nd block).
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, new_size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        kprint(b"init: grow map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return;
+    }
+    let base = addr as u64;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: offset `PAGE + i` is in the 2nd mapped page (the appended block).
+        unsafe { ((base + PAGE + i as u64) as *mut u8).write_volatile(*m) };
+    }
+    // SAFETY: `fh` is our writable handle.
+    if unsafe { syscall1(SYS_FILE_SYNC, fh) } != 0 {
+        kprint(b"init: grow sync FAIL\n");
+    }
+
+    // 3. Re-resolve (a fresh FileObject reads from disk) and verify the appended data.
+    let (st2, fh2) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+    if st2 != 0 || fh2 == 0 {
+        kprint(b"init: grow re-read FAIL\n");
+        return;
+    }
+    let addr2 = unsafe { syscall4(SYS_MEMORY_MAP, fh2, 0, new_size, RIGHT_MAP_READ) };
+    if addr2 < 0 {
+        kprint(b"init: grow re-read map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh2) };
+        return;
+    }
+    let base2 = addr2 as u64;
+    let mut ok = true;
+    for (i, m) in marker.iter().enumerate() {
+        // SAFETY: within the 2nd mapped page.
+        if unsafe { ((base2 + PAGE + i as u64) as *const u8).read_volatile() } != *m {
+            ok = false;
+        }
+    }
+    if ok {
+        kprint(b"init: grow appended a block + persisted + verified ok\n");
+    } else {
+        kprint(b"init: grow MISMATCH\n");
+    }
+}
+
 /// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
 /// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
 /// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
@@ -974,6 +1070,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // fs-server-rw Part C: overwrite an existing file in place and confirm it persists.
     #[cfg(feature = "selftest")]
     overwrite_test(root_ns);
+    // fs-server-rw Part D: grow a file past EOF and confirm the appended data persists.
+    #[cfg(feature = "selftest")]
+    grow_test(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

@@ -165,7 +165,10 @@ fn record(entry: PartEntry) {
 /// init's root namespace is built (the supervisor). Read-only (`READ` + generic
 /// band) — uniform with `/dev/blk`.
 pub fn bind_partition_names(ns: &Namespace) {
-    let rights = Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    // READ + WRITE (the RW fs-server writes filesystem metadata to its partition) + the
+    // generic band (DUPLICATE lets it hand a device copy to the kernel for the data path).
+    let rights =
+        Rights::READ | Rights::WRITE | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     // Snapshot under the lock (clone refs + copy path bytes), then bind without
     // holding the registry lock across the namespace lock.
     let mut snapshot: KVec<(ObjectRef, KVec<u8>, Option<KVec<u8>>)> = KVec::new();

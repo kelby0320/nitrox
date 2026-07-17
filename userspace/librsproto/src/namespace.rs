@@ -14,6 +14,10 @@ pub const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
 /// not its bytes; no handle rides in `handles[0]` — the kernel builds the
 /// page-cache object itself, pointed back at this server.
 pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
+/// `RESOLVE_GROW` — grow the file to the `new_size` appended after the suffix (a `u32`)
+/// before replying its map. Combined with `RESOLVE_FILE_LAZY`. See
+/// [`parse_resolve_grow_size`]. `docs/architecture/ext4-fs-server-rw.md`.
+pub const RESOLVE_GROW: u32 = 1 << 2;
 
 // --- object_kind values (reply) ---------------------------------------------
 
@@ -88,6 +92,20 @@ pub fn parse_resolve_request(body: &[u8]) -> Option<ResolveRequest<'_>> {
         flags: get_u32(body, 8),
         suffix: &body[RESOLVE_REQUEST_PREFIX_LEN..end],
     })
+}
+
+/// For a `RESOLVE_GROW` request, the target `new_size` (a `u32` appended after the suffix),
+/// or `None` if the body is too short. See [`RESOLVE_GROW`].
+pub fn parse_resolve_grow_size(body: &[u8]) -> Option<u32> {
+    if body.len() < RESOLVE_REQUEST_PREFIX_LEN {
+        return None;
+    }
+    let suffix_len = get_u16(body, 12) as usize;
+    let off = RESOLVE_REQUEST_PREFIX_LEN.checked_add(suffix_len)?;
+    if body.len() < off + 4 {
+        return None;
+    }
+    Some(get_u32(body, off))
 }
 
 // --- Resolve reply (success) ------------------------------------------------
