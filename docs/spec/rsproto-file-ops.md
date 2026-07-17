@@ -16,8 +16,14 @@ with their consumers.
 | Category | Level | Role here |
 |---|---|---|
 | `Stream` (`0x02`) | byte, **cursor-based** | sequential read/write/seek; not used for page fills |
-| `Block` (`0x03`) | extent / block, fs-specific | **Model A** (extent query) — deferred to Phase 3 |
-| `File` (`0x06`) | byte, **positioned, stateless** | **Model B** page-cache fill (`ReadRange`) |
+| `Block` (`0x03`) | **device block runs**, fs-neutral | **Model A** page-cache path for **block** filesystems — [rsproto-block-ops.md](rsproto-block-ops.md) |
+| `File` (`0x06`) | byte, **positioned, stateless** | **Model B** page-cache fill (`ReadRange`) for **non-block** filesystems |
+
+Model A (block filesystems) and Model B (non-block) are complementary — one data path per
+filesystem class, not competing alternatives (see
+[filesystem-data-path.md](../architecture/filesystem-data-path.md)). This document specifies
+Model B (`ReadRange`); Model A's `MapRange`/`AllocRange` are in
+[rsproto-block-ops.md](rsproto-block-ops.md).
 
 ## The file-mapping flow (Model B)
 

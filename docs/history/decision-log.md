@@ -6599,3 +6599,31 @@ the resolve-reply channel-endpoint relaxation · C the logging service (resolve�
 channel, ingest, stamp, `Sink` + serial + ring) · D service-mgr resolves a per-service
 `system/<principal>` endpoint, routes stdio/log to it (retires the `sys_kprint` stub) · E
 client + self-registration demo.
+
+## 2026-07-17 — Model A (block) and Model B (non-block) are complementary, not competing
+
+Affirms and sharpens the 2026-06-25 "keep both" decision, prompted by the fs-server-ext4 RW
+slice (which adds Model A). The clarification: **Model A and Model B are not two options for
+the same job — they are one data path per filesystem class**, selected by whether the backing
+store has a device-block map, not by performance. (A mid-design-pass move to *retire* Model B
+was reconsidered for exactly this reason: it does not compete with A, it covers a class A
+cannot.)
+
+- **Model A — block filesystems (ext4, FAT32, …).** The file is a sequence of device blocks,
+  so the fs-server hands the kernel a `BlockRun` map and the kernel does file-data I/O — reads
+  and writes — zero-copy against the device; the fs-server is a metadata/allocation oracle
+  that never touches file data. For a block fs this strictly dominates shipping bytes, so
+  within the block world there is no A-vs-B choice — it is always A. The RW slice builds
+  Model A and converts ext4 (the one block fs today) from `ReadRange` to it.
+- **Model B — non-block filesystems (network / synthetic / transforming-overlay).** No
+  device-block map exists, so the server serves bytes (`File::ReadRange`) and the kernel
+  copies. Model A is not "slower" here, it is **impossible** (no LBAs to hand over). Model B
+  ships today and **stays**; it is the only path for this class.
+- No non-block fs-server exists yet, so Model B currently has no live consumer once ext4
+  converts — but it remains documented and in place, because the *next* fs-server might be
+  non-block, and it plugs into the same `FileObject` producer seam.
+
+Small *synthetic* content (`/dev/log`, `current-generation`) is served as an eager
+`MemoryObject` snapshot on resolve — a third, separate path, unaffected. Documented in
+`docs/architecture/filesystem-data-path.md` (both paths, framed by class) and
+`docs/architecture/ext4-fs-server-rw.md` (ext4's Model A realization).
