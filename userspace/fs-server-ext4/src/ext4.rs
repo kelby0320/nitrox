@@ -257,6 +257,84 @@ pub fn read_file_range<R: BlockReader>(
     Ok(want)
 }
 
+/// Map the logical block range `[start_block, start_block + count)` of the regular file at
+/// `path` to device block runs (the **Model A** data path), writing them into `out` and
+/// returning the run count. Runs coalesce contiguous mappings — and contiguous holes
+/// (`device_lba = 0`). The range is clamped to the file's block count; blocks past EOF are
+/// omitted. Bounded by `out.len()` (a short return means re-request from the first
+/// uncovered block). Errors as [`resolve_regular_file`] / `Io` / `Corrupt`.
+pub fn map_range<R: BlockReader>(
+    r: &R,
+    path: &[u8],
+    start_block: u64,
+    count: u64,
+    out: &mut [crate::BlockRun],
+) -> Result<usize, FsError> {
+    let sb = read_superblock(r)?;
+    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let bs = sb.block_size as u64;
+    let file_blocks = size.div_ceil(bs as usize) as u64;
+    let hdr = &inode[40..100];
+    let end = start_block.saturating_add(count).min(file_blocks);
+    let mut n = 0;
+    let mut lb = start_block;
+    while lb < end && n < out.len() {
+        let phys = extent_find(r, &sb, hdr, lb)?;
+        // Extend the run while the mapping stays contiguous (a hole extends over holes).
+        let mut len = 1u64;
+        while lb + len < end {
+            let next = extent_find(r, &sb, hdr, lb + len)?;
+            let contiguous = if phys == 0 { next == 0 } else { next == phys + len };
+            if !contiguous {
+                break;
+            }
+            len += 1;
+        }
+        out[n] = crate::BlockRun { file_block: lb, device_lba: phys, length: len as u32, flags: 0 };
+        n += 1;
+        lb += len;
+    }
+    Ok(n)
+}
+
+/// Resolve `path` to a regular file and map its **entire** block range to device runs (the
+/// **Model A** resolve): returns `(size, block_size, run_count)` with the runs in `out`.
+/// Coalesces contiguous runs. `Err(TooLarge)` if the file needs more runs than `out` holds
+/// (too fragmented to inline in a resolve reply — the standalone `MapRange` op handles that,
+/// deferred). Errors otherwise as [`resolve_regular_file`].
+pub fn map_file<R: BlockReader>(
+    r: &R,
+    path: &[u8],
+    out: &mut [crate::BlockRun],
+) -> Result<(usize, u32, usize), FsError> {
+    let sb = read_superblock(r)?;
+    let (inode, size) = resolve_regular_file(r, &sb, path)?;
+    let bs = sb.block_size;
+    let file_blocks = size.div_ceil(bs as usize) as u64;
+    let hdr = &inode[40..100];
+    let mut n = 0;
+    let mut lb = 0u64;
+    while lb < file_blocks {
+        if n >= out.len() {
+            return Err(FsError::TooLarge); // too fragmented to inline in the resolve reply
+        }
+        let phys = extent_find(r, &sb, hdr, lb)?;
+        let mut len = 1u64;
+        while lb + len < file_blocks {
+            let next = extent_find(r, &sb, hdr, lb + len)?;
+            let contiguous = if phys == 0 { next == 0 } else { next == phys + len };
+            if !contiguous {
+                break;
+            }
+            len += 1;
+        }
+        out[n] = crate::BlockRun { file_block: lb, device_lba: phys, length: len as u32, flags: 0 };
+        n += 1;
+        lb += len;
+    }
+    Ok((size, bs, n))
+}
+
 /// Resolve `path` (absolute) to a **regular file** and read its content into
 /// `out`, returning the file size. The file's content occupies `out[..size]`;
 /// the caller (the fs-server) sizes its `MemoryObject` to `size`. The eager

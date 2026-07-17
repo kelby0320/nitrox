@@ -51,6 +51,18 @@ pub enum FsError {
     TooLarge,
 }
 
+/// One contiguous mapping from a file's blocks to the device, for the **Model A** data
+/// path (`docs/architecture/filesystem-data-path.md`). `device_lba` is a **filesystem
+/// block** number (`0` = a hole → reads as zero); the kernel scales it to a byte offset by
+/// the filesystem block size. Mirrors the wire `BlockRun` (`docs/spec/rsproto-block-ops.md`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Default)]
+pub struct BlockRun {
+    pub file_block: u64,
+    pub device_lba: u64,
+    pub length: u32,
+    pub flags: u32,
+}
+
 // --- little-endian byte helpers (shared by the ext4 parser) -----------------
 
 pub(crate) fn rd_u16(b: &[u8], off: usize) -> u16 {
@@ -210,5 +222,45 @@ mod tests {
             .unwrap();
         assert_eq!(n, 2000);
         assert_eq!(&out[..n], &content[1500..3500]);
+    }
+
+    #[test]
+    fn map_range_maps_blocks_to_correct_device_data() {
+        use crate::BlockRun;
+        // A ~3.02-block file (4 KiB blocks) so runs span multiple blocks + a tail.
+        let mut content = std::vec::Vec::new();
+        for i in 0..(4096 * 3 + 100) {
+            content.push((i * 7 % 251) as u8);
+        }
+        let r = ImageReader(fixture(4096, &content));
+        let path = b"/system/current-generation";
+        let bs = 4096usize;
+        let file_blocks = content.len().div_ceil(bs) as u64; // 4
+
+        let mut runs = [BlockRun::default(); 16];
+        let n = ext4::map_range(&r, path, 0, file_blocks, &mut runs).unwrap();
+        assert!(n >= 1);
+
+        // Runs cover [0, file_blocks) contiguously in file-block space, none sparse.
+        let mut next_fb = 0u64;
+        for run in &runs[..n] {
+            assert_eq!(run.file_block, next_fb);
+            assert_ne!(run.device_lba, 0, "content is not sparse");
+            next_fb += run.length as u64;
+        }
+        assert_eq!(next_fb, file_blocks);
+
+        // Cross-check: each mapped device block holds the file's bytes for that block.
+        for run in &runs[..n] {
+            for k in 0..run.length as u64 {
+                let fb = run.file_block + k;
+                let dev_block = run.device_lba + k;
+                let mut dev = std::vec![0u8; bs];
+                r.read_at(dev_block * bs as u64, &mut dev).unwrap();
+                let mut want = std::vec![0u8; bs];
+                let got = ext4::read_file_range(&r, path, fb * bs as u64, bs, &mut want).unwrap();
+                assert_eq!(&dev[..got], &want[..got], "file block {fb} device data mismatch");
+            }
+        }
     }
 }

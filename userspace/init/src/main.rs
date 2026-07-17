@@ -318,7 +318,13 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             return false;
         }
     };
-    let (st, device) = ns_lookup_wait(root_ns, dev_path.as_bytes(), RIGHT_READ | RIGHT_TRANSFER);
+    // DUPLICATE so the fs-server can hand a device handle to the kernel for the Model A
+    // data path (zero-copy file-data IRPs) while keeping its own for metadata reads.
+    let (st, device) = ns_lookup_wait(
+        root_ns,
+        dev_path.as_bytes(),
+        RIGHT_READ | RIGHT_TRANSFER | RIGHT_DUPLICATE,
+    );
     if st != 0 || device == 0 {
         kprint(b"init: device ");
         kprint(dev_path.as_bytes());

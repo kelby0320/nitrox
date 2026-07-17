@@ -31,6 +31,11 @@ pub const OBJECT_KIND_FILE: u16 = 4;
 /// resolving server, not a file. Used by connect-style servers (the logging service
 /// resolves a log path to a per-principal write channel). `content_len` is unused.
 pub const OBJECT_KIND_CHANNEL: u16 = 5;
+/// A **Model A** (block-filesystem) lazy file: `content_len` is the file size, `handles[0]`
+/// transfers the block device, and the reply body carries the filesystem block size + the
+/// file's `BlockRun` map (see `docs/spec/rsproto-block-ops.md`). The kernel fills each page
+/// zero-copy from the device.
+pub const OBJECT_KIND_FILE_BLOCKS: u16 = 6;
 
 // --- Resolve request --------------------------------------------------------
 

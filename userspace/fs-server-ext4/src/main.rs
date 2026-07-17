@@ -316,7 +316,7 @@ fn send_reply(serve_end: u64, count: usize) {
 
 /// The serve loop: block for a forwarded `Namespace::Resolve`, resolve it, and
 /// reply. Never returns (the server runs until torn down).
-fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
+fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64, device: u64) -> ! {
     loop {
         // Block until a forwarded request lands in our inbox.
         // SAFETY: one waiter on the serving endpoint.
@@ -394,8 +394,28 @@ fn serve_loop<R: BlockReader>(reader: &R, serve_end: u64) -> ! {
                     stage_reply(elen, None)
                 }
             },
-            // A lazy resolve: a complete reply, no transferred handle.
-            Served::Lazy { reply_len } => stage_reply(reply_len, None),
+            // A Model A lazy resolve: transfer a READ|TRANSFER duplicate of the device
+            // handle (the kernel does the file-data I/O); keep our own for metadata reads.
+            Served::LazyBlocks { reply_len } => {
+                // SAFETY: `device` is our block-device handle (READ | TRANSFER | DUPLICATE).
+                let dup = unsafe {
+                    syscall2(SYS_HANDLE_DUPLICATE, device, RIGHT_READ | RIGHT_TRANSFER)
+                };
+                if dup < 0 {
+                    // Can't share the device — degrade to an error reply.
+                    // SAFETY: disjoint static; reply region as above.
+                    let elen = unsafe {
+                        let reply = core::slice::from_raw_parts_mut(
+                            ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+                            MSG_LEN - PAYLOAD_OFF,
+                        );
+                        encode_error(reply, request_id, KError::KernelError.as_i32(), served_op)
+                    };
+                    stage_reply(elen, None)
+                } else {
+                    stage_reply(reply_len, Some(dup as u64))
+                }
+            }
             Served::Error { reply_len } => stage_reply(reply_len, None),
         };
         send_reply(serve_end, count);
@@ -440,7 +460,7 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     kprint(b"fs-server: ready (ext4, read-only)\n");
 
     // 5. Serve forwarded Resolve requests forever.
-    serve_loop(&reader, serve_end);
+    serve_loop(&reader, serve_end, device);
 }
 
 #[panic_handler]

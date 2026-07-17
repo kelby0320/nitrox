@@ -49,6 +49,14 @@ Translate a range of a file's blocks to the device blocks that currently back it
 effects.** The kernel uses this to fill reads (Model A) and to locate existing blocks when
 flushing an overwrite.
 
+> **Initial map via the resolve reply.** For a freshly resolved file the kernel does not need
+> a separate `MapRange` round-trip: the Model A lazy resolve reply already returns the file
+> size, so it also carries the file's initial `BlockRun` map inline (and transfers the device
+> handle) — the same way it bundles the size instead of a separate `stat`. `MapRange` is the
+> op for **re-mapping** after the map changes (a file grown by `AllocRange`) or for a map too
+> large to inline. So the read-only page-cache fill path uses the resolve-delivered map;
+> `MapRange` earns its keep with writes and large files.
+
 ### Request body
 
 ```rust

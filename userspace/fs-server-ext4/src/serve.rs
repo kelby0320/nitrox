@@ -15,7 +15,7 @@ use crate::{BlockReader, FsError, ext4};
 use libkern::KError;
 use librsproto::file::{READ_RANGE_REPLY_LEN, parse_read_range_request, read_range_reply};
 use librsproto::namespace::{
-    OBJECT_KIND_FILE, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY, RESOLVE_REPLY_LEN,
+    OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ, RESOLVE_FILE_LAZY, RESOLVE_REPLY_LEN,
     parse_resolve_request, resolve_reply,
 };
 use librsproto::{
@@ -33,12 +33,19 @@ pub enum Served {
     /// read-only `MemoryObject` of `content[..content_len]` in `IpcMsg.handles[0]`.
     /// Both an eager resolve and a `ReadRange` fill produce this.
     File { reply_len: usize, content_len: usize },
-    /// Success with **no** transferred handle: `reply[..reply_len]`. A lazy resolve
-    /// (the reply carries the file size; the kernel builds the object itself).
-    Lazy { reply_len: usize },
+    /// A **Model A** lazy resolve: `reply[..reply_len]` carries the file size + block map;
+    /// the caller transfers a `READ | TRANSFER` **duplicate of the block-device handle** in
+    /// `IpcMsg.handles[0]` (the kernel does the file-data I/O). Keep the original device
+    /// handle for metadata reads.
+    LazyBlocks { reply_len: usize },
     /// An error reply (no handle transferred): `reply[..reply_len]`.
     Error { reply_len: usize },
 }
+
+/// Largest `BlockRun` map inlined in a Model A resolve reply. A file needing more runs is
+/// too fragmented to inline (→ `TooLarge`); the standalone `MapRange` op covers it (deferred).
+/// 64 runs = 1536 body bytes, comfortably inside the 4 KiB IPC payload.
+pub const MAX_RUNS: usize = 64;
 
 /// Serve one forwarded request: dispatch by op to [`serve_resolve`] (a
 /// `Namespace::Resolve`) or [`serve_read_range`] (a `File::ReadRange`). An
@@ -100,15 +107,20 @@ pub fn serve_resolve<R: BlockReader>(
     let path = &path_buf[..1 + req.suffix.len()];
 
     if req.flags & RESOLVE_FILE_LAZY != 0 {
-        // Lazy: stat the file (no content read), reply the size + OBJECT_KIND_FILE.
-        return match ext4::stat_file(reader, path) {
-            Ok(size) if size > u32::MAX as usize => {
+        // Model A lazy resolve: map the file's blocks to device runs, reply the size +
+        // block size + map (the kernel then does file-data I/O; the caller transfers the
+        // device handle).
+        let mut runs = [crate::BlockRun::default(); MAX_RUNS];
+        return match ext4::map_file(reader, path, &mut runs) {
+            Ok((size, _, _)) if size > u32::MAX as usize => {
                 error_reply(reply, request_id, KError::TooLarge, OP_NS_RESOLVE)
             }
-            Ok(size) => match lazy_reply(reply, request_id, size) {
-                Some(reply_len) => Served::Lazy { reply_len },
-                None => error_reply(reply, request_id, KError::KernelError, OP_NS_RESOLVE),
-            },
+            Ok((size, block_size, n)) => {
+                match model_a_reply(reply, request_id, size, block_size, &runs[..n]) {
+                    Some(reply_len) => Served::LazyBlocks { reply_len },
+                    None => error_reply(reply, request_id, KError::KernelError, OP_NS_RESOLVE),
+                }
+            }
             Err(e) => error_reply(reply, request_id, fs_error_to_kerror(e), OP_NS_RESOLVE),
         };
     }
@@ -177,13 +189,32 @@ fn success_reply(reply: &mut [u8], request_id: u64, content_len: usize) -> Optio
     encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..body_len], 1)
 }
 
-/// Build a lazy `ResolveReply` (object_kind `FILE`, `content_len` = the file size)
-/// into `reply` — **no** transferred handle (`handle_count = 0`); the kernel builds
-/// the page-cache object. `None` only if `reply` is too small.
-fn lazy_reply(reply: &mut [u8], request_id: u64, size: usize) -> Option<usize> {
-    let mut body = [0u8; RESOLVE_REPLY_LEN];
-    let body_len = resolve_reply(&mut body, OBJECT_KIND_FILE, size as u32)?;
-    encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..body_len], 0)
+/// Build a **Model A** lazy `ResolveReply` into `reply`: `OBJECT_KIND_FILE_BLOCKS` +
+/// `content_len` = file size, then `block_size` + the `BlockRun` map, with `handle_count = 1`
+/// (the caller transfers the device handle). Body layout matches `rsproto-block-ops.md` /
+/// the kernel's `file_blocks_reply_header`/`file_blocks_run`. `None` only if `reply` is too
+/// small.
+fn model_a_reply(
+    reply: &mut [u8],
+    request_id: u64,
+    size: usize,
+    block_size: u32,
+    runs: &[crate::BlockRun],
+) -> Option<usize> {
+    let mut body = [0u8; 16 + MAX_RUNS * 24];
+    // ResolveReply prefix (kind @0, _reserved @2, content_len @4) — 8 bytes.
+    resolve_reply(&mut body, OBJECT_KIND_FILE_BLOCKS, size as u32)?;
+    body[8..12].copy_from_slice(&block_size.to_le_bytes());
+    body[12..16].copy_from_slice(&(runs.len() as u32).to_le_bytes());
+    let mut off = 16;
+    for r in runs {
+        body[off..off + 8].copy_from_slice(&r.file_block.to_le_bytes());
+        body[off + 8..off + 16].copy_from_slice(&r.device_lba.to_le_bytes());
+        body[off + 16..off + 20].copy_from_slice(&r.length.to_le_bytes());
+        body[off + 20..off + 24].copy_from_slice(&r.flags.to_le_bytes());
+        off += 24;
+    }
+    encode(reply, OP_NS_RESOLVE, request_id, RS_FLAG_REPLY, &body[..off], 1)
 }
 
 /// Build a success `ReadRangeReply` (the `content_len` bytes ride in `handles[0]`)
@@ -367,24 +398,37 @@ mod tests {
     }
 
     #[test]
-    fn lazy_resolve_replies_file_kind_with_size_no_handle() {
-        let r = ImageReader(fixture(1024, b"nitrox-gen-0001\n")); // 16 bytes
+    fn lazy_resolve_replies_block_map_and_device_handle() {
+        use librsproto::namespace::OBJECT_KIND_FILE_BLOCKS;
+        let r = ImageReader(fixture(1024, b"nitrox-gen-0001\n")); // 16 bytes → 1 block
         let (req, req_len) = make_lazy_request(11, b"system/current-generation");
         let mut content = [0u8; ext4::MAX_FILE];
         let mut reply = [0u8; 4096];
 
         match serve(&r, &req[..req_len], &mut content, &mut reply) {
-            Served::Lazy { reply_len } => {
+            Served::LazyBlocks { reply_len } => {
                 let m = decode(&reply[..reply_len]).unwrap();
                 assert_eq!(m.op, OP_NS_RESOLVE);
                 assert_eq!(m.request_id, 11);
                 assert!(m.is_reply() && !m.is_error());
-                assert_eq!(m.handle_count, 0); // the kernel builds the object
-                let rr = parse_resolve_reply(m.body).unwrap();
-                assert_eq!(rr.object_kind, OBJECT_KIND_FILE);
+                assert_eq!(m.handle_count, 1); // the transferred device handle
+                let body = m.body;
+                let rr = parse_resolve_reply(body).unwrap();
+                assert_eq!(rr.object_kind, OBJECT_KIND_FILE_BLOCKS);
                 assert_eq!(rr.content_len, 16); // the file size
+                let block_size = u32::from_le_bytes(body[8..12].try_into().unwrap());
+                let run_count = u32::from_le_bytes(body[12..16].try_into().unwrap());
+                assert_eq!(block_size, 1024);
+                assert_eq!(run_count, 1);
+                // The single run covers file block 0, non-hole, length 1.
+                let file_block = u64::from_le_bytes(body[16..24].try_into().unwrap());
+                let device_lba = u64::from_le_bytes(body[24..32].try_into().unwrap());
+                let length = u32::from_le_bytes(body[32..36].try_into().unwrap());
+                assert_eq!(file_block, 0);
+                assert_eq!(length, 1);
+                assert_ne!(device_lba, 0);
             }
-            _ => panic!("expected a Lazy reply"),
+            _ => panic!("expected a LazyBlocks reply"),
         }
     }
 

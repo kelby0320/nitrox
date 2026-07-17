@@ -159,6 +159,68 @@ pub fn dispatch_block_irp(
     Ok(())
 }
 
+/// Dispatch a block IRP that transfers `length` bytes between device byte offset
+/// `dev_offset` and a **single physical `frame`** (a page-cache frame), completing `po`.
+/// Unlike [`dispatch_block_irp`] the DMA target is a raw frame, not a `MemoryObject` — the
+/// **Model A** page-cache fill (a disk read straight into the cache page, zero-copy). `pin`
+/// is an owning reference that keeps the frame's owner (the `FileObject`) alive for the
+/// IRP's lifetime — the box holds it in the `_buffer` slot. `length` must be `≤ PAGE_SIZE`.
+/// Returns `Err` only on allocation failure (the caller rolls back `po`).
+pub fn dispatch_block_irp_into_frame(
+    device: &ObjectRef,
+    frame: PhysAddr,
+    pin: ObjectRef,
+    po: &ObjectRef,
+    opcode: IoOpcode,
+    dev_offset: u64,
+    length: u64,
+) -> Result<(), KError> {
+    // SAFETY: `device` pins a live `DeviceNode` (type checked by the caller).
+    let dn: &DeviceNode = unsafe { &*(device.as_ptr() as *const DeviceNode) };
+    let backend = dn.block_backend().ok_or(KError::Unsupported)?;
+
+    // One page-sized fragment covering `[0, length)` of the single frame.
+    let frags = build_frags(&[frame], 0, length)?;
+
+    let op = match opcode {
+        IoOpcode::Read => IrpOp::Read,
+        IoOpcode::Write => IrpOp::Write,
+    };
+    let irp = Irp::new_block(
+        op,
+        device.as_ptr() as *const (),
+        dev_offset,
+        length,
+        IrpBuffer::NONE, // patched to point at `frags` after placement
+        po.as_ptr(),
+        0,
+    );
+    let bx = KBox::try_new(IrpBox {
+        irp,
+        frags,
+        _po: po.clone(),
+        _buffer: pin, // pins the frame owner (the FileObject), not a MemoryObject
+        _device: device.clone(),
+    })
+    .map_err(|_| KError::OutOfMemory)?;
+    let bx_ptr = KBox::into_raw(bx).as_ptr();
+
+    // SAFETY: `bx_ptr` is a freshly placed, uniquely-owned `IrpBox`; wire `irp.buffer` at
+    // the now-stable `frags`, arm the completion DPC at the box (irp is the first field).
+    let irp_ptr = unsafe {
+        let bx = &mut *bx_ptr;
+        bx.irp.buffer = IrpBuffer {
+            kind: IRP_BUF_FRAGS,
+            count: bx.frags.len() as u32,
+            frags: bx.frags.as_ptr() as u64,
+        };
+        bx.irp.dpc = Dpc::new(irp_complete_dpc, bx_ptr as *mut ());
+        &mut bx.irp as *mut Irp
+    };
+    (backend.submit)(irp_ptr, backend.ctx);
+    Ok(())
+}
+
 /// The IRP completion DPC: signal the request's `PendingOperation` with the
 /// IRP's terminal status (and bytes transferred), then reclaim the `IrpBox`
 /// (dropping its owning references). `ctx` is the `*mut IrpBox` (== `*mut Irp`).

@@ -2039,7 +2039,8 @@ fn complete_resolve_reply(
     payload_len: usize,
 ) -> SysResult {
     use crate::rsproto::{
-        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply,
+        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ,
+        ReplyKind, parse_reply,
     };
 
     // Parse the reply (recovers the `request_id` even on a malformed body).
@@ -2063,6 +2064,14 @@ fn complete_resolve_reply(
         // install it. `content_len` is the total file size.
         ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
             build_and_install_file(reg, &pl, content_len)
+        }
+        // A Model A (block-fs) lazy file: `handles[0]` is the device, and the body carries
+        // the block size + the initial `BlockRun` map. Build a page-cache object the kernel
+        // fills zero-copy from the device.
+        ReplyKind::Success { object_kind, content_len }
+            if object_kind == OBJECT_KIND_FILE_BLOCKS =>
+        {
+            build_and_install_file_blocks(&pl, content_len, &bounce.payload[..payload_len], transfers)
         }
         ReplyKind::Success { object_kind, .. }
             if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
@@ -2164,6 +2173,73 @@ fn build_and_install_file(
     // Grant `INSPECT` alongside the requested rights so a client can `sys_handle_stat`
     // the lazy file for its size before mapping (e.g. eshell `cat`) — `INSPECT` is a
     // generic right, benign on a handle the client already maps.
+    let rights = pl.requested | Rights::INSPECT;
+    match global::get().allocate(pl.owner_pid, op, ot, rights) {
+        Ok(h) => (0, h.bits()),
+        Err(e) => {
+            // SAFETY: `allocate` did not adopt the reference; reclaim it.
+            drop(unsafe { ObjectRef::from_raw(op, ot) });
+            (map_handle_err(e) as i32, 0)
+        }
+    }
+}
+
+/// Build + install a **Model A** (block-fs) lazy file from a resolve reply: adopt the
+/// transferred block `DeviceNode` (`handles[0]`), parse the block size + `BlockRun` map from
+/// the reply body, and construct a `FileObject` whose `FsServerBlocks` producer fills each
+/// page zero-copy from the device. `content_len` is the file size; `reply_msg` is the rsproto
+/// reply message (envelope + body). Returns `(0, handle)` or `(kerror, 0)`.
+fn build_and_install_file_blocks(
+    pl: &crate::object::userspace_server::PendingLookup,
+    content_len: u32,
+    reply_msg: &[u8],
+    transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
+) -> (i32, u64) {
+    use crate::libkern::KVec;
+    use crate::object::{BlockRun, FileObject, Producer};
+    use crate::rsproto::{file_blocks_reply_header, file_blocks_run, reply_body};
+
+    // The block device rides in handles[0].
+    let device = match transfers[0].take() {
+        Some(tr) if tr.obj.object_type() == KObjectType::DeviceNode => tr.obj,
+        Some(tr) => {
+            drop(tr.obj);
+            return (KError::Unsupported as i32, 0);
+        }
+        None => return (KError::InvalidArgument as i32, 0), // success but no device
+    };
+    // Parse the block size + BlockRun map from the reply body.
+    let Some(body) = reply_body(reply_msg) else {
+        return (KError::KernelError as i32, 0);
+    };
+    let Some((block_size, run_count)) = file_blocks_reply_header(body) else {
+        return (KError::KernelError as i32, 0);
+    };
+    let mut runs: KVec<BlockRun> = KVec::new();
+    if runs.try_reserve(run_count as usize).is_err() {
+        return (KError::OutOfMemory as i32, 0);
+    }
+    for i in 0..run_count as usize {
+        let Some((file_block, device_lba, length, flags)) = file_blocks_run(body, i) else {
+            return (KError::KernelError as i32, 0);
+        };
+        // `try_reserve` above guarantees this push does not allocate.
+        let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
+    }
+
+    let fobj = match FileObject::try_new(
+        content_len as usize,
+        Producer::FsServerBlocks { device, runs, block_size },
+    ) {
+        Ok(f) => f,
+        Err(_) => return (KError::OutOfMemory as i32, 0),
+    };
+    // SAFETY: `into_raw` yields the single creation reference; adopt it.
+    let fref = unsafe {
+        ObjectRef::from_raw(KBox::into_raw(fobj).as_ptr() as *mut (), KObjectType::FileObject)
+    };
+    let (op, ot) = fref.into_raw();
+    // Grant `INSPECT` alongside the requested rights (a `sys_handle_stat` before mapping).
     let rights = pl.requested | Rights::INSPECT;
     match global::get().allocate(pl.owner_pid, op, ot, rights) {
         Ok(h) => (0, h.bits()),
