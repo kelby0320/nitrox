@@ -2038,7 +2038,9 @@ fn complete_resolve_reply(
     pid: u32,
     payload_len: usize,
 ) -> SysResult {
-    use crate::rsproto::{OBJECT_KIND_FILE, OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply};
+    use crate::rsproto::{
+        OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_MEMOBJ, ReplyKind, parse_reply,
+    };
 
     // Parse the reply (recovers the `request_id` even on a malformed body).
     let reply = parse_reply(&bounce.payload[..payload_len]);
@@ -2062,20 +2064,24 @@ fn complete_resolve_reply(
         ReplyKind::Success { object_kind, content_len } if object_kind == OBJECT_KIND_FILE => {
             build_and_install_file(reg, &pl, content_len)
         }
-        ReplyKind::Success { object_kind, .. } if object_kind != OBJECT_KIND_MEMOBJ => {
+        ReplyKind::Success { object_kind, .. }
+            if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
+        {
             (KError::Unsupported as i32, 0)
         }
         ReplyKind::Success { .. } => match transfers[0].take() {
             None => (KError::InvalidArgument as i32, 0), // success but no handle
-            // The resolved object must be a readable file object. A `MemoryObject` is
-            // the fs-server's eager reply; a `FileObject` is a **re-exported** handle —
-            // an indirection server (e.g. the profile server) resolves a path onward
-            // and passes the resulting store `FileObject` straight through. Both install
+            // The resolved object is a capability the server hands back. A `MemoryObject`
+            // is the fs-server's eager reply; a `FileObject` is a **re-exported** handle
+            // (an indirection server like the profile server resolves onward and passes
+            // the store `FileObject` through); an `IpcChannel` is a live **connection** to
+            // the server (the "resolve a service path → get a channel to it" case, e.g. the
+            // logging service handing back a per-principal log channel). All install
             // identically below; other object types are not valid resolve results.
             Some(tr)
                 if !matches!(
                     tr.obj.object_type(),
-                    KObjectType::MemoryObject | KObjectType::FileObject
+                    KObjectType::MemoryObject | KObjectType::FileObject | KObjectType::IpcChannel
                 ) =>
             {
                 drop(tr.obj);

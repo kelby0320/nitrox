@@ -21,6 +21,7 @@
 
 pub mod error;
 pub mod file;
+pub mod log;
 pub mod meta;
 pub mod namespace;
 

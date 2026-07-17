@@ -50,6 +50,11 @@ pub const OBJECT_KIND_MEMOBJ: u16 = 1;
 /// size and `handles[0]` is empty; the kernel builds the page-cache object,
 /// pointed back at the server, and fills it on demand via `build_read_range_request`.
 pub const OBJECT_KIND_FILE: u16 = 4;
+/// Reply `object_kind`: `handles[0]` is a live `IpcChannel` endpoint — a connection to
+/// the resolving server, not a file. The general "resolve a service path → get a channel
+/// to it" case (the logging service's first use); the kernel installs the transferred
+/// endpoint like any other resolved handle. `content_len` is unused.
+pub const OBJECT_KIND_CHANNEL: u16 = 5;
 
 /// Fixed prefix of a `ResolveRequest` body (before the suffix bytes).
 const RESOLVE_REQUEST_PREFIX_LEN: usize = 16;
