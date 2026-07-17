@@ -149,15 +149,19 @@ fn get_u64(b: &[u8], off: usize) -> u64 {
 /// (allocate blocks + extend its extent tree) **before** replying its Model A map. Combined
 /// with `RESOLVE_FILE_LAZY`. For `sys_file_grow`. See `docs/architecture/ext4-fs-server-rw.md`.
 pub const RESOLVE_GROW: u32 = 1 << 2;
+/// `RESOLVE_CREATE` — create the file (in its parent directory) if it does not exist, before
+/// growing/mapping. Combined with `RESOLVE_GROW`. For `sys_file_create`.
+pub const RESOLVE_CREATE: u32 = 1 << 3;
 
-/// Like [`build_resolve_request`] but sets `RESOLVE_GROW` and appends `new_size` (a `u32`
-/// after the suffix): the server grows the file to `new_size` before replying its Model A
-/// map. `handle_count = 0`.
+/// Like [`build_resolve_request`] but sets `RESOLVE_GROW` (+ `RESOLVE_CREATE` if `create`)
+/// and appends `new_size` (a `u32` after the suffix): the server creates (if `create`) then
+/// grows the file to `new_size` before replying its Model A map. `handle_count = 0`.
 pub fn build_resolve_request_grow(
     out: &mut [u8],
     requested_rights: u64,
     suffix: &[u8],
     new_size: u32,
+    create: bool,
 ) -> Option<usize> {
     if suffix.len() > u16::MAX as usize {
         return None;
@@ -176,8 +180,13 @@ pub fn build_resolve_request_grow(
     put_u16(out, 24, 0);
     put_u16(out, 26, 0);
     let b = RS_HEADER_LEN;
+    let flags = if create {
+        RESOLVE_FILE_LAZY | RESOLVE_GROW | RESOLVE_CREATE
+    } else {
+        RESOLVE_FILE_LAZY | RESOLVE_GROW
+    };
     put_u64(out, b, requested_rights);
-    put_u32(out, b + 8, RESOLVE_FILE_LAZY | RESOLVE_GROW);
+    put_u32(out, b + 8, flags);
     put_u16(out, b + 12, suffix.len() as u16);
     put_u16(out, b + 14, 0);
     let s = b + RESOLVE_REQUEST_PREFIX_LEN;

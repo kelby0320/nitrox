@@ -1949,8 +1949,12 @@ transforming fs-servers, which have no LBA mapping.) See the decision log
   (on growth) but never touches file data.
 - [ ] Filesystem consistency on power loss (journal replay on mount) — deferred to its own
   slice (the fixtures are `^has_journal`; crash consistency is best-effort ordering today).
-- [ ] File creation (inode allocation + directory-entry insertion), extent-tree splitting,
-  truncate / delete / rename — deferred (Part E and beyond).
+- [x] File creation (inode allocation + directory-entry insertion) — Part E,
+  `ext4::create_file`, `e2fsck`-verified; triggered by create-on-resolve
+  (`RESOLVE_CREATE | RESOLVE_GROW` + `sys_file_create` = 33). Group 0 only; new-dir-block
+  growth on a full parent directory deferred.
+- [ ] Cross-group inode/block allocation, extent-tree splitting / index nodes,
+  truncate / delete / rename — deferred (beyond Part E).
 
 ### Milestone
 

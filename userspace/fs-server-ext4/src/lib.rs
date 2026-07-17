@@ -341,4 +341,39 @@ mod tests {
             String::from_utf8_lossy(&out.stdout)
         );
     }
+
+    #[test]
+    fn create_file_links_grows_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+
+        // Create a new regular file in /system.
+        let ino = ext4::create_file(&rw, b"/system", b"newfile").unwrap();
+        assert!(ino > 10, "should not reuse a reserved inode");
+        // It resolves and is empty.
+        assert_eq!(ext4::stat_file(&rw, b"/system/newfile"), Ok(0));
+        // Idempotent: creating again returns the same inode.
+        assert_eq!(ext4::create_file(&rw, b"/system", b"newfile"), Ok(ino));
+        // Grow + write path works on the freshly-created file.
+        assert_eq!(ext4::grow_file(&rw, b"/system/newfile", 100), Ok(100));
+        assert_eq!(ext4::stat_file(&rw, b"/system/newfile"), Ok(100));
+
+        // e2fsck the mutated image: the new inode, its dir entry, the bitmaps + counts, and
+        // the extent must all be consistent.
+        let img = rw.0.into_inner();
+        let dir = std::env::temp_dir().join(std::format!("nitrox-create-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, &img).unwrap();
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "e2fsck reported errors:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
 }

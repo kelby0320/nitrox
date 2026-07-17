@@ -81,6 +81,8 @@ pub const SYS_NS_ENUMERATE: u64 = 30;
 pub const SYS_FILE_SYNC: u64 = 31;
 /// `sys_file_grow` — resolve a file, growing it to a target size first.
 pub const SYS_FILE_GROW: u64 = 32;
+/// `sys_file_create` — create a file, grow it to a target size, then resolve.
+pub const SYS_FILE_CREATE: u64 = 33;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: end the QEMU run with a harness verdict (the argument's

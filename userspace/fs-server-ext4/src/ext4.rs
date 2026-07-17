@@ -21,6 +21,10 @@ const EXTENTS_FL: u32 = 0x0008_0000;
 const INLINE_DATA_FL: u32 = 0x1000_0000;
 const S_IFMT: u16 = 0xF000;
 const S_IFREG: u16 = 0x8000;
+/// `ext4_dir_entry_2.file_type` for a regular file.
+const EXT4_FT_REG_FILE: u8 = 1;
+/// A regular file's default mode: `S_IFREG | 0o644`.
+const REG_FILE_MODE: u16 = S_IFREG | 0o644;
 const S_IFDIR: u16 = 0x4000;
 
 /// The parsed superblock facts the reader (and the write path) need.
@@ -523,6 +527,139 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     let off = inode_offset(rw, &sb, ino)?;
     rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
     Ok(new_size)
+}
+
+/// Round `n` up to the 4-byte alignment ext4 directory entries use.
+fn round4(n: usize) -> usize {
+    (n + 3) & !3
+}
+
+/// Allocate one free inode from **group 0** (small fixtures keep everything there;
+/// cross-group is deferred, as with [`alloc_block`]). Sets the inode-bitmap bit and
+/// decrements the group-descriptor + superblock free-inode counts. Returns the inode
+/// number. `TooLarge` if group 0's inodes are exhausted.
+fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Result<u32, FsError> {
+    let bs = sb.block_size as usize;
+    let gd_off = sb.first_gdt_block * sb.block_size as u64; // group 0 descriptor
+    let mut gd = [0u8; 64];
+    let dsz = (sb.desc_size as usize).min(64);
+    rw.read_at(gd_off, &mut gd[..dsz])?;
+    let ibitmap_block = rd_u32(&gd, 4) as u64; // bg_inode_bitmap_lo
+
+    let mut bitmap = [0u8; MAX_BLOCK];
+    rw.read_at(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+    let idx = (0..sb.inodes_per_group as usize)
+        .find(|&i| bit_clear(&bitmap, i))
+        .ok_or(FsError::TooLarge)?;
+    bit_set(&mut bitmap, idx);
+    rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+
+    // Free-inode counts: group descriptor (bg_free_inodes_count_lo @14, u16) + superblock
+    // (s_free_inodes_count @16, u32).
+    let gfree = rd_u16(&gd, 14).wrapping_sub(1);
+    gd[14..16].copy_from_slice(&gfree.to_le_bytes());
+    rw.write_at(gd_off, &gd[..dsz])?;
+    let mut sbbuf = [0u8; 1024];
+    rw.read_at(1024, &mut sbbuf)?;
+    let sfree = rd_u32(&sbbuf, 16).wrapping_sub(1);
+    sbbuf[16..20].copy_from_slice(&sfree.to_le_bytes());
+    rw.write_at(1024, &sbbuf)?;
+
+    Ok(idx as u32 + 1) // inode numbers are 1-based; group 0
+}
+
+/// Insert a directory entry `(name → ino, file_type)` into directory `dir_inode` by
+/// splitting the slack of an existing entry (the last entry in a block carries the free
+/// tail as extra `rec_len`). `TooLarge` if no block has room (allocating a new directory
+/// block is deferred). Writes the modified block via the `BlockWriter`.
+fn dir_insert<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    dir_inode: &[u8; 256],
+    name: &[u8],
+    ino: u32,
+    file_type: u8,
+) -> Result<(), FsError> {
+    let bs = sb.block_size as usize;
+    let size = rd_u32(dir_inode, 4) as u64;
+    let nblocks = size.div_ceil(sb.block_size as u64);
+    let need = round4(8 + name.len());
+    let mut buf = [0u8; MAX_BLOCK];
+    for lb in 0..nblocks {
+        let phys = extent_find(rw, sb, &dir_inode[40..100], lb)?;
+        if phys == 0 {
+            continue;
+        }
+        rw.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        let mut off = 0;
+        while off + 8 <= bs {
+            let e_ino = rd_u32(&buf, off);
+            let rec_len = rd_u16(&buf, off + 4) as usize;
+            let e_name_len = buf[off + 6] as usize;
+            if rec_len < 8 || off + rec_len > bs {
+                break; // malformed / end of block
+            }
+            // Space this entry actually needs (0 for a deleted slot, `ino == 0`).
+            let used = if e_ino != 0 { round4(8 + e_name_len) } else { 0 };
+            if rec_len - used >= need {
+                let new_off = off + used;
+                let new_rec = rec_len - used;
+                if e_ino != 0 {
+                    buf[off + 4..off + 6].copy_from_slice(&(used as u16).to_le_bytes());
+                }
+                buf[new_off..new_off + 4].copy_from_slice(&ino.to_le_bytes());
+                buf[new_off + 4..new_off + 6].copy_from_slice(&(new_rec as u16).to_le_bytes());
+                buf[new_off + 6] = name.len() as u8;
+                buf[new_off + 7] = file_type;
+                buf[new_off + 8..new_off + 8 + name.len()].copy_from_slice(name);
+                rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
+                return Ok(());
+            }
+            off += rec_len;
+        }
+    }
+    Err(FsError::TooLarge) // no room; new directory block allocation is deferred
+}
+
+/// Create an empty regular file `name` in the directory at `parent_path`: allocate + init
+/// an inode (regular, empty extent tree, size 0) and link it into the parent directory.
+/// Idempotent — if `name` already exists, returns its inode. The caller grows + writes the
+/// file afterwards (metadata-only here). `NotFound` if the parent is not a directory.
+/// Depth-0 dirs with slack only (a new directory block is deferred). See
+/// `docs/architecture/ext4-fs-server-rw.md`.
+pub fn create_file<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    parent_path: &[u8],
+    name: &[u8],
+) -> Result<u32, FsError> {
+    if name.is_empty() || name.len() > 255 || name.contains(&b'/') {
+        return Err(FsError::Unsupported);
+    }
+    let sb = read_superblock(rw)?;
+    let (_, parent_inode) = resolve_path_ino(rw, &sb, parent_path)?;
+    if rd_u16(&parent_inode, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    if let Ok(existing) = dir_lookup(rw, &sb, &parent_inode, name) {
+        return Ok(existing); // already exists — idempotent
+    }
+
+    let ino = alloc_inode(rw, &sb)?;
+    // Initialise the new inode: regular file, one link, empty depth-0 extent tree, size 0.
+    let mut inode = [0u8; 256];
+    inode[0..2].copy_from_slice(&REG_FILE_MODE.to_le_bytes()); // i_mode
+    inode[26..28].copy_from_slice(&1u16.to_le_bytes()); // i_links_count
+    inode[32..36].copy_from_slice(&EXTENTS_FL.to_le_bytes()); // i_flags
+    // Extent header at i_block (offset 40): magic, 0 entries, max 4, depth 0.
+    inode[40..42].copy_from_slice(&EXTENT_MAGIC.to_le_bytes());
+    inode[44..46].copy_from_slice(&4u16.to_le_bytes()); // eh_max = (60 - 12) / 12
+    let off = inode_offset(rw, &sb, ino)?;
+    rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
+
+    // Link it into the parent directory. (On failure the inode is allocated-but-unlinked;
+    // acceptable for slice-1 fixtures, which always have directory slack.)
+    dir_insert(rw, &sb, &parent_inode, name, ino, EXT4_FT_REG_FILE)?;
+    Ok(ino)
 }
 
 /// Resolve `path` (absolute) to a **regular file** and read its content into

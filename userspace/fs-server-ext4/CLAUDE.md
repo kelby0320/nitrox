@@ -37,26 +37,29 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   a-time into a scratch `MemoryObject`; writes are read-modify-write per sector), the
   bootstrap (recv the **read-write** device handle via the setup message; forwarding
   channel; `Meta::Ready`), and the serve loop — a Model A lazy resolve replies the file's
-  `BlockRun` map + transfers a device handle, and a `RESOLVE_GROW` request grows the file
-  (`maybe_grow` → `grow_file`) before mapping. **Alloc-free** — fixed `.bss` buffers, no
-  `#[global_allocator]`.
+  `BlockRun` map + transfers a device handle, a `RESOLVE_GROW` request grows the file
+  (`maybe_grow` → `grow_file`), and a `RESOLVE_CREATE` request first creates it
+  (`maybe_grow` → `create_file`, splitting the suffix into parent-dir + leaf name) before
+  mapping. **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
 
 ## Scope
 
 Implements: superblock (`0xEF53`), block-group descriptors, inodes, the **extent
-tree** (`0xF30A`, walk + in-place extend), a linear `ext4_dir_entry_2` directory walk,
-path resolution to a regular file, block-bitmap allocation + free-count updates, and
+tree** (`0xF30A`, walk + in-place extend), a linear `ext4_dir_entry_2` directory walk
++ **insert** (split an entry's slack), path resolution to a regular file, block-bitmap
+allocation + free-count updates, **inode-bitmap allocation** (new-file creation), and
 file growth. **Reject / skip** (return `FsError::Unsupported`/`Corrupt`): the journal,
 bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, ACLs,
 symlinks, checksums. htree directories need no special handling (the linear walk is
 backward-compatible).
 
 **Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`): extent-tree
-splitting / index nodes (depth > 0), cross-group allocation, truncate / delete / rename,
-inode allocation + directory-entry insertion (new-file creation), `metadata_csum`
-checksums, and jbd2 journaling + replay (the fixtures are `^has_journal`). Overwrite is
-data-only (no metadata change) and is the kernel's writeback; the server allocates on
-growth but never touches file data (Model A).
+splitting / index nodes (depth > 0), cross-group inode/block allocation (creation is
+**group 0 only**), new-directory-block growth on a full parent directory (yields
+`TooLarge`), truncate / delete / rename, `metadata_csum` checksums, and jbd2 journaling +
+replay (the fixtures are `^has_journal`). Overwrite is data-only (no metadata change) and
+is the kernel's writeback; the server allocates on growth + creation but never touches file
+data (Model A).
 
 ## Capability discipline
 

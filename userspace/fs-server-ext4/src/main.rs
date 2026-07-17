@@ -32,7 +32,9 @@ use core::arch::asm;
 use fs_server_ext4::serve::{MAX_SUFFIX, Served, encode_error, serve};
 use fs_server_ext4::{BlockReader, BlockWriter, FsError, ext4};
 use librsproto::OP_NS_RESOLVE;
-use librsproto::namespace::{RESOLVE_GROW, parse_resolve_grow_size, parse_resolve_request};
+use librsproto::namespace::{
+    RESOLVE_CREATE, RESOLVE_GROW, parse_resolve_grow_size, parse_resolve_request,
+};
 use libkern::*;
 
 /// One page; the scratch buffer + memory-object granularity.
@@ -372,8 +374,10 @@ fn send_reply(serve_end: u64, count: usize) {
 /// The serve loop: block for a forwarded `Namespace::Resolve`, resolve it, and
 /// reply. Never returns (the server runs until torn down).
 /// If `req` is a `RESOLVE_GROW` resolve, grow the named file to the requested size (the
-/// write path's ext4 metadata mutation). Best-effort — any parse / grow error is ignored and
-/// the subsequent `serve` maps the file at its current size (the reply reflects that).
+/// write path's ext4 metadata mutation); if it also carries `RESOLVE_CREATE`, create the
+/// file first (allocate an inode + insert a directory entry in the parent). Best-effort —
+/// any parse / create / grow error is ignored and the subsequent `serve` maps the file at
+/// its current size (the reply reflects that, so a failed create surfaces as `NotFound`).
 fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
     let Ok(m) = librsproto::decode(req) else {
         return;
@@ -393,7 +397,20 @@ fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
     let mut path = [0u8; MAX_SUFFIX + 1];
     path[0] = b'/';
     path[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
-    let _ = ext4::grow_file(reader, &path[..1 + r.suffix.len()], new_size as usize);
+    let path = &path[..1 + r.suffix.len()];
+
+    // Create-on-resolve: split the absolute path into parent dir + leaf name at the last
+    // `/`, then allocate the inode + link it into the parent. Idempotent (existing file →
+    // its inode), so a re-resolve of an already-created file is harmless.
+    if r.flags & RESOLVE_CREATE != 0 {
+        if let Some(slash) = path.iter().rposition(|&b| b == b'/') {
+            let parent = if slash == 0 { &b"/"[..] } else { &path[..slash] };
+            let name = &path[slash + 1..];
+            let _ = ext4::create_file(reader, parent, name);
+        }
+    }
+
+    let _ = ext4::grow_file(reader, path, new_size as usize);
 }
 
 fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: u64) -> ! {

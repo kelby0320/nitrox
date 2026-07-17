@@ -84,14 +84,23 @@ Each part builds on proven machinery and is independently verifiable.
   inode size/block-count) — **`e2fsck`-verified**. Triggered by grow-on-resolve
   (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the
   client writes the new region + syncs. The fs-server now holds a read-write device handle.
-- **Part E — file creation** — inode allocation (inode bitmap) + directory-entry insertion.
-  Not yet built.
+- **Part E — file creation** ✅. `create_file` (inode allocation via the inode bitmap +
+  `ext4_dir_entry_2` insertion by splitting an existing entry's slack in the parent
+  directory, then inode init as an extents regular file) — **`e2fsck`-verified**. Triggered
+  by create-on-resolve (`RESOLVE_CREATE | RESOLVE_GROW` + `sys_file_create`): the server
+  creates the file (idempotent — an existing name returns its inode), grows it to the
+  requested size, then replies its map; the client writes + syncs, and a subsequent plain
+  `sys_ns_lookup` of the new path resolves (proving the directory entry is on disk).
+  **Group 0 only** for now (cross-group inode/block allocation deferred), and directory
+  growth (a new dir block when the last block has no slack) is deferred — a full parent
+  directory yields `TooLarge`.
 
-**Deferred**: file creation (Part E); extent-tree splitting / index nodes (depth > 0);
-cross-group allocation; jbd2 journaling + replay-on-mount (needs `has_journal` fixtures);
-`metadata_csum` checksums; a periodic writeback daemon; per-page dirty tracking;
-truncate / delete / rename; read-ahead / clustered fill; the standalone `MapRange`/`AllocRange`
-ops (the resolve reply carries the map today); the fs-server open-file cookie.
+**Deferred**: cross-group inode/block allocation; new-directory-block growth on a full
+parent directory; extent-tree splitting / index nodes (depth > 0); jbd2 journaling +
+replay-on-mount (needs `has_journal` fixtures); `metadata_csum` checksums; a periodic
+writeback daemon; per-page dirty tracking; truncate / delete / rename; read-ahead /
+clustered fill; the standalone `MapRange`/`AllocRange` ops (the resolve reply carries the
+map today); the fs-server open-file cookie.
 
 ## Verification
 

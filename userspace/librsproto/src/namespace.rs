@@ -18,6 +18,11 @@ pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 /// before replying its map. Combined with `RESOLVE_FILE_LAZY`. See
 /// [`parse_resolve_grow_size`]. `docs/architecture/ext4-fs-server-rw.md`.
 pub const RESOLVE_GROW: u32 = 1 << 2;
+/// `RESOLVE_CREATE` — create the file (allocate an inode + insert a directory entry in
+/// the parent) if it does not exist, before growing/mapping it. Combined with
+/// `RESOLVE_FILE_LAZY | RESOLVE_GROW`; the `new_size` rides after the suffix as for
+/// [`RESOLVE_GROW`]. `docs/architecture/ext4-fs-server-rw.md`.
+pub const RESOLVE_CREATE: u32 = 1 << 3;
 
 // --- object_kind values (reply) ---------------------------------------------
 
