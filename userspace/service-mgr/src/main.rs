@@ -214,6 +214,31 @@ fn create_control_channel() -> Option<(u64, u64)> {
     Some((a, b))
 }
 
+/// Hand the resolved log endpoint to a service over its control endpoint, **transferring**
+/// it (the service receives it as its first control message — a message with one moved
+/// handle and no payload). After this, `log_ep` has moved to the service, or is closed if
+/// the transfer failed.
+fn send_log_handoff(ctrl: u64, log_ep: u64) {
+    // SAFETY: SEND_MSG/SEND_HANDLES are valid buffers; transfer one handle, empty payload.
+    let sr = unsafe {
+        (&raw mut SEND_MSG.header.payload_len).write(0);
+        SEND_HANDLES[0] = log_ep;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ctrl,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        // The transfer failed; the handle did not move — reclaim it.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
+    }
+}
+
 /// Send a control opcode to a service over its control endpoint (`ctrl`). No handles,
 /// non-blocking (the control ring is otherwise idle).
 fn send_control(ctrl: u64, op: u8) {
@@ -315,24 +340,17 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     kprint(b"service-mgr: starting service '");
     kprint(decl.name.as_bytes());
     kprint(b"'\n");
-    // SAFETY: SPAWN_SERVICE is a valid writable arg block. Moved handles, in child
-    // register order: `handles[0]` = control endpoint (RECV + WAIT — it receives
-    // commands) at `rdx`; `handles[1]` = log endpoint (SEND) at `rcx`. The log slot is
-    // only used when the control slot is present, so positions stay fixed.
+    // SAFETY: SPAWN_SERVICE is a valid writable arg block. Move the control endpoint into
+    // the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
+    // register, so the log endpoint is handed over the control channel after spawn (below),
+    // mirroring init's device handoff to an fs-server.
     let h = unsafe {
         SPAWN_SERVICE.image = image;
         if svc_end != 0 {
             SPAWN_SERVICE.handles[0] = svc_end;
+            SPAWN_SERVICE.handle_count = 1;
+            SPAWN_SERVICE.move_mask = 1;
             SPAWN_SERVICE.rights[0] = RIGHT_RECV | RIGHT_WAIT;
-            if log_ep != 0 {
-                SPAWN_SERVICE.handles[1] = log_ep;
-                SPAWN_SERVICE.rights[1] = RIGHT_SEND;
-                SPAWN_SERVICE.handle_count = 2;
-                SPAWN_SERVICE.move_mask = 0b11;
-            } else {
-                SPAWN_SERVICE.handle_count = 1;
-                SPAWN_SERVICE.move_mask = 0b1;
-            }
         } else {
             SPAWN_SERVICE.handle_count = 0;
             SPAWN_SERVICE.move_mask = 0;
@@ -344,7 +362,7 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
         kprint(b"service-mgr: spawn FAIL\n");
-        // The service + log endpoints were not moved (spawn failed) — close them.
+        // Nothing was moved (spawn failed) — close the control ends + the log endpoint.
         // SAFETY: closing our own handles (0 is ignored by the kernel).
         unsafe {
             if smgr_end != 0 {
@@ -356,6 +374,18 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
             }
         }
         return (h, 0);
+    }
+    // Hand the log endpoint to the service over its control channel (an IPC transfer —
+    // the child receives it as its first control message). service-mgr thus vouches the
+    // identity (it resolved `system/<name>`) without the child ever naming itself.
+    if log_ep != 0 {
+        if smgr_end != 0 {
+            send_log_handoff(smgr_end, log_ep);
+        } else {
+            // No control channel to hand it over — drop it.
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, log_ep) };
+        }
     }
     // `svc_end` has moved to the child; retain `smgr_end` as the control endpoint.
     (h, smgr_end)

@@ -29,6 +29,7 @@ name = "heartbeat"
 version = "0.1.0"
 dependencies = [
  "libkern",
+ "liblog",
 ]
 
 [[package]]
@@ -57,6 +58,14 @@ dependencies = [
 [[package]]
 name = "libkern"
 version = "0.1.0"
+
+[[package]]
+name = "liblog"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
 
 [[package]]
 name = "libos"

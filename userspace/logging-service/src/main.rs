@@ -62,6 +62,9 @@ struct Source {
     handle: u64,
     principal: String,
     tier: u8,
+    /// A named-source sub-label from the resolve path (`<principal>/<label>`), stamped on
+    /// every record on this channel unless the record carries its own `source`.
+    label: Option<String>,
 }
 
 /// A stamped log record. The trusted fields (`principal`/`tier`/`timestamp`/`sequence`)
@@ -303,7 +306,8 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>) {
                 Some(r) => match core::str::from_utf8(r.suffix).ok().and_then(path::classify) {
                     Some(c) => {
                         // Owned copies before we touch the shared buffers again.
-                        (m.op, m.request_id, Some((c.tier, String::from(c.principal))))
+                        let label = c.source.map(String::from);
+                        (m.op, m.request_id, Some((c.tier, String::from(c.principal), label)))
                     }
                     None => {
                         reply_error(serve_end, m.request_id, m.op, KError::NotFound.as_i32());
@@ -323,7 +327,7 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>) {
         }
     };
     let _ = op;
-    let (tier, principal) = match req_ok {
+    let (tier, principal, label) = match req_ok {
         Some(v) => v,
         None => return,
     };
@@ -343,8 +347,16 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>) {
     };
     // Transfer the write end to the resolving client; keep the read end tagged.
     if reply_channel(serve_end, request_id, write_end) {
-        kprint(format!("logging-service: opened {}/{}\n", tier_name(tier), principal).as_bytes());
-        sources.push(Source { handle: read_end, principal, tier });
+        match &label {
+            Some(l) => kprint(
+                format!("logging-service: opened {}/{}/{}\n", tier_name(tier), principal, l)
+                    .as_bytes(),
+            ),
+            None => {
+                kprint(format!("logging-service: opened {}/{}\n", tier_name(tier), principal).as_bytes())
+            }
+        }
+        sources.push(Source { handle: read_end, principal, tier, label });
     } else {
         // Reply failed (the write end did not move): reclaim both ends.
         // SAFETY: closing our own handles.
@@ -358,8 +370,8 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>) {
 /// Drain and stamp every queued `LogRecord` on the source channel `h`, routing each to
 /// the sinks. `seq` is the global monotonic sequence counter.
 fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &mut u64) {
-    let (principal, tier) = match sources.iter().find(|s| s.handle == h) {
-        Some(s) => (s.principal.clone(), s.tier),
+    let (principal, tier, chan_label) = match sources.iter().find(|s| s.handle == h) {
+        Some(s) => (s.principal.clone(), s.tier, s.label.clone()),
         None => return, // unknown handle (shouldn't happen)
     };
     loop {
@@ -388,9 +400,11 @@ fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &m
             sequence: *seq,
             level: la.level,
             message: String::from(core::str::from_utf8(la.message).unwrap_or("<non-utf8>")),
+            // A record's own `source` wins; otherwise the channel's named-source label.
             source: la
                 .source
-                .map(|s| String::from(core::str::from_utf8(s).unwrap_or("?"))),
+                .map(|s| String::from(core::str::from_utf8(s).unwrap_or("?")))
+                .or_else(|| chan_label.clone()),
         };
         for sink in sinks.iter_mut() {
             sink.write(&rec);
