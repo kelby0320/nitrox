@@ -343,6 +343,7 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>) {
     };
     // Transfer the write end to the resolving client; keep the read end tagged.
     if reply_channel(serve_end, request_id, write_end) {
+        kprint(format!("logging-service: opened {}/{}\n", tier_name(tier), principal).as_bytes());
         sources.push(Source { handle: read_end, principal, tier });
     } else {
         // Reply failed (the write end did not move): reclaim both ends.
