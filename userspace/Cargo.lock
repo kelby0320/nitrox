@@ -37,8 +37,10 @@ dependencies = [
 name = "heartbeat"
 version = "0.1.0"
 dependencies = [
+ "libheap",
  "libkern",
  "liblog",
+ "libstream",
 ]
 
 [[package]]
@@ -102,6 +104,7 @@ dependencies = [
  "libheap",
  "libkern",
  "librsproto",
+ "libstream",
 ]
 
 [[package]]

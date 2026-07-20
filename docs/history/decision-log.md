@@ -7036,3 +7036,44 @@ Stepping-stone path (each a real milestone):
 - ⟂ parallel / consumer-driven: the full std cluster (with portable apps / the browser)
 
 **Subsequent north stars**, reusing the compositor + toolkit: **the browser** — favor a hybrid reusing pure-Rust Servo crates (html5ever, cssparser, selectors) + a pure-Rust JS engine (Boa) over porting full Servo (SpiderMonkey/C/GPU weight); **networking** (NIC → TCP/IP → socket-as-namespace → rustls → DHCP/DNS); the **package-management + sysadmin layer**. USB is real-hardware-input-driven (QEMU gives PS/2), so it trails the QEMU-first loop.
+
+---
+
+## 2026-07-20 — libstream: typed structured streams (TSM1), and the typed-log demo
+
+Closes Phase 3 milestone **clause 2** ("a service-mgr-spawned program produces typed,
+TableWriter-based output to its log channel"). Built as `userspace/libstream` over four
+parts; the wire core is `core + alloc`, zero-dependency, host-tested like `libcrypto`.
+
+- **Part A — TSM1 wire layer** (`wire.rs`): pinned the `TypeTag` byte values the spec left
+  "to libstream" (`0x00`..`0x09`) + the header/schema/value/terminator/error encodings, over
+  transport-agnostic `ByteSink`/`ByteSource` seams. v1 is **flat records** (scalars +
+  `String`/`Bytes`/`Handle`); `List`/`Record` (nested) reserve their tags.
+- **Part B — `TableWriter` / `TableReader`** (`table.rs`): schema → rows → terminator, with
+  row/schema validation; `Item::{Row,Error,End}` iteration; `write_text_fallback` (the
+  Unix-floor wrapper). Added `SliceSink` (encode into a caller-owned `IpcMsg` body — the
+  transport primitive; the program does the `sys_channel_send`), keeping libstream
+  dependency-free rather than pulling in `libkern`.
+- **Part C — `TypedRecord`** (`record.rs`): map a Rust struct to a schema + rows
+  (`schema`/`to_values`/`from_values`), with `write_schema_for::<T>`/`write_record`/`read_record`.
+  Implemented by hand in v1; `#[derive(TypedRecord)]` is a deferred follow-on (its
+  proc-macro-vs-hand-rolled choice is the project's first external-userspace-dep question).
+- **Part D — the demo**: converted the existing **`heartbeat`** service (rather than adding a
+  throwaway) to emit typed beat rows `{seq, uptime_ns, healthy}` via `TableWriter` +
+  `SliceSink` on its log channel; it keeps its "up" status + `worker` self-registration source
+  on `liblog` text `LogRecord`s, so **both** log paths stay exercised. The **logging service**
+  now routes by leading magic: `TSM1` → decode + render via `TableReader` (a `name=value` line
+  per row, stamped `.typed`); anything else → `parse_append`. heartbeat gains `alloc`
+  (libheap); the no-alloc-leaf path stays covered by init/eshell/usersh, and the `LogRecord`
+  path stays host-tested.
+
+Terminology clarified in the spec (`typed-stream-format.md`): **`TypedRecord`** (the Rust
+trait) vs. **data record** (a row, wire tag `0x01`) vs. **`Record`** (the nested-struct
+`TypeTag`); and the `WireValue`/`TypedRecord` split (so `Vec<V: WireValue>` → `List`
+uniformly), correcting the spec's `Vec<T: TypedRecord>`.
+
+**Verified**: 19 libstream host tests + the full suite green; `test-qemu` **5/5** with the
+typed beat reliably decoded + rendered before the verdict (an immediate first beat sends
+alongside the startup logs the logging service drains, so it doesn't lose the race to
+session-mgr's `SYS_TEST_EXIT`). The typed demonstration is grep-verifiable boot output, not
+verdict-gated. Phase 3's remaining gate is **clause 3** (a `/proc` scheduler-stats surface).

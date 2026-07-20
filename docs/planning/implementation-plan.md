@@ -2022,7 +2022,11 @@ exhaustive service catalogue. That machinery is done; a representative service s
 supervised. DoD is the four milestone clauses above — **two are met** (supervised services;
 login → per-user namespace → home write) and **two remain, and are the only gating work:**
 
-- [ ] **libstream + a service-mgr-driven typed-log demo** (clause 2 — the last open runtime lib).
+- [x] **libstream + a service-mgr-driven typed-log demo** (clause 2 — the last open runtime lib).
+  **Done (2026-07-20).** `libstream` (TSM1 wire codec, `TableWriter`/`TableReader`,
+  `TypedRecord`); `heartbeat` emits typed beat rows `{seq, uptime_ns, healthy}` to its log
+  channel; the logging service detects the `TSM1` magic and renders the decoded table (text
+  `LogRecord`s still route to `parse_append`). See the decision log (2026-07-20 "libstream").
 - [ ] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
   `MemoryObject` snapshot* primitive (also unblocks numeric `/proc/self/status`).
 

@@ -7,6 +7,9 @@ edition = "2024"
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
 librsproto = { path = "../librsproto" }
+# Typed-stream (TSM1) log messages are decoded + rendered via libstream; text
+# LogRecord messages still go through librsproto::log::parse_append.
+libstream = { path = "../libstream" }
 
 # A library + binary split (mirroring profile-server): the library holds the
 # host-testable log-path classifier; the binary is the bare-target resource

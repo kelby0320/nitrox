@@ -6,6 +6,11 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 liblog = { path = "../liblog" }
+# Typed beats go out via libstream (needs alloc → libheap as the global allocator).
+# The text "up" status + the `worker` self-registration source still use liblog, so
+# both the typed (TSM1) and text (LogRecord) log paths are exercised on-target.
+libheap = { path = "../libheap" }
+libstream = { path = "../libstream" }
 
 [[bin]]
 name = "heartbeat"
