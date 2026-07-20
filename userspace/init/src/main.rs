@@ -407,6 +407,33 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             endpoint,
         )
     };
+    // auth+session Part B smoke test (selftest): bind the *same* fs endpoint a second
+    // time as a **subtree** scoped to `/system` at `/subtreetest`, so a later lookup of
+    // `/subtreetest/current-generation` forwards `system/current-generation` to the
+    // server. This shares the server's registration (bind-mount semantics) — the kernel
+    // reuses it rather than minting a rival that would hijack replies. `sys_ns_bind`
+    // holds its own reference, so `endpoint` stays valid for the close below. Root mount
+    // only (it owns `/system`).
+    #[cfg(feature = "selftest")]
+    if m.mount_point.as_bytes() == b"/" {
+        let sub = b"/subtreetest";
+        let base = b"/system";
+        // SAFETY: valid namespace handle, path/base pointers, and endpoint handle.
+        let r = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                root_ns,
+                sub.as_ptr() as u64,
+                sub.len() as u64,
+                endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if r != 0 {
+            kprint(b"init: subtree test bind FAIL\n");
+        }
+    }
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     if br != 0 {
         kprint(b"init: bind FAIL at ");
@@ -918,6 +945,58 @@ fn create_test(root_ns: u64) {
     }
 }
 
+/// auth+session Part B milestone (selftest): prove **subtree-scoped namespace
+/// binding** end to end. `mount_one` bound the fs endpoint a second time at
+/// `/subtreetest` scoped to base `/system` (sharing the server's registration), so a
+/// lookup of `/subtreetest/current-generation` must forward `system/current-generation`
+/// to the server and resolve to the *same* file as `/system/current-generation`. Read
+/// the leading bytes of both and confirm they match — the kernel prepended the base to
+/// the forwarded suffix, and the shared registration routed both replies correctly.
+#[cfg(feature = "selftest")]
+fn subtree_bind_test(root_ns: u64) {
+    // Resolve + map the first page of `path` read-only; returns its address or 0.
+    fn map_first_page(root_ns: u64, path: &[u8]) -> u64 {
+        let (st, fh) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+        if st != 0 || fh == 0 {
+            return 0;
+        }
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ) };
+        // The mapping pins its own reference to the object; close the handle.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        if addr < 0 { 0 } else { addr as u64 }
+    }
+
+    let direct = map_first_page(root_ns, b"/system/current-generation");
+    let via_sub = map_first_page(root_ns, b"/subtreetest/current-generation");
+    if direct == 0 || via_sub == 0 {
+        kprint(b"init: subtree resolve FAIL\n");
+        return;
+    }
+    // Compare the leading bytes (the file is a short text line; the page tail is
+    // zero-padded, so the head suffices).
+    let mut same = true;
+    for i in 0..64u64 {
+        // SAFETY: both addresses map a full page; `i < 64 < PAGE`.
+        let a = unsafe { ((direct + i) as *const u8).read_volatile() };
+        let b = unsafe { ((via_sub + i) as *const u8).read_volatile() };
+        if a != b {
+            same = false;
+            break;
+        }
+    }
+    // SAFETY: unmap our two mappings (init runs forever — don't leak).
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, direct, PAGE);
+        syscall2(SYS_MEMORY_UNMAP, via_sub, PAGE);
+    }
+    if same {
+        kprint(b"init: subtree bind (/subtreetest -> /system) resolves + matches ok\n");
+    } else {
+        kprint(b"init: subtree bind MISMATCH\n");
+    }
+}
+
 /// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
 /// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
 /// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
@@ -1173,6 +1252,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // fs-server-rw Part E: create a brand-new file and confirm inode + dir entry persist.
     #[cfg(feature = "selftest")]
     create_test(root_ns);
+    // auth+session Part B: resolve through a subtree-scoped binding (the shared-reg
+    // bind-mount from mount_one) and confirm it reaches the right file.
+    #[cfg(feature = "selftest")]
+    subtree_bind_test(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

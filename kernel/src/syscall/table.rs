@@ -1183,7 +1183,22 @@ pub fn sys_ns_bind(
     // direct handle (slice-1 behaviour). See
     // `docs/architecture/namespace-and-resource-servers.md`.
     if res_ok.object.object_type() == KObjectType::IpcChannel {
-        // Wrap a clone of the endpoint in a registration record.
+        // Bind-mount semantics: if this endpoint already backs a registration, *share*
+        // it — one server connection, many names, each binding carrying its own base +
+        // rights. Minting a rival registration would clobber the endpoint→reg
+        // reply-routing back-pointer (the second bind would hijack the first's
+        // replies). See docs/architecture/namespace-and-resource-servers.md.
+        if let Some(existing) = crate::sched::us_forward_existing_reg(res_ok.object.as_ptr()) {
+            return match ns.bind_userspace_server(path, existing, rights, base) {
+                Ok(()) => Ok(0),
+                Err((returned, e)) => {
+                    // Drop the shared-reg reference **outside** the namespace lock.
+                    drop(returned);
+                    Err(map_ns_err(e))
+                }
+            };
+        }
+        // First bind of this endpoint: wrap a clone of it in a fresh registration.
         let reg_box = UserspaceServerReg::try_new(res_ok.object.clone())
             .map_err(|_| KError::OutOfMemory)?;
         // SAFETY: `into_raw` yields the single creation reference; adopt it.

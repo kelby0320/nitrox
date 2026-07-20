@@ -1920,10 +1920,12 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
   path) on a `UserspaceServer` binding (`base + suffix` forwarded, leading `/`
   stripped), `..`/`.`-rejecting; `sys_ns_bind` gained `base_ptr`/`base_len` (a4/a5,
   backward-compatible). Host-tested (`from_path`, `resolve` carries base,
-  `join_subtree`); boot unaffected. **Finding**: exposing one server through
-  *concurrent* bindings hits the single-registration-per-endpoint reply routing
-  (N = 1 pending slot) — the end-to-end subtree exercise + the multi-binding fix
-  (shared reg, or per-binding channel) move into Part D's endpoint plumbing.
+  `join_subtree`); boot unaffected. **Multi-binding to one server** (a finding here,
+  then resolved with the user): exposing one server through several bindings **shares
+  its registration** (bind-mount semantics — one connection, many names) rather than a
+  per-binding channel; the pending slot grew N = 1 → a small table (`US_PENDING_MAX`)
+  for concurrent in-flight requests. Validated end-to-end under `test-qemu` (init binds
+  the fs endpoint a second time as a subtree; a lookup through it resolves correctly).
 - [ ] **Part C — auth-service + user DB**: the credential-oracle RS speaking the new
   `Auth` rsproto category (`Authenticate` → `AUTHENTICATED{principal,home}`/`DENIED`,
   PBKDF2 verify, dummy-verify on missing user) — wire contract in
@@ -1932,10 +1934,9 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
 - [ ] **Part D — service-mgr → session-mgr + endpoint plumbing**: service-mgr spawns
   auth-service (bind `/svc/auth`) + session-mgr (re-delegated `BIND_NAMESPACE` +
   fs-server/console endpoints + auth channel); init hands the fs-server endpoint down.
-  Resolve the **multi-binding-to-one-server** routing (Part B finding): share one
-  registration across the `/` and session `/home` bindings (+ grow the reg's pending
-  set beyond N = 1), or vend session-mgr a per-binding forwarding channel. Includes
-  the end-to-end subtree resolve that Part B deferred.
+  Multi-binding-to-one-server is already solved (Part B: shared registration /
+  bind-mount) — session-mgr just binds the fs endpoint at `/home` with a subtree base
+  and the kernel shares init's registration.
 - [ ] **Part E — login + namespace construction + user shell** (the milestone):
   session-mgr's `login:` loop → auth → `sys_ns_create` + attenuated binds
   ({console, /home subtree RW, /bin, /store}) → spawn the throwaway user shell (empty

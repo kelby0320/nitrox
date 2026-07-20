@@ -64,7 +64,7 @@ use crate::object::{
     ObjectRef, PendingOperation, ReclaimedSend, RecvState, SchedClass, SendOutcome, StoredMsg,
     Thread, ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
-use crate::object::userspace_server::{PendingFill, PendingLookup};
+use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -1168,9 +1168,10 @@ pub fn us_forward_originate(
             ForwardOutcome::Pending
         }
         SendOutcome::Full | SendOutcome::PeerClosed => {
-            // Roll back the reserved slot; drop its `po` clone **outside** `SCHED`.
+            // Roll back the slot we just reserved (by its `request_id`); drop its
+            // `po` clone **outside** `SCHED`.
             // SAFETY: `reg` live, `SCHED` held.
-            let pl = unsafe { UserspaceServerReg::take_pending_any(reg) };
+            let pl = unsafe { UserspaceServerReg::take_pending_matching(reg, request_id) };
             drop(g);
             drop(pl);
             if outcome == SendOutcome::Full {
@@ -1226,9 +1227,10 @@ pub fn us_forward_originate_fill(
             ForwardOutcome::Pending
         }
         SendOutcome::Full | SendOutcome::PeerClosed => {
-            // Roll back; drop the fill's `po` / `file_obj` clones **outside** `SCHED`.
+            // Roll back the slot we just reserved (by its `request_id`); drop the
+            // fill's `po` / `file_obj` clones **outside** `SCHED`.
             // SAFETY: `reg` live, `SCHED` held.
-            let pf = unsafe { UserspaceServerReg::take_pending_fill_any(reg) };
+            let pf = unsafe { UserspaceServerReg::take_pending_fill_matching(reg, request_id) };
             drop(g);
             drop(pf);
             if outcome == SendOutcome::Full {
@@ -1280,6 +1282,31 @@ pub fn us_server_attach(endpoint: *mut (), reg: *mut ()) {
     let _g = SCHED.lock();
     // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
     unsafe { IpcChannel::set_us_reg(endpoint, reg) };
+}
+
+/// If `endpoint` already backs a Userspace Server registration, return a **new owned
+/// reference** to it (bump-and-adopt) so an additional namespace binding can share
+/// the one connection — *bind-mount* semantics: one server endpoint, many names,
+/// each with its own subtree base + rights on the binding. `None` if the endpoint is
+/// not yet registered (the caller mints a fresh registration). Reusing the existing
+/// registration is what keeps reply routing correct: the endpoint→reg back-pointer
+/// stays a single, consistent target rather than being clobbered by a rival reg.
+/// Takes `SCHED`; the caller pins `endpoint` (its bound handle).
+pub fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
+    let _g = SCHED.lock();
+    // SAFETY: `endpoint` is a live `IpcChannel` pinned by the caller; `SCHED` held.
+    let reg = unsafe { IpcChannel::us_reg_of(endpoint) };
+    if reg.is_null() {
+        return None;
+    }
+    // `reg` is a live `UserspaceServerReg`: the existing binding that installed the
+    // back-pointer still holds a reference (refcount ≥ 1), and `SCHED` serialises
+    // against its teardown. Bump the header count and adopt a new owned ref.
+    // SAFETY: `reg` addresses a live object with an outstanding reference; `SCHED` held.
+    let header = unsafe { &*(reg as *const crate::object::header::KObjectHeader) };
+    header.bump();
+    // SAFETY: the `bump` above balances this adoption of a new reference.
+    Some(unsafe { ObjectRef::from_raw(reg, KObjectType::UserspaceServerReg) })
 }
 
 /// Take the forwarded lookup outstanding on `reg` whose `request_id` matches a
@@ -1420,17 +1447,22 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     // **this** endpoint is the kernel end (its registration is being torn down),
     // or its **peer** is (the server process just died). Each taken PO is signalled
     // here; its reference is dropped **outside** `SCHED` (below).
-    let mut orphan_self: Option<ObjectRef> = None;
-    let mut orphan_peer: Option<ObjectRef> = None;
+    // A registration's endpoint is shared by many bindings (bind-mount semantics),
+    // so it can hold up to `US_PENDING_MAX` forwarded lookups in flight — drain *all*
+    // of them, failing each `PeerClosed`. Each taken PO is signalled here and
+    // collected into `orphans`; the references are dropped **outside** `SCHED` below.
+    let mut orphans: [Option<ObjectRef>; 2 * US_PENDING_MAX] = core::array::from_fn(|_| None);
+    let mut n_orphans = 0usize;
     // SAFETY: `endpoint` is valid memory; `SCHED` held.
     let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
     if !reg_self.is_null() {
         // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
         // is being dropped *because* the registration is — `reg_self` is still
         // valid memory mid-drop); `SCHED` held.
-        if let Some(pl) = unsafe { UserspaceServerReg::take_pending_any(reg_self) } {
+        while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg_self) } {
             signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
-            orphan_self = Some(pl.po);
+            orphans[n_orphans] = Some(pl.po);
+            n_orphans += 1;
         }
     }
     if !peer.is_null() {
@@ -1443,9 +1475,10 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
         if !reg_peer.is_null() {
             // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
             // `SCHED` held.
-            if let Some(pl) = unsafe { UserspaceServerReg::take_pending_any(reg_peer) } {
+            while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg_peer) } {
                 signal_pending_op(&mut g, pl.po.as_ptr(), crate::syscall::error::KError::PeerClosed as i32);
-                orphan_peer = Some(pl.po);
+                orphans[n_orphans] = Some(pl.po);
+                n_orphans += 1;
             }
         }
     }
@@ -1468,8 +1501,7 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     // Release `SCHED` before dropping any orphaned forwarded-lookup PO references
     // (an `ObjectRef` Drop must not run under the rank-1 lock).
     drop(g);
-    drop(orphan_self);
-    drop(orphan_peer);
+    drop(orphans);
 }
 
 /// Point the ring-0 trap stack (`TSS.RSP0`) and the per-CPU syscall stack at

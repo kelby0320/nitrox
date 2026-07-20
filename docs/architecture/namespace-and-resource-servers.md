@@ -136,14 +136,20 @@ path can never escape the subtree. The wire protocol is unchanged: the server
 receives one server-relative path and resolves it, unaware a base was prepended. An
 empty base is the original whole-tree behaviour.
 
-> **One server, many bindings.** Subtree scoping is a property of the *binding*, so
-> the same server can be exposed through several bindings (whole-tree at one path, a
-> scoped sub-tree at another, in different namespaces). Reply routing today keys a
-> single registration to a server endpoint (one outstanding forwarded lookup per
-> endpoint), so *multiple concurrent* bindings to one server endpoint are an
-> endpoint-plumbing concern handled where a supervisor composes such views (the
-> session-manager slice) — either by sharing one registration across bindings or by
-> vending a per-binding forwarding channel.
+> **One server, many bindings (bind-mount).** Subtree scoping is a property of the
+> *binding*, so the same server is exposed through several bindings — whole-tree at
+> one path, a scoped sub-tree at another, in different namespaces. Binding the same
+> server endpoint again **shares its registration** (the kernel's per-connection
+> bookkeeping) rather than minting a rival: one connection, many names, each carrying
+> its own base + rights. This is exactly a Linux **bind mount** — the registration is
+> the shared "superblock," a binding is a (bind-)mount of it. Sharing keeps reply
+> routing correct (the endpoint→registration back-pointer stays a single consistent
+> target) and is efficient at scale — a handful of supervisors and every session view
+> reach one fs-server over one connection, not N. The registration tracks several
+> outstanding forwarded requests at once (correlated by `request_id`); its refcount
+> keeps it alive while any binding references it. A separate per-binding channel
+> (server-side multiplexing) is deliberately *not* used — it buys no real parallelism
+> against a single-threaded server and costs a channel + serve-loop slot per view.
 
 ## Binding targets
 

@@ -6762,3 +6762,39 @@ registration** across bindings (endpoint→reg stays consistent; grow the pendin
 to a small request-id-keyed table) or a **per-binding forwarding channel** (the
 server serves several). Choice deferred to Part D; Part B's end-to-end validation
 lands there. Recorded in `namespace-and-resource-servers.md` § Subtree scoping.
+
+## 2026-07-20 — Multi-binding to one server: shared registration (bind-mount)
+
+Resolved the finding above (pulled forward from Part D after a design discussion with
+the user). **Decision: bind-mount semantics — one server connection, many names.**
+Binding the same server endpoint again *shares its `UserspaceServerReg`* (the kernel's
+per-connection bookkeeping) instead of minting a rival that clobbers the endpoint→reg
+reply-routing back-pointer. The registration is the shared "superblock"; a binding is a
+(bind-)mount of it, carrying its own `SubtreeBase` + rights. Chosen over a per-binding
+forwarding channel: it needs no server-side multiplexing, and a second channel buys no
+real parallelism against a single-threaded serve loop — only a channel + serve-loop slot
+per view. The user's motivation: many processes (session-mgr, every session view,
+service-mgr, daemons) will reach the fs-server; sharing one connection scales, N channels
+don't.
+
+Implementation:
+- `sys_ns_bind` (IpcChannel target): if the endpoint already backs a registration
+  (`us_forward_existing_reg` — a bump-and-adopt of the existing reg under `SCHED`), bind
+  a reference to it with the new base; otherwise mint a fresh reg + attach the
+  back-pointer as before. Refcounting keeps the reg alive while any binding holds it.
+- The registration's pending slot grew from **N = 1 to a small table** (`US_PENDING_MAX
+  = 8`) for lookups and, independently, fills — several consumers can have a request in
+  flight at once (a full table → `WouldBlock`). Correlation was already by `request_id`;
+  `begin` finds a free slot, `take_pending_matching` scans by id. Server-death teardown
+  (`ipc_endpoint_closing`) now **drains all** pending lookups (`take_pending_next` loop),
+  failing each `PeerClosed` and collecting the POs to drop outside `SCHED`. Origination
+  rollback takes the specific reserved slot by id.
+
+Verified: 532 kernel host tests (new: concurrent-lookups-correlate, caps-at-capacity);
+end-to-end under `test-qemu` — init binds the fs endpoint a second time as a subtree
+(`/subtreetest` → base `/system`, sharing the reg) and a lookup of
+`/subtreetest/current-generation` resolves to the same file as
+`/system/current-generation` (`init: subtree bind … resolves + matches ok`). This is the
+Part B end-to-end validation the earlier finding deferred; it lands here. Part D no longer
+needs to solve multi-binding — it consumes this. `namespace-and-resource-servers.md`
+§ Subtree scoping updated (bind-mount, no longer "deferred").
