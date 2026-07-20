@@ -17,9 +17,14 @@ stable).
 Status: as of 2026-07-01 the system boots to a userspace `eshell` on `-smp 4`
 with **user threads distributing across all cores and migrating via
 work-stealing**, verified 0 failures over 150 KVM boot-loops plus a scripted
-`eshell` interaction stress. The two remaining slice-3b items (a cross-CPU
-deschedule IPI and per-`AddressSpace` `active_cpus`) are deferred until a
-multi-threaded user process exists to exercise them.
+`eshell` interaction stress. Cross-CPU **wake** delivery is now explicit: a
+**reschedule IPI** (§6) pokes a core when a thread is placed on it from another
+core, so a woken thread on an idle core runs immediately instead of waiting for
+that core's next tick (added 2026-07-20 to fix a concurrent-block-I/O hang — see
+the decision log). Per-`AddressSpace` `active_cpus` (shootdown targeting) and a
+preemptive cross-CPU *deschedule* IPI (forcing a **running** remote thread off,
+vs. just resuming an idle one) remain deferred until a multi-threaded user
+process exercises them.
 
 ---
 
@@ -97,8 +102,9 @@ thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
    `current` (a transient AP boot thread) + `idle` thread + `ready`/`reap`
    reserves, sets its `cpu_online` bit and the lock-free `ONLINE_MASK`). The AP's
    boot thread then `exit_thread`s, switching the AP into its idle loop; the AP
-   runs `idle_body` (`reap_pending(); hlt();`) until the scheduler gives it work.
-   After this point **any online CPU may pick up runnable work**.
+   runs `idle_body` (`reap_pending(); idle_halt();`, where `idle_halt` is `sti;
+   hlt`) until the timer or a reschedule IPI gives it work. After this point **any
+   online CPU may pick up runnable work**.
 5. **First userspace** — `run_first_userspace` (`main.rs`) loads the init ELF
    (`ImageId::Init`), builds its address space, creates `Process` pid 1, and
    `sched::spawn_user`s init's first thread — which `place_thread` puts on the
@@ -184,6 +190,15 @@ machinery was already correct once the hazards below were fixed.
   so userspace uses the APs from the start. A **woken** thread re-homes to its
   `last_cpu` when permitted (`pick_wake_cpu`), else the least-loaded core —
   cache-warm, avoiding needless migration.
+- **Reschedule IPI** (`place_thread` → `arch::send_reschedule_ipi`, vector `0x41`;
+  handler `sched::on_reschedule_ipi`): when a thread lands on a core **other than**
+  the one doing the placing, that core is poked so it runs the newcomer promptly.
+  The handler resumes an **idle** core into the scheduler (a busy TimeShared thread
+  is left to its quantum — the newcomer is already enqueued and will be picked or
+  stolen in turn). This is what makes a cross-core wake *land*: without it, delivery
+  depended on the target core's next periodic tick, which is not a dependable wake
+  for a core halted in `hlt`. The idle loop parks with `sti; hlt` (`Cpu::idle_halt`)
+  so it is always wakeable by that IPI (or the timer), whatever its inbound IF state.
 - **Pick** (`pick_next`): this core's own `ready` queue first (`dequeue_front`, an
   O(n) class-aware scan: RealTime by priority, else TimeShared by min-vruntime),
   else **steal** from the busiest peer.

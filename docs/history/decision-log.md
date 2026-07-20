@@ -6930,3 +6930,54 @@ Sequenced after the demo chain (the concurrent-forwarded-lookup item stays open 
 `deferred-decisions.md`). The **auth + session-mgr slice is complete**; remaining items
 (roles / privilege broker, per-user profile overlays, session tokens, the real Phase-4
 shell) are deferred in `session-and-auth.md`.
+
+---
+
+## 2026-07-20 — SMP scheduler: reschedule IPI for cross-CPU wakes (concurrency-hang fix)
+
+Fixes the "concurrent direct-block + forwarded-lookup hang" left open in
+`deferred-decisions.md`. The bug was **not** in the block / forwarding-reply path — it
+was a missing cross-CPU wake primitive in the scheduler, exposed once user threads
+migrate across CPUs (Phase 3 slice 3b) and two clients drive block I/O concurrently.
+
+**Root cause.** When a completion (an AHCI IRQ + DPC on the CPU that owns the
+controller, always CPU 0 here) makes a thread runnable, `place_thread` re-homes it to
+its `last_cpu` and enqueues it on that CPU's run queue — but sent **no signal** to that
+CPU. Delivery of the wake therefore depended entirely on the target CPU noticing the new
+`ready` entry on its own next periodic timer tick. That is a latency floor at best, and —
+crucially — **not a dependable wake for a halted CPU**: an idle AP parked in `hlt` did
+not reliably resume on its LAPIC timer under the QEMU/TCG dev loop, so a thread parked on
+an idle remote CPU's queue could sit there indefinitely. As each AP went idle it went
+dark; once the fs-server's forwarded block read landed on a dark CPU, the lookup hung.
+The failure was intermittent and migration-dependent, which is why it only showed up
+with concurrent block clients.
+
+**Fix (two parts):**
+
+- **Reschedule IPI (vector `0x41`).** New arch transport
+  `arch::send_reschedule_ipi(cpu)` (mirrors the TLB-shootdown IPI: `kernel/src/arch/
+  x86_64/resched.rs` + a returning stub/dispatcher in `idt.rs`). `place_thread` now
+  pokes the target CPU whenever a thread lands on a CPU other than the current one. The
+  neutral handler `sched::on_reschedule_ipi` resumes an **idle** CPU into the scheduler
+  (it leaves a busy TimeShared thread to its quantum — the newcomer is already enqueued
+  and will be picked/stolen in turn). An incoming IPI reliably resumes a halted CPU,
+  making cross-CPU wake delivery immediate and independent of the periodic tick.
+- **`Cpu::idle_halt` (`sti; hlt`).** The idle loop parked with a bare `hlt` that trusted
+  the inbound IF state; an idle CPU that reached it with IF=0 would sleep forever (a
+  maskable IRQ/IPI cannot resume `hlt` while IF=0). Idle now uses the canonical `sti;
+  hlt` idiom — the enable's one-instruction interrupt shadow guarantees the CPU parks
+  with IF=1 and cannot miss a wake that races the enable — so the reschedule IPI (and the
+  timer) can always wake it.
+
+**Verified** under `test-qemu`: the full boot (mounts → demo chain → login chain →
+`usersh` home write → `verdict PASS`) passes 5/5 consecutively; a stress probe hammering
+200 forwarded namespace lookups concurrently with the demo `parent`'s block I/O ran to
+completion (previously it hung deterministically around lookup ~24–155). Host suite +
+check-arch green.
+
+The demo→login **sequencing** in init's selftest boot is now a correctness *non*-issue
+(concurrent direct + fs-mediated block I/O is handled). It is retained only because the
+`test-harness` verdict is fired by session-mgr at the end of the login chain and the
+serial console is shared; lifting it into a genuinely-overlapped concurrent boot is a
+separable test-verdict-flow change, not a kernel concern. Full 32-slot NCQ for AHCI
+remains the other open block-path item.

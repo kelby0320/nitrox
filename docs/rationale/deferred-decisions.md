@@ -148,15 +148,19 @@ arrive with the fs-server (slice 7).
 > to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
 > bound, e.g. an SSD or many concurrent readers).
 
-> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, open).** A `/dev/blk`
-> client doing direct block I/O concurrently with the fs-server's own reads still hangs
-> a *forwarded* namespace lookup, even after the AHCI submit-queue + DPC-drain fixes
-> (which resolved concurrent *direct* clients). Confirmed isolated — the auth/session
-> login chain completes cleanly when the demo chain is not running alongside it. Root
-> cause not yet pinned (a second concurrency issue in the block / forwarding-reply path).
-> Worked around for now by **sequencing** the login chain after the demo chain (the
-> fs-server is the only block client then, serialised by its single serve loop). To
-> investigate before workloads genuinely overlap direct and fs-mediated block I/O.
+> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, RESOLVED 2026-07-20).**
+> A `/dev/blk` client doing direct block I/O concurrently with the fs-server's own reads
+> hung a *forwarded* namespace lookup. The cause was **not** in the block / forwarding
+> path — it was a missing cross-CPU wake in the scheduler, exposed by user-thread
+> migration (slice 3b): a completion on one CPU enqueued the woken thread on a *remote*
+> CPU's run queue but sent no signal, so delivery depended on that CPU's next periodic
+> tick — unreliable for an idle CPU halted in `hlt`, so a thread parked on a dark AP sat
+> there forever. Fixed with a **reschedule IPI** (`arch::send_reschedule_ipi`, poked from
+> `place_thread` on any cross-CPU placement) plus an `sti; hlt` idle so an idle CPU always
+> parks wakeable. See the decision log (2026-07-20 "SMP scheduler: reschedule IPI"). The
+> demo→login sequencing in init's selftest boot is no longer a *correctness* requirement
+> (concurrent direct + fs-mediated block I/O now works); it is retained only for
+> `test-harness` verdict ordering + shared-console tidiness.
 
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).

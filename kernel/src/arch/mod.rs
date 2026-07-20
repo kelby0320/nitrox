@@ -94,6 +94,7 @@ pub use x86_64::smp::{adopt_dense_index, bind_cpu_identity};
 // TLB-shootdown transport: send the shootdown IPI to a dense CPU index, and the
 // vector it uses. The architecture-neutral coordinator lives in `crate::tlb`.
 #[cfg(target_arch = "x86_64")]
+pub use x86_64::resched::{RESCHEDULE_VECTOR, send_reschedule_ipi};
 pub use x86_64::tlb::{TLB_SHOOTDOWN_VECTOR, send_shootdown_ipi};
 // `MAX_CPUS` (neutral) sizes the per-CPU arrays; re-exported as `crate::arch::MAX_CPUS`.
 pub use smp::MAX_CPUS;

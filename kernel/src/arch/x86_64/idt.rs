@@ -497,6 +497,49 @@ extern "C" fn tlb_shootdown_dispatch(_frame: *mut ExceptionFrame) {
     unsafe { crate::arch::Irq::eoi() };
 }
 
+// --- Reschedule IPI stub (vector 0x41) ----------------------------------
+//
+// Another CPU made a thread runnable on *this* CPU and poked us to run the
+// scheduler now (rather than wait for our next periodic tick). Like the timer,
+// the dispatcher may switch away and not return to this frame for a while, so it
+// EOIs *first*; control returns here to `iretq` once this thread is resumed.
+
+/// Reschedule IPI (vector `0x41`) entry stub. See [`super::resched`] /
+/// [`crate::sched::on_reschedule_ipi`].
+#[unsafe(naked)]
+extern "C" fn reschedule_ipi_stub() {
+    ::core::arch::naked_asm!(
+        concat!(
+            "push 0\n",
+            "push 0x41\n",
+            "push rax\npush rbx\npush rcx\npush rdx\n",
+            "push rsi\npush rdi\npush rbp\n",
+            "push r8\npush r9\npush r10\npush r11\n",
+            "push r12\npush r13\npush r14\npush r15\n",
+            "mov rdi, rsp\n",
+        ),
+        "call {dispatch}",
+        concat!(
+            "pop r15\npop r14\npop r13\npop r12\n",
+            "pop r11\npop r10\npop r9\npop r8\n",
+            "pop rbp\npop rdi\npop rsi\n",
+            "pop rdx\npop rcx\npop rbx\npop rax\n",
+            "add rsp, 16\n",
+            "iretq\n",
+        ),
+        dispatch = sym reschedule_ipi_dispatch,
+    );
+}
+
+/// Reschedule IPI dispatcher: EOI **first** (the tick may switch away via
+/// [`crate::sched::on_reschedule_ipi`] and not return here promptly, so a late
+/// EOI would stall further IPIs), then drive the scheduler. The frame is unused.
+extern "C" fn reschedule_ipi_dispatch(_frame: *mut ExceptionFrame) {
+    // SAFETY: ring-0 IPI context; a single write acknowledges the local APIC.
+    unsafe { crate::arch::Irq::eoi() };
+    crate::sched::on_reschedule_ipi();
+}
+
 // --- Device-IRQ vectors (external interrupts routed by the IOAPIC) ----------
 //
 // The system interrupt router (`arch::IrqRouter`) routes a device's interrupt
@@ -840,6 +883,9 @@ pub fn init() {
     // TLB-shootdown IPI (vector 0x40): a returning interrupt like the timer. IST0.
     let shootdown: extern "C" fn() = tlb_shootdown_stub;
     idt[super::tlb::TLB_SHOOTDOWN_VECTOR as usize].set_handler(shootdown as usize as u64, 0);
+    // Reschedule IPI (vector 0x41): a returning interrupt like the timer. IST0.
+    let reschedule: extern "C" fn() = reschedule_ipi_stub;
+    idt[super::resched::RESCHEDULE_VECTOR as usize].set_handler(reschedule as usize as u64, 0);
 
     // Device-IRQ vectors (0x30..): the gates are pre-installed here; a driver
     // routes a GSI to one of these and registers a handler via

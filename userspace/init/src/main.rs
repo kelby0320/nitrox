@@ -147,7 +147,7 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// `handles[0]` (the fs-server forwarding endpoint) is filled at spawn from
 /// `FS_ENDPOINT` and **moved** to service-mgr (it forwards it to session-mgr). The
 /// endpoint carries `TRANSFER` so service-mgr can hand it onward. Spawned in **both**
-/// boots now (the selftest boot brings the login chain up alongside the demo chain so
+/// boots now (the selftest boot brings the login chain up after the demo chain reaps so
 /// it is exercised under `test-qemu`).
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/service-mgr
@@ -1128,17 +1128,19 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
 /// reap_loop drops to the emergency console as the interim recovery, until a reboot
 /// path exists; see `docs/architecture/service-manager.md` § Recovery). **Under
-/// `selftest`**, run the Phase-1/2 demo chain (`parent`) to completion FIRST, then
-/// launch the interactive shell — they share the single-outstanding-command disk and
-/// the serial console, so overlapping them corrupts the fs-server's reads; eshell is
-/// launched once `parent` reaps (in [`reap_loop`]).
+/// `selftest`**, run the Phase-1/2 demo chain (`parent`) to completion FIRST, then bring
+/// up the login chain — sequenced in [`reap_loop`]. Concurrent direct + fs-mediated block
+/// I/O is now correct (the reschedule-IPI fix; see the 2026-07-20 decision log), so this
+/// ordering is no longer a correctness requirement — it is retained only so the
+/// `test-harness` verdict (fired by session-mgr at the end of the login chain) comes after
+/// the demo's, and the two don't interleave on the shared serial console.
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
-        // Run the demo chain (`parent`) first. Its block I/O (`/dev/blk`) must not
-        // overlap the fs-server's reads (a concurrent-forwarded-lookup issue, tracked
-        // separately), so the login chain (service-mgr → auth-service + session-mgr) is
-        // brought up **after** `parent` reaps — sequenced in `reap_loop`.
+        // Run the demo chain (`parent`) first, then the login chain (service-mgr →
+        // auth-service + session-mgr) once `parent` reaps — sequenced in `reap_loop` for
+        // verdict ordering + console tidiness, not correctness (concurrent block I/O is
+        // handled now; see `docs/rationale/deferred-decisions.md`).
         kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
         // SAFETY: SPAWN_PARENT is a valid writable arg block.
         let parent_h =
@@ -1226,9 +1228,10 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     parent_h = 0;
                     // The demo chain finished. Under test-harness a failed demo fails the
                     // run now; otherwise hand off to the **login chain** (service-mgr →
-                    // auth-service + session-mgr), sequenced here so its block I/O does not
-                    // overlap `parent`'s. session-mgr fires the final verdict once it has
-                    // authenticated the demo user (see its `_start`).
+                    // auth-service + session-mgr), sequenced here for verdict ordering (not
+                    // correctness — concurrent block I/O is handled). session-mgr fires the
+                    // final verdict once it has authenticated the demo user (see its
+                    // `_start`).
                     #[cfg(feature = "test-harness")]
                     if code != 0 {
                         test_exit(false);
