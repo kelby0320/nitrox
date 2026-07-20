@@ -503,6 +503,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libstream` host tests (the TSM1 wire codec — type tags, header/schema/value
+    // round-trips, truncation/EOF handling). Pure `core + alloc`, no deps, so it
+    // host-tests unchanged like `libcrypto`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libstream")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // init's library tests (the `manifest` + `toml_lite` parsers). `--lib` skips the
     // `#![no_main]` bin, which can't build for the host.
     run(Command::new("cargo")

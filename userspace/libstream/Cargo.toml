@@ -1,0 +1,16 @@
+[package]
+name = "libstream"
+version = "0.1.0"
+edition = "2024"
+
+# `libstream` — typed structured streams (the TSM1 wire format; see
+# `docs/spec/typed-stream-format.md`). The wire core (`wire.rs`) is `core + alloc`
+# only, with **no dependencies** — so it stays transport-agnostic and host-tests
+# cleanly (`cargo test -p libstream --target <host>`), exactly like `libcrypto`.
+# The channel/transport adapter (a later part) will add `libos`/`libkern`; the
+# codec itself never touches a syscall.
+[dependencies]
+
+[lib]
+name = "libstream"
+path = "src/lib.rs"
