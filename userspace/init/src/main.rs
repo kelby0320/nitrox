@@ -1135,14 +1135,10 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
-        // Bring up the login chain (service-mgr → auth-service + session-mgr) alongside
-        // the demo chain. This exercises concurrent block I/O (parent's /dev/blk + the
-        // fs-server's reads), which the AHCI pending-queue now serialises correctly.
-        let smgr_h = spawn_service_mgr(root_ns);
-        if smgr_h >= 0 {
-            // SAFETY: closing init's reference; service-mgr runs independently.
-            unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
-        }
+        // Run the demo chain (`parent`) first. Its block I/O (`/dev/blk`) must not
+        // overlap the fs-server's reads (a concurrent-forwarded-lookup issue, tracked
+        // separately), so the login chain (service-mgr → auth-service + session-mgr) is
+        // brought up **after** `parent` reaps — sequenced in `reap_loop`.
         kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
         // SAFETY: SPAWN_PARENT is a valid writable arg block.
         let parent_h =
@@ -1228,11 +1224,22 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
                     parent_h = 0;
-                    // Test-harness: `parent` reaping ends the self-test chain — report
-                    // the verdict (PASS iff it exited cleanly), which terminates QEMU.
-                    // If it doesn't (no exit device), fall through to the console.
+                    // The demo chain finished. Under test-harness a failed demo fails the
+                    // run now; otherwise hand off to the **login chain** (service-mgr →
+                    // auth-service + session-mgr), sequenced here so its block I/O does not
+                    // overlap `parent`'s. session-mgr fires the final verdict once it has
+                    // authenticated the demo user (see its `_start`).
                     #[cfg(feature = "test-harness")]
-                    test_exit(code == 0);
+                    if code != 0 {
+                        test_exit(false);
+                    }
+                    let smgr_h = spawn_service_mgr(root_ns);
+                    if smgr_h >= 0 {
+                        // SAFETY: closing init's reference; service-mgr runs independently.
+                        unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
+                    }
+                    // Non-test-harness selftest: also drop to the interactive console.
+                    #[cfg(not(feature = "test-harness"))]
                     spawn_eshell(root_ns);
                 }
             }

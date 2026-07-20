@@ -148,8 +148,15 @@ arrive with the fs-server (slice 7).
 > to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
 > bound, e.g. an SSD or many concurrent readers).
 
-**Writeback IRPs.** The page cache initially flows reads only; dirty-page
-writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
+> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, open).** A `/dev/blk`
+> client doing direct block I/O concurrently with the fs-server's own reads still hangs
+> a *forwarded* namespace lookup, even after the AHCI submit-queue + DPC-drain fixes
+> (which resolved concurrent *direct* clients). Confirmed isolated — the auth/session
+> login chain completes cleanly when the demo chain is not running alongside it. Root
+> cause not yet pinned (a second concurrency issue in the block / forwarding-reply path).
+> Worked around for now by **sequencing** the login chain after the demo chain (the
+> fs-server is the only block client then, serialised by its single serve loop). To
+> investigate before workloads genuinely overlap direct and fs-mediated block I/O.
 
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).

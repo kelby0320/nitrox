@@ -125,3 +125,11 @@ dependencies = [
  "libheap",
  "libkern",
 ]
+
+[[package]]
+name = "session-mgr"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]

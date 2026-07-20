@@ -6859,3 +6859,40 @@ future point — recorded in `deferred-decisions.md`. The software queue depth i
 I/O-latency-bound workload (SSD, many concurrent readers). This fix unblocked Part D:
 the login chain can now run concurrently with the demo chain, so no verdict restructure
 is needed.
+
+## 2026-07-20 — Auth + session-mgr Part D: service-mgr → session-mgr + endpoint plumbing
+
+The login chain stands up end to end. init hands the retained fs-server forwarding
+endpoint to service-mgr; service-mgr spawns **auth-service** (RS `Meta::Ready`
+handshake → its client channel) and **session-mgr** (re-delegated `BIND_NAMESPACE` +
+a control channel), then transfers session-mgr the fs endpoint + the auth channel.
+session-mgr (new bin-only crate) receives the handoffs, **authenticates the demo user**
+against auth-service over the auth channel (correct → `AUTHENTICATED`, home path
+returned; wrong → `DENIED`), and **constructs a session namespace** binding `/home` as
+a subtree of the fs-server using the home from the auth reply — proving `BIND_NAMESPACE`
++ subtree scoping + shared-registration bind-mount together. This is the first
+end-to-end exercise of the whole credential stack (Parts A–C) under real spawning.
+service-mgr keeps its slice-A heartbeat supervision after bringing the chain up.
+
+**Verdict moved to session-mgr.** session-mgr fires the `test-harness` self-test
+verdict once its Part-D checks pass (it takes the build-mode feature like init). The
+chain is sequenced **after** the demo chain (see below), so the demo `parent`'s reap no
+longer ends the run — on `parent`'s clean reap init spawns the login chain and
+session-mgr gates the verdict. Verified under `test-qemu`: `session-mgr: authenticated
+'alice' -> home=/home/alice` … `session namespace built` … `wrong password correctly
+denied` … `verdict PASS`.
+
+**Finding — concurrent block I/O still hangs a *forwarded* lookup (sequenced around,
+tracked).** The AHCI pending-queue + DPC-drain fixed concurrent *direct* block clients,
+but a `/dev/blk` client (the demo `parent`) running concurrently with the fs-server's
+reads still hangs auth-service's forwarded `/system/users` lookup — confirmed isolated:
+the login chain completes cleanly when `parent` does **not** run alongside it. Root
+cause is not yet pinned (a second concurrency issue in the block/forwarding path beyond
+the AHCI submit race). Worked around by **sequencing** the login chain after the demo
+chain (the fs-server is then the only block client, serialised by its single serve
+loop); recorded in `deferred-decisions.md` as a concurrency item to investigate. The
+`SpawnArgs` for the login chain carry `TRANSFER`/`DUPLICATE` on the fs endpoint so it
+can be handed down the init → service-mgr → session-mgr chain.
+
+Deferred to Part E: the interactive `login:` prompt (replacing the hardcoded round-trip)
++ spawning the user shell into the constructed namespace + writing to `/home`.

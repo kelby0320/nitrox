@@ -1934,12 +1934,17 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
   `/system/users`, Ready-hand a client channel, serve). `passwd`-style `/system/users`
   + `/home/alice` seeded into the ext4 by xtask (one-way verifier only — no secrets
   in-tree). Host-tested; image assembles; boot green. **Spawning/wiring is Part D.**
-- [ ] **Part D — service-mgr → session-mgr + endpoint plumbing**: service-mgr spawns
-  auth-service (bind `/svc/auth`) + session-mgr (re-delegated `BIND_NAMESPACE` +
-  fs-server/console endpoints + auth channel); init hands the fs-server endpoint down.
-  Multi-binding-to-one-server is already solved (Part B: shared registration /
-  bind-mount) — session-mgr just binds the fs endpoint at `/home` with a subtree base
-  and the kernel shares init's registration.
+- [x] **Part D — service-mgr → session-mgr + endpoint plumbing**: init hands the
+  retained fs-server endpoint to service-mgr; service-mgr spawns auth-service (RS Ready
+  handshake → its client channel) + session-mgr (re-delegated `BIND_NAMESPACE` +
+  control channel) and hands session-mgr the fs endpoint + auth channel. session-mgr
+  (new bin crate) authenticates the demo user over the auth channel and constructs a
+  session namespace binding `/home` as an fs-server subtree (proving `BIND_NAMESPACE` +
+  subtree + shared-reg bind-mount). session-mgr fires the `test-harness` verdict.
+  Sequenced after the demo chain (a concurrent direct-block + forwarded-lookup hang is
+  tracked in `deferred-decisions.md`). Auth is reached over a **direct channel** (not
+  bound at `/svc/auth`) since session-mgr is the sole consumer. AHCI concurrent-command
+  bug fixed along the way (single-slot queue + DPC-drain).
 - [ ] **Part E — login + namespace construction + user shell** (the milestone):
   session-mgr's `login:` loop → auth → `sys_ns_create` + attenuated binds
   ({console, /home subtree RW, /bin, /store}) → spawn the throwaway user shell (empty
