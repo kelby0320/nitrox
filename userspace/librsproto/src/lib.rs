@@ -19,6 +19,7 @@
 
 #![cfg_attr(not(test), no_std)]
 
+pub mod auth;
 pub mod error;
 pub mod file;
 pub mod log;
@@ -57,6 +58,8 @@ pub const OP_NS_RESOLVE: u16 = 0x0100;
 /// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
 /// page-cache fill). See [`file`].
 pub const OP_FILE_READ_RANGE: u16 = 0x0600;
+/// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
+pub const OP_AUTHENTICATE: u16 = 0x0800;
 
 /// A decoding/validation failure.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]

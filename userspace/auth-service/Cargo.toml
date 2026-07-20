@@ -1,0 +1,22 @@
+[package]
+name = "auth-service"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libcrypto = { path = "../libcrypto" }
+librsproto = { path = "../librsproto" }
+
+# A library + binary split (mirroring fs-server-ext4/profile-server): the library
+# holds the host-testable credential logic (user-DB parse + PBKDF2 verify + the
+# Auth serve path); the binary is the bare-target resource server. `cargo xtask
+# test` runs `cargo test -p auth-service --lib`; the `#![no_main]` bin can't build
+# on host. Alloc-free — fixed `.bss` buffers, no `#[global_allocator]`.
+[lib]
+name = "auth_service"
+path = "src/lib.rs"
+
+[[bin]]
+name = "auth-service"
+path = "src/main.rs"

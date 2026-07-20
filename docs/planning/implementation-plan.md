@@ -1926,11 +1926,14 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
   per-binding channel; the pending slot grew N = 1 → a small table (`US_PENDING_MAX`)
   for concurrent in-flight requests. Validated end-to-end under `test-qemu` (init binds
   the fs endpoint a second time as a subtree; a lookup through it resolves correctly).
-- [ ] **Part C — auth-service + user DB**: the credential-oracle RS speaking the new
+- [x] **Part C — auth-service + user DB**: the credential-oracle RS speaking the new
   `Auth` rsproto category (`Authenticate` → `AUTHENTICATED{principal,home}`/`DENIED`,
   PBKDF2 verify, dummy-verify on missing user) — wire contract in
-  `docs/spec/rsproto-auth-ops.md`; a `passwd`-style `/system/users` seeded by xtask
-  (no secrets in-tree).
+  `docs/spec/rsproto-auth-ops.md`. New `librsproto::auth` codec + `auth-service`
+  crate (host-tested lib: DB parse + verify + serve; bare-target bin: read
+  `/system/users`, Ready-hand a client channel, serve). `passwd`-style `/system/users`
+  + `/home/alice` seeded into the ext4 by xtask (one-way verifier only — no secrets
+  in-tree). Host-tested; image assembles; boot green. **Spawning/wiring is Part D.**
 - [ ] **Part D — service-mgr → session-mgr + endpoint plumbing**: service-mgr spawns
   auth-service (bind `/svc/auth`) + session-mgr (re-delegated `BIND_NAMESPACE` +
   fs-server/console endpoints + auth channel); init hands the fs-server endpoint down.

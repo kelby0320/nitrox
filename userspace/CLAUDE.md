@@ -64,6 +64,7 @@ Each crate has its own `CLAUDE.md` for crate-specific guidance:
 - `userspace/eshell/CLAUDE.md` — emergency shell constraints (similar to init)
 - `userspace/fs-server-ext4/CLAUDE.md` — filesystem driver
 - `userspace/service-mgr/CLAUDE.md` — service supervisor
+- `userspace/auth-service/CLAUDE.md` — credential oracle (auth + session-mgr)
 
 Read the crate-specific `CLAUDE.md` before significant work in any of these.
 

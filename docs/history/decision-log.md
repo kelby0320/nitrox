@@ -6798,3 +6798,37 @@ end-to-end under `test-qemu` — init binds the fs endpoint a second time as a s
 Part B end-to-end validation the earlier finding deferred; it lands here. Part D no longer
 needs to solve multi-binding — it consumes this. `namespace-and-resource-servers.md`
 § Subtree scoping updated (bind-mount, no longer "deferred").
+
+## 2026-07-20 — Auth + session-mgr Part C: auth-service + user DB
+
+The credential oracle. Two new pieces plus image seeding, all host-verified; the
+spawning/wiring is Part D.
+
+- **`librsproto::auth`** — the `Auth` category (`0x08xx`) codec: `Authenticate`
+  (`0x0800`) request/reply build+parse per `rsproto-auth-ops.md` (a `DENIED` reply is
+  a normal reply, not `ERROR`). `OP_AUTHENTICATE` added to the op table. 6 round-trip
+  host tests.
+- **`auth-service` crate** — a lib/bin split (like fs-server-ext4). The lib
+  (`#![no_std]`, no-`alloc`) is the credential *policy*: parse the `passwd`-style user
+  DB (`name:salt_hex:iterations:verifier_hex:home`, `#`/blank lines skipped) and
+  verify against a stored **PBKDF2** verifier (`libcrypto`), with a **dummy verify for
+  an unknown user** so it is timing/shape-indistinguishable from a wrong password (no
+  enumeration oracle). `serve_authenticate` turns a request body + DB into a reply
+  body. 7 host tests (correct/wrong/unknown, multi-user + comments, serve, malformed →
+  error). The bin is the bare-target server: reads `/system/users`, hands a **client
+  channel endpoint** to the supervisor via `Meta::Ready` (it is *not* a namespace
+  forwarder — session-mgr sends `Authenticate` on a direct channel), then serves.
+  Alloc-free.
+- **Image seeding** — `tools/xtask` links `libcrypto` (pure `core`) and seeds
+  `/system/users` + an empty `/home/alice` into the ext4 staging tree. The stored
+  value is the one-way PBKDF2 verifier of a **fixture** demo password (a build input,
+  not a secret — no plaintext/verifier in the source tree, per the forbidden-patterns
+  rule); the same `libcrypto` derivation runs at seed time and verify time, so they
+  cannot drift. The fixture user/password/home/salt are xtask consts; init's Part-E
+  login selftest must reuse the literals.
+
+Verified: 24 `librsproto` + 7 `auth-service` host tests; the bare-target bin builds;
+the image assembles with `/system/users` seeded; the healthy boot still passes
+(`test-qemu` PASS — auth-service is built and packed into the initramfs but not yet
+spawned). New crate wired into the workspace, `xtask build`, `xtask test`, and the
+initramfs program list. Docs: `userspace/auth-service/CLAUDE.md`, `userspace/CLAUDE.md`.
