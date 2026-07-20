@@ -36,7 +36,7 @@ use crate::mm::{PAGE_SIZE, VirtAddr};
 // `Timer` (the arch hardware-clock alias) is imported above; the Timer kernel
 // object is referenced as `TimerObject` to avoid the name clash.
 use crate::object::kernel_server::{self, OpStatus};
-use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, validate_path};
+use crate::object::namespace::{NS_PATH_MAX, ResolvedTarget, SubtreeBase, validate_path};
 use crate::object::device_node::DeviceClass;
 use crate::object::{
     BlockSendOutcome, DeviceNode, EntropyObject, FileObject, IpcChannel, MAX_WAIT_HANDLES,
@@ -171,7 +171,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None, false)),
         SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some(a4 as u32), false)),
         SYS_FILE_CREATE => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some(a4 as u32), true)),
-        SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3)),
+        SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
         SYS_ENTROPY_CREATE => encode(sys_entropy_create()),
@@ -1138,7 +1138,14 @@ fn require_syscap(cap: crate::libkern::SysCaps) -> Result<(), KError> {
     }
 }
 
-pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -> SysResult {
+pub fn sys_ns_bind(
+    ns_h: u64,
+    path_ptr: u64,
+    path_len: usize,
+    resource_h: u64,
+    base_ptr: u64,
+    base_len: usize,
+) -> SysResult {
     // Namespace construction is a supervisor-only privilege: BIND_NAMESPACE is an
     // *additional* gate atop the `BIND` handle right below (a process cannot bind even
     // into a namespace it created without it). See docs/architecture/syscaps.md.
@@ -1147,6 +1154,20 @@ pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -
     let ns_ok = lookup_typed(ns_h, pid, Rights::BIND, KObjectType::Namespace)?;
     let mut buf = [0u8; NS_PATH_MAX];
     let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
+
+    // Optional subtree scoping (a5 = base_len; a4 = base_ptr): a userspace-server
+    // binding may be scoped to a sub-tree of the server, so a lookup's suffix is
+    // prepended with `base` before forwarding. `base_len == 0` = unscoped (a
+    // whole-tree mount). Only valid for a userspace-server bind (rejected on a
+    // direct-handle bind below). See docs/architecture/session-and-auth.md.
+    let mut base_buf = [0u8; NS_PATH_MAX];
+    let base = if base_len > 0 {
+        let bpath = copy_ns_path(base_ptr, base_len, &mut base_buf)?;
+        SubtreeBase::from_path(bpath).map_err(|_| KError::InvalidArgument)?
+    } else {
+        SubtreeBase::empty()
+    };
+
     // Resolve the resource handle (any type; ownership is the authority).
     let res_ok = global::get()
         .lookup(RawHandle(resource_h), pid, Rights::empty())
@@ -1173,7 +1194,7 @@ pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -
             )
         };
         let reg_ptr = reg_ref.as_ptr();
-        return match ns.bind_userspace_server(path, reg_ref, rights) {
+        return match ns.bind_userspace_server(path, reg_ref, rights, base) {
             Ok(()) => {
                 // Now that the binding owns the registration, record the endpoint →
                 // registration back-pointer so the server's reply reaches it. (Set
@@ -1190,8 +1211,13 @@ pub fn sys_ns_bind(ns_h: u64, path_ptr: u64, path_len: usize, resource_h: u64) -
         };
     }
 
-    // Direct-handle bind: clone the resource for the binding; the binding's rights
-    // are the handle's rights.
+    // Direct-handle bind: subtree scoping is a userspace-server concept (it scopes
+    // the path forwarded to a server), so a base on a direct-handle bind is a caller
+    // error rather than silently ignored.
+    if !base.is_empty() {
+        return Err(KError::InvalidArgument);
+    }
+    // Clone the resource for the binding; the binding's rights are the handle's rights.
     let target = res_ok.object.clone();
     match ns.bind(path, target, rights) {
         Ok(()) => Ok(0),
@@ -1451,11 +1477,32 @@ pub fn sys_ns_lookup(
                 }
             }
         }
-        Some((ResolvedTarget::UserspaceServer(reg), _binding_rights, suffix)) => {
+        Some((ResolvedTarget::UserspaceServer(reg, base), _binding_rights, suffix)) => {
             // Forward the lookup to the userspace server over IPC and leave the PO
             // pending (the reply completes it inline — see `sys_channel_send`). A
             // synchronous failure (server busy / full / gone) completes it now.
-            forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, grow_size, create)
+            //
+            // A subtree binding prepends its `base` to the suffix so the server sees
+            // only its scoped sub-tree (e.g. `/home` bound with base `/home/alice`).
+            // Both `base` (validated at bind) and `suffix` (the lookup path was
+            // `validate_path`d above) are free of `.`/`..`, so the join cannot escape
+            // the subtree.
+            if base.is_empty() {
+                forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, grow_size, create)
+            } else {
+                let mut jbuf = [0u8; NS_PATH_MAX];
+                match join_subtree(base.as_path(), suffix, &mut jbuf) {
+                    Some(joined) => forward_userspace_lookup(
+                        reg, &po_ref, pid, requested, joined, grow_size, create,
+                    ),
+                    None => {
+                        // The joined path overflows the buffer — drop the forwarding
+                        // reference (outside the namespace lock) and fail the lookup.
+                        drop(reg);
+                        Some((KError::TooLarge as i32, 0))
+                    }
+                }
+            }
         }
     };
     match outcome {
@@ -1480,6 +1527,33 @@ pub fn sys_ns_lookup(
 /// PO; `suffix` is the path past the mount prefix.
 ///
 /// [`UserspaceServer`]: crate::object::namespace::ResolvedTarget::UserspaceServer
+/// Join a subtree binding's `base` (an absolute namespace path, e.g. `/home/alice`)
+/// with a resolved server-relative `suffix` (e.g. `notes.txt`), producing the
+/// server-root-relative path to forward (`home/alice/notes.txt`). The base's leading
+/// `/` is stripped — a forwarded path is always relative to the server's own root,
+/// like any suffix. Writes into `out`; returns the joined slice, or `None` if it
+/// would exceed `out`. Callers guarantee `base` and `suffix` are already validated
+/// (no `.`/`..`), so the join cannot escape the subtree.
+fn join_subtree<'o>(base: &[u8], suffix: &[u8], out: &'o mut [u8]) -> Option<&'o [u8]> {
+    // `base` is a validated absolute path (leading `/`, non-root), so `base[1..]` is
+    // its non-empty server-relative form.
+    let base_rel = &base[1..];
+    let joined_len = if suffix.is_empty() {
+        base_rel.len()
+    } else {
+        base_rel.len() + 1 + suffix.len()
+    };
+    if joined_len > out.len() {
+        return None;
+    }
+    out[..base_rel.len()].copy_from_slice(base_rel);
+    if !suffix.is_empty() {
+        out[base_rel.len()] = b'/';
+        out[base_rel.len() + 1..joined_len].copy_from_slice(suffix);
+    }
+    Some(&out[..joined_len])
+}
+
 fn forward_userspace_lookup(
     reg: ObjectRef,
     po_ref: &ObjectRef,
@@ -2497,6 +2571,35 @@ mod tests {
     #[test]
     fn unknown_number_is_unsupported() {
         assert_eq!(dispatch(0xDEAD, 0, 0, 0, 0, 0, 0), KError::Unsupported.as_isize());
+    }
+
+    #[test]
+    fn join_subtree_prepends_base_stripping_leading_slash() {
+        let mut out = [0u8; NS_PATH_MAX];
+        // base + non-empty suffix → `<base-relative>/<suffix>`.
+        assert_eq!(
+            join_subtree(b"/home/alice", b"notes.txt", &mut out),
+            Some(&b"home/alice/notes.txt"[..])
+        );
+        // Empty suffix (an exact lookup of the mount point) → just the base-relative.
+        assert_eq!(join_subtree(b"/home/alice", b"", &mut out), Some(&b"home/alice"[..]));
+        // A deep base + deep suffix.
+        assert_eq!(
+            join_subtree(b"/a/b", b"c/d/e", &mut out),
+            Some(&b"a/b/c/d/e"[..])
+        );
+    }
+
+    #[test]
+    fn join_subtree_rejects_overflow() {
+        // A tiny buffer that cannot hold the joined path → None (→ TooLarge).
+        let mut tiny = [0u8; 4];
+        assert_eq!(join_subtree(b"/home/alice", b"notes.txt", &mut tiny), None);
+        // Exactly-fits boundary: "home/alice" is 10 bytes.
+        let mut exact = [0u8; 10];
+        assert_eq!(join_subtree(b"/home/alice", b"", &mut exact), Some(&b"home/alice"[..]));
+        let mut one_short = [0u8; 9];
+        assert_eq!(join_subtree(b"/home/alice", b"", &mut one_short), None);
     }
 
     #[test]

@@ -114,6 +114,37 @@ The slice-1 store is a small per-namespace list scanned for the longest match
 optimization if a namespace ever grows large enough to matter; the resolution
 *contract* (longest-prefix, suffix, attenuation) is independent of the structure.
 
+### Subtree scoping (userspace-server bindings)
+
+By default a resource-server binding forwards the bare `suffix`, so it exposes the
+server's *whole* tree from the server's root. A **userspace-server** binding may
+additionally carry a **base path** — a scoping prefix the kernel prepends to the
+suffix before forwarding — so the binding exposes only a *sub-tree* of the server:
+
+```
+binding /home → fs-server, base "/home/alice"
+lookup  /home/notes   →  suffix "notes"  →  forwarded as  home/alice/notes
+lookup  /home         →  suffix ""        →  forwarded as  home/alice
+```
+
+Nothing above `/home/alice` is nameable through this binding — the isolation is
+structural (this is how a session manager scopes a login to its user's home; see
+[session-and-auth](session-and-auth.md)). The base is set at bind time
+(`sys_ns_bind`'s `base` argument) and validated like any binding path — no `.`/`..`
+components — so, combined with the lookup path itself being validated, a forwarded
+path can never escape the subtree. The wire protocol is unchanged: the server
+receives one server-relative path and resolves it, unaware a base was prepended. An
+empty base is the original whole-tree behaviour.
+
+> **One server, many bindings.** Subtree scoping is a property of the *binding*, so
+> the same server can be exposed through several bindings (whole-tree at one path, a
+> scoped sub-tree at another, in different namespaces). Reply routing today keys a
+> single registration to a server endpoint (one outstanding forwarded lookup per
+> endpoint), so *multiple concurrent* bindings to one server endpoint are an
+> endpoint-plumbing concern handled where a supervisor composes such views (the
+> session-manager slice) — either by sharing one registration across bindings or by
+> vending a per-binding forwarding channel.
+
 ## Binding targets
 
 A binding's `target` is one of:

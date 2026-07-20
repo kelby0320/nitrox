@@ -253,9 +253,13 @@ fn sys_ns_bind(
     path:     UserPtr<u8>,
     path_len: usize,
     resource: RawHandle,
+    base:     UserPtr<u8>,   // subtree base path; ignored when base_len == 0
+    base_len: usize,
 ) -> isize
 ```
-Binds `resource` (a direct kernel-object handle in slice 1; an IPC resource-server endpoint in slice 3) at `path` in `ns`. Requires the `BIND` right on `ns` (the enforced gate); the `BIND_NAMESPACE` system capability is an additional required gate once the syscap/process-capability model lands. Returns `0` on success.
+Binds `resource` (a direct kernel-object handle in slice 1; an IPC resource-server endpoint in slice 3) at `path` in `ns`. Requires the `BIND` right on `ns` (the enforced gate) **and** the `BIND_NAMESPACE` system capability (an additional gate; see [syscaps](../architecture/syscaps.md)). Returns `0` on success.
+
+**Subtree scoping** (`base_len > 0`): for an IPC resource-server (userspace-server) bind, `base` is an absolute namespace path the kernel prepends to every forwarded lookup's suffix, so the binding exposes only that sub-tree of the server — e.g. `sys_ns_bind(ns, "/home", …, fs_endpoint, "/home/alice", 11)` makes a lookup of `/home/notes` reach the server as `home/alice/notes`, and nothing above `/home/alice` nameable. `base` is validated like any binding path (no `.`/`..`, so it cannot escape the subtree; root `/` and paths over 128 bytes are rejected → `InvalidArgument`). `base_len == 0` = an unscoped whole-tree mount (the original behaviour; existing callers via `syscall4` pass 0 automatically). A non-zero `base` on a **direct-handle** bind is rejected (`InvalidArgument`) — scoping applies only to servers. See [session-and-auth](../architecture/session-and-auth.md) § Session construction.
 
 ```rust
 fn sys_ns_unbind(

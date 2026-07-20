@@ -6732,3 +6732,33 @@ no enumeration/timing oracle). Same feedback: the `session-and-auth.md` architec
 doc was pared back to *architecture only* — the A–E build staging + verification
 harness live in the implementation plan, not the arch doc (the arch doc references
 the spec for wire details rather than implying wire types with no home).
+
+## 2026-07-20 — Auth + session-mgr Part B: subtree-scoped namespace binding (kernel)
+
+The enabling kernel primitive for per-user home isolation. A `UserspaceServer`
+namespace binding gains an optional **base path** (`SubtreeBase`, a small `Copy`,
+allocation-free inline value on the binding): the kernel prepends it to a lookup's
+forwarded suffix, so the binding exposes only a sub-tree of the server (`/home` bound
+with base `/home/alice` → a lookup of `/home/notes` reaches the server as
+`home/alice/notes`; nothing above is nameable). `sys_ns_bind` grew two args
+(`base_ptr`, `base_len` in a4/a5) — backward-compatible because `syscall4` already
+zeroes a4/a5, so every existing caller passes `base_len = 0` (unscoped) untouched. A
+base on a direct-handle bind is rejected (scoping is a server concept). Both the base
+(validated at bind) and the suffix (the lookup path is `validate_path`d) are free of
+`.`/`..`, so the join (`join_subtree`, leading `/` stripped) cannot escape the
+subtree. Host-tested: `SubtreeBase::from_path` validation, `resolve` carries the base
+out, `join_subtree` prepend + overflow (531 kernel host tests green); healthy boot
+unaffected by the ABI change.
+
+**Finding — multi-binding one server needs endpoint plumbing (deferred to Part D).**
+An attempted end-to-end boot smoke test (bind the fs endpoint a *second* time as a
+subtree) hung: reply routing keys the endpoint→registration back-pointer on the
+shared `IpcChannel`, and each registration has a **single** pending-lookup slot
+(N = 1, slice-7 sizing), so binding the same endpoint twice makes the second bind
+hijack the first's replies. This is orthogonal to the subtree primitive (the base
+rides on the *binding*, not the reg) and is exactly the "endpoint plumbing" Part D
+owns: exposing one server through concurrent bindings needs either a **shared
+registration** across bindings (endpoint→reg stays consistent; grow the pending set
+to a small request-id-keyed table) or a **per-binding forwarding channel** (the
+server serves several). Choice deferred to Part D; Part B's end-to-end validation
+lands there. Recorded in `namespace-and-resource-servers.md` § Subtree scoping.

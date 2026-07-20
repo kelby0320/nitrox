@@ -1916,17 +1916,26 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
   PBKDF2-HMAC-SHA256 + `password`/`ct_eq`, `no_std`/`core`-only/no-deps, verified vs
   NIST/RFC 4231/RFC 7914 vectors (17 host tests). Pure `core` so `xtask` links it to
   seed image hashes. Wired into `xtask test`.
-- [ ] **Part B — subtree-scoped namespace binding** (kernel): a base path on a
-  `UserspaceServer` binding (`base + suffix` forwarded), `..`/`.`-rejecting; the
-  enabler for `/home` → `/home/<user>`.
+- [x] **Part B — subtree-scoped namespace binding** (kernel): a `SubtreeBase` (base
+  path) on a `UserspaceServer` binding (`base + suffix` forwarded, leading `/`
+  stripped), `..`/`.`-rejecting; `sys_ns_bind` gained `base_ptr`/`base_len` (a4/a5,
+  backward-compatible). Host-tested (`from_path`, `resolve` carries base,
+  `join_subtree`); boot unaffected. **Finding**: exposing one server through
+  *concurrent* bindings hits the single-registration-per-endpoint reply routing
+  (N = 1 pending slot) — the end-to-end subtree exercise + the multi-binding fix
+  (shared reg, or per-binding channel) move into Part D's endpoint plumbing.
 - [ ] **Part C — auth-service + user DB**: the credential-oracle RS speaking the new
   `Auth` rsproto category (`Authenticate` → `AUTHENTICATED{principal,home}`/`DENIED`,
   PBKDF2 verify, dummy-verify on missing user) — wire contract in
   `docs/spec/rsproto-auth-ops.md`; a `passwd`-style `/system/users` seeded by xtask
   (no secrets in-tree).
-- [ ] **Part D — service-mgr → session-mgr**: service-mgr spawns auth-service (bind
-  `/svc/auth`) + session-mgr (re-delegated `BIND_NAMESPACE` + fs-server/console
-  endpoints + auth channel); init hands the fs-server endpoint down.
+- [ ] **Part D — service-mgr → session-mgr + endpoint plumbing**: service-mgr spawns
+  auth-service (bind `/svc/auth`) + session-mgr (re-delegated `BIND_NAMESPACE` +
+  fs-server/console endpoints + auth channel); init hands the fs-server endpoint down.
+  Resolve the **multi-binding-to-one-server** routing (Part B finding): share one
+  registration across the `/` and session `/home` bindings (+ grow the reg's pending
+  set beyond N = 1), or vend session-mgr a per-binding forwarding channel. Includes
+  the end-to-end subtree resolve that Part B deferred.
 - [ ] **Part E — login + namespace construction + user shell** (the milestone):
   session-mgr's `login:` loop → auth → `sys_ns_create` + attenuated binds
   ({console, /home subtree RW, /bin, /store}) → spawn the throwaway user shell (empty
