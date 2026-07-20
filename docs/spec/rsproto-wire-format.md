@@ -66,7 +66,8 @@ The 16-bit `op` field decomposes:
 | `Power` | `0x05xx` | Suspend, resume, device power |
 | `File` | `0x06xx` | Positioned, stateless file-content reads (page-cache fill) |
 | `Log` | `0x07xx` | Reserved for *reply-bearing* logging ops (read-back/query). The hot append path uses **no** op — see [Log records](#log-records). |
-| (reserved) | `0x08xx` – `0xFExx` | Future categories |
+| `Auth` | `0x08xx` | Credential validation (username/password → principal). See [Auth operations spec](rsproto-auth-ops.md). |
+| (reserved) | `0x09xx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 A resource server must implement at least the Meta category. Each server declares which other categories it supports via `Meta::QueryCaps`.
@@ -182,9 +183,10 @@ Each operation's body is documented per category. See:
 - [File operations spec](rsproto-file-ops.md)
 - [Stream operations spec](rsproto-stream-ops.md) (TBD when implemented)
 - [Block operations spec](rsproto-block-ops.md) (`MapRange`/`AllocRange` — Model A)
+- [Auth operations spec](rsproto-auth-ops.md) (`Authenticate` — credential validation)
 
-The Meta, Namespace, and File operations are specified; the rest land with their
-consumers.
+The Meta, Namespace, File, Block, and Auth operations are specified; the rest land
+with their consumers.
 
 ## Log records
 

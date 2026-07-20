@@ -6687,3 +6687,48 @@ Scope: **group 0 only** (cross-group inode/block allocation deferred), and direc
 directory returns `TooLarge`. Remaining deferrals from the Parts A–D entry stand
 (cross-group allocation, extent splitting / index nodes, truncate/delete/rename, journaling,
 `metadata_csum`, standalone `MapRange`/`AllocRange`, per-page dirty tracking, read-ahead).
+
+## 2026-07-20 — Auth + session-mgr slice: design + Part A (`libcrypto`)
+
+Started the "Auth + session-mgr" slice (Phase 3 backlog item 5) — login → authenticate →
+per-user namespace → user shell → home write. Design decided with the user across four
+forks, all taken at **full fidelity**: (1) a hand-rolled SHA-256 + PBKDF2 password KDF
+(not plaintext); (2) **true subtree-scoped** home isolation (a kernel change), not
+sandbox-by-omission; (3) service-mgr **spawns** session-mgr and re-delegates
+`BIND_NAMESPACE` (faithful to the committed design), not init-direct; (4) a **separate**
+auth-service process (credential validation), not folded into session-mgr.
+
+New design doc `docs/architecture/session-and-auth.md` (the previously-missing
+session/auth architecture doc) captures the whole authority chain and stages the slice
+into Parts A–E: A = crypto + doc; B = subtree-scoped namespace binding (kernel); C =
+auth-service + user DB; D = service-mgr → session-mgr + endpoint plumbing; E = login + ns
+construction + user shell (the milestone). The defining property this slice proves:
+**a sandbox is a namespace you were handed, not a permission you were denied** — the user
+shell holds empty syscaps and a namespace naming only its session's resources, so it
+cannot *name* `/dev/blk` or another home.
+
+**Part A — `libcrypto` (built, host-verified).** New `userspace/libcrypto` crate:
+`#![no_std]`, no `alloc`, `core`-only, no dependencies (the `libkern`/`chacha.rs`
+discipline). SHA-256 (FIPS 180-4) + HMAC-SHA256 (RFC 2104) + PBKDF2-HMAC-SHA256 (RFC
+8018) + a `password` helper (`derive`/constant-time `verify`) + `ct_eq`. Verified against
+published vectors (NIST SHA-256, RFC 4231 HMAC, RFC 7914 PBKDF2) — 17 host tests, wired
+into `xtask test`. PBKDF2 chosen over an ad-hoc salted hash for its standard status,
+testable vectors, and a per-record tunable iteration cost. Pure `core` so `tools/xtask`
+links the *same* code to seed image password hashes (Part C) that the on-target
+auth-service verifies with. Shared-by-design with the future audit subsystem's
+hash-chained records ("build the hash once").
+
+Sub-decisions (defaulted, recorded): KDF = PBKDF2-HMAC-SHA256; user DB = a minimal
+`passwd`-style line file at `/system/users`, seeded by xtask, no secrets in-tree (a
+credential DB is not TOML config); the milestone verdict uses a `test-harness`
+auto-login for determinism, with the interactive `login:` prompt as the real entry.
+
+**Auth gets a first-class rsproto category** (review feedback): credential validation
+is a stable request/reply contract, not an opaque `Control` (`0x04xx`) ioctl and not
+resource I/O, so it claims the first reserved category `Auth = 0x08xx` with its own
+spec `docs/spec/rsproto-auth-ops.md` (`Authenticate` = `0x0800`;
+`AUTHENTICATED{principal,home}` / `DENIED`; deny is a normal reply, not an `ERROR`;
+no enumeration/timing oracle). Same feedback: the `session-and-auth.md` architecture
+doc was pared back to *architecture only* — the A–E build staging + verification
+harness live in the implementation plan, not the arch doc (the arch doc references
+the spec for wire details rather than implying wire types with no home).

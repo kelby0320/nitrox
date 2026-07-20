@@ -1907,10 +1907,31 @@ bytes; it becomes a handle to the program's bytes.
 
 #### Authentication and session management
 
-- [ ] Authentication service (initially: trivial password file in store)
-- [ ] Session manager
-- [ ] Per-user namespace construction (overlay layers, subtree handles)
-- [ ] User shell spawn with constructed namespace
+Design + staging: `docs/architecture/session-and-auth.md` (written 2026-07-20). Four
+forks taken at full fidelity: hand-rolled password KDF; **true subtree-scoped** home
+isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-delegated
+`BIND_NAMESPACE`; a **separate** auth-service. Staged Parts A–E:
+
+- [x] **Part A — `libcrypto` + design doc** (`phase-3/auth-session`): SHA-256 + HMAC +
+  PBKDF2-HMAC-SHA256 + `password`/`ct_eq`, `no_std`/`core`-only/no-deps, verified vs
+  NIST/RFC 4231/RFC 7914 vectors (17 host tests). Pure `core` so `xtask` links it to
+  seed image hashes. Wired into `xtask test`.
+- [ ] **Part B — subtree-scoped namespace binding** (kernel): a base path on a
+  `UserspaceServer` binding (`base + suffix` forwarded), `..`/`.`-rejecting; the
+  enabler for `/home` → `/home/<user>`.
+- [ ] **Part C — auth-service + user DB**: the credential-oracle RS speaking the new
+  `Auth` rsproto category (`Authenticate` → `AUTHENTICATED{principal,home}`/`DENIED`,
+  PBKDF2 verify, dummy-verify on missing user) — wire contract in
+  `docs/spec/rsproto-auth-ops.md`; a `passwd`-style `/system/users` seeded by xtask
+  (no secrets in-tree).
+- [ ] **Part D — service-mgr → session-mgr**: service-mgr spawns auth-service (bind
+  `/svc/auth`) + session-mgr (re-delegated `BIND_NAMESPACE` + fs-server/console
+  endpoints + auth channel); init hands the fs-server endpoint down.
+- [ ] **Part E — login + namespace construction + user shell** (the milestone):
+  session-mgr's `login:` loop → auth → `sys_ns_create` + attenuated binds
+  ({console, /home subtree RW, /bin, /store}) → spawn the throwaway user shell (empty
+  syscaps) → shell writes `$HOME`. eshell demoted to emergency-only. Verdict: a
+  `test-harness` auto-login; wrong-password rejected; `/dev/blk` unreachable.
 
 Scope notes (decided 2026-07-17, for when this slice runs):
 - **Proper password hashing, if scope allows.** Prefer storing a **password hash** (a hand-

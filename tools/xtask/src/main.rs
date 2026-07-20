@@ -504,6 +504,15 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libcrypto` host tests (SHA-256 / HMAC / PBKDF2 against published vectors). A
+    // plain `core`-only lib (no bare-target bin), host-tested like `librsproto`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libcrypto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // service-mgr's library tests (the service-declaration parser). `--lib` skips the
     // `#![no_main]` supervisor bin, which can't build for the host.
     run(Command::new("cargo")

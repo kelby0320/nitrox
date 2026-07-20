@@ -1,0 +1,14 @@
+[package]
+name = "libcrypto"
+version = "0.1.0"
+edition = "2024"
+
+# Hand-rolled cryptographic primitives (SHA-256, HMAC-SHA256, PBKDF2-HMAC-SHA256),
+# `core`-only, `#![no_std]`, no `alloc`, no dependencies — following the
+# `kernel/src/libkern/chacha.rs` "hand-rolled crypto, no external crates" precedent.
+# All routines operate on caller-provided slices / fixed stack buffers. Under
+# `cargo test` it builds as a host `std` crate so the vectors run on the host; the
+# same code links into `tools/xtask` (pure `core`, host-compilable) to seed
+# password hashes into the image at build time. See
+# `docs/architecture/session-and-auth.md`.
+[dependencies]
