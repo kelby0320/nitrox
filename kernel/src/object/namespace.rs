@@ -52,24 +52,85 @@ pub enum NsError {
     OutOfMemory,
 }
 
+/// Maximum length of a subtree base path (a userspace-server binding's scoping
+/// prefix), in bytes. Home-directory bases are short; this bound keeps
+/// [`SubtreeBase`] a small, `Copy`, allocation-free inline value that resolution can
+/// carry out without a heap copy or a drop hazard.
+pub const NS_SUBTREE_BASE_MAX: usize = 128;
+
+/// A **subtree base path** attached to a userspace-server binding: the
+/// server-root-relative prefix the kernel prepends to every forwarded lookup's
+/// suffix, so the binding exposes only a *sub-tree* of the server (e.g. a session's
+/// `/home` bound to the fs-server with base `/home/alice` — a lookup of
+/// `/home/notes` reaches the server as `home/alice/notes`, and nothing above
+/// `/home/alice` is nameable). See
+/// `docs/architecture/namespace-and-resource-servers.md` § Subtree scoping.
+///
+/// Empty = no scoping (the whole server tree is exposed — the original behaviour).
+/// A small, `Copy`, allocation-free inline buffer: it owns no `ObjectRef`, so
+/// [`Namespace::resolve`] can copy it out from under the lock without an allocation
+/// or a drop hazard. The stored path is a validated absolute namespace path (leading
+/// `/`, no `.`/`..` — see [`validate_path`]); the leading `/` is stripped where the
+/// kernel prepends it to a server-relative suffix.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub struct SubtreeBase {
+    buf: [u8; NS_SUBTREE_BASE_MAX],
+    len: u16,
+}
+
+impl SubtreeBase {
+    /// No scoping — the whole server tree is exposed.
+    pub const fn empty() -> Self {
+        SubtreeBase { buf: [0u8; NS_SUBTREE_BASE_MAX], len: 0 }
+    }
+
+    /// Build a base from an absolute namespace `path`. Validated like any binding
+    /// path (leading `/`, no `.`/`..`, no empty components — so a base can never
+    /// escape a subtree); root `/` is rejected (it scopes to nothing), and a path
+    /// longer than [`NS_SUBTREE_BASE_MAX`] is rejected. Returns [`NsError::InvalidPath`]
+    /// otherwise.
+    pub fn from_path(path: &[u8]) -> Result<Self, NsError> {
+        validate_path(path)?;
+        if path == b"/" || path.len() > NS_SUBTREE_BASE_MAX {
+            return Err(NsError::InvalidPath);
+        }
+        let mut b = SubtreeBase::empty();
+        b.buf[..path.len()].copy_from_slice(path);
+        b.len = path.len() as u16;
+        Ok(b)
+    }
+
+    /// The stored absolute base path (leading `/`), empty when unscoped.
+    pub fn as_path(&self) -> &[u8] {
+        &self.buf[..self.len as usize]
+    }
+
+    /// True when no scoping is applied.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+}
+
 /// What a binding resolves to. One of three kinds: a **direct handle** (a bound
 /// `ObjectRef`, returned by a lookup directly), a **Kernel Server** (an in-kernel
 /// resource server the lookup calls to *produce* a handle — see
 /// [`crate::object::kernel_server`]), or a **Userspace Server** (a process reached
 /// over IPC; the lookup is forwarded to it — see
-/// [`crate::object::UserspaceServerReg`]).
+/// [`crate::object::UserspaceServerReg`]). A userspace-server binding also carries a
+/// [`SubtreeBase`] (empty for a whole-tree mount).
 ///
 /// Drop discipline (see "Mutation discipline"): `DirectHandle` and
 /// `UserspaceServer` each own an `ObjectRef` and must be dropped **outside** the
-/// namespace lock; `KernelServer` holds a `Copy` id and is drop-free.
+/// namespace lock; `KernelServer` holds a `Copy` id and is drop-free. The
+/// `SubtreeBase` is `Copy` bytes — drop-free.
 pub enum BindingTarget {
     /// A directly-bound resource. A lookup returns a clone of this handle.
     DirectHandle(ObjectRef),
     /// An in-kernel resource server, identified by its dispatch id.
     KernelServer(KernelServerId),
     /// A userspace resource server, via its kernel registration record (the
-    /// kernel forwards the lookup to it over IPC).
-    UserspaceServer(ObjectRef),
+    /// kernel forwards the lookup to it over IPC), with an optional subtree base.
+    UserspaceServer(ObjectRef, SubtreeBase),
 }
 
 /// The result of [`Namespace::resolve`] for the matched binding: the same three
@@ -83,8 +144,9 @@ pub enum ResolvedTarget {
     /// An in-kernel resource server to dispatch to (id copied out).
     KernelServer(KernelServerId),
     /// A cloned reference to a userspace server's registration, owned by the
-    /// caller (which forwards the lookup to it).
-    UserspaceServer(ObjectRef),
+    /// caller (which forwards the lookup to it), plus the binding's [`SubtreeBase`]
+    /// (empty for a whole-tree mount) the caller prepends to the forwarded suffix.
+    UserspaceServer(ObjectRef, SubtreeBase),
 }
 
 /// One binding: the absolute path it owns, the target it resolves to, and the
@@ -234,11 +296,15 @@ impl Namespace {
     /// discipline"). Rejects an invalid path or a duplicate exact path.
     ///
     /// [`bind`]: Namespace::bind
+    /// `base` is the subtree scoping prefix ([`SubtreeBase::empty`] for a whole-tree
+    /// mount); a lookup's suffix is prepended with it before being forwarded to the
+    /// server (see [`SubtreeBase`]).
     pub fn bind_userspace_server(
         &self,
         path: &[u8],
         reg: ObjectRef,
         rights: Rights,
+        base: SubtreeBase,
     ) -> Result<(), (ObjectRef, NsError)> {
         if let Err(e) = validate_path(path) {
             return Err((reg, e));
@@ -260,7 +326,7 @@ impl Namespace {
             .bindings
             .try_push(Binding {
                 path: p,
-                target: BindingTarget::UserspaceServer(reg),
+                target: BindingTarget::UserspaceServer(reg, base),
                 rights,
             })
             .expect("slot reserved above");
@@ -376,7 +442,7 @@ impl Namespace {
         out.kind = match &b.target {
             BindingTarget::DirectHandle(_) => NS_KIND_DIRECT,
             BindingTarget::KernelServer(_) => NS_KIND_KERNEL,
-            BindingTarget::UserspaceServer(_) => NS_KIND_MOUNT,
+            BindingTarget::UserspaceServer(_, _) => NS_KIND_MOUNT,
         };
         out.rights = b.rights.bits();
         true
@@ -420,7 +486,9 @@ fn resolve_target(t: &BindingTarget) -> ResolvedTarget {
     match t {
         BindingTarget::DirectHandle(obj) => ResolvedTarget::DirectHandle(obj.clone()),
         BindingTarget::KernelServer(id) => ResolvedTarget::KernelServer(*id),
-        BindingTarget::UserspaceServer(reg) => ResolvedTarget::UserspaceServer(reg.clone()),
+        BindingTarget::UserspaceServer(reg, base) => {
+            ResolvedTarget::UserspaceServer(reg.clone(), *base)
+        }
     }
 }
 
@@ -691,7 +759,7 @@ mod tests {
         assert_eq!(rights, Rights::READ);
         match target {
             ResolvedTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
-            ResolvedTarget::DirectHandle(_) | ResolvedTarget::UserspaceServer(_) => {
+            ResolvedTarget::DirectHandle(_) | ResolvedTarget::UserspaceServer(..) => {
                 panic!("expected a kernel-server target")
             }
         }
@@ -758,15 +826,21 @@ mod tests {
     #[test]
     fn bind_userspace_server_resolves_to_the_registration() {
         let n = ns();
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP | Rights::MAP_READ)
-            .unwrap();
+        n.bind_userspace_server(
+            b"/fs",
+            us_reg_target(),
+            Rights::LOOKUP | Rights::MAP_READ,
+            SubtreeBase::empty(),
+        )
+        .unwrap();
         // Exact match → empty suffix, the userspace-server target, its rights.
         let (target, rights, suf) = n.resolve(b"/fs").unwrap();
         assert_eq!(suf, b"");
         assert_eq!(rights, Rights::LOOKUP | Rights::MAP_READ);
         match target {
-            ResolvedTarget::UserspaceServer(reg) => {
+            ResolvedTarget::UserspaceServer(reg, base) => {
                 assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
+                assert!(base.is_empty(), "an unscoped mount carries no base");
             }
             _ => panic!("expected a userspace-server target"),
         }
@@ -774,7 +848,43 @@ mod tests {
         // forwards (leaf-vs-subtree is the lookup syscall's concern, not resolve's).
         let (target, _, suf) = n.resolve(b"/fs/system/current-generation").unwrap();
         assert_eq!(suf, b"system/current-generation");
-        assert!(matches!(target, ResolvedTarget::UserspaceServer(_)));
+        assert!(matches!(target, ResolvedTarget::UserspaceServer(..)));
+    }
+
+    #[test]
+    fn subtree_base_from_path_validates() {
+        // A valid absolute path is accepted and stored verbatim.
+        let b = SubtreeBase::from_path(b"/home/alice").unwrap();
+        assert_eq!(b.as_path(), b"/home/alice");
+        assert!(!b.is_empty());
+        assert!(SubtreeBase::empty().is_empty());
+        // Rejected: relative, dot/dotdot (subtree escape), root, and over-long.
+        for bad in [&b"home"[..], b"/a/../b", b"/./x", b"/", b"//x"] {
+            assert_eq!(SubtreeBase::from_path(bad), Err(NsError::InvalidPath), "{bad:?}");
+        }
+        let toolong = {
+            let mut v = [b'a'; NS_SUBTREE_BASE_MAX + 2];
+            v[0] = b'/';
+            v
+        };
+        assert_eq!(SubtreeBase::from_path(&toolong), Err(NsError::InvalidPath));
+    }
+
+    #[test]
+    fn bind_userspace_server_carries_subtree_base() {
+        let n = ns();
+        let base = SubtreeBase::from_path(b"/home/alice").unwrap();
+        n.bind_userspace_server(b"/home", us_reg_target(), Rights::LOOKUP | Rights::WRITE, base)
+            .unwrap();
+        // Resolving through the binding carries the base out to the caller (which
+        // prepends it to the suffix before forwarding). The suffix itself is
+        // unchanged — the join is the syscall layer's job.
+        let (target, _, suf) = n.resolve(b"/home/notes.txt").unwrap();
+        assert_eq!(suf, b"notes.txt");
+        match target {
+            ResolvedTarget::UserspaceServer(_, b) => assert_eq!(b.as_path(), b"/home/alice"),
+            _ => panic!("expected a userspace-server target"),
+        }
     }
 
     #[test]
@@ -782,15 +892,16 @@ mod tests {
         let n = ns();
         // Invalid path: the registration ref is handed back to drop outside the lock.
         let (t, e) = n
-            .bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP)
+            .bind_userspace_server(b"bad", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
             .unwrap_err();
         assert_eq!(e, NsError::InvalidPath);
         assert_eq!(t.object_type(), KObjectType::UserspaceServerReg);
         drop(t);
         // Duplicate exact path.
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP).unwrap();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
+            .unwrap();
         let (t, e) = n
-            .bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP)
+            .bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
             .unwrap_err();
         assert_eq!(e, NsError::AlreadyBound);
         drop(t);
@@ -799,9 +910,10 @@ mod tests {
     #[test]
     fn unbind_userspace_server_returns_the_registration_ref() {
         let n = ns();
-        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP).unwrap();
+        n.bind_userspace_server(b"/fs", us_reg_target(), Rights::LOOKUP, SubtreeBase::empty())
+            .unwrap();
         match n.unbind(b"/fs").expect("was bound") {
-            BindingTarget::UserspaceServer(reg) => {
+            BindingTarget::UserspaceServer(reg, _) => {
                 assert_eq!(reg.object_type(), KObjectType::UserspaceServerReg);
                 drop(reg); // released outside the lock
             }
@@ -817,7 +929,7 @@ mod tests {
             .unwrap();
         match n.unbind(b"/dev/entropy").expect("was bound") {
             BindingTarget::KernelServer(id) => assert_eq!(id, KernelServerId::Entropy),
-            BindingTarget::DirectHandle(_) | BindingTarget::UserspaceServer(_) => {
+            BindingTarget::DirectHandle(_) | BindingTarget::UserspaceServer(..) => {
                 panic!("expected a kernel-server target")
             }
         }

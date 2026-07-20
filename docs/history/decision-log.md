@@ -6687,3 +6687,246 @@ Scope: **group 0 only** (cross-group inode/block allocation deferred), and direc
 directory returns `TooLarge`. Remaining deferrals from the Parts A–D entry stand
 (cross-group allocation, extent splitting / index nodes, truncate/delete/rename, journaling,
 `metadata_csum`, standalone `MapRange`/`AllocRange`, per-page dirty tracking, read-ahead).
+
+## 2026-07-20 — Auth + session-mgr slice: design + Part A (`libcrypto`)
+
+Started the "Auth + session-mgr" slice (Phase 3 backlog item 5) — login → authenticate →
+per-user namespace → user shell → home write. Design decided with the user across four
+forks, all taken at **full fidelity**: (1) a hand-rolled SHA-256 + PBKDF2 password KDF
+(not plaintext); (2) **true subtree-scoped** home isolation (a kernel change), not
+sandbox-by-omission; (3) service-mgr **spawns** session-mgr and re-delegates
+`BIND_NAMESPACE` (faithful to the committed design), not init-direct; (4) a **separate**
+auth-service process (credential validation), not folded into session-mgr.
+
+New design doc `docs/architecture/session-and-auth.md` (the previously-missing
+session/auth architecture doc) captures the whole authority chain and stages the slice
+into Parts A–E: A = crypto + doc; B = subtree-scoped namespace binding (kernel); C =
+auth-service + user DB; D = service-mgr → session-mgr + endpoint plumbing; E = login + ns
+construction + user shell (the milestone). The defining property this slice proves:
+**a sandbox is a namespace you were handed, not a permission you were denied** — the user
+shell holds empty syscaps and a namespace naming only its session's resources, so it
+cannot *name* `/dev/blk` or another home.
+
+**Part A — `libcrypto` (built, host-verified).** New `userspace/libcrypto` crate:
+`#![no_std]`, no `alloc`, `core`-only, no dependencies (the `libkern`/`chacha.rs`
+discipline). SHA-256 (FIPS 180-4) + HMAC-SHA256 (RFC 2104) + PBKDF2-HMAC-SHA256 (RFC
+8018) + a `password` helper (`derive`/constant-time `verify`) + `ct_eq`. Verified against
+published vectors (NIST SHA-256, RFC 4231 HMAC, RFC 7914 PBKDF2) — 17 host tests, wired
+into `xtask test`. PBKDF2 chosen over an ad-hoc salted hash for its standard status,
+testable vectors, and a per-record tunable iteration cost. Pure `core` so `tools/xtask`
+links the *same* code to seed image password hashes (Part C) that the on-target
+auth-service verifies with. Shared-by-design with the future audit subsystem's
+hash-chained records ("build the hash once").
+
+Sub-decisions (defaulted, recorded): KDF = PBKDF2-HMAC-SHA256; user DB = a minimal
+`passwd`-style line file at `/system/users`, seeded by xtask, no secrets in-tree (a
+credential DB is not TOML config); the milestone verdict uses a `test-harness`
+auto-login for determinism, with the interactive `login:` prompt as the real entry.
+
+**Auth gets a first-class rsproto category** (review feedback): credential validation
+is a stable request/reply contract, not an opaque `Control` (`0x04xx`) ioctl and not
+resource I/O, so it claims the first reserved category `Auth = 0x08xx` with its own
+spec `docs/spec/rsproto-auth-ops.md` (`Authenticate` = `0x0800`;
+`AUTHENTICATED{principal,home}` / `DENIED`; deny is a normal reply, not an `ERROR`;
+no enumeration/timing oracle). Same feedback: the `session-and-auth.md` architecture
+doc was pared back to *architecture only* — the A–E build staging + verification
+harness live in the implementation plan, not the arch doc (the arch doc references
+the spec for wire details rather than implying wire types with no home).
+
+## 2026-07-20 — Auth + session-mgr Part B: subtree-scoped namespace binding (kernel)
+
+The enabling kernel primitive for per-user home isolation. A `UserspaceServer`
+namespace binding gains an optional **base path** (`SubtreeBase`, a small `Copy`,
+allocation-free inline value on the binding): the kernel prepends it to a lookup's
+forwarded suffix, so the binding exposes only a sub-tree of the server (`/home` bound
+with base `/home/alice` → a lookup of `/home/notes` reaches the server as
+`home/alice/notes`; nothing above is nameable). `sys_ns_bind` grew two args
+(`base_ptr`, `base_len` in a4/a5) — backward-compatible because `syscall4` already
+zeroes a4/a5, so every existing caller passes `base_len = 0` (unscoped) untouched. A
+base on a direct-handle bind is rejected (scoping is a server concept). Both the base
+(validated at bind) and the suffix (the lookup path is `validate_path`d) are free of
+`.`/`..`, so the join (`join_subtree`, leading `/` stripped) cannot escape the
+subtree. Host-tested: `SubtreeBase::from_path` validation, `resolve` carries the base
+out, `join_subtree` prepend + overflow (531 kernel host tests green); healthy boot
+unaffected by the ABI change.
+
+**Finding — multi-binding one server needs endpoint plumbing (deferred to Part D).**
+An attempted end-to-end boot smoke test (bind the fs endpoint a *second* time as a
+subtree) hung: reply routing keys the endpoint→registration back-pointer on the
+shared `IpcChannel`, and each registration has a **single** pending-lookup slot
+(N = 1, slice-7 sizing), so binding the same endpoint twice makes the second bind
+hijack the first's replies. This is orthogonal to the subtree primitive (the base
+rides on the *binding*, not the reg) and is exactly the "endpoint plumbing" Part D
+owns: exposing one server through concurrent bindings needs either a **shared
+registration** across bindings (endpoint→reg stays consistent; grow the pending set
+to a small request-id-keyed table) or a **per-binding forwarding channel** (the
+server serves several). Choice deferred to Part D; Part B's end-to-end validation
+lands there. Recorded in `namespace-and-resource-servers.md` § Subtree scoping.
+
+## 2026-07-20 — Multi-binding to one server: shared registration (bind-mount)
+
+Resolved the finding above (pulled forward from Part D after a design discussion with
+the user). **Decision: bind-mount semantics — one server connection, many names.**
+Binding the same server endpoint again *shares its `UserspaceServerReg`* (the kernel's
+per-connection bookkeeping) instead of minting a rival that clobbers the endpoint→reg
+reply-routing back-pointer. The registration is the shared "superblock"; a binding is a
+(bind-)mount of it, carrying its own `SubtreeBase` + rights. Chosen over a per-binding
+forwarding channel: it needs no server-side multiplexing, and a second channel buys no
+real parallelism against a single-threaded serve loop — only a channel + serve-loop slot
+per view. The user's motivation: many processes (session-mgr, every session view,
+service-mgr, daemons) will reach the fs-server; sharing one connection scales, N channels
+don't.
+
+Implementation:
+- `sys_ns_bind` (IpcChannel target): if the endpoint already backs a registration
+  (`us_forward_existing_reg` — a bump-and-adopt of the existing reg under `SCHED`), bind
+  a reference to it with the new base; otherwise mint a fresh reg + attach the
+  back-pointer as before. Refcounting keeps the reg alive while any binding holds it.
+- The registration's pending slot grew from **N = 1 to a small table** (`US_PENDING_MAX
+  = 8`) for lookups and, independently, fills — several consumers can have a request in
+  flight at once (a full table → `WouldBlock`). Correlation was already by `request_id`;
+  `begin` finds a free slot, `take_pending_matching` scans by id. Server-death teardown
+  (`ipc_endpoint_closing`) now **drains all** pending lookups (`take_pending_next` loop),
+  failing each `PeerClosed` and collecting the POs to drop outside `SCHED`. Origination
+  rollback takes the specific reserved slot by id.
+
+Verified: 532 kernel host tests (new: concurrent-lookups-correlate, caps-at-capacity);
+end-to-end under `test-qemu` — init binds the fs endpoint a second time as a subtree
+(`/subtreetest` → base `/system`, sharing the reg) and a lookup of
+`/subtreetest/current-generation` resolves to the same file as
+`/system/current-generation` (`init: subtree bind … resolves + matches ok`). This is the
+Part B end-to-end validation the earlier finding deferred; it lands here. Part D no longer
+needs to solve multi-binding — it consumes this. `namespace-and-resource-servers.md`
+§ Subtree scoping updated (bind-mount, no longer "deferred").
+
+## 2026-07-20 — Auth + session-mgr Part C: auth-service + user DB
+
+The credential oracle. Two new pieces plus image seeding, all host-verified; the
+spawning/wiring is Part D.
+
+- **`librsproto::auth`** — the `Auth` category (`0x08xx`) codec: `Authenticate`
+  (`0x0800`) request/reply build+parse per `rsproto-auth-ops.md` (a `DENIED` reply is
+  a normal reply, not `ERROR`). `OP_AUTHENTICATE` added to the op table. 6 round-trip
+  host tests.
+- **`auth-service` crate** — a lib/bin split (like fs-server-ext4). The lib
+  (`#![no_std]`, no-`alloc`) is the credential *policy*: parse the `passwd`-style user
+  DB (`name:salt_hex:iterations:verifier_hex:home`, `#`/blank lines skipped) and
+  verify against a stored **PBKDF2** verifier (`libcrypto`), with a **dummy verify for
+  an unknown user** so it is timing/shape-indistinguishable from a wrong password (no
+  enumeration oracle). `serve_authenticate` turns a request body + DB into a reply
+  body. 7 host tests (correct/wrong/unknown, multi-user + comments, serve, malformed →
+  error). The bin is the bare-target server: reads `/system/users`, hands a **client
+  channel endpoint** to the supervisor via `Meta::Ready` (it is *not* a namespace
+  forwarder — session-mgr sends `Authenticate` on a direct channel), then serves.
+  Alloc-free.
+- **Image seeding** — `tools/xtask` links `libcrypto` (pure `core`) and seeds
+  `/system/users` + an empty `/home/alice` into the ext4 staging tree. The stored
+  value is the one-way PBKDF2 verifier of a **fixture** demo password (a build input,
+  not a secret — no plaintext/verifier in the source tree, per the forbidden-patterns
+  rule); the same `libcrypto` derivation runs at seed time and verify time, so they
+  cannot drift. The fixture user/password/home/salt are xtask consts; init's Part-E
+  login selftest must reuse the literals.
+
+Verified: 24 `librsproto` + 7 `auth-service` host tests; the bare-target bin builds;
+the image assembles with `/system/users` seeded; the healthy boot still passes
+(`test-qemu` PASS — auth-service is built and packed into the initramfs but not yet
+spawned). New crate wired into the workspace, `xtask build`, `xtask test`, and the
+initramfs program list. Docs: `userspace/auth-service/CLAUDE.md`, `userspace/CLAUDE.md`.
+
+## 2026-07-20 — AHCI: serialise concurrent block submits (bug fix; found in Part D)
+
+Bringing the login chain up alongside the demo chain (Part D) hung — traced to a real
+AHCI driver bug, not the documented "one command at a time" scope. `submit()` blindly
+`inflight.store(irp)` with no check that slot 0 was free, so a **second concurrent
+block submit** (e.g. `parent`'s `/dev/blk` read + the fs-server's read) overwrote the
+first's in-flight pointer, **orphaning it** (its `PendingOperation` never completes →
+its waiter hangs) and issuing a command on an already-busy slot. It was also latently
+SMP-unsafe (two CPUs in `sys_io_submit`/fault-fill racing the store).
+
+Fix: a small software FIFO in front of slot 0 (`PendingRing`, `IrqSpinLock`-guarded —
+submit runs in thread context, completion in the ISR). `submit` issues immediately if
+the slot is idle, else enqueues (a full queue fails the excess submit `IoError`, so a
+demand-fault fill fails cleanly rather than hanging). Both completion paths (`isr`,
+`poll_complete_inflight`) drain the next queued IRP via a shared `advance_slot` after
+taking the retired one out of flight. Concurrent clients now serialise correctly
+through slot 0 instead of clobbering each other. Verified: the concurrent boot that
+hung now passes (`parent`'s `/dev/blk` read completes while service-mgr runs); the
+single-client boot is unchanged; the demo chain still PASSES under `test-qemu`.
+
+The user confirmed we also want to **use the full 32 command slots (NCQ)** at some
+future point — recorded in `deferred-decisions.md`. The software queue depth is already
+`PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly; the trigger is an
+I/O-latency-bound workload (SSD, many concurrent readers). This fix unblocked Part D:
+the login chain can now run concurrently with the demo chain, so no verdict restructure
+is needed.
+
+## 2026-07-20 — Auth + session-mgr Part D: service-mgr → session-mgr + endpoint plumbing
+
+The login chain stands up end to end. init hands the retained fs-server forwarding
+endpoint to service-mgr; service-mgr spawns **auth-service** (RS `Meta::Ready`
+handshake → its client channel) and **session-mgr** (re-delegated `BIND_NAMESPACE` +
+a control channel), then transfers session-mgr the fs endpoint + the auth channel.
+session-mgr (new bin-only crate) receives the handoffs, **authenticates the demo user**
+against auth-service over the auth channel (correct → `AUTHENTICATED`, home path
+returned; wrong → `DENIED`), and **constructs a session namespace** binding `/home` as
+a subtree of the fs-server using the home from the auth reply — proving `BIND_NAMESPACE`
++ subtree scoping + shared-registration bind-mount together. This is the first
+end-to-end exercise of the whole credential stack (Parts A–C) under real spawning.
+service-mgr keeps its slice-A heartbeat supervision after bringing the chain up.
+
+**Verdict moved to session-mgr.** session-mgr fires the `test-harness` self-test
+verdict once its Part-D checks pass (it takes the build-mode feature like init). The
+chain is sequenced **after** the demo chain (see below), so the demo `parent`'s reap no
+longer ends the run — on `parent`'s clean reap init spawns the login chain and
+session-mgr gates the verdict. Verified under `test-qemu`: `session-mgr: authenticated
+'alice' -> home=/home/alice` … `session namespace built` … `wrong password correctly
+denied` … `verdict PASS`.
+
+**Finding — concurrent block I/O still hangs a *forwarded* lookup (sequenced around,
+tracked).** The AHCI pending-queue + DPC-drain fixed concurrent *direct* block clients,
+but a `/dev/blk` client (the demo `parent`) running concurrently with the fs-server's
+reads still hangs auth-service's forwarded `/system/users` lookup — confirmed isolated:
+the login chain completes cleanly when `parent` does **not** run alongside it. Root
+cause is not yet pinned (a second concurrency issue in the block/forwarding path beyond
+the AHCI submit race). Worked around by **sequencing** the login chain after the demo
+chain (the fs-server is then the only block client, serialised by its single serve
+loop); recorded in `deferred-decisions.md` as a concurrency item to investigate. The
+`SpawnArgs` for the login chain carry `TRANSFER`/`DUPLICATE` on the fs endpoint so it
+can be handed down the init → service-mgr → session-mgr chain.
+
+Deferred to Part E: the interactive `login:` prompt (replacing the hardcoded round-trip)
++ spawning the user shell into the constructed namespace + writing to `/home`.
+
+## 2026-07-20 — Auth + session-mgr Part E: login → user shell → home write (slice complete)
+
+The slice's headline milestone runs end to end: **login → authenticate → per-user
+namespace → sandboxed user shell → home write**. session-mgr now (a) authenticates a
+user — `test-harness` auto-logs-in the demo user for a deterministic verdict, the
+interactive path prompts `nitrox login:` + password (no echo) on `/dev/console` — (b)
+constructs the session namespace binding `/home` as the user's fs-server home subtree
+(RW) **and** `/dev/console` (the shell's I/O), deliberately omitting everything else,
+(c) spawns the new **`usersh`** throwaway shell into that namespace with **empty
+syscaps**, and (d) reaps it and gates the boot verdict on its exit code.
+
+`usersh` (new bin crate, `libkern`-only, alloc-free — the eshell family) is the login
+leaf: it `sys_file_create`s `/home/greeting`, writes + `sys_file_sync`s, then re-resolves
+with a plain lookup and verifies the bytes — the fs-RW create/grow/write path exercised
+from an unprivileged sandbox through the subtree binding (create-on-resolve forwards
+`home/alice/greeting` to the fs-server). Under `test-harness` it exits with its verdict;
+otherwise it runs a minimal console loop (`cat`/`exit`). This is the **defining property
+made real**: the shell holds empty syscaps and a namespace naming only `/home` +
+`/dev/console`, so `/dev/blk`, other homes, and the raw fs root are *unnameable* — a
+sandbox by construction, not permission denial.
+
+`eshell` is demoted to what its name means — the **emergency** shell on a critical-path
+failure — no longer the normal interactive console (which is now session-mgr's `login:`
+via the login chain).
+
+Verified under `test-qemu`: `login ok -> home=/home/alice` … `session namespace built
+(/home subtree + /dev/console)` … `user shell spawned into the session namespace` …
+`usersh: wrote + verified /home/greeting` … `verdict PASS`. Both the `test-harness`
+(auto-login) and interactive (`selftest`) builds compile; host suite + check-arch green.
+Sequenced after the demo chain (the concurrent-forwarded-lookup item stays open in
+`deferred-decisions.md`). The **auth + session-mgr slice is complete**; remaining items
+(roles / privilege broker, per-user profile overlays, session tokens, the real Phase-4
+shell) are deferred in `session-and-auth.md`.

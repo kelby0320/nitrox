@@ -34,10 +34,14 @@
 //! **outside** `SCHED`) or moved out of a `take_pending_*` return for the caller
 //! to drop outside `SCHED` — never dropped under the lock.
 //!
-//! Slice 7 sizes the pending table at **N = 1** (a single outstanding lookup per
-//! server): the milestone init path issues lookups one at a time, and N = 1 makes
-//! request correlation trivial. Raising it to a small fixed array is a localized
-//! change (Part 4, if boot issues overlapping lookups).
+//! The pending table holds up to [`US_PENDING_MAX`] outstanding lookups (and,
+//! independently, fills), correlated to replies by `request_id`. A single server
+//! endpoint is shared by *many* namespace bindings — one connection, many names
+//! (bind-mount semantics; see `docs/architecture/namespace-and-resource-servers.md`
+//! § Subtree scoping) — so several consumers can have a request in flight at once; a
+//! full table fails a new request `WouldBlock`. (Slice 7 shipped this at N = 1, when
+//! init issued lookups one at a time; sharing one endpoint across bindings made
+//! concurrent in-flight requests real, so the slot became a small table.)
 
 use core::cell::UnsafeCell;
 
@@ -115,16 +119,25 @@ pub struct PendingFill {
     pub(crate) index: usize,
 }
 
+/// Concurrent outstanding forwarded requests a single registration tracks, for
+/// lookups and (independently) for fills. Because one server endpoint is now shared
+/// by *many* namespace bindings (bind-mount semantics — see
+/// `docs/architecture/namespace-and-resource-servers.md` § Subtree scoping), several
+/// consumers can have a lookup/fill in flight at once; a full table fails a new
+/// request `WouldBlock` (the caller retries). Small and pre-sized — the fs-server
+/// drains quickly, so the in-flight count is low.
+pub const US_PENDING_MAX: usize = 8;
+
 struct Inner {
     /// The kernel's IPC endpoint; its peer is the endpoint the server services.
     endpoint: ObjectRef,
-    /// The single outstanding forwarded lookup (N = 1), or `None` when idle.
-    pending: Option<PendingLookup>,
-    /// The single outstanding forwarded page-cache fill (N = 1), or `None`. Separate
+    /// Outstanding forwarded lookups (up to [`US_PENDING_MAX`]), correlated to
+    /// replies by `request_id`. A free slot is `None`.
+    pending: [Option<PendingLookup>; US_PENDING_MAX],
+    /// Outstanding forwarded page-cache fills (up to [`US_PENDING_MAX`]). Separate
     /// from `pending` — a lookup and a fill correlate by distinct `request_id`s and
-    /// route by reply op; the milestone never overlaps them, but the slots are
-    /// independent so it would be correct if it did.
-    pending_fill: Option<PendingFill>,
+    /// route by reply op.
+    pending_fill: [Option<PendingFill>; US_PENDING_MAX],
     /// Monotonic `request_id` stamp (shared across lookups and fills).
     next_id: u64,
 }
@@ -162,8 +175,8 @@ impl UserspaceServerReg {
             magic: Self::MAGIC,
             inner: UnsafeCell::new(Inner {
                 endpoint,
-                pending: None,
-                pending_fill: None,
+                pending: core::array::from_fn(|_| None),
+                pending_fill: core::array::from_fn(|_| None),
                 next_id: 1,
             }),
         })
@@ -202,11 +215,10 @@ impl UserspaceServerReg {
         unsafe { Self::inner(reg) }.endpoint.as_ptr()
     }
 
-    /// Reserve the (single) pending-lookup slot for a new forwarded lookup,
-    /// assigning and returning its `request_id`; `None` if a lookup is already
-    /// outstanding (N = 1 — the caller fails the new lookup `WouldBlock`). Stores a
-    /// clone of `po` (an atomic bump, sound under `SCHED`) so the reply can
-    /// complete it later.
+    /// Reserve a free pending-lookup slot for a new forwarded lookup, assigning and
+    /// returning its `request_id`; `None` if all [`US_PENDING_MAX`] slots are in
+    /// flight (the caller fails the new lookup `WouldBlock`). Stores a clone of `po`
+    /// (an atomic bump, sound under `SCHED`) so the reply can complete it later.
     ///
     /// # Safety
     /// See the accessor contract above; `po` references a live `PendingOperation`.
@@ -218,9 +230,8 @@ impl UserspaceServerReg {
         suffix: &[u8],
     ) -> Option<u64> {
         let inner = unsafe { Self::inner(reg) };
-        if inner.pending.is_some() {
-            return None; // already busy (N = 1)
-        }
+        // First free slot, or `None` when the table is full (all in flight).
+        let slot = inner.pending.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
         // Copy the suffix inline (a memcpy, no allocation — sound under `SCHED`);
@@ -228,7 +239,7 @@ impl UserspaceServerReg {
         let mut sbuf = [0u8; LOOKUP_SUFFIX_MAX];
         let n = suffix.len().min(LOOKUP_SUFFIX_MAX);
         sbuf[..n].copy_from_slice(&suffix[..n]);
-        inner.pending = Some(PendingLookup {
+        inner.pending[slot] = Some(PendingLookup {
             request_id,
             po: po.clone(),
             owner_pid,
@@ -255,12 +266,10 @@ impl UserspaceServerReg {
         index: usize,
     ) -> Option<u64> {
         let inner = unsafe { Self::inner(reg) };
-        if inner.pending_fill.is_some() {
-            return None; // already busy (N = 1)
-        }
+        let slot = inner.pending_fill.iter().position(Option::is_none)?;
         let request_id = inner.next_id;
         inner.next_id = inner.next_id.wrapping_add(1);
-        inner.pending_fill = Some(PendingFill {
+        inner.pending_fill[slot] = Some(PendingFill {
             request_id,
             po: po.clone(),
             file_obj: file_obj.clone(),
@@ -270,10 +279,10 @@ impl UserspaceServerReg {
         Some(request_id)
     }
 
-    /// Take the outstanding pending fill **iff** its `request_id` matches (a
-    /// `ReadRange` reply's echoed id); `None` on a mismatch or an empty slot. The
-    /// returned [`PendingFill`]'s `po` / `file_obj` are dropped by the caller
-    /// **outside** `SCHED`.
+    /// Take the pending fill **iff** some slot's `request_id` matches (a `ReadRange`
+    /// reply's echoed id); `None` on a mismatch or no such slot. The returned
+    /// [`PendingFill`]'s `po` / `file_obj` are dropped by the caller **outside**
+    /// `SCHED`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -282,26 +291,17 @@ impl UserspaceServerReg {
         request_id: u64,
     ) -> Option<PendingFill> {
         let inner = unsafe { Self::inner(reg) };
-        match &inner.pending_fill {
-            Some(p) if p.request_id == request_id => inner.pending_fill.take(),
-            _ => None,
-        }
+        let slot = inner
+            .pending_fill
+            .iter()
+            .position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
+        inner.pending_fill[slot].take()
     }
 
-    /// Take the outstanding pending fill unconditionally (origination rollback /
-    /// dead-peer fail). `None` if empty. The returned references drop **outside**
-    /// `SCHED`.
-    ///
-    /// # Safety
-    /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_fill_any(reg: *mut ()) -> Option<PendingFill> {
-        unsafe { Self::inner(reg) }.pending_fill.take()
-    }
-
-    /// Take the outstanding pending lookup **iff** its `request_id` matches
-    /// `request_id` (a reply's echoed id); `None` on a mismatch or an empty slot
-    /// (a duplicate / stale reply). The returned [`PendingLookup`]'s `po` is
-    /// dropped by the caller **outside** `SCHED`.
+    /// Take the pending lookup **iff** some slot's `request_id` matches `request_id`
+    /// (a reply's echoed id); `None` on a mismatch or no such slot (a duplicate /
+    /// stale reply). The returned [`PendingLookup`]'s `po` is dropped by the caller
+    /// **outside** `SCHED`.
     ///
     /// # Safety
     /// See the accessor contract above.
@@ -310,20 +310,23 @@ impl UserspaceServerReg {
         request_id: u64,
     ) -> Option<PendingLookup> {
         let inner = unsafe { Self::inner(reg) };
-        match &inner.pending {
-            Some(p) if p.request_id == request_id => inner.pending.take(),
-            _ => None,
-        }
+        let slot = inner
+            .pending
+            .iter()
+            .position(|s| matches!(s, Some(p) if p.request_id == request_id))?;
+        inner.pending[slot].take()
     }
 
-    /// Take the outstanding pending lookup unconditionally (used to fail it on a
-    /// dead peer / origination rollback). `None` if the slot is empty. The returned
-    /// `po` is dropped by the caller **outside** `SCHED`.
+    /// Take the next occupied pending lookup (lowest slot), for **draining** the
+    /// table when the server dies — the caller loops until `None`, failing each. The
+    /// returned `po` is dropped by the caller **outside** `SCHED`.
     ///
     /// # Safety
     /// See the accessor contract above.
-    pub(crate) unsafe fn take_pending_any(reg: *mut ()) -> Option<PendingLookup> {
-        unsafe { Self::inner(reg) }.pending.take()
+    pub(crate) unsafe fn take_pending_next(reg: *mut ()) -> Option<PendingLookup> {
+        let inner = unsafe { Self::inner(reg) };
+        let slot = inner.pending.iter().position(Option::is_some)?;
+        inner.pending[slot].take()
     }
 }
 
@@ -381,24 +384,52 @@ mod tests {
     }
 
     #[test]
-    fn begin_assigns_monotonic_ids_and_caps_at_one() {
+    fn begin_assigns_monotonic_ids_and_caps_at_capacity() {
         init_global_heap();
         let r = reg();
         let po = make_po();
-        // First begin succeeds with an id.
-        let id0 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
-        assert_eq!(id0, Some(1));
-        // Second begin while one is outstanding → busy (N = 1).
-        let id1 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
-        assert_eq!(id1, None);
-        // Take it; the next begin gets the next id.
-        let taken = unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) };
+        // Fill every slot: each `begin` succeeds with the next monotonic id.
+        for expect in 1..=US_PENDING_MAX as u64 {
+            let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") };
+            assert_eq!(id, Some(expect));
+        }
+        // The table is now full → the next `begin` is `None` (caller: WouldBlock).
+        assert_eq!(
+            unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 5, Rights::MAP_READ, b"sys/gen") },
+            None
+        );
+        // Free one slot; a `begin` succeeds again with the next id.
+        let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) };
         assert_eq!(taken.as_ref().map(|p| p.request_id), Some(1));
         drop(taken);
-        let id2 = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 9, Rights::MAP_READ, b"sys/gen") };
-        assert_eq!(id2, Some(2));
-        // Clean up the outstanding entry before dropping.
-        drop(unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) });
+        let id = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 9, Rights::MAP_READ, b"sys/gen") };
+        assert_eq!(id, Some(US_PENDING_MAX as u64 + 1));
+        // Drain the rest before dropping.
+        while unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.is_some() {}
+        drop(po);
+        drop(r);
+    }
+
+    #[test]
+    fn concurrent_lookups_correlate_independently() {
+        init_global_heap();
+        let r = reg();
+        let po = make_po();
+        // Two lookups in flight at once (impossible under the old N = 1 slot).
+        let a = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 1, Rights::MAP_READ, b"one") }
+            .unwrap();
+        let b = unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 2, Rights::MAP_READ, b"two") }
+            .unwrap();
+        assert_ne!(a, b);
+        // Replies arrive out of order: each takes exactly its own entry.
+        let tb = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), b) }.unwrap();
+        assert_eq!(tb.owner_pid, 2);
+        assert_eq!(tb.suffix(), Some(&b"two"[..]));
+        let ta = unsafe { UserspaceServerReg::take_pending_matching(r.as_ptr(), a) }.unwrap();
+        assert_eq!(ta.owner_pid, 1);
+        assert_eq!(ta.suffix(), Some(&b"one"[..]));
+        drop(tb);
+        drop(ta);
         drop(po);
         drop(r);
     }
@@ -439,7 +470,7 @@ mod tests {
         let r = reg();
         let po = make_po();
         unsafe { UserspaceServerReg::begin(r.as_ptr(), &po, 3, Rights::MAP_READ, b"a/b/c") };
-        let taken = unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) }.unwrap();
+        let taken = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.unwrap();
         assert_eq!(taken.suffix(), Some(&b"a/b/c"[..]));
         drop(taken);
         drop(po);
@@ -459,8 +490,6 @@ mod tests {
         let fid =
             unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 2) }.unwrap();
         assert_ne!(lid, fid); // distinct request ids
-        // A second fill while one is outstanding → busy (N = 1).
-        assert!(unsafe { UserspaceServerReg::begin_fill(r.as_ptr(), &po, &fo, frame, 3) }.is_none());
         // A mismatched id leaves the fill in place; the matching id takes it.
         assert!(
             unsafe { UserspaceServerReg::take_pending_fill_matching(r.as_ptr(), fid ^ 0xFF) }
@@ -472,7 +501,7 @@ mod tests {
         assert_eq!(pf.frame, frame);
         assert_eq!(pf.index, 2);
         // The lookup slot is untouched by fill operations.
-        let pl = unsafe { UserspaceServerReg::take_pending_any(r.as_ptr()) }.unwrap();
+        let pl = unsafe { UserspaceServerReg::take_pending_next(r.as_ptr()) }.unwrap();
         assert_eq!(pl.request_id, lid);
         drop(pf);
         drop(pl);

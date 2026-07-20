@@ -44,6 +44,47 @@ static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
+/// Recv buffers for a resource server's `Meta::Ready` (auth-service's client endpoint).
+static mut RDY_MSG: [u8; 4096] = [0; 4096];
+static mut RDY_HANDLES: [u64; 8] = [0; 8];
+static mut RDY_COUNT: usize = 0;
+
+/// The resource-server protocol magic (`"RSMG"`) and `Meta::Ready` op — hand-parsed from
+/// the `IpcMsg` payload (offset 24: magic @0, op @6), like init. service-mgr does not
+/// build rsproto, only recognises Ready to take the endpoint it transfers.
+const RS_MAGIC: u32 = 0x5253_4D47;
+const RS_OP_READY: u16 = 0x0004;
+/// Bounded wait for a spawned server's Ready.
+const READY_TIMEOUT_NS: u64 = 30_000_000_000; // 30 s
+
+/// Spawn args for `auth-service`: its control endpoint is moved in at `rdx`
+/// (`handles[0]`), on which it sends `Meta::Ready` carrying the client channel. No
+/// ambient capabilities.
+static mut SPAWN_AUTH: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0,
+};
+
+/// Spawn args for `session-mgr`: its control endpoint is moved in at `rdx`
+/// (`handles[0]`), over which service-mgr hands it the fs-server endpoint + the auth
+/// channel. Re-delegated `BIND_NAMESPACE` (⊆ service-mgr's) so it can construct
+/// per-session namespaces.
+static mut SPAWN_SESSION: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: SYSCAP_BIND_NAMESPACE,
+};
 
 /// Spawn args for the service being started/restarted. `image` and the control-channel
 /// handle are filled per spawn; a leaf service inherits a LOOKUP-only handle to
@@ -391,11 +432,176 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     (h, smgr_end)
 }
 
+/// Spawn a child (resolved from `path`) with a fresh control channel whose child end
+/// is moved in at `handles[0]`; returns `(proc_handle, smgr_control_end)`. The caller
+/// fills the rest of `args` (rights/syscaps). `smgr_control_end` is `0` on failure.
+fn spawn_with_control(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> (i64, u64) {
+    let image = ns_lookup(root_ns, path, RIGHT_MAP_READ);
+    if image == 0 {
+        kprint(b"service-mgr: image not found (login chain)\n");
+        return (-1, 0);
+    }
+    let (smgr_end, child_end) = match create_control_channel() {
+        Some(pair) => pair,
+        None => {
+            // SAFETY: closing our own image handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
+            return (-1, 0);
+        }
+    };
+    // SAFETY: `args` is a valid writable arg block; move the control end into the child.
+    let h = unsafe {
+        (*args).image = image;
+        (*args).handles[0] = child_end;
+        (*args).handle_count = 1;
+        (*args).move_mask = 1;
+        syscall1(SYS_PROCESS_SPAWN, args as u64)
+    };
+    // SAFETY: the kernel copied the ELF during spawn; close our image handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
+    if h < 0 {
+        // Nothing moved (spawn failed) — close both control ends.
+        // SAFETY: closing our own handles.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, smgr_end);
+            syscall1(SYS_HANDLE_CLOSE, child_end);
+        }
+        return (h, 0);
+    }
+    (h, smgr_end)
+}
+
+/// Wait (bounded) for a `Meta::Ready` on `ctrl` and return the endpoint it transfers
+/// (`handles[0]`), hand-parsing the rsproto envelope (magic + `Ready` op). `0` on
+/// timeout / error / an unexpected message.
+fn wait_ready(ctrl: u64) -> u64 {
+    // SAFETY: `&now` is a valid u64 out-param.
+    let mut now: u64 = 0;
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    let deadline = now.saturating_add(READY_TIMEOUT_NS);
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS valid; one waiter, bounded deadline.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = ctrl;
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
+    };
+    if waited < 1 {
+        return 0;
+    }
+    // SAFETY: valid recv out-params; on success the kernel installs handles[0].
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ctrl,
+            (&raw mut RDY_MSG) as u64,
+            (&raw mut RDY_HANDLES) as u64,
+            (&raw mut RDY_COUNT) as u64,
+        )
+    };
+    let count = unsafe { (&raw const RDY_COUNT).read() };
+    if rr != 0 || count < 1 {
+        return 0;
+    }
+    // SAFETY: read the envelope (payload at offset 24: magic @0, op @6) + handles[0].
+    let (magic, op, endpoint) = unsafe {
+        let magic = u32::from_le_bytes([RDY_MSG[24], RDY_MSG[25], RDY_MSG[26], RDY_MSG[27]]);
+        let op = u16::from_le_bytes([RDY_MSG[30], RDY_MSG[31]]);
+        (magic, op, (&raw const RDY_HANDLES[0]).read())
+    };
+    if magic != RS_MAGIC || op != RS_OP_READY {
+        // SAFETY: not the message we expected — drop the transferred endpoint.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+        return 0;
+    }
+    endpoint
+}
+
+/// Transfer a single `handle` to a child over its control channel (`ctrl`) — an IPC
+/// message with one moved handle and no payload (the child receives it as its next
+/// control message). On failure the handle did not move; it is closed.
+fn send_handle(ctrl: u64, handle: u64) {
+    // SAFETY: SEND_MSG/SEND_HANDLES valid; transfer one handle, empty payload.
+    let sr = unsafe {
+        (&raw mut SEND_MSG.header.payload_len).write(0);
+        SEND_HANDLES[0] = handle;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ctrl,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        // SAFETY: the transfer failed; reclaim the handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+    }
+}
+
+/// Bring up the login chain: spawn `auth-service` (await its `Meta::Ready` → the auth
+/// client channel), then spawn `session-mgr` with re-delegated `BIND_NAMESPACE` and hand
+/// it the fs-server endpoint + the auth channel over its control channel. `fs_endpoint`
+/// is init's root fs-server forwarding endpoint (moved in at service-mgr's `rdx`).
+fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64) {
+    if fs_endpoint == 0 {
+        kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
+        return;
+    }
+    // 1. auth-service — spawn + Ready handshake → the client channel session-mgr uses.
+    let (auth_h, auth_ctrl) = spawn_with_control(root_ns, b"/initramfs/sbin/auth-service", &raw mut SPAWN_AUTH);
+    if auth_h < 0 || auth_ctrl == 0 {
+        kprint(b"service-mgr: auth-service spawn FAIL\n");
+        // SAFETY: closing our own fs endpoint (login chain aborted).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fs_endpoint) };
+        return;
+    }
+    let auth_client = wait_ready(auth_ctrl);
+    // The control channel is done (auth-service serves on the client channel's peer).
+    // SAFETY: closing our own control + process handles for auth-service.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, auth_ctrl);
+        syscall1(SYS_HANDLE_CLOSE, auth_h as u64);
+    }
+    if auth_client == 0 {
+        kprint(b"service-mgr: auth-service Ready timeout/invalid\n");
+        // SAFETY: closing our own fs endpoint (login chain aborted).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fs_endpoint) };
+        return;
+    }
+    kprint(b"service-mgr: auth-service ready\n");
+
+    // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint + auth channel.
+    let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/initramfs/sbin/session-mgr", &raw mut SPAWN_SESSION);
+    if sess_h < 0 || sess_ctrl == 0 {
+        kprint(b"service-mgr: session-mgr spawn FAIL\n");
+        // SAFETY: closing our own handles (nothing handed off).
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, fs_endpoint);
+            syscall1(SYS_HANDLE_CLOSE, auth_client);
+        }
+        return;
+    }
+    // Handoffs, in order: (1) the fs-server endpoint, (2) the auth channel.
+    send_handle(sess_ctrl, fs_endpoint);
+    send_handle(sess_ctrl, auth_client);
+    // The handoffs are queued in session-mgr's inbox; the control channel + our process
+    // handle are no longer needed for Part D (session-mgr runs independently).
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, sess_ctrl);
+        syscall1(SYS_HANDLE_CLOSE, sess_h as u64);
+    }
+    kprint(b"service-mgr: login chain up (auth-service + session-mgr)\n");
+}
+
 /// Bootstrap registers (see init's `_start`): `rdi` = notification channel, `rsi` =
-/// namespace handle (delegated by init), `rdx`/`rcx` unused in slice A.
+/// namespace handle (delegated by init), `rdx` = the fs-server forwarding endpoint init
+/// moved in (handed to session-mgr), `rcx` unused.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, fs_endpoint: u64, _arg0: u64) -> ! {
     kprint(b"service-mgr: up\n");
+    // Bring up the login chain (auth-service + session-mgr) before the service demo.
+    bring_up_login_chain(root_ns, fs_endpoint);
     match load_declaration(root_ns) {
         Some(decl) => {
             let (h, ctrl) = spawn_service(root_ns, &decl);

@@ -1,0 +1,20 @@
+[package]
+name = "usersh"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+
+[features]
+# Mirror the build modes xtask passes. Under `test-harness` usersh exits with its
+# home-write verdict (session-mgr gates the boot verdict on the exit code); otherwise
+# it drops into the interactive console loop. `selftest` is a no-op (declared so
+# `--features selftest` is valid).
+selftest = []
+test-harness = []
+
+# Bin-only, bare-target throwaway shell (libkern only, no alloc) — the eshell family.
+[[bin]]
+name = "usersh"
+path = "src/main.rs"

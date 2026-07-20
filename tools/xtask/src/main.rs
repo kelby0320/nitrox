@@ -35,6 +35,17 @@ const IMAGE_SIZE_MIB: u64 = 128;
 /// `nitrox-root` partition.
 const ESP_SIZE_MIB: u64 = 48;
 
+// Test-only fixture credential for the auth + session-mgr login-path demo. **Not a
+// secret**: the shipped image stores only the one-way PBKDF2 verifier of
+// `DEMO_PASSWORD`; the password is a build input for the emulator demo user. init's
+// login selftest (auth Part E) must use these same literals. A fixed salt keeps the
+// image build reproducible (a single demo user makes salt-uniqueness moot). See
+// `docs/architecture/session-and-auth.md`.
+const DEMO_USER: &str = "alice";
+const DEMO_PASSWORD: &str = "correct horse battery staple";
+const DEMO_HOME: &str = "/home/alice";
+const DEMO_SALT: [u8; 8] = [0x9e, 0x3f, 0xa2, 0x5c, 0x71, 0x0b, 0xd4, 0x86];
+
 type R<T> = Result<T, Box<dyn Error>>;
 
 /// What to compile into the kernel + `init`. Selects the cargo feature the two
@@ -180,6 +191,13 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("heartbeat", None)?;
     build_userspace_bin("profile-server", None)?;
     build_userspace_bin("logging-service", None)?;
+    build_userspace_bin("auth-service", None)?;
+    // session-mgr fires the self-test verdict, so it takes the build-mode feature
+    // (`selftest`/`test-harness`) like init.
+    build_userspace_bin("session-mgr", mode.features())?;
+    // usersh (the throwaway user shell) exits with its home-write verdict under
+    // test-harness, so it also takes the build-mode feature.
+    build_userspace_bin("usersh", mode.features())?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -504,6 +522,15 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `libcrypto` host tests (SHA-256 / HMAC / PBKDF2 against published vectors). A
+    // plain `core`-only lib (no bare-target bin), host-tested like `librsproto`.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libcrypto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // service-mgr's library tests (the service-declaration parser). `--lib` skips the
     // `#![no_main]` supervisor bin, which can't build for the host.
     run(Command::new("cargo")
@@ -520,6 +547,16 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("profile-server")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // auth-service's library tests (the credential logic: user-DB parse + PBKDF2
+    // verify + the Auth serve path). `--lib` skips the `#![no_main]` server bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("auth-service")
         .arg("--lib")
         .arg("--target")
         .arg(&host)
@@ -777,6 +814,9 @@ fn build_initramfs(out: &Path) -> R<()> {
         "child",
         "profile-server",
         "logging-service",
+        "auth-service",
+        "session-mgr",
+        "usersh",
     ];
     let mut ino = 3u32;
     for name in programs {
@@ -920,6 +960,35 @@ fn assemble_image(
         *b = (i & 0xFF) as u8;
     }
     fs::write(staging.join("system").join("rwtest"), &rwtest)?;
+    // `/system/users` — the auth-service credential DB (passwd-style:
+    // `name:salt_hex:iterations:verifier_hex:home`). Seeded here so NO plaintext or
+    // verifier is committed to the source tree: the stored value is the one-way
+    // PBKDF2 of the fixture password, computed with the *same* libcrypto the
+    // on-target auth-service verifies with (no drift). The fixture credential is a
+    // build input for the emulator demo user, not a secret; init's login selftest
+    // (auth Part E) uses the same literals. See docs/architecture/session-and-auth.md.
+    {
+        use std::fmt::Write as _;
+        let iters = libcrypto::password::DEFAULT_ITERATIONS;
+        let verifier = libcrypto::password::derive(DEMO_PASSWORD.as_bytes(), &DEMO_SALT, iters);
+        let mut users = String::new();
+        users.push_str("# Nitrox user database (auth-service).\n");
+        users.push_str("# name:salt_hex:iterations:verifier_hex:home\n");
+        write!(users, "{DEMO_USER}:").unwrap();
+        for b in &DEMO_SALT {
+            write!(users, "{b:02x}").unwrap();
+        }
+        write!(users, ":{iters}:").unwrap();
+        for b in &verifier {
+            write!(users, "{b:02x}").unwrap();
+        }
+        writeln!(users, ":{DEMO_HOME}").unwrap();
+        fs::write(staging.join("system").join("users"), users.as_bytes())?;
+    }
+    // The demo user's home directory — the writable session root a login constructs
+    // (auth Part E). Empty for now; the user shell writes a file into it.
+    fs::create_dir_all(staging.join(DEMO_HOME.trim_start_matches('/')))?;
+    println!("xtask: seeded /system/users + {DEMO_HOME}");
     // The content-addressed store, pre-built read-only into the ext4 root. Each package
     // lives at /store/<hash>-<name>-<version>/bin/<prog> — a demand-paged file the profile
     // server projects into /bin. heartbeat is the first package. The store path (hash) is

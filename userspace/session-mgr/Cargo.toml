@@ -1,0 +1,22 @@
+[package]
+name = "session-mgr"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+librsproto = { path = "../librsproto" }
+
+[features]
+# Mirror the build modes xtask passes (via `mode.features()`). `test-harness` lets
+# session-mgr fire the boot verdict (`SYS_TEST_EXIT`) once its Part-D self-check
+# passes; `selftest` is a no-op here (declared so `--features selftest` is valid).
+selftest = []
+test-harness = []
+
+# Bin-only, bare-target supervisor (no host-testable lib yet — Part D is syscall
+# plumbing; Part E may extract a testable line-editor/policy). Alloc-free — fixed
+# `.bss` buffers, no `#[global_allocator]`.
+[[bin]]
+name = "session-mgr"
+path = "src/main.rs"

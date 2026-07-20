@@ -9,3 +9,6 @@ name = "xtask"
 path = "src/main.rs"
 
 [dependencies]
+# Pure `core`, host-compilable: seed the user DB's PBKDF2 verifiers with the *same*
+# KDF the on-target auth-service verifies with (no drift). See `assemble_image`.
+libcrypto = { path = "../../userspace/libcrypto" }

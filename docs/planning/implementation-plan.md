@@ -1907,10 +1907,53 @@ bytes; it becomes a handle to the program's bytes.
 
 #### Authentication and session management
 
-- [ ] Authentication service (initially: trivial password file in store)
-- [ ] Session manager
-- [ ] Per-user namespace construction (overlay layers, subtree handles)
-- [ ] User shell spawn with constructed namespace
+Design + staging: `docs/architecture/session-and-auth.md` (written 2026-07-20). Four
+forks taken at full fidelity: hand-rolled password KDF; **true subtree-scoped** home
+isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-delegated
+`BIND_NAMESPACE`; a **separate** auth-service. Staged Parts A–E:
+
+- [x] **Part A — `libcrypto` + design doc** (`phase-3/auth-session`): SHA-256 + HMAC +
+  PBKDF2-HMAC-SHA256 + `password`/`ct_eq`, `no_std`/`core`-only/no-deps, verified vs
+  NIST/RFC 4231/RFC 7914 vectors (17 host tests). Pure `core` so `xtask` links it to
+  seed image hashes. Wired into `xtask test`.
+- [x] **Part B — subtree-scoped namespace binding** (kernel): a `SubtreeBase` (base
+  path) on a `UserspaceServer` binding (`base + suffix` forwarded, leading `/`
+  stripped), `..`/`.`-rejecting; `sys_ns_bind` gained `base_ptr`/`base_len` (a4/a5,
+  backward-compatible). Host-tested (`from_path`, `resolve` carries base,
+  `join_subtree`); boot unaffected. **Multi-binding to one server** (a finding here,
+  then resolved with the user): exposing one server through several bindings **shares
+  its registration** (bind-mount semantics — one connection, many names) rather than a
+  per-binding channel; the pending slot grew N = 1 → a small table (`US_PENDING_MAX`)
+  for concurrent in-flight requests. Validated end-to-end under `test-qemu` (init binds
+  the fs endpoint a second time as a subtree; a lookup through it resolves correctly).
+- [x] **Part C — auth-service + user DB**: the credential-oracle RS speaking the new
+  `Auth` rsproto category (`Authenticate` → `AUTHENTICATED{principal,home}`/`DENIED`,
+  PBKDF2 verify, dummy-verify on missing user) — wire contract in
+  `docs/spec/rsproto-auth-ops.md`. New `librsproto::auth` codec + `auth-service`
+  crate (host-tested lib: DB parse + verify + serve; bare-target bin: read
+  `/system/users`, Ready-hand a client channel, serve). `passwd`-style `/system/users`
+  + `/home/alice` seeded into the ext4 by xtask (one-way verifier only — no secrets
+  in-tree). Host-tested; image assembles; boot green. **Spawning/wiring is Part D.**
+- [x] **Part D — service-mgr → session-mgr + endpoint plumbing**: init hands the
+  retained fs-server endpoint to service-mgr; service-mgr spawns auth-service (RS Ready
+  handshake → its client channel) + session-mgr (re-delegated `BIND_NAMESPACE` +
+  control channel) and hands session-mgr the fs endpoint + auth channel. session-mgr
+  (new bin crate) authenticates the demo user over the auth channel and constructs a
+  session namespace binding `/home` as an fs-server subtree (proving `BIND_NAMESPACE` +
+  subtree + shared-reg bind-mount). session-mgr fires the `test-harness` verdict.
+  Sequenced after the demo chain (a concurrent direct-block + forwarded-lookup hang is
+  tracked in `deferred-decisions.md`). Auth is reached over a **direct channel** (not
+  bound at `/svc/auth`) since session-mgr is the sole consumer. AHCI concurrent-command
+  bug fixed along the way (single-slot queue + DPC-drain).
+- [x] **Part E — login + namespace construction + user shell** (the milestone):
+  session-mgr authenticates (test-harness auto-login / interactive `nitrox login:` on
+  the console), builds the session namespace (`/home` subtree RW + `/dev/console`),
+  spawns the new **`usersh`** throwaway shell into it with **empty syscaps**, and reaps
+  it. `usersh` `sys_file_create`s `/home/greeting`, writes + syncs + re-reads to verify
+  — the fs-RW write path from a sandbox through the subtree binding. eshell demoted to
+  emergency-only. Verdict: `test-harness` auto-login → shell home-write; wrong-password
+  denied. **The auth + session-mgr slice is complete** — login → per-user namespace →
+  user shell → home write runs end to end.
 
 Scope notes (decided 2026-07-17, for when this slice runs):
 - **Proper password hashing, if scope allows.** Prefer storing a **password hash** (a hand-

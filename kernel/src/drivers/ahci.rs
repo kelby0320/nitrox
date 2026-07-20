@@ -20,7 +20,7 @@ use crate::dpc::Dpc;
 use crate::io::block::BlockBackend;
 use crate::io::irp::{Irp, IrpStatus, PhysFrag};
 use crate::libkern::handle::KObjectType;
-use crate::libkern::KBox;
+use crate::libkern::{IrqSpinLock, KBox};
 use crate::mm::dma::DmaBuffer;
 use crate::mm::{PhysAddr, kvmap};
 use crate::arch::timer::ArchTimer;
@@ -79,6 +79,50 @@ const POLL_TIMEOUT_NS: u64 = 1_000_000_000;
 
 // --- Driver state -----------------------------------------------------------
 
+/// Depth of the software pending-IRP queue in front of slot 0. The driver issues one
+/// command at a time (slot 0); concurrent block submits beyond that are queued here
+/// and drained FIFO as slot 0 retires, so concurrent clients serialise correctly
+/// instead of clobbering each other's in-flight request. Full 32-slot NCQ (letting the
+/// controller run many commands at once) is a future item — see
+/// `docs/rationale/deferred-decisions.md`. A full queue fails the excess submit with
+/// `IoError` (backpressure); 32 is far beyond realistic concurrency here.
+const PENDING_DEPTH: usize = 32;
+
+/// A FIFO ring of block IRPs waiting for slot 0. Guarded by [`AhciDisk::pending`]; the
+/// ring holds only *pointers* (the `Irp` boxes are owned by the submitter until
+/// completion), so it needs no `Irp` layout change.
+struct PendingRing {
+    ring: [*mut Irp; PENDING_DEPTH],
+    head: usize,
+    len: usize,
+}
+
+impl PendingRing {
+    const fn new() -> Self {
+        PendingRing { ring: [core::ptr::null_mut(); PENDING_DEPTH], head: 0, len: 0 }
+    }
+    /// Enqueue `irp`; `false` if the ring is full.
+    fn push(&mut self, irp: *mut Irp) -> bool {
+        if self.len == PENDING_DEPTH {
+            return false;
+        }
+        let tail = (self.head + self.len) % PENDING_DEPTH;
+        self.ring[tail] = irp;
+        self.len += 1;
+        true
+    }
+    /// Dequeue the oldest waiter, or `null` if empty.
+    fn pop(&mut self) -> *mut Irp {
+        if self.len == 0 {
+            return core::ptr::null_mut();
+        }
+        let irp = self.ring[self.head];
+        self.head = (self.head + 1) % PENDING_DEPTH;
+        self.len -= 1;
+        irp
+    }
+}
+
 /// State for the single supported AHCI disk. Leaked to `'static` at bring-up (the
 /// hardware lives for the kernel's lifetime); the ISR reaches it through
 /// [`AHCI`].
@@ -91,8 +135,13 @@ pub struct AhciDisk {
     cmd_table: DmaBuffer, // CFIS + PRDT for slot 0
     sectors: u64,
     /// The IRP currently issued on slot 0 (`null` when idle), for the ISR to
-    /// complete. One outstanding command in Phase 2.
+    /// complete. One command runs at a time; further submits queue in [`pending`].
+    /// Accessed under [`pending`]'s lock (the atomic type is retained for the
+    /// boot-path lock-free peek in [`poll_complete_inflight`]).
     inflight: AtomicPtr<Irp>,
+    /// FIFO queue of block IRPs waiting for slot 0 (drained as it retires). An
+    /// interrupt-safe lock: submit runs in thread context, completion in the ISR.
+    pending: IrqSpinLock<PendingRing>,
     /// The controller's IRQ object, signalled by the ISR (exercises the
     /// signal-from-real-ISR path; no waiter in Phase 2).
     intr: *mut (),
@@ -109,6 +158,10 @@ static AHCI: AtomicPtr<AhciDisk> = AtomicPtr::new(core::ptr::null_mut());
 
 /// DPC that signals the controller's `InterruptObject` (queued by the ISR).
 static AHCI_INTR_DPC: Dpc = Dpc::new(ahci_intr_dpc, core::ptr::null_mut());
+
+/// DPC that issues the next queued command after a completion (queued by the ISR).
+/// Draining from a DPC — not the ISR — keeps command-issue off the interrupt path.
+static AHCI_DRAIN_DPC: Dpc = Dpc::new(ahci_drain_dpc, core::ptr::null_mut());
 
 // --- MMIO helpers -----------------------------------------------------------
 
@@ -221,6 +274,7 @@ pub fn init(controller: &ObjectRef) -> bool {
         cmd_table,
         sectors: 0,
         inflight: AtomicPtr::new(core::ptr::null_mut()),
+        pending: IrqSpinLock::new(PendingRing::new()),
         intr: intr_ptr,
     };
     let disk = match KBox::try_new(disk) {
@@ -451,16 +505,45 @@ fn publish_disk(controller: &ObjectRef, sectors: u64, disk: *mut AhciDisk) -> bo
 /// IRQ (or the boot self-test's polled fallback). `ctx` is the `*mut AhciDisk`.
 fn submit(irp: *mut Irp, ctx: *mut ()) {
     let disk = ctx as *mut AhciDisk;
-    // SAFETY: `disk` is the live published disk; `irp` is the in-flight request.
+    // SAFETY: `disk` is the live published disk.
+    let d = unsafe { &*disk };
+    // Take the port lock: it masks interrupts, so the completion ISR cannot run on
+    // this CPU while we decide whether slot 0 is free — `inflight` is stable here.
+    let mut q = d.pending.lock();
+    if d.inflight.load(Ordering::Acquire).is_null() {
+        // Slot 0 is idle — issue immediately.
+        d.inflight.store(irp, Ordering::Release);
+        // SAFETY: slot 0 is free; `irp` is a live block IRP.
+        unsafe { issue_locked(d, irp) };
+    } else if !q.push(irp) {
+        // Slot busy and the queue is full — refuse this submit with backpressure
+        // rather than clobber an in-flight request. Complete it with an error so its
+        // waiter is released (a demand-fault fill then fails cleanly, not silently).
+        drop(q);
+        // SAFETY: `irp` is uniquely owned during submit; complete it with an error.
+        unsafe {
+            (*irp).set_completion(crate::syscall::error::KError::IoError as i32, 0);
+            crate::dpc::enqueue(&(*irp).dpc);
+        }
+    }
+    // Otherwise `irp` is queued; it issues when slot 0 next retires (`advance_slot`).
+}
+
+/// Build slot 0's command for `irp` and issue it. The caller holds [`AhciDisk::pending`]
+/// and has established that slot 0 is idle.
+///
+/// # Safety
+/// `irp` is a live block IRP whose `buffer.frags` is a valid `[PhysFrag; count]`;
+/// slot 0 is idle (no other command building/running).
+unsafe fn issue_locked(d: &AhciDisk, irp: *mut Irp) {
+    // SAFETY: `irp` is live; its `frags` array is owned by the IRP box.
     let (op, offset, length) = unsafe { ((*irp).op, (*irp).offset, (*irp).length) };
-    // SAFETY: `irp.buffer.frags` is a `[PhysFrag; count]` owned by the IRP box.
     let frags = unsafe {
         core::slice::from_raw_parts(
             (*irp).buffer.frags as *const PhysFrag,
             (*irp).buffer.count as usize,
         )
     };
-
     let lba = offset / SECTOR_SIZE as u64;
     let count = (length / SECTOR_SIZE as u64) as u16;
     let is_write = op == crate::io::irp::IrpOp::Write as u32;
@@ -469,12 +552,36 @@ fn submit(irp: *mut Irp, ctx: *mut ()) {
     } else {
         ATA_READ_DMA_EXT
     };
+    // Slot 0 is idle (caller established): build its command table + issue.
+    build_command(d, command, lba, count, frags, is_write);
+    issue(d);
+}
 
-    // SAFETY: single outstanding command in Phase 2; record it for the ISR.
-    unsafe {
-        (*disk).inflight.store(irp, Ordering::Release);
-        build_command(&*disk, command, lba, count, frags, is_write);
-        issue(&*disk);
+/// Slot 0 has retired: under the port lock, take the completed IRP out of flight
+/// (capturing its error status) and mark the slot idle. Returns the retired IRP
+/// (`null` if the slot was already idle) and whether it errored. Does **not** issue
+/// the next command — that is deferred to [`drain_queue`] (run from a DPC, not the
+/// ISR, so a fast pipelined completion cannot race the interrupt ack). The caller
+/// completes the retired IRP **outside** any driver lock.
+fn take_retired(d: &AhciDisk) -> (*mut Irp, bool) {
+    let _q = d.pending.lock();
+    let retired = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
+    (retired, err)
+}
+
+/// If slot 0 is idle and the queue is non-empty, issue the next waiting IRP. Called
+/// from the completion DPC (and the boot poll path) — not the ISR — so issuing a new
+/// command is decoupled from the interrupt acknowledge.
+fn drain_queue(d: &AhciDisk) {
+    let mut q = d.pending.lock();
+    if d.inflight.load(Ordering::Acquire).is_null() {
+        let next = q.pop();
+        if !next.is_null() {
+            d.inflight.store(next, Ordering::Release);
+            // SAFETY: slot 0 is idle; `next` is a live queued IRP.
+            unsafe { issue_locked(d, next) };
+        }
     }
 }
 
@@ -496,12 +603,12 @@ extern "C" fn isr() {
     write32(d.port_base, PX_IS, pxis);
     write32(d.abar, HBA_IS, 1 << d.port);
 
-    // If slot 0's command has retired, complete the in-flight IRP.
+    // If slot 0's command has retired, take it out of flight + complete it, then queue
+    // the drain DPC to issue the next waiting command (off the interrupt path).
     if read32(d.port_base, PX_CI) & 1 == 0 {
-        let irp = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
+        let (irp, err) = take_retired(d);
         if !irp.is_null() {
-            let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
-            // SAFETY: `irp` is the in-flight request; set status + queue its DPC.
+            // SAFETY: `irp` is the retired request; set status + queue its DPC.
             unsafe {
                 let status = if err {
                     crate::syscall::error::KError::IoError as i32
@@ -512,6 +619,8 @@ extern "C" fn isr() {
                 (*irp).set_completion(status, transferred);
                 crate::dpc::enqueue(&(*irp).dpc);
             }
+            // Issue the next queued command from a DPC (not here in the ISR).
+            crate::dpc::enqueue(&AHCI_DRAIN_DPC);
         }
     }
     // Exercise the signal-from-real-ISR path (no waiter in Phase 2).
@@ -534,6 +643,15 @@ fn ahci_intr_dpc(_ctx: *mut ()) {
     }
 }
 
+/// DPC queued by [`isr`] after a completion: issue the next queued command.
+fn ahci_drain_dpc(_ctx: *mut ()) {
+    let disk = AHCI.load(Ordering::Acquire);
+    if !disk.is_null() {
+        // SAFETY: live published state.
+        drain_queue(unsafe { &*disk });
+    }
+}
+
 /// Poll the in-flight command to completion and complete its IRP — the boot
 /// self-test's fallback when the IRQ does not fire (e.g. an unrouted GSI).
 /// Returns `true` if a command was completed this way.
@@ -544,18 +662,20 @@ pub fn poll_complete_inflight() -> bool {
     }
     // SAFETY: live published state.
     let d = unsafe { &*disk };
+    // Lock-free peek (this is the boot-time synchronous path — single-threaded).
     if d.inflight.load(Ordering::Acquire).is_null() {
         return false;
     }
-    if !wait_command_polled(d) {
-        // leave inflight for the caller to observe the failure
-    }
-    let irp = d.inflight.swap(core::ptr::null_mut(), Ordering::AcqRel);
+    // Spin until slot 0 retires (or times out); then take it out of flight and complete
+    // it. On timeout `take_retired` still completes it with its (error) status so its
+    // waiter is not left stuck. The boot poll path is synchronous, so issue the next
+    // queued IRP directly (no interrupt-race concern here).
+    let _ = wait_command_polled(d);
+    let (irp, err) = take_retired(d);
     if irp.is_null() {
         return false;
     }
-    let err = read32(d.port_base, PX_TFD) & TFD_ERR != 0;
-    // SAFETY: `irp` is the in-flight request.
+    // SAFETY: `irp` is the retired request.
     unsafe {
         let status = if err {
             crate::syscall::error::KError::IoError as i32
@@ -565,6 +685,7 @@ pub fn poll_complete_inflight() -> bool {
         (*irp).set_completion(status, if err { 0 } else { (*irp).length });
         crate::dpc::enqueue(&(*irp).dpc);
     }
+    drain_queue(d);
     crate::dpc::run_pending();
     true
 }

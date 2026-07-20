@@ -29,6 +29,8 @@ A crate can depend on anything below it but not above. `libstream` can use `libo
 
 There is **no `librt` crate** — the Go-style fiber scheduler and a standalone sync-wrapper crate were cut (see the 2026-07-13 decision log). In-process concurrency is `async` tasks on the libos executor; blocking convenience for sequential callers is a small `block_on` in libos.
 
+`libcrypto` (hand-rolled SHA-256 / HMAC / PBKDF2) is an off-to-the-side foundation like `libheap`: `core`-only, no `alloc`, depends on nothing (not even `libkern` — it touches no syscalls), so it slots in beside `libkern` at the bottom. Consumers link it directly (auth-service; later the audit subsystem). See `userspace/libcrypto/CLAUDE.md`.
+
 Application code typically uses `libos` directly for async work (or its `block_on` for sync ergonomics). Reaching down to `libkern` should be rare — that's the raw syscall surface, used by early services and runtime infrastructure, not by ordinary application code.
 
 ## Async-first
@@ -57,10 +59,14 @@ Each crate has its own `CLAUDE.md` for crate-specific guidance:
 
 - `userspace/libkern/CLAUDE.md` — the syscall layer, no_alloc
 - `userspace/libheap/CLAUDE.md` — the freeing heap / `#[global_allocator]`
+- `userspace/libcrypto/CLAUDE.md` — hand-rolled SHA-256 / HMAC / PBKDF2, no_alloc
 - `userspace/init/CLAUDE.md` — PID 1, critical-path constraints
 - `userspace/eshell/CLAUDE.md` — emergency shell constraints (similar to init)
 - `userspace/fs-server-ext4/CLAUDE.md` — filesystem driver
 - `userspace/service-mgr/CLAUDE.md` — service supervisor
+- `userspace/auth-service/CLAUDE.md` — credential oracle (auth + session-mgr)
+- `userspace/session-mgr/CLAUDE.md` — session supervisor (login, per-user namespaces)
+- `userspace/usersh/CLAUDE.md` — throwaway sandboxed user shell (the login leaf)
 
 Read the crate-specific `CLAUDE.md` before significant work in any of these.
 

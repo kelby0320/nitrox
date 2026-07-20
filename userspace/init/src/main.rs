@@ -56,6 +56,11 @@ static mut NOTIF: Notification = Notification::zeroed();
 /// server gets `[1]`). Reused across mounts (processed one at a time).
 static mut CTRL0: u64 = 0;
 static mut CTRL1: u64 = 0;
+
+/// The root fs-server's forwarding endpoint, retained after the `/` mount so init
+/// can hand it to service-mgr (→ session-mgr binds it as each login's `/home`
+/// subtree, sharing the one registration — Part B.2). `0` until the root is mounted.
+static mut FS_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -139,16 +144,18 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// slice A it supervises a leaf service and binds nothing yet; the bind-righted
 /// namespace handle (the second gate) and the `LOAD_MODULE`/`SYSTEM_CLOCK`
 /// pass-through caps arrive with the RS protocol + those services (slice B onward).
-/// Only in a non-`selftest` build: a selftest boot runs the demo chain instead of
-/// handing off to service-mgr.
-#[cfg(not(feature = "selftest"))]
+/// `handles[0]` (the fs-server forwarding endpoint) is filled at spawn from
+/// `FS_ENDPOINT` and **moved** to service-mgr (it forwards it to session-mgr). The
+/// endpoint carries `TRANSFER` so service-mgr can hand it onward. Spawned in **both**
+/// boots now (the selftest boot brings the login chain up alongside the demo chain so
+/// it is exercised under `test-qemu`).
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/service-mgr
-    handle_count: 0,
-    move_mask: 0,
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the fs endpoint) to service-mgr
     arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
+    handles: [0; 4], // handles[0] = FS_ENDPOINT, set at spawn
+    rights: [RIGHT_TRANSFER | RIGHT_DUPLICATE, 0, 0, 0],
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
@@ -407,7 +414,45 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             endpoint,
         )
     };
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    // auth+session Part B smoke test (selftest): bind the *same* fs endpoint a second
+    // time as a **subtree** scoped to `/system` at `/subtreetest`, so a later lookup of
+    // `/subtreetest/current-generation` forwards `system/current-generation` to the
+    // server. This shares the server's registration (bind-mount semantics) — the kernel
+    // reuses it rather than minting a rival that would hijack replies. `sys_ns_bind`
+    // holds its own reference, so `endpoint` stays valid for the close below. Root mount
+    // only (it owns `/system`).
+    #[cfg(feature = "selftest")]
+    if m.mount_point.as_bytes() == b"/" {
+        let sub = b"/subtreetest";
+        let base = b"/system";
+        // SAFETY: valid namespace handle, path/base pointers, and endpoint handle.
+        let r = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                root_ns,
+                sub.as_ptr() as u64,
+                sub.len() as u64,
+                endpoint,
+                base.as_ptr() as u64,
+                base.len() as u64,
+            )
+        };
+        if r != 0 {
+            kprint(b"init: subtree test bind FAIL\n");
+        }
+    }
+    // The root fs-server's forwarding endpoint is handed down to service-mgr (→
+    // session-mgr, which binds it as each login's `/home` subtree — bind-mount
+    // sharing, Part B.2). `sys_ns_bind` cloned its own reference above, so keeping
+    // this handle open is fine; stash it (transfer ownership to the global) instead
+    // of closing. Non-root mounts have no consumer yet → close as before.
+    if m.mount_point.as_bytes() == b"/" {
+        // SAFETY: single-threaded init; the global takes ownership of `endpoint`.
+        unsafe { FS_ENDPOINT = endpoint };
+    } else {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    }
     if br != 0 {
         kprint(b"init: bind FAIL at ");
         kprint(m.mount_point.as_bytes());
@@ -918,6 +963,58 @@ fn create_test(root_ns: u64) {
     }
 }
 
+/// auth+session Part B milestone (selftest): prove **subtree-scoped namespace
+/// binding** end to end. `mount_one` bound the fs endpoint a second time at
+/// `/subtreetest` scoped to base `/system` (sharing the server's registration), so a
+/// lookup of `/subtreetest/current-generation` must forward `system/current-generation`
+/// to the server and resolve to the *same* file as `/system/current-generation`. Read
+/// the leading bytes of both and confirm they match — the kernel prepended the base to
+/// the forwarded suffix, and the shared registration routed both replies correctly.
+#[cfg(feature = "selftest")]
+fn subtree_bind_test(root_ns: u64) {
+    // Resolve + map the first page of `path` read-only; returns its address or 0.
+    fn map_first_page(root_ns: u64, path: &[u8]) -> u64 {
+        let (st, fh) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
+        if st != 0 || fh == 0 {
+            return 0;
+        }
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, PAGE, RIGHT_MAP_READ) };
+        // The mapping pins its own reference to the object; close the handle.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        if addr < 0 { 0 } else { addr as u64 }
+    }
+
+    let direct = map_first_page(root_ns, b"/system/current-generation");
+    let via_sub = map_first_page(root_ns, b"/subtreetest/current-generation");
+    if direct == 0 || via_sub == 0 {
+        kprint(b"init: subtree resolve FAIL\n");
+        return;
+    }
+    // Compare the leading bytes (the file is a short text line; the page tail is
+    // zero-padded, so the head suffices).
+    let mut same = true;
+    for i in 0..64u64 {
+        // SAFETY: both addresses map a full page; `i < 64 < PAGE`.
+        let a = unsafe { ((direct + i) as *const u8).read_volatile() };
+        let b = unsafe { ((via_sub + i) as *const u8).read_volatile() };
+        if a != b {
+            same = false;
+            break;
+        }
+    }
+    // SAFETY: unmap our two mappings (init runs forever — don't leak).
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, direct, PAGE);
+        syscall2(SYS_MEMORY_UNMAP, via_sub, PAGE);
+    }
+    if same {
+        kprint(b"init: subtree bind (/subtreetest -> /system) resolves + matches ok\n");
+    } else {
+        kprint(b"init: subtree bind MISMATCH\n");
+    }
+}
+
 /// The slice-8 Part-5 milestone: map the **large** file `/system/large.bin`
 /// (lazily, a `FileObject`) and read **every** byte — each first touch of a page is
 /// a demand fault the kernel services by a `File::ReadRange` to the fs-server. Verify
@@ -1007,15 +1104,22 @@ fn spawn_eshell(root_ns: u64) {
 /// Spawn the service manager — the normal boot handoff. init keeps a handle to it (it
 /// is init's child; service-mgr's death is a critical fault init must observe). Unlike
 /// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
-/// `ChildExited` for it. Returns the process handle, or a negative error.
-#[cfg(not(feature = "selftest"))]
+/// `ChildExited` for it. Moves the retained fs-server endpoint (`FS_ENDPOINT`) to it
+/// as `handles[0]` so service-mgr can hand it to session-mgr. Returns the process
+/// handle, or a negative error.
 fn spawn_service_mgr(root_ns: u64) -> i64 {
     kprint(b"init: handing off to service manager\n");
-    // SAFETY: SPAWN_SERVICE_MGR is a valid writable arg block.
-    let h =
-        unsafe { spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR) };
+    // SAFETY: single-threaded init; stamp the retained fs endpoint into the (moved)
+    // handle slot, then spawn. `move_mask`/`handle_count`/`rights` are set in the static.
+    let h = unsafe {
+        SPAWN_SERVICE_MGR.handles[0] = FS_ENDPOINT;
+        spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
+    };
     if h < 0 {
         kprint(b"init: service-mgr spawn FAIL\n");
+    } else {
+        // The endpoint moved to service-mgr; drop init's stale copy of the handle value.
+        unsafe { FS_ENDPOINT = 0 };
     }
     h
 }
@@ -1031,6 +1135,10 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
+        // Run the demo chain (`parent`) first. Its block I/O (`/dev/blk`) must not
+        // overlap the fs-server's reads (a concurrent-forwarded-lookup issue, tracked
+        // separately), so the login chain (service-mgr → auth-service + session-mgr) is
+        // brought up **after** `parent` reaps — sequenced in `reap_loop`.
         kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
         // SAFETY: SPAWN_PARENT is a valid writable arg block.
         let parent_h =
@@ -1116,12 +1224,23 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
                     parent_h = 0;
-                    // Test-harness: `parent` reaping ends the self-test chain — report
-                    // the verdict (PASS iff it exited cleanly), which terminates QEMU.
-                    // If it doesn't (no exit device), fall through to the console.
+                    // The demo chain finished. Under test-harness a failed demo fails the
+                    // run now; otherwise hand off to the **login chain** (service-mgr →
+                    // auth-service + session-mgr), sequenced here so its block I/O does not
+                    // overlap `parent`'s. session-mgr fires the final verdict once it has
+                    // authenticated the demo user (see its `_start`).
                     #[cfg(feature = "test-harness")]
-                    test_exit(code == 0);
-                    spawn_eshell(root_ns);
+                    if code != 0 {
+                        test_exit(false);
+                    }
+                    let smgr_h = spawn_service_mgr(root_ns);
+                    if smgr_h >= 0 {
+                        // SAFETY: closing init's reference; service-mgr runs independently.
+                        unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
+                    }
+                    // The interactive console is now session-mgr's `login:` prompt (via the
+                    // login chain), not eshell — eshell is the *emergency* shell only (the
+                    // `emergency` path below). Nothing more to spawn here.
                 }
             }
         }
@@ -1173,6 +1292,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // fs-server-rw Part E: create a brand-new file and confirm inode + dir entry persist.
     #[cfg(feature = "selftest")]
     create_test(root_ns);
+    // auth+session Part B: resolve through a subtree-scoped binding (the shared-reg
+    // bind-mount from mount_one) and confirm it reaches the right file.
+    #[cfg(feature = "selftest")]
+    subtree_bind_test(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

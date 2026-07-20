@@ -128,13 +128,35 @@ the first filter use case (encrypted root / LVM, both already deferred under
 Tier 1 feature follows. Trigger: NVMe hardware or a faster boot device matters.
 
 **AHCI driver scope.** The Phase 2 AHCI driver (Part 3) supports a **single
-controller, single SATA disk, one outstanding command** (slot 0). Multi-port /
-multi-disk, multiple controllers, NCQ (queued commands), and port multipliers are
-deferred to when a configuration needs them. It resolves the controller's GSI
-from the **PCI interrupt-line register** (firmware-programmed on QEMU); proper
-ACPI `_PRT` routing (which needs AML) is deferred — see `device-node.md`. The
-read self-test brings up against the existing AHCI boot disk; the dedicated
-`xtask build-disk` + ext4 test disk arrive with the fs-server (slice 7).
+controller, single SATA disk, one command *issued* at a time** (slot 0). Multi-port /
+multi-disk, multiple controllers, and port multipliers are deferred to when a
+configuration needs them. It resolves the controller's GSI from the **PCI
+interrupt-line register** (firmware-programmed on QEMU); proper ACPI `_PRT` routing
+(which needs AML) is deferred — see `device-node.md`. The read self-test brings up
+against the existing AHCI boot disk; the dedicated `xtask build-disk` + ext4 test disk
+arrive with the fs-server (slice 7).
+
+> **Concurrent submits are queued, not dropped (2026-07-20).** The driver drives one
+> command at a time, but *concurrent* block submits from different clients (a page-fault
+> fill, a `sys_io_submit`, another CPU) are now serialised through a small software FIFO
+> in front of slot 0 (`PendingRing`, `IrqSpinLock`-guarded) — a second submit while slot 0
+> is busy queues and issues when the slot retires, rather than clobbering the in-flight
+> IRP (which orphaned its waiter → a hang). This was a real correctness bug found bringing
+> up the auth/session login chain concurrently with the demo chain. **Full NCQ — letting
+> the controller run up to 32 commands at once across the command list — remains a future
+> item** (the queue depth is already `PENDING_DEPTH = 32`, so the software queue converts
+> to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
+> bound, e.g. an SSD or many concurrent readers).
+
+> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, open).** A `/dev/blk`
+> client doing direct block I/O concurrently with the fs-server's own reads still hangs
+> a *forwarded* namespace lookup, even after the AHCI submit-queue + DPC-drain fixes
+> (which resolved concurrent *direct* clients). Confirmed isolated — the auth/session
+> login chain completes cleanly when the demo chain is not running alongside it. Root
+> cause not yet pinned (a second concurrency issue in the block / forwarding-reply path).
+> Worked around for now by **sequencing** the login chain after the demo chain (the
+> fs-server is the only block client then, serialised by its single serve loop). To
+> investigate before workloads genuinely overlap direct and fs-mediated block I/O.
 
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
