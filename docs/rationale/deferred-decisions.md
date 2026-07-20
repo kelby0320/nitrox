@@ -307,9 +307,17 @@ Raising it to a small fixed array (correlating replies by the already-present
 
 **Shell grammar specification.** The shell's data model is committed (typed structured streams, port-based wiring, the display verb, model-view decomposition). The exact syntax is deferred to shell implementation. Trigger: when shell implementation begins.
 
-**`std` port for Nitrox target.** The native interface is handle-based; `std::fs`, `std::thread`, `std::net`, `std::sync`, `std::io` need implementation over the native syscalls. Trigger: stabilization of the syscall ABI plus a desire to enable the broader Rust ecosystem on Nitrox.
+**`std` port for Nitrox target (now a Phase 4 target, 2026-07-20).** Reframed from "deferred
+indefinitely" to a serious, faithful compatibility target — the portable API for *application*
+code, riding the native ABI (libos/libstream stay the capability-native API for system code).
+`std::fs` resolves paths through the process's root namespace (bounded ambient, capability-safe);
+`std::io` blocking maps to `sys_io_submit` + `block_on`; the kernel stays pure. Placement: **FP/AVX2
++ XSAVE lands early** (also unblocks `no_std + alloc` ecosystem crates); the **full cluster**
+(thread-local storage, real `std::thread` → the slice-3b deschedule IPI, the `std::{fs,io,sync,thread}`
+subset, `x86_64-unknown-nitrox.json`) is **consumer-driven** — it lands with portable programs / the
+browser, not as a desktop-MVP gate. See the decision log (2026-07-20; supersedes 2026-07-13).
 
-**POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a desire to port specific C software.
+**POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Resource servers (in-kernel)
 

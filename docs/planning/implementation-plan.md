@@ -63,13 +63,21 @@ Throughout this document, links to `docs/architecture/`, `docs/spec/`, and `docs
   prerequisite band + slices 1–9 shipped; boots Limine → kernel/PCI → init → ext4
   mount (userspace fs-server) → demand-paged reads → a live `eshell>`. Slice 10 (FAT,
   read-only) deferred to Phase 3.
-- **Phase 3 (Service ecosystem):** **in progress** — the kernel-first band (slices
-  0–3b: per-CPU foundation, SMP bring-up, scheduler classes, per-CPU runqueues +
-  work-stealing + migration, TLB shootdown) is **done**, bar the cross-CPU deschedule
-  IPI (gated on the first multi-threaded user process). Next: the sequenced
-  **userspace-runtime band (slices 4–7)** — allocator → libos/libstream → SysCaps →
-  libos authority surface — then the service backlog. std deferred to Phase 4+.
-- **Phase 4+ (Shell, display, networking):** not started
+- **Phase 3 (Service ecosystem):** **in progress, nearly done** — the kernel-first band
+  (slices 0–3b) and the userspace-runtime band (slices 4–7: libheap, libos core, SysCaps,
+  libos authority surface) are **done**, bar the cross-CPU deschedule IPI (gated on the
+  first multi-threaded user process) and **`libstream`** (the one open runtime lib). The
+  service-ecosystem *machinery* is complete (service-mgr + supervision, RS startup protocol,
+  path-based ELF spawn, RW ext4 fs, the auth/session login chain, logging + profile servers).
+  **Definition of Done** (see §Phase 3 → Definition of Done, and the decision log 2026-07-20)
+  = close the two open milestone clauses: **libstream + a typed-log demo** and a **`/proc`
+  scheduler-stats surface**. The remaining backlog services are **consumer-driven and defer
+  to Phase 4**. std is now a **serious compatibility target** (not deferred indefinitely) —
+  see the 2026-07-20 std stance.
+- **Phase 4+ (a usable windowed desktop → browser, networking, sysadmin):** not started.
+  North star = a compositor on the boot framebuffer + a shared GUI toolkit + a GUI
+  terminal/file-browser/editor, with a typed-shell + coreutils CLI as the first stepping
+  stone. See §Phase 4+ and the decision log (2026-07-20).
 
 ---
 
@@ -2007,6 +2015,34 @@ transforming fs-servers, which have no LBA mapping.) See the decision log
 - Two CPUs are visibly active (e.g., scheduler stats accessible via `/proc`)
 - A user can log in, get a per-user namespace, and write files to their home directory
 
+### Definition of Done (2026-07-20)
+
+Phase 3 = **"the service-ecosystem machinery is complete and demonstrated,"** not an
+exhaustive service catalogue. That machinery is done; a representative service set runs
+supervised. DoD is the four milestone clauses above — **two are met** (supervised services;
+login → per-user namespace → home write) and **two remain, and are the only gating work:**
+
+- [ ] **libstream + a service-mgr-driven typed-log demo** (clause 2 — the last open runtime lib).
+- [ ] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
+  `MemoryObject` snapshot* primitive (also unblocks numeric `/proc/self/status`).
+
+Everything else in the backlog below is **consumer-driven and defers to Phase 4**, landing
+with its first consumer (the project's standing deferral discipline). Triage:
+
+- **Defer — blocked or no near consumer:** time-sync (blocked on networking), device manager
+  (blocked on the Tier-2 module loader; no loadable-driver need under QEMU), namespace manager
+  (premature — supervisors already construct namespaces), mount daemon (no dynamic-mount
+  consumer), OOM daemon (no memory-pressure scenario until heavy apps), audit subsystem
+  (security; no functional consumer yet — revisit in a hardening pass).
+- **Optional early Phase 4:** crash reporter (developer-experience value as userspace grows).
+- **When their scale demands it:** service-mgr dependency-graph + RS startup ordering;
+  content-store package manager / generations / GC (the package-management + sysadmin layer —
+  a Phase 4 north-star component).
+
+**Directory operations** (readdir/mkdir/rmdir) are **not** Phase 3 — no Phase 3 consumer needs
+them; they open Phase 4's CLI-complete work, driven by coreutils/the shell. See the decision
+log (2026-07-20 "Phase 3 Definition of Done, the `std` stance, and the Phase 4 north star").
+
 ### Notes / deviations
 
 - **2026-06-26 — Phase 3 scope analysis + kernel-first sequencing.** Stock-take at
@@ -2024,75 +2060,135 @@ transforming fs-servers, which have no LBA mapping.) See the decision log
 
 ---
 
-## Phase 4+: Shell and beyond
+## Phase 4+: A usable windowed desktop (and beyond)
 
-**Goal:** an interactive system. The phase distinction breaks down here — this is ongoing development rather than discrete phases. Items below are roughly ordered by foundational importance.
+**Goal:** move from toy demos to an OS that looks and behaves like a production system
+from a user's perspective. The phase distinction breaks down here — this is ongoing
+development rather than discrete phases.
 
-### Shell
+**North star (scoped now): a usable windowed desktop.** A compositor on the boot
+framebuffer, one shared GUI toolkit, and three flagship apps — a **GUI terminal**, a **GUI
+file browser**, and a **GUI text editor** (MVP = compositor + toolkit + GUI terminal). It is
+the common denominator of the whole GUI vision: the browser and every later app are "another
+window on this compositor + toolkit." **Subsequent north stars** (a web browser; networking;
+a package-management + sysadmin layer) reuse this foundation. See the decision log
+(2026-07-20 "Phase 3 Definition of Done, the `std` stance, and the Phase 4 north star") for
+the full rationale, including the `std` stance and the browser strategy.
 
+**Stepping-stone path** (each a real, satisfying milestone; roughly ordered):
+
+1. Phase 3 close (libstream + `/proc`) — the gate out of Phase 3.
+2. FP/AVX2 + XSAVE (below).
+3. dir ops + typed shell + coreutils → **CLI-complete**.
+4. framebuffer display server + input routing.
+5. compositor + minimal shared toolkit.
+6. **GUI terminal** (hosts the shell) — the "looks like an OS" moment.
+7. GUI file browser + GUI text editor → a usable desktop.
+
+The **full std cluster** runs as a parallel, consumer-driven track (below) — not a
+desktop-MVP gate.
+
+### Floating-point + SIMD (early enablement)
+
+The kernel saves **zero** FPU state today (soft-float everywhere). Real Rust programs and the
+ecosystem use hardware float/SIMD. This is the one std-adjacent prerequisite that lands
+*early*, ahead of any graphics: it also unblocks a pile of `no_std + alloc` ecosystem crates
+(font rasterizers, image codecs) the toolkit will want.
+
+- [ ] Enable SSE/AVX (up to AVX2) for userspace; per-thread `XSAVE`/`XRSTOR` in both switch paths
+- [ ] Lazy vs. eager FPU-state policy decided; context-switch cost measured
+- [ ] First hard-float userspace thread demonstrated
+
+### CLI-complete: dir ops + the typed shell + coreutils
+
+The first stepping stone and the substrate the GUI terminal will host. Directory operations
+land here (their consumer is the shell/coreutils — not Phase 3).
+
+- [ ] Filesystem directory ops: `readdir`, `mkdir`, `rmdir`, unlink/rename (fs-server + rsproto + syscall surface)
 - [ ] Basic interactive shell (Rust REPL evolving into the eventual shell over time)
-- [ ] Pipeline support (typed streams between processes)
+- [ ] Pipeline support (typed streams between processes, over libstream)
 - [ ] Built-in operators: sort, filter, take, count, select
 - [ ] The `display` verb (renders typed streams to terminal as ANSI tables)
-- [ ] Text fallback for processes that emit plain text
-- [ ] Shell grammar (deferred — see [docs/rationale/deferred-decisions.md])
+- [ ] Text fallback for processes that emit plain text (auto-wrap as `Table<String>`)
+- [ ] A handful of coreutils (`ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`, …) — typed-on-Nitrox where structure helps
+- [ ] Shell grammar (deferred until shell implementation — see [docs/rationale/deferred-decisions.md])
 
-### Display infrastructure
+### Display + input
 
-- [ ] Display server (renders typed streams as ANSI in terminal mode)
-- [ ] `/dev/framebuffer` direct rendering for now
-- [ ] Future: GPU driver as Tier 2 LKM
-- [ ] Future: Compositor as userspace server (deferred — see [docs/rationale/deferred-decisions.md])
-- [ ] Future: `WidgetRecord` rendering
+- [ ] Display server over the persisted **boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind; firmware-fixed resolution, one linear framebuffer, no acceleration)
+- [ ] Input routing: keyboard + mouse (PS/2 under QEMU; USB HID later — see below)
+- [ ] Font rasterization (a `no_std`-friendly Rust crate, e.g. `fontdue`/`ab_glyph`) + a text/ANSI render path
 
-### Networking
+### Compositor + shared GUI toolkit
+
+- [ ] Compositor (userspace server): windows/surfaces, stacking, focus, damage/redraw
+- [ ] Shared GUI toolkit (the "common GUI library"): window creation, an event loop, drawing primitives, basic widgets. **Conventional surface model first** (apps draw into a surface; the compositor composites — Wayland-shaped)
+- [ ] `WidgetRecord` model layered on top **later, as the typed opt-in** (programs emit structured UI over a typed stream; the display server renders — the text-floor/typed-stream duality on the screen). The first desktop is **not** gated on this research bet.
+
+### Desktop apps (the north-star MVP)
+
+- [ ] **GUI terminal** (hosts the shell) — the MVP flagship
+- [ ] **GUI file browser**
+- [ ] **GUI text editor**
+
+### The full std cluster (parallel, consumer-driven)
+
+Not a desktop-MVP gate — the desktop can be built on `no_std + alloc` + crates + FP. Full std
+lands with **portable application programs** and the **browser**. `std` is the portable API
+for application code; libos/libstream stay the capability-native API for system code. It sits
+on the native ABI (no kernel change): `std::fs` resolves paths through the process's root
+namespace (bounded ambient, capability-safe); `std::io` blocking maps to `sys_io_submit` +
+`block_on`. See the decision log (2026-07-20 std stance; supersedes 2026-07-13).
+
+- [ ] Thread-local storage (`FS_BASE` / `sys_thread_set_tls`)
+- [ ] Real `std::thread` — multi-threaded user processes; this triggers the slice-3b **cross-CPU deschedule IPI** (its first consumer) + per-thread FPU/TLS
+- [ ] `std` subset over the native ABI: `std::{fs,io,sync,thread}` (`net` after networking)
+- [ ] Target spec: `x86_64-unknown-nitrox.json`
+- [ ] First non-trivial external Rust crate ported unmodified; a Nitrox program cross-built + run on Linux (portability proof)
+
+### Subsequent north stars
+
+**Web browser** (a capstone / integration test — exercises networking, TLS, threads, FP/SIMD,
+graphics, fonts, memory, std at once). Favor a **hybrid**: reuse pure-Rust Servo crates
+(`html5ever`, `cssparser`, `selectors`) + a pure-Rust JS engine (`Boa`, restricted subset)
+over porting full Servo (SpiderMonkey/C/GPU weight, which would force the POSIX C shim early).
+Portable to Nitrox/Linux/Windows.
+
+- [ ] Restricted HTML/CSS/JS engine on pure-Rust crates
+- [ ] `rustls`-based HTTPS (needs networking below)
+
+**Networking** (gates `std::net`, NTP, the browser's fetch path):
 
 - [ ] Network driver (e1000 or virtio-net as starting point)
 - [ ] Userspace netstack server (smoltcp port or from-scratch)
 - [ ] Socket-as-namespace-resource architecture
 - [ ] DHCP, DNS
+- [ ] TLS-the-protocol via `rustls` + a Rust crypto provider
 
-### Additional filesystems
+**Package management + system administration** (the content-store daemon + generations + GC,
+pulled up from the Phase 3 backlog; the "sysadmin layer" of a production-feel OS):
 
-- [ ] fs-server-fat read-write (for ESP updates from within OS)
-- [ ] fs-server-btrfs (if a use case emerges)
-- [ ] fs-server-xfs (if a use case emerges)
+- [ ] Package manager daemon (list/add/remove store paths)
+- [ ] Generation manifests + atomic switch/rollback
+- [ ] Store GC (mark reachable, sweep unreachable)
 
-### Phase 2 ACPI
+### Opportunistic / trigger-driven
 
-- [ ] Trigger condition reached (laptop / graceful shutdown / etc.)
-- [ ] Vendor ACPICA at `kernel/vendor/acpica/`
-- [ ] OSL implementation in `kernel/src/kacpi/osl/`
-- [ ] `bindgen` build integration
-- [ ] Power management daemon
+Landed when a concrete consumer or need appears, not on a fixed schedule:
 
-### aarch64
-
-- [ ] x86_64 implementation stable enough that porting is worthwhile
-- [ ] Fill in `kernel/src/arch/aarch64/` stubs
-- [ ] Equivalent userspace work
-- [ ] First aarch64 target system identified
-
-### std port
-
-> **Affirmatively deferred (2026-07-13).** Reconsidered at the start of the Phase 3
-> userspace-runtime work and kept here, not pulled forward. std is POSIX-shaped
-> (ambient-authority `fs`/`net`, synchronous blocking `io`, errno, signals,
-> `thread_local!`) and sits on the syscall ABI, which is pre-stabilization; a
-> faithful port would either reintroduce the Unix patterns Nitrox rejects or stub
-> half its surface. The near-term ergonomic win comes from the Nitrox-native runtime
-> libraries (Phase 3 slices 4–7) instead. Revisit once the ABI is stabilizing and a
-> concrete unmodified external crate justifies the cost. See the decision log
-> (2026-07-13).
-
-- [ ] Syscall ABI stable enough to commit to
-- [ ] `std::fs`, `std::thread`, `std::net`, `std::sync`, `std::io` implementations
-- [ ] Target spec: `x86_64-unknown-nitrox.json`
-- [ ] First non-trivial external Rust crate ported
+- [ ] **USB subsystem** (xHCI + USB core + HID) — real-hardware input/storage; QEMU gives PS/2, so it trails the QEMU-first loop
+- [ ] **Dynamic linking** — off the std critical path (Rust static-links); an ecosystem/image-size concern
+- [ ] **POSIX C shim** — deferred until a must-have C dependency forces it (target the pure-Rust ecosystem first)
+- [ ] **Additional filesystems:** fs-server-fat read-write (ESP updates from within the OS; also the orphaned Phase-2 "FAT read-only" deferral folds in here), btrfs/xfs if a use case emerges
+- [ ] **Phase 2 ACPI:** vendor ACPICA (`kernel/vendor/acpica/`), OSL (`kernel/src/kacpi/osl/`), `bindgen` integration, power-management daemon — triggered by laptop / graceful-shutdown needs
+- [ ] **GPU / compositor acceleration** — modesetting GPU driver is out of scope (opacity); the boot framebuffer is the display substrate
+- [ ] **aarch64:** fill `kernel/src/arch/aarch64/` stubs once x86_64 is mature; equivalent userspace work
 
 ### Notes
 
-This phase is open-ended. The implementation plan stops being useful as a tracking tool around here; ongoing work is better tracked as GitHub issues, project boards, or whatever workflow fits.
+This phase is open-ended. The implementation plan stops being useful as a fine-grained
+tracking tool around here; ongoing work is better tracked as GitHub issues / project boards.
+The north star and the decision log (2026-07-20) are the durable guides.
 
 ---
 
