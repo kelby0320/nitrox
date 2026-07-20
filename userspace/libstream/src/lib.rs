@@ -34,9 +34,11 @@
 
 extern crate alloc;
 
+pub mod table;
 pub mod wire;
 
+pub use table::{Item, TableReader, TableWriter, write_text_fallback};
 pub use wire::{
-    ByteSink, ByteSource, FieldDef, Schema, StreamFlags, TypeModifiers, TypeTag, Value, WireError,
-    WireErrorRecord,
+    ByteSink, ByteSource, FieldDef, Schema, SliceSink, StreamFlags, TypeModifiers, TypeTag, Value,
+    WireError, WireErrorRecord,
 };

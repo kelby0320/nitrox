@@ -156,6 +156,10 @@ pub enum WireError {
     Unsupported(TypeTag),
     /// The sink refused the write (e.g. a fixed frame is full).
     SinkFull,
+    /// A record's values don't match the schema: wrong field count, a `Null` in a
+    /// non-nullable field, a value whose type differs from its column, or a write in
+    /// the wrong order (a row before the schema / after the terminator).
+    SchemaMismatch,
 }
 
 /// Codec result.
@@ -173,6 +177,57 @@ pub trait ByteSink {
 impl ByteSink for Vec<u8> {
     fn put(&mut self, bytes: &[u8]) -> Result<()> {
         self.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+/// Forwarding impl so a `&mut S` can be handed to something that takes a `ByteSink`
+/// by value (e.g. `TableWriter::new(&mut sink)`), keeping ownership with the caller.
+impl<S: ByteSink + ?Sized> ByteSink for &mut S {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        (**self).put(bytes)
+    }
+}
+
+/// A [`ByteSink`] over a caller-owned fixed buffer — the practical transport primitive:
+/// a program encodes a stream straight into an `IpcMsg` body, then `sys_channel_send`s
+/// [`as_bytes`](SliceSink::as_bytes). Overflowing the buffer fails with
+/// [`WireError::SinkFull`] (backpressure) rather than truncating.
+pub struct SliceSink<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl<'a> SliceSink<'a> {
+    /// Wrap a fixed buffer; writing starts at offset 0.
+    pub fn new(buf: &'a mut [u8]) -> Self {
+        SliceSink { buf, len: 0 }
+    }
+
+    /// Bytes written so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// `true` if nothing has been written yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The written prefix — what to send.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.buf[..self.len]
+    }
+}
+
+impl ByteSink for SliceSink<'_> {
+    fn put(&mut self, bytes: &[u8]) -> Result<()> {
+        let end = self.len + bytes.len();
+        if end > self.buf.len() {
+            return Err(WireError::SinkFull);
+        }
+        self.buf[self.len..end].copy_from_slice(bytes);
+        self.len = end;
         Ok(())
     }
 }
