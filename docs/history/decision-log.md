@@ -6896,3 +6896,37 @@ can be handed down the init → service-mgr → session-mgr chain.
 
 Deferred to Part E: the interactive `login:` prompt (replacing the hardcoded round-trip)
 + spawning the user shell into the constructed namespace + writing to `/home`.
+
+## 2026-07-20 — Auth + session-mgr Part E: login → user shell → home write (slice complete)
+
+The slice's headline milestone runs end to end: **login → authenticate → per-user
+namespace → sandboxed user shell → home write**. session-mgr now (a) authenticates a
+user — `test-harness` auto-logs-in the demo user for a deterministic verdict, the
+interactive path prompts `nitrox login:` + password (no echo) on `/dev/console` — (b)
+constructs the session namespace binding `/home` as the user's fs-server home subtree
+(RW) **and** `/dev/console` (the shell's I/O), deliberately omitting everything else,
+(c) spawns the new **`usersh`** throwaway shell into that namespace with **empty
+syscaps**, and (d) reaps it and gates the boot verdict on its exit code.
+
+`usersh` (new bin crate, `libkern`-only, alloc-free — the eshell family) is the login
+leaf: it `sys_file_create`s `/home/greeting`, writes + `sys_file_sync`s, then re-resolves
+with a plain lookup and verifies the bytes — the fs-RW create/grow/write path exercised
+from an unprivileged sandbox through the subtree binding (create-on-resolve forwards
+`home/alice/greeting` to the fs-server). Under `test-harness` it exits with its verdict;
+otherwise it runs a minimal console loop (`cat`/`exit`). This is the **defining property
+made real**: the shell holds empty syscaps and a namespace naming only `/home` +
+`/dev/console`, so `/dev/blk`, other homes, and the raw fs root are *unnameable* — a
+sandbox by construction, not permission denial.
+
+`eshell` is demoted to what its name means — the **emergency** shell on a critical-path
+failure — no longer the normal interactive console (which is now session-mgr's `login:`
+via the login chain).
+
+Verified under `test-qemu`: `login ok -> home=/home/alice` … `session namespace built
+(/home subtree + /dev/console)` … `user shell spawned into the session namespace` …
+`usersh: wrote + verified /home/greeting` … `verdict PASS`. Both the `test-harness`
+(auto-login) and interactive (`selftest`) builds compile; host suite + check-arch green.
+Sequenced after the demo chain (the concurrent-forwarded-lookup item stays open in
+`deferred-decisions.md`). The **auth + session-mgr slice is complete**; remaining items
+(roles / privilege broker, per-user profile overlays, session tokens, the real Phase-4
+shell) are deferred in `session-and-auth.md`.

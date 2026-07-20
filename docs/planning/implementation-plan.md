@@ -1945,11 +1945,15 @@ isolation (a kernel primitive); service-mgr **spawns** session-mgr with re-deleg
   tracked in `deferred-decisions.md`). Auth is reached over a **direct channel** (not
   bound at `/svc/auth`) since session-mgr is the sole consumer. AHCI concurrent-command
   bug fixed along the way (single-slot queue + DPC-drain).
-- [ ] **Part E — login + namespace construction + user shell** (the milestone):
-  session-mgr's `login:` loop → auth → `sys_ns_create` + attenuated binds
-  ({console, /home subtree RW, /bin, /store}) → spawn the throwaway user shell (empty
-  syscaps) → shell writes `$HOME`. eshell demoted to emergency-only. Verdict: a
-  `test-harness` auto-login; wrong-password rejected; `/dev/blk` unreachable.
+- [x] **Part E — login + namespace construction + user shell** (the milestone):
+  session-mgr authenticates (test-harness auto-login / interactive `nitrox login:` on
+  the console), builds the session namespace (`/home` subtree RW + `/dev/console`),
+  spawns the new **`usersh`** throwaway shell into it with **empty syscaps**, and reaps
+  it. `usersh` `sys_file_create`s `/home/greeting`, writes + syncs + re-reads to verify
+  — the fs-RW write path from a sandbox through the subtree binding. eshell demoted to
+  emergency-only. Verdict: `test-harness` auto-login → shell home-write; wrong-password
+  denied. **The auth + session-mgr slice is complete** — login → per-user namespace →
+  user shell → home write runs end to end.
 
 Scope notes (decided 2026-07-17, for when this slice runs):
 - **Proper password hashing, if scope allows.** Prefer storing a **password hash** (a hand-

@@ -29,11 +29,13 @@ use librsproto::{OP_AUTHENTICATE, decode, encode};
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
 
-/// The demo credential the Part-D self-check authenticates. **Must match** the fixture
-/// seeded into `/system/users` by `tools/xtask` (`DEMO_USER`/`DEMO_PASSWORD`). This
-/// hardcoded login is a throwaway Part-D proof — Part E reads the credential from the
-/// console instead.
+/// The demo credential the test-harness auto-login uses. **Must match** the fixture
+/// seeded into `/system/users` by `tools/xtask` (`DEMO_USER`/`DEMO_PASSWORD`). Only the
+/// deterministic test-harness path uses it; the interactive login reads the credential
+/// from the console instead.
+#[cfg(feature = "test-harness")]
 const DEMO_USER: &[u8] = b"alice";
+#[cfg(feature = "test-harness")]
 const DEMO_PASSWORD: &[u8] = b"correct horse battery staple";
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
@@ -43,6 +45,21 @@ static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: usize = 0;
 static mut SEND_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut SEND_HANDLES: [u64; 8] = [0; 8];
+static mut NOTIF: Notification = Notification::zeroed();
+
+/// Spawn args for the user shell: run in the **constructed session namespace** with
+/// **empty syscaps** (a fully unprivileged sandbox). `image`/`namespace` are filled at
+/// spawn.
+static mut SPAWN_USERSH: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0, // set at spawn = the session namespace
+    syscaps: 0,   // empty — the shell is sandboxed
+};
 
 /// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
@@ -162,11 +179,13 @@ fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> 
 }
 
 /// Construct a session namespace for a login whose home is `home` (an absolute path,
-/// e.g. `/home/alice`): create a fresh namespace and bind the fs-server `fs_endpoint`
-/// at `/home` **scoped to the user's home subtree**. Proves `BIND_NAMESPACE` (the bind
-/// syscap gate), subtree scoping, and shared-registration bind-mount all at once.
-/// Returns the session-namespace handle, or `0` on failure.
-fn build_session_namespace(fs_endpoint: u64, home: &[u8]) -> u64 {
+/// e.g. `/home/alice`): a fresh namespace binding the user's home subtree of the
+/// fs-server at `/home` (RW) and the console at `/dev/console` (so the shell has I/O).
+/// Deliberately **omits** everything else (`/dev/blk`, other homes, the raw fs root) —
+/// absence is the sandbox. Proves `BIND_NAMESPACE` + subtree scoping + shared-
+/// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
+/// `root_ns` is session-mgr's inherited namespace (to resolve the console).
+fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8]) -> u64 {
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -174,9 +193,9 @@ fn build_session_namespace(fs_endpoint: u64, home: &[u8]) -> u64 {
         return 0;
     }
     let ns = ns as u64;
-    // Bind the fs-server endpoint at `/home` scoped to the user's home subtree. The
-    // kernel shares init's existing fs registration (bind-mount) and prepends `home`
-    // to every forwarded suffix. Requires BIND_NAMESPACE (re-delegated) + BIND on `ns`.
+    // `/home` → the fs-server endpoint scoped to the user's home subtree. The kernel
+    // shares init's fs registration (bind-mount) and prepends `home` to every forwarded
+    // suffix. Requires BIND_NAMESPACE (re-delegated) + BIND on `ns`.
     let sub = b"/home";
     let br = unsafe {
         syscall6(
@@ -195,14 +214,106 @@ fn build_session_namespace(fs_endpoint: u64, home: &[u8]) -> u64 {
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
         return 0;
     }
+    // `/dev/console` → a direct-handle bind of the console device (resolved from our own
+    // namespace), so the shell can do console I/O within its sandbox. Non-fatal if
+    // absent (the test-harness shell does not read the console).
+    let (cst, console) = ns_lookup(root_ns, b"/dev/console", RIGHT_READ | RIGHT_TRANSFER);
+    if cst == 0 && console != 0 {
+        let dev = b"/dev/console";
+        // SAFETY: valid namespace handle, path pointer, and console handle (a device
+        // node → a direct-handle bind; no subtree base).
+        let cr = unsafe {
+            syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, console, 0, 0)
+        };
+        // The bind cloned its own reference; drop ours.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, console) };
+        if cr != 0 {
+            kprint(b"session-mgr: /dev/console bind FAIL (shell has no console)\n");
+        }
+    }
     ns
 }
 
-/// Bootstrap registers: `rdi` = notification channel (unused in Part D), `rsi` = the
-/// inherited (LOOKUP-only) root namespace, `rdx` = the control channel service-mgr
+/// Resolve `path` in `ns` with `rights`, waiting the PO; returns `(status, handle)`.
+fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
+    // SAFETY: valid path pointer + namespace handle.
+    let po = unsafe { syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights) };
+    if po < 0 {
+        return (po as i32, 0);
+    }
+    if !wait_one(po as u64) {
+        // SAFETY: closing our own PO.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+        return (-1, 0);
+    }
+    let (status, handle) = unsafe {
+        (
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
+            u64::from_le_bytes([
+                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            ]),
+        )
+    };
+    // SAFETY: closing our own PO handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+    (status, handle)
+}
+
+/// Spawn the user shell (`/initramfs/sbin/usersh`) into `session_ns` (empty syscaps),
+/// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
+/// shell could not be spawned. This is the login's payoff: an unprivileged process in a
+/// per-user namespace, reaped by session-mgr.
+fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
+    let image = ns_lookup(root_ns, b"/initramfs/sbin/usersh", RIGHT_MAP_READ).1;
+    if image == 0 {
+        kprint(b"session-mgr: usersh image not found\n");
+        return -1;
+    }
+    // SAFETY: SPAWN_USERSH is a valid writable arg block; run in the session namespace.
+    let h = unsafe {
+        SPAWN_USERSH.image = image;
+        SPAWN_USERSH.namespace = session_ns;
+        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_USERSH) as u64)
+    };
+    // The kernel copied the ELF during spawn; close our image handle.
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
+    if h < 0 {
+        kprint(b"session-mgr: usersh spawn FAIL\n");
+        return -1;
+    }
+    kprint(b"session-mgr: user shell spawned into the session namespace\n");
+    // Reap it: block on the notification channel for its ChildExited, then read the code.
+    loop {
+        if !wait_one(notif) {
+            continue;
+        }
+        // Drain queued notifications.
+        loop {
+            // SAFETY: NOTIF is a valid 64-byte writable out-param.
+            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+            if r != 0 {
+                break;
+            }
+            let (kind, body) =
+                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            if kind == KIND_CHILD_EXITED {
+                let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+                // SAFETY: closing our reference to the exited shell (reaping).
+                unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+                return code;
+            }
+        }
+    }
+}
+
+/// Bootstrap registers: `rdi` = notification channel (reaps the user shell), `rsi` =
+/// the inherited (LOOKUP-only) root namespace, `rdx` = the control channel service-mgr
 /// hands the endpoints over, `rcx` = `arg0` (unused).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"session-mgr: up\n");
     // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) auth channel.
     let fs_endpoint = recv_handoff(control);
@@ -214,38 +325,145 @@ pub extern "C" fn _start(_notif: u64, _root_ns: u64, control: u64, _arg0: u64) -
     }
     kprint(b"session-mgr: received fs endpoint + auth channel\n");
 
-    // Part-D self-check: authenticate the demo user (the first end-to-end exercise of
-    // the credential stack under real spawning), construct their session namespace, and
-    // confirm a wrong password is denied. All three must pass.
+    // The session loop: authenticate a user, construct their per-user namespace, spawn
+    // the shell into it, and reap it. (Part D auto-logs-in the demo user for a
+    // deterministic verdict; the interactive path reads the credential from console.)
     let mut home = [0u8; 256];
-    let mut ok = false;
-    match authenticate(auth_ch, DEMO_USER, DEMO_PASSWORD, &mut home) {
-        Some(home_len) => {
-            kprint(b"session-mgr: authenticated 'alice' -> home=");
-            kprint(&home[..home_len]);
+    match login(root_ns, auth_ch, &mut home) {
+        Some(hl) => {
+            kprint(b"session-mgr: login ok -> home=");
+            kprint(&home[..hl]);
             kprint(b"\n");
-            let ns = build_session_namespace(fs_endpoint, &home[..home_len]);
-            if ns != 0 {
-                kprint(b"session-mgr: session namespace built (/home subtree bound)\n");
-                ok = true;
+            let session_ns = build_session_namespace(root_ns, fs_endpoint, &home[..hl]);
+            if session_ns == 0 {
+                verdict(false);
+                idle();
+            }
+            kprint(b"session-mgr: session namespace built (/home subtree + /dev/console)\n");
+            // The payoff: an unprivileged shell in the per-user namespace writes to home.
+            let code = spawn_user_shell(root_ns, session_ns, notif);
+            let ok = code == 0;
+            if ok {
+                kprint(b"session-mgr: user shell wrote to home + exited cleanly (login proven)\n");
+            } else {
+                kprint(b"session-mgr: user shell failed\n");
+            }
+            verdict(ok);
+        }
+        None => {
+            kprint(b"session-mgr: login denied\n");
+            verdict(false);
+        }
+    }
+    idle();
+}
+
+/// Authenticate a user, returning their home path (copied into `home_out`) length, or
+/// `None` if denied. **test-harness**: a wrong-password sanity check, then auto-login of
+/// the demo user (deterministic verdict). **interactive**: prompt username + password on
+/// the console (up to a few attempts).
+#[cfg(feature = "test-harness")]
+fn login(_root_ns: u64, auth_ch: u64, home_out: &mut [u8]) -> Option<usize> {
+    // Sanity: a wrong password must be denied (no enumeration/timing oracle upstream).
+    let mut scratch = [0u8; 256];
+    if authenticate(auth_ch, DEMO_USER, b"not-the-password", &mut scratch).is_some() {
+        kprint(b"session-mgr: wrong password WRONGLY accepted\n");
+        return None;
+    }
+    kprint(b"session-mgr: wrong password correctly denied\n");
+    authenticate(auth_ch, DEMO_USER, DEMO_PASSWORD, home_out)
+}
+
+#[cfg(not(feature = "test-harness"))]
+fn login(root_ns: u64, auth_ch: u64, home_out: &mut [u8]) -> Option<usize> {
+    let (cst, console) = ns_lookup(root_ns, b"/dev/console", RIGHT_READ);
+    if cst != 0 || console == 0 {
+        kprint(b"session-mgr: no console for login\n");
+        return None;
+    }
+    // A one-page read buffer for console input.
+    let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    if buf_h < 0 {
+        return None;
+    }
+    let buf_h = buf_h as u64;
+    let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if buf_addr < 0 {
+        return None;
+    }
+    let buf_addr = buf_addr as u64;
+    for _ in 0..3 {
+        kprint(b"\r\nnitrox login: ");
+        let mut user = [0u8; 64];
+        let ulen = read_line(console, buf_h, buf_addr, &mut user, true);
+        kprint(b"password: ");
+        let mut pass = [0u8; 128];
+        let plen = read_line(console, buf_h, buf_addr, &mut pass, false);
+        kprint(b"\r\n");
+        if let Some(hl) = authenticate(auth_ch, &user[..ulen], &pass[..plen], home_out) {
+            return Some(hl);
+        }
+        kprint(b"login incorrect\r\n");
+    }
+    None
+}
+
+/// Read a line from `console` into `out` (until CR/LF), echoing each byte iff `echo`.
+/// Returns the line length. `buf`/`buf_addr` are a shared one-page read buffer.
+#[cfg(not(feature = "test-harness"))]
+fn read_line(console: u64, buf: u64, buf_addr: u64, out: &mut [u8], echo: bool) -> usize {
+    let mut len = 0usize;
+    loop {
+        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: buf, buf_offset: 0, offset: 0, length: 256 };
+        // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
+        let po = unsafe { syscall2(SYS_IO_SUBMIT, console, (&op as *const IoOp) as u64) };
+        if po < 0 {
+            continue;
+        }
+        if !wait_one(po as u64) {
+            unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+            continue;
+        }
+        let (status, n) = unsafe {
+            (
+                i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
+                u64::from_le_bytes([
+                    WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+                    WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                ]),
+            )
+        };
+        // SAFETY: closing our own PO.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+        if status != 0 {
+            continue;
+        }
+        for i in 0..(n as usize).min(256) {
+            // SAFETY: `buf_addr + i` is within the mapped read buffer.
+            let b = unsafe { ((buf_addr + i as u64) as *const u8).read_volatile() };
+            match b {
+                b'\r' | b'\n' => return len,
+                0x08 | 0x7F => {
+                    if len > 0 {
+                        len -= 1;
+                        if echo {
+                            kprint(b"\x08 \x08");
+                        }
+                    }
+                }
+                0x20..=0x7E => {
+                    if len < out.len() {
+                        out[len] = b;
+                        len += 1;
+                        if echo {
+                            kprint(&[b]);
+                        }
+                    }
+                }
+                _ => {}
             }
         }
-        None => kprint(b"session-mgr: demo authentication FAILED\n"),
     }
-    // Negative check: a wrong password must be denied.
-    let mut scratch = [0u8; 256];
-    if authenticate(auth_ch, DEMO_USER, b"not-the-password", &mut scratch).is_none() {
-        kprint(b"session-mgr: wrong password correctly denied\n");
-    } else {
-        kprint(b"session-mgr: wrong password WRONGLY accepted\n");
-        ok = false;
-    }
-
-    if ok {
-        kprint(b"session-mgr: login-path plumbing verified (Part D)\n");
-    }
-    verdict(ok);
-    idle();
 }
 
 /// Fire the boot verdict under `test-harness` (terminates QEMU via `SYS_TEST_EXIT`);

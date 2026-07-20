@@ -195,6 +195,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // session-mgr fires the self-test verdict, so it takes the build-mode feature
     // (`selftest`/`test-harness`) like init.
     build_userspace_bin("session-mgr", mode.features())?;
+    // usersh (the throwaway user shell) exits with its home-write verdict under
+    // test-harness, so it also takes the build-mode feature.
+    build_userspace_bin("usersh", mode.features())?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -813,6 +816,7 @@ fn build_initramfs(out: &Path) -> R<()> {
         "logging-service",
         "auth-service",
         "session-mgr",
+        "usersh",
     ];
     let mut ino = 3u32;
     for name in programs {

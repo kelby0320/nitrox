@@ -1,8 +1,11 @@
 # Sessions and authentication
 
-**Status:** in progress (Phase 3, "Auth + session-mgr" slice). Living document. This
-describes the architecture; the build sequence lives in the
-[implementation plan](../planning/implementation-plan.md).
+**Status:** implemented (Phase 3, "Auth + session-mgr" slice, 2026-07-20). The full
+path — login → authenticate → per-user namespace → sandboxed user shell → home write —
+runs end to end. Living document; describes the architecture, with the build sequence
+in the [implementation plan](../planning/implementation-plan.md). What remains is
+deferred polish (roles, profile overlays, session tokens, the real Phase-4 shell) — see
+Deferred.
 
 This is how a human logs in and gets a running, *sandboxed* shell — the first time
 Nitrox exercises its defining property end to end: **authority is constructed, not

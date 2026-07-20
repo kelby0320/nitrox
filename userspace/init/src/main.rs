@@ -1238,9 +1238,9 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                         // SAFETY: closing init's reference; service-mgr runs independently.
                         unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
                     }
-                    // Non-test-harness selftest: also drop to the interactive console.
-                    #[cfg(not(feature = "test-harness"))]
-                    spawn_eshell(root_ns);
+                    // The interactive console is now session-mgr's `login:` prompt (via the
+                    // login chain), not eshell — eshell is the *emergency* shell only (the
+                    // `emergency` path below). Nothing more to spawn here.
                 }
             }
         }
