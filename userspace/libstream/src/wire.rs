@@ -160,6 +160,8 @@ pub enum WireError {
     /// non-nullable field, a value whose type differs from its column, or a write in
     /// the wrong order (a row before the schema / after the terminator).
     SchemaMismatch,
+    /// A typed read (`read_record`) hit an in-stream error record; carries its code.
+    StreamError(i32),
 }
 
 /// Codec result.
@@ -373,6 +375,54 @@ impl Value {
             Value::Str(_) => TypeTag::String,
             Value::Bytes(_) => TypeTag::Bytes,
             Value::Handle(_) => TypeTag::Handle,
+        }
+    }
+
+    /// `true` for [`Value::Null`].
+    pub fn is_null(&self) -> bool {
+        matches!(self, Value::Null)
+    }
+
+    /// The boolean, if this is a [`Value::Bool`] — for ergonomic `from_values` impls.
+    pub fn as_bool(&self) -> Option<bool> {
+        match self {
+            Value::Bool(b) => Some(*b),
+            _ => None,
+        }
+    }
+    /// The integer, if this is a [`Value::Int`].
+    pub fn as_int(&self) -> Option<i64> {
+        match self {
+            Value::Int(i) => Some(*i),
+            _ => None,
+        }
+    }
+    /// The float, if this is a [`Value::Float`].
+    pub fn as_float(&self) -> Option<f64> {
+        match self {
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
+    /// The string, if this is a [`Value::Str`].
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            Value::Str(s) => Some(s),
+            _ => None,
+        }
+    }
+    /// The bytes, if this is a [`Value::Bytes`].
+    pub fn as_bytes(&self) -> Option<&[u8]> {
+        match self {
+            Value::Bytes(b) => Some(b),
+            _ => None,
+        }
+    }
+    /// The handle value, if this is a [`Value::Handle`].
+    pub fn as_handle(&self) -> Option<u64> {
+        match self {
+            Value::Handle(h) => Some(*h),
+            _ => None,
         }
     }
 }
