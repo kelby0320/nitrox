@@ -2,7 +2,17 @@
 
 This document specifies the wire format of typed structured streams — the format used by programs to communicate via stdin/stdout pipelines. The format is identified by the magic bytes `TSM1` (Typed Stream Magic, version 1).
 
-**Status:** Pre-stabilization. The envelope and structural types are committed; specific `TypeTag` byte values are deferred to implementation. Until those land, this document specifies the shape; `libstream` is the canonical source for byte-level details.
+**Status:** Pre-stabilization. The envelope and structural types are committed; the `TypeTag` byte values are now **pinned** (below), implemented in `userspace/libstream/src/wire.rs` (the canonical source for byte-level details). **v1 implements flat records** — the scalar types plus `String`/`Bytes`/`Handle`; `List` (a `Vec`) and `Record` (nested struct) reserve their tags but are not yet encoded (they land with their first consumer, the shell).
+
+### Terminology: three things called "record"
+
+The word "record" appears at three different levels; keep them distinct:
+
+- **`TypedRecord`** — the *Rust trait* (`#[derive(TypedRecord)]`): "this struct maps to the wire." At the top level it defines a stream's columns; nested, it is a field value.
+- **data record** (record tag `0x01`) — a *row*: one instance of the schema. `Body := Record*` means "a sequence of rows."
+- **`Record`** (the `TypeTag` below) — the *nested-struct field encoding* (a sub-schema + values), used when a `TypedRecord` appears as a field value.
+
+The underlying model separates a **`WireValue`** (anything with a `TypeTag` and an encoding — the scalars, `String`, `Bytes`, `Handle`, `List<V>`, `Record<R>`) from a **`TypedRecord`** (a struct = ordered named `WireValue` fields = a schema; *as a value* it is a `Record`). So `Vec<V: WireValue>` maps to `List` uniformly (both `Vec<i64>` and `Vec<Thread>` work).
 
 ## Overall structure
 
@@ -65,20 +75,20 @@ A schema with zero fields is valid; it indicates a record-free stream (just a te
 
 The set of structural types is fixed:
 
-| Tag value | Type | Wire encoding |
-|---|---|---|
-| (TBD) | `Null` | zero bytes |
-| (TBD) | `Bool` | 1 byte (0 or 1) |
-| (TBD) | `Int` | 8 bytes, little-endian i64 |
-| (TBD) | `Float` | 8 bytes, IEEE 754 binary64 |
-| (TBD) | `String` | `length: u32` + `length` bytes of UTF-8 |
-| (TBD) | `Bytes` | `length: u32` + `length` raw bytes |
-| (TBD) | `List` | `length: u32` + `length` × inner-type encoding |
-| (TBD) | `Record` | (recursive sub-schema) |
-| (TBD) | `Handle` | 8 bytes (`RawHandle`) |
-| (TBD) | `Error` | nested error structure (see below) |
+| Tag | Type | v1 | Wire encoding |
+|---|---|---|---|
+| `0x00` | `Null` | ✓ | zero bytes |
+| `0x01` | `Bool` | ✓ | 1 byte (0 or 1) |
+| `0x02` | `Int` | ✓ | 8 bytes, little-endian i64 |
+| `0x03` | `Float` | ✓ | 8 bytes, IEEE 754 binary64 (LE) |
+| `0x04` | `String` | ✓ | `length: u32` + `length` bytes of UTF-8 |
+| `0x05` | `Bytes` | ✓ | `length: u32` + `length` raw bytes |
+| `0x06` | `Handle` | ✓ | 8 bytes (`RawHandle`, LE) |
+| `0x07` | `List` | — | `length: u32` + `length` × inner-type encoding |
+| `0x08` | `Record` | — | nested sub-schema + values |
+| `0x09` | `Error` | — | nested error structure, value-level (see below) |
 
-The exact `TypeTag` byte values are deferred to `libstream` implementation. The mapping is recorded in `libstream/src/wire.rs` and tracked here once stable.
+The `TypeTag` byte values are pinned as above; `userspace/libstream/src/wire.rs` is the canonical source. The **v1** column marks what libstream encodes today; `List`/`Record`/`Error` are recognised on the wire but return an "unsupported" error until implemented.
 
 ### TypeModifiers
 
@@ -205,7 +215,9 @@ tw.finish_with_status(0)?;
 
 The macro reflects the struct's field names and types at compile time, generating the appropriate schema and per-field encoding calls. No registry, no coordination.
 
-Initial supported types: primitive scalars (`bool`, `i*`, `u*`, `f32`, `f64`), `String`, `Vec<T: TypedRecord>`, nested structs with `#[derive(TypedRecord)]`, `Option<T>` (maps to nullable field), `RawHandle`. Deferred: enums (tagged unions), generics beyond `Vec<T>`, lifetimes beyond `'static`.
+Field types map to `WireValue`s (a `Vec<V>` field is a `List` of `V`; a nested `#[derive(TypedRecord)]` struct is a `Record`). The full target set: primitive scalars (`bool`, `i*`, `u*`, `f32`, `f64`), `String`, `Bytes`/`Vec<u8>`, `Vec<V: WireValue>` → `List`, nested `#[derive(TypedRecord)]` structs → `Record`, `Option<T>` → nullable field, `RawHandle`. Deferred: enums (tagged unions), generics beyond `Vec<T>`, lifetimes beyond `'static`.
+
+**v1 (flat records)** implements the scalar types + `String`/`Bytes`/`Option`/`RawHandle` only; `Vec` (→ `List`) and nested structs (→ `Record`) land with their first consumer (the shell rendering list/nested columns).
 
 ## Streaming model
 

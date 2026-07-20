@@ -367,6 +367,97 @@ fn process_resolve(serve_end: u64, sources: &mut Vec<Source>) {
     }
 }
 
+/// Decode a `TSM1` typed-stream message and render its rows through the sinks (each row as
+/// a `name=value …` line, stamped like any other record), plus a one-time marker naming the
+/// schema's columns — the end-to-end demonstration of a typed stream flowing through the log
+/// channel. A malformed / truncated stream is dropped, never fatal.
+fn render_typed(
+    body: &[u8],
+    principal: &str,
+    tier: u8,
+    chan_label: &Option<String>,
+    seq: &mut u64,
+    sinks: &mut [Box<dyn Sink>],
+) {
+    let mut tr = match libstream::TableReader::new(body) {
+        Ok(t) => t,
+        Err(_) => {
+            kprint(b"logging-service: malformed typed stream (drop)\n");
+            return;
+        }
+    };
+    let schema = tr.schema().clone();
+    // One-time marker: the typed header decoded; show which columns arrived.
+    let mut cols = String::from("logging-service: typed stream from ");
+    cols.push_str(principal);
+    cols.push_str(" [");
+    for (i, f) in schema.fields.iter().enumerate() {
+        if i > 0 {
+            cols.push_str(", ");
+        }
+        cols.push_str(&f.name);
+    }
+    cols.push_str("]\n");
+    kprint(cols.as_bytes());
+
+    loop {
+        match tr.next() {
+            Some(Ok(libstream::Item::Row(values))) => {
+                *seq += 1;
+                let rec = Record {
+                    principal: String::from(principal),
+                    tier,
+                    timestamp: clock_now(),
+                    sequence: *seq,
+                    level: LEVEL_INFO,
+                    message: format_typed_row(&schema, &values),
+                    source: chan_label.clone().or_else(|| Some(String::from("typed"))),
+                };
+                for sink in sinks.iter_mut() {
+                    sink.write(&rec);
+                }
+            }
+            Some(Ok(libstream::Item::End(_))) | None => break,
+            Some(Ok(libstream::Item::Error(_))) => continue, // pass over in-stream errors
+            Some(Err(_)) => {
+                kprint(b"logging-service: typed decode error (drop rest)\n");
+                break;
+            }
+        }
+    }
+}
+
+/// Render one decoded row as `name=value name=value …`.
+fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> String {
+    use core::fmt::Write;
+    use libstream::Value;
+    let mut s = String::new();
+    for (i, field) in schema.fields.iter().enumerate() {
+        if i > 0 {
+            s.push(' ');
+        }
+        let _ = write!(s, "{}=", field.name);
+        match values.get(i) {
+            Some(Value::Bool(b)) => s.push_str(if *b { "true" } else { "false" }),
+            Some(Value::Int(v)) => {
+                let _ = write!(s, "{}", v);
+            }
+            Some(Value::Float(v)) => {
+                let _ = write!(s, "{}", v);
+            }
+            Some(Value::Str(v)) => s.push_str(v),
+            Some(Value::Bytes(v)) => {
+                let _ = write!(s, "<{}B>", v.len());
+            }
+            Some(Value::Handle(v)) => {
+                let _ = write!(s, "{:#x}", v);
+            }
+            Some(Value::Null) | None => s.push_str("null"),
+        }
+    }
+    s
+}
+
 /// Drain and stamp every queued `LogRecord` on the source channel `h`, routing each to
 /// the sinks. `seq` is the global monotonic sequence counter.
 fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &mut u64) {
@@ -378,17 +469,22 @@ fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &m
         if recv(h) != 0 {
             break; // WouldBlock: drained
         }
-        // SAFETY: read payload_len then a bounded read-only slice over RECV_MSG.
-        let la = unsafe {
+        // SAFETY: read payload_len, then a bounded read-only slice over RECV_MSG.
+        let body: &[u8] = unsafe {
             let payload_len =
                 u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
-            let body = core::slice::from_raw_parts(
+            core::slice::from_raw_parts(
                 ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
                 payload_len.min(MSG_LEN - PAYLOAD_OFF),
-            );
-            parse_append(body)
+            )
         };
-        let la = match la {
+        // Route by the leading magic: a TSM1 typed stream is decoded + rendered; anything
+        // else is a text LogRecord append.
+        if body.starts_with(&libstream::wire::MAGIC) {
+            render_typed(body, &principal, tier, &chan_label, seq, sinks);
+            continue;
+        }
+        let la = match parse_append(body) {
             Some(la) => la,
             None => continue, // malformed record: drop
         };
