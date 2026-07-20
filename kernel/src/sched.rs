@@ -754,6 +754,27 @@ pub fn on_timer_tick() {
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
 }
 
+/// Handle a reschedule IPI: another CPU made a thread runnable on this CPU (a
+/// cross-CPU wake or a placement onto this otherwise-idle CPU) and poked us to run
+/// it now instead of waiting for the next periodic tick. If this CPU is idle and
+/// there is runnable work — on our own queue or stealable from a peer — switch to
+/// it; otherwise return (a busy thread keeps running until its own quantum tick).
+///
+/// Called from the arch reschedule-IPI dispatcher, which already EOI'd (mirroring
+/// the timer path, since the switch here may not return promptly). Runs with IF=0.
+pub fn on_reschedule_ipi() {
+    let g = SCHED.lock();
+    let me = SchedState::this_cpu();
+    // Only preempt the idle thread — a running TimeShared thread is left to its
+    // quantum (the woken thread is already enqueued and will be picked in turn or
+    // stolen). The point is purely liveness: resume an idle CPU so a thread parked
+    // on its queue actually runs.
+    if current_is_idle(&g) && (!g.ready[me].is_empty() || steal_available(&g, me)) {
+        switch_to_next(g); // consumes the guard; switches with IF masked
+    }
+    // else: guard drops here — IF stays as the IPI gate left it (0) until iretq.
+}
+
 /// `true` if this CPU's current thread is its idle thread (its object address equals
 /// this CPU's `idle_addr`). Caller holds `SCHED`.
 fn current_is_idle(g: &SchedState) -> bool {
@@ -2439,6 +2460,14 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
     g.ready[cpu]
         .try_push(r)
         .expect("push within reserved capacity is infallible");
+    // If the thread landed on a *different* CPU, poke that CPU with a reschedule
+    // IPI so it runs the newcomer promptly (resuming it if idle) instead of waiting
+    // for its next periodic tick — the timer is not a dependable wake for a halted
+    // CPU, so cross-CPU wake delivery must be explicit. Same-CPU placement needs no
+    // IPI: this CPU reschedules on its own tick / at the next scheduling point.
+    if cpu != SchedState::this_cpu() {
+        crate::arch::send_reschedule_ipi(cpu);
+    }
     Ok(())
 }
 
@@ -2638,9 +2667,10 @@ pub fn current_thread() -> Option<ObjectRef> {
 extern "C" fn idle_body(_arg: usize) {
     loop {
         reap_pending();
-        // SAFETY: ring-0; IF=1 here, so the periodic timer (or any IRQ) wakes
-        // the CPU and drives a reschedule when a thread becomes ready.
-        unsafe { Cpu::halt() };
+        // SAFETY: ring-0. `idle_halt` enables interrupts as it parks (`sti; hlt`),
+        // so the CPU always sleeps with IF=1 — the periodic timer or a reschedule
+        // IPI can then wake it, regardless of the inbound IF state.
+        unsafe { Cpu::idle_halt() };
     }
 }
 

@@ -6930,3 +6930,109 @@ Sequenced after the demo chain (the concurrent-forwarded-lookup item stays open 
 `deferred-decisions.md`). The **auth + session-mgr slice is complete**; remaining items
 (roles / privilege broker, per-user profile overlays, session tokens, the real Phase-4
 shell) are deferred in `session-and-auth.md`.
+
+---
+
+## 2026-07-20 — SMP scheduler: reschedule IPI for cross-CPU wakes (concurrency-hang fix)
+
+Fixes the "concurrent direct-block + forwarded-lookup hang" left open in
+`deferred-decisions.md`. The bug was **not** in the block / forwarding-reply path — it
+was a missing cross-CPU wake primitive in the scheduler, exposed once user threads
+migrate across CPUs (Phase 3 slice 3b) and two clients drive block I/O concurrently.
+
+**Root cause.** When a completion (an AHCI IRQ + DPC on the CPU that owns the
+controller, always CPU 0 here) makes a thread runnable, `place_thread` re-homes it to
+its `last_cpu` and enqueues it on that CPU's run queue — but sent **no signal** to that
+CPU. Delivery of the wake therefore depended entirely on the target CPU noticing the new
+`ready` entry on its own next periodic timer tick. That is a latency floor at best, and —
+crucially — **not a dependable wake for a halted CPU**: an idle AP parked in `hlt` did
+not reliably resume on its LAPIC timer under the QEMU/TCG dev loop, so a thread parked on
+an idle remote CPU's queue could sit there indefinitely. As each AP went idle it went
+dark; once the fs-server's forwarded block read landed on a dark CPU, the lookup hung.
+The failure was intermittent and migration-dependent, which is why it only showed up
+with concurrent block clients.
+
+**Fix (two parts):**
+
+- **Reschedule IPI (vector `0x41`).** New arch transport
+  `arch::send_reschedule_ipi(cpu)` (mirrors the TLB-shootdown IPI: `kernel/src/arch/
+  x86_64/resched.rs` + a returning stub/dispatcher in `idt.rs`). `place_thread` now
+  pokes the target CPU whenever a thread lands on a CPU other than the current one. The
+  neutral handler `sched::on_reschedule_ipi` resumes an **idle** CPU into the scheduler
+  (it leaves a busy TimeShared thread to its quantum — the newcomer is already enqueued
+  and will be picked/stolen in turn). An incoming IPI reliably resumes a halted CPU,
+  making cross-CPU wake delivery immediate and independent of the periodic tick.
+- **`Cpu::idle_halt` (`sti; hlt`).** The idle loop parked with a bare `hlt` that trusted
+  the inbound IF state; an idle CPU that reached it with IF=0 would sleep forever (a
+  maskable IRQ/IPI cannot resume `hlt` while IF=0). Idle now uses the canonical `sti;
+  hlt` idiom — the enable's one-instruction interrupt shadow guarantees the CPU parks
+  with IF=1 and cannot miss a wake that races the enable — so the reschedule IPI (and the
+  timer) can always wake it.
+
+**Verified** under `test-qemu`: the full boot (mounts → demo chain → login chain →
+`usersh` home write → `verdict PASS`) passes 5/5 consecutively; a stress probe hammering
+200 forwarded namespace lookups concurrently with the demo `parent`'s block I/O ran to
+completion (previously it hung deterministically around lookup ~24–155). Host suite +
+check-arch green.
+
+The demo→login **sequencing** in init's selftest boot is now a correctness *non*-issue
+(concurrent direct + fs-mediated block I/O is handled). It is retained only because the
+`test-harness` verdict is fired by session-mgr at the end of the login chain and the
+serial console is shared; lifting it into a genuinely-overlapped concurrent boot is a
+separable test-verdict-flow change, not a kernel concern. Full 32-slot NCQ for AHCI
+remains the other open block-path item.
+
+---
+
+## 2026-07-20 — Phase 3 Definition of Done, the `std` stance, and the Phase 4 north star
+
+A planning stock-take at the end of the Phase 3 service work — three decisions: what "Phase 3 done" means, a material shift in the `std` stance, and a scoped Phase 4 north star. This **supersedes** the "std affirmatively deferred to Phase 4+" position (2026-07-13): std is now a target, on the terms below.
+
+### Phase 3 Definition of Done
+
+Phase 3 is **"the service-ecosystem machinery is complete and demonstrated,"** not an exhaustive catalogue of services. The machinery is done — service-mgr (supervision, restart, backoff, control channels, TOML), the RS startup protocol, path-based ELF spawn, SysCaps, the runtime libs (libheap/libos), the namespace/capability model, RW ext4 fs, the login chain — and a representative service set runs supervised.
+
+DoD = the existing Phase 3 milestone's four clauses. Two are met (multiple supervised services; login → per-user namespace → home write); two remain and are the **only gating work**:
+- **libstream + a service-mgr-driven typed-log demo** (milestone clause 2 — the last open runtime-lib slice).
+- **a `/proc` scheduler-stats surface** (clause 3), which pulls forward the *synthesized read-only `MemoryObject` snapshot* primitive (also unblocks numeric `/proc/self/status`).
+
+The remaining backlog **services are consumer-driven and defer to Phase 4**, landing with their first consumer (the deferral discipline used throughout the project). Triage:
+- **Defer — blocked or no near consumer:** time-sync (blocked on networking), device manager (blocked on the Tier-2 module loader; no loadable-driver need under QEMU), namespace manager (premature — supervisors already construct namespaces), mount daemon (no dynamic-mount consumer), OOM daemon (no memory-pressure scenario until heavy apps), audit subsystem (security; no functional consumer — revisit in a hardening pass; it reuses `libcrypto`).
+- **Optional early Phase 4:** crash reporter (developer-experience value — dumps + symbolication — as userspace grows).
+- **When their scale demands it:** service-mgr dependency-graph + RS startup ordering (once many interdependent services exist); content-store package manager / generations / GC (the package-management + sysadmin layer — a Phase 4 north-star component).
+
+**Directory operations** (readdir/mkdir/rmdir) are **not** pulled into Phase 3 — no Phase 3 consumer needs them; their consumer is coreutils/the shell, so they open Phase 4's CLI-complete work.
+
+### The `std` stance (supersedes 2026-07-13)
+
+`std` becomes a serious, faithful compatibility target, driven by three goals: bidirectional software porting (Nitrox↔Linux, later Windows), the ergonomics of standard common Rust, and the browser north star (below). It does **not** displace the native runtime libs: **libos/libstream stay the capability-native, async-first, typed-stream API for system code (fs-servers, service-mgr, the shell); std is the portable API for application code.** Both ride the native ABI — as raw syscalls and std coexist on Linux.
+
+The 2026-07-13 objection ("std is POSIX-shaped → ambient authority + blocking io") is weaker than it reads, and is resolved in userspace without bending the kernel:
+- **`std::fs` path access** resolves against the **process's root namespace**, which a supervisor constructed at spawn with only that process's authority — *bounded* ambient, not global. Capability enforcement is at namespace construction; std::fs over it is capability-safe.
+- **`std::io` blocking** maps to `sys_io_submit` → `block_on(sys_wait)` — the sanctioned blocking primitive, not "block inside a syscall."
+- The kernel stays pure; std is a userspace compat layer.
+
+The honest cost is real threads, so std splits at a seam:
+- **FP up to AVX2 + XSAVE/XRSTOR** (the kernel saves zero FPU state today) — an *early* kernel enablement; also unblocks a pile of `no_std + alloc` ecosystem crates (font rasterizers, image codecs).
+- **The full std cluster** — thread-local storage (`FS_BASE`/`sys_thread_set_tls`), real `std::thread` (which finally triggers the slice-3b cross-CPU **deschedule IPI** — std::thread is its first consumer), the std subset (`fs`/`io`/`sync`/`thread`; `net` after networking), and the `x86_64-unknown-nitrox.json` target. **Consumer-driven, not a desktop-MVP gate** — the whole desktop MVP can be built on `no_std + alloc` + crates + FP; full std lands with portable application programs and the browser.
+
+Targeting the **pure-Rust ecosystem** (rustls, fontdue/ab_glyph, Boa, html5ever/cssparser) keeps the **POSIX C shim deferred** until a must-have C dependency forces it. **Dynamic linking is off the std critical path** (Rust static-links) — an ecosystem/image-size concern for later.
+
+### Phase 4 north star: a usable windowed desktop
+
+Of several long-range aspirations (a web browser, a GUI application suite, a package-management/sysadmin layer — all toward "a production OS from the user's perspective"), the north star scoped for *now* is **a usable windowed desktop**: a compositor on the boot framebuffer, one shared GUI toolkit, and three flagship apps — a **GUI terminal**, a **GUI file browser**, and a **GUI text editor** (MVP = compositor + toolkit + GUI terminal). It is the common denominator of the whole GUI vision (the browser and every later app are "another window on this compositor + toolkit"), reachable without the browser's longest poles, and each step is a satisfying sub-milestone.
+
+- **Display via the persisted boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind). Consequence: firmware-fixed resolution, no acceleration, one linear framebuffer — fine for a compositor + DE.
+- **Toolkit: conventional surface model first** (apps draw into a surface; the compositor composites — Wayland-shaped), layering the committed **`WidgetRecord`** model (programs emit *structured* UI over a typed stream; the display server renders — the text-floor/typed-stream duality extended to the screen) on top **later, as the typed opt-in**. The first desktop is not gated on that research bet.
+
+Stepping-stone path (each a real milestone):
+1. Phase 3 close (libstream + `/proc`)
+2. FP/AVX2 + XSAVE
+3. dir ops + typed shell + a handful of coreutils → **CLI-complete**
+4. framebuffer display server + input routing (keyboard/mouse)
+5. compositor + minimal shared toolkit
+6. **GUI terminal** (hosts the shell) — the "looks like an OS" moment
+7. GUI file browser + GUI text editor → a usable desktop
+- ⟂ parallel / consumer-driven: the full std cluster (with portable apps / the browser)
+
+**Subsequent north stars**, reusing the compositor + toolkit: **the browser** — favor a hybrid reusing pure-Rust Servo crates (html5ever, cssparser, selectors) + a pure-Rust JS engine (Boa) over porting full Servo (SpiderMonkey/C/GPU weight); **networking** (NIC → TCP/IP → socket-as-namespace → rustls → DHCP/DNS); the **package-management + sysadmin layer**. USB is real-hardware-input-driven (QEMU gives PS/2), so it trails the QEMU-first loop.

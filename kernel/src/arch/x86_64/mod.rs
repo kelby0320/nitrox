@@ -18,6 +18,7 @@ pub mod regs;
 pub mod serial;
 pub mod smp;
 pub mod syscall;
+pub mod resched;
 pub mod timer;
 pub mod tlb;
 pub mod user_access;

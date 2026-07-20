@@ -46,6 +46,17 @@ pub trait ArchCpu {
     /// periodic timer wakes it.
     unsafe fn halt();
 
+    /// Park this CPU idle until the next interrupt, **atomically enabling
+    /// interrupts as it parks** (the `sti; hlt` idiom). Unlike [`halt`](Self::halt),
+    /// it does not trust the inbound IF state — it guarantees the CPU sleeps with
+    /// IF=1, so the periodic timer or a reschedule IPI can always wake it, and the
+    /// enable's interrupt shadow closes the wake-race window. This is the only
+    /// correct primitive for the idle loop.
+    ///
+    /// # Safety
+    /// Ring-0 only.
+    unsafe fn idle_halt();
+
     /// `true` if maskable interrupts are currently enabled on this CPU (the
     /// neutral name for `RFLAGS.IF` on x86_64).
     fn interrupts_enabled() -> bool;

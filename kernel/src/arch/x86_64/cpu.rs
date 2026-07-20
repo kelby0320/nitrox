@@ -76,6 +76,17 @@ impl ArchCpu for X86Cpu {
         unsafe { asm!("hlt", options(nomem, nostack, preserves_flags)) };
     }
 
+    unsafe fn idle_halt() {
+        // SAFETY: ring-0. `sti; hlt` is the canonical idle idiom: `sti` enables
+        // interrupts but its one-instruction interrupt shadow defers delivery
+        // until *after* the `hlt` retires, so the CPU is guaranteed to park with
+        // IF=1 (wakeable by the periodic timer / a reschedule IPI) yet cannot miss
+        // a wake that races the enable. Unlike bare `halt`, it does not trust the
+        // caller's inbound IF — an idle CPU that parked with IF=0 would sleep
+        // forever, since a maskable IRQ cannot resume `hlt` while IF=0.
+        unsafe { asm!("sti; hlt", options(nomem, nostack, preserves_flags)) };
+    }
+
     fn interrupts_enabled() -> bool {
         regs::read_rflags() & RFLAGS_IF != 0
     }

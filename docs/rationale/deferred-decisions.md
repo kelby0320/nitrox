@@ -148,15 +148,23 @@ arrive with the fs-server (slice 7).
 > to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
 > bound, e.g. an SSD or many concurrent readers).
 
-> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, open).** A `/dev/blk`
-> client doing direct block I/O concurrently with the fs-server's own reads still hangs
-> a *forwarded* namespace lookup, even after the AHCI submit-queue + DPC-drain fixes
-> (which resolved concurrent *direct* clients). Confirmed isolated — the auth/session
-> login chain completes cleanly when the demo chain is not running alongside it. Root
-> cause not yet pinned (a second concurrency issue in the block / forwarding-reply path).
-> Worked around for now by **sequencing** the login chain after the demo chain (the
-> fs-server is the only block client then, serialised by its single serve loop). To
-> investigate before workloads genuinely overlap direct and fs-mediated block I/O.
+> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, RESOLVED 2026-07-20).**
+> A `/dev/blk` client doing direct block I/O concurrently with the fs-server's own reads
+> hung a *forwarded* namespace lookup. The cause was **not** in the block / forwarding
+> path — it was a missing cross-CPU wake in the scheduler, exposed by user-thread
+> migration (slice 3b): a completion on one CPU enqueued the woken thread on a *remote*
+> CPU's run queue but sent no signal, so delivery depended on that CPU's next periodic
+> tick — unreliable for an idle CPU halted in `hlt`, so a thread parked on a dark AP sat
+> there forever. Fixed with a **reschedule IPI** (`arch::send_reschedule_ipi`, poked from
+> `place_thread` on any cross-CPU placement) plus an `sti; hlt` idle so an idle CPU always
+> parks wakeable. See the decision log (2026-07-20 "SMP scheduler: reschedule IPI"). The
+> demo→login sequencing that had worked around this is now **lifted**: init's selftest boot
+> runs the demo chain and the login chain concurrently, so the default `test-qemu` exercises
+> concurrent direct + fs-mediated block I/O. A *deterministic* regression test for the hang
+> proved impractical — it only reproduced under sustained multi-second load (amplified by
+> the diagnostic serial output during the hunt); a bounded stress up to 50k forwarded
+> lookups did not re-trigger it with the fix removed. The concurrent boot is therefore a
+> concurrency smoke test, not a razor regression catch.
 
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
@@ -299,9 +307,17 @@ Raising it to a small fixed array (correlating replies by the already-present
 
 **Shell grammar specification.** The shell's data model is committed (typed structured streams, port-based wiring, the display verb, model-view decomposition). The exact syntax is deferred to shell implementation. Trigger: when shell implementation begins.
 
-**`std` port for Nitrox target.** The native interface is handle-based; `std::fs`, `std::thread`, `std::net`, `std::sync`, `std::io` need implementation over the native syscalls. Trigger: stabilization of the syscall ABI plus a desire to enable the broader Rust ecosystem on Nitrox.
+**`std` port for Nitrox target (now a Phase 4 target, 2026-07-20).** Reframed from "deferred
+indefinitely" to a serious, faithful compatibility target — the portable API for *application*
+code, riding the native ABI (libos/libstream stay the capability-native API for system code).
+`std::fs` resolves paths through the process's root namespace (bounded ambient, capability-safe);
+`std::io` blocking maps to `sys_io_submit` + `block_on`; the kernel stays pure. Placement: **FP/AVX2
++ XSAVE lands early** (also unblocks `no_std + alloc` ecosystem crates); the **full cluster**
+(thread-local storage, real `std::thread` → the slice-3b deschedule IPI, the `std::{fs,io,sync,thread}`
+subset, `x86_64-unknown-nitrox.json`) is **consumer-driven** — it lands with portable programs / the
+browser, not as a desktop-MVP gate. See the decision log (2026-07-20; supersedes 2026-07-13).
 
-**POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a desire to port specific C software.
+**POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Resource servers (in-kernel)
 
