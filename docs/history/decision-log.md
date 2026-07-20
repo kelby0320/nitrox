@@ -6832,3 +6832,30 @@ the image assembles with `/system/users` seeded; the healthy boot still passes
 (`test-qemu` PASS — auth-service is built and packed into the initramfs but not yet
 spawned). New crate wired into the workspace, `xtask build`, `xtask test`, and the
 initramfs program list. Docs: `userspace/auth-service/CLAUDE.md`, `userspace/CLAUDE.md`.
+
+## 2026-07-20 — AHCI: serialise concurrent block submits (bug fix; found in Part D)
+
+Bringing the login chain up alongside the demo chain (Part D) hung — traced to a real
+AHCI driver bug, not the documented "one command at a time" scope. `submit()` blindly
+`inflight.store(irp)` with no check that slot 0 was free, so a **second concurrent
+block submit** (e.g. `parent`'s `/dev/blk` read + the fs-server's read) overwrote the
+first's in-flight pointer, **orphaning it** (its `PendingOperation` never completes →
+its waiter hangs) and issuing a command on an already-busy slot. It was also latently
+SMP-unsafe (two CPUs in `sys_io_submit`/fault-fill racing the store).
+
+Fix: a small software FIFO in front of slot 0 (`PendingRing`, `IrqSpinLock`-guarded —
+submit runs in thread context, completion in the ISR). `submit` issues immediately if
+the slot is idle, else enqueues (a full queue fails the excess submit `IoError`, so a
+demand-fault fill fails cleanly rather than hanging). Both completion paths (`isr`,
+`poll_complete_inflight`) drain the next queued IRP via a shared `advance_slot` after
+taking the retired one out of flight. Concurrent clients now serialise correctly
+through slot 0 instead of clobbering each other. Verified: the concurrent boot that
+hung now passes (`parent`'s `/dev/blk` read completes while service-mgr runs); the
+single-client boot is unchanged; the demo chain still PASSES under `test-qemu`.
+
+The user confirmed we also want to **use the full 32 command slots (NCQ)** at some
+future point — recorded in `deferred-decisions.md`. The software queue depth is already
+`PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly; the trigger is an
+I/O-latency-bound workload (SSD, many concurrent readers). This fix unblocked Part D:
+the login chain can now run concurrently with the demo chain, so no verdict restructure
+is needed.

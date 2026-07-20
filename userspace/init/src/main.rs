@@ -56,6 +56,11 @@ static mut NOTIF: Notification = Notification::zeroed();
 /// server gets `[1]`). Reused across mounts (processed one at a time).
 static mut CTRL0: u64 = 0;
 static mut CTRL1: u64 = 0;
+
+/// The root fs-server's forwarding endpoint, retained after the `/` mount so init
+/// can hand it to service-mgr (→ session-mgr binds it as each login's `/home`
+/// subtree, sharing the one registration — Part B.2). `0` until the root is mounted.
+static mut FS_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -139,16 +144,18 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// slice A it supervises a leaf service and binds nothing yet; the bind-righted
 /// namespace handle (the second gate) and the `LOAD_MODULE`/`SYSTEM_CLOCK`
 /// pass-through caps arrive with the RS protocol + those services (slice B onward).
-/// Only in a non-`selftest` build: a selftest boot runs the demo chain instead of
-/// handing off to service-mgr.
-#[cfg(not(feature = "selftest"))]
+/// `handles[0]` (the fs-server forwarding endpoint) is filled at spawn from
+/// `FS_ENDPOINT` and **moved** to service-mgr (it forwards it to session-mgr). The
+/// endpoint carries `TRANSFER` so service-mgr can hand it onward. Spawned in **both**
+/// boots now (the selftest boot brings the login chain up alongside the demo chain so
+/// it is exercised under `test-qemu`).
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/service-mgr
-    handle_count: 0,
-    move_mask: 0,
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the fs endpoint) to service-mgr
     arg0: 0,
-    handles: [0; 4],
-    rights: [0; 4],
+    handles: [0; 4], // handles[0] = FS_ENDPOINT, set at spawn
+    rights: [RIGHT_TRANSFER | RIGHT_DUPLICATE, 0, 0, 0],
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
@@ -434,7 +441,18 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             kprint(b"init: subtree test bind FAIL\n");
         }
     }
-    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    // The root fs-server's forwarding endpoint is handed down to service-mgr (→
+    // session-mgr, which binds it as each login's `/home` subtree — bind-mount
+    // sharing, Part B.2). `sys_ns_bind` cloned its own reference above, so keeping
+    // this handle open is fine; stash it (transfer ownership to the global) instead
+    // of closing. Non-root mounts have no consumer yet → close as before.
+    if m.mount_point.as_bytes() == b"/" {
+        // SAFETY: single-threaded init; the global takes ownership of `endpoint`.
+        unsafe { FS_ENDPOINT = endpoint };
+    } else {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    }
     if br != 0 {
         kprint(b"init: bind FAIL at ");
         kprint(m.mount_point.as_bytes());
@@ -1086,15 +1104,22 @@ fn spawn_eshell(root_ns: u64) {
 /// Spawn the service manager — the normal boot handoff. init keeps a handle to it (it
 /// is init's child; service-mgr's death is a critical fault init must observe). Unlike
 /// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
-/// `ChildExited` for it. Returns the process handle, or a negative error.
-#[cfg(not(feature = "selftest"))]
+/// `ChildExited` for it. Moves the retained fs-server endpoint (`FS_ENDPOINT`) to it
+/// as `handles[0]` so service-mgr can hand it to session-mgr. Returns the process
+/// handle, or a negative error.
 fn spawn_service_mgr(root_ns: u64) -> i64 {
     kprint(b"init: handing off to service manager\n");
-    // SAFETY: SPAWN_SERVICE_MGR is a valid writable arg block.
-    let h =
-        unsafe { spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR) };
+    // SAFETY: single-threaded init; stamp the retained fs endpoint into the (moved)
+    // handle slot, then spawn. `move_mask`/`handle_count`/`rights` are set in the static.
+    let h = unsafe {
+        SPAWN_SERVICE_MGR.handles[0] = FS_ENDPOINT;
+        spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
+    };
     if h < 0 {
         kprint(b"init: service-mgr spawn FAIL\n");
+    } else {
+        // The endpoint moved to service-mgr; drop init's stale copy of the handle value.
+        unsafe { FS_ENDPOINT = 0 };
     }
     h
 }
@@ -1110,6 +1135,14 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
+        // Bring up the login chain (service-mgr → auth-service + session-mgr) alongside
+        // the demo chain. This exercises concurrent block I/O (parent's /dev/blk + the
+        // fs-server's reads), which the AHCI pending-queue now serialises correctly.
+        let smgr_h = spawn_service_mgr(root_ns);
+        if smgr_h >= 0 {
+            // SAFETY: closing init's reference; service-mgr runs independently.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
+        }
         kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
         // SAFETY: SPAWN_PARENT is a valid writable arg block.
         let parent_h =
