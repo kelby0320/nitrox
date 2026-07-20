@@ -158,9 +158,13 @@ arrive with the fs-server (slice 7).
 > there forever. Fixed with a **reschedule IPI** (`arch::send_reschedule_ipi`, poked from
 > `place_thread` on any cross-CPU placement) plus an `sti; hlt` idle so an idle CPU always
 > parks wakeable. See the decision log (2026-07-20 "SMP scheduler: reschedule IPI"). The
-> demo→login sequencing in init's selftest boot is no longer a *correctness* requirement
-> (concurrent direct + fs-mediated block I/O now works); it is retained only for
-> `test-harness` verdict ordering + shared-console tidiness.
+> demo→login sequencing that had worked around this is now **lifted**: init's selftest boot
+> runs the demo chain and the login chain concurrently, so the default `test-qemu` exercises
+> concurrent direct + fs-mediated block I/O. A *deterministic* regression test for the hang
+> proved impractical — it only reproduced under sustained multi-second load (amplified by
+> the diagnostic serial output during the hunt); a bounded stress up to 50k forwarded
+> lookups did not re-trigger it with the fix removed. The concurrent boot is therefore a
+> concurrency smoke test, not a razor regression catch.
 
 **Writeback IRPs.** The page cache initially flows reads only; dirty-page
 writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).

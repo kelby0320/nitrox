@@ -1128,33 +1128,45 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
 /// reap_loop drops to the emergency console as the interim recovery, until a reboot
 /// path exists; see `docs/architecture/service-manager.md` § Recovery). **Under
-/// `selftest`**, run the Phase-1/2 demo chain (`parent`) to completion FIRST, then bring
-/// up the login chain — sequenced in [`reap_loop`]. Concurrent direct + fs-mediated block
-/// I/O is now correct (the reschedule-IPI fix; see the 2026-07-20 decision log), so this
-/// ordering is no longer a correctness requirement — it is retained only so the
-/// `test-harness` verdict (fired by session-mgr at the end of the login chain) comes after
-/// the demo's, and the two don't interleave on the shared serial console.
+/// `selftest`**, bring up the login chain (service-mgr → auth-service + session-mgr) and
+/// the Phase-1/2 demo chain (`parent`) **concurrently**, then supervise via [`reap_loop`].
+/// Running them together is deliberate: `parent`'s direct `/dev/blk` reads overlap the
+/// login chain's fs-mediated block I/O (session-mgr/usersh's forwarded `/home` reads), so
+/// the default test exercises concurrent direct + fs-mediated block I/O across all CPUs —
+/// the scenario that originally surfaced the cross-CPU-wake hang (now fixed by the
+/// reschedule IPI; see the 2026-07-20 decision log). The prior demo→login *sequencing* was
+/// a workaround for that hang and is no longer needed. (This is a concurrency *smoke test*,
+/// not a deterministic catch of that specific timing bug, which only reproduced under
+/// sustained multi-second load.) session-mgr fires the `test-harness` verdict once login is
+/// proven; a crashed demo `parent` fails the run first (in `reap_loop`).
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
-        // Run the demo chain (`parent`) first, then the login chain (service-mgr →
-        // auth-service + session-mgr) once `parent` reaps — sequenced in `reap_loop` for
-        // verdict ordering + console tidiness, not correctness (concurrent block I/O is
-        // handled now; see `docs/rationale/deferred-decisions.md`).
-        kprint(b"init: spawning parent (slice-1/2/3 demo chain)\n");
+        // Bring up the login chain first, then the demo chain — both run concurrently
+        // (init does not wait on either before spawning the other). Their block I/O
+        // overlaps on purpose — see this fn's doc + the 2026-07-20 decision log.
+        kprint(b"init: bringing up login chain + demo chain (concurrent)\n");
+        let smgr_h = spawn_service_mgr(root_ns);
+        if smgr_h >= 0 {
+            // service-mgr runs independently — the login chain fires the verdict (or, in
+            // an interactive selftest, drops to the `login:` prompt) on its own; init need
+            // not hold its handle. SAFETY: closing init's reference; service-mgr runs on.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
+        }
         // SAFETY: SPAWN_PARENT is a valid writable arg block.
         let parent_h =
             unsafe { spawn_program(root_ns, b"/initramfs/sbin/parent", &raw mut SPAWN_PARENT) };
         if parent_h >= 0 {
-            // reap_loop launches eshell once `parent` (the only exiting child) reaps.
+            // Reap forever; `parent`'s exit is fail-checked (a crash fails the run). The
+            // login chain is already up, so its own exit is not init's handoff trigger.
             reap_loop(notif, root_ns, parent_h);
         }
         kprint(b"init: parent spawn FAIL\n");
         // Test-harness: couldn't even launch the demo chain — fail the run.
         #[cfg(feature = "test-harness")]
         test_exit(false);
-        // Selftest parent-spawn-failure fallback: the console.
-        spawn_eshell(root_ns);
+        // Interactive selftest: the login chain is already up (its `login:` prompt is the
+        // console); nothing to spawn — just reap.
         reap_loop(notif, root_ns, 0);
     }
     // Normal boot: hand off to the service manager and supervise it.
@@ -1180,11 +1192,15 @@ fn emergency(notif: u64, root_ns: u64) -> ! {
 
 /// Reap exited children forever (init is the eventual parent of every orphan).
 /// `parent_h` is the handle of the one child whose exit init reacts to — the demo
-/// `parent` under `selftest`, or `service-mgr` on a normal boot — or `0` if none is
-/// pending. When it reaps, init hands off to the interactive console: the demo-done
-/// handoff under selftest, or the emergency-recovery fallback if service-mgr died
-/// (interim, until a reboot path exists). All other orphans are logged and released.
+/// `parent` under `selftest` (a crash fails the test run; the login chain is already
+/// up concurrently, so nothing is spawned on its exit), or `service-mgr` on a normal
+/// boot (its death is a critical fault → interim recovery brings a fresh one up) — or
+/// `0` if none is pending. All other orphans are logged and released.
 fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
+    // `root_ns` is only needed on a normal boot (to respawn a dead service-mgr); under
+    // `selftest` the login chain is already up, so mark it used to avoid a warning.
+    #[cfg(feature = "selftest")]
+    let _ = root_ns;
     kprint(b"init: entering reaping loop\n");
     loop {
         // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
@@ -1219,31 +1235,36 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                 kprint(b" code=");
                 kprint_u64(code as u64);
                 kprint(b"\n");
-                // Release init's reference to the exited child. When the demo
-                // `parent` reaps, launch the interactive console. Reparented orphans
-                // have no handle here — the kernel tears them down; init observes.
+                // Release init's reference to the primary child on its exit. Reparented
+                // orphans have no handle here — the kernel tears them down; init observes.
                 if parent_h != 0 {
                     // SAFETY: closing our own process handle.
                     unsafe { syscall1(SYS_HANDLE_CLOSE, parent_h as u64) };
                     parent_h = 0;
-                    // The demo chain finished. Under test-harness a failed demo fails the
-                    // run now; otherwise hand off to the **login chain** (service-mgr →
-                    // auth-service + session-mgr), sequenced here for verdict ordering (not
-                    // correctness — concurrent block I/O is handled). session-mgr fires the
-                    // final verdict once it has authenticated the demo user (see its
-                    // `_start`).
-                    #[cfg(feature = "test-harness")]
-                    if code != 0 {
-                        test_exit(false);
+                    #[cfg(feature = "selftest")]
+                    {
+                        // Primary = the demo `parent`. The login chain is already running
+                        // concurrently (spawned in `supervise`) and owns the verdict; here
+                        // a crashed demo fails the run. session-mgr fires the final PASS once
+                        // it has authenticated the demo user under that concurrent load.
+                        #[cfg(feature = "test-harness")]
+                        if code != 0 {
+                            test_exit(false);
+                        }
+                        // The interactive console is session-mgr's `login:` prompt (via the
+                        // login chain), not eshell — eshell is the *emergency* shell only
+                        // (the `emergency` path). Nothing to spawn here.
                     }
-                    let smgr_h = spawn_service_mgr(root_ns);
-                    if smgr_h >= 0 {
-                        // SAFETY: closing init's reference; service-mgr runs independently.
-                        unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
+                    #[cfg(not(feature = "selftest"))]
+                    {
+                        // Primary = service-mgr; its death is a critical fault. Interim
+                        // recovery until a reboot path exists: bring a fresh one up.
+                        let smgr_h = spawn_service_mgr(root_ns);
+                        if smgr_h >= 0 {
+                            // SAFETY: closing init's reference; service-mgr runs independently.
+                            unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
+                        }
                     }
-                    // The interactive console is now session-mgr's `login:` prompt (via the
-                    // login chain), not eshell — eshell is the *emergency* shell only (the
-                    // `emergency` path below). Nothing more to spawn here.
                 }
             }
         }
