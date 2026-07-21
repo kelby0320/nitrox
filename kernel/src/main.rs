@@ -654,6 +654,11 @@ fn run_first_userspace() {
     // ambiently would be a capability-escalation smell.
     let proc_self_namespace_rights =
         Rights::LOOKUP | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    // `/proc/self/status` returns a synthesized read-only `MemoryObject` text
+    // snapshot (numeric pid/tid), so its cap is the snapshot-server shape
+    // (`MAP_READ` + the generic band), not a principal-object cap.
+    let proc_self_status_rights =
+        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     let proc_self_binds = [
         (
             &b"/proc/self/process"[..],
@@ -670,12 +675,36 @@ fn run_first_userspace() {
             KernelServerId::ProcSelfNamespace,
             proc_self_namespace_rights,
         ),
+        (
+            &b"/proc/self/status"[..],
+            KernelServerId::ProcSelfStatus,
+            proc_self_status_rights,
+        ),
     ];
     for (path, id, rights) in proc_self_binds {
         if ns.bind_kernel_server(path, id, rights).is_err() {
             kprintln!("init: binding /proc/self/* failed");
             return;
         }
+    }
+
+    // `/proc/sched/stats` — per-CPU scheduler statistics as a read-only
+    // `MemoryObject` text snapshot (the same shape as `/dev/log`): the caller
+    // maps + stats it, so the binding grants `MAP_READ` + the generic management
+    // band. Reachability is by namespace construction, like all of `/proc` — a
+    // supervisor may omit it from a sandbox's namespace.
+    let sched_stats_binding_rights =
+        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(
+            b"/proc/sched/stats",
+            KernelServerId::SchedStats,
+            sched_stats_binding_rights,
+        )
+        .is_err()
+    {
+        kprintln!("init: binding /proc/sched/stats failed");
+        return;
     }
 
     // `/initramfs/<path>` — a subtree server returning a read-only `MemoryObject`

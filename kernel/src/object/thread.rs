@@ -411,6 +411,14 @@ impl Thread {
         self.process.clone()
     }
 
+    /// `true` if this is a user thread (it has an owning
+    /// [`Process`](crate::object::Process)). Unlike [`process_ref`](Self::process_ref)
+    /// this touches no refcount, so it is safe to call with the rank-1 `SCHED`
+    /// lock held (an `ObjectRef` clone/drop must not run under it).
+    pub fn has_process(&self) -> bool {
+        self.process.is_some()
+    }
+
     // --- Scheduler-only field accessors --------------------------------
     //
     // Each takes the type-erased object pointer (`ObjectRef::as_ptr()`) and

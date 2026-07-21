@@ -7077,3 +7077,50 @@ typed beat reliably decoded + rendered before the verdict (an immediate first be
 alongside the startup logs the logging service drains, so it doesn't lose the race to
 session-mgr's `SYS_TEST_EXIT`). The typed demonstration is grep-verifiable boot output, not
 verdict-gated. Phase 3's remaining gate is **clause 3** (a `/proc` scheduler-stats surface).
+
+## 2026-07-21 — `/proc` scheduler stats + the snapshot-synthesis primitive (Phase 3 complete)
+
+Closes Phase 3 milestone **clause 3** ("two CPUs visibly active — scheduler stats
+accessible via `/proc`"), the last open gate: **Phase 3 is complete.** Built as slice
+`phase-3/proc-sched-stats` in four parts. Design decisions (endorsed 2026-07-21):
+plain-**text** snapshot now, TSM1 typed emission revisited only when a Phase 4 consumer
+forces the kernel-side-encoder question; `/proc/self/status` included as the primitive's
+second consumer; verification **verdict-gated**, not just grep-visible.
+
+- **The primitive.** The deferred "synthesized read-only `MemoryObject` snapshot" turned
+  out to be a **discipline**, not new machinery: **capture** (copy `Copy` data under the
+  owning lock — never allocate under a spinlock) → **format** (pure `KString` rendering,
+  no lock held) → **synthesize** (`MemoryObject::try_new_filled`, existing since the
+  initramfs server). Documented in `scheduler.md` § "The stats surface"; the
+  deferred-decisions entry is resolved (the handle-introspection alternative was not
+  needed).
+- **Part A — counters.** Five per-CPU `u64`s in `SchedState`
+  (`switches`/`steals`/`placed`/`resched_ipis`/`ticks`) — every increment site already
+  holds rank-1 `SCHED`, so no atomics. `switches` counts once in `switch_into` (the
+  common tail of all four parking dispositions); `placed` counts against the *target*
+  CPU. `stats_snapshot()` captures under one hold; `stats::format` is pure and
+  host-tested.
+- **Part B — the surface.** `KernelServerId::SchedStats`, a leaf at `/proc/sched/stats`
+  bound by pid 1 with the `/dev/log` rights shape (`MAP_READ` + the generic band). The
+  success path is fully host-testable (the never-onlined host `SCHED` static renders
+  exactly the `cpus_online=0` header into a fresh `MemoryObject`).
+- **Part C — `/proc/self/status`.** `pid=`/`tid=` rows from the calling syscall context
+  via `sched::current_pid_tid()` (one `SCHED` hold); a refcount-free
+  `Thread::has_process` gates kernel/boot callers (an `ObjectRef` clone/drop must not
+  run under the rank-1 lock). The fourth synthesizing server justified factoring the
+  shared `complete_with_memobj` adoption tail.
+- **Part D — verification, and a verdict race found by negative-testing.** The demo
+  `parent` maps + parses both surfaces and echoes the winning snapshot (grep-visible;
+  all 4 CPUs show nonzero switches/steals/IPIs under `-smp 4`). The first negative check
+  (an impossible threshold) exposed that a **failing demo loses the race to
+  session-mgr's login-proven PASS** — the concurrent login chain fires
+  `SYS_TEST_EXIT(PASS)` while the demo is still retrying, so the demo alone never truly
+  gated the verdict. Fix: the authoritative **`sched_gate` runs in session-mgr,
+  synchronously before the single `SYS_TEST_EXIT(PASS)` call** (require ≥ 2 CPUs with
+  `switches > 0`); a failure cannot race the verdict by construction. The demo's own
+  nonzero exit remains as init's fast-fail path. Negative-tested in both directions:
+  injected failure → verdict FAIL (qemu exit 35); reverted → PASS.
+
+**Verified:** full host suite green (formatter, dispatch, leaf rejection, snapshot
+content); `test-qemu` PASS with `session-mgr: sched gate ok` in the log; the injected
+negative fails the run. No ABI-hash impact anywhere in the slice.

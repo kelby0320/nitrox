@@ -2027,8 +2027,39 @@ login → per-user namespace → home write) and **two remain, and are the only 
   `TypedRecord`); `heartbeat` emits typed beat rows `{seq, uptime_ns, healthy}` to its log
   channel; the logging service detects the `TSM1` magic and renders the decoded table (text
   `LogRecord`s still route to `parse_append`). See the decision log (2026-07-20 "libstream").
-- [ ] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
+- [x] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
   `MemoryObject` snapshot* primitive (also unblocks numeric `/proc/self/status`).
+  **Done (2026-07-21)** — slice `phase-3/proc-sched-stats`; **Phase 3 is complete** (see the
+  decision log, 2026-07-21). The primitive is the **capture → format →
+  synthesize** discipline (copy `Copy` data under one lock hold; format via `KString` with no
+  lock held; wrap in a read-only `MemoryObject` — `try_new_filled` is the existing synthesis
+  step, as `/dev/log`/initramfs already exercise):
+  - [x] **Part A — counters + capture + format.** Per-CPU `u64` counters in `SchedState`
+    (`switches` / `steals` / `placed` / `resched_ipis` / `ticks`), incremented at their event
+    sites — all already hold the rank-1 `SCHED` lock, so no atomics; `sched::stats_snapshot()`
+    captures them plus instantaneous state (`ready` length, idle-current, online) under one
+    hold; the pure `sched::stats::format` renders `cpus_online=N` + one `name=value` row per
+    online CPU. Host tests for the formatter; full suite + `test-qemu` green.
+  - [x] **Part B — the surface.** `KernelServerId::SchedStats` leaf server at
+    `/proc/sched/stats` (the `/dev/log` rights pattern: `MAP_READ` + generic band), bound by
+    pid 1 at boot; `scheduler.md` gains § "The stats surface" (counters table + the
+    capture → format → synthesize discipline). Host tests (the all-offline snapshot renders
+    exactly the header into a fresh `MemoryObject`; leaf suffix rejection); `test-qemu` green.
+  - [x] **Part C — `/proc/self/status`.** `KernelServerId::ProcSelfStatus`: `pid=`/`tid=`
+    text from the calling syscall context (`sched::current_pid_tid()`, one `SCHED` hold; a
+    refcount-free `Thread::has_process` gates kernel/boot callers to *not found*), bound with
+    the snapshot-server rights shape. The shared `complete_with_memobj` tail replaces the
+    4× duplicated MemoryObject adoption. Closes the deferred numeric-`/proc/self/status`
+    entry (`deferred-decisions.md`). Suffix rejection host-tested; success arm is
+    QEMU-covered (Part D); full suite + `test-qemu` green.
+  - [x] **Part D — demo + verdict gate + close-out.** The demo `parent` maps + parses both
+    surfaces (pid/tid sanity; snapshot echoed grep-visibly — 4 CPUs with nonzero
+    switches/steals/IPIs under `-smp 4`) and exits nonzero on failure (init's fast-fail
+    path). Negative-testing exposed a **verdict race** — a failing demo loses to
+    session-mgr's login-proven PASS — so the authoritative **`sched_gate` runs in
+    session-mgr synchronously before the single `SYS_TEST_EXIT(PASS)`** (≥2 CPUs with
+    `switches>0`); a failure cannot race the verdict by construction. Negative-tested both
+    ways (injected failure → FAIL, exit 35; reverted → PASS). Decision-log entry 2026-07-21.
 
 Everything else in the backlog below is **consumer-driven and defers to Phase 4**, landing
 with its first consumer (the project's standing deferral discipline). Triage:
