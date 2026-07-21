@@ -376,6 +376,21 @@ Trigger: that second consumer, or a drift bug.
 ### Concurrency primitives
 
 **General deferred object reclamation from a `SCHED`/IRQ context.** Code running under the rank-1 `SCHED` lock (or, later, in an IRQ before the scheduler lock is taken) cannot drop an `ObjectRef`/`TransferRef`: object destruction may take a lower-rank lock (e.g. the buddy allocator frees a `MemoryObject`'s frames), which must not nest under `SCHED`. The first concrete instance — a `BlockBounded` IPC send timing out in the timer tick (2026-06-12) — is handled *locally* with **reclaim-on-recv**: the timeout only tombstones the held send (completing its PO `TimedOut`); the actual refs are swept out and dropped outside `SCHED` on the next `recv` (or at channel close). That works because a channel still being received on (or eventually closed) always reaches a safe drop point. The **general** mechanism — a deferred-free list drained at a safe point outside the lock, the DPC queue being its natural vehicle — is deferred until a consumer needs reclamation with no such natural drain (e.g. device-I/O request cancellation, where the completion/cancel runs in a DPC). Trigger: such a consumer; until then per-path reclaim (reclaim-on-recv, `Inner`-drop-at-close) suffices. See the decision log (2026-06-12).
+**Done in essence (2026-07-21, review fix F2):** the trigger fired from the entropy seed-wake path (the timer tick had no natural drain point and was dropping the refs under `SCHED`, a deadlock hazard). The mechanism landed as `SchedState::deferred_drops` — a pre-reserved move-only parking list drained by `reap_pending` in thread context (not the DPC queue: DPC handlers also may not free). Future SCHED/IRQ-context producers reuse it within its reserve.
+
+**SMP panic path: unsynchronized emergency serial, no stop-IPI (review F8).** The
+panic/exception handlers write through `serial::emergency_writer()` — lock-free by
+design (a fault while `SERIAL` is held must not deadlock) — which was sound
+single-CPU but under SMP can interleave with another CPU's locked serial writes
+(garbled diagnostics, not corruption). And a panicking CPU does not stop the
+others: no halt/stop IPI exists, so the other CPUs keep scheduling and mutating
+state while the panic prints (and, under `test-harness`, while the verdict is
+written — a fail verdict still terminates QEMU promptly, so adjudication is
+unaffected). Fix shape when taken: a panic-broadcast NMI/IPI parking other CPUs
+(`cli; hlt`), then unsynchronized output is genuinely exclusive. Deferred: purely
+a diagnostics-quality issue today; revisit with real-hardware bring-up or when a
+flaky-boot investigation is hampered by garbled panic output. From the 2026-07-21
+substrate review (decision log).
 
 **Priority inheritance for userspace synchronization.** Userspace mutex/condvar implementations built on `sys_wait` don't initially address priority inversion. Trigger: a real-time workload where priority inversion is a problem.
 

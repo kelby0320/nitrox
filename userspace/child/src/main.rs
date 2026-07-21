@@ -5,7 +5,8 @@
 //!
 //! - `notif`    — a handle to this process's own notification channel (unused);
 //! - `endpoint` — one end of an IPC channel shared with the sibling child;
-//! - `role`     — `0` = sender, `1` = receiver.
+//! - `role`     — `0` = sender, `1` = receiver, `2` = exit immediately (the
+//!   exit-storm stress child; no endpoint needed).
 //!
 //! Role 0 creates a `MemoryObject`, writes a marker into it, and **transfers the
 //! handle** to the sibling over `endpoint` (capability propagation). Role 1
@@ -186,6 +187,13 @@ fn ns_inheritance_check(ns: u64, resource: u64) {
 /// channel endpoint, `rcx` = `role` (0 = sender, 1 = receiver).
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, ns: u64, endpoint: u64, role: u64) -> ! {
+    // Role 2 — the exit-storm stress child (spawned with no handles): exit
+    // immediately. The payload IS the process teardown — kernel-stack free,
+    // TLB shootdown, reap — racing across CPUs (substrate-hardening Part F;
+    // decision log 2026-07-21).
+    if role == 2 {
+        exit(0);
+    }
     ns_inheritance_check(ns, endpoint);
     if role == 0 {
         run_sender(endpoint);

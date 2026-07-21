@@ -7124,3 +7124,148 @@ second consumer; verification **verdict-gated**, not just grep-visible.
 **Verified:** full host suite green (formatter, dispatch, leaf rejection, snapshot
 content); `test-qemu` PASS with `session-mgr: sched gate ok` in the log; the injected
 negative fails the run. No ABI-hash impact anywhere in the slice.
+
+## 2026-07-21 — Substrate concurrency review (the pre-Phase-4 gate): findings F1–F10
+
+The planned adversarial review of the kernel substrate (scheduler, SMP, work-stealing/
+migration, locking, the unsafe arch layer, the context switch) before Phase 4 builds on
+it — run by Fable 5 per the 2026-07-20 plan. **Verdict:** the core machinery is sound
+(the `on_cpu` asm ordering — including the no-writes-after-sp-commit property; the
+single-lock wait/wake domain; the GS/kernel-stack re-arm model; the IPC transfer drop
+discipline; the TLB ack protocol) — but several **single-CPU-era justifications had
+silently become load-bearing SMP claims**. Findings, ranked:
+
+- **F1 (HIGH, deadlock): TLB shootdown from IF=0 contexts.** `tlb.rs`'s caller contract
+  requires IF=1 (a spinning initiator must service incoming shootdown IPIs), but every
+  syscall body runs IF=0 — `SFMASK` masks IF at entry (a Phase-1 posture, never revisited)
+  and nothing re-enables it; exception handlers likewise. `KernelStack::Drop → shootdown_all`
+  runs in `reap_pending()` at the top of `exit_thread`/`exit_process`/`suspend_with_fault`
+  — all IF=0. Two concurrent IF=0 initiators deadlock (one holds the shootdown `LOCK`
+  spinning for an ack the other — spinning on `LOCK` with IRQs masked — can never send).
+  **Decision: fix by making `tlb::shootdown` IF-robust** (save IF, run the lock acquisition
+  + ack spin with IF temporarily enabled, restore after) rather than funneling stack frees
+  to IF=1 contexts. Explicitly rejected: globally re-enabling IF in syscall bodies — the
+  handle-table grace tracker's per-CPU read-side assumes non-preemptible lookups; that
+  redesign is out of scope here.
+- **F2 (HIGH, deadlock): `ObjectRef` drop under `SCHED`.** `wake_entropy_seed_waiters`
+  drops drained `PendingOperation` refs while the tick's `SCHED` guard is held — the one
+  violation of the rule stated at four other sites. The lock-ordering doc blessed it as
+  "rank 1 → 6, the legal direction", but that argument covers ordering cycles, not the IRQ
+  interaction: allocator locks are plain (IF=1) spinlocks and `SCHED` is IRQ-acquired, so
+  {CPU A: holds allocator, tick handler spins on `SCHED` IRQs-masked} × {CPU B: holds
+  `SCHED`, last-ref drop spins on the allocator} deadlocks. Fires only when the drop is
+  the last ref (waiter's handle already closed) — why it was never seen. Fix: hoist the
+  drain buffer to the tick's frame (drops after the guard releases on every path); restate
+  the rule as "nothing that can reach a plain spinlock runs under `SCHED` — drops or
+  allocation" and correct the lock-ordering doc.
+- **F11 (HIGH, deadlock; found while fixing F2): the reap lists lose their reserve on
+  first drain.** `reap_pending` drained via `core::mem::take(g.reap_slot())`, swapping in
+  a `KVec::new()` with **capacity 0** — and `KVec::try_push` grows by *allocating* when at
+  capacity, so after a CPU's first reap every later exit-path push into its reap list
+  silently allocated under `SCHED` (the F2 deadlock shape, on the every-thread-exit hot
+  path; the `expect("reap within reserve")` never fired because `try_push` "succeeds" by
+  growing). Fix: drain by popping into a fixed local buffer under the lock (moves only —
+  no drop, no allocation), preserving the list's reserved capacity; drop outside. The same
+  applies to any future `mem::take` of a pre-reserved `SCHED` collection. Relatedly, the
+  F2 fix must not drop in the tick's own frame either — the tick is IRQ context, where a
+  free can **self**-deadlock against an interrupted allocator holder on the same CPU; the
+  drained refs park in a new pre-reserved `SchedState::deferred_drops` list and are
+  dropped by `reap_pending` in thread context.
+- **F3 (MED-HIGH, Phase 4 security): user-page unmap has no shootdown.**
+  `sys_memory_unmap → unmap_covering` flushes only locally; safe today solely because
+  processes are single-threaded and `switch_into` reloads CR3 every switch-in. With Phase
+  4 multi-threaded processes, a sibling on another CPU keeps a live stale translation to a
+  freed-and-reused frame (cross-process exposure). The deferred `active_cpus` note framed
+  targeting as an optimization over broadcast — but user unmaps do not broadcast at all.
+  Fix: broadcast shootdown on user unmap/protect (depends on F1 — unmap is a syscall, an
+  IF=0 initiator); `active_cpus` stays the later optimization.
+- **F4 (MED, panic): `steal_one`/`steal_available` mismatch.** `steal_available` checks
+  *any* victim; `steal_one` searches only the *busiest*. If the busiest queue holds only
+  pinned/`on_cpu` threads while a smaller queue has a stealable one, the idle-steal paths
+  (gated on `steal_available`, current == idle) reach `pick_next → None` and panic on the
+  empty `idle_slot().take().expect(...)`. Reachable via `sys_thread_set_affinity`. Fix:
+  `steal_one` picks the busiest victim *among those with a stealable thread*.
+- **F5 (MED, latent race): the `on_cpu` guard is only honored by stealers.** Two other
+  consumers read a possibly-uncommitted context: (a) an affinity-diverted wake/resume can
+  place a still-mid-switch-out thread on a third CPU whose `dequeue_front → switch_into`
+  reads `saved_sp` unguarded (the Bug-4 double-run through a different door); (b)
+  `exit_process`'s reap sweeps can queue a stack for freeing while its owner CPU is still
+  executing the switch-out tail (stack UAF). Fix: spin on `!is_on_cpu` in `switch_into`
+  before reading `saved_sp` (the Linux `smp_cond_load_acquire` analog — bounded, lock-free)
+  and wait out the guard in the reap sweeps.
+- **F6 (MED, capacity panic):** wake placement ignores queue capacity and
+  `make_runnable`/`resume_suspended` panic at `READY_RESERVE` (16) runnable threads on one
+  CPU. Fix: fall back to the least-loaded permitted queue with room; panic only when all
+  are full.
+- **F7 (latent):** `SchedState.quantum` is global, decremented by every CPU's tick —
+  benign only while `QUANTUM_TICKS == 1`. Make per-CPU.
+- **F8 (low, deferred):** the panic/emergency serial path is unsynchronized under SMP and
+  a panicking CPU does not halt the others (no stop IPI) — the lock-ordering doc's own
+  "revisit at SMP" flag. Deferred with a tracking entry.
+- **F9 (doc debt):** stale single-CPU arguments in `lock-ordering.md` (the IrqSpinLock
+  audit, the entropy blessing); `scheduler.md` claims affinity masks are validated against
+  online CPUs (only nonzero/`MAX_CPUS` is checked; an all-offline mask silently runs on
+  CPU 0); `kernel/CLAUDE.md` forbids #PF-handler allocation while `fault_in → map_page`
+  can allocate intermediate page tables.
+- **F10 (info):** deadline math compares `Timer::read_ns()` across CPUs (synchronized-TSC
+  assumption) — fine under QEMU/KVM and invariant-TSC hardware; document before real-metal
+  boots.
+
+**Fix plan** (slice `phase-4/substrate-hardening`; the Phase-4 gate): Part A = F2+F11+F4
+(small, self-contained); Part B = F1 (IF-robust shootdown + contract assertion); Part C =
+F3 (broadcast user-unmap shootdown); Part D = F5 (`on_cpu` everywhere); Part E = F6+F7;
+Part F = docs (F8 deferral entry, F9, F10) + a concurrent-exit stress selftest (KVM
+boot-loop methodology, per the Bug-4 playbook). Recorded in
+`docs/planning/implementation-plan.md`.
+
+## 2026-07-21 — F12: the descheduled-spinlock-holder deadlock (found by the exit-storm stress)
+
+The Part F **exit-storm** selftest (waves of concurrently exiting processes) immediately
+paid for itself: ~30 % of KVM `-smp 4` boots **hung** — and the same storm hung the
+**pre-hardening** kernel at the same rate, so this was a latent SMP bug, not a
+regression from Parts A–E. TCG never reproduced it. Diagnosed with a QEMU-monitor
+harness (boot until hung, dump every CPU's RIP/RFLAGS twice 2 s apart, symbolize
+against the kernel ELF — the non-perturbing analogue of the Bug-4 methodology).
+
+**The deadlock, in two captured poses:**
+
+1. All four CPUs IF=1, spinning to *acquire* the TLB-shootdown `LOCK` — the holder was
+   the **idle thread** (reaping kernel stacks), descheduled mid-window by its tick and
+   parked in `idle_slot`; idle is only re-picked when its CPU has nothing else to run,
+   but the spinners themselves kept every CPU busy. A zero-priority holder starved by
+   its own waiters, forever.
+2. Two CPUs spinning on **slab-cache locks with IF=0** (syscall-context allocator ops:
+   they can neither *tick* — so a descheduled slab holder parked on their queue never
+   runs — nor *ack a shootdown*), one CPU holding the shootdown `LOCK` spinning for
+   those acks, one behind it. The slab holder had been preempted while holding the
+   cache lock (allocator locks are held at IF=1 by kernel threads / the boot thread /
+   idle's reap), and the only tick-capable CPUs were preempt-disabled inside the
+   shootdown window.
+
+**The general law both poses instantiate:** *a plain-spinlock holder that can be
+descheduled is a system-wide liveness hazard*, because spinners are not obligated to be
+tick-capable (IF=0 syscall contexts) and the idle thread is not re-queueable at all.
+
+**Fix (three layers, one mechanism):**
+- **`sched::preempt_disable` / `preempt_enable`** — a per-CPU nestable depth; while
+  raised, `on_timer_tick` / `on_reschedule_ipi` do all their bookkeeping but skip the
+  switch, latching it in a per-CPU `RESCHED_PENDING` that `preempt_enable` replays
+  (backstop: the next tick). The counter update runs in a brief IRQ-masked window so
+  the increment lands on the CPU the thread is actually on (an interrupt between
+  read-index and increment could migrate the thread and stick another CPU's counter).
+- **Every plain `SpinLock` critical section is a no-preemption region**: `lock()`
+  raises the depth before the acquire attempt (the winner must not be descheduled
+  between winning and recording); the guard drop releases the lock first, then lowers
+  the depth. Holders now always run to release, so any spinner — IF-masked or not —
+  waits a bounded critical-section, and the idle-holder case cannot arise.
+  `IrqSpinLock` is deliberately **not** wrapped (its holders are already
+  unpreemptible via IF-masking, and `SCHED` *is* the scheduler).
+- **The TLB-shootdown window and `reap_pending`'s drop phase** wrap explicitly (the
+  ack spin runs inside the `LOCK` hold and is covered; the reap wrap keeps the idle
+  thread's multi-drop sequence intact).
+
+**Verified:** the storm-hang rate went ~30 % → 4 % with the shootdown/reap wraps alone
+(the residual was pose 2) → **0/60 + 0/60 KVM boot-loops** with the `SpinLock` wrap;
+full host suite and `test-qemu` green throughout. The preempt cost is one atomic
+add/sub + a ~10-instruction masked window per plain-lock acquisition; worst-case
+preemption latency is the longest plain-lock critical section (µs) plus one tick.

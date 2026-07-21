@@ -2110,9 +2110,81 @@ a package-management + sysadmin layer) reuse this foundation. See the decision l
 (2026-07-20 "Phase 3 Definition of Done, the `std` stance, and the Phase 4 north star") for
 the full rationale, including the `std` stance and the browser strategy.
 
+### Substrate hardening — the gate into Phase 4 (2026-07-21 concurrency review)
+
+The adversarial kernel-substrate review (decision log, 2026-07-21 "Substrate concurrency
+review") found two live cross-CPU deadlocks, a panic path, and two Phase-4 time bombs —
+mostly single-CPU-era justifications that had become load-bearing SMP claims. Fixing them
+**gates the Phase 4 build-out** (threads/FP/TLS stress the substrate harder than anything
+to date). Slice `phase-4/substrate-hardening`:
+
+- [x] **Part A — F2 + F11 + F4** (small, self-contained; landed with 3 host tests,
+  `test-qemu` green, 20/20 KVM boot-loop). F2: the drained entropy
+  seed-waiter refs park in a new pre-reserved `SchedState::deferred_drops` list (moves
+  only under the lock) and are dropped by `reap_pending` in **thread context** — an
+  `ObjectRef` drop can reach the plain-spinlock allocator, which must never run under
+  `SCHED` **or in IRQ context** (cross-CPU and same-CPU deadlock); correct
+  `lock-ordering.md`'s blessing. F11: `reap_pending` drains by popping into a fixed local
+  under the lock instead of `mem::take` (which zeroed the reserved capacity, making every
+  later exit push *allocate under `SCHED`* via `KVec::try_push` growth). F4: `steal_one`
+  picks the busiest victim *among those with a stealable thread*, matching
+  `steal_available` (fixes the idle-steal `expect` panic + the missed-steal liveness wart).
+- [x] **Part B — F1: IF-robust TLB shootdown** (landed; `test-qemu` green, 30/30 KVM
+  boot-loop). `tlb::shootdown` saves IF, runs the whole window — `LOCK` acquisition,
+  IPIs, ack spin — with interrupts enabled, restores after: IF=0 initiators
+  (syscall/exception-context `KernelStack::Drop` via `reap_pending`) cannot mutually
+  deadlock and always service incoming shootdown IPIs while waiting. Because the
+  initiator is now preemptible (and can migrate) mid-window, the request targets
+  **every online CPU including the initiator's** (a self-IPI replaces the local
+  invalidate) — position-independent, so the ack count stays exact wherever the
+  initiator resumes. Caller contract tightened: preemptible kernel context, no
+  spinlocks held, never IRQ/DPC. `smp.md` §8 updated.
+- [x] **Part C — F3: broadcast shootdown on user-page unmap** (landed; `test-qemu`
+  green — the sched-stats demo exercises the path ~50×/boot — and 30/30 KVM boot-loop).
+  New `unmap_covering_deferred`: under the AS lock the VMA is removed and PTEs cleared,
+  but every frame release is **deferred** — anonymous frames collect into a
+  caller-reserved `KVec` (`Err(pages)` = reserve-outside-lock-and-retry) and the `Vma`
+  keeps its object ref; `sys_memory_unmap` then runs the (IF-robust) broadcast
+  shootdown **outside the AS lock** (a `#PF` handler spins on that lock IF-masked and
+  could not ack) and only then frees frames / drops the VMA. The old in-lock-freeing
+  `unmap_covering` is `#[cfg(test)]` (host tests have no remote TLBs). `active_cpus`
+  targeting stays the later optimization.
+- [x] **Part D — F5: honor `on_cpu` everywhere** (landed; `test-qemu` green, 30/30 KVM
+  boot-loop). `switch_into` spins on `!is_on_cpu(next)` before reading `saved_sp` — the
+  Linux `smp_cond_load_acquire` analog — covering affinity-diverted wake/resume
+  placements picked up by `dequeue_front` (which, unlike `stealable_to`, has no guard
+  filter); `reap_matching`/`reap_blocked_matching` wait out the guard before queueing a
+  sibling's stack for freeing (the mid-switch-out UAF window). Bounded + deadlock-free
+  under `SCHED`: the owning CPU clears the guard from post-release straight-line code,
+  no lock needed.
+- [x] **Part E — F6 + F7** (landed; host test for the fallback, `test-qemu` green,
+  30/30 KVM boot-loop). F6: `pick_wake_cpu` requires queue room at the home CPU,
+  falling back to the least-loaded permitted queue (which has room unless *every*
+  permitted queue is full — the only case wakes still treat as fatal, e.g. a pinned
+  thread whose sole queue is at reserve); `READY_RESERVE` raised 16 → 32 for Phase 4
+  headroom. F7: `quantum` is per-CPU (`[u32; MAX_CPUS]`) — the shared counter was
+  benign only while `QUANTUM_TICKS == 1`.
+- [x] **Part F — stress selftest + F12 + docs** (landed). The **exit-storm** selftest
+  (`parent` spawns 6 waves × 3 immediately-exiting children; teardown races spawn, the
+  login chain, and itself across CPUs) immediately exposed **F12** — a latent
+  descheduled-spinlock-holder deadlock hanging ~30 % of KVM boots (pre-hardening `main`
+  hangs identically; TCG never reproduces). Diagnosed via a QEMU-monitor capture harness
+  (per-CPU RIP/RFLAGS dumps, symbolized); two poses captured: the **idle thread**
+  descheduled holding the shootdown `LOCK` (starved forever by its own spinners), and
+  **IF-masked allocator spinners** that can neither tick nor ack. Fix:
+  `sched::preempt_disable/enable` (per-CPU depth; tick/IPI latch skipped switches into
+  `RESCHED_PENDING`, replayed at enable) + **every plain `SpinLock` critical section is
+  a no-preemption region** (holders always run to release; `IrqSpinLock` deliberately
+  unwrapped) + explicit wraps for the shootdown window and `reap_pending`'s drop phase.
+  Verified: ~30 % → 4 % (wraps alone) → **0/60 + 0/60** KVM boot-loops; host suite +
+  `test-qemu` green. Docs: F8 deferral entry (+ the general deferred-reclamation entry
+  marked done-in-essence via `deferred_drops`), F9 corrections (affinity-validation
+  claim, #PF-allocation rule, serial-at-SMP pointer), F10 TSC-sync note, smp.md
+  invariant **I6**, lock-ordering § no-preemption regions.
+
 **Stepping-stone path** (each a real, satisfying milestone; roughly ordered):
 
-1. Phase 3 close (libstream + `/proc`) — the gate out of Phase 3.
+1. Phase 3 close (libstream + `/proc`) — the gate out of Phase 3. ✅ (2026-07-21)
 2. FP/AVX2 + XSAVE (below).
 3. dir ops + typed shell + coreutils → **CLI-complete**.
 4. framebuffer display server + input routing.

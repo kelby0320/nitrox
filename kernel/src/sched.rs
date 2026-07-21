@@ -48,7 +48,7 @@
 //!
 //! [`release_keeping_irqs_masked`]: crate::libkern::IrqSpinLockGuard::release_keeping_irqs_masked
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
@@ -71,10 +71,13 @@ use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX
 // (the `ArchTimer` trait, imported above, provides `read_ns`). The two names
 // live in different paths — see `arch/timer.rs`.
 
-/// Run-queue capacity reserved once at [`init`]. Phase 1 runs a handful of
-/// kernel threads; enqueueing beyond this is a logic error (debug-asserted)
-/// rather than an allocation under the rank-1 lock.
-const READY_RESERVE: usize = 16;
+/// Per-CPU run-queue capacity, reserved once at [`init`]/[`ap_init`].
+/// Enqueueing beyond this is refused (spawn) or fatal (wake, after every
+/// permitted CPU's queue is full — see [`place_thread`]) rather than an
+/// allocation under the rank-1 lock. Raised 16 → 32 for Phase 4 headroom
+/// (multi-threaded processes + affinity pinning concentrate runnable threads;
+/// review finding F6): 32 refs = 256 bytes per CPU.
+const READY_RESERVE: usize = 32;
 
 /// Periodic scheduler tick: 10 ms (100 Hz). Matches the PIT calibration
 /// window; fine-grained enough for round-robin without excessive IRQ overhead.
@@ -100,6 +103,14 @@ const BLOCKED_RESERVE: usize = 16;
 /// thread plus any sibling threads a process exit tears down; sized like the
 /// run queue so a whole process's threads fit without allocating under the lock.
 const REAP_RESERVE: usize = 16;
+
+/// Pre-reserved capacity for [`SchedState::deferred_drops`] — `ObjectRef`s a
+/// lock-held or IRQ-context path must release but cannot drop in place (a drop
+/// can reach the plain-spinlock allocator, forbidden under `SCHED` and in IRQ
+/// context — decision log 2026-07-21, F2/F11). Sized to twice the only current
+/// producer's burst (the entropy seed wake parks ≤ [`crate::entropy::SEED_WAITERS_MAX`]
+/// refs, once per boot); [`reap_pending`] drains it in thread context.
+const DEFERRED_DROP_RESERVE: usize = 2 * crate::entropy::SEED_WAITERS_MAX;
 
 /// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by
 /// absolute monotonic ns, drained on each periodic tick. A pure binary heap in
@@ -384,6 +395,100 @@ pub fn online_mask() -> u64 {
     ONLINE_MASK.load(Ordering::Acquire)
 }
 
+/// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
+/// the thread running on that CPU (which, while nonzero, cannot migrate — that
+/// is the point); read by the same CPU's tick / reschedule-IPI handlers.
+static PREEMPT_OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Set when a reschedule opportunity (tick expiry or reschedule IPI) was
+/// skipped because [`PREEMPT_OFF`] was raised; consumed by [`preempt_enable`],
+/// which replays the reschedule. Backstop: the CPU's next periodic tick.
+static RESCHED_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Disable preemption on the current CPU (nestable). While the depth is
+/// nonzero, the tick and the reschedule IPI will not deschedule the running
+/// thread (interrupts themselves stay enabled — handlers run; only the
+/// *switch* is deferred, latched in [`RESCHED_PENDING`]).
+///
+/// This exists for **preemption-critical windows**: code holding a plain
+/// spinlock other CPUs may spin on — the TLB-shootdown serialiser, the
+/// allocator locks during reclamation. A preempted *normal* holder sits in a
+/// ready queue and is rescheduled within a tick (slow, but live); the **idle
+/// thread** is the fatal case — it parks in `idle_slot` and runs only when its
+/// CPU has nothing else, so if it is descheduled while holding such a lock,
+/// the spinners themselves keep every CPU busy and the holder is starved
+/// forever (F12, decision log 2026-07-21 — an all-CPUs-spinning-on-the-
+/// shootdown-lock deadlock found by the exit-storm stress).
+///
+/// Contract: pair with [`preempt_enable`] on the same thread; the window must
+/// be bounded (no blocking, no `sys_wait`) and hold no `SCHED`-ordered lock.
+///
+/// [`SpinLock`](crate::libkern::SpinLock) calls this in `lock()` (and the
+/// matching enable in its guard drop), making **every plain-spinlock critical
+/// section a no-preemption region**: a holder is never descheduled, so a
+/// spinner — even one with interrupts masked, which cannot tick — always waits
+/// on a *running* holder and the wait is bounded by the critical section.
+pub fn preempt_disable() {
+    // Mask IRQs across read-index + increment: an interrupt between them could
+    // deschedule/migrate this thread and the increment would land on the wrong
+    // CPU's counter (sticking it nonzero — that CPU would never preempt again).
+    // Once the count is raised, descheduling is impossible, which is what makes
+    // the per-CPU counter track the thread for the window's duration.
+    let prev = preempt_irqs_mask();
+    PREEMPT_OFF[SchedState::this_cpu()].fetch_add(1, Ordering::Relaxed);
+    preempt_irqs_restore(prev);
+}
+
+/// Re-enable preemption (see [`preempt_disable`]); at depth zero, replays a
+/// reschedule that was skipped during the window. (If the thread is descheduled
+/// or migrates between the depth reaching zero and the replay, the replay's
+/// under-lock re-check makes it a no-op; the origin CPU's next tick covers any
+/// consumed-but-unserviced wake.)
+pub fn preempt_enable() {
+    let prev = preempt_irqs_mask();
+    let me = SchedState::this_cpu();
+    let replay = PREEMPT_OFF[me].fetch_sub(1, Ordering::Relaxed) == 1
+        && RESCHED_PENDING[me].swap(false, Ordering::AcqRel);
+    preempt_irqs_restore(prev);
+    if replay {
+        // Mirror `on_reschedule_ipi`: resume an idle CPU into the scheduler; a
+        // busy thread is left to its quantum (the next tick reschedules it).
+        let g = SCHED.lock();
+        let cpu = SchedState::this_cpu();
+        if current_is_idle(&g) && (!g.ready[cpu].is_empty() || steal_available(&g, cpu)) {
+            switch_to_next(g);
+        }
+    }
+}
+
+/// Mask interrupts for the preempt-counter update window. Host tests run ring-3
+/// single-threaded (a real `cli` would `#GP`), and have no ticks to race — a
+/// no-op there, mirroring the `IrqSpinLock` test backend.
+#[inline]
+fn preempt_irqs_mask() -> bool {
+    #[cfg(not(test))]
+    {
+        // SAFETY: ring-0; a microseconds-bounded masked window, restored below.
+        unsafe { Cpu::interrupts_disable() }
+    }
+    #[cfg(test)]
+    {
+        false
+    }
+}
+
+/// Restore the interrupt state captured by [`preempt_irqs_mask`].
+#[inline]
+fn preempt_irqs_restore(prev: bool) {
+    #[cfg(not(test))]
+    // SAFETY: ring-0; restoring the state captured by the paired mask.
+    unsafe {
+        Cpu::interrupts_restore(prev)
+    };
+    #[cfg(test)]
+    let _ = prev;
+}
+
 /// The page-table root a thread should run under: its own process root if it
 /// has one, else the boot root. Caller holds the run-queue lock.
 ///
@@ -437,10 +542,14 @@ struct SchedState {
     /// children take 2, 3, …. (Phase 1 has no pid reuse; recycling lands with a
     /// real process table.)
     next_pid: u32,
-    /// Ticks remaining in the current thread's slice; reset to
+    /// **Per-CPU** ticks remaining in that CPU's current slice; reset to
     /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
-    /// here rather than on `Thread` (no `Thread` layout/ABI change).
-    quantum: u32,
+    /// here rather than on `Thread` (no `Thread` layout/ABI change). Per-CPU
+    /// because every CPU's tick decrements its own slice — a single shared
+    /// counter was only benign while `QUANTUM_TICKS == 1` (each tick reset it);
+    /// any longer quantum would have had CPUs consuming each other's slices
+    /// (review finding F7).
+    quantum: [u32; MAX_CPUS],
     /// **Per-CPU** monotonic TimeShared vruntime floor (≈ that CPU's run queue's
     /// smallest vruntime), advanced to the picked thread's vruntime on each dequeue.
     /// A thread placed on CPU `c` is seeded against `min_vruntime[c]` (new → the
@@ -468,6 +577,15 @@ struct SchedState {
     /// incremented at their event sites — all of which already hold this lock —
     /// and copied out by [`stats_snapshot`] for the `/proc/sched/stats` surface.
     stats: [stats::Counters; MAX_CPUS],
+    /// `ObjectRef`s parked for a **thread-context** drop by [`reap_pending`]:
+    /// refs a lock-held or IRQ-context path must release but may not drop in
+    /// place, because an `ObjectRef` drop can reach the plain-spinlock allocator
+    /// — which must never run under this IRQ-acquired lock (cross-CPU deadlock)
+    /// nor in IRQ context (same-CPU self-deadlock against an interrupted
+    /// allocator holder). Producers *move* refs in within the reserve (see
+    /// [`DEFERRED_DROP_RESERVE`]); the only producer today is the entropy seed
+    /// wake ([`wake_entropy_seed_waiters`]). Decision log 2026-07-21, F2.
+    deferred_drops: KVec<ObjectRef>,
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
@@ -478,13 +596,14 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     suspended: KVec::new(),
     next_tid: 1,
     next_pid: 2,
-    quantum: QUANTUM_TICKS,
+    quantum: [QUANTUM_TICKS; MAX_CPUS],
     min_vruntime: [0; MAX_CPUS],
     idle: [const { None }; MAX_CPUS],
     idle_addr: [0; MAX_CPUS],
     blocked: KVec::new(),
     deadlines: KVec::new(),
     stats: [stats::Counters::ZERO; MAX_CPUS],
+    deferred_drops: KVec::new(),
 });
 
 impl SchedState {
@@ -585,6 +704,8 @@ pub fn init() -> Result<(), AllocError> {
     reap.try_reserve(REAP_RESERVE)?;
     let mut deadlines: KVec<deadline::Entry> = KVec::new();
     deadlines.try_reserve(deadline::HEAP_RESERVE)?;
+    let mut deferred_drops: KVec<ObjectRef> = KVec::new();
+    deferred_drops.try_reserve(DEFERRED_DROP_RESERVE)?;
     let boot = Thread::try_new_boot(0, 0)?;
     let boot_ref = into_objref(boot);
 
@@ -603,10 +724,11 @@ pub fn init() -> Result<(), AllocError> {
     g.suspended = suspended;
     g.reap[0] = reap;
     g.deadlines = deadlines;
+    g.deferred_drops = deferred_drops;
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
-    g.quantum = QUANTUM_TICKS;
+    g.quantum = [QUANTUM_TICKS; MAX_CPUS];
     Ok(())
 }
 
@@ -875,8 +997,18 @@ pub fn on_timer_tick() {
     let me = SchedState::this_cpu();
     g.stats[me].ticks += 1;
     let ready_here = !g.ready[me].is_empty();
-    let (new_quantum, reschedule) = tick_quantum(g.quantum, ready_here);
-    g.quantum = new_quantum;
+    let (new_quantum, reschedule) = tick_quantum(g.quantum[me], ready_here);
+    g.quantum[me] = new_quantum;
+    // A preemption-critical window (the running thread may hold a plain lock
+    // other CPUs spin on — see [`preempt_disable`]): do not deschedule it. The
+    // bookkeeping above (deadlines, wakes, vruntime, quantum) still ran; latch
+    // the skipped switch for `preempt_enable` / the next tick.
+    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
+        if reschedule || (!ready_here && current_is_idle(&g) && steal_available(&g, me)) {
+            RESCHED_PENDING[me].store(true, Ordering::Release);
+        }
+        return; // guard drops — IF stays 0 (IRQ context) until iretq
+    }
     if reschedule {
         switch_to_next(g); // consumes the guard; switches with IF masked
         return;
@@ -903,6 +1035,13 @@ pub fn on_reschedule_ipi() {
     let mut g = SCHED.lock();
     let me = SchedState::this_cpu();
     g.stats[me].resched_ipis += 1;
+    // A preemption-critical window (see [`preempt_disable`] — notably the idle
+    // thread mid-reap holding the shootdown/allocator locks): don't deschedule;
+    // latch the wake for `preempt_enable` (backstop: this CPU's next tick).
+    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
+        RESCHED_PENDING[me].store(true, Ordering::Release);
+        return;
+    }
     // Only preempt the idle thread — a running TimeShared thread is left to its
     // quantum (the woken thread is already enqueued and will be picked in turn or
     // stolen). The point is purely liveness: resume an idle CPU so a thread parked
@@ -948,10 +1087,13 @@ pub fn stats_snapshot() -> stats::Snapshot {
 /// already-seeded / no-waiters case costs one atomic load. Caller holds `SCHED`.
 ///
 /// The entropy subsystem owns the waiter refs (the IPC-`Block` pattern); we move
-/// them out, signal each via its raw pointer, and let the local array drop them.
-/// Dropping a `PendingOperation` ref under `SCHED` is sound: its `Drop` touches only
-/// the allocator (acquired *below* `SCHED` in the lock order — the legal direction),
-/// never re-entering `SCHED`. See `kernel/docs/lock-ordering.md` § The entropy lock.
+/// them out, signal each, and **park the refs in [`SchedState::deferred_drops`]**
+/// for [`reap_pending`] to drop in thread context. They must not drop here: an
+/// `ObjectRef` drop can reach the plain-spinlock allocator, which may neither run
+/// under the IRQ-acquired `SCHED` lock (a cross-CPU deadlock against an allocator
+/// holder whose own tick spins on `SCHED`) nor anywhere in this tick's IRQ context
+/// (a same-CPU self-deadlock against an allocator holder this tick interrupted).
+/// See the decision log (2026-07-21, F2) and `kernel/docs/lock-ordering.md`.
 fn wake_entropy_seed_waiters(g: &mut SchedState) {
     if !crate::entropy::seed_wake_pending() {
         return;
@@ -959,13 +1101,17 @@ fn wake_entropy_seed_waiters(g: &mut SchedState) {
     let mut buf: [Option<ObjectRef>; crate::entropy::SEED_WAITERS_MAX] =
         [const { None }; crate::entropy::SEED_WAITERS_MAX];
     let n = crate::entropy::drain_seed_waiters(&mut buf);
-    for slot in buf[..n].iter() {
-        if let Some(po) = slot {
+    for slot in buf[..n].iter_mut() {
+        if let Some(po) = slot.take() {
             signal_pending_op_with_result(g, po.as_ptr(), 0, 0);
+            // A move within the reserve — no drop, no allocation under the lock.
+            // Bounded: waiters queue only pre-seed and the drain fires post-seed,
+            // so the lifetime total is ≤ SEED_WAITERS_MAX (< the reserve).
+            g.deferred_drops
+                .try_push(po)
+                .expect("deferred-drop list within reserve");
         }
     }
-    // `buf` (the moved-out waiter refs) drops here — see the doc comment for why
-    // dropping a `PendingOperation` ref under `SCHED` is sound.
 }
 
 /// Drain every deadline at or before `now`, firing each: a timer entry signals
@@ -1743,6 +1889,19 @@ unsafe fn switch_into(
     next_obj: *mut (),
 ) {
     g.stats[SchedState::this_cpu()].switches += 1;
+    // Wait out the incoming thread's mid-switch-out guard before touching its
+    // parked context. A waker can re-home a thread to a **third** CPU's queue
+    // (an affinity-diverted wake/resume) in the window between its old CPU
+    // releasing `SCHED` and `context_switch` committing `saved_sp` — and
+    // `dequeue_front`, unlike `stealable_to`, does not filter on the guard, so
+    // that CPU could otherwise resume a not-yet-committed context (the Bug-4
+    // double-run through a different door — F5, decision log 2026-07-21).
+    // Bounded and deadlock-free even though `SCHED` is held: the owning CPU is
+    // in straight-line post-release code and clears the guard without any lock.
+    // SAFETY: `next_obj` is pinned (now `current`).
+    while unsafe { Thread::is_on_cpu(next_obj) } {
+        core::hint::spin_loop();
+    }
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
     // here, satisfying the Thread accessor contract for these reads.
     let next_sp = unsafe { Thread::saved_sp(next_obj) };
@@ -1833,11 +1992,12 @@ fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     let r = g.blocked.remove(i);
     // SAFETY: `r` pins `thread`; `SCHED` held.
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
-    // Re-home onto its CPU (cache-warm), seeding its vruntime near that CPU's floor
-    // with a latency boost. Within the per-CPU reserve, so this cannot fail; a full
-    // queue would be a reserve-exhaustion bug (treated as fatal, as the old `expect`).
+    // Re-home onto its CPU (cache-warm; a full home falls back to the
+    // least-loaded permitted queue with room — F6). This fails only when
+    // *every* permitted queue is at reserve — e.g. a thread pinned to a single
+    // CPU whose queue is full — which is genuine reserve exhaustion, still fatal.
     if place_thread(g, r, true).is_err() {
-        panic!("wake placement exceeded the per-CPU ready reserve");
+        panic!("wake placement: every affinity-permitted ready queue is at reserve");
     }
     true
 }
@@ -2139,6 +2299,17 @@ fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid:
         // exit would otherwise sweep them all up.
         th.owner_pid() == my_pid && th.tid() != IDLE_TID
     }) {
+        // Wait out a mid-switch-out guard before reclaiming: the sweep can see
+        // a sibling parked on another CPU's queue whose switch-out has not yet
+        // committed — that CPU is still executing on the sibling's kernel stack
+        // for a few more instructions, and queueing it for the stack free here
+        // would be a use-after-free (F5, decision log 2026-07-21). Bounded: the
+        // owning CPU clears the guard from post-release straight-line code, no
+        // lock needed.
+        // SAFETY: the entry pins a live Thread; `SCHED` held.
+        while unsafe { Thread::is_on_cpu(list[i].as_ptr()) } {
+            core::hint::spin_loop();
+        }
         let r = list.remove(i);
         // SAFETY: `r` pins the thread; `SCHED` held.
         unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
@@ -2162,6 +2333,13 @@ fn reap_blocked_matching(
         // Never reap an idle thread (see `reap_matching`).
         th.owner_pid() == my_pid && th.tid() != IDLE_TID
     }) {
+        // Wait out a mid-switch-out guard before reclaiming (see
+        // [`reap_matching`] — a just-blocked sibling's switch-out may not have
+        // committed; its CPU is still on the sibling's stack).
+        // SAFETY: the entry pins a live Thread; `SCHED` held.
+        while unsafe { Thread::is_on_cpu(blocked[i].as_ptr()) } {
+            core::hint::spin_loop();
+        }
         let r = blocked.remove(i);
         let obj = r.as_ptr();
         // Unregister from every object this thread was waiting on, mirroring
@@ -2441,9 +2619,10 @@ pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
         Thread::set_disposition(thread, disp_tag, disp_code);
         Thread::set_state(thread, ThreadState::Ready);
     }
-    // Re-home on its CPU (a wake): within the per-CPU reserve, so it cannot fail.
+    // Re-home on its CPU (a wake; a full home falls back to a permitted queue
+    // with room — F6). Fails only when every permitted queue is at reserve.
     if place_thread(&mut g, r, true).is_err() {
-        panic!("resume placement exceeded the per-CPU ready reserve");
+        panic!("resume placement: every affinity-permitted ready queue is at reserve");
     }
     true
 }
@@ -2462,20 +2641,64 @@ pub fn thread_exception_frame(thread: *mut ()) -> Option<usize> {
     unsafe { Thread::exception_frame(thread) }
 }
 
-/// Drop every pending reaped thread **outside** the run-queue lock (their
-/// `KernelStack` `Drop` takes rank-6 allocator locks). Idempotent; called at the
-/// top of [`yield_now`]/[`exit_thread`]/[`exit_process`]/[`suspend_with_fault`]
-/// and by the boot drainer. The list (rather than one slot) lets a process exit
-/// reap its torn-down sibling threads alongside the caller; we drain it under a
-/// brief lock into a local `KVec`, then drop them all with the lock released.
+/// Pop up to `buf.len()` parked refs — this CPU's `reap` list first, then the
+/// global [`SchedState::deferred_drops`] — into `buf`. **Moves only**: no drop,
+/// no allocation, and the lists keep their reserved buffers. (The previous
+/// `mem::take` drain swapped in a zero-capacity `KVec`, so every later exit-path
+/// push *allocated under `SCHED`* via `KVec::try_push` growth — the F11 deadlock
+/// hazard, decision log 2026-07-21.) Returns the count. Caller holds `SCHED` and
+/// drops the moved refs after releasing it, in thread context.
+fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRef>]) -> usize {
+    let mut n = 0;
+    while n < buf.len() {
+        let Some(r) = g.reap_slot().pop() else { break };
+        buf[n] = Some(r);
+        n += 1;
+    }
+    while n < buf.len() {
+        let Some(r) = g.deferred_drops.pop() else { break };
+        buf[n] = Some(r);
+        n += 1;
+    }
+    n
+}
+
+/// Drop every pending reaped thread — and every deferred-drop ref — **outside**
+/// the run-queue lock, in thread context (a reaped thread's `KernelStack` `Drop`
+/// takes rank-6 allocator locks and initiates a TLB shootdown). Idempotent;
+/// called at the top of [`yield_now`]/[`exit_thread`]/[`exit_process`]/
+/// [`suspend_with_fault`], by the idle loop, and by the boot drainer. Only this
+/// CPU's reap list is drained — a thread is reclaimed by the CPU it died on,
+/// after its `switch_into` completed (so its stack is no longer in use) — plus
+/// the CPU-agnostic [`SchedState::deferred_drops`]. Draining moves refs into a
+/// fixed local buffer under a brief hold ([`drain_pending_drops`] — preserving
+/// the lists' reserved capacity), then drops them with the lock released.
 pub fn reap_pending() {
-    let reaped = {
-        let mut g = SCHED.lock();
-        // Only this CPU's reap list — a thread is reclaimed by the CPU it died on,
-        // after its `switch_into` completed (so its stack is no longer in use).
-        core::mem::take(g.reap_slot())
-    };
-    drop(reaped);
+    loop {
+        let mut buf: [Option<ObjectRef>; REAP_RESERVE + DEFERRED_DROP_RESERVE] =
+            [const { None }; REAP_RESERVE + DEFERRED_DROP_RESERVE];
+        let n = {
+            let mut g = SCHED.lock();
+            drain_pending_drops(&mut g, &mut buf)
+        };
+        // Drop with preemption disabled: the drops take the allocator locks and
+        // (for a kernel stack) run a TLB shootdown — plain locks other CPUs may
+        // spin on. Being descheduled while holding one starves the spinners for
+        // a scheduling round — or forever, when the reaper is the **idle**
+        // thread, which is never re-picked while the spinners keep every CPU
+        // busy (F12, decision log 2026-07-21). Interrupts stay enabled; only
+        // the switch is deferred.
+        preempt_disable();
+        for slot in buf[..n].iter_mut() {
+            drop(slot.take());
+        }
+        preempt_enable();
+        if n < buf.len() {
+            return; // drained everything that was parked when we looked
+        }
+        // Filled the buffer (defensive; both lists stay within their reserves,
+        // which the buffer covers exactly) — go around for any remainder.
+    }
 }
 
 /// `true` when no thread other than the current one is ready to run.
@@ -2579,13 +2802,20 @@ fn pick_target_cpu(g: &SchedState, obj: *mut ()) -> usize {
 }
 
 /// The CPU to place a **waking** thread on: its home CPU (`last_cpu`) when that CPU
-/// is online and affinity-permitted (cache-warm, and avoids needless migration),
-/// otherwise the least-loaded permitted CPU. Caller holds `SCHED`.
+/// is online, affinity-permitted, **and has queue room** (cache-warm, and avoids
+/// needless migration), otherwise the least-loaded permitted CPU. The room check
+/// (F6, decision log 2026-07-21) keeps a full home queue from being a fatal wake:
+/// the fallback's least-loaded pick has room unless *every* permitted queue is
+/// full — the only case [`place_thread`] still refuses. Caller holds `SCHED`.
 fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
     let mask = unsafe { Thread::cpu_mask(obj) };
-    if home < MAX_CPUS && g.cpu_online[home] && mask & (1 << home) != 0 {
+    if home < MAX_CPUS
+        && g.cpu_online[home]
+        && mask & (1 << home) != 0
+        && g.ready[home].len() < g.ready[home].capacity()
+    {
         return home;
     }
     pick_target_cpu(g, obj)
@@ -2633,29 +2863,41 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
     Ok(())
 }
 
-/// Steal one runnable thread from the **busiest other** online CPU's queue — one
-/// whose affinity permits *this* CPU — so an otherwise-idle CPU picks up slack. The
-/// thread is removed from the victim's queue and returned. `None` if no other CPU has
-/// a thread this CPU may run. Caller holds `SCHED`.
+/// Steal one runnable thread for this CPU: from the **busiest** other online CPU
+/// that actually holds a thread this CPU may run (affinity permits `me`, not
+/// mid-switch-out) — so an otherwise-idle CPU picks up slack. Victims are ranked
+/// by queue length, but a busier victim with **no** stealable thread does not
+/// shadow a smaller one that has one: `steal_one` succeeds exactly when
+/// [`steal_available`] is true. (The idle-steal paths are gated on
+/// `steal_available` and fall back to taking the idle slot on a `None` — with
+/// idle already current that slot is empty, so a mismatch was a panic: F4,
+/// decision log 2026-07-21.) The thread is removed from the victim's queue and
+/// returned. `None` if no other CPU has a thread this CPU may run. Caller holds
+/// `SCHED`.
 fn steal_one(g: &mut SchedState) -> Option<ObjectRef> {
     let me = SchedState::this_cpu();
     let mut victim = usize::MAX;
-    let mut best = 0usize;
+    let mut victim_pos = 0usize;
+    let mut victim_len = 0usize;
     for c in 0..MAX_CPUS {
-        if c != me && g.cpu_online[c] && g.ready[c].len() > best {
-            best = g.ready[c].len();
+        if c == me || !g.cpu_online[c] || g.ready[c].len() <= victim_len {
+            continue;
+        }
+        // The first thread on this candidate that is stealable to this CPU.
+        // SAFETY: each entry pins a live Thread; `SCHED` held.
+        let stealable =
+            (0..g.ready[c].len()).find(|&i| unsafe { stealable_to(g.ready[c][i].as_ptr(), me) });
+        if let Some(pos) = stealable {
             victim = c;
+            victim_pos = pos;
+            victim_len = g.ready[c].len();
         }
     }
     if victim == usize::MAX {
         return None;
     }
-    // The first thread on the victim that is stealable to this CPU.
-    let n = g.ready[victim].len();
-    // SAFETY: each entry pins a live Thread; `SCHED` held.
-    let pos = (0..n).find(|&i| unsafe { stealable_to(g.ready[victim][i].as_ptr(), me) })?;
     g.stats[me].steals += 1;
-    Some(g.ready[victim].remove(pos))
+    Some(g.ready[victim].remove(victim_pos))
 }
 
 /// `true` if some other online CPU holds a thread this CPU (`me`) may run — the cheap
@@ -2948,13 +3190,14 @@ mod tests {
             suspended: KVec::new(),
             next_tid: 1,
             next_pid: 2,
-            quantum: QUANTUM_TICKS,
+            quantum: [QUANTUM_TICKS; MAX_CPUS],
             min_vruntime: [0; MAX_CPUS],
             idle: [const { None }; MAX_CPUS],
             idle_addr: [0; MAX_CPUS],
             blocked: KVec::new(),
             deadlines: KVec::new(),
             stats: [stats::Counters::ZERO; MAX_CPUS],
+            deferred_drops: KVec::new(),
         }
     }
 
@@ -3125,6 +3368,91 @@ mod tests {
             assert!(stealable_to(t.as_ptr(), 0));
             assert!(!stealable_to(t.as_ptr(), 1));
         }
+    }
+
+    #[test]
+    fn wake_placement_falls_back_when_home_queue_is_full() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 2);
+        let t = inert_ref(1);
+        unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
+        // Fill CPU 0's queue to its reserve: the home pick must divert (F6 — a
+        // full home queue used to be a fatal wake).
+        for tid in 100..(100 + READY_RESERVE as u32) {
+            st.ready[0].try_push(inert_ref(tid)).unwrap();
+        }
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 1);
+        // With room at home again, the cache-warm home pick returns.
+        drop(st.ready[0].pop().unwrap());
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 0);
+    }
+
+    #[test]
+    fn steal_one_skips_busiest_victim_with_no_stealable_thread() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 3);
+        // CPU 1 (busiest, 2 threads) — both pinned to CPU 1: not stealable to 0.
+        for tid in 10..12 {
+            let t = inert_ref(tid);
+            unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 1) };
+            st.ready[1].try_push(t).unwrap();
+        }
+        // CPU 2 (smaller, 1 thread) — default all-CPU mask: stealable.
+        st.ready[2].try_push(inert_ref(20)).unwrap();
+        // Host `this_cpu()` is 0. `steal_available` says true; the F4 bug was
+        // `steal_one` returning None here (it searched only the busiest victim),
+        // which panics the idle-steal paths on the empty idle slot.
+        assert!(steal_available(&st, 0));
+        let stolen = steal_one(&mut st).expect("steal_one must succeed when steal_available");
+        let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
+        assert_eq!(stolen_tid, 20);
+        assert!(st.ready[2].is_empty());
+    }
+
+    #[test]
+    fn steal_one_prefers_the_busiest_stealable_victim() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 3);
+        st.ready[1].try_push(inert_ref(10)).unwrap();
+        for tid in 20..22 {
+            st.ready[2].try_push(inert_ref(tid)).unwrap();
+        }
+        // Both victims have stealable threads; CPU 2 is busier — steal from it.
+        let stolen = steal_one(&mut st).unwrap();
+        let stolen_tid = unsafe { &*(stolen.as_ptr() as *const Thread) }.tid();
+        assert_eq!(stolen_tid, 20);
+        assert_eq!(st.ready[2].len(), 1);
+        assert_eq!(st.ready[1].len(), 1);
+    }
+
+    #[test]
+    fn drain_pending_drops_moves_all_and_preserves_capacity() {
+        init_global_heap();
+        let mut st = test_state();
+        st.reap[0].try_reserve(REAP_RESERVE).unwrap();
+        st.deferred_drops.try_reserve(DEFERRED_DROP_RESERVE).unwrap();
+        let reap_cap = st.reap[0].capacity();
+        let dd_cap = st.deferred_drops.capacity();
+        for tid in 1..=3 {
+            st.reap[0].try_push(inert_ref(tid)).unwrap();
+        }
+        for tid in 4..=5 {
+            st.deferred_drops.try_push(inert_ref(tid)).unwrap();
+        }
+        let mut buf: [Option<ObjectRef>; REAP_RESERVE + DEFERRED_DROP_RESERVE] =
+            [const { None }; REAP_RESERVE + DEFERRED_DROP_RESERVE];
+        let n = drain_pending_drops(&mut st, &mut buf);
+        assert_eq!(n, 5);
+        assert!(st.reap[0].is_empty());
+        assert!(st.deferred_drops.is_empty());
+        // The reserves survive the drain — the F11 hazard was `mem::take` zeroing
+        // them, making the next exit-path push allocate under `SCHED`.
+        assert_eq!(st.reap[0].capacity(), reap_cap);
+        assert_eq!(st.deferred_drops.capacity(), dd_cap);
+        drop(buf); // the moved refs release their threads here (outside any lock)
     }
 
     // --- stats: the pure format step of capture → format → synthesize. The

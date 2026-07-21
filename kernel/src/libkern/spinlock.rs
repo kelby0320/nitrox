@@ -65,7 +65,21 @@ impl<T> SpinLock<T> {
 
     /// Acquire the lock, spinning until it becomes available. Returns a
     /// guard that releases the lock when dropped.
+    ///
+    /// The critical section is a **no-preemption region**
+    /// ([`sched::preempt_disable`](crate::sched::preempt_disable), raised
+    /// before the acquire attempt so the winner cannot be descheduled between
+    /// winning and recording; lowered by the guard drop after release). This is
+    /// the SMP holder-liveness invariant (F12, decision log 2026-07-21): a
+    /// plain-lock holder descheduled mid-section strands every spinner for a
+    /// scheduling round at best — and forever when the spinner has interrupts
+    /// masked (a syscall-context allocator op: it cannot tick to reschedule the
+    /// holder, nor ack a TLB shootdown while it waits) or when the holder is
+    /// the idle thread (never re-picked while spinners keep every CPU busy).
+    /// With preemption off for the hold, a spinner always waits on a *running*
+    /// holder and the wait is bounded by the critical section.
     pub fn lock(&self) -> SpinLockGuard<'_, T> {
+        crate::sched::preempt_disable();
         loop {
             if self
                 .locked
@@ -114,7 +128,10 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        // Release first, then re-enable preemption: a deferred reschedule
+        // replayed by `preempt_enable` must not run while this lock is held.
         self.lock.release();
+        crate::sched::preempt_enable();
     }
 }
 
