@@ -48,7 +48,7 @@
 //!
 //! [`release_keeping_irqs_masked`]: crate::libkern::IrqSpinLockGuard::release_keeping_irqs_masked
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
@@ -393,6 +393,100 @@ static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
 /// Used by [`crate::tlb`] to pick TLB-shootdown IPI targets without taking `SCHED`.
 pub fn online_mask() -> u64 {
     ONLINE_MASK.load(Ordering::Acquire)
+}
+
+/// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
+/// the thread running on that CPU (which, while nonzero, cannot migrate — that
+/// is the point); read by the same CPU's tick / reschedule-IPI handlers.
+static PREEMPT_OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
+
+/// Set when a reschedule opportunity (tick expiry or reschedule IPI) was
+/// skipped because [`PREEMPT_OFF`] was raised; consumed by [`preempt_enable`],
+/// which replays the reschedule. Backstop: the CPU's next periodic tick.
+static RESCHED_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+/// Disable preemption on the current CPU (nestable). While the depth is
+/// nonzero, the tick and the reschedule IPI will not deschedule the running
+/// thread (interrupts themselves stay enabled — handlers run; only the
+/// *switch* is deferred, latched in [`RESCHED_PENDING`]).
+///
+/// This exists for **preemption-critical windows**: code holding a plain
+/// spinlock other CPUs may spin on — the TLB-shootdown serialiser, the
+/// allocator locks during reclamation. A preempted *normal* holder sits in a
+/// ready queue and is rescheduled within a tick (slow, but live); the **idle
+/// thread** is the fatal case — it parks in `idle_slot` and runs only when its
+/// CPU has nothing else, so if it is descheduled while holding such a lock,
+/// the spinners themselves keep every CPU busy and the holder is starved
+/// forever (F12, decision log 2026-07-21 — an all-CPUs-spinning-on-the-
+/// shootdown-lock deadlock found by the exit-storm stress).
+///
+/// Contract: pair with [`preempt_enable`] on the same thread; the window must
+/// be bounded (no blocking, no `sys_wait`) and hold no `SCHED`-ordered lock.
+///
+/// [`SpinLock`](crate::libkern::SpinLock) calls this in `lock()` (and the
+/// matching enable in its guard drop), making **every plain-spinlock critical
+/// section a no-preemption region**: a holder is never descheduled, so a
+/// spinner — even one with interrupts masked, which cannot tick — always waits
+/// on a *running* holder and the wait is bounded by the critical section.
+pub fn preempt_disable() {
+    // Mask IRQs across read-index + increment: an interrupt between them could
+    // deschedule/migrate this thread and the increment would land on the wrong
+    // CPU's counter (sticking it nonzero — that CPU would never preempt again).
+    // Once the count is raised, descheduling is impossible, which is what makes
+    // the per-CPU counter track the thread for the window's duration.
+    let prev = preempt_irqs_mask();
+    PREEMPT_OFF[SchedState::this_cpu()].fetch_add(1, Ordering::Relaxed);
+    preempt_irqs_restore(prev);
+}
+
+/// Re-enable preemption (see [`preempt_disable`]); at depth zero, replays a
+/// reschedule that was skipped during the window. (If the thread is descheduled
+/// or migrates between the depth reaching zero and the replay, the replay's
+/// under-lock re-check makes it a no-op; the origin CPU's next tick covers any
+/// consumed-but-unserviced wake.)
+pub fn preempt_enable() {
+    let prev = preempt_irqs_mask();
+    let me = SchedState::this_cpu();
+    let replay = PREEMPT_OFF[me].fetch_sub(1, Ordering::Relaxed) == 1
+        && RESCHED_PENDING[me].swap(false, Ordering::AcqRel);
+    preempt_irqs_restore(prev);
+    if replay {
+        // Mirror `on_reschedule_ipi`: resume an idle CPU into the scheduler; a
+        // busy thread is left to its quantum (the next tick reschedules it).
+        let g = SCHED.lock();
+        let cpu = SchedState::this_cpu();
+        if current_is_idle(&g) && (!g.ready[cpu].is_empty() || steal_available(&g, cpu)) {
+            switch_to_next(g);
+        }
+    }
+}
+
+/// Mask interrupts for the preempt-counter update window. Host tests run ring-3
+/// single-threaded (a real `cli` would `#GP`), and have no ticks to race — a
+/// no-op there, mirroring the `IrqSpinLock` test backend.
+#[inline]
+fn preempt_irqs_mask() -> bool {
+    #[cfg(not(test))]
+    {
+        // SAFETY: ring-0; a microseconds-bounded masked window, restored below.
+        unsafe { Cpu::interrupts_disable() }
+    }
+    #[cfg(test)]
+    {
+        false
+    }
+}
+
+/// Restore the interrupt state captured by [`preempt_irqs_mask`].
+#[inline]
+fn preempt_irqs_restore(prev: bool) {
+    #[cfg(not(test))]
+    // SAFETY: ring-0; restoring the state captured by the paired mask.
+    unsafe {
+        Cpu::interrupts_restore(prev)
+    };
+    #[cfg(test)]
+    let _ = prev;
 }
 
 /// The page-table root a thread should run under: its own process root if it
@@ -905,6 +999,16 @@ pub fn on_timer_tick() {
     let ready_here = !g.ready[me].is_empty();
     let (new_quantum, reschedule) = tick_quantum(g.quantum[me], ready_here);
     g.quantum[me] = new_quantum;
+    // A preemption-critical window (the running thread may hold a plain lock
+    // other CPUs spin on — see [`preempt_disable`]): do not deschedule it. The
+    // bookkeeping above (deadlines, wakes, vruntime, quantum) still ran; latch
+    // the skipped switch for `preempt_enable` / the next tick.
+    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
+        if reschedule || (!ready_here && current_is_idle(&g) && steal_available(&g, me)) {
+            RESCHED_PENDING[me].store(true, Ordering::Release);
+        }
+        return; // guard drops — IF stays 0 (IRQ context) until iretq
+    }
     if reschedule {
         switch_to_next(g); // consumes the guard; switches with IF masked
         return;
@@ -931,6 +1035,13 @@ pub fn on_reschedule_ipi() {
     let mut g = SCHED.lock();
     let me = SchedState::this_cpu();
     g.stats[me].resched_ipis += 1;
+    // A preemption-critical window (see [`preempt_disable`] — notably the idle
+    // thread mid-reap holding the shootdown/allocator locks): don't deschedule;
+    // latch the wake for `preempt_enable` (backstop: this CPU's next tick).
+    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
+        RESCHED_PENDING[me].store(true, Ordering::Release);
+        return;
+    }
     // Only preempt the idle thread — a running TimeShared thread is left to its
     // quantum (the woken thread is already enqueued and will be picked in turn or
     // stolen). The point is purely liveness: resume an idle CPU so a thread parked
@@ -2570,7 +2681,18 @@ pub fn reap_pending() {
             let mut g = SCHED.lock();
             drain_pending_drops(&mut g, &mut buf)
         };
-        // `buf`'s refs drop at the end of this iteration — lock released.
+        // Drop with preemption disabled: the drops take the allocator locks and
+        // (for a kernel stack) run a TLB shootdown — plain locks other CPUs may
+        // spin on. Being descheduled while holding one starves the spinners for
+        // a scheduling round — or forever, when the reaper is the **idle**
+        // thread, which is never re-picked while the spinners keep every CPU
+        // busy (F12, decision log 2026-07-21). Interrupts stay enabled; only
+        // the switch is deferred.
+        preempt_disable();
+        for slot in buf[..n].iter_mut() {
+            drop(slot.take());
+        }
+        preempt_enable();
         if n < buf.len() {
             return; // drained everything that was parked when we looked
         }

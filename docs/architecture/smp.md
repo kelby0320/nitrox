@@ -234,6 +234,16 @@ These are the load-bearing rules. Every bug in Part 2 was a violation of one.
 - **I5 — the shared kernel vmap stays TLB-coherent across cores.** Kernel stacks
   live in a vmap region mapped in every address space; unmapping/​freeing one must
   invalidate other cores' TLBs before the frame is reused (§8).
+- **I6 — a plain-spinlock holder is never descheduled** (added 2026-07-21, review
+  F12). Plain `SpinLock` critical sections are no-preemption regions
+  (`sched::preempt_disable`, raised by `lock()` itself): spinners — including
+  IF-masked syscall contexts that cannot tick, and shootdown initiators waiting
+  on acks — always wait on a *running* holder. Violated (before the fix) by the
+  idle thread being switched out while holding the shootdown lock mid-reap: idle
+  is only re-picked on an otherwise-empty CPU, and the spinners kept every CPU
+  busy — a permanent starvation deadlock the exit-storm stress reproduced on
+  ~30 % of KVM boots. See `kernel/docs/lock-ordering.md` § Plain spinlocks are
+  no-preemption regions.
 
 ### 8. TLB shootdown
 
@@ -435,6 +445,14 @@ syscalls while migratable.
 - **`sys_thread_set_affinity`-driven active migration** — changing affinity to
   exclude a thread's current core does not yet forcibly migrate it mid-slice
   (it moves on its next reschedule).
+- **SMP panic path** (review F8, 2026-07-21) — the emergency serial writer is
+  unsynchronized and no stop IPI parks the other cores on a panic; diagnostics
+  can garble under SMP. Tracked in `deferred-decisions.md`.
+- **Cross-CPU TSC synchronization is assumed, not verified** (review F10) — the
+  deadline heap compares `Timer::read_ns()` values captured on different cores;
+  saturating arithmetic makes a small skew merely delay a firing. Holds under
+  QEMU/KVM and on invariant-TSC hardware (the project baseline); verify (or
+  gate) at real-hardware bring-up.
 
 ## References
 

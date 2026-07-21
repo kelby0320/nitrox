@@ -292,7 +292,11 @@ path that drives the UART directly. The lock cannot be force-unlocked,
 so a handler that tried to lock `SERIAL` after a fault that struck while
 the lock was held would deadlock. Bypassing the lock is sound only
 because Phase 1 is single-CPU: at fault time no other context can be driving
-the UART. This must be revisited at SMP.
+the UART. Under SMP this can garble diagnostics (another CPU's locked writes
+interleave) and a panicking CPU does not stop the others — reviewed 2026-07-21
+(finding F8) and deliberately deferred with a tracking entry in
+`docs/rationale/deferred-decisions.md` § Concurrency primitives (the fix shape
+is a panic-broadcast stop IPI).
 
 The syscall path (`sys_kprint`) takes only `SERIAL`, at rank 7, and holds
 **no** lock across the user-memory copy: `copy_slice_from_user` runs its
@@ -412,6 +416,30 @@ context). `IpcChannel::Drop`
 back-pointer and wake its receivers — sound because endpoint `ObjectRef`s are
 released only outside `SCHED` (handle close, the `sys_wait`/lookup references),
 never under it, so the destructor's acquire can never nest on a held `SCHED`.
+
+## Plain spinlocks are no-preemption regions (2026-07-21, F12)
+
+Every plain [`SpinLock`] critical section runs with **preemption disabled**:
+`lock()` raises the per-CPU depth (`sched::preempt_disable`) before the acquire
+attempt and the guard drop lowers it after release. While the depth is nonzero
+the tick and reschedule IPI do their bookkeeping but skip the switch, latching
+it for `preempt_enable` to replay.
+
+The invariant this buys: **a plain-lock holder is never descheduled**, so every
+spinner waits on a *running* holder and the wait is bounded by the critical
+section. Without it, two deadlock poses were captured live (decision log,
+2026-07-21 F12): the **idle thread** descheduled while holding the
+TLB-shootdown lock (idle is only re-picked when its CPU is otherwise empty —
+but the spinners keep every CPU busy), and an **IF-masked syscall-context
+spinner** on a slab lock (it can neither tick to reschedule the descheduled
+holder nor ack a TLB shootdown while it waits). `IrqSpinLock` is deliberately
+not wrapped — its holders are already unpreemptible (IF-masked), and `SCHED`
+*is* the scheduler.
+
+Corollaries: plain-lock critical sections must stay short and must never
+block (both were already the rule); and the preempt depth means a long-held
+plain lock now also delays preemption on that CPU — another reason to keep
+holds bounded.
 
 ## Adding a new lock
 

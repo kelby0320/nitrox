@@ -211,8 +211,13 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
   affinity mask, preferring its last CPU (cache warmth) then the least-loaded
   permitted CPU.
 - **`sys_thread_set_affinity`** becomes functional (replaces the `table.rs:384`
-  no-op), validating the mask against `active_cpus`/`MAX_CPUS` and migrating the
-  thread if its current CPU is excluded.
+  no-op). Validation as implemented (corrected 2026-07-21, review F9): the mask is
+  clamped to `MAX_CPUS` bits and rejected only if empty — it is **not** checked
+  against the *online* set, so a mask naming only offline CPUs is accepted and
+  placement falls back defensively to CPU 0 (`pick_target_cpu`), running the
+  thread outside its requested affinity rather than stranding it. Active
+  migration off an excluded current CPU is deferred (see [smp.md](smp.md)
+  § Deferred); the thread moves at its next reschedule.
 
 ## Data-structure changes
 

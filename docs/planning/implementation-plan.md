@@ -2164,9 +2164,23 @@ to date). Slice `phase-4/substrate-hardening`:
   thread whose sole queue is at reserve); `READY_RESERVE` raised 16 → 32 for Phase 4
   headroom. F7: `quantum` is per-CPU (`[u32; MAX_CPUS]`) — the shared counter was
   benign only while `QUANTUM_TICKS == 1`.
-- [ ] **Part F — docs + stress selftest.** F8 deferral entry (SMP panic path / stop IPI),
-  F9 doc corrections (IrqSpinLock audit, affinity-validation claim, #PF-allocation rule),
-  F10 TSC-sync note; a concurrent-exit stress selftest (KVM boot-loop methodology).
+- [x] **Part F — stress selftest + F12 + docs** (landed). The **exit-storm** selftest
+  (`parent` spawns 6 waves × 3 immediately-exiting children; teardown races spawn, the
+  login chain, and itself across CPUs) immediately exposed **F12** — a latent
+  descheduled-spinlock-holder deadlock hanging ~30 % of KVM boots (pre-hardening `main`
+  hangs identically; TCG never reproduces). Diagnosed via a QEMU-monitor capture harness
+  (per-CPU RIP/RFLAGS dumps, symbolized); two poses captured: the **idle thread**
+  descheduled holding the shootdown `LOCK` (starved forever by its own spinners), and
+  **IF-masked allocator spinners** that can neither tick nor ack. Fix:
+  `sched::preempt_disable/enable` (per-CPU depth; tick/IPI latch skipped switches into
+  `RESCHED_PENDING`, replayed at enable) + **every plain `SpinLock` critical section is
+  a no-preemption region** (holders always run to release; `IrqSpinLock` deliberately
+  unwrapped) + explicit wraps for the shootdown window and `reap_pending`'s drop phase.
+  Verified: ~30 % → 4 % (wraps alone) → **0/60 + 0/60** KVM boot-loops; host suite +
+  `test-qemu` green. Docs: F8 deferral entry (+ the general deferred-reclamation entry
+  marked done-in-essence via `deferred_drops`), F9 corrections (affinity-validation
+  claim, #PF-allocation rule, serial-at-SMP pointer), F10 TSC-sync note, smp.md
+  invariant **I6**, lock-ordering § no-preemption regions.
 
 **Stepping-stone path** (each a real, satisfying milestone; roughly ordered):
 

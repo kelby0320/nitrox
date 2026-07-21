@@ -82,7 +82,12 @@ This is intentional — strict equality matching prevents subtle ABI mismatches.
 
 - `panic!()` outside of explicitly-unrecoverable error paths. Use `Result<T, KError>` or `Option<T>`.
 - `unwrap()` outside of tests or known-impossible cases (with `// unwrap: <reason>` comment).
-- Allocating in the page fault handler, IRQ handler, or DPC.
+- Allocating in the IRQ handler or DPC — and **freeing counts as allocating**:
+  an `ObjectRef` drop can reach the allocator locks, so no drops there (or under
+  `SCHED`) either; park refs in `sched`'s `deferred_drops` instead. (The ring-3
+  `#PF` fault-in path is the one documented exception: `map_page` may allocate
+  intermediate page-table frames — see `kernel/docs/lock-ordering.md`
+  § The AddressSpace lock.)
 - Holding a spinlock across a function call that might allocate or block.
 - Manual `Box::leak` patterns. If you need a `'static` reference, the design is wrong.
 - Direct hardware port I/O outside the arch layer.

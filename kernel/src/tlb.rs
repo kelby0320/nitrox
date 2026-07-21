@@ -110,12 +110,19 @@ fn shootdown(va: Option<VirtAddr>) {
         return;
     }
 
-    // Run the whole request with interrupts **enabled**, restoring the caller's
-    // state after (the module-doc IF-robustness contract): an IF-masked spinner
-    // here could never service another initiator's shootdown IPI (two IF=0
-    // initiators deadlock — F1), and enabling IF means we may be preempted and
-    // resume on another CPU, which is why the target set below is
-    // position-independent (every online CPU, self included).
+    // Run the whole request with **preemption disabled** but interrupts
+    // **enabled**, restoring the caller's IF state after. The split matters:
+    // - IF enabled (F1): an IF-masked spinner here could never service another
+    //   initiator's shootdown IPI — two IF=0 initiators deadlock.
+    // - Preemption disabled (F12): a holder of [`LOCK`] descheduled mid-window
+    //   starves every spinner for a scheduling round — and *forever* when the
+    //   holder is the idle thread (reaping stacks), which is never re-picked
+    //   while the spinners keep every CPU busy. Only the switch is deferred;
+    //   IRQ handlers (this CPU's own shootdown IPI included) still run.
+    // With preemption off the initiator cannot migrate mid-window; the
+    // all-online-CPUs target set (self-IPI included) is kept anyway — it is
+    // simpler than a local-invalidate special case and immune to revisiting.
+    crate::sched::preempt_disable();
     let prev_if = Cpu::interrupts_enabled();
     // SAFETY: ring-0, preemptible kernel context (the caller contract); the IDT
     // and timer are live (APs are online). Restored below.
@@ -151,6 +158,9 @@ fn shootdown(va: Option<VirtAddr>) {
 
     // SAFETY: ring-0; restore the interrupt state captured above.
     unsafe { Cpu::interrupts_restore(prev_if) };
+    // Re-enable preemption last; a reschedule latched during the window (a
+    // wake IPI aimed at this CPU, or a tick expiry) is replayed here.
+    crate::sched::preempt_enable();
 }
 
 /// Handle an incoming TLB-shootdown IPI on this CPU: invalidate as the current

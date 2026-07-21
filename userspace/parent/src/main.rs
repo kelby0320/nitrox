@@ -71,6 +71,19 @@ static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
 /// `sys_clock_read` out-param (the sched-stats demo's timer sleeps).
 static mut CLOCK_BUF: u64 = 0;
+/// Spawn args for the exit-storm stress children: `child` role 2 (exit
+/// immediately), no handles, inherited namespace, empty syscaps. `image` is
+/// filled per run.
+static mut STORM_SPAWN: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 2, // role 2 = exit immediately
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0, // inherit the parent's namespace
+    syscaps: 0,
+};
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
 /// blocking-send demo, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
@@ -849,6 +862,80 @@ fn timer_sleep_ms(ms: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
 }
 
+/// Concurrent-exit stress (substrate-hardening Part F, decision log 2026-07-21):
+/// spawn waves of immediately-exiting children (`child` role 2, no handles) and
+/// reap each wave, so process teardowns — kernel-stack frees, their TLB
+/// shootdowns, reap sweeps — race each other and the concurrently-running login
+/// chain across all 4 CPUs. Regression cover for the review's F1 (each exit's
+/// reap can initiate a shootdown from an IF-masked syscall context; waves make
+/// initiators collide), F5 (reap vs a mid-switch-out sibling), and F11 (the
+/// reap lists' reserve discipline across repeated drains). A lost exit hangs
+/// the wave (→ the selftest wall-clock timeout fails the run); a crash exits
+/// nonzero (→ init's fail path).
+fn exit_storm_demo(root_ns: u64, notif: u64) {
+    kprint(b"parent: exit-storm start\n");
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        kprint(b"parent: exit-storm image lookup FAIL\n");
+        exit(1);
+    }
+    const ROUNDS: usize = 6;
+    const WAVE: usize = 3;
+    for _ in 0..ROUNDS {
+        let mut procs = [const { None }; WAVE];
+        for slot in procs.iter_mut() {
+            // SAFETY: STORM_SPAWN is a valid writable arg block, exclusively
+            // read here (image set just above; no handle grants).
+            let spawned = unsafe {
+                STORM_SPAWN.image = img;
+                spawn(&*(&raw const STORM_SPAWN))
+            };
+            match spawned {
+                Ok(p) => *slot = Some(p),
+                Err(_) => {
+                    kprint(b"parent: exit-storm spawn FAIL\n");
+                    exit(1);
+                }
+            }
+        }
+        // Drain this wave's ChildExited notifications (other kinds ignored).
+        let mut got = 0;
+        while got < WAVE {
+            // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+            let waited = unsafe {
+                WAIT_HANDLES[0] = notif;
+                syscall4(
+                    SYS_WAIT,
+                    (&raw const WAIT_HANDLES) as u64,
+                    1,
+                    (&raw mut WAIT_RESULTS) as u64,
+                    u64::MAX,
+                )
+            };
+            if waited < 1 {
+                kprint(b"parent: exit-storm wait FAIL\n");
+                exit(1);
+            }
+            loop {
+                // SAFETY: NOTIF is a valid 64-byte writable out-param.
+                let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+                if r != 0 {
+                    break; // WouldBlock: drained
+                }
+                // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+                if unsafe { (&raw const NOTIF.kind).read() } == KIND_CHILD_EXITED {
+                    got += 1;
+                }
+            }
+        }
+        // `procs` drops here: closing each process handle reaps the wave while
+        // the next wave's spawns run — teardown and spawn race by design.
+    }
+    // SAFETY: closing our own image handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
+    kprint(b"parent: exit-storm ok (18 exits reaped)\n");
+}
+
 /// `/proc/self/status` + `/proc/sched/stats` demo — the Phase 3 **clause 3**
 /// milestone check ("two CPUs visibly active via `/proc`"). **Verdict-gated**:
 /// any failure here exits nonzero, which init (under `test-harness`) turns into
@@ -1407,7 +1494,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
-    // 4. The sched-stats milestone check runs LAST, after the spawn/IPC demos
+    // 4. The concurrent-exit stress: waves of exiting children race teardown
+    // against spawn, the login chain, and each other (substrate-hardening
+    // regression cover — see `exit_storm_demo`).
+    exit_storm_demo(root_ns, notif);
+
+    // 5. The sched-stats milestone check runs LAST, after the spawn/IPC demos
     // above have put real work on multiple CPUs (and the login chain has been
     // running concurrently throughout) — see `sched_stats_demo`.
     sched_stats_demo(root_ns);

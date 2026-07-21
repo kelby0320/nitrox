@@ -7217,3 +7217,55 @@ F3 (broadcast user-unmap shootdown); Part D = F5 (`on_cpu` everywhere); Part E =
 Part F = docs (F8 deferral entry, F9, F10) + a concurrent-exit stress selftest (KVM
 boot-loop methodology, per the Bug-4 playbook). Recorded in
 `docs/planning/implementation-plan.md`.
+
+## 2026-07-21 — F12: the descheduled-spinlock-holder deadlock (found by the exit-storm stress)
+
+The Part F **exit-storm** selftest (waves of concurrently exiting processes) immediately
+paid for itself: ~30 % of KVM `-smp 4` boots **hung** — and the same storm hung the
+**pre-hardening** kernel at the same rate, so this was a latent SMP bug, not a
+regression from Parts A–E. TCG never reproduced it. Diagnosed with a QEMU-monitor
+harness (boot until hung, dump every CPU's RIP/RFLAGS twice 2 s apart, symbolize
+against the kernel ELF — the non-perturbing analogue of the Bug-4 methodology).
+
+**The deadlock, in two captured poses:**
+
+1. All four CPUs IF=1, spinning to *acquire* the TLB-shootdown `LOCK` — the holder was
+   the **idle thread** (reaping kernel stacks), descheduled mid-window by its tick and
+   parked in `idle_slot`; idle is only re-picked when its CPU has nothing else to run,
+   but the spinners themselves kept every CPU busy. A zero-priority holder starved by
+   its own waiters, forever.
+2. Two CPUs spinning on **slab-cache locks with IF=0** (syscall-context allocator ops:
+   they can neither *tick* — so a descheduled slab holder parked on their queue never
+   runs — nor *ack a shootdown*), one CPU holding the shootdown `LOCK` spinning for
+   those acks, one behind it. The slab holder had been preempted while holding the
+   cache lock (allocator locks are held at IF=1 by kernel threads / the boot thread /
+   idle's reap), and the only tick-capable CPUs were preempt-disabled inside the
+   shootdown window.
+
+**The general law both poses instantiate:** *a plain-spinlock holder that can be
+descheduled is a system-wide liveness hazard*, because spinners are not obligated to be
+tick-capable (IF=0 syscall contexts) and the idle thread is not re-queueable at all.
+
+**Fix (three layers, one mechanism):**
+- **`sched::preempt_disable` / `preempt_enable`** — a per-CPU nestable depth; while
+  raised, `on_timer_tick` / `on_reschedule_ipi` do all their bookkeeping but skip the
+  switch, latching it in a per-CPU `RESCHED_PENDING` that `preempt_enable` replays
+  (backstop: the next tick). The counter update runs in a brief IRQ-masked window so
+  the increment lands on the CPU the thread is actually on (an interrupt between
+  read-index and increment could migrate the thread and stick another CPU's counter).
+- **Every plain `SpinLock` critical section is a no-preemption region**: `lock()`
+  raises the depth before the acquire attempt (the winner must not be descheduled
+  between winning and recording); the guard drop releases the lock first, then lowers
+  the depth. Holders now always run to release, so any spinner — IF-masked or not —
+  waits a bounded critical-section, and the idle-holder case cannot arise.
+  `IrqSpinLock` is deliberately **not** wrapped (its holders are already
+  unpreemptible via IF-masking, and `SCHED` *is* the scheduler).
+- **The TLB-shootdown window and `reap_pending`'s drop phase** wrap explicitly (the
+  ack spin runs inside the `LOCK` hold and is covered; the reap wrap keeps the idle
+  thread's multi-drop sequence intact).
+
+**Verified:** the storm-hang rate went ~30 % → 4 % with the shootdown/reap wraps alone
+(the residual was pose 2) → **0/60 + 0/60 KVM boot-loops** with the `SpinLock` wrap;
+full host suite and `test-qemu` green throughout. The preempt cost is one atomic
+add/sub + a ~10-instruction masked window per plain-lock acquisition; worst-case
+preemption latency is the longest plain-lock critical section (µs) plus one tick.
