@@ -2157,8 +2157,13 @@ to date). Slice `phase-4/substrate-hardening`:
   sibling's stack for freeing (the mid-switch-out UAF window). Bounded + deadlock-free
   under `SCHED`: the owning CPU clears the guard from post-release straight-line code,
   no lock needed.
-- [ ] **Part E — F6 + F7.** F6: wake placement falls back to the least-loaded permitted
-  queue with room instead of panicking at `READY_RESERVE`. F7: per-CPU `quantum`.
+- [x] **Part E — F6 + F7** (landed; host test for the fallback, `test-qemu` green,
+  30/30 KVM boot-loop). F6: `pick_wake_cpu` requires queue room at the home CPU,
+  falling back to the least-loaded permitted queue (which has room unless *every*
+  permitted queue is full — the only case wakes still treat as fatal, e.g. a pinned
+  thread whose sole queue is at reserve); `READY_RESERVE` raised 16 → 32 for Phase 4
+  headroom. F7: `quantum` is per-CPU (`[u32; MAX_CPUS]`) — the shared counter was
+  benign only while `QUANTUM_TICKS == 1`.
 - [ ] **Part F — docs + stress selftest.** F8 deferral entry (SMP panic path / stop IPI),
   F9 doc corrections (IrqSpinLock audit, affinity-validation claim, #PF-allocation rule),
   F10 TSC-sync note; a concurrent-exit stress selftest (KVM boot-loop methodology).

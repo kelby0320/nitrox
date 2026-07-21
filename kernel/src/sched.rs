@@ -71,10 +71,13 @@ use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX
 // (the `ArchTimer` trait, imported above, provides `read_ns`). The two names
 // live in different paths — see `arch/timer.rs`.
 
-/// Run-queue capacity reserved once at [`init`]. Phase 1 runs a handful of
-/// kernel threads; enqueueing beyond this is a logic error (debug-asserted)
-/// rather than an allocation under the rank-1 lock.
-const READY_RESERVE: usize = 16;
+/// Per-CPU run-queue capacity, reserved once at [`init`]/[`ap_init`].
+/// Enqueueing beyond this is refused (spawn) or fatal (wake, after every
+/// permitted CPU's queue is full — see [`place_thread`]) rather than an
+/// allocation under the rank-1 lock. Raised 16 → 32 for Phase 4 headroom
+/// (multi-threaded processes + affinity pinning concentrate runnable threads;
+/// review finding F6): 32 refs = 256 bytes per CPU.
+const READY_RESERVE: usize = 32;
 
 /// Periodic scheduler tick: 10 ms (100 Hz). Matches the PIT calibration
 /// window; fine-grained enough for round-robin without excessive IRQ overhead.
@@ -445,10 +448,14 @@ struct SchedState {
     /// children take 2, 3, …. (Phase 1 has no pid reuse; recycling lands with a
     /// real process table.)
     next_pid: u32,
-    /// Ticks remaining in the current thread's slice; reset to
+    /// **Per-CPU** ticks remaining in that CPU's current slice; reset to
     /// [`QUANTUM_TICKS`] on each reschedule. Scheduler **policy**, so it lives
-    /// here rather than on `Thread` (no `Thread` layout/ABI change).
-    quantum: u32,
+    /// here rather than on `Thread` (no `Thread` layout/ABI change). Per-CPU
+    /// because every CPU's tick decrements its own slice — a single shared
+    /// counter was only benign while `QUANTUM_TICKS == 1` (each tick reset it);
+    /// any longer quantum would have had CPUs consuming each other's slices
+    /// (review finding F7).
+    quantum: [u32; MAX_CPUS],
     /// **Per-CPU** monotonic TimeShared vruntime floor (≈ that CPU's run queue's
     /// smallest vruntime), advanced to the picked thread's vruntime on each dequeue.
     /// A thread placed on CPU `c` is seeded against `min_vruntime[c]` (new → the
@@ -495,7 +502,7 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     suspended: KVec::new(),
     next_tid: 1,
     next_pid: 2,
-    quantum: QUANTUM_TICKS,
+    quantum: [QUANTUM_TICKS; MAX_CPUS],
     min_vruntime: [0; MAX_CPUS],
     idle: [const { None }; MAX_CPUS],
     idle_addr: [0; MAX_CPUS],
@@ -627,7 +634,7 @@ pub fn init() -> Result<(), AllocError> {
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
-    g.quantum = QUANTUM_TICKS;
+    g.quantum = [QUANTUM_TICKS; MAX_CPUS];
     Ok(())
 }
 
@@ -896,8 +903,8 @@ pub fn on_timer_tick() {
     let me = SchedState::this_cpu();
     g.stats[me].ticks += 1;
     let ready_here = !g.ready[me].is_empty();
-    let (new_quantum, reschedule) = tick_quantum(g.quantum, ready_here);
-    g.quantum = new_quantum;
+    let (new_quantum, reschedule) = tick_quantum(g.quantum[me], ready_here);
+    g.quantum[me] = new_quantum;
     if reschedule {
         switch_to_next(g); // consumes the guard; switches with IF masked
         return;
@@ -1874,11 +1881,12 @@ fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     let r = g.blocked.remove(i);
     // SAFETY: `r` pins `thread`; `SCHED` held.
     unsafe { Thread::set_state(thread, ThreadState::Ready) };
-    // Re-home onto its CPU (cache-warm), seeding its vruntime near that CPU's floor
-    // with a latency boost. Within the per-CPU reserve, so this cannot fail; a full
-    // queue would be a reserve-exhaustion bug (treated as fatal, as the old `expect`).
+    // Re-home onto its CPU (cache-warm; a full home falls back to the
+    // least-loaded permitted queue with room — F6). This fails only when
+    // *every* permitted queue is at reserve — e.g. a thread pinned to a single
+    // CPU whose queue is full — which is genuine reserve exhaustion, still fatal.
     if place_thread(g, r, true).is_err() {
-        panic!("wake placement exceeded the per-CPU ready reserve");
+        panic!("wake placement: every affinity-permitted ready queue is at reserve");
     }
     true
 }
@@ -2500,9 +2508,10 @@ pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
         Thread::set_disposition(thread, disp_tag, disp_code);
         Thread::set_state(thread, ThreadState::Ready);
     }
-    // Re-home on its CPU (a wake): within the per-CPU reserve, so it cannot fail.
+    // Re-home on its CPU (a wake; a full home falls back to a permitted queue
+    // with room — F6). Fails only when every permitted queue is at reserve.
     if place_thread(&mut g, r, true).is_err() {
-        panic!("resume placement exceeded the per-CPU ready reserve");
+        panic!("resume placement: every affinity-permitted ready queue is at reserve");
     }
     true
 }
@@ -2671,13 +2680,20 @@ fn pick_target_cpu(g: &SchedState, obj: *mut ()) -> usize {
 }
 
 /// The CPU to place a **waking** thread on: its home CPU (`last_cpu`) when that CPU
-/// is online and affinity-permitted (cache-warm, and avoids needless migration),
-/// otherwise the least-loaded permitted CPU. Caller holds `SCHED`.
+/// is online, affinity-permitted, **and has queue room** (cache-warm, and avoids
+/// needless migration), otherwise the least-loaded permitted CPU. The room check
+/// (F6, decision log 2026-07-21) keeps a full home queue from being a fatal wake:
+/// the fallback's least-loaded pick has room unless *every* permitted queue is
+/// full — the only case [`place_thread`] still refuses. Caller holds `SCHED`.
 fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
     let mask = unsafe { Thread::cpu_mask(obj) };
-    if home < MAX_CPUS && g.cpu_online[home] && mask & (1 << home) != 0 {
+    if home < MAX_CPUS
+        && g.cpu_online[home]
+        && mask & (1 << home) != 0
+        && g.ready[home].len() < g.ready[home].capacity()
+    {
         return home;
     }
     pick_target_cpu(g, obj)
@@ -3052,7 +3068,7 @@ mod tests {
             suspended: KVec::new(),
             next_tid: 1,
             next_pid: 2,
-            quantum: QUANTUM_TICKS,
+            quantum: [QUANTUM_TICKS; MAX_CPUS],
             min_vruntime: [0; MAX_CPUS],
             idle: [const { None }; MAX_CPUS],
             idle_addr: [0; MAX_CPUS],
@@ -3230,6 +3246,24 @@ mod tests {
             assert!(stealable_to(t.as_ptr(), 0));
             assert!(!stealable_to(t.as_ptr(), 1));
         }
+    }
+
+    #[test]
+    fn wake_placement_falls_back_when_home_queue_is_full() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 2);
+        let t = inert_ref(1);
+        unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
+        // Fill CPU 0's queue to its reserve: the home pick must divert (F6 — a
+        // full home queue used to be a fatal wake).
+        for tid in 100..(100 + READY_RESERVE as u32) {
+            st.ready[0].try_push(inert_ref(tid)).unwrap();
+        }
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 1);
+        // With room at home again, the cache-warm home pick returns.
+        drop(st.ready[0].pop().unwrap());
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 0);
     }
 
     #[test]
