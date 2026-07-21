@@ -271,6 +271,60 @@ plumbing in place, host tests green."
 TLB shootdown reads it — and adds context-switch bookkeeping best landed *with* the
 shootdown that exercises it, so it moves to slice 1.
 
+## The stats surface (`/proc/sched/stats`)
+
+The scheduler's observability surface (Phase 3 milestone clause 3 — "two CPUs
+visibly active via `/proc`"): per-CPU event counters, served as a read-only
+`MemoryObject` **text snapshot** by the `KernelServerId::SchedStats` kernel
+server, bound at `/proc/sched/stats` by pid 1 at boot. Reachability is by
+namespace construction like the rest of `/proc` — a supervisor may omit it from
+a sandbox's namespace.
+
+The counters live in `SchedState` as plain per-CPU `u64`s — **no atomics** —
+because every event site already holds the rank-1 `SCHED` lock:
+
+| Counter | Incremented | Meaning |
+|---------|-------------|---------|
+| `switches` | `switch_into` (the common tail of all four parking dispositions) | context switches performed by this CPU |
+| `steals` | `steal_one` | threads this CPU stole from a peer's queue |
+| `placed` | `place_thread` | placements **received** by this CPU (spawn + wake re-homing), counted against the target CPU |
+| `ipis` | `on_reschedule_ipi` | reschedule IPIs handled by this CPU |
+| `ticks` | `on_timer_tick` | periodic scheduler ticks taken by this CPU |
+
+A read renders a `cpus_online=N` header plus one `name=value` row per online
+CPU, with instantaneous `ready` (queue length) and `idle` (idle thread current)
+fields captured alongside the counters:
+
+```text
+cpus_online=2
+cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0
+cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1
+```
+
+The format is plain text by design — the Unix floor; a typed (TSM1) emission
+was deliberately deferred until a Phase 4 consumer forces the kernel-side
+encoder question (see the decision log).
+
+### The snapshot-synthesis discipline (capture → format → synthesize)
+
+The surface pins down the project's reusable pattern for **synthesized
+read-only snapshots** of kernel state (the primitive `/proc/self/status` and
+future surfaces like a keep-recent `/dev/log` ring reuse; anticipated in
+`docs/rationale/deferred-decisions.md`):
+
+1. **Capture** — under the owning subsystem's lock, copy the raw numbers into a
+   plain `Copy` snapshot struct on the stack (`sched::stats_snapshot()`), then
+   drop the lock. No allocation under a spinlock, ever.
+2. **Format** — a pure function renders the snapshot to text
+   (`sched::stats::format`, a `KString` built via `core::fmt::Write`) —
+   host-testable, no lock held.
+3. **Synthesize** — `MemoryObject::try_new_filled(bytes)` allocates frames and
+   fills them via the HHDM; the kernel server returns the object and the
+   binding's rights cap the caller to `MAP_READ` + the generic band.
+
+Consistency is per-capture: one `SCHED` hold makes each snapshot internally
+consistent; successive reads each produce a fresh object (like `/dev/log`).
+
 ## Decisions (locked 2026-06-26)
 
 - **All three classes** in the first cut (RealTime FIFO is simple; building the

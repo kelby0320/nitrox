@@ -2039,9 +2039,11 @@ login → per-user namespace → home write) and **two remain, and are the only 
     captures them plus instantaneous state (`ready` length, idle-current, online) under one
     hold; the pure `sched::stats::format` renders `cpus_online=N` + one `name=value` row per
     online CPU. Host tests for the formatter; full suite + `test-qemu` green.
-  - [ ] **Part B — the surface.** `KernelServerId::SchedStats` leaf server at
+  - [x] **Part B — the surface.** `KernelServerId::SchedStats` leaf server at
     `/proc/sched/stats` (the `/dev/log` rights pattern: `MAP_READ` + generic band), bound by
-    pid 1 at boot; scheduler architecture doc gains the stats section.
+    pid 1 at boot; `scheduler.md` gains § "The stats surface" (counters table + the
+    capture → format → synthesize discipline). Host tests (the all-offline snapshot renders
+    exactly the header into a fresh `MemoryObject`; leaf suffix rejection); `test-qemu` green.
   - [ ] **Part C — `/proc/self/status`.** `pid=`/`tid=` text via the same three steps
     (closes the deferred-decisions entry; second consumer proves the primitive's reuse).
   - [ ] **Part D — demo + close-out.** QEMU selftest demo parses the snapshot and gates the

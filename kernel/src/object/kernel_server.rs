@@ -58,6 +58,9 @@ pub enum KernelServerId {
     /// `/dev/log` — the kernel log ring, served as a read-only [`MemoryObject`]
     /// snapshot the caller maps + reads (`cat /dev/log` = dmesg; see [`log_server`]).
     Log,
+    /// `/proc/sched/stats` — per-CPU scheduler statistics, served as a read-only
+    /// [`MemoryObject`] text snapshot (see [`sched_stats_server`]).
+    SchedStats,
     // `/proc/self/status` (numeric pid/tid) and the `/dev` directory listing are
     // deferred — see `docs/rationale/deferred-decisions.md`.
 }
@@ -104,6 +107,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
         KernelServerId::Console => console_server(suffix, requested),
         KernelServerId::Log => log_server(suffix, requested),
+        KernelServerId::SchedStats => sched_stats_server(suffix, requested),
     }
 }
 
@@ -250,6 +254,36 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     })
 }
 
+/// `/proc/sched/stats` — a **leaf** server returning the per-CPU scheduler
+/// statistics as a fresh read-only [`MemoryObject`] text snapshot (`cpus_online=N`
+/// + one `name=value` row per online CPU — see `crate::sched::stats` and
+/// `docs/architecture/scheduler.md` § "The stats surface"). The full
+/// **capture → format → synthesize** discipline in one place: the counters are
+/// copied under a single `SCHED` hold ([`crate::sched::stats_snapshot`]), the
+/// text is formatted with no lock held, and the bytes become the object via
+/// [`MemoryObject::try_new_filled`]. Any non-empty `suffix` is *not found*.
+///
+/// `requested` is accepted to match the RS contract but ignored — the binding's
+/// rights cap what the caller obtains, applied by the lookup syscall.
+fn sched_stats_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    if !suffix.is_empty() {
+        return OpStatus::Rejected(KError::NotFound);
+    }
+    let snap = crate::sched::stats_snapshot();
+    let text = match crate::sched::stats::format(&snap) {
+        Ok(t) => t,
+        Err(_) => return OpStatus::Rejected(KError::OutOfMemory),
+    };
+    match MemoryObject::try_new_filled(text.as_bytes()) {
+        // Adopt the creation reference into an `ObjectRef` for the caller.
+        // SAFETY: `into_raw` yields the one outstanding creation reference.
+        Ok(obj) => OpStatus::Completed(unsafe {
+            ObjectRef::from_raw(KBox::into_raw(obj).as_ptr() as *mut (), KObjectType::MemoryObject)
+        }),
+        Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+    }
+}
+
 /// `/dev/console` — a **leaf** server returning a counted reference to the serial
 /// console (a char [`DeviceNode`](crate::object::DeviceNode)). An exact match yields
 /// the console node, on which the caller issues `sys_io_submit(Read)` to read
@@ -318,6 +352,50 @@ mod tests {
     fn entropy_rejects_non_empty_suffix() {
         init_global_heap();
         match dispatch(KernelServerId::Entropy, b"sub", Rights::READ) {
+            OpStatus::Rejected(KError::NotFound) => {}
+            OpStatus::Rejected(e) => panic!("expected NotFound, got {e:?}"),
+            OpStatus::Completed(_) => panic!("a non-empty suffix must not resolve on a leaf"),
+            OpStatus::Pending => panic!("a kernel server never returns Pending"),
+        }
+    }
+
+    // `/proc/sched/stats` is fully host-testable: `stats_snapshot` only locks the
+    // `SCHED` static (no `current_cpu()` read), and host tests never online a CPU
+    // there — so the snapshot is deterministically "all offline" and the rendered
+    // text is exactly the header. The populated multi-CPU rendering is covered by
+    // the formatter tests in `sched::tests`; the live counters by the QEMU selftest.
+    #[test]
+    fn sched_stats_exact_match_yields_text_snapshot_memobj() {
+        use crate::mm::{PAGE_SIZE, heap};
+        use crate::object::MemoryObject;
+
+        init_global_heap();
+        match dispatch(KernelServerId::SchedStats, b"", Rights::MAP_READ) {
+            OpStatus::Completed(obj) => {
+                assert_eq!(obj.object_type(), KObjectType::MemoryObject);
+                // SAFETY: `obj` pins a live MemoryObject just created above.
+                let m = unsafe { &*(obj.as_ptr() as *const MemoryObject) };
+                assert_eq!(m.size(), PAGE_SIZE); // one page holds the header
+                let expected = b"cpus_online=0\n";
+                let base = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;
+                for (i, &want) in expected.iter().enumerate() {
+                    // SAFETY: a live MemoryObject's frame is HHDM-reachable;
+                    // read-only check within the page.
+                    assert_eq!(unsafe { *base.add(i) }, want, "byte {i}");
+                }
+                // SAFETY: as above; the fill zero-pads past the text.
+                assert_eq!(unsafe { *base.add(expected.len()) }, 0);
+                drop(obj);
+            }
+            OpStatus::Rejected(e) => panic!("expected Completed, got Rejected({e:?})"),
+            OpStatus::Pending => panic!("a kernel server never returns Pending"),
+        }
+    }
+
+    #[test]
+    fn sched_stats_rejects_non_empty_suffix() {
+        init_global_heap();
+        match dispatch(KernelServerId::SchedStats, b"sub", Rights::MAP_READ) {
             OpStatus::Rejected(KError::NotFound) => {}
             OpStatus::Rejected(e) => panic!("expected NotFound, got {e:?}"),
             OpStatus::Completed(_) => panic!("a non-empty suffix must not resolve on a leaf"),

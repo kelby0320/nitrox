@@ -678,6 +678,25 @@ fn run_first_userspace() {
         }
     }
 
+    // `/proc/sched/stats` — per-CPU scheduler statistics as a read-only
+    // `MemoryObject` text snapshot (the same shape as `/dev/log`): the caller
+    // maps + stats it, so the binding grants `MAP_READ` + the generic management
+    // band. Reachability is by namespace construction, like all of `/proc` — a
+    // supervisor may omit it from a sandbox's namespace.
+    let sched_stats_binding_rights =
+        Rights::MAP_READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(
+            b"/proc/sched/stats",
+            KernelServerId::SchedStats,
+            sched_stats_binding_rights,
+        )
+        .is_err()
+    {
+        kprintln!("init: binding /proc/sched/stats failed");
+        return;
+    }
+
     // `/initramfs/<path>` — a subtree server returning a read-only `MemoryObject`
     // copy of a file from the boot CPIO blob. The caller maps it `MAP_READ`, so
     // the binding grants `MAP_READ` + the generic management band.
