@@ -1771,6 +1771,19 @@ unsafe fn switch_into(
     next_obj: *mut (),
 ) {
     g.stats[SchedState::this_cpu()].switches += 1;
+    // Wait out the incoming thread's mid-switch-out guard before touching its
+    // parked context. A waker can re-home a thread to a **third** CPU's queue
+    // (an affinity-diverted wake/resume) in the window between its old CPU
+    // releasing `SCHED` and `context_switch` committing `saved_sp` — and
+    // `dequeue_front`, unlike `stealable_to`, does not filter on the guard, so
+    // that CPU could otherwise resume a not-yet-committed context (the Bug-4
+    // double-run through a different door — F5, decision log 2026-07-21).
+    // Bounded and deadlock-free even though `SCHED` is held: the owning CPU is
+    // in straight-line post-release code and clears the guard without any lock.
+    // SAFETY: `next_obj` is pinned (now `current`).
+    while unsafe { Thread::is_on_cpu(next_obj) } {
+        core::hint::spin_loop();
+    }
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
     // here, satisfying the Thread accessor contract for these reads.
     let next_sp = unsafe { Thread::saved_sp(next_obj) };
@@ -2167,6 +2180,17 @@ fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid:
         // exit would otherwise sweep them all up.
         th.owner_pid() == my_pid && th.tid() != IDLE_TID
     }) {
+        // Wait out a mid-switch-out guard before reclaiming: the sweep can see
+        // a sibling parked on another CPU's queue whose switch-out has not yet
+        // committed — that CPU is still executing on the sibling's kernel stack
+        // for a few more instructions, and queueing it for the stack free here
+        // would be a use-after-free (F5, decision log 2026-07-21). Bounded: the
+        // owning CPU clears the guard from post-release straight-line code, no
+        // lock needed.
+        // SAFETY: the entry pins a live Thread; `SCHED` held.
+        while unsafe { Thread::is_on_cpu(list[i].as_ptr()) } {
+            core::hint::spin_loop();
+        }
         let r = list.remove(i);
         // SAFETY: `r` pins the thread; `SCHED` held.
         unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
@@ -2190,6 +2214,13 @@ fn reap_blocked_matching(
         // Never reap an idle thread (see `reap_matching`).
         th.owner_pid() == my_pid && th.tid() != IDLE_TID
     }) {
+        // Wait out a mid-switch-out guard before reclaiming (see
+        // [`reap_matching`] — a just-blocked sibling's switch-out may not have
+        // committed; its CPU is still on the sibling's stack).
+        // SAFETY: the entry pins a live Thread; `SCHED` held.
+        while unsafe { Thread::is_on_cpu(blocked[i].as_ptr()) } {
+            core::hint::spin_loop();
+        }
         let r = blocked.remove(i);
         let obj = r.as_ptr();
         // Unregister from every object this thread was waiting on, mirroring

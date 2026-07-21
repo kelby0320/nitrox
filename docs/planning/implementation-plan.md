@@ -2149,10 +2149,14 @@ to date). Slice `phase-4/substrate-hardening`:
   could not ack) and only then frees frames / drops the VMA. The old in-lock-freeing
   `unmap_covering` is `#[cfg(test)]` (host tests have no remote TLBs). `active_cpus`
   targeting stays the later optimization.
-- [ ] **Part D — F5: honor `on_cpu` everywhere.** Spin on `!is_on_cpu` in `switch_into`
-  before reading `saved_sp` (covers affinity-diverted wake/resume placement picked up by
-  `dequeue_front`), and wait out the guard in `exit_process`'s reap sweeps (stack-UAF
-  window).
+- [x] **Part D — F5: honor `on_cpu` everywhere** (landed; `test-qemu` green, 30/30 KVM
+  boot-loop). `switch_into` spins on `!is_on_cpu(next)` before reading `saved_sp` — the
+  Linux `smp_cond_load_acquire` analog — covering affinity-diverted wake/resume
+  placements picked up by `dequeue_front` (which, unlike `stealable_to`, has no guard
+  filter); `reap_matching`/`reap_blocked_matching` wait out the guard before queueing a
+  sibling's stack for freeing (the mid-switch-out UAF window). Bounded + deadlock-free
+  under `SCHED`: the owning CPU clears the guard from post-release straight-line code,
+  no lock needed.
 - [ ] **Part E — F6 + F7.** F6: wake placement falls back to the least-loaded permitted
   queue with room instead of panicking at `READY_RESERVE`. F7: per-CPU `quantum`.
 - [ ] **Part F — docs + stress selftest.** F8 deferral entry (SMP panic path / stop IPI),
