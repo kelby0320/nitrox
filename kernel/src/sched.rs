@@ -233,6 +233,137 @@ mod deadline {
     }
 }
 
+/// Scheduler statistics: the per-CPU event counters behind `/proc/sched/stats`,
+/// their point-in-time snapshot, and the pure text formatter.
+///
+/// The surface follows the **capture → format → synthesize** discipline for
+/// kernel-state snapshots (see `docs/architecture/scheduler.md` § "The stats
+/// surface"): [`stats_snapshot`](super::stats_snapshot) copies plain `Copy`
+/// data under one `SCHED` hold, [`format`] renders it to text with no lock
+/// held (allocation never happens under the rank-1 lock), and the
+/// `/proc/sched/stats` kernel server wraps the bytes in a read-only
+/// `MemoryObject`.
+///
+/// The counters live in [`SchedState`](super::SchedState) as plain `u64`s —
+/// no atomics — because every increment site already holds `SCHED`.
+pub mod stats {
+    use core::fmt::Write;
+
+    use crate::arch::MAX_CPUS;
+    use crate::libkern::{AllocError, KString};
+
+    /// One CPU's monotonic scheduler event counters. Owned by
+    /// [`SchedState`](super::SchedState) under the rank-1 `SCHED` lock;
+    /// snapshot-copied by [`stats_snapshot`](super::stats_snapshot).
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct Counters {
+        /// Context switches performed by this CPU — every [`switch_into`]
+        /// (super), across all four parking dispositions (ready / blocked /
+        /// suspended / reap). Nonzero on ≥2 CPUs is the Phase 3 milestone's
+        /// "two CPUs visibly active" witness.
+        pub switches: u64,
+        /// Threads this CPU stole from a peer's ready queue (`steal_one`).
+        pub steals: u64,
+        /// Runnable threads placed **onto** this CPU's ready queue by spawn
+        /// placement or wake re-homing (`place_thread`) — placements *received*,
+        /// counted against the target CPU, possibly performed by another.
+        pub placed: u64,
+        /// Reschedule IPIs handled by this CPU (`on_reschedule_ipi`).
+        pub resched_ipis: u64,
+        /// Periodic scheduler ticks taken by this CPU (`on_timer_tick`).
+        pub ticks: u64,
+    }
+
+    impl Counters {
+        /// All-zero counters (`const` — usable in the `SCHED` static initializer).
+        pub const ZERO: Counters = Counters {
+            switches: 0,
+            steals: 0,
+            placed: 0,
+            resched_ipis: 0,
+            ticks: 0,
+        };
+    }
+
+    /// One CPU's row in a [`Snapshot`]: its [`Counters`] plus instantaneous
+    /// state read at capture time.
+    #[derive(Clone, Copy, PartialEq, Eq, Debug)]
+    pub struct CpuSnapshot {
+        /// Whether this CPU's scheduler state is initialized (`cpu_online`).
+        pub online: bool,
+        /// Whether this CPU was running its idle thread at capture time.
+        pub idle: bool,
+        /// This CPU's ready-queue length at capture time.
+        pub ready: u32,
+        /// The monotonic event counters.
+        pub counters: Counters,
+    }
+
+    impl CpuSnapshot {
+        /// A never-onlined CPU's row (`const` — the snapshot array initializer).
+        pub const OFFLINE: CpuSnapshot = CpuSnapshot {
+            online: false,
+            idle: false,
+            ready: 0,
+            counters: Counters::ZERO,
+        };
+    }
+
+    /// A consistent point-in-time copy of every CPU's scheduler statistics,
+    /// captured under one `SCHED` hold by [`stats_snapshot`](super::stats_snapshot).
+    #[derive(Clone, Copy, Debug)]
+    pub struct Snapshot {
+        /// Per-CPU rows, indexed by dense CPU index.
+        pub cpus: [CpuSnapshot; MAX_CPUS],
+    }
+
+    impl Snapshot {
+        /// The number of online CPUs in this snapshot.
+        pub fn cpus_online(&self) -> usize {
+            self.cpus.iter().filter(|c| c.online).count()
+        }
+    }
+
+    /// Render `snap` as the `/proc/sched/stats` text: a `cpus_online=N` header
+    /// line, then one `name=value` row per **online** CPU (offline CPUs are
+    /// omitted — their counters are zero by construction). Booleans render as
+    /// `0`/`1`. Pure (host-tested); the only failure is heap exhaustion.
+    ///
+    /// ```text
+    /// cpus_online=2
+    /// cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0
+    /// cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1
+    /// ```
+    pub fn format(snap: &Snapshot) -> Result<KString, AllocError> {
+        let mut out = KString::new();
+        // `fmt::Error` from a `KString` sink only ever means allocation failure
+        // (see `KString`'s `Write` impl).
+        (|| -> Result<(), core::fmt::Error> {
+            writeln!(out, "cpus_online={}", snap.cpus_online())?;
+            for (c, cpu) in snap.cpus.iter().enumerate() {
+                if !cpu.online {
+                    continue;
+                }
+                writeln!(
+                    out,
+                    "cpu={} online=1 switches={} steals={} placed={} ipis={} ticks={} ready={} idle={}",
+                    c,
+                    cpu.counters.switches,
+                    cpu.counters.steals,
+                    cpu.counters.placed,
+                    cpu.counters.resched_ipis,
+                    cpu.counters.ticks,
+                    cpu.ready,
+                    cpu.idle as u8,
+                )?;
+            }
+            Ok(())
+        })()
+        .map_err(|_| AllocError)?;
+        Ok(out)
+    }
+}
+
 /// The kernel/boot page-table root, captured once at [`init`]. Threads with
 /// no per-process address space (`addr_space_root == None`) run on this root;
 /// the scheduler loads it on switch-in so a dying user thread's address space
@@ -333,6 +464,10 @@ struct SchedState {
     /// The deadline min-heap (armed timers + `sys_wait` deadlines), drained on
     /// each periodic tick. Pre-reserved (see [`deadline::HEAP_RESERVE`]).
     deadlines: KVec<deadline::Entry>,
+    /// **Per-CPU** scheduler event counters (see [`stats::Counters`]),
+    /// incremented at their event sites — all of which already hold this lock —
+    /// and copied out by [`stats_snapshot`] for the `/proc/sched/stats` surface.
+    stats: [stats::Counters; MAX_CPUS],
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
@@ -349,6 +484,7 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
     idle_addr: [0; MAX_CPUS],
     blocked: KVec::new(),
     deadlines: KVec::new(),
+    stats: [stats::Counters::ZERO; MAX_CPUS],
 });
 
 impl SchedState {
@@ -737,6 +873,7 @@ pub fn on_timer_tick() {
     // (nice-weighted) before deciding whether to reschedule.
     accrue_vruntime(&mut g);
     let me = SchedState::this_cpu();
+    g.stats[me].ticks += 1;
     let ready_here = !g.ready[me].is_empty();
     let (new_quantum, reschedule) = tick_quantum(g.quantum, ready_here);
     g.quantum = new_quantum;
@@ -763,8 +900,9 @@ pub fn on_timer_tick() {
 /// Called from the arch reschedule-IPI dispatcher, which already EOI'd (mirroring
 /// the timer path, since the switch here may not return promptly). Runs with IF=0.
 pub fn on_reschedule_ipi() {
-    let g = SCHED.lock();
+    let mut g = SCHED.lock();
     let me = SchedState::this_cpu();
+    g.stats[me].resched_ipis += 1;
     // Only preempt the idle thread — a running TimeShared thread is left to its
     // quantum (the woken thread is already enqueued and will be picked in turn or
     // stolen). The point is purely liveness: resume an idle CPU so a thread parked
@@ -781,6 +919,28 @@ fn current_is_idle(g: &SchedState) -> bool {
     g.cur_ref()
         .as_ref()
         .is_some_and(|c| c.as_ptr() as usize == g.idle_addr())
+}
+
+/// Capture a consistent point-in-time copy of every CPU's scheduler statistics
+/// under one `SCHED` hold — the **capture** step of the capture → format →
+/// synthesize snapshot discipline behind `/proc/sched/stats` (see
+/// [`stats`] and `docs/architecture/scheduler.md` § "The stats surface").
+/// Copies plain `Copy` data only; the caller runs [`stats::format`] (which
+/// allocates) with the lock released.
+pub fn stats_snapshot() -> stats::Snapshot {
+    let g = SCHED.lock();
+    let mut cpus = [stats::CpuSnapshot::OFFLINE; MAX_CPUS];
+    for (c, slot) in cpus.iter_mut().enumerate() {
+        *slot = stats::CpuSnapshot {
+            online: g.cpu_online[c],
+            idle: g.current[c]
+                .as_ref()
+                .is_some_and(|t| t.as_ptr() as usize == g.idle_addr[c]),
+            ready: g.ready[c].len() as u32,
+            counters: g.stats[c],
+        };
+    }
+    stats::Snapshot { cpus }
 }
 
 /// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the
@@ -1577,11 +1737,12 @@ unsafe fn arm_kernel_stack_for(obj: *mut ()) {
 /// under the `SCHED` hold being released here. Single-CPU: nothing else
 /// touches either thread's saved SP across the switch.
 unsafe fn switch_into(
-    g: IrqSpinLockGuard<'_, SchedState>,
+    mut g: IrqSpinLockGuard<'_, SchedState>,
     out_slot: *mut u64,
     out_obj: *mut (),
     next_obj: *mut (),
 ) {
+    g.stats[SchedState::this_cpu()].switches += 1;
     // SAFETY: `next_obj` is pinned (now `current`) and `SCHED` is still held
     // here, satisfying the Thread accessor contract for these reads.
     let next_sp = unsafe { Thread::saved_sp(next_obj) };
@@ -2460,6 +2621,7 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
     g.ready[cpu]
         .try_push(r)
         .expect("push within reserved capacity is infallible");
+    g.stats[cpu].placed += 1;
     // If the thread landed on a *different* CPU, poke that CPU with a reschedule
     // IPI so it runs the newcomer promptly (resuming it if idle) instead of waiting
     // for its next periodic tick — the timer is not a dependable wake for a halted
@@ -2492,6 +2654,7 @@ fn steal_one(g: &mut SchedState) -> Option<ObjectRef> {
     let n = g.ready[victim].len();
     // SAFETY: each entry pins a live Thread; `SCHED` held.
     let pos = (0..n).find(|&i| unsafe { stealable_to(g.ready[victim][i].as_ptr(), me) })?;
+    g.stats[me].steals += 1;
     Some(g.ready[victim].remove(pos))
 }
 
@@ -2770,6 +2933,7 @@ mod tests {
             idle_addr: [0; MAX_CPUS],
             blocked: KVec::new(),
             deadlines: KVec::new(),
+            stats: [stats::Counters::ZERO; MAX_CPUS],
         }
     }
 
@@ -2940,6 +3104,87 @@ mod tests {
             assert!(stealable_to(t.as_ptr(), 0));
             assert!(!stealable_to(t.as_ptr(), 1));
         }
+    }
+
+    // --- stats: the pure format step of capture → format → synthesize. The
+    // increment sites and `stats_snapshot` need a running scheduler (they read
+    // `this_cpu()`) and are validated under QEMU (Part D's selftest gates the
+    // verdict on two-CPU activity).
+
+    /// A snapshot with the given rows online (all other CPUs offline).
+    fn snap_with(rows: &[(usize, stats::CpuSnapshot)]) -> stats::Snapshot {
+        let mut s = stats::Snapshot {
+            cpus: [stats::CpuSnapshot::OFFLINE; MAX_CPUS],
+        };
+        for &(c, row) in rows {
+            s.cpus[c] = row;
+        }
+        s
+    }
+
+    #[test]
+    fn stats_format_renders_header_and_one_row_per_online_cpu() {
+        init_global_heap();
+        let snap = snap_with(&[
+            (
+                0,
+                stats::CpuSnapshot {
+                    online: true,
+                    idle: false,
+                    ready: 1,
+                    counters: stats::Counters {
+                        switches: 1342,
+                        steals: 3,
+                        placed: 57,
+                        resched_ipis: 12,
+                        ticks: 4096,
+                    },
+                },
+            ),
+            (
+                1,
+                stats::CpuSnapshot {
+                    online: true,
+                    idle: true,
+                    ready: 0,
+                    counters: stats::Counters {
+                        switches: 987,
+                        steals: 11,
+                        placed: 40,
+                        resched_ipis: 9,
+                        ticks: 4080,
+                    },
+                },
+            ),
+        ]);
+        assert_eq!(snap.cpus_online(), 2);
+        let text = stats::format(&snap).unwrap();
+        assert_eq!(
+            text.as_str(),
+            "cpus_online=2\n\
+             cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0\n\
+             cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1\n"
+        );
+    }
+
+    #[test]
+    fn stats_format_omits_offline_cpus_preserving_indices() {
+        init_global_heap();
+        let row = stats::CpuSnapshot {
+            online: true,
+            idle: true,
+            ready: 0,
+            counters: stats::Counters::ZERO,
+        };
+        // CPUs 0 and 2 online, 1 offline: rows keep their dense indices.
+        let snap = snap_with(&[(0, row), (2, row)]);
+        let text = stats::format(&snap).unwrap();
+        assert_eq!(
+            text.as_str(),
+            "cpus_online=2\n\
+             cpu=0 online=1 switches=0 steals=0 placed=0 ipis=0 ticks=0 ready=0 idle=1\n\
+             cpu=2 online=1 switches=0 steals=0 placed=0 ipis=0 ticks=0 ready=0 idle=1\n"
+        );
     }
 
     // --- Deadline min-heap (pure) -------------------------------------

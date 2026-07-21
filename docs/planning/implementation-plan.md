@@ -2029,6 +2029,23 @@ login → per-user namespace → home write) and **two remain, and are the only 
   `LogRecord`s still route to `parse_append`). See the decision log (2026-07-20 "libstream").
 - [ ] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
   `MemoryObject` snapshot* primitive (also unblocks numeric `/proc/self/status`).
+  Building as slice `phase-3/proc-sched-stats`; the primitive is the **capture → format →
+  synthesize** discipline (copy `Copy` data under one lock hold; format via `KString` with no
+  lock held; wrap in a read-only `MemoryObject` — `try_new_filled` is the existing synthesis
+  step, as `/dev/log`/initramfs already exercise):
+  - [x] **Part A — counters + capture + format.** Per-CPU `u64` counters in `SchedState`
+    (`switches` / `steals` / `placed` / `resched_ipis` / `ticks`), incremented at their event
+    sites — all already hold the rank-1 `SCHED` lock, so no atomics; `sched::stats_snapshot()`
+    captures them plus instantaneous state (`ready` length, idle-current, online) under one
+    hold; the pure `sched::stats::format` renders `cpus_online=N` + one `name=value` row per
+    online CPU. Host tests for the formatter; full suite + `test-qemu` green.
+  - [ ] **Part B — the surface.** `KernelServerId::SchedStats` leaf server at
+    `/proc/sched/stats` (the `/dev/log` rights pattern: `MAP_READ` + generic band), bound by
+    pid 1 at boot; scheduler architecture doc gains the stats section.
+  - [ ] **Part C — `/proc/self/status`.** `pid=`/`tid=` text via the same three steps
+    (closes the deferred-decisions entry; second consumer proves the primitive's reuse).
+  - [ ] **Part D — demo + close-out.** QEMU selftest demo parses the snapshot and gates the
+    verdict on `switches>0` for ≥2 CPUs; decision-log entry; Phase 3 close-out.
 
 Everything else in the backlog below is **consumer-driven and defers to Phase 4**, landing
 with its first consumer (the project's standing deferral discipline). Triage:
