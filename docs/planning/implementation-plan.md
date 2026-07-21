@@ -2110,9 +2110,45 @@ a package-management + sysadmin layer) reuse this foundation. See the decision l
 (2026-07-20 "Phase 3 Definition of Done, the `std` stance, and the Phase 4 north star") for
 the full rationale, including the `std` stance and the browser strategy.
 
+### Substrate hardening — the gate into Phase 4 (2026-07-21 concurrency review)
+
+The adversarial kernel-substrate review (decision log, 2026-07-21 "Substrate concurrency
+review") found two live cross-CPU deadlocks, a panic path, and two Phase-4 time bombs —
+mostly single-CPU-era justifications that had become load-bearing SMP claims. Fixing them
+**gates the Phase 4 build-out** (threads/FP/TLS stress the substrate harder than anything
+to date). Slice `phase-4/substrate-hardening`:
+
+- [x] **Part A — F2 + F11 + F4** (small, self-contained; landed with 3 host tests,
+  `test-qemu` green, 20/20 KVM boot-loop). F2: the drained entropy
+  seed-waiter refs park in a new pre-reserved `SchedState::deferred_drops` list (moves
+  only under the lock) and are dropped by `reap_pending` in **thread context** — an
+  `ObjectRef` drop can reach the plain-spinlock allocator, which must never run under
+  `SCHED` **or in IRQ context** (cross-CPU and same-CPU deadlock); correct
+  `lock-ordering.md`'s blessing. F11: `reap_pending` drains by popping into a fixed local
+  under the lock instead of `mem::take` (which zeroed the reserved capacity, making every
+  later exit push *allocate under `SCHED`* via `KVec::try_push` growth). F4: `steal_one`
+  picks the busiest victim *among those with a stealable thread*, matching
+  `steal_available` (fixes the idle-steal `expect` panic + the missed-steal liveness wart).
+- [ ] **Part B — F1: IF-robust TLB shootdown.** `tlb::shootdown` saves IF, runs the
+  `LOCK` acquisition + ack spin with interrupts enabled, restores after — so IF=0
+  initiators (syscall/exception-context `KernelStack::Drop` via `reap_pending`) cannot
+  mutually deadlock and always service incoming shootdown IPIs while waiting.
+- [ ] **Part C — F3: broadcast shootdown on user-page unmap** (`unmap_covering` /
+  protect edits) — required before multi-threaded processes; `active_cpus` targeting
+  stays the later optimization. Depends on Part B.
+- [ ] **Part D — F5: honor `on_cpu` everywhere.** Spin on `!is_on_cpu` in `switch_into`
+  before reading `saved_sp` (covers affinity-diverted wake/resume placement picked up by
+  `dequeue_front`), and wait out the guard in `exit_process`'s reap sweeps (stack-UAF
+  window).
+- [ ] **Part E — F6 + F7.** F6: wake placement falls back to the least-loaded permitted
+  queue with room instead of panicking at `READY_RESERVE`. F7: per-CPU `quantum`.
+- [ ] **Part F — docs + stress selftest.** F8 deferral entry (SMP panic path / stop IPI),
+  F9 doc corrections (IrqSpinLock audit, affinity-validation claim, #PF-allocation rule),
+  F10 TSC-sync note; a concurrent-exit stress selftest (KVM boot-loop methodology).
+
 **Stepping-stone path** (each a real, satisfying milestone; roughly ordered):
 
-1. Phase 3 close (libstream + `/proc`) — the gate out of Phase 3.
+1. Phase 3 close (libstream + `/proc`) — the gate out of Phase 3. ✅ (2026-07-21)
 2. FP/AVX2 + XSAVE (below).
 3. dir ops + typed shell + coreutils → **CLI-complete**.
 4. framebuffer display server + input routing.

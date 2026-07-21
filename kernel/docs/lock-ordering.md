@@ -126,11 +126,23 @@ The seeded-latch's wake of any `PendingOperation` waiters (the userspace read
 contract) runs on the `PendingOperation` completion path under `SCHED`, **outside**
 this lock — so `ENTROPY` never nests with `SCHED`. Concretely, `on_timer_tick`'s
 `wake_entropy_seed_waiters` (`sched.rs`) *moves* the queued waiter `ObjectRef`s out
-of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern), then
-signals + **drops** them under `SCHED`. Dropping a `PendingOperation` ref under
-`SCHED` is sound — unlike a `Process`/`Thread` ref, a `PendingOperation`'s `Drop`
-touches only the allocator (rank 6), acquired *below* `SCHED` (rank 1) in the legal
-top-to-bottom direction; it never re-enters `SCHED`.
+of `ENTROPY` (the entropy subsystem owns them, the IPC-`Block` pattern), signals
+each, and **parks the refs in `SchedState::deferred_drops`** for `reap_pending` to
+drop later, in thread context with no lock held.
+
+> **History (corrected 2026-07-21, review finding F2).** An earlier revision
+> blessed dropping the refs under `SCHED` because "rank 1 → rank 6 is the legal
+> direction". That argument covers ordering *cycles* but not the SMP interrupt
+> interaction: the allocator locks are **plain** (non-IRQ-masking) spinlocks held
+> with IF=1 all over the kernel, while `SCHED` is acquired from the timer IRQ. A
+> CPU holding an allocator lock whose tick then spins on `SCHED` (IRQs now
+> masked), against a CPU holding `SCHED` whose ref-drop spins on that allocator
+> lock, is a cross-CPU deadlock — and a free performed *anywhere in the tick's
+> IRQ context* can self-deadlock against an allocator holder the tick interrupted
+> on the same CPU. The rule is therefore strict: **nothing that can reach a plain
+> spinlock may run under `SCHED` or in IRQ context — neither allocation nor an
+> `ObjectRef` drop.** Refs that must be released from such contexts are moved
+> (never dropped) into `deferred_drops` within its reserve.
 
 ## The AddressSpace lock and the page-fault handler
 
@@ -323,6 +335,17 @@ wait-queues slice the timer handler also drains the deadline heap and wakes
 waiters — all still under `SCHED`, with no allocation (the heap/waiter/blocked
 collections are pre-reserved) and one new lock-free call (`arch::Timer::read_ns`,
 a TSC read). So the conclusion is unchanged.
+
+**The SMP corollary (2026-07-21 review, F2/F11):** because `SCHED` is acquired
+from IRQ context, any plain `SpinLock` transitively acquirable **while holding
+`SCHED`** becomes deadlock-bait — the plain lock's ordinary holders run with
+IF=1 and can be interrupted into a spin on `SCHED`. Freeing is acquiring: an
+`ObjectRef` drop can reach the slab/buddy locks, so the no-allocation rule under
+`SCHED` (and in IRQ context) extends to **no `ObjectRef` drops** there. Watch
+`KVec::try_push` growth too: a `mem::take` of a pre-reserved collection swaps in
+a zero-capacity `KVec`, and later pushes then allocate under whatever lock is
+held — drain pre-reserved `SCHED` collections by popping into fixed buffers
+instead (`sched::drain_pending_drops`).
 
 ## Wait queues and the deadline heap live under rank 1 (Phase 1)
 
