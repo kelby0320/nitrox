@@ -866,6 +866,16 @@ fn init_memory() -> bool {
 fn paging_init() {
     arch::Cpu::init_protections();
     kprintln!("memory protections enabled");
+    // Enable this CPU's FP/SIMD units before any thread is created (a thread's
+    // save area is initialised at construction and restored on its first
+    // switch-in). Each AP repeats this for itself in `ap_cpu_init` — CR0/CR4 and
+    // the extended-state mask are per-CPU registers.
+    arch::fpu_init_cpu();
+    kprintln!(
+        "fp/simd enabled ({}-bit vectors, {} B per-thread save area)",
+        arch::fpu_vector_bits(),
+        arch::fpu_area_bytes()
+    );
     // SAFETY: HHDM is up (init_memory ran first) and the buddy
     // allocator is live; no AS exists yet whose captured template
     // could disagree with the new PML4 entries.

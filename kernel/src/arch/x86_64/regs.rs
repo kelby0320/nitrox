@@ -67,6 +67,81 @@ pub fn read_cr2() -> u64 {
     val
 }
 
+/// Read control register `CR0` — the mode/arithmetic-coprocessor control
+/// bits (paging enable, write protect, and the x87/SSE emulation and
+/// task-switched flags the FPU slice configures).
+///
+/// Safe: reading `CR0` has no side effects and is always valid in ring 0.
+#[inline]
+pub fn read_cr0() -> u64 {
+    let val: u64;
+    // SAFETY: `mov reg, cr0` reads CR0 into a general register. No memory
+    // side effects, no flag changes.
+    unsafe {
+        asm!("mov {}, cr0", out(reg) val,
+             options(nomem, nostack, preserves_flags));
+    }
+    val
+}
+
+/// Write control register `CR0`.
+///
+/// # Safety
+/// CR0 controls paging, protection, and the FPU emulation/task-switched
+/// bits. Clearing a bit the running kernel depends on (`PG`, `PE`, `WP`)
+/// is undefined. The caller must ensure the written value is a legal
+/// combination for the running CPU (e.g. `EM=1` together with `NE=0` on a
+/// CPU without an external FPU is a `#GP`).
+#[inline]
+pub unsafe fn write_cr0(value: u64) {
+    // SAFETY: `mov cr0, reg` installs the new control bits; the caller
+    // upholds the legal-combination contract. `nomem` is omitted because
+    // flipping CR0 bits changes how subsequent accesses are interpreted.
+    unsafe {
+        asm!("mov cr0, {}", in(reg) value,
+             options(nostack, preserves_flags));
+    }
+}
+
+/// Read extended control register `XCR0` — the mask of processor state
+/// components enabled for `XSAVE`/`XRSTOR`.
+///
+/// # Safety
+/// `XGETBV` `#UD`s unless `CR4.OSXSAVE` is set, so the caller must have
+/// confirmed CPUID advertises `XSAVE` **and** enabled `CR4.OSXSAVE` first.
+#[inline]
+pub unsafe fn read_xcr0() -> u64 {
+    let lo: u32;
+    let hi: u32;
+    // SAFETY: `xgetbv` reads the XCR selected by ECX (0 = XCR0) into
+    // EDX:EAX. No memory side effects. Valid once `CR4.OSXSAVE` is set
+    // (the caller's contract). ECX=0 is the only XCR that exists today.
+    unsafe {
+        asm!("xgetbv", in("ecx") 0u32, out("eax") lo, out("edx") hi,
+             options(nomem, nostack, preserves_flags));
+    }
+    ((hi as u64) << 32) | (lo as u64)
+}
+
+/// Write extended control register `XCR0`.
+///
+/// # Safety
+/// `XSETBV` `#UD`s unless `CR4.OSXSAVE` is set, and `#GP`s if `value`
+/// requests a component the CPU does not support, clears bit 0 (x87 is
+/// mandatory), or sets an illegal combination (e.g. AVX without SSE). The
+/// caller must have masked `value` against `CPUID.0DH.0:EDX:EAX`.
+#[inline]
+pub unsafe fn write_xcr0(value: u64) {
+    // SAFETY: `xsetbv` writes EDX:EAX into the XCR selected by ECX
+    // (0 = XCR0); the caller upholds the supported-and-legal contract.
+    // `nomem` is omitted because enabling a component changes the layout
+    // subsequent `XSAVE`s write.
+    unsafe {
+        asm!("xsetbv", in("ecx") 0u32, in("eax") value as u32, in("edx") (value >> 32) as u32,
+             options(nostack, preserves_flags));
+    }
+}
+
 /// Read control register `CR4` — the bag of feature-enable bits for
 /// paging extensions, user-access protections, and others.
 ///

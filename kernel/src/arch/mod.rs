@@ -113,6 +113,19 @@ pub use x86_64::entropy::X86Entropy as Entropy;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::context::{ArchThreadContext, context_switch, fabricate_frame, thread_trampoline};
 
+// Per-thread floating-point / SIMD register state: the opaque save area a
+// [`Thread`](crate::object::Thread) carries, the per-CPU enable, and the swap
+// the scheduler performs on every context switch. Every architecture with a
+// separate FP/SIMD register file needs exactly this shape (aarch64 would map it
+// to the `Q`/`Z` registers plus `FPCR`/`FPSR`), so the names stay neutral —
+// `XSAVE`, `XCR0`, and the format selection live inside the arch layer.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::fpu::{
+    ArchFpuState, area_bytes as fpu_area_bytes, init_area as fpu_init_area,
+    init_cpu as fpu_init_cpu, restore as fpu_restore, save as fpu_save,
+    vector_bits as fpu_vector_bits,
+};
+
 // Syscall fast-path: arm it once at boot, set the per-thread kernel stack on
 // switch-in, and descend to ring 3 from a scheduled user thread.
 #[cfg(target_arch = "x86_64")]

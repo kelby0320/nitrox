@@ -287,23 +287,23 @@ fn cmd_image(mode: BuildMode) -> R<()> {
 fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
     qemu.arg("-M")
         .arg("q35")
-        // CPU model = "the features the kernel actually requires,
-        // nothing more". Base `qemu64` brings long mode, NX, and basic
-        // SSE; the `+smap,+smep` opt-ins give us the user-access
-        // protections `arch::init_protections` asserts on. The on-chip APIC
-        // (CPUID.01H:EDX.9) is present in `qemu64` by default. The entropy slice
-        // opts in `+rdrand,+rdseed` so the boot CSPRNG seeds from the hardware
-        // source (TCG emulates both); without them the kernel falls back to
-        // jitter-only seeding, which is correct but leaves `seeded=false` at boot.
-        // The Phase-3 per-CPU substrate opts in `+rdtscp`: `current_cpu()` reads
-        // the logical CPU id from `IA32_TSC_AUX` via `RDTSCP`. The Phase-3 SMP slice
-        // brings the local APIC up in **x2APIC** mode and opts in `+x2apic`; TCG
-        // only emulates x2APIC from **QEMU 9.0**, so the dev-loop QEMU floor is now
-        // ≥ 9.0. Both RDTSCP and x2APIC are universal on the project's ≈2014
-        // hardware baseline but are not in the bare `qemu64` model's defaults — the
-        // kernel `#UD`s / `#GP`s on them without these flags. SMP runs `-smp N`.
+        // CPU model = QEMU's `max`: every feature the emulator can provide,
+        // which is a strict superset of what the kernel requires. The kernel
+        // enables only what it opts into (SMAP/SMEP in `init_protections`;
+        // x87+SSE+AVX in `fpu_init_cpu`'s `XCR0`, never AVX-512 or LA57), so a
+        // richer model changes nothing it doesn't ask for. `max` supplies, in
+        // one word, everything the previous hand-rolled `qemu64,+…` string spelt
+        // out — SMEP/SMAP (user-access protections), the on-chip + x2APIC local
+        // controller, RDRAND/RDSEED (hardware CSPRNG seed), RDTSCP (`current_cpu`
+        // reads `IA32_TSC_AUX`) — **plus** a properly-emulated XSAVE/AVX extended
+        // state. That last point is why we moved off `qemu64`: splicing
+        // `+xsave,+avx` onto the ancient `qemu64` model *hangs* TCG at the
+        // `CR4.OSXSAVE` enable (a QEMU emulation fragility), whereas `max`
+        // emulates the whole XSAVE path and boots clean. The real hardware path
+        // is additionally proven under KVM (`-cpu host`); see the decision log
+        // (2026-07-21 floating-point). x2APIC needs QEMU ≥ 9.0. SMP runs `-smp N`.
         .arg("-cpu")
-        .arg("qemu64,+smap,+smep,+rdrand,+rdseed,+rdtscp,+x2apic")
+        .arg("max")
         .arg("-m")
         .arg("256M");
     // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a

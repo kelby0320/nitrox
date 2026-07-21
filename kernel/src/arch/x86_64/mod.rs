@@ -6,6 +6,7 @@ pub mod apic;
 pub mod context;
 pub mod cpu;
 pub mod entropy;
+pub mod fpu;
 pub mod gdt;
 pub mod idt;
 pub mod ioapic;

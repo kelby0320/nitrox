@@ -1931,6 +1931,38 @@ unsafe fn switch_into(
     // the switch also ensures a dying thread leaves CR3 on the incoming root
     // before it is reaped (its `AddressSpace::Drop` may free the old PML4).
     unsafe { Paging::set_page_table(next_root) };
+    // Swap the floating-point / SIMD register file. Eager, not lazy: leaving the
+    // outgoing thread's registers live behind a `CR0.TS` trap is CVE-2018-3665,
+    // and Nitrox's premise is that nothing leaks between processes (see
+    // `arch/../fpu.rs` for the full rationale).
+    //
+    // Placement is load-bearing on both ends. The **save** must precede
+    // `context_switch`, because that is what clears `out_obj`'s `on_cpu` guard —
+    // the FP image is part of the parked context, so it has to be complete
+    // before another CPU is allowed to resume the thread and restore it. The
+    // **restore** must follow the `is_on_cpu(next_obj)` spin above, for the
+    // mirror-image reason: until that guard clears, the incoming thread's image
+    // may still be mid-write on its old CPU.
+    //
+    // Restoring `next` before the stack swap rather than after is correct
+    // because the FP register file is CPU state, not stack state: once
+    // `context_switch` lands us on `next`'s stack we are already running with
+    // `next`'s registers loaded. Neither call allocates, so both are legal in
+    // this lock-free, IRQ-masked window.
+    //
+    // SAFETY: both areas are live, 64-byte-aligned images belonging to pinned
+    // threads, and every CPU ran `fpu_init_cpu` during bring-up. A null area
+    // means an inert thread that is never scheduled — skip it.
+    unsafe {
+        let out_fpu = Thread::fpu_area_ptr(out_obj);
+        if !out_fpu.is_null() {
+            crate::arch::fpu_save(out_fpu);
+        }
+        let next_fpu = Thread::fpu_area_ptr(next_obj);
+        if !next_fpu.is_null() {
+            crate::arch::fpu_restore(next_fpu);
+        }
+    }
     // SAFETY: lock released; interrupts masked; `out_slot` points into the
     // outgoing thread (pinned) and `next_sp` is the saved RSP of the now-current
     // thread (pinned). `out_on_cpu` is the outgoing thread's guard byte, cleared
