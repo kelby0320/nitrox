@@ -348,7 +348,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             } else {
                 kprint(b"session-mgr: user shell failed\n");
             }
-            verdict(ok);
+            // The clause-3 sched gate runs at the single PASS point (see
+            // `sched_gate`): login proving alone must not PASS a boot whose
+            // SMP substrate is dead.
+            verdict(ok && sched_gate(root_ns));
         }
         None => {
             kprint(b"session-mgr: login denied\n");
@@ -464,6 +467,84 @@ fn read_line(console: u64, buf: u64, buf_addr: u64, out: &mut [u8], echo: bool) 
             }
         }
     }
+}
+
+/// Find the first occurrence of `key` in `text` and parse the ASCII decimal
+/// run that follows it. `None` if the key is absent or not followed by a digit.
+#[cfg(feature = "test-harness")]
+fn parse_field(text: &[u8], key: &[u8]) -> Option<u64> {
+    let start = text.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut n: u64 = 0;
+    let mut any = false;
+    for &b in &text[start..] {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        any = true;
+        n = n.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+    }
+    if any { Some(n) } else { None }
+}
+
+/// Count the `cpu=` rows in a `/proc/sched/stats` snapshot whose `switches`
+/// counter is nonzero — the clause-3 "CPUs visibly active" measure.
+#[cfg(feature = "test-harness")]
+fn cpus_with_switches(text: &[u8]) -> u64 {
+    let mut n = 0;
+    for line in text.split(|&b| b == b'\n') {
+        if line.starts_with(b"cpu=") && parse_field(line, b"switches=").is_some_and(|v| v > 0) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// The Phase 3 **clause 3** verdict gate, checked synchronously at the single
+/// PASS point: resolve `/proc/sched/stats` through the inherited namespace, map
+/// the snapshot, and require **≥ 2 CPUs with `switches` > 0** ("two CPUs
+/// visibly active via `/proc`"). Login proving alone must not PASS a boot whose
+/// SMP substrate has died — and because this runs *before* the only
+/// `SYS_TEST_EXIT(PASS)` call, a failure cannot lose a race to the verdict (the
+/// demo `parent`'s richer sched-stats check exits nonzero for init to fail the
+/// run, but that path races the login chain; this placement is airtight).
+#[cfg(feature = "test-harness")]
+fn sched_gate(root_ns: u64) -> bool {
+    let (st, mem) = ns_lookup(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        kprint(b"session-mgr: sched gate: lookup FAIL\n");
+        return false;
+    }
+    // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, 4096, RIGHT_MAP_READ) };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        kprint(b"session-mgr: sched gate: map FAIL\n");
+        return false;
+    }
+    // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the snapshot
+    // text (zero-padded to the page).
+    let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 4096) };
+    let active = cpus_with_switches(text);
+    // SAFETY: unmapping the page mapped above (`text` is not used past here);
+    // closing our own handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
+    if active >= 2 {
+        kprint(b"session-mgr: sched gate ok (>=2 CPUs with switches>0)\n");
+        true
+    } else {
+        kprint(b"session-mgr: sched gate FAIL (<2 CPUs with switches>0)\n");
+        false
+    }
+}
+
+/// Interactive/normal boots have no verdict to gate.
+#[cfg(not(feature = "test-harness"))]
+fn sched_gate(_root_ns: u64) -> bool {
+    true
 }
 
 /// Fire the boot verdict under `test-harness` (terminates QEMU via `SYS_TEST_EXIT`);

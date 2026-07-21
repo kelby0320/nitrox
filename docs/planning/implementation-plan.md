@@ -2027,9 +2027,10 @@ login → per-user namespace → home write) and **two remain, and are the only 
   `TypedRecord`); `heartbeat` emits typed beat rows `{seq, uptime_ns, healthy}` to its log
   channel; the logging service detects the `TSM1` magic and renders the decoded table (text
   `LogRecord`s still route to `parse_append`). See the decision log (2026-07-20 "libstream").
-- [ ] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
+- [x] **`/proc` scheduler-stats surface** (clause 3), pulling forward the *synthesized read-only
   `MemoryObject` snapshot* primitive (also unblocks numeric `/proc/self/status`).
-  Building as slice `phase-3/proc-sched-stats`; the primitive is the **capture → format →
+  **Done (2026-07-21)** — slice `phase-3/proc-sched-stats`; **Phase 3 is complete** (see the
+  decision log, 2026-07-21). The primitive is the **capture → format →
   synthesize** discipline (copy `Copy` data under one lock hold; format via `KString` with no
   lock held; wrap in a read-only `MemoryObject` — `try_new_filled` is the existing synthesis
   step, as `/dev/log`/initramfs already exercise):
@@ -2051,8 +2052,14 @@ login → per-user namespace → home write) and **two remain, and are the only 
     4× duplicated MemoryObject adoption. Closes the deferred numeric-`/proc/self/status`
     entry (`deferred-decisions.md`). Suffix rejection host-tested; success arm is
     QEMU-covered (Part D); full suite + `test-qemu` green.
-  - [ ] **Part D — demo + close-out.** QEMU selftest demo parses the snapshot and gates the
-    verdict on `switches>0` for ≥2 CPUs; decision-log entry; Phase 3 close-out.
+  - [x] **Part D — demo + verdict gate + close-out.** The demo `parent` maps + parses both
+    surfaces (pid/tid sanity; snapshot echoed grep-visibly — 4 CPUs with nonzero
+    switches/steals/IPIs under `-smp 4`) and exits nonzero on failure (init's fast-fail
+    path). Negative-testing exposed a **verdict race** — a failing demo loses to
+    session-mgr's login-proven PASS — so the authoritative **`sched_gate` runs in
+    session-mgr synchronously before the single `SYS_TEST_EXIT(PASS)`** (≥2 CPUs with
+    `switches>0`); a failure cannot race the verdict by construction. Negative-tested both
+    ways (injected failure → FAIL, exit 35; reverted → PASS). Decision-log entry 2026-07-21.
 
 Everything else in the backlog below is **consumer-driven and defers to Phase 4**, landing
 with its first consumer (the project's standing deferral discipline). Triage:

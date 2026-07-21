@@ -15,7 +15,9 @@
 //!    endpoint into each — so the children share a channel they can talk over;
 //! 3. blocks on its notification channel (`sys_wait`) and drains two
 //!    `ChildExited` notifications (`sys_notif_recv`), reporting each;
-//! 4. exits the whole process (`sys_process_exit`).
+//! 4. runs the **sched-stats demo** (`/proc/self/status` + `/proc/sched/stats`,
+//!    the Phase 3 clause-3 gate — see [`sched_stats_demo`]);
+//! 5. exits the whole process (`sys_process_exit`).
 //!
 //! This is the Phase-1 milestone proof: a multi-threaded supervisor that
 //! suspends + inspects + terminates a faulting thread, plus two userspace
@@ -67,6 +69,8 @@ static mut SPAWN_B: SpawnArgs = SpawnArgs {
 static mut NOTIF: Notification = Notification::zeroed();
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
+/// `sys_clock_read` out-param (the sched-stats demo's timer sleeps).
+static mut CLOCK_BUF: u64 = 0;
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
 /// blocking-send demo, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
@@ -785,6 +789,164 @@ fn initramfs_demo(root_ns: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
 }
 
+/// Find the first occurrence of `key` in `text` and parse the ASCII decimal
+/// run that follows it. `None` if the key is absent or not followed by a digit.
+fn parse_field(text: &[u8], key: &[u8]) -> Option<u64> {
+    let start = text.windows(key.len()).position(|w| w == key)? + key.len();
+    let mut n: u64 = 0;
+    let mut any = false;
+    for &b in &text[start..] {
+        if !b.is_ascii_digit() {
+            break;
+        }
+        any = true;
+        n = n.wrapping_mul(10).wrapping_add((b - b'0') as u64);
+    }
+    if any { Some(n) } else { None }
+}
+
+/// Count the `cpu=` rows in a `/proc/sched/stats` snapshot whose `switches`
+/// counter is nonzero — the clause-3 "CPUs visibly active" measure.
+fn cpus_with_switches(text: &[u8]) -> u64 {
+    let mut n = 0;
+    for line in text.split(|&b| b == b'\n') {
+        if line.starts_with(b"cpu=") && parse_field(line, b"switches=").is_some_and(|v| v > 0) {
+            n += 1;
+        }
+    }
+    n
+}
+
+/// Block this thread for `ms` milliseconds on a one-shot timer (create → arm →
+/// `sys_wait`). Best-effort: on any failure it just returns (the caller's retry
+/// loop is attempt-bounded either way).
+fn timer_sleep_ms(ms: u64) {
+    // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
+    let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
+    if th < 0 {
+        return;
+    }
+    let th = th as u64;
+    // SAFETY: CLOCK_BUF is a writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    let now = unsafe { (&raw const CLOCK_BUF).read() };
+    let fire_at = now + ms * 1_000_000;
+    // SAFETY: arming our own timer handle (absolute monotonic, one-shot).
+    unsafe { syscall4(SYS_TIMER_SET, th, fire_at, 0, 0) };
+    // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers; generous
+    // outer deadline so the timer (not the deadline) normally wakes us.
+    unsafe {
+        WAIT_HANDLES[0] = th;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            fire_at + 1_000_000_000,
+        );
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
+}
+
+/// `/proc/self/status` + `/proc/sched/stats` demo — the Phase 3 **clause 3**
+/// milestone check ("two CPUs visibly active via `/proc`"). **Verdict-gated**:
+/// any failure here exits nonzero, which init (under `test-harness`) turns into
+/// a FAIL verdict — an SMP-liveness regression fails `xtask test-qemu` outright.
+///
+/// Both surfaces are synthesized read-only `MemoryObject` text snapshots (the
+/// capture → format → synthesize discipline; see
+/// `docs/architecture/scheduler.md` § "The stats surface"):
+///
+/// 1. `/proc/self/status` — map it and parse the `pid=`/`tid=` rows; ours must
+///    be a real spawned identity (pid ≥ 2 — init is 1 — and tid ≥ 1).
+/// 2. `/proc/sched/stats` — each lookup returns a *fresh* snapshot; require
+///    **≥ 2 CPUs with `switches` > 0**. Runs last in the demo chain (the
+///    spawn/IPC demos and the concurrent login chain have exercised multiple
+///    CPUs by now); counters only grow, so retry with a 100 ms timer sleep
+///    (up to ~5 s) before declaring the run dead.
+fn sched_stats_demo(root_ns: u64) {
+    kprint(b"parent: sched-stats demo start\n");
+
+    // --- /proc/self/status: the caller's own numeric identity.
+    let (st, mem) = ns_lookup_wait(root_ns, b"/proc/self/status", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        kprint(b"parent: /proc/self/status lookup FAIL\n");
+        exit(1);
+    }
+    // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+    if addr < 0 {
+        kprint(b"parent: /proc/self/status map FAIL\n");
+        exit(1);
+    }
+    // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the status
+    // text (zero-padded to the page).
+    let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
+    let pid = parse_field(text, b"pid=").unwrap_or(0);
+    let tid = parse_field(text, b"tid=").unwrap_or(0);
+    if pid < 2 || tid < 1 {
+        kprint(b"parent: /proc/self/status content FAIL\n");
+        exit(1);
+    }
+    kprint(b"parent: /proc/self/status ok pid=");
+    kprint_u64(pid);
+    kprint(b" tid=");
+    kprint_u64(tid);
+    kprint(b"\n");
+    // SAFETY: unmapping the page we mapped above (`text` is not used past here);
+    // closing our own handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
+
+    // --- /proc/sched/stats: >= 2 CPUs with switches > 0.
+    let mut attempt = 0u32;
+    loop {
+        attempt += 1;
+        let (st, mem) = ns_lookup_wait(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
+        if st != 0 || mem == 0 {
+            kprint(b"parent: /proc/sched/stats lookup FAIL\n");
+            exit(1);
+        }
+        // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
+        let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+        if addr < 0 {
+            kprint(b"parent: /proc/sched/stats map FAIL\n");
+            exit(1);
+        }
+        // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the
+        // snapshot text (zero-padded to the page).
+        let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
+        let active = cpus_with_switches(text);
+        let done = active >= 2;
+        if done {
+            // Echo the winning snapshot into the boot log (grep-visible
+            // evidence of the milestone, alongside the machine-checked gate).
+            let len = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+            kprint(b"parent: /proc/sched/stats ok (");
+            kprint_u64(active);
+            kprint(b" CPUs with switches>0):\n");
+            kprint(&text[..len]);
+        }
+        // SAFETY: unmapping the page mapped above (`text` is not used past
+        // here); closing our own handle (each lookup minted a fresh snapshot).
+        unsafe {
+            syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
+            syscall1(SYS_HANDLE_CLOSE, mem);
+        }
+        if done {
+            return;
+        }
+        if attempt >= 50 {
+            kprint(b"parent: /proc/sched/stats FAIL (<2 CPUs with switches>0)\n");
+            exit(1);
+        }
+        timer_sleep_ms(100);
+    }
+}
+
 /// Wait on a single `PendingOperation` handle and return its completion
 /// `(status, result)` from the `IoResult` (status at bytes 8..12, result at
 /// 16..24). Closes `po`.
@@ -1245,7 +1407,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
-    // 4. Exit. The child process handles (`_pa`/`_pb`, owning libos Handles) reap on
+    // 4. The sched-stats milestone check runs LAST, after the spawn/IPC demos
+    // above have put real work on multiple CPUs (and the login chain has been
+    // running concurrently throughout) — see `sched_stats_demo`.
+    sched_stats_demo(root_ns);
+
+    // 5. Exit. The child process handles (`_pa`/`_pb`, owning libos Handles) reap on
     // drop as this function returns into the exit below.
     kprint(b"parent: both children reaped; exiting\n");
     exit(0);

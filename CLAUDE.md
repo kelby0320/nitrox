@@ -122,4 +122,4 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phase 1 (kernel substrate) is **complete**; Phase 0 (foundation) is complete. Phase 2 is next. See `docs/history/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
+Phases 0–3 (foundation, kernel substrate, boot-to-userspace, service ecosystem) are **complete** (Phase 3 closed 2026-07-21). Phase 4 (toward a usable windowed desktop) is next. See `docs/history/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
