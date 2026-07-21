@@ -2044,8 +2044,13 @@ login → per-user namespace → home write) and **two remain, and are the only 
     pid 1 at boot; `scheduler.md` gains § "The stats surface" (counters table + the
     capture → format → synthesize discipline). Host tests (the all-offline snapshot renders
     exactly the header into a fresh `MemoryObject`; leaf suffix rejection); `test-qemu` green.
-  - [ ] **Part C — `/proc/self/status`.** `pid=`/`tid=` text via the same three steps
-    (closes the deferred-decisions entry; second consumer proves the primitive's reuse).
+  - [x] **Part C — `/proc/self/status`.** `KernelServerId::ProcSelfStatus`: `pid=`/`tid=`
+    text from the calling syscall context (`sched::current_pid_tid()`, one `SCHED` hold; a
+    refcount-free `Thread::has_process` gates kernel/boot callers to *not found*), bound with
+    the snapshot-server rights shape. The shared `complete_with_memobj` tail replaces the
+    4× duplicated MemoryObject adoption. Closes the deferred numeric-`/proc/self/status`
+    entry (`deferred-decisions.md`). Suffix rejection host-tested; success arm is
+    QEMU-covered (Part D); full suite + `test-qemu` green.
   - [ ] **Part D — demo + close-out.** QEMU selftest demo parses the snapshot and gates the
     verdict on `switches>0` for ≥2 CPUs; decision-log entry; Phase 3 close-out.
 

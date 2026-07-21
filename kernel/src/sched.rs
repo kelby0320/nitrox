@@ -2767,6 +2767,27 @@ pub fn current_owner_pid() -> u32 {
     unsafe { &*(cur.as_ptr() as *const crate::object::Thread) }.owner_pid()
 }
 
+/// The calling thread's numeric identity `(pid, tid)`, read under one `SCHED`
+/// hold — the capture step of the `/proc/self/status` snapshot (see
+/// `object::kernel_server` and `docs/architecture/scheduler.md` § "The stats
+/// surface"). `None` when no thread is current yet, or when the current thread
+/// is a kernel/boot thread with no owning process (mirroring
+/// [`current_process`]'s `None` arm, which the other `/proc/self` leaves map to
+/// *not found*).
+pub fn current_pid_tid() -> Option<(u32, u32)> {
+    let g = SCHED.lock();
+    let cur = g.cur_ref().as_ref()?;
+    // SAFETY: `current` is pinned alive and the run-queue lock serialises
+    // Thread access; shared `&Thread` reads of the identity fields are sound.
+    // `has_process` touches no refcount, so no `ObjectRef` clone/drop happens
+    // under the rank-1 lock.
+    let t = unsafe { &*(cur.as_ptr() as *const crate::object::Thread) };
+    if !t.has_process() {
+        return None;
+    }
+    Some((t.owner_pid(), t.tid()))
+}
+
 /// The tid of the currently running thread. Used by the exception path to fill
 /// the `thread` field of a fault notification. Takes only the rank-1 lock.
 pub fn current_tid() -> u32 {

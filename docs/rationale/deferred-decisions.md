@@ -334,6 +334,13 @@ contract to return a scalar in `IoResult.result` (a permanent per-path
 handle-vs-value ambiguity / footgun). Trigger: a real consumer of numeric pid/tid
 (e.g. logging infra), or the first synthesized read-only snapshot (`/proc/self/status`)
 that forces the primitive. See the decision log (2026-06-22).
+**Done (Phase 3, the `/proc/sched/stats` slice).** The trigger fired from the snapshot
+side: the Phase 3 clause-3 scheduler-stats surface pinned the primitive down as the
+**capture → format → synthesize** discipline (copy `Copy` data under the owning lock;
+format via `KString` with no lock held; `MemoryObject::try_new_filled` — see
+`docs/architecture/scheduler.md` § "The stats surface"), and `/proc/self/status`
+shipped as its second consumer (`KernelServerId::ProcSelfStatus`, `pid=`/`tid=` rows
+from the calling syscall context). The handle-introspection extension was not needed.
 
 **`/dev` directory stub (enumerable placeholder).** Slice 5 gives `DeviceNode` a
 real kernel struct (PCI-discovered nodes; block disks resolve via
