@@ -2129,10 +2129,16 @@ to date). Slice `phase-4/substrate-hardening`:
   later exit push *allocate under `SCHED`* via `KVec::try_push` growth). F4: `steal_one`
   picks the busiest victim *among those with a stealable thread*, matching
   `steal_available` (fixes the idle-steal `expect` panic + the missed-steal liveness wart).
-- [ ] **Part B — F1: IF-robust TLB shootdown.** `tlb::shootdown` saves IF, runs the
-  `LOCK` acquisition + ack spin with interrupts enabled, restores after — so IF=0
-  initiators (syscall/exception-context `KernelStack::Drop` via `reap_pending`) cannot
-  mutually deadlock and always service incoming shootdown IPIs while waiting.
+- [x] **Part B — F1: IF-robust TLB shootdown** (landed; `test-qemu` green, 30/30 KVM
+  boot-loop). `tlb::shootdown` saves IF, runs the whole window — `LOCK` acquisition,
+  IPIs, ack spin — with interrupts enabled, restores after: IF=0 initiators
+  (syscall/exception-context `KernelStack::Drop` via `reap_pending`) cannot mutually
+  deadlock and always service incoming shootdown IPIs while waiting. Because the
+  initiator is now preemptible (and can migrate) mid-window, the request targets
+  **every online CPU including the initiator's** (a self-IPI replaces the local
+  invalidate) — position-independent, so the ack count stays exact wherever the
+  initiator resumes. Caller contract tightened: preemptible kernel context, no
+  spinlocks held, never IRQ/DPC. `smp.md` §8 updated.
 - [ ] **Part C — F3: broadcast shootdown on user-page unmap** (`unmap_covering` /
   protect edits) — required before multi-threaded processes; `active_cpus` targeting
   stays the later optimization. Depends on Part B.

@@ -13,27 +13,47 @@
 //! acknowledged. The transport (the IPI itself, the dense-index → APIC-id map) is
 //! in the arch layer; the protocol here is arch-neutral.
 //!
-//! ## Model (v1: broadcast + synchronous)
-//! One shootdown at a time system-wide (serialised by [`LOCK`]); it targets **all**
-//! other online CPUs rather than only those currently running the affected address
-//! space. That is always correct and is required for the kernel vmap (kernel-stack
-//! mappings live in every address space); per-address-space targeting is a later
-//! optimisation. The initiator spins for acknowledgements; because `LOCK` is a
-//! plain (non-IRQ-masking) spinlock and callers run with interrupts enabled, a
-//! CPU waiting here still services an incoming shootdown IPI, so two initiators
-//! cannot deadlock.
+//! ## Model (v1: broadcast + synchronous, IF-robust)
+//! One shootdown at a time system-wide (serialised by [`LOCK`]); it targets
+//! **every online CPU, including the initiator's own** (a self-IPI rather than a
+//! local invalidation — see below), rather than only those currently running the
+//! affected address space. That is always correct and is required for the kernel
+//! vmap (kernel-stack mappings live in every address space); per-address-space
+//! targeting is a later optimisation.
+//!
+//! The whole request — lock acquisition, IPIs, ack spin — runs with **interrupts
+//! enabled**, saving and restoring the caller's interrupt state (F1, decision log
+//! 2026-07-21). Two consequences:
+//!
+//! - **No mutual-wait deadlock, from any caller.** Callers reach here from
+//!   IF-masked contexts (syscall bodies run masked end-to-end; the ring-3
+//!   exception path) via `reap_pending → KernelStack::Drop`. An IF-masked
+//!   spinner — on [`LOCK`] or on the acks — could never service *another*
+//!   initiator's shootdown IPI, so two IF=0 initiators deadlocked. Enabling IF
+//!   for the window restores the invariant the ack protocol depends on: anyone
+//!   waiting can always take an incoming shootdown IPI.
+//! - **The initiator may be preempted — and migrate — mid-window**, so the
+//!   request must not depend on *where* the initiator runs. Targeting every
+//!   online CPU (self included) makes the target set position-independent:
+//!   whichever CPU the initiator resumes on, every CPU that could hold the stale
+//!   translation invalidates exactly once, and the ack count is exact.
 //!
 //! ## Caller contract
-//! Invoke with **interrupts enabled** and **without holding a lock that a remote
-//! CPU could be waiting on with interrupts masked** (in particular not the `SCHED`
-//! run-queue lock). Shootdown sites live in the mm layer (unmap / protect / frame
-//! free), which satisfies this.
+//! Call from **preemptible kernel context only** — a thread body, a syscall, or
+//! the ring-3 exception path — never from an IRQ handler or DPC (the window
+//! enables interrupts, and frees — the only initiators — are already forbidden
+//! there), and **never while holding any spinlock** (in particular not `SCHED`:
+//! remote CPUs spin for it IF-masked and could not ack; and preemption while
+//! holding a lock stalls every other waiter). Shootdown sites live in the mm
+//! layer (unmap / frame free), reached via `reap_pending` outside all locks,
+//! which satisfies this.
 
 use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
 use crate::arch::smp::ArchSmp;
-use crate::arch::{MAX_CPUS, Paging, Smp, send_shootdown_ipi};
+use crate::arch::{Cpu, MAX_CPUS, Paging, Smp, send_shootdown_ipi};
 use crate::libkern::SpinLock;
 use crate::mm::VirtAddr;
 
@@ -79,40 +99,58 @@ unsafe fn invalidate_local(va: Option<VirtAddr>) {
 
 fn shootdown(va: Option<VirtAddr>) {
     let me = Smp::current_cpu() as usize;
-    let others = crate::sched::online_mask() & !(1u64 << me);
+    let online = crate::sched::online_mask();
 
     // Fast path: sole online CPU (or pre-SMP boot) — just invalidate locally.
-    if others == 0 {
+    // With no other CPU there is no cross-CPU stale entry, no possible second
+    // initiator, and no preemption target to migrate to.
+    if online & !(1u64 << me) == 0 {
         // SAFETY: ring-0; local invalidation of a caller-owned page-table change.
         unsafe { invalidate_local(va) };
         return;
     }
 
-    let _guard = LOCK.lock();
+    // Run the whole request with interrupts **enabled**, restoring the caller's
+    // state after (the module-doc IF-robustness contract): an IF-masked spinner
+    // here could never service another initiator's shootdown IPI (two IF=0
+    // initiators deadlock — F1), and enabling IF means we may be preempted and
+    // resume on another CPU, which is why the target set below is
+    // position-independent (every online CPU, self included).
+    let prev_if = Cpu::interrupts_enabled();
+    // SAFETY: ring-0, preemptible kernel context (the caller contract); the IDT
+    // and timer are live (APs are online). Restored below.
+    unsafe { Cpu::interrupts_enable() };
 
-    // Publish the request before signalling any target (Release pairs with the
-    // targets' Acquire loads in `on_ipi`).
-    REQUEST_ALL.store(va.is_none(), Ordering::Relaxed);
-    REQUEST_VA.store(va.map(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
-    PENDING.store(others.count_ones(), Ordering::Release);
+    {
+        let _guard = LOCK.lock();
 
-    // Signal every other online CPU.
-    for cpu in 0..MAX_CPUS {
-        if others & (1u64 << cpu) != 0 {
-            send_shootdown_ipi(cpu);
+        // Publish the request before signalling any target (Release pairs with
+        // the targets' Acquire loads in `on_ipi`).
+        REQUEST_ALL.store(va.is_none(), Ordering::Relaxed);
+        REQUEST_VA.store(va.map(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
+        PENDING.store(online.count_ones(), Ordering::Release);
+
+        // Signal every online CPU — including the one we are running on (a
+        // self-IPI, serviced during the ack spin below). A CPU that comes
+        // online after this snapshot cannot hold the stale translation: the
+        // caller cleared the PTEs *before* initiating, so a later walk caches
+        // only the new state.
+        for cpu in 0..MAX_CPUS {
+            if online & (1u64 << cpu) != 0 {
+                send_shootdown_ipi(cpu);
+            }
+        }
+
+        // Wait for every target (self included) to acknowledge. Interrupts are
+        // enabled, so this CPU services its own IPI — and any other initiator's
+        // — while spinning.
+        while PENDING.load(Ordering::Acquire) != 0 {
+            core::hint::spin_loop();
         }
     }
 
-    // Invalidate locally while the targets work.
-    // SAFETY: ring-0; local invalidation of a caller-owned page-table change.
-    unsafe { invalidate_local(va) };
-
-    // Wait for every target to acknowledge. Interrupts are enabled (caller
-    // contract + non-masking `LOCK`), so this CPU still services any shootdown
-    // IPI aimed at it while spinning — no mutual-wait deadlock.
-    while PENDING.load(Ordering::Acquire) != 0 {
-        core::hint::spin_loop();
-    }
+    // SAFETY: ring-0; restore the interrupt state captured above.
+    unsafe { Cpu::interrupts_restore(prev_if) };
 }
 
 /// Handle an incoming TLB-shootdown IPI on this CPU: invalidate as the current

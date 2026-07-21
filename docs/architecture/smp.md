@@ -239,12 +239,29 @@ These are the load-bearing rules. Every bug in Part 2 was a violation of one.
 
 `crate::tlb` is the architecture-neutral coordinator; `arch::send_shootdown_ipi`
 (vector `0x40`) is the transport. On a kernel-vmap free (`KernelStack::Drop`):
-clear the PTEs, then `shootdown_all()` — broadcast to every *other* online core
-(`sched::online_mask() & !(1<<me)`), each of which invalidates and acknowledges,
-and spin until all acknowledge — *then* return the frames to the allocator. The
-lock is a plain (non-IRQ-masking) spinlock and callers run with interrupts
-enabled, so a core spinning for acks still services an incoming shootdown IPI —
-two initiators cannot deadlock. **Map-side installs are not shot down** (adding a
+clear the PTEs, then `shootdown_all()` — broadcast to **every online core,
+including the initiator's own** (a self-IPI), each of which invalidates and
+acknowledges; spin until all acknowledge — *then* return the frames to the
+allocator.
+
+The request window is **IF-robust** (reworked 2026-07-21, review finding F1): the
+coordinator saves the caller's interrupt state and runs the whole window — lock
+acquisition, IPIs, ack spin — with interrupts *enabled*, restoring after. The
+original design assumed callers arrived with IF=1, but shootdowns are reached
+from `reap_pending → KernelStack::Drop` in **IF-masked** contexts (syscall bodies
+run masked end-to-end; the ring-3 exception path) — and an IF-masked spinner can
+never service *another* initiator's shootdown IPI, so two IF=0 initiators
+deadlocked (one holding the serialising lock spinning for an ack the other,
+spinning on that lock with IRQs masked, could never send). Enabling IF for the
+window also means the initiator may be **preempted and resume on another core**
+mid-request — which is why the target set is *every* online core rather than
+"everyone but me": it is position-independent, so wherever the initiator ends up,
+every core that could hold the stale translation invalidates exactly once and the
+ack count is exact. Callers must be preemptible kernel contexts holding no
+spinlock (never an IRQ handler/DPC — frees, the only initiators, are already
+forbidden there).
+
+**Map-side installs are not shot down** (adding a
 mapping needs no cross-core invalidation on x86; the vmap PDPT is pre-allocated so
 intermediate structures are already present) — matching Linux, which shoots down
 only on unmap / permission-restrict.
