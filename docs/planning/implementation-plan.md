@@ -2139,9 +2139,16 @@ to date). Slice `phase-4/substrate-hardening`:
   invalidate) — position-independent, so the ack count stays exact wherever the
   initiator resumes. Caller contract tightened: preemptible kernel context, no
   spinlocks held, never IRQ/DPC. `smp.md` §8 updated.
-- [ ] **Part C — F3: broadcast shootdown on user-page unmap** (`unmap_covering` /
-  protect edits) — required before multi-threaded processes; `active_cpus` targeting
-  stays the later optimization. Depends on Part B.
+- [x] **Part C — F3: broadcast shootdown on user-page unmap** (landed; `test-qemu`
+  green — the sched-stats demo exercises the path ~50×/boot — and 30/30 KVM boot-loop).
+  New `unmap_covering_deferred`: under the AS lock the VMA is removed and PTEs cleared,
+  but every frame release is **deferred** — anonymous frames collect into a
+  caller-reserved `KVec` (`Err(pages)` = reserve-outside-lock-and-retry) and the `Vma`
+  keeps its object ref; `sys_memory_unmap` then runs the (IF-robust) broadcast
+  shootdown **outside the AS lock** (a `#PF` handler spins on that lock IF-masked and
+  could not ack) and only then frees frames / drops the VMA. The old in-lock-freeing
+  `unmap_covering` is `#[cfg(test)]` (host tests have no remote TLBs). `active_cpus`
+  targeting stays the later optimization.
 - [ ] **Part D — F5: honor `on_cpu` everywhere.** Spin on `!is_on_cpu` in `switch_into`
   before reading `saved_sp` (covers affinity-diverted wake/resume placement picked up by
   `dequeue_front`), and wait out the guard in `exit_process`'s reap sweeps (stack-UAF

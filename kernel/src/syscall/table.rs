@@ -963,17 +963,32 @@ pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
     }
     let proc_ref = crate::sched::current_process().ok_or(KError::KernelError)?;
     let asp = current_address_space(&proc_ref).ok_or(KError::KernelError)?;
-    match asp.unmap_covering(va) {
-        Some(_vma) => {
-            // `_vma` drops here, releasing its object reference (for object
-            // mappings) or freeing its anonymous frames. The AS is active;
-            // flush the removed PTEs.
-            // SAFETY: ring-0 TLB flush; reloads the active root with itself.
-            unsafe { Paging::flush_tlb_all() };
-            Ok(0)
+    // Size the frame buffer outside the AS lock; `Err(pages)` = reserve and
+    // retry (the covering VMA can change between attempts once processes are
+    // multi-threaded, so the capacity is re-checked under the lock each time).
+    let mut frames: crate::libkern::KVec<crate::mm::PhysAddr> = crate::libkern::KVec::new();
+    let vma = loop {
+        match asp.unmap_covering_deferred(va, &mut frames) {
+            Ok(Some(vma)) => break vma,
+            Ok(None) => return Err(KError::InvalidArgument),
+            Err(pages) => frames
+                .try_reserve(pages as usize)
+                .map_err(|_| KError::OutOfMemory)?,
         }
-        None => Err(KError::InvalidArgument),
+    };
+    // The PTEs are cleared, but another CPU running this address space may
+    // still hold live translations for the range (F3, decision log 2026-07-21):
+    // invalidate everywhere — this CPU included — BEFORE any frame becomes
+    // reusable. Only then free the anonymous frames and drop the VMA (whose
+    // drop may release the backing MemoryObject's frames). We are in a syscall
+    // (IF-masked); `shootdown_all` is IF-robust and enables interrupts for its
+    // window (see `crate::tlb`).
+    crate::tlb::shootdown_all();
+    for &f in frames.iter() {
+        crate::mm::heap::buddy_free(f, 0);
     }
+    drop(vma);
+    Ok(0)
 }
 
 // --- Clock syscall ------------------------------------------------------

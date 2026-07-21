@@ -53,7 +53,7 @@ use crate::arch::Paging;
 use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_VIRT_END};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
-use crate::libkern::{AllocError, KBox, SpinLock};
+use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{MemoryObject, ObjectRef};
@@ -633,11 +633,70 @@ impl AddressSpace {
     /// its range uninstalling every PTE and freeing the backing frame
     /// (for anonymous mappings). Returns the VMA box, or `None` if no
     /// VMA covers `addr`.
+    ///
+    /// **Host tests only.** Freeing frames in place is wrong on SMP — another
+    /// CPU running this address space may still hold live TLB translations for
+    /// the range (F3, decision log 2026-07-21); the production unmap is
+    /// [`unmap_covering_deferred`](Self::unmap_covering_deferred), which defers
+    /// every frame release until after a cross-CPU shootdown. Host tests have
+    /// no remote TLBs, so the simpler in-lock free stays valid there.
+    #[cfg(test)]
     pub fn unmap_covering(&self, addr: VirtAddr) -> Option<KBox<Vma>> {
         let mut guard = self.inner.lock();
         let boxed = guard.vma_tree.remove_covering(addr)?;
         free_vma_pages(guard.root, &boxed);
         Some(boxed)
+    }
+
+    /// Remove the VMA covering `addr` and uninstall its PTEs, **deferring every
+    /// frame release to the caller**: anonymous leaf frames are collected into
+    /// `frames` (whose spare capacity must already hold them — nothing grows
+    /// under the lock) instead of being freed here, and the returned [`Vma`]
+    /// still holds its backing-object reference.
+    ///
+    /// This is the production unmap (`sys_memory_unmap`): another CPU running
+    /// this address space may still hold live TLB translations for the removed
+    /// range, so no frame may become reusable until they are invalidated (F3,
+    /// decision log 2026-07-21). The caller must broadcast a TLB shootdown
+    /// after this returns and only then free the collected frames and drop the
+    /// returned `Vma` (whose drop can release the backing `MemoryObject`'s
+    /// frames).
+    ///
+    /// Returns `Err(pages)` — with the tree and PTEs untouched — if `frames`'
+    /// spare capacity cannot hold the VMA's page count; the caller reserves
+    /// (outside this lock) and retries.
+    pub fn unmap_covering_deferred(
+        &self,
+        addr: VirtAddr,
+        frames: &mut KVec<PhysAddr>,
+    ) -> Result<Option<KBox<Vma>>, u64> {
+        let mut guard = self.inner.lock();
+        let pages = match guard.vma_tree.find_covering(addr) {
+            Some(v) => v.range.pages(),
+            None => return Ok(None),
+        };
+        if ((frames.capacity() - frames.len()) as u64) < pages {
+            return Err(pages);
+        }
+        let boxed = guard
+            .vma_tree
+            .remove_covering(addr)
+            .expect("find_covering matched under the same hold");
+        for i in 0..boxed.range.pages() {
+            let virt = VirtAddr::new(boxed.range.start().as_u64() + i * (PAGE_SIZE as u64));
+            // SAFETY: every page in the range was mapped by a prior `map_vma`
+            // under this same AS lock; `guard.root` is the top-level table they
+            // were installed into.
+            let r = unsafe { Paging::unmap_page(guard.root, virt) };
+            if let Ok(phys) = r {
+                if matches!(boxed.mapping, MappingKind::Anonymous) {
+                    frames
+                        .try_push(phys)
+                        .expect("within the spare capacity checked above");
+                }
+            }
+        }
+        Ok(Some(boxed))
     }
 }
 
