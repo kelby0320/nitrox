@@ -9,10 +9,14 @@
 # PIE/ET_DYN and dynamic interpreters. `user.ld` (via build.rs) fixes the load
 # address; these flags force static/non-PIE small-code-model output.
 
+# `x86_64-unknown-nitrox` (custom spec, one directory up) rather than the
+# built-in `x86_64-unknown-none`: userspace needs a **hard-float** ABI, and no
+# stock freestanding x86_64 target provides one. The path is relative to the
+# build cwd, which xtask sets to this crate directory.
 [build]
-target = "x86_64-unknown-none"
+target = "../x86_64-unknown-nitrox.json"
 
-[target.x86_64-unknown-none]
+[target.x86_64-unknown-nitrox]
 rustflags = [
     "-C", "code-model=small",
     "-C", "relocation-model=static",

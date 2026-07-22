@@ -96,6 +96,7 @@ fn main() -> ExitCode {
         Some("test") => cmd_test(),
         Some("test-qemu") => cmd_test_qemu(),
         Some("check-arch") => cmd_check_arch(),
+        Some("check-nightly") => cmd_check_nightly(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -128,6 +129,7 @@ fn print_help() {
            test          host-side unit tests (kernel lib + tools)\n  \
            test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
+           check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
            help          show this message\n\
@@ -214,10 +216,60 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     Ok(())
 }
 
+/// The userspace target's name — the stem of `userspace/x86_64-unknown-nitrox.json`,
+/// which is also the directory cargo puts its artifacts under.
+///
+/// A **custom** spec rather than a built-in target because userspace needs a hard-float
+/// ABI and stable rustc ships no freestanding x86_64 target that has one (see the
+/// decision log, 2026-07-21). The kernel keeps the built-in `x86_64-unknown-none`.
+const USERSPACE_TARGET: &str = "x86_64-unknown-nitrox";
+
+/// A `cargo` command for the **userspace** workspace, resolved against
+/// `userspace/rust-toolchain.toml`.
+///
+/// xtask is itself launched by `cargo run`, which exports `RUSTUP_TOOLCHAIN` into our
+/// environment — and that variable *overrides* rustup's directory-based lookup, so a
+/// child `cargo` would silently stay on the outer (stable) toolchain and reject `-Z`.
+/// Clearing it lets `userspace/rust-toolchain.toml` govern, which keeps the nightly pin
+/// in exactly one place instead of duplicating the version string here. `RUSTC`/`RUSTDOC`
+/// go too: cargo points them at the outer toolchain's binaries, which would defeat the
+/// re-resolution.
+fn userspace_cargo() -> Command {
+    let mut c = Command::new("cargo");
+    c.env_remove("RUSTUP_TOOLCHAIN")
+        .env_remove("RUSTC")
+        .env_remove("RUSTDOC");
+    c
+}
+
+/// Point a bare-target `cargo` invocation at the Nitrox userspace target.
+///
+/// A custom spec has no precompiled sysroot, so `core`/`alloc`/`compiler_builtins` are
+/// rebuilt from source with `-Z build-std` — the reason `userspace/rust-toolchain.toml`
+/// pins a nightly. `compiler-builtins-mem` is deliberately **not** requested: `libkern`
+/// exports its own `memcpy`/`memmove`/`memset`/`memcmp`, and enabling the feature would
+/// define them twice.
+///
+/// `--target` is passed as the JSON path relative to the crate directory (which is the
+/// cwd for these builds), matching the crate's own `.cargo/config.toml`.
+fn arg_userspace_target(c: &mut Command) {
+    c.arg("--target")
+        .arg(format!("../{USERSPACE_TARGET}.json"))
+        .arg("-Z")
+        .arg("build-std=core,alloc,compiler_builtins");
+}
+
+/// Directory holding built userspace release artifacts.
+fn userspace_release_dir() -> PathBuf {
+    repo_root()
+        .join("userspace/target")
+        .join(USERSPACE_TARGET)
+        .join("release")
+}
+
 /// Path to the built `hello` userspace ELF (release; the kernel embeds this).
 fn hello_elf() -> PathBuf {
-    repo_root()
-        .join("userspace/target/x86_64-unknown-none/release/hello")
+    userspace_release_dir().join("hello")
 }
 
 /// Build the `hello` userspace program as a static `ET_EXEC` for the bare
@@ -226,12 +278,10 @@ fn hello_elf() -> PathBuf {
 /// userspace members.
 fn cmd_build_hello() -> R<()> {
     let hello_dir = repo_root().join("userspace").join("hello");
-    run(Command::new("cargo")
-        .arg("build")
-        .arg("--release")
-        .arg("--target")
-        .arg("x86_64-unknown-none")
-        .current_dir(&hello_dir))?;
+    let mut c = userspace_cargo();
+    c.arg("build").arg("--release");
+    arg_userspace_target(&mut c);
+    run(c.current_dir(&hello_dir))?;
     let elf = hello_elf();
     if !elf.exists() {
         return Err(format!("hello ELF missing after build: {}", elf.display()).into());
@@ -246,18 +296,14 @@ fn cmd_build_hello() -> R<()> {
 /// for the spawn-demo binaries (`parent`, `child`).
 fn build_userspace_bin(name: &str, features: Option<&str>) -> R<()> {
     let dir = repo_root().join("userspace").join(name);
-    let mut c = Command::new("cargo");
-    c.arg("build")
-        .arg("--release")
-        .arg("--target")
-        .arg("x86_64-unknown-none");
+    let mut c = userspace_cargo();
+    c.arg("build").arg("--release");
+    arg_userspace_target(&mut c);
     if let Some(f) = features {
         c.arg("--features").arg(f);
     }
     run(c.current_dir(&dir))?;
-    let elf = repo_root()
-        .join("userspace/target/x86_64-unknown-none/release")
-        .join(name);
+    let elf = userspace_release_dir().join(name);
     if !elf.exists() {
         return Err(format!("{name} ELF missing after build: {}", elf.display()).into());
     }
@@ -600,6 +646,51 @@ fn cmd_test() -> R<()> {
 /// `mod x86_64` already makes such a path a compile error; this lint is the
 /// regression net for comments, doc-links, and future re-export slips that
 /// the compiler can't catch. See `docs/conventions/arch-boundary.md`.
+/// Enforce the **narrowed** stable-Rust rule: userspace pins a nightly toolchain (it
+/// must, to `-Z build-std` a custom hard-float target), but no crate anywhere may use a
+/// nightly *language or library* feature.
+///
+/// Without this check the pin would quietly turn into a licence to reach for
+/// `#![feature(...)]`, and the project would drift onto nightly for real. See
+/// `userspace/rust-toolchain.toml` and the decision log (2026-07-21 floating-point).
+fn cmd_check_nightly() -> R<()> {
+    let mut violations: Vec<String> = Vec::new();
+    // The two workspaces that ship *in* Nitrox. `tools/` is deliberately excluded:
+    // xtask is host tooling, explicitly outside the stable-Rust rule (see this file's
+    // module docs). `target/` is pruned because build-std rebuilds `core` from a
+    // vendored checkout that legitimately uses nightly features.
+    for ws in ["kernel/src", "userspace"] {
+        let src_root = repo_root().join(ws);
+        visit_rs_files_skipping(&src_root, &["target"], &mut |path| {
+            let text = fs::read_to_string(path)?;
+            for (i, line) in text.lines().enumerate() {
+                // Only real code counts; prose may legitimately discuss the attribute.
+                let code = line.split("//").next().unwrap_or("");
+                if code.contains("#![feature(") {
+                    violations.push(format!("{}:{}: {}", path.display(), i + 1, line.trim()));
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    if violations.is_empty() {
+        println!("check-nightly: no `#![feature(...)]` — nightly is used only for build-std ✓");
+        Ok(())
+    } else {
+        let mut msg = String::from(
+            "nightly language/library features are not permitted — the nightly toolchain \
+             exists solely to `-Z build-std` the custom userspace target:\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        Err(msg.into())
+    }
+}
+
 fn cmd_check_arch() -> R<()> {
     let kernel_src = repo_root().join("kernel").join("src");
     let arch_dir = kernel_src.join("arch");
@@ -639,6 +730,28 @@ fn cmd_check_arch() -> R<()> {
 }
 
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each.
+/// [`visit_rs_files`], but pruning any directory whose name is in `skip` (e.g. build
+/// output trees, which can be enormous and are not project source).
+fn visit_rs_files_skipping(
+    dir: &Path,
+    skip: &[&str],
+    f: &mut dyn FnMut(&Path) -> R<()>,
+) -> R<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if skip.contains(&name) {
+                continue;
+            }
+            visit_rs_files_skipping(&path, skip, f)?;
+        } else if path.extension().map_or(false, |e| e == "rs") {
+            f(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn visit_rs_files(dir: &Path, f: &mut dyn FnMut(&Path) -> R<()>) -> R<()> {
     for entry in fs::read_dir(dir)? {
         let path = entry?.path();
@@ -777,9 +890,7 @@ fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
 
 /// The release path of a built userspace binary (bare target).
 fn userspace_bin_path(name: &str) -> PathBuf {
-    repo_root()
-        .join("userspace/target/x86_64-unknown-none/release")
-        .join(name)
+    userspace_release_dir().join(name)
 }
 
 /// FNV-1a content hash of `bytes` as the store path's opaque `<hash>` (12 hex chars).

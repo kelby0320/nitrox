@@ -7448,3 +7448,75 @@ are meaningful; the selftest says so in its own output.)
 **Verified:** both builds warning-free; full host suite green; `check-arch` clean;
 `test-qemu` (TCG `-cpu max`) PASS; KVM `-cpu host` PASS and **20/20** boot-loop with the
 isolation demo passing every run.
+
+## 2026-07-21 — FP enablement Part C: `x86_64-unknown-nitrox`, and a narrowed stable-Rust rule
+
+The toolchain half of the floating-point plan. Userspace now builds for a custom
+hard-float target; the kernel and tools are untouched and stay on stable.
+
+**The target.** `userspace/x86_64-unknown-nitrox.json`, derived from a dump of
+`x86_64-unknown-none` and changed in exactly the ways that matter: `features` becomes
+`+sse,+sse2`, the `rustc-abi: softfloat` key is dropped (that key, not the feature
+string, is what makes the ABI soft-float), and `os` becomes `nitrox` so
+`target_os = "nitrox"` is available to the eventual `std` port. Everything else — data
+layout, `rust-lld`, `panic-strategy: abort`, `disable-redzone`, code model — is carried
+over unchanged, deliberately: introducing a new target is not the moment to vary five
+things at once. (The red zone is one we *could* enable, since Nitrox has no signals and
+traps switch stacks, but that is a separate change with its own justification; noted as a
+follow-up rather than smuggled in here.)
+
+**SSE2 baseline, not AVX2.** A base-AVX2 target `#UD`s on pre-Haswell hardware and on
+QEMU's `qemu64` model. Wider vectors are opted into per function with
+`#[target_feature(enable = "avx2")]` behind a runtime CPUID check — exactly what the
+ecosystem crates the toolkit will pull in already do. The kernel independently saves AVX
+state whenever the CPU has it, regardless of what userspace was compiled for.
+
+**Build plumbing.** A custom spec has no precompiled sysroot, so `core`/`alloc`/
+`compiler_builtins` are rebuilt with `-Z build-std`. That is passed by xtask on the
+command line for **bare-target builds only**, never in `.cargo/config.toml`, so
+`cargo xtask test` keeps using the precompiled *host* sysroot instead of trying to
+rebuild `std` from source. `compiler-builtins-mem` is deliberately **not** requested:
+`libkern` already exports strong `memcpy`/`memmove`/`memset`/`memcmp` (they exist to work
+around a 2026-06-22 codegen hazard), and enabling the feature would define the same
+symbols twice. Their signatures moved from `*mut u8` to `*mut c_void` to satisfy rustc's
+runtime-symbol lint, which the newer toolchain surfaced.
+
+One trap worth recording: xtask is itself launched by `cargo run`, which exports
+`RUSTUP_TOOLCHAIN` — and that variable **overrides** rustup's directory-based lookup, so
+a child `cargo` ignored `userspace/rust-toolchain.toml` and rejected `-Z` as
+"stable channel". xtask now clears `RUSTUP_TOOLCHAIN`/`RUSTC`/`RUSTDOC` for userspace
+invocations, which keeps the nightly version pinned in one place (the toml) rather than
+duplicated in the build tool.
+
+**The rule is narrowed, not abandoned.** `CLAUDE.md` previously said "Stable Rust only.
+No nightly features." It now says: **no nightly language or library features anywhere in
+`kernel/` or `userspace/`**, and a nightly toolchain *solely* to `-Z build-std` the
+custom target. The pin is an exact date (`nightly-2026-07-20`), not a floating `nightly`
+— an unpinned channel would make every build a fresh roll of the dice on regressions.
+The exception is enforced, not merely stated: `cargo xtask check-nightly` fails on any
+`#![feature(` in the two shipped workspaces and runs in CI (`tools/` is excluded — xtask's
+own module docs already exempt host tooling). The check was negative-controlled by
+inserting `#![feature(never_type)]` into `hello` and confirming it fails.
+
+**The payoff, immediately.** Part A's decision log argued for doing this *now* rather
+than when the display stack needs it, on the grounds that the toolchain half is unknown
+work best de-risked early. It paid off on the first boot: `init` faulted at a
+`movaps %xmm0,(%rsp)`. The cause was a **latent kernel ABI bug three phases old**.
+`enter_user` descends to ring 3 by `iretq` with `RSP` 16-byte aligned — but userspace
+entry points are ordinary `extern "C"` functions, and the SysV AMD64 ABI lets a function
+body assume `RSP ≡ 8 (mod 16)` on entry, because a `call` has just pushed an 8-byte
+return address. Every stack slot in userspace was therefore misaligned by 8. With a
+soft-float userspace nothing needed more than 8-byte alignment, so it was completely
+invisible; the first hard-float build made LLVM spill `xmm` registers with `movaps`,
+which `#GP`s. Fixed in `enter_user` with `and rsi, -16; sub rsi, 8` — synthesising the
+post-`call` shape, and the exact ring-3 analogue of the `and rsp, -16` that
+`thread_trampoline` has always done for kernel threads. Placing it in the descent path
+rather than in the ELF loader makes the guarantee unconditional: it will cover a
+user-supplied stack pointer for a future `sys_thread_create` too. Had this waited for the
+compositor slice, it would have surfaced as a mystery fault inside a new graphics stack.
+
+**Verified:** every userspace binary is `ET_EXEC` with no interpreter, **zero**
+`__muldf3`/`__adddf3`-style soft-float libcalls, and real `xmm` instructions in the text;
+warning-free builds; full host suite green; `check-arch` and `check-nightly` green;
+`test-qemu` boots the whole hard-float userspace (init → mount → services → login →
+shell) to the PASS verdict; KVM `-cpu host` 10/10.

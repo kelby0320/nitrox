@@ -2,7 +2,7 @@
 //!
 //! `core`/`alloc` (and any `[u8; N]` copy/compare the compiler lowers to a
 //! libcall) reference `memcpy`/`memmove`/`memset`/`memcmp`. On this
-//! `x86_64-unknown-none`, `-sse,+soft-float`, non-PIE/`/DISCARD/`-`.plt` target the
+//! `x86_64-unknown-nitrox`, non-PIE/`/DISCARD/`-`.plt` target the
 //! `compiler_builtins` versions resolve incorrectly — the `memcpy` symbol lands in
 //! the middle of an unrelated function, so a call jumps into garbage and faults
 //! (the 2026-06-22 codegen hazard, now hit for real by init's `alloc` use). We
@@ -17,17 +17,26 @@
 //!
 //! Built only for the bare target (`cfg(not(test))`): under `cargo test` libkern
 //! is a host `std` crate and must not redefine libc's `mem*`.
+//!
+//! The signatures use [`c_void`] rather than `u8` because rustc checks these
+//! well-known runtime symbols against the shapes the standard library expects, and
+//! warns on a mismatch. (They also mean `-Z build-std-features=compiler-builtins-mem`
+//! must stay **off** in the userspace build — these strong definitions are the ones
+//! we want, and enabling that feature would define the same symbols twice.)
+
+use core::ffi::c_void;
 
 /// `memcpy(dest, src, n)` — copy `n` bytes; `dest`/`src` must not overlap.
 ///
 /// # Safety
 /// `dest` and `src` must be valid for `n` bytes and non-overlapping.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memcpy(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let (d, s) = (dest.cast::<u8>(), src.cast::<u8>());
     let mut i = 0;
     while i < n {
         // SAFETY: caller guarantees `dest`/`src` valid for `n` bytes; `i < n`.
-        unsafe { dest.add(i).write_volatile(src.add(i).read_volatile()) };
+        unsafe { d.add(i).write_volatile(s.add(i).read_volatile()) };
         i += 1;
     }
     dest
@@ -38,12 +47,13 @@ pub unsafe extern "C" fn memcpy(dest: *mut u8, src: *const u8, n: usize) -> *mut
 /// # Safety
 /// `dest` and `src` must be valid for `n` bytes (may overlap).
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mut u8 {
-    if (dest as usize) < (src as usize) {
+pub unsafe extern "C" fn memmove(dest: *mut c_void, src: *const c_void, n: usize) -> *mut c_void {
+    let (d, s) = (dest.cast::<u8>(), src.cast::<u8>());
+    if (d as usize) < (s as usize) {
         let mut i = 0;
         while i < n {
             // SAFETY: as `memcpy`; ascending copy is correct when dest < src.
-            unsafe { dest.add(i).write_volatile(src.add(i).read_volatile()) };
+            unsafe { d.add(i).write_volatile(s.add(i).read_volatile()) };
             i += 1;
         }
     } else {
@@ -51,7 +61,7 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
         while i > 0 {
             i -= 1;
             // SAFETY: as above; descending copy is correct when dest >= src.
-            unsafe { dest.add(i).write_volatile(src.add(i).read_volatile()) };
+            unsafe { d.add(i).write_volatile(s.add(i).read_volatile()) };
         }
     }
     dest
@@ -62,12 +72,13 @@ pub unsafe extern "C" fn memmove(dest: *mut u8, src: *const u8, n: usize) -> *mu
 /// # Safety
 /// `dest` must be valid for `n` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
+pub unsafe extern "C" fn memset(dest: *mut c_void, c: i32, n: usize) -> *mut c_void {
+    let d = dest.cast::<u8>();
     let byte = c as u8;
     let mut i = 0;
     while i < n {
         // SAFETY: caller guarantees `dest` valid for `n` bytes; `i < n`.
-        unsafe { dest.add(i).write_volatile(byte) };
+        unsafe { d.add(i).write_volatile(byte) };
         i += 1;
     }
     dest
@@ -79,7 +90,8 @@ pub unsafe extern "C" fn memset(dest: *mut u8, c: i32, n: usize) -> *mut u8 {
 /// # Safety
 /// `a` and `b` must be valid for `n` bytes.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn memcmp(a: *const u8, b: *const u8, n: usize) -> i32 {
+pub unsafe extern "C" fn memcmp(a: *const c_void, b: *const c_void, n: usize) -> i32 {
+    let (a, b) = (a.cast::<u8>(), b.cast::<u8>());
     let mut i = 0;
     while i < n {
         // SAFETY: caller guarantees `a`/`b` valid for `n` bytes; `i < n`.

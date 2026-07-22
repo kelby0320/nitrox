@@ -2239,9 +2239,27 @@ hard-float dummy program.
   timing `yield_now`). *Measured (KVM, `-cpu host`):* **162 cycles of a ≈4109-cycle context
   switch — 3 %**, which is what settles eager-vs-lazy: a 3 % saving is not worth a
   speculative-disclosure channel. TCG PASS, KVM PASS, 20/20 KVM boot-loop.
-- [ ] **Part C** — `x86_64-unknown-nitrox.json` (SSE2 baseline, AVX2 per-fn via
-  `#[target_feature]`) + `-Z build-std` for the **userspace** workspace only; pinned
-  nightly in `rust-toolchain.toml`; CI grep for `#![feature(`.
+- [x] **Part C — the custom userspace target.** `userspace/x86_64-unknown-nitrox.json`:
+  freestanding ELF like `x86_64-unknown-none` but **hard-float** (`+sse,+sse2`, no
+  `rustc-abi: softfloat`) and `target_os = "nitrox"`. SSE2 baseline, not AVX2 — a
+  base-AVX2 target `#UD`s on pre-Haswell and on `qemu64`; wider vectors are per-function
+  `#[target_feature]` + runtime CPUID, as ecosystem crates already do. All 13 bin crates
+  retargeted; `userspace/rust-toolchain.toml` pins an exact nightly (+`rust-src`) and
+  xtask passes `-Z build-std=core,alloc,compiler_builtins` for bare builds only, so host
+  test builds keep the precompiled host sysroot. `compiler-builtins-mem` stays **off** —
+  `libkern` exports its own `mem*`, whose signatures moved to `c_void` to satisfy
+  rustc's runtime-symbol lint. The nightly is contained by `cargo xtask check-nightly`
+  (fails on any `#![feature(`, wired into CI, negative-controlled), and the rule in
+  `CLAUDE.md` is narrowed rather than dropped: *no nightly language/library features; a
+  nightly toolchain solely for build-std*. Kernel and tools stay on stable.
+  **Found a latent kernel ABI bug**: `enter_user` entered ring 3 with `RSP` 16-byte
+  aligned, but an `extern "C"` body may assume `RSP ≡ 8 (mod 16)` (a `call` pushed a
+  return address). Soft-float never spilled anything needing >8-byte alignment, so this
+  was invisible for three phases; the first hard-float build made `init` `#GP` on a
+  `movaps` spill. Fixed in `enter_user` (`and rsi,-16; sub rsi,8`), the ring-3 analogue
+  of `thread_trampoline`'s existing `and rsp,-16`. *Verified:* every binary is `ET_EXEC`,
+  no interpreter, **zero** soft-float libcalls and real `xmm` instructions; host suite,
+  `check-arch`, `check-nightly` green; `test-qemu` PASS; KVM 10/10.
 - [ ] **Part D** — first hard-float userspace thread demonstrated (a dummy program
   exercising real `f64`/SIMD Rust through the new target).
 
