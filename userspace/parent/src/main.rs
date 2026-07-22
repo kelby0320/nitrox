@@ -84,6 +84,19 @@ static mut STORM_SPAWN: SpawnArgs = SpawnArgs {
     namespace: 0, // inherit the parent's namespace
     syscaps: 0,
 };
+/// Spawn args for the hard-float workers: `child` role 3, no handles, inherited
+/// namespace, empty syscaps. `image` and the per-worker seed in `arg0` are filled per
+/// spawn (`arg0` = role in the low 8 bits, seed above — see `child`'s module docs).
+static mut FP_SPAWN: SpawnArgs = SpawnArgs {
+    image: 0,
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 3, // role 3 = hard-float worker; seed OR'd in per spawn
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0, // inherit the parent's namespace
+    syscaps: 0,
+};
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
 /// blocking-send demo, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
@@ -936,6 +949,96 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
     kprint(b"parent: exit-storm ok (18 exits reaped)\n");
 }
 
+/// **Hardware floating point, end to end in ring 3** (Phase 4 FP enablement Part D;
+/// decision log 2026-07-21).
+///
+/// Spawns `FP_WORKERS` copies of `child` role 3, each with a different seed, and requires
+/// every one to exit `0`. A worker checks its own `f64` arithmetic bit-exactly against
+/// integer math, round-trips values across syscalls and preemption, and — when the OS has
+/// enabled `YMM` state — cross-checks an `#[target_feature(enable = "avx2")]` SIMD path
+/// against the scalar one. See `child::run_fp_worker` for what each exit code means.
+///
+/// Running several concurrently is the point: the workers hold *different* live FP state
+/// on different CPUs, so a context switch that cross-wired two processes' register files
+/// would show up as one worker seeing another's values. That is the ring-3 counterpart to
+/// the kernel-thread isolation the boot selftest proves — this one goes through real
+/// compiler-generated float, real syscalls, and a real address-space switch.
+///
+/// A nonzero exit code fails the run (`exit(1)` → init's fail path → FAIL verdict).
+fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
+    const FP_WORKERS: usize = 3;
+    // No "start" banner: session-mgr owns the PASS verdict and races this process, so on
+    // a fast (KVM) boot the run can be adjudicated while these workers are still going.
+    // Announcing a start we might not finish reads like a hang; staying silent until
+    // there is a result is honest — the *guarantee* lives in session-mgr's `fp_gate`,
+    // checked synchronously at the verdict. This demo is breadth on top of that.
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        kprint(b"parent: hard-float image lookup FAIL\n");
+        exit(1);
+    }
+    let mut procs = [const { None }; FP_WORKERS];
+    for (i, slot) in procs.iter_mut().enumerate() {
+        // SAFETY: FP_SPAWN is a valid writable arg block, exclusively written and read
+        // here (image + seeded arg0; no handle grants).
+        let spawned = unsafe {
+            FP_SPAWN.image = img;
+            // Role 3 in the low byte, this worker's seed above it.
+            FP_SPAWN.arg0 = 3 | ((i as u64 + 1) << 8);
+            spawn(&*(&raw const FP_SPAWN))
+        };
+        match spawned {
+            Ok(p) => *slot = Some(p),
+            Err(_) => {
+                kprint(b"parent: hard-float spawn FAIL\n");
+                exit(1);
+            }
+        }
+    }
+    // Collect one ChildExited per worker; any nonzero code is a real FP failure.
+    let mut got = 0;
+    while got < FP_WORKERS {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            kprint(b"parent: hard-float wait FAIL\n");
+            exit(1);
+        }
+        loop {
+            // SAFETY: NOTIF is a valid 64-byte writable out-param.
+            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+            if r != 0 {
+                break; // WouldBlock: drained
+            }
+            // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+            let (kind, b) =
+                unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+            if kind == KIND_CHILD_EXITED {
+                let code = i32::from_le_bytes([b[8], b[9], b[10], b[11]]);
+                if code != 0 {
+                    kprint(b"parent: hard-float worker FAILED code=");
+                    kprint_u64(code as u64);
+                    kprint(b"\n");
+                    exit(1);
+                }
+                got += 1;
+            }
+        }
+    }
+    // SAFETY: closing our own image handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
+    kprint(b"parent: hard-float ok (3 workers, f64 + simd verified in ring 3)\n");
+}
+
 /// `/proc/self/status` + `/proc/sched/stats` demo — the Phase 3 **clause 3**
 /// milestone check ("two CPUs visibly active via `/proc`"). **Verdict-gated**:
 /// any failure here exits nonzero, which init (under `test-harness`) turns into
@@ -1350,6 +1453,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 0. Exception demo: a worker thread faults; we suspend, inspect, terminate.
     worker_exception_demo(notif);
+
+    // 0a. Hardware floating point in ring 3 (Phase-4 FP enablement Part D). Runs
+    //     **early**, not at the end of the chain, and deliberately so: the login chain
+    //     owns the PASS verdict and races this process, so a demo placed last can have
+    //     the run adjudicated out from under it — which is exactly what happened under
+    //     KVM, where the boot is fast enough that the verdict fired mid-demo and the
+    //     check silently never ran. Up front it always completes, and a failure always
+    //     reaches init's `code != 0` fail path in time to fail the run.
+    fp_hardfloat_demo(root_ns, notif);
 
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();

@@ -1,0 +1,22 @@
+# Nitrox userspace pins a **nightly** toolchain — the one narrow exception to the
+# project's stable-Rust rule, and it exists for exactly one reason: hardware
+# floating point.
+#
+# Userspace needs a target whose ABI is hard-float. Stable rustc ships no such
+# freestanding x86_64 target (`x86_64-unknown-none` and `x86_64-unknown-uefi` are
+# both `+soft-float`, and `-Ctarget-feature=-soft-float` is being phased out —
+# rust-lang/rust#116344), so `x86_64-unknown-nitrox.json` is a custom spec, and a
+# custom spec has no precompiled `core`/`alloc`. Rebuilding them requires
+# `-Z build-std`, which is nightly-only. See the decision log, 2026-07-21.
+#
+# The rule is therefore narrowed, not abandoned: **no nightly language or library
+# features** — no `#![feature(...)]` anywhere, enforced by `cargo xtask
+# check-nightly` — and a nightly toolchain *solely* to rebuild the sysroot for a
+# custom target. The kernel and tools workspaces have no toolchain file and stay
+# on stable.
+#
+# Pinned exactly, not floating: an unpinned `nightly` would make every build a
+# fresh roll of the dice on compiler regressions. Bump deliberately.
+[toolchain]
+channel = "nightly-2026-07-20"
+components = ["rust-src", "rustfmt", "clippy"]

@@ -19,11 +19,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable)
+      # Two toolchains, on purpose. The kernel and tools stay on **stable** with the
+      # built-in bare target. Userspace pins a **nightly** in
+      # `userspace/rust-toolchain.toml` because its hard-float target is a custom spec,
+      # and a custom spec has no precompiled sysroot — `-Z build-std` (nightly-only)
+      # rebuilds `core`/`alloc` from `rust-src`. rustup picks the right one per
+      # directory; the `check-nightly` step below keeps the pin from becoming a licence
+      # to use nightly language features. See the decision log, 2026-07-21.
+      - name: Install Rust (stable for kernel/tools, pinned nightly for userspace)
         run: |
           rustup toolchain install stable --profile minimal --no-self-update
           rustup default stable
           rustup target add x86_64-unknown-none
+          rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' userspace/rust-toolchain.toml)" \
+            --profile minimal --component rust-src --no-self-update
 
       - name: Cache cargo registry and build outputs
         uses: actions/cache@v4
@@ -33,7 +42,8 @@ jobs:
             ~/.cargo/git
             kernel/target
             tools/target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml', 'kernel/.cargo/config.toml') }}
+            userspace/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml', 'kernel/.cargo/config.toml', 'userspace/rust-toolchain.toml', 'userspace/x86_64-unknown-nitrox.json') }}
           restore-keys: |
             ${{ runner.os }}-cargo-
 
@@ -42,6 +52,12 @@ jobs:
       # docs/conventions/arch-boundary.md.
       - name: cargo xtask check-arch
         run: cargo xtask check-arch
+
+      # The nightly pin in userspace/ exists solely to `-Z build-std` the custom
+      # hard-float target. This fails the build if any shipped crate reaches for a
+      # nightly language or library feature, keeping the exception narrow.
+      - name: cargo xtask check-nightly
+        run: cargo xtask check-nightly
 
       # Builds the kernel ELF for x86_64-unknown-none. Image assembly
       # (sgdisk + mtools) and QEMU are intentionally not exercised here —

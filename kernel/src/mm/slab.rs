@@ -69,6 +69,11 @@ const SIZE_CLASSES: [usize; 7] = [32, 64, 128, 256, 512, 1024, 2048];
 /// the buddy allocator (see [`large_alloc`]).
 const MAX_SLAB_OBJ: usize = 2048;
 
+/// The strongest alignment any size bucket provides. Requests needing more
+/// go to [`large_alloc`], which honours `align` directly — see the routing
+/// condition in [`kmalloc`] and the cap applied in [`slab_init`].
+const MAX_BUCKET_ALIGN: usize = core::mem::align_of::<u64>();
+
 // Compile-time check that the two constants don't drift apart. The
 // pointer-masking trick falls over silently if pages are not
 // `SLAB_SIZE`-aligned.
@@ -369,12 +374,13 @@ pub fn slab_init() {
     );
     let mut i = 0;
     while i < SIZE_CLASSES.len() {
-        // Bucket alignment is capped at `align_of::<u64>()`: bumping align
+        // Bucket alignment is capped at `MAX_BUCKET_ALIGN`: bumping align
         // beyond the natural alignment of the bucket's size doesn't serve
         // any allocation we route into this bucket. Callers that need
         // stronger alignment than the bucket provides go through the
-        // large-alloc path (where `align` is honoured directly).
-        let align = SIZE_CLASSES[i].min(core::mem::align_of::<u64>());
+        // large-alloc path (where `align` is honoured directly) — see the
+        // routing condition in [`kmalloc`], which enforces exactly that.
+        let align = SIZE_CLASSES[i].min(MAX_BUCKET_ALIGN);
         SLAB_CACHES[i].init(SIZE_CLASSES[i], align);
         i += 1;
     }
@@ -413,7 +419,16 @@ pub fn kmalloc(size: usize, align: usize) -> *mut u8 {
         panic!("kmalloc called before slab_init");
     }
     let bucket_size = size.max(align);
-    if bucket_size > MAX_SLAB_OBJ {
+    // Route to the buddy-backed large path when the request is too big for any
+    // bucket, **or** when it needs stronger alignment than a bucket provides.
+    // `slab_init` caps every bucket's alignment at `align_of::<u64>()`, so a
+    // bucket cannot satisfy `align > 8` — and `bucket_size` alone does not catch
+    // that (a 64-byte-aligned 832-byte request has `bucket_size == 832` and would
+    // otherwise land in the 1024 bucket at 8-byte alignment). `large_alloc`
+    // honours `align` directly by rounding the object offset up from a
+    // page-aligned buddy block. Its first client is the per-thread FPU save area,
+    // whose `XSAVE` image `#GP`s unless 64-byte aligned.
+    if bucket_size > MAX_SLAB_OBJ || align > MAX_BUCKET_ALIGN {
         return large_alloc(size, align, &HeapBuddy);
     }
     // bucket_size <= MAX_SLAB_OBJ, so SIZE_CLASSES has a suitable entry.

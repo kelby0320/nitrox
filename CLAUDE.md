@@ -22,7 +22,19 @@ These shape every decision; deviation requires explicit discussion:
 ## Language and toolchain rules
 
 - **Rust throughout.** Kernel, userspace services, and runtime libraries.
-- **Stable Rust only.** No nightly features. The `Handle<T, M>` design uses typestate markers rather than const-generic bitflags specifically to stay on stable.
+- **No nightly language or library features.** No `#![feature(...)]` anywhere in
+  `kernel/` or `userspace/` — enforced by `cargo xtask check-nightly` in CI. The
+  `Handle<T, M>` design uses typestate markers rather than const-generic bitflags
+  specifically to honour this.
+- **Toolchain: stable, with one narrow exception.** The kernel and tools build on
+  **stable** against the built-in `x86_64-unknown-none`. **Userspace** pins a nightly
+  (`userspace/rust-toolchain.toml`) for one reason: it targets
+  `x86_64-unknown-nitrox`, a custom spec, because hardware floating point needs a
+  hard-float ABI and stable rustc ships no freestanding x86_64 target that has one. A
+  custom spec has no precompiled sysroot, so `core`/`alloc` are rebuilt with
+  `-Z build-std`, which is nightly-only. The pin is exact, not floating. This buys a
+  *target*, not a licence — see `docs/history/decision-log.md` (2026-07-21
+  floating-point).
 - **Assembly is emitted from Rust**, not NASM: `core::arch::asm!`, `global_asm!`, and `#[unsafe(naked)]` + `naked_asm!` (all stable since Rust 1.88). The exception entry stubs, the GDT/TSS load, the user-memory copy routines, and the thread context switch are all in-tree Rust asm. There is no assembler in the build — `build.rs` only passes the linker script. (Earlier drafts reserved NASM for the entry stub and context switch; both turned out cleaner as Rust-emitted asm — see `docs/history/decision-log.md` 2026-05-13 and 2026-05-29 — so NASM is not used. Re-evaluate only if a routine genuinely cannot be expressed via `asm!`/`naked_asm!`.)
 - **Cargo + cargo xtask** for builds. The `xtask` workspace provides higher-level commands (`xtask qemu`, `xtask image`, etc.).
 - **Limine** as the bootloader.

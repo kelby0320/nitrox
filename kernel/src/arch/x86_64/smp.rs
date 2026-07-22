@@ -127,6 +127,10 @@ pub fn ap_cpu_init() {
     super::gdt::init();
     super::idt::load();
     super::cpu::X86Cpu::init_protections();
+    // CR0/CR4/XCR0 are per-CPU, so each AP enables its own FP/SIMD units. Must
+    // precede the first `context_switch` on this CPU, which unconditionally
+    // restores the incoming thread's save area.
+    super::fpu::init_cpu();
     // SAFETY: ring-0 AP bring-up path; the CPU advertises x2APIC (asserted inside
     // `enable_this_cpu`), and this runs before the AP touches the local APIC.
     unsafe { super::apic::enable_this_cpu() };

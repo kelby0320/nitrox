@@ -1,0 +1,13 @@
+# Workspace-wide cargo configuration for Nitrox userspace.
+#
+# Only the one flag every crate here needs: permission to name a custom target by
+# JSON path. Cargo merges config files up the directory tree, so the per-crate
+# `.cargo/config.toml` files inherit this and keep just their own `build.target`
+# and link flags.
+#
+# `-Z build-std` is deliberately **not** set here. It is passed on the command
+# line by xtask for bare-target builds only, so that host-target test builds
+# (`cargo xtask test`, which runs the library crates for the host) keep using the
+# precompiled host sysroot instead of trying to rebuild `std` from source.
+[unstable]
+json-target-spec = true

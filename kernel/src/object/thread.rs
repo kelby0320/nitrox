@@ -3,8 +3,10 @@
 //! A thread is a register state, a kernel stack, scheduling state, an entry
 //! point, the owning process, and — for a thread blocked in `sys_wait` — its
 //! wait bookkeeping (the objects it waits on + the wake handshake; see the
-//! `wait_*` fields). The FPU/XSAVE context and TLS `fs_base` still arrive with
-//! later slices (see the deferred notes on the fields below and
+//! `wait_*` fields), and — for every schedulable thread — its floating-point /
+//! SIMD register file (`fpu`), which the scheduler swaps eagerly on each
+//! context switch. The TLS `fs_base` still arrives with a later slice (see the
+//! deferred note on the fields below and
 //! `docs/planning/implementation-plan.md`).
 //!
 //! ## Mutation discipline
@@ -20,7 +22,7 @@
 
 use core::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 
-use crate::arch::{ArchThreadContext, fabricate_frame, thread_trampoline};
+use crate::arch::{ArchFpuState, ArchThreadContext, fabricate_frame, thread_trampoline};
 use crate::libkern::handle::KObjectType;
 use crate::arch::paging::ArchPaging;
 use crate::libkern::{AllocError, KBox};
@@ -194,9 +196,34 @@ pub struct Thread {
     /// skips threads with this set. Cleared by the arch switch, so an
     /// [`AtomicBool`] whose storage the asm pokes as a raw `u8`.
     on_cpu: AtomicBool,
+    /// This thread's floating-point / SIMD register file while it is not
+    /// running, swapped eagerly by `sched::switch_into` (see
+    /// [`crate::arch::fpu_save`]). `None` only for **inert** threads — objects
+    /// that exist purely as handle-table entries and are never scheduled — so
+    /// the switch path treats a null area as "nothing to swap" rather than
+    /// asserting.
+    ///
+    /// Boxed rather than inline: the area is 1 KiB and needs 64-byte alignment,
+    /// which would force that alignment (and padding) onto every `Thread`.
+    /// Written under the same discipline as `arch`: only by the CPU running the
+    /// thread, and only while the thread's `on_cpu` guard is raised, so a
+    /// stealer that observes the guard clear also observes the finished image.
+    fpu: Option<KBox<ArchFpuState>>,
     // Deferred to later slices:
-    //   fpu_context  — kernel is soft-float; lands with userspace threads.
     //   fs_base/TLS  — no userspace, no `sys_thread_set_tls` yet.
+}
+
+/// Allocate and initialise a schedulable thread's FP/SIMD save area.
+///
+/// The area must hold a *valid* image before the thread's first switch-in —
+/// which restores it — so it is initialised to the architectural power-on state
+/// here rather than merely zeroed (see [`crate::arch::fpu_init_area`]).
+fn new_fpu_area() -> Result<KBox<ArchFpuState>, AllocError> {
+    let mut area = KBox::try_new(ArchFpuState::zeroed())?;
+    // SAFETY: `area` is a live, uniquely owned, correctly aligned `ArchFpuState`
+    // (`KBox` allocates at `align_of::<ArchFpuState>()` = 64).
+    unsafe { crate::arch::fpu_init_area(&raw mut *area) };
+    Ok(area)
 }
 
 /// A non-scheduling default entry, used for threads that exist only as
@@ -237,6 +264,9 @@ impl Thread {
             last_cpu: 0,
             cpu_mask: u8::MAX,
             on_cpu: AtomicBool::new(false),
+            // Inert threads are never scheduled, so they never reach the switch
+            // path and need no FP/SIMD save area.
+            fpu: None,
         })
     }
 
@@ -275,6 +305,7 @@ impl Thread {
             last_cpu: 0,
             cpu_mask: u8::MAX,
             on_cpu: AtomicBool::new(false),
+            fpu: Some(new_fpu_area()?),
         })
     }
 
@@ -325,6 +356,7 @@ impl Thread {
             last_cpu: 0,
             cpu_mask: u8::MAX,
             on_cpu: AtomicBool::new(false),
+            fpu: Some(new_fpu_area()?),
         })
     }
 
@@ -390,6 +422,7 @@ impl Thread {
             last_cpu: 0,
             cpu_mask: u8::MAX,
             on_cpu: AtomicBool::new(false),
+            fpu: Some(new_fpu_area()?),
         })
     }
 
@@ -666,6 +699,33 @@ impl Thread {
         let p = obj as *mut Thread;
         // SAFETY: `on_cpu` is an `AtomicBool` (a single `u8`); expose its byte.
         unsafe { (&raw mut (*p).on_cpu) as *mut u8 }
+    }
+
+    /// A raw pointer to this thread's FP/SIMD save area, or **null** for an
+    /// inert thread that has none.
+    ///
+    /// The scheduler's switch path passes the result straight to
+    /// [`fpu_save`](crate::arch::fpu_save) / [`fpu_restore`](crate::arch::fpu_restore),
+    /// skipping the swap on null. The pointee outlives the switch: the `Thread`
+    /// is refcount-pinned by the caller, and the `KBox` is dropped only when the
+    /// thread object is destroyed.
+    ///
+    /// # Safety
+    /// See the accessor contract above. The returned pointer may be used only
+    /// for the switch's save/restore on the CPU running this thread, under the
+    /// `on_cpu` guard discipline that already protects `saved_sp` — the FP image
+    /// is part of the same parked context and inherits the same publication
+    /// rules.
+    pub(crate) unsafe fn fpu_area_ptr(obj: *mut ()) -> *mut ArchFpuState {
+        let p = obj as *mut Thread;
+        // SAFETY: `obj` is a live Thread. Reading the `Option`'s payload pointer
+        // does not move or alias the box; a `None` yields null.
+        unsafe {
+            match &*(&raw const (*p).fpu) {
+                Some(area) => &raw const **area as *mut ArchFpuState,
+                None => core::ptr::null_mut(),
+            }
+        }
     }
 
     /// Read the entry point and its argument.
@@ -964,6 +1024,7 @@ mod tests {
             last_cpu: 0,
             cpu_mask: u8::MAX,
             on_cpu: AtomicBool::new(false),
+            fpu: Some(new_fpu_area().expect("fpu area")),
         })
         .unwrap()
     }

@@ -7269,3 +7269,312 @@ tick-capable (IF=0 syscall contexts) and the idle thread is not re-queueable at 
 full host suite and `test-qemu` green throughout. The preempt cost is one atomic
 add/sub + a ~10-instruction masked window per plain-lock acquisition; worst-case
 preemption latency is the longest plain-lock critical section (µs) plus one tick.
+
+## 2026-07-21 — Floating point: hardware FP needs a custom userspace target; kernel-first sequencing
+
+The Phase-4 FP item ("enable SSE/AVX up to AVX2 for userspace; per-thread XSAVE") opened
+with a toolchain investigation, because the first question — *how does a Nitrox program
+get compiled to emit `mulsd`?* — turned out to have no answer on the current target.
+
+**Finding: hardware FP is unreachable from the stock target by any escape hatch.** Both
+workspaces build for the built-in `x86_64-unknown-none`, whose spec is
+`-mmx,-sse,+soft-float`. Verified against rustc 1.95 by codegen inspection:
+
+- `a * b + 1.0` on `f64` compiles to `call *__muldf3` / `__adddf3`. No xmm register is
+  touched anywhere in the output.
+- `#[target_feature(enable = "sse2")]` + `core::arch::x86_64::_mm_mul_ps` does **not**
+  work around it — the intrinsic is scalarized into soft-float calls. There is no
+  per-function opt-in.
+- `-C target-feature=-soft-float` now warns *"cannot be disabled with `-Ctarget-feature`:
+  use a soft-float target instead … will become a hard error"* (rust-lang/rust#116344).
+  It is a dead end, not a workaround.
+
+Surveying what stable rustc ships for x86_64: `x86_64-unknown-none` and
+`x86_64-unknown-uefi` are both soft-float; `x86_64-unknown-linux-none` (tier 3, hard
+float) and any custom JSON have no precompiled `core`, so both need `-Z build-std`, which
+is nightly-only. The one stable hard-float option is piggybacking
+`x86_64-unknown-linux-musl` with `-nostdlib` — **rejected**: the triple would claim an OS
+we are not, and it defers the real Nitrox target without removing the need for it.
+
+**Decision: author a custom `x86_64-unknown-nitrox.json` for userspace — but land the
+kernel side first, on stable, as the gate.** Four parts:
+
+- **A/B (stable, no toolchain change):** the kernel FPU slice. CPUID-driven XSAVE-area
+  sizing, `CR4.OSFXSR|OSXSAVE` + `XCR0` + `CR0` setup, per-thread state, save/restore in
+  both switch paths, the eager-vs-lazy policy decided and the cost measured (B) — proved
+  by a `core::arch::asm!` selftest that stamps exact bit patterns into all sixteen xmm
+  registers plus the ymm high halves and checks them byte-for-byte across a forced
+  cross-CPU migration.
+- **C/D:** `x86_64-unknown-nitrox.json` + `-Z build-std` for the **userspace workspace
+  only**, then a hard-float dummy program exercising real `f64`/SIMD Rust through it.
+
+**Why this order, given that C is where we end up anyway.** The `asm!` selftest is not
+scaffolding — it is a *stronger* test than a Rust one and stays as the permanent
+regression test: compiler-generated float code cannot be steered tightly enough to prove
+"no bit of FPU state leaks between threads," only "floats work." The Rust dummy program
+then validates a genuinely different claim (toolchain + ABI) on top of an already-proven
+kernel. And if the build-std work proves to be a swamp, the kernel capability is landed
+and verified rather than half-built.
+
+**Why do C now rather than wait for a consumer** (departing from the project's usual
+"no code without a consumer" rule): the display/compositor slice is the consumer, and it
+will arrive alongside font rasterization and image decoding — discovering the build-std
+swamp *then*, concurrently with a new graphics stack, is the bad version. A dummy
+consumer now buys the display slice a proven path. The rule is relaxed deliberately and
+narrowly, for a toolchain seam rather than a feature.
+
+**Three subordinate calls:**
+
+1. **The target spec baselines SSE2 only, not AVX2.** A base-AVX2 target `#UD`s on
+   pre-Haswell hardware and on QEMU's `qemu64` model. AVX2 is opted into per-function via
+   `#[target_feature]` + runtime CPUID — which is what the ecosystem crates already do.
+   Independently, the **kernel** saves AVX state whenever CPUID says the CPU has it,
+   regardless of what userspace was compiled for.
+2. **Test with *and* without AVX** (`qemu64` has SSE2 but no AVX; TCG emulates AVX from
+   QEMU 7.2), so the XSAVE-area sizing is proved to be CPUID-driven rather than a
+   hardcoded 832 bytes. Run under **KVM** as well as TCG — KVM exercises the real
+   XSAVE/XRSTOR path and host-FPU interaction that TCG emulates away, and it is already
+   the project's SMP-race proving ground.
+3. **The "stable Rust only" rule is amended narrowly, not abandoned:** *no nightly
+   language or library features; a nightly toolchain solely for `-Z build-std` on the
+   userspace target.* The kernel stays on stock `x86_64-unknown-none` and remains fully
+   stable — the containment matters, since the workspace taking the toolchain hit is
+   exactly the one that will host crates.io code and, later, `std`. The nightly is pinned
+   exactly in `rust-toolchain.toml`, and CI greps for `#![feature(` so the discipline is
+   enforced rather than aspirational.
+
+## 2026-07-21 — FP enablement Part A: the kernel FPU mechanism (landed)
+
+The kernel side of the floating-point plan above, on the stable target with no toolchain
+change. Branch `phase-4/fp-enablement`.
+
+**What landed.** `kernel/src/arch/x86_64/fpu.rs` (new): `init_cpu()` enables the FP/SIMD
+units on the running CPU — `CR0` (clear EM/TS, set MP/NE), `CR4` (OSFXSR + OSXMMEXCPT,
+plus OSXSAVE when CPUID advertises XSAVE), and `XCR0` = x87 + SSE + AVX-if-present, masked
+against the CPU's supported component bitmap and read back to confirm. It selects
+`XSAVE`/`XRSTOR` vs. `FXSAVE`/`FXRSTOR` from CPUID and sizes the per-thread area from
+`CPUID.0DH:EBX`. Called on the BSP in `paging_init` and on each AP in `ap_cpu_init`
+(CR0/CR4/XCR0 are per-CPU). Every schedulable `Thread` now carries a boxed,
+64-byte-aligned `ArchFpuState` (initialised to the architectural power-on state, not
+merely zeroed — a zero `MXCSR` unmasks every SIMD exception); inert (never-scheduled)
+threads carry `None`. `sched::switch_into` swaps the register file inside its existing
+`on_cpu`-guarded window: **save** the outgoing thread before `context_switch` clears its
+guard (the FP image is part of the parked context), **restore** the incoming thread after
+the `is_on_cpu` spin (its image may still be mid-write on its old CPU until then).
+
+**Eager, not lazy** — decided and recorded in `fpu.rs`'s module docs. Lazy `CR0.TS`
+switching is CVE-2018-3665 (the previous thread's registers are speculatively readable
+across the privilege boundary between the switch and the `#NM`), and it demands a second
+cross-CPU coherence protocol (which CPU holds a thread's live registers, shot down on
+migration) atop the one the substrate-hardening slice just paid off. The eager
+`XSAVE`/`XRSTOR` cost is ~100 cycles against a switch that already does a CR3 load, a TSS
+re-arm, and a stack swap. **AVX-512 is deliberately not enabled**: it inflates the
+per-thread area from 832 B to ~2.7 KiB to serve a userspace baseline that is SSE2.
+
+**A latent allocator gap this surfaced.** `kmalloc` *documented* that over-aligned
+requests route to the buddy-backed large path, but only actually branched on size — the
+slab caps every bucket's alignment at `align_of::<u64>()`. A 64-byte-aligned 832-byte
+request would have landed in the 1024 bucket at 8-byte alignment and `#GP`'d the first
+`XSAVE`. Fixed: `kmalloc` now routes to `large_alloc` when `align > MAX_BUCKET_ALIGN`, and
+that constant is the single source of truth `slab_init` also caps against. (The FPU area
+is its first over-aligned client; the bug was dormant only because nothing had needed
+`align > 8` before.)
+
+**A QEMU-model change forced by the extended state.** Bolting `+xsave,+avx` onto the
+`qemu64` model *hangs TCG* at the `CR4.OSXSAVE` enable — a QEMU emulation fragility, not a
+kernel fault (the `int,cpu_reset` log shows no exception, and KVM runs the identical code
+clean). QEMU's `max` model emulates the whole XSAVE path correctly and is a strict
+superset of the hand-rolled `qemu64,+smap,+smep,+rdrand,+rdseed,+rdtscp,+x2apic` string
+the harness used, so `tools/xtask` now runs `-cpu max`. The kernel enables only what it
+opts into (never AVX-512 or LA57), so the richer model changes nothing it doesn't ask for.
+
+**Verified.** 3 new host tests (area alignment/size, `init_area` writing the architectural
+`FCW`/`MXCSR` defaults, the AVX-requires-SSE `XCR0` invariant) + the full host suite (546)
+green; `cargo xtask check-arch` clean (the FP surface is exposed only through neutral
+`crate::arch` names). `test-qemu` under TCG `-cpu max` boots the 256-bit XSAVE path (832 B
+area) to the PASS verdict. KVM `-cpu host` — the real hardware XSAVE/AVX path the plan
+calls for — passes end-to-end and survives a 20/20 boot-loop under `-smp 4` (the FP swap
+exercised across live cross-CPU migration). The FXSAVE fallback (512 B, 128-bit) is the
+path a no-XSAVE CPU takes; both sizings are CPUID-driven, not hardcoded.
+
+Parts B–D (the `asm!` cross-contamination selftest + cost measurement, the custom
+userspace target, the hard-float dummy program) follow on this branch.
+
+## 2026-07-21 — FP enablement Part B: the isolation selftest and the measured swap cost
+
+Part A built the mechanism; Part B proves it, and replaces the eager-vs-lazy cost estimate
+with a measurement.
+
+**The isolation selftest** (`boot_selftest::fp_isolation_demo`, `selftest` builds). Twelve
+kernel workers — 3× the CPU count, so they contend for CPUs and preempt one another — each
+stamp all sixteen vector registers with a pattern unique to themselves, then run six rounds
+of "burn enough cycles to span several ticks, then re-read and compare byte-for-byte". The
+pattern mixes the worker seed, the register index, and the byte offset, so a whole-register
+or whole-file cross-wire is caught as surely as a single flipped byte, and a leak shows up
+as *another worker's* pattern rather than as noise. Any mismatch `panic!`s, which under
+`test-harness` writes the FAIL verdict.
+
+**Why this is a sharper instrument than hard-float Rust would be.** The asm that loads and
+stores the register file declares **no vector-register operands and no vector clobbers** —
+which would be unsound on a normal target. It is sound here because the kernel builds for
+`x86_64-unknown-none` (`-mmx,-sse,+soft-float`): rustc cannot allocate a vector register,
+so there is never a live value to clobber. (It is also why the operands could not be
+declared even if we wanted to — the `xmm_reg` class requires the `sse` target feature.
+Inline-asm mnemonics assemble regardless of target features; only codegen is gated.) That
+same property is what gives the test its power: between the stamp and the check, the *only*
+agents that can touch those registers are the context switch and another thread. A
+mismatch has exactly one explanation. Compiler-emitted float code could not be steered
+tightly enough to make that claim — it would prove "floats work", not "nothing leaks".
+
+**Negative-controlled, in both directions.** A test that passes proves nothing until it has
+been shown to fail. Disabling `fpu_restore` in `switch_into` produces immediate corruption
+reports; disabling `fpu_save` instead produces 52. Both halves of the swap are therefore
+load-bearing and the test is known-sensitive — the discipline this project adopted after
+the reschedule-IPI slice, where the concurrent-boot test passed with the bug present.
+
+**The cost, measured rather than assumed.** `fp_swap_cost` times an `XSAVE`+`XRSTOR` pair
+(min of 64 samples, to reject samples polluted by an interrupt) and prices it against a
+real context switch — two threads pinned to a single CPU so each `yield_now` genuinely
+switches, timing 2000 yields and halving (a yield is two switches). On real hardware (KVM,
+`-cpu host`): **162 cycles of a ≈4109-cycle switch — 3 %**. A switch already pays for a
+`SCHED` acquire, a CR3 load, a TSS re-arm, and a stack swap; the register file is noise
+beside them. This is the number that settles the eager-vs-lazy question recorded in Part A:
+lazy switching would trade a 3 % saving for a speculative-disclosure channel
+(CVE-2018-3665) plus a second cross-CPU coherence protocol. The `fpu.rs` module docs now
+cite the measurement instead of the estimate. (Under TCG the same figures read ≈1346 /
+≈25964 cycles — `RDTSC` there counts emulator progress, not cycles, so only the KVM numbers
+are meaningful; the selftest says so in its own output.)
+
+**Verified:** both builds warning-free; full host suite green; `check-arch` clean;
+`test-qemu` (TCG `-cpu max`) PASS; KVM `-cpu host` PASS and **20/20** boot-loop with the
+isolation demo passing every run.
+
+## 2026-07-21 — FP enablement Part C: `x86_64-unknown-nitrox`, and a narrowed stable-Rust rule
+
+The toolchain half of the floating-point plan. Userspace now builds for a custom
+hard-float target; the kernel and tools are untouched and stay on stable.
+
+**The target.** `userspace/x86_64-unknown-nitrox.json`, derived from a dump of
+`x86_64-unknown-none` and changed in exactly the ways that matter: `features` becomes
+`+sse,+sse2`, the `rustc-abi: softfloat` key is dropped (that key, not the feature
+string, is what makes the ABI soft-float), and `os` becomes `nitrox` so
+`target_os = "nitrox"` is available to the eventual `std` port. Everything else — data
+layout, `rust-lld`, `panic-strategy: abort`, `disable-redzone`, code model — is carried
+over unchanged, deliberately: introducing a new target is not the moment to vary five
+things at once. (The red zone is one we *could* enable, since Nitrox has no signals and
+traps switch stacks, but that is a separate change with its own justification; noted as a
+follow-up rather than smuggled in here.)
+
+**SSE2 baseline, not AVX2.** A base-AVX2 target `#UD`s on pre-Haswell hardware and on
+QEMU's `qemu64` model. Wider vectors are opted into per function with
+`#[target_feature(enable = "avx2")]` behind a runtime CPUID check — exactly what the
+ecosystem crates the toolkit will pull in already do. The kernel independently saves AVX
+state whenever the CPU has it, regardless of what userspace was compiled for.
+
+**Build plumbing.** A custom spec has no precompiled sysroot, so `core`/`alloc`/
+`compiler_builtins` are rebuilt with `-Z build-std`. That is passed by xtask on the
+command line for **bare-target builds only**, never in `.cargo/config.toml`, so
+`cargo xtask test` keeps using the precompiled *host* sysroot instead of trying to
+rebuild `std` from source. `compiler-builtins-mem` is deliberately **not** requested:
+`libkern` already exports strong `memcpy`/`memmove`/`memset`/`memcmp` (they exist to work
+around a 2026-06-22 codegen hazard), and enabling the feature would define the same
+symbols twice. Their signatures moved from `*mut u8` to `*mut c_void` to satisfy rustc's
+runtime-symbol lint, which the newer toolchain surfaced.
+
+One trap worth recording: xtask is itself launched by `cargo run`, which exports
+`RUSTUP_TOOLCHAIN` — and that variable **overrides** rustup's directory-based lookup, so
+a child `cargo` ignored `userspace/rust-toolchain.toml` and rejected `-Z` as
+"stable channel". xtask now clears `RUSTUP_TOOLCHAIN`/`RUSTC`/`RUSTDOC` for userspace
+invocations, which keeps the nightly version pinned in one place (the toml) rather than
+duplicated in the build tool.
+
+**The rule is narrowed, not abandoned.** `CLAUDE.md` previously said "Stable Rust only.
+No nightly features." It now says: **no nightly language or library features anywhere in
+`kernel/` or `userspace/`**, and a nightly toolchain *solely* to `-Z build-std` the
+custom target. The pin is an exact date (`nightly-2026-07-20`), not a floating `nightly`
+— an unpinned channel would make every build a fresh roll of the dice on regressions.
+The exception is enforced, not merely stated: `cargo xtask check-nightly` fails on any
+`#![feature(` in the two shipped workspaces and runs in CI (`tools/` is excluded — xtask's
+own module docs already exempt host tooling). The check was negative-controlled by
+inserting `#![feature(never_type)]` into `hello` and confirming it fails.
+
+**The payoff, immediately.** Part A's decision log argued for doing this *now* rather
+than when the display stack needs it, on the grounds that the toolchain half is unknown
+work best de-risked early. It paid off on the first boot: `init` faulted at a
+`movaps %xmm0,(%rsp)`. The cause was a **latent kernel ABI bug three phases old**.
+`enter_user` descends to ring 3 by `iretq` with `RSP` 16-byte aligned — but userspace
+entry points are ordinary `extern "C"` functions, and the SysV AMD64 ABI lets a function
+body assume `RSP ≡ 8 (mod 16)` on entry, because a `call` has just pushed an 8-byte
+return address. Every stack slot in userspace was therefore misaligned by 8. With a
+soft-float userspace nothing needed more than 8-byte alignment, so it was completely
+invisible; the first hard-float build made LLVM spill `xmm` registers with `movaps`,
+which `#GP`s. Fixed in `enter_user` with `and rsi, -16; sub rsi, 8` — synthesising the
+post-`call` shape, and the exact ring-3 analogue of the `and rsp, -16` that
+`thread_trampoline` has always done for kernel threads. Placing it in the descent path
+rather than in the ELF loader makes the guarantee unconditional: it will cover a
+user-supplied stack pointer for a future `sys_thread_create` too. Had this waited for the
+compositor slice, it would have surfaced as a mystery fault inside a new graphics stack.
+
+**Verified:** every userspace binary is `ET_EXEC` with no interpreter, **zero**
+`__muldf3`/`__adddf3`-style soft-float libcalls, and real `xmm` instructions in the text;
+warning-free builds; full host suite green; `check-arch` and `check-nightly` green;
+`test-qemu` boots the whole hard-float userspace (init → mount → services → login →
+shell) to the PASS verdict; KVM `-cpu host` 10/10.
+
+## 2026-07-21 — FP enablement Part D: hardware floating point proven from ring 3
+
+Parts A–C built the kernel mechanism, its isolation proof, and the hard-float toolchain.
+Part D closes the slice by showing that ordinary Rust floating-point code actually works
+in a Nitrox process.
+
+**What is checked, and why it is bit-exact.** Every value in the workload is a small exact
+integer held in an `f64`, which turns each check into an exact comparison rather than an
+epsilon threshold:
+
+- **`f64` against `u64`.** Σ v[k]² is computed in floating point and again in integer
+  arithmetic; they must agree exactly. This is the check that catches a *self-consistent
+  but wrong* FPU — a bad multiply, a stuck rounding mode, an `MXCSR` we failed to
+  initialise. A float-only comparison would pass all of those happily.
+- **Round trip across a syscall.** `x → 2x+1 → (x-1)/2` is exactly invertible at these
+  magnitudes. The forward half runs, the process enters the kernel (and may be preempted
+  and migrated), and the inverse half must reproduce the original bit patterns.
+- **AVX2 against scalar, and `XCR0` read from ring 3.** The same sum computed through
+  `#[target_feature(enable = "avx2")]` intrinsics must match exactly. Because the lane
+  values are exact integers well under 2⁵³, addition is exact and the vector
+  reassociation is bit-identical to the scalar left-to-right sum — the exact-integer
+  design is what makes that comparison legitimate. The path is gated on the full
+  three-part ecosystem check: CPU has AVX2, OS enabled `XSAVE`, and `XGETBV` shows the
+  SSE+AVX state components enabled. That last clause is **userspace independently
+  confirming, from ring 3, the `XCR0` write the kernel performed in `fpu_init_cpu`** —
+  and a CPU with AVX2 whose OS left `YMM` state disabled is treated as a *failure*, not a
+  quiet fallback, because using AVX then would silently corrupt across a context switch.
+
+**Two placements, and the evidence that forced the split.** The check first lived only in
+the demo `parent`, which spawns three concurrent `child` role-3 workers with different
+seeds. It passed. Then a KVM boot-loop showed it completing in **2 of 15 runs**: the login
+chain owns the PASS verdict and races the demo chain, so on a fast boot the run was
+adjudicated while the workers were still running — the check silently did not execute in
+87 % of runs, and a *failure* in those runs would not have failed the build. Moving it
+earlier in `parent`'s sequence helped but stayed a race.
+
+The fix is the pattern this codebase already established for exactly this hazard:
+`session-mgr::sched_gate`, "checked synchronously at the single `SYS_TEST_EXIT(PASS)`
+call, [so] a failure cannot lose a race to the verdict". `fp_gate` now sits beside it —
+`verdict(ok && sched_gate(root_ns) && fp_gate())` — and runs **15/15**. `parent` keeps its
+concurrent multi-process version as breadth (different processes holding different live FP
+state simultaneously), with its "start" banner removed: announcing work that the verdict
+may cut short reads like a hang, and silence until there is a result is honest.
+
+**Negative-controlled three ways**, because a passing test proves nothing until it has been
+made to fail: corrupting the expected sum in `child` (exit 20 → run FAIL, exit 35);
+corrupting it in the gate (→ FAIL); and — the one that matters — disabling the kernel's
+`fpu_restore` *with Part B's kernel-level demo silenced so it could not panic first and
+mask the result*, which the **ring-3** check caught on its own. The two layers therefore
+have genuinely independent detection power, and the division of labour is honest: Part B's
+`asm!` selftest owns the "no state leaks across a context switch" claim with a far sharper
+instrument; Part D owns "real compiler-generated hard float works in ring 3".
+
+**Verified:** warning-free builds; full host suite green; `check-arch` and `check-nightly`
+green; `test-qemu` (TCG `-cpu max`) PASS with the kernel isolation demo, the concurrent
+worker demo, and the gate all reporting; KVM `-cpu host` 15/15 with the gate running every
+time. **Phase 4 FP enablement is complete (Parts A–D).**

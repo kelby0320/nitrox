@@ -336,6 +336,27 @@ extern "C" fn syscall_entry() -> ! {
 /// frame and go. No `swapgs`: ring 0 runs with `GS_BASE = 0` and
 /// `KERNEL_GS_BASE = &CPU0`, and the user's first `syscall` swaps it in.
 ///
+/// ## Stack alignment at ring-3 entry
+///
+/// The entry point is reached by `iretq`, not by `call`, but userspace entry points
+/// are ordinary `extern "C"` functions — and the SysV AMD64 ABI says a function
+/// body may assume `RSP ≡ 8 (mod 16)` on entry, because a `call` has just pushed
+/// an 8-byte return address onto a 16-aligned stack. So this routine rounds
+/// `user_sp` **down** to a 16-byte boundary and then subtracts 8, synthesising the
+/// state a `call` would have left. It is the exact ring-3 analogue of
+/// [`thread_trampoline`](crate::arch::thread_trampoline)'s `and rsp, -16` before
+/// its `call`.
+///
+/// This is not cosmetic. With a soft-float userspace nothing on the stack needed
+/// more than 8-byte alignment, so a misaligned `RSP` was invisible; the moment
+/// userspace moved to a hard-float target (Phase 4, `x86_64-unknown-nitrox`) LLVM
+/// began spilling `xmm` registers with `movaps`, which `#GP`s on a 16-byte
+/// misalignment — `init` faulted on its first such spill. Adjusting here rather
+/// than at load time makes the guarantee unconditional: it covers a user-supplied
+/// stack pointer for a future `sys_thread_create` just as it covers the initial
+/// stack the ELF loader picks. Rounding *down* only ever moves `RSP` further into
+/// the mapped stack, never past its top.
+///
 /// # Safety
 /// `entry`/`user_sp` must be canonical user addresses mapped executable /
 /// writable in the active address space; [`init_syscall_entry`] must have
@@ -354,8 +375,13 @@ pub unsafe extern "C" fn enter_user(
     // into the user's rdi/rsi/rdx/rcx and zero every other GPR so no kernel value
     // leaks to userspace.
     naked_asm!(
+        // Synthesise the post-`call` stack shape the SysV ABI promises a function
+        // body: 16-byte align, then bias by 8 (see the doc comment above). Without
+        // this, the first `movaps` spill in the entry point `#GP`s.
+        "and rsi, -16",
+        "sub rsi, 8",
         "push {user_ss}",           // SS
-        "push rsi",                 // RSP = user_sp
+        "push rsi",                 // RSP = user_sp (16-aligned, minus the ABI bias)
         "push {rflags}",            // RFLAGS (IF=1; bit1 reserved=1) — ring 3 runs preemptible
         "push {user_cs}",           // CS
         "push rdi",                 // RIP = entry

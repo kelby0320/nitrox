@@ -4,9 +4,23 @@ Userspace workspace constraints. Loaded when Claude Code reads files under `user
 
 ## Build environment
 
-- **Standard target** (Nitrox-targeted, eventually `x86_64-unknown-nitrox.json` once the target is finalized; currently building against `x86_64-unknown-none` plus the `libkern` syscall surface).
+- **Target: `x86_64-unknown-nitrox`** — the custom spec at
+  `userspace/x86_64-unknown-nitrox.json`, landed 2026-07-21. Freestanding ELF like the
+  old `x86_64-unknown-none`, but with a **hard-float ABI** (SSE2 baseline, `target_os =
+  "nitrox"`). Each bin crate's `.cargo/config.toml` points at it and adds the
+  static/non-PIE link flags the kernel's ELF loader requires (it rejects `ET_DYN` and
+  dynamic interpreters). Build through `cargo xtask`, which passes the `-Z build-std`
+  the custom spec needs; a bare `cargo build` here will fail without it.
+- **AVX2 is opt-in per function**, not a baseline. The target compiles to SSE2 so the
+  binaries run on any x86_64; reach wider vectors with `#[target_feature(enable =
+  "avx2")]` guarded by a runtime CPUID check, the way ecosystem crates do. (The kernel
+  saves AVX state whenever the CPU has it, independent of what userspace was built for.)
 - **`#![no_std]` + `alloc`** is the typical configuration. Userspace runs without the Rust standard library; `alloc` is available via the kernel-provided allocator interface in `libkern`.
-- **Stable Rust only.** No nightly features.
+- **No nightly language or library features.** The toolchain here *is* a pinned nightly
+  (`rust-toolchain.toml`), but solely so `-Z build-std` can rebuild `core`/`alloc` for
+  the custom target. `#![feature(...)]` is forbidden and CI fails on it
+  (`cargo xtask check-nightly`). If you want a nightly feature, the answer is no —
+  see the decision log, 2026-07-21.
 - The `std` crate is not yet ported. When it lands, this guidance changes — until then, every userspace crate is `no_std`-with-alloc.
 
 ## Crate layering

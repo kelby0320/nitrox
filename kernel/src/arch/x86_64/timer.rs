@@ -322,3 +322,13 @@ mod tests {
         assert_eq!(CAL_PIT_COUNT, 11931);
     }
 }
+
+/// Raw CPU cycle counter, for self-test micro-measurements only.
+///
+/// Distinct from [`X86Timer::read_ns`]: no scaling, no monotonicity guarantee across
+/// CPUs — just the bare `RDTSC`, so a self-test can price a code path in cycles. Only
+/// meaningful under KVM or on real hardware; TCG's `RDTSC` counts emulator progress.
+#[cfg(feature = "selftest")]
+pub fn read_cycles() -> u64 {
+    regs::rdtsc()
+}

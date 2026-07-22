@@ -18,6 +18,7 @@ use core::sync::atomic::{AtomicU32, Ordering};
 use nitrox_kernel::arch;
 use nitrox_kernel::arch::paging::ArchPaging;
 use nitrox_kernel::kprintln;
+use nitrox_kernel::libkern::KBox;
 use nitrox_kernel::mm;
 use nitrox_kernel::sched;
 
@@ -56,10 +57,275 @@ pub fn pre_smp() {
     dma_smoke_test();
 }
 
-/// Post-SMP demos (after AP bring-up): work distribution across CPUs + affinity.
+/// Post-SMP demos (after AP bring-up): work distribution across CPUs + affinity, and the
+/// FP/SIMD register-file isolation proof (needs multiple CPUs to be worth running).
 pub fn post_smp() {
     smp_distribution_demo();
     smp_affinity_demo();
+    fp_isolation_demo();
+    fp_swap_cost();
+}
+
+// === FP/SIMD register-file isolation ====================================================
+
+/// Workers that finished, and the count that observed **any** corruption of their vector
+/// registers. A single non-zero `FP_CORRUPT` is a failed run.
+static FP_DONE: AtomicU32 = AtomicU32::new(0);
+static FP_CORRUPT: AtomicU32 = AtomicU32::new(0);
+/// Distinct CPUs the FP workers were seen on — migration is what makes the test sharp.
+static FP_CPU_MASK: AtomicU32 = AtomicU32::new(0);
+
+/// Number of FP workers. Deliberately more than `MAX_CPUS` so they must contend for CPUs
+/// and preempt one another mid-round.
+const FP_WORKERS: u32 = 12;
+/// Rounds each worker runs. Each round burns enough cycles to span several 10 ms ticks,
+/// so every worker is preempted — and re-scheduled, possibly on another CPU — many times
+/// while holding a live vector-register pattern.
+const FP_ROUNDS: u32 = 6;
+
+/// **The proof that no vector-register state leaks between threads.**
+///
+/// Each worker stamps all sixteen vector registers with a pattern unique to itself, then
+/// repeatedly burns CPU and re-reads them, checking byte-for-byte that the pattern
+/// survived. With twelve workers on four CPUs the scheduler preempts and migrates them
+/// constantly, so every round straddles many context switches — each one a chance for the
+/// swap in `sched::switch_into` to drop, duplicate, or cross-wire a register file.
+///
+/// This is a *stronger* check than compiler-emitted float code could give: because the
+/// kernel target is soft-float, rustc never allocates a vector register, so between the
+/// stamp and the check the **only** agents that can touch them are the context switch and
+/// another thread. A mismatch therefore has exactly one explanation.
+fn fp_isolation_demo() {
+    FP_DONE.store(0, Ordering::Relaxed);
+    FP_CORRUPT.store(0, Ordering::Relaxed);
+    FP_CPU_MASK.store(0, Ordering::Relaxed);
+
+    for i in 0..FP_WORKERS {
+        if sched::spawn(fp_worker, i as usize).is_err() {
+            kprintln!("fp: isolation spawn {} failed", i);
+        }
+    }
+    let mut spins: u64 = 0;
+    while FP_DONE.load(Ordering::Acquire) < FP_WORKERS {
+        sched::reap_pending();
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 20_000_000_000 {
+            kprintln!("fp: isolation demo timed out");
+            break;
+        }
+    }
+    sched::reap_pending();
+
+    let corrupt = FP_CORRUPT.load(Ordering::Acquire);
+    let mask = FP_CPU_MASK.load(Ordering::Relaxed);
+    let width = arch::fpu_selftest_reg_bytes() * 8;
+    if corrupt == 0 {
+        kprintln!(
+            "fp: isolation demo complete — {} workers × {} rounds, {}-bit regs intact \
+             across {} CPU(s) (cpu mask {:#06b})",
+            FP_WORKERS,
+            FP_ROUNDS,
+            width,
+            mask.count_ones(),
+            mask,
+        );
+    } else {
+        // A leak here is a correctness failure, not a demo hiccup: under `test-harness`
+        // the panic handler writes the FAIL verdict and ends the run.
+        panic!("fp: VECTOR REGISTER STATE LEAKED — {corrupt} corrupted observation(s)");
+    }
+}
+
+/// Fill `img` with a pattern unique to `seed`, so that two workers can never hold the
+/// same bytes in any register — a leak shows up as *another worker's* pattern, not just
+/// as noise. Only the architectural bytes of each slot are written; the rest stays zero
+/// so the comparison can ignore it.
+fn fp_fill_pattern(img: &mut arch::VectorRegsImage, seed: u64, live: usize) {
+    for r in 0..arch::FPU_SELFTEST_REGS {
+        let slot = img.slot_mut(r);
+        for b in 0..live {
+            // Mixes the worker seed, the register index, and the byte offset, so a
+            // whole-register or whole-file cross-wire is caught as surely as a byte flip.
+            let v = seed
+                .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                .wrapping_add((r as u64) << 8)
+                .wrapping_add(b as u64);
+            slot[b] = (v ^ (v >> 29)) as u8;
+        }
+    }
+}
+
+/// One [`fp_isolation_demo`] worker.
+extern "C" fn fp_worker(arg: usize) {
+    use arch::smp::ArchSmp;
+
+    let live = arch::fpu_selftest_reg_bytes();
+    let seed = 0xA5A5_0000_u64 ^ (arg as u64 + 1);
+
+    let mut expect = arch::VectorRegsImage::zeroed();
+    let mut actual = arch::VectorRegsImage::zeroed();
+    fp_fill_pattern(&mut expect, seed, live);
+
+    // SAFETY: ring 0; `fpu_init_cpu` ran on every CPU during bring-up, and `expect` is a
+    // live, correctly aligned image. From here until the last check below this thread
+    // holds live vector state — sound because kernel code never allocates a vector
+    // register (see the note in the arch FPU module).
+    unsafe { arch::fpu_selftest_load_regs(&raw const expect) };
+
+    for _ in 0..FP_ROUNDS {
+        // Burn enough cycles to span several ticks, so this thread is preempted — and
+        // re-scheduled, possibly elsewhere — while its pattern is live in the registers.
+        let mut acc: u64 = 0;
+        for i in 0..8_000_000u64 {
+            acc = acc.wrapping_add(i ^ arg as u64);
+        }
+        core::hint::black_box(acc);
+
+        FP_CPU_MASK.fetch_or(1 << arch::Smp::current_cpu(), Ordering::Relaxed);
+
+        // SAFETY: as above; `actual` is a live, writable, correctly aligned image.
+        unsafe { arch::fpu_selftest_store_regs(&raw mut actual) };
+        for r in 0..arch::FPU_SELFTEST_REGS {
+            if actual.slot(r)[..live] != expect.slot(r)[..live] {
+                FP_CORRUPT.fetch_add(1, Ordering::Release);
+                kprintln!("fp: worker {} register {} CORRUPTED", arg, r);
+                break;
+            }
+        }
+    }
+
+    FP_DONE.fetch_add(1, Ordering::Release);
+}
+
+// === FP swap cost ======================================================================
+
+/// Report the measured cost of one FP save+restore pair — the per-context-switch price of
+/// eager swapping (see the arch FPU module's "Eager, not lazy" rationale).
+///
+/// `RDTSC`-based, so the number is only meaningful under KVM or on real hardware; TCG
+/// reports emulator time, not cycles.
+fn fp_swap_cost() {
+    // Boxed rather than a stack local: a kilobyte of 64-byte-aligned scratch on the boot
+    // thread's kernel stack is avoidable, and `KBox` gives the alignment by construction.
+    let mut scratch = match KBox::try_new(arch::ArchFpuState::zeroed()) {
+        Ok(s) => s,
+        Err(_) => {
+            kprintln!("fp: swap-cost scratch alloc failed");
+            return;
+        }
+    };
+    // SAFETY: ring 0, `fpu_init_cpu` has run, `scratch` is a live aligned save area. The
+    // boot thread holds no live vector state here (kernel code never allocates one), so
+    // round-tripping the register file through `scratch` is harmless. The first `save`
+    // populates the area before any `restore` reads it, so the zeroed start is fine.
+    let swap = unsafe { arch::fpu_selftest_swap_cycles(&raw mut *scratch, 64) };
+
+    // The denominator: what a whole context switch costs, so the swap can be priced as a
+    // fraction rather than as a bare number. Without it "162 cycles" says nothing about
+    // whether eager swapping was the right call.
+    let switch = measure_switch_cycles();
+
+    if switch > 0 {
+        kprintln!(
+            "fp: save+restore ≈ {} cycles of a ≈{}-cycle context switch ({}%) — \
+             {}-bit state, {} B area; RDTSC, meaningful under KVM",
+            swap,
+            switch,
+            (swap * 100) / switch,
+            arch::fpu_vector_bits(),
+            arch::fpu_area_bytes(),
+        );
+    } else {
+        kprintln!(
+            "fp: save+restore ≈ {} cycles ({}-bit state, {} B area); switch measurement \
+             unavailable",
+            swap,
+            arch::fpu_vector_bits(),
+            arch::fpu_area_bytes(),
+        );
+    }
+}
+
+/// Cycles for one context switch, measured by timing `yield_now` against a partner thread
+/// pinned to the same CPU.
+///
+/// Both threads are pinned to one CPU so each `yield_now` genuinely switches (on an idle
+/// CPU with nothing else runnable the scheduler would simply return). One `yield_now`
+/// round trip is **two** switches — out to the partner and back — so the per-switch figure
+/// is half the measured per-yield cost. Returns `0` if the threads could not be spawned.
+fn measure_switch_cycles() -> u64 {
+    // Pin to the last online CPU: keeping the pair off CPU 0 leaves the boot thread (this
+    // caller) undisturbed on its own CPU while it waits.
+    let cpu = (sched::online_cpus().min(arch::MAX_CPUS)).saturating_sub(1);
+    if cpu == 0 {
+        return 0; // single-CPU boot: no CPU to isolate the pair on
+    }
+    let mask = 1u8 << cpu;
+
+    SWITCH_PARTNER_RUN.store(true, Ordering::Release);
+    SWITCH_CYCLES.store(0, Ordering::Relaxed);
+    SWITCH_DONE.store(0, Ordering::Relaxed);
+
+    if sched::spawn_with_affinity(switch_partner, 0, mask).is_err()
+        || sched::spawn_with_affinity(switch_measurer, 0, mask).is_err()
+    {
+        SWITCH_PARTNER_RUN.store(false, Ordering::Release);
+        kprintln!("fp: switch-cost spawn failed");
+        return 0;
+    }
+
+    let mut spins: u64 = 0;
+    while SWITCH_DONE.load(Ordering::Acquire) < 2 {
+        sched::reap_pending();
+        core::hint::spin_loop();
+        spins += 1;
+        if spins > 20_000_000_000 {
+            SWITCH_PARTNER_RUN.store(false, Ordering::Release);
+            kprintln!("fp: switch-cost measurement timed out");
+            return 0;
+        }
+    }
+    sched::reap_pending();
+    SWITCH_CYCLES.load(Ordering::Acquire)
+}
+
+/// Yields taken by the measurer. Large enough to swamp the `RDTSC` bracket, small enough
+/// not to stretch the boot.
+const SWITCH_YIELDS: u64 = 2000;
+
+static SWITCH_PARTNER_RUN: core::sync::atomic::AtomicBool =
+    core::sync::atomic::AtomicBool::new(false);
+static SWITCH_DONE: AtomicU32 = AtomicU32::new(0);
+static SWITCH_CYCLES: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// The thread the measurer bounces off: yield until released.
+extern "C" fn switch_partner(_arg: usize) {
+    while SWITCH_PARTNER_RUN.load(Ordering::Acquire) {
+        sched::yield_now();
+    }
+    SWITCH_DONE.fetch_add(1, Ordering::Release);
+}
+
+/// Times `SWITCH_YIELDS` yields and publishes the **per-switch** cost.
+extern "C" fn switch_measurer(_arg: usize) {
+    // Warm up so the first samples don't pay for cold caches / a first-touch of the
+    // partner's stack.
+    for _ in 0..64 {
+        sched::yield_now();
+    }
+    let t0 = arch::selftest_read_cycles();
+    for _ in 0..SWITCH_YIELDS {
+        sched::yield_now();
+    }
+    let t1 = arch::selftest_read_cycles();
+    // Two switches per yield (out and back).
+    SWITCH_CYCLES.store(
+        t1.wrapping_sub(t0) / (SWITCH_YIELDS * 2),
+        Ordering::Release,
+    );
+    SWITCH_PARTNER_RUN.store(false, Ordering::Release);
+    SWITCH_DONE.fetch_add(1, Ordering::Release);
 }
 
 // === preemptive scheduler demo =========================================================
