@@ -2223,10 +2223,22 @@ hard-float dummy program.
   baseline). *Verified:* 3 host tests + full suite (546) green; `test-qemu` now runs
   `-cpu max` (256-bit XSAVE path — splicing `+xsave` onto `qemu64` hangs TCG) PASS; KVM
   `-cpu host` PASS + 20/20 boot-loop (real hardware XSAVE/AVX under SMP migration).
-- [ ] **Part B** — the `asm!` xmm/ymm cross-contamination selftest (all 16 xmm + ymm high
-  halves stamped and checked byte-for-byte across a forced cross-CPU migration) +
-  context-switch cost measured. Proves isolation more tightly than compiler-emitted float
-  code can.
+- [x] **Part B — isolation selftest + measured cost.** `boot_selftest::fp_isolation_demo`
+  runs 12 kernel workers (3× the CPUs, so they contend and migrate) × 6 preemption-spanning
+  rounds: each stamps all 16 vector registers with a *self-identifying* pattern (mixing
+  worker seed, register index, and byte offset, so a whole-register cross-wire is caught as
+  surely as a byte flip), then re-reads and compares byte-for-byte. Corruption `panic!`s →
+  FAIL verdict. The load/store go through `arch::fpu_selftest_{load,store}_regs`, whose asm
+  declares **no vector operands** — impossible on a `-sse` target, and unnecessary, because
+  that same soft-float property means rustc never allocates a vector register: between
+  stamp and check the only agents that can touch them are the context switch and another
+  thread, so a mismatch has exactly one explanation. **Negative-controlled both ways**:
+  disabling the restore or the save in `switch_into` makes it fail loudly (52 corruption
+  reports), so the test is known-sensitive rather than merely passing.
+  `fp_swap_cost` prices the swap against a real switch (two threads pinned to one CPU,
+  timing `yield_now`). *Measured (KVM, `-cpu host`):* **162 cycles of a ≈4109-cycle context
+  switch — 3 %**, which is what settles eager-vs-lazy: a 3 % saving is not worth a
+  speculative-disclosure channel. TCG PASS, KVM PASS, 20/20 KVM boot-loop.
 - [ ] **Part C** — `x86_64-unknown-nitrox.json` (SSE2 baseline, AVX2 per-fn via
   `#[target_feature]`) + `-Z build-std` for the **userspace** workspace only; pinned
   nightly in `rust-toolchain.toml`; CI grep for `#![feature(`.

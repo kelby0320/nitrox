@@ -125,6 +125,21 @@ pub use x86_64::fpu::{
     init_cpu as fpu_init_cpu, restore as fpu_restore, save as fpu_save,
     vector_bits as fpu_vector_bits,
 };
+// Vector-register self-test primitives (`selftest` builds only): load/store the whole
+// vector register file through an image buffer, so a neutral test can stamp a pattern,
+// let the scheduler run, and check the pattern survived. The width and register count are
+// arch facts the test reads rather than assumes.
+#[cfg(all(target_arch = "x86_64", feature = "selftest"))]
+pub use x86_64::fpu::{
+    SELFTEST_REGS as FPU_SELFTEST_REGS, SELFTEST_REG_STRIDE as FPU_SELFTEST_REG_STRIDE,
+    VectorRegsImage, selftest_load_regs as fpu_selftest_load_regs,
+    selftest_reg_bytes as fpu_selftest_reg_bytes,
+    selftest_store_regs as fpu_selftest_store_regs,
+    selftest_swap_cycles as fpu_selftest_swap_cycles,
+};
+/// Raw cycle counter for self-test micro-measurements (`selftest` builds only).
+#[cfg(all(target_arch = "x86_64", feature = "selftest"))]
+pub use x86_64::timer::read_cycles as selftest_read_cycles;
 
 // Syscall fast-path: arm it once at boot, set the per-thread kernel stack on
 // switch-in, and descend to ring 3 from a scheduled user thread.

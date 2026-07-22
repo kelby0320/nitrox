@@ -7399,3 +7399,52 @@ path a no-XSAVE CPU takes; both sizings are CPUID-driven, not hardcoded.
 
 Parts B–D (the `asm!` cross-contamination selftest + cost measurement, the custom
 userspace target, the hard-float dummy program) follow on this branch.
+
+## 2026-07-21 — FP enablement Part B: the isolation selftest and the measured swap cost
+
+Part A built the mechanism; Part B proves it, and replaces the eager-vs-lazy cost estimate
+with a measurement.
+
+**The isolation selftest** (`boot_selftest::fp_isolation_demo`, `selftest` builds). Twelve
+kernel workers — 3× the CPU count, so they contend for CPUs and preempt one another — each
+stamp all sixteen vector registers with a pattern unique to themselves, then run six rounds
+of "burn enough cycles to span several ticks, then re-read and compare byte-for-byte". The
+pattern mixes the worker seed, the register index, and the byte offset, so a whole-register
+or whole-file cross-wire is caught as surely as a single flipped byte, and a leak shows up
+as *another worker's* pattern rather than as noise. Any mismatch `panic!`s, which under
+`test-harness` writes the FAIL verdict.
+
+**Why this is a sharper instrument than hard-float Rust would be.** The asm that loads and
+stores the register file declares **no vector-register operands and no vector clobbers** —
+which would be unsound on a normal target. It is sound here because the kernel builds for
+`x86_64-unknown-none` (`-mmx,-sse,+soft-float`): rustc cannot allocate a vector register,
+so there is never a live value to clobber. (It is also why the operands could not be
+declared even if we wanted to — the `xmm_reg` class requires the `sse` target feature.
+Inline-asm mnemonics assemble regardless of target features; only codegen is gated.) That
+same property is what gives the test its power: between the stamp and the check, the *only*
+agents that can touch those registers are the context switch and another thread. A
+mismatch has exactly one explanation. Compiler-emitted float code could not be steered
+tightly enough to make that claim — it would prove "floats work", not "nothing leaks".
+
+**Negative-controlled, in both directions.** A test that passes proves nothing until it has
+been shown to fail. Disabling `fpu_restore` in `switch_into` produces immediate corruption
+reports; disabling `fpu_save` instead produces 52. Both halves of the swap are therefore
+load-bearing and the test is known-sensitive — the discipline this project adopted after
+the reschedule-IPI slice, where the concurrent-boot test passed with the bug present.
+
+**The cost, measured rather than assumed.** `fp_swap_cost` times an `XSAVE`+`XRSTOR` pair
+(min of 64 samples, to reject samples polluted by an interrupt) and prices it against a
+real context switch — two threads pinned to a single CPU so each `yield_now` genuinely
+switches, timing 2000 yields and halving (a yield is two switches). On real hardware (KVM,
+`-cpu host`): **162 cycles of a ≈4109-cycle switch — 3 %**. A switch already pays for a
+`SCHED` acquire, a CR3 load, a TSS re-arm, and a stack swap; the register file is noise
+beside them. This is the number that settles the eager-vs-lazy question recorded in Part A:
+lazy switching would trade a 3 % saving for a speculative-disclosure channel
+(CVE-2018-3665) plus a second cross-CPU coherence protocol. The `fpu.rs` module docs now
+cite the measurement instead of the estimate. (Under TCG the same figures read ≈1346 /
+≈25964 cycles — `RDTSC` there counts emulator progress, not cycles, so only the KVM numbers
+are meaningful; the selftest says so in its own output.)
+
+**Verified:** both builds warning-free; full host suite green; `check-arch` clean;
+`test-qemu` (TCG `-cpu max`) PASS; KVM `-cpu host` PASS and **20/20** boot-loop with the
+isolation demo passing every run.

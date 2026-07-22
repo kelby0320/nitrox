@@ -26,9 +26,13 @@
 //!   removed lazy switching outright for this reason. Nitrox's whole premise is
 //!   that authority does not leak between processes; leaving another process's
 //!   AES round keys sitting in `xmm` is exactly that leak.
-//! - **Cost.** `XSAVE`/`XRSTOR` of the x87+SSE+AVX area is on the order of a
-//!   hundred cycles against a context switch that already does a CR3 load, a
-//!   TSS re-arm, and a stack swap. (Measured in Part B.)
+//! - **Cost — measured, not assumed.** `XSAVE`+`XRSTOR` of the 832-byte
+//!   x87+SSE+AVX area costs **≈162 cycles of a ≈4100-cycle context switch — 3 %**
+//!   (KVM, `-cpu host`, `RDTSC`; `boot_selftest::fp_swap_cost` reports both
+//!   figures every selftest boot). A switch already pays for a `SCHED` acquire, a
+//!   CR3 load, a TSS re-arm, and a stack swap; the register file is noise beside
+//!   them. Lazy switching would trade a 3 % saving for a speculative-disclosure
+//!   channel.
 //! - **Simplicity under SMP.** Lazy switching requires tracking *which CPU* holds
 //!   a thread's live registers and shooting it down when the thread migrates.
 //!   That is a second cross-CPU coherence protocol, in a substrate that just
@@ -356,6 +360,180 @@ pub unsafe fn restore(area: *const ArchFpuState) {
             );
         }
     }
+}
+
+// === self-test support ==================================================================
+//
+// Compiled only into `selftest` builds. See `boot_selftest::fp_isolation_demo` for the
+// test these primitives serve.
+
+/// Number of vector registers the self-test stamps (`xmm0`–`xmm15` / `ymm0`–`ymm15`).
+#[cfg(feature = "selftest")]
+pub const SELFTEST_REGS: usize = 16;
+
+/// Bytes reserved per register in a [`VectorRegsImage`]. Always the `ymm` width, even
+/// when only `xmm` is enabled, so the image layout does not depend on the CPU — only
+/// how much of each slot is meaningful does (see [`selftest_reg_bytes`]).
+#[cfg(feature = "selftest")]
+pub const SELFTEST_REG_STRIDE: usize = 32;
+
+/// A snapshot of every vector register, one `SELFTEST_REG_STRIDE`-byte slot each.
+///
+/// 32-byte aligned because `vmovaps`/`movaps` `#GP` on a misaligned operand.
+#[cfg(feature = "selftest")]
+#[repr(C, align(32))]
+pub struct VectorRegsImage {
+    bytes: [u8; SELFTEST_REGS * SELFTEST_REG_STRIDE],
+}
+
+#[cfg(feature = "selftest")]
+impl VectorRegsImage {
+    /// A zeroed image.
+    pub const fn zeroed() -> Self {
+        Self {
+            bytes: [0; SELFTEST_REGS * SELFTEST_REG_STRIDE],
+        }
+    }
+
+    /// The slot for register `i`, as a byte slice of the full stride.
+    pub fn slot_mut(&mut self, i: usize) -> &mut [u8] {
+        &mut self.bytes[i * SELFTEST_REG_STRIDE..(i + 1) * SELFTEST_REG_STRIDE]
+    }
+
+    /// The slot for register `i`.
+    pub fn slot(&self, i: usize) -> &[u8] {
+        &self.bytes[i * SELFTEST_REG_STRIDE..(i + 1) * SELFTEST_REG_STRIDE]
+    }
+}
+
+/// How many bytes of each slot are actually held in a register on this CPU: 32 with AVX
+/// enabled (`ymm`), 16 otherwise (`xmm`). Bytes beyond this are not architectural state
+/// and must not be compared.
+#[cfg(feature = "selftest")]
+pub fn selftest_reg_bytes() -> usize {
+    if vector_bits() >= 256 { 32 } else { 16 }
+}
+
+// The load/store pairs below deliberately declare **no vector-register operands and no
+// vector clobbers** — which would normally be unsound, since the compiler could be
+// holding a live value in one.
+//
+// It is sound here, and only here, because the kernel is built for
+// `x86_64-unknown-none` (`-mmx,-sse,+soft-float`): rustc will not allocate a vector
+// register under any circumstance, so there is never a live value to clobber. (That is
+// also why the operands *cannot* be declared — the `xmm_reg` class requires the `sse`
+// target feature, which this target disables. Inline-asm mnemonics are assembled
+// regardless of target features; only codegen is gated.) The same property is what makes
+// this test meaningful: between [`selftest_load_regs`] and [`selftest_store_regs`] the
+// **only** things that can touch these registers are the context switch's save/restore
+// and another thread running on this CPU — which is precisely the leak being tested for.
+
+/// Load every vector register from `img`.
+///
+/// # Safety
+/// `img` must point to a valid, 32-byte-aligned [`VectorRegsImage`]. Ring-0, and
+/// [`init_cpu`] must have run on this CPU (otherwise `CR0.EM` would `#UD` these).
+#[cfg(feature = "selftest")]
+pub unsafe fn selftest_load_regs(img: *const VectorRegsImage) {
+    // SAFETY: see the module note above on the absent vector clobbers. The pointer is a
+    // valid aligned image; each access is within its `SELFTEST_REGS * STRIDE` bytes.
+    unsafe {
+        let p = (&raw const (*img).bytes).cast::<u8>();
+        if vector_bits() >= 256 {
+            asm!(
+                "vmovaps ymm0,  [{p} + 0]", "vmovaps ymm1,  [{p} + 32]",
+                "vmovaps ymm2,  [{p} + 64]", "vmovaps ymm3,  [{p} + 96]",
+                "vmovaps ymm4,  [{p} + 128]", "vmovaps ymm5,  [{p} + 160]",
+                "vmovaps ymm6,  [{p} + 192]", "vmovaps ymm7,  [{p} + 224]",
+                "vmovaps ymm8,  [{p} + 256]", "vmovaps ymm9,  [{p} + 288]",
+                "vmovaps ymm10, [{p} + 320]", "vmovaps ymm11, [{p} + 352]",
+                "vmovaps ymm12, [{p} + 384]", "vmovaps ymm13, [{p} + 416]",
+                "vmovaps ymm14, [{p} + 448]", "vmovaps ymm15, [{p} + 480]",
+                p = in(reg) p,
+                options(readonly, nostack, preserves_flags),
+            );
+        } else {
+            asm!(
+                "movaps xmm0,  [{p} + 0]", "movaps xmm1,  [{p} + 32]",
+                "movaps xmm2,  [{p} + 64]", "movaps xmm3,  [{p} + 96]",
+                "movaps xmm4,  [{p} + 128]", "movaps xmm5,  [{p} + 160]",
+                "movaps xmm6,  [{p} + 192]", "movaps xmm7,  [{p} + 224]",
+                "movaps xmm8,  [{p} + 256]", "movaps xmm9,  [{p} + 288]",
+                "movaps xmm10, [{p} + 320]", "movaps xmm11, [{p} + 352]",
+                "movaps xmm12, [{p} + 384]", "movaps xmm13, [{p} + 416]",
+                "movaps xmm14, [{p} + 448]", "movaps xmm15, [{p} + 480]",
+                p = in(reg) p,
+                options(readonly, nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+/// Store every vector register into `img`.
+///
+/// # Safety
+/// As [`selftest_load_regs`], but `img` must be writable.
+#[cfg(feature = "selftest")]
+pub unsafe fn selftest_store_regs(img: *mut VectorRegsImage) {
+    // SAFETY: see the module note above on the absent vector clobbers.
+    unsafe {
+        let p = (&raw mut (*img).bytes).cast::<u8>();
+        if vector_bits() >= 256 {
+            asm!(
+                "vmovaps [{p} + 0],   ymm0", "vmovaps [{p} + 32],  ymm1",
+                "vmovaps [{p} + 64],  ymm2", "vmovaps [{p} + 96],  ymm3",
+                "vmovaps [{p} + 128], ymm4", "vmovaps [{p} + 160], ymm5",
+                "vmovaps [{p} + 192], ymm6", "vmovaps [{p} + 224], ymm7",
+                "vmovaps [{p} + 256], ymm8", "vmovaps [{p} + 288], ymm9",
+                "vmovaps [{p} + 320], ymm10", "vmovaps [{p} + 352], ymm11",
+                "vmovaps [{p} + 384], ymm12", "vmovaps [{p} + 416], ymm13",
+                "vmovaps [{p} + 448], ymm14", "vmovaps [{p} + 480], ymm15",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+        } else {
+            asm!(
+                "movaps [{p} + 0],   xmm0", "movaps [{p} + 32],  xmm1",
+                "movaps [{p} + 64],  xmm2", "movaps [{p} + 96],  xmm3",
+                "movaps [{p} + 128], xmm4", "movaps [{p} + 160], xmm5",
+                "movaps [{p} + 192], xmm6", "movaps [{p} + 224], xmm7",
+                "movaps [{p} + 256], xmm8", "movaps [{p} + 288], xmm9",
+                "movaps [{p} + 320], xmm10", "movaps [{p} + 352], xmm11",
+                "movaps [{p} + 384], xmm12", "movaps [{p} + 416], xmm13",
+                "movaps [{p} + 448], xmm14", "movaps [{p} + 480], xmm15",
+                p = in(reg) p,
+                options(nostack, preserves_flags),
+            );
+        }
+    }
+}
+
+/// Median cycle cost of one save+restore pair, over `rounds` samples.
+///
+/// Measured with `RDTSC` around a back-to-back [`save`]/[`restore`] of a scratch area, so
+/// it isolates the FP swap from the rest of the switch. Meaningful only under KVM or on
+/// real hardware — TCG's `RDTSC` is not a cycle counter.
+///
+/// # Safety
+/// Ring-0; [`init_cpu`] must have run on this CPU. Clobbers the live FP register file
+/// (it round-trips it through the scratch area), so the caller must not hold live vector
+/// state across the call.
+#[cfg(feature = "selftest")]
+pub unsafe fn selftest_swap_cycles(scratch: *mut ArchFpuState, rounds: u32) -> u64 {
+    let mut best = u64::MAX;
+    for _ in 0..rounds {
+        let t0 = regs::rdtsc();
+        // SAFETY: forwarded — `scratch` is a valid, aligned area and the CPU is enabled.
+        unsafe {
+            save(scratch);
+            restore(scratch);
+        }
+        let t1 = regs::rdtsc();
+        // Minimum over the samples: the cheapest observation is the one least polluted by
+        // an interrupt or a cache miss landing inside the window.
+        best = best.min(t1.wrapping_sub(t0));
+    }
+    best
 }
 
 #[cfg(test)]
