@@ -2260,8 +2260,26 @@ hard-float dummy program.
   of `thread_trampoline`'s existing `and rsp,-16`. *Verified:* every binary is `ET_EXEC`,
   no interpreter, **zero** soft-float libcalls and real `xmm` instructions; host suite,
   `check-arch`, `check-nightly` green; `test-qemu` PASS; KVM 10/10.
-- [ ] **Part D** — first hard-float userspace thread demonstrated (a dummy program
-  exercising real `f64`/SIMD Rust through the new target).
+- [x] **Part D — first hard-float userspace code demonstrated.** Real Rust `f64`
+  arithmetic running in ring 3 on the new target, checked **bit-exactly** rather than
+  epsilon-fuzzily: every value is a small exact integer in an `f64`, so Σ v[k]² computed
+  in `f64` must equal the same sum computed in `u64` — a self-consistent-but-wrong FPU
+  (bad multiply, stuck rounding mode, uninitialised `MXCSR`) fails where a float-only
+  check would not. Plus a `x → 2x+1 → (x-1)/2` round trip across a syscall (exactly
+  invertible at these magnitudes), and an `#[target_feature(enable = "avx2")]` SIMD path
+  cross-checked against the scalar one — gated on `XGETBV` read **from ring 3**, which is
+  userspace independently confirming the `XCR0` write the kernel made in `fpu_init_cpu`.
+  Two placements, deliberately: `session-mgr::fp_gate` is the **guarantee**, checked
+  synchronously at the single `SYS_TEST_EXIT(PASS)` call alongside `sched_gate`;
+  `parent` + `child` role 3 spawn three concurrent workers with different seeds as
+  cross-process **breadth**. *The split was forced by evidence*: the check lived only in
+  `parent` first and a KVM boot-loop showed it completing in **2 of 15** runs — the login
+  chain owns the verdict and races the demo chain, so on a fast boot the run was
+  adjudicated PASS while the workers still ran, and the check silently never executed.
+  After gating: **15/15**. *Negative-controlled three ways* — corrupting the expected sum
+  in `child` (exit 20 → FAIL) and in the gate (→ FAIL), and disabling the kernel's
+  `fpu_restore` with Part B's kernel demo silenced, which the **ring-3** check caught on
+  its own. TCG PASS, KVM 15/15.
 
 ### CLI-complete: dir ops + the typed shell + coreutils
 

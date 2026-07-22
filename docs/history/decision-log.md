@@ -7520,3 +7520,61 @@ compositor slice, it would have surfaced as a mystery fault inside a new graphic
 warning-free builds; full host suite green; `check-arch` and `check-nightly` green;
 `test-qemu` boots the whole hard-float userspace (init → mount → services → login →
 shell) to the PASS verdict; KVM `-cpu host` 10/10.
+
+## 2026-07-21 — FP enablement Part D: hardware floating point proven from ring 3
+
+Parts A–C built the kernel mechanism, its isolation proof, and the hard-float toolchain.
+Part D closes the slice by showing that ordinary Rust floating-point code actually works
+in a Nitrox process.
+
+**What is checked, and why it is bit-exact.** Every value in the workload is a small exact
+integer held in an `f64`, which turns each check into an exact comparison rather than an
+epsilon threshold:
+
+- **`f64` against `u64`.** Σ v[k]² is computed in floating point and again in integer
+  arithmetic; they must agree exactly. This is the check that catches a *self-consistent
+  but wrong* FPU — a bad multiply, a stuck rounding mode, an `MXCSR` we failed to
+  initialise. A float-only comparison would pass all of those happily.
+- **Round trip across a syscall.** `x → 2x+1 → (x-1)/2` is exactly invertible at these
+  magnitudes. The forward half runs, the process enters the kernel (and may be preempted
+  and migrated), and the inverse half must reproduce the original bit patterns.
+- **AVX2 against scalar, and `XCR0` read from ring 3.** The same sum computed through
+  `#[target_feature(enable = "avx2")]` intrinsics must match exactly. Because the lane
+  values are exact integers well under 2⁵³, addition is exact and the vector
+  reassociation is bit-identical to the scalar left-to-right sum — the exact-integer
+  design is what makes that comparison legitimate. The path is gated on the full
+  three-part ecosystem check: CPU has AVX2, OS enabled `XSAVE`, and `XGETBV` shows the
+  SSE+AVX state components enabled. That last clause is **userspace independently
+  confirming, from ring 3, the `XCR0` write the kernel performed in `fpu_init_cpu`** —
+  and a CPU with AVX2 whose OS left `YMM` state disabled is treated as a *failure*, not a
+  quiet fallback, because using AVX then would silently corrupt across a context switch.
+
+**Two placements, and the evidence that forced the split.** The check first lived only in
+the demo `parent`, which spawns three concurrent `child` role-3 workers with different
+seeds. It passed. Then a KVM boot-loop showed it completing in **2 of 15 runs**: the login
+chain owns the PASS verdict and races the demo chain, so on a fast boot the run was
+adjudicated while the workers were still running — the check silently did not execute in
+87 % of runs, and a *failure* in those runs would not have failed the build. Moving it
+earlier in `parent`'s sequence helped but stayed a race.
+
+The fix is the pattern this codebase already established for exactly this hazard:
+`session-mgr::sched_gate`, "checked synchronously at the single `SYS_TEST_EXIT(PASS)`
+call, [so] a failure cannot lose a race to the verdict". `fp_gate` now sits beside it —
+`verdict(ok && sched_gate(root_ns) && fp_gate())` — and runs **15/15**. `parent` keeps its
+concurrent multi-process version as breadth (different processes holding different live FP
+state simultaneously), with its "start" banner removed: announcing work that the verdict
+may cut short reads like a hang, and silence until there is a result is honest.
+
+**Negative-controlled three ways**, because a passing test proves nothing until it has been
+made to fail: corrupting the expected sum in `child` (exit 20 → run FAIL, exit 35);
+corrupting it in the gate (→ FAIL); and — the one that matters — disabling the kernel's
+`fpu_restore` *with Part B's kernel-level demo silenced so it could not panic first and
+mask the result*, which the **ring-3** check caught on its own. The two layers therefore
+have genuinely independent detection power, and the division of labour is honest: Part B's
+`asm!` selftest owns the "no state leaks across a context switch" claim with a far sharper
+instrument; Part D owns "real compiler-generated hard float works in ring 3".
+
+**Verified:** warning-free builds; full host suite green; `check-arch` and `check-nightly`
+green; `test-qemu` (TCG `-cpu max`) PASS with the kernel isolation demo, the concurrent
+worker demo, and the gate all reporting; KVM `-cpu host` 15/15 with the gate running every
+time. **Phase 4 FP enablement is complete (Parts A–D).**
