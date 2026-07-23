@@ -23,6 +23,15 @@ pub const RESOLVE_GROW: u32 = 1 << 2;
 /// `RESOLVE_FILE_LAZY | RESOLVE_GROW`; the `new_size` rides after the suffix as for
 /// [`RESOLVE_GROW`]. `docs/architecture/ext4-fs-server-rw.md`.
 pub const RESOLVE_CREATE: u32 = 1 << 3;
+/// `RESOLVE_DIR_OPEN` — resolve a path to an **open directory handle**: the server
+/// resolves the suffix to a directory inode, mints a session [`IpcChannel`] scoped to
+/// that directory, and replies [`OBJECT_KIND_DIRECTORY`] with the channel in
+/// `handles[0]`. The client then issues [`File::ReadDir`](crate::file) and the
+/// name-addressed mutation ops on that channel. Because the suffix is resolved once (with
+/// the mount's subtree base already prepended by the kernel) and subsequent ops address
+/// entries by **name, not path**, the handle cannot reach outside the resolved directory —
+/// confinement is structural. See `docs/spec/rsproto-file-ops.md`.
+pub const RESOLVE_DIR_OPEN: u32 = 1 << 4;
 
 // --- object_kind values (reply) ---------------------------------------------
 
