@@ -47,8 +47,16 @@ use libkern::*;
 
 /// One page; the scratch buffer + memory-object granularity.
 const PAGE: u64 = 4096;
-/// Block-device sector size (the `sys_io_submit` transfer unit).
-const SECTOR: usize = 512;
+/// The `DiskReader` device transfer unit: one **4 KiB filesystem block** (= one scratch
+/// page). The AHCI path does the 8-sector transfer in a single command (it computes
+/// `sector_count = length / 512`), so reading or writing a whole block costs **one**
+/// `sys_io_submit` + one completion wake, not eight — 8× fewer block-I/O round trips than
+/// the original 512-byte-sector-at-a-time path. The device's logical sector is still 512
+/// bytes; this is the I/O granularity, aligned to the 4 KiB block. See
+/// `docs/rationale/deferred-decisions.md` (fs-server 4 KiB-block I/O). The ext4 fs is
+/// 4 KiB-block-aligned within a partition ≥ its size, so a covering-block access never
+/// runs past the device.
+const IO_BLOCK: usize = 4096;
 /// IPC message size (the `RECV_MSG`/`REPLY_MSG` buffers); payload starts at 24.
 const MSG_LEN: usize = 4096;
 const PAYLOAD_OFF: usize = 24;
@@ -121,10 +129,13 @@ fn po_wait(po: u64) -> (i32, u64) {
     if waited != 1 { (-1, 0) } else { (status, result) }
 }
 
-/// A [`BlockReader`] over the block device: each `read_at` reads the covering
-/// 512-byte sectors via `sys_io_submit` into a one-page scratch `MemoryObject`
-/// (mapped R/W) and copies the requested sub-range out. Sector-at-a-time — simple
-/// and correct; the parser's reads are small (≤ one 4 KiB filesystem block).
+/// A [`BlockReader`]/[`BlockWriter`] over the block device: each `read_at` reads the
+/// covering **4 KiB blocks** via `sys_io_submit` into a one-page scratch `MemoryObject`
+/// (mapped R/W) and copies the requested sub-range out; `write_at` is a per-block
+/// read-modify-write. One `sys_io_submit` per 4 KiB block (the AHCI path does the 8-sector
+/// transfer in a single command), not one per 512-byte sector — 8× fewer block-I/O round
+/// trips, which is what made the same-CPU wake latency so acute (see the decision log,
+/// 2026-07-23). The parser's individual reads are small (≤ one 4 KiB filesystem block).
 struct DiskReader {
     /// The read-only block-device handle (from the setup message).
     device: u64,
@@ -135,15 +146,15 @@ struct DiskReader {
 }
 
 impl DiskReader {
-    /// DMA `sector` (512 bytes) into the scratch object; `Io` on any failure.
-    fn read_sector(&self, sector: u64) -> Result<(), FsError> {
+    /// DMA `block` (4 KiB) into the scratch object in a single command; `Io` on any failure.
+    fn read_block(&self, block: u64) -> Result<(), FsError> {
         let op = IoOp {
             opcode: IO_OPCODE_READ,
             flags: 0,
             buffer: self.scratch,
             buf_offset: 0,
-            offset: sector * SECTOR as u64,
-            length: SECTOR as u64,
+            offset: block * IO_BLOCK as u64,
+            length: IO_BLOCK as u64,
         };
         // SAFETY: `device` is a block DeviceNode with READ; `&op` is a valid IoOp.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
@@ -151,7 +162,7 @@ impl DiskReader {
             return Err(FsError::Io);
         }
         let (status, result) = po_wait(po as u64);
-        if status != 0 || result != SECTOR as u64 {
+        if status != 0 || result != IO_BLOCK as u64 {
             return Err(FsError::Io);
         }
         Ok(())
@@ -163,15 +174,15 @@ impl BlockReader for DiskReader {
         let mut done = 0usize;
         while done < buf.len() {
             let cur = offset + done as u64;
-            let sector = cur / SECTOR as u64;
-            let in_sector = (cur % SECTOR as u64) as usize;
-            let n = core::cmp::min(SECTOR - in_sector, buf.len() - done);
-            self.read_sector(sector)?;
-            // SAFETY: `scratch_addr` maps a full page R/W; the read sector occupies
-            // `[0, 512)`, so `[in_sector, in_sector + n)` is in bounds.
+            let block = cur / IO_BLOCK as u64;
+            let in_block = (cur % IO_BLOCK as u64) as usize;
+            let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
+            self.read_block(block)?;
+            // SAFETY: `scratch_addr` maps a full page R/W; the read block occupies
+            // `[0, 4096)`, so `[in_block, in_block + n)` is in bounds.
             let src = unsafe {
                 core::slice::from_raw_parts(
-                    (self.scratch_addr as usize + in_sector) as *const u8,
+                    (self.scratch_addr as usize + in_block) as *const u8,
                     n,
                 )
             };
@@ -183,15 +194,16 @@ impl BlockReader for DiskReader {
 }
 
 impl DiskReader {
-    /// Write the scratch object's sector-0 (512 bytes) to device `sector`; `Io` on failure.
-    fn write_sector(&self, sector: u64) -> Result<(), FsError> {
+    /// Write the scratch object's first 4 KiB to device `block` in a single command; `Io`
+    /// on failure.
+    fn write_block(&self, block: u64) -> Result<(), FsError> {
         let op = IoOp {
             opcode: IO_OPCODE_WRITE,
             flags: 0,
             buffer: self.scratch,
             buf_offset: 0,
-            offset: sector * SECTOR as u64,
-            length: SECTOR as u64,
+            offset: block * IO_BLOCK as u64,
+            length: IO_BLOCK as u64,
         };
         // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
@@ -199,7 +211,7 @@ impl DiskReader {
             return Err(FsError::Io);
         }
         let (status, result) = po_wait(po as u64);
-        if status != 0 || result != SECTOR as u64 {
+        if status != 0 || result != IO_BLOCK as u64 {
             return Err(FsError::Io);
         }
         Ok(())
@@ -211,24 +223,24 @@ impl BlockWriter for DiskReader {
         let mut done = 0usize;
         while done < buf.len() {
             let cur = offset + done as u64;
-            let sector = cur / SECTOR as u64;
-            let in_sector = (cur % SECTOR as u64) as usize;
-            let n = core::cmp::min(SECTOR - in_sector, buf.len() - done);
-            // Read-modify-write for a partial sector: read it into scratch first so the
-            // untouched bytes are preserved. A full-sector write skips the read.
-            if n != SECTOR {
-                self.read_sector(sector)?;
+            let block = cur / IO_BLOCK as u64;
+            let in_block = (cur % IO_BLOCK as u64) as usize;
+            let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
+            // Read-modify-write for a partial block: read it into scratch first so the
+            // untouched bytes are preserved. A full-block write skips the read.
+            if n != IO_BLOCK {
+                self.read_block(block)?;
             }
-            // SAFETY: `scratch_addr` maps a full page R/W; `[in_sector, in_sector + n)` is
-            // within the sector-0 region `[0, 512)`.
+            // SAFETY: `scratch_addr` maps a full page R/W; `[in_block, in_block + n)` is
+            // within the block region `[0, 4096)`.
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(
-                    (self.scratch_addr as usize + in_sector) as *mut u8,
+                    (self.scratch_addr as usize + in_block) as *mut u8,
                     n,
                 )
             };
             dst.copy_from_slice(&buf[done..done + n]);
-            self.write_sector(sector)?;
+            self.write_block(block)?;
             done += n;
         }
         Ok(())
