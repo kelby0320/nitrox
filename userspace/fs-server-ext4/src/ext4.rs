@@ -233,6 +233,97 @@ pub fn stat_file<R: BlockReader>(r: &R, path: &[u8]) -> Result<usize, FsError> {
     Ok(size)
 }
 
+/// ext4 `ext4_dir_entry_2.file_type` values (the ones we surface). Others map to
+/// [`EXT4_FT_UNKNOWN`].
+pub const EXT4_FT_UNKNOWN: u8 = 0;
+/// A directory.
+pub const EXT4_FT_DIR: u8 = 2;
+/// A symbolic link.
+pub const EXT4_FT_SYMLINK: u8 = 7;
+
+/// Resolve `path` (absolute) to a **directory** inode number, for binding a directory
+/// handle (`RESOLVE_DIR_OPEN`). Errors `NotFound` if the path is missing or is not a
+/// directory; the caller then enumerates it by inode via [`read_dir`], addressing entries
+/// by name — so the handle can never reach outside this directory.
+pub fn resolve_dir<R: BlockReader>(r: &R, path: &[u8]) -> Result<u32, FsError> {
+    let sb = read_superblock(r)?;
+    let (ino, inode) = resolve_path_ino(r, &sb, path)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    Ok(ino)
+}
+
+/// Enumerate directory inode `dir_ino` starting at the opaque `cursor` (a logical byte
+/// offset into the directory's data; `0` starts from the beginning), calling `emit(inode,
+/// file_type, name)` for each live entry. `emit` returns `false` to stop early (the reply
+/// buffer is full); enumeration then resumes from the returned cursor. Returns the
+/// **next cursor** — `0` once every entry has been emitted.
+///
+/// `.` and `..` are included (they are real directory entries; the caller decides whether
+/// to show them). Entries never span a block; a block's slack rides in the last entry's
+/// `rec_len`, so iteration steps by `rec_len` and rounds up to the next block at its end.
+///
+/// # Errors
+/// `NotFound` if `dir_ino` is not a directory, plus `Io`/`Corrupt` from the device.
+pub fn read_dir<R: BlockReader>(
+    r: &R,
+    dir_ino: u32,
+    cursor: u64,
+    mut emit: impl FnMut(u32, u8, &[u8]) -> bool,
+) -> Result<u64, FsError> {
+    let sb = read_superblock(r)?;
+    let inode = read_inode(r, &sb, dir_ino)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    let size = rd_u32(&inode, 4) as u64;
+    let bs = sb.block_size as u64;
+    let mut pos = cursor;
+    let mut buf = [0u8; MAX_BLOCK];
+    let mut loaded_block = u64::MAX; // which logical block `buf` currently holds
+
+    while pos < size {
+        let lb = pos / bs;
+        let in_block = (pos % bs) as usize;
+        if loaded_block != lb {
+            let phys = extent_find(r, &sb, &inode[40..100], lb)?;
+            if phys == 0 {
+                // Sparse directory block (no live entries) — skip to the next block.
+                pos = (lb + 1) * bs;
+                continue;
+            }
+            r.read_at(phys * bs, &mut buf[..bs as usize])?;
+            loaded_block = lb;
+        }
+        // Bounds: an entry needs at least its 8-byte header within the block.
+        if in_block + 8 > bs as usize {
+            pos = (lb + 1) * bs;
+            continue;
+        }
+        let e_ino = rd_u32(&buf, in_block);
+        let rec_len = rd_u16(&buf, in_block + 4) as usize;
+        let name_len = buf[in_block + 6] as usize;
+        let file_type = buf[in_block + 7];
+        if rec_len < 8 || in_block + rec_len > bs as usize {
+            // Malformed / no valid tail in this block — advance to the next block.
+            pos = (lb + 1) * bs;
+            continue;
+        }
+        // A live entry has a non-zero inode and a name that fits; `e_ino == 0` marks a
+        // deleted/gap slot (skipped, its `rec_len` still consumed).
+        if e_ino != 0 && name_len > 0 && in_block + 8 + name_len <= bs as usize {
+            let name = &buf[in_block + 8..in_block + 8 + name_len];
+            if !emit(e_ino, file_type, name) {
+                // Buffer full: resume *at this same entry* next call.
+                return Ok(pos);
+            }
+        }
+        pos += rec_len as u64;
+    }
+    Ok(0)
+}
+
 /// Read the byte range `[offset, offset + len)` of the regular file at `path` into
 /// `out`, returning the number of bytes read — the page-cache fill (`File::ReadRange`)
 /// primitive. The range is clamped to the file size and `out.len()`; a request past

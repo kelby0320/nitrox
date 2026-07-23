@@ -205,6 +205,91 @@ mod tests {
         assert_eq!(read_file(&r, b"/system", &mut out), Err(FsError::NotFound));
     }
 
+    /// Collect every entry name of a directory (draining the cursor across calls, as the
+    /// server does when a listing spans messages).
+    fn list_dir(r: &ImageReader, path: &[u8]) -> Vec<(String, u8)> {
+        let dir_ino = ext4::resolve_dir(r, path).unwrap();
+        let mut names = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let next = ext4::read_dir(r, dir_ino, cursor, |_ino, ft, name| {
+                names.push((String::from_utf8_lossy(name).into_owned(), ft));
+                true
+            })
+            .unwrap();
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        names
+    }
+
+    #[test]
+    fn read_dir_lists_system_directory() {
+        let r = ImageReader(fixture(1024, b"gen\n"));
+        let names = list_dir(&r, b"/system");
+        // ext4 `file_type` 1 = regular file.
+        assert!(names.iter().any(|(n, ft)| n == "current-generation" && *ft == 1),
+            "expected current-generation as a regular file, got {names:?}");
+        assert!(names.iter().any(|(n, _)| n == "."), "must include .");
+        assert!(names.iter().any(|(n, _)| n == ".."), "must include ..");
+    }
+
+    #[test]
+    fn read_dir_lists_root_directory() {
+        let r = ImageReader(fixture(4096, b"gen\n"));
+        let names = list_dir(&r, b"/");
+        assert!(names.iter().any(|(n, ft)| n == "system" && *ft == ext4::EXT4_FT_DIR),
+            "root must contain the `system` subdirectory, got {names:?}");
+    }
+
+    #[test]
+    fn read_dir_cursor_resumes_when_emit_stops_early() {
+        // Stop after the first entry, then resume from the returned cursor and confirm the
+        // union covers every entry exactly once (no drop, no dup at the boundary).
+        let r = ImageReader(fixture(1024, b"gen\n"));
+        let dir_ino = ext4::resolve_dir(&r, b"/system").unwrap();
+
+        // Mirror the server's `DirReplyWriter::push` contract: returning `false` means
+        // "this entry was NOT accepted (buffer full) — resume at it", so accept one entry
+        // then reject the next.
+        let mut first = Vec::new();
+        let cursor = ext4::read_dir(&r, dir_ino, 0, |_i, _ft, name| {
+            if first.len() >= 1 {
+                return false; // reject (do not consume) the second entry
+            }
+            first.push(String::from_utf8_lossy(name).into_owned());
+            true
+        })
+        .unwrap();
+        assert_eq!(first.len(), 1);
+        assert_ne!(cursor, 0, "a stop-early must report a resumable cursor");
+
+        let mut rest = Vec::new();
+        let done = ext4::read_dir(&r, dir_ino, cursor, |_i, _ft, name| {
+            rest.push(String::from_utf8_lossy(name).into_owned());
+            true
+        })
+        .unwrap();
+        assert_eq!(done, 0);
+
+        let full = list_dir(&r, b"/system");
+        let mut union: Vec<String> = first;
+        union.extend(rest);
+        union.sort();
+        let mut expected: Vec<String> = full.into_iter().map(|(n, _)| n).collect();
+        expected.sort();
+        assert_eq!(union, expected, "cursor split must partition the entries exactly");
+    }
+
+    #[test]
+    fn resolve_dir_rejects_a_regular_file_and_missing_path() {
+        let r = ImageReader(fixture(1024, b"gen\n"));
+        assert_eq!(ext4::resolve_dir(&r, b"/system/current-generation"), Err(FsError::NotFound));
+        assert_eq!(ext4::resolve_dir(&r, b"/nope"), Err(FsError::NotFound));
+    }
+
     #[test]
     fn buffer_too_small_is_too_large() {
         let r = ImageReader(fixture(1024, b"0123456789\n"));
