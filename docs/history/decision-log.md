@@ -7578,3 +7578,56 @@ instrument; Part D owns "real compiler-generated hard float works in ring 3".
 green; `test-qemu` (TCG `-cpu max`) PASS with the kernel isolation demo, the concurrent
 worker demo, and the gate all reporting; KVM `-cpu host` 15/15 with the gate running every
 time. **Phase 4 FP enablement is complete (Parts A–D).**
+
+## 2026-07-23 — Directory operations (Part A + B), and an intermittent fs-server I/O hang
+
+Phase-4 CLI substrate prereq #1: filesystem directory operations, on the branch
+`phase-4/dir-ops`. **Transport decided with the maintainer: direct client↔fs-server RPC**
+(not kernel-mediated syscalls), honoring "filesystems are userspace processes, no fs code
+in the kernel."
+
+**The mechanism (refined during the build).** A **directory handle is a session channel
+scoped to one directory.** A client `sys_ns_lookup`s a directory path; the fs-server
+resolves it (with the mount's subtree base already applied by the kernel), mints a session
+`IpcChannel` bound to that inode, and returns it as `OBJECT_KIND_CHANNEL` — the kernel has
+no distinct "directory" reply kind, and already installs a transferred channel from a
+resolve reply (the logging service does the same), so **no kernel change was needed.**
+Directory-ness is inferred from the resolved inode (resolve flags aren't plumbed from
+userspace). All ops then address entries **by name, never path**, so a handle can never
+reach outside its directory — **confinement is structural**, like `openat`/`readdir` on a
+directory fd, and the "whole-tree only" restriction I'd initially planned is unnecessary.
+
+**Part A — reading** (committed, proven): `librsproto` `File::ReadDir` (cursor-paginated);
+an `ext4::read_dir` enumerator + `resolve_dir` (alloc-free, host-tested); the fs-server
+serve loop multiplexed over session channels (logging-service pattern, fixed arrays);
+`parent` lists `/system` end to end under TCG (`dir-list ok`). Reply correlation is the
+bidirectional session channel. Directory reads are pure IPC + parsing (no arch divergence),
+so the deterministic TCG proof suffices.
+
+**Part B — mutation** (ops correct, transport wired): four ext4 write ops
+(`mkdir`/`unlink`/`rmdir`/`rename`, name-addressed on the bound inode), each **e2fsck-clean**
+against the `mke2fs` fixture. Two ext4 subtleties the e2fsck gate caught: freeing an inode
+must zero `i_links_count` **and** stamp a nonzero `i_dtime` (e2fsck decides "in use" from
+those, not the bitmap), and that `dtime` must be a plausible timestamp — a small value is
+read as an orphan-list pointer. `mkdir` also maintains `bg_used_dirs_count` and the parent
+link count. The wire ops + fs-server session dispatch are wired and demonstrated (a
+`mkdir`+`rmdir` round trip printed `dir-mutate ok`; single `mkdir`/`rename`/`rmdir` each
+returned OK in QEMU).
+
+**The finding: an intermittent fs-server I/O hang.** A **pure `File::ReadDir` loop on one
+session stalls within ~10 iterations**, while single ops and a mixed mkdir+rename+rmdir
+sequence complete — the non-determinism (not a fixed I/O count) is the signature of a
+**concurrency hang in the block/wake path**, the same class as the Phase-3 reschedule-IPI
+hunt (a blocked fs-server waiter not reliably woken when a client sends on the session
+channel under load). It is **not** a directory-op bug: the ops are e2fsck-clean and the
+readdir logic terminates in host tests. It is the **top follow-up** — it blocks reliable
+I/O-heavy demos and, more importantly, the shell/coreutils, which will hammer this path —
+and deserves a dedicated, instrumented investigation (KVM boot-loop + QEMU-monitor capture,
+per the Bug-4 / substrate-hardening playbook). The Part B demo is kept minimal to stay
+clear of it; it cannot false-pass (a real mutation error exits nonzero → the run fails).
+
+**Deferred within dir-ops** (record when picked up): a reusable `libos` `open_dir`/`read_dir`
+client wrapper (parent drives the raw syscalls for now); cross-directory `rename` (needs a
+second handle); `rename` overwrite of an existing target; a new-directory-block grow when a
+parent directory has no slack (`TooLarge` today); the session cap (`MAX_SESSIONS = 7`,
+lifted by an aggregate wait); and a spec doc for the `File` directory ops.
