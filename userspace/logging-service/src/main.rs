@@ -452,6 +452,16 @@ fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> 
             Some(Value::Handle(v)) => {
                 let _ = write!(s, "{:#x}", v);
             }
+            // Collection cells are summarised compactly — a log line stays one line.
+            Some(Value::List(items)) => {
+                let _ = write!(s, "<list:{}>", items.len());
+            }
+            Some(Value::Record(r)) => {
+                let _ = write!(s, "<record:{}>", r.schema.fields.len());
+            }
+            Some(Value::Table(t)) => {
+                let _ = write!(s, "<table:{}rows>", t.rows.len());
+            }
             Some(Value::Null) | None => s.push_str("null"),
         }
     }

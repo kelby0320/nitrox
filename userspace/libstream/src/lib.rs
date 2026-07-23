@@ -27,8 +27,10 @@
 //! - **`Record`** ([`wire::TypeTag::Record`]) — the *nested-struct field encoding*
 //!   (a sub-schema + values), used when a `TypedRecord` appears as a field value.
 //!
-//! v1 implements **flat records** (scalars + `String`/`Bytes`/`Handle`); the `List`
-//! (a `Vec`) and `Record` (nested-struct) tags are reserved but not yet encoded.
+//! Scalars (+ `String`/`Bytes`/`Handle`) and the collection cells `List` (an
+//! `Arc<[Value]>`) and `Record` (a nested sub-schema + values) are all encoded; a whole
+//! table is the stream itself ([`wire::Value::Table`], serialised via [`wire::Table`],
+//! not a cell tag). Only the value-level `Error` tag remains reserved.
 
 #![cfg_attr(not(test), no_std)]
 
@@ -41,6 +43,6 @@ pub mod wire;
 pub use record::TypedRecord;
 pub use table::{Item, TableReader, TableWriter, write_text_fallback};
 pub use wire::{
-    ByteSink, ByteSource, FieldDef, Schema, SliceSink, StreamFlags, TypeModifiers, TypeTag, Value,
-    WireError, WireErrorRecord,
+    ByteSink, ByteSource, FieldDef, Record, Schema, SliceSink, StreamFlags, Table, TypeModifiers,
+    TypeTag, Value, WireError, WireErrorRecord,
 };

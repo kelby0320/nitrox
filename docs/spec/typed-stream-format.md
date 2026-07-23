@@ -2,7 +2,7 @@
 
 This document specifies the wire format of typed structured streams — the format used by programs to communicate via stdin/stdout pipelines. The format is identified by the magic bytes `TSM1` (Typed Stream Magic, version 1).
 
-**Status:** Pre-stabilization. The envelope and structural types are committed; the `TypeTag` byte values are now **pinned** (below), implemented in `userspace/libstream/src/wire.rs` (the canonical source for byte-level details). **v1 implements flat records** — the scalar types plus `String`/`Bytes`/`Handle`; `List` (a `Vec`) and `Record` (nested struct) reserve their tags but are not yet encoded (they land with their first consumer, the shell).
+**Status:** Pre-stabilization. The envelope and structural types are committed; the `TypeTag` byte values are now **pinned** (below), implemented in `userspace/libstream/src/wire.rs` (the canonical source for byte-level details). The scalar types plus `String`/`Bytes`/`Handle` and the **collection cells** `List` (a persistent, `Arc`-backed `Value::List`) and `Record` (nested sub-schema + values, `Value::Record`) are all encoded; a whole table is the stream itself (`Value::Table`, no cell tag). Only the value-level `Error` tag remains reserved-but-unsupported.
 
 ### Terminology: three things called "record"
 
@@ -84,11 +84,15 @@ The set of structural types is fixed:
 | `0x04` | `String` | ✓ | `length: u32` + `length` bytes of UTF-8 |
 | `0x05` | `Bytes` | ✓ | `length: u32` + `length` raw bytes |
 | `0x06` | `Handle` | ✓ | 8 bytes (`RawHandle`, LE) |
-| `0x07` | `List` | — | `length: u32` + `length` × inner-type encoding |
-| `0x08` | `Record` | — | nested sub-schema + values |
+| `0x07` | `List` | ✓ | `count: u32` + `count` × (`tag: u8` + that value's encoding) |
+| `0x08` | `Record` | ✓ | nested sub-schema (as a Schema) + one row of values |
 | `0x09` | `Error` | — | nested error structure, value-level (see below) |
 
-The `TypeTag` byte values are pinned as above; `userspace/libstream/src/wire.rs` is the canonical source. The **v1** column marks what libstream encodes today; `List`/`Record`/`Error` are recognised on the wire but return an "unsupported" error until implemented.
+The `TypeTag` byte values are pinned as above; `userspace/libstream/src/wire.rs` is the canonical source. The **v1** column marks what libstream encodes today; only the value-level `Error` tag remains recognised-but-unsupported.
+
+A `List` is **self-describing per element**: each element carries its own `TypeTag` byte before its value, so a list may be heterogeneous (`List<Value>`) and may nest arbitrarily (a list of lists, or a list of records). An empty list stores no element type. A `Record` value likewise carries its own sub-schema, so it is self-describing. Both decode to the persistent, `Arc`-backed `Value::List`/`Value::Record`.
+
+There is **no `Table` value tag** by design: a table is a whole *stream* (the `Schema` header + data records + terminator described by this document), not a nested cell. libstream's in-memory `Value::Table` serialises via that stream form (`Table::encode`/`decode`), and a `Value`'s `type_tag()` is therefore `Option<TypeTag>` — `None` for a table. This keeps "a `Value` is exactly what TSM1 can represent" honest: the scalar/`String`/`Bytes`/`Handle`/`List`/`Record` cell values are the tagged `WireValue`s; a table is the stream that contains them.
 
 ### TypeModifiers
 
@@ -111,7 +115,6 @@ After the schema, the body is a sequence of records terminated by a terminator m
 RecordTag  := u8
    0x01 = data record
    0x02 = error record
-   0x03 = widget record
    0xFF = terminator (end of stream)
 ```
 
@@ -123,7 +126,7 @@ DataRecord := tag(0x01) field_value*
 
 `field_value` for each field in the schema, in declaration order, encoded per the field's `TypeTag`.
 
-For variable-length types (`String`, `Bytes`, `List`), the wire encoding includes a length prefix as specified above. For fixed-length types (`Int`, `Float`, `Handle`, `Bool`), the value is written directly.
+For variable-length types (`String`, `Bytes`), the wire encoding includes a length prefix as specified above; a `List` is a `u32` count followed by self-describing elements, and a `Record` is a nested sub-schema plus its values. For fixed-length types (`Int`, `Float`, `Handle`, `Bool`), the value is written directly.
 
 For nullable fields (TypeModifiers includes `NULLABLE`), the value is preceded by a single byte: `0` for absent, `1` for present. If absent, no value bytes follow for that field.
 
@@ -143,35 +146,7 @@ Used to embed a structured error in the middle of a data stream — e.g., `filte
 
 Generic operators handle error records by passing them through unmodified; the consuming end (typically `display`) renders them.
 
-### Widget record (`0x03`)
-
-```
-WidgetRecord := tag(0x03) WidgetBody
-WidgetBody   :=
-    widget_type: u8       (WidgetType enum)
-    style_len: u32
-    style: <style_len> bytes (StyleDescriptor encoded as record)
-    data_stream_handle: RawHandle    (8 bytes)
-    control_channel_handle: RawHandle (8 bytes)
-    actions_count: u16
-    actions: <actions_count> × ActionSpec
-```
-
-`WidgetType`:
-```rust
-#[repr(u8)]
-pub enum WidgetType {
-    Table   = 0,
-    Chart   = 1,
-    Form    = 2,
-    Tree    = 3,
-    Canvas  = 4,
-}
-```
-
-`ActionSpec` is a small record describing user-invokable actions on the widget; details TBD when widget rendering is implemented.
-
-The handles in `data_stream_handle` and `control_channel_handle` are transferred via the IPC mechanism that delivers the stream (typically inline in the IPC message's handle list, with the wire encoding referring to slot indices in that list — TBD).
+Record tag `0x03` was reserved for a **widget record** (structured UI embedded in a stream). It has been dropped: TSM1 is a *data* format, and structured UI is a compositor concern, not a stream record type (see `docs/history/nitrox-ui-composition-model-v1.md` §1 "TSM1 stays data-only" and the decision log, 2026-07-23). A `0x03` record tag is now a decode error (`BadRecordTag`).
 
 ### Terminator (`0xFF`)
 

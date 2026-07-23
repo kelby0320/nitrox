@@ -211,11 +211,17 @@ The full gap analysis is in the subproject plan (§1); this is the checklist.
   `libos` `open_dir`/`read_dir` client wrapper (parent drives raw syscalls today),
   cross-directory + overwrite `rename`, a new-parent-block grow on a full directory, the
   `MAX_SESSIONS = 7` session cap, and a `File` directory-ops spec doc.
-- [ ] **`Value` collection types** — extend the in-memory `libstream` `Value` (today scalar +
-  `Str`/`Bytes`/`Handle` only) with `List`/`Record`/`Table` (Arc-backed, persistent), and
-  implement the wire codecs for the reserved `List` (0x07) / `Record` (0x08) `TypeTag`s (currently
-  `Unsupported`). Also drop the `REC_WIDGET` (0x03) stub — TSM1 is data-only (UI-composition doc
-  §1). **Blocks the entire interpreter data model.**
+- [x] **`Value` collection types** — extended the in-memory `libstream` `Value` (was scalar +
+  `Str`/`Bytes`/`Handle`) with `List(Arc<[Value]>)` / `Record(Arc<Record>)` / `Table(Arc<Table>)`
+  (Arc-backed, persistent), and implemented the wire codecs for the reserved `List` (0x07) /
+  `Record` (0x08) `TypeTag`s. `List` is self-describing (per-element tag → heterogeneous +
+  nested lists round-trip); `Record` = sub-schema + a row of values; `Table` is a whole *stream*
+  (`Table::encode`/`decode`), not a cell — `type_tag()` is now `Option<TypeTag>` (`None` for a
+  table) and `write_value` refuses a nested table (`WireError::NestedTable`). Factored the
+  `NULLABLE`-aware row codec into shared `wire::write_row_values`/`read_row_values` (data rows,
+  records, and table rows now frame identically). Dropped the `REC_WIDGET` (0x03) stub — TSM1 is
+  data-only. Host-tested (23 wire tests); the live logging typed-stream path still passes
+  `test-qemu` (branch `phase-4/value-collections`, 2026-07-23).
 - [ ] **stdio / pipe convention** — a spawn contract + library for wiring `stdin`/`stdout`/`stderr`
   channels across pipeline stages, plus a `libstream` stdin-*reader* pattern and `libos`
   pipe-wiring helpers. Resolve the **bootstrap-capacity collision** first: a stage needs 5 handles

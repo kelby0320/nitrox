@@ -10,19 +10,27 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use crate::wire::{
-    ByteSink, ByteSource, REC_DATA, REC_ERROR, REC_TERMINATOR, REC_WIDGET, Result, Schema,
-    StreamFlags, TypeModifiers, TypeTag, Value, WireError, WireErrorRecord, decode_header,
-    encode_header, encode_terminator, put_u8, read_value, write_value,
+    ByteSink, ByteSource, REC_DATA, REC_ERROR, REC_TERMINATOR, Result, Schema, StreamFlags,
+    TypeModifiers, TypeTag, Value, WireError, WireErrorRecord, decode_header, encode_header,
+    encode_terminator, put_u8, read_row_values, write_row_values,
 };
 
 /// Writes a typed stream to a [`ByteSink`]: one header (magic + flags + schema), then a
 /// run of data/error records, then a terminator. Enforces that rows match the schema.
 ///
-/// ```ignore
+/// ```
+/// use libstream::{Schema, StreamFlags, TableWriter, TypeModifiers, TypeTag, Value};
+/// # fn demo() -> Result<(), libstream::WireError> {
+/// let schema = Schema::new()
+///     .field("pid", TypeTag::Int, TypeModifiers::NONE)
+///     .field("name", TypeTag::String, TypeModifiers::NONE);
+/// let mut buf = Vec::new();
 /// let mut tw = TableWriter::new(&mut buf);
 /// tw.write_schema(StreamFlags::NONE, &schema)?;
 /// tw.write_row(&[Value::Int(7), Value::Str("init".into())])?;
 /// tw.finish_with_status(0)?;
+/// # Ok(())
+/// # }
 /// ```
 pub struct TableWriter<W: ByteSink> {
     sink: W,
@@ -57,32 +65,13 @@ impl<W: ByteSink> TableWriter<W> {
     /// Write one data record. `values` must have exactly one entry per column, each
     /// matching the column's type (a `Null` only where the column is `NULLABLE`).
     pub fn write_row(&mut self, values: &[Value]) -> Result<()> {
-        if !self.begun || self.finished || values.len() != self.schema.fields.len() {
+        if !self.begun || self.finished {
             return Err(WireError::SchemaMismatch);
         }
         put_u8(&mut self.sink, REC_DATA)?;
-        for i in 0..self.schema.fields.len() {
-            let ty = self.schema.fields[i].ty;
-            let nullable = self.schema.fields[i]
-                .modifiers
-                .contains(TypeModifiers::NULLABLE);
-            let value = &values[i];
-            let is_null = matches!(value, Value::Null);
-            if nullable {
-                put_u8(&mut self.sink, (!is_null) as u8)?;
-                if is_null {
-                    continue;
-                }
-            } else if is_null {
-                return Err(WireError::SchemaMismatch);
-            }
-            // A present value's type must match its column (`Null` columns take `Null`).
-            if value.type_tag() != ty {
-                return Err(WireError::SchemaMismatch);
-            }
-            write_value(&mut self.sink, value)?;
-        }
-        Ok(())
+        // The value framing (count/type checks + `NULLABLE` presence bytes) is shared
+        // with `Value::Record`/`Table` rows — see `wire::write_row_values`.
+        write_row_values(&mut self.sink, &self.schema, values)
     }
 
     /// Write a structured error record into the stream.
@@ -174,8 +163,6 @@ impl<'a> TableReader<'a> {
                 self.ended = true;
                 return Some(self.src.i32().map(Item::End));
             }
-            // Widget records are reserved for the GUI era; unsupported in v1.
-            REC_WIDGET => Err(WireError::Unsupported(TypeTag::Record)),
             other => Err(WireError::BadRecordTag(other)),
         };
         if item.is_err() {
@@ -185,20 +172,8 @@ impl<'a> TableReader<'a> {
     }
 
     fn read_row(&mut self) -> Result<Vec<Value>> {
-        let mut out = Vec::with_capacity(self.schema.fields.len());
-        for i in 0..self.schema.fields.len() {
-            let ty = self.schema.fields[i].ty;
-            let nullable = self.schema.fields[i]
-                .modifiers
-                .contains(TypeModifiers::NULLABLE);
-            let value = if nullable && self.src.u8()? == 0 {
-                Value::Null
-            } else {
-                read_value(&mut self.src, ty)?
-            };
-            out.push(value);
-        }
-        Ok(out)
+        // Shares its framing with `Value::Record`/`Table` rows — see `wire::read_row_values`.
+        read_row_values(&mut self.src, &self.schema)
     }
 }
 
