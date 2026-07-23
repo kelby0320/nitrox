@@ -588,6 +588,17 @@ extern "C" fn device_irq_dispatch(frame: *mut ExceptionFrame) {
     // Run any DPCs the handler queued — the deferred completion work (run at the
     // interrupt tail, IF=0; see `crate::dpc`).
     crate::dpc::run_pending();
+    // A scheduling point at the device-IRQ tail. A completion DPC above may have made a
+    // thread runnable on THIS CPU (an I/O completion wakes its waiter via
+    // `complete_pending_op`), and a same-CPU placement sends no reschedule IPI. Unlike the
+    // timer tail (`on_timer_tick`), this tail has no other scheduling point, so without
+    // this an idle CPU `iretq`s back into `hlt` and the woken thread waits for the next
+    // 10 ms tick — which serialises block I/O on the tick clock (the fs-server "I/O hang";
+    // decision log 2026-07-23). `resched_if_idle` only resumes an *idle* CPU, so a running
+    // thread keeps its quantum. EOI was already sent above; the device stub is a
+    // frame-parking stub, so a delayed return resumes into its epilogue and `iretq`s,
+    // exactly like the timer/resched stubs.
+    crate::sched::resched_if_idle();
 }
 
 /// Register `handler` for the next free device-IRQ vector and return that

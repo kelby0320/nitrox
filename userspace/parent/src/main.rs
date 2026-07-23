@@ -1087,24 +1087,42 @@ fn dir_mutate_demo(root_ns: u64) {
         kprint(b"parent: dir-mutate open FAIL\n");
         exit(1);
     }
-    // A minimal round trip: mkdir then rmdir the same temp dir. Each op's reply status is
-    // the proof it applied on disk (Part B.1 proves the ext4 ops leave the image
-    // e2fsck-clean). The client-visible ReadDir verify is deliberately omitted here — a
-    // repeated fs-server I/O load intermittently hangs the block path (a concurrency issue
-    // tracked separately, see the decision log), unrelated to directory-op correctness.
+    // mkdir nx-tmp → confirm it appears (a ReadDir on the same session).
     let mut body = [0u8; 32];
     let n = librsproto::file::name_request(&mut body, b"nx-tmp").unwrap();
     if !session_mutate(dir_ch, librsproto::OP_FILE_MKDIR, &body[..n]) {
         kprint(b"parent: mkdir FAIL\n");
         exit(1);
     }
-    if !session_mutate(dir_ch, librsproto::OP_FILE_RMDIR, &body[..n]) {
+    if !session_dir_contains(dir_ch, b"nx-tmp") {
+        kprint(b"parent: mkdir not visible\n");
+        exit(1);
+    }
+    // rename nx-tmp → nx-tmp2 → confirm the old name is gone and the new one present.
+    let mut rbody = [0u8; 48];
+    let rn = librsproto::file::rename_request(&mut rbody, b"nx-tmp", b"nx-tmp2").unwrap();
+    if !session_mutate(dir_ch, librsproto::OP_FILE_RENAME, &rbody[..rn]) {
+        kprint(b"parent: rename FAIL\n");
+        exit(1);
+    }
+    if session_dir_contains(dir_ch, b"nx-tmp") || !session_dir_contains(dir_ch, b"nx-tmp2") {
+        kprint(b"parent: rename not applied\n");
+        exit(1);
+    }
+    // rmdir nx-tmp2 → confirm it is gone.
+    let mut dbody = [0u8; 32];
+    let dn = librsproto::file::name_request(&mut dbody, b"nx-tmp2").unwrap();
+    if !session_mutate(dir_ch, librsproto::OP_FILE_RMDIR, &dbody[..dn]) {
         kprint(b"parent: rmdir FAIL\n");
+        exit(1);
+    }
+    if session_dir_contains(dir_ch, b"nx-tmp2") {
+        kprint(b"parent: rmdir not applied\n");
         exit(1);
     }
     // SAFETY: closing our own channel handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, dir_ch) };
-    kprint(b"parent: dir-mutate ok (mkdir + rmdir round trip)\n");
+    kprint(b"parent: dir-mutate ok (mkdir + rename + rmdir, each ReadDir-verified)\n");
 }
 
 /// Send one mutation op (`body` already built) on the directory channel and await its
@@ -1154,6 +1172,76 @@ fn session_mutate(dir_ch: u64, op: u16, body: &[u8]) -> bool {
     }
 }
 
+
+/// Whether the bound directory currently lists an entry named `name` (drains the ReadDir
+/// cursor across replies). Exits the demo on a transport failure.
+fn session_dir_contains(dir_ch: u64, name: &[u8]) -> bool {
+    let mut cursor = 0u64;
+    let mut rounds = 0u32;
+    loop {
+        rounds += 1;
+        if rounds > 64 {
+            kprint(b"parent: dir-contains runaway\n");
+            exit(1);
+        }
+        // Build + send File::ReadDir{cursor}.
+        // SAFETY: DIR_SEND is a valid writable buffer; the rsproto body is bounded.
+        let sent = unsafe {
+            let mut b = [0u8; 8];
+            let bn = librsproto::file::read_dir_request(&mut b, cursor).unwrap();
+            let region = core::slice::from_raw_parts_mut(((&raw mut DIR_SEND) as *mut u8).add(24), 4096 - 24);
+            match librsproto::encode(region, librsproto::OP_FILE_READ_DIR, 0, 0, &b[..bn], 0) {
+                Some(rn) => {
+                    DIR_SEND[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
+                    DIR_SEND[8] = 0;
+                    syscall5(SYS_CHANNEL_SEND, dir_ch, (&raw const DIR_SEND) as u64, 0, 0, SENDMODE_NOBLOCK) == 0
+                }
+                None => false,
+            }
+        };
+        if !sent {
+            kprint(b"parent: dir-contains send FAIL\n");
+            exit(1);
+        }
+        // SAFETY: single-waiter buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = dir_ch;
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+        };
+        if waited != 1 {
+            kprint(b"parent: dir-contains wait FAIL\n");
+            exit(1);
+        }
+        // SAFETY: valid recv out-params.
+        let rr = unsafe {
+            syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
+        };
+        if rr != 0 {
+            kprint(b"parent: dir-contains recv FAIL\n");
+            exit(1);
+        }
+        // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
+        let (found, next) = unsafe {
+            let payload_len = u32::from_le_bytes([DIR_RECV[4], DIR_RECV[5], DIR_RECV[6], DIR_RECV[7]]) as usize;
+            let payload = core::slice::from_raw_parts(((&raw const DIR_RECV) as *const u8).add(24), payload_len.min(4096 - 24));
+            let m = match librsproto::decode(payload) { Ok(m) => m, Err(_) => return false };
+            if m.is_error() { return false; }
+            let (hdr, iter) = match librsproto::file::parse_read_dir_reply(m.body) { Some(x) => x, None => return false };
+            let mut f = false;
+            for e in iter {
+                if e.name == name { f = true; }
+            }
+            (f, hdr.next_cursor)
+        };
+        if found {
+            return true;
+        }
+        if next == 0 {
+            return false;
+        }
+        cursor = next;
+    }
+}
 
 /// **Hardware floating point, end to end in ring 3** (Phase 4 FP enablement Part D;
 /// decision log 2026-07-21).
@@ -1672,6 +1760,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a2. Directory listing over the direct-RPC transport (dir-ops Part A). Early, before
     //      the login chain adjudicates, for the same reason as the FP demo above.
     dir_list_demo(root_ns);
+
+    // 0a2b. REPRO INSTRUMENTATION (uncommitted): pure ReadDir loop on one session — the
+    //       intermittent fs-server I/O hang (2026-07-23 decision log).
 
     // 0a3. Directory mutation over the same transport (dir-ops Part B): mkdir + rmdir.
     dir_mutate_demo(root_ns);

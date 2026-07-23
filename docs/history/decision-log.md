@@ -7631,3 +7631,56 @@ client wrapper (parent drives the raw syscalls for now); cross-directory `rename
 second handle); `rename` overwrite of an existing target; a new-directory-block grow when a
 parent directory has no slack (`TooLarge` today); the session cap (`MAX_SESSIONS = 7`,
 lifted by an aggregate wait); and a spec doc for the `File` directory ops.
+
+## 2026-07-23 — Correction + fix: the "fs-server I/O hang" was same-CPU wake latency, not a lost wake
+
+The 2026-07-23 entry above ("Directory operations … an intermittent fs-server I/O hang")
+hypothesized a **lost-wake concurrency bug** ("a blocked fs-server waiter not reliably woken
+… the Phase-3 reschedule-IPI class"). **That hypothesis was wrong.** A Fable 5 investigation
+(branch `phase-4/dir-ops`) root-caused it: no wake is ever lost, there is no deadlock and no
+SMP race. The real defect is **same-CPU wake latency**, and it is now fixed. The original
+entry stays as history; this corrects it.
+
+**Mechanism.** Three pieces compose:
+1. `place_thread` sends a reschedule IPI only when a woken thread lands on a *different* CPU;
+   a same-CPU placement relies on this CPU reaching a scheduling point on its own.
+2. `device_irq_dispatch` (the tail shared by every IOAPIC-routed device IRQ) ran the ISR,
+   EOI'd, drained DPCs, and `iretq`'d — with **no scheduling point** (unlike the timer tail,
+   which calls `on_timer_tick`). The AHCI completion DPC (`irp_complete_dpc` →
+   `complete_pending_op`) wakes the fs-server onto *this* CPU → no IPI → nothing runs it.
+3. `idle_body` is `loop { reap_pending(); hlt }` — no ready-queue check, so an idle CPU
+   returns from the IRQ straight back into `hlt`.
+
+So a thread woken by an I/O completion on the IRQ CPU waited for the **next 10 ms timer
+tick** (~5 ms average). The fs-server does **sector-at-a-time** I/O (one `sys_io_submit` +
+`sys_wait` per 512 bytes), so on a **1-vCPU** guest every directory op paid ~5 ms × sectors
+touched — ~120 ms per `ReadDir`, ~2.3 s per mkdir+enumerate+rmdir round. I/O-heavy loops
+looked hung; single ops looked fine. **≥2 CPUs masks it completely** (wakes usually land
+cross-CPU → an IPI fires), which is why `test-qemu` (`-smp 4`) and every KVM run were green
+and the bug only showed under `cargo xtask qemu --selftest` (**no `-smp` → 1 vCPU**). The
+"intermittent / not a fixed I/O count" character was per-op latency varying with IRQ-vs-block
+timing (when the completion IRQ lands before the waiter blocks, `sys_wait` fast-paths).
+
+**Evidence (Fable 5):** ~160 boot-loop runs at HEAD across KVM/TCG × smp 1/4 — **zero true
+deadlocks**; register captures during "stalls" show CPU 0 in the idle `hlt`, IF=1 (alive,
+waiting). Tick-bound smoking gun: the same stress took **128.1 s (TCG smp1)** vs **126.6 s
+(KVM smp1)** — identical wall time despite ~10× CPU speed, i.e. bound by the tick clock.
+
+**Fix.** A scheduling point at the device-IRQ tail: `sched::resched_if_idle()`, the shared
+same-CPU-wake liveness primitive factored out of `on_reschedule_ipi` (honor the `PREEMPT_OFF`
+latch; otherwise `switch_to_next` **only if the current thread is idle** and there is work —
+a running thread keeps its quantum). Called from `device_irq_dispatch` after
+`dpc::run_pending()`. EOI is already sent before the drain, and the device stub is a
+frame-parking stub, so a delayed return resumes into its epilogue and `iretq`s, exactly like
+the timer/resched stubs — no stub change. `place_thread`'s "same-CPU needs no IPI" comment is
+now *true* because this tail provides that scheduling point.
+
+**Verified.** Latency collapse: the 1-vCPU stress run drops **~128 s → 5.5 s (TCG) / 4.0 s
+(KVM)** — 23×. Negative control (call removed) balloons back to **128.6 s**, so the helper is
+causally load-bearing. No regressions: host suite, `check-arch`, `check-nightly`, and
+`test-qemu` all green; the full-verify `dir_mutate_demo` (mkdir→verify→rename→verify→
+rmdir→verify) now completes on a 1-vCPU boot.
+
+**Deferred follow-up (logged, not blocking):** the fs-server's `DiskReader`/`BlockWriter` do
+512-byte **sector**-at-a-time I/O; batching to 4 KiB filesystem blocks would cut wake round
+trips ~8× on every metadata path. Worth doing when the fs write path is next touched.
