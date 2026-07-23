@@ -49,6 +49,10 @@ pub enum FsError {
     NotFound,
     /// The file is larger than the caller's buffer (the 64 KiB Phase-2 cap).
     TooLarge,
+    /// A create/rename target already exists (POSIX `EEXIST`).
+    Exists,
+    /// An `rmdir` target directory is not empty (POSIX `ENOTEMPTY`).
+    NotEmpty,
 }
 
 /// A block-device **writer** — the read-write counterpart of [`BlockReader`], for the
@@ -385,6 +389,141 @@ mod tests {
                 assert_eq!(&dev[..got], &want[..got], "file block {fb} device data mismatch");
             }
         }
+    }
+
+    /// Run `e2fsck -fn` over an image and assert it is clean (no changes needed, no errors).
+    fn assert_e2fsck_clean(img: &[u8], tag: &str) {
+        let dir = std::env::temp_dir()
+            .join(std::format!("nitrox-{}-{}", tag, std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let p = dir.join("img.ext4");
+        std::fs::write(&p, img).unwrap();
+        let out = std::process::Command::new("e2fsck")
+            .args(["-fn", p.to_str().unwrap()])
+            .output()
+            .unwrap();
+        std::fs::remove_dir_all(&dir).ok();
+        assert!(
+            out.status.success(),
+            "e2fsck reported errors:\n{}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    /// The inode number of a directory path (for the name-addressed mutation ops).
+    fn dir_ino(rw: &RwImage, path: &[u8]) -> u32 {
+        ext4::resolve_dir(rw, path).unwrap()
+    }
+
+    /// The entry names of a directory, as owned strings.
+    fn names_of(rw: &RwImage, path: &[u8]) -> Vec<String> {
+        let ino = dir_ino(rw, path);
+        let mut names = Vec::new();
+        let mut cursor = 0u64;
+        loop {
+            let next = ext4::read_dir(rw, ino, cursor, |_i, _ft, name| {
+                names.push(String::from_utf8_lossy(name).into_owned());
+                true
+            })
+            .unwrap();
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        names
+    }
+
+
+    #[test]
+    fn mkdir_at_creates_a_subdir_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+
+        ext4::mkdir_at(&rw, sys, b"sub").unwrap();
+        // It appears in /system, is itself a directory, and lists exactly `.`/`..`.
+        assert!(names_of(&rw, b"/system").iter().any(|n| n == "sub"));
+        let sub = ext4::resolve_dir(&rw, b"/system/sub").unwrap();
+        assert!(sub > 10);
+        let mut inner: Vec<String> = names_of(&rw, b"/system/sub");
+        inner.sort();
+        assert_eq!(inner, vec![".".to_string(), "..".to_string()]);
+
+        // Duplicate is rejected; `.`/`..` are rejected.
+        assert_eq!(ext4::mkdir_at(&rw, sys, b"sub"), Err(FsError::Exists));
+        assert_eq!(ext4::mkdir_at(&rw, sys, b"."), Err(FsError::Unsupported));
+
+        assert_e2fsck_clean(&rw.0.into_inner(), "mkdir");
+    }
+
+    #[test]
+    fn unlink_at_removes_a_file_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+
+        // Create a file with content (so it owns a data block to free), then unlink it.
+        let ino = ext4::create_file(&rw, b"/system", b"scratch").unwrap();
+        ext4::grow_file(&rw, b"/system/scratch", 4096).unwrap();
+        assert!(names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
+
+        ext4::unlink_at(&rw, sys, b"scratch").unwrap();
+        assert!(!names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
+        // The name is gone; the inode was freed (a fresh create can reuse it).
+        assert_eq!(ext4::stat_file(&rw, b"/system/scratch"), Err(FsError::NotFound));
+        let _ = ino;
+
+        // Unlink of a directory is rejected (use rmdir); missing name is NotFound.
+        ext4::mkdir_at(&rw, sys, b"adir").unwrap();
+        assert_eq!(ext4::unlink_at(&rw, sys, b"adir"), Err(FsError::Unsupported));
+        assert_eq!(ext4::unlink_at(&rw, sys, b"nope"), Err(FsError::NotFound));
+
+        assert_e2fsck_clean(&rw.0.into_inner(), "unlink");
+    }
+
+    #[test]
+    fn rmdir_at_removes_empty_dir_rejects_nonempty_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+
+        ext4::mkdir_at(&rw, sys, b"empty").unwrap();
+        ext4::mkdir_at(&rw, sys, b"full").unwrap();
+        // Put a file inside `full` so it is non-empty.
+        ext4::create_file(&rw, b"/system/full", b"f").unwrap();
+
+        // Non-empty rmdir is refused; a regular file is refused (use unlink).
+        let full = dir_ino(&rw, b"/system/full");
+        let _ = full;
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"full"), Err(FsError::NotEmpty));
+        ext4::create_file(&rw, b"/system", b"afile").unwrap();
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"afile"), Err(FsError::Unsupported));
+
+        ext4::rmdir_at(&rw, sys, b"empty").unwrap();
+        assert!(!names_of(&rw, b"/system").iter().any(|n| n == "empty"));
+
+        assert_e2fsck_clean(&rw.0.into_inner(), "rmdir");
+    }
+
+    #[test]
+    fn rename_at_moves_within_a_dir_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+
+        ext4::create_file(&rw, b"/system", b"before").unwrap();
+        ext4::rename_at(&rw, sys, b"before", b"after").unwrap();
+        let names = names_of(&rw, b"/system");
+        assert!(names.iter().any(|n| n == "after"));
+        assert!(!names.iter().any(|n| n == "before"));
+
+        // Renaming onto an existing name is refused; a missing source is NotFound.
+        ext4::create_file(&rw, b"/system", b"other").unwrap();
+        assert_eq!(ext4::rename_at(&rw, sys, b"after", b"other"), Err(FsError::Exists));
+        assert_eq!(ext4::rename_at(&rw, sys, b"ghost", b"x"), Err(FsError::NotFound));
+
+        assert_e2fsck_clean(&rw.0.into_inner(), "rename");
     }
 
     #[test]
