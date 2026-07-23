@@ -923,7 +923,7 @@ fn draw_nitrox_band(writer: &mut FbWriter) {
 
     // Phase indicator below the band, slightly dimmer so the eye reads
     // the tank decal first.
-    let status = b"PHASE 3: SERVICE ECOSYSTEM";
+    let status = b"PHASE 4: WINDOWED DESKTOP";
     let status_scale = 2;
     let status_w = FbWriter::text_width(status, status_scale);
     let status_x = (width - status_w) / 2;

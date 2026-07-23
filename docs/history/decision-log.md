@@ -7684,3 +7684,55 @@ rmdir→verify) now completes on a 1-vCPU boot.
 **Deferred follow-up (logged, not blocking):** the fs-server's `DiskReader`/`BlockWriter` do
 512-byte **sector**-at-a-time I/O; batching to 4 KiB filesystem blocks would cut wake round
 trips ~8× on every metadata path. Worth doing when the fs write path is next touched.
+
+---
+
+## 2026-07-23 — `Value` collection types (`List`/`Record`/`Table`) + the row-codec factoring
+
+Phase 4 CLI-substrate prereq. The `libstream` in-memory `Value` (scalars + `Str`/`Bytes`/
+`Handle`) gains the three collection variants the shell data model is built on, and the two
+reserved wire tags — `List` (0x07), `Record` (0x08) — go from `Unsupported` to fully coded.
+This unblocks the interpreter data model (shell design v1.1 §5c/§6/§9d: `Value` is *exactly*
+what TSM1 can represent).
+
+**Representation.** All three are `Arc`-backed and persistent, so a `Value` clone is a refcount
+bump and the shell's copy-on-write "mutation" (§9d) is a cheap rebind, never in-place mutation:
+
+- `Value::List(Arc<[Value]>)` — wire tag 0x07. Body = `u32` count, then each element as a
+  `u8` `TypeTag` + that value's bytes. **Self-describing per element**, so a list may be
+  heterogeneous and nest arbitrarily (a `List<Value>` round-trips); an empty list stores no
+  element type. The pre-allocation is capped (`SCHEMA_FIELD_HINT_CAP`) so a bogus huge count
+  can't OOM the decoder — each element read is still bounds-checked.
+- `Value::Record(Arc<Record>)` — wire tag 0x08. Body = a nested sub-schema (`Schema::encode`)
+  + one row of values. A record carries its own field names/types, so it is self-describing too.
+- `Value::Table(Arc<Table>)` — a whole **stream** (header + `REC_DATA` rows + terminator), *not*
+  a nested cell. TSM1 has no table value tag by design (only List/Record are reserved), so a
+  table has no `TypeTag` and serialises via `Table::encode`/`Table::decode`.
+
+**The stream-vs-cell distinction, made honest in the types.** Because a table is a stream, not a
+cell, `Value::type_tag()` now returns **`Option<TypeTag>`** (`None` for a table), and
+`write_value` refuses a nested table with a new `WireError::NestedTable` (reached only via a
+list element or record field — a table in a schema-typed row already fails the type check). The
+one internal caller (`TableWriter::write_row`) adapts to `!= Some(ty)`. This keeps the codec
+total without a panic: you cannot silently serialise a table where a cell is expected.
+
+**Shared row codec.** The `NULLABLE`-aware value framing (presence byte + type-vs-column check)
+was duplicated in `TableWriter::write_row`/`TableReader::read_row`; it is now factored into
+`wire::write_row_values`/`read_row_values` and reused by data rows, `Value::Record`, and
+`Table` rows — all three frame values identically by construction, so a record cell and a data
+row of the same schema are byte-for-byte the same.
+
+**`REC_WIDGET` (0x03) dropped.** The widget-record stub is gone (const + the reader's dead arm);
+a 0x03 record tag now falls through to `BadRecordTag`. TSM1 is a data format — structured UI is
+a compositor concern, not a stream record type (UI-composition doc §1). Reserving the tag bought
+nothing and implied a direction the format doesn't take.
+
+**Also (bundled at the user's request):** the boot banner in `kernel/src/main.rs`
+(`draw_nitrox_band`) now reads `PHASE 4: WINDOWED DESKTOP` (was `PHASE 3: SERVICE ECOSYSTEM`),
+matching the Phase-4 north star.
+
+**Verified.** 23 `libstream` wire host tests (empty/homogeneous/heterogeneous/nested lists;
+present + absent-nullable + list-in-record records; a table stream round-trip; the
+table-is-not-a-cell rejection; the `Error` tag still `Unsupported`). Full `test-qemu` PASS — the
+live logging typed-stream path (`heartbeat.typed [seq, uptime_ns, healthy]`) exercises the
+refactored shared row codec end to end. `check-arch` + `check-nightly` green.
