@@ -97,7 +97,7 @@ pub fn parse_read_range_reply(body: &[u8]) -> Option<ReadRangeReply> {
 // --- ReadDir (open-directory-handle enumeration) ----------------------------
 //
 // `ReadDir` is client-initiated on an **open directory handle** — a session channel the
-// server minted, scoped to one directory (resolved once via `RESOLVE_DIR_OPEN`). The
+// server minted, scoped to one directory (the fs-server mints it when a directory path resolves). The
 // request names no path: the channel *is* the directory, so entries are addressed by name
 // and there is nothing to escape confinement with. Listings that exceed one message
 // paginate via an opaque `cursor` (0 = from the start; the reply returns the next cursor,

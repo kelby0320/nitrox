@@ -58,10 +58,10 @@ pub const OP_NS_RESOLVE: u16 = 0x0100;
 /// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
 /// page-cache fill). See [`file`].
 pub const OP_FILE_READ_RANGE: u16 = 0x0600;
-/// `File::ReadDir` — read a batch of entries from an open **directory handle** (a
-/// session channel scoped to one directory; see [`file`] and
-/// `docs/spec/rsproto-file-ops.md`). Client-initiated, sent on the directory channel;
-/// the reply rides back on the same channel.
+/// `File::ReadDir` — read a batch of entries from an open **directory handle** (a session
+/// channel the fs-server mints when a directory path resolves, scoped to that directory;
+/// see [`file`] and `docs/spec/rsproto-file-ops.md`). Client-initiated, sent on the
+/// directory channel; the reply rides back on the same channel.
 pub const OP_FILE_READ_DIR: u16 = 0x0601;
 /// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
 pub const OP_AUTHENTICATE: u16 = 0x0800;

@@ -23,21 +23,15 @@ pub const RESOLVE_GROW: u32 = 1 << 2;
 /// `RESOLVE_FILE_LAZY | RESOLVE_GROW`; the `new_size` rides after the suffix as for
 /// [`RESOLVE_GROW`]. `docs/architecture/ext4-fs-server-rw.md`.
 pub const RESOLVE_CREATE: u32 = 1 << 3;
-/// `RESOLVE_DIR_OPEN` — resolve a path to an **open directory handle**: the server
-/// resolves the suffix to a directory inode, mints a session [`IpcChannel`] scoped to
-/// that directory, and replies [`OBJECT_KIND_DIRECTORY`] with the channel in
-/// `handles[0]`. The client then issues [`File::ReadDir`](crate::file) and the
-/// name-addressed mutation ops on that channel. Because the suffix is resolved once (with
-/// the mount's subtree base already prepended by the kernel) and subsequent ops address
-/// entries by **name, not path**, the handle cannot reach outside the resolved directory —
-/// confinement is structural. See `docs/spec/rsproto-file-ops.md`.
-pub const RESOLVE_DIR_OPEN: u32 = 1 << 4;
 
 // --- object_kind values (reply) ---------------------------------------------
 
 /// The reply's `handles[0]` is a read-only `MemoryObject` of file content.
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
-/// A directory resource (deferred).
+/// A directory resource. The fs-server does not use this kind on the wire — the kernel has
+/// no "directory" reply kind, so an **open directory handle** is returned as an
+/// [`OBJECT_KIND_CHANNEL`] (a session [`IpcChannel`] scoped to the resolved directory). This
+/// value is reserved.
 pub const OBJECT_KIND_DIRECTORY: u16 = 2;
 /// A nested namespace (deferred).
 pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;
