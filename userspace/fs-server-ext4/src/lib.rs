@@ -436,6 +436,22 @@ mod tests {
 
 
     #[test]
+    fn mkdir_rename_rmdir_sequence_stays_readable_and_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let sys = dir_ino(&rw, b"/system");
+        // The exact demo sequence on one directory.
+        ext4::mkdir_at(&rw, sys, b"a").unwrap();
+        ext4::rename_at(&rw, sys, b"a", b"b").unwrap();
+        ext4::rmdir_at(&rw, sys, b"b").unwrap();
+        // The directory must still enumerate cleanly (terminating), with a/b gone.
+        let names = names_of(&rw, b"/system");
+        assert!(!names.iter().any(|n| n == "a" || n == "b"), "a/b linger: {names:?}");
+        assert!(names.iter().any(|n| n == "current-generation"));
+        assert_e2fsck_clean(&rw.0.into_inner(), "seq");
+    }
+
+    #[test]
     fn mkdir_at_creates_a_subdir_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
