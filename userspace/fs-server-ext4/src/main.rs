@@ -33,13 +33,16 @@ use fs_server_ext4::serve::{MAX_SUFFIX, Served, encode_error, serve};
 use fs_server_ext4::{BlockReader, BlockWriter, FsError, ext4};
 use librsproto::file::{
     DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, DIRENT_KIND_UNKNOWN, DirReplyWriter,
-    parse_read_dir_request,
+    parse_name_request, parse_read_dir_request, parse_rename_request,
 };
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_REPLY_LEN, parse_resolve_grow_size,
     parse_resolve_request, resolve_reply,
 };
-use librsproto::{OP_FILE_READ_DIR, OP_NS_RESOLVE, RS_FLAG_REPLY};
+use librsproto::{
+    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_UNLINK, OP_NS_RESOLVE,
+    RS_FLAG_REPLY,
+};
 use libkern::*;
 
 /// One page; the scratch buffer + memory-object granularity.
@@ -606,8 +609,11 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
             }
             return; // WouldBlock (drained) or PeerClosed (freed)
         }
-        // SAFETY: RECV_MSG holds the request; the slice is bounded.
-        let (request_id, op, cursor) = unsafe {
+        // Decode the request and copy its rsproto body into an owned buffer (two 255-byte
+        // names + prefixes fit), so the op logic + reply staging don't interleave borrows of
+        // the shared statics. SAFETY: RECV_MSG holds the request; the slice is bounded.
+        let mut body_buf = [0u8; 600];
+        let (request_id, op, body_len) = unsafe {
             let payload_len =
                 u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
@@ -616,22 +622,92 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
             );
             match librsproto::decode(req) {
                 Ok(m) => {
-                    let cursor = parse_read_dir_request(m.body).map(|r| r.cursor).unwrap_or(0);
-                    (m.request_id, m.op, cursor)
+                    let n = m.body.len().min(body_buf.len());
+                    body_buf[..n].copy_from_slice(&m.body[..n]);
+                    (m.request_id, m.op, n)
                 }
                 Err(_) => continue, // malformed frame: skip
             }
         };
-        if op != OP_FILE_READ_DIR {
-            reply_session_error(session_ch, request_id, KError::Unsupported.as_i32());
-            continue;
-        }
+        let body = &body_buf[..body_len];
         // SAFETY: `slot` still valid here (only freed on PeerClosed, handled above).
         let dir_ino = unsafe { SESSION_INO[slot] };
-        match build_readdir_reply(reader, dir_ino, cursor) {
-            Some(body_len) => send_session_reply(session_ch, request_id, body_len),
-            None => reply_session_error(session_ch, request_id, KError::KernelError.as_i32()),
+
+        match op {
+            OP_FILE_READ_DIR => {
+                let cursor = parse_read_dir_request(body).map(|r| r.cursor).unwrap_or(0);
+                match build_readdir_reply(reader, dir_ino, cursor) {
+                    Some(bl) => send_session_reply(session_ch, request_id, bl),
+                    None => reply_session_error(session_ch, request_id, OP_FILE_READ_DIR, KError::KernelError.as_i32()),
+                }
+            }
+            // The name-addressed mutations: each names an entry in the bound directory, so a
+            // handle can never mutate outside it.
+            OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR => {
+                let r = match parse_name_request(body) {
+                    Some(name) => match op {
+                        OP_FILE_MKDIR => ext4::mkdir_at(reader, dir_ino, name),
+                        OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name),
+                        _ => ext4::rmdir_at(reader, dir_ino, name),
+                    },
+                    None => Err(FsError::Unsupported),
+                };
+                reply_session_status(session_ch, request_id, op, r);
+            }
+            OP_FILE_RENAME => {
+                let r = match parse_rename_request(body) {
+                    Some((old, new)) => ext4::rename_at(reader, dir_ino, old, new),
+                    None => Err(FsError::Unsupported),
+                };
+                reply_session_status(session_ch, request_id, op, r);
+            }
+            _ => reply_session_error(session_ch, request_id, op, KError::Unsupported.as_i32()),
         }
+    }
+}
+
+/// Map an `FsError` to the `KError` discriminant carried in a reply.
+fn fs_kerror(e: FsError) -> i32 {
+    match e {
+        FsError::NotFound => KError::NotFound.as_i32(),
+        FsError::Unsupported => KError::Unsupported.as_i32(),
+        FsError::TooLarge => KError::OutOfMemory.as_i32(),
+        FsError::Exists | FsError::NotEmpty => KError::InvalidArgument.as_i32(),
+        FsError::Corrupt | FsError::Io => KError::KernelError.as_i32(),
+    }
+}
+
+/// Reply to a mutation op on `session_ch`: an empty-body success reply, or an error reply
+/// carrying the mapped `KError`.
+fn reply_session_status(session_ch: u64, request_id: u64, op: u16, r: Result<(), FsError>) {
+    match r {
+        Ok(()) => {
+            // SAFETY: REPLY_MSG is a valid buffer; an empty-body reply, no handles.
+            unsafe {
+                let rs_len = match librsproto::encode(
+                    &mut REPLY_MSG[PAYLOAD_OFF..],
+                    op,
+                    request_id,
+                    RS_FLAG_REPLY,
+                    &[],
+                    0,
+                ) {
+                    Some(n) => n,
+                    None => return,
+                };
+                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+                REPLY_MSG[8] = 0;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    session_ch,
+                    (&raw const REPLY_MSG) as u64,
+                    (&raw const REPLY_HANDLES) as u64,
+                    0,
+                    SENDMODE_NOBLOCK,
+                );
+            }
+        }
+        Err(e) => reply_session_error(session_ch, request_id, op, fs_kerror(e)),
     }
 }
 
@@ -681,14 +757,14 @@ fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
 }
 
 /// Send an error reply for a `File::ReadDir` on a session channel.
-fn reply_session_error(session_ch: u64, request_id: u64, kerror: i32) {
+fn reply_session_error(session_ch: u64, request_id: u64, op: u16, kerror: i32) {
     // SAFETY: disjoint reply region.
     let elen = unsafe {
         let reply = core::slice::from_raw_parts_mut(
             ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
             MSG_LEN - PAYLOAD_OFF,
         );
-        encode_error(reply, request_id, kerror, OP_FILE_READ_DIR)
+        encode_error(reply, request_id, kerror, op)
     };
     let count = stage_reply(elen, None);
     send_reply(session_ch, count);

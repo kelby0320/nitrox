@@ -266,9 +266,92 @@ impl<'a> Iterator for DirEntryIter<'a> {
     }
 }
 
+// --- name-addressed mutation requests (Mkdir / Unlink / Rmdir / Rename) ------
+//
+// The mutation ops are sent on an open directory handle and address entries by **name**,
+// never path — the handle already identifies the directory. Their replies carry no body
+// on success (an `RS_FLAG_REPLY` with an empty body) and the standard `ErrorBody` on
+// failure, so no reply codec is needed here.
+
+/// Write a single-name request body (`Mkdir`/`Unlink`/`Rmdir`): a `u16` length + the name.
+pub fn name_request(out: &mut [u8], name: &[u8]) -> Option<usize> {
+    if name.len() > u16::MAX as usize || out.len() < 2 + name.len() {
+        return None;
+    }
+    put_u16(out, 0, name.len() as u16);
+    out[2..2 + name.len()].copy_from_slice(name);
+    Some(2 + name.len())
+}
+
+/// Parse a single-name request body.
+pub fn parse_name_request(body: &[u8]) -> Option<&[u8]> {
+    if body.len() < 2 {
+        return None;
+    }
+    let n = get_u16(body, 0) as usize;
+    if body.len() < 2 + n {
+        return None;
+    }
+    Some(&body[2..2 + n])
+}
+
+/// Write a `Rename` request body: `u16 old_len + old + u16 new_len + new`.
+pub fn rename_request(out: &mut [u8], old: &[u8], new: &[u8]) -> Option<usize> {
+    if old.len() > u16::MAX as usize || new.len() > u16::MAX as usize {
+        return None;
+    }
+    let total = 2 + old.len() + 2 + new.len();
+    if out.len() < total {
+        return None;
+    }
+    put_u16(out, 0, old.len() as u16);
+    out[2..2 + old.len()].copy_from_slice(old);
+    let o = 2 + old.len();
+    put_u16(out, o, new.len() as u16);
+    out[o + 2..o + 2 + new.len()].copy_from_slice(new);
+    Some(total)
+}
+
+/// Parse a `Rename` request body into `(old, new)`.
+pub fn parse_rename_request(body: &[u8]) -> Option<(&[u8], &[u8])> {
+    if body.len() < 2 {
+        return None;
+    }
+    let old_len = get_u16(body, 0) as usize;
+    let o = 2 + old_len;
+    if body.len() < o + 2 {
+        return None;
+    }
+    let new_len = get_u16(body, o) as usize;
+    if body.len() < o + 2 + new_len {
+        return None;
+    }
+    Some((&body[2..o], &body[o + 2..o + 2 + new_len]))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn name_request_round_trips() {
+        let mut buf = [0u8; 64];
+        let n = name_request(&mut buf, b"subdir").unwrap();
+        assert_eq!(parse_name_request(&buf[..n]).unwrap(), b"subdir");
+        // Empty and truncated bodies are rejected.
+        assert!(parse_name_request(&[0u8; 1]).is_none());
+        let mut short = [0u8; 8];
+        super::put_u16(&mut short, 0, 20); // claims 20 bytes, body has 6
+        assert!(parse_name_request(&short).is_none());
+    }
+
+    #[test]
+    fn rename_request_round_trips() {
+        let mut buf = [0u8; 64];
+        let n = rename_request(&mut buf, b"before", b"after").unwrap();
+        assert_eq!(parse_rename_request(&buf[..n]).unwrap(), (&b"before"[..], &b"after"[..]));
+        assert!(parse_rename_request(&[0u8; 1]).is_none());
+    }
 
     #[test]
     fn read_dir_request_round_trips() {
