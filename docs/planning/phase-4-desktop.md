@@ -198,10 +198,19 @@ infrastructure**, not shell-specific — directory ops in particular unblock muc
 shell. Build these first, here, so the subproject can assume them. Each is independently testable.
 The full gap analysis is in the subproject plan (§1); this is the checklist.
 
-- [ ] **Directory operations** — `readdir`/`mkdir`/`rmdir`/`unlink`/`rename` across the stack:
-  `librsproto` op codes + `fs-server-ext4` handlers + any kernel/syscall surface + a `libos`
-  client wrapper. Today `librsproto` defines only `ReadRange` (`docs/spec/rsproto-file-ops.md`
-  marks `stat`/`readdir` as "land later"). **Blocks every file coreutil.**
+- [x] **Directory operations** — `readdir`/`mkdir`/`rmdir`/`unlink`/`rename` (branch
+  `phase-4/dir-ops`, 2026-07-23). Transport = **direct client↔fs-server RPC**: a directory
+  handle is a session `IpcChannel` scoped to one inode (resolved via the normal
+  `OBJECT_KIND_CHANNEL` path — **no kernel change**), and ops address entries **by name, not
+  path**, so confinement is structural. `librsproto` `File::ReadDir`/`Mkdir`/`Unlink`/`Rmdir`/
+  `Rename`; a multiplexed `fs-server-ext4` serve loop; four ext4 mutation ops, all
+  **e2fsck-clean**. Proven end to end in QEMU (read + mutate, including the 1-vCPU path).
+  Along the way: root-caused + fixed the fs-server "I/O hang" (same-CPU IRQ-wake latency —
+  a scheduling point at the device-IRQ tail; decision log 2026-07-23) and batched the
+  fs-server's block I/O to 4 KiB blocks (8× fewer wakes). **Deferred within dir-ops:** a
+  `libos` `open_dir`/`read_dir` client wrapper (parent drives raw syscalls today),
+  cross-directory + overwrite `rename`, a new-parent-block grow on a full directory, the
+  `MAX_SESSIONS = 7` session cap, and a `File` directory-ops spec doc.
 - [ ] **`Value` collection types** — extend the in-memory `libstream` `Value` (today scalar +
   `Str`/`Bytes`/`Handle` only) with `List`/`Record`/`Table` (Arc-backed, persistent), and
   implement the wire codecs for the reserved `List` (0x07) / `Record` (0x08) `TypeTag`s (currently

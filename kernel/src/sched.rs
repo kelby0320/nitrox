@@ -1023,6 +1023,26 @@ pub fn on_timer_tick() {
     // else: guard drops here — IF was already 0 (IRQ context), stays 0 until iretq.
 }
 
+/// Resume an idle CPU into the scheduler if a thread has just been made runnable on it —
+/// the shared **same-CPU-wake liveness** primitive. Under `SCHED` (the caller passes the
+/// held guard): honor the preempt latch (a preemption-critical window — e.g. the idle
+/// thread mid-reap holding the shootdown/allocator locks — latches the wake for
+/// `preempt_enable` instead of descheduling), and otherwise switch to the next runnable
+/// thread **only if this CPU is idle** and there is work (our own queue or stealable). A
+/// running `TimeShared` thread is left to its quantum; the woken thread is already
+/// enqueued and will be picked in turn or stolen. Consumes the guard.
+fn resched_if_idle_locked(g: IrqSpinLockGuard<'_, SchedState>) {
+    let me = SchedState::this_cpu();
+    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
+        RESCHED_PENDING[me].store(true, Ordering::Release);
+        return; // guard drops
+    }
+    if current_is_idle(&g) && (!g.ready[me].is_empty() || steal_available(&g, me)) {
+        switch_to_next(g); // consumes the guard; switches with IF masked
+    }
+    // else: guard drops here — IF stays as the caller left it until iretq.
+}
+
 /// Handle a reschedule IPI: another CPU made a thread runnable on this CPU (a
 /// cross-CPU wake or a placement onto this otherwise-idle CPU) and poked us to run
 /// it now instead of waiting for the next periodic tick. If this CPU is idle and
@@ -1033,23 +1053,24 @@ pub fn on_timer_tick() {
 /// the timer path, since the switch here may not return promptly). Runs with IF=0.
 pub fn on_reschedule_ipi() {
     let mut g = SCHED.lock();
-    let me = SchedState::this_cpu();
-    g.stats[me].resched_ipis += 1;
-    // A preemption-critical window (see [`preempt_disable`] — notably the idle
-    // thread mid-reap holding the shootdown/allocator locks): don't deschedule;
-    // latch the wake for `preempt_enable` (backstop: this CPU's next tick).
-    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
-        RESCHED_PENDING[me].store(true, Ordering::Release);
-        return;
-    }
-    // Only preempt the idle thread — a running TimeShared thread is left to its
-    // quantum (the woken thread is already enqueued and will be picked in turn or
-    // stolen). The point is purely liveness: resume an idle CPU so a thread parked
-    // on its queue actually runs.
-    if current_is_idle(&g) && (!g.ready[me].is_empty() || steal_available(&g, me)) {
-        switch_to_next(g); // consumes the guard; switches with IF masked
-    }
-    // else: guard drops here — IF stays as the IPI gate left it (0) until iretq.
+    g.stats[SchedState::this_cpu()].resched_ipis += 1;
+    resched_if_idle_locked(g);
+}
+
+/// Resume an idle CPU into the scheduler after a **same-CPU wake** that sent no reschedule
+/// IPI — the device-IRQ counterpart of [`on_reschedule_ipi`]. Called from the device-IRQ
+/// dispatch tail: an I/O-completion DPC (e.g. AHCI `irp_complete_dpc` → `complete_pending_op`)
+/// can make a thread runnable on *this* CPU, and `place_thread` sends an IPI only for
+/// *cross-CPU* placements, so a same-CPU wake has no other scheduling point on that path —
+/// without this, an idle CPU `iretq`s straight back into `hlt` and the woken thread waits
+/// for the next periodic tick (~5 ms). On a 1-vCPU guest that serialises every block I/O on
+/// the tick clock, which is what the fs-server "I/O hang" actually was (see the decision
+/// log, 2026-07-23 fs-server I/O wake latency). Same discipline as the IPI handler: honors
+/// the preempt latch, only ever preempts the idle thread. Runs with IF=0 in IRQ context;
+/// the device stub is a frame-parking stub, so a delayed return resumes into its epilogue
+/// and `iretq`s exactly as the timer/resched stubs do.
+pub fn resched_if_idle() {
+    resched_if_idle_locked(SCHED.lock());
 }
 
 /// `true` if this CPU's current thread is its idle thread (its object address equals
@@ -2888,7 +2909,11 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
     // IPI so it runs the newcomer promptly (resuming it if idle) instead of waiting
     // for its next periodic tick — the timer is not a dependable wake for a halted
     // CPU, so cross-CPU wake delivery must be explicit. Same-CPU placement needs no
-    // IPI: this CPU reschedules on its own tick / at the next scheduling point.
+    // IPI: whichever path made this thread runnable reaches a scheduling point before
+    // returning to userspace — the timer tail (`on_timer_tick`), the syscall return,
+    // or, for a wake from a device-completion DPC, the device-IRQ tail's
+    // `resched_if_idle` (added 2026-07-23; without it a same-CPU I/O-completion wake on
+    // an idle CPU stalled until the next tick — the fs-server "I/O hang").
     if cpu != SchedState::this_cpu() {
         crate::arch::send_reschedule_ipi(cpu);
     }

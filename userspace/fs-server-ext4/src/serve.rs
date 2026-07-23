@@ -259,6 +259,8 @@ fn fs_error_to_kerror(e: FsError) -> KError {
         FsError::Unsupported => KError::Unsupported,
         FsError::NotFound => KError::NotFound,
         FsError::TooLarge => KError::TooLarge,
+        // A create/rename onto an existing name, or a non-empty rmdir.
+        FsError::Exists | FsError::NotEmpty => KError::InvalidArgument,
     }
 }
 

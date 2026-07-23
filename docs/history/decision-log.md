@@ -7578,3 +7578,109 @@ instrument; Part D owns "real compiler-generated hard float works in ring 3".
 green; `test-qemu` (TCG `-cpu max`) PASS with the kernel isolation demo, the concurrent
 worker demo, and the gate all reporting; KVM `-cpu host` 15/15 with the gate running every
 time. **Phase 4 FP enablement is complete (Parts A–D).**
+
+## 2026-07-23 — Directory operations (Part A + B), and an intermittent fs-server I/O hang
+
+Phase-4 CLI substrate prereq #1: filesystem directory operations, on the branch
+`phase-4/dir-ops`. **Transport decided with the maintainer: direct client↔fs-server RPC**
+(not kernel-mediated syscalls), honoring "filesystems are userspace processes, no fs code
+in the kernel."
+
+**The mechanism (refined during the build).** A **directory handle is a session channel
+scoped to one directory.** A client `sys_ns_lookup`s a directory path; the fs-server
+resolves it (with the mount's subtree base already applied by the kernel), mints a session
+`IpcChannel` bound to that inode, and returns it as `OBJECT_KIND_CHANNEL` — the kernel has
+no distinct "directory" reply kind, and already installs a transferred channel from a
+resolve reply (the logging service does the same), so **no kernel change was needed.**
+Directory-ness is inferred from the resolved inode (resolve flags aren't plumbed from
+userspace). All ops then address entries **by name, never path**, so a handle can never
+reach outside its directory — **confinement is structural**, like `openat`/`readdir` on a
+directory fd, and the "whole-tree only" restriction I'd initially planned is unnecessary.
+
+**Part A — reading** (committed, proven): `librsproto` `File::ReadDir` (cursor-paginated);
+an `ext4::read_dir` enumerator + `resolve_dir` (alloc-free, host-tested); the fs-server
+serve loop multiplexed over session channels (logging-service pattern, fixed arrays);
+`parent` lists `/system` end to end under TCG (`dir-list ok`). Reply correlation is the
+bidirectional session channel. Directory reads are pure IPC + parsing (no arch divergence),
+so the deterministic TCG proof suffices.
+
+**Part B — mutation** (ops correct, transport wired): four ext4 write ops
+(`mkdir`/`unlink`/`rmdir`/`rename`, name-addressed on the bound inode), each **e2fsck-clean**
+against the `mke2fs` fixture. Two ext4 subtleties the e2fsck gate caught: freeing an inode
+must zero `i_links_count` **and** stamp a nonzero `i_dtime` (e2fsck decides "in use" from
+those, not the bitmap), and that `dtime` must be a plausible timestamp — a small value is
+read as an orphan-list pointer. `mkdir` also maintains `bg_used_dirs_count` and the parent
+link count. The wire ops + fs-server session dispatch are wired and demonstrated (a
+`mkdir`+`rmdir` round trip printed `dir-mutate ok`; single `mkdir`/`rename`/`rmdir` each
+returned OK in QEMU).
+
+**The finding: an intermittent fs-server I/O hang.** A **pure `File::ReadDir` loop on one
+session stalls within ~10 iterations**, while single ops and a mixed mkdir+rename+rmdir
+sequence complete — the non-determinism (not a fixed I/O count) is the signature of a
+**concurrency hang in the block/wake path**, the same class as the Phase-3 reschedule-IPI
+hunt (a blocked fs-server waiter not reliably woken when a client sends on the session
+channel under load). It is **not** a directory-op bug: the ops are e2fsck-clean and the
+readdir logic terminates in host tests. It is the **top follow-up** — it blocks reliable
+I/O-heavy demos and, more importantly, the shell/coreutils, which will hammer this path —
+and deserves a dedicated, instrumented investigation (KVM boot-loop + QEMU-monitor capture,
+per the Bug-4 / substrate-hardening playbook). The Part B demo is kept minimal to stay
+clear of it; it cannot false-pass (a real mutation error exits nonzero → the run fails).
+
+**Deferred within dir-ops** (record when picked up): a reusable `libos` `open_dir`/`read_dir`
+client wrapper (parent drives the raw syscalls for now); cross-directory `rename` (needs a
+second handle); `rename` overwrite of an existing target; a new-directory-block grow when a
+parent directory has no slack (`TooLarge` today); the session cap (`MAX_SESSIONS = 7`,
+lifted by an aggregate wait); and a spec doc for the `File` directory ops.
+
+## 2026-07-23 — Correction + fix: the "fs-server I/O hang" was same-CPU wake latency, not a lost wake
+
+The 2026-07-23 entry above ("Directory operations … an intermittent fs-server I/O hang")
+hypothesized a **lost-wake concurrency bug** ("a blocked fs-server waiter not reliably woken
+… the Phase-3 reschedule-IPI class"). **That hypothesis was wrong.** A Fable 5 investigation
+(branch `phase-4/dir-ops`) root-caused it: no wake is ever lost, there is no deadlock and no
+SMP race. The real defect is **same-CPU wake latency**, and it is now fixed. The original
+entry stays as history; this corrects it.
+
+**Mechanism.** Three pieces compose:
+1. `place_thread` sends a reschedule IPI only when a woken thread lands on a *different* CPU;
+   a same-CPU placement relies on this CPU reaching a scheduling point on its own.
+2. `device_irq_dispatch` (the tail shared by every IOAPIC-routed device IRQ) ran the ISR,
+   EOI'd, drained DPCs, and `iretq`'d — with **no scheduling point** (unlike the timer tail,
+   which calls `on_timer_tick`). The AHCI completion DPC (`irp_complete_dpc` →
+   `complete_pending_op`) wakes the fs-server onto *this* CPU → no IPI → nothing runs it.
+3. `idle_body` is `loop { reap_pending(); hlt }` — no ready-queue check, so an idle CPU
+   returns from the IRQ straight back into `hlt`.
+
+So a thread woken by an I/O completion on the IRQ CPU waited for the **next 10 ms timer
+tick** (~5 ms average). The fs-server does **sector-at-a-time** I/O (one `sys_io_submit` +
+`sys_wait` per 512 bytes), so on a **1-vCPU** guest every directory op paid ~5 ms × sectors
+touched — ~120 ms per `ReadDir`, ~2.3 s per mkdir+enumerate+rmdir round. I/O-heavy loops
+looked hung; single ops looked fine. **≥2 CPUs masks it completely** (wakes usually land
+cross-CPU → an IPI fires), which is why `test-qemu` (`-smp 4`) and every KVM run were green
+and the bug only showed under `cargo xtask qemu --selftest` (**no `-smp` → 1 vCPU**). The
+"intermittent / not a fixed I/O count" character was per-op latency varying with IRQ-vs-block
+timing (when the completion IRQ lands before the waiter blocks, `sys_wait` fast-paths).
+
+**Evidence (Fable 5):** ~160 boot-loop runs at HEAD across KVM/TCG × smp 1/4 — **zero true
+deadlocks**; register captures during "stalls" show CPU 0 in the idle `hlt`, IF=1 (alive,
+waiting). Tick-bound smoking gun: the same stress took **128.1 s (TCG smp1)** vs **126.6 s
+(KVM smp1)** — identical wall time despite ~10× CPU speed, i.e. bound by the tick clock.
+
+**Fix.** A scheduling point at the device-IRQ tail: `sched::resched_if_idle()`, the shared
+same-CPU-wake liveness primitive factored out of `on_reschedule_ipi` (honor the `PREEMPT_OFF`
+latch; otherwise `switch_to_next` **only if the current thread is idle** and there is work —
+a running thread keeps its quantum). Called from `device_irq_dispatch` after
+`dpc::run_pending()`. EOI is already sent before the drain, and the device stub is a
+frame-parking stub, so a delayed return resumes into its epilogue and `iretq`s, exactly like
+the timer/resched stubs — no stub change. `place_thread`'s "same-CPU needs no IPI" comment is
+now *true* because this tail provides that scheduling point.
+
+**Verified.** Latency collapse: the 1-vCPU stress run drops **~128 s → 5.5 s (TCG) / 4.0 s
+(KVM)** — 23×. Negative control (call removed) balloons back to **128.6 s**, so the helper is
+causally load-bearing. No regressions: host suite, `check-arch`, `check-nightly`, and
+`test-qemu` all green; the full-verify `dir_mutate_demo` (mkdir→verify→rename→verify→
+rmdir→verify) now completes on a 1-vCPU boot.
+
+**Deferred follow-up (logged, not blocking):** the fs-server's `DiskReader`/`BlockWriter` do
+512-byte **sector**-at-a-time I/O; batching to 4 KiB filesystem blocks would cut wake round
+trips ~8× on every metadata path. Worth doing when the fs write path is next touched.

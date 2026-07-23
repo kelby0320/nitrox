@@ -28,7 +28,10 @@ pub const RESOLVE_CREATE: u32 = 1 << 3;
 
 /// The reply's `handles[0]` is a read-only `MemoryObject` of file content.
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
-/// A directory resource (deferred).
+/// A directory resource. The fs-server does not use this kind on the wire — the kernel has
+/// no "directory" reply kind, so an **open directory handle** is returned as an
+/// [`OBJECT_KIND_CHANNEL`] (a session [`IpcChannel`] scoped to the resolved directory). This
+/// value is reserved.
 pub const OBJECT_KIND_DIRECTORY: u16 = 2;
 /// A nested namespace (deferred).
 pub const OBJECT_KIND_SUBNAMESPACE: u16 = 3;

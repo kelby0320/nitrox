@@ -233,6 +233,97 @@ pub fn stat_file<R: BlockReader>(r: &R, path: &[u8]) -> Result<usize, FsError> {
     Ok(size)
 }
 
+/// ext4 `ext4_dir_entry_2.file_type` values (the ones we surface). Others map to
+/// [`EXT4_FT_UNKNOWN`].
+pub const EXT4_FT_UNKNOWN: u8 = 0;
+/// A directory.
+pub const EXT4_FT_DIR: u8 = 2;
+/// A symbolic link.
+pub const EXT4_FT_SYMLINK: u8 = 7;
+
+/// Resolve `path` (absolute) to a **directory** inode number, for binding a directory
+/// handle (`RESOLVE_DIR_OPEN`). Errors `NotFound` if the path is missing or is not a
+/// directory; the caller then enumerates it by inode via [`read_dir`], addressing entries
+/// by name — so the handle can never reach outside this directory.
+pub fn resolve_dir<R: BlockReader>(r: &R, path: &[u8]) -> Result<u32, FsError> {
+    let sb = read_superblock(r)?;
+    let (ino, inode) = resolve_path_ino(r, &sb, path)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    Ok(ino)
+}
+
+/// Enumerate directory inode `dir_ino` starting at the opaque `cursor` (a logical byte
+/// offset into the directory's data; `0` starts from the beginning), calling `emit(inode,
+/// file_type, name)` for each live entry. `emit` returns `false` to stop early (the reply
+/// buffer is full); enumeration then resumes from the returned cursor. Returns the
+/// **next cursor** — `0` once every entry has been emitted.
+///
+/// `.` and `..` are included (they are real directory entries; the caller decides whether
+/// to show them). Entries never span a block; a block's slack rides in the last entry's
+/// `rec_len`, so iteration steps by `rec_len` and rounds up to the next block at its end.
+///
+/// # Errors
+/// `NotFound` if `dir_ino` is not a directory, plus `Io`/`Corrupt` from the device.
+pub fn read_dir<R: BlockReader>(
+    r: &R,
+    dir_ino: u32,
+    cursor: u64,
+    mut emit: impl FnMut(u32, u8, &[u8]) -> bool,
+) -> Result<u64, FsError> {
+    let sb = read_superblock(r)?;
+    let inode = read_inode(r, &sb, dir_ino)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    let size = rd_u32(&inode, 4) as u64;
+    let bs = sb.block_size as u64;
+    let mut pos = cursor;
+    let mut buf = [0u8; MAX_BLOCK];
+    let mut loaded_block = u64::MAX; // which logical block `buf` currently holds
+
+    while pos < size {
+        let lb = pos / bs;
+        let in_block = (pos % bs) as usize;
+        if loaded_block != lb {
+            let phys = extent_find(r, &sb, &inode[40..100], lb)?;
+            if phys == 0 {
+                // Sparse directory block (no live entries) — skip to the next block.
+                pos = (lb + 1) * bs;
+                continue;
+            }
+            r.read_at(phys * bs, &mut buf[..bs as usize])?;
+            loaded_block = lb;
+        }
+        // Bounds: an entry needs at least its 8-byte header within the block.
+        if in_block + 8 > bs as usize {
+            pos = (lb + 1) * bs;
+            continue;
+        }
+        let e_ino = rd_u32(&buf, in_block);
+        let rec_len = rd_u16(&buf, in_block + 4) as usize;
+        let name_len = buf[in_block + 6] as usize;
+        let file_type = buf[in_block + 7];
+        if rec_len < 8 || in_block + rec_len > bs as usize {
+            // Malformed / no valid tail in this block — advance to the next block.
+            pos = (lb + 1) * bs;
+            continue;
+        }
+        // A live entry has a non-zero inode and a name that fits; `e_ino == 0` marks a
+        // deleted/gap slot (skipped, its `rec_len` still consumed).
+        if e_ino != 0 && name_len > 0 && in_block + 8 + name_len <= bs as usize {
+            let name = &buf[in_block + 8..in_block + 8 + name_len];
+            if !emit(e_ino, file_type, name) {
+                // Buffer full: resume *at this same entry* next call.
+                return Ok(pos);
+            }
+        }
+        pos += rec_len as u64;
+    }
+    Ok(0)
+}
+
 /// Read the byte range `[offset, offset + len)` of the regular file at `path` into
 /// `out`, returning the number of bytes read — the page-cache fill (`File::ReadRange`)
 /// primitive. The range is clamped to the file size and `out.len()`; a request past
@@ -660,6 +751,392 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     // acceptable for slice-1 fixtures, which always have directory slack.)
     dir_insert(rw, &sb, &parent_inode, name, ino, EXT4_FT_REG_FILE)?;
     Ok(ino)
+}
+
+/// A directory's default mode: `S_IFDIR | 0o755`.
+const DIR_MODE: u16 = S_IFDIR | 0o755;
+
+/// Fixed `i_dtime` stamp for a freed inode (2023-11-14T22:13:20Z). The server has no wall
+/// clock; the value only needs to be a plausible timestamp (not a small inode-number-like
+/// value that `e2fsck` would read as an orphan-list link).
+const DELETION_TIME: u32 = 1_700_000_000;
+
+/// Clear a bitmap bit (mark a block/inode free).
+fn bit_unset(map: &mut [u8], i: usize) {
+    map[i / 8] &= !(1 << (i % 8));
+}
+
+/// Free inode `ino`: clear its inode-bitmap bit and increment the group-descriptor +
+/// superblock free-inode counts. The inverse of [`alloc_inode`], generic over the inode's
+/// group. If `is_dir`, also decrements the group's `bg_used_dirs_count`.
+fn free_inode<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    ino: u32,
+    is_dir: bool,
+) -> Result<(), FsError> {
+    let bs = sb.block_size as usize;
+    let group = (ino - 1) / sb.inodes_per_group;
+    let index = ((ino - 1) % sb.inodes_per_group) as usize;
+    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let dsz = (sb.desc_size as usize).min(64);
+    let mut gd = [0u8; 64];
+    rw.read_at(gd_off, &mut gd[..dsz])?;
+    let ibitmap_block = rd_u32(&gd, 4) as u64;
+
+    // Mark the inode itself deleted: `e2fsck` decides an inode is in use from its
+    // `i_links_count` + `i_dtime`, *not* the bitmap. Clearing only the bitmap leaves a live
+    // inode (links > 0, dtime = 0) whose bitmap says free — an inconsistency. Zero
+    // `i_links_count` (@26) and stamp a nonzero `i_dtime` (@20); the value only has to be
+    // nonzero for `-fn` (no wall clock in the server), so use a fixed sentinel.
+    let ioff = inode_offset(rw, sb, ino)?;
+    let mut inode = [0u8; 256];
+    let n = (sb.inode_size as usize).min(256);
+    rw.read_at(ioff, &mut inode[..n])?;
+    // `i_dtime` doubles as the orphan-list "next" pointer while `i_links_count == 0`; a
+    // small value looks like an inode number and `e2fsck` reads it as a corrupted orphan
+    // chain. Use a plausible fixed timestamp (2023-11-14), unambiguously not an inode ref.
+    inode[20..24].copy_from_slice(&DELETION_TIME.to_le_bytes()); // i_dtime
+    inode[26..28].copy_from_slice(&0u16.to_le_bytes()); // i_links_count = 0
+    rw.write_at(ioff, &inode[..n])?;
+
+    let mut bitmap = [0u8; MAX_BLOCK];
+    rw.read_at(ibitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+    bit_unset(&mut bitmap, index);
+    rw.write_at(ibitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+
+    // Group free-inode count (@14, u16) + optionally used-dirs count (@16, u16).
+    let gfree = rd_u16(&gd, 14).wrapping_add(1);
+    gd[14..16].copy_from_slice(&gfree.to_le_bytes());
+    if is_dir {
+        let used = rd_u16(&gd, 16).wrapping_sub(1);
+        gd[16..18].copy_from_slice(&used.to_le_bytes());
+    }
+    rw.write_at(gd_off, &gd[..dsz])?;
+    // Superblock free-inode count (@16, u32).
+    let mut sbbuf = [0u8; 1024];
+    rw.read_at(1024, &mut sbbuf)?;
+    let sfree = rd_u32(&sbbuf, 16).wrapping_add(1);
+    sbbuf[16..20].copy_from_slice(&sfree.to_le_bytes());
+    rw.write_at(1024, &sbbuf)?;
+    Ok(())
+}
+
+/// Free filesystem block `block`: clear its block-bitmap bit and increment the
+/// group-descriptor + superblock free-block counts. The inverse of the allocation in
+/// [`alloc_block`], generic over the block's group.
+fn free_block<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    block: u64,
+) -> Result<(), FsError> {
+    let bs = sb.block_size as usize;
+    let rel = block - sb.first_data_block as u64;
+    let group = (rel / sb.blocks_per_group as u64) as u32;
+    let index = (rel % sb.blocks_per_group as u64) as usize;
+    let gd_off = sb.first_gdt_block * sb.block_size as u64 + group as u64 * sb.desc_size as u64;
+    let dsz = (sb.desc_size as usize).min(64);
+    let mut gd = [0u8; 64];
+    rw.read_at(gd_off, &mut gd[..dsz])?;
+    let bitmap_block = rd_u32(&gd, 0) as u64;
+
+    let mut bitmap = [0u8; MAX_BLOCK];
+    rw.read_at(bitmap_block * sb.block_size as u64, &mut bitmap[..bs])?;
+    bit_unset(&mut bitmap, index);
+    rw.write_at(bitmap_block * sb.block_size as u64, &bitmap[..bs])?;
+
+    let gfree = rd_u16(&gd, 12).wrapping_add(1);
+    gd[12..14].copy_from_slice(&gfree.to_le_bytes());
+    rw.write_at(gd_off, &gd[..dsz])?;
+    let mut sbbuf = [0u8; 1024];
+    rw.read_at(1024, &mut sbbuf)?;
+    let sfree = rd_u32(&sbbuf, 12).wrapping_add(1);
+    sbbuf[12..16].copy_from_slice(&sfree.to_le_bytes());
+    rw.write_at(1024, &sbbuf)?;
+    Ok(())
+}
+
+/// Free every data block of the depth-0 extent inode `inode` (its regular-file or
+/// directory data). Depth > 0 (index nodes) is `Unsupported`, as elsewhere in the write
+/// path. Does not touch the inode itself.
+fn free_inode_blocks<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    inode: &[u8; 256],
+) -> Result<(), FsError> {
+    let eh = 40;
+    if rd_u16(inode, eh) != EXTENT_MAGIC {
+        return Err(FsError::Corrupt);
+    }
+    if rd_u16(inode, eh + 6) != 0 {
+        return Err(FsError::Unsupported); // index nodes deferred
+    }
+    let entries = rd_u16(inode, eh + 2) as usize;
+    for i in 0..entries {
+        let e = eh + 12 + i * 12;
+        let ee_len = (rd_u16(inode, e + 4) & 0x7FFF) as u64;
+        let phys = rd_u32(inode, e + 8) as u64 | ((rd_u16(inode, e + 6) as u64) << 32);
+        for b in 0..ee_len {
+            free_block(rw, sb, phys + b)?;
+        }
+    }
+    Ok(())
+}
+
+/// Remove the directory entry `name` from directory-inode bytes `dir_inode`, returning the
+/// removed entry's `(inode, file_type)`. Merges the entry's `rec_len` into the previous
+/// entry in its block; if it is the first entry in a block, tombstones it (`e_ino = 0`).
+/// Both forms are the standard ext2/3/4 removal and stay `e2fsck`-clean. `NotFound` if the
+/// name is absent. The inverse of [`dir_insert`].
+fn dir_remove<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    dir_inode: &[u8; 256],
+    name: &[u8],
+) -> Result<(u32, u8), FsError> {
+    let bs = sb.block_size as usize;
+    let size = rd_u32(dir_inode, 4) as u64;
+    let nblocks = size.div_ceil(sb.block_size as u64);
+    let mut buf = [0u8; MAX_BLOCK];
+    for lb in 0..nblocks {
+        let phys = extent_find(rw, sb, &dir_inode[40..100], lb)?;
+        if phys == 0 {
+            continue;
+        }
+        rw.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        let mut off = 0;
+        let mut prev: Option<usize> = None;
+        while off + 8 <= bs {
+            let e_ino = rd_u32(&buf, off);
+            let rec_len = rd_u16(&buf, off + 4) as usize;
+            let name_len = buf[off + 6] as usize;
+            let file_type = buf[off + 7];
+            if rec_len < 8 || off + rec_len > bs {
+                break;
+            }
+            if e_ino != 0 && name_len == name.len() && off + 8 + name_len <= bs
+                && &buf[off + 8..off + 8 + name_len] == name
+            {
+                match prev {
+                    Some(p) => {
+                        // Absorb this entry into the previous one's rec_len.
+                        let prev_rec = rd_u16(&buf, p + 4) as usize + rec_len;
+                        buf[p + 4..p + 6].copy_from_slice(&(prev_rec as u16).to_le_bytes());
+                    }
+                    None => {
+                        // First entry in the block — tombstone it.
+                        buf[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
+                    }
+                }
+                rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
+                return Ok((e_ino, file_type));
+            }
+            prev = Some(off);
+            off += rec_len;
+        }
+    }
+    Err(FsError::NotFound)
+}
+
+/// Adjust directory inode `ino`'s `i_links_count` by `delta` (+1 / -1), reading and writing
+/// it back. Used when a subdirectory's `..` is created/removed (which links/unlinks the
+/// parent).
+fn adjust_links<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    ino: u32,
+    delta: i32,
+) -> Result<(), FsError> {
+    let off = inode_offset(rw, sb, ino)?;
+    let mut inode = [0u8; 256];
+    let n = (sb.inode_size as usize).min(256);
+    rw.read_at(off, &mut inode[..n])?;
+    let links = (rd_u16(&inode, 26) as i32 + delta) as u16;
+    inode[26..28].copy_from_slice(&links.to_le_bytes());
+    rw.write_at(off, &inode[..n])?;
+    Ok(())
+}
+
+/// Create a subdirectory `name` inside directory inode `dir_ino`: allocate a directory
+/// inode + one data block, initialise the block with `.`/`..`, link it into the parent, and
+/// bump the parent's link count (for the new dir's `..`). Name-addressed — the caller holds
+/// an open handle to `dir_ino`, so `name` cannot escape it. `Exists` if `name` is taken;
+/// `TooLarge` if the parent directory has no slack (a new parent block is deferred).
+pub fn mkdir_at<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    dir_ino: u32,
+    name: &[u8],
+) -> Result<(), FsError> {
+    if name.is_empty() || name.len() > 255 || name.contains(&b'/') || name == b"." || name == b".."
+    {
+        return Err(FsError::Unsupported);
+    }
+    let sb = read_superblock(rw)?;
+    let parent = read_inode(rw, &sb, dir_ino)?;
+    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    if dir_lookup(rw, &sb, &parent, name).is_ok() {
+        return Err(FsError::Exists);
+    }
+    let bs = sb.block_size as usize;
+
+    let new_ino = alloc_inode(rw, &sb)?;
+    let dblock = alloc_block(rw, &sb, sb.first_data_block as u64)?;
+
+    // Initialise the new directory's data block: `.` → self, `..` → parent.
+    let mut db = [0u8; MAX_BLOCK];
+    // `.` at offset 0 (rec_len 12).
+    db[0..4].copy_from_slice(&new_ino.to_le_bytes());
+    db[4..6].copy_from_slice(&12u16.to_le_bytes());
+    db[6] = 1;
+    db[7] = EXT4_FT_DIR;
+    db[8] = b'.';
+    // `..` at offset 12 (rec_len fills the rest of the block).
+    db[12..16].copy_from_slice(&dir_ino.to_le_bytes());
+    db[16..18].copy_from_slice(&((bs - 12) as u16).to_le_bytes());
+    db[18] = 2;
+    db[19] = EXT4_FT_DIR;
+    db[20] = b'.';
+    db[21] = b'.';
+    rw.write_at(dblock * sb.block_size as u64, &db[..bs])?;
+
+    // Initialise the new inode: directory, 2 links (`.` + the parent's entry), one extent.
+    let mut inode = [0u8; 256];
+    inode[0..2].copy_from_slice(&DIR_MODE.to_le_bytes());
+    inode[4..8].copy_from_slice(&(bs as u32).to_le_bytes()); // i_size = one block
+    inode[26..28].copy_from_slice(&2u16.to_le_bytes()); // i_links_count
+    inode[28..32].copy_from_slice(&((bs / 512) as u32).to_le_bytes()); // i_blocks (512-B units)
+    inode[32..36].copy_from_slice(&EXTENTS_FL.to_le_bytes());
+    // Extent header (magic, 1 entry, max 4, depth 0) + one leaf extent → `dblock`.
+    inode[40..42].copy_from_slice(&EXTENT_MAGIC.to_le_bytes());
+    inode[42..44].copy_from_slice(&1u16.to_le_bytes()); // eh_entries
+    inode[44..46].copy_from_slice(&4u16.to_le_bytes()); // eh_max
+    inode[52..56].copy_from_slice(&0u32.to_le_bytes()); // ee_block = 0
+    inode[56..58].copy_from_slice(&1u16.to_le_bytes()); // ee_len = 1
+    inode[58..60].copy_from_slice(&((dblock >> 32) as u16).to_le_bytes()); // start_hi
+    inode[60..64].copy_from_slice(&(dblock as u32).to_le_bytes()); // start_lo
+    let ioff = inode_offset(rw, &sb, new_ino)?;
+    rw.write_at(ioff, &inode[..(sb.inode_size as usize).min(256)])?;
+
+    // `bg_used_dirs_count` (@16, u16) for the new inode's group (group 0 — alloc_inode).
+    let gd_off = sb.first_gdt_block * sb.block_size as u64; // group 0
+    let dsz = (sb.desc_size as usize).min(64);
+    let mut gd = [0u8; 64];
+    rw.read_at(gd_off, &mut gd[..dsz])?;
+    let used = rd_u16(&gd, 16).wrapping_add(1);
+    gd[16..18].copy_from_slice(&used.to_le_bytes());
+    rw.write_at(gd_off, &gd[..dsz])?;
+
+    // Link into the parent + bump the parent's link count (the new dir's `..`).
+    dir_insert(rw, &sb, &parent, name, new_ino, EXT4_FT_DIR)?;
+    adjust_links(rw, &sb, dir_ino, 1)?;
+    Ok(())
+}
+
+/// Remove the **regular file** `name` from directory inode `dir_ino`: unlink the directory
+/// entry, decrement the target's link count, and — when it reaches zero — free the target's
+/// data blocks and inode. Name-addressed. `NotFound` if absent; `Unsupported` if `name` is a
+/// directory (use [`rmdir_at`]).
+pub fn unlink_at<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    dir_ino: u32,
+    name: &[u8],
+) -> Result<(), FsError> {
+    let sb = read_superblock(rw)?;
+    let parent = read_inode(rw, &sb, dir_ino)?;
+    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    let target_ino = dir_lookup(rw, &sb, &parent, name)?;
+    let target = read_inode(rw, &sb, target_ino)?;
+    if rd_u16(&target, 0) & S_IFMT == S_IFDIR {
+        return Err(FsError::Unsupported); // rmdir handles directories
+    }
+
+    dir_remove(rw, &sb, &parent, name)?;
+
+    let links = rd_u16(&target, 26).wrapping_sub(1);
+    if links == 0 {
+        free_inode_blocks(rw, &sb, &target)?;
+        free_inode(rw, &sb, target_ino, false)?;
+    } else {
+        let off = inode_offset(rw, &sb, target_ino)?;
+        let mut t = target;
+        t[26..28].copy_from_slice(&links.to_le_bytes());
+        rw.write_at(off, &t[..(sb.inode_size as usize).min(256)])?;
+    }
+    Ok(())
+}
+
+/// Remove the **empty subdirectory** `name` from directory inode `dir_ino`: verify it holds
+/// only `.`/`..`, unlink it, free its data block + inode, and decrement the parent's link
+/// count (the removed `..`). Name-addressed. `NotFound` if absent; `Unsupported` if `name`
+/// is not a directory (use [`unlink_at`]); `NotEmpty` if it still has entries.
+pub fn rmdir_at<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    dir_ino: u32,
+    name: &[u8],
+) -> Result<(), FsError> {
+    if name == b"." || name == b".." {
+        return Err(FsError::Unsupported);
+    }
+    let sb = read_superblock(rw)?;
+    let parent = read_inode(rw, &sb, dir_ino)?;
+    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    let sub_ino = dir_lookup(rw, &sb, &parent, name)?;
+    let sub = read_inode(rw, &sb, sub_ino)?;
+    if rd_u16(&sub, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::Unsupported);
+    }
+    // Empty iff its only entries are `.` and `..`.
+    let mut extra = false;
+    read_dir(rw, sub_ino, 0, |_ino, _ft, ename| {
+        if ename != b"." && ename != b".." {
+            extra = true;
+        }
+        !extra // stop as soon as a third entry is seen
+    })?;
+    if extra {
+        return Err(FsError::NotEmpty);
+    }
+
+    dir_remove(rw, &sb, &parent, name)?;
+    free_inode_blocks(rw, &sb, &sub)?;
+    free_inode(rw, &sb, sub_ino, true)?;
+    adjust_links(rw, &sb, dir_ino, -1)?; // the subdir's `..` no longer links the parent
+    Ok(())
+}
+
+/// Rename `old` to `new` **within** directory inode `dir_ino` (the session's bound
+/// directory): move the entry, preserving its target inode + type. `new` must not already
+/// exist (overwrite is deferred). Cross-directory rename needs a second handle and is
+/// deferred. Name-addressed. `NotFound` if `old` is absent; `Exists` if `new` is taken.
+pub fn rename_at<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    dir_ino: u32,
+    old: &[u8],
+    new: &[u8],
+) -> Result<(), FsError> {
+    if new.is_empty() || new.len() > 255 || new.contains(&b'/') || new == b"." || new == b".." {
+        return Err(FsError::Unsupported);
+    }
+    let sb = read_superblock(rw)?;
+    let parent = read_inode(rw, &sb, dir_ino)?;
+    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    if dir_lookup(rw, &sb, &parent, new).is_ok() {
+        return Err(FsError::Exists);
+    }
+    // Remove `old` (yielding its inode + type), then insert it under `new`. Re-read the
+    // parent bytes between the two: `dir_remove` rewrote a directory block, but the parent
+    // *inode* (extent map) is unchanged, so the cached bytes still locate the blocks.
+    let (ino, ft) = dir_remove(rw, &sb, &parent, old)?;
+    dir_insert(rw, &sb, &parent, new, ino, ft)?;
+    Ok(())
 }
 
 /// Resolve `path` (absolute) to a **regular file** and read its content into

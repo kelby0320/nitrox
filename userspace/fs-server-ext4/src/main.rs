@@ -31,16 +31,32 @@
 use core::arch::asm;
 use fs_server_ext4::serve::{MAX_SUFFIX, Served, encode_error, serve};
 use fs_server_ext4::{BlockReader, BlockWriter, FsError, ext4};
-use librsproto::OP_NS_RESOLVE;
+use librsproto::file::{
+    DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, DIRENT_KIND_UNKNOWN, DirReplyWriter,
+    parse_name_request, parse_read_dir_request, parse_rename_request,
+};
 use librsproto::namespace::{
-    RESOLVE_CREATE, RESOLVE_GROW, parse_resolve_grow_size, parse_resolve_request,
+    OBJECT_KIND_CHANNEL, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_REPLY_LEN, parse_resolve_grow_size,
+    parse_resolve_request, resolve_reply,
+};
+use librsproto::{
+    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_UNLINK, OP_NS_RESOLVE,
+    RS_FLAG_REPLY,
 };
 use libkern::*;
 
 /// One page; the scratch buffer + memory-object granularity.
 const PAGE: u64 = 4096;
-/// Block-device sector size (the `sys_io_submit` transfer unit).
-const SECTOR: usize = 512;
+/// The `DiskReader` device transfer unit: one **4 KiB filesystem block** (= one scratch
+/// page). The AHCI path does the 8-sector transfer in a single command (it computes
+/// `sector_count = length / 512`), so reading or writing a whole block costs **one**
+/// `sys_io_submit` + one completion wake, not eight — 8× fewer block-I/O round trips than
+/// the original 512-byte-sector-at-a-time path. The device's logical sector is still 512
+/// bytes; this is the I/O granularity, aligned to the 4 KiB block. See
+/// `docs/rationale/deferred-decisions.md` (fs-server 4 KiB-block I/O). The ext4 fs is
+/// 4 KiB-block-aligned within a partition ≥ its size, so a covering-block access never
+/// runs past the device.
+const IO_BLOCK: usize = 4096;
 /// IPC message size (the `RECV_MSG`/`REPLY_MSG` buffers); payload starts at 24.
 const MSG_LEN: usize = 4096;
 const PAYLOAD_OFF: usize = 24;
@@ -55,9 +71,27 @@ static mut REPLY_MSG: [u8; 4096] = [0; 4096];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// Scratch for the file content (the 64 KiB read-model cap).
 static mut CONTENT: [u8; ext4::MAX_FILE] = [0; ext4::MAX_FILE];
-/// `sys_wait` scratch (one handle at a time).
-static mut WAIT_HANDLES: [u64; 1] = [0];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// `sys_wait` scratch: the forwarding endpoint plus every open directory session. The
+/// kernel's `MAX_WAIT_HANDLES` is 8; one slot is `serve_end`, so up to [`MAX_SESSIONS`]
+/// directory sessions can be waited on at once. Each result is a 24-byte `IoResult`.
+static mut WAIT_HANDLES: [u64; 8] = [0; 8];
+static mut WAIT_RESULTS: [u8; 8 * 24] = [0; 8 * 24];
+
+/// The most open directory-handle sessions the server serves concurrently (one `sys_wait`
+/// slot is reserved for `serve_end`). Sessions are short-lived — a client opens a
+/// directory, reads it, and closes — so this bounds concurrent *in-flight* listings, not
+/// total clients. Lifting it (an aggregate wait, or a multi-endpoint receive) is a later
+/// refinement; a full slot table returns `WouldBlock` on `RESOLVE_DIR_OPEN`.
+const MAX_SESSIONS: usize = 7;
+/// Per-session state: the kept (server) endpoint (`0` = free slot) and the directory inode
+/// the session is bound to. A session addresses entries by name, never path, so it can
+/// only ever touch this inode's directory (structural confinement).
+static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
+static mut SESSION_INO: [u32; MAX_SESSIONS] = [0; MAX_SESSIONS];
+/// Body scratch for a `File::ReadDir` reply (packed entries), before the rsproto header is
+/// prepended into `REPLY_MSG`. Bounded to one IPC payload minus the two headers.
+const DIR_BODY_CAP: usize = MSG_LEN - PAYLOAD_OFF - librsproto::RS_HEADER_LEN;
+static mut DIR_BODY: [u8; DIR_BODY_CAP] = [0; DIR_BODY_CAP];
 
 /// Log `msg` and exit non-zero — the bootstrap failure path. (The server is not a
 /// critical-path process like init/eshell, so exiting on a bootstrap fault is the
@@ -95,10 +129,13 @@ fn po_wait(po: u64) -> (i32, u64) {
     if waited != 1 { (-1, 0) } else { (status, result) }
 }
 
-/// A [`BlockReader`] over the block device: each `read_at` reads the covering
-/// 512-byte sectors via `sys_io_submit` into a one-page scratch `MemoryObject`
-/// (mapped R/W) and copies the requested sub-range out. Sector-at-a-time — simple
-/// and correct; the parser's reads are small (≤ one 4 KiB filesystem block).
+/// A [`BlockReader`]/[`BlockWriter`] over the block device: each `read_at` reads the
+/// covering **4 KiB blocks** via `sys_io_submit` into a one-page scratch `MemoryObject`
+/// (mapped R/W) and copies the requested sub-range out; `write_at` is a per-block
+/// read-modify-write. One `sys_io_submit` per 4 KiB block (the AHCI path does the 8-sector
+/// transfer in a single command), not one per 512-byte sector — 8× fewer block-I/O round
+/// trips, which is what made the same-CPU wake latency so acute (see the decision log,
+/// 2026-07-23). The parser's individual reads are small (≤ one 4 KiB filesystem block).
 struct DiskReader {
     /// The read-only block-device handle (from the setup message).
     device: u64,
@@ -109,15 +146,15 @@ struct DiskReader {
 }
 
 impl DiskReader {
-    /// DMA `sector` (512 bytes) into the scratch object; `Io` on any failure.
-    fn read_sector(&self, sector: u64) -> Result<(), FsError> {
+    /// DMA `block` (4 KiB) into the scratch object in a single command; `Io` on any failure.
+    fn read_block(&self, block: u64) -> Result<(), FsError> {
         let op = IoOp {
             opcode: IO_OPCODE_READ,
             flags: 0,
             buffer: self.scratch,
             buf_offset: 0,
-            offset: sector * SECTOR as u64,
-            length: SECTOR as u64,
+            offset: block * IO_BLOCK as u64,
+            length: IO_BLOCK as u64,
         };
         // SAFETY: `device` is a block DeviceNode with READ; `&op` is a valid IoOp.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
@@ -125,7 +162,7 @@ impl DiskReader {
             return Err(FsError::Io);
         }
         let (status, result) = po_wait(po as u64);
-        if status != 0 || result != SECTOR as u64 {
+        if status != 0 || result != IO_BLOCK as u64 {
             return Err(FsError::Io);
         }
         Ok(())
@@ -137,15 +174,15 @@ impl BlockReader for DiskReader {
         let mut done = 0usize;
         while done < buf.len() {
             let cur = offset + done as u64;
-            let sector = cur / SECTOR as u64;
-            let in_sector = (cur % SECTOR as u64) as usize;
-            let n = core::cmp::min(SECTOR - in_sector, buf.len() - done);
-            self.read_sector(sector)?;
-            // SAFETY: `scratch_addr` maps a full page R/W; the read sector occupies
-            // `[0, 512)`, so `[in_sector, in_sector + n)` is in bounds.
+            let block = cur / IO_BLOCK as u64;
+            let in_block = (cur % IO_BLOCK as u64) as usize;
+            let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
+            self.read_block(block)?;
+            // SAFETY: `scratch_addr` maps a full page R/W; the read block occupies
+            // `[0, 4096)`, so `[in_block, in_block + n)` is in bounds.
             let src = unsafe {
                 core::slice::from_raw_parts(
-                    (self.scratch_addr as usize + in_sector) as *const u8,
+                    (self.scratch_addr as usize + in_block) as *const u8,
                     n,
                 )
             };
@@ -157,15 +194,16 @@ impl BlockReader for DiskReader {
 }
 
 impl DiskReader {
-    /// Write the scratch object's sector-0 (512 bytes) to device `sector`; `Io` on failure.
-    fn write_sector(&self, sector: u64) -> Result<(), FsError> {
+    /// Write the scratch object's first 4 KiB to device `block` in a single command; `Io`
+    /// on failure.
+    fn write_block(&self, block: u64) -> Result<(), FsError> {
         let op = IoOp {
             opcode: IO_OPCODE_WRITE,
             flags: 0,
             buffer: self.scratch,
             buf_offset: 0,
-            offset: sector * SECTOR as u64,
-            length: SECTOR as u64,
+            offset: block * IO_BLOCK as u64,
+            length: IO_BLOCK as u64,
         };
         // SAFETY: `device` is a block DeviceNode with WRITE; `&op` is a valid IoOp.
         let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
@@ -173,7 +211,7 @@ impl DiskReader {
             return Err(FsError::Io);
         }
         let (status, result) = po_wait(po as u64);
-        if status != 0 || result != SECTOR as u64 {
+        if status != 0 || result != IO_BLOCK as u64 {
             return Err(FsError::Io);
         }
         Ok(())
@@ -185,24 +223,24 @@ impl BlockWriter for DiskReader {
         let mut done = 0usize;
         while done < buf.len() {
             let cur = offset + done as u64;
-            let sector = cur / SECTOR as u64;
-            let in_sector = (cur % SECTOR as u64) as usize;
-            let n = core::cmp::min(SECTOR - in_sector, buf.len() - done);
-            // Read-modify-write for a partial sector: read it into scratch first so the
-            // untouched bytes are preserved. A full-sector write skips the read.
-            if n != SECTOR {
-                self.read_sector(sector)?;
+            let block = cur / IO_BLOCK as u64;
+            let in_block = (cur % IO_BLOCK as u64) as usize;
+            let n = core::cmp::min(IO_BLOCK - in_block, buf.len() - done);
+            // Read-modify-write for a partial block: read it into scratch first so the
+            // untouched bytes are preserved. A full-block write skips the read.
+            if n != IO_BLOCK {
+                self.read_block(block)?;
             }
-            // SAFETY: `scratch_addr` maps a full page R/W; `[in_sector, in_sector + n)` is
-            // within the sector-0 region `[0, 512)`.
+            // SAFETY: `scratch_addr` maps a full page R/W; `[in_block, in_block + n)` is
+            // within the block region `[0, 4096)`.
             let dst = unsafe {
                 core::slice::from_raw_parts_mut(
-                    (self.scratch_addr as usize + in_sector) as *mut u8,
+                    (self.scratch_addr as usize + in_block) as *mut u8,
                     n,
                 )
             };
             dst.copy_from_slice(&buf[done..done + n]);
-            self.write_sector(sector)?;
+            self.write_block(block)?;
             done += n;
         }
         Ok(())
@@ -413,36 +451,401 @@ fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
     let _ = ext4::grow_file(reader, path, new_size as usize);
 }
 
+/// Receive one message on `h` into the `RECV_*` statics. Returns the syscall result:
+/// `0` = a message arrived; `-11` (`WouldBlock`) = the ring is drained; `-13`
+/// (`PeerClosed`) = the peer closed (a directory session's client is gone).
+fn recv_on(h: u64) -> i64 {
+    // SAFETY: valid recv out-params; the server is single-threaded, one message at a time.
+    unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            h,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    }
+}
+
+/// Map an ext4 `ext4_dir_entry_2.file_type` to the neutral wire kind.
+fn map_kind(ext4_ft: u8) -> u8 {
+    match ext4_ft {
+        1 => DIRENT_KIND_FILE, // EXT4_FT_REG_FILE
+        ext4::EXT4_FT_DIR => DIRENT_KIND_DIR,
+        ext4::EXT4_FT_SYMLINK => DIRENT_KIND_SYMLINK,
+        _ => DIRENT_KIND_UNKNOWN,
+    }
+}
+
+/// If the forwarded request in `RECV_MSG` is a `Namespace::Resolve` whose suffix names a
+/// **directory**, return its `(request_id, directory inode)`. A directory path resolves to
+/// a directory session (below); a file path (or a miss) returns `None` and takes the file
+/// path. Resolve flags are not plumbed from userspace, so the kind is inferred from what
+/// the path actually names — the same way the logging service decides `OBJECT_KIND_CHANNEL`
+/// by what it resolves. (The directory walk is repeated by the file path for a non-match;
+/// folding it into a single `serve` pass — a `Served::Directory` — is a later refinement.)
+fn try_resolve_directory<R: BlockReader + BlockWriter>(reader: &R) -> Option<(u64, u32)> {
+    let mut suffix = [0u8; MAX_SUFFIX];
+    // SAFETY: `RECV_MSG` holds a just-received message; the slice is bounded.
+    let (request_id, suffix_len) = unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        let m = librsproto::decode(req).ok()?;
+        if m.op != OP_NS_RESOLVE {
+            return None;
+        }
+        let r = parse_resolve_request(m.body)?;
+        let n = r.suffix.len().min(MAX_SUFFIX);
+        suffix[..n].copy_from_slice(&r.suffix[..n]);
+        (m.request_id, n)
+    };
+    let dir_ino = ext4::resolve_dir(reader, &suffix[..suffix_len]).ok()?;
+    Some((request_id, dir_ino))
+}
+
+/// Free directory-session slot `slot`: close the server endpoint and mark it empty.
+fn free_session_at(slot: usize) {
+    // SAFETY: `slot < MAX_SESSIONS`; closing our own endpoint handle.
+    unsafe {
+        let ch = SESSION_CH[slot];
+        SESSION_CH[slot] = 0;
+        SESSION_INO[slot] = 0;
+        if ch != 0 {
+            syscall1(SYS_HANDLE_CLOSE, ch);
+        }
+    }
+}
+
+/// Send an error reply for a forwarded resolve (no transferred handle) on `serve_end`.
+fn reply_resolve_error(serve_end: u64, request_id: u64, kerror: i32) {
+    // SAFETY: disjoint reply region.
+    let elen = unsafe {
+        let reply = core::slice::from_raw_parts_mut(
+            ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+            MSG_LEN - PAYLOAD_OFF,
+        );
+        encode_error(reply, request_id, kerror, OP_NS_RESOLVE)
+    };
+    let count = stage_reply(elen, None);
+    send_reply(serve_end, count);
+}
+
+/// Reply `OBJECT_KIND_DIRECTORY` to a forwarded `RESOLVE_DIR_OPEN`, transferring
+/// `client_end` (the session channel's client side) in `handles[0]`. Mirrors the logging
+/// service's `OBJECT_KIND_CHANNEL` reply. `true` on a successful send.
+fn reply_dir_handle(serve_end: u64, request_id: u64, client_end: u64) -> bool {
+    let mut body = [0u8; RESOLVE_REPLY_LEN];
+    // A directory handle is a live channel to the server (the kernel installs the
+    // transferred `IpcChannel` from an `OBJECT_KIND_CHANNEL` reply — it has no distinct
+    // "directory" reply kind). `content_len` is unused; the channel rides in handles[0].
+    let _ = resolve_reply(&mut body, OBJECT_KIND_CHANNEL, 0);
+    // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset PAYLOAD_OFF,
+    // and the transferred handle in REPLY_HANDLES[0].
+    unsafe {
+        let rs_len = match librsproto::encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            OP_NS_RESOLVE,
+            request_id,
+            RS_FLAG_REPLY,
+            &body,
+            1,
+        ) {
+            Some(n) => n,
+            None => return false,
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 1;
+        REPLY_HANDLES[0] = client_end;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            serve_end,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    }
+}
+
+/// Open a directory session for the already-resolved directory `dir_ino`: mint a session
+/// channel bound to it and reply `OBJECT_KIND_CHANNEL` with the client endpoint. The kernel
+/// installs the transferred channel in the client's table and completes its lookup. On any
+/// failure an error reply is sent instead.
+fn open_dir_session(serve_end: u64, request_id: u64, dir_ino: u32) {
+    // SAFETY: single-threaded scan of the session table.
+    let slot = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) };
+    let Some(slot) = slot else {
+        // Every session slot in use — ask the client to retry (WouldBlock).
+        reply_resolve_error(serve_end, request_id, KError::WouldBlock.as_i32());
+        return;
+    };
+
+    let (client_end, session_end) = match make_channel() {
+        Some(p) => p,
+        None => {
+            reply_resolve_error(serve_end, request_id, KError::KernelError.as_i32());
+            return;
+        }
+    };
+    // SAFETY: `slot` is free; bind the session before replying so a fast client request
+    // cannot arrive before the slot is live.
+    unsafe {
+        SESSION_CH[slot] = session_end;
+        SESSION_INO[slot] = dir_ino;
+    }
+    if !reply_dir_handle(serve_end, request_id, client_end) {
+        // The reply send failed — roll back the session and drop the client endpoint.
+        free_session_at(slot);
+        // SAFETY: closing our own not-yet-transferred handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, client_end) };
+    }
+}
+
+/// Serve requests that arrived on an open directory session `session_ch`. Drains the
+/// channel: each `File::ReadDir` enumerates the bound directory into a batch reply sent
+/// back on the same channel; a `PeerClosed` frees the session.
+fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
+    // SAFETY: single-threaded scan.
+    let Some(slot) = (unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == session_ch) }) else {
+        return; // already freed (e.g. an earlier result in this batch closed it)
+    };
+    loop {
+        let rr = recv_on(session_ch);
+        if rr != 0 {
+            if rr == KError::PeerClosed.as_i32() as i64 {
+                free_session_at(slot);
+            }
+            return; // WouldBlock (drained) or PeerClosed (freed)
+        }
+        // Decode the request and copy its rsproto body into an owned buffer (two 255-byte
+        // names + prefixes fit), so the op logic + reply staging don't interleave borrows of
+        // the shared statics. SAFETY: RECV_MSG holds the request; the slice is bounded.
+        let mut body_buf = [0u8; 600];
+        let (request_id, op, body_len) = unsafe {
+            let payload_len =
+                u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+            let req = core::slice::from_raw_parts(
+                ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+                payload_len.min(MSG_LEN - PAYLOAD_OFF),
+            );
+            match librsproto::decode(req) {
+                Ok(m) => {
+                    let n = m.body.len().min(body_buf.len());
+                    body_buf[..n].copy_from_slice(&m.body[..n]);
+                    (m.request_id, m.op, n)
+                }
+                Err(_) => continue, // malformed frame: skip
+            }
+        };
+        let body = &body_buf[..body_len];
+        // SAFETY: `slot` still valid here (only freed on PeerClosed, handled above).
+        let dir_ino = unsafe { SESSION_INO[slot] };
+
+        match op {
+            OP_FILE_READ_DIR => {
+                let cursor = parse_read_dir_request(body).map(|r| r.cursor).unwrap_or(0);
+                match build_readdir_reply(reader, dir_ino, cursor) {
+                    Some(bl) => send_session_reply(session_ch, request_id, bl),
+                    None => reply_session_error(session_ch, request_id, OP_FILE_READ_DIR, KError::KernelError.as_i32()),
+                }
+            }
+            // The name-addressed mutations: each names an entry in the bound directory, so a
+            // handle can never mutate outside it.
+            OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR => {
+                let r = match parse_name_request(body) {
+                    Some(name) => match op {
+                        OP_FILE_MKDIR => ext4::mkdir_at(reader, dir_ino, name),
+                        OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name),
+                        _ => ext4::rmdir_at(reader, dir_ino, name),
+                    },
+                    None => Err(FsError::Unsupported),
+                };
+                reply_session_status(session_ch, request_id, op, r);
+            }
+            OP_FILE_RENAME => {
+                let r = match parse_rename_request(body) {
+                    Some((old, new)) => ext4::rename_at(reader, dir_ino, old, new),
+                    None => Err(FsError::Unsupported),
+                };
+                reply_session_status(session_ch, request_id, op, r);
+            }
+            _ => reply_session_error(session_ch, request_id, op, KError::Unsupported.as_i32()),
+        }
+    }
+}
+
+/// Map an `FsError` to the `KError` discriminant carried in a reply.
+fn fs_kerror(e: FsError) -> i32 {
+    match e {
+        FsError::NotFound => KError::NotFound.as_i32(),
+        FsError::Unsupported => KError::Unsupported.as_i32(),
+        FsError::TooLarge => KError::OutOfMemory.as_i32(),
+        FsError::Exists | FsError::NotEmpty => KError::InvalidArgument.as_i32(),
+        FsError::Corrupt | FsError::Io => KError::KernelError.as_i32(),
+    }
+}
+
+/// Reply to a mutation op on `session_ch`: an empty-body success reply, or an error reply
+/// carrying the mapped `KError`.
+fn reply_session_status(session_ch: u64, request_id: u64, op: u16, r: Result<(), FsError>) {
+    match r {
+        Ok(()) => {
+            // SAFETY: REPLY_MSG is a valid buffer; an empty-body reply, no handles.
+            unsafe {
+                let rs_len = match librsproto::encode(
+                    &mut REPLY_MSG[PAYLOAD_OFF..],
+                    op,
+                    request_id,
+                    RS_FLAG_REPLY,
+                    &[],
+                    0,
+                ) {
+                    Some(n) => n,
+                    None => return,
+                };
+                REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+                REPLY_MSG[8] = 0;
+                syscall5(
+                    SYS_CHANNEL_SEND,
+                    session_ch,
+                    (&raw const REPLY_MSG) as u64,
+                    (&raw const REPLY_HANDLES) as u64,
+                    0,
+                    SENDMODE_NOBLOCK,
+                );
+            }
+        }
+        Err(e) => reply_session_error(session_ch, request_id, op, fs_kerror(e)),
+    }
+}
+
+/// Enumerate directory `dir_ino` from `cursor` into `DIR_BODY`, packing as many entries as
+/// fit; returns the body length, or `None` on a device/parse error.
+fn build_readdir_reply<R: BlockReader>(reader: &R, dir_ino: u32, cursor: u64) -> Option<usize> {
+    // SAFETY: DIR_BODY is a disjoint static; the writer holds it for this call only.
+    let body = unsafe {
+        core::slice::from_raw_parts_mut((&raw mut DIR_BODY) as *mut u8, DIR_BODY_CAP)
+    };
+    let mut w = DirReplyWriter::new(body)?;
+    let next = ext4::read_dir(reader, dir_ino, cursor, |ino, ft, name| {
+        w.push(ino, map_kind(ft), name)
+    });
+    let next_cursor = next.ok()?;
+    Some(w.finish(next_cursor))
+}
+
+/// Send a `File::ReadDir` reply (the packed body in `DIR_BODY[..body_len]`) on
+/// `session_ch`, wrapping it in the rsproto reply header.
+fn send_session_reply(session_ch: u64, request_id: u64, body_len: usize) {
+    // SAFETY: DIR_BODY (read) and REPLY_MSG (write) are disjoint statics.
+    unsafe {
+        let body = core::slice::from_raw_parts((&raw const DIR_BODY) as *const u8, body_len);
+        let rs_len = match librsproto::encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            OP_FILE_READ_DIR,
+            request_id,
+            RS_FLAG_REPLY,
+            body,
+            0,
+        ) {
+            Some(n) => n,
+            None => return,
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            session_ch,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        );
+    }
+}
+
+/// Send an error reply for a `File::ReadDir` on a session channel.
+fn reply_session_error(session_ch: u64, request_id: u64, op: u16, kerror: i32) {
+    // SAFETY: disjoint reply region.
+    let elen = unsafe {
+        let reply = core::slice::from_raw_parts_mut(
+            ((&raw mut REPLY_MSG) as *mut u8).add(PAYLOAD_OFF),
+            MSG_LEN - PAYLOAD_OFF,
+        );
+        encode_error(reply, request_id, kerror, op)
+    };
+    let count = stage_reply(elen, None);
+    send_reply(session_ch, count);
+}
+
 fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: u64) -> ! {
     loop {
-        // Block until a forwarded request lands in our inbox.
-        // SAFETY: one waiter on the serving endpoint.
-        let waited = unsafe {
+        // Wait set: the forwarding endpoint plus every open directory session (mirrors the
+        // logging service). `count ≤ 1 + MAX_SESSIONS = 8 = MAX_WAIT_HANDLES`.
+        // SAFETY: single-threaded build of the wait array.
+        let count = unsafe {
             WAIT_HANDLES[0] = serve_end;
+            let mut n = 1;
+            for i in 0..MAX_SESSIONS {
+                if SESSION_CH[i] != 0 {
+                    WAIT_HANDLES[n] = SESSION_CH[i];
+                    n += 1;
+                }
+            }
+            n
+        };
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count ≤ 8`.
+        let waited = unsafe {
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                1,
+                count as u64,
                 (&raw mut WAIT_RESULTS) as u64,
                 u64::MAX,
             )
         };
-        if waited != 1 {
+        if waited < 1 {
             continue;
         }
-        // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                serve_end,
-                (&raw mut RECV_MSG) as u64,
-                (&raw mut RECV_HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        if rr != 0 {
-            continue;
+        // Each signaled handle yields one 24-byte `IoResult` (the handle at offset 0).
+        for j in 0..(waited as usize) {
+            // SAFETY: `waited` records were written; `off + 8 ≤ 8*24`.
+            let h = unsafe {
+                let off = j * 24;
+                u64::from_le_bytes([
+                    WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
+                    WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
+                    WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
+                ])
+            };
+            if h == serve_end {
+                // Drain every queued forwarded request on the kernel endpoint.
+                while recv_on(serve_end) == 0 {
+                    handle_forwarded_resolve(reader, serve_end, device);
+                }
+            } else {
+                serve_session(reader, h);
+            }
         }
+    }
+}
+
+/// Handle one forwarded `Namespace::Resolve` already received into `RECV_MSG`. A
+/// `RESOLVE_DIR_OPEN` resolve opens a directory session (above); every other resolve takes
+/// the file path (Model-A lazy blocks / eager memobj) unchanged.
+fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
+    reader: &R,
+    serve_end: u64,
+    device: u64,
+) {
+    if let Some((request_id, dir_ino)) = try_resolve_directory(reader) {
+        open_dir_session(serve_end, request_id, dir_ino);
+        return;
+    }
 
         // The rsproto request occupies the IpcMsg payload (offset 24, `payload_len`
         // bytes). Form non-aliasing slices over the distinct request/content/reply
@@ -520,8 +923,7 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
             }
             Served::Error { reply_len } => stage_reply(reply_len, None),
         };
-        send_reply(serve_end, count);
-    }
+    send_reply(serve_end, count);
 }
 
 /// `_start` bootstrap registers (`kernel/src/syscall/table.rs`): `rdi` = the

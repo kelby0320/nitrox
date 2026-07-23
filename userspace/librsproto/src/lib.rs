@@ -58,6 +58,19 @@ pub const OP_NS_RESOLVE: u16 = 0x0100;
 /// `File::ReadRange` — read a byte range of a lazily-resolved file (the Model-B
 /// page-cache fill). See [`file`].
 pub const OP_FILE_READ_RANGE: u16 = 0x0600;
+/// `File::ReadDir` — read a batch of entries from an open **directory handle** (a session
+/// channel the fs-server mints when a directory path resolves, scoped to that directory;
+/// see [`file`] and `docs/spec/rsproto-file-ops.md`). Client-initiated, sent on the
+/// directory channel; the reply rides back on the same channel.
+pub const OP_FILE_READ_DIR: u16 = 0x0601;
+/// `File::Mkdir` — create a subdirectory `name` in the open directory handle. See [`file`].
+pub const OP_FILE_MKDIR: u16 = 0x0602;
+/// `File::Unlink` — remove the regular file `name` from the open directory handle.
+pub const OP_FILE_UNLINK: u16 = 0x0603;
+/// `File::Rmdir` — remove the empty subdirectory `name` from the open directory handle.
+pub const OP_FILE_RMDIR: u16 = 0x0604;
+/// `File::Rename` — rename `old` to `new` **within** the open directory handle.
+pub const OP_FILE_RENAME: u16 = 0x0605;
 /// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
 pub const OP_AUTHENTICATE: u16 = 0x0800;
 
