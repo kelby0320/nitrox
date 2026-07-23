@@ -100,6 +100,12 @@ static mut FP_SPAWN: SpawnArgs = SpawnArgs {
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
 /// blocking-send demo, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
+/// Directory-listing demo buffers (dir-ops Part A): send a `File::ReadDir` and receive its
+/// reply on an open directory-handle channel.
+static mut DIR_SEND: [u8; 4096] = [0; 4096];
+static mut DIR_RECV: [u8; 4096] = [0; 4096];
+static mut DIR_XFER: [u64; 8] = [0; 8];
+static mut DIR_XCOUNT: usize = 0;
 /// Transferred-handle out-array for recv (always empty in the demo).
 static mut HBUF: [u64; 8] = [0; 8];
 /// Recv'd handle-count out-param.
@@ -949,6 +955,126 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
     kprint(b"parent: exit-storm ok (18 exits reaped)\n");
 }
 
+/// **Directory listing over the direct-RPC transport** (dir-ops Part A). Opens `/system`
+/// as a directory handle (`sys_ns_lookup` resolves a directory path to a session channel —
+/// `OBJECT_KIND_CHANNEL`), then issues `File::ReadDir` on that channel, following the
+/// cursor across replies, and confirms the known entry `current-generation` is listed.
+/// Proves the whole transport end to end: endpoint acquisition, the session channel,
+/// name-addressed enumeration, and reply correlation. A failure exits non-zero (init's
+/// fail path); like the other early demos it runs before the login chain adjudicates.
+fn dir_list_demo(root_ns: u64) {
+    kprint(b"parent: dir-list demo start\n");
+    // Open the directory: resolving a directory path yields a session channel (SEND|RECV).
+    let (st, dir_ch) = ns_lookup_wait(root_ns, b"/system", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if st != 0 || dir_ch == 0 {
+        kprint(b"parent: dir-list open FAIL\n");
+        exit(1);
+    }
+
+    let mut cursor = 0u64;
+    let mut saw_currentgen = false;
+    let mut rounds = 0u32;
+    loop {
+        rounds += 1;
+        if rounds > 64 {
+            kprint(b"parent: dir-list runaway (cursor did not terminate)\n");
+            exit(1);
+        }
+        // Build File::ReadDir{cursor} into the send buffer's payload region (offset 24).
+        // SAFETY: DIR_SEND is a valid writable buffer; the rsproto body is bounded.
+        let ok = unsafe {
+            let mut body = [0u8; 8];
+            let bn = match librsproto::file::read_dir_request(&mut body, cursor) {
+                Some(n) => n,
+                None => return_fail(b"parent: dir-list request build FAIL\n"),
+            };
+            let reply = core::slice::from_raw_parts_mut(((&raw mut DIR_SEND) as *mut u8).add(24), 4096 - 24);
+            match librsproto::encode(reply, librsproto::OP_FILE_READ_DIR, 0, 0, &body[..bn], 0) {
+                Some(rn) => {
+                    DIR_SEND[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
+                    DIR_SEND[8] = 0;
+                    true
+                }
+                None => false,
+            }
+        };
+        if !ok {
+            kprint(b"parent: dir-list encode FAIL\n");
+            exit(1);
+        }
+        // Send on the directory channel.
+        // SAFETY: valid endpoint + message; no transferred handles.
+        let sr = unsafe {
+            syscall5(SYS_CHANNEL_SEND, dir_ch, (&raw const DIR_SEND) as u64, 0, 0, SENDMODE_NOBLOCK)
+        };
+        if sr != 0 {
+            kprint(b"parent: dir-list send FAIL\n");
+            exit(1);
+        }
+        // Wait for + receive the reply on the same channel.
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid single-waiter buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = dir_ch;
+            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
+        };
+        if waited != 1 {
+            kprint(b"parent: dir-list wait FAIL\n");
+            exit(1);
+        }
+        // SAFETY: valid recv out-params.
+        let rr = unsafe {
+            syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
+        };
+        if rr != 0 {
+            kprint(b"parent: dir-list recv FAIL\n");
+            exit(1);
+        }
+        // Decode the reply and scan its entries.
+        // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
+        let next_cursor = unsafe {
+            let payload_len = u32::from_le_bytes([DIR_RECV[4], DIR_RECV[5], DIR_RECV[6], DIR_RECV[7]]) as usize;
+            let payload = core::slice::from_raw_parts(((&raw const DIR_RECV) as *const u8).add(24), payload_len.min(4096 - 24));
+            let m = match librsproto::decode(payload) {
+                Ok(m) => m,
+                Err(_) => return_fail(b"parent: dir-list decode FAIL\n"),
+            };
+            if m.is_error() {
+                return_fail(b"parent: dir-list error reply\n");
+            }
+            let (hdr, iter) = match librsproto::file::parse_read_dir_reply(m.body) {
+                Some(x) => x,
+                None => return_fail(b"parent: dir-list parse FAIL\n"),
+            };
+            for e in iter {
+                if e.name == b"current-generation" {
+                    saw_currentgen = true;
+                }
+            }
+            hdr.next_cursor
+        };
+        if next_cursor == 0 {
+            break;
+        }
+        cursor = next_cursor;
+    }
+
+    // SAFETY: closing our own channel handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, dir_ch) };
+    if saw_currentgen {
+        kprint(b"parent: dir-list ok (/system lists current-generation)\n");
+    } else {
+        kprint(b"parent: dir-list FAIL (current-generation not found)\n");
+        exit(1);
+    }
+}
+
+/// Print `msg` and exit non-zero — a `-> !` helper so the demo's `match`/closure arms can
+/// bail without an awkward control-flow dance.
+fn return_fail(msg: &[u8]) -> ! {
+    kprint(msg);
+    exit(1)
+}
+
 /// **Hardware floating point, end to end in ring 3** (Phase 4 FP enablement Part D;
 /// decision log 2026-07-21).
 ///
@@ -1462,6 +1588,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //     check silently never ran. Up front it always completes, and a failure always
     //     reaches init's `code != 0` fail path in time to fail the run.
     fp_hardfloat_demo(root_ns, notif);
+
+    // 0a2. Directory listing over the direct-RPC transport (dir-ops Part A). Early, before
+    //      the login chain adjudicates, for the same reason as the FP demo above.
+    dir_list_demo(root_ns);
 
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();
