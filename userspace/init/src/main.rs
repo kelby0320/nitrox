@@ -108,20 +108,20 @@ static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
-/// Spawn args for the demo `parent`: no handles, inherit a LOOKUP-only handle to
-/// init's root namespace (so parent can resolve the kernel servers but not bind
-/// into init's root — it constructs its own namespaces for its children, which is
-/// why init grants it `BIND_NAMESPACE`).
+/// Spawn args for the integration test harness (`/initramfs/sbin/test-harness`): no
+/// handles, inherit a LOOKUP-only handle to init's root namespace (so it resolves the
+/// kernel servers). It constructs fresh namespaces in its `ns`/`forward` checks, so init
+/// grants it `BIND_NAMESPACE`. Selftest builds only.
 #[cfg(feature = "selftest")]
-static mut SPAWN_PARENT: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/parent
+static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/test-harness
     handle_count: 0,
     move_mask: 0,
     arg0: 0,
     handles: [0; 4],
     rights: [0; 4],
     namespace: 0,
-    syscaps: SYSCAP_BIND_NAMESPACE, // parent constructs namespaces for its children
+    syscaps: SYSCAP_BIND_NAMESPACE,
 };
 /// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
 /// inherit a LOOKUP-only handle to init's root namespace (so it resolves
@@ -1124,6 +1124,52 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     h
 }
 
+/// Run the integration test harness synchronously (selftest builds): spawn it, block
+/// until it exits, and report whether it exited `0`. A non-zero exit lets the caller
+/// fail the run; a hang means this never returns, so the runner's wall-clock timeout
+/// fails it. Its child processes (test-stages) are reaped by the harness, not init.
+#[cfg(feature = "selftest")]
+fn run_test_harness(notif: u64, root_ns: u64) -> bool {
+    kprint(b"init: running integration test harness\n");
+    // SAFETY: SPAWN_HARNESS is a valid writable arg block.
+    let h =
+        unsafe { spawn_program(root_ns, b"/initramfs/sbin/test-harness", &raw mut SPAWN_HARNESS) };
+    if h < 0 {
+        kprint(b"init: test-harness spawn FAIL\n");
+        return false;
+    }
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            continue;
+        }
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            continue; // WouldBlock: drained
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let (kind, body) =
+            unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        if kind == KIND_CHILD_EXITED {
+            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            // SAFETY: closing our own process handle for the harness.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+            return code == 0;
+        }
+    }
+}
+
 /// The healthy supervise path. **Normally**, hand off to the service manager: spawn
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
 /// reap_loop drops to the emergency console as the interim recovery, until a reboot
@@ -1142,31 +1188,26 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
-        // Bring up the login chain first, then the demo chain — both run concurrently
-        // (init does not wait on either before spawning the other). Their block I/O
-        // overlaps on purpose — see this fn's doc + the 2026-07-20 decision log.
-        kprint(b"init: bringing up login chain + demo chain (concurrent)\n");
+        // Serial adjudication (decision log 2026-07-24): run the integration test harness
+        // **first**, synchronously — a non-zero exit fails the run, and a hang fails it via
+        // the runner's wall-clock timeout (init never reaches the verdict) — **then** hand
+        // off to the login chain, which fires the PASS verdict once login is proven. (The
+        // earlier harness/login concurrency is retired with the parent/child demos.)
+        if !run_test_harness(notif, root_ns) {
+            kprint(b"init: integration test harness FAILED\n");
+            #[cfg(feature = "test-harness")]
+            test_exit(false);
+            // Interactive selftest: nothing to hand off to; reap orphans.
+            reap_loop(notif, root_ns, 0);
+        }
+        kprint(b"init: harness passed; handing off to login chain\n");
         let smgr_h = spawn_service_mgr(root_ns);
         if smgr_h >= 0 {
-            // service-mgr runs independently — the login chain fires the verdict (or, in
-            // an interactive selftest, drops to the `login:` prompt) on its own; init need
-            // not hold its handle. SAFETY: closing init's reference; service-mgr runs on.
+            // service-mgr runs independently and fires the verdict once login is proven
+            // (or drops to the `login:` prompt in an interactive selftest). SAFETY:
+            // closing init's reference; service-mgr runs on.
             unsafe { syscall1(SYS_HANDLE_CLOSE, smgr_h as u64) };
         }
-        // SAFETY: SPAWN_PARENT is a valid writable arg block.
-        let parent_h =
-            unsafe { spawn_program(root_ns, b"/initramfs/sbin/parent", &raw mut SPAWN_PARENT) };
-        if parent_h >= 0 {
-            // Reap forever; `parent`'s exit is fail-checked (a crash fails the run). The
-            // login chain is already up, so its own exit is not init's handoff trigger.
-            reap_loop(notif, root_ns, parent_h);
-        }
-        kprint(b"init: parent spawn FAIL\n");
-        // Test-harness: couldn't even launch the demo chain — fail the run.
-        #[cfg(feature = "test-harness")]
-        test_exit(false);
-        // Interactive selftest: the login chain is already up (its `login:` prompt is the
-        // console); nothing to spawn — just reap.
         reap_loop(notif, root_ns, 0);
     }
     // Normal boot: hand off to the service manager and supervise it.

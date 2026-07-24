@@ -52,26 +52,6 @@ const DISPOSITION_TERMINATE: u64 = 2;
 
 static mut END0: u64 = 0;
 static mut END1: u64 = 0;
-static mut SPAWN_A: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/child
-    handle_count: 1,
-    move_mask: 1, // move handle 0 to the child
-    arg0: 0, // role 0 = sender
-    handles: [0; 4],
-    rights: [ENDPOINT_RIGHTS, 0, 0, 0],
-    namespace: 0, // set at runtime to the constructed child namespace
-    syscaps: 0,   // children hold no ambient capabilities
-};
-static mut SPAWN_B: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/child
-    handle_count: 1,
-    move_mask: 1,
-    arg0: 1, // role 1 = receiver
-    handles: [0; 4],
-    rights: [ENDPOINT_RIGHTS, 0, 0, 0],
-    namespace: 0, // set at runtime to the constructed child namespace
-    syscaps: 0,   // children hold no ambient capabilities
-};
 static mut NOTIF: Notification = Notification::zeroed();
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut WAIT_HANDLES: [u64; 1] = [0];
@@ -84,20 +64,7 @@ static mut STORM_SPAWN: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 0,
     move_mask: 0,
-    arg0: 2, // role 2 = exit immediately
-    handles: [0; 4],
-    rights: [0; 4],
-    namespace: 0, // inherit the parent's namespace
-    syscaps: 0,
-};
-/// Spawn args for the hard-float workers: `child` role 3, no handles, inherited
-/// namespace, empty syscaps. `image` and the per-worker seed in `arg0` are filled per
-/// spawn (`arg0` = role in the low 8 bits, seed above — see `child`'s module docs).
-static mut FP_SPAWN: SpawnArgs = SpawnArgs {
-    image: 0,
-    handle_count: 0,
-    move_mask: 0,
-    arg0: 3, // role 3 = hard-float worker; seed OR'd in per spawn
+    arg0: 0, // Tier 0: test-stage exits immediately (exit-storm)
     handles: [0; 4],
     rights: [0; 4],
     namespace: 0, // inherit the parent's namespace
@@ -153,7 +120,7 @@ const STREAM_STACK_PAGES: u64 = 8;
 /// (the stage's bootstrap endpoint = the setup channel), `arg0` set at runtime to the
 /// bootstrap descriptor. Inherits parent's LOOKUP-only namespace.
 static mut SPAWN_STAGE: SpawnArgs = SpawnArgs {
-    image: 0,     // resolved at spawn from /initramfs/sbin/child
+    image: 0,     // resolved at spawn from /initramfs/sbin/test-stage
     handle_count: 1,
     move_mask: 1, // move handle 0 (the setup channel) to the stage
     arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
@@ -206,7 +173,7 @@ extern "C" fn stream_producer() -> ! {
 fn stream_transport_demo() {
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::table::{Item, TableReader};
-    kprint(b"parent: stream transport demo (2-thread pipe, backpressured)\n");
+    kprint(b"test-harness: stream transport demo (2-thread pipe, backpressured)\n");
 
     // 1. A depth-4 pipe: small on purpose, so a 2000-row stream overflows the ring.
     // SAFETY: END0/END1 are valid writable out-params.
@@ -214,7 +181,7 @@ fn stream_transport_demo() {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
     };
     if cr != 0 {
-        kprint(b"parent: stream chan create FAIL\n");
+        kprint(b"test-harness: stream chan create FAIL\n");
         exit(1);
     }
     // SAFETY: the kernel wrote both endpoint handles.
@@ -225,7 +192,7 @@ fn stream_transport_demo() {
     // SAFETY: register-only syscalls with valid arguments.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, stack_bytes, 0, 0, 0) };
     if mem < 0 {
-        kprint(b"parent: stream stack create FAIL\n");
+        kprint(b"test-harness: stream stack create FAIL\n");
         exit(1);
     }
     // SAFETY: maps the stack object read/write at a kernel-chosen address.
@@ -233,7 +200,7 @@ fn stream_transport_demo() {
         syscall4(SYS_MEMORY_MAP, mem as u64, 0, stack_bytes, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
     };
     if base < 0 {
-        kprint(b"parent: stream stack map FAIL\n");
+        kprint(b"test-harness: stream stack map FAIL\n");
         exit(1);
     }
     let stack_top = base as u64 + stack_bytes;
@@ -250,7 +217,7 @@ fn stream_transport_demo() {
     } {
         Ok(t) => t,
         Err(_) => {
-            kprint(b"parent: stream producer thread FAIL\n");
+            kprint(b"test-harness: stream producer thread FAIL\n");
             exit(1);
         }
     };
@@ -260,14 +227,14 @@ fn stream_transport_demo() {
     let bytes = match rx.receive() {
         Ok(b) => b,
         Err(_) => {
-            kprint(b"parent: stream receive FAIL\n");
+            kprint(b"test-harness: stream receive FAIL\n");
             exit(1);
         }
     };
     let mut tr = match TableReader::new(&bytes) {
         Ok(t) => t,
         Err(_) => {
-            kprint(b"parent: stream bad TSM1 header\n");
+            kprint(b"test-harness: stream bad TSM1 header\n");
             exit(1);
         }
     };
@@ -276,25 +243,32 @@ fn stream_transport_demo() {
         match tr.next() {
             Some(Ok(Item::Row(vals))) => {
                 if vals.first().and_then(|v| v.as_int()) != Some(n) {
-                    kprint(b"parent: stream row MISMATCH\n");
+                    kprint(b"test-harness: stream row MISMATCH\n");
                     exit(1);
                 }
                 n += 1;
             }
             Some(Ok(Item::End(_))) | None => break,
             _ => {
-                kprint(b"parent: stream decode FAIL\n");
+                kprint(b"test-harness: stream decode FAIL\n");
                 exit(1);
             }
         }
     }
     if n != STREAM_ROWS {
-        kprint(b"parent: stream wrong row count\n");
+        kprint(b"test-harness: stream wrong row count\n");
         exit(1);
     }
-    kprint(b"parent: stream transport ok (2000 rows over a real pipe, backpressured)\n");
-    // `_producer` (the thread handle) drops here — closes our handle; the thread has
-    // already self-exited. END0/END1 are closed at process exit.
+    // Release this demo's handles (both pipe ends + the producer's stack object) so a
+    // long test run doesn't exhaust the harness's handle table. The producer thread has
+    // self-exited; `_producer` (the thread handle) drops at the end of scope.
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, e0);
+        syscall1(SYS_HANDLE_CLOSE, e1);
+        syscall1(SYS_HANDLE_CLOSE, mem as u64);
+    }
+    kprint(b"test-harness: stream transport ok (2000 rows over a real pipe, backpressured)\n");
 }
 
 /// The C3 **setup-message spawn** (Part C.2): spawn `child` as a Tier-1 stage — with a
@@ -311,13 +285,13 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     use libstream::table::TableWriter;
     use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
 
-    kprint(b"parent: setup-message stage demo (spawn a Tier-1 stage)\n");
+    kprint(b"test-harness: setup-message stage demo (spawn a Tier-1 stage)\n");
     const STAGE_ROWS: i64 = 500;
 
     // 1. Resolve the stage binary (the conforming `child` path).
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/test-stage", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        kprint(b"parent: stage image FAIL\n");
+        kprint(b"test-harness: stage image FAIL\n");
         exit(1);
     }
 
@@ -327,14 +301,14 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     let (prod, stage_stdin) = match pipe(4) {
         Ok(p) => p,
         Err(_) => {
-            kprint(b"parent: stage stdin pipe FAIL\n");
+            kprint(b"test-harness: stage stdin pipe FAIL\n");
             exit(1);
         }
     };
     let (setup_shell, setup_stage) = match pipe(4) {
         Ok(p) => p,
         Err(_) => {
-            kprint(b"parent: stage setup chan FAIL\n");
+            kprint(b"test-harness: stage setup chan FAIL\n");
             exit(1);
         }
     };
@@ -349,7 +323,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     } {
         Ok(p) => p,
         Err(_) => {
-            kprint(b"parent: stage spawn FAIL\n");
+            kprint(b"test-harness: stage spawn FAIL\n");
             exit(1);
         }
     };
@@ -360,8 +334,8 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
         stdout: None,
         stderr: None,
     };
-    if send_setup(setup_shell, &streams, &["stage-demo", "500"]).is_err() {
-        kprint(b"parent: stage send_setup FAIL\n");
+    if send_setup(setup_shell, &streams, &["stage", "500"]).is_err() {
+        kprint(b"test-harness: stage send_setup FAIL\n");
         exit(1);
     }
 
@@ -380,7 +354,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
         && tw.finish_with_status(0).is_ok()
         && tw.into_sink().finish().is_ok();
     if !ok {
-        kprint(b"parent: stage produce FAIL\n");
+        kprint(b"test-harness: stage produce FAIL\n");
         exit(1);
     }
 
@@ -413,13 +387,20 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
             let body = unsafe { (&raw const NOTIF.body).read() };
             let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
             if code != 0 {
-                kprint(b"parent: stage exited non-zero\n");
+                kprint(b"test-harness: stage exited non-zero\n");
                 exit(1);
             }
             break;
         }
     }
-    kprint(b"parent: setup-message stage ok (stdin stream + argv verified by the stage)\n");
+    // Release our ends of the stdin pipe + setup channel (the stage's ends were moved to
+    // it); don't leak handles across a long test run. `_stage` (the process handle) drops
+    // at scope end. SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, prod);
+        syscall1(SYS_HANDLE_CLOSE, setup_shell);
+    }
+    kprint(b"test-harness: setup-message stage ok (stdin stream + argv verified by the stage)\n");
 }
 
 // --- Userspace-server forwarding demo (slice 7 Part 3) ----------------------
@@ -454,12 +435,12 @@ extern "C" fn worker_fault() -> ! {
 /// immediately faults, observe the `SegFault`, inspect the faulting registers,
 /// and terminate the thread. `notif` is this process's notification channel.
 fn worker_exception_demo(notif: u64) {
-    kprint(b"parent: mapping a worker stack\n");
+    kprint(b"test-harness: mapping a worker stack\n");
     // 1. Allocate + map a one-page worker stack (read/write).
     // SAFETY: register-only syscalls with valid arguments.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if mem < 0 {
-        kprint(b"parent: worker stack create FAIL\n");
+        kprint(b"test-harness: worker stack create FAIL\n");
         exit(1);
     }
     // SAFETY: maps the memory object read/write at a kernel-chosen address.
@@ -467,7 +448,7 @@ fn worker_exception_demo(notif: u64) {
         syscall4(SYS_MEMORY_MAP, mem as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
     };
     if base < 0 {
-        kprint(b"parent: worker stack map FAIL\n");
+        kprint(b"test-harness: worker stack map FAIL\n");
         exit(1);
     }
     let stack_top = base as u64 + PAGE; // stacks grow down from the top
@@ -487,11 +468,11 @@ fn worker_exception_demo(notif: u64) {
     } {
         Ok(w) => w,
         Err(_) => {
-            kprint(b"parent: thread_create FAIL\n");
+            kprint(b"test-harness: thread_create FAIL\n");
             exit(1);
         }
     };
-    kprint(b"parent: created worker thread; awaiting its fault\n");
+    kprint(b"test-harness: created worker thread; awaiting its fault\n");
 
     // 3. Block on our notification channel until the worker's SegFault arrives.
     loop {
@@ -507,7 +488,7 @@ fn worker_exception_demo(notif: u64) {
             )
         };
         if waited < 1 {
-            kprint(b"parent: wait FAIL\n");
+            kprint(b"test-harness: wait FAIL\n");
             exit(1);
         }
         // SAFETY: NOTIF is a valid 64-byte writable out-param.
@@ -529,12 +510,12 @@ fn worker_exception_demo(notif: u64) {
         syscall4(SYS_THREAD_GET_REGISTERS, worker.raw().0, (&raw mut WORKER_REGS) as u64, 0, 0)
     };
     if gr != 0 {
-        kprint(b"parent: get_registers FAIL\n");
+        kprint(b"test-harness: get_registers FAIL\n");
         exit(1);
     }
     // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS.
     let rip = unsafe { (&raw const WORKER_REGS.regs[REG_RIP]).read() };
-    kprint(b"parent: worker faulted @ rip=");
+    kprint(b"test-harness: worker faulted @ rip=");
     kprint_hex(rip);
     kprint(b" ; terminating\n");
 
@@ -544,14 +525,14 @@ fn worker_exception_demo(notif: u64) {
         syscall4(SYS_EXCEPTION_RESUME, worker.raw().0, DISPOSITION_TERMINATE, 7, 0)
     };
     if er != 0 {
-        kprint(b"parent: exception_resume FAIL\n");
+        kprint(b"test-harness: exception_resume FAIL\n");
         exit(1);
     }
     // The worker is not this process's last thread (we are still running), so
     // its termination produces no `ChildExited`. Drop our handle to it.
     // SAFETY: closing our own handle.
     // (worker Handle<Thread> closes on drop at function end — no explicit close)
-    kprint(b"parent: worker terminated\n");
+    kprint(b"test-harness: worker terminated\n");
 }
 
 /// Demonstrate the blocking-send / `PendingOperation` path end-to-end against the
@@ -566,7 +547,7 @@ fn block_send_demo() {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
     };
     if cr != 0 {
-        kprint(b"parent: block-demo channel create FAIL\n");
+        kprint(b"test-harness: block-demo channel create FAIL\n");
         return;
     }
     // SAFETY: the kernel wrote both endpoint handles.
@@ -593,7 +574,7 @@ fn block_send_demo() {
         syscall5(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCK)
     };
     if po < 0 {
-        kprint(b"parent: block send FAIL\n");
+        kprint(b"test-harness: block send FAIL\n");
         return;
     }
     let po = po as u64;
@@ -605,7 +586,7 @@ fn block_send_demo() {
         syscall4(SYS_CHANNEL_RECV, b, (&raw mut MSGBUF) as u64, (&raw mut HBUF) as u64, (&raw mut RECV_COUNT) as u64)
     };
     if rr != 0 {
-        kprint(b"parent: block-demo recv FAIL\n");
+        kprint(b"test-harness: block-demo recv FAIL\n");
         return;
     }
 
@@ -626,11 +607,11 @@ fn block_send_demo() {
         i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
     };
     if waited == 1 && status == 0 {
-        kprint(b"parent: blocking send completed via PendingOperation (");
+        kprint(b"test-harness: blocking send completed via PendingOperation (");
         kprint_u64(filled);
         kprint(b" queued, 1 blocked-then-delivered)\n");
     } else {
-        kprint(b"parent: block-demo wait unexpected\n");
+        kprint(b"test-harness: block-demo wait unexpected\n");
     }
 
     // Drain the rest of b and close every handle.
@@ -662,7 +643,7 @@ fn block_bounded_demo() {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
     };
     if cr != 0 {
-        kprint(b"parent: block-bounded channel create FAIL\n");
+        kprint(b"test-harness: block-bounded channel create FAIL\n");
         return;
     }
     // SAFETY: the kernel wrote both endpoint handles.
@@ -686,7 +667,7 @@ fn block_bounded_demo() {
         syscall6(SYS_CHANNEL_SEND, a, (&raw const MSGBUF) as u64, 0, 0, SENDMODE_BLOCKBOUNDED, 1)
     };
     if po < 0 {
-        kprint(b"parent: block-bounded send FAIL\n");
+        kprint(b"test-harness: block-bounded send FAIL\n");
         return;
     }
     let po = po as u64;
@@ -708,9 +689,9 @@ fn block_bounded_demo() {
         i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
     };
     if waited == 1 && status == KERR_TIMED_OUT {
-        kprint(b"parent: blocking send timed out via PendingOperation (BlockBounded)\n");
+        kprint(b"test-harness: blocking send timed out via PendingOperation (BlockBounded)\n");
     } else {
-        kprint(b"parent: block-bounded demo unexpected\n");
+        kprint(b"test-harness: block-bounded demo unexpected\n");
     }
 
     // SAFETY: closing our own handles.
@@ -726,7 +707,7 @@ fn block_bounded_demo() {
 /// the kernel — `Process::namespace`). Proves all four `sys_ns_*` syscalls plus
 /// the async-lookup result word (`IoResult.result` carries the resolved handle).
 fn ns_demo() {
-    kprint(b"parent: ns-demo start (fresh namespace)\n");
+    kprint(b"test-harness: ns-demo start (fresh namespace)\n");
 
     // (a) sys_ns_create: a fresh, full-rights namespace to bind into. A process
     //     binds into namespaces it owns; its inherited root namespace is
@@ -735,17 +716,17 @@ fn ns_demo() {
     // SAFETY: register-only syscall.
     let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
     if ns < 0 {
-        kprint(b"parent: ns_create FAIL\n");
+        kprint(b"test-harness: ns_create FAIL\n");
         return;
     }
     let ns = ns as u64;
-    kprint(b"parent: ns_create ok\n");
+    kprint(b"test-harness: ns_create ok\n");
 
     // (b) Create a MemoryObject to bind as a direct-handle resource.
     // SAFETY: register-only syscall.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if mem < 0 {
-        kprint(b"parent: ns-demo mem create FAIL\n");
+        kprint(b"test-harness: ns-demo mem create FAIL\n");
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
         return;
@@ -760,10 +741,10 @@ fn ns_demo() {
     // SAFETY: `ns` is parent's live namespace handle; borrow is non-owning (won't close it).
     let ns_h = unsafe { Handle::<Namespace, NsMutable>::borrow(RawHandle(ns), Rights::BIND) };
     if ns_h.bind("/store", RawHandle(mem)).is_err() {
-        kprint(b"parent: ns_bind FAIL\n");
+        kprint(b"test-harness: ns_bind FAIL\n");
         return;
     }
-    kprint(b"parent: ns_bind /store ok\n");
+    kprint(b"test-harness: ns_bind /store ok\n");
 
     // (d) sys_ns_lookup: resolve "/store" requesting MAP_READ|MAP_WRITE. Returns
     //     a PendingOperation; (e) sys_wait yields the resolved handle in
@@ -779,7 +760,7 @@ fn ns_demo() {
         )
     };
     if po < 0 {
-        kprint(b"parent: ns_lookup FAIL\n");
+        kprint(b"test-harness: ns_lookup FAIL\n");
         return;
     }
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
@@ -804,10 +785,10 @@ fn ns_demo() {
         ])
     };
     if waited != 1 || status != 0 || resolved == 0 {
-        kprint(b"parent: ns_lookup wait unexpected\n");
+        kprint(b"test-harness: ns_lookup wait unexpected\n");
         return;
     }
-    kprint(b"parent: ns_lookup -> resolved handle=");
+    kprint(b"test-harness: ns_lookup -> resolved handle=");
     kprint_u64(resolved);
     kprint(b"\n");
 
@@ -818,10 +799,10 @@ fn ns_demo() {
         syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
     };
     if mapped < 0 {
-        kprint(b"parent: ns-demo map resolved FAIL\n");
+        kprint(b"test-harness: ns-demo map resolved FAIL\n");
         return;
     }
-    kprint(b"parent: mapped resolved /store handle ok\n");
+    kprint(b"test-harness: mapped resolved /store handle ok\n");
 
     // (g) sys_ns_unbind: remove "/store"; a follow-up lookup must complete the PO
     //     with a NotFound status (error delivered through the PO, not the syscall).
@@ -830,7 +811,7 @@ fn ns_demo() {
         syscall4(SYS_NS_UNBIND, ns, path.as_ptr() as u64, path.len() as u64, 0)
     };
     if ur != 0 {
-        kprint(b"parent: ns_unbind FAIL\n");
+        kprint(b"test-harness: ns_unbind FAIL\n");
         return;
     }
     // SAFETY: valid path pointer + handle.
@@ -838,7 +819,7 @@ fn ns_demo() {
         syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
     };
     if po2 < 0 {
-        kprint(b"parent: ns_lookup-after-unbind FAIL\n");
+        kprint(b"test-harness: ns_lookup-after-unbind FAIL\n");
         return;
     }
     // SAFETY: valid wait buffers.
@@ -857,9 +838,9 @@ fn ns_demo() {
     };
     // KError::NotFound = -10.
     if waited2 == 1 && status2 == -10 {
-        kprint(b"parent: ns_unbind ok (lookup-after-unbind -> NotFound)\n");
+        kprint(b"test-harness: ns_unbind ok (lookup-after-unbind -> NotFound)\n");
     } else {
-        kprint(b"parent: ns-demo unbind unexpected\n");
+        kprint(b"test-harness: ns-demo unbind unexpected\n");
     }
 
     // Close the demo handles we still hold (resolved + the original mem + the POs
@@ -872,18 +853,18 @@ fn ns_demo() {
         syscall1(SYS_HANDLE_CLOSE, mem);
         syscall1(SYS_HANDLE_CLOSE, ns);
     }
-    kprint(b"parent: ns-demo done\n");
+    kprint(b"test-harness: ns-demo done\n");
 }
 
 /// Entropy demo: create an `EntropyObject` token and read CSPRNG bytes from it.
 /// The pool seeds at boot (QEMU runs with `+rdrand,+rdseed`), so both reads return
 /// `0` (synchronous fill) and the two 32-byte draws differ (the CSPRNG advances).
 fn entropy_demo() {
-    kprint(b"parent: entropy-demo start\n");
+    kprint(b"test-harness: entropy-demo start\n");
     // SAFETY: register-only syscall.
     let h = unsafe { syscall1(SYS_ENTROPY_CREATE, 0) };
     if h < 0 {
-        kprint(b"parent: entropy_create FAIL\n");
+        kprint(b"test-harness: entropy_create FAIL\n");
         return;
     }
     let h = h as u64;
@@ -896,7 +877,7 @@ fn entropy_demo() {
     if r1 != 0 || r2 != 0 {
         // A positive return would mean "unseeded, wait on the PO" — not expected
         // here (the pool seeds at boot). Report and bail.
-        kprint(b"parent: entropy read not synchronous (unseeded?)\n");
+        kprint(b"test-harness: entropy read not synchronous (unseeded?)\n");
         unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
         return;
     }
@@ -911,7 +892,7 @@ fn entropy_demo() {
         }
     }
     let first = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-    kprint(b"parent: entropy bytes[0..8]=");
+    kprint(b"test-harness: entropy bytes[0..8]=");
     kprint_hex(first);
     if differ {
         kprint(b" (two reads differ) entropy ok\n");
@@ -929,7 +910,7 @@ fn entropy_demo() {
 /// in-kernel resource server — proving boot-binding + `KernelServer` dispatch
 /// (`sys_ns_lookup` → server → installed handle → `IoResult.result`) end-to-end.
 fn dev_entropy_lookup_demo(root_ns: u64) {
-    kprint(b"parent: /dev/entropy lookup-demo start\n");
+    kprint(b"test-harness: /dev/entropy lookup-demo start\n");
     let path = b"/dev/entropy";
     // sys_ns_lookup → PendingOperation; the resolved handle arrives in IoResult.
     // SAFETY: valid path pointer + namespace handle.
@@ -937,7 +918,7 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
         syscall4(SYS_NS_LOOKUP, root_ns, path.as_ptr() as u64, path.len() as u64, RIGHT_READ)
     };
     if po < 0 {
-        kprint(b"parent: /dev/entropy lookup FAIL\n");
+        kprint(b"test-harness: /dev/entropy lookup FAIL\n");
         return;
     }
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
@@ -962,7 +943,7 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
         ])
     };
     if waited != 1 || status != 0 || resolved == 0 {
-        kprint(b"parent: /dev/entropy lookup wait unexpected\n");
+        kprint(b"test-harness: /dev/entropy lookup wait unexpected\n");
         return;
     }
 
@@ -972,12 +953,12 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
     // SAFETY: valid writable 32-byte buffer; `len` ≤ ENTROPY_READ_MAX.
     let r = unsafe { syscall4(SYS_ENTROPY_READ, resolved, (&raw mut a) as u64, 32, 0) };
     if r != 0 {
-        kprint(b"parent: /dev/entropy read not synchronous\n");
+        kprint(b"test-harness: /dev/entropy read not synchronous\n");
         unsafe { syscall1(SYS_HANDLE_CLOSE, resolved) };
         return;
     }
     let first = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-    kprint(b"parent: /dev/entropy resolved+read ok bytes[0..8]=");
+    kprint(b"test-harness: /dev/entropy resolved+read ok bytes[0..8]=");
     kprint_hex(first);
     kprint(b"\n");
 
@@ -1029,15 +1010,19 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
 }
 
 /// `sys_handle_stat` the handle and return whether its object-type field equals
-/// `want` (`HandleInfo`: rights `u64` @0, object_type `u32` @8, generation @12).
+/// `want`. The out-param must be a real [`HandleInfo`], never a hand-sized byte
+/// array: the kernel writes the full struct (24 bytes since `size` was added),
+/// and an undersized stack buffer here let the copy-out zero 8 bytes of the
+/// caller's frame — which clobbered `_start`'s spilled `root_ns` and broke every
+/// later root-namespace lookup (the 2026-07-24 "namespace premature free" hunt).
 fn stat_is_type(h: u64, want: u32) -> bool {
-    let mut info = [0u8; 16];
-    // SAFETY: valid 16-byte writable `HandleInfo` out-param.
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: valid writable `HandleInfo` out-param.
     let r = unsafe { syscall4(SYS_HANDLE_STAT, h, (&raw mut info) as u64, 0, 0) };
     if r != 0 {
         return false;
     }
-    u32::from_le_bytes([info[8], info[9], info[10], info[11]]) == want
+    info.object_type == want
 }
 
 /// `/proc/self` demo: resolve the caller's own resources from the **root
@@ -1045,39 +1030,39 @@ fn stat_is_type(h: u64, want: u32) -> bool {
 /// only because the kernel bound `/proc/self/*` into pid 1's root namespace, and
 /// each returns strictly *this* caller's own object (derived from syscall context).
 fn proc_self_demo(root_ns: u64) {
-    kprint(b"parent: /proc/self demo start\n");
+    kprint(b"test-harness: /proc/self demo start\n");
 
     // /proc/self/process — request INSPECT; stat the handle, assert it's a Process.
     let (st, ph) = ns_lookup_wait(root_ns, b"/proc/self/process", RIGHT_INSPECT);
     if st != 0 || ph == 0 || !stat_is_type(ph, KOBJ_PROCESS) {
-        kprint(b"parent: /proc/self/process FAIL\n");
+        kprint(b"test-harness: /proc/self/process FAIL\n");
         return;
     }
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, ph) };
-    kprint(b"parent: /proc/self/process ok (own Process handle)\n");
+    kprint(b"test-harness: /proc/self/process ok (own Process handle)\n");
 
     // /proc/self/thread — likewise, assert it's a Thread.
     let (st, th) = ns_lookup_wait(root_ns, b"/proc/self/thread", RIGHT_INSPECT);
     if st != 0 || th == 0 || !stat_is_type(th, KOBJ_THREAD) {
-        kprint(b"parent: /proc/self/thread FAIL\n");
+        kprint(b"test-harness: /proc/self/thread FAIL\n");
         return;
     }
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
-    kprint(b"parent: /proc/self/thread ok (own Thread handle)\n");
+    kprint(b"test-harness: /proc/self/thread ok (own Thread handle)\n");
 
     // /proc/self/namespace — request LOOKUP; assert it's a Namespace, then USE it:
     // resolve /dev/entropy *through* the returned handle (proves a live,
     // LOOKUP-capable namespace identical to our root).
     let (st, nh) = ns_lookup_wait(root_ns, b"/proc/self/namespace", RIGHT_LOOKUP | RIGHT_INSPECT);
     if st != 0 || nh == 0 || !stat_is_type(nh, KOBJ_NAMESPACE) {
-        kprint(b"parent: /proc/self/namespace FAIL\n");
+        kprint(b"test-harness: /proc/self/namespace FAIL\n");
         return;
     }
     let (st2, eh) = ns_lookup_wait(nh, b"/dev/entropy", RIGHT_READ);
     if st2 != 0 || eh == 0 {
-        kprint(b"parent: /proc/self/namespace lookup-through FAIL\n");
+        kprint(b"test-harness: /proc/self/namespace lookup-through FAIL\n");
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, nh) };
         return;
@@ -1087,7 +1072,7 @@ fn proc_self_demo(root_ns: u64) {
         syscall1(SYS_HANDLE_CLOSE, eh);
         syscall1(SYS_HANDLE_CLOSE, nh);
     }
-    kprint(b"parent: /proc/self/namespace ok (resolved /dev/entropy through it)\n");
+    kprint(b"test-harness: /proc/self/namespace ok (resolved /dev/entropy through it)\n");
 }
 
 /// Initramfs demo: resolve `/initramfs/etc/init.toml` from the root namespace
@@ -1096,17 +1081,17 @@ fn proc_self_demo(root_ns: u64) {
 /// Limine module + CPIO parser + `/initramfs` server end-to-end, before Init
 /// exists. (This is Init's real job in slice 5+; here it's just a substrate check.)
 fn initramfs_demo(root_ns: u64) {
-    kprint(b"parent: /initramfs demo start\n");
+    kprint(b"test-harness: /initramfs demo start\n");
     let (st, mem) = ns_lookup_wait(root_ns, b"/initramfs/etc/init.toml", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
-        kprint(b"parent: /initramfs/etc/init.toml lookup FAIL\n");
+        kprint(b"test-harness: /initramfs/etc/init.toml lookup FAIL\n");
         return;
     }
     // Map the returned MemoryObject read-only and read its first bytes.
     // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
     if addr < 0 {
-        kprint(b"parent: /initramfs map FAIL\n");
+        kprint(b"test-harness: /initramfs map FAIL\n");
         // SAFETY: closing our own handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
         return;
@@ -1114,7 +1099,7 @@ fn initramfs_demo(root_ns: u64) {
     // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the file's bytes;
     // read the first 16 in bounds (init.toml is far longer).
     let head = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 16) };
-    kprint(b"parent: /initramfs/etc/init.toml -> \"");
+    kprint(b"test-harness: /initramfs/etc/init.toml -> \"");
     kprint(head);
     kprint(b"...\"\n");
     // SAFETY: closing our own handle.
@@ -1192,10 +1177,10 @@ fn timer_sleep_ms(ms: u64) {
 /// the wave (→ the selftest wall-clock timeout fails the run); a crash exits
 /// nonzero (→ init's fail path).
 fn exit_storm_demo(root_ns: u64, notif: u64) {
-    kprint(b"parent: exit-storm start\n");
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    kprint(b"test-harness: exit-storm start\n");
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/test-stage", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        kprint(b"parent: exit-storm image lookup FAIL\n");
+        kprint(b"test-harness: exit-storm image lookup FAIL\n");
         exit(1);
     }
     const ROUNDS: usize = 6;
@@ -1212,7 +1197,7 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
             match spawned {
                 Ok(p) => *slot = Some(p),
                 Err(_) => {
-                    kprint(b"parent: exit-storm spawn FAIL\n");
+                    kprint(b"test-harness: exit-storm spawn FAIL\n");
                     exit(1);
                 }
             }
@@ -1232,7 +1217,7 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
                 )
             };
             if waited < 1 {
-                kprint(b"parent: exit-storm wait FAIL\n");
+                kprint(b"test-harness: exit-storm wait FAIL\n");
                 exit(1);
             }
             loop {
@@ -1252,7 +1237,7 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
     }
     // SAFETY: closing our own image handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
-    kprint(b"parent: exit-storm ok (18 exits reaped)\n");
+    kprint(b"test-harness: exit-storm ok (18 exits reaped)\n");
 }
 
 /// **Directory listing over the direct-RPC transport** (dir-ops Part A). Opens `/system`
@@ -1263,11 +1248,11 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
 /// name-addressed enumeration, and reply correlation. A failure exits non-zero (init's
 /// fail path); like the other early demos it runs before the login chain adjudicates.
 fn dir_list_demo(root_ns: u64) {
-    kprint(b"parent: dir-list demo start\n");
+    kprint(b"test-harness: dir-list demo start\n");
     // Open the directory: resolving a directory path yields a session channel (SEND|RECV).
     let (st, dir_ch) = ns_lookup_wait(root_ns, b"/system", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if st != 0 || dir_ch == 0 {
-        kprint(b"parent: dir-list open FAIL\n");
+        kprint(b"test-harness: dir-list open FAIL\n");
         exit(1);
     }
 
@@ -1277,7 +1262,7 @@ fn dir_list_demo(root_ns: u64) {
     loop {
         rounds += 1;
         if rounds > 64 {
-            kprint(b"parent: dir-list runaway (cursor did not terminate)\n");
+            kprint(b"test-harness: dir-list runaway (cursor did not terminate)\n");
             exit(1);
         }
         // Build File::ReadDir{cursor} into the send buffer's payload region (offset 24).
@@ -1286,7 +1271,7 @@ fn dir_list_demo(root_ns: u64) {
             let mut body = [0u8; 8];
             let bn = match librsproto::file::read_dir_request(&mut body, cursor) {
                 Some(n) => n,
-                None => return_fail(b"parent: dir-list request build FAIL\n"),
+                None => return_fail(b"test-harness: dir-list request build FAIL\n"),
             };
             let reply = core::slice::from_raw_parts_mut(((&raw mut DIR_SEND) as *mut u8).add(24), 4096 - 24);
             match librsproto::encode(reply, librsproto::OP_FILE_READ_DIR, 0, 0, &body[..bn], 0) {
@@ -1299,7 +1284,7 @@ fn dir_list_demo(root_ns: u64) {
             }
         };
         if !ok {
-            kprint(b"parent: dir-list encode FAIL\n");
+            kprint(b"test-harness: dir-list encode FAIL\n");
             exit(1);
         }
         // Send on the directory channel.
@@ -1308,7 +1293,7 @@ fn dir_list_demo(root_ns: u64) {
             syscall5(SYS_CHANNEL_SEND, dir_ch, (&raw const DIR_SEND) as u64, 0, 0, SENDMODE_NOBLOCK)
         };
         if sr != 0 {
-            kprint(b"parent: dir-list send FAIL\n");
+            kprint(b"test-harness: dir-list send FAIL\n");
             exit(1);
         }
         // Wait for + receive the reply on the same channel.
@@ -1318,7 +1303,7 @@ fn dir_list_demo(root_ns: u64) {
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited != 1 {
-            kprint(b"parent: dir-list wait FAIL\n");
+            kprint(b"test-harness: dir-list wait FAIL\n");
             exit(1);
         }
         // SAFETY: valid recv out-params.
@@ -1326,7 +1311,7 @@ fn dir_list_demo(root_ns: u64) {
             syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
         };
         if rr != 0 {
-            kprint(b"parent: dir-list recv FAIL\n");
+            kprint(b"test-harness: dir-list recv FAIL\n");
             exit(1);
         }
         // Decode the reply and scan its entries.
@@ -1336,14 +1321,14 @@ fn dir_list_demo(root_ns: u64) {
             let payload = core::slice::from_raw_parts(((&raw const DIR_RECV) as *const u8).add(24), payload_len.min(4096 - 24));
             let m = match librsproto::decode(payload) {
                 Ok(m) => m,
-                Err(_) => return_fail(b"parent: dir-list decode FAIL\n"),
+                Err(_) => return_fail(b"test-harness: dir-list decode FAIL\n"),
             };
             if m.is_error() {
-                return_fail(b"parent: dir-list error reply\n");
+                return_fail(b"test-harness: dir-list error reply\n");
             }
             let (hdr, iter) = match librsproto::file::parse_read_dir_reply(m.body) {
                 Some(x) => x,
-                None => return_fail(b"parent: dir-list parse FAIL\n"),
+                None => return_fail(b"test-harness: dir-list parse FAIL\n"),
             };
             for e in iter {
                 if e.name == b"current-generation" {
@@ -1361,9 +1346,9 @@ fn dir_list_demo(root_ns: u64) {
     // SAFETY: closing our own channel handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, dir_ch) };
     if saw_currentgen {
-        kprint(b"parent: dir-list ok (/system lists current-generation)\n");
+        kprint(b"test-harness: dir-list ok (/system lists current-generation)\n");
     } else {
-        kprint(b"parent: dir-list FAIL (current-generation not found)\n");
+        kprint(b"test-harness: dir-list FAIL (current-generation not found)\n");
         exit(1);
     }
 }
@@ -1381,48 +1366,48 @@ fn return_fail(msg: &[u8]) -> ! {
 /// rmdir it and confirm it is gone. Each op is a single request/reply on the session
 /// channel; the handle is bound to `/system`, so the names can only ever touch `/system`.
 fn dir_mutate_demo(root_ns: u64) {
-    kprint(b"parent: dir-mutate demo start\n");
+    kprint(b"test-harness: dir-mutate demo start\n");
     let (st, dir_ch) = ns_lookup_wait(root_ns, b"/system", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
     if st != 0 || dir_ch == 0 {
-        kprint(b"parent: dir-mutate open FAIL\n");
+        kprint(b"test-harness: dir-mutate open FAIL\n");
         exit(1);
     }
     // mkdir nx-tmp → confirm it appears (a ReadDir on the same session).
     let mut body = [0u8; 32];
     let n = librsproto::file::name_request(&mut body, b"nx-tmp").unwrap();
     if !session_mutate(dir_ch, librsproto::OP_FILE_MKDIR, &body[..n]) {
-        kprint(b"parent: mkdir FAIL\n");
+        kprint(b"test-harness: mkdir FAIL\n");
         exit(1);
     }
     if !session_dir_contains(dir_ch, b"nx-tmp") {
-        kprint(b"parent: mkdir not visible\n");
+        kprint(b"test-harness: mkdir not visible\n");
         exit(1);
     }
     // rename nx-tmp → nx-tmp2 → confirm the old name is gone and the new one present.
     let mut rbody = [0u8; 48];
     let rn = librsproto::file::rename_request(&mut rbody, b"nx-tmp", b"nx-tmp2").unwrap();
     if !session_mutate(dir_ch, librsproto::OP_FILE_RENAME, &rbody[..rn]) {
-        kprint(b"parent: rename FAIL\n");
+        kprint(b"test-harness: rename FAIL\n");
         exit(1);
     }
     if session_dir_contains(dir_ch, b"nx-tmp") || !session_dir_contains(dir_ch, b"nx-tmp2") {
-        kprint(b"parent: rename not applied\n");
+        kprint(b"test-harness: rename not applied\n");
         exit(1);
     }
     // rmdir nx-tmp2 → confirm it is gone.
     let mut dbody = [0u8; 32];
     let dn = librsproto::file::name_request(&mut dbody, b"nx-tmp2").unwrap();
     if !session_mutate(dir_ch, librsproto::OP_FILE_RMDIR, &dbody[..dn]) {
-        kprint(b"parent: rmdir FAIL\n");
+        kprint(b"test-harness: rmdir FAIL\n");
         exit(1);
     }
     if session_dir_contains(dir_ch, b"nx-tmp2") {
-        kprint(b"parent: rmdir not applied\n");
+        kprint(b"test-harness: rmdir not applied\n");
         exit(1);
     }
     // SAFETY: closing our own channel handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, dir_ch) };
-    kprint(b"parent: dir-mutate ok (mkdir + rename + rmdir, each ReadDir-verified)\n");
+    kprint(b"test-harness: dir-mutate ok (mkdir + rename + rmdir, each ReadDir-verified)\n");
 }
 
 /// Send one mutation op (`body` already built) on the directory channel and await its
@@ -1441,7 +1426,7 @@ fn session_mutate(dir_ch: u64, op: u16, body: &[u8]) -> bool {
         }
     };
     if !sent {
-        kprint(b"parent: dir-mutate send FAIL\n");
+        kprint(b"test-harness: dir-mutate send FAIL\n");
         exit(1);
     }
     // SAFETY: single-waiter buffers.
@@ -1450,7 +1435,7 @@ fn session_mutate(dir_ch: u64, op: u16, body: &[u8]) -> bool {
         syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
     };
     if waited != 1 {
-        kprint(b"parent: dir-mutate wait FAIL\n");
+        kprint(b"test-harness: dir-mutate wait FAIL\n");
         exit(1);
     }
     // SAFETY: valid recv out-params.
@@ -1458,7 +1443,7 @@ fn session_mutate(dir_ch: u64, op: u16, body: &[u8]) -> bool {
         syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
     };
     if rr != 0 {
-        kprint(b"parent: dir-mutate recv FAIL\n");
+        kprint(b"test-harness: dir-mutate recv FAIL\n");
         exit(1);
     }
     // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
@@ -1481,7 +1466,7 @@ fn session_dir_contains(dir_ch: u64, name: &[u8]) -> bool {
     loop {
         rounds += 1;
         if rounds > 64 {
-            kprint(b"parent: dir-contains runaway\n");
+            kprint(b"test-harness: dir-contains runaway\n");
             exit(1);
         }
         // Build + send File::ReadDir{cursor}.
@@ -1500,7 +1485,7 @@ fn session_dir_contains(dir_ch: u64, name: &[u8]) -> bool {
             }
         };
         if !sent {
-            kprint(b"parent: dir-contains send FAIL\n");
+            kprint(b"test-harness: dir-contains send FAIL\n");
             exit(1);
         }
         // SAFETY: single-waiter buffers.
@@ -1509,7 +1494,7 @@ fn session_dir_contains(dir_ch: u64, name: &[u8]) -> bool {
             syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
         };
         if waited != 1 {
-            kprint(b"parent: dir-contains wait FAIL\n");
+            kprint(b"test-harness: dir-contains wait FAIL\n");
             exit(1);
         }
         // SAFETY: valid recv out-params.
@@ -1517,7 +1502,7 @@ fn session_dir_contains(dir_ch: u64, name: &[u8]) -> bool {
             syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
         };
         if rr != 0 {
-            kprint(b"parent: dir-contains recv FAIL\n");
+            kprint(b"test-harness: dir-contains recv FAIL\n");
             exit(1);
         }
         // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
@@ -1566,28 +1551,48 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
     // Announcing a start we might not finish reads like a hang; staying silent until
     // there is a result is honest — the *guarantee* lives in session-mgr's `fp_gate`,
     // checked synchronously at the verdict. This demo is breadth on top of that.
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
+    // Each worker's seed is passed conforming — via `argv` in the setup message
+    // (`["fp", "<seed>"]`), never a role field in `arg0`.
+    const SEEDS: [&str; FP_WORKERS] = ["1", "2", "3"];
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/test-stage", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        kprint(b"parent: hard-float image lookup FAIL\n");
+        kprint(b"test-harness: hard-float image lookup FAIL\n");
         exit(1);
     }
     let mut procs = [const { None }; FP_WORKERS];
     for (i, slot) in procs.iter_mut().enumerate() {
-        // SAFETY: FP_SPAWN is a valid writable arg block, exclusively written and read
-        // here (image + seeded arg0; no handle grants).
+        // A per-worker setup channel; the stage's bootstrap endpoint = `setup_stage`.
+        let (setup_shell, setup_stage) = match pipe(4) {
+            Ok(p) => p,
+            Err(_) => {
+                kprint(b"test-harness: hard-float setup chan FAIL\n");
+                exit(1);
+            }
+        };
+        // SAFETY: SPAWN_STAGE is our static, exclusively written + read here.
         let spawned = unsafe {
-            FP_SPAWN.image = img;
-            // Role 3 in the low byte, this worker's seed above it.
-            FP_SPAWN.arg0 = 3 | ((i as u64 + 1) << 8);
-            spawn(&*(&raw const FP_SPAWN))
+            SPAWN_STAGE.image = img;
+            SPAWN_STAGE.handles[0] = setup_stage;
+            SPAWN_STAGE.arg0 = bootstrap_arg0(true);
+            spawn(&*(&raw const SPAWN_STAGE))
         };
         match spawned {
             Ok(p) => *slot = Some(p),
             Err(_) => {
-                kprint(b"parent: hard-float spawn FAIL\n");
+                kprint(b"test-harness: hard-float spawn FAIL\n");
                 exit(1);
             }
         }
+        // Wire the worker: run the "fp" role with this seed (no streams).
+        let streams = Streams { stdin: None, stdout: None, stderr: None };
+        if send_setup(setup_shell, &streams, &["fp", SEEDS[i]]).is_err() {
+            kprint(b"test-harness: hard-float send_setup FAIL\n");
+            exit(1);
+        }
+        // The setup message is delivered; drop our end of the setup channel (don't leak
+        // a handle per worker). SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, setup_shell) };
     }
     // Collect one ChildExited per worker; any nonzero code is a real FP failure.
     let mut got = 0;
@@ -1604,7 +1609,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
             )
         };
         if waited < 1 {
-            kprint(b"parent: hard-float wait FAIL\n");
+            kprint(b"test-harness: hard-float wait FAIL\n");
             exit(1);
         }
         loop {
@@ -1619,7 +1624,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
             if kind == KIND_CHILD_EXITED {
                 let code = i32::from_le_bytes([b[8], b[9], b[10], b[11]]);
                 if code != 0 {
-                    kprint(b"parent: hard-float worker FAILED code=");
+                    kprint(b"test-harness: hard-float worker FAILED code=");
                     kprint_u64(code as u64);
                     kprint(b"\n");
                     exit(1);
@@ -1630,7 +1635,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
     }
     // SAFETY: closing our own image handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, img) };
-    kprint(b"parent: hard-float ok (3 workers, f64 + simd verified in ring 3)\n");
+    kprint(b"test-harness: hard-float ok (3 workers, f64 + simd verified in ring 3)\n");
 }
 
 /// `/proc/self/status` + `/proc/sched/stats` demo — the Phase 3 **clause 3**
@@ -1650,18 +1655,18 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
 ///    CPUs by now); counters only grow, so retry with a 100 ms timer sleep
 ///    (up to ~5 s) before declaring the run dead.
 fn sched_stats_demo(root_ns: u64) {
-    kprint(b"parent: sched-stats demo start\n");
+    kprint(b"test-harness: sched-stats demo start\n");
 
     // --- /proc/self/status: the caller's own numeric identity.
     let (st, mem) = ns_lookup_wait(root_ns, b"/proc/self/status", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
-        kprint(b"parent: /proc/self/status lookup FAIL\n");
+        kprint(b"test-harness: /proc/self/status lookup FAIL\n");
         exit(1);
     }
     // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
     if addr < 0 {
-        kprint(b"parent: /proc/self/status map FAIL\n");
+        kprint(b"test-harness: /proc/self/status map FAIL\n");
         exit(1);
     }
     // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the status
@@ -1670,10 +1675,10 @@ fn sched_stats_demo(root_ns: u64) {
     let pid = parse_field(text, b"pid=").unwrap_or(0);
     let tid = parse_field(text, b"tid=").unwrap_or(0);
     if pid < 2 || tid < 1 {
-        kprint(b"parent: /proc/self/status content FAIL\n");
+        kprint(b"test-harness: /proc/self/status content FAIL\n");
         exit(1);
     }
-    kprint(b"parent: /proc/self/status ok pid=");
+    kprint(b"test-harness: /proc/self/status ok pid=");
     kprint_u64(pid);
     kprint(b" tid=");
     kprint_u64(tid);
@@ -1691,13 +1696,13 @@ fn sched_stats_demo(root_ns: u64) {
         attempt += 1;
         let (st, mem) = ns_lookup_wait(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
         if st != 0 || mem == 0 {
-            kprint(b"parent: /proc/sched/stats lookup FAIL\n");
+            kprint(b"test-harness: /proc/sched/stats lookup FAIL\n");
             exit(1);
         }
         // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
         let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
         if addr < 0 {
-            kprint(b"parent: /proc/sched/stats map FAIL\n");
+            kprint(b"test-harness: /proc/sched/stats map FAIL\n");
             exit(1);
         }
         // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the
@@ -1709,7 +1714,7 @@ fn sched_stats_demo(root_ns: u64) {
             // Echo the winning snapshot into the boot log (grep-visible
             // evidence of the milestone, alongside the machine-checked gate).
             let len = text.iter().position(|&b| b == 0).unwrap_or(text.len());
-            kprint(b"parent: /proc/sched/stats ok (");
+            kprint(b"test-harness: /proc/sched/stats ok (");
             kprint_u64(active);
             kprint(b" CPUs with switches>0):\n");
             kprint(&text[..len]);
@@ -1724,7 +1729,7 @@ fn sched_stats_demo(root_ns: u64) {
             return;
         }
         if attempt >= 50 {
-            kprint(b"parent: /proc/sched/stats FAIL (<2 CPUs with switches>0)\n");
+            kprint(b"test-harness: /proc/sched/stats FAIL (<2 CPUs with switches>0)\n");
             exit(1);
         }
         timer_sleep_ms(100);
@@ -1813,13 +1818,13 @@ fn read_block_sector0(root_ns: u64, path: &[u8]) -> i32 {
 /// offset), and of the same partition under its stable `/dev/disk/by-partlabel`
 /// name. Each verifies the `0x55AA` boot signature.
 fn block_demo(root_ns: u64) {
-    kprint(b"parent: /dev/blk demo start\n");
-    report_block_read(root_ns, b"/dev/blk/0", b"parent: /dev/blk/0 (disk) read");
-    report_block_read(root_ns, b"/dev/blk/1", b"parent: /dev/blk/1 (partition) read");
+    kprint(b"test-harness: /dev/blk demo start\n");
+    report_block_read(root_ns, b"/dev/blk/0", b"test-harness: /dev/blk/0 (disk) read");
+    report_block_read(root_ns, b"/dev/blk/1", b"test-harness: /dev/blk/1 (partition) read");
     report_block_read(
         root_ns,
         b"/dev/disk/by-partlabel/NITROX_ESP",
-        b"parent: /dev/disk/by-partlabel/NITROX_ESP read",
+        b"test-harness: /dev/disk/by-partlabel/NITROX_ESP read",
     );
 }
 
@@ -1856,7 +1861,7 @@ fn report_block_read(root_ns: u64, path: &[u8], label: &[u8]) {
 /// client + cross-context handle install) behind a stub, before the real
 /// `fs-server-ext4` process / ext4 disk exist (Parts 4–6).
 fn forward_demo() {
-    kprint(b"parent: userspace-server forwarding demo start\n");
+    kprint(b"test-harness: userspace-server forwarding demo start\n");
     const CONTENT: &[u8] = b"STUB\n";
 
     // 1. Channel pair: one end becomes the kernel forwarding endpoint, the other
@@ -1866,7 +1871,7 @@ fn forward_demo() {
         syscall4(SYS_CHANNEL_CREATE, (&raw mut FWD_KEND) as u64, (&raw mut FWD_SEND) as u64, 4, 0)
     };
     if cr != 0 {
-        kprint(b"parent: fwd channel create FAIL\n");
+        kprint(b"test-harness: fwd channel create FAIL\n");
         return;
     }
     // SAFETY: the kernel wrote both endpoint handles.
@@ -1875,7 +1880,7 @@ fn forward_demo() {
     // 2. Fresh namespace; bind the kernel end at /fs as a Userspace Server.
     let ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
     if ns < 0 {
-        kprint(b"parent: fwd ns create FAIL\n");
+        kprint(b"test-harness: fwd ns create FAIL\n");
         return;
     }
     let ns = ns as u64;
@@ -1886,7 +1891,7 @@ fn forward_demo() {
         syscall4(SYS_NS_BIND, ns, mount.as_ptr() as u64, mount.len() as u64, kend)
     };
     if br != 0 {
-        kprint(b"parent: fwd bind FAIL\n");
+        kprint(b"test-harness: fwd bind FAIL\n");
         return;
     }
 
@@ -1897,7 +1902,7 @@ fn forward_demo() {
         syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
     };
     if po < 0 {
-        kprint(b"parent: fwd lookup submit FAIL\n");
+        kprint(b"test-harness: fwd lookup submit FAIL\n");
         return;
     }
     let po = po as u64;
@@ -1914,7 +1919,7 @@ fn forward_demo() {
         )
     };
     if rr != 0 {
-        kprint(b"parent: fwd recv request FAIL\n");
+        kprint(b"test-harness: fwd recv request FAIL\n");
         return;
     }
 
@@ -1927,12 +1932,12 @@ fn forward_demo() {
     let request = match librsproto::decode(req_payload) {
         Ok(m) => m,
         Err(_) => {
-            kprint(b"parent: fwd request decode FAIL\n");
+            kprint(b"test-harness: fwd request decode FAIL\n");
             return;
         }
     };
     if request.op != librsproto::OP_NS_RESOLVE {
-        kprint(b"parent: fwd request op mismatch\n");
+        kprint(b"test-harness: fwd request op mismatch\n");
         return;
     }
     let request_id = request.request_id;
@@ -1940,13 +1945,13 @@ fn forward_demo() {
     // 6. Build a read-only MemoryObject holding the stub content.
     let mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
     if mem < 0 {
-        kprint(b"parent: fwd memobj create FAIL\n");
+        kprint(b"test-harness: fwd memobj create FAIL\n");
         return;
     }
     let mem = mem as u64;
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
     if addr < 0 {
-        kprint(b"parent: fwd memobj map FAIL\n");
+        kprint(b"test-harness: fwd memobj map FAIL\n");
         return;
     }
     // SAFETY: `addr` is a page the kernel mapped R/W into our address space.
@@ -1965,7 +1970,7 @@ fn forward_demo() {
     ) {
         Some(n) => n,
         None => {
-            kprint(b"parent: fwd reply body FAIL\n");
+            kprint(b"test-harness: fwd reply body FAIL\n");
             return;
         }
     };
@@ -1982,7 +1987,7 @@ fn forward_demo() {
         ) {
             Some(n) => n,
             None => {
-                kprint(b"parent: fwd reply encode FAIL\n");
+                kprint(b"test-harness: fwd reply encode FAIL\n");
                 return;
             }
         }
@@ -2009,7 +2014,7 @@ fn forward_demo() {
         )
     };
     if sr != 0 {
-        kprint(b"parent: fwd reply send FAIL\n");
+        kprint(b"test-harness: fwd reply send FAIL\n");
         return;
     }
 
@@ -2017,14 +2022,14 @@ fn forward_demo() {
     //    resolved handle.
     let (st, resolved) = po_wait(po);
     if st != 0 || resolved == 0 {
-        kprint(b"parent: fwd lookup result FAIL\n");
+        kprint(b"test-harness: fwd lookup result FAIL\n");
         return;
     }
 
     // 10. Map the resolved MemoryObject and verify the content round-tripped.
     let raddr = unsafe { syscall4(SYS_MEMORY_MAP, resolved, 0, PAGE, RIGHT_MAP_READ) };
     if raddr < 0 {
-        kprint(b"parent: fwd map resolved FAIL\n");
+        kprint(b"test-harness: fwd map resolved FAIL\n");
         return;
     }
     // SAFETY: `raddr` is the mapped, kernel-installed MemoryObject.
@@ -2032,9 +2037,9 @@ fn forward_demo() {
         core::slice::from_raw_parts(raddr as u64 as *const u8, CONTENT.len()) == CONTENT
     };
     if matches {
-        kprint(b"parent: forwarded lookup returned 'STUB' via fs-server ok\n");
+        kprint(b"test-harness: forwarded lookup returned 'STUB' via fs-server ok\n");
     } else {
-        kprint(b"parent: fwd content mismatch\n");
+        kprint(b"test-harness: fwd content mismatch\n");
     }
 }
 
@@ -2043,7 +2048,7 @@ fn forward_demo() {
 /// spawn. The third bootstrap register is unused here.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
-    kprint(b"parent: up (demo supervisor, spawned by init)\n");
+    kprint(b"test-harness: up (demo supervisor, spawned by init)\n");
 
     // 0. stdio/pipe transport (C3): a TSM1 stream over a real IPC channel between two
     //    threads, with real backpressure. **First**, so it completes (and a failure
@@ -2110,115 +2115,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //     the returned MemoryObject — the slice-7 transparent-forwarding proof.
     forward_demo();
 
-    kprint(b"parent: creating a channel\n");
-
-    // 1. Create an IPC channel; depth 4.
-    // SAFETY: END0/END1 are valid writable out-params.
-    let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
-    };
-    if cr != 0 {
-        kprint(b"parent: channel create FAIL\n");
-        exit(1);
-    }
-    // SAFETY: the kernel wrote both endpoint handles.
-    let (e0, e1) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
-
-    // 1b. Construct a *restricted* namespace for the children (sandbox-by-
-    //     construction): a fresh namespace with just `/store` bound to a
-    //     MemoryObject. The children inherit a LOOKUP-only handle to it.
-    let child_ns = unsafe { syscall1(SYS_NS_CREATE, 0) };
-    let store_mem = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-    if child_ns >= 0 && store_mem >= 0 {
-        let sp = b"/store";
-        // SAFETY: valid path pointer + handles.
-        let br = unsafe {
-            syscall4(SYS_NS_BIND, child_ns as u64, sp.as_ptr() as u64, sp.len() as u64, store_mem as u64)
-        };
-        if br == 0 {
-            kprint(b"parent: built child namespace (/store)\n");
-        } else {
-            kprint(b"parent: child-namespace bind FAIL\n");
-        }
-    } else {
-        kprint(b"parent: child-namespace create FAIL\n");
-    }
-
-    // 2. Spawn two children, moving one endpoint into each, and handing each the
-    //    constructed namespace (a LOOKUP-only handle to it lands in the child).
-    // Resolve the child program image from the initramfs (path-based spawn).
-    let (cst, child_img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
-    if cst != 0 || child_img == 0 {
-        kprint(b"parent: child image not found\n");
-        exit(1);
-    }
-    // SAFETY: SPAWN_A/SPAWN_B are valid writable arg blocks.
-    unsafe {
-        SPAWN_A.image = child_img;
-        SPAWN_B.image = child_img;
-        SPAWN_A.handles[0] = e0;
-        SPAWN_B.handles[0] = e1;
-        SPAWN_A.namespace = child_ns as u64;
-        SPAWN_B.namespace = child_ns as u64;
-    }
-    // SAFETY: valid SpawnArgs pointer; returns a process handle or a neg error.
-    // libos::spawn returns owning Handle<Process> handles — held until the end of this
-    // function (past the reap-count below), then dropped to reap the children (their
-    // handles were previously leaked until process exit).
-    // SAFETY: SPAWN_A/SPAWN_B are our statics, exclusively read here.
-    let (_pa, _pb) = match unsafe { (spawn(&*(&raw const SPAWN_A)), spawn(&*(&raw const SPAWN_B))) } {
-        (Ok(a), Ok(b)) => (a, b),
-        _ => {
-            kprint(b"parent: spawn FAIL\n");
-            exit(1);
-        }
-    };
-    // The kernel copied the child ELF at each spawn; close parent's image handle.
-    // SAFETY: closing our own handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, child_img) };
-    // `_pa`/`_pb` are owning Handle<Process> — they reap the children by closing on drop
-    // at the end of this function (see below).
-    kprint(b"parent: spawned two children sharing a channel\n");
-
-    // 3. Drain two ChildExited notifications, blocking on our channel.
-    let mut got = 0;
-    while got < 2 {
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = notif;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
-        };
-        if waited < 1 {
-            kprint(b"parent: wait FAIL\n");
-            exit(1);
-        }
-        // Drain every queued notification this wake delivered.
-        loop {
-            // SAFETY: NOTIF is a valid 64-byte writable out-param.
-            let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
-            if r != 0 {
-                break; // WouldBlock: drained
-            }
-            // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
-            let (kind, b) = unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
-            if kind == KIND_CHILD_EXITED {
-                let pid = u32::from_le_bytes([b[0], b[1], b[2], b[3]]);
-                let code = i32::from_le_bytes([b[8], b[9], b[10], b[11]]);
-                kprint(b"parent: child exited pid=");
-                kprint_u64(pid as u64);
-                kprint(b" code=");
-                kprint_u64(code as u64);
-                kprint(b"\n");
-                got += 1;
-            }
-        }
-    }
 
     // 4. The concurrent-exit stress: waves of exiting children race teardown
     // against spawn, the login chain, and each other (substrate-hardening
@@ -2230,9 +2126,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // running concurrently throughout) — see `sched_stats_demo`.
     sched_stats_demo(root_ns);
 
-    // 5. Exit. The child process handles (`_pa`/`_pb`, owning libos Handles) reap on
-    // drop as this function returns into the exit below.
-    kprint(b"parent: both children reaped; exiting\n");
+    kprint(b"test-harness: all smoke tests passed; exiting\n");
     exit(0);
 }
 

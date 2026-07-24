@@ -184,8 +184,11 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
     // time. Only `init` (and the kernel) carry the selftest / test-harness feature.
     cmd_build_hello()?;
-    build_userspace_bin("parent", None)?;
-    build_userspace_bin("child", None)?;
+    // The integration smoke-test harness (bins `test-harness` + `test-stage`) is built
+    // + embedded ONLY in selftest/test-harness builds — absent from release images.
+    if mode.features().is_some() {
+        build_userspace_bin("test-harness", None)?;
+    }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
     build_userspace_bin("eshell", None)?;
@@ -316,7 +319,7 @@ fn cmd_image(mode: BuildMode) -> R<()> {
     let limine_root = cmd_fetch_limine()?;
     let bootx64 = find_bootx64(&limine_root)?;
     let initramfs = initramfs_path();
-    build_initramfs(&initramfs)?;
+    build_initramfs(&initramfs, mode)?;
     assemble_image(
         &bootx64,
         &kernel_elf(),
@@ -918,27 +921,31 @@ fn store_path_for(bin: &str, name: &str, version: &str) -> R<String> {
 /// Pack the initramfs CPIO `newc` archive at `out`: the config manifests, the `init`
 /// ELF (the kernel boot-loads `/sbin/init` from here — retiring the embedded copy),
 /// and the mandatory `TRAILER!!!`. Built by `cmd_build` before this runs.
-fn build_initramfs(out: &Path) -> R<()> {
+fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     let mut buf = Vec::new();
     cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
     cpio_entry(&mut buf, 2, "etc/services/heartbeat.toml", HEARTBEAT_TOML.as_bytes());
     // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and
     // the spawners resolve their children by path (`/initramfs/sbin/<name>`), retiring
     // the kernel-embedded `ImageId` images. Built by `cmd_build` before this runs.
-    let programs = [
+    let mut programs = vec![
         "init",
         "service-mgr",
         "heartbeat",
         "fs-server-ext4",
         "eshell",
-        "parent",
-        "child",
         "profile-server",
         "logging-service",
         "auth-service",
         "session-mgr",
         "usersh",
     ];
+    // The integration smoke-test harness is embedded only in selftest/test-harness
+    // builds (it is also only built then) — never in a release image.
+    if mode.features().is_some() {
+        programs.push("test-harness");
+        programs.push("test-stage");
+    }
     let mut ino = 3u32;
     for name in programs {
         let elf = userspace_bin_path(name);
