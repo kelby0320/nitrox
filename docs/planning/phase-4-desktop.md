@@ -257,9 +257,10 @@ pipe — is the subproject's Milestone 1, once these three are in.
 ### Substrate gaps surfaced by the coreutils subproject
 
 Milestone 1 (`list` + `copy`) put real programs on both ends of a real pipe for the first
-time, which surfaced three substrate gaps the demos could not paper over. Each is its own
-branch off `main` — they are kernel/filesystem work with different risk profiles, not shell
-work (decision log, 2026-07-24):
+time, which surfaced three substrate gaps the demos could not paper over. Each got its own
+branch off `main` — kernel/filesystem work with different risk profiles, not shell work
+(decision log, 2026-07-24). **All three are now closed**, and both assertions Milestone 1
+had to weaken are restored and serving as their regression tests:
 
 - [x] **Exit-time handle reclamation** (branch `phase-4/handle-reclaim`). Nothing swept the
   global handle table at process exit, so a dead process's entries pinned their objects —
@@ -277,10 +278,13 @@ work (decision log, 2026-07-24):
   Found and fixed a bug in merged M1 code: the mtime epoch-extension bits were read from
   `i_ctime_extra`. **Still open:** `mtime` on an in-place overwrite, which Model A hides
   from the server. See the decision log (2026-07-24).
-- [ ] **File truncate.** Create is idempotent and grow-smaller is a no-op, so `copy --force`
-  onto a *longer* destination is refused rather than leaving the old tail behind. Needs an
-  ext4 truncate, a syscall/`File`-op surface, and page-cache invalidation of the dropped
-  range. Blocks in-place rewrites (`save`, editors).
+- [x] **File truncate** (branch `phase-4/fs-truncate`, 2026-07-24). `sys_file_truncate` →
+  `RESOLVE_TRUNCATE` → `ext4::truncate_file` (extent walk: free whole extents past the new
+  end, shorten a straddling one, compact the tree, return blocks to the allocator).
+  **Kernel-forwarded, not a directory-session op** — the kernel owns the page cache and
+  mints the `FileObject` from the reply's size, so a shrink it never saw would leave a stale
+  size and stale pages. `copy --force` now overwrites a longer destination, shrinking first
+  and verifying the shrink took. e2fsck-clean; negative-controlled.
 
 ### Typed shell + coreutils (subproject)
 

@@ -1811,8 +1811,8 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
 ///    destination is left **unchanged**, which is the part that matters: a refusal that
 ///    had already clobbered the file would be worse than no refusal at all.
 /// 3. **`--force` overwrites** a same-size destination.
-/// 4. **Overwriting a longer file is refused even with `--force`** — the filesystem has no
-///    truncate, so the old tail would survive. The destination must again be untouched.
+/// 4. **Overwriting a longer file shrinks it first** — the destination ends up exactly the
+///    source, with no byte of the longer original surviving past the new end.
 /// 5. **Directory copy is recursive** — a nested tree arrives with its files' contents.
 fn copy_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: copy demo (the mutation side)\n");
@@ -1866,16 +1866,18 @@ fn copy_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: --force did not overwrite\n");
     }
 
-    // --- 4. --force onto a LONGER destination is refused ---------------------
-    // No truncate exists, so the old tail would survive the write. `copy` must refuse
-    // rather than leave a file that is neither the old one nor the new one.
+    // --- 4. --force onto a LONGER destination shrinks it first ---------------
+    // The case that was refused outright until the filesystem gained truncate. The
+    // check that matters is not merely that it succeeds: the destination must end up
+    // **exactly** the source, with no byte of the longer original surviving past the
+    // new end. `file_matches` compares the size first, so a stale tail fails here.
     write_file(root_ns, b"/system/nx-copy/long.txt", COPY_CONTENT_LONG);
     let code = run_copy(root_ns, notif, &["copy", "--force", "/system/nx-copy/a.txt", "/system/nx-copy/long.txt"]);
-    if code == 0 {
-        return_fail(b"test-harness: copy over a longer file wrongly succeeded\n");
+    if code != 0 {
+        return_fail(b"test-harness: copy over a longer file failed\n");
     }
-    if !file_matches(root_ns, b"/system/nx-copy/long.txt", COPY_CONTENT_LONG) {
-        return_fail(b"test-harness: refused truncating copy still modified the destination\n");
+    if !file_matches(root_ns, b"/system/nx-copy/long.txt", COPY_CONTENT_A) {
+        return_fail(b"test-harness: overwrite left a stale tail (truncate did not take)\n");
     }
 
     // --- 5. directory copy is recursive --------------------------------------
@@ -1914,7 +1916,7 @@ fn copy_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: copy teardown rmdir FAIL\n");
     }
     sys.close();
-    kprint(b"test-harness: copy ok (file, recursive dir, and both refusals)\n");
+    kprint(b"test-harness: copy ok (file, recursive dir, overwrite-with-shrink)\n");
 }
 
 /// Fixture contents. `A` and `B` are the same length so the `--force` overwrite in step 3

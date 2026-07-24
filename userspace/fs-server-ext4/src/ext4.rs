@@ -1349,6 +1349,117 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     Ok(())
 }
 
+/// Shrink the regular file at `path` to `new_size` bytes, freeing the blocks past the
+/// new end, and return the resulting size.
+///
+/// Shrink **only**: growing a file allocates, which is [`grow_file`]'s job, so a
+/// `new_size` at or above the current size is a no-op that reports the current size
+/// rather than an error. That keeps a caller which just wants "make this file exactly
+/// N bytes" from having to know which direction it is going.
+///
+/// Why this exists: without it, creating a file is idempotent and growing it to a
+/// smaller size does nothing, so writing short content over a long file would leave the
+/// old tail in place — a file that is neither the old one nor the new one. `copy --force`
+/// refused that case outright until this landed (decision log, 2026-07-24).
+///
+/// The extent walk handles the three cases an extent can be in relative to the new end:
+/// entirely past it (freed and dropped), straddling it (shortened, its tail freed), or
+/// entirely within it (untouched). Depth-0 extent trees only, as elsewhere in this
+/// server; an index node returns `Unsupported` rather than silently corrupting the tree.
+pub fn truncate_file<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    path: &[u8],
+    new_size: usize,
+    now: i64,
+) -> Result<usize, FsError> {
+    let sb = read_superblock(rw)?;
+    let (ino, mut inode) = resolve_path_ino(rw, &sb, path)?;
+    if rd_u16(&inode, 0) & S_IFMT != S_IFREG {
+        return Err(FsError::NotFound);
+    }
+    let flags = rd_u32(&inode, 32);
+    if flags & EXTENTS_FL == 0 || flags & INLINE_DATA_FL != 0 {
+        return Err(FsError::Unsupported);
+    }
+
+    let size_hi = if sb.inode_size > 128 { rd_u32(&inode, 108) as u64 } else { 0 };
+    let cur_size = ((rd_u32(&inode, 4) as u64) | (size_hi << 32)) as usize;
+    if new_size >= cur_size {
+        return Ok(cur_size); // nothing to shrink; growing is `grow_file`'s job
+    }
+
+    let bs = sb.block_size as usize;
+    // Blocks the file keeps: everything holding a byte below `new_size`. A partial
+    // final block stays — the bytes past `new_size` inside it are simply no longer
+    // part of the file, exactly as a regular write leaves slack in the last block.
+    let keep_blocks = new_size.div_ceil(bs) as u64;
+
+    let eh = 40;
+    if rd_u16(&inode, eh) != EXTENT_MAGIC {
+        return Err(FsError::Corrupt);
+    }
+    if rd_u16(&inode, eh + 6) != 0 {
+        return Err(FsError::Unsupported); // index nodes (depth > 0) deferred
+    }
+    let entries = rd_u16(&inode, eh + 2) as usize;
+    let mut kept = 0usize;
+    let mut freed_blocks = 0u64;
+
+    for i in 0..entries {
+        let e = eh + 12 + i * 12;
+        let ee_block = rd_u32(&inode, e) as u64; // first logical block of the extent
+        let ee_len = (rd_u16(&inode, e + 4) & 0x7FFF) as u64;
+        let phys = rd_u32(&inode, e + 8) as u64 | ((rd_u16(&inode, e + 6) as u64) << 32);
+
+        if ee_block >= keep_blocks {
+            // Entirely past the new end — free every block and drop the entry.
+            for b in 0..ee_len {
+                free_block(rw, &sb, phys + b)?;
+            }
+            freed_blocks += ee_len;
+            continue;
+        }
+        let keep_len = (keep_blocks - ee_block).min(ee_len);
+        if keep_len < ee_len {
+            // Straddles the new end — free the tail and shorten it.
+            for b in keep_len..ee_len {
+                free_block(rw, &sb, phys + b)?;
+            }
+            freed_blocks += ee_len - keep_len;
+        }
+        // Compact surviving entries toward the front of the tree so the kept ones stay
+        // contiguous; `kept` is where this one lands.
+        let dst = eh + 12 + kept * 12;
+        let mut entry = [0u8; 12];
+        entry.copy_from_slice(&inode[e..e + 12]);
+        entry[4..6].copy_from_slice(&(keep_len as u16).to_le_bytes()); // ee_len
+        inode[dst..dst + 12].copy_from_slice(&entry);
+        kept += 1;
+    }
+
+    // Zero the entries the walk dropped, so a stale copy of a freed extent cannot be
+    // read back as live if `eh_entries` were ever mis-set.
+    for i in kept..entries {
+        let e = eh + 12 + i * 12;
+        inode[e..e + 12].fill(0);
+    }
+    inode[eh + 2..eh + 4].copy_from_slice(&(kept as u16).to_le_bytes()); // eh_entries
+
+    // i_size (lo @4, hi @108) + i_blocks (@28, in 512-byte units).
+    inode[4..8].copy_from_slice(&(new_size as u32).to_le_bytes());
+    if sb.inode_size > 128 {
+        inode[108..112].copy_from_slice(&((new_size as u64 >> 32) as u32).to_le_bytes());
+    }
+    let freed_sectors = (freed_blocks * bs as u64 / 512) as u32;
+    let i_blocks = rd_u32(&inode, 28).saturating_sub(freed_sectors);
+    inode[28..32].copy_from_slice(&i_blocks.to_le_bytes());
+    stamp(&mut inode, now, sb.inode_size, Stamp::Modified);
+
+    let off = inode_offset(rw, &sb, ino)?;
+    rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
+    Ok(new_size)
+}
+
 /// Resolve `path` (absolute) to a **regular file** and read its content into
 /// `out`, returning the file size. The file's content occupies `out[..size]`;
 /// the caller (the fs-server) sizes its `MemoryObject` to `size`. The eager

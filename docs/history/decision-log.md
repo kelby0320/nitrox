@@ -8291,3 +8291,66 @@ a new ring-3 demo requires the clock to be readable, plausible (2024–2100) and
 wall-clock rate; and `list_pipeline_demo`'s `modified` assertion — weakened to shape-only
 while the gap existed — is **restored** to requiring a plausible date, which fails the run
 if the server reports no clock.
+
+## 2026-07-24 — File truncate: `sys_file_truncate`, and `copy --force` stops refusing
+
+**The gap.** The filesystem could create a file and grow it but never shrink one: creating
+an existing file is idempotent and growing it to a smaller size is a no-op. Writing short
+content over a long file therefore left the old tail in place — a file that is neither the
+old one nor the new one — so `copy --force` **refused** that case outright (Milestone 1
+Part D). Also blocks `save` (design §4) and any editor that shortens a file.
+
+**Where the operation lives: a kernel-forwarded resolve, not a directory-session op.** The
+directory session (`librsproto::session::Dir`) would have been the natural home — it is
+name-addressed and structurally confined — but it is a *direct client↔server* channel the
+kernel never sees, and **the kernel owns the page cache**. Every resolve mints a
+`FileObject` whose size and cached pages come from the reply; a shrink the kernel did not
+observe would leave a stale size and stale pages behind it. So truncate follows
+`sys_file_grow`'s existing shape: `sys_file_truncate(ns, path, rights, new_size)` →
+`Namespace::Resolve` carrying **`RESOLVE_TRUNCATE`** → the server shrinks → the reply's
+`content_len` is the new size → the kernel builds a `FileObject` of exactly that size. The
+new handle is therefore correct by construction, with no cache-invalidation path to get
+wrong.
+
+**A separate flag, not "grow to a smaller size".** `RESOLVE_GROW` and `RESOLVE_TRUNCATE`
+move the block allocator in opposite directions, and a caller that asked for one must never
+silently get the other. The three size-changing resolves are now one `SizeChange` enum
+(`Grow` / `Create` / `Truncate`) rather than a `(size, create: bool)` pair, which is what
+made adding the third case a one-line change at each call site instead of another boolean.
+
+**The ext4 side.** `truncate_file` walks the depth-0 extent tree and handles the three
+positions an extent can be in relative to the new end: entirely past it (freed, entry
+dropped), straddling it (tail freed, `ee_len` shortened), or entirely within it (untouched).
+Surviving entries are compacted toward the front and the dropped ones zeroed, `eh_entries`
+is rewritten, freed blocks go back through `free_block` (bitmap + group + superblock
+counts), `i_size`/`i_blocks` are updated and mtime/ctime stamped. **Shrink only**: a
+`new_size` at or above the current size is a no-op reporting the current size, because
+growing allocates and that is `grow_file`'s job — silently extending here would hand back a
+file whose tail was never written. A partial final block is kept: the bytes past the new
+end are slack, exactly as after any short write. Index nodes (depth > 0) return
+`Unsupported` as everywhere else in this server.
+
+**`copy --force` now overwrites a longer destination** by shrinking first, and
+**verifies** the shrink took (`file_size` again) before writing — a silently-failed
+truncate would produce exactly the corruption the check exists to prevent. `FileError`'s
+`WouldTruncate` becomes `TruncateFailed`: the refusal is gone, the safety net is not.
+
+*Verified:* host suite **782** green — four new ext4 tests, all **e2fsck-clean**: a shrink
+that both drops whole extents and shortens a straddling one, with the superblock's
+free-block count proving the blocks reached the allocator rather than merely leaving the
+extent tree; truncate-to-zero and truncate-inside-the-first-block; the no-grow rule; and
+mtime moving plus a directory being rejected. `test-qemu` PASS with the harness's
+Milestone 1 `copy` case rewritten from "refuses" to "overwrites, with no stale tail" —
+`file_matches` compares length first, so a surviving tail fails it. `check-arch` /
+`check-nightly` green.
+
+**Negative-controlled:** skipping the shrink in `copy_file` fails the run with
+"overwrite left a stale tail (truncate did not take)".
+
+**One unexplained anomaly, recorded rather than dismissed.** A single `test-qemu` run
+during this slice timed out with no verdict. It did **not** reproduce in **107** subsequent
+boots on the same image (40 KVM `-cpu host`, 67 TCG `-cpu max`, all `-smp 4`), and no log
+was captured from it. Host load is an unconvincing explanation — a healthy boot finishes in
+about 5 s against a 90 s ceiling, a 20× margin. So it is unattributed, not benign: if a
+hang recurs around the write path, this is the first datapoint, and the boot-loop scripts
+keep the serial log on any non-pass exit.

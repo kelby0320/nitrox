@@ -13,7 +13,7 @@ use alloc::string::String;
 use libkern::abi::HandleInfo;
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
+    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
     SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4, syscall5,
 };
 
@@ -24,10 +24,9 @@ pub enum FileError {
     NotFound,
     /// The destination already exists and no overwrite was requested.
     Exists,
-    /// The destination exists and is **longer** than the source, and the filesystem has no
-    /// truncate operation — overwriting would leave the old tail behind, silently
-    /// corrupting the result. See [`copy_file`].
-    WouldTruncate,
+    /// The destination could not be shrunk to the source's length, so overwriting it
+    /// would have left the old tail behind. See [`copy_file`].
+    TruncateFailed,
     /// The file exceeds [`MAX_COPY`].
     TooLarge,
     /// A syscall failed; the payload is its negative return.
@@ -69,12 +68,11 @@ pub fn file_size(ns: u64, path: &[u8]) -> Option<u64> {
 /// the fail-loud default (design §10d: "fail loud if destination exists, unless
 /// `--force`").
 ///
-/// **Overwriting a longer file fails** with [`FileError::WouldTruncate`] rather than
-/// producing a wrong answer. The filesystem has no truncate operation yet: creating an
-/// existing file is idempotent and growing it to a smaller size is a no-op, so writing a
-/// short source over a long destination would leave the destination's old tail in place —
-/// a file that is neither the old one nor the new one. Refusing is the only honest
-/// behaviour until truncate lands (`deferred-decisions.md`).
+/// **Overwriting a longer file shrinks it first.** Creating an existing file is
+/// idempotent and growing it to a smaller size is a no-op, so without an explicit
+/// truncate the destination's old tail would survive past the new content — a file that
+/// is neither the old one nor the new one. `copy` refused that case outright until the
+/// filesystem gained a truncate (decision log, 2026-07-24).
 pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64, FileError> {
     let size = file_size(ns, src).ok_or(FileError::NotFound)?;
     if size > MAX_COPY {
@@ -85,7 +83,14 @@ pub fn copy_file(ns: u64, src: &[u8], dst: &[u8], overwrite: bool) -> Result<u64
             return Err(FileError::Exists);
         }
         if existing > size {
-            return Err(FileError::WouldTruncate);
+            // Shrink to the source's length *before* writing, so no byte of the old
+            // tail can survive — and verify it, since a silently-failed truncate would
+            // leave exactly the corruption this is here to prevent.
+            truncate(ns, dst, size)?;
+            if file_size(ns, dst) != Some(size) {
+                return Err(FileError::TruncateFailed);
+            }
+
         }
     }
 
@@ -157,6 +162,36 @@ fn map_copy(src_handle: u64, dst_handle: u64, size: u64) -> Result<(), FileError
     }
     if synced != 0 {
         return Err(FileError::Io(synced as i32));
+    }
+    Ok(())
+}
+
+/// Shrink `path` to `size` bytes, freeing the blocks past the new end. A no-op if the
+/// file is already that size or shorter — growing is [`create`]'s job.
+fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
+    // SAFETY: valid path slice + namespace handle.
+    let po = unsafe {
+        syscall5(
+            SYS_FILE_TRUNCATE,
+            ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+            size,
+        )
+    };
+    if po < 0 {
+        return Err(FileError::Io(po as i32));
+    }
+    let (status, handle) = po_wait(po as u64);
+    if handle != 0 {
+        // The resolve hands back a file handle as a side effect; the caller only wanted
+        // the size change, so close it rather than leak one per overwrite.
+        // SAFETY: closing a handle just installed into our table.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+    }
+    if status != 0 {
+        return Err(FileError::Io(status));
     }
     Ok(())
 }

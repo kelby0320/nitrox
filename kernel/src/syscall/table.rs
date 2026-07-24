@@ -17,6 +17,7 @@ use crate::arch::timer::ArchTimer;
 use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
+use crate::rsproto::SizeChange;
 use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
@@ -120,6 +121,8 @@ pub const SYS_FILE_SYNC: u64 = 31;
 pub const SYS_FILE_GROW: u64 = 32;
 /// `sys_file_create` — create a file, then grow it to a target size (a5 = new size), then resolve.
 pub const SYS_FILE_CREATE: u64 = 33;
+/// `sys_file_truncate` — resolve a file, shrinking it to a target size first (a5 = new size).
+pub const SYS_FILE_TRUNCATE: u64 = 34;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -168,9 +171,16 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_NS_CREATE => encode(sys_ns_create()),
-        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None, false)),
-        SYS_FILE_GROW => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some(a4 as u32), false)),
-        SYS_FILE_CREATE => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some(a4 as u32), true)),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None)),
+        SYS_FILE_GROW => {
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Grow))))
+        }
+        SYS_FILE_CREATE => {
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Create))))
+        }
+        SYS_FILE_TRUNCATE => {
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Truncate))))
+        }
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
         SYS_NS_ENUMERATE => encode(sys_ns_enumerate(a0, a1, a2)),
@@ -1431,8 +1441,7 @@ pub fn sys_ns_lookup(
     path_ptr: u64,
     path_len: usize,
     rights_bits: u64,
-    grow_size: Option<u32>,
-    create: bool,
+    size_change: Option<(u32, SizeChange)>,
 ) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     // --- synchronous validation (no PO created on these) ---
@@ -1528,12 +1537,12 @@ pub fn sys_ns_lookup(
             // `validate_path`d above) are free of `.`/`..`, so the join cannot escape
             // the subtree.
             if base.is_empty() {
-                forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, grow_size, create)
+                forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, size_change)
             } else {
                 let mut jbuf = [0u8; NS_PATH_MAX];
                 match join_subtree(base.as_path(), suffix, &mut jbuf) {
                     Some(joined) => forward_userspace_lookup(
-                        reg, &po_ref, pid, requested, joined, grow_size, create,
+                        reg, &po_ref, pid, requested, joined, size_change,
                     ),
                     None => {
                         // The joined path overflows the buffer — drop the forwarding
@@ -1600,8 +1609,7 @@ fn forward_userspace_lookup(
     pid: u32,
     requested: Rights,
     suffix: &[u8],
-    grow_size: Option<u32>,
-    create: bool,
+    size_change: Option<(u32, SizeChange)>,
 ) -> Option<(i32, u64)> {
     // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
     // request (`sys_file_grow`/`sys_file_create`) additionally carries the target size +
@@ -1610,13 +1618,13 @@ fn forward_userspace_lookup(
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
-    let built = match grow_size {
-        Some(new_size) => crate::rsproto::build_resolve_request_grow(
+    let built = match size_change {
+        Some((new_size, change)) => crate::rsproto::build_resolve_request_sized(
             &mut msg.payload,
             requested.bits(),
             suffix,
             new_size,
-            create,
+            change,
         ),
         None => crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix),
     };
