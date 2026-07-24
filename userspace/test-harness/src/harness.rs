@@ -1501,14 +1501,12 @@ fn list_pipeline_demo(root_ns: u64, notif: u64) {
                 let kind_ok = matches!(&vals[2], Value::Str(s) if s == "dir");
                 // `size` is a directory's own data size — one block on this filesystem.
                 let size_ok = matches!(vals[1], Value::Int(n) if n > 0);
-                // `modified` is checked for *shape* only, not for a plausible date: these
-                // entries were created by `mkdir` at run time, and the fs-server stamps a
-                // new inode with **0** because the system has no wall clock
-                // (`CLOCK_REALTIME` is `Unsupported` — see the decision log, 2026-07-24).
-                // The fidelity check that does require a real timestamp lives in
-                // `dir_list_demo`, against an image-built file; repeating it here would
-                // only assert the gap.
-                let mtime_ok = matches!(vals[3], Value::Int(_));
+                // `modified` must be a plausible date. These entries were created by
+                // `mkdir` moments ago, so this asserts the whole chain end to end: the
+                // kernel anchored a wall clock from the RTC, the fs-server read it, and
+                // it reached the inode. (This check was shape-only while the system had
+                // no wall clock; restoring it is what the clock slice is *for*.)
+                let mtime_ok = matches!(vals[3], Value::Int(t) if t >= 1_600_000_000);
                 if !name_ok || !kind_ok || !size_ok || !mtime_ok {
                     return_fail(b"test-harness: list row wrong (name/size/kind/modified)\n");
                 }

@@ -444,11 +444,11 @@ fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
         if let Some(slash) = path.iter().rposition(|&b| b == b'/') {
             let parent = if slash == 0 { &b"/"[..] } else { &path[..slash] };
             let name = &path[slash + 1..];
-            let _ = ext4::create_file(reader, parent, name);
+            let _ = ext4::create_file(reader, parent, name, now_secs());
         }
     }
 
-    let _ = ext4::grow_file(reader, path, new_size as usize);
+    let _ = ext4::grow_file(reader, path, new_size as usize, now_secs());
 }
 
 /// Receive one message on `h` into the `RECV_*` statics. Returns the syscall result:
@@ -666,9 +666,9 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
             OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR => {
                 let r = match parse_name_request(body) {
                     Some(name) => match op {
-                        OP_FILE_MKDIR => ext4::mkdir_at(reader, dir_ino, name),
-                        OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name),
-                        _ => ext4::rmdir_at(reader, dir_ino, name),
+                        OP_FILE_MKDIR => ext4::mkdir_at(reader, dir_ino, name, now_secs()),
+                        OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name, now_secs()),
+                        _ => ext4::rmdir_at(reader, dir_ino, name, now_secs()),
                     },
                     None => Err(FsError::Unsupported),
                 };
@@ -676,7 +676,7 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
             }
             OP_FILE_RENAME => {
                 let r = match parse_rename_request(body) {
-                    Some((old, new)) => ext4::rename_at(reader, dir_ino, old, new),
+                    Some((old, new)) => ext4::rename_at(reader, dir_ino, old, new, now_secs()),
                     None => Err(FsError::Unsupported),
                 };
                 reply_session_status(session_ch, request_id, op, r);
@@ -684,6 +684,27 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
             _ => reply_session_error(session_ch, request_id, op, KError::Unsupported.as_i32()),
         }
     }
+}
+
+/// Wall-clock time in seconds since the Unix epoch, for stamping inode timestamps —
+/// or `0` if this machine has no anchored clock.
+///
+/// **The server reads this itself; a client never supplies it.** A timestamp a caller
+/// could choose would be forgeable metadata, so the filesystem's own authority for its
+/// metadata is the only thing that may set it. (Inside the server, the value is passed
+/// down into `ext4.rs` as a parameter — that boundary exists only because the parser is
+/// deliberately syscall-free so it can be host-tested, and it is not a trust boundary.)
+///
+/// `0` propagates as "unknown" rather than as 1970-with-confidence: the ext4 layer falls
+/// back to its fixed sentinel where a nonzero value is structurally required.
+fn now_secs() -> i64 {
+    let mut ns: u64 = 0;
+    // SAFETY: `ns` is a valid writable out-param; the syscall writes 8 bytes.
+    let r = unsafe { syscall4(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut ns) as u64, 0, 0) };
+    if r != 0 {
+        return 0; // no anchored wall clock on this machine
+    }
+    (ns / 1_000_000_000) as i64
 }
 
 /// Map an `FsError` to the `KError` discriminant carried in a reply.

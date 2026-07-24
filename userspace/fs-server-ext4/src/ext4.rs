@@ -27,6 +27,89 @@ const EXT4_FT_REG_FILE: u8 = 1;
 const REG_FILE_MODE: u16 = S_IFREG | 0o644;
 const S_IFDIR: u16 = 0x4000;
 
+// --- inode timestamp fields -------------------------------------------------
+//
+// `ext4_inode` byte offsets. The four 32-bit second counts sit in the base
+// (128-byte) inode; the matching `*_extra` words only exist when the filesystem's
+// inode is larger, and carry the post-2038 epoch extension in their low two bits
+// plus nanoseconds above that. Spelled out as constants because they are trivially
+// confusable — `i_ctime_extra` (132) and `i_mtime_extra` (136) are adjacent, and
+// reading one for the other is invisible for any date before 2038.
+
+/// `i_atime` — last access.
+const I_ATIME: usize = 8;
+/// `i_ctime` — last inode (metadata) change.
+const I_CTIME: usize = 12;
+/// `i_mtime` — last content modification.
+const I_MTIME: usize = 16;
+/// `i_ctime_extra`.
+const I_CTIME_EXTRA: usize = 132;
+/// `i_mtime_extra`.
+const I_MTIME_EXTRA: usize = 136;
+/// `i_atime_extra`.
+const I_ATIME_EXTRA: usize = 140;
+/// `i_crtime` — creation time (large inodes only).
+const I_CRTIME: usize = 144;
+/// `i_crtime_extra`.
+const I_CRTIME_EXTRA: usize = 148;
+/// An inode larger than this base size carries the `*_extra` words.
+const INODE_BASE_SIZE: u32 = 128;
+
+/// Decode an ext4 timestamp: `secs` plus the two epoch-extension bits in the low
+/// bits of its `extra` word (`0` when the inode has no extra fields).
+///
+/// The extension is what keeps timestamps correct past 2038: ext4 widens the
+/// 32-bit second count by two high bits rather than moving to 64-bit fields.
+fn decode_time(secs: u32, extra: u32) -> i64 {
+    secs as i64 | ((extra & 0x3) as i64) << 32
+}
+
+/// Write `now` (Unix epoch seconds) into an inode's timestamp fields.
+///
+/// `which` selects which of the three are stamped — a content change touches
+/// mtime and ctime, a pure metadata change only ctime — and `crtime` is set on
+/// creation. `atime` is stamped at creation and never updated afterwards:
+/// updating it on every read is the `noatime`-by-default choice every modern
+/// filesystem has converged on, and this one has no read path through the server
+/// to hook anyway (the kernel owns the data path).
+///
+/// The epoch-extension bits are written alongside, so a timestamp past 2038 is
+/// stored as ext4 defines rather than wrapping.
+fn stamp(inode: &mut [u8], now: i64, inode_size: u32, which: Stamp) {
+    let secs = now as u32;
+    let extra = ((now >> 32) & 0x3) as u32;
+    let large = inode_size > INODE_BASE_SIZE && inode.len() > I_CRTIME_EXTRA;
+    let mut put = |off: usize, off_extra: usize| {
+        inode[off..off + 4].copy_from_slice(&secs.to_le_bytes());
+        if large {
+            inode[off_extra..off_extra + 4].copy_from_slice(&extra.to_le_bytes());
+        }
+    };
+    // Every case touches ctime: it is "the inode changed", which is true whenever
+    // anything here is being written at all.
+    put(I_CTIME, I_CTIME_EXTRA);
+    if matches!(which, Stamp::Created | Stamp::Modified) {
+        put(I_MTIME, I_MTIME_EXTRA);
+    }
+    if matches!(which, Stamp::Created) {
+        put(I_ATIME, I_ATIME_EXTRA);
+        if large {
+            put(I_CRTIME, I_CRTIME_EXTRA);
+        }
+    }
+}
+
+/// Which timestamps [`stamp`] writes.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum Stamp {
+    /// A new inode: crtime + atime + mtime + ctime.
+    Created,
+    /// Contents changed: mtime + ctime.
+    Modified,
+    /// Only metadata changed (a link count, say): ctime.
+    MetadataOnly,
+}
+
 /// The parsed superblock facts the reader (and the write path) need.
 struct Superblock {
     block_size: u32,
@@ -105,8 +188,8 @@ fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<[u8; 2
 /// `i_size` is the 32-bit `i_size_lo` plus `i_size_hi` (offset 108) when the inode is
 /// larger than the 128-byte base — for a directory that high half is `i_dir_acl`, so it
 /// is taken only for non-directories. `i_mtime` (offset 16) is a 32-bit epoch second
-/// count; `i_mtime_extra` (offset 132) carries two epoch-extension bits above it, which
-/// is what keeps timestamps correct past 2038.
+/// count; `i_mtime_extra` carries two epoch-extension bits above it, which is what keeps
+/// timestamps correct past 2038.
 fn stat_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<InodeStat, FsError> {
     let inode = read_inode(r, sb, ino)?;
     let mode = rd_u16(&inode, 0);
@@ -117,8 +200,8 @@ fn stat_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<InodeS
         0
     };
     let size = (rd_u32(&inode, 4) as u64) | (size_hi << 32);
-    let epoch_bits = if large { (rd_u32(&inode, 132) & 0x3) as i64 } else { 0 };
-    let mtime = rd_u32(&inode, 16) as i64 | (epoch_bits << 32);
+    let extra = if large { rd_u32(&inode, I_MTIME_EXTRA) } else { 0 };
+    let mtime = decode_time(rd_u32(&inode, I_MTIME), extra);
     Ok(InodeStat { ino, mode, size, mtime })
 }
 
@@ -550,6 +633,26 @@ fn resolve_path_ino<R: BlockReader>(
 }
 
 /// The absolute device byte offset of inode `ino` (for writing it back).
+/// Re-stamp an existing inode in place — read it, write its timestamps, write it
+/// back.
+///
+/// Used for the *containing directory* after a link, unlink, or rename: a
+/// directory's contents changed, so its mtime and ctime move even though nothing
+/// about the entries' own inodes did. Callers that are already holding a modified
+/// inode buffer stamp it directly instead.
+fn touch_inode<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    ino: u32,
+    now: i64,
+    which: Stamp,
+) -> Result<(), FsError> {
+    let mut inode = read_inode(rw, sb, ino)?;
+    stamp(&mut inode, now, sb.inode_size, which);
+    let off = inode_offset(rw, sb, ino)?;
+    rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])
+}
+
 fn inode_offset<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<u64, FsError> {
     let group = (ino - 1) / sb.inodes_per_group;
     let index = (ino - 1) % sb.inodes_per_group;
@@ -617,6 +720,7 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     rw: &RW,
     path: &[u8],
     new_size: usize,
+    now: i64,
 ) -> Result<usize, FsError> {
     let sb = read_superblock(rw)?;
     let bs = sb.block_size as usize;
@@ -692,6 +796,8 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     let added_sectors = ((new_blocks - cur_blocks) * bs / 512) as u32;
     let i_blocks = rd_u32(&inode, 28).wrapping_add(added_sectors);
     inode[28..32].copy_from_slice(&i_blocks.to_le_bytes());
+    // A size change is a content change.
+    stamp(&mut inode, now, sb.inode_size, Stamp::Modified);
 
     let off = inode_offset(rw, &sb, ino)?;
     rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
@@ -800,6 +906,7 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     rw: &RW,
     parent_path: &[u8],
     name: &[u8],
+    now: i64,
 ) -> Result<u32, FsError> {
     if name.is_empty() || name.len() > 255 || name.contains(&b'/') {
         return Err(FsError::Unsupported);
@@ -817,6 +924,7 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     // Initialise the new inode: regular file, one link, empty depth-0 extent tree, size 0.
     let mut inode = [0u8; 256];
     inode[0..2].copy_from_slice(&REG_FILE_MODE.to_le_bytes()); // i_mode
+    stamp(&mut inode, now, sb.inode_size, Stamp::Created);
     inode[26..28].copy_from_slice(&1u16.to_le_bytes()); // i_links_count
     inode[32..36].copy_from_slice(&EXTENTS_FL.to_le_bytes()); // i_flags
     // Extent header at i_block (offset 40): magic, 0 entries, max 4, depth 0.
@@ -828,6 +936,10 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     // Link it into the parent directory. (On failure the inode is allocated-but-unlinked;
     // acceptable for slice-1 fixtures, which always have directory slack.)
     dir_insert(rw, &sb, &parent_inode, name, ino, EXT4_FT_REG_FILE)?;
+    // The parent's contents changed, so its own mtime/ctime move even though nothing
+    // about its inode's other fields did.
+    let (parent_ino, _) = resolve_path_ino(rw, &sb, parent_path)?;
+    touch_inode(rw, &sb, parent_ino, now, Stamp::Modified)?;
     Ok(ino)
 }
 
@@ -837,6 +949,9 @@ const DIR_MODE: u16 = S_IFDIR | 0o755;
 /// Fixed `i_dtime` stamp for a freed inode (2023-11-14T22:13:20Z). The server has no wall
 /// clock; the value only needs to be a plausible timestamp (not a small inode-number-like
 /// value that `e2fsck` would read as an orphan-list link).
+///
+/// Retained as the **fallback** for a machine whose wall clock could not be anchored: the
+/// server now stamps `i_dtime` with the real deletion time when it has one.
 const DELETION_TIME: u32 = 1_700_000_000;
 
 /// Clear a bitmap bit (mark a block/inode free).
@@ -852,6 +967,7 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     sb: &Superblock,
     ino: u32,
     is_dir: bool,
+    now: i64,
 ) -> Result<(), FsError> {
     let bs = sb.block_size as usize;
     let group = (ino - 1) / sb.inodes_per_group;
@@ -873,8 +989,10 @@ fn free_inode<RW: BlockReader + BlockWriter>(
     rw.read_at(ioff, &mut inode[..n])?;
     // `i_dtime` doubles as the orphan-list "next" pointer while `i_links_count == 0`; a
     // small value looks like an inode number and `e2fsck` reads it as a corrupted orphan
-    // chain. Use a plausible fixed timestamp (2023-11-14), unambiguously not an inode ref.
-    inode[20..24].copy_from_slice(&DELETION_TIME.to_le_bytes()); // i_dtime
+    // chain. The real deletion time is both correct and unambiguously not an inode ref;
+    // `DELETION_TIME` stands in when the machine has no anchored wall clock (`now == 0`).
+    let dtime = if now > 0 { now as u32 } else { DELETION_TIME };
+    inode[20..24].copy_from_slice(&dtime.to_le_bytes()); // i_dtime
     inode[26..28].copy_from_slice(&0u16.to_le_bytes()); // i_links_count = 0
     rw.write_at(ioff, &inode[..n])?;
 
@@ -1044,6 +1162,7 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
     rw: &RW,
     dir_ino: u32,
     name: &[u8],
+    now: i64,
 ) -> Result<(), FsError> {
     if name.is_empty() || name.len() > 255 || name.contains(&b'/') || name == b"." || name == b".."
     {
@@ -1082,6 +1201,7 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
     // Initialise the new inode: directory, 2 links (`.` + the parent's entry), one extent.
     let mut inode = [0u8; 256];
     inode[0..2].copy_from_slice(&DIR_MODE.to_le_bytes());
+    stamp(&mut inode, now, sb.inode_size, Stamp::Created);
     inode[4..8].copy_from_slice(&(bs as u32).to_le_bytes()); // i_size = one block
     inode[26..28].copy_from_slice(&2u16.to_le_bytes()); // i_links_count
     inode[28..32].copy_from_slice(&((bs / 512) as u32).to_le_bytes()); // i_blocks (512-B units)
@@ -1109,6 +1229,7 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
     // Link into the parent + bump the parent's link count (the new dir's `..`).
     dir_insert(rw, &sb, &parent, name, new_ino, EXT4_FT_DIR)?;
     adjust_links(rw, &sb, dir_ino, 1)?;
+    touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
     Ok(())
 }
 
@@ -1120,6 +1241,7 @@ pub fn unlink_at<RW: BlockReader + BlockWriter>(
     rw: &RW,
     dir_ino: u32,
     name: &[u8],
+    now: i64,
 ) -> Result<(), FsError> {
     let sb = read_superblock(rw)?;
     let parent = read_inode(rw, &sb, dir_ino)?;
@@ -1137,13 +1259,17 @@ pub fn unlink_at<RW: BlockReader + BlockWriter>(
     let links = rd_u16(&target, 26).wrapping_sub(1);
     if links == 0 {
         free_inode_blocks(rw, &sb, &target)?;
-        free_inode(rw, &sb, target_ino, false)?;
+        free_inode(rw, &sb, target_ino, false, now)?;
     } else {
         let off = inode_offset(rw, &sb, target_ino)?;
         let mut t = target;
         t[26..28].copy_from_slice(&links.to_le_bytes());
+        // A surviving hard link: the file's *contents* did not change, only its
+        // link count — so ctime moves and mtime does not.
+        stamp(&mut t, now, sb.inode_size, Stamp::MetadataOnly);
         rw.write_at(off, &t[..(sb.inode_size as usize).min(256)])?;
     }
+    touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
     Ok(())
 }
 
@@ -1155,6 +1281,7 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(
     rw: &RW,
     dir_ino: u32,
     name: &[u8],
+    now: i64,
 ) -> Result<(), FsError> {
     if name == b"." || name == b".." {
         return Err(FsError::Unsupported);
@@ -1183,8 +1310,9 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(
 
     dir_remove(rw, &sb, &parent, name)?;
     free_inode_blocks(rw, &sb, &sub)?;
-    free_inode(rw, &sb, sub_ino, true)?;
+    free_inode(rw, &sb, sub_ino, true, now)?;
     adjust_links(rw, &sb, dir_ino, -1)?; // the subdir's `..` no longer links the parent
+    touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
     Ok(())
 }
 
@@ -1197,6 +1325,7 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     dir_ino: u32,
     old: &[u8],
     new: &[u8],
+    now: i64,
 ) -> Result<(), FsError> {
     if new.is_empty() || new.len() > 255 || new.contains(&b'/') || new == b"." || new == b".." {
         return Err(FsError::Unsupported);
@@ -1214,6 +1343,9 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     // *inode* (extent map) is unchanged, so the cached bytes still locate the blocks.
     let (ino, ft) = dir_remove(rw, &sb, &parent, old)?;
     dir_insert(rw, &sb, &parent, new, ino, ft)?;
+    // The directory's contents changed. The renamed inode is untouched — its name
+    // is not part of it, it lives in the directory entry.
+    touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
     Ok(())
 }
 
@@ -1246,4 +1378,66 @@ pub fn read_file<R: BlockReader>(r: &R, path: &[u8], out: &mut [u8]) -> Result<u
         lb += 1;
     }
     Ok(size)
+}
+
+#[cfg(test)]
+mod tests {
+    /// `decode_time` must take the epoch-extension bits from the *matching* `extra`
+    /// word. The fields are adjacent (`i_ctime_extra` at 132, `i_mtime_extra` at 136)
+    /// and reading one for the other is invisible for any date before 2038 — which is
+    /// exactly how that bug survived until now.
+    #[test]
+    fn decode_time_applies_the_epoch_extension() {
+        // No extension: a plain 32-bit second count.
+        assert_eq!(super::decode_time(1_784_900_730, 0), 1_784_900_730);
+        // The low two bits of `extra` are the epoch, added above bit 31. Bit 0 set
+        // pushes the timestamp past 2038 instead of wrapping.
+        assert_eq!(super::decode_time(0, 1), 1i64 << 32);
+        assert_eq!(super::decode_time(7, 2), (2i64 << 32) | 7);
+        // The upper bits of `extra` are nanoseconds and must be ignored here.
+        assert_eq!(super::decode_time(5, 0xFFFF_FFFC), 5);
+    }
+
+    /// A stamped inode must place each timestamp at its own offset — the check that
+    /// would have caught reading `i_ctime_extra` as `i_mtime_extra`.
+    #[test]
+    fn stamp_writes_each_field_at_its_own_offset() {
+        use super::{I_ATIME, I_CRTIME, I_CTIME, I_MTIME, I_MTIME_EXTRA, Stamp, stamp};
+        let now: i64 = (1i64 << 32) | 1_784_900_730; // past 2038: epoch bit set
+        let mut inode = [0u8; 256];
+        stamp(&mut inode, now, 256, Stamp::Created);
+
+        let at = |off: usize| u32::from_le_bytes(inode[off..off + 4].try_into().unwrap());
+        assert_eq!(at(I_MTIME), 1_784_900_730);
+        assert_eq!(at(I_CTIME), 1_784_900_730);
+        assert_eq!(at(I_ATIME), 1_784_900_730);
+        assert_eq!(at(I_CRTIME), 1_784_900_730);
+        // The epoch bit lands in mtime's own extra word, and the round trip through
+        // `decode_time` recovers the full value.
+        assert_eq!(at(I_MTIME_EXTRA) & 0x3, 1);
+        assert_eq!(super::decode_time(at(I_MTIME), at(I_MTIME_EXTRA)), now);
+    }
+
+    /// A metadata-only change moves ctime and leaves mtime alone — the distinction
+    /// `unlink` relies on for a file that still has other links.
+    #[test]
+    fn metadata_only_stamp_leaves_mtime_untouched() {
+        use super::{I_CTIME, I_MTIME, Stamp, stamp};
+        let mut inode = [0u8; 256];
+        stamp(&mut inode, 1000, 256, Stamp::Created);
+        stamp(&mut inode, 2000, 256, Stamp::MetadataOnly);
+        let at = |off: usize| u32::from_le_bytes(inode[off..off + 4].try_into().unwrap());
+        assert_eq!(at(I_MTIME), 1000, "contents did not change");
+        assert_eq!(at(I_CTIME), 2000, "the inode did");
+    }
+
+    /// A base-size (128-byte) inode has no `*_extra` words; stamping must not write
+    /// past the fields that exist.
+    #[test]
+    fn a_small_inode_gets_no_extra_words() {
+        use super::{I_CTIME_EXTRA, Stamp, stamp};
+        let mut inode = [0u8; 256];
+        stamp(&mut inode, 1_784_900_730, 128, Stamp::Created);
+        assert_eq!(&inode[I_CTIME_EXTRA..I_CTIME_EXTRA + 4], &[0, 0, 0, 0]);
+    }
 }

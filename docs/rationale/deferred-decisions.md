@@ -320,20 +320,22 @@ thread + a batched sweep in `reap_pending`; see the decision log (2026-07-24) an
 `next_owned` intrusive list stays unbuilt — the sweep scans segments instead, and the list
 remains the optimization if that ever becomes measurable.
 
-**Wall-clock time, and filesystem timestamps on newly created inodes.** `sys_clock_read`
-services `Monotonic` only; `Realtime` returns `Unsupported` — there is no RTC read and no
-NTP, so **nothing in the system knows the date**. Consequently `fs-server-ext4`'s
-`create_file`/`mkdir_at` leave `i_atime`/`i_ctime`/`i_mtime` at **0**: a file or directory
-the OS creates reports `modified: 0` (1970), while entries baked into the image by
-`mke2fs` carry real timestamps. Surfaced by coreutils Milestone 1 (2026-07-24), whose
-`list` reports a `modified` column faithfully and therefore made the gap visible. Two
-pieces, in order: (1) a realtime clock — read the CMOS RTC at boot, keep a wall-clock
-offset against the monotonic counter, service `CLOCK_REALTIME`; (2) thread a timestamp
-parameter into the ext4 mutation ops (the parser stays syscall-free and host-tested, so
-the *caller* must supply the time) and stamp new inodes, plus update a parent directory's
-mtime on modification. Trigger: anything that needs to order events by date — a build
-system, a package manager, `list --sort modified`, or log timestamps that survive a
-reboot. Until then, treat `modified` on OS-created files as "unknown", not as 1970.
+**Wall-clock time — DONE (2026-07-24).** Was: `sys_clock_read` serviced `Monotonic` only
+and the fs-server wrote no inode timestamps, so anything the OS created reported
+`modified: 0`. Now: the kernel anchors `CLOCK_REALTIME` from the CMOS RTC at boot
+(`kernel/src/clock.rs`) and the fs-server reads it to stamp inodes. Reading is ambient;
+**setting** the clock is not built — it is real authority and belongs behind a syscap when
+NTP or `date --set` needs it. See the decision log (2026-07-24).
+
+**`mtime` on an in-place overwrite.** The fs-server stamps inodes on create, grow, mkdir,
+unlink, rmdir and rename — every operation that passes through it. It is **not** told about
+a plain overwrite: under Model A the kernel writes file data straight to the device, so
+editing a file's existing bytes leaves its `mtime` at the last size change. This is the
+timestamp gap users actually notice ("I saved the file and the date didn't change"). Needs
+a writeback notification to the server — the natural hook is `sys_file_sync`, which already
+crosses into the kernel with the file's identity in hand, though a notification per sync
+has its own cost to weigh. Trigger: a text editor, or anything that rewrites a file in
+place without changing its length.
 
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
