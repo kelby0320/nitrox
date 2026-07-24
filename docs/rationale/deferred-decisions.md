@@ -301,16 +301,12 @@ Raising it to a small fixed array (correlating replies by the already-present
 
 **LVM / software RAID at early boot.** Same architectural accommodation as LUKS. Initial scope is direct partition mounts.
 
-**File truncate.** The filesystem can create a file and grow it, but never shrink it:
-there is no truncate operation and `sys_file_grow` to a smaller size is a no-op. So
-overwriting an existing file with shorter content would leave the old tail in place — a
-file that is neither the old one nor the new one. `copy --force` therefore **refuses** to
-overwrite a longer destination (coreutils Milestone 1, 2026-07-24) rather than produce a
-corrupt result. Needs: an ext4 truncate (free the extents past the new size, update
-`i_size`/`i_blocks`), a `File`-category op or a `sys_file_truncate`, and page-cache
-invalidation for the dropped range. Trigger: any workflow that rewrites a file in place —
-which `copy --force`, a text editor saving a shortened file, and `save` (design §4) all
-are.
+**File truncate — DONE (2026-07-24).** Was: the filesystem could create and grow a file
+but never shrink one, so `copy --force` refused to overwrite a longer destination rather
+than leave the old tail behind. Now: `sys_file_truncate` → `RESOLVE_TRUNCATE` →
+`ext4::truncate_file`, kernel-forwarded (not a directory-session op) because the kernel
+owns the page cache and mints the `FileObject` from the reply's size. See the decision log
+(2026-07-24).
 
 **Reclaiming a process's handles at exit — DONE (2026-07-24).** Was: nothing swept the
 global `HandleTable` at process exit, so a dead process's entries pinned their objects and

@@ -42,10 +42,29 @@ pub struct ResolveRequest {
 |---|---|---|
 | `RESOLVE_FILE_AS_MEMOBJ` | `1 << 0` | Slice-7 mode: a regular file resolves to a read-only `MemoryObject` holding its content, materialised eagerly. |
 | `RESOLVE_FILE_LAZY` | `1 << 1` | Slice-8 mode: a regular file resolves to a lazily page-cache-filled `File` (`OBJECT_KIND_FILE`); the reply carries the file **size**, not its bytes, and the kernel fills pages on demand via `File::ReadRange` ([rsproto-file-ops.md](rsproto-file-ops.md)). |
+| `RESOLVE_GROW` | `1 << 2` | **Grow** the file to the `new_size` appended after the suffix (allocate blocks, extend the extent tree) before replying its map. For `sys_file_grow`. |
+| `RESOLVE_CREATE` | `1 << 3` | **Create** the file in its parent directory if absent, before growing. Combined with `RESOLVE_GROW`. For `sys_file_create`. |
+| `RESOLVE_TRUNCATE` | `1 << 4` | **Shrink** the file to the `new_size` appended after the suffix, freeing the blocks past the new end, before replying its map. For `sys_file_truncate`. |
 
 With `RESOLVE_FILE_LAZY` the server reports the file size and does not materialise
 content up front; pages are pulled later by `File::ReadRange`. Without it the
 server must materialise the content eagerly.
+
+### Size-changing resolves
+
+`RESOLVE_GROW`, `RESOLVE_CREATE` and `RESOLVE_TRUNCATE` append the target size as a
+**`u32` immediately after the suffix**, and the server applies the change *before*
+replying — so the reply's `content_len` is the file's new size and the kernel builds a
+page-cache object of exactly that size.
+
+`GROW` and `TRUNCATE` are **mutually exclusive**: they move the block allocator in
+opposite directions, and a caller that asked for one must never silently get the other.
+A shrink is a distinct flag rather than "grow to a smaller size" for that reason.
+
+These live on the resolve path — rather than on the directory session, where the other
+name-addressed mutations live — because **the kernel owns the page cache**. A size change
+the kernel never observed would leave it holding a stale size and stale pages for the
+file.
 
 ### Reply body (success)
 

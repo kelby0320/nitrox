@@ -36,7 +36,8 @@ use librsproto::file::{
     parse_name_request, parse_read_dir_request, parse_rename_request,
 };
 use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_REPLY_LEN, parse_resolve_grow_size,
+    OBJECT_KIND_CHANNEL, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE,
+    parse_resolve_grow_size,
     parse_resolve_request, resolve_reply,
 };
 use librsproto::{
@@ -411,8 +412,9 @@ fn send_reply(serve_end: u64, count: usize) {
 
 /// The serve loop: block for a forwarded `Namespace::Resolve`, resolve it, and
 /// reply. Never returns (the server runs until torn down).
-/// If `req` is a `RESOLVE_GROW` resolve, grow the named file to the requested size (the
-/// write path's ext4 metadata mutation); if it also carries `RESOLVE_CREATE`, create the
+/// Apply a resolve's size change, if it carries one: `RESOLVE_GROW` grows the named file
+/// to the requested size (the write path's ext4 metadata mutation) and `RESOLVE_TRUNCATE`
+/// shrinks it, freeing the blocks past the new end; if it also carries `RESOLVE_CREATE`, create the
 /// file first (allocate an inode + insert a directory entry in the parent). Best-effort —
 /// any parse / create / grow error is ignored and the subsequent `serve` maps the file at
 /// its current size (the reply reflects that, so a failed create surfaces as `NotFound`).
@@ -426,7 +428,7 @@ fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
     let Some(r) = parse_resolve_request(m.body) else {
         return;
     };
-    if r.flags & RESOLVE_GROW == 0 || r.suffix.len() > MAX_SUFFIX {
+    if r.flags & (RESOLVE_GROW | RESOLVE_TRUNCATE) == 0 || r.suffix.len() > MAX_SUFFIX {
         return;
     }
     let Some(new_size) = parse_resolve_grow_size(m.body) else {
@@ -448,7 +450,13 @@ fn maybe_grow<RW: BlockReader + BlockWriter>(reader: &RW, req: &[u8]) {
         }
     }
 
-    let _ = ext4::grow_file(reader, path, new_size as usize, now_secs());
+    if r.flags & RESOLVE_TRUNCATE != 0 {
+        // Shrink: free the blocks past the new end. Never combined with GROW — the two
+        // move the allocator in opposite directions, so the flags are exclusive.
+        let _ = ext4::truncate_file(reader, path, new_size as usize, now_secs());
+    } else {
+        let _ = ext4::grow_file(reader, path, new_size as usize, now_secs());
+    }
 }
 
 /// Receive one message on `h` into the `RECV_*` statics. Returns the syscall result:

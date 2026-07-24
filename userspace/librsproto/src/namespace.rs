@@ -23,6 +23,12 @@ pub const RESOLVE_GROW: u32 = 1 << 2;
 /// `RESOLVE_FILE_LAZY | RESOLVE_GROW`; the `new_size` rides after the suffix as for
 /// [`RESOLVE_GROW`]. `docs/architecture/ext4-fs-server-rw.md`.
 pub const RESOLVE_CREATE: u32 = 1 << 3;
+/// `RESOLVE_TRUNCATE` — **shrink** the file to the `new_size` appended after the suffix
+/// (free the blocks past the new end) before replying its map. Combined with
+/// [`RESOLVE_FILE_LAZY`]. For `sys_file_truncate`. The inverse of [`RESOLVE_GROW`], and a
+/// separate flag rather than "grow to a smaller size" because the two do opposite things
+/// to the block allocator and a caller must not get one when it asked for the other.
+pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
 
 // --- object_kind values (reply) ---------------------------------------------
 

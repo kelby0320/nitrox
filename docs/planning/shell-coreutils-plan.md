@@ -182,9 +182,12 @@ needs. Slice branch: `phase-4/coreutils-m1`.
   peer never sees `PeerClosed` — which is the mechanism the pipeline model needs for a stage that
   dies early. Negative-controlled. See the decision log (2026-07-24).
 
-**Milestone 1 is complete.** The substrate composes end to end, with two follow-ups owed
-(`deferred-decisions.md`): exit-time handle reclamation (a correctness gate for stage failure) and
-file truncate.
+**Milestone 1 is complete**, and so are the three substrate gaps it surfaced — exit-time handle
+reclamation (PR #117), the wall clock (PR #118), and file truncate (2026-07-24). Both assertions
+the milestone had to weaken are restored and now serve as those fixes' regression tests: `copy`'s
+demo drains a stage's stream before reaping it, and `list`'s demo requires a plausible `modified`
+date. The remaining known timestamp gap is `mtime` on an **in-place overwrite**, which Model A
+hides from the fs-server (`deferred-decisions.md`).
 
 ### Milestone 2 — coreutils breadth
 

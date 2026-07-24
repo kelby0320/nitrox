@@ -17,10 +17,10 @@
 //!   hazard — so demanding a flag would be ceremony (§10d).
 //! - **An existing destination is an error** unless `--force`. Fail loud, don't fail
 //!   silent (§1).
-//! - **Overwriting a *longer* file is refused**, even with `--force`. The filesystem has
-//!   no truncate operation: the old tail would survive past the new content, producing a
-//!   file that is neither the old one nor the new one. Refusing beats corrupting; see
-//!   `deferred-decisions.md`.
+//! - **Overwriting a *longer* file shrinks it first.** Creating an existing file is
+//!   idempotent and growing it smaller is a no-op, so without an explicit truncate the
+//!   old tail would survive past the new content — a file that is neither the old one nor
+//!   the new one. `copy` refused that case outright until the filesystem gained truncate.
 //! - **It emits a table.** `Table<{source: String, destination: String, bytes: Int}>`, one
 //!   row per file copied. A stage that produced nothing would leave a downstream consumer
 //!   waiting on a stream that never arrives, and "what did it actually copy" is exactly
@@ -278,9 +278,9 @@ fn describe(src: &[u8], dst: &[u8], e: FileError) -> String {
     s.push_str(match e {
         FileError::NotFound => ": source not found\n",
         FileError::Exists => ": destination exists (use --force)\n",
-        FileError::WouldTruncate => {
-            ": destination is longer than the source, and this filesystem cannot \
-             truncate — refusing to leave a corrupt tail\n"
+        FileError::TruncateFailed => {
+            ": could not shrink the destination to the source's length — refusing to \
+             leave a corrupt tail\n"
         }
         FileError::TooLarge => ": file is too large to copy in one mapping\n",
         FileError::Io(_) => ": I/O error\n",

@@ -666,6 +666,101 @@ mod tests {
     }
 
     #[test]
+    fn truncate_frees_blocks_and_stays_e2fsck_clean() {
+        use crate::BlockRun;
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let path = b"/system/current-generation";
+
+        // Grow to 5 blocks, then cut back to 1.5 — so the shrink must drop whole
+        // extents *and* shorten the one straddling the new end, which is where a
+        // naive "free everything past the last kept extent" gets it wrong.
+        ext4::grow_file(&rw, path, 5 * 4096, TEST_NOW).unwrap();
+        let before_free = free_blocks(&rw);
+
+        assert_eq!(ext4::truncate_file(&rw, path, 6000, TEST_NOW), Ok(6000));
+        assert_eq!(ext4::stat_file(&rw, path), Ok(6000));
+
+        // 6000 bytes needs 2 blocks; the other 3 must have come back.
+        let mut runs = [BlockRun::default(); 8];
+        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        assert_eq!(size, 6000);
+        let covered: u64 = runs[..n].iter().map(|r| r.length as u64).sum();
+        assert_eq!(covered, 2, "only the blocks holding live bytes are mapped");
+        assert_eq!(
+            free_blocks(&rw),
+            before_free + 3,
+            "freed blocks must return to the allocator, not just leave the extent tree"
+        );
+
+        assert_e2fsck_clean(&rw.0.into_inner(), "truncate");
+    }
+
+    #[test]
+    fn truncate_to_zero_and_partial_blocks() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let path = b"/system/current-generation";
+        ext4::grow_file(&rw, path, 3 * 4096, TEST_NOW).unwrap();
+
+        // A size inside the first block keeps exactly that block: the bytes past the
+        // new end are slack, as they are after any short write.
+        assert_eq!(ext4::truncate_file(&rw, path, 1, TEST_NOW), Ok(1));
+        assert_eq!(ext4::stat_file(&rw, path), Ok(1));
+        assert_e2fsck_clean(&rw.0.borrow(), "truncate-partial");
+
+        // Zero keeps nothing at all.
+        assert_eq!(ext4::truncate_file(&rw, path, 0, TEST_NOW), Ok(0));
+        assert_eq!(ext4::stat_file(&rw, path), Ok(0));
+        let mut runs = [crate::BlockRun::default(); 8];
+        let (size, _, n) = ext4::map_file(&rw, path, &mut runs).unwrap();
+        assert_eq!(size, 0);
+        assert_eq!(runs[..n].iter().map(|r| r.length as u64).sum::<u64>(), 0);
+        assert_e2fsck_clean(&rw.0.into_inner(), "truncate-zero");
+    }
+
+    #[test]
+    fn truncate_never_grows_and_reports_the_current_size() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
+        let path = b"/system/current-generation";
+        ext4::grow_file(&rw, path, 4096, TEST_NOW).unwrap();
+
+        // At or above the current size is a no-op reporting the current size —
+        // growing allocates, which is `grow_file`'s job. Silently *extending* here
+        // would hand back a file whose tail was never written.
+        assert_eq!(ext4::truncate_file(&rw, path, 4096, TEST_NOW), Ok(4096));
+        assert_eq!(ext4::truncate_file(&rw, path, 999_999, TEST_NOW), Ok(4096));
+        assert_eq!(ext4::stat_file(&rw, path), Ok(4096));
+    }
+
+    #[test]
+    fn truncate_moves_mtime_and_rejects_a_directory() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"seed\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        ext4::grow_file(&rw, b"/system/current-generation", 2048, TEST_NOW).unwrap();
+
+        let later = TEST_NOW + 900;
+        ext4::truncate_file(&rw, b"/system/current-generation", 10, later).unwrap();
+        assert_eq!(dir_entry_mtime(&rw, sys, b"current-generation"), Some(later));
+
+        // A directory is not truncatable — its size is its data, not a byte count a
+        // caller may set.
+        assert_eq!(
+            ext4::truncate_file(&rw, b"/system", 0, TEST_NOW),
+            Err(FsError::NotFound)
+        );
+    }
+
+    /// The superblock's free-block count — what proves a freed block reached the
+    /// allocator rather than merely leaving the inode's extent tree.
+    fn free_blocks(rw: &RwImage) -> u32 {
+        let img = rw.0.borrow();
+        u32::from_le_bytes(img[1024 + 12..1024 + 16].try_into().unwrap())
+    }
+
+    #[test]
     fn grow_file_appends_blocks_and_stays_e2fsck_clean() {
         use crate::BlockRun;
         use std::cell::RefCell;
