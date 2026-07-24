@@ -8142,3 +8142,67 @@ over a longer file wrongly succeeded"). `check-arch`/`check-nightly` green.
 **Milestone 1 is complete** — the substrate composes end to end: dir-ops supplies the data,
 the TSM1/`Value` model types it, the stdio/setup convention delivers it, and two real
 programs sit on each end of a real pipe.
+
+## 2026-07-24 — A process's handles are now reclaimed at exit (the `PeerClosed` gate)
+
+**The gap.** `HandleTable` is a single global segmented table with a per-entry
+`owner_pid`, and **nothing swept it when a process exited** — `HandleTable::close` was the
+only close path and it is per-handle, called by the owner. A dead process's entries
+therefore persisted, pinning every object they referenced. Two consequences, the second far
+worse than the first: handles leaked for the life of the boot, and **a pipe endpoint held
+by a dead process never closed, so its peer never observed `PeerClosed`**. A consumer
+blocked on a stage that died without writing waited forever. Found by coreutils Milestone 1
+Part D (2026-07-24), whose harness hung on exactly that; confirmed by probing the peer's
+`sys_channel_recv`, which returned `WouldBlock` (`-11`) rather than `PeerClosed` (`-13`)
+long after the child had exited and been reaped.
+
+This is not a leak footnote — it is the mechanism the pipeline model needs for a stage that
+dies early (shell design §1). The `yes | head -1` direction (the *consumer* closing) worked
+all along; this is the other one.
+
+**Where the sweep runs, and why it cannot run at exit.** The exiting thread holds rank-1
+`SCHED` and never returns from `finish_exit`; releasing an object reference runs a
+destructor that reaches the rank-6 allocator and, for an `IpcChannel`, takes rank-1 `SCHED`
+itself to wake blocked receivers. So the work is split:
+
+1. The exiting thread **marks** itself under `SCHED` — `Thread::set_process_ended`, set by
+   `exit_process` unconditionally and by `exit_thread` when no live sibling remains.
+2. `reap_pending` — thread context, no `SCHED` held, never IRQ context, and already the
+   sanctioned home for object drops (Parts A/F of the substrate hardening) — sees the mark
+   on a reaped thread and calls `handle::global::close_all_owned_by(pid)`. It runs
+   **before** the batch's own drops, so a dying process's pipes close as promptly as the
+   reap does.
+3. The sweep **batches**: entries are unlinked under the rank-3 lock, the lock is released,
+   and only then are that batch's references dropped. `close_owned_batch` takes a resume
+   cursor and returns `(count, more_remain)` for exactly this reason. Dropping under rank 3
+   would take rank 1 or rank 4/6 while holding rank 3 — an inversion. Same shape as
+   `close`'s `ClosedObject` contract and `unmap_covering_deferred`'s deferred frame
+   release; the drops sit inside `preempt_disable`/`enable` for the F12 reason.
+
+`pid == 0` (kernel/idle threads) is never swept. Pid reuse is not a hazard — pids are
+monotonic and never reused, so a sweep running after the process is gone cannot touch a
+live process's entries.
+
+**A scan, not the `next_owned` list.** `HandleEntry::next_owned` was reserved in the
+original design for an intrusive per-process list so exit could walk exactly its own
+entries. It stays unused. The list makes exit `O(handles owned)` but adds list maintenance
+to every `allocate`/`close`/`duplicate`, all under the rank-3 lock and all needing to stay
+consistent with the deferred-reclamation ring that recycles slots. The scan is
+`O(allocated slots)` with no bookkeeping anywhere else — today one or two 4096-entry
+segments. If churn ever makes it measurable, `next_owned` is the optimization already
+designed for it, and the sweep's interface does not change. The stale "the `Process` slice
+wires it up" claim in `handle-system.md` is corrected.
+
+*Verified:* host suite **760** green — 5 new sweep tests: a sweep closes exactly one
+process's handles with a second process's interleaved and untouched (a sweep keyed on the
+wrong field would take the whole table), the objects are actually *destroyed* rather than
+merely unlinked, the cursor resumes across batches (17 handles through a 4-slot batch), a
+sweep of an unknown pid is a no-op, and swept slots return to the freelist. `test-qemu`
+PASS; **60/60 KVM boot loops** (`-cpu host`, `-smp 4`). `check-arch`/`check-nightly` green.
+
+**Negative-controlled, and the regression test is the one that found the bug.** The
+Milestone 1 `copy` demo's workaround — reap-before-drain — is **reverted** to
+drain-before-reap, which is what hung before this fix; and a new focused demo spawns `list`
+on an unresolvable path (so it exits non-zero writing nothing) and requires the consumer's
+read to end in `PeerClosed`. Disabling the sweep makes both hang (`TIMED OUT`, no verdict),
+so they are known-sensitive rather than merely passing.

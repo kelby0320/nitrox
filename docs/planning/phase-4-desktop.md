@@ -254,6 +254,30 @@ Each prereq slice self-validates (host tests for the codecs; a conforming produc
 QEMU for the stdio convention). The first *integrated* proof — real coreutils streaming over a real
 pipe — is the subproject's Milestone 1, once these three are in.
 
+### Substrate gaps surfaced by the coreutils subproject
+
+Milestone 1 (`list` + `copy`) put real programs on both ends of a real pipe for the first
+time, which surfaced three substrate gaps the demos could not paper over. Each is its own
+branch off `main` — they are kernel/filesystem work with different risk profiles, not shell
+work (decision log, 2026-07-24):
+
+- [x] **Exit-time handle reclamation** (branch `phase-4/handle-reclaim`). Nothing swept the
+  global handle table at process exit, so a dead process's entries pinned their objects —
+  and its end of a pipe never closed, so a peer never observed `PeerClosed`. That is the
+  mechanism the pipeline model needs for a stage that dies early (design §1). The exiting
+  thread marks itself under `SCHED`; `reap_pending` runs a **batched** sweep (unlink under
+  rank 3, release, then drop) since a destructor can take rank 1/4/6. 5 host tests,
+  `test-qemu` PASS, 120/120 KVM boot loops, negative-controlled.
+- [ ] **Wall clock** (`CLOCK_REALTIME` + inode timestamps). Nothing in the system knows the
+  date: `sys_clock_read` services `Monotonic` only, and the fs-server never writes
+  `i_mtime`/`i_ctime`/`i_atime`, so anything the OS creates reports `modified: 0`. Two
+  parts: a CMOS-RTC-backed realtime clock, then a timestamp parameter threaded into the
+  ext4 mutation ops (the parser is deliberately syscall-free, so the caller supplies it).
+- [ ] **File truncate.** Create is idempotent and grow-smaller is a no-op, so `copy --force`
+  onto a *longer* destination is refused rather than leaving the old tail behind. Needs an
+  ext4 truncate, a syscall/`File`-op surface, and page-cache invalidation of the dropped
+  range. Blocks in-place rewrites (`save`, editors).
+
 ### Typed shell + coreutils (subproject)
 
 The prereqs above are in, so this subproject is **🚧 active** (from 2026-07-24, at Milestone 1 —

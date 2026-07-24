@@ -312,22 +312,13 @@ invalidation for the dropped range. Trigger: any workflow that rewrites a file i
 which `copy --force`, a text editor saving a shortened file, and `save` (design §4) all
 are.
 
-**Reclaiming a process's handles at exit.** `HandleTable` is global with a per-entry
-`owner_pid`, and **nothing sweeps it when a process exits** — `HandleTable::close` is the
-only close path and it is per-handle, called by the owner. A dead process's entries
-therefore persist, pinning every object they reference. Two consequences: handles leak for
-the life of the boot (bounded by table size), and — the observable one — **a pipe endpoint
-held by a dead process never closes, so its peer never observes `PeerClosed`**. A consumer
-blocked on a stage that died without writing waits forever. Found by coreutils Milestone 1
-Part D (2026-07-24), whose harness hung exactly there; the demo now reaps a stage's exit
-before draining its stream, which sidesteps it but does not fix it. This directly
-undermines the pipeline model's early-termination story (design §1, the `yes | head -1`
-case works only because the *consumer* closes explicitly today). Fix: sweep entries owned
-by the dying pid on process exit, collecting their `ObjectRef`s and dropping them
-**outside `SCHED` and outside IRQ context** — the deferred-drop discipline from
-substrate hardening Parts A/F, since an `ObjectRef` drop can reach the allocator. Trigger:
-before the shell spawns real pipelines; it is a correctness gate for stage failure, not a
-nicety.
+**Reclaiming a process's handles at exit — DONE (2026-07-24).** Was: nothing swept the
+global `HandleTable` at process exit, so a dead process's entries pinned their objects and
+its pipe endpoints never closed (a peer never saw `PeerClosed`). Implemented as a marked
+thread + a batched sweep in `reap_pending`; see the decision log (2026-07-24) and
+`docs/architecture/handle-system.md` § Releasing a process's handles at exit. The
+`next_owned` intrusive list stays unbuilt — the sweep scans segments instead, and the list
+remains the optimization if that ever becomes measurable.
 
 **Wall-clock time, and filesystem timestamps on newly created inodes.** `sys_clock_read`
 services `Monotonic` only; `Realtime` returns `Unsupported` — there is no RTC read and no

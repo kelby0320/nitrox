@@ -2477,6 +2477,10 @@ pub fn exit_thread(status: ExitStatus) -> ! {
     // SAFETY: same.
     let has_process = unsafe { &*(me_obj as *const Thread) }.process_ref().is_some();
     if has_process && !has_live_siblings(&g, me_pid) {
+        // Last thread out: the process is ending, so its handles must be closed.
+        // Deferred to the reaper for the same reason as in `exit_process`.
+        // SAFETY: `me_obj` is the running thread, pinned, lock held.
+        unsafe { Thread::set_process_ended(me_obj) };
         deliver_child_exited(&mut g, me_obj, status);
     }
 
@@ -2524,7 +2528,13 @@ pub fn exit_process(status: ExitStatus) -> ! {
         reap_matching(&mut st.suspended, &mut st.reap[cpu], me_pid);
         reap_blocked_matching(&mut st.blocked, &mut st.deadlines, &mut st.reap[cpu], me_pid);
         // The process is ending: always deliver ChildExited (we are now its
-        // last thread).
+        // last thread), and mark this thread so the reaper closes the process's
+        // handles. The sweep cannot happen here — it drops object references
+        // (destructors reach the rank-6 allocator, and an IPC endpoint's takes
+        // rank-1 `SCHED` to wake blocked receivers), and we hold `SCHED` and never
+        // return from `finish_exit`.
+        // SAFETY: `me_obj` is the running thread, pinned, lock held.
+        unsafe { Thread::set_process_ended(me_obj) };
         deliver_child_exited(st, me_obj, status);
     }
 
@@ -2734,6 +2744,29 @@ pub fn reap_pending() {
             let mut g = SCHED.lock();
             drain_pending_drops(&mut g, &mut buf)
         };
+        // Close the handles of any process whose last thread is in this batch —
+        // **before** the drops below, so its pipes close (waking peers) as promptly
+        // as the reap runs. This is the sweep's home: thread context, no `SCHED`
+        // held, not IRQ context. The exiting thread could not do it itself; it
+        // holds `SCHED` and never returns from `finish_exit`.
+        for slot in buf[..n].iter() {
+            let Some(r) = slot else { continue };
+            if r.object_type() != KObjectType::Thread {
+                continue;
+            }
+            // SAFETY: the `ObjectRef` pins this `Thread`; nothing else mutates a
+            // reaped thread's fields.
+            let (ended, pid) = unsafe {
+                let t = &*(r.as_ptr() as *const Thread);
+                (Thread::process_ended(r.as_ptr()), t.owner_pid())
+            };
+            // `pid == 0` is a kernel/idle thread, which owns no handles and whose
+            // pid must never be swept.
+            if ended && pid != 0 {
+                crate::handle::global::close_all_owned_by(pid);
+            }
+        }
+
         // Drop with preemption disabled: the drops take the allocator locks and
         // (for a kernel stack) run a TLB shootdown — plain locks other CPUs may
         // spin on. Being descheduled while holding one starves the spinners for

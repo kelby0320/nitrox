@@ -86,3 +86,53 @@ pub fn get() -> &'static HandleTable {
     // sound. See the `Sync` impl above.
     unsafe { (*GLOBAL.slot.get()).assume_init_ref() }
 }
+
+/// Handles closed per batch by [`close_all_owned_by`].
+///
+/// Each entry is a pointer + a type tag, so the batch is ~32 bytes on the sweeping
+/// thread's kernel stack. Small enough to be free, large enough that a process with a
+/// handful of handles is reclaimed in one pass.
+const SWEEP_BATCH: usize = 16;
+
+/// Close **every** handle owned by `pid` and release the objects they pinned.
+///
+/// This is what makes a process's handles die with it. Without it a dead process's
+/// entries persist — the table is global with a per-entry `owner_pid`, and nothing else
+/// sweeps it — pinning every object they reference. The visible consequence is that the
+/// process's end of a pipe never closes, so a peer blocked on it never observes
+/// `PeerClosed` (see the decision log, 2026-07-24).
+///
+/// # Context
+///
+/// Must run in **thread context, outside `SCHED`, and not in IRQ context**: releasing the
+/// references runs object destructors, which reach the rank-6 allocator and — for an IPC
+/// endpoint — take rank-1 `SCHED` to wake blocked receivers. Holding rank-1 or rank-3
+/// across that would invert the ranking. The sweep therefore works in batches: entries are
+/// unlinked under the rank-3 lock, and each batch's references are dropped after that lock
+/// is released. Preemption is disabled across the drops for the same reason
+/// [`reap_pending`](crate::sched::reap_pending) does it — a descheduled holder of an
+/// allocator spinlock starves every CPU spinning on it (F12, decision log 2026-07-21).
+///
+/// Safe against pid reuse because pids are monotonic and never reused
+/// ([`alloc_pid`](crate::sched::alloc_pid)).
+pub fn close_all_owned_by(pid: u32) {
+    use super::table::{ClosedObject, SweepCursor};
+    use crate::object::ObjectRef;
+
+    let mut cursor = SweepCursor::START;
+    loop {
+        let mut batch: [Option<ClosedObject>; SWEEP_BATCH] = [None; SWEEP_BATCH];
+        let (n, more) = get().close_owned_batch(pid, &mut cursor, &mut batch);
+        crate::sched::preempt_disable();
+        for co in batch[..n].iter().flatten() {
+            // SAFETY: each `ClosedObject` carries exactly the one reference its
+            // handle-table entry held; the entry is already unlinked, so this
+            // accounts for it once and only once.
+            drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+        }
+        crate::sched::preempt_enable();
+        if !more {
+            return;
+        }
+    }
+}

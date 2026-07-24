@@ -147,6 +147,21 @@ unsafe impl Send for ClosedObject {}
 // SAFETY: as `Send`.
 unsafe impl Sync for ClosedObject {}
 
+/// Where a [`HandleTable::close_owned_batch`] sweep resumes.
+///
+/// A sweep is batched — it must not drop object references while holding the rank-3
+/// lock — so it stops mid-scan and continues from here. Start at [`SweepCursor::START`].
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct SweepCursor {
+    seg: usize,
+    slot: usize,
+}
+
+impl SweepCursor {
+    /// A sweep that has examined nothing yet.
+    pub const START: SweepCursor = SweepCursor { seg: 0, slot: 0 };
+}
+
 /// The segmented handle table.
 ///
 /// `directory` is a fixed-size inline array of `AtomicPtr` slots; each
@@ -771,6 +786,100 @@ impl HandleTable {
         sum
     }
 
+    /// Close up to `out.len()` live handles owned by `pid`, resuming at `cursor`.
+    ///
+    /// Writes each closed slot's object into `out` and returns
+    /// `(count, more_remain)`. As with [`close`](HandleTable::close), the caller
+    /// **must** release each returned reference — and must do so **after this
+    /// returns**, never while the rank-3 lock is held: an object destructor can take
+    /// rank-4 object locks and, for an IPC endpoint, rank-1 `SCHED`, which would
+    /// invert the ranking. Batching is what makes that possible.
+    ///
+    /// `more_remain` is `true` when the batch filled, when the deferred-close ring
+    /// is full (the caller draining its batch is what lets the ring drain), or when
+    /// the scan simply has not reached the end. Call again with the same `cursor`
+    /// until it returns `false`.
+    ///
+    /// This is the process-exit sweep: a dead process's entries are otherwise never
+    /// reclaimed, and the objects they pin — notably its end of every pipe — stay
+    /// alive forever, so a peer never observes `PeerClosed`.
+    pub fn close_owned_batch(
+        &self,
+        pid: u32,
+        cursor: &mut SweepCursor,
+        out: &mut [Option<ClosedObject>],
+    ) -> (usize, bool) {
+        let mut n = 0usize;
+        if out.is_empty() {
+            return (0, true);
+        }
+        let mut guard = self.inner.lock();
+        // Give expired closes their slots back first, so a long sweep is not the
+        // thing that fills the ring.
+        self.drain_expired(&mut guard);
+        let segments = guard.segments_count as usize;
+
+        while cursor.seg < segments {
+            let entries_ptr = self.directory[cursor.seg].load(Ordering::Relaxed);
+            if entries_ptr.is_null() {
+                cursor.seg += 1;
+                cursor.slot = 0;
+                continue;
+            }
+            while cursor.slot < SEGMENT_LEN {
+                // SAFETY: as in `close` — segments are published once and outlive
+                // the table; the rank-3 lock excludes every other writer.
+                let entry = unsafe { &(*entries_ptr)[cursor.slot] };
+                let matches = entry.owner_pid.load(Ordering::Relaxed) == pid
+                    && !entry.object.load(Ordering::Acquire).is_null();
+                if !matches {
+                    cursor.slot += 1;
+                    continue;
+                }
+                if n == out.len() {
+                    return (n, true); // batch full — resume at this same slot
+                }
+                let obj = entry.object.load(Ordering::Acquire);
+                let object_type =
+                    match KObjectType::from_u32(entry.object_type.load(Ordering::Relaxed)) {
+                        Some(t) => t,
+                        None => {
+                            // A malformed entry must not stall the sweep: skip it
+                            // rather than leaving the process half-reclaimed.
+                            cursor.slot += 1;
+                            continue;
+                        }
+                    };
+                // Reconstruct this slot's handle to schedule its deferred
+                // reclamation, exactly as `close` does.
+                let handle = RawHandle::encode(
+                    cursor.seg as u32,
+                    cursor.slot as u32,
+                    entry.generation.load(Ordering::Relaxed),
+                );
+                let epoch = self.grace.current_epoch();
+                if guard.defer_ring.push(DeferredClose { handle, epoch }).is_err() {
+                    // The ring is full and nothing more has expired. Stop here
+                    // *without* closing this slot: the caller releasing its batch
+                    // (and the readers that then quiesce) is what frees the ring.
+                    return (n, true);
+                }
+                // Null the object under the seqlock; the generation is not bumped
+                // (spec § "Generation counter behavior"), as in `close`.
+                {
+                    let _wg = WriteGuard::new(entry);
+                    entry.object.store(ptr::null_mut(), Ordering::Release);
+                }
+                out[n] = Some(ClosedObject(obj, object_type));
+                n += 1;
+                cursor.slot += 1;
+            }
+            cursor.seg += 1;
+            cursor.slot = 0;
+        }
+        (n, false)
+    }
+
     /// Pop every deferred close whose grace period has fully elapsed
     /// and return its slot to the segment's freelist. Then bump the
     /// global epoch so subsequent closes are tagged with a fresh
@@ -913,6 +1022,117 @@ mod tests {
         assert!(ok.rights.contains(Rights::TERMINATE));
         drop(ok);
         close_release(&t, h, 7).unwrap();
+    }
+
+    /// Run a full sweep for `pid`, releasing each batch's references outside the
+    /// lock (the contract `close_owned_batch` requires). Returns how many handles
+    /// it closed — the shape the kernel's exit path uses.
+    fn sweep_owned(t: &HandleTable, pid: u32) -> usize {
+        let mut cursor = SweepCursor::START;
+        let mut total = 0;
+        loop {
+            let mut batch: [Option<ClosedObject>; 4] = [None; 4];
+            let (n, more) = t.close_owned_batch(pid, &mut cursor, &mut batch);
+            for co in batch[..n].iter().flatten() {
+                // SAFETY: each carries exactly the closed handle's one reference.
+                drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
+            }
+            total += n;
+            if !more {
+                return total;
+            }
+        }
+    }
+
+    #[test]
+    fn sweep_closes_every_handle_of_one_process_and_no_others() {
+        let t = fresh_table();
+        // Two processes with handles interleaved across slots, so a sweep that
+        // walked slots blindly (or stopped at the first non-match) would be caught.
+        let mut doomed = Vec::new();
+        let mut survivor = Vec::new();
+        for i in 0..5 {
+            doomed.push(t.allocate(1, mk_process(1), KObjectType::Process, sig()).unwrap());
+            survivor.push(t.allocate(2, mk_process(2), KObjectType::Process, sig()).unwrap());
+            let _ = i;
+        }
+
+        assert_eq!(sweep_owned(&t, 1), 5);
+
+        // Every swept handle is gone…
+        for h in &doomed {
+            assert_eq!(t.lookup(*h, 1, sig()).unwrap_err(), HandleError::InvalidHandle);
+        }
+        // …and the other process is untouched, which is the part that matters:
+        // a sweep keyed on the wrong field would take the whole table with it.
+        for h in &survivor {
+            assert!(t.lookup(*h, 2, sig()).is_ok());
+        }
+        for h in survivor {
+            close_release(&t, h, 2).unwrap();
+        }
+    }
+
+    #[test]
+    fn sweep_releases_the_objects() {
+        // The point of the sweep: the objects a dead process pinned must actually
+        // be destroyed, not merely unlinked from the table.
+        let t = fresh_table();
+        let before = test_probe::process_destroys();
+        for _ in 0..3 {
+            t.allocate(9, mk_process(9), KObjectType::Process, sig()).unwrap();
+        }
+        assert_eq!(test_probe::process_destroys(), before, "nothing destroyed yet");
+        assert_eq!(sweep_owned(&t, 9), 3);
+        assert_eq!(
+            test_probe::process_destroys(),
+            before + 3,
+            "each swept handle held the last reference to its object"
+        );
+    }
+
+    #[test]
+    fn sweep_resumes_across_batches() {
+        // More handles than one batch holds: the cursor must carry the scan
+        // forward rather than restarting (which would loop forever) or stopping.
+        let t = fresh_table();
+        for _ in 0..17 {
+            t.allocate(3, mk_process(3), KObjectType::Process, sig()).unwrap();
+        }
+        assert_eq!(sweep_owned(&t, 3), 17);
+        assert_eq!(sweep_owned(&t, 3), 0, "a second sweep finds nothing left");
+    }
+
+    #[test]
+    fn sweep_of_a_process_with_no_handles_is_a_no_op() {
+        let t = fresh_table();
+        let h = t.allocate(4, mk_process(4), KObjectType::Process, sig()).unwrap();
+        assert_eq!(sweep_owned(&t, 99), 0);
+        assert!(t.lookup(h, 4, sig()).is_ok());
+        close_release(&t, h, 4).unwrap();
+    }
+
+    #[test]
+    fn swept_slots_are_reusable() {
+        // A sweep must return slots to the freelist like `close` does; otherwise
+        // repeated process churn exhausts the table instead of leaking only
+        // objects.
+        let t = fresh_table();
+        let before = t.allocated_count();
+        for _ in 0..8 {
+            t.allocate(5, mk_process(5), KObjectType::Process, sig()).unwrap();
+        }
+        assert_eq!(t.allocated_count(), before + 8);
+        assert_eq!(sweep_owned(&t, 5), 8);
+        // The slots are deferred, not yet free; an allocation drains the expired
+        // deferrals and hands one back.
+        let h = t.allocate(6, mk_process(6), KObjectType::Process, sig()).unwrap();
+        close_release(&t, h, 6).unwrap();
+        assert_eq!(
+            t.allocated_count(),
+            before,
+            "swept slots were not returned to the freelist"
+        );
     }
 
     #[test]

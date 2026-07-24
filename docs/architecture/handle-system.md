@@ -314,13 +314,46 @@ nonsensical combinations (e.g. `MAP_WRITE` on a `Process` handle).
 Generic rights are valid on every type; modifier rights are not
 constrained per type today.
 
-## Per-process owned-handle list
+## Releasing a process's handles at exit
 
-`HandleEntry::next_owned` is reserved for an intrusive linked list
-threading every handle a process owns, used at process exit to
-release them all. The field is **declared but unused** this slice:
-`allocate` writes `RawHandle::NULL`, `close` ignores it. The `Process`
-slice wires it up.
+When a process's last thread exits, every handle it owned is closed and the
+objects they pinned are released. Without this the entries persist — the table
+is global with a per-entry `owner_pid`, and nothing else sweeps it — pinning
+their objects for the life of the boot. The visible symptom is worse than the
+leak: the process's end of a pipe never closes, so a peer blocked on it never
+observes `PeerClosed` (decision log, 2026-07-24).
+
+The mechanism, and why it is shaped this way:
+
+- The exiting thread only **marks** itself (`Thread::set_process_ended`). It
+  holds rank-1 `SCHED` and never returns from `finish_exit`, so it cannot do
+  the work itself.
+- `reap_pending` — thread context, no `SCHED` held, never IRQ context — sees
+  the mark on a reaped thread and calls `handle::global::close_all_owned_by`.
+- That sweep **batches**: it unlinks entries under the rank-3 lock, releases
+  the lock, then drops that batch's references. Dropping under rank 3 would
+  invert the ranking (a destructor takes rank 4/6, and an `IpcChannel`'s takes
+  rank-1 `SCHED` to wake receivers). `close_owned_batch` therefore takes a
+  resume cursor and returns `(count, more_remain)`.
+
+Pid reuse is not a hazard: pids are monotonic and never reused, so a sweep
+that runs after the process is gone cannot hit a live process's entries.
+
+### Why a scan, not the `next_owned` list
+
+`HandleEntry::next_owned` was reserved for an intrusive list threading every
+handle a process owns, so exit could walk exactly those entries. It is still
+**declared but unused**: the sweep scans allocated segments instead, matching
+on `owner_pid`.
+
+The trade is deliberate. The list makes exit `O(handles owned)` but adds
+list maintenance to every `allocate`, `close`, and `duplicate` — all under the
+rank-3 lock, all needing to stay consistent with the deferred-reclamation ring
+that already recycles slots. The scan is `O(allocated slots)` with no
+bookkeeping anywhere else, and today that is one or two 4096-entry segments per
+sweep. If process churn ever makes the scan measurable, `next_owned` is the
+optimization already designed for it — the sweep's interface (`cursor` +
+batching) does not change.
 
 ## Phase 1 limitations
 
@@ -328,9 +361,9 @@ slice wires it up.
   will plug in real ids.
 - The PRNG seed comes from a caller-supplied `u64`. Production code
   will seed from `RDTSC`; the entropy slice swaps to `RDRAND/RDSEED`.
-- `next_owned` field exists; the list it threads is not built. The
-  owned-handle list (release-at-exit) is wired up in the `Process`
-  slice, not the handle-syscalls slice.
+- `next_owned` field exists; the list it threads is not built.
+  Release-at-exit is implemented as a segment scan instead — see
+  § Releasing a process's handles at exit for the trade.
 - No per-process quota enforcement. The spec's "soft cap" of 65,536
   handles per process is unenforced until `Process` exists.
 - `sys_handle_close`, `sys_handle_duplicate`, `sys_handle_restrict`,
