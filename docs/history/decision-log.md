@@ -7812,3 +7812,48 @@ the `arg0` descriptor; (C) `libos` **pipe-wiring helpers** (`pipe(depth)`, `spaw
 producer/consumer **demo** under the self-test build proving TSM1-over-a-real-pipe, backpressure,
 and early-consumer close. Docs: a new stdio/bootstrap convention doc + a `process-spawn-args.md`
 update for the `arg0` descriptor; tick the phase-4 box at slice end.
+
+---
+
+## 2026-07-24 — One process-spawn convention: `arg0` is the bootstrap descriptor, system-wide
+
+Refines the C3 ABI call (2026-07-23) into a hard, system-wide rule after noticing the
+legacy `parent`/`child` demos use `arg0` as a private role/seed field (roles 0–3, fp
+seed in the high bits) — a *second*, ad-hoc spawn convention living alongside the
+bootstrap descriptor. The system must have exactly **one** program-spawning convention,
+not two.
+
+**Decision.** `arg0` (the fourth bootstrap register, `SpawnArgs.arg0`) **is the
+bootstrap descriptor — the one meaning it has, for every process.** No program
+repurposes `arg0`, the bootstrap `endpoint`, or any register for private payload.
+Everything a program needs beyond `{notif, namespace, endpoint}` — argv, extra streams,
+env — arrives in the **setup message** (Tier 1). `arg0 == 0` is Tier 0 (register-only);
+a versioned descriptor with `SETUP_PENDING` is Tier 1.
+
+**Consequences.**
+
+- **`arg0` becomes cleanly universal.** With no competing use, "is this a setup
+  descriptor?" is unambiguous — no magic marker is needed (the alternative considered
+  when `arg0` still had to coexist with the demo's role field). A single generic
+  `_start` runtime can decode `arg0` for any program and auto-fetch the setup message.
+- **Scope boundary.** This governs `sys_process_spawn`. `sys_thread_create`'s `arg0` is
+  a *different* mechanism — an in-process argument to a new thread in the same address
+  space, where the creator controls both ends — and is unaffected; it stays a free word.
+- **Blast radius is tiny.** Every real service (`fs-server`, `service-mgr`,
+  `session-mgr`, `auth`, `profile`, `logging`, the leaf shells) already passes
+  `arg0 == 0` and ignores it. The **only** violators are the `parent`/`child` demo
+  programs — among the first userspace code written, from a time when the spawn
+  convention was ad hoc.
+- **`parent`/`child` are retired into a conforming test harness** — a dedicated,
+  test-only harness that speaks the one convention (parameters via `argv`, streams via
+  the setup message) and is **de-entangled from normal bringup** (they currently run
+  woven into the selftest login chain). Tracked as the plan item immediately after the
+  C3 stdio/pipe work (`docs/planning/phase-4-desktop.md`); a coverage audit precedes any
+  removal, since `parent` aggregates ~15 demos, several of which may be the only
+  automated coverage of their paths. Until then the demos keep working (their `arg0`
+  role field never trips the descriptor's `SETUP_PENDING`-plus-version guard, and no
+  binary uses both decoders), but they are the documented exception, not a second
+  convention.
+
+C3's own demos are therefore built as dedicated, convention-conforming test programs,
+not by extending `child`'s `arg0` roles.

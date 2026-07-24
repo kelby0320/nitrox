@@ -102,14 +102,19 @@ than the four register values (a pipeline stage wanting `stdin`/`stdout`/`stderr
 bootstrap endpoint (`rdx`), not from the kernel. See
 [`pipeline-stdio.md`](pipeline-stdio.md).
 
-### `arg0` as a bootstrap descriptor
+### `arg0` is the bootstrap descriptor
 
-`arg0` (`rcx`) is opaque to the kernel. When `arg0 == 0` (the value every current
-spawner passes) there is **no descriptor** — the child is Tier 0, register-only. A
-non-zero `arg0` is a small descriptor telling the child's runtime to fetch a setup
-message: `[7:0]` version (`1`), `[8]` `SETUP_PENDING` (a setup message is queued on
-the endpoint). Full layout and the setup-message contract are in
-[`pipeline-stdio.md`](pipeline-stdio.md).
+`arg0` (`rcx`) is opaque *to the kernel*, but userspace has exactly **one**
+convention for it, system-wide: it is the **bootstrap descriptor**. No program
+repurposes it for private payload — a program that needs parameters receives them as
+`argv` in the setup message (Tier 1), not in `arg0`. `arg0 == 0` ⇒ Tier 0,
+register-only; a non-zero descriptor (`[7:0]` version `1`, `[8]` `SETUP_PENDING`)
+tells the runtime to fetch a setup message on the endpoint. Full layout and the
+setup-message contract are in [`pipeline-stdio.md`](pipeline-stdio.md).
+
+(The legacy `parent`/`child` demos predate this convention and misuse `arg0` as a
+role/seed field; they are the sole exception and are being retired into a conforming
+test harness — decision log, 2026-07-24.)
 
 ## Image loading
 

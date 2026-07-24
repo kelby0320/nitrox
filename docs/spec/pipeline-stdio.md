@@ -40,20 +40,31 @@ floor; the setup message is opt-in.
 
 ## The `arg0` bootstrap descriptor
 
-`rcx` (`SpawnArgs.arg0`) is repurposed from an opaque word into a small descriptor.
-`arg0 == 0` means **no descriptor → Tier 0** (backward-compatible: every current
-spawner passes `0`).
+`rcx` (`SpawnArgs.arg0`) **is the bootstrap descriptor — system-wide, the one
+meaning it has.** This is the single process-spawn convention: no program repurposes
+`arg0` (or `endpoint`, or any register) for private payload. A program that needs
+parameters gets them from `argv` in the setup message (Tier 1), never from `arg0`.
+(This governs `sys_process_spawn`; `sys_thread_create`'s `arg0` is a separate,
+in-process thread argument and is unaffected.)
+
+`arg0 == 0` is **Tier 0** — no descriptor, register-only. A non-zero descriptor:
 
 | Bits | Field | Meaning |
 |---|---|---|
-| `[7:0]` | `version` | Bootstrap-descriptor version. `0` ⇒ no descriptor (Tier 0). This ABI is version `1`. |
+| `[7:0]` | `version` | Bootstrap-descriptor version, for format evolution. `0` ⇒ no descriptor (Tier 0). This ABI is version `1`. |
 | `[8]` | `SETUP_PENDING` | A setup message is queued on the bootstrap endpoint (`rdx`); the runtime should receive it. |
 | `[63:9]` | reserved | Must be `0`. |
 
 A Tier-1 stage is spawned with `arg0 = 0x0000_0000_0000_0101` (`version = 1`,
-`SETUP_PENDING`). `libos::bootstrap()` reads `arg0`: if `SETUP_PENDING` is set it
-recvs the setup message; otherwise it returns the register-only view and makes no
-syscall.
+`SETUP_PENDING`). A generic `_start` runtime reads `arg0` for *any* program: if
+`SETUP_PENDING` is set it recvs the setup message; otherwise it returns the
+register-only view and makes no syscall. Because `arg0` has exactly one meaning,
+that detection is unambiguous — no magic marker is needed.
+
+> The legacy `parent`/`child` demo programs predate this convention and abuse `arg0`
+> as a private role/seed field. They are the only violators; every real service
+> already passes `arg0 == 0`. They are slated to be rewritten as a conforming test
+> harness (decision log, 2026-07-24) and are not part of normal bringup.
 
 ## The setup message
 
