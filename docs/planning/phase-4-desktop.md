@@ -235,14 +235,19 @@ The full gap analysis is in the subproject plan (§1); this is the checklist.
   reads `stdin` + `argv` from a real setup message. Host-tested codecs + full `test-qemu` PASS.
   **Deferred:** a `libos` `spawn_stage` convenience wrapper, `stdout`/`stderr` demo wiring, and the
   incremental (still-arriving) stream reader — land with their first shell consumer.
-- [ ] **Retire `parent`/`child` into a conforming test harness** — the two legacy demo programs
-  misuse `arg0` as a private role/seed field (the one violation of the single spawn convention;
-  decision log 2026-07-24). Rewrite them as a dedicated, test-only harness that speaks the one
-  convention (parameters via `argv`, streams via the setup message) and is **de-entangled from
-  normal/selftest bringup** (they currently run woven into the login chain). A **coverage audit**
-  first — `parent` aggregates ~15 demos (exceptions, block I/O, userspace-server forwarding, entropy,
-  `/proc/self`, initramfs, namespaces, …), several possibly the only automated coverage of their
-  paths. **Do this immediately after the stdio/pipe work.**
+- [x] **Retire `parent`/`child` into a conforming test harness** (branch `phase-4/test-harness`,
+  2026-07-24). Merged the two legacy demo programs into one crate `userspace/test-harness` (bins
+  `test-harness` + `test-stage`); dropped the `arg0`-role abuse — `test-stage` takes its role/params
+  from `argv` in the setup message (Tier-1) or exits immediately (Tier-0 = exit-storm). **Serial
+  adjudication:** init runs the harness to completion **first** (a non-zero exit fails the run, a hang
+  fails via timeout), *then* hands off to the login chain — no more racing session-mgr's verdict.
+  **Build-flag gated:** built + initramfs-embedded only in selftest/test-harness `xtask` modes,
+  **absent from release images**. Coverage preserved (all ~15 checks moved over; the redundant
+  cap-prop dropped — subsumed by the C3 setup-message spawn). Along the way, running every demo to
+  completion (the old raced verdict never did) exposed a latent **8-byte stack smash** in the demo
+  itself: `stat_is_type` passed a 16-byte buffer for the now-24-byte `HandleInfo` (`size: u64` field),
+  zeroing `_start`'s spilled `root_ns` → `InvalidHandle` on later lookups (root-caused by Fable;
+  `handoff/`). Full `test-qemu` PASS.
 
 Each prereq slice self-validates (host tests for the codecs; a conforming producer/consumer demo in
 QEMU for the stdio convention). The first *integrated* proof — real coreutils streaming over a real

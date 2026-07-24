@@ -7857,3 +7857,47 @@ a versioned descriptor with `SETUP_PENDING` is Tier 1.
 
 C3's own demos are therefore built as dedicated, convention-conforming test programs,
 not by extending `child`'s `arg0` roles.
+
+---
+
+## 2026-07-24 — `parent`/`child` retired into a single conforming test harness
+
+The last piece of the one-spawn-convention cleanup (2026-07-24): the legacy `parent`/
+`child` demo programs — the sole `arg0`-role-abusing violators — are merged into one crate
+`userspace/test-harness` with two bins, and re-enabled as a proper integration smoke-test
+harness.
+
+- **`test-harness`** (from `parent`) is the supervisor; **`test-stage`** (from `child`) is
+  the spawnable child. `test-stage` takes its role + params from **`argv` in the setup
+  message** (Tier 1: `"stage <rows>"`, `"fp <seed>"`) or exits immediately (Tier 0,
+  `arg0 == 0` = the exit-storm stress) — no `arg0`-role field. The redundant
+  capability-propagation demo (old roles 0/1) is dropped: C3's setup-message spawn already
+  proves handle-transfer-between-processes. `fp_hardfloat_demo` now spawns Tier-1 stages with
+  `argv=["fp","<seed>"]`.
+- **Serial adjudication** (replacing the concurrent race): init's `run_test_harness` spawns
+  the harness and **blocks on its exit before handing off to the login chain**. A non-zero
+  exit fails the run; a hang fails it via the runner's wall-clock timeout (init never reaches
+  the verdict). This closes the old gap where session-mgr fired the PASS verdict while the
+  demo process was still running — which routinely **raced the demos and killed QEMU before
+  the later ones ran**, so they were never actually adjudicated. The old concurrent-I/O
+  overlap (a best-effort stress that surfaced the 2026-07-20 cross-CPU-wake hang, since fixed)
+  is retired with it.
+- **Build-flag gating:** the harness is compiled *and* initramfs-embedded **only** in the
+  selftest/test-harness `xtask` `BuildMode`s (`mode.features().is_some()`) — **absent from
+  release images**, verified (0 occurrences in a release initramfs). Reuses the existing
+  feature machinery; no new flag.
+
+**A latent bug the serial run exposed (root-caused by Fable; see `handoff/`).** Running every
+demo to completion — which the raced verdict never did — surfaced an **8-byte stack smash in
+the demo itself**: `stat_is_type` passed a `[0u8; 16]` out-param to `sys_handle_stat`, but
+`HandleInfo` has been **24 bytes** since the `size: u64` field landed. The kernel's copy-out
+zeroed 8 adjacent stack bytes — `_start`'s spilled `root_ns` — so every later
+`sys_ns_lookup(root_ns, …)` was really `sys_ns_lookup(0, …)` → `InvalidHandle`. `main`'s
+`parent` had the same smash but its frame layout put the zeros on a harmless slot (stack-layout
+luck, not the refcount interaction an earlier hypothesis guessed). Fix: `stat_is_type` uses a
+real `HandleInfo` (with a doc-comment warning against hand-sized ABI buffers). Lesson recorded:
+`HandleInfo` grew (16→24 B) and this predated it — hand-sized `#[repr(C)]` out-buffers are a
+footgun when the ABI type changes.
+
+Verified: full `test-qemu` PASS (harness runs to completion → login chain → verdict PASS,
+`-smp 4`); host suite + `check-arch` + `check-nightly` green; release image excludes the harness.

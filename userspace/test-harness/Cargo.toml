@@ -1,0 +1,26 @@
+[package]
+name = "test-harness"
+version = "0.1.0"
+edition = "2024"
+
+# The userspace integration smoke-test harness (formerly the `parent`/`child` demo
+# pair). Two bins: `test-harness` is the serial supervisor init spawns first under
+# selftest; `test-stage` is the spawnable child it drives (a Tier-1 stage via the
+# setup message, or a Tier-0 fast-exit child for the exit-storm). Built + embedded in
+# the initramfs **only** in selftest/test-harness builds (xtask gates it), so it is
+# absent from release images. Speaks the one spawn convention (decision log
+# 2026-07-24) — no `arg0`-role abuse.
+[dependencies]
+libkern = { path = "../libkern" }
+libos = { path = "../libos" }
+librsproto = { path = "../librsproto" }
+libheap = { path = "../libheap" }
+libstream = { path = "../libstream", features = ["io"] }
+
+[[bin]]
+name = "test-harness"
+path = "src/harness.rs"
+
+[[bin]]
+name = "test-stage"
+path = "src/stage.rs"

@@ -12,15 +12,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "child"
-version = "0.1.0"
-dependencies = [
- "libheap",
- "libkern",
- "libstream",
-]
-
-[[package]]
 name = "eshell"
 version = "0.1.0"
 dependencies = [
@@ -113,17 +104,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "parent"
-version = "0.1.0"
-dependencies = [
- "libheap",
- "libkern",
- "libos",
- "librsproto",
- "libstream",
-]
-
-[[package]]
 name = "profile-server"
 version = "0.1.0"
 dependencies = [
@@ -146,6 +126,17 @@ version = "0.1.0"
 dependencies = [
  "libkern",
  "librsproto",
+]
+
+[[package]]
+name = "test-harness"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "libos",
+ "librsproto",
+ "libstream",
 ]
 
 [[package]]

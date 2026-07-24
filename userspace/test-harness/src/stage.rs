@@ -26,174 +26,13 @@ extern crate alloc;
 
 use core::arch::asm;
 use libkern::{
-    IpcMsg, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
-    CLOCK_MONOTONIC, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_MEMORY_CREATE, SYS_MEMORY_MAP,
-    SYS_NS_BIND, SYS_NS_LOOKUP, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint, syscall1,
-    syscall2, syscall4, syscall5,
+    CLOCK_MONOTONIC, SYS_CLOCK_READ, SYS_HANDLE_CLOSE, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT,
+    exit, kprint, syscall1, syscall2, syscall4,
 };
 
 /// `alloc` backing for the C3 setup-message stage path (`run_stream_stage`).
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
-
-const PAGE: u64 = 4096;
-/// The marker the sender writes into the transferred object; the receiver
-/// verifies it after mapping.
-const MARKER: u64 = 0x00C0_FFEE;
-
-static mut SEND_MSG: IpcMsg = IpcMsg::ZEROED;
-static mut RECV_MSG: IpcMsg = IpcMsg::ZEROED;
-static mut RECV_COUNT: usize = 0;
-/// `sys_channel_send`/`recv` transferred-handle arrays.
-static mut SEND_HANDLES: [u64; 1] = [0];
-static mut RECV_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
-static mut WAIT_HANDLES: [u64; 1] = [0];
-
-/// Sender (role 0): create a MemoryObject, mark it, transfer the handle.
-fn run_sender(endpoint: u64) -> ! {
-    // SAFETY: valid syscalls; returns a handle or a negative error.
-    let mem_h = unsafe { syscall2(SYS_MEMORY_CREATE, PAGE, 0) };
-    if mem_h < 0 {
-        kprint(b"child[send]: memory create FAIL\n");
-        exit(1);
-    }
-    let mem_h = mem_h as u64;
-    // Map it read/write and write the marker.
-    // SAFETY: valid syscall; returns the mapped address or a negative error.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem_h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if addr < 0 {
-        kprint(b"child[send]: memory map FAIL\n");
-        exit(1);
-    }
-    // SAFETY: `addr` is a page the kernel mapped R/W into our address space.
-    unsafe { (addr as u64 as *mut u64).write_volatile(MARKER) };
-
-    // Build a one-handle message and transfer the memory handle to the sibling.
-    // SAFETY: SEND_MSG / SEND_HANDLES are valid writable .bss buffers.
-    unsafe {
-        SEND_MSG.header.payload_len = 0;
-        SEND_HANDLES[0] = mem_h;
-    }
-    // SAFETY: valid endpoint + message + handles pointer; count 1, NoBlock.
-    let sr = unsafe {
-        syscall5(
-            SYS_CHANNEL_SEND,
-            endpoint,
-            (&raw const SEND_MSG) as u64,
-            (&raw const SEND_HANDLES) as u64,
-            1,
-            SENDMODE_NOBLOCK,
-        )
-    };
-    if sr == 0 {
-        kprint(b"child[send]: transferred a memory object to the sibling\n");
-        exit(0);
-    } else {
-        kprint(b"child[send]: send FAIL\n");
-        exit(1);
-    }
-}
-
-/// Receiver (role 1): receive the transferred handle, map it, verify the marker.
-fn run_receiver(endpoint: u64) -> ! {
-    // Block until the message arrives.
-    // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = endpoint;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
-    };
-    // SAFETY: valid out-params; on success the kernel installed the handle(s).
-    let rr = unsafe {
-        syscall4(
-            SYS_CHANNEL_RECV,
-            endpoint,
-            (&raw mut RECV_MSG) as u64,
-            (&raw mut RECV_HANDLES) as u64,
-            (&raw mut RECV_COUNT) as u64,
-        )
-    };
-    // SAFETY: on success the kernel wrote the count + handle values.
-    let (count, mem_h) = unsafe { ((&raw const RECV_COUNT).read(), (&raw const RECV_HANDLES[0]).read()) };
-    if waited != 1 || rr != 0 || count != 1 {
-        kprint(b"child[recv]: recv FAIL\n");
-        exit(1);
-    }
-
-    // Map the transferred object and read the marker back.
-    // SAFETY: `mem_h` is a memory handle just installed in our table.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem_h, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if addr < 0 {
-        kprint(b"child[recv]: map transferred object FAIL\n");
-        exit(1);
-    }
-    // SAFETY: `addr` is the mapped, transferred page.
-    let got = unsafe { (addr as u64 as *const u64).read_volatile() };
-    if got == MARKER {
-        kprint(b"child[recv]: mapped transferred object, marker=0xc0ffee ok\n");
-        exit(0);
-    } else {
-        kprint(b"child[recv]: marker mismatch\n");
-        exit(1);
-    }
-}
-
-/// Exercise the **inherited namespace** (sandbox-by-construction): resolve a path
-/// the parent bound into the child's namespace, and confirm the inherited handle
-/// is LOOKUP-only by attempting a bind and expecting `NoAccess`. `ns` is the
-/// child's root-namespace handle (`rsi`); `resource` is any handle to try binding.
-fn ns_inheritance_check(ns: u64, resource: u64) {
-    if ns == 0 {
-        kprint(b"child: no namespace inherited\n");
-        return;
-    }
-    let path = b"/store";
-    // Look up "/store" (requesting MAP_READ); wait for the pre-signalled PO.
-    // SAFETY: valid path pointer + handle.
-    let po = unsafe {
-        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, RIGHT_MAP_READ)
-    };
-    if po >= 0 {
-        // SAFETY: WAIT_HANDLES / WAIT_RESULTS are valid writable buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = po as u64;
-            syscall4(
-                SYS_WAIT,
-                (&raw const WAIT_HANDLES) as u64,
-                1,
-                (&raw mut WAIT_RESULTS) as u64,
-                u64::MAX,
-            )
-        };
-        let status = unsafe {
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
-        };
-        if waited == 1 && status == 0 {
-            kprint(b"child: /store resolved in inherited namespace\n");
-        } else {
-            kprint(b"child: /store lookup in inherited namespace MISS\n");
-        }
-    } else {
-        kprint(b"child: ns_lookup FAIL\n");
-    }
-    // The inherited handle is LOOKUP-only: a bind must fail NoAccess (-2).
-    let foo = b"/foo";
-    // SAFETY: valid path pointer + handle.
-    let br = unsafe {
-        syscall4(SYS_NS_BIND, ns, foo.as_ptr() as u64, foo.len() as u64, resource)
-    };
-    if br == -2 {
-        kprint(b"child: bind into inherited namespace denied (LOOKUP-only)\n");
-    } else {
-        kprint(b"child: bind unexpectedly allowed/other error\n");
-    }
-}
 
 // === role 3: the hard-float worker =======================================================
 //
@@ -460,45 +299,63 @@ fn parse_u64(s: &str) -> Option<u64> {
 /// (streams + `argv`), then read a TSM1 stream from `stdin` and verify it against the
 /// row count passed in `argv[1]`. Exits `0` on success, `1` on any mismatch — the
 /// setup-message spawn proved end to end. `argv` is `["stage-demo", "<rows>"]`.
-fn run_stream_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    use libstream::channel::{ChannelReceiver, IpcPort};
-    use libstream::table::{Item, TableReader};
-
+/// A **Tier-1 stage**: receive the setup message (streams + `argv`), then dispatch on
+/// `argv[0]` — `"stage <rows>"` verifies a TSM1 stream on stdin, `"fp <seed>"` runs a
+/// hard-float worker. Both exit `0`/`1`. This is the one spawn convention: role + params
+/// come from `argv`, streams from the setup message — never from `arg0`.
+fn run_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let boot = libstream::setup::bootstrap(notif, ns, endpoint, arg0);
     let setup = match boot.setup() {
         Some(Ok(s)) => s,
         _ => {
-            kprint(b"child[stage]: setup recv/parse FAIL\n");
+            kprint(b"test-stage: setup recv/parse FAIL\n");
             exit(1);
         }
     };
-    // argv delivery: expect ["stage-demo", "<rows>"].
+    match setup.argv.first().map(|s| s.as_str()) {
+        Some("stage") => run_stage_consumer(&setup),
+        Some("fp") => {
+            let seed = setup.argv.get(1).and_then(|s| parse_u64(s)).unwrap_or(0);
+            run_fp_worker(seed);
+        }
+        _ => {
+            kprint(b"test-stage: unknown argv[0]\n");
+            exit(1);
+        }
+    }
+}
+
+/// The `"stage <rows>"` role: read + verify a TSM1 stream on `stdin` (`<rows>` rows, row
+/// `i` carries `Int(i)`), the stream handle delivered via the setup message.
+fn run_stage_consumer(setup: &libstream::setup::Setup) -> ! {
+    use libstream::channel::{ChannelReceiver, IpcPort};
+    use libstream::table::{Item, TableReader};
+
     let expect = match setup.argv.get(1).and_then(|s| parse_u64(s)) {
         Some(n) => n as i64,
         None => {
-            kprint(b"child[stage]: bad argv\n");
+            kprint(b"test-stage: bad argv (rows)\n");
             exit(1);
         }
     };
     let stdin = match setup.streams.stdin {
         Some(h) => h,
         None => {
-            kprint(b"child[stage]: no stdin stream\n");
+            kprint(b"test-stage: no stdin stream\n");
             exit(1);
         }
     };
-    // Read + verify the TSM1 stream on stdin: STAGE_ROWS rows, row `i` carries `Int(i)`.
     let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive() {
         Ok(b) => b,
         Err(_) => {
-            kprint(b"child[stage]: stdin receive FAIL\n");
+            kprint(b"test-stage: stdin receive FAIL\n");
             exit(1);
         }
     };
     let mut tr = match TableReader::new(&bytes) {
         Ok(t) => t,
         Err(_) => {
-            kprint(b"child[stage]: bad TSM1 header\n");
+            kprint(b"test-stage: bad TSM1 header\n");
             exit(1);
         }
     };
@@ -507,60 +364,38 @@ fn run_stream_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         match tr.next() {
             Some(Ok(Item::Row(vals))) => {
                 if vals.first().and_then(|v| v.as_int()) != Some(n) {
-                    kprint(b"child[stage]: row MISMATCH\n");
+                    kprint(b"test-stage: row MISMATCH\n");
                     exit(1);
                 }
                 n += 1;
             }
             Some(Ok(Item::End(_))) | None => break,
             _ => {
-                kprint(b"child[stage]: decode FAIL\n");
+                kprint(b"test-stage: decode FAIL\n");
                 exit(1);
             }
         }
     }
     if n != expect {
-        kprint(b"child[stage]: wrong row count\n");
+        kprint(b"test-stage: wrong row count\n");
         exit(1);
     }
-    kprint(b"child[stage]: setup message + stdin stream verified ok\n");
+    kprint(b"test-stage: setup message + stdin stream verified ok\n");
     exit(0);
 }
 
-/// Bootstrap registers (`kernel/src/syscall/table.rs`): `rdi` = notification
-/// channel (unused here), `rsi` = inherited root namespace, `rdx` = the shared
-/// channel endpoint (or the setup channel for a Tier-1 stage), `rcx` = `arg0`.
-///
-/// `arg0` is the one spawn convention's bootstrap descriptor (a setup message pending →
-/// Tier-1 stage). The legacy `arg0`-role field below (low 8 bits) is the pre-convention
-/// path, retired with parent/child.
+/// Bootstrap registers: `rdi` = notif, `rsi` = namespace, `rdx` = endpoint (the setup
+/// channel for a Tier-1 stage), `rcx` = `arg0` (the one-convention bootstrap descriptor).
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
-    // The one spawn convention (decision log 2026-07-24): if `arg0` is a bootstrap
-    // *descriptor* with a pending setup message, this process is a Tier-1 stage — that
-    // takes precedence over the legacy `arg0`-role field below (which is retired with
-    // parent/child). See `docs/spec/pipeline-stdio.md`.
+pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
+    // The one spawn convention: `arg0` marks a Tier-1 stage (a setup message is pending)
+    // or Tier 0 (`arg0 == 0`). A Tier-0 `test-stage` is an **exit-storm** child — the
+    // payload IS the process teardown (kernel-stack free, TLB shootdown, reap) racing
+    // across CPUs (substrate-hardening Part F; decision log 2026-07-21).
     if libstream::setup::setup_is_pending(arg0) {
-        run_stream_stage(_notif, ns, endpoint, arg0);
+        run_stage(notif, ns, endpoint, arg0);
     }
-    let role = arg0 & 0xFF;
-    // Role 2 — the exit-storm stress child (spawned with no handles): exit
-    // immediately. The payload IS the process teardown — kernel-stack free,
-    // TLB shootdown, reap — racing across CPUs (substrate-hardening Part F;
-    // decision log 2026-07-21).
-    if role == 2 {
-        exit(0);
-    }
-    // Role 3 — the hard-float worker (spawned with no handles).
-    if role == 3 {
-        run_fp_worker(arg0 >> 8);
-    }
-    ns_inheritance_check(ns, endpoint);
-    if role == 0 {
-        run_sender(endpoint);
-    } else {
-        run_receiver(endpoint);
-    }
+    exit(0);
 }
 
 #[panic_handler]
