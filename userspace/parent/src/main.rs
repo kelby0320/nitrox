@@ -149,6 +149,20 @@ const STREAM_ROWS: i64 = 2000;
 /// The producer thread's stack, in pages.
 const STREAM_STACK_PAGES: u64 = 8;
 
+/// Spawn args for the C3 **Tier-1 stage** (`child` conforming path): one moved handle
+/// (the stage's bootstrap endpoint = the setup channel), `arg0` set at runtime to the
+/// bootstrap descriptor. Inherits parent's LOOKUP-only namespace.
+static mut SPAWN_STAGE: SpawnArgs = SpawnArgs {
+    image: 0,     // resolved at spawn from /initramfs/sbin/child
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the setup channel) to the stage
+    arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
+    handles: [0; 4],
+    rights: [ENDPOINT_RIGHTS, 0, 0, 0],
+    namespace: 0, // inherit (LOOKUP-only)
+    syscaps: 0,
+};
+
 /// The producer thread: write a `{ i: Int, name: String }` TSM1 stream of
 /// [`STREAM_ROWS`] rows onto its endpoint via [`libstream::channel::ChannelSink`], then
 /// exit cleanly. The process keeps the endpoint (handles are process-owned), so the
@@ -281,6 +295,131 @@ fn stream_transport_demo() {
     kprint(b"parent: stream transport ok (2000 rows over a real pipe, backpressured)\n");
     // `_producer` (the thread handle) drops here — closes our handle; the thread has
     // already self-exited. END0/END1 are closed at process exit.
+}
+
+/// The C3 **setup-message spawn** (Part C.2): spawn `child` as a Tier-1 stage — with a
+/// bootstrap descriptor `arg0` and a setup channel — then send it a setup message that
+/// transfers a `stdin` pipe end and carries `argv = ["stage-demo", "500"]`. Parent then
+/// produces the `stdin` TSM1 stream; the stage reads `stdin` + `argv` from the setup
+/// message and verifies the rows, exiting `0`/`1`. Parent reaps that exit and fails the
+/// run on a non-zero code. Exercises the one spawn convention (Part B) end to end over a
+/// real `sys_process_spawn` + setup message.
+fn stage_spawn_demo(root_ns: u64, notif: u64) {
+    use alloc::string::String;
+    use libstream::channel::{ChannelSink, IpcPort};
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
+    use libstream::table::TableWriter;
+    use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
+
+    kprint(b"parent: setup-message stage demo (spawn a Tier-1 stage)\n");
+    const STAGE_ROWS: i64 = 500;
+
+    // 1. Resolve the stage binary (the conforming `child` path).
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/child", RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        kprint(b"parent: stage image FAIL\n");
+        exit(1);
+    }
+
+    // 2. The stdin pipe (parent produces on `prod`; the stage reads the transferred end)
+    //    and the setup channel (`setup_shell` = parent's end, `setup_stage` = the stage's
+    //    bootstrap endpoint).
+    let (prod, stage_stdin) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => {
+            kprint(b"parent: stage stdin pipe FAIL\n");
+            exit(1);
+        }
+    };
+    let (setup_shell, setup_stage) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => {
+            kprint(b"parent: stage setup chan FAIL\n");
+            exit(1);
+        }
+    };
+
+    // 3. Spawn `child` as a Tier-1 stage: endpoint = `setup_stage` (moved), `arg0` = the
+    //    bootstrap descriptor. SAFETY: SPAWN_STAGE is our static, initialised here.
+    let _stage = match unsafe {
+        SPAWN_STAGE.image = img;
+        SPAWN_STAGE.handles[0] = setup_stage;
+        SPAWN_STAGE.arg0 = bootstrap_arg0(true);
+        spawn(&*(&raw const SPAWN_STAGE))
+    } {
+        Ok(p) => p,
+        Err(_) => {
+            kprint(b"parent: stage spawn FAIL\n");
+            exit(1);
+        }
+    };
+
+    // 4. Send the setup message: transfer `stage_stdin` as stdin, carry `argv`.
+    let streams = Streams {
+        stdin: Some(stage_stdin),
+        stdout: None,
+        stderr: None,
+    };
+    if send_setup(setup_shell, &streams, &["stage-demo", "500"]).is_err() {
+        kprint(b"parent: stage send_setup FAIL\n");
+        exit(1);
+    }
+
+    // 5. Produce the stdin stream on `prod` (the stage drains it concurrently). It waits
+    //    for the terminator before verifying, so `finish` completes before it exits — no
+    //    PeerClosed race.
+    let schema = Schema::new()
+        .field("i", TypeTag::Int, TypeModifiers::NONE)
+        .field("name", TypeTag::String, TypeModifiers::NONE);
+    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(prod), IPC_PAYLOAD_SIZE));
+    let ok = tw.write_schema(StreamFlags::NONE, &schema).is_ok()
+        && (0..STAGE_ROWS).all(|i| {
+            tw.write_row(&[Value::Int(i), Value::Str(String::from("row"))])
+                .is_ok()
+        })
+        && tw.finish_with_status(0).is_ok()
+        && tw.into_sink().finish().is_ok();
+    if !ok {
+        kprint(b"parent: stage produce FAIL\n");
+        exit(1);
+    }
+
+    // 6. Reap the stage's exit — the first `ChildExited` (no other child process has been
+    //    spawned yet) — and fail the run on a non-zero code.
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            continue;
+        }
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            continue; // WouldBlock: re-block
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let kind = unsafe { (&raw const NOTIF.kind).read() };
+        if kind == KIND_CHILD_EXITED {
+            // SAFETY: body[8..12] is the exit code.
+            let body = unsafe { (&raw const NOTIF.body).read() };
+            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            if code != 0 {
+                kprint(b"parent: stage exited non-zero\n");
+                exit(1);
+            }
+            break;
+        }
+    }
+    kprint(b"parent: setup-message stage ok (stdin stream + argv verified by the stage)\n");
 }
 
 // --- Userspace-server forwarding demo (slice 7 Part 3) ----------------------
@@ -1911,6 +2050,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //    reaches init's `code != 0` fail path) before the concurrent login chain fires
     //    the verdict — same race the FP demo dodges by running early.
     stream_transport_demo();
+
+    // 0b. stdio/pipe setup-message spawn (C3 Part C.2): spawn a Tier-1 stage and hand it
+    //     stdin + argv via a setup message. Also early (before the login-chain verdict).
+    stage_spawn_demo(root_ns, notif);
 
     // 0a. Exception demo: a worker thread faults; we suspend, inspect, terminate.
     worker_exception_demo(notif);

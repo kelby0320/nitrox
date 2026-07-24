@@ -22,6 +22,8 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::asm;
 use libkern::{
     IpcMsg, RIGHT_MAP_READ, RIGHT_MAP_WRITE, SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND,
@@ -29,6 +31,10 @@ use libkern::{
     SYS_NS_BIND, SYS_NS_LOOKUP, SYS_TIMER_CREATE, SYS_TIMER_SET, SYS_WAIT, exit, kprint, syscall1,
     syscall2, syscall4, syscall5,
 };
+
+/// `alloc` backing for the C3 setup-message stage path (`run_stream_stage`).
+#[global_allocator]
+static ALLOC: libheap::Heap = libheap::Heap;
 
 const PAGE: u64 = 4096;
 /// The marker the sender writes into the transferred object; the receiver
@@ -435,15 +441,108 @@ fn run_fp_worker(seed: u64) -> ! {
     exit(0);
 }
 
+/// Parse a base-10 unsigned integer (no `std`); `None` on any non-digit.
+fn parse_u64(s: &str) -> Option<u64> {
+    if s.is_empty() {
+        return None;
+    }
+    let mut v: u64 = 0;
+    for b in s.bytes() {
+        if !b.is_ascii_digit() {
+            return None;
+        }
+        v = v.checked_mul(10)?.checked_add((b - b'0') as u64)?;
+    }
+    Some(v)
+}
+
+/// The C3 **Tier-1 stage** path: receive the setup message on the bootstrap endpoint
+/// (streams + `argv`), then read a TSM1 stream from `stdin` and verify it against the
+/// row count passed in `argv[1]`. Exits `0` on success, `1` on any mismatch — the
+/// setup-message spawn proved end to end. `argv` is `["stage-demo", "<rows>"]`.
+fn run_stream_stage(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
+    use libstream::channel::{ChannelReceiver, IpcPort};
+    use libstream::table::{Item, TableReader};
+
+    let boot = libstream::setup::bootstrap(notif, ns, endpoint, arg0);
+    let setup = match boot.setup() {
+        Some(Ok(s)) => s,
+        _ => {
+            kprint(b"child[stage]: setup recv/parse FAIL\n");
+            exit(1);
+        }
+    };
+    // argv delivery: expect ["stage-demo", "<rows>"].
+    let expect = match setup.argv.get(1).and_then(|s| parse_u64(s)) {
+        Some(n) => n as i64,
+        None => {
+            kprint(b"child[stage]: bad argv\n");
+            exit(1);
+        }
+    };
+    let stdin = match setup.streams.stdin {
+        Some(h) => h,
+        None => {
+            kprint(b"child[stage]: no stdin stream\n");
+            exit(1);
+        }
+    };
+    // Read + verify the TSM1 stream on stdin: STAGE_ROWS rows, row `i` carries `Int(i)`.
+    let bytes = match ChannelReceiver::new(IpcPort::new(stdin)).receive() {
+        Ok(b) => b,
+        Err(_) => {
+            kprint(b"child[stage]: stdin receive FAIL\n");
+            exit(1);
+        }
+    };
+    let mut tr = match TableReader::new(&bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            kprint(b"child[stage]: bad TSM1 header\n");
+            exit(1);
+        }
+    };
+    let mut n: i64 = 0;
+    loop {
+        match tr.next() {
+            Some(Ok(Item::Row(vals))) => {
+                if vals.first().and_then(|v| v.as_int()) != Some(n) {
+                    kprint(b"child[stage]: row MISMATCH\n");
+                    exit(1);
+                }
+                n += 1;
+            }
+            Some(Ok(Item::End(_))) | None => break,
+            _ => {
+                kprint(b"child[stage]: decode FAIL\n");
+                exit(1);
+            }
+        }
+    }
+    if n != expect {
+        kprint(b"child[stage]: wrong row count\n");
+        exit(1);
+    }
+    kprint(b"child[stage]: setup message + stdin stream verified ok\n");
+    exit(0);
+}
+
 /// Bootstrap registers (`kernel/src/syscall/table.rs`): `rdi` = notification
 /// channel (unused here), `rsi` = inherited root namespace, `rdx` = the shared
-/// channel endpoint, `rcx` = `arg0`.
+/// channel endpoint (or the setup channel for a Tier-1 stage), `rcx` = `arg0`.
 ///
-/// `arg0` is split: the low 8 bits select the **role**, the rest is a role-specific
-/// payload. Roles 0–2 carry no payload, so their `arg0` values are unchanged; role 3
-/// takes its per-worker seed from the high bits.
+/// `arg0` is the one spawn convention's bootstrap descriptor (a setup message pending →
+/// Tier-1 stage). The legacy `arg0`-role field below (low 8 bits) is the pre-convention
+/// path, retired with parent/child.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(_notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
+    // The one spawn convention (decision log 2026-07-24): if `arg0` is a bootstrap
+    // *descriptor* with a pending setup message, this process is a Tier-1 stage — that
+    // takes precedence over the legacy `arg0`-role field below (which is retired with
+    // parent/child). See `docs/spec/pipeline-stdio.md`.
+    if libstream::setup::setup_is_pending(arg0) {
+        run_stream_stage(_notif, ns, endpoint, arg0);
+    }
     let role = arg0 & 0xFF;
     // Role 2 — the exit-storm stress child (spawned with no handles): exit
     // immediately. The payload IS the process teardown — kernel-stack free,
