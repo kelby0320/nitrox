@@ -7,9 +7,16 @@ edition = "2024"
 # `docs/spec/typed-stream-format.md`). The wire core (`wire.rs`) is `core + alloc`
 # only, with **no dependencies** — so it stays transport-agnostic and host-tests
 # cleanly (`cargo test -p libstream --target <host>`), exactly like `libcrypto`.
-# The channel/transport adapter (a later part) will add `libos`/`libkern`; the
-# codec itself never touches a syscall.
 [dependencies]
+# The concrete channel transport (`IpcPort`) touches syscalls, so it depends on the
+# raw syscall layer — but only under the `io` feature, so the wire core keeps
+# host-testing with no dependency. Off by default; a userspace bin that moves streams
+# over a real IPC channel enables it (`libstream = { …, features = ["io"] }`).
+libkern = { path = "../libkern", optional = true }
+
+[features]
+# The syscall-backed transport: `channel::IpcPort` over `sys_channel_send`/`recv`.
+io = ["dep:libkern"]
 
 [lib]
 name = "libstream"

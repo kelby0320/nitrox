@@ -28,9 +28,15 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use core::arch::asm;
 use libkern::*;
 use libos::{Handle, Namespace, NsMutable, spawn, thread_create};
+
+/// `alloc` backing for the `libstream` transport demo (`stream_transport_demo`).
+#[global_allocator]
+static ALLOC: libheap::Heap = libheap::Heap;
 
 /// `KError::TimedOut` as an `IoResult.status` value (derived from `libkern`).
 const KERR_TIMED_OUT: i32 = KError::TimedOut.as_i32();
@@ -121,6 +127,161 @@ static mut WORKER_ARGS: ThreadArgs = ThreadArgs {
     _reserved: [0; 36],
 };
 static mut WORKER_REGS: RegisterValues = RegisterValues { regs: [0; 18] };
+
+// --- stdio/pipe transport demo (C3) -----------------------------------------
+/// Thread args for the stream producer.
+static mut STREAM_ARGS: ThreadArgs = ThreadArgs {
+    entry: 0,
+    user_sp: 0,
+    arg0: 0,
+    class: 0,
+    rt_priority: 0,
+    nice: 0,
+    cpu_affinity: 0,
+    _reserved: [0; 36],
+};
+/// The producer thread's send endpoint (an in-process hand-off — not the spawn ABI).
+static mut STREAM_E0: u64 = 0;
+/// Rows the producer writes; large enough that the stream far exceeds the pipe's
+/// bounded ring, so the producer thread actually blocks on backpressure while the
+/// consumer (the main thread) drains.
+const STREAM_ROWS: i64 = 2000;
+/// The producer thread's stack, in pages.
+const STREAM_STACK_PAGES: u64 = 8;
+
+/// The producer thread: write a `{ i: Int, name: String }` TSM1 stream of
+/// [`STREAM_ROWS`] rows onto its endpoint via [`libstream::channel::ChannelSink`], then
+/// exit cleanly. The process keeps the endpoint (handles are process-owned), so the
+/// consumer sees no spurious `PeerClosed`.
+extern "C" fn stream_producer() -> ! {
+    use alloc::string::String;
+    use libstream::channel::{ChannelSink, IpcPort};
+    use libstream::table::TableWriter;
+    use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
+
+    // SAFETY: main initialised STREAM_E0 before creating this thread.
+    let e0 = unsafe { (&raw const STREAM_E0).read() };
+    let schema = Schema::new()
+        .field("i", TypeTag::Int, TypeModifiers::NONE)
+        .field("name", TypeTag::String, TypeModifiers::NONE);
+    let mut tw = TableWriter::new(ChannelSink::new(IpcPort::new(e0), IPC_PAYLOAD_SIZE));
+    let ok = tw.write_schema(StreamFlags::NONE, &schema).is_ok()
+        && (0..STREAM_ROWS).all(|i| {
+            tw.write_row(&[Value::Int(i), Value::Str(String::from("row"))])
+                .is_ok()
+        })
+        && tw.finish_with_status(0).is_ok()
+        && tw.into_sink().finish().is_ok();
+    let _ = ok; // a mismatch surfaces as the consumer's fail-loud verdict
+    // Clean thread exit (the process retains e0 for the consumer to finish draining).
+    // SAFETY: `sys_thread_exit` ends this thread; the exit code is unused.
+    unsafe { syscall1(SYS_THREAD_EXIT, 0) };
+    // Unreachable once the thread is gone.
+    loop {
+        // SAFETY: `pause` is always valid in ring 3 with no effects.
+        unsafe { asm!("pause", options(nomem, nostack)) };
+    }
+}
+
+/// Move a TSM1 stream over a **real IPC channel between two threads** — the C3
+/// transport proof. Main creates a small-ring pipe, spawns [`stream_producer`] on one
+/// end, and consumes + verifies [`STREAM_ROWS`] rows on the other via
+/// [`libstream::channel::ChannelReceiver`]. Because the stream far exceeds the ring, the
+/// producer blocks on backpressure while main drains — exercising the real blocking-send
+/// path. A mismatch is fail-loud (`exit(1)` → init fails the run).
+fn stream_transport_demo() {
+    use libstream::channel::{ChannelReceiver, IpcPort};
+    use libstream::table::{Item, TableReader};
+    kprint(b"parent: stream transport demo (2-thread pipe, backpressured)\n");
+
+    // 1. A depth-4 pipe: small on purpose, so a 2000-row stream overflows the ring.
+    // SAFETY: END0/END1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut END0) as u64, (&raw mut END1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        kprint(b"parent: stream chan create FAIL\n");
+        exit(1);
+    }
+    // SAFETY: the kernel wrote both endpoint handles.
+    let (e0, e1) = unsafe { ((&raw const END0).read(), (&raw const END1).read()) };
+
+    // 2. The producer thread's stack (mapped read/write; grows down from the top).
+    let stack_bytes = STREAM_STACK_PAGES * PAGE;
+    // SAFETY: register-only syscalls with valid arguments.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, stack_bytes, 0, 0, 0) };
+    if mem < 0 {
+        kprint(b"parent: stream stack create FAIL\n");
+        exit(1);
+    }
+    // SAFETY: maps the stack object read/write at a kernel-chosen address.
+    let base = unsafe {
+        syscall4(SYS_MEMORY_MAP, mem as u64, 0, stack_bytes, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
+    };
+    if base < 0 {
+        kprint(b"parent: stream stack map FAIL\n");
+        exit(1);
+    }
+    let stack_top = base as u64 + stack_bytes;
+
+    // 3. Spawn the producer thread on `e0`.
+    // SAFETY: STREAM_E0/STREAM_ARGS are our statics; we initialise them, then hand a
+    // shared reference to the wrapper.
+    let _producer = match unsafe {
+        STREAM_E0 = e0;
+        STREAM_ARGS.entry = stream_producer as *const () as u64;
+        STREAM_ARGS.user_sp = stack_top;
+        STREAM_ARGS.arg0 = 0;
+        thread_create(&*(&raw const STREAM_ARGS))
+    } {
+        Ok(t) => t,
+        Err(_) => {
+            kprint(b"parent: stream producer thread FAIL\n");
+            exit(1);
+        }
+    };
+
+    // 4. Consume + verify on `e1`: STREAM_ROWS rows, row `i` carries `Int(i)`.
+    let mut rx = ChannelReceiver::new(IpcPort::new(e1));
+    let bytes = match rx.receive() {
+        Ok(b) => b,
+        Err(_) => {
+            kprint(b"parent: stream receive FAIL\n");
+            exit(1);
+        }
+    };
+    let mut tr = match TableReader::new(&bytes) {
+        Ok(t) => t,
+        Err(_) => {
+            kprint(b"parent: stream bad TSM1 header\n");
+            exit(1);
+        }
+    };
+    let mut n: i64 = 0;
+    loop {
+        match tr.next() {
+            Some(Ok(Item::Row(vals))) => {
+                if vals.first().and_then(|v| v.as_int()) != Some(n) {
+                    kprint(b"parent: stream row MISMATCH\n");
+                    exit(1);
+                }
+                n += 1;
+            }
+            Some(Ok(Item::End(_))) | None => break,
+            _ => {
+                kprint(b"parent: stream decode FAIL\n");
+                exit(1);
+            }
+        }
+    }
+    if n != STREAM_ROWS {
+        kprint(b"parent: stream wrong row count\n");
+        exit(1);
+    }
+    kprint(b"parent: stream transport ok (2000 rows over a real pipe, backpressured)\n");
+    // `_producer` (the thread handle) drops here — closes our handle; the thread has
+    // already self-exited. END0/END1 are closed at process exit.
+}
 
 // --- Userspace-server forwarding demo (slice 7 Part 3) ----------------------
 /// The kernel end of the forwarding channel (bound at `/fs` as a Userspace
@@ -1745,7 +1906,13 @@ fn forward_demo() {
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"parent: up (demo supervisor, spawned by init)\n");
 
-    // 0. Exception demo: a worker thread faults; we suspend, inspect, terminate.
+    // 0. stdio/pipe transport (C3): a TSM1 stream over a real IPC channel between two
+    //    threads, with real backpressure. **First**, so it completes (and a failure
+    //    reaches init's `code != 0` fail path) before the concurrent login chain fires
+    //    the verdict — same race the FP demo dodges by running early.
+    stream_transport_demo();
+
+    // 0a. Exception demo: a worker thread faults; we suspend, inspect, terminate.
     worker_exception_demo(notif);
 
     // 0a. Hardware floating point in ring 3 (Phase-4 FP enablement Part D). Runs

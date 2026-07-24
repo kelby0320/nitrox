@@ -156,6 +156,180 @@ impl<P: MsgPort> ChannelReceiver<P> {
     }
 }
 
+#[cfg(feature = "io")]
+pub use self::io_port::IpcPort;
+
+/// The concrete [`MsgPort`] over a real IPC channel endpoint — the syscall-touching
+/// half of the transport. Gated behind the `io` feature so the framing above stays
+/// host-testable with no dependency.
+#[cfg(feature = "io")]
+mod io_port {
+    use super::MsgPort;
+    use crate::wire::{Result, WireError};
+    use alloc::boxed::Box;
+    use alloc::vec::Vec;
+    use libkern::abi::{IPC_MSG_SIZE, IPC_PAYLOAD_SIZE, SENDMODE_BLOCK};
+    use libkern::syscall::{
+        SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE, SYS_WAIT, syscall1, syscall4,
+        syscall6,
+    };
+
+    // `KError` discriminants we distinguish (see `libkern::error::KError`).
+    const E_WOULDBLOCK: i64 = -11;
+    const E_PEERCLOSED: i64 = -13;
+
+    // `IpcMsgHeader` field byte offsets (see `libkern::abi::IpcMsgHeader`) — accessed by
+    // offset so the buffer can be a plain byte array (no `align(4096)` allocation).
+    const OFF_PAYLOAD_LEN: usize = 4;
+    const OFF_HANDLE_COUNT: usize = 8;
+    const OFF_FLAGS: usize = 10;
+    const OFF_PAYLOAD: usize = 24;
+
+    /// Transport flag, carried in the IPC header's `flags`: the final message of a
+    /// stream. The kernel passes `flags` through untouched, so the receiver reads it.
+    const MSG_FLAG_LAST: u16 = 1 << 0;
+
+    /// A [`MsgPort`] over one IPC channel endpoint (`sys_channel_send`/`recv`), owning a
+    /// reusable one-page message buffer. Backpressure and `PeerClosed` are the channel's
+    /// own behaviour (a full ring blocks the send; a closed peer fails it).
+    pub struct IpcPort {
+        endpoint: u64,
+        buf: Box<[u8; IPC_MSG_SIZE]>,
+    }
+
+    impl IpcPort {
+        /// Wrap a channel-endpoint handle.
+        pub fn new(endpoint: u64) -> Self {
+            IpcPort {
+                endpoint,
+                buf: Box::new([0u8; IPC_MSG_SIZE]),
+            }
+        }
+        /// The endpoint handle this port sends/receives on.
+        pub fn endpoint(&self) -> u64 {
+            self.endpoint
+        }
+    }
+
+    fn map_err(r: i64) -> WireError {
+        match r {
+            E_PEERCLOSED => WireError::PeerClosed,
+            _ => WireError::SinkFull, // WouldBlock / pending-queue-full / other
+        }
+    }
+
+    impl MsgPort for IpcPort {
+        fn send(&mut self, payload: &[u8], last: bool) -> Result<()> {
+            if payload.len() > IPC_PAYLOAD_SIZE {
+                return Err(WireError::SinkFull);
+            }
+            let flags: u16 = if last { MSG_FLAG_LAST } else { 0 };
+            self.buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
+                .copy_from_slice(&(payload.len() as u32).to_le_bytes());
+            self.buf[OFF_HANDLE_COUNT] = 0;
+            self.buf[OFF_FLAGS..OFF_FLAGS + 2].copy_from_slice(&flags.to_le_bytes());
+            self.buf[OFF_PAYLOAD..OFF_PAYLOAD + payload.len()].copy_from_slice(payload);
+
+            let no_handles = [0u64; 1];
+            // Block-mode send returns a PendingOperation handle to wait on (delivery,
+            // i.e. backpressure), or a negative `KError`. The message is committed once
+            // it returns a handle. SAFETY: `buf` is a valid IPC_MSG_SIZE buffer;
+            // `no_handles` is a valid (empty) handle array with count 0.
+            let r = unsafe {
+                syscall6(
+                    SYS_CHANNEL_SEND,
+                    self.endpoint,
+                    self.buf.as_ptr() as u64,
+                    no_handles.as_ptr() as u64,
+                    0,
+                    SENDMODE_BLOCK,
+                    u64::MAX,
+                )
+            };
+            if r < 0 {
+                return Err(map_err(r));
+            }
+            // Wait for the delivery PO to complete (this is where a full ring blocks),
+            // then release it.
+            let po = r as u64;
+            let wait_handles = [po];
+            let mut result = [0u8; 24]; // one IoResult
+            // SAFETY: valid handle + result out-buffers.
+            let waited = unsafe {
+                syscall4(
+                    SYS_WAIT,
+                    wait_handles.as_ptr() as u64,
+                    1,
+                    result.as_mut_ptr() as u64,
+                    u64::MAX,
+                )
+            };
+            // SAFETY: closing the PO handle we own.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
+            if waited < 1 {
+                return Err(WireError::PeerClosed);
+            }
+            // IoResult.status is an i32 at offset 8; negative ⇒ the peer died while queued.
+            let status = i32::from_le_bytes([result[8], result[9], result[10], result[11]]);
+            if status < 0 {
+                return Err(map_err(status as i64));
+            }
+            Ok(())
+        }
+
+        fn recv(&mut self, out: &mut Vec<u8>) -> Result<bool> {
+            let mut recv_handles = [0u64; 8];
+            let mut count: usize = 0;
+            loop {
+                // SAFETY: valid msg/handles/count out-params.
+                let r = unsafe {
+                    syscall4(
+                        SYS_CHANNEL_RECV,
+                        self.endpoint,
+                        self.buf.as_mut_ptr() as u64,
+                        recv_handles.as_mut_ptr() as u64,
+                        (&raw mut count) as u64,
+                    )
+                };
+                if r == 0 {
+                    let n = u32::from_le_bytes([
+                        self.buf[OFF_PAYLOAD_LEN],
+                        self.buf[OFF_PAYLOAD_LEN + 1],
+                        self.buf[OFF_PAYLOAD_LEN + 2],
+                        self.buf[OFF_PAYLOAD_LEN + 3],
+                    ]) as usize;
+                    if n > IPC_PAYLOAD_SIZE {
+                        return Err(WireError::UnexpectedEof);
+                    }
+                    out.extend_from_slice(&self.buf[OFF_PAYLOAD..OFF_PAYLOAD + n]);
+                    let flags = u16::from_le_bytes([self.buf[OFF_FLAGS], self.buf[OFF_FLAGS + 1]]);
+                    return Ok(flags & MSG_FLAG_LAST != 0);
+                }
+                if r == E_WOULDBLOCK {
+                    // Empty ring: block until a message (or the peer's close) signals it.
+                    let wait_handles = [self.endpoint];
+                    let mut result = [0u8; 24];
+                    // SAFETY: valid handle + result out-buffers.
+                    let waited = unsafe {
+                        syscall4(
+                            SYS_WAIT,
+                            wait_handles.as_ptr() as u64,
+                            1,
+                            result.as_mut_ptr() as u64,
+                            u64::MAX,
+                        )
+                    };
+                    if waited < 1 {
+                        return Err(WireError::PeerClosed);
+                    }
+                    continue;
+                }
+                return Err(map_err(r));
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
