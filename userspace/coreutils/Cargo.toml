@@ -25,3 +25,7 @@ path = "src/lib.rs"
 [[bin]]
 name = "list"
 path = "src/bin/list.rs"
+
+[[bin]]
+name = "copy"
+path = "src/bin/copy.rs"

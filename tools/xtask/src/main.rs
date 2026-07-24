@@ -196,7 +196,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("heartbeat", None)?;
     // The coreutils (`list`, …) — real programs, present in release images. One crate,
     // a bin per program, so the crate directory is named separately from the bins.
-    build_userspace_crate("coreutils", &["list"], None)?;
+    build_userspace_crate("coreutils", &["list", "copy"], None)?;
     build_userspace_bin("profile-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
@@ -966,6 +966,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         "session-mgr",
         "usersh",
         "list",
+        "copy",
     ];
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.

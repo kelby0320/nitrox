@@ -8087,3 +8087,58 @@ one crate directory per program, which `coreutils` (a bin per program) breaks.
 release image builds with `list` embedded. **Negative-controlled:** making `list` treat
 `PeerClosed` as a failure fails the run ("list exited non-zero"), so the early-close check
 is known-sensitive.
+
+## 2026-07-24 — Coreutils Milestone 1 Part D: `copy`, and two gaps it refused to paper over
+
+**`copy` completes Milestone 1** — where `list` reads, `copy` mutates: creating files,
+growing them, writing contents, and building directory trees. Behaviour per design §10d,
+with the choices worth recording:
+
+- **Directories copy recursively with no flag.** `remove` requires `--recursive` as a
+  safety rail; copying has no destructive-by-default hazard, so demanding a flag would be
+  ceremony.
+- **An existing destination is an error** unless `--force` — fail loud, don't fail silent.
+- **It emits a table** (`Table<{source, destination, bytes}>`). A stage that produced
+  nothing would leave a downstream consumer waiting on a stream that never arrives, and
+  "what did it actually copy" is what a pipeline wants to see.
+- **File contents do not go through the directory protocol at all.** A file resolves to a
+  page-cache object the process maps, so a copy is a `memcpy` between two mappings and the
+  kernel moves the data (Model A). That is why the new helpers live in `coreutils::fs`
+  rather than in `librsproto`: no protocol is involved.
+
+**Gap 1 — no truncate, so `--force` onto a longer file is refused.** Creating an existing
+file is idempotent and growing it to a smaller size is a no-op, so writing short content
+over a long destination would leave the old tail behind: a file that is neither the old one
+nor the new one. `copy` refuses (`WouldTruncate`) rather than corrupt. The demo asserts
+both that the refusal happens **and that the destination is unchanged afterwards** — a
+refusal that had already clobbered the file would be worse than no refusal.
+
+**Gap 2 — a dead process's handles are never reclaimed, so `PeerClosed` never fires.**
+The harness hung, and the cause was not in `copy`. `HandleTable` is global with a
+per-entry `owner_pid`, and **nothing sweeps it at process exit**: `HandleTable::close` is
+the only close path and it is per-handle. A dead child's pipe endpoint therefore stays
+open, its peer's `sys_channel_recv` returns `WouldBlock` forever (verified directly: the
+probe returned `-11`, not `-13`), and `IpcChannel::already_signaled` never reports ready
+because `peer` is non-null. Ruled out along the way: the parent's `Process` handle (drop
+made no difference), the handle transfer itself (the success path proves it), and lazy
+thread reaping (the idle thread reaps, and `ChildExited` had already been delivered).
+
+This matters well beyond the test: it is exactly the mechanism the pipeline model depends
+on for a stage that dies early (design §1). The `yes | head -1` case works today only
+because the *consumer* closes explicitly. The demo now reaps a stage's exit **before**
+draining its stream, which sidesteps the hang without pretending it is fixed; the fix is
+filed in `deferred-decisions.md` — sweep the dying pid's entries at exit, dropping their
+`ObjectRef`s outside `SCHED` and outside IRQ context (the deferred-drop discipline from
+substrate hardening Parts A/F, since an `ObjectRef` drop can reach the allocator).
+
+*Verified:* host suite 755 green (3 new path-splitting tests: a trailing separator must not
+yield an empty basename, and a single-component path's parent is `/`, not `""`);
+`test-qemu` PASS covering file copy, refusal-without-`--force` with the destination
+unchanged, `--force` overwrite, the no-truncate refusal with the destination unchanged, and
+a recursive directory copy verified by reading the copied file's bytes back through a fresh
+resolve. **Negative-controlled:** disabling the truncate guard makes the run fail ("copy
+over a longer file wrongly succeeded"). `check-arch`/`check-nightly` green.
+
+**Milestone 1 is complete** — the substrate composes end to end: dir-ops supplies the data,
+the TSM1/`Value` model types it, the stdio/setup convention delivers it, and two real
+programs sit on each end of a real pipe.

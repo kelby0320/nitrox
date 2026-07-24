@@ -1690,6 +1690,323 @@ fn reap_child_exit(notif: u64) -> i32 {
     }
 }
 
+/// **`copy`, the mutation side of the filesystem** (coreutils Milestone 1 Part D).
+///
+/// Where the `list` demo proves the read path and the pipe, this proves that a coreutil
+/// can *change* the filesystem correctly: create a file, write its contents, build a
+/// directory tree, and — importantly — **refuse** the cases that would silently produce a
+/// wrong result.
+///
+/// The fixture is built under `/system` and removed afterwards. Checks, in order:
+///
+/// 1. **File copy** — the destination exists with the source's exact size, and its bytes
+///    match, read back through a fresh resolve (so this is what actually reached the
+///    filesystem, not what is sitting in a mapping we still hold).
+/// 2. **An existing destination is refused** without `--force` — exit `2` (usage), and the
+///    destination is left **unchanged**, which is the part that matters: a refusal that
+///    had already clobbered the file would be worse than no refusal at all.
+/// 3. **`--force` overwrites** a same-size destination.
+/// 4. **Overwriting a longer file is refused even with `--force`** — the filesystem has no
+///    truncate, so the old tail would survive. The destination must again be untouched.
+/// 5. **Directory copy is recursive** — a nested tree arrives with its files' contents.
+fn copy_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: copy demo (the mutation side)\n");
+
+    // --- fixture: /system/nx-copy/{a.txt, sub/b.txt} -------------------------
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: copy fixture open FAIL\n"),
+    };
+    if sys.mkdir(b"nx-copy").is_err() {
+        return_fail(b"test-harness: copy fixture mkdir FAIL\n");
+    }
+    sys.close();
+    {
+        let mut b2 = [0u8; 4096];
+        let mut d = match Dir::open(root_ns, b"/system/nx-copy", &mut b2) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: copy fixture reopen FAIL\n"),
+        };
+        if d.mkdir(b"sub").is_err() {
+            return_fail(b"test-harness: copy fixture subdir FAIL\n");
+        }
+        d.close();
+    }
+    write_file(root_ns, b"/system/nx-copy/a.txt", COPY_CONTENT_A);
+    write_file(root_ns, b"/system/nx-copy/sub/b.txt", COPY_CONTENT_B);
+
+    // --- 1. file → file ------------------------------------------------------
+    if run_copy(root_ns, notif, &["copy", "/system/nx-copy/a.txt", "/system/nx-copy/c.txt"]) != 0 {
+        return_fail(b"test-harness: copy file exited non-zero\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-copy/c.txt", COPY_CONTENT_A) {
+        return_fail(b"test-harness: copied file content MISMATCH\n");
+    }
+
+    // --- 2. an existing destination is refused, and left alone ---------------
+    let code = run_copy(root_ns, notif, &["copy", "/system/nx-copy/sub/b.txt", "/system/nx-copy/c.txt"]);
+    if code == 0 {
+        return_fail(b"test-harness: copy over an existing file wrongly succeeded\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-copy/c.txt", COPY_CONTENT_A) {
+        return_fail(b"test-harness: refused copy still modified the destination\n");
+    }
+
+    // --- 3. --force overwrites (same size) -----------------------------------
+    if run_copy(root_ns, notif, &["copy", "--force", "/system/nx-copy/sub/b.txt", "/system/nx-copy/c.txt"]) != 0 {
+        return_fail(b"test-harness: copy --force exited non-zero\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-copy/c.txt", COPY_CONTENT_B) {
+        return_fail(b"test-harness: --force did not overwrite\n");
+    }
+
+    // --- 4. --force onto a LONGER destination is refused ---------------------
+    // No truncate exists, so the old tail would survive the write. `copy` must refuse
+    // rather than leave a file that is neither the old one nor the new one.
+    write_file(root_ns, b"/system/nx-copy/long.txt", COPY_CONTENT_LONG);
+    let code = run_copy(root_ns, notif, &["copy", "--force", "/system/nx-copy/a.txt", "/system/nx-copy/long.txt"]);
+    if code == 0 {
+        return_fail(b"test-harness: copy over a longer file wrongly succeeded\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-copy/long.txt", COPY_CONTENT_LONG) {
+        return_fail(b"test-harness: refused truncating copy still modified the destination\n");
+    }
+
+    // --- 5. directory copy is recursive --------------------------------------
+    if run_copy(root_ns, notif, &["copy", "/system/nx-copy/sub", "/system/nx-copy/sub2"]) != 0 {
+        return_fail(b"test-harness: copy directory exited non-zero\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-copy/sub2/b.txt", COPY_CONTENT_B) {
+        return_fail(b"test-harness: recursive copy did not reproduce the tree\n");
+    }
+
+    // --- teardown ------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-copy/sub", &[b"b.txt"]);
+    unlink_all(root_ns, b"/system/nx-copy/sub2", &[b"b.txt"]);
+    unlink_all(
+        root_ns,
+        b"/system/nx-copy",
+        &[b"a.txt", b"c.txt", b"long.txt"],
+    );
+    {
+        let mut b3 = [0u8; 4096];
+        let mut d = match Dir::open(root_ns, b"/system/nx-copy", &mut b3) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: copy teardown open FAIL\n"),
+        };
+        if d.rmdir(b"sub").is_err() || d.rmdir(b"sub2").is_err() {
+            return_fail(b"test-harness: copy teardown rmdir FAIL\n");
+        }
+        d.close();
+    }
+    let mut b4 = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut b4) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: copy teardown FAIL\n"),
+    };
+    if sys.rmdir(b"nx-copy").is_err() {
+        return_fail(b"test-harness: copy teardown rmdir FAIL\n");
+    }
+    sys.close();
+    kprint(b"test-harness: copy ok (file, recursive dir, and both refusals)\n");
+}
+
+/// Fixture contents. `A` and `B` are the same length so the `--force` overwrite in step 3
+/// is a same-size write (the case that *is* supported), while `LONG` is longer than `A` so
+/// step 4 hits the no-truncate refusal.
+const COPY_CONTENT_A: &[u8] = b"alpha content, fixed length.\n";
+const COPY_CONTENT_B: &[u8] = b"bravo content, fixed length.\n";
+const COPY_CONTENT_LONG: &[u8] =
+    b"a much longer destination whose tail would survive a short overwrite\n";
+
+/// Spawn `copy` with `argv` as a Tier-1 stage (stdout wired, so its report table is
+/// produced and drained) and return its exit code.
+fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
+    use libstream::channel::{ChannelReceiver, IpcPort};
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
+
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/copy", RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        return_fail(b"test-harness: copy image FAIL\n");
+    }
+    let (rx, stdout) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: copy stdout pipe FAIL\n"),
+    };
+    let (setup_shell, setup_stage) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: copy setup chan FAIL\n"),
+    };
+    // SAFETY: SPAWN_LIST is our static (shared by the coreutil spawns, which are
+    // sequential); initialised here for this spawn.
+    let _proc = match unsafe {
+        SPAWN_LIST.image = img;
+        SPAWN_LIST.handles[0] = setup_stage;
+        SPAWN_LIST.arg0 = bootstrap_arg0(true);
+        spawn(&*(&raw const SPAWN_LIST))
+    } {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: copy spawn FAIL\n"),
+    };
+    let streams = Streams {
+        stdin: None,
+        stdout: Some(stdout),
+        stderr: None,
+    };
+    if send_setup(setup_shell, &streams, argv).is_err() {
+        return_fail(b"test-harness: copy send_setup FAIL\n");
+    }
+    // Reap first, then drain — deliberately in that order.
+    //
+    // A `copy` that fails exits *without* writing its report, and waiting for a stream
+    // that will never arrive would hang: a dead process's handles are not reclaimed at
+    // exit (the handle table is global and keyed by `owner_pid`, with no exit-time
+    // sweep), so its end of this pipe stays open and the peer never observes
+    // `PeerClosed`. Knowing the exit code first lets this drain only the streams that
+    // exist. See the decision log, 2026-07-24 — this is a kernel gap, not a property of
+    // `copy`.
+    let code = reap_child_exit(notif);
+    drop(_proc);
+    if code == 0 {
+        let _ = ChannelReceiver::new(IpcPort::new(rx)).receive();
+    }
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, rx);
+        syscall1(SYS_HANDLE_CLOSE, setup_shell);
+    }
+    code
+}
+
+/// Create `path` with exactly `content` (the fixture writer).
+fn write_file(ns: u64, path: &[u8], content: &[u8]) {
+    let size = content.len() as u64;
+    // SAFETY: valid path slice + namespace handle.
+    let po = unsafe {
+        syscall5(
+            SYS_FILE_CREATE,
+            ns,
+            path.as_ptr() as u64,
+            path.len() as u64,
+            RIGHT_MAP_READ | RIGHT_MAP_WRITE,
+            size,
+        )
+    };
+    if po < 0 {
+        return_fail(b"test-harness: fixture create FAIL\n");
+    }
+    let (st, fh) = po_wait_pair(po as u64);
+    if st != 0 || fh == 0 {
+        return_fail(b"test-harness: fixture create FAIL\n");
+    }
+    // SAFETY: mapping our own writable file handle.
+    let addr = unsafe {
+        syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
+    };
+    if addr < 0 {
+        return_fail(b"test-harness: fixture map FAIL\n");
+    }
+    for (i, b) in content.iter().enumerate() {
+        // SAFETY: `i` is within the `size`-byte mapping.
+        unsafe { ((addr as u64 + i as u64) as *mut u8).write_volatile(*b) };
+    }
+    // SAFETY: flushing, unmapping, and closing our own handle.
+    unsafe {
+        syscall1(SYS_FILE_SYNC, fh);
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+        syscall1(SYS_HANDLE_CLOSE, fh);
+    }
+}
+
+/// Whether `path` resolves to a file of exactly `expect`'s length and bytes.
+///
+/// Resolves fresh, so this reads what reached the filesystem rather than a mapping the
+/// writer still holds.
+fn file_matches(ns: u64, path: &[u8], expect: &[u8]) -> bool {
+    let (st, fh) = ns_lookup_wait(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT);
+    if st != 0 || fh == 0 {
+        return false;
+    }
+    let mut info = HandleInfo {
+        rights: 0,
+        object_type: 0,
+        generation: 0,
+        size: 0,
+    };
+    // SAFETY: a real, correctly sized `HandleInfo` out-param.
+    let r = unsafe { syscall2(SYS_HANDLE_STAT, fh, (&raw mut info) as u64) };
+    if r != 0 || info.size != expect.len() as u64 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return false;
+    }
+    // SAFETY: mapping a readable file handle.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, info.size, RIGHT_MAP_READ) };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+        return false;
+    }
+    let mut ok = true;
+    for (i, b) in expect.iter().enumerate() {
+        // SAFETY: `i` is within the mapped `info.size` bytes.
+        let got = unsafe { ((addr as u64 + i as u64) as *const u8).read_volatile() };
+        if got != *b {
+            ok = false;
+            break;
+        }
+    }
+    // SAFETY: unmapping + closing our own resources.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, info.size);
+        syscall1(SYS_HANDLE_CLOSE, fh);
+    }
+    ok
+}
+
+/// Remove the named entries from `dir` (fixture teardown).
+fn unlink_all(ns: u64, dir: &[u8], names: &[&[u8]]) {
+    let mut buf = [0u8; 4096];
+    let mut d = match Dir::open(ns, dir, &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: teardown open FAIL\n"),
+    };
+    for name in names {
+        if d.unlink(name).is_err() {
+            return_fail(b"test-harness: teardown unlink FAIL\n");
+        }
+    }
+    d.close();
+}
+
+/// `sys_wait` on a `PendingOperation`, returning `(status, result)` and closing it.
+fn po_wait_pair(po: u64) -> (i32, u64) {
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid single-waiter buffers.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = po;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    let (status, result) = unsafe {
+        (
+            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
+            u64::from_le_bytes([
+                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
+                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+            ]),
+        )
+    };
+    // SAFETY: closing the PO we own.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po) };
+    if waited != 1 { (-1, 0) } else { (status, result) }
+}
+
 /// **Hardware floating point, end to end in ring 3** (Phase 4 FP enablement Part D;
 /// decision log 2026-07-21).
 ///
@@ -2248,6 +2565,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //      Tier-1 stage, its typed table consumed over a real depth-1 pipe. Early, like
     //      its neighbours, so it completes before the login chain adjudicates.
     list_pipeline_demo(root_ns, notif);
+
+    // 0a5. `copy` — the mutation side of the filesystem, including the two cases it must
+    //      refuse rather than get wrong (existing destination; no-truncate overwrite).
+    copy_demo(root_ns, notif);
 
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();

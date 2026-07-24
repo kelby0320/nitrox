@@ -5,6 +5,9 @@
 //!
 //! - [`stage`] — the Tier-0/Tier-1 startup prologue: streams, `argv`, `stderr`, exits.
 //! - [`args`] — GNU-style flag parsing (`--long`, `-f`, `--`, `--help`/`--version`).
+//! - [`fs`] — whole-file read/write + path splitting. File *contents* do not go through
+//!   the directory protocol at all: a file resolves to a page-cache object the process
+//!   maps, so a copy is a `memcpy` between two mappings.
 //!
 //! The directory client they all use is [`librsproto::session::Dir`], not something in
 //! here: it belongs beside the protocol it speaks.
@@ -19,6 +22,7 @@
 extern crate alloc;
 
 pub mod args;
+pub mod fs;
 pub mod stage;
 
 pub use args::{ArgError, Args, Flag, parse};

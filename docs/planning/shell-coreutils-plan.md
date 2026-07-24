@@ -173,8 +173,18 @@ needs. Slice branch: `phase-4/coreutils-m1`.
   reported bare names; the crate's host test build was broken by a bin-only `build.rs`) and
   surfaced the **no-wall-clock** gap: nothing can stamp a new inode, so OS-created files
   report `modified: 0` (filed in `deferred-decisions.md`). See the decision log (2026-07-24).
-- [ ] **Part D** — `copy` (file + recursive directory, `--force`), plus whatever write-path gap it
-  turns up.
+- [x] **Part D — `copy`, the mutation side** (2026-07-24). File and recursive-directory copy,
+  `--force`, emitting `Table<{source, destination, bytes}>`. File *contents* bypass the directory
+  protocol entirely (a file is a mapped page-cache object), so the helpers live in `coreutils::fs`.
+  Turned up **two gaps**, both filed rather than papered over: (1) **no truncate** — `--force` onto
+  a *longer* destination is refused, since the old tail would survive; (2) **a dead process's
+  handles are never reclaimed**, so a pipe endpoint held by an exited stage never closes and its
+  peer never sees `PeerClosed` — which is the mechanism the pipeline model needs for a stage that
+  dies early. Negative-controlled. See the decision log (2026-07-24).
+
+**Milestone 1 is complete.** The substrate composes end to end, with two follow-ups owed
+(`deferred-decisions.md`): exit-time handle reclamation (a correctness gate for stage failure) and
+file truncate.
 
 ### Milestone 2 — coreutils breadth
 
