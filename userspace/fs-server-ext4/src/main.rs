@@ -467,13 +467,21 @@ fn recv_on(h: u64) -> i64 {
     }
 }
 
-/// Map an ext4 `ext4_dir_entry_2.file_type` to the neutral wire kind.
-fn map_kind(ext4_ft: u8) -> u8 {
+/// Map an ext4 `ext4_dir_entry_2.file_type` to the neutral wire kind, falling back to the
+/// inode's `i_mode` format bits when the directory entry does not carry a type (a
+/// filesystem without the `filetype` feature stores `0` in every entry, and a listing that
+/// reported everything as "unknown" would be useless).
+fn map_kind(ext4_ft: u8, mode: u16) -> u8 {
     match ext4_ft {
         1 => DIRENT_KIND_FILE, // EXT4_FT_REG_FILE
         ext4::EXT4_FT_DIR => DIRENT_KIND_DIR,
         ext4::EXT4_FT_SYMLINK => DIRENT_KIND_SYMLINK,
-        _ => DIRENT_KIND_UNKNOWN,
+        _ => match mode & 0xF000 {
+            0x8000 => DIRENT_KIND_FILE,
+            0x4000 => DIRENT_KIND_DIR,
+            0xA000 => DIRENT_KIND_SYMLINK,
+            _ => DIRENT_KIND_UNKNOWN,
+        },
     }
 }
 
@@ -731,8 +739,10 @@ fn build_readdir_reply<R: BlockReader>(reader: &R, dir_ino: u32, cursor: u64) ->
         core::slice::from_raw_parts_mut((&raw mut DIR_BODY) as *mut u8, DIR_BODY_CAP)
     };
     let mut w = DirReplyWriter::new(body)?;
-    let next = ext4::read_dir(reader, dir_ino, cursor, |ino, ft, name| {
-        w.push(ino, map_kind(ft), name)
+    // The listing form: each entry carries its inode's size/mtime/mode, so a client gets a
+    // complete `Table<{name, size, kind, modified}>` from one round trip per reply.
+    let next = ext4::read_dir_stat(reader, dir_ino, cursor, |ino, ft, name, st| {
+        w.push(ino, map_kind(ft, st.mode), st.mode, st.size, st.mtime, name)
     });
     let next_cursor = next.ok()?;
     Some(w.finish(next_cursor))

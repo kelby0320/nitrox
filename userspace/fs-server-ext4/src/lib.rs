@@ -249,6 +249,42 @@ mod tests {
     }
 
     #[test]
+    fn read_dir_stat_reports_size_mode_and_mtime() {
+        // The listing form must resolve each entry's inode: `list` reports
+        // `Table<{name, size, kind, modified}>` straight off these fields.
+        let content = b"generation-42\n";
+        let r = ImageReader(fixture(1024, content));
+        let dir_ino = ext4::resolve_dir(&r, b"/system").unwrap();
+        let mut entries = Vec::new();
+        ext4::read_dir_stat(&r, dir_ino, 0, |_i, _ft, name, st| {
+            entries.push((String::from_utf8_lossy(name).into_owned(), *st));
+            true
+        })
+        .unwrap();
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+
+        let (_, file) = entries.iter().find(|(n, _)| n == "current-generation").unwrap();
+        assert_eq!(file.size, content.len() as u64, "exact file size, not a block count");
+        assert_eq!(file.mode & 0xF000, 0x8000, "S_IFREG");
+        assert_ne!(file.mode & 0o777, 0, "permission bits must survive");
+        // The fixture is built moments ago: a plausible, non-zero, non-future timestamp
+        // catches a mis-decoded field (a zeroed or byte-swapped mtime fails this).
+        assert!(
+            file.mtime > now - 3600 && file.mtime <= now + 60,
+            "mtime {} is not near now ({now})",
+            file.mtime
+        );
+
+        let (_, dot) = entries.iter().find(|(n, _)| n == ".").unwrap();
+        assert_eq!(dot.mode & 0xF000, 0x4000, "S_IFDIR for the directory itself");
+        assert_eq!(dot.ino, dir_ino, "`.` is the directory's own inode");
+    }
+
+    #[test]
     fn read_dir_cursor_resumes_when_emit_stops_early() {
         // Stop after the first entry, then resume from the returned cursor and confirm the
         // union covers every entry exactly once (no drop, no dup at the boundary).

@@ -255,8 +255,9 @@ pipe — is the subproject's Milestone 1, once these three are in.
 
 ### Typed shell + coreutils (subproject)
 
-Once the prereqs above are in, the language, interpreter, generic operators, coreutils breadth, and
-a minimal (non-rich) REPL are their own subproject:
+The prereqs above are in, so this subproject is **🚧 active** (from 2026-07-24, at Milestone 1 —
+`list` + `copy`, branch `phase-4/coreutils-m1`). The language, interpreter, generic operators,
+coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).

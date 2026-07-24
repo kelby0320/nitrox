@@ -1333,6 +1333,27 @@ fn dir_list_demo(root_ns: u64) {
             for e in iter {
                 if e.name == b"current-generation" {
                     saw_currentgen = true;
+                    // The entry now carries its inode metadata (the fields `list` reports
+                    // as `Table<{name, size, kind, modified}>`). Check them against what
+                    // this file must be: a non-empty regular file, smaller than a block,
+                    // stamped by the image build — a zeroed or mis-decoded field fails
+                    // every one of these, which a name-only check would have missed.
+                    if e.kind != librsproto::file::DIRENT_KIND_FILE {
+                        return_fail(b"test-harness: dir-list FAIL (current-generation not a file)\n");
+                    }
+                    if e.size == 0 || e.size > 4096 {
+                        return_fail(b"test-harness: dir-list FAIL (implausible size)\n");
+                    }
+                    if e.mode & 0xF000 != 0x8000 {
+                        return_fail(b"test-harness: dir-list FAIL (mode not S_IFREG)\n");
+                    }
+                    // 1_600_000_000 = Sep 2020, comfortably before this image was built.
+                    if e.mtime < 1_600_000_000 {
+                        return_fail(b"test-harness: dir-list FAIL (implausible mtime)\n");
+                    }
+                }
+                if e.name == b"." && e.kind != librsproto::file::DIRENT_KIND_DIR {
+                    return_fail(b"test-harness: dir-list FAIL (. not a directory)\n");
                 }
             }
             hdr.next_cursor

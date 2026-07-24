@@ -6,10 +6,19 @@ client **positioned, stateless access to a file's content** — the byte-level
 reads that back a demand-paged, page-cache-filled file mapping.
 
 **Status:** Pre-stabilization. Introduced with Phase 2 slice 8 (the kernel page
-cache). This is a **kernel↔server ABI** — the kernel hand-codes the request/reply
-(`kernel/src/rsproto.rs`); `librsproto` (`userspace/librsproto/src/file.rs`)
-carries the userspace mirror. Only `ReadRange` is defined; `stat`/`readdir` land
-with their consumers.
+cache); the directory operations landed with the Phase 4 dir-ops slice (2026-07-23)
+and gained per-entry metadata with coreutils Milestone 1 (2026-07-24).
+
+The category spans **two different client relationships**, which is why the
+transports differ:
+
+| Op | Client | Transport |
+|---|---|---|
+| `ReadRange` (`0x0600`) | the **kernel** (page-cache fill) | the server's forwarding channel; the kernel hand-codes the request/reply in `kernel/src/rsproto.rs` |
+| `ReadDir` (`0x0601`), `Mkdir` (`0x0602`), `Unlink` (`0x0603`), `Rmdir` (`0x0604`), `Rename` (`0x0605`) | an ordinary **userspace process** | a **directory session channel** — direct client↔server RPC, no kernel involvement |
+
+`librsproto` (`userspace/librsproto/src/file.rs`) is the userspace mirror for both
+and the canonical source for byte-level details.
 
 `File` is deliberately distinct from the neighbouring categories:
 
@@ -90,9 +99,71 @@ Flagged `RS_FLAG_REPLY | RS_FLAG_ERROR`; the body is the standard `ErrorBody`
 (12-byte prefix; see the wire-format spec). The kernel fails the page fault with
 the carried `KError`.
 
+## The directory session
+
+A directory path resolved through the namespace yields an `OBJECT_KIND_CHANNEL` —
+a session channel the server mints, **scoped to one directory inode**. The channel
+*is* the directory: every op below addresses entries **by name**, never by path, so
+a client holding a directory handle structurally cannot reach outside it. No kernel
+change was needed for this (see the decision log, 2026-07-23).
+
+### ReadDir (`op = 0x0601`)
+
+Enumerate the directory. Listings that exceed one message paginate via an opaque
+`cursor`.
+
+```rust
+#[repr(C, packed)]
+pub struct ReadDirRequest {
+    pub cursor: u64,      // 0 = from the start; else a prior reply's next_cursor
+}
+```
+
+Reply body: a 12-byte header (`next_cursor: u64`, `entry_count: u16`, 2 reserved),
+then `entry_count` packed entries. Each entry is a **24-byte prefix** followed by
+`name_len` name bytes (no padding between entries):
+
+| Offset | Field | Type | Meaning |
+|---|---|---|---|
+| 0 | `inode` | `u32` | Server-defined entry identity |
+| 4 | `kind` | `u8` | `DIRENT_KIND_{UNKNOWN,FILE,DIR,SYMLINK}` |
+| 5 | `name_len` | `u8` | Name length (names are ≤ 255 bytes) |
+| 6 | `mode` | `u16` | POSIX `st_mode` — format bits + permissions; `0` if unreported |
+| 8 | `size` | `u64` | Byte size (a directory reports its own directory-data size) |
+| 16 | `mtime` | `i64` | Modification time, seconds since the Unix epoch; `0` if unknown |
+
+`next_cursor == 0` means the listing is complete. A `cursor` is opaque to the
+client — for the ext4 server it is a byte offset into the directory's data.
+
+**Why the metadata is in the entry.** `list` reports
+`Table<{name, size, kind, modified}>`, and carrying those fields inline keeps a
+listing at **one round trip per reply** instead of `1 + N` (a per-name `Stat` op).
+The server reads each entry's inode locally, which is far cheaper than a client
+round trip. `mode` occupies what would otherwise be alignment padding ahead of
+`size`, so it is free. A server that does not track a field sends `0`; `kind` may
+then be recovered from `mode`'s format bits.
+
+`.` and `..` are included — they are real directory entries, and filtering them is
+a display decision, not a protocol one.
+
+### Mkdir (`0x0602`) / Unlink (`0x0603`) / Rmdir (`0x0604`)
+
+Request body: `name_len: u16` followed by the name bytes. Success is an empty-body
+reply; failure is the standard error reply.
+
+### Rename (`0x0605`)
+
+Request body: `old_len: u16` + the old name + `new_len: u16` + the new name (each
+length immediately precedes its own name). Both names are resolved **within this
+directory** — cross-directory rename is not yet supported.
+
 ## Versioning
 
 Adding `File` is a new category (minor version bump per the wire-format spec's
 evolution rules). Older servers that do not advertise `File` in `Meta::QueryCaps`
 are never sent `RESOLVE_FILE_LAZY`; the kernel falls back to the eager
 `RESOLVE_FILE_AS_MEMOBJ` path (slice 7).
+
+The `ReadDir` entry prefix widened from 8 to 24 bytes when per-entry metadata was
+added. Both sides are in-tree and pre-stabilization, so this was a flag-day change
+rather than a negotiated one; `librsproto` is the single definition both speak.

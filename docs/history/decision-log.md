@@ -7901,3 +7901,56 @@ footgun when the ABI type changes.
 
 Verified: full `test-qemu` PASS (harness runs to completion → login chain → verdict PASS,
 `-smp 4`); host suite + `check-arch` + `check-nightly` green; release image excludes the harness.
+
+## 2026-07-24 — Coreutils Milestone 1 Part A: `File::ReadDir` entries carry inode metadata
+
+**Context.** The shell/coreutils subproject starts at Milestone 1 (`list` + `copy`), and
+`list`'s specified output is `Table<{name, size, kind, modified}>` (design §10d). The
+dir-ops slice's `ReadDir` reply carried only `{inode, kind, name}` — so **two of the four
+columns had no source at all**. `size` was reachable indirectly (`sys_ns_lookup` +
+`sys_handle_info`, whose `HandleInfo.size` is the exact file size), but only at one full
+resolve round trip per entry; `modified` had no path whatsoever, and no `File::Stat` op
+exists.
+
+**Decision: put the metadata in the directory entry, not behind a per-name `Stat` op.**
+The `ReadDir` entry prefix widens 8 → 24 bytes: `inode: u32`, `kind: u8`, `name_len: u8`,
+`mode: u16`, `size: u64`, `mtime: i64`.
+
+- **Round-trip count is the deciding argument.** Inline metadata keeps a listing at **one
+  round trip per reply**; a `Stat` op makes it `1 + N`. The server reads each entry's
+  inode locally — the same block device, no IPC, no scheduling round trip — which is
+  categorically cheaper than a client crossing the process boundary N times. The
+  fs-server's I/O latency was the subject of two decision-log entries this month
+  (2026-07-23); adding an N-multiplier on the most common directory operation would have
+  walked straight back into it.
+- **`mode` is free.** `inode`+`kind`+`name_len` is 6 bytes and `size` wants 8-byte
+  alignment, so `mode` occupies padding that existed anyway. It also gives `kind` a
+  fallback: a filesystem without the `filetype` feature stores `0` in every directory
+  entry, and a listing reporting everything as "unknown" would be useless, so `map_kind`
+  now falls back to the `i_mode` format bits.
+- **A `Stat` op is still expected later** — `touch`, `copy --preserve`, and a future
+  `stat` want a single entry's metadata by name. This decision is "don't make *listing*
+  pay for it," not "never add `Stat`."
+
+**Implementation.** `ext4::read_dir` keeps its metadata-free signature and gains a sibling
+`read_dir_stat`, sharing one inner walk behind a `want_stat` flag. Deliberate: `rmdir_at`'s
+emptiness scan enumerates names only, and must not start paying an inode read per entry.
+An entry whose inode fails to read degrades to a zeroed `InodeStat` rather than failing the
+listing — one damaged inode must not make a directory unlistable. `mtime` decodes ext4's
+own encoding, `i_mtime` plus the low two bits of `i_mtime_extra` (the post-2038 epoch
+extension), so timestamps stay correct past 2038 rather than wrapping.
+
+**Flag-day, not negotiated.** Both sides of this wire are in-tree and pre-stabilization, so
+the prefix widened outright; `librsproto` is the single definition both speak. Also
+refreshed `docs/spec/rsproto-file-ops.md`, which still claimed "only `ReadRange` is
+defined" — it now documents the directory session and all five directory ops, and its
+`Rename` body layout was corrected to match the code (each length immediately precedes its
+own name, not both lengths first).
+
+*Verified:* host suite green (a new ext4 test checks size/mode/mtime against a live
+`mke2fs` fixture — exact size, `S_IFREG`, and an mtime within the hour of the build; two
+new codec tests, one covering a >4 GiB size and a post-2038 mtime so a truncated field
+cannot pass). `test-qemu` PASS with the harness's dir-list demo now asserting the metadata
+of a real ext4 file rather than just its name. **Negative-controlled:** making the server
+push zeroed metadata fails the run (`dir-list FAIL (implausible size)`, qemu exit 35), so
+the check is known-sensitive rather than merely passing.

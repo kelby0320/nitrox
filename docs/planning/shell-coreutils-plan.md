@@ -1,7 +1,8 @@
 # Nitrox Shell & Coreutils — Subproject Plan
 
-**Status:** planning (2026-07-22). Not started. This is a large, multi-slice subproject that will
-run in its own Claude Code session(s). This document is the entry point for that work.
+**Status:** 🚧 active (started 2026-07-24, Milestone 1). The three CLI substrate prereqs (§1C) are
+all in, so the milestones below are unblocked. This is a large, multi-slice subproject running in
+its own Claude Code session(s); this document is the entry point for that work.
 
 ## What this is
 
@@ -135,6 +136,28 @@ deliverable, and the first time the prereqs are proven *integrated* rather than 
 Proof: `list` piped into a trivial consumer over a real channel, output correct, backpressure and
 `PeerClosed` (early-consumer close) both exercised. Validates the pipeline model **before a line of
 interpreter is written**.
+
+**Decisions taken at the start of the milestone (2026-07-24):** entry metadata rides in the
+`ReadDir` reply rather than a per-name `Stat` op (Part A below); the integrated proof lives in
+`test-harness`, which init runs to completion and adjudicates serially; the coreutils are one
+`userspace/coreutils` crate with a bin per program plus a shared lib for the pieces every stage
+needs. Slice branch: `phase-4/coreutils-m1`.
+
+- [x] **Part A — `ReadDir` entries carry inode metadata** (2026-07-24). `list`'s `size` and
+  `modified` columns had **no source**: the dir-ops reply carried `{inode, kind, name}` only, and
+  no `File::Stat` op exists. The entry prefix widens 8 → 24 bytes (`mode: u16`, `size: u64`,
+  `mtime: i64` added — `mode` fits in what was alignment padding), keeping a listing at **one round
+  trip per reply** instead of `1 + N`. `ext4::read_dir` keeps its metadata-free form (so `rmdir`'s
+  emptiness scan pays nothing) alongside a new `read_dir_stat`; `mtime` decodes ext4's post-2038
+  `i_mtime_extra` epoch bits. `rsproto-file-ops.md` refreshed — it still documented only
+  `ReadRange`. Host tests + `test-qemu` PASS, negative-controlled (zeroed metadata fails the run).
+  See the decision log (2026-07-24).
+- [ ] **Part B** — `libos` dir client (`open_dir`/`read_dir`), the `coreutils` crate skeleton,
+  shared arg parsing + the Tier-1 stage prologue.
+- [ ] **Part C** — `list` emitting TSM1 on `stdout`; the harness proof over a real pipe
+  (backpressure + `PeerClosed`).
+- [ ] **Part D** — `copy` (file + recursive directory, `--force`), plus whatever write-path gap it
+  turns up.
 
 ### Milestone 2 — coreutils breadth
 
