@@ -60,6 +60,7 @@ pub(crate) mod type_rights;
 
 pub use table::{
     ClosedObject, DEFER_RING_CAPACITY, HandleError, HandleStat, HandleTable, LookupOk,
+    SweepCursor,
 };
 
 /// Number of top-level directory slots.

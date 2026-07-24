@@ -134,6 +134,13 @@ pub struct Thread {
     /// kernel threads and the boot/`hello` path. (A later phase replaces this with
     /// a stack-resident bootstrap block / the real init handoff.)
     user_boot_args: [u64; 4],
+    /// Set when this thread is the one whose exit **ends its process** — the
+    /// whole-process exit, or the last thread of a multi-threaded one. The reaper
+    /// reads it to run the process's handle sweep
+    /// ([`handle::global::close_all_owned_by`](crate::handle::global::close_all_owned_by)),
+    /// which cannot run at exit time itself: the exiting thread holds rank-1 `SCHED`
+    /// and never returns from `finish_exit`. Scheduler-owned, like the fields above.
+    process_ended: bool,
     /// Owning process, for a user thread. Holding this [`ObjectRef`] keeps
     /// the `Process` — and thus its `AddressSpace` — alive for as long as
     /// the thread exists; it is released when the thread is reaped, freeing
@@ -248,6 +255,7 @@ impl Thread {
             addr_space_root: None,
             user_entry: None,
             user_boot_args: [0; 4],
+            process_ended: false,
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -289,6 +297,7 @@ impl Thread {
             addr_space_root: None,
             user_entry: None,
             user_boot_args: [0; 4],
+            process_ended: false,
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -340,6 +349,7 @@ impl Thread {
             addr_space_root: None,
             user_entry: None,
             user_boot_args: [0; 4],
+            process_ended: false,
             process: None,
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],
@@ -402,6 +412,7 @@ impl Thread {
             state: ThreadState::Ready,
             entry: inert_entry, // unused: user threads descend via user_entry
             arg: 0,
+            process_ended: false,
             stack: Some(stack),
             addr_space_root: Some(root),
             user_entry: Some((entry, user_sp)),
@@ -479,6 +490,26 @@ impl Thread {
     pub(crate) unsafe fn set_state(obj: *mut (), s: ThreadState) {
         let p = obj as *mut Thread;
         unsafe { core::ptr::write(&raw mut (*p).state, s) }
+    }
+
+    /// Mark this thread as the one whose exit ends its process, so the reaper knows
+    /// to sweep the process's handles. See [`process_ended`](Self::process_ended).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn set_process_ended(obj: *mut ()) {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::write(&raw mut (*p).process_ended, true) }
+    }
+
+    /// Whether this thread's exit ended its process (set by the exit paths under
+    /// `SCHED`; read by the reaper, which then closes the process's handles).
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    pub(crate) unsafe fn process_ended(obj: *mut ()) -> bool {
+        let p = obj as *mut Thread;
+        unsafe { core::ptr::read(&raw const (*p).process_ended) }
     }
 
     /// The thread's scheduling class.
@@ -1008,6 +1039,7 @@ mod tests {
             addr_space_root: Some(root),
             user_entry: Some((entry, user_sp)),
             user_boot_args: [0; 4],
+            process_ended: false,
             process: Some(process),
             wait_objs: [0; MAX_WAIT_HANDLES],
             wait_signaled: [false; MAX_WAIT_HANDLES],

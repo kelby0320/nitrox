@@ -1690,6 +1690,69 @@ fn reap_child_exit(notif: u64) -> i32 {
     }
 }
 
+/// **A dead stage's pipe closes** — the regression test for exit-time handle reclamation
+/// (decision log, 2026-07-24).
+///
+/// Spawns `list` on a path that does not resolve, so it exits non-zero **without writing
+/// anything** to `stdout`, and requires the consumer's read to end in `PeerClosed` rather
+/// than blocking forever. That only holds if the dead process's handles are actually
+/// closed at exit: while they were not, its end of this pipe stayed open, the peer's
+/// `sys_channel_recv` returned `WouldBlock` for ever, and this call never returned.
+///
+/// This is the case the pipeline model depends on for a stage that dies early (design §1).
+/// The `yes | head -1` direction — the *consumer* closing — worked all along; this is the
+/// other one.
+fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
+    use libstream::channel::{ChannelReceiver, IpcPort};
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
+    use libstream::wire::WireError;
+
+    kprint(b"test-harness: dead-stage pipe-close demo\n");
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/list", RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        return_fail(b"test-harness: dead-stage image FAIL\n");
+    }
+    let (rx, stdout) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: dead-stage pipe FAIL\n"),
+    };
+    let (setup_shell, setup_stage) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: dead-stage setup chan FAIL\n"),
+    };
+    // SAFETY: SPAWN_LIST is our static; the coreutil spawns are sequential.
+    let _proc = match unsafe {
+        SPAWN_LIST.image = img;
+        SPAWN_LIST.handles[0] = setup_stage;
+        SPAWN_LIST.arg0 = bootstrap_arg0(true);
+        spawn(&*(&raw const SPAWN_LIST))
+    } {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: dead-stage spawn FAIL\n"),
+    };
+    let streams = Streams { stdin: None, stdout: Some(stdout), stderr: None };
+    if send_setup(setup_shell, &streams, &["list", "/nx-no-such-directory"]).is_err() {
+        return_fail(b"test-harness: dead-stage send_setup FAIL\n");
+    }
+
+    // The stage writes nothing and exits non-zero. This must come back `PeerClosed` —
+    // not a hang, and not a spurious success.
+    match ChannelReceiver::new(IpcPort::new(rx)).receive() {
+        Err(WireError::PeerClosed) => {}
+        Err(_) => return_fail(b"test-harness: dead-stage receive failed for the wrong reason\n"),
+        Ok(_) => return_fail(b"test-harness: dead-stage produced a stream it should not have\n"),
+    }
+    if reap_child_exit(notif) == 0 {
+        return_fail(b"test-harness: dead-stage exited 0 on an unresolvable path\n");
+    }
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, rx);
+        syscall1(SYS_HANDLE_CLOSE, setup_shell);
+    }
+    kprint(b"test-harness: dead-stage ok (its pipe closed; peer saw PeerClosed)\n");
+}
+
 /// **`copy`, the mutation side of the filesystem** (coreutils Milestone 1 Part D).
 ///
 /// Where the `list` demo proves the read path and the pipe, this proves that a coreutil
@@ -1857,20 +1920,15 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     if send_setup(setup_shell, &streams, argv).is_err() {
         return_fail(b"test-harness: copy send_setup FAIL\n");
     }
-    // Reap first, then drain — deliberately in that order.
-    //
-    // A `copy` that fails exits *without* writing its report, and waiting for a stream
-    // that will never arrive would hang: a dead process's handles are not reclaimed at
-    // exit (the handle table is global and keyed by `owner_pid`, with no exit-time
-    // sweep), so its end of this pipe stays open and the peer never observes
-    // `PeerClosed`. Knowing the exit code first lets this drain only the streams that
-    // exist. See the decision log, 2026-07-24 — this is a kernel gap, not a property of
-    // `copy`.
+    // Drain first, then reap — and note that a **failing** `copy` exits without writing
+    // its report at all. That case is the point: the receive must end in `PeerClosed`,
+    // which requires the dead stage's end of this pipe to actually close. It only does
+    // because a process's handles are now swept at exit (decision log, 2026-07-24); with
+    // that sweep missing this call hangs forever, so this demo is the regression test for
+    // it.
+    let _ = ChannelReceiver::new(IpcPort::new(rx)).receive();
     let code = reap_child_exit(notif);
     drop(_proc);
-    if code == 0 {
-        let _ = ChannelReceiver::new(IpcPort::new(rx)).receive();
-    }
     // SAFETY: closing our own handles.
     unsafe {
         syscall1(SYS_HANDLE_CLOSE, rx);
@@ -2569,6 +2627,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5. `copy` — the mutation side of the filesystem, including the two cases it must
     //      refuse rather than get wrong (existing destination; no-truncate overwrite).
     copy_demo(root_ns, notif);
+
+    // 0a6. A stage that dies without writing must close its pipe, so the peer sees
+    //      `PeerClosed` instead of hanging (exit-time handle reclamation).
+    dead_stage_closes_its_pipe_demo(root_ns, notif);
 
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();

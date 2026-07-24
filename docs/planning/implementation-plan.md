@@ -62,8 +62,12 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **CLI substrate prereqs** — directory ops, `Value` collection types, and the stdio/pipe
     convention (plus the `parent`/`child` retirement into a conforming test harness) — ✅ done
     (2026-07-23/24). See [phase-4-desktop.md](phase-4-desktop.md) → "CLI substrate prereqs".
-  - **Now: the typed shell + coreutils subproject** — 🚧 active from 2026-07-24, at Milestone 1
-    (`list` + `copy`). Tracked in [shell-coreutils-plan.md](shell-coreutils-plan.md).
+  - **The typed shell + coreutils subproject** — 🚧 active from 2026-07-24. **Milestone 1
+    (`list` + `copy`) complete** (PR #116). Tracked in
+    [shell-coreutils-plan.md](shell-coreutils-plan.md).
+  - **Substrate gaps it surfaced** — exit-time handle reclamation ✅ (2026-07-24), then the
+    wall clock and file truncate. See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
+    gaps surfaced by the coreutils subproject".
 
 ---
 

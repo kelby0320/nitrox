@@ -181,6 +181,37 @@ to the caller on every path so it is dropped **outside** the lock (an `ObjectRef
 drop may run a destructor that takes a higher-ranked lock); `resolve` only *clones*
 the target (an atomic refcount bump, sound under the lock).
 
+## The process-exit handle sweep batches across rank 3
+
+When a process's last thread exits, every handle it owned must be closed —
+otherwise its entries pin their objects forever, and the visible symptom is
+that its end of a pipe never closes so a peer never observes `PeerClosed`
+(decision log, 2026-07-24).
+
+The sweep cannot run where the process actually dies. `exit_process` /
+`exit_thread` hold rank-1 `SCHED` and never return from `finish_exit`, and
+releasing an object reference runs a destructor that reaches the rank-6
+allocator — and, for an `IpcChannel`, takes rank-1 `SCHED` itself to wake
+blocked receivers. So:
+
+1. The exiting thread only *marks* itself (`Thread::set_process_ended`) under
+   `SCHED`.
+2. `reap_pending` — thread context, no `SCHED` held, never IRQ context — sees
+   the mark on a reaped thread and calls
+   `handle::global::close_all_owned_by(pid)`.
+3. That sweep unlinks entries **under rank 3** into a fixed-size batch, then
+   **releases rank 3** before dropping the batch's references.
+
+Step 3 is the load-bearing part: dropping under rank 3 would take rank 1
+(`ipc_endpoint_closing`) or rank 4/6 (other destructors) while holding rank 3,
+inverting the ranking. `HandleTable::close_owned_batch` therefore returns a
+`(count, more_remain)` pair and a resume cursor rather than sweeping the whole
+process in one critical section — the same "unlink under the lock, free
+outside it" shape as `close`'s `ClosedObject` contract and
+`unmap_covering_deferred`'s deferred frame release. The drops run inside a
+`preempt_disable`/`enable` region for the reason F12 established: a descheduled
+holder of an allocator spinlock starves every CPU spinning on it.
+
 ## Handle-table segment growth releases rank 3 before rank 6
 
 `HandleTable::grow_one` (`kernel/src/handle/table.rs`) needs to call

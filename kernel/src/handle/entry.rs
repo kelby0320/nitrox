@@ -67,10 +67,14 @@ pub(crate) struct HandleEntry {
     /// Read in step 6 of the validation algorithm as a single
     /// `Acquire` load outside the seqlock loop.
     pub object: AtomicPtr<()>,
-    /// Intrusive list pointer threading this entry onto its owning
-    /// process's owned-handles list. `RawHandle::NULL` at the tail
-    /// (and throughout this slice — the threading lands with the
-    /// `Process` slice; see `docs/architecture/handle-system.md`).
+    /// Intrusive list pointer reserved for threading this entry onto its owning
+    /// process's owned-handles list. **Still unused** (`RawHandle::NULL`
+    /// everywhere): release-at-exit is implemented as a segment scan keyed on
+    /// `owner_pid` instead of a list, which keeps every other path free of list
+    /// maintenance under the rank-3 lock. See
+    /// `docs/architecture/handle-system.md` § Releasing a process's handles at
+    /// exit for the trade, and why this field is the optimization to reach for
+    /// if a sweep ever becomes measurable.
     pub next_owned: AtomicU64,
     /// Index of the next free slot within the same segment when this
     /// slot is on the segment freelist. Meaningless when the slot is
