@@ -144,8 +144,13 @@ pub fn parse_read_dir_request(body: &[u8]) -> Option<ReadDirRequest> {
 /// Fixed header of a `ReadDirReply` body, before the packed entries.
 pub const READ_DIR_REPLY_HEADER_LEN: usize = 12;
 /// Fixed prefix of each packed directory entry, before its name bytes:
-/// `inode: u32`, `kind: u8`, `name_len: u8`, `_pad: u16`.
-pub const DIR_ENTRY_PREFIX_LEN: usize = 8;
+/// `inode: u32`, `kind: u8`, `name_len: u8`, `mode: u16`, `size: u64`, `mtime: i64`.
+///
+/// The metadata rides in the entry rather than in a separate per-name `Stat` op so that
+/// listing an N-entry directory stays **one round trip per reply**, not `1 + N`: the
+/// server reads each inode locally, which is far cheaper than a client round trip. `mode`
+/// occupies what would otherwise be alignment padding ahead of `size`.
+pub const DIR_ENTRY_PREFIX_LEN: usize = 24;
 
 /// The header of a success `ReadDirReply` (the entries follow, packed).
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -160,8 +165,77 @@ pub struct ReadDirReplyHeader {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub struct DirEntry<'a> {
     pub inode: u32,
+    /// One of the `DIRENT_KIND_*` constants.
     pub kind: u8,
+    /// Permission + format bits, in the POSIX `st_mode` encoding every filesystem
+    /// already speaks. `0` if the server does not report a mode.
+    pub mode: u16,
+    /// The entry's byte size (a directory reports its own directory-data size).
+    pub size: u64,
+    /// Modification time, seconds since the Unix epoch. `0` if unknown.
+    pub mtime: i64,
     pub name: &'a [u8],
+}
+
+/// The longest entry name a `ReadDir` reply can carry (its `name_len` is a `u8`).
+pub const MAX_NAME: usize = 255;
+
+/// A [`DirEntry`] copied out of the reply buffer, so it outlives the message it arrived
+/// in. A borrowed entry is only valid until the next reply overwrites the buffer; any
+/// caller accumulating a listing (every file coreutil) wants this form.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OwnedEntry {
+    pub inode: u32,
+    /// One of the `DIRENT_KIND_*` constants.
+    pub kind: u8,
+    /// POSIX `st_mode` bits; `0` if unreported.
+    pub mode: u16,
+    /// Byte size.
+    pub size: u64,
+    /// Modification time, seconds since the Unix epoch; `0` if unknown.
+    pub mtime: i64,
+    name: [u8; MAX_NAME],
+    name_len: u8,
+}
+
+impl OwnedEntry {
+    /// Copy a borrowed entry's fields, including its name.
+    ///
+    /// A name is capped at [`MAX_NAME`], which is also the longest a wire entry can
+    /// express (`name_len` is a `u8`), so no name a server can legally send is truncated.
+    pub fn from_entry(e: &DirEntry<'_>) -> OwnedEntry {
+        let mut name = [0u8; MAX_NAME];
+        let n = e.name.len().min(MAX_NAME);
+        name[..n].copy_from_slice(&e.name[..n]);
+        OwnedEntry {
+            inode: e.inode,
+            kind: e.kind,
+            mode: e.mode,
+            size: e.size,
+            mtime: e.mtime,
+            name,
+            name_len: n as u8,
+        }
+    }
+
+    /// The entry's name.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
+impl Default for OwnedEntry {
+    fn default() -> Self {
+        OwnedEntry {
+            inode: 0,
+            kind: DIRENT_KIND_UNKNOWN,
+            mode: 0,
+            size: 0,
+            mtime: 0,
+            name: [0u8; MAX_NAME],
+            name_len: 0,
+        }
+    }
 }
 
 /// Builds a `ReadDirReply` body incrementally, packing entries until the buffer is full.
@@ -185,7 +259,18 @@ impl<'a> DirReplyWriter<'a> {
 
     /// Try to append one entry. Returns `false` (appending nothing) if it would not fit —
     /// the caller stops and resumes it in the next reply via the cursor.
-    pub fn push(&mut self, inode: u32, kind: u8, name: &[u8]) -> bool {
+    ///
+    /// `mode`/`size`/`mtime` are the entry's inode metadata; a server that does not track
+    /// one passes `0` (see [`DirEntry`]).
+    pub fn push(
+        &mut self,
+        inode: u32,
+        kind: u8,
+        mode: u16,
+        size: u64,
+        mtime: i64,
+        name: &[u8],
+    ) -> bool {
         if name.len() > u8::MAX as usize {
             return false;
         }
@@ -196,7 +281,9 @@ impl<'a> DirReplyWriter<'a> {
         put_u32(self.buf, self.len, inode);
         self.buf[self.len + 4] = kind;
         self.buf[self.len + 5] = name.len() as u8;
-        put_u16(self.buf, self.len + 6, 0);
+        put_u16(self.buf, self.len + 6, mode);
+        put_u64(self.buf, self.len + 8, size);
+        put_u64(self.buf, self.len + 16, mtime as u64);
         self.buf[self.len + DIR_ENTRY_PREFIX_LEN..self.len + need].copy_from_slice(name);
         self.len += need;
         self.count += 1;
@@ -258,6 +345,9 @@ impl<'a> Iterator for DirEntryIter<'a> {
         let entry = DirEntry {
             inode: get_u32(self.body, 0),
             kind: self.body[4],
+            mode: get_u16(self.body, 6),
+            size: get_u64(self.body, 8),
+            mtime: get_u64(self.body, 16) as i64,
             name: &self.body[DIR_ENTRY_PREFIX_LEN..end],
         };
         self.body = &self.body[end..];
@@ -365,23 +455,78 @@ mod tests {
     fn read_dir_reply_round_trips() {
         let mut buf = [0u8; 256];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
-        assert!(w.push(2, DIRENT_KIND_DIR, b"."));
-        assert!(w.push(2, DIRENT_KIND_DIR, b".."));
-        assert!(w.push(11, DIRENT_KIND_FILE, b"hello.txt"));
-        assert!(w.push(12, DIRENT_KIND_DIR, b"subdir"));
+        assert!(w.push(2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b"."));
+        assert!(w.push(2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b".."));
+        assert!(w.push(11, DIRENT_KIND_FILE, 0o100644, 13, 1_800_000_001, b"hello.txt"));
+        assert!(w.push(12, DIRENT_KIND_DIR, 0, 0, 0, b"subdir"));
         assert!(!w.is_empty());
         let n = w.finish(0);
 
         let (h, iter) = parse_read_dir_reply(&buf[..n]).unwrap();
         assert_eq!(h.next_cursor, 0);
         assert_eq!(h.entry_count, 4);
-        let got: Vec<_> = iter.map(|e| (e.inode, e.kind, e.name.to_vec())).collect();
+        let got: Vec<_> = iter
+            .map(|e| (e.inode, e.kind, e.mode, e.size, e.mtime, e.name.to_vec()))
+            .collect();
         assert_eq!(got, vec![
-            (2, DIRENT_KIND_DIR, b".".to_vec()),
-            (2, DIRENT_KIND_DIR, b"..".to_vec()),
-            (11, DIRENT_KIND_FILE, b"hello.txt".to_vec()),
-            (12, DIRENT_KIND_DIR, b"subdir".to_vec()),
+            (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b".".to_vec()),
+            (2, DIRENT_KIND_DIR, 0o40755, 4096, 1_700_000_000, b"..".to_vec()),
+            (11, DIRENT_KIND_FILE, 0o100644, 13, 1_800_000_001, b"hello.txt".to_vec()),
+            // A server with no metadata to report zeroes the fields.
+            (12, DIRENT_KIND_DIR, 0, 0, 0, b"subdir".to_vec()),
         ]);
+    }
+
+    #[test]
+    fn owned_entry_copies_every_field_out_of_the_reply_buffer() {
+        // The listing path decodes into a shared 4 KiB buffer that the next reply
+        // overwrites, so a caller accumulating entries must get a real copy.
+        let mut buf = [0u8; 128];
+        let mut w = DirReplyWriter::new(&mut buf).unwrap();
+        w.push(42, DIRENT_KIND_FILE, 0o100644, 1234, 1_700_000_000, b"notes.txt");
+        let n = w.finish(0);
+        let owned = {
+            let (_, mut iter) = parse_read_dir_reply(&buf[..n]).unwrap();
+            OwnedEntry::from_entry(&iter.next().unwrap())
+        };
+        buf.fill(0xAA); // the next reply lands on top of the one we parsed
+        assert_eq!(owned.name(), b"notes.txt");
+        assert_eq!(
+            (owned.inode, owned.kind, owned.mode, owned.size, owned.mtime),
+            (42, DIRENT_KIND_FILE, 0o100644, 1234, 1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn owned_entry_keeps_a_maximum_length_name() {
+        // `name_len` is a u8, so 255 bytes is the longest name a server can send; it must
+        // survive the copy whole rather than losing a byte to an off-by-one.
+        let long = [b'x'; MAX_NAME];
+        let e = DirEntry {
+            inode: 1,
+            kind: DIRENT_KIND_DIR,
+            mode: 0,
+            size: 0,
+            mtime: 0,
+            name: &long,
+        };
+        let owned = OwnedEntry::from_entry(&e);
+        assert_eq!(owned.name(), &long[..]);
+    }
+
+    #[test]
+    fn entry_metadata_survives_the_full_range() {
+        // The wide fields must not be silently truncated: a >4 GiB size and a post-2038
+        // mtime both need their full width on the wire.
+        let mut buf = [0u8; 128];
+        let mut w = DirReplyWriter::new(&mut buf).unwrap();
+        let big_size = 5 * 1024 * 1024 * 1024u64; // 5 GiB — past a u32
+        let past_2038 = 2_500_000_000i64; // past a signed 32-bit epoch
+        assert!(w.push(9, DIRENT_KIND_FILE, 0o100600, big_size, past_2038, b"big"));
+        let n = w.finish(0);
+        let (_, mut iter) = parse_read_dir_reply(&buf[..n]).unwrap();
+        let e = iter.next().unwrap();
+        assert_eq!((e.size, e.mtime, e.mode), (big_size, past_2038, 0o100600));
     }
 
     #[test]
@@ -389,8 +534,8 @@ mod tests {
         // A tiny buffer holds the header + exactly one 1-char-name entry.
         let mut buf = [0u8; READ_DIR_REPLY_HEADER_LEN + DIR_ENTRY_PREFIX_LEN + 1];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
-        assert!(w.push(2, DIRENT_KIND_DIR, b"a"));
-        assert!(!w.push(3, DIRENT_KIND_DIR, b"b"), "second entry must not fit");
+        assert!(w.push(2, DIRENT_KIND_DIR, 0, 0, 0, b"a"));
+        assert!(!w.push(3, DIRENT_KIND_DIR, 0, 0, 0, b"b"), "second entry must not fit");
         let n = w.finish(0x99);
         let (h, mut iter) = parse_read_dir_reply(&buf[..n]).unwrap();
         assert_eq!(h.next_cursor, 0x99, "a non-zero cursor signals more entries remain");
@@ -404,7 +549,7 @@ mod tests {
         // Header claims 2 entries but only one full entry's bytes are present.
         let mut buf = [0u8; 256];
         let mut w = DirReplyWriter::new(&mut buf).unwrap();
-        w.push(2, DIRENT_KIND_DIR, b"only");
+        w.push(2, DIRENT_KIND_DIR, 0, 0, 0, b"only");
         let mut n = w.finish(0);
         // Forge the count to 2, then hand the parser a body cut mid-second-entry.
         super::put_u16(&mut buf, 8, 2);

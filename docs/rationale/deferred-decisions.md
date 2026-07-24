@@ -301,6 +301,49 @@ Raising it to a small fixed array (correlating replies by the already-present
 
 **LVM / software RAID at early boot.** Same architectural accommodation as LUKS. Initial scope is direct partition mounts.
 
+**File truncate.** The filesystem can create a file and grow it, but never shrink it:
+there is no truncate operation and `sys_file_grow` to a smaller size is a no-op. So
+overwriting an existing file with shorter content would leave the old tail in place — a
+file that is neither the old one nor the new one. `copy --force` therefore **refuses** to
+overwrite a longer destination (coreutils Milestone 1, 2026-07-24) rather than produce a
+corrupt result. Needs: an ext4 truncate (free the extents past the new size, update
+`i_size`/`i_blocks`), a `File`-category op or a `sys_file_truncate`, and page-cache
+invalidation for the dropped range. Trigger: any workflow that rewrites a file in place —
+which `copy --force`, a text editor saving a shortened file, and `save` (design §4) all
+are.
+
+**Reclaiming a process's handles at exit.** `HandleTable` is global with a per-entry
+`owner_pid`, and **nothing sweeps it when a process exits** — `HandleTable::close` is the
+only close path and it is per-handle, called by the owner. A dead process's entries
+therefore persist, pinning every object they reference. Two consequences: handles leak for
+the life of the boot (bounded by table size), and — the observable one — **a pipe endpoint
+held by a dead process never closes, so its peer never observes `PeerClosed`**. A consumer
+blocked on a stage that died without writing waits forever. Found by coreutils Milestone 1
+Part D (2026-07-24), whose harness hung exactly there; the demo now reaps a stage's exit
+before draining its stream, which sidesteps it but does not fix it. This directly
+undermines the pipeline model's early-termination story (design §1, the `yes | head -1`
+case works only because the *consumer* closes explicitly today). Fix: sweep entries owned
+by the dying pid on process exit, collecting their `ObjectRef`s and dropping them
+**outside `SCHED` and outside IRQ context** — the deferred-drop discipline from
+substrate hardening Parts A/F, since an `ObjectRef` drop can reach the allocator. Trigger:
+before the shell spawns real pipelines; it is a correctness gate for stage failure, not a
+nicety.
+
+**Wall-clock time, and filesystem timestamps on newly created inodes.** `sys_clock_read`
+services `Monotonic` only; `Realtime` returns `Unsupported` — there is no RTC read and no
+NTP, so **nothing in the system knows the date**. Consequently `fs-server-ext4`'s
+`create_file`/`mkdir_at` leave `i_atime`/`i_ctime`/`i_mtime` at **0**: a file or directory
+the OS creates reports `modified: 0` (1970), while entries baked into the image by
+`mke2fs` carry real timestamps. Surfaced by coreutils Milestone 1 (2026-07-24), whose
+`list` reports a `modified` column faithfully and therefore made the gap visible. Two
+pieces, in order: (1) a realtime clock — read the CMOS RTC at boot, keep a wall-clock
+offset against the monotonic counter, service `CLOCK_REALTIME`; (2) thread a timestamp
+parameter into the ext4 mutation ops (the parser stays syscall-free and host-tested, so
+the *caller* must supply the time) and stamp new inodes, plus update a parent directory's
+mtime on modification. Trigger: anything that needs to order events by date — a build
+system, a package manager, `list --sort modified`, or log timestamps that survive a
+reboot. Until then, treat `modified` on OS-created files as "unknown", not as 1970.
+
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
 ### Userspace

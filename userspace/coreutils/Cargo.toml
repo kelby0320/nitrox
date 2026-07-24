@@ -1,0 +1,31 @@
+[package]
+name = "coreutils"
+version = "0.1.0"
+edition = "2024"
+
+# The Nitrox coreutils — `list`, `copy`, and the rest of design §10c. Each program is
+# an ordinary userspace process that speaks **TSM1 on stdio** so it composes in a shell
+# pipeline; none of them is a resource server (they are *clients* of one). Naming
+# departs from GNU deliberately (`list`, not `ls`) — see the shell design doc §10c; the
+# familiar short names are namespace binds, not aliases.
+#
+# One crate, a bin per program, plus this shared lib: every program needs the same
+# Tier-1 stage prologue, the same GNU-style argument parsing, and the same TSM1 stdout
+# plumbing, and that shared surface is the point of keeping them together.
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto", features = ["io"] }
+libstream = { path = "../libstream", features = ["io"] }
+
+[lib]
+name = "coreutils"
+path = "src/lib.rs"
+
+[[bin]]
+name = "list"
+path = "src/bin/list.rs"
+
+[[bin]]
+name = "copy"
+path = "src/bin/copy.rs"

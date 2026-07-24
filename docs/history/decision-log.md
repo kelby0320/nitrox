@@ -7901,3 +7901,244 @@ footgun when the ABI type changes.
 
 Verified: full `test-qemu` PASS (harness runs to completion → login chain → verdict PASS,
 `-smp 4`); host suite + `check-arch` + `check-nightly` green; release image excludes the harness.
+
+## 2026-07-24 — Coreutils Milestone 1 Part A: `File::ReadDir` entries carry inode metadata
+
+**Context.** The shell/coreutils subproject starts at Milestone 1 (`list` + `copy`), and
+`list`'s specified output is `Table<{name, size, kind, modified}>` (design §10d). The
+dir-ops slice's `ReadDir` reply carried only `{inode, kind, name}` — so **two of the four
+columns had no source at all**. `size` was reachable indirectly (`sys_ns_lookup` +
+`sys_handle_info`, whose `HandleInfo.size` is the exact file size), but only at one full
+resolve round trip per entry; `modified` had no path whatsoever, and no `File::Stat` op
+exists.
+
+**Decision: put the metadata in the directory entry, not behind a per-name `Stat` op.**
+The `ReadDir` entry prefix widens 8 → 24 bytes: `inode: u32`, `kind: u8`, `name_len: u8`,
+`mode: u16`, `size: u64`, `mtime: i64`.
+
+- **Round-trip count is the deciding argument.** Inline metadata keeps a listing at **one
+  round trip per reply**; a `Stat` op makes it `1 + N`. The server reads each entry's
+  inode locally — the same block device, no IPC, no scheduling round trip — which is
+  categorically cheaper than a client crossing the process boundary N times. The
+  fs-server's I/O latency was the subject of two decision-log entries this month
+  (2026-07-23); adding an N-multiplier on the most common directory operation would have
+  walked straight back into it.
+- **`mode` is free.** `inode`+`kind`+`name_len` is 6 bytes and `size` wants 8-byte
+  alignment, so `mode` occupies padding that existed anyway. It also gives `kind` a
+  fallback: a filesystem without the `filetype` feature stores `0` in every directory
+  entry, and a listing reporting everything as "unknown" would be useless, so `map_kind`
+  now falls back to the `i_mode` format bits.
+- **A `Stat` op is still expected later** — `touch`, `copy --preserve`, and a future
+  `stat` want a single entry's metadata by name. This decision is "don't make *listing*
+  pay for it," not "never add `Stat`."
+
+**Implementation.** `ext4::read_dir` keeps its metadata-free signature and gains a sibling
+`read_dir_stat`, sharing one inner walk behind a `want_stat` flag. Deliberate: `rmdir_at`'s
+emptiness scan enumerates names only, and must not start paying an inode read per entry.
+An entry whose inode fails to read degrades to a zeroed `InodeStat` rather than failing the
+listing — one damaged inode must not make a directory unlistable. `mtime` decodes ext4's
+own encoding, `i_mtime` plus the low two bits of `i_mtime_extra` (the post-2038 epoch
+extension), so timestamps stay correct past 2038 rather than wrapping.
+
+**Flag-day, not negotiated.** Both sides of this wire are in-tree and pre-stabilization, so
+the prefix widened outright; `librsproto` is the single definition both speak. Also
+refreshed `docs/spec/rsproto-file-ops.md`, which still claimed "only `ReadRange` is
+defined" — it now documents the directory session and all five directory ops, and its
+`Rename` body layout was corrected to match the code (each length immediately precedes its
+own name, not both lengths first).
+
+*Verified:* host suite green (a new ext4 test checks size/mode/mtime against a live
+`mke2fs` fixture — exact size, `S_IFREG`, and an mtime within the hour of the build; two
+new codec tests, one covering a >4 GiB size and a post-2038 mtime so a truncated field
+cannot pass). `test-qemu` PASS with the harness's dir-list demo now asserting the metadata
+of a real ext4 file rather than just its name. **Negative-controlled:** making the server
+push zeroed metadata fails the run (`dir-list FAIL (implausible size)`, qemu exit 35), so
+the check is known-sensitive rather than merely passing.
+
+## 2026-07-24 — Coreutils Milestone 1 Part B: the directory client lives in `librsproto`, not `libos`
+
+**The deferred item said `libos`; that turned out to be the wrong home.** The dir-ops
+slice parked "a `libos` `open_dir`/`read_dir` client wrapper" for its first consumer.
+Building it revealed the placement is impossible as stated: `libos` sits **below**
+`librsproto` in the userspace layering (`userspace/CLAUDE.md`), so it cannot speak a
+protocol defined above it, and it is `no_std` **without `alloc`** by deliberate choice so
+the heap-free binaries can use it.
+
+**Decision: the client goes in `librsproto`, behind an `io` feature.** `librsproto` was a
+pure codec with no dependencies; it gains an optional `libkern` dependency that carries
+`session::Dir`. This is the seam `libstream` already established for
+`channel::IpcPort` — the wire core stays dependency-free and host-testable, and only the
+syscall-touching part is feature-gated. The client belongs next to the wire definition it
+speaks, and `libos` keeps the namespace half it already owns (`Handle<Namespace>::lookup`).
+
+`Dir` owns what every call site was hand-rolling: encode → `sys_channel_send` → `sys_wait`
+→ `sys_channel_recv` → decode, with cursor-following built into `read_dir` so a caller
+sees whole directories rather than pages. Notable choices:
+
+- **A caller-provided message buffer**, not an owned one — `librsproto` stays `alloc`-free,
+  and a caller decides where 4 KiB lives (a coreutil's stack, a server's `.bss`). One
+  buffer serves both directions: the request is consumed by the time the send returns.
+- **Errors are three-way** — `Server(KError)` / `Transport(i32)` / `Protocol`. A caller
+  must be able to tell "no such entry" from "the pipe broke"; collapsing them is what
+  makes a broken transport read as a passing test.
+- **A non-advancing cursor is a protocol fault**, not an infinite loop. The hand-rolled
+  call sites guarded this with a round counter; the invariant belongs in the client.
+- **`close` is explicit, not `Drop`** — a drop cannot report failure, and closing a handle
+  silently is worth avoiding.
+- **Blocking, but not a blocking syscall.** Each op parks in `sys_wait`, never inside
+  another syscall — the async-first contract. Sequential callers want this shape; a future
+  task-based caller can drive the same codecs over `libos::Op`.
+
+**The `coreutils` crate.** One crate, a bin per program, plus a shared lib — every program
+needs the same startup prologue and the same argument parsing, and that shared surface is
+the reason to keep them together. Two modules so far:
+
+- `stage` — the Tier-0/Tier-1 prologue. **Both tiers, deliberately:** Tier 1 is the
+  shell-spawned case that supplies `argv`; Tier 0 is what init or the test harness gives a
+  program spawned *without* a shell, which is exactly the position Milestone 1 is in.
+  `diag`/`die` route to the shared `stderr` sink when there is one and fall back to the
+  kernel log when there is not, so a diagnostic never corrupts the typed stream on stdout.
+- `args` — GNU conventions per design §10f (long, short, clustered shorts, `--`,
+  universal `--help`/`--version`), **declarative**: an undeclared flag is an error, not a
+  silently ignored argument. One deliberate omission, GNU's bare `-` for stdin: piping is
+  structural here (a stage's input *is* its stdin), so `-` is just a path.
+
+**The harness's hand-rolled plumbing is now the client's integration proof.** The two
+directory demos dropped ~150 lines of inline syscall code in favour of `Dir`, which both
+proves the client end to end in QEMU and removes the duplication. The mutate demo gained a
+case the old code could not express: `rmdir` of a missing name must come back as
+`DirError::Server`, not a transport fault and not a false success.
+
+*Verified:* host suite 752 green (8 new `args` tests, 2 new `OwnedEntry` tests — one
+checks a listing survives the reply buffer being overwritten, the other a 255-byte name);
+`test-qemu` PASS with both directory demos driving the new client; `check-arch` and
+`check-nightly` green. **Also fixed:** `cargo xtask test` enumerates test crates
+explicitly, so a new crate is invisible to CI until registered — `coreutils` was, and its
+8 tests were silently not running until it was added.
+
+## 2026-07-24 — Coreutils Milestone 1 Part C: `list`, and the first coreutil through a real pipe
+
+**The milestone's point is the integration, not the program.** `list` is small; what it
+proves is that the three CLI substrate prereqs compose — dir-ops (C1) supplies the data,
+the `Value`/TSM1 model (C2) types it, the stdio/setup convention (C3) delivers it — with a
+real process on each end of a real pipe. That is the first time any of that has been true
+at once.
+
+**What `list` emits.** `Table<{name: String, size: Int, kind: String, modified: Int}>` on
+`stdout`, per design §10d. Choices worth recording:
+
+- **`kind` is a string** (`"file"`/`"dir"`/`"symlink"`), not an integer. The consumer is a
+  shell predicate — `filter kind == "dir"` — not C code; an integer would make every
+  consumer carry a decoder ring.
+- **`modified` is raw epoch seconds.** Rendering a date is `display`/`date`'s job: a stage
+  emits data, and formatting belongs at the terminal end of a pipeline.
+- **`.` and `..` are filtered.** They are real directory entries and the protocol carries
+  them, but they are structure, not content — every consumer would filter them, so it
+  happens once, here.
+- **`--recursive` reports parent-relative paths** (`sub/dir/file`), not bare names.
+  Otherwise a recursive listing cannot distinguish two same-named files in different
+  subdirectories. Each directory's entries are collected and its session **closed before
+  descending**, so a deep tree holds one session at a time — the server's concurrent
+  session cap is small, and a recursive listing must not be what exhausts it.
+- **No `stdout` ⇒ plain text to the kernel log.** A Tier-0 spawn (no shell) still has to be
+  observable. That is the text floor, not a second data path — the typed stream is the
+  contract.
+- **`PeerClosed` is a clean exit (`0`), not a failure** — the `yes | head -1` case
+  (design §1).
+
+**The harness demo is sized to prove things, not to look busy.** 30 fixture entries with
+110-byte names: the TSM1 stream then exceeds one IPC payload (so it *provably* spanned
+several messages on a **depth-1** pipe — the producer blocked and was woken as the consumer
+drained) while the ext4 directory data still fits one block (so it never trips the deferred
+grow-a-full-directory path). Both bounds are asserted by the demo rather than assumed —
+if the stream ever fits one message, the run fails with "backpressure untested" rather than
+passing while testing nothing. The schema is checked field by field: it *is* the contract
+this program publishes.
+
+**Two real defects the demo caught, both invisible to a smaller test:**
+
+1. **`--recursive` reported bare names.** `collect` documented parent-relative paths and
+   pushed bare ones — a recursive listing was ambiguous. The fix separates the two paths a
+   descent needs: the *filesystem* path to open, and the *relative* path to report.
+   Conflating them breaks one or the other.
+2. **`coreutils`' host test build was broken** by a `build.rs` copied from a bin-only
+   crate: it passed the bare-target linker script via `rustc-link-arg`, which also reaches
+   the host lib-test link and breaks it. `init`'s `build.rs` had already solved this with
+   `rustc-link-arg-bins`. Worth noting *how* this surfaced: `cargo xtask test` failed
+   loudly, but a summary that only counted `test result:` lines read as green — the count
+   silently dropped from 752 to 744. Count-only summaries of a multi-crate run hide a crate
+   that failed to build.
+
+**And one gap it surfaced, filed rather than fixed:** the system has **no wall clock**.
+`sys_clock_read` services `Monotonic` only, and `fs-server-ext4` never writes
+`i_mtime`/`i_ctime`/`i_atime` on create — so anything the OS creates reports
+`modified: 0`. The demo's assertion on freshly-`mkdir`'d entries was written expecting a
+plausible date and failed, correctly: `list` was reporting faithfully. The check now
+verifies shape there and keeps the real-timestamp assertion where it means something (an
+image-built file, in `dir_list_demo`). Recorded in `deferred-decisions.md` with the
+two-step fix: a CMOS-RTC-backed `CLOCK_REALTIME`, then a timestamp parameter threaded into
+the ext4 mutation ops (the parser is deliberately syscall-free, so the caller must supply
+the time).
+
+**Build plumbing:** `build_userspace_crate(dir, bins, features)` — the old helper assumed
+one crate directory per program, which `coreutils` (a bin per program) breaks.
+
+*Verified:* host suite 752 green; `test-qemu` PASS; `check-arch`/`check-nightly` green;
+release image builds with `list` embedded. **Negative-controlled:** making `list` treat
+`PeerClosed` as a failure fails the run ("list exited non-zero"), so the early-close check
+is known-sensitive.
+
+## 2026-07-24 — Coreutils Milestone 1 Part D: `copy`, and two gaps it refused to paper over
+
+**`copy` completes Milestone 1** — where `list` reads, `copy` mutates: creating files,
+growing them, writing contents, and building directory trees. Behaviour per design §10d,
+with the choices worth recording:
+
+- **Directories copy recursively with no flag.** `remove` requires `--recursive` as a
+  safety rail; copying has no destructive-by-default hazard, so demanding a flag would be
+  ceremony.
+- **An existing destination is an error** unless `--force` — fail loud, don't fail silent.
+- **It emits a table** (`Table<{source, destination, bytes}>`). A stage that produced
+  nothing would leave a downstream consumer waiting on a stream that never arrives, and
+  "what did it actually copy" is what a pipeline wants to see.
+- **File contents do not go through the directory protocol at all.** A file resolves to a
+  page-cache object the process maps, so a copy is a `memcpy` between two mappings and the
+  kernel moves the data (Model A). That is why the new helpers live in `coreutils::fs`
+  rather than in `librsproto`: no protocol is involved.
+
+**Gap 1 — no truncate, so `--force` onto a longer file is refused.** Creating an existing
+file is idempotent and growing it to a smaller size is a no-op, so writing short content
+over a long destination would leave the old tail behind: a file that is neither the old one
+nor the new one. `copy` refuses (`WouldTruncate`) rather than corrupt. The demo asserts
+both that the refusal happens **and that the destination is unchanged afterwards** — a
+refusal that had already clobbered the file would be worse than no refusal.
+
+**Gap 2 — a dead process's handles are never reclaimed, so `PeerClosed` never fires.**
+The harness hung, and the cause was not in `copy`. `HandleTable` is global with a
+per-entry `owner_pid`, and **nothing sweeps it at process exit**: `HandleTable::close` is
+the only close path and it is per-handle. A dead child's pipe endpoint therefore stays
+open, its peer's `sys_channel_recv` returns `WouldBlock` forever (verified directly: the
+probe returned `-11`, not `-13`), and `IpcChannel::already_signaled` never reports ready
+because `peer` is non-null. Ruled out along the way: the parent's `Process` handle (drop
+made no difference), the handle transfer itself (the success path proves it), and lazy
+thread reaping (the idle thread reaps, and `ChildExited` had already been delivered).
+
+This matters well beyond the test: it is exactly the mechanism the pipeline model depends
+on for a stage that dies early (design §1). The `yes | head -1` case works today only
+because the *consumer* closes explicitly. The demo now reaps a stage's exit **before**
+draining its stream, which sidesteps the hang without pretending it is fixed; the fix is
+filed in `deferred-decisions.md` — sweep the dying pid's entries at exit, dropping their
+`ObjectRef`s outside `SCHED` and outside IRQ context (the deferred-drop discipline from
+substrate hardening Parts A/F, since an `ObjectRef` drop can reach the allocator).
+
+*Verified:* host suite 755 green (3 new path-splitting tests: a trailing separator must not
+yield an empty basename, and a single-component path's parent is `/`, not `""`);
+`test-qemu` PASS covering file copy, refusal-without-`--force` with the destination
+unchanged, `--force` overwrite, the no-truncate refusal with the destination unchanged, and
+a recursive directory copy verified by reading the copied file's bytes back through a fresh
+resolve. **Negative-controlled:** disabling the truncate guard makes the run fail ("copy
+over a longer file wrongly succeeded"). `check-arch`/`check-nightly` green.
+
+**Milestone 1 is complete** — the substrate composes end to end: dir-ops supplies the data,
+the TSM1/`Value` model types it, the stdio/setup convention delivers it, and two real
+programs sit on each end of a real pipe.

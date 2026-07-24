@@ -207,10 +207,11 @@ The full gap analysis is in the subproject plan (§1); this is the checklist.
   **e2fsck-clean**. Proven end to end in QEMU (read + mutate, including the 1-vCPU path).
   Along the way: root-caused + fixed the fs-server "I/O hang" (same-CPU IRQ-wake latency —
   a scheduling point at the device-IRQ tail; decision log 2026-07-23) and batched the
-  fs-server's block I/O to 4 KiB blocks (8× fewer wakes). **Deferred within dir-ops:** a
-  `libos` `open_dir`/`read_dir` client wrapper (parent drives raw syscalls today),
-  cross-directory + overwrite `rename`, a new-parent-block grow on a full directory, the
-  `MAX_SESSIONS = 7` session cap, and a `File` directory-ops spec doc.
+  fs-server's block I/O to 4 KiB blocks (8× fewer wakes). **Deferred within dir-ops:** a client
+  wrapper (landed 2026-07-24 as `librsproto::session::Dir` — *not* in `libos`, which sits below
+  the protocol and is `alloc`-free), cross-directory + overwrite `rename`, a new-parent-block
+  grow on a full directory, the `MAX_SESSIONS = 7` session cap, and a `File` directory-ops spec
+  doc (written 2026-07-24).
 - [x] **`Value` collection types** — extended the in-memory `libstream` `Value` (was scalar +
   `Str`/`Bytes`/`Handle`) with `List(Arc<[Value]>)` / `Record(Arc<Record>)` / `Table(Arc<Table>)`
   (Arc-backed, persistent), and implemented the wire codecs for the reserved `List` (0x07) /
@@ -255,8 +256,9 @@ pipe — is the subproject's Milestone 1, once these three are in.
 
 ### Typed shell + coreutils (subproject)
 
-Once the prereqs above are in, the language, interpreter, generic operators, coreutils breadth, and
-a minimal (non-rich) REPL are their own subproject:
+The prereqs above are in, so this subproject is **🚧 active** (from 2026-07-24, at Milestone 1 —
+`list` + `copy`, branch `phase-4/coreutils-m1`). The language, interpreter, generic operators,
+coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).

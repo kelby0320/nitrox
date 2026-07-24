@@ -100,6 +100,28 @@ fn read_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<[u8; 2
     Ok(inode)
 }
 
+/// Read inode `ino` and decode the metadata a directory listing reports.
+///
+/// `i_size` is the 32-bit `i_size_lo` plus `i_size_hi` (offset 108) when the inode is
+/// larger than the 128-byte base — for a directory that high half is `i_dir_acl`, so it
+/// is taken only for non-directories. `i_mtime` (offset 16) is a 32-bit epoch second
+/// count; `i_mtime_extra` (offset 132) carries two epoch-extension bits above it, which
+/// is what keeps timestamps correct past 2038.
+fn stat_inode<R: BlockReader>(r: &R, sb: &Superblock, ino: u32) -> Result<InodeStat, FsError> {
+    let inode = read_inode(r, sb, ino)?;
+    let mode = rd_u16(&inode, 0);
+    let large = sb.inode_size > 128;
+    let size_hi = if large && mode & S_IFMT != S_IFDIR {
+        rd_u32(&inode, 108) as u64
+    } else {
+        0
+    };
+    let size = (rd_u32(&inode, 4) as u64) | (size_hi << 32);
+    let epoch_bits = if large { (rd_u32(&inode, 132) & 0x3) as i64 } else { 0 };
+    let mtime = rd_u32(&inode, 16) as i64 | (epoch_bits << 32);
+    Ok(InodeStat { ino, mode, size, mtime })
+}
+
 /// Map an inode's logical block `logical` to a physical block by walking its
 /// extent tree. `node` starts at an extent header (the inode's `i_block`, or a
 /// child extent block). Returns `0` for a hole (sparse).
@@ -254,6 +276,23 @@ pub fn resolve_dir<R: BlockReader>(r: &R, path: &[u8]) -> Result<u32, FsError> {
     Ok(ino)
 }
 
+/// One directory entry's inode metadata, resolved by [`read_dir_stat`].
+///
+/// `mtime` is seconds since the Unix epoch, decoded from `i_mtime` plus the low two bits
+/// of `i_mtime_extra` (the post-2038 epoch extension) when the inode is large enough to
+/// carry it — ext4's own encoding, not an approximation of it.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct InodeStat {
+    /// The inode number (also passed to `emit` as the entry's inode).
+    pub ino: u32,
+    /// Raw `i_mode` — the format bits (`S_IFMT`) plus permissions.
+    pub mode: u16,
+    /// `i_size` (both halves when the inode carries the high one).
+    pub size: u64,
+    /// Modification time, seconds since the Unix epoch.
+    pub mtime: i64,
+}
+
 /// Enumerate directory inode `dir_ino` starting at the opaque `cursor` (a logical byte
 /// offset into the directory's data; `0` starts from the beginning), calling `emit(inode,
 /// file_type, name)` for each live entry. `emit` returns `false` to stop early (the reply
@@ -264,6 +303,10 @@ pub fn resolve_dir<R: BlockReader>(r: &R, path: &[u8]) -> Result<u32, FsError> {
 /// to show them). Entries never span a block; a block's slack rides in the last entry's
 /// `rec_len`, so iteration steps by `rec_len` and rounds up to the next block at its end.
 ///
+/// This form reads **only the directory's own blocks**. Callers that need each entry's
+/// size/mtime/mode want [`read_dir_stat`], which additionally reads one inode per entry;
+/// a caller that only needs names (an emptiness scan) should stay here and not pay for it.
+///
 /// # Errors
 /// `NotFound` if `dir_ino` is not a directory, plus `Io`/`Corrupt` from the device.
 pub fn read_dir<R: BlockReader>(
@@ -271,6 +314,33 @@ pub fn read_dir<R: BlockReader>(
     dir_ino: u32,
     cursor: u64,
     mut emit: impl FnMut(u32, u8, &[u8]) -> bool,
+) -> Result<u64, FsError> {
+    read_dir_inner(r, dir_ino, cursor, |ino, ft, name, _| emit(ino, ft, name), false)
+}
+
+/// [`read_dir`], plus each entry's [`InodeStat`] — the listing form (`File::ReadDir`),
+/// which reports size/kind/modified per entry. Costs one extra inode read per entry
+/// (the inode table is not cached; entries of one directory usually share a few blocks).
+///
+/// # Errors
+/// As [`read_dir`]. An entry whose inode cannot be read is emitted with a **default**
+/// (zeroed) `InodeStat` rather than failing the whole listing — one damaged inode must
+/// not make a directory unlistable.
+pub fn read_dir_stat<R: BlockReader>(
+    r: &R,
+    dir_ino: u32,
+    cursor: u64,
+    mut emit: impl FnMut(u32, u8, &[u8], &InodeStat) -> bool,
+) -> Result<u64, FsError> {
+    read_dir_inner(r, dir_ino, cursor, |ino, ft, name, st| emit(ino, ft, name, st), true)
+}
+
+fn read_dir_inner<R: BlockReader>(
+    r: &R,
+    dir_ino: u32,
+    cursor: u64,
+    mut emit: impl FnMut(u32, u8, &[u8], &InodeStat) -> bool,
+    want_stat: bool,
 ) -> Result<u64, FsError> {
     let sb = read_superblock(r)?;
     let inode = read_inode(r, &sb, dir_ino)?;
@@ -314,7 +384,15 @@ pub fn read_dir<R: BlockReader>(
         // deleted/gap slot (skipped, its `rec_len` still consumed).
         if e_ino != 0 && name_len > 0 && in_block + 8 + name_len <= bs as usize {
             let name = &buf[in_block + 8..in_block + 8 + name_len];
-            if !emit(e_ino, file_type, name) {
+            // The entry's inode metadata, if the caller asked for it. A single bad inode
+            // degrades to a zeroed stat rather than failing the listing. This reads into
+            // its own small buffers, so the cached directory block in `buf` survives.
+            let stat = if want_stat {
+                stat_inode(r, &sb, e_ino).unwrap_or_default()
+            } else {
+                InodeStat::default()
+            };
+            if !emit(e_ino, file_type, name, &stat) {
                 // Buffer full: resume *at this same entry* next call.
                 return Ok(pos);
             }

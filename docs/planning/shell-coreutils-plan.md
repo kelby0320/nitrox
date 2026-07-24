@@ -1,7 +1,8 @@
 # Nitrox Shell & Coreutils — Subproject Plan
 
-**Status:** planning (2026-07-22). Not started. This is a large, multi-slice subproject that will
-run in its own Claude Code session(s). This document is the entry point for that work.
+**Status:** 🚧 active (started 2026-07-24, Milestone 1). The three CLI substrate prereqs (§1C) are
+all in, so the milestones below are unblocked. This is a large, multi-slice subproject running in
+its own Claude Code session(s); this document is the entry point for that work.
 
 ## What this is
 
@@ -85,7 +86,7 @@ These are substrate, independently testable, and each is roughly a slice of its 
 
 | # | Prerequisite | Blocks | Current status |
 |---|---|---|---|
-| **C1** | **Directory operations** — `readdir`/`mkdir`/`rmdir`/`unlink`/`rename` across the stack: `librsproto` op codes + `fs-server-ext4` handlers + any kernel/syscall surface + a `libos` client wrapper. | Every file coreutil: `list`, `mkdir`, `remove`, `move`, `copy`, `rename`, `touch`. | **Built** (2026-07-23, PR #112). Direct client↔fs-server RPC; `librsproto` `ReadDir`/`Mkdir`/`Unlink`/`Rmdir`/`Rename`; four e2fsck-clean ext4 mutation ops. **Deferred within:** the `libos` `open_dir`/`read_dir` client wrapper, cross-dir/overwrite `rename`, full-directory grow. |
+| **C1** | **Directory operations** — `readdir`/`mkdir`/`rmdir`/`unlink`/`rename` across the stack: `librsproto` op codes + `fs-server-ext4` handlers + any kernel/syscall surface + a `libos` client wrapper. | Every file coreutil: `list`, `mkdir`, `remove`, `move`, `copy`, `rename`, `touch`. | **Built** (2026-07-23, PR #112). Direct client↔fs-server RPC; `librsproto` `ReadDir`/`Mkdir`/`Unlink`/`Rmdir`/`Rename`; four e2fsck-clean ext4 mutation ops. **Deferred within:** the client wrapper (landed 2026-07-24 as `librsproto::session::Dir`; `libos` was the wrong home — it is below the protocol and `alloc`-free), cross-dir/overwrite `rename`, full-directory grow. |
 | **C2** | **`Value` collection types** — extend the in-memory `libstream` `Value` enum with `List`/`Record`/`Table` (Arc-backed, persistent), and implement the wire codecs for the reserved `List` (0x07) / `Record` (0x08) `TypeTag`s (currently `Unsupported`). Also **drop the `REC_WIDGET` (0x03) stub** — the companion doc §1 removed `widget_tag`; TSM1 is data-only. | The entire interpreter data model (§5c/§6/§9d/§9f). | **Built** (2026-07-23, branch `phase-4/value-collections`). `Value::List(Arc<[Value]>)`/`Record(Arc<Record>)`/`Table(Arc<Table>)`; self-describing `List` + sub-schema `Record` codecs; `Table` is a stream, not a cell (`type_tag()` → `Option`, `write_value` refuses it). Shared `wire::write_row_values`/`read_row_values`. `REC_WIDGET` removed. |
 | **C3** | **stdio / pipe substrate** — a convention + library for wiring `stdin`/`stdout`/`stderr` channels across spawned stages. Includes resolving the **bootstrap-capacity collision** (see below) and a `libstream` **stdin reader** + `libos` pipe-wiring helpers. | All pipelines; the shell's ability to spawn and connect stages. | **Not built.** No stdio concept exists; today spawn passes handles ad hoc via bootstrap registers. |
 | **C4** | **TSM1 stdin *reader* pattern** — a reusable pattern for a stage *consuming* a structured stdin stream. Today only the *produce* side is exercised (heartbeat → log channel). | Every non-source pipeline stage. | Partially there — `TableReader` exists; the wiring pattern does not. Folds into C3. |
@@ -135,6 +136,55 @@ deliverable, and the first time the prereqs are proven *integrated* rather than 
 Proof: `list` piped into a trivial consumer over a real channel, output correct, backpressure and
 `PeerClosed` (early-consumer close) both exercised. Validates the pipeline model **before a line of
 interpreter is written**.
+
+**Decisions taken at the start of the milestone (2026-07-24):** entry metadata rides in the
+`ReadDir` reply rather than a per-name `Stat` op (Part A below); the integrated proof lives in
+`test-harness`, which init runs to completion and adjudicates serially; the coreutils are one
+`userspace/coreutils` crate with a bin per program plus a shared lib for the pieces every stage
+needs. Slice branch: `phase-4/coreutils-m1`.
+
+- [x] **Part A — `ReadDir` entries carry inode metadata** (2026-07-24). `list`'s `size` and
+  `modified` columns had **no source**: the dir-ops reply carried `{inode, kind, name}` only, and
+  no `File::Stat` op exists. The entry prefix widens 8 → 24 bytes (`mode: u16`, `size: u64`,
+  `mtime: i64` added — `mode` fits in what was alignment padding), keeping a listing at **one round
+  trip per reply** instead of `1 + N`. `ext4::read_dir` keeps its metadata-free form (so `rmdir`'s
+  emptiness scan pays nothing) alongside a new `read_dir_stat`; `mtime` decodes ext4's post-2038
+  `i_mtime_extra` epoch bits. `rsproto-file-ops.md` refreshed — it still documented only
+  `ReadRange`. Host tests + `test-qemu` PASS, negative-controlled (zeroed metadata fails the run).
+  See the decision log (2026-07-24).
+- [x] **Part B — the directory client + the `coreutils` crate** (2026-07-24). The deferred
+  "`libos` `open_dir`/`read_dir` wrapper" **moved to `librsproto`** behind an `io` feature:
+  `libos` is *below* `librsproto` in the layering and is `alloc`-free, so it cannot host a
+  client for a protocol defined above it. `session::Dir` owns encode → send → wait → recv →
+  decode plus cursor-following, over a caller-provided buffer, with three-way errors
+  (`Server`/`Transport`/`Protocol`) so "no such entry" is distinguishable from "the pipe broke".
+  New `userspace/coreutils` crate: shared `stage` prologue (Tier 0 *and* Tier 1 — a coreutil must
+  be spawnable before the shell exists) and `args` (GNU §10f conventions, declarative, no bare
+  `-`). The harness's two directory demos now drive `Dir` (~150 lines of hand-rolled syscall code
+  deleted) — the client's integration proof, plus a new error-path case. Host suite 752 green,
+  `test-qemu` PASS. See the decision log (2026-07-24).
+- [x] **Part C — `list`, through a real pipe** (2026-07-24). The first coreutil:
+  `Table<{name, size, kind, modified}>` on stdout, `--recursive` with parent-relative names,
+  a plain-text fallback when there is no `stdout` (Tier 0), and `PeerClosed` as a **clean**
+  exit. The harness spawns it as a Tier-1 stage over a **depth-1** pipe and asserts the
+  stream exceeded one IPC payload — so backpressure was provably exercised, not assumed —
+  plus the schema field by field, the row contents, `--recursive` descent, and a clean exit
+  after an early consumer close (negative-controlled). Caught two defects (`--recursive`
+  reported bare names; the crate's host test build was broken by a bin-only `build.rs`) and
+  surfaced the **no-wall-clock** gap: nothing can stamp a new inode, so OS-created files
+  report `modified: 0` (filed in `deferred-decisions.md`). See the decision log (2026-07-24).
+- [x] **Part D — `copy`, the mutation side** (2026-07-24). File and recursive-directory copy,
+  `--force`, emitting `Table<{source, destination, bytes}>`. File *contents* bypass the directory
+  protocol entirely (a file is a mapped page-cache object), so the helpers live in `coreutils::fs`.
+  Turned up **two gaps**, both filed rather than papered over: (1) **no truncate** — `--force` onto
+  a *longer* destination is refused, since the old tail would survive; (2) **a dead process's
+  handles are never reclaimed**, so a pipe endpoint held by an exited stage never closes and its
+  peer never sees `PeerClosed` — which is the mechanism the pipeline model needs for a stage that
+  dies early. Negative-controlled. See the decision log (2026-07-24).
+
+**Milestone 1 is complete.** The substrate composes end to end, with two follow-ups owed
+(`deferred-decisions.md`): exit-time handle reclamation (a correctness gate for stage failure) and
+file truncate.
 
 ### Milestone 2 — coreutils breadth
 

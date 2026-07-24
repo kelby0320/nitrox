@@ -59,10 +59,11 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     fixed; decision log 2026-07-21).
   - **Floating-point + SIMD enablement** — ✅ done (Parts A–D; per-thread XSAVE, hard-float userspace
     target `x86_64-unknown-nitrox`, proven in ring 3; decision log 2026-07-21, PR #110).
-  - **Next: the CLI substrate prereqs** — directory ops, `Value` collection types, and the
-    stdio/pipe convention — which unblock the typed shell + coreutils subproject. See
-    [phase-4-desktop.md](phase-4-desktop.md) → "CLI substrate prereqs" and
-    [shell-coreutils-plan.md](shell-coreutils-plan.md).
+  - **CLI substrate prereqs** — directory ops, `Value` collection types, and the stdio/pipe
+    convention (plus the `parent`/`child` retirement into a conforming test harness) — ✅ done
+    (2026-07-23/24). See [phase-4-desktop.md](phase-4-desktop.md) → "CLI substrate prereqs".
+  - **Now: the typed shell + coreutils subproject** — 🚧 active from 2026-07-24, at Milestone 1
+    (`list` + `copy`). Tracked in [shell-coreutils-plan.md](shell-coreutils-plan.md).
 
 ---
 

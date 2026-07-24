@@ -13,7 +13,7 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libos = { path = "../libos" }
-librsproto = { path = "../librsproto" }
+librsproto = { path = "../librsproto", features = ["io"] }
 libheap = { path = "../libheap" }
 libstream = { path = "../libstream", features = ["io"] }
 

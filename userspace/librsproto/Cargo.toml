@@ -9,3 +9,12 @@ edition = "2024"
 # in IpcMsg.handles, managed by the caller. Under `cargo test` it builds as a host
 # `std` crate so the round-trip logic is unit-tested.
 [dependencies]
+# The `session` client (`Dir`) drives real IPC, so it needs the raw syscall layer —
+# but only under the `io` feature, so the codec core keeps its no-dependency,
+# host-testable shape. Off by default; a bin that talks to a directory server
+# enables it. Same seam as `libstream`'s `io` feature.
+libkern = { path = "../libkern", optional = true }
+
+[features]
+# The syscall-backed directory-session client (`session::Dir`).
+io = ["dep:libkern"]
