@@ -86,7 +86,7 @@ These are substrate, independently testable, and each is roughly a slice of its 
 
 | # | Prerequisite | Blocks | Current status |
 |---|---|---|---|
-| **C1** | **Directory operations** — `readdir`/`mkdir`/`rmdir`/`unlink`/`rename` across the stack: `librsproto` op codes + `fs-server-ext4` handlers + any kernel/syscall surface + a `libos` client wrapper. | Every file coreutil: `list`, `mkdir`, `remove`, `move`, `copy`, `rename`, `touch`. | **Built** (2026-07-23, PR #112). Direct client↔fs-server RPC; `librsproto` `ReadDir`/`Mkdir`/`Unlink`/`Rmdir`/`Rename`; four e2fsck-clean ext4 mutation ops. **Deferred within:** the `libos` `open_dir`/`read_dir` client wrapper, cross-dir/overwrite `rename`, full-directory grow. |
+| **C1** | **Directory operations** — `readdir`/`mkdir`/`rmdir`/`unlink`/`rename` across the stack: `librsproto` op codes + `fs-server-ext4` handlers + any kernel/syscall surface + a `libos` client wrapper. | Every file coreutil: `list`, `mkdir`, `remove`, `move`, `copy`, `rename`, `touch`. | **Built** (2026-07-23, PR #112). Direct client↔fs-server RPC; `librsproto` `ReadDir`/`Mkdir`/`Unlink`/`Rmdir`/`Rename`; four e2fsck-clean ext4 mutation ops. **Deferred within:** the client wrapper (landed 2026-07-24 as `librsproto::session::Dir`; `libos` was the wrong home — it is below the protocol and `alloc`-free), cross-dir/overwrite `rename`, full-directory grow. |
 | **C2** | **`Value` collection types** — extend the in-memory `libstream` `Value` enum with `List`/`Record`/`Table` (Arc-backed, persistent), and implement the wire codecs for the reserved `List` (0x07) / `Record` (0x08) `TypeTag`s (currently `Unsupported`). Also **drop the `REC_WIDGET` (0x03) stub** — the companion doc §1 removed `widget_tag`; TSM1 is data-only. | The entire interpreter data model (§5c/§6/§9d/§9f). | **Built** (2026-07-23, branch `phase-4/value-collections`). `Value::List(Arc<[Value]>)`/`Record(Arc<Record>)`/`Table(Arc<Table>)`; self-describing `List` + sub-schema `Record` codecs; `Table` is a stream, not a cell (`type_tag()` → `Option`, `write_value` refuses it). Shared `wire::write_row_values`/`read_row_values`. `REC_WIDGET` removed. |
 | **C3** | **stdio / pipe substrate** — a convention + library for wiring `stdin`/`stdout`/`stderr` channels across spawned stages. Includes resolving the **bootstrap-capacity collision** (see below) and a `libstream` **stdin reader** + `libos` pipe-wiring helpers. | All pipelines; the shell's ability to spawn and connect stages. | **Not built.** No stdio concept exists; today spawn passes handles ad hoc via bootstrap registers. |
 | **C4** | **TSM1 stdin *reader* pattern** — a reusable pattern for a stage *consuming* a structured stdin stream. Today only the *produce* side is exercised (heartbeat → log channel). | Every non-source pipeline stage. | Partially there — `TableReader` exists; the wiring pattern does not. Folds into C3. |
@@ -152,8 +152,17 @@ needs. Slice branch: `phase-4/coreutils-m1`.
   `i_mtime_extra` epoch bits. `rsproto-file-ops.md` refreshed — it still documented only
   `ReadRange`. Host tests + `test-qemu` PASS, negative-controlled (zeroed metadata fails the run).
   See the decision log (2026-07-24).
-- [ ] **Part B** — `libos` dir client (`open_dir`/`read_dir`), the `coreutils` crate skeleton,
-  shared arg parsing + the Tier-1 stage prologue.
+- [x] **Part B — the directory client + the `coreutils` crate** (2026-07-24). The deferred
+  "`libos` `open_dir`/`read_dir` wrapper" **moved to `librsproto`** behind an `io` feature:
+  `libos` is *below* `librsproto` in the layering and is `alloc`-free, so it cannot host a
+  client for a protocol defined above it. `session::Dir` owns encode → send → wait → recv →
+  decode plus cursor-following, over a caller-provided buffer, with three-way errors
+  (`Server`/`Transport`/`Protocol`) so "no such entry" is distinguishable from "the pipe broke".
+  New `userspace/coreutils` crate: shared `stage` prologue (Tier 0 *and* Tier 1 — a coreutil must
+  be spawnable before the shell exists) and `args` (GNU §10f conventions, declarative, no bare
+  `-`). The harness's two directory demos now drive `Dir` (~150 lines of hand-rolled syscall code
+  deleted) — the client's integration proof, plus a new error-path case. Host suite 752 green,
+  `test-qemu` PASS. See the decision log (2026-07-24).
 - [ ] **Part C** — `list` emitting TSM1 on `stdout`; the harness proof over a real pipe
   (backpressure + `PeerClosed`).
 - [ ] **Part D** — `copy` (file + recursive directory, `--force`), plus whatever write-path gap it

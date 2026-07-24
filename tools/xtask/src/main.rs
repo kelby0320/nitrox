@@ -640,6 +640,16 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `coreutils` shared-library tests (argument parsing). `--lib` skips the
+    // bare-target program `[[bin]]`s.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("coreutils")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     Ok(())
 }
 

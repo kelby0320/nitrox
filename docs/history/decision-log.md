@@ -7954,3 +7954,64 @@ cannot pass). `test-qemu` PASS with the harness's dir-list demo now asserting th
 of a real ext4 file rather than just its name. **Negative-controlled:** making the server
 push zeroed metadata fails the run (`dir-list FAIL (implausible size)`, qemu exit 35), so
 the check is known-sensitive rather than merely passing.
+
+## 2026-07-24 — Coreutils Milestone 1 Part B: the directory client lives in `librsproto`, not `libos`
+
+**The deferred item said `libos`; that turned out to be the wrong home.** The dir-ops
+slice parked "a `libos` `open_dir`/`read_dir` client wrapper" for its first consumer.
+Building it revealed the placement is impossible as stated: `libos` sits **below**
+`librsproto` in the userspace layering (`userspace/CLAUDE.md`), so it cannot speak a
+protocol defined above it, and it is `no_std` **without `alloc`** by deliberate choice so
+the heap-free binaries can use it.
+
+**Decision: the client goes in `librsproto`, behind an `io` feature.** `librsproto` was a
+pure codec with no dependencies; it gains an optional `libkern` dependency that carries
+`session::Dir`. This is the seam `libstream` already established for
+`channel::IpcPort` — the wire core stays dependency-free and host-testable, and only the
+syscall-touching part is feature-gated. The client belongs next to the wire definition it
+speaks, and `libos` keeps the namespace half it already owns (`Handle<Namespace>::lookup`).
+
+`Dir` owns what every call site was hand-rolling: encode → `sys_channel_send` → `sys_wait`
+→ `sys_channel_recv` → decode, with cursor-following built into `read_dir` so a caller
+sees whole directories rather than pages. Notable choices:
+
+- **A caller-provided message buffer**, not an owned one — `librsproto` stays `alloc`-free,
+  and a caller decides where 4 KiB lives (a coreutil's stack, a server's `.bss`). One
+  buffer serves both directions: the request is consumed by the time the send returns.
+- **Errors are three-way** — `Server(KError)` / `Transport(i32)` / `Protocol`. A caller
+  must be able to tell "no such entry" from "the pipe broke"; collapsing them is what
+  makes a broken transport read as a passing test.
+- **A non-advancing cursor is a protocol fault**, not an infinite loop. The hand-rolled
+  call sites guarded this with a round counter; the invariant belongs in the client.
+- **`close` is explicit, not `Drop`** — a drop cannot report failure, and closing a handle
+  silently is worth avoiding.
+- **Blocking, but not a blocking syscall.** Each op parks in `sys_wait`, never inside
+  another syscall — the async-first contract. Sequential callers want this shape; a future
+  task-based caller can drive the same codecs over `libos::Op`.
+
+**The `coreutils` crate.** One crate, a bin per program, plus a shared lib — every program
+needs the same startup prologue and the same argument parsing, and that shared surface is
+the reason to keep them together. Two modules so far:
+
+- `stage` — the Tier-0/Tier-1 prologue. **Both tiers, deliberately:** Tier 1 is the
+  shell-spawned case that supplies `argv`; Tier 0 is what init or the test harness gives a
+  program spawned *without* a shell, which is exactly the position Milestone 1 is in.
+  `diag`/`die` route to the shared `stderr` sink when there is one and fall back to the
+  kernel log when there is not, so a diagnostic never corrupts the typed stream on stdout.
+- `args` — GNU conventions per design §10f (long, short, clustered shorts, `--`,
+  universal `--help`/`--version`), **declarative**: an undeclared flag is an error, not a
+  silently ignored argument. One deliberate omission, GNU's bare `-` for stdin: piping is
+  structural here (a stage's input *is* its stdin), so `-` is just a path.
+
+**The harness's hand-rolled plumbing is now the client's integration proof.** The two
+directory demos dropped ~150 lines of inline syscall code in favour of `Dir`, which both
+proves the client end to end in QEMU and removes the duplication. The mutate demo gained a
+case the old code could not express: `rmdir` of a missing name must come back as
+`DirError::Server`, not a transport fault and not a false success.
+
+*Verified:* host suite 752 green (8 new `args` tests, 2 new `OwnedEntry` tests — one
+checks a listing survives the reply buffer being overwritten, the other a 255-byte name);
+`test-qemu` PASS with both directory demos driving the new client; `check-arch` and
+`check-nightly` green. **Also fixed:** `cargo xtask test` enumerates test crates
+explicitly, so a new crate is invisible to CI until registered — `coreutils` was, and its
+8 tests were silently not running until it was added.

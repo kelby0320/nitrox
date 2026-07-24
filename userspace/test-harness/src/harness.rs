@@ -33,6 +33,7 @@ extern crate alloc;
 use core::arch::asm;
 use libkern::*;
 use libos::{Handle, Namespace, NsMutable, spawn, thread_create};
+use librsproto::session::{Dir, DirError};
 
 /// `alloc` backing for the `libstream` transport demo (`stream_transport_demo`).
 #[global_allocator]
@@ -73,12 +74,9 @@ static mut STORM_SPAWN: SpawnArgs = SpawnArgs {
 /// A zeroed 4096-byte IPC message (empty payload, no transfers) for the
 /// blocking-send demo, used for both send and recv.
 static mut MSGBUF: [u8; 4096] = [0; 4096];
-/// Directory-listing demo buffers (dir-ops Part A): send a `File::ReadDir` and receive its
-/// reply on an open directory-handle channel.
-static mut DIR_SEND: [u8; 4096] = [0; 4096];
-static mut DIR_RECV: [u8; 4096] = [0; 4096];
-static mut DIR_XFER: [u64; 8] = [0; 8];
-static mut DIR_XCOUNT: usize = 0;
+// (The directory demos' message buffers moved into `librsproto::session::Dir`, which owns
+// the request/reply plumbing they used to hand-roll — each demo now passes it one stack
+// buffer.)
 /// Transferred-handle out-array for recv (always empty in the demo).
 static mut HBUF: [u64; 8] = [0; 8];
 /// Recv'd handle-count out-param.
@@ -1241,137 +1239,63 @@ fn exit_storm_demo(root_ns: u64, notif: u64) {
 }
 
 /// **Directory listing over the direct-RPC transport** (dir-ops Part A). Opens `/system`
-/// as a directory handle (`sys_ns_lookup` resolves a directory path to a session channel —
-/// `OBJECT_KIND_CHANNEL`), then issues `File::ReadDir` on that channel, following the
-/// cursor across replies, and confirms the known entry `current-generation` is listed.
-/// Proves the whole transport end to end: endpoint acquisition, the session channel,
-/// name-addressed enumeration, and reply correlation. A failure exits non-zero (init's
-/// fail path); like the other early demos it runs before the login chain adjudicates.
+/// as a directory session (`sys_ns_lookup` resolves a directory path to a session channel —
+/// `OBJECT_KIND_CHANNEL`), enumerates it, and confirms the known entry
+/// `current-generation` is listed *with plausible metadata*. Proves the whole transport
+/// end to end: endpoint acquisition, the session channel, name-addressed enumeration,
+/// cursor-following, and reply correlation.
+///
+/// Drives [`librsproto::session::Dir`] — the shared client — rather than hand-rolled
+/// syscall plumbing, so this demo is also the client's integration proof. A failure exits
+/// non-zero (init's fail path).
 fn dir_list_demo(root_ns: u64) {
     kprint(b"test-harness: dir-list demo start\n");
-    // Open the directory: resolving a directory path yields a session channel (SEND|RECV).
-    let (st, dir_ch) = ns_lookup_wait(root_ns, b"/system", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if st != 0 || dir_ch == 0 {
-        kprint(b"test-harness: dir-list open FAIL\n");
-        exit(1);
-    }
+    let mut buf = [0u8; 4096];
+    let mut dir = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: dir-list open FAIL\n"),
+    };
 
-    let mut cursor = 0u64;
     let mut saw_currentgen = false;
-    let mut rounds = 0u32;
-    loop {
-        rounds += 1;
-        if rounds > 64 {
-            kprint(b"test-harness: dir-list runaway (cursor did not terminate)\n");
-            exit(1);
-        }
-        // Build File::ReadDir{cursor} into the send buffer's payload region (offset 24).
-        // SAFETY: DIR_SEND is a valid writable buffer; the rsproto body is bounded.
-        let ok = unsafe {
-            let mut body = [0u8; 8];
-            let bn = match librsproto::file::read_dir_request(&mut body, cursor) {
-                Some(n) => n,
-                None => return_fail(b"test-harness: dir-list request build FAIL\n"),
-            };
-            let reply = core::slice::from_raw_parts_mut(((&raw mut DIR_SEND) as *mut u8).add(24), 4096 - 24);
-            match librsproto::encode(reply, librsproto::OP_FILE_READ_DIR, 0, 0, &body[..bn], 0) {
-                Some(rn) => {
-                    DIR_SEND[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
-                    DIR_SEND[8] = 0;
-                    true
-                }
-                None => false,
+    let mut saw_dot_dir = false;
+    let listed = dir.read_dir(|e| {
+        if e.name == b"current-generation" {
+            saw_currentgen = true;
+            // The entry carries its inode metadata (the fields `list` reports as
+            // `Table<{name, size, kind, modified}>`). Check them against what this file
+            // must be: a non-empty regular file, smaller than a block, stamped by the
+            // image build — a zeroed or mis-decoded field fails every one of these, which
+            // a name-only check would have missed.
+            if e.kind != librsproto::file::DIRENT_KIND_FILE {
+                return_fail(b"test-harness: dir-list FAIL (current-generation not a file)\n");
             }
-        };
-        if !ok {
-            kprint(b"test-harness: dir-list encode FAIL\n");
-            exit(1);
-        }
-        // Send on the directory channel.
-        // SAFETY: valid endpoint + message; no transferred handles.
-        let sr = unsafe {
-            syscall5(SYS_CHANNEL_SEND, dir_ch, (&raw const DIR_SEND) as u64, 0, 0, SENDMODE_NOBLOCK)
-        };
-        if sr != 0 {
-            kprint(b"test-harness: dir-list send FAIL\n");
-            exit(1);
-        }
-        // Wait for + receive the reply on the same channel.
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid single-waiter buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = dir_ch;
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
-        if waited != 1 {
-            kprint(b"test-harness: dir-list wait FAIL\n");
-            exit(1);
-        }
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
-        };
-        if rr != 0 {
-            kprint(b"test-harness: dir-list recv FAIL\n");
-            exit(1);
-        }
-        // Decode the reply and scan its entries.
-        // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
-        let next_cursor = unsafe {
-            let payload_len = u32::from_le_bytes([DIR_RECV[4], DIR_RECV[5], DIR_RECV[6], DIR_RECV[7]]) as usize;
-            let payload = core::slice::from_raw_parts(((&raw const DIR_RECV) as *const u8).add(24), payload_len.min(4096 - 24));
-            let m = match librsproto::decode(payload) {
-                Ok(m) => m,
-                Err(_) => return_fail(b"test-harness: dir-list decode FAIL\n"),
-            };
-            if m.is_error() {
-                return_fail(b"test-harness: dir-list error reply\n");
+            if e.size == 0 || e.size > 4096 {
+                return_fail(b"test-harness: dir-list FAIL (implausible size)\n");
             }
-            let (hdr, iter) = match librsproto::file::parse_read_dir_reply(m.body) {
-                Some(x) => x,
-                None => return_fail(b"test-harness: dir-list parse FAIL\n"),
-            };
-            for e in iter {
-                if e.name == b"current-generation" {
-                    saw_currentgen = true;
-                    // The entry now carries its inode metadata (the fields `list` reports
-                    // as `Table<{name, size, kind, modified}>`). Check them against what
-                    // this file must be: a non-empty regular file, smaller than a block,
-                    // stamped by the image build — a zeroed or mis-decoded field fails
-                    // every one of these, which a name-only check would have missed.
-                    if e.kind != librsproto::file::DIRENT_KIND_FILE {
-                        return_fail(b"test-harness: dir-list FAIL (current-generation not a file)\n");
-                    }
-                    if e.size == 0 || e.size > 4096 {
-                        return_fail(b"test-harness: dir-list FAIL (implausible size)\n");
-                    }
-                    if e.mode & 0xF000 != 0x8000 {
-                        return_fail(b"test-harness: dir-list FAIL (mode not S_IFREG)\n");
-                    }
-                    // 1_600_000_000 = Sep 2020, comfortably before this image was built.
-                    if e.mtime < 1_600_000_000 {
-                        return_fail(b"test-harness: dir-list FAIL (implausible mtime)\n");
-                    }
-                }
-                if e.name == b"." && e.kind != librsproto::file::DIRENT_KIND_DIR {
-                    return_fail(b"test-harness: dir-list FAIL (. not a directory)\n");
-                }
+            if e.mode & 0xF000 != 0x8000 {
+                return_fail(b"test-harness: dir-list FAIL (mode not S_IFREG)\n");
             }
-            hdr.next_cursor
-        };
-        if next_cursor == 0 {
-            break;
+            // 1_600_000_000 = Sep 2020, comfortably before this image was built.
+            if e.mtime < 1_600_000_000 {
+                return_fail(b"test-harness: dir-list FAIL (implausible mtime)\n");
+            }
         }
-        cursor = next_cursor;
+        if e.name == b"." {
+            saw_dot_dir = e.kind == librsproto::file::DIRENT_KIND_DIR;
+        }
+        true
+    });
+    if listed.is_err() {
+        return_fail(b"test-harness: dir-list enumerate FAIL\n");
     }
-
-    // SAFETY: closing our own channel handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, dir_ch) };
-    if saw_currentgen {
-        kprint(b"test-harness: dir-list ok (/system lists current-generation)\n");
-    } else {
-        kprint(b"test-harness: dir-list FAIL (current-generation not found)\n");
-        exit(1);
+    dir.close();
+    if !saw_currentgen {
+        return_fail(b"test-harness: dir-list FAIL (current-generation not found)\n");
     }
+    if !saw_dot_dir {
+        return_fail(b"test-harness: dir-list FAIL (. missing or not a directory)\n");
+    }
+    kprint(b"test-harness: dir-list ok (/system lists current-generation + metadata)\n");
 }
 
 /// Print `msg` and exit non-zero — a `-> !` helper so the demo's `match`/closure arms can
@@ -1382,171 +1306,71 @@ fn return_fail(msg: &[u8]) -> ! {
 }
 
 /// **Directory mutation over the direct-RPC transport** (dir-ops Part B). On the same kind
-/// of open directory handle as `dir_list_demo`, exercises the name-addressed mutations end
+/// of open directory session as `dir_list_demo`, exercises the name-addressed mutations end
 /// to end: mkdir a temp subdir, confirm it appears, rename it, confirm the rename, then
 /// rmdir it and confirm it is gone. Each op is a single request/reply on the session
-/// channel; the handle is bound to `/system`, so the names can only ever touch `/system`.
+/// channel; the session is bound to `/system`, so the names can only ever touch `/system`.
+///
+/// Also covers the client's error path: removing a name that does not exist must come back
+/// as a *server* error carrying a `KError`, not as a transport failure or a false success.
 fn dir_mutate_demo(root_ns: u64) {
     kprint(b"test-harness: dir-mutate demo start\n");
-    let (st, dir_ch) = ns_lookup_wait(root_ns, b"/system", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
-    if st != 0 || dir_ch == 0 {
-        kprint(b"test-harness: dir-mutate open FAIL\n");
-        exit(1);
-    }
+    let mut buf = [0u8; 4096];
+    let mut dir = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: dir-mutate open FAIL\n"),
+    };
+
     // mkdir nx-tmp → confirm it appears (a ReadDir on the same session).
-    let mut body = [0u8; 32];
-    let n = librsproto::file::name_request(&mut body, b"nx-tmp").unwrap();
-    if !session_mutate(dir_ch, librsproto::OP_FILE_MKDIR, &body[..n]) {
-        kprint(b"test-harness: mkdir FAIL\n");
-        exit(1);
+    if dir.mkdir(b"nx-tmp").is_err() {
+        return_fail(b"test-harness: mkdir FAIL\n");
     }
-    if !session_dir_contains(dir_ch, b"nx-tmp") {
-        kprint(b"test-harness: mkdir not visible\n");
-        exit(1);
+    if !dir_contains(&mut dir, b"nx-tmp") {
+        return_fail(b"test-harness: mkdir not visible\n");
     }
     // rename nx-tmp → nx-tmp2 → confirm the old name is gone and the new one present.
-    let mut rbody = [0u8; 48];
-    let rn = librsproto::file::rename_request(&mut rbody, b"nx-tmp", b"nx-tmp2").unwrap();
-    if !session_mutate(dir_ch, librsproto::OP_FILE_RENAME, &rbody[..rn]) {
-        kprint(b"test-harness: rename FAIL\n");
-        exit(1);
+    if dir.rename(b"nx-tmp", b"nx-tmp2").is_err() {
+        return_fail(b"test-harness: rename FAIL\n");
     }
-    if session_dir_contains(dir_ch, b"nx-tmp") || !session_dir_contains(dir_ch, b"nx-tmp2") {
-        kprint(b"test-harness: rename not applied\n");
-        exit(1);
+    if dir_contains(&mut dir, b"nx-tmp") || !dir_contains(&mut dir, b"nx-tmp2") {
+        return_fail(b"test-harness: rename not applied\n");
+    }
+    // A failing op must surface as a server error, distinguishable from a transport fault:
+    // the client's whole point is that a caller can tell "no such entry" from "the pipe
+    // broke" without decoding replies itself.
+    match dir.rmdir(b"nx-does-not-exist") {
+        Err(DirError::Server(_)) => {}
+        Err(_) => return_fail(b"test-harness: rmdir(missing) reported a transport fault\n"),
+        Ok(()) => return_fail(b"test-harness: rmdir(missing) wrongly succeeded\n"),
     }
     // rmdir nx-tmp2 → confirm it is gone.
-    let mut dbody = [0u8; 32];
-    let dn = librsproto::file::name_request(&mut dbody, b"nx-tmp2").unwrap();
-    if !session_mutate(dir_ch, librsproto::OP_FILE_RMDIR, &dbody[..dn]) {
-        kprint(b"test-harness: rmdir FAIL\n");
-        exit(1);
+    if dir.rmdir(b"nx-tmp2").is_err() {
+        return_fail(b"test-harness: rmdir FAIL\n");
     }
-    if session_dir_contains(dir_ch, b"nx-tmp2") {
-        kprint(b"test-harness: rmdir not applied\n");
-        exit(1);
+    if dir_contains(&mut dir, b"nx-tmp2") {
+        return_fail(b"test-harness: rmdir not applied\n");
     }
-    // SAFETY: closing our own channel handle.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, dir_ch) };
+    dir.close();
     kprint(b"test-harness: dir-mutate ok (mkdir + rename + rmdir, each ReadDir-verified)\n");
 }
 
-/// Send one mutation op (`body` already built) on the directory channel and await its
-/// reply; returns `true` on a non-error reply. Exits the demo on a transport failure.
-fn session_mutate(dir_ch: u64, op: u16, body: &[u8]) -> bool {
-    // SAFETY: DIR_SEND is a valid writable buffer; the rsproto message is bounded.
-    let sent = unsafe {
-        let region = core::slice::from_raw_parts_mut(((&raw mut DIR_SEND) as *mut u8).add(24), 4096 - 24);
-        match librsproto::encode(region, op, 0, 0, body, 0) {
-            Some(rn) => {
-                DIR_SEND[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
-                DIR_SEND[8] = 0;
-                syscall5(SYS_CHANNEL_SEND, dir_ch, (&raw const DIR_SEND) as u64, 0, 0, SENDMODE_NOBLOCK) == 0
-            }
-            None => false,
+/// Whether the open directory currently lists an entry named `name`. Exits the demo on a
+/// transport failure — a listing that cannot complete is not the same as a name that is
+/// absent, and conflating them would let a broken transport read as a passing test.
+fn dir_contains(dir: &mut Dir<'_>, name: &[u8]) -> bool {
+    let mut found = false;
+    // Returning `false` from the callback stops enumeration early — no need to drain the
+    // rest of a directory once the name is seen.
+    let r = dir.read_dir(|e| {
+        if e.name == name {
+            found = true;
         }
-    };
-    if !sent {
-        kprint(b"test-harness: dir-mutate send FAIL\n");
-        exit(1);
+        !found
+    });
+    if r.is_err() {
+        return_fail(b"test-harness: dir-contains enumerate FAIL\n");
     }
-    // SAFETY: single-waiter buffers.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = dir_ch;
-        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-    };
-    if waited != 1 {
-        kprint(b"test-harness: dir-mutate wait FAIL\n");
-        exit(1);
-    }
-    // SAFETY: valid recv out-params.
-    let rr = unsafe {
-        syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
-    };
-    if rr != 0 {
-        kprint(b"test-harness: dir-mutate recv FAIL\n");
-        exit(1);
-    }
-    // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
-    unsafe {
-        let payload_len = u32::from_le_bytes([DIR_RECV[4], DIR_RECV[5], DIR_RECV[6], DIR_RECV[7]]) as usize;
-        let payload = core::slice::from_raw_parts(((&raw const DIR_RECV) as *const u8).add(24), payload_len.min(4096 - 24));
-        match librsproto::decode(payload) {
-            Ok(m) => !m.is_error(),
-            Err(_) => false,
-        }
-    }
-}
-
-
-/// Whether the bound directory currently lists an entry named `name` (drains the ReadDir
-/// cursor across replies). Exits the demo on a transport failure.
-fn session_dir_contains(dir_ch: u64, name: &[u8]) -> bool {
-    let mut cursor = 0u64;
-    let mut rounds = 0u32;
-    loop {
-        rounds += 1;
-        if rounds > 64 {
-            kprint(b"test-harness: dir-contains runaway\n");
-            exit(1);
-        }
-        // Build + send File::ReadDir{cursor}.
-        // SAFETY: DIR_SEND is a valid writable buffer; the rsproto body is bounded.
-        let sent = unsafe {
-            let mut b = [0u8; 8];
-            let bn = librsproto::file::read_dir_request(&mut b, cursor).unwrap();
-            let region = core::slice::from_raw_parts_mut(((&raw mut DIR_SEND) as *mut u8).add(24), 4096 - 24);
-            match librsproto::encode(region, librsproto::OP_FILE_READ_DIR, 0, 0, &b[..bn], 0) {
-                Some(rn) => {
-                    DIR_SEND[4..8].copy_from_slice(&(rn as u32).to_le_bytes());
-                    DIR_SEND[8] = 0;
-                    syscall5(SYS_CHANNEL_SEND, dir_ch, (&raw const DIR_SEND) as u64, 0, 0, SENDMODE_NOBLOCK) == 0
-                }
-                None => false,
-            }
-        };
-        if !sent {
-            kprint(b"test-harness: dir-contains send FAIL\n");
-            exit(1);
-        }
-        // SAFETY: single-waiter buffers.
-        let waited = unsafe {
-            WAIT_HANDLES[0] = dir_ch;
-            syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, u64::MAX)
-        };
-        if waited != 1 {
-            kprint(b"test-harness: dir-contains wait FAIL\n");
-            exit(1);
-        }
-        // SAFETY: valid recv out-params.
-        let rr = unsafe {
-            syscall4(SYS_CHANNEL_RECV, dir_ch, (&raw mut DIR_RECV) as u64, (&raw mut DIR_XFER) as u64, (&raw mut DIR_XCOUNT) as u64)
-        };
-        if rr != 0 {
-            kprint(b"test-harness: dir-contains recv FAIL\n");
-            exit(1);
-        }
-        // SAFETY: DIR_RECV holds the reply; the payload slice is bounded.
-        let (found, next) = unsafe {
-            let payload_len = u32::from_le_bytes([DIR_RECV[4], DIR_RECV[5], DIR_RECV[6], DIR_RECV[7]]) as usize;
-            let payload = core::slice::from_raw_parts(((&raw const DIR_RECV) as *const u8).add(24), payload_len.min(4096 - 24));
-            let m = match librsproto::decode(payload) { Ok(m) => m, Err(_) => return false };
-            if m.is_error() { return false; }
-            let (hdr, iter) = match librsproto::file::parse_read_dir_reply(m.body) { Some(x) => x, None => return false };
-            let mut f = false;
-            for e in iter {
-                if e.name == name { f = true; }
-            }
-            (f, hdr.next_cursor)
-        };
-        if found {
-            return true;
-        }
-        if next == 0 {
-            return false;
-        }
-        cursor = next;
-    }
+    found
 }
 
 /// **Hardware floating point, end to end in ring 3** (Phase 4 FP enablement Part D;

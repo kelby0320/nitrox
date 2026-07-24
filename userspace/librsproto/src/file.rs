@@ -177,6 +177,67 @@ pub struct DirEntry<'a> {
     pub name: &'a [u8],
 }
 
+/// The longest entry name a `ReadDir` reply can carry (its `name_len` is a `u8`).
+pub const MAX_NAME: usize = 255;
+
+/// A [`DirEntry`] copied out of the reply buffer, so it outlives the message it arrived
+/// in. A borrowed entry is only valid until the next reply overwrites the buffer; any
+/// caller accumulating a listing (every file coreutil) wants this form.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub struct OwnedEntry {
+    pub inode: u32,
+    /// One of the `DIRENT_KIND_*` constants.
+    pub kind: u8,
+    /// POSIX `st_mode` bits; `0` if unreported.
+    pub mode: u16,
+    /// Byte size.
+    pub size: u64,
+    /// Modification time, seconds since the Unix epoch; `0` if unknown.
+    pub mtime: i64,
+    name: [u8; MAX_NAME],
+    name_len: u8,
+}
+
+impl OwnedEntry {
+    /// Copy a borrowed entry's fields, including its name.
+    ///
+    /// A name is capped at [`MAX_NAME`], which is also the longest a wire entry can
+    /// express (`name_len` is a `u8`), so no name a server can legally send is truncated.
+    pub fn from_entry(e: &DirEntry<'_>) -> OwnedEntry {
+        let mut name = [0u8; MAX_NAME];
+        let n = e.name.len().min(MAX_NAME);
+        name[..n].copy_from_slice(&e.name[..n]);
+        OwnedEntry {
+            inode: e.inode,
+            kind: e.kind,
+            mode: e.mode,
+            size: e.size,
+            mtime: e.mtime,
+            name,
+            name_len: n as u8,
+        }
+    }
+
+    /// The entry's name.
+    pub fn name(&self) -> &[u8] {
+        &self.name[..self.name_len as usize]
+    }
+}
+
+impl Default for OwnedEntry {
+    fn default() -> Self {
+        OwnedEntry {
+            inode: 0,
+            kind: DIRENT_KIND_UNKNOWN,
+            mode: 0,
+            size: 0,
+            mtime: 0,
+            name: [0u8; MAX_NAME],
+            name_len: 0,
+        }
+    }
+}
+
 /// Builds a `ReadDirReply` body incrementally, packing entries until the buffer is full.
 /// The server appends entries with [`push`](DirReplyWriter::push) until one is rejected
 /// (buffer full), then calls [`finish`](DirReplyWriter::finish) with the next cursor.
@@ -414,6 +475,43 @@ mod tests {
             // A server with no metadata to report zeroes the fields.
             (12, DIRENT_KIND_DIR, 0, 0, 0, b"subdir".to_vec()),
         ]);
+    }
+
+    #[test]
+    fn owned_entry_copies_every_field_out_of_the_reply_buffer() {
+        // The listing path decodes into a shared 4 KiB buffer that the next reply
+        // overwrites, so a caller accumulating entries must get a real copy.
+        let mut buf = [0u8; 128];
+        let mut w = DirReplyWriter::new(&mut buf).unwrap();
+        w.push(42, DIRENT_KIND_FILE, 0o100644, 1234, 1_700_000_000, b"notes.txt");
+        let n = w.finish(0);
+        let owned = {
+            let (_, mut iter) = parse_read_dir_reply(&buf[..n]).unwrap();
+            OwnedEntry::from_entry(&iter.next().unwrap())
+        };
+        buf.fill(0xAA); // the next reply lands on top of the one we parsed
+        assert_eq!(owned.name(), b"notes.txt");
+        assert_eq!(
+            (owned.inode, owned.kind, owned.mode, owned.size, owned.mtime),
+            (42, DIRENT_KIND_FILE, 0o100644, 1234, 1_700_000_000)
+        );
+    }
+
+    #[test]
+    fn owned_entry_keeps_a_maximum_length_name() {
+        // `name_len` is a u8, so 255 bytes is the longest name a server can send; it must
+        // survive the copy whole rather than losing a byte to an off-by-one.
+        let long = [b'x'; MAX_NAME];
+        let e = DirEntry {
+            inode: 1,
+            kind: DIRENT_KIND_DIR,
+            mode: 0,
+            size: 0,
+            mtime: 0,
+            name: &long,
+        };
+        let owned = OwnedEntry::from_entry(&e);
+        assert_eq!(owned.name(), &long[..]);
     }
 
     #[test]

@@ -12,6 +12,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "coreutils"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "librsproto",
+ "libstream",
+]
+
+[[package]]
 name = "eshell"
 version = "0.1.0"
 dependencies = [
@@ -85,6 +95,9 @@ dependencies = [
 [[package]]
 name = "librsproto"
 version = "0.1.0"
+dependencies = [
+ "libkern",
+]
 
 [[package]]
 name = "libstream"
