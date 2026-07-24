@@ -13,6 +13,7 @@
 #![cfg_attr(not(test), no_std)]
 
 pub mod arch;
+pub mod clock;
 pub mod device;
 pub mod dpc;
 pub mod drivers;

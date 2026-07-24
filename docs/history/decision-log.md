@@ -8206,3 +8206,88 @@ drain-before-reap, which is what hung before this fix; and a new focused demo sp
 on an unresolvable path (so it exits non-zero writing nothing) and requires the consumer's
 read to end in `PeerClosed`. Disabling the sweep makes both hang (`TIMED OUT`, no verdict),
 so they are known-sensitive rather than merely passing.
+
+## 2026-07-24 — The wall clock: ambient to read, capability-gated to set
+
+**The gap.** Nothing in the system knew the date. `sys_clock_read` serviced `Monotonic`
+only, with a `TODO(realtime)` saying it "needs a wall-clock offset service", and
+`fs-server-ext4` never wrote `i_mtime`/`i_ctime`/`i_atime` — so every file the OS created
+reported `modified: 0`, while files baked into the image by `mke2fs` carried real times.
+Surfaced by coreutils Milestone 1, whose `list` reports the column faithfully and therefore
+made the gap visible.
+
+**Who may supply a timestamp — the question that shaped this.** An earlier note said the
+ext4 mutation ops would take the time "from the caller", which reads as *the client* may
+choose it. That would be forgeable metadata and is rejected. The rule: **the filesystem
+server is the sole authority for its metadata and reads the clock itself; no client ever
+supplies a timestamp.** The `now` parameter that `main.rs` passes into `ext4.rs` is an
+*internal* boundary — the parser is deliberately syscall-free so it can be host-tested
+against an `mke2fs` fixture — not a trust boundary.
+
+**Read is ambient; set is authority.** Reading time-of-day is information a caller cannot
+act on, and `CLOCK_MONOTONIC` is already ambient to every process — every timeout in the
+system depends on it. What this architecture rejects is ambient *authority*, and reading a
+clock grants none. *Setting* the clock does: it moves every future timestamp and,
+eventually, certificate validity. So `CLOCK_REALTIME` is readable by anyone and there is
+**no setter yet** — when NTP or `date --set` needs one it goes behind a syscap. Reading
+needed no new syscall at all: `ClockId::Realtime` already existed and returned
+`Unsupported`.
+
+**Rejected: a time resource server for reads.** It fits "everything is a resource server",
+but (1) the fs-server stamps an inode on every create/mkdir/rename/grow, so it would pay a
+send + `sys_wait` + recv and a scheduling round per metadata op — fs-server latency has
+been a decision-log subject twice this month; (2) it inverts bootstrap, since init spawns
+the fs-server early to mount the root and a time server would have to precede it and drive
+a device itself; (3) caching in each server to avoid (1) is just reimplementing the
+kernel's offset math everywhere. A time *service* still makes sense later as the privileged
+**writer**.
+
+**Derived, not sampled.** The RTC is read **once** at boot to compute
+`offset = rtc_epoch_ns − monotonic_ns`; every later reading is `monotonic + offset`. So
+time-of-day cannot step backwards (timestamps taken in order are ordered, and differences
+are never negative), the RTC's slow racy port I/O is paid once, and a future setter is a
+single atomic store. A machine whose RTC cannot be read leaves the clock **unset** and
+`CLOCK_REALTIME` returning `Unsupported` — a filesystem stamping 1970 is honestly wrong,
+where a fabricated "plausible" time is silently wrong.
+
+The CMOS read handles the three ways it goes quietly wrong: the update-in-progress window
+(wait out `UIP`, then double-read — an update can begin between the check and the last
+register read), BCD vs binary per status register B, and 12-hour mode, where the PM flag
+rides in bit 7 of the hours register (so it must be masked *before* BCD conversion) and 12
+AM means hour 0. RTC assumed **UTC** (QEMU's default and the Unix convention; a timezone is
+a display concern for the shell). With no ACPI to locate the century register, a two-digit
+year maps into 2000–2099.
+
+**What the server stamps.** `create_file`/`mkdir_at` stamp crtime+atime+mtime+ctime;
+`grow_file` moves mtime+ctime (a size change is a content change); `unlink`/`rmdir`/
+`rename` stamp the **containing directory** (its contents changed) and, for a file that
+still has other links, only the target's ctime — its contents did not change, its link
+count did. `i_dtime` on a freed inode now carries the real deletion time (the fixed
+sentinel remains the fallback for a machine with no clock). **atime is stamped at creation
+and never updated** — `noatime` semantics, which every modern filesystem defaults to, and
+there is no server-side read path to hook anyway (the kernel owns the data path).
+
+**A bug this found in already-merged code.** Milestone 1 Part A read the mtime epoch-
+extension bits from **offset 132**, which is `i_ctime_extra`; `i_mtime_extra` is at **136**.
+Invisible for any date before 2038 (both words are zero), and it would have silently taken
+ctime's epoch bits after. Fixed here, with the offsets named as constants and the decode
+extracted into a pure `decode_time` with a test that fails on the confusion.
+
+**Deliberately out of scope: mtime on in-place overwrite.** Under Model A the kernel writes
+file data straight to the device and the server is never told — only create/grow/mkdir/
+rename pass through it. So editing a file's existing bytes does not move its mtime. That
+needs a writeback notification to the server (probably on `sys_file_sync`) and is a
+separate design; filed in `deferred-decisions.md`. It is the one users notice, so it is
+called out rather than left to be discovered.
+
+*Verified:* host suite **778** green — the fiddly parts are pure and tested (BCD rejecting
+non-digits, `days_from_civil` against the 1900/2000/2100 leap cases, all three register
+encodings, implausible registers rejected, `decode_time`'s epoch extension, each stamp
+field at its own offset, metadata-only leaving mtime alone, a 128-byte inode getting no
+extra words), plus four fixture tests asserting the exact stamped values reached the inode
+and the parent directory. `test-qemu` PASS; 20/20 KVM; `check-arch`/`check-nightly` green;
+the booted guest anchors within ~10 s of the host clock. **Negative-controlled** two ways:
+a new ring-3 demo requires the clock to be readable, plausible (2024–2100) and advancing at
+wall-clock rate; and `list_pipeline_demo`'s `modified` assertion — weakened to shape-only
+while the gap existed — is **restored** to requiring a plausible date, which fails the run
+if the server reports no clock.

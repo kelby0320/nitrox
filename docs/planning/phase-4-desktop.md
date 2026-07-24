@@ -268,11 +268,15 @@ work (decision log, 2026-07-24):
   thread marks itself under `SCHED`; `reap_pending` runs a **batched** sweep (unlink under
   rank 3, release, then drop) since a destructor can take rank 1/4/6. 5 host tests,
   `test-qemu` PASS, 120/120 KVM boot loops, negative-controlled.
-- [ ] **Wall clock** (`CLOCK_REALTIME` + inode timestamps). Nothing in the system knows the
-  date: `sys_clock_read` services `Monotonic` only, and the fs-server never writes
-  `i_mtime`/`i_ctime`/`i_atime`, so anything the OS creates reports `modified: 0`. Two
-  parts: a CMOS-RTC-backed realtime clock, then a timestamp parameter threaded into the
-  ext4 mutation ops (the parser is deliberately syscall-free, so the caller supplies it).
+- [x] **Wall clock** (branch `phase-4/wall-clock`, 2026-07-24). The kernel anchors
+  `CLOCK_REALTIME` from the CMOS RTC once at boot and derives it as `monotonic + offset`
+  (so it cannot step backwards); the fs-server reads it and stamps inodes on create, grow,
+  mkdir, unlink, rmdir and rename, including the containing directory. **Reading is
+  ambient, setting is authority** — no setter exists yet, and a time *server* was rejected
+  for the read path (an IPC round trip per metadata op, and it inverts fs-server bootstrap).
+  Found and fixed a bug in merged M1 code: the mtime epoch-extension bits were read from
+  `i_ctime_extra`. **Still open:** `mtime` on an in-place overwrite, which Model A hides
+  from the server. See the decision log (2026-07-24).
 - [ ] **File truncate.** Create is idempotent and grow-smaller is a no-op, so `copy --force`
   onto a *longer* destination is refused rather than leaving the old tail behind. Needs an
   ext4 truncate, a syscall/`File`-op surface, and page-cache invalidation of the dropped

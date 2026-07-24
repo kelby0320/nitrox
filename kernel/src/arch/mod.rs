@@ -103,6 +103,12 @@ pub use smp::MAX_CPUS;
 // object. See `arch/timer.rs`.
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::timer::X86Timer as Timer;
+// The machine's battery-backed wall clock, read **once** at boot to anchor
+// `crate::clock`. Neutral name because the concept is portable and the hardware is
+// not: x86 has the CMOS RTC behind ports 0x70/0x71, aarch64 boards a memory-mapped
+// `PL031`. See `arch/rtc.rs`.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::rtc::wall_clock_seconds;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::user_access::X86UserAccess as UserAccess;
 // Hardware-entropy source (the x86 impl uses RDSEED/RDRAND; aarch64 would use

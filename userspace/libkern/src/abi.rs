@@ -257,6 +257,13 @@ const _: () = assert!(offset_of!(IpcMsg, handles) == 4032);
 /// `ClockId::Monotonic` — nanoseconds since boot, never decreasing.
 pub const CLOCK_MONOTONIC: u64 = 0;
 
+/// `ClockId::Realtime` — nanoseconds since the Unix epoch (UTC).
+///
+/// Derived as monotonic + a boot-time offset anchored from the hardware RTC, so it
+/// advances smoothly and never steps backwards. Returns `Unsupported` on a machine
+/// whose RTC could not be read rather than reporting a fabricated epoch.
+pub const CLOCK_REALTIME: u64 = 1;
+
 // --- sys_wait completion record --------------------------------------------
 
 /// One completion record `sys_wait` writes per signaled handle; 24 bytes.

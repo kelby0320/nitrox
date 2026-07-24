@@ -1001,7 +1001,13 @@ pub fn sys_memory_unmap(addr: u64, _size: u64) -> SysResult {
 /// read, so the invalid-selector and unsupported-clock paths are reachable
 /// without touching user memory (host-testable).
 ///
-/// TODO(realtime): `Realtime` needs a wall-clock offset service (none yet).
+/// `Realtime` is serviced once the wall clock has been anchored from the hardware
+/// RTC at boot ([`crate::clock`]); on a machine with no readable RTC it keeps
+/// returning `Unsupported` rather than inventing an epoch. Reading time-of-day is
+/// deliberately **ambient** — it is information a caller cannot act on, and
+/// `Monotonic` already is; *setting* it is the part that carries authority, and
+/// that syscall does not exist yet (decision log, 2026-07-24).
+///
 /// TODO(sched-acct): `ProcessCpu`/`ThreadCpu` need per-thread CPU accounting
 /// from the scheduler tick (none yet). See docs/planning/implementation-plan.md.
 pub fn sys_clock_read(clock: u64, out: u64) -> SysResult {
@@ -1012,7 +1018,11 @@ pub fn sys_clock_read(clock: u64, out: u64) -> SysResult {
     let uptr = UserMutPtr::<u64>::new(out).map_err(from_user_access)?;
     let ns = match id {
         ClockId::Monotonic => Timer::read_ns(),
-        ClockId::Realtime | ClockId::ProcessCpu | ClockId::ThreadCpu => {
+        // Negative (pre-1970) realtime cannot arise here — the clock is anchored
+        // from an RTC reading that is validated as a plausible 21st-century date —
+        // so the `u64` the ABI carries is lossless.
+        ClockId::Realtime => crate::clock::realtime_ns().ok_or(KError::Unsupported)? as u64,
+        ClockId::ProcessCpu | ClockId::ThreadCpu => {
             return Err(KError::Unsupported);
         }
     };

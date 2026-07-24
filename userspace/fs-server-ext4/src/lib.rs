@@ -141,6 +141,12 @@ pub(crate) mod test_support {
     /// the slice-5/Part-5 disk so the reader's supported feature set is exercised
     /// against a real e2fsprogs image. Panics with a clear message if `mke2fs` is
     /// unavailable (e2fsprogs is a project dependency — see Part 5).
+    /// A fixed wall-clock instant the mutation tests stamp with: 2026-07-24
+    /// 13:45:30 UTC. Fixed rather than "now" so a test can assert the exact
+    /// value that reached the inode — the fs-server is handed the time, it does
+    /// not read a clock itself.
+    pub(crate) const TEST_NOW: i64 = 1_784_900_730;
+
     pub(crate) fn fixture(block_size: u32, content: &[u8]) -> Vec<u8> {
         // A unique dir per call (cargo runs tests in parallel threads) so they
         // never share / remove each other's staging tree.
@@ -176,7 +182,7 @@ pub(crate) mod test_support {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::test_support::{ImageReader, RwImage, fixture};
+    use crate::test_support::{ImageReader, RwImage, TEST_NOW, fixture};
 
     #[test]
     fn reads_current_generation_1k_blocks() {
@@ -246,6 +252,87 @@ mod tests {
         let names = list_dir(&r, b"/");
         assert!(names.iter().any(|(n, ft)| n == "system" && *ft == ext4::EXT4_FT_DIR),
             "root must contain the `system` subdirectory, got {names:?}");
+    }
+
+    #[test]
+    fn creating_a_file_stamps_it_and_its_parent_directory() {
+        use std::cell::RefCell;
+        // The whole point of threading a clock into the mutation ops: a new inode
+        // carries the time it was made, and the directory that now contains it
+        // records that its contents changed.
+        let r = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&r, b"/system").unwrap();
+        let before = dir_entry_mtime(&r, sys, b".").unwrap();
+
+        ext4::create_file(&r, b"/system", b"stamped", TEST_NOW).unwrap();
+
+        assert_eq!(
+            dir_entry_mtime(&r, sys, b"stamped"),
+            Some(TEST_NOW),
+            "the new file must carry exactly the time it was created with"
+        );
+        let after = dir_entry_mtime(&r, sys, b".").unwrap();
+        assert_eq!(after, TEST_NOW, "the parent directory's mtime must move");
+        assert_ne!(before, after, "…and it must actually have changed");
+    }
+
+    #[test]
+    fn mkdir_and_rmdir_stamp_the_parent() {
+        use std::cell::RefCell;
+        let r = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&r, b"/system").unwrap();
+
+        ext4::mkdir_at(&r, sys, b"kid", TEST_NOW).unwrap();
+        assert_eq!(dir_entry_mtime(&r, sys, b"kid"), Some(TEST_NOW));
+        assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(TEST_NOW));
+
+        // Removing an entry changes the directory's contents too — stamp it with a
+        // later time and require the parent to move forward.
+        let later = TEST_NOW + 600;
+        ext4::rmdir_at(&r, sys, b"kid", later).unwrap();
+        assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(later));
+    }
+
+    #[test]
+    fn a_rename_stamps_the_directory_but_not_the_file() {
+        use std::cell::RefCell;
+        // A file's name lives in the directory entry, not in its inode, so renaming
+        // it changes the directory and leaves the file's own mtime alone.
+        let r = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&r, b"/system").unwrap();
+        ext4::create_file(&r, b"/system", b"before", TEST_NOW).unwrap();
+
+        let later = TEST_NOW + 3600;
+        ext4::rename_at(&r, sys, b"before", b"after", later).unwrap();
+
+        assert_eq!(dir_entry_mtime(&r, sys, b"after"), Some(TEST_NOW), "file untouched");
+        assert_eq!(dir_entry_mtime(&r, sys, b"."), Some(later), "directory stamped");
+    }
+
+    #[test]
+    fn growing_a_file_moves_its_mtime() {
+        use std::cell::RefCell;
+        let r = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&r, b"/system").unwrap();
+        ext4::create_file(&r, b"/system", b"grows", TEST_NOW).unwrap();
+
+        let later = TEST_NOW + 42;
+        ext4::grow_file(&r, b"/system/grows", 4096, later).unwrap();
+        assert_eq!(dir_entry_mtime(&r, sys, b"grows"), Some(later));
+    }
+
+    /// The `mtime` a directory listing reports for `name` in directory `dir_ino`.
+    fn dir_entry_mtime<R: crate::BlockReader>(r: &R, dir_ino: u32, name: &[u8]) -> Option<i64> {
+        let mut found = None;
+        ext4::read_dir_stat(r, dir_ino, 0, |_i, _ft, ename, st| {
+            if ename == name {
+                found = Some(st.mtime);
+                return false;
+            }
+            true
+        })
+        .unwrap();
+        found
     }
 
     #[test]
@@ -477,9 +564,9 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let sys = dir_ino(&rw, b"/system");
         // The exact demo sequence on one directory.
-        ext4::mkdir_at(&rw, sys, b"a").unwrap();
-        ext4::rename_at(&rw, sys, b"a", b"b").unwrap();
-        ext4::rmdir_at(&rw, sys, b"b").unwrap();
+        ext4::mkdir_at(&rw, sys, b"a", TEST_NOW).unwrap();
+        ext4::rename_at(&rw, sys, b"a", b"b", TEST_NOW).unwrap();
+        ext4::rmdir_at(&rw, sys, b"b", TEST_NOW).unwrap();
         // The directory must still enumerate cleanly (terminating), with a/b gone.
         let names = names_of(&rw, b"/system");
         assert!(!names.iter().any(|n| n == "a" || n == "b"), "a/b linger: {names:?}");
@@ -493,7 +580,7 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let sys = dir_ino(&rw, b"/system");
 
-        ext4::mkdir_at(&rw, sys, b"sub").unwrap();
+        ext4::mkdir_at(&rw, sys, b"sub", TEST_NOW).unwrap();
         // It appears in /system, is itself a directory, and lists exactly `.`/`..`.
         assert!(names_of(&rw, b"/system").iter().any(|n| n == "sub"));
         let sub = ext4::resolve_dir(&rw, b"/system/sub").unwrap();
@@ -503,8 +590,8 @@ mod tests {
         assert_eq!(inner, vec![".".to_string(), "..".to_string()]);
 
         // Duplicate is rejected; `.`/`..` are rejected.
-        assert_eq!(ext4::mkdir_at(&rw, sys, b"sub"), Err(FsError::Exists));
-        assert_eq!(ext4::mkdir_at(&rw, sys, b"."), Err(FsError::Unsupported));
+        assert_eq!(ext4::mkdir_at(&rw, sys, b"sub", TEST_NOW), Err(FsError::Exists));
+        assert_eq!(ext4::mkdir_at(&rw, sys, b".", TEST_NOW), Err(FsError::Unsupported));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "mkdir");
     }
@@ -516,20 +603,20 @@ mod tests {
         let sys = dir_ino(&rw, b"/system");
 
         // Create a file with content (so it owns a data block to free), then unlink it.
-        let ino = ext4::create_file(&rw, b"/system", b"scratch").unwrap();
-        ext4::grow_file(&rw, b"/system/scratch", 4096).unwrap();
+        let ino = ext4::create_file(&rw, b"/system", b"scratch", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/scratch", 4096, TEST_NOW).unwrap();
         assert!(names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
 
-        ext4::unlink_at(&rw, sys, b"scratch").unwrap();
+        ext4::unlink_at(&rw, sys, b"scratch", TEST_NOW).unwrap();
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "scratch"));
         // The name is gone; the inode was freed (a fresh create can reuse it).
         assert_eq!(ext4::stat_file(&rw, b"/system/scratch"), Err(FsError::NotFound));
         let _ = ino;
 
         // Unlink of a directory is rejected (use rmdir); missing name is NotFound.
-        ext4::mkdir_at(&rw, sys, b"adir").unwrap();
-        assert_eq!(ext4::unlink_at(&rw, sys, b"adir"), Err(FsError::Unsupported));
-        assert_eq!(ext4::unlink_at(&rw, sys, b"nope"), Err(FsError::NotFound));
+        ext4::mkdir_at(&rw, sys, b"adir", TEST_NOW).unwrap();
+        assert_eq!(ext4::unlink_at(&rw, sys, b"adir", TEST_NOW), Err(FsError::Unsupported));
+        assert_eq!(ext4::unlink_at(&rw, sys, b"nope", TEST_NOW), Err(FsError::NotFound));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "unlink");
     }
@@ -540,19 +627,19 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let sys = dir_ino(&rw, b"/system");
 
-        ext4::mkdir_at(&rw, sys, b"empty").unwrap();
-        ext4::mkdir_at(&rw, sys, b"full").unwrap();
+        ext4::mkdir_at(&rw, sys, b"empty", TEST_NOW).unwrap();
+        ext4::mkdir_at(&rw, sys, b"full", TEST_NOW).unwrap();
         // Put a file inside `full` so it is non-empty.
-        ext4::create_file(&rw, b"/system/full", b"f").unwrap();
+        ext4::create_file(&rw, b"/system/full", b"f", TEST_NOW).unwrap();
 
         // Non-empty rmdir is refused; a regular file is refused (use unlink).
         let full = dir_ino(&rw, b"/system/full");
         let _ = full;
-        assert_eq!(ext4::rmdir_at(&rw, sys, b"full"), Err(FsError::NotEmpty));
-        ext4::create_file(&rw, b"/system", b"afile").unwrap();
-        assert_eq!(ext4::rmdir_at(&rw, sys, b"afile"), Err(FsError::Unsupported));
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"full", TEST_NOW), Err(FsError::NotEmpty));
+        ext4::create_file(&rw, b"/system", b"afile", TEST_NOW).unwrap();
+        assert_eq!(ext4::rmdir_at(&rw, sys, b"afile", TEST_NOW), Err(FsError::Unsupported));
 
-        ext4::rmdir_at(&rw, sys, b"empty").unwrap();
+        ext4::rmdir_at(&rw, sys, b"empty", TEST_NOW).unwrap();
         assert!(!names_of(&rw, b"/system").iter().any(|n| n == "empty"));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "rmdir");
@@ -564,16 +651,16 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
         let sys = dir_ino(&rw, b"/system");
 
-        ext4::create_file(&rw, b"/system", b"before").unwrap();
-        ext4::rename_at(&rw, sys, b"before", b"after").unwrap();
+        ext4::create_file(&rw, b"/system", b"before", TEST_NOW).unwrap();
+        ext4::rename_at(&rw, sys, b"before", b"after", TEST_NOW).unwrap();
         let names = names_of(&rw, b"/system");
         assert!(names.iter().any(|n| n == "after"));
         assert!(!names.iter().any(|n| n == "before"));
 
         // Renaming onto an existing name is refused; a missing source is NotFound.
-        ext4::create_file(&rw, b"/system", b"other").unwrap();
-        assert_eq!(ext4::rename_at(&rw, sys, b"after", b"other"), Err(FsError::Exists));
-        assert_eq!(ext4::rename_at(&rw, sys, b"ghost", b"x"), Err(FsError::NotFound));
+        ext4::create_file(&rw, b"/system", b"other", TEST_NOW).unwrap();
+        assert_eq!(ext4::rename_at(&rw, sys, b"after", b"other", TEST_NOW), Err(FsError::Exists));
+        assert_eq!(ext4::rename_at(&rw, sys, b"ghost", b"x", TEST_NOW), Err(FsError::NotFound));
 
         assert_e2fsck_clean(&rw.0.into_inner(), "rename");
     }
@@ -586,7 +673,7 @@ mod tests {
         let path = b"/system/current-generation";
 
         // Grow 5 → 5000 bytes (1 → 2 blocks): allocate + extend the extent tree + inode.
-        assert_eq!(ext4::grow_file(&rw, path, 5000), Ok(5000));
+        assert_eq!(ext4::grow_file(&rw, path, 5000, TEST_NOW), Ok(5000));
         assert_eq!(ext4::stat_file(&rw, path), Ok(5000));
 
         // The block map now covers 2 blocks, none sparse.
@@ -624,14 +711,14 @@ mod tests {
         let rw = RwImage(RefCell::new(fixture(4096, b"seed\n")));
 
         // Create a new regular file in /system.
-        let ino = ext4::create_file(&rw, b"/system", b"newfile").unwrap();
+        let ino = ext4::create_file(&rw, b"/system", b"newfile", TEST_NOW).unwrap();
         assert!(ino > 10, "should not reuse a reserved inode");
         // It resolves and is empty.
         assert_eq!(ext4::stat_file(&rw, b"/system/newfile"), Ok(0));
         // Idempotent: creating again returns the same inode.
-        assert_eq!(ext4::create_file(&rw, b"/system", b"newfile"), Ok(ino));
+        assert_eq!(ext4::create_file(&rw, b"/system", b"newfile", TEST_NOW), Ok(ino));
         // Grow + write path works on the freshly-created file.
-        assert_eq!(ext4::grow_file(&rw, b"/system/newfile", 100), Ok(100));
+        assert_eq!(ext4::grow_file(&rw, b"/system/newfile", 100, TEST_NOW), Ok(100));
         assert_eq!(ext4::stat_file(&rw, b"/system/newfile"), Ok(100));
 
         // e2fsck the mutated image: the new inode, its dir entry, the bitmaps + counts, and

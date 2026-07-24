@@ -193,6 +193,17 @@ fn kernel_main() {
         arch::Timer::read_ns(),
     );
 
+    // Anchor the wall clock from the hardware RTC, now that the monotonic source
+    // it offsets from is calibrated. Read **once**: every later `CLOCK_REALTIME`
+    // is monotonic + this offset, so time-of-day advances smoothly and cannot
+    // step backwards. A machine with no readable RTC simply leaves the clock
+    // unset — `CLOCK_REALTIME` keeps reporting `Unsupported` rather than
+    // pretending it is 1970.
+    match nitrox_kernel::clock::init() {
+        Some(epoch) => kprintln!("wall clock: anchored at {} (Unix epoch seconds, UTC)", epoch),
+        None => kprintln!("wall clock: no readable RTC — CLOCK_REALTIME stays unsupported"),
+    }
+
     // Reserve the DPC (deferred-procedure-call) queue before any interrupt can
     // enqueue onto it — the IOAPIC self-test below routes the PIT, whose ISR
     // queues a DPC, and device IRQs queue DPCs in general. Needs the allocator

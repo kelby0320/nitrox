@@ -16,6 +16,7 @@ pub mod paging;
 pub mod qemu;
 pub mod registers;
 pub mod regs;
+pub mod rtc;
 pub mod serial;
 pub mod smp;
 pub mod syscall;
