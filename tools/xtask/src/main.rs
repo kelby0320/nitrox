@@ -194,6 +194,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("eshell", None)?;
     build_userspace_bin("service-mgr", None)?;
     build_userspace_bin("heartbeat", None)?;
+    // The coreutils (`list`, …) — real programs, present in release images. One crate,
+    // a bin per program, so the crate directory is named separately from the bins.
+    build_userspace_crate("coreutils", &["list"], None)?;
     build_userspace_bin("profile-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
@@ -298,19 +301,32 @@ fn cmd_build_hello() -> R<()> {
 /// kernel embeds the result via `include_bytes!`. Generalises `cmd_build_hello`
 /// for the spawn-demo binaries (`parent`, `child`).
 fn build_userspace_bin(name: &str, features: Option<&str>) -> R<()> {
-    let dir = repo_root().join("userspace").join(name);
+    build_userspace_crate(name, &[name], features)
+}
+
+/// Build the userspace crate in `userspace/<dir>` for the bare target, then verify each of
+/// `bins` produced an ELF. Most crates are one directory per program, so
+/// [`build_userspace_bin`] covers them; a crate holding several programs (`coreutils`,
+/// `test-harness`) names them here, since the directory no longer matches the bin name.
+///
+/// The build must run with `cwd` = the crate directory: its `.cargo/config.toml` is what
+/// selects the custom target and the static/non-PIE link flags.
+fn build_userspace_crate(dir: &str, bins: &[&str], features: Option<&str>) -> R<()> {
+    let crate_dir = repo_root().join("userspace").join(dir);
     let mut c = userspace_cargo();
     c.arg("build").arg("--release");
     arg_userspace_target(&mut c);
     if let Some(f) = features {
         c.arg("--features").arg(f);
     }
-    run(c.current_dir(&dir))?;
-    let elf = userspace_release_dir().join(name);
-    if !elf.exists() {
-        return Err(format!("{name} ELF missing after build: {}", elf.display()).into());
+    run(c.current_dir(&crate_dir))?;
+    for name in bins {
+        let elf = userspace_release_dir().join(name);
+        if !elf.exists() {
+            return Err(format!("{name} ELF missing after build: {}", elf.display()).into());
+        }
+        println!("xtask: built {name} ELF at {}", elf.display());
     }
-    println!("xtask: built {name} ELF at {}", elf.display());
     Ok(())
 }
 
@@ -949,6 +965,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         "auth-service",
         "session-mgr",
         "usersh",
+        "list",
     ];
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.

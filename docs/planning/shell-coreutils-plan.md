@@ -163,8 +163,16 @@ needs. Slice branch: `phase-4/coreutils-m1`.
   `-`). The harness's two directory demos now drive `Dir` (~150 lines of hand-rolled syscall code
   deleted) — the client's integration proof, plus a new error-path case. Host suite 752 green,
   `test-qemu` PASS. See the decision log (2026-07-24).
-- [ ] **Part C** — `list` emitting TSM1 on `stdout`; the harness proof over a real pipe
-  (backpressure + `PeerClosed`).
+- [x] **Part C — `list`, through a real pipe** (2026-07-24). The first coreutil:
+  `Table<{name, size, kind, modified}>` on stdout, `--recursive` with parent-relative names,
+  a plain-text fallback when there is no `stdout` (Tier 0), and `PeerClosed` as a **clean**
+  exit. The harness spawns it as a Tier-1 stage over a **depth-1** pipe and asserts the
+  stream exceeded one IPC payload — so backpressure was provably exercised, not assumed —
+  plus the schema field by field, the row contents, `--recursive` descent, and a clean exit
+  after an early consumer close (negative-controlled). Caught two defects (`--recursive`
+  reported bare names; the crate's host test build was broken by a bin-only `build.rs`) and
+  surfaced the **no-wall-clock** gap: nothing can stamp a new inode, so OS-created files
+  report `modified: 0` (filed in `deferred-decisions.md`). See the decision log (2026-07-24).
 - [ ] **Part D** — `copy` (file + recursive directory, `--force`), plus whatever write-path gap it
   turns up.
 

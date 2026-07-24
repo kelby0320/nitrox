@@ -21,3 +21,7 @@ libstream = { path = "../libstream", features = ["io"] }
 [lib]
 name = "coreutils"
 path = "src/lib.rs"
+
+[[bin]]
+name = "list"
+path = "src/bin/list.rs"

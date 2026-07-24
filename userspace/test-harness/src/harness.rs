@@ -1373,6 +1373,323 @@ fn dir_contains(dir: &mut Dir<'_>, name: &[u8]) -> bool {
     found
 }
 
+/// Entries the `list` fixture directory gets, and how long each name is.
+///
+/// Chosen so the **TSM1 stream exceeds one IPC message** (`IPC_PAYLOAD_SIZE`) while the
+/// ext4 directory data still fits **one 4 KiB block**: a row costs ~28 bytes plus the
+/// name, an ext4 entry 8 plus the name. 30 × 110-byte names is ≈ 4.1 KB of stream (two
+/// messages, so the depth-1 pipe really blocks the producer) against ≈ 3.5 KB of
+/// directory data (under the block limit, so this never trips the deferred
+/// grow-a-full-directory path). Both bounds are checked by the demo rather than assumed.
+const LIST_FIXTURE_ENTRIES: usize = 30;
+const LIST_FIXTURE_NAME_LEN: usize = 110;
+/// The fixture directory, created under `/system` and removed at the end.
+const LIST_FIXTURE_DIR: &[u8] = b"nx-list";
+const LIST_FIXTURE_PATH: &[u8] = b"/system/nx-list";
+const LIST_FIXTURE_PATH_STR: &str = "/system/nx-list";
+
+/// Spawn args for a `list` stage: one moved handle (its bootstrap/setup endpoint).
+static mut SPAWN_LIST: SpawnArgs = SpawnArgs {
+    image: 0,     // resolved at spawn from /initramfs/sbin/list
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the setup channel) to the stage
+    arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
+    handles: [0; 4],
+    rights: [ENDPOINT_RIGHTS, 0, 0, 0],
+    namespace: 0, // inherit (LOOKUP-only)
+    syscaps: 0,
+};
+
+/// The `i`-th fixture entry name: a short distinctive prefix padded to
+/// [`LIST_FIXTURE_NAME_LEN`], so names are long enough to size the stream predictably and
+/// still individually identifiable.
+fn fixture_name(i: usize) -> alloc::string::String {
+    use alloc::string::String;
+    let mut s = String::from("e");
+    s.push((b'0' + (i / 10) as u8) as char);
+    s.push((b'0' + (i % 10) as u8) as char);
+    while s.len() < LIST_FIXTURE_NAME_LEN {
+        s.push('x');
+    }
+    s
+}
+
+/// **The first coreutil, end to end through a real pipe** (coreutils Milestone 1).
+///
+/// Builds a fixture directory, spawns `list` as a Tier-1 stage with its `stdout` wired to
+/// a **depth-1** pipe, and consumes the TSM1 table it produces. This is the first
+/// integrated proof that the Milestone-1 substrate composes: dir-ops (C1) → the typed
+/// value model (C2) → the stdio/setup convention (C3) → a real program.
+///
+/// Three things are checked that a smaller demo could not:
+///
+/// 1. **The typed contract** — the schema is exactly
+///    `{name: String, size: Int, kind: String, modified: Int}`, and every fixture entry
+///    arrives with the right kind and a plausible mtime.
+/// 2. **Real backpressure** — the received stream is larger than one IPC payload, so it
+///    provably spanned several messages on a pipe whose ring holds one: the producer
+///    blocked and was woken as this side drained.
+/// 3. **Early-consumer close** — a second `list` whose reader closes immediately must exit
+///    **`0`**: `PeerClosed` is "stop producing, exit cleanly" (design §1, the `yes | head -1`
+///    case), not a failure. A stage that treated it as an error would fail the run here.
+fn list_pipeline_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::{TypeTag, Value};
+
+    kprint(b"test-harness: list-pipeline demo (the first coreutil over a real pipe)\n");
+
+    // 1. Fixture: a directory of known entries, built through the same client `list` uses.
+    let mut fbuf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut fbuf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: list fixture open FAIL\n"),
+    };
+    if sys.mkdir(LIST_FIXTURE_DIR).is_err() {
+        return_fail(b"test-harness: list fixture mkdir FAIL\n");
+    }
+    sys.close();
+    {
+        let mut dbuf = [0u8; 4096];
+        let mut fixture = match Dir::open(root_ns, LIST_FIXTURE_PATH, &mut dbuf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: list fixture reopen FAIL\n"),
+        };
+        for i in 0..LIST_FIXTURE_ENTRIES {
+            if fixture.mkdir(fixture_name(i).as_bytes()).is_err() {
+                // A failure here is most likely the deferred full-directory grow: the
+                // fixture is sized to stay under one block, so this means the sizing
+                // assumption broke, not that the test is flaky.
+                return_fail(b"test-harness: list fixture entry mkdir FAIL (directory full?)\n");
+            }
+        }
+        fixture.close();
+    }
+
+    // 2. Run `list <fixture>` with stdout on a depth-1 pipe and verify what arrives.
+    let bytes = run_list(root_ns, notif, &["list", LIST_FIXTURE_PATH_STR], true);
+    if bytes.len() <= IPC_PAYLOAD_SIZE {
+        // Not a style check: if the stream fit one message, the pipe never filled and the
+        // backpressure path below was not exercised at all.
+        return_fail(b"test-harness: list stream fit one message (backpressure untested)\n");
+    }
+    let mut tr = match TableReader::new(&bytes) {
+        Ok(t) => t,
+        Err(_) => return_fail(b"test-harness: list stream bad TSM1 header\n"),
+    };
+    // The schema *is* the contract this coreutil publishes; check it field by field.
+    let schema = tr.schema();
+    let expect: [(&str, TypeTag); 4] = [
+        ("name", TypeTag::String),
+        ("size", TypeTag::Int),
+        ("kind", TypeTag::String),
+        ("modified", TypeTag::Int),
+    ];
+    if schema.fields.len() != expect.len() {
+        return_fail(b"test-harness: list schema field count wrong\n");
+    }
+    for (field, (name, tag)) in schema.fields.iter().zip(expect.iter()) {
+        if field.name != *name || field.ty != *tag {
+            return_fail(b"test-harness: list schema mismatch\n");
+        }
+    }
+    let mut rows = 0usize;
+    let mut ended = false;
+    loop {
+        match tr.next() {
+            Some(Ok(Item::Row(vals))) => {
+                let name_ok = matches!(&vals[0], Value::Str(s) if s.len() == LIST_FIXTURE_NAME_LEN);
+                let kind_ok = matches!(&vals[2], Value::Str(s) if s == "dir");
+                // `size` is a directory's own data size — one block on this filesystem.
+                let size_ok = matches!(vals[1], Value::Int(n) if n > 0);
+                // `modified` is checked for *shape* only, not for a plausible date: these
+                // entries were created by `mkdir` at run time, and the fs-server stamps a
+                // new inode with **0** because the system has no wall clock
+                // (`CLOCK_REALTIME` is `Unsupported` — see the decision log, 2026-07-24).
+                // The fidelity check that does require a real timestamp lives in
+                // `dir_list_demo`, against an image-built file; repeating it here would
+                // only assert the gap.
+                let mtime_ok = matches!(vals[3], Value::Int(_));
+                if !name_ok || !kind_ok || !size_ok || !mtime_ok {
+                    return_fail(b"test-harness: list row wrong (name/size/kind/modified)\n");
+                }
+                rows += 1;
+            }
+            Some(Ok(Item::End(status))) => {
+                if status != 0 {
+                    return_fail(b"test-harness: list stream terminator non-zero\n");
+                }
+                ended = true;
+                break;
+            }
+            None => break,
+            _ => return_fail(b"test-harness: list stream decode FAIL\n"),
+        }
+    }
+    if !ended {
+        return_fail(b"test-harness: list stream had no terminator\n");
+    }
+    // Exactly the fixture entries: `.`/`..` are filtered by `list`, so a count that
+    // includes them (or drops a real entry) fails here.
+    if rows != LIST_FIXTURE_ENTRIES {
+        return_fail(b"test-harness: list row count wrong\n");
+    }
+
+    // 3. Early-consumer close: the reader goes away mid-stream; `list` must exit cleanly.
+    let _ = run_list(root_ns, notif, &["list", LIST_FIXTURE_PATH_STR], false);
+
+    // 3b. `--recursive`: listing `/system` must descend into the fixture and report its
+    //     children under a parent-relative path (`nx-list/e…`, not a bare name) — otherwise a recursive listing
+    //     could not tell two same-named files in different directories apart.
+    let deep = run_list(root_ns, notif, &["list", "--recursive", "/system"], true);
+    let mut tr = match TableReader::new(&deep) {
+        Ok(t) => t,
+        Err(_) => return_fail(b"test-harness: list --recursive bad TSM1 header\n"),
+    };
+    let mut nested = 0usize;
+    while let Some(Ok(item)) = tr.next() {
+        if let Item::Row(vals) = item {
+            if let Value::Str(name) = &vals[0] {
+                if name.starts_with("nx-list/e") {
+                    nested += 1;
+                }
+            }
+        }
+    }
+    if nested != LIST_FIXTURE_ENTRIES {
+        return_fail(b"test-harness: list --recursive did not descend correctly\n");
+    }
+
+    // 4. Tear the fixture down, leaving the filesystem as we found it.
+    {
+        let mut dbuf = [0u8; 4096];
+        let mut fixture = match Dir::open(root_ns, LIST_FIXTURE_PATH, &mut dbuf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: list fixture teardown open FAIL\n"),
+        };
+        for i in 0..LIST_FIXTURE_ENTRIES {
+            if fixture.rmdir(fixture_name(i).as_bytes()).is_err() {
+                return_fail(b"test-harness: list fixture entry rmdir FAIL\n");
+            }
+        }
+        fixture.close();
+    }
+    let mut tbuf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut tbuf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: list fixture teardown FAIL\n"),
+    };
+    if sys.rmdir(LIST_FIXTURE_DIR).is_err() {
+        return_fail(b"test-harness: list fixture rmdir FAIL\n");
+    }
+    sys.close();
+    kprint(b"test-harness: list-pipeline ok (typed table over a real pipe, backpressure + early close)\n");
+}
+
+/// Spawn `list` with `argv` as a Tier-1 stage, `stdout` on a **depth-1** pipe (so the ring
+/// fills and the producer must block), then either drain the stream (`consume`) or close
+/// the read end immediately to exercise early-consumer close. Requires the stage to exit
+/// `0` either way. Returns the received bytes (empty when not consuming).
+fn run_list(root_ns: u64, notif: u64, argv: &[&str], consume: bool) -> alloc::vec::Vec<u8> {
+    use alloc::vec::Vec;
+    use libstream::channel::{ChannelReceiver, IpcPort};
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
+
+    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/list", RIGHT_MAP_READ);
+    if st != 0 || img == 0 {
+        return_fail(b"test-harness: list image FAIL\n");
+    }
+    // Depth 1: the smallest ring there is, so a stream of more than one message cannot
+    // complete without the consumer draining — real backpressure, not a big buffer.
+    let (rx, list_stdout) = match pipe(1) {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: list stdout pipe FAIL\n"),
+    };
+    let (setup_shell, setup_stage) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: list setup chan FAIL\n"),
+    };
+    // SAFETY: SPAWN_LIST is our static, initialised here; spawns are sequential.
+    let _proc = match unsafe {
+        SPAWN_LIST.image = img;
+        SPAWN_LIST.handles[0] = setup_stage;
+        SPAWN_LIST.arg0 = bootstrap_arg0(true);
+        spawn(&*(&raw const SPAWN_LIST))
+    } {
+        Ok(p) => p,
+        Err(_) => return_fail(b"test-harness: list spawn FAIL\n"),
+    };
+
+    let streams = Streams {
+        stdin: None, // a source stage: its input is the filesystem, not a pipe
+        stdout: Some(list_stdout),
+        stderr: None,
+    };
+    if send_setup(setup_shell, &streams, argv).is_err() {
+        return_fail(b"test-harness: list send_setup FAIL\n");
+    }
+
+    let out = if consume {
+        match ChannelReceiver::new(IpcPort::new(rx)).receive() {
+            Ok(b) => b,
+            Err(_) => return_fail(b"test-harness: list stdout receive FAIL\n"),
+        }
+    } else {
+        // Close the read end without reading a byte. The stage's next send surfaces
+        // `PeerClosed`, which it must treat as a clean stop.
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, rx) };
+        Vec::new()
+    };
+
+    if reap_child_exit(notif) != 0 {
+        return_fail(b"test-harness: list exited non-zero\n");
+    }
+    // SAFETY: closing our own handles (the stage's ends were moved to it). When the read
+    // end was already closed above, only the setup channel is left.
+    unsafe {
+        if consume {
+            syscall1(SYS_HANDLE_CLOSE, rx);
+        }
+        syscall1(SYS_HANDLE_CLOSE, setup_shell);
+    }
+    out
+}
+
+/// Block until a `ChildExited` notification arrives, returning the child's exit code.
+///
+/// The harness spawns children one at a time and reaps each before the next, so the first
+/// `ChildExited` is always this child's.
+fn reap_child_exit(notif: u64) -> i32 {
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            continue;
+        }
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            continue; // WouldBlock: re-block
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let kind = unsafe { (&raw const NOTIF.kind).read() };
+        if kind == KIND_CHILD_EXITED {
+            // SAFETY: body[8..12] is the exit code.
+            let body = unsafe { (&raw const NOTIF.body).read() };
+            return i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+        }
+    }
+}
+
 /// **Hardware floating point, end to end in ring 3** (Phase 4 FP enablement Part D;
 /// decision log 2026-07-21).
 ///
@@ -1926,6 +2243,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 0a3. Directory mutation over the same transport (dir-ops Part B): mkdir + rmdir.
     dir_mutate_demo(root_ns);
+
+    // 0a4. The first coreutil end to end (coreutils Milestone 1): `list` as a spawned
+    //      Tier-1 stage, its typed table consumed over a real depth-1 pipe. Early, like
+    //      its neighbours, so it completes before the login chain adjudicates.
+    list_pipeline_demo(root_ns, notif);
 
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();

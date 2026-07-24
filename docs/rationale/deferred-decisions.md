@@ -301,6 +301,21 @@ Raising it to a small fixed array (correlating replies by the already-present
 
 **LVM / software RAID at early boot.** Same architectural accommodation as LUKS. Initial scope is direct partition mounts.
 
+**Wall-clock time, and filesystem timestamps on newly created inodes.** `sys_clock_read`
+services `Monotonic` only; `Realtime` returns `Unsupported` — there is no RTC read and no
+NTP, so **nothing in the system knows the date**. Consequently `fs-server-ext4`'s
+`create_file`/`mkdir_at` leave `i_atime`/`i_ctime`/`i_mtime` at **0**: a file or directory
+the OS creates reports `modified: 0` (1970), while entries baked into the image by
+`mke2fs` carry real timestamps. Surfaced by coreutils Milestone 1 (2026-07-24), whose
+`list` reports a `modified` column faithfully and therefore made the gap visible. Two
+pieces, in order: (1) a realtime clock — read the CMOS RTC at boot, keep a wall-clock
+offset against the monotonic counter, service `CLOCK_REALTIME`; (2) thread a timestamp
+parameter into the ext4 mutation ops (the parser stays syscall-free and host-tested, so
+the *caller* must supply the time) and stamp new inodes, plus update a parent directory's
+mtime on modification. Trigger: anything that needs to order events by date — a build
+system, a package manager, `list --sort modified`, or log timestamps that survive a
+reboot. Until then, treat `modified` on OS-created files as "unknown", not as 1970.
+
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
 ### Userspace

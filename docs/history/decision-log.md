@@ -8015,3 +8015,75 @@ checks a listing survives the reply buffer being overwritten, the other a 255-by
 `check-nightly` green. **Also fixed:** `cargo xtask test` enumerates test crates
 explicitly, so a new crate is invisible to CI until registered — `coreutils` was, and its
 8 tests were silently not running until it was added.
+
+## 2026-07-24 — Coreutils Milestone 1 Part C: `list`, and the first coreutil through a real pipe
+
+**The milestone's point is the integration, not the program.** `list` is small; what it
+proves is that the three CLI substrate prereqs compose — dir-ops (C1) supplies the data,
+the `Value`/TSM1 model (C2) types it, the stdio/setup convention (C3) delivers it — with a
+real process on each end of a real pipe. That is the first time any of that has been true
+at once.
+
+**What `list` emits.** `Table<{name: String, size: Int, kind: String, modified: Int}>` on
+`stdout`, per design §10d. Choices worth recording:
+
+- **`kind` is a string** (`"file"`/`"dir"`/`"symlink"`), not an integer. The consumer is a
+  shell predicate — `filter kind == "dir"` — not C code; an integer would make every
+  consumer carry a decoder ring.
+- **`modified` is raw epoch seconds.** Rendering a date is `display`/`date`'s job: a stage
+  emits data, and formatting belongs at the terminal end of a pipeline.
+- **`.` and `..` are filtered.** They are real directory entries and the protocol carries
+  them, but they are structure, not content — every consumer would filter them, so it
+  happens once, here.
+- **`--recursive` reports parent-relative paths** (`sub/dir/file`), not bare names.
+  Otherwise a recursive listing cannot distinguish two same-named files in different
+  subdirectories. Each directory's entries are collected and its session **closed before
+  descending**, so a deep tree holds one session at a time — the server's concurrent
+  session cap is small, and a recursive listing must not be what exhausts it.
+- **No `stdout` ⇒ plain text to the kernel log.** A Tier-0 spawn (no shell) still has to be
+  observable. That is the text floor, not a second data path — the typed stream is the
+  contract.
+- **`PeerClosed` is a clean exit (`0`), not a failure** — the `yes | head -1` case
+  (design §1).
+
+**The harness demo is sized to prove things, not to look busy.** 30 fixture entries with
+110-byte names: the TSM1 stream then exceeds one IPC payload (so it *provably* spanned
+several messages on a **depth-1** pipe — the producer blocked and was woken as the consumer
+drained) while the ext4 directory data still fits one block (so it never trips the deferred
+grow-a-full-directory path). Both bounds are asserted by the demo rather than assumed —
+if the stream ever fits one message, the run fails with "backpressure untested" rather than
+passing while testing nothing. The schema is checked field by field: it *is* the contract
+this program publishes.
+
+**Two real defects the demo caught, both invisible to a smaller test:**
+
+1. **`--recursive` reported bare names.** `collect` documented parent-relative paths and
+   pushed bare ones — a recursive listing was ambiguous. The fix separates the two paths a
+   descent needs: the *filesystem* path to open, and the *relative* path to report.
+   Conflating them breaks one or the other.
+2. **`coreutils`' host test build was broken** by a `build.rs` copied from a bin-only
+   crate: it passed the bare-target linker script via `rustc-link-arg`, which also reaches
+   the host lib-test link and breaks it. `init`'s `build.rs` had already solved this with
+   `rustc-link-arg-bins`. Worth noting *how* this surfaced: `cargo xtask test` failed
+   loudly, but a summary that only counted `test result:` lines read as green — the count
+   silently dropped from 752 to 744. Count-only summaries of a multi-crate run hide a crate
+   that failed to build.
+
+**And one gap it surfaced, filed rather than fixed:** the system has **no wall clock**.
+`sys_clock_read` services `Monotonic` only, and `fs-server-ext4` never writes
+`i_mtime`/`i_ctime`/`i_atime` on create — so anything the OS creates reports
+`modified: 0`. The demo's assertion on freshly-`mkdir`'d entries was written expecting a
+plausible date and failed, correctly: `list` was reporting faithfully. The check now
+verifies shape there and keeps the real-timestamp assertion where it means something (an
+image-built file, in `dir_list_demo`). Recorded in `deferred-decisions.md` with the
+two-step fix: a CMOS-RTC-backed `CLOCK_REALTIME`, then a timestamp parameter threaded into
+the ext4 mutation ops (the parser is deliberately syscall-free, so the caller must supply
+the time).
+
+**Build plumbing:** `build_userspace_crate(dir, bins, features)` — the old helper assumed
+one crate directory per program, which `coreutils` (a bin per program) breaks.
+
+*Verified:* host suite 752 green; `test-qemu` PASS; `check-arch`/`check-nightly` green;
+release image builds with `list` embedded. **Negative-controlled:** making `list` treat
+`PeerClosed` as a failure fails the run ("list exited non-zero"), so the early-close check
+is known-sensitive.
