@@ -166,6 +166,11 @@ pub enum WireError {
     NestedTable,
     /// The sink refused the write (e.g. a fixed frame is full).
     SinkFull,
+    /// The transport's peer closed its end mid-stream (a channel `ByteSink`/reader).
+    /// Per the pipeline model (design §1), a producer treats this as "stop producing,
+    /// exit cleanly" — the early-consumer-cancel case (`yes | head -1`). Never produced
+    /// by the in-memory codec; only by the channel transport ([`crate::channel`]).
+    PeerClosed,
     /// A record's values don't match the schema: wrong field count, a `Null` in a
     /// non-nullable field, a value whose type differs from its column, or a write in
     /// the wrong order (a row before the schema / after the terminator).

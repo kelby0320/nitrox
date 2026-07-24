@@ -7,6 +7,12 @@ edition = "2024"
 libkern = { path = "../libkern" }
 libos = { path = "../libos" }
 librsproto = { path = "../librsproto" }
+# The stdio/pipe transport demo (C3): move a TSM1 stream over a real IPC channel
+# between two threads. `libstream[io]` needs an allocator → `libheap`. (This demo is
+# convention-conforming; it will move into the test harness when parent/child are
+# retired — decision log 2026-07-24.)
+libheap = { path = "../libheap" }
+libstream = { path = "../libstream", features = ["io"] }
 
 [[bin]]
 name = "parent"

@@ -222,15 +222,29 @@ The full gap analysis is in the subproject plan (§1); this is the checklist.
   records, and table rows now frame identically). Dropped the `REC_WIDGET` (0x03) stub — TSM1 is
   data-only. Host-tested (23 wire tests); the live logging typed-stream path still passes
   `test-qemu` (branch `phase-4/value-collections`, 2026-07-23).
-- [ ] **stdio / pipe convention** — a spawn contract + library for wiring `stdin`/`stdout`/`stderr`
-  channels across pipeline stages, plus a `libstream` stdin-*reader* pattern and `libos`
-  pipe-wiring helpers. Resolve the **bootstrap-capacity collision** first: a stage needs 5 handles
-  (notif + namespace + stdin + stdout + stderr) but spawn delivers only 4 (`SPAWN_MAX_HANDLES`,
-  4 bootstrap registers) — either raise the limit (ABI/spawn-hash change) or adopt the
-  stack-resident bootstrap block the kernel already anticipates (`object/thread.rs`). **ABI
-  decision; record it in the decision log.**
+- [x] **stdio / pipe convention** — spawn contract + library for wiring `stdin`/`stdout`/`stderr`
+  channels across pipeline stages (branch `phase-4/stdio-pipe`, 2026-07-24). **No kernel/ABI-hash
+  change** — the register bootstrap stays, richer needs arrive in an opt-in userspace **setup
+  message**, and `arg0` is the single system-wide **bootstrap descriptor** (Tier 0 = `0`, Tier 1 =
+  `SETUP_PENDING`; decision log 2026-07-23 + 2026-07-24). Built: **A** `libstream::channel` transport
+  (eager-chunked `ChannelSink`/`ChannelReceiver` over a `MsgPort`, `PeerClosed`); **B**
+  `libstream::setup` protocol (`arg0` descriptor, `Streams` bitmap↔handles, TSM1 `Record` payload);
+  **C.1** concrete `IpcPort` over `sys_channel_send`/`recv` + a two-thread transport proof (2000 rows,
+  real backpressure); **C.2** the setup-message spawn — `pipe()` / `send_setup()` sender +
+  `bootstrap().setup()` receiver, proven by spawning a Tier-1 stage (`child` conforming path) that
+  reads `stdin` + `argv` from a real setup message. Host-tested codecs + full `test-qemu` PASS.
+  **Deferred:** a `libos` `spawn_stage` convenience wrapper, `stdout`/`stderr` demo wiring, and the
+  incremental (still-arriving) stream reader — land with their first shell consumer.
+- [ ] **Retire `parent`/`child` into a conforming test harness** — the two legacy demo programs
+  misuse `arg0` as a private role/seed field (the one violation of the single spawn convention;
+  decision log 2026-07-24). Rewrite them as a dedicated, test-only harness that speaks the one
+  convention (parameters via `argv`, streams via the setup message) and is **de-entangled from
+  normal/selftest bringup** (they currently run woven into the login chain). A **coverage audit**
+  first — `parent` aggregates ~15 demos (exceptions, block I/O, userspace-server forwarding, entropy,
+  `/proc/self`, initramfs, namespaces, …), several possibly the only automated coverage of their
+  paths. **Do this immediately after the stdio/pipe work.**
 
-Each prereq slice self-validates (host tests for the codecs; a throwaway producer/consumer pair in
+Each prereq slice self-validates (host tests for the codecs; a conforming producer/consumer demo in
 QEMU for the stdio convention). The first *integrated* proof — real coreutils streaming over a real
 pipe — is the subproject's Milestone 1, once these three are in.
 

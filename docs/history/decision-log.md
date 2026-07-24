@@ -7736,3 +7736,124 @@ present + absent-nullable + list-in-record records; a table stream round-trip; t
 table-is-not-a-cell rejection; the `Error` tag still `Unsupported`). Full `test-qemu` PASS — the
 live logging typed-stream path (`heartbeat.typed [seq, uptime_ns, healthy]`) exercises the
 refactored shared row codec end to end. `check-arch` + `check-nightly` green.
+
+---
+
+## 2026-07-23 — C3 ABI call: stdio/pipe via an opt-in userspace setup message, not a kernel bootstrap block
+
+The Phase-4 CLI-substrate prereq C3 (`docs/planning/shell-coreutils-plan.md`) forces an ABI
+decision: a shell-spawned pipeline stage needs `{notif, namespace, stdin, stdout, stderr, argv}`
+(and later `env`), but the spawn bootstrap delivers only **four registers** —
+`[rdi=notif, rsi=namespace, rdx=installed[0], rcx=arg0]` — surfacing exactly **one** installed
+handle and **no strings** (the spec is explicit: "Phase 1/2 has no argc/argv/auxv"). Registers
+fundamentally cannot carry `argv`, and coreutils need it from Milestone 1 (`list`/`copy`).
+
+The plan framed this as "raise `SPAWN_MAX_HANDLES` / add registers" vs. "stack-resident bootstrap
+block" (both anticipated by `object/thread.rs:130` and `process-spawn-args.md`). Both are rejected
+in favour of a third option that needs **no kernel or ABI change**.
+
+**Decision: an opt-in, userspace *setup-message* handshake, layered on the existing register
+bootstrap.** The register bootstrap is unchanged and remains the universal, zero-syscall floor. A
+parent that wants to hand a child the richer set sends **one IPC setup message** on the child's
+bootstrap endpoint, carrying stdin/stdout/stderr as transferred handles plus `argv` (+ later `env`)
+as a TSM1 payload. This reuses the pattern init already uses to hand fs-server its block device.
+
+**Tiered, pay-per-use:**
+
+- **Tier 0 — register-only, zero syscalls.** `{notif, namespace, arg0, one endpoint}` straight from
+  registers, exactly as today. **init** (kernel-spawned, no parent to send it anything) is the
+  archetype; every existing service (fs-server, service-mgr, session-mgr, auth, profile, heartbeat,
+  logging) and the leaf shells stay here **unchanged**.
+- **Tier 1 — register + one setup recv (opt-in).** Pipeline stages / coreutils call
+  `libos::bootstrap().setup()`, which recvs + parses the setup message. Because the parent sends it
+  before/as the stage starts, that recv is normally **pre-queued and non-blocking** (the
+  already-waiting fast path), so Tier 1 costs ~one cheap syscall, not a stall.
+
+**Register semantics we assign (no layout change):**
+
+- **`rdx` (the one installed endpoint)** = the **setup channel** for a Tier-1 stage (the parent
+  installs the stage's end of a shell↔stage control channel here). For Tier-0 processes it stays
+  whatever they use today (a control channel, or unused).
+- **`rcx` (`arg0`)** = a **bootstrap descriptor**: a version field + a "setup-message-pending" flag.
+  Crucially, **`arg0 == 0` — the value every current spawner already passes — means "Tier 0, no
+  setup,"** so all existing processes are classified correctly with no change and the format is
+  versioned for future growth.
+
+**Setup-message shape:** transferred handles `{stdin?, stdout?, stderr?}` (each optional — a source
+stage has no stdin, a sink no stdout) + a TSM1 payload `{argv: List<String>, env?: …}`. `argv` is
+**TSM1 `List<String>`**, not raw bytes — the C2 codec already exists, it is self-describing, and it
+keeps "everything on the wire is TSM1" true. `stderr` is a **shared diagnostic sink** (design §1:
+"separate from the pipe, surfaces to display/log") — delivered as a handle (a dup of the session's
+shared stderr send-end), uniform with stdin/stdout, no bespoke `/dev/stderr` namespace plumbing.
+
+**Why this over the alternatives.** The stack-resident block's only real win is "zero syscalls at
+entry," bought with a hash-invalidating, rebuild-the-world kernel change: the spawn path + thread
+first-entry + the ABI hash, kernel-side marshaling of `argv` strings into the child address space,
+and a changed `_start` for **every** existing binary. That is a poor trade when a non-invasive
+userspace convention does the job, is more aligned with the capability model (handles flow as
+data), and carries `argv`/`env`/variable handle counts that a fixed register-or-stack shape handles
+awkwardly. Raising `SPAWN_MAX_HANDLES`/register count can't carry strings at all and is sidestepped
+entirely — `SPAWN_MAX_HANDLES` stays 4 (now slightly over-provisioned). If profiling ever shows the
+one recv matters (it won't for coreutils spawn), a stack block can be added later without undoing
+this.
+
+**Enabled entirely in userspace** — the kernel already provides every hard part: bounded-queue
+backpressure + `PeerClosed` on the IPC channel (`object/ipc_channel.rs`), inline handle transfer
+(`IPC_HANDLE_MAX = 8`, room for stdin/stdout/stderr + growth), and `sys_channel_create(end0, end1,
+queue_depth)` so the shell mints pipes with per-pipe backpressure depth. No new syscall, no ABI
+hash change.
+
+**Scope of the C3 slice (userspace only):** (A) a `libstream` **channel transport** — a TSM1
+`ByteSink` that frames into IPC messages (blocking send = backpressure, `PeerClosed` → "stop
+producing, exit clean") + a channel **reader** feeding `TableReader` (this is also C4's stdin-reader
+pattern); (B) the **setup-message protocol** + `libos::bootstrap()/.setup()` (Tier-1 stage side) and
+the `arg0` descriptor; (C) `libos` **pipe-wiring helpers** (`pipe(depth)`, `spawn_stage(image, argv,
+{stdin,stdout,stderr})`, lifecycle watch on `ChildExited`/`PeerClosed`); (D) a throwaway
+producer/consumer **demo** under the self-test build proving TSM1-over-a-real-pipe, backpressure,
+and early-consumer close. Docs: a new stdio/bootstrap convention doc + a `process-spawn-args.md`
+update for the `arg0` descriptor; tick the phase-4 box at slice end.
+
+---
+
+## 2026-07-24 — One process-spawn convention: `arg0` is the bootstrap descriptor, system-wide
+
+Refines the C3 ABI call (2026-07-23) into a hard, system-wide rule after noticing the
+legacy `parent`/`child` demos use `arg0` as a private role/seed field (roles 0–3, fp
+seed in the high bits) — a *second*, ad-hoc spawn convention living alongside the
+bootstrap descriptor. The system must have exactly **one** program-spawning convention,
+not two.
+
+**Decision.** `arg0` (the fourth bootstrap register, `SpawnArgs.arg0`) **is the
+bootstrap descriptor — the one meaning it has, for every process.** No program
+repurposes `arg0`, the bootstrap `endpoint`, or any register for private payload.
+Everything a program needs beyond `{notif, namespace, endpoint}` — argv, extra streams,
+env — arrives in the **setup message** (Tier 1). `arg0 == 0` is Tier 0 (register-only);
+a versioned descriptor with `SETUP_PENDING` is Tier 1.
+
+**Consequences.**
+
+- **`arg0` becomes cleanly universal.** With no competing use, "is this a setup
+  descriptor?" is unambiguous — no magic marker is needed (the alternative considered
+  when `arg0` still had to coexist with the demo's role field). A single generic
+  `_start` runtime can decode `arg0` for any program and auto-fetch the setup message.
+- **Scope boundary.** This governs `sys_process_spawn`. `sys_thread_create`'s `arg0` is
+  a *different* mechanism — an in-process argument to a new thread in the same address
+  space, where the creator controls both ends — and is unaffected; it stays a free word.
+- **Blast radius is tiny.** Every real service (`fs-server`, `service-mgr`,
+  `session-mgr`, `auth`, `profile`, `logging`, the leaf shells) already passes
+  `arg0 == 0` and ignores it. The **only** violators are the `parent`/`child` demo
+  programs — among the first userspace code written, from a time when the spawn
+  convention was ad hoc.
+- **`parent`/`child` are retired into a conforming test harness** — a dedicated,
+  test-only harness that speaks the one convention (parameters via `argv`, streams via
+  the setup message) and is **de-entangled from normal bringup** (they currently run
+  woven into the selftest login chain). Tracked as the plan item immediately after the
+  C3 stdio/pipe work (`docs/planning/phase-4-desktop.md`); a coverage audit precedes any
+  removal, since `parent` aggregates ~15 demos, several of which may be the only
+  automated coverage of their paths. Until then the demos keep working (their `arg0`
+  role field never trips the descriptor's `SETUP_PENDING`-plus-version guard, and no
+  binary uses both decoders), but they are the documented exception, not a second
+  convention.
+
+C3's own demos are therefore built as dedicated, convention-conforming test programs,
+not by extending `child`'s `arg0` roles.

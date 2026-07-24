@@ -6,8 +6,11 @@ process.
 
 **Status:** Pre-stabilization. The form below is implemented; the `namespace`
 field + the 4-register bootstrap landed with Phase 2 slice 1 (namespaces). The
-**`image` field became a `MemoryObject` handle** (path-based spawn, Phase 3) — the
-register ABI still changes later (a real stack-resident init handoff).
+**`image` field became a `MemoryObject` handle** (path-based spawn, Phase 3). The
+4-register bootstrap is now settled as the permanent floor: richer needs
+(`stdin`/`stdout`/`stderr` + `argv`) are met by a userspace setup message, not a
+kernel bootstrap-block ABI change (decision log 2026-07-23; see
+[`pipeline-stdio.md`](pipeline-stdio.md)).
 
 ## Layout
 
@@ -89,10 +92,29 @@ the child's `_start`. This is the uniform bootstrap convention across pid 1,
 | `rdi` | the child's notification-channel handle |
 | `rsi` | the child's **root-namespace** handle (`LOOKUP`-only), or `0` if none |
 | `rdx` | the child's first installed handle (`handles[0]`), or `0` if none |
-| `rcx` | `args.arg0` |
+| `rcx` | `args.arg0` — an opaque word, or a **bootstrap descriptor** (below) |
 
-(A later phase replaces this with a stack-resident bootstrap block carrying the
-full initial handle set, matching the real init handoff.)
+This register bootstrap is the universal, zero-syscall floor and it **stays** — the
+earlier plan to replace it with a kernel stack-resident bootstrap block was considered
+and **deferred** (decision log, 2026-07-23, "C3 ABI call"): a child that needs more
+than the four register values (a pipeline stage wanting `stdin`/`stdout`/`stderr` +
+`argv`) receives them from a **userspace setup message** its parent sends on the
+bootstrap endpoint (`rdx`), not from the kernel. See
+[`pipeline-stdio.md`](pipeline-stdio.md).
+
+### `arg0` is the bootstrap descriptor
+
+`arg0` (`rcx`) is opaque *to the kernel*, but userspace has exactly **one**
+convention for it, system-wide: it is the **bootstrap descriptor**. No program
+repurposes it for private payload — a program that needs parameters receives them as
+`argv` in the setup message (Tier 1), not in `arg0`. `arg0 == 0` ⇒ Tier 0,
+register-only; a non-zero descriptor (`[7:0]` version `1`, `[8]` `SETUP_PENDING`)
+tells the runtime to fetch a setup message on the endpoint. Full layout and the
+setup-message contract are in [`pipeline-stdio.md`](pipeline-stdio.md).
+
+(The legacy `parent`/`child` demos predate this convention and misuse `arg0` as a
+role/seed field; they are the sole exception and are being retired into a conforming
+test harness — decision log, 2026-07-24.)
 
 ## Image loading
 

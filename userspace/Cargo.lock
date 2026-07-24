@@ -15,7 +15,9 @@ dependencies = [
 name = "child"
 version = "0.1.0"
 dependencies = [
+ "libheap",
  "libkern",
+ "libstream",
 ]
 
 [[package]]
@@ -96,6 +98,9 @@ version = "0.1.0"
 [[package]]
 name = "libstream"
 version = "0.1.0"
+dependencies = [
+ "libkern",
+]
 
 [[package]]
 name = "logging-service"
@@ -111,9 +116,11 @@ dependencies = [
 name = "parent"
 version = "0.1.0"
 dependencies = [
+ "libheap",
  "libkern",
  "libos",
  "librsproto",
+ "libstream",
 ]
 
 [[package]]
