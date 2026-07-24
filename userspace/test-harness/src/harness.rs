@@ -1690,6 +1690,50 @@ fn reap_child_exit(notif: u64) -> i32 {
     }
 }
 
+/// **The wall clock, from ring 3** (`CLOCK_REALTIME`).
+///
+/// Checks the three properties a filesystem timestamp depends on: the clock is
+/// readable at all, it reports a *plausible* date rather than a fabricated one, and it
+/// advances. A clock that returned a fixed value, or 1970, would pass a mere
+/// "syscall succeeded" check and fail all three here.
+fn wall_clock_demo() {
+    kprint(b"test-harness: wall-clock demo\n");
+    let mut first: u64 = 0;
+    // SAFETY: valid u64 out-param.
+    let r = unsafe { syscall4(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut first) as u64, 0, 0) };
+    if r != 0 {
+        // Not a soft failure: without a wall clock the filesystem stamps 1970 on
+        // everything, so a build that cannot read one must fail loudly.
+        return_fail(b"test-harness: CLOCK_REALTIME unreadable\n");
+    }
+    // 2024-01-01 .. 2100-01-01 in nanoseconds. Wide enough never to need touching,
+    // narrow enough to catch a zero, a monotonic value mistakenly returned as
+    // realtime (nanoseconds since boot is a handful of seconds), or a botched
+    // BCD/epoch conversion.
+    const NS_2024: u64 = 1_704_067_200_000_000_000;
+    const NS_2100: u64 = 4_102_444_800_000_000_000;
+    if first < NS_2024 || first > NS_2100 {
+        return_fail(b"test-harness: CLOCK_REALTIME is not a plausible date\n");
+    }
+
+    // It must advance. Sleeping on a timer rather than spinning keeps this honest
+    // about wall-clock progress rather than measuring loop speed.
+    timer_sleep_ms(20);
+    let mut second: u64 = 0;
+    // SAFETY: valid u64 out-param.
+    let r2 = unsafe { syscall4(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut second) as u64, 0, 0) };
+    if r2 != 0 || second <= first {
+        return_fail(b"test-harness: CLOCK_REALTIME did not advance\n");
+    }
+    // …and it must advance at roughly wall-clock rate: a 20 ms nap cannot show up as
+    // an hour. (Generous upper bound — this is catching a broken multiplier, not
+    // measuring scheduler latency.)
+    if second - first > 60_000_000_000 {
+        return_fail(b"test-harness: CLOCK_REALTIME advanced implausibly fast\n");
+    }
+    kprint(b"test-harness: wall-clock ok (plausible date, advancing)\n");
+}
+
 /// **A dead stage's pipe closes** — the regression test for exit-time handle reclamation
 /// (decision log, 2026-07-24).
 ///
@@ -2631,6 +2675,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).
     dead_stage_closes_its_pipe_demo(root_ns, notif);
+
+    // 0a7. The wall clock, from ring 3 — the source of every filesystem timestamp.
+    wall_clock_demo();
 
     // 0b. Blocking-send / PendingOperation demos (async-I/O primitive).
     block_send_demo();
