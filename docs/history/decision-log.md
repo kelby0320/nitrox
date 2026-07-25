@@ -8424,3 +8424,55 @@ including debug-build lock-ordering enforcement.
 *Verified:* `check-deferrals` green (5 tags, all recorded); host suite 782 green;
 `test-qemu` PASS (including through the new `locate_ovmf` ordering); `check-arch` /
 `check-nightly` green.
+
+## 2026-07-24 — Dynamic linking belongs with the GUI toolkit, not with "opportunistic"
+
+Raised by the maintainer while scheduling copy-on-write: everything is a static binary for
+simplicity, and that will start to hurt at the GUI. Agreed, and it sharpens the CoW
+scheduling decision rather than competing with it.
+
+**The precise reason it hurts at a toolkit.** Static linking defeats page sharing exactly
+where sharing would pay. Shared file-backed text (B4a of the pre-CLI pass) shares pages
+across *instances of one program* — it works by mapping the same `FileObject`. Two
+different statically-linked apps that both embed the toolkit hold **byte-identical code in
+different files**, so they share nothing: not through B4a, not through CoW, and not through
+the content-addressed store, which dedupes at whole-file granularity. Five apps each
+embedding a 2–5 MB toolkit is 10–25 MB of duplicated, unshareable text on a 256 MB machine.
+
+So the three are one story, not three options:
+
+- **B4a (shared text)** shares a program's text across its own instances.
+- **Dynamic linking** extends that sharing *across different programs*.
+- **B4a is a prerequisite for dynamic linking to pay off** — without file-backed mapping,
+  loading a `.so` would eagerly copy it per process: the complexity with none of the win.
+
+**Why not now.** The shipping binaries are 13–73 KB (`no_std` + `alloc`, hand-rolled
+runtime). A loader today would cost real complexity and save nothing measurable.
+
+**What it needs**, in dependency order: TLS (`FS_BASE`/`sys_thread_set_tls`, itself deferred
+in the `std` cluster) → kernel acceptance of `ET_DYN` + `PT_INTERP` (both rejected today;
+user-space ASLR already provides PIE's base randomization) → a userspace `ld.so` (segment
+mapping over B4a's path, dependency graph, `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` relocations,
+init/fini) → **an answer to Rust's lack of a stable ABI**.
+
+That last one is the real design fork, and Nitrox has an unusually good option. Either a
+**C ABI seam** at the library boundary (stable across compiler versions, awkward for
+Rust-to-Rust), or **whole-system build coherence** — one pinned compiler, everything in a
+generation rebuilt together, Rust's ABI used freely within it. The content-addressed store
+plus generations makes the second genuinely viable in a way it is not on a conventional
+distro: a generation already *is* a coherent closure, and a toolchain bump is simply a new
+generation with a new store hash. Recommended shape: coherence by default, with a
+deliberate C seam only where a plugin boundary must outlive a rebuild. The store and profile
+layers already reserve the slot — `content-addressed-store.md` has `lib/<library>` and
+`profiles-and-namespace-projection.md` designs `/lib`, both "once dynamic linking exists".
+
+**Decision: scheduled with the GUI toolkit milestone**, alongside the process-memory-model
+bundle, and moved out of "opportunistic / trigger-driven" in the Phase 4 plan. One
+sequencing caveat: do not build the loader speculatively, but **decide the toolkit's ABI
+seam when the toolkit is designed** — retrofitting three shipped apps is far worse than
+starting them right. Build the loader at the second or third GUI app, the point where one
+library would otherwise be resident more than once.
+
+**Process note:** dynamic linking was itself an *implicit* deferral — recorded in the Phase 4
+plan and the decision log but **not** in `deferred-decisions.md`, which is precisely the
+pattern the same-day audit flagged. It now has an entry.

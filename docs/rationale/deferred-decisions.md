@@ -284,6 +284,52 @@ code, riding the native ABI (libos/libstream stay the capability-native API for 
 subset, `x86_64-unknown-nitrox.json`) is **consumer-driven** — it lands with portable programs / the
 browser, not as a desktop-MVP gate. See the decision log (2026-07-20; supersedes 2026-07-13).
 
+**Dynamic linking.** Everything is a **static, non-PIE `ET_EXEC`** today: the kernel ELF
+loader rejects `ET_DYN` and `PT_INTERP` outright, and each program carries its own copy of
+everything it uses. At present that is *right* — the shipping binaries are 13–73 KB
+(`no_std` + `alloc`, hand-rolled runtime), so a loader would cost complexity and save
+nothing.
+
+**It stops being right at the GUI toolkit**, for a reason worth stating precisely: static
+linking defeats page sharing exactly where sharing would pay. Shared file-backed text
+(planned as B4a) shares pages across *instances of one program*, because it maps the same
+`FileObject`. Two different statically-linked apps that both embed the toolkit hold
+byte-identical code in **different files**, so they share nothing — not through B4a, not
+through CoW, and not through the content-addressed store, which dedupes whole files. Five
+apps each embedding a 2–5 MB toolkit is 10–25 MB of duplicated, unshareable text on a
+256 MB machine. Dynamic linking is what extends B4a's sharing *across* programs; B4a is
+what makes a loaded library shareable at all (without file-backed mapping, loading a `.so`
+would eagerly copy it per process — the complexity with none of the benefit).
+
+What it needs, roughly in order:
+
+1. **Thread-local storage first.** The dynamic TLS models need `FS_BASE` /
+   `sys_thread_set_tls`, which is itself deferred in the `std` cluster. Hard prerequisite.
+2. **Kernel: accept `ET_DYN` + `PT_INTERP`** — map the interpreter and enter it instead of
+   the program. User-space ASLR already supplies the base randomization PIE wants (28 bits
+   for ELF/stack/mmap).
+3. **A userspace `ld.so`**: map segments (over B4a's file-backed path), walk the dependency
+   graph, process relocations (`RELATIVE` / `GLOB_DAT` / `JUMP_SLOT`), resolve symbols, run
+   init/fini arrays.
+4. **An ABI answer, because Rust has no stable ABI.** Two viable shapes: a **C ABI seam**
+   at the library boundary (`extern "C"`, `#[no_mangle]`) — stable across compiler versions
+   but awkward for Rust-to-Rust calls; or **whole-system build coherence** — one pinned
+   compiler, everything in a generation rebuilt together, Rust ABI used freely within it.
+   The **content-addressed store + generations makes the second genuinely viable here** in a
+   way it is not on a conventional distro: a generation already *is* a coherent closure, and
+   a toolchain bump is just a new generation. Recommended shape: coherence as the default,
+   with a deliberate C seam only where a plugin boundary needs to outlive a rebuild.
+
+The store and profile layers already anticipate this — `content-addressed-store.md` reserves
+`lib/<library>` and `profiles-and-namespace-projection.md` designs `/lib`, both explicitly
+"once dynamic linking exists".
+
+**Scheduled with the GUI toolkit milestone**, alongside the process-memory-model bundle.
+Sequencing note: do not build the loader speculatively, but **decide the toolkit's ABI seam
+when the toolkit is designed** — retrofitting three shipped apps is far worse than starting
+them right. Natural trigger: the second or third GUI app, i.e. the point where one library
+would be resident more than once.
+
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Resource servers (in-kernel)

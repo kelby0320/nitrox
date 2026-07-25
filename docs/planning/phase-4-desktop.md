@@ -409,6 +409,16 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 - [ ] Compositor (userspace server): windows/surfaces, stacking, focus, damage/redraw
 - [ ] Shared GUI toolkit (the "common GUI library"): window creation, an event loop, drawing primitives, basic widgets. **Conventional surface model first** (apps draw into a surface; the compositor composites — Wayland-shaped)
+- [ ] **Dynamic linking** — scheduled here rather than "opportunistic", with the
+  process-memory-model bundle (CoW, lazy `MemoryObject`, rlimits, guard pages). Everything
+  is static today and that is correct at 13–73 KB per binary, but **static linking defeats
+  page sharing exactly where it starts to pay**: shared file-backed text (B4a) shares pages
+  across instances of *one* program, and two apps that each embed the toolkit hold identical
+  code in *different files*, so they share nothing. Needs TLS first, then `ET_DYN`/`PT_INTERP`
+  in the loader, a userspace `ld.so`, and an answer to Rust's lack of a stable ABI — where
+  the content-addressed store's generations make whole-system build coherence a better fit
+  than a C seam. **Decide the toolkit's ABI seam when the toolkit is designed**; build the
+  loader at the second or third app. See `deferred-decisions.md`.
 - [ ] `WidgetRecord` model layered on top **later, as the typed opt-in** (programs emit structured UI over a typed stream; the display server renders — the text-floor/typed-stream duality on the screen). The first desktop is **not** gated on this research bet.
 
 ### Desktop apps (the north-star MVP)
@@ -463,7 +473,6 @@ pulled up from the Phase 3 backlog; the "sysadmin layer" of a production-feel OS
 Landed when a concrete consumer or need appears, not on a fixed schedule:
 
 - [ ] **USB subsystem** (xHCI + USB core + HID) — real-hardware input/storage; QEMU gives PS/2, so it trails the QEMU-first loop
-- [ ] **Dynamic linking** — off the std critical path (Rust static-links); an ecosystem/image-size concern
 - [ ] **POSIX C shim** — deferred until a must-have C dependency forces it (target the pure-Rust ecosystem first)
 - [ ] **Additional filesystems:** fs-server-fat read-write (ESP updates from within the OS; also the orphaned Phase-2 "FAT read-only" deferral folds in here), btrfs/xfs if a use case emerges
 - [ ] **Phase 2 ACPI:** vendor ACPICA (`kernel/vendor/acpica/`), OSL (`kernel/src/kacpi/osl/`), `bindgen` integration, power-management daemon — triggered by laptop / graceful-shutdown needs
