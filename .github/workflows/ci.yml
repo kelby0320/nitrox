@@ -59,13 +59,84 @@ jobs:
       - name: cargo xtask check-nightly
         run: cargo xtask check-nightly
 
-      # Builds the kernel ELF for x86_64-unknown-none. Image assembly
-      # (sgdisk + mtools) and QEMU are intentionally not exercised here —
-      # those are integration concerns deferred to Phase 1 CI.
+      # A `TODO(tag)` in shipping source must have an entry in
+      # docs/rationale/deferred-decisions.md. Three deferrals that cost real time to
+      # rediscover were each recorded outside that list; this makes the code half
+      # mechanical. See the 2026-07-24 audit.
+      - name: cargo xtask check-deferrals
+        run: cargo xtask check-deferrals
+
+      # Builds the kernel ELF for x86_64-unknown-none.
       - name: cargo xtask build
         run: cargo xtask build
 
       # Host-side tests: kernel lib (compiled against the host triple via
       # an internal override in xtask) plus the tools workspace.
+      #
+      # `e2fsprogs` is a real dependency of this step, not a nicety: the ext4
+      # mutation tests build an image with `mke2fs` and then require `e2fsck -fn`
+      # to find it clean, which is what keeps the write path honest.
       - name: cargo xtask test
         run: cargo xtask test
+
+  integration:
+    name: QEMU integration (image + boot self-test)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable for kernel/tools, pinned nightly for userspace)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-none
+          rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' userspace/rust-toolchain.toml)" \
+            --profile minimal --component rust-src --no-self-update
+
+      # The image build needs the GPT/FAT tooling and OVMF firmware.
+      #
+      # The boot runs under **KVM**, not TCG, and that is a requirement rather than an
+      # optimisation: the kernel is x2APIC-only (decision log, 2026-06-26) and QEMU's
+      # TCG only emulates x2APIC from 9.0, while ubuntu-latest ships 8.2 — under TCG
+      # the guest panics with "CPU lacks x2APIC". KVM's in-kernel APIC has no such
+      # limit, and it is also several times faster. `xtask test-qemu --kvm` preflights
+      # /dev/kvm and fails with that explanation if it is missing.
+      #
+      # The udev rule widens /dev/kvm permissions: the runner user is not in the `kvm`
+      # group, and a group change would not apply to the already-running shell.
+      - name: Install QEMU, OVMF and image tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            qemu-system-x86 qemu-kvm ovmf gdisk mtools e2fsprogs
+          qemu-system-x86_64 --version
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm-writable.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
+
+      - name: Cache cargo registry and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+            tools/target
+            userspace/target
+            tools/build-cache/limine
+          key: ${{ runner.os }}-cargo-integration-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml', 'kernel/.cargo/config.toml', 'userspace/rust-toolchain.toml', 'userspace/x86_64-unknown-nitrox.json') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-integration-
+            ${{ runner.os }}-cargo-
+
+      # The whole boot, adjudicated: kernel -> init -> ext4 mount -> userspace demos
+      # -> login chain, with the guest writing a verdict to isa-debug-exit and a
+      # wall-clock timeout catching a hang. This is the gate that catches what host
+      # unit tests structurally cannot — every regression found during coreutils
+      # Milestone 1 was caught here, and none of them would have failed the jobs
+      # above. See docs/conventions/qemu-integration-tests.md.
+      - name: cargo xtask test-qemu --kvm
+        run: cargo xtask test-qemu --kvm

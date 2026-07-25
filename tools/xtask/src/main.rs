@@ -7,6 +7,7 @@
 //!   qemu-debug      build + launch QEMU paused for GDB on :1234
 //!   test            host-side unit tests (kernel lib + tools workspace)
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
+//!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
@@ -81,7 +82,20 @@ fn main() -> ExitCode {
     // (kernel `boot_selftest` + init's demo chain); without it the build boots straight
     // to userspace. Strip it out before forwarding the rest to QEMU.
     let selftest = rest.iter().any(|a| a == "--selftest");
-    let qargs: Vec<String> = rest.iter().filter(|a| *a != "--selftest").cloned().collect();
+    // `--kvm` runs the guest under hardware virtualisation instead of TCG. Two reasons to
+    // reach for it: speed (a boot loop runs in a fraction of the time), and hosts whose
+    // QEMU predates 9.0 and therefore cannot emulate the x2APIC this kernel requires —
+    // KVM has no such limit. Stripped before the rest is forwarded to QEMU.
+    let accel = if rest.iter().any(|a| a == "--kvm") {
+        Accel::Kvm
+    } else {
+        Accel::Tcg
+    };
+    let qargs: Vec<String> = rest
+        .iter()
+        .filter(|a| *a != "--selftest" && *a != "--kvm")
+        .cloned()
+        .collect();
     let mode = if selftest {
         BuildMode::Selftest
     } else {
@@ -91,12 +105,13 @@ fn main() -> ExitCode {
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
         Some("image") => cmd_image(mode),
-        Some("qemu") => cmd_qemu(false, mode, &qargs),
-        Some("qemu-debug") => cmd_qemu(true, mode, &qargs),
+        Some("qemu") => cmd_qemu(false, mode, accel, &qargs),
+        Some("qemu-debug") => cmd_qemu(true, mode, accel, &qargs),
         Some("test") => cmd_test(),
-        Some("test-qemu") => cmd_test_qemu(),
+        Some("test-qemu") => cmd_test_qemu(accel),
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
+        Some("check-deferrals") => cmd_check_deferrals(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -130,12 +145,16 @@ fn print_help() {
            test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
+           check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
            help          show this message\n\
          \n\
          `--selftest` (build/image/qemu) compiles + runs the boot self-tests / demos;\n         \
          without it the build boots straight to userspace.\n         \
+         `--kvm` (qemu/qemu-debug/test-qemu) runs under hardware virtualisation instead\n         \
+         of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG emulates\n         \
+         x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
          Other args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
     );
 }
@@ -349,7 +368,67 @@ fn cmd_image(mode: BuildMode) -> R<()> {
 
 /// Append the machine / CPU / memory / UEFI-firmware flags shared by every QEMU
 /// launch (`qemu`, `qemu-debug`, `test-qemu`) to `qemu`.
-fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
+/// How the guest CPU is executed.
+///
+/// The kernel is **x2APIC-only** (decision log, 2026-06-26), which sets a hard floor on
+/// the host side: QEMU's TCG only emulates x2APIC from **9.0**, so an older QEMU boots to
+/// a kernel panic ("CPU lacks x2APIC"). KVM has no such limit — the in-kernel APIC has
+/// supported x2APIC for years — so `--kvm` is both the fast path and the way to run on a
+/// host whose QEMU is too old to emulate it.
+#[derive(Clone, Copy, PartialEq)]
+enum Accel {
+    /// Pure emulation. Requires QEMU ≥ 9.0 for x2APIC.
+    Tcg,
+    /// Hardware virtualisation (`-enable-kvm -cpu host`). Needs `/dev/kvm`.
+    Kvm,
+}
+
+/// The host QEMU's `(major, minor)` version, or `None` if it could not be parsed.
+fn qemu_version() -> Option<(u32, u32)> {
+    let out = Command::new("qemu-system-x86_64").arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "QEMU emulator version 9.2.0 (…)" — take the first dotted number.
+    let ver = text.split_whitespace().find(|w| w.contains('.') && w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = ver.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Fail *before* launching if the host cannot give the guest what the kernel requires, so
+/// the operator sees an actionable message instead of a kernel panic from inside QEMU.
+///
+/// This check exists because the failure it replaces was genuinely confusing: a CI runner
+/// with QEMU 8.2 booted to `*** KERNEL PANIC *** CPU lacks x2APIC`, which reads like a
+/// kernel bug and is actually a host-tooling floor.
+fn preflight_accel(accel: Accel) -> R<()> {
+    match accel {
+        Accel::Kvm => {
+            if !Path::new("/dev/kvm").exists() {
+                return Err("`--kvm` requested but /dev/kvm is absent — no hardware \
+                     virtualisation available (nested virt off, or the kvm module is not \
+                     loaded). Drop `--kvm` to use TCG, which needs QEMU >= 9.0."
+                    .into());
+            }
+        }
+        Accel::Tcg => {
+            if let Some((major, minor)) = qemu_version() {
+                if major < 9 {
+                    return Err(format!(
+                        "QEMU {major}.{minor} is too old: TCG only emulates x2APIC from 9.0, \
+                         and this kernel is x2APIC-only (decision log 2026-06-26), so the \
+                         guest would panic with \"CPU lacks x2APIC\". Use `--kvm` (needs \
+                         /dev/kvm) or install QEMU >= 9.0."
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel) -> R<()> {
     qemu.arg("-M")
         .arg("q35")
         // CPU model = QEMU's `max`: every feature the emulator can provide,
@@ -367,10 +446,20 @@ fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
         // emulates the whole XSAVE path and boots clean. The real hardware path
         // is additionally proven under KVM (`-cpu host`); see the decision log
         // (2026-07-21 floating-point). x2APIC needs QEMU ≥ 9.0. SMP runs `-smp N`.
-        .arg("-cpu")
-        .arg("max")
         .arg("-m")
         .arg("256M");
+    // `max` (TCG) is every feature the emulator can provide; `host` (KVM) is every
+    // feature the physical CPU has. Both are strict supersets of what the kernel asks
+    // for, and both carry x2APIC — under TCG only from QEMU 9.0, which `preflight_accel`
+    // checks before we get here.
+    match accel {
+        Accel::Tcg => {
+            qemu.arg("-cpu").arg("max");
+        }
+        Accel::Kvm => {
+            qemu.arg("-enable-kvm").arg("-cpu").arg("host");
+        }
+    }
     // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a
     // single combined image on legacy setups (see `locate_ovmf`).
     for a in firmware_pflash_args(ovmf)? {
@@ -379,11 +468,12 @@ fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
     Ok(())
 }
 
-fn cmd_qemu(debug: bool, mode: BuildMode, extra_args: &[String]) -> R<()> {
+fn cmd_qemu(debug: bool, mode: BuildMode, accel: Accel, extra_args: &[String]) -> R<()> {
+    preflight_accel(accel)?;
     cmd_image(mode)?;
     let ovmf = locate_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut qemu, &ovmf)?;
+    qemu_base_args(&mut qemu, &ovmf, accel)?;
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-serial")
@@ -405,7 +495,8 @@ fn cmd_qemu(debug: bool, mode: BuildMode, extra_args: &[String]) -> R<()> {
 /// verdict to the `isa-debug-exit` device (init on success/failure, or the kernel
 /// panic handler); QEMU then exits `(verdict << 1) | 1`. A hung boot is caught by a
 /// wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
-fn cmd_test_qemu() -> R<()> {
+fn cmd_test_qemu(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
     let ovmf = locate_ovmf()?;
 
@@ -422,7 +513,7 @@ fn cmd_test_qemu() -> R<()> {
     // fires from outside its process group.
     cmd.arg("--foreground").arg(TIMEOUT_SECS.to_string());
     cmd.arg("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf)?;
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         // The guest ends the run by writing its verdict to this port.
@@ -710,6 +801,83 @@ fn cmd_check_nightly() -> R<()> {
         let mut msg = String::from(
             "nightly language/library features are not permitted — the nightly toolchain \
              exists solely to `-Z build-std` the custom userspace target:\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        Err(msg.into())
+    }
+}
+
+/// Every `TODO(tag)` in the shipping source must have a matching entry in
+/// `docs/rationale/deferred-decisions.md`.
+///
+/// This exists because of a specific, repeated failure: the three deferrals that cost the
+/// most to rediscover (exit-time handle reclamation, the wall clock, file truncate) were
+/// each recorded *somewhere other than* the canonical list — one in an architecture doc,
+/// one as a `TODO` tag in the kernel's syscall table, one in a crate `CLAUDE.md` — so none was
+/// ever reviewed, and each surfaced only when a consumer tripped over it (audit,
+/// 2026-07-24). A `TODO` is a deferral; this makes the code half of that mechanical.
+///
+/// The document must name the tag **literally** — `TODO(msi)`, not just the word "msi" —
+/// because a bare short tag (`mm`) matches half the prose in any technical document, which
+/// would make the check pass without recording anything. Naming it also makes the entry
+/// searchable from the code and vice versa.
+fn cmd_check_deferrals() -> R<()> {
+    let doc_path = repo_root()
+        .join("docs")
+        .join("rationale")
+        .join("deferred-decisions.md");
+    let doc = fs::read_to_string(&doc_path)
+        .map_err(|e| format!("read {}: {e}", doc_path.display()))?
+        .to_lowercase();
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    for ws in ["kernel/src", "userspace", "tools/xtask/src"] {
+        let src_root = repo_root().join(ws);
+        visit_rs_files_skipping(&src_root, &["target"], &mut |path| {
+            let text = fs::read_to_string(path)?;
+            for (i, line) in text.lines().enumerate() {
+                let Some(rest) = line.split_once("TODO(") else {
+                    continue;
+                };
+                let Some((tag, _)) = rest.1.split_once(')') else {
+                    continue;
+                };
+                // A tag has to be a plain word to be searchable; anything else is prose
+                // that happens to contain the marker.
+                if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    continue;
+                }
+                if !tags.iter().any(|t| t == tag) {
+                    tags.push(tag.to_string());
+                }
+                if !doc.contains(&format!("todo({})", tag.to_lowercase())) {
+                    violations.push(format!(
+                        "{}:{}: TODO({tag}) has no entry in deferred-decisions.md",
+                        path.display(),
+                        i + 1
+                    ));
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    if violations.is_empty() {
+        println!(
+            "check-deferrals: {} TODO tag(s) — every one is recorded in deferred-decisions.md ✓",
+            tags.len()
+        );
+        Ok(())
+    } else {
+        let mut msg = String::from(
+            "every `TODO(tag)` must have a matching entry in \
+             docs/rationale/deferred-decisions.md — a deferral only exists if it is in the \
+             canonical list (see that document's closing section):\n",
         );
         for v in &violations {
             msg.push_str("  ");
@@ -1244,6 +1412,15 @@ fn locate_ovmf() -> R<Firmware> {
         (
             "/usr/share/qemu/edk2-x86_64-code.fd",
             "/usr/share/qemu/edk2-i386-vars.fd",
+        ),
+        // Debian/Ubuntu's `ovmf` package has shipped the 4 MB build under these names
+        // since 22.04, and on current releases they are the *only* ones present — the
+        // unsuffixed pair below is older layouts (and the `/usr/share/ovmf/OVMF.fd`
+        // single image at the end is older still). Ordered newest-first so a machine
+        // with both prefers the split pair, which gives a writable VARS store.
+        (
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
         ),
         (
             "/usr/share/OVMF/OVMF_CODE.fd",

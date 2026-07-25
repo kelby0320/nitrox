@@ -65,9 +65,14 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **The typed shell + coreutils subproject** — 🚧 active from 2026-07-24. **Milestone 1
     (`list` + `copy`) complete** (PR #116). Tracked in
     [shell-coreutils-plan.md](shell-coreutils-plan.md).
-  - **Substrate gaps it surfaced** — exit-time handle reclamation ✅ (2026-07-24), then the
-    wall clock and file truncate. See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
+  - **Substrate gaps it surfaced** — exit-time handle reclamation, the wall clock, and file
+    truncate — all ✅ (2026-07-24). See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
     gaps surfaced by the coreutils subproject".
+  - **Now: pre-CLI substrate hardening** (the deferral audit, 2026-07-24) — four slices
+    landing before coreutils Milestone 2: trustworthy deferral docs + CI running the QEMU
+    gate; the demand-fault path (fill cookie, read-ahead, blocking second faulter, shared
+    file-backed text); fs/ext4 completeness for M2; and the now-triggered hygiene items.
+    See [phase-4-desktop.md](phase-4-desktop.md) → "Pre-CLI substrate hardening".
 
 ---
 

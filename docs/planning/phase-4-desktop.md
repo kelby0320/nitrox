@@ -286,6 +286,103 @@ had to weaken are restored and serving as their regression tests:
   size and stale pages. `copy --force` now overwrites a longer destination, shrinking first
   and verifying the shrink took. e2fsck-clean; negative-controlled.
 
+### Pre-CLI substrate hardening — the deferral audit (2026-07-24)
+
+Three consecutive slices (handle reclamation, the wall clock, file truncate) were spent
+paying down gaps that a coreutil tripped over. An audit of every deferral — the canonical
+list, the decision log, the planning docs, and the code's `TODO(...)` tags — found two
+things worth acting on before the shell subproject continues.
+
+**The gaps that bit us were never recorded as deferrals.** None of the three was in
+`deferred-decisions.md`. Handle reclamation lived as a sentence in `handle-system.md`
+("the `Process` slice wires it up"), the wall clock as a `TODO(realtime)` in the syscall
+table, truncate as a bullet in `fs-server-ext4/CLAUDE.md`. The canonical-list discipline
+works; the leak is **implicit deferrals** — a stub, a TODO, or prose promising a later
+slice — which never reach the list and so are never reviewed.
+
+**The list cannot be scanned for what is still owed.** Roughly 17 of 96 entries describe
+finished work, interleaved with open ones and marked four different ways. Two entries were
+found stale only by reading the code: **x2APIC** (built and committed x2APIC-*only* since
+2026-06-26; the entry still describes an unbuilt dual-mode plan) and **forwarded-lookup
+N=1** (`US_PENDING_MAX = 8`). Verified-stale alongside them: writeback IRPs (built), the
+range-TLB/shootdown entry (shootdown built, range flush not), and the AHCI
+single-command entry (its stated workaround was lifted and `PendingRing` superseded it).
+
+The pass below lands **before coreutils Milestone 2** — a solid kernel/system underneath
+the userspace work, rather than discovering each gap from a coreutil.
+
+#### Slice A — trustworthy docs, and CI that catches things
+
+- [ ] Split `deferred-decisions.md` into **Open** and **Resolved**; delete the superseded
+  ELF-copy entry; correct the five verified-stale entries; bundle the four
+  process-memory-model entries (lazy `MemoryObject`, rlimits, stack guard pages, CoW) into
+  one, since they extend the same AS/fault machinery.
+- [ ] `cargo xtask check-deferrals` — every `TODO(tag)` in `kernel/`/`userspace/` must have
+  a matching entry in `deferred-decisions.md`, in the spirit of `check-arch`/`check-nightly`.
+  Four tags today (`msi`, `smp`, `sched-acct`, `mm`), so it is cheap to satisfy.
+- [ ] **CI runs `xtask image` + `xtask test-qemu`.** Today CI runs only `check-arch`,
+  `check-nightly`, `build`, `test` — the integration gate that caught every regression in
+  the Milestone 1 work does not run there at all.
+
+#### Slice B — the demand-fault path
+
+The shell is what makes this hurt: a pipeline spawns a process per stage, and each spawn
+currently reads the **whole** ELF into a kernel buffer and copies every `PT_LOAD` into
+fresh anonymous frames. Page fills compound it — one 4 KiB `ReadRange` per fault, each
+re-reading the superblock, re-resolving the path, and re-walking the extent tree.
+
+- [ ] **B1 — fs-server open-file cookie.** Resolve returns a cookie; `ReadRange` carries
+  it. Each fill becomes O(1) instead of a full re-resolve.
+- [ ] **B2 — clustered fill (read-ahead).** One `ReadRange` per N pages: *pages* round
+  trips become *⌈pages/N⌉*. The biggest single lever; B1 makes each remaining one cheaper.
+- [ ] **B3 — block the second faulter.** Store the fill `PendingOperation` in the cache
+  page so a concurrent faulter blocks on it instead of `yield_now`-spinning. Reachable now
+  under SMP; mandatory before `std::thread`.
+- [ ] **B4a — shared, file-backed read-only text.** Map read-only `PT_LOAD` segments as
+  `FileBacked` VMAs against the image `FileObject` instead of copying them; writable
+  segments keep the eager copy; the BSS tail uses the existing demand-zero anonymous path.
+  **Requires the spawner to reuse one image handle per program** — every resolve mints a
+  fresh `FileObject` with its own page cache, so without handle reuse "shared text" shares
+  nothing. The linker script already guarantees the `p_vaddr ≡ p_offset (mod PAGE)` the
+  mapping needs.
+- **B4b — copy-on-write data: deliberately not in this pass.** Without `fork`, CoW's only
+  consumer is the ELF data segment, and after B4a the sole remaining eager copy is `.data`
+  — a few KB for a coreutil, since a Rust static binary is dominated by `.text`/`.rodata`.
+  **Scheduled with the GUI toolkit / desktop-apps milestone** (stepping stones 5–7), where
+  several apps link one toolkit and carry real `.data`/`.bss`, or earlier if a profile
+  shows spawn/RSS bound. It lands with the process-memory-model bundle, not alone.
+
+#### Slice C — fs/ext4 completeness for Milestone 2
+
+- [ ] **C1 — grow a full directory.** A directory whose single block fills returns
+  `TooLarge`; `mkdir`/`touch` at any scale hits it (a Milestone 1 test fixture had to be
+  sized around it).
+- [ ] **C2 — cross-directory and overwrite `rename`.** Blocks `move`.
+- [ ] **C3 — the `MAX_SESSIONS = 7` cap.** Each pipeline stage holding a directory session
+  makes seven concurrent sessions a normal working set, not a stress case.
+- [ ] **C4 — `mtime` on an in-place overwrite.** Model A hides a same-length rewrite from
+  the server; the hook is `sys_file_sync` notifying it. The timestamp gap users notice.
+
+#### Slice D — cheap, now-triggered hygiene
+
+- [ ] **D1 — klog keep-recent ring.** Still a linear append buffer that stops capturing
+  once 16 KiB of boot log fills — i.e. exactly when a long-running system gets interesting.
+- [ ] **D2 — `cargo xtask abi-sync-check`.** Its trigger was "a second non-demo consumer";
+  there are now five or six.
+- [ ] **D3 — a listable `/dev`.** `list /dev` is a day-one shell command. `sys_ns_enumerate`
+  exists with no consumer; needs a design call on how `list` chooses namespace enumeration
+  versus an fs-server directory session.
+- [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
+  violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
+  boot-loop bisection; this turns that class into an immediate, located failure.
+
+**Staying deferred** (verified against the code, triggers intact): MSI/MSI-X, IOMMU and
+userspace drivers, NVMe, Tier-2 modules, filter drivers, IRP cancellation, networking,
+GPU/3D and the compositor protocol, other filesystems, LUKS/LVM, POSIX shim, TypedRecord
+enums/generics/lifetimes, iovec, vDSO clock, priority inheritance, EDF, NUMA, per-CPU slab,
+empty-slab reclaim, DMA zones, intermediate page-table reclaim, the SMP panic path, and
+systemwide tracing.
+
 ### Typed shell + coreutils (subproject)
 
 The prereqs above are in, so this subproject is **🚧 active** (from 2026-07-24, at Milestone 1 —
@@ -312,6 +409,16 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 - [ ] Compositor (userspace server): windows/surfaces, stacking, focus, damage/redraw
 - [ ] Shared GUI toolkit (the "common GUI library"): window creation, an event loop, drawing primitives, basic widgets. **Conventional surface model first** (apps draw into a surface; the compositor composites — Wayland-shaped)
+- [ ] **Dynamic linking** — scheduled here rather than "opportunistic", with the
+  process-memory-model bundle (CoW, lazy `MemoryObject`, rlimits, guard pages). Everything
+  is static today and that is correct at 13–73 KB per binary, but **static linking defeats
+  page sharing exactly where it starts to pay**: shared file-backed text (B4a) shares pages
+  across instances of *one* program, and two apps that each embed the toolkit hold identical
+  code in *different files*, so they share nothing. Needs TLS first, then `ET_DYN`/`PT_INTERP`
+  in the loader, a userspace `ld.so`, and an answer to Rust's lack of a stable ABI — where
+  the content-addressed store's generations make whole-system build coherence a better fit
+  than a C seam. **Decide the toolkit's ABI seam when the toolkit is designed**; build the
+  loader at the second or third app. See `deferred-decisions.md`.
 - [ ] `WidgetRecord` model layered on top **later, as the typed opt-in** (programs emit structured UI over a typed stream; the display server renders — the text-floor/typed-stream duality on the screen). The first desktop is **not** gated on this research bet.
 
 ### Desktop apps (the north-star MVP)
@@ -366,7 +473,6 @@ pulled up from the Phase 3 backlog; the "sysadmin layer" of a production-feel OS
 Landed when a concrete consumer or need appears, not on a fixed schedule:
 
 - [ ] **USB subsystem** (xHCI + USB core + HID) — real-hardware input/storage; QEMU gives PS/2, so it trails the QEMU-first loop
-- [ ] **Dynamic linking** — off the std critical path (Rust static-links); an ecosystem/image-size concern
 - [ ] **POSIX C shim** — deferred until a must-have C dependency forces it (target the pure-Rust ecosystem first)
 - [ ] **Additional filesystems:** fs-server-fat read-write (ESP updates from within the OS; also the orphaned Phase-2 "FAT read-only" deferral folds in here), btrfs/xfs if a use case emerges
 - [ ] **Phase 2 ACPI:** vendor ACPICA (`kernel/vendor/acpica/`), OSL (`kernel/src/kacpi/osl/`), `bindgen` integration, power-management daemon — triggered by laptop / graceful-shutdown needs

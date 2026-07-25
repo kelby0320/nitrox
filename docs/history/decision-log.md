@@ -8354,3 +8354,182 @@ was captured from it. Host load is an unconvincing explanation — a healthy boo
 about 5 s against a 90 s ceiling, a 20× margin. So it is unattributed, not benign: if a
 hang recurs around the write path, this is the first datapoint, and the boot-loop scripts
 keep the serial log on any non-pass exit.
+
+## 2026-07-24 — The deferral audit: a canonical list, a guard, and CI that runs the gate
+
+**Why.** Three consecutive slices (exit-time handle reclamation, the wall clock, file
+truncate) were spent on gaps a coreutil tripped over. That prompted an audit of every
+deferral across `deferred-decisions.md`, the decision log, the planning docs, and the
+code's `TODO(...)` tags.
+
+**Finding 1 — the gaps that bit us were never recorded as deferrals.** None of the three
+was in the canonical list. Handle reclamation lived as a sentence in `handle-system.md`
+("the `Process` slice wires it up"), the wall clock as a `TODO` in the syscall table,
+truncate as a bullet in `fs-server-ext4/CLAUDE.md`. So the canonical-list *discipline* is
+fine; the leak is **implicit deferrals** — a stub, a TODO, or prose promising a later slice
+— which never reach the list and therefore never get reviewed.
+
+**Finding 2 — the list could not be scanned for what was owed.** Roughly 17 of 96 entries
+described finished work, interleaved with open ones and marked four different ways
+(`DONE`, `RESOLVED`, `Done in essence`, or a paragraph appended). Two were discovered stale
+only by reading the code, after an initial triage that trusted the prose got them wrong:
+
+- **x2APIC** — the entry describes an unbuilt "dual-mode with auto-detection" plan. The
+  kernel has been **x2APIC-only** since 2026-06-26, deliberately carrying no xAPIC
+  fallback. (The maintainer caught this; the triage from the doc had it as "stay deferred".)
+- **Forwarded-lookup concurrency (N = 1)** — `US_PENDING_MAX = 8` for some time.
+
+Also corrected: writeback IRPs (built), the range-TLB entry (the *shootdown* is built; only
+`flush_tlb_range` is missing), the AHCI single-command entry (its stated workaround was
+lifted and `PendingRing` superseded it — only NCQ remains), and per-CPU slab caching (its
+"SMP bring-up" trigger fired and it was not done, so it now carries a performance trigger).
+
+**Changes.**
+
+1. **`deferred-decisions.md` is now open-only**, with a **Resolved** table at the bottom
+   (18 rows). The rule is recorded in the document: a triggered entry *moves* to that table
+   rather than being annotated in place.
+2. **`cargo xtask check-deferrals`** — every `TODO(tag)` in shipping source must have an
+   entry naming that tag literally. It found **four unrecorded deferrals on its first run**,
+   which is the point: `TODO(sched-acct)` (per-thread CPU accounting for the
+   `ProcessCpu`/`ThreadCpu` clocks), `TODO(mm)` (`sys_memory_unmap` **ignores its `size`**
+   and unmaps the whole VMA — the caller asks for less and silently gets more),
+   `TODO(smp)` (explicit grace-tracker quiescence on the syscall path — worth a look now
+   that exit-time handle reclamation added a writer there), and a stray example in xtask's
+   own docs. The literal-tag match is deliberate: a bare short tag like `mm` matches half
+   the prose in a technical document, so a loose check would pass while recording nothing.
+3. **CI runs the QEMU gate.** A second job builds the image and runs `xtask test-qemu`.
+   Until now CI ran only `check-arch`, `check-nightly`, `build`, `test` — so *every*
+   regression caught during coreutils Milestone 1 would have passed CI. `locate_ovmf` also
+   gained the `OVMF_CODE_4M.fd`/`OVMF_VARS_4M.fd` pair, which is the only one current
+   Debian/Ubuntu ships; without it the job would depend on a legacy fallback existing.
+4. **The four process-memory-model entries are bundled into one** (CoW data, lazy
+   `MemoryObject`, rlimits, stack guard pages) — they extend the same AS/fault machinery,
+   and as separate entries each read as waiting on the others.
+
+**Copy-on-write is now scheduled rather than open-ended.** Without `fork`, CoW's only
+consumer is the ELF data segment; after shared read-only text (planned as B4a of the
+pre-CLI hardening pass) the sole remaining eager copy is `.data`, a few KB for a coreutil,
+since a Rust static binary is dominated by `.text`/`.rodata`. It therefore lands with the
+**GUI toolkit / desktop-apps milestone**, alongside the rest of the bundle — or earlier if
+a profile shows spawn latency or RSS bound. A constraint that surfaced while scheduling it:
+every resolve mints a **fresh `FileObject` with its own page cache**, so shared text shares
+nothing unless the spawner reuses one image handle per program.
+
+**The plan this feeds** is recorded in `docs/planning/phase-4-desktop.md` § Pre-CLI
+substrate hardening: four slices before coreutils Milestone 2 — (A) this one, (B) the
+demand-fault path, (C) fs/ext4 completeness for M2, (D) the cheap now-triggered items
+including debug-build lock-ordering enforcement.
+
+*Verified:* `check-deferrals` green (5 tags, all recorded); host suite 782 green;
+`test-qemu` PASS (including through the new `locate_ovmf` ordering); `check-arch` /
+`check-nightly` green.
+
+## 2026-07-24 — Dynamic linking belongs with the GUI toolkit, not with "opportunistic"
+
+Raised by the maintainer while scheduling copy-on-write: everything is a static binary for
+simplicity, and that will start to hurt at the GUI. Agreed, and it sharpens the CoW
+scheduling decision rather than competing with it.
+
+**The precise reason it hurts at a toolkit.** Static linking defeats page sharing exactly
+where sharing would pay. Shared file-backed text (B4a of the pre-CLI pass) shares pages
+across *instances of one program* — it works by mapping the same `FileObject`. Two
+different statically-linked apps that both embed the toolkit hold **byte-identical code in
+different files**, so they share nothing: not through B4a, not through CoW, and not through
+the content-addressed store, which dedupes at whole-file granularity. Five apps each
+embedding a 2–5 MB toolkit is 10–25 MB of duplicated, unshareable text on a 256 MB machine.
+
+So the three are one story, not three options:
+
+- **B4a (shared text)** shares a program's text across its own instances.
+- **Dynamic linking** extends that sharing *across different programs*.
+- **B4a is a prerequisite for dynamic linking to pay off** — without file-backed mapping,
+  loading a `.so` would eagerly copy it per process: the complexity with none of the win.
+
+**Why not now.** The shipping binaries are 13–73 KB (`no_std` + `alloc`, hand-rolled
+runtime). A loader today would cost real complexity and save nothing measurable.
+
+**What it needs**, in dependency order: TLS (`FS_BASE`/`sys_thread_set_tls`, itself deferred
+in the `std` cluster) → kernel acceptance of `ET_DYN` + `PT_INTERP` (both rejected today;
+user-space ASLR already provides PIE's base randomization) → a userspace `ld.so` (segment
+mapping over B4a's path, dependency graph, `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT` relocations,
+init/fini) → **an answer to Rust's lack of a stable ABI**.
+
+That last one is the real design fork, and Nitrox has an unusually good option. Either a
+**C ABI seam** at the library boundary (stable across compiler versions, awkward for
+Rust-to-Rust), or **whole-system build coherence** — one pinned compiler, everything in a
+generation rebuilt together, Rust's ABI used freely within it. The content-addressed store
+plus generations makes the second genuinely viable in a way it is not on a conventional
+distro: a generation already *is* a coherent closure, and a toolchain bump is simply a new
+generation with a new store hash. Recommended shape: coherence by default, with a
+deliberate C seam only where a plugin boundary must outlive a rebuild. The store and profile
+layers already reserve the slot — `content-addressed-store.md` has `lib/<library>` and
+`profiles-and-namespace-projection.md` designs `/lib`, both "once dynamic linking exists".
+
+**Decision: scheduled with the GUI toolkit milestone**, alongside the process-memory-model
+bundle, and moved out of "opportunistic / trigger-driven" in the Phase 4 plan. One
+sequencing caveat: do not build the loader speculatively, but **decide the toolkit's ABI
+seam when the toolkit is designed** — retrofitting three shipped apps is far worse than
+starting them right. Build the loader at the second or third GUI app, the point where one
+library would otherwise be resident more than once.
+
+**Process note:** dynamic linking was itself an *implicit* deferral — recorded in the Phase 4
+plan and the decision log but **not** in `deferred-decisions.md`, which is precisely the
+pattern the same-day audit flagged. It now has an entry.
+
+## 2026-07-24 — CI runs the QEMU gate under KVM, and `xtask` preflights the x2APIC floor
+
+The first CI run of the new integration job failed with a guest kernel panic:
+
+```
+*** KERNEL PANIC *** at src/arch/x86_64/apic.rs:141:5
+CPU lacks x2APIC (CPUID.01H:ECX.21) — required.
+```
+
+**Not a kernel bug — a host-tooling floor.** The kernel is x2APIC-only by decision
+(2026-06-26), and QEMU's **TCG only emulates x2APIC from 9.0**. GitHub's `ubuntu-latest`
+ships QEMU **8.2**, so the runner's TCG cannot provide it. The dev box runs 11.0.2, which
+is why this never appeared locally.
+
+**Fix: `xtask … --kvm`, and CI uses it.** KVM's in-kernel APIC has supported x2APIC for
+years, so hardware virtualisation sidesteps the QEMU-version floor entirely — and is
+several times faster, which also serves the boot-loop campaigns the project runs for
+scheduler/fault/lifecycle changes (previously done with an ad-hoc script). The flag applies
+to `qemu`, `qemu-debug` and `test-qemu`; TCG uses `-cpu max`, KVM `-enable-kvm -cpu host`.
+This is precisely the remedy the old x2APIC deferral entry anticipated ("a QEMU-floor bump
+or an opt-in `xtask qemu --kvm`") before that entry went stale.
+
+**And a preflight, so the failure explains itself.** `preflight_accel` runs *before*
+launching: under TCG it parses `qemu-system-x86_64 --version` and refuses below 9.0 with
+the reason; under `--kvm` it requires `/dev/kvm`. A confusing guest panic becomes an
+actionable host message. The CI job also installs `qemu-kvm` and a udev rule widening
+`/dev/kvm` permissions (the runner user is not in the `kvm` group, and a group change would
+not apply to the already-running shell).
+
+`locate_ovmf` additionally learned the `OVMF_CODE_4M.fd` / `OVMF_VARS_4M.fd` split pair,
+which is the only one current Debian/Ubuntu ships.
+
+### A second sighting of the intermittent boot hang
+
+The first `test-qemu --kvm` run **hung** (no verdict, 90 s), then passed twice immediately
+after. This is the **second** sighting of an unexplained intermittent — the first was
+during the truncate slice (2026-07-24), under TCG. What is known:
+
+- **It is not a regression from this branch**, which changes no guest code at all (docs,
+  `xtask`, CI only). Both sightings sit on kernel/userspace trees that otherwise boot
+  cleanly hundreds of times.
+- **It does not reproduce in a loop.** 30 boots with the *exact* argument set that hung
+  (KVM, split firmware, `-m 256M`, `-smp 4`) were clean, on top of ~100 earlier KVM boots
+  and 67 TCG boots across the preceding slices.
+- **Both sightings were the first boot after a rebuild**, which is suggestive but not
+  evidence — the 20× margin between a ~5 s healthy boot and the 90 s ceiling makes plain
+  host load an unconvincing explanation on its own.
+- **Where it stopped:** the KVM hang's last serial line was
+  `service-mgr: parsed service 'heartbeat'` — i.e. deep in userspace, with the filesystem
+  mounted and services starting, so it is not firmware or early boot.
+
+Recorded rather than chased: the observed rate (~2 in ~200 boots) means CI will flake
+occasionally, and if it does, the serial log printed on timeout is the first evidence to
+collect — specifically the last line of progress. A targeted investigation belongs with the
+Slice B fault-path work, which touches the same fs/page-fill machinery the hang's last
+progress point implicates.

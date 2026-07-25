@@ -26,17 +26,18 @@ These are not going to be done. Architecture is structured to not require them.
 
 **Legacy (pre-2014) x86 hardware.** There is no requirement to run on old machines. The kernel already requires SMEP and SMAP (it enables and asserts them; the dev loop passes `+smep,+smap`) — SMAP is Broadwell, so the de-facto x86 floor is **≈ 2014**. The baseline is roughly **x86-64-v2 ISA plus SMEP/SMAP**; on any CPU meeting it, an invariant TSC and x2APIC are also guaranteed. This is a deliberate "no legacy" scope choice, not an oversight, and it is what lets the kernel assume modern features rather than carry fallback paths for ancient hardware. (BIOS/legacy-boot is separately out of scope — the project is UEFI + Limine only.)
 
-## Deferred to later phases
+## Open deferrals
 
-These will eventually be done, but aren't in initial scope. Each entry documents what's deferred and what triggers it.
+These will eventually be done, but aren't in initial scope. Each entry documents what's
+deferred and what triggers it. **Everything below is still open** — resolved entries move
+to the [Resolved](#resolved-kept-for-the-record) table at the bottom, so this section can
+be read as the list of what is actually owed.
 
 ### Hardware support
 
 **aarch64.** The architecture abstraction layer is designed in from the start. Every arch-specific concern (paging, interrupts, FPU, user memory access, power) is behind a trait. The `kernel/src/arch/aarch64/` directory exists as stubs. Initial implementation targets x86_64; aarch64 implementation comes after the x86_64 system is mature. Trigger: when there's a specific aarch64 target system to support, or when the x86_64 implementation is stable enough to make the porting effort worthwhile.
 
 **5-level paging on x86_64 (57-bit virtual addresses).** Ice Lake and later support 5-level paging, allowing virtual address spaces up to 128 PiB. Nitrox uses 4-level paging (canonical 48-bit). The address space is plenty for any conceivable workload. Trigger: a use case that requires it. None foreseen.
-
-**x2APIC mode (dual-mode local APIC).** The local-APIC bring-up (`arch/x86_64/apic.rs`) uses **xAPIC** (MMIO) only. x2APIC accesses the same registers via MSRs (`0x800 + reg>>4`) with 32-bit APIC IDs; it is the right mode on real hardware and is **mandatory** once SMP exceeds 255 logical CPUs (xAPIC's 8-bit IDs cannot address them; >255 additionally wants IOMMU interrupt remapping). Per the "no legacy hardware" baseline above, every supported CPU *has* x2APIC — so the plan is **dual-mode with boot-time auto-detection (`CPUID.01H:ECX[21]`), preferring x2APIC**, keeping xAPIC for the early-boot transition (firmware hands off in xAPIC mode), as a fallback, and for the TCG dev loop. The xAPIC↔x2APIC difference is localised to the register accessors (`read_reg`/`write_reg`, plus the 32-bit `id()` and the single-MSR ICR write for IPIs), so it is a small, contained change. **Deferred** because: (a) it is only needed at SMP / real-hardware bring-up, and (b) QEMU's TCG only began emulating x2APIC in **9.0** (the dev loop runs older QEMU under TCG), so it cannot be exercised under the current loop without bumping the dev QEMU floor to ≥ 9.0 or using KVM (`-enable-kvm -cpu host`). Trigger: Phase 3 SMP (especially > 255 CPUs) or real-hardware bring-up; implement alongside a QEMU-floor bump or an opt-in `xtask qemu --kvm`. See the decision log (2026-06-11).
 
 **KASLR (kernel image ASLR).** The kernel image is loaded at a fixed higher-half address. User-space ASLR is implemented (28 bits of entropy for ELF, stack, and mmap arena). Kernel ASLR is a defense-in-depth measure against kernel-mode exploits. Not initially. Trigger: a security hardening pass after the system is mature.
 
@@ -148,47 +149,15 @@ arrive with the fs-server (slice 7).
 > to NCQ slots cleanly when we build it; the trigger is a workload that is I/O-latency
 > bound, e.g. an SSD or many concurrent readers).
 
-> **Concurrent direct-block + forwarded-lookup hang (2026-07-20, RESOLVED 2026-07-20).**
-> A `/dev/blk` client doing direct block I/O concurrently with the fs-server's own reads
-> hung a *forwarded* namespace lookup. The cause was **not** in the block / forwarding
-> path — it was a missing cross-CPU wake in the scheduler, exposed by user-thread
-> migration (slice 3b): a completion on one CPU enqueued the woken thread on a *remote*
-> CPU's run queue but sent no signal, so delivery depended on that CPU's next periodic
-> tick — unreliable for an idle CPU halted in `hlt`, so a thread parked on a dark AP sat
-> there forever. Fixed with a **reschedule IPI** (`arch::send_reschedule_ipi`, poked from
-> `place_thread` on any cross-CPU placement) plus an `sti; hlt` idle so an idle CPU always
-> parks wakeable. See the decision log (2026-07-20 "SMP scheduler: reschedule IPI"). The
-> demo→login sequencing that had worked around this is now **lifted**: init's selftest boot
-> runs the demo chain and the login chain concurrently, so the default `test-qemu` exercises
-> concurrent direct + fs-mediated block I/O. A *deterministic* regression test for the hang
-> proved impractical — it only reproduced under sustained multi-second load (amplified by
-> the diagnostic serial output during the hunt); a bounded stress up to 50k forwarded
-> lookups did not re-trigger it with the fix removed. The concurrent boot is therefore a
-> concurrency smoke test, not a razor regression catch.
-
-**Writeback IRPs.** The page cache initially flows reads only; dirty-page
-writeback through write IRPs lands with read-write `fs-server-ext4` (Phase 3).
-
-**Concurrent same-page faults (slice 8 Part 2b).** When a file page fault misses, the
-fault path reserves the frame (`Loading`), starts the producer fill, and parks the
-thread on a per-*fault* `PendingOperation`. A *second* thread faulting the **same**
-page (`Reserve::Loading`) has no handle on that in-flight fill's PO, so it `yield_now`s
-and retries until the page is `Ready`. This cannot occur in the milestone (single CPU,
-one faulter per `FileObject`), so the yield path is never taken; the proper fix —
-store the fill PO in the cache page so a second faulter blocks on it (one wakeup, no
-spin) — is deferred. Trigger: a multi-threaded process (or shared `FileObject`) that
-faults the same page concurrently. Until then the yield-retry is correct, just
-not elegant.
-
-**File-size discovery via `sys_handle_stat` — RESOLVED (slice 9 Part 3).** Slice 8
-deferred this: a client holding a lazily-resolved `FileObject` had no way to ask its
-size (`HandleInfo` reported only rights/type/generation, and the lazy resolve consumed
-`content_len`). **Done in slice 9 Part 3** (the named consumer, eshell `cat`):
-`HandleInfo` gained a `size: u64` (16 → 24 bytes, not in the ABI hash), `stat_on` reads
-the per-type size (`FileObject.size`, `MemoryObject.size`, else `0`), and the lazy
-resolve grants `INSPECT`. See the decision log, 2026-06-27. (The slice-8 large-file
-milestone's shared `LARGE_FILE_BYTES` constant remains as a now-unnecessary bridge; a
-future cleanup could switch init's verifier to `stat`.)
+**Concurrent same-page faults.** When a file page fault misses, the fault path reserves
+the frame (`Loading`), starts the producer fill, and parks the faulting thread on a
+per-*fault* `PendingOperation`. A *second* thread faulting the **same** page has no handle
+on that in-flight fill's PO, so it `yield_now`s and retries until the page is `Ready` — a
+spin, not a block. This was unreachable when written (single CPU, one faulter per
+`FileObject`); **under SMP it is reachable today**, and `std::thread` makes it ordinary.
+The fix — store the fill PO in the cache page so a second faulter blocks on it (one wakeup,
+no spin) — is scheduled as **B3 of the pre-CLI substrate-hardening pass**
+(`docs/planning/phase-4-desktop.md`).
 
 **Kernel log buffer is keep-early, not keep-recent (slice 9 Part 5).** `klog`
 (`/dev/log`) is a **linear append** buffer: it captures kernel `kprint!` output from
@@ -201,16 +170,14 @@ deferred until the system runs long enough to overflow 16 KiB (eshell/services b
 boot). The snapshot fill (`copy_into_frames`) already handles the segmented copy a
 ring would need.
 
-**AHCI single-outstanding-command contention (slice 9 Part 3).** The AHCI driver runs
-**one command at a time** (Phase 2; `inflight: AtomicPtr<Irp>`). Two processes issuing
-disk reads concurrently (e.g. the demo `parent`'s block reads + the fs-server's ext4
-reads driven by eshell `cat`) race the single command slot and corrupt each other's
-reads. Slice 9 Part 3 sidesteps it by **sequencing** init's children (the demo runs to
-completion before eshell launches), so only one disk consumer is live. The proper fix —
-queue IRPs in the driver (a software command queue, or AHCI NCQ with multiple slots) so
-concurrent submissions serialise correctly instead of clobbering — is deferred to the
-storage hardening in Phase 3 (RW + writeback already pull on the driver). Trigger: any
-two processes doing concurrent block I/O.
+**AHCI NCQ (multiple in-flight commands).** The driver issues **one command at a time**
+(slot 0). The *contention* this used to cause is resolved — concurrent submits from
+different clients queue in a software FIFO in front of slot 0 (`PendingRing`, 2026-07-20)
+instead of clobbering the in-flight IRP, and the demo/login sequencing that worked around
+it has been lifted. What remains is **throughput**: letting the controller run up to 32
+commands at once across the command list. The software queue's depth is already
+`PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly. Trigger: an I/O-latency-bound
+workload (an SSD, or many concurrent readers).
 
 **Stateless `File::ReadRange` fill (slice 8 Part 3).** A page-cache fill names its
 file by re-sending the path `suffix` on every `ReadRange` (the same suffix the lazy
@@ -265,16 +232,6 @@ showing up in a profile. (Note: read-ahead also multiplies the per-fill disk I/O
 which interacts with the AHCI single-command limit above — both want the same
 Phase-3 storage-hardening pass.)
 
-**Forwarded-lookup concurrency (N = 1).** A Userspace Server's
-`UserspaceServerReg` (slice 7 Part 3) holds a single pending-lookup slot: one
-forwarded `sys_ns_lookup` per server may be outstanding; a second returns
-`WouldBlock`. The milestone init path issues lookups serially, so N = 1 suffices.
-Raising it to a small fixed array (correlating replies by the already-present
-`request_id`) is a localized change — done when boot issues overlapping lookups
-(Part 4 if needed). The reply completion is **inline-in-send** (no DPC) because
-`run_pending` drains only at the interrupt-dispatch tail — see the decision log
-(2026-06-25, slice 7 Part 3).
-
 ### Networking
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
@@ -300,28 +257,6 @@ Raising it to a small fixed array (correlating replies by the already-present
 **Encrypted root (LUKS).** Architecture accommodates this — LUKS is a block device filter driver in initramfs; init invokes it before spawning fs-server. Not in initial scope. Trigger: encrypted-root deployment.
 
 **LVM / software RAID at early boot.** Same architectural accommodation as LUKS. Initial scope is direct partition mounts.
-
-**File truncate — DONE (2026-07-24).** Was: the filesystem could create and grow a file
-but never shrink one, so `copy --force` refused to overwrite a longer destination rather
-than leave the old tail behind. Now: `sys_file_truncate` → `RESOLVE_TRUNCATE` →
-`ext4::truncate_file`, kernel-forwarded (not a directory-session op) because the kernel
-owns the page cache and mints the `FileObject` from the reply's size. See the decision log
-(2026-07-24).
-
-**Reclaiming a process's handles at exit — DONE (2026-07-24).** Was: nothing swept the
-global `HandleTable` at process exit, so a dead process's entries pinned their objects and
-its pipe endpoints never closed (a peer never saw `PeerClosed`). Implemented as a marked
-thread + a batched sweep in `reap_pending`; see the decision log (2026-07-24) and
-`docs/architecture/handle-system.md` § Releasing a process's handles at exit. The
-`next_owned` intrusive list stays unbuilt — the sweep scans segments instead, and the list
-remains the optimization if that ever becomes measurable.
-
-**Wall-clock time — DONE (2026-07-24).** Was: `sys_clock_read` serviced `Monotonic` only
-and the fs-server wrote no inode timestamps, so anything the OS created reported
-`modified: 0`. Now: the kernel anchors `CLOCK_REALTIME` from the CMOS RTC at boot
-(`kernel/src/clock.rs`) and the fs-server reads it to stamp inodes. Reading is ambient;
-**setting** the clock is not built — it is real authority and belongs behind a syscap when
-NTP or `date --set` needs it. See the decision log (2026-07-24).
 
 **`mtime` on an in-place overwrite.** The fs-server stamps inodes on create, grow, mkdir,
 unlink, rmdir and rename — every operation that passes through it. It is **not** told about
@@ -349,39 +284,68 @@ code, riding the native ABI (libos/libstream stay the capability-native API for 
 subset, `x86_64-unknown-nitrox.json`) is **consumer-driven** — it lands with portable programs / the
 browser, not as a desktop-MVP gate. See the decision log (2026-07-20; supersedes 2026-07-13).
 
+**Dynamic linking.** Everything is a **static, non-PIE `ET_EXEC`** today: the kernel ELF
+loader rejects `ET_DYN` and `PT_INTERP` outright, and each program carries its own copy of
+everything it uses. At present that is *right* — the shipping binaries are 13–73 KB
+(`no_std` + `alloc`, hand-rolled runtime), so a loader would cost complexity and save
+nothing.
+
+**It stops being right at the GUI toolkit**, for a reason worth stating precisely: static
+linking defeats page sharing exactly where sharing would pay. Shared file-backed text
+(planned as B4a) shares pages across *instances of one program*, because it maps the same
+`FileObject`. Two different statically-linked apps that both embed the toolkit hold
+byte-identical code in **different files**, so they share nothing — not through B4a, not
+through CoW, and not through the content-addressed store, which dedupes whole files. Five
+apps each embedding a 2–5 MB toolkit is 10–25 MB of duplicated, unshareable text on a
+256 MB machine. Dynamic linking is what extends B4a's sharing *across* programs; B4a is
+what makes a loaded library shareable at all (without file-backed mapping, loading a `.so`
+would eagerly copy it per process — the complexity with none of the benefit).
+
+What it needs, roughly in order:
+
+1. **Thread-local storage first.** The dynamic TLS models need `FS_BASE` /
+   `sys_thread_set_tls`, which is itself deferred in the `std` cluster. Hard prerequisite.
+2. **Kernel: accept `ET_DYN` + `PT_INTERP`** — map the interpreter and enter it instead of
+   the program. User-space ASLR already supplies the base randomization PIE wants (28 bits
+   for ELF/stack/mmap).
+3. **A userspace `ld.so`**: map segments (over B4a's file-backed path), walk the dependency
+   graph, process relocations (`RELATIVE` / `GLOB_DAT` / `JUMP_SLOT`), resolve symbols, run
+   init/fini arrays.
+4. **An ABI answer, because Rust has no stable ABI.** Two viable shapes: a **C ABI seam**
+   at the library boundary (`extern "C"`, `#[no_mangle]`) — stable across compiler versions
+   but awkward for Rust-to-Rust calls; or **whole-system build coherence** — one pinned
+   compiler, everything in a generation rebuilt together, Rust ABI used freely within it.
+   The **content-addressed store + generations makes the second genuinely viable here** in a
+   way it is not on a conventional distro: a generation already *is* a coherent closure, and
+   a toolchain bump is just a new generation. Recommended shape: coherence as the default,
+   with a deliberate C seam only where a plugin boundary needs to outlive a rebuild.
+
+The store and profile layers already anticipate this — `content-addressed-store.md` reserves
+`lib/<library>` and `profiles-and-namespace-projection.md` designs `/lib`, both explicitly
+"once dynamic linking exists".
+
+**Scheduled with the GUI toolkit milestone**, alongside the process-memory-model bundle.
+Sequencing note: do not build the loader speculatively, but **decide the toolkit's ABI seam
+when the toolkit is designed** — retrofitting three shipped apps is far worse than starting
+them right. Natural trigger: the second or third GUI app, i.e. the point where one library
+would be resident more than once.
+
 **POSIX compatibility shim.** Optional future. Translates POSIX calls to handle-based equivalents. Enables ported C software without native rewrites. Not a design constraint; the native interface design doesn't bend to accommodate POSIX. Trigger: a must-have C dependency (target the pure-Rust ecosystem first — see the 2026-07-20 std stance).
 
 ### Resource servers (in-kernel)
-
-**Numeric `/proc/self/{pid,tid}` (`/proc/self/status`).** Slice 3 ships the
-`/proc/self/{process,thread,namespace}` Kernel Servers (handles to the caller's own
-objects) but **not** numeric pid/tid. pid/tid are *attributes* of the `Process`/`Thread`
-objects a caller now holds, so the eventual mechanism is itself an open choice — a
-**synthesized read-only `MemoryObject` snapshot** (`/proc/self/status`) vs. **extending
-handle introspection** (`sys_handle_stat` returns only type/rights/generation today).
-The MemoryObject route needs a *synthesis primitive* first (allocate a frame, write
-kernel bytes via the HHDM, hand back `MAP_READ`-only) — a reusable building block worth
-designing deliberately. **Rejected** alternative: extending the namespace-lookup
-contract to return a scalar in `IoResult.result` (a permanent per-path
-handle-vs-value ambiguity / footgun). Trigger: a real consumer of numeric pid/tid
-(e.g. logging infra), or the first synthesized read-only snapshot (`/proc/self/status`)
-that forces the primitive. See the decision log (2026-06-22).
-**Done (Phase 3, the `/proc/sched/stats` slice).** The trigger fired from the snapshot
-side: the Phase 3 clause-3 scheduler-stats surface pinned the primitive down as the
-**capture → format → synthesize** discipline (copy `Copy` data under the owning lock;
-format via `KString` with no lock held; `MemoryObject::try_new_filled` — see
-`docs/architecture/scheduler.md` § "The stats surface"), and `/proc/self/status`
-shipped as its second consumer (`KernelServerId::ProcSelfStatus`, `pid=`/`tid=` rows
-from the calling syscall context). The handle-introspection extension was not needed.
 
 **`/dev` directory stub (enumerable placeholder).** Slice 5 gives `DeviceNode` a
 real kernel struct (PCI-discovered nodes; block disks resolve via
 `KernelServerId::BlockDevice` at `/dev/blk`), but there is still **no enumeration
 syscall** (`ENUMERATE` is defined but unused) and **no listable `/dev` directory**
 — lookups resolve a known path to a node; nothing enumerates the children of
-`/dev`. A directory-listing surface is deferred until a device manager (slice 7)
-or a real enumeration consumer exists. Trigger: either of those. See the decision
-log (2026-06-22, 2026-06-23).
+`/dev`. A directory-listing surface was deferred until a device manager or a real enumeration
+consumer existed. **The consumer now exists**: `list` (coreutils Milestone 1) makes
+`list /dev` a day-one shell command, and `sys_ns_enumerate` is built but has no user. The
+open design question is how a listing tool chooses between *namespace enumeration* (what
+`/dev` needs — it is kernel-served) and an *fs-server directory session* (what `list` uses
+today). Scheduled as **D3 of the pre-CLI substrate-hardening pass**
+(`docs/planning/phase-4-desktop.md`). See the decision log (2026-06-22, 2026-06-23).
 
 ### Runtime libraries
 
@@ -403,12 +367,17 @@ Trigger: that second consumer, or a drift bug.
 
 **iovec-style scatter/gather user access.** All current copy primitives operate on contiguous buffers. Scatter/gather (vectored I/O equivalents) isn't initially needed. Trigger: a syscall whose performance benefits from it.
 
+**Per-thread CPU accounting (`ProcessCpu` / `ThreadCpu` clocks) — `TODO(sched-acct)`.**
+`sys_clock_read` services `Monotonic` and `Realtime`; the two CPU-time clocks return
+`Unsupported` because the scheduler does not accumulate per-thread run time. The natural
+home is the context switch (charge elapsed monotonic time to the outgoing thread) plus a
+per-`Process` roll-up on reap. Trigger: profiling or accounting that needs CPU time rather
+than wall time — a `time` builtin, per-process scheduler statistics beyond the existing
+`/proc/sched/stats`, or rlimits (which need CPU-time accounting to enforce a CPU limit).
+
 **vDSO-equivalent for `sys_clock_read`.** On modern Linux, `clock_gettime` is implemented in vDSO — userspace reads TSC directly, no syscall. Nitrox initially does one syscall per `sys_clock_read`. The API shape leaves room for this optimization later (the `ClockId` enum can map to fixed memory locations) without changing call sites.
 
 ### Concurrency primitives
-
-**General deferred object reclamation from a `SCHED`/IRQ context.** Code running under the rank-1 `SCHED` lock (or, later, in an IRQ before the scheduler lock is taken) cannot drop an `ObjectRef`/`TransferRef`: object destruction may take a lower-rank lock (e.g. the buddy allocator frees a `MemoryObject`'s frames), which must not nest under `SCHED`. The first concrete instance — a `BlockBounded` IPC send timing out in the timer tick (2026-06-12) — is handled *locally* with **reclaim-on-recv**: the timeout only tombstones the held send (completing its PO `TimedOut`); the actual refs are swept out and dropped outside `SCHED` on the next `recv` (or at channel close). That works because a channel still being received on (or eventually closed) always reaches a safe drop point. The **general** mechanism — a deferred-free list drained at a safe point outside the lock, the DPC queue being its natural vehicle — is deferred until a consumer needs reclamation with no such natural drain (e.g. device-I/O request cancellation, where the completion/cancel runs in a DPC). Trigger: such a consumer; until then per-path reclaim (reclaim-on-recv, `Inner`-drop-at-close) suffices. See the decision log (2026-06-12).
-**Done in essence (2026-07-21, review fix F2):** the trigger fired from the entropy seed-wake path (the timer tick had no natural drain point and was dropping the refs under `SCHED`, a deadlock hazard). The mechanism landed as `SchedState::deferred_drops` — a pre-reserved move-only parking list drained by `reap_pending` in thread context (not the DPC queue: DPC handlers also may not free). Future SCHED/IRQ-context producers reuse it within its reserve.
 
 **SMP panic path: unsynchronized emergency serial, no stop-IPI (review F8).** The
 panic/exception handlers write through `serial::emergency_writer()` — lock-free by
@@ -424,43 +393,103 @@ a diagnostics-quality issue today; revisit with real-hardware bring-up or when a
 flaky-boot investigation is hampered by garbled panic output. From the 2026-07-21
 substrate review (decision log).
 
+**Explicit grace-tracker quiescence on the syscall path — `TODO(smp)`.** The handle
+table's deferred-close reclamation waits for a grace period tracked per *context id*, and
+`current_ctx_id()` returns **0 in production builds** — every CPU shares one context. Today
+nothing depends on the distinction: every handle syscall routes through a `HandleTable`
+method that takes and drops a read guard, marking the context quiescent on drop, so
+deferred closes are reclaimed on the next allocate/close. The `TODO(smp)` marks the case
+that would break it — a syscall path that touches the table *without* going through such a
+method, or a real per-CPU context id where one CPU's quiescence no longer implies
+another's. **Worth an explicit look during the pre-CLI hardening pass** rather than
+carrying as a comment: the sweep added for exit-time handle reclamation (2026-07-24) is a
+new writer on this path. Trigger: that review, a per-CPU `ctx_id`, or a non-method table
+access.
+
 **Priority inheritance for userspace synchronization.** Userspace mutex/condvar implementations built on `sys_wait` don't initially address priority inversion. Trigger: a real-time workload where priority inversion is a problem.
 
 **Deadline scheduling (EDF) as a fourth scheduler class.** RealTime class uses fixed priority, not EDF. Adding EDF is possible without architectural changes — fourth scheduler class. Trigger: a workload that benefits.
 
-**Per-process resource limits (rlimits).** Handle table has a per-process soft cap. CPU time, file descriptor count beyond the global handle cap, process count, memory consumption — none of these have explicit limits initially. The capability model plus the OOM daemon provide partial substitutes. Trigger: deployment scenarios with untrusted multi-tenant workloads.
-
 ### Memory management
+
+**The process memory model — one pass, four parts.** These extend the same AS/fault
+machinery and should land together rather than as four independent entries each waiting on
+the others:
+
+1. **Copy-on-write, private file-backed data.** `MappingKind` has only
+   `Anonymous`/`FileBacked` — no private/CoW kind — so a writable `PT_LOAD` cannot be
+   mapped from the image. Needs a CoW fault path plus refcounted shared frames.
+2. **Lazy `MemoryObject` backing.** `sys_memory_create` allocates and zeroes **every**
+   frame eagerly, which is why `MemoryObject::MAX_SIZE` (16 MiB) exists at all — a DoS
+   guard, not a designed ceiling. The `#PF` half of the gate is already closed
+   (`AddressSpace::fault_in` + `map_vma_lazy`, 2026-06-12); what remains is a sparse
+   per-page frame table allocated on fault.
+3. **Per-process resource limits (rlimits).** CPU time, process count, committed memory —
+   none are bounded today. Lifting `MAX_SIZE` *requires* this: the cap is what currently
+   stands in for accounting.
+4. **User-stack guard page + grow-down stacks.** The loader reserves a fixed 4-page stack
+   with **no guard page**, so an overflow runs into whatever VMA sits beneath it. Kernel
+   thread stacks already have the discipline (vmap: 16 KiB + 1 guard page); this is the
+   userspace counterpart.
+
+**Shared read-only text is *not* in this bundle** — it needs no CoW (the existing
+`FileBacked` kind suffices) and is scheduled as **B4a of the pre-CLI substrate-hardening
+pass** (`docs/planning/phase-4-desktop.md`). One design constraint it exposes and this
+bundle inherits: every resolve mints a **fresh `FileObject` with its own page cache**, so
+sharing across instances requires the spawner to reuse one image handle per program (or,
+later, inode-keyed global caching).
+
+**Trigger for the bundle:** the GUI toolkit / desktop-apps milestone — several apps linking
+one toolkit, with real `.data`/`.bss` and enough concurrent instances that private copies
+and eager allocation start to matter — or, earlier, a profile showing spawn latency or RSS
+bound. Without `fork`, CoW's only consumer is the ELF data segment, which after B4a is a
+few KB per process; that is why this is scheduled rather than urgent.
 
 **NUMA-aware scheduling and memory allocation.** Architecture does not preclude NUMA but does not exploit topology. Single buddy allocator zones, scheduler treats all CPUs as uniform, work stealing ignores topology. Trigger: NUMA hardware where the lack of awareness is producing measurable problems.
 
-**Per-CPU slab caching.** Phase 1's slab allocator uses a single global spinlock per cache. SLUB's per-CPU optimisation (a `current_slab` pointer per CPU, with the cache lock taken only on slow paths) is structurally compatible with the existing state machine but requires per-CPU infrastructure that doesn't exist yet. Trigger: SMP bring-up in Phase 3 introduces per-CPU areas; the slab fast path migrates onto them at that point.
+**Per-CPU slab caching.** Phase 1's slab allocator uses a single global spinlock per
+cache. SLUB's per-CPU optimisation (a `current_slab` pointer per CPU, the cache lock taken
+only on slow paths) is structurally compatible with the existing state machine. **Its
+original trigger — "SMP bring-up introduces per-CPU areas" — has fired** (SMP landed in
+Phase 3 and per-CPU areas exist), and it was not done, so this is now carried on a
+performance trigger instead: allocator contention showing up in a profile, or a workload
+where several CPUs allocate hard concurrently.
 
 **Empty-slab reclamation back to the buddy.** Once a slab cache grows by one page, that page stays with the cache forever. Production kernels reclaim wholly-empty slabs after a watermark; Nitrox doesn't yet. Trigger: long-running workloads where slab churn produces visible memory bloat, or memory-pressure handling (the OOM daemon) needs a hook to drain caches.
 
-**Alignment greater than `SLAB_SIZE` (4 KiB) in `kmalloc`.** `kmalloc(_, align)` for `align > SLAB_SIZE` returns null (the slab's descriptor-at-byte-0 trick relies on the user pointer staying in the first page of the buddy block; larger alignments push it into later pages and break the recovery). As anticipated, the one client that needs it — **DMA buffers** — got a separate path rather than a `kmalloc` extension: [`mm::dma::DmaBuffer`](../../kernel/src/mm/dma.rs) (2026-06-12, `phase-2/dma-alloc`) allocates a power-of-two block straight from the buddy (whose order-`k` blocks are aligned to `2^k × PAGE_SIZE`), zeroes it, and exposes the **physical address** + contiguity a device needs. So `kmalloc` itself keeps the cap; this is a non-issue now (no remaining client wants `> SLAB_SIZE` alignment from `kmalloc`).
-
 **DMA / Normal zone split in the buddy.** The buddy treats every Usable frame above 1 MiB as a single pool — `DmaBuffer` returns whatever block the buddy gives, with no address-range constraint. A below-16 MiB (ISA-DMA) or below-4 GiB (32-bit-only PCI) zone would only matter for a device that **cannot** do 64-bit DMA, which the project's **no-legacy ≈2014 / x86-64-v2 baseline excludes** (modern AHCI advertises `CAP.S64A`); the dev loop's 256 MiB of RAM is sub-4 GiB regardless. Trigger: a real driver that genuinely needs an address-constrained zone (none foreseen). When it lands, `DmaBuffer::alloc` grows a max-physical-address (DMA-mask) parameter and the buddy a zoned free-list. See the `TODO:` comment in `kernel/src/mm/buddy.rs`.
+
+**Partial / splitting `sys_memory_unmap` — `TODO(mm)`.** The syscall takes `(addr, size)`
+but **ignores `size`**: it unmaps the whole VMA covering `addr`. So an unmap of part of a
+mapping silently unmaps all of it — the caller asked for less and got more, with no error.
+Every caller today maps and unmaps whole objects, so it has not bitten, but it is a
+footgun rather than a limitation. Honouring `size` means splitting a VMA (and, for a
+file-backed one, adjusting the cache-page range), which the VMA tree does not do yet.
+Trigger: any caller that unmaps a sub-range — an allocator returning part of an arena, or a
+`std`-style `munmap`. Until then the argument should arguably be rejected when it does not
+cover the whole VMA, rather than ignored.
 
 **Reclaiming empty intermediate page tables on unmap.** `ArchPaging::unmap_page` clears the leaf entry but leaves the PDPT/PD/PT frames it walked through allocated, even when an unmap empties one. Reclaiming them needs a per-table populated-entry count (or a 512-slot scan on every unmap). Phase 1 runs a single address space with little mapping churn, so the leak is negligible. See the `TODO:` comment in `kernel/src/arch/x86_64/paging.rs`. Trigger: address-space teardown (process exit) or `munmap`-heavy workloads make the retained tables a measurable cost.
 
-**Lazy (demand-paged) `MemoryObject` backing.** `sys_memory_create` allocates and zeroes **every** frame eagerly, up front (`MemoryObject::try_new` → one `buddy_alloc(0)` per page). That is why the syscall imposes a `MemoryObject::MAX_SIZE` cap (16 MiB in Phase 1): with eager allocation, a single large create commits that much physical RAM at once and runs an unpreemptable allocate-and-zero loop, which on a small VM (QEMU `-m 256M`, no swap, cooperative scheduler) could exhaust the buddy or stall the machine. The cap is a denial-of-service guard, **not** a designed ceiling — Linux (`mmap(MAP_ANONYMOUS)`/`memfd`) and Windows (pagefile-backed section objects) impose no per-allocation byte limit because they are lazy: reserve the range, fault in demand-zero pages on first touch, and bound the total with system-wide accounting (overcommit policy / `RLIMIT_AS` / cgroups; the commit limit). The real fix is the same here — reserve the object + its VMA cheaply and allocate frames in the page-fault handler on first access — at which point the per-call cap is replaced by per-process committed-memory quotas + address-space limits enforced through the capability model. **The `#PF`-handler half of that gate is now closed** (demand-paging slice, 2026-06-12): `AddressSpace::fault_in` resolves not-present user faults against the VMA tree and `map_vma_lazy` reserves anonymous ranges without backing them — the ELF loader already reserves stacks this way. What remains for *objects* is making `MemoryObject` itself lazy (a sparse per-page frame table, allocated on fault rather than at `try_new`) plus `Process`-level resource accounting (see "Per-process resource limits (rlimits)" above); only then can the `MAX_SIZE` cap be lifted. Trigger: a workload needing objects larger than the cap. Until then, raising the constant only moves the DoS threshold, so it stays small and tied to eager allocation.
-
-**User-stack guard page + grow-down stacks.** The ELF loader reserves a fixed **4-page** user stack (`DEFAULT_USER_STACK_SIZE`) and, as of the demand-paging slice (2026-06-12), backs it lazily via `map_vma_lazy` — each page faults in on first touch. There is **no guard page** below it: a stack overflow runs straight into whatever VMA sits beneath the reservation (today nothing, but eventually the mmap window), silently corrupting it instead of faulting. The demand-paging machinery is exactly what a real stack wants — a larger grow-down reservation with an **unmapped guard page** (and, optionally, demand-growth: a fault just below the current stack extends it rather than SegFaulting). Deferred deliberately: at 4 pages the guard page buys little and the stack size is a placeholder. Trigger: **"real" userspace processes with realistic (larger) stacks** — at that point give the loader/thread-spawn path a guard page below each stack and decide whether to support automatic grow-down. The kernel-thread stacks already have this discipline (vmap allocates 16 KiB + 1 guard page — see `docs/architecture/memory-management.md`); this is the userspace counterpart.
-
-**Range TLB invalidation and cross-CPU shootdown.** `ArchPaging` exposes `flush_tlb_page` (one page) and `flush_tlb_all` (a CR3 reload). There is no range flush — a bulk unmapper issues one `flush_tlb_page` per page — and no cross-CPU shootdown IPI. Phase 1 is single-CPU, so a local flush is a complete flush. Trigger: SMP bring-up (Phase 3) makes a stale TLB entry on another CPU a correctness bug; a `flush_tlb_range` and a `send_shootdown_ipi` land with the per-CPU and IPI infrastructure.
+**Range TLB invalidation (`flush_tlb_range`).** `ArchPaging` exposes `flush_tlb_page`
+(one page) and `flush_tlb_all` (a CR3 reload), so a bulk unmapper issues one
+`flush_tlb_page` per page. The **cross-CPU shootdown is built** (substrate hardening Parts
+B/C, 2026-07-21: `tlb::shootdown`, IF-robust, broadcast on user-page unmap) — only the
+*range* form is missing. Trigger: an unmap path whose per-page flush loop is measurable
+(large `munmap`, address-space teardown).
 
 **Debug-build lock-ordering enforcement.** `kernel/CLAUDE.md` documents that debug builds will track acquisition order and panic on violations. The mechanism doesn't yet exist; the only lock-ordering enforcement today is code review and `kernel/docs/lock-ordering.md`. Trigger: enough locks exist that the cost of building the rank-tracker outweighs the cost of a missed bug.
 
 ### Testing and CI
 
-**Kernel host-side unit tests.** Phase 0 ships without host-side tests for kernel code. The kernel crate is `#![no_std]` / `#![no_main]` against `x86_64-unknown-none` with `panic = "abort"`; making it host-testable requires splitting into `lib + bin` with conditional compilation. The current Phase 0 kernel has roughly thirty lines of testable arithmetic (`pick_scale`, `text_width`, `Rgb::pack`) that will be replaced when the PSF loader and a proper console land on top of an allocator. Trigger: Phase 1 lands code with real, non-throwaway host-testable logic (handle table operations, namespace resolution, ABI encoding/decoding — all called out in `kernel/CLAUDE.md` as candidates).
-
-**`xtask test` subcommand.** The convention is that `cargo xtask test` runs host-side tests for the OS we are building. With no host-testable kernel/userspace code in Phase 0, a stub subcommand would be ceremony. Trigger: same as above — when there is something to run, the subcommand lands alongside it.
-
 **`xtask test-qemu` integration harness.** ~~A QEMU integration test today would amount to a single "did the kernel reach the end of `kernel_main`?" smoke via `isa-debug-exit`.~~ **Implemented 2026-07-14** (Phase 3, after the storage/fs/SMP stack gave real regression surface — the SMP migration hazard was caught by a boot loop, not a unit test). `cargo xtask test-qemu` boots the `test-harness` build headless and adjudicates the whole boot from QEMU's `isa-debug-exit` exit code. The self-test payload (`selftest` feature) *is* the suite; a per-case framework under `tests/qemu-tests/` remains deferred (trigger: a test that needs to assert something the boot chain doesn't already exercise). See `docs/conventions/qemu-integration-tests.md`.
 
-**Image assembly and QEMU smoke in CI.** Phase 0 CI runs `cargo xtask build` only. Adding `cargo xtask image` would exercise the sgdisk + mtools path; adding a QEMU smoke run would exercise the boot path. Both are deferred until there is meaningful regression surface beyond the build itself. Trigger: Phase 1 boot path complexity warrants it.
+**Per-case QEMU test framework (`tests/qemu-tests/`).** `cargo xtask test-qemu` adjudicates
+the *whole boot* from one `isa-debug-exit` verdict — the self-test payload is the suite, and
+CI runs it (2026-07-24). A per-case framework, where an individual test asserts something
+the boot chain does not already exercise, remains deferred. Trigger: a case that cannot be
+expressed as "the boot completes and the harness agrees". See
+`docs/conventions/qemu-integration-tests.md`.
 
 **`libkern` mock-syscall test mode.** `userspace/libkern/CLAUDE.md` describes a feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
 
@@ -468,16 +497,43 @@ substrate review (decision log).
 
 **Comprehensive systemwide tracing infrastructure (DTrace/eBPF equivalent).** Per-CPU ring buffers for kernel tracing exist in concept. A full programmable tracing facility (DTrace probes, eBPF-style filters, etc.) is out of scope initially. Trigger: deep performance analysis needs that exceed what `kprintln!` and basic tracing handles.
 
+## Resolved (kept for the record)
+
+Entries that have been **done**, listed here rather than left in the open sections above —
+scanning "what is still owed" has to be reliable. The reasoning for each lives in the
+decision log entry for the date shown.
+
+| What was deferred | Resolved | How |
+|---|---|---|
+| x2APIC | 2026-06-26 | Built — and **x2APIC-only**, not dual-mode: the ≈2014 baseline guarantees it, so no xAPIC fallback is carried. The dev loop runs QEMU ≥ 9.0. |
+| Concurrent direct-block + forwarded-lookup hang | 2026-07-20 | Not the block/forwarding path — a missing cross-CPU wake; fixed by the reschedule IPI. |
+| Writeback IRPs | Phase 3 | Dirty-page writeback landed with read-write `fs-server-ext4` (`FileObject::writeback` / `sys_file_sync`). |
+| File-size discovery via `sys_handle_stat` | 2026-06-27 | `HandleInfo` gained `size: u64`; the lazy resolve grants `INSPECT`. |
+| Forwarded-lookup concurrency (N = 1) | Phase 2/3 | `US_PENDING_MAX = 8` outstanding forwarded lookups, correlated by `request_id`. |
+| File truncate | 2026-07-24 | `sys_file_truncate` → `RESOLVE_TRUNCATE` → `ext4::truncate_file`, kernel-forwarded so the page cache stays coherent. |
+| Reclaiming a process's handles at exit | 2026-07-24 | Marked thread + a batched sweep in `reap_pending`; `next_owned` stays unbuilt (the sweep scans). |
+| Wall-clock time | 2026-07-24 | `CLOCK_REALTIME` anchored from the CMOS RTC at boot; the fs-server stamps inodes. Setting the clock stays unbuilt — see the open entry. |
+| Numeric `/proc/self/{pid,tid}` | Phase 3 | The capture → format → synthesize primitive landed with `/proc/sched/stats`; `/proc/self/status` was its second consumer. |
+| General deferred object reclamation from `SCHED`/IRQ context | 2026-07-21 | `SchedState::deferred_drops`, drained by `reap_pending` in thread context (review fix F2). |
+| `kmalloc` alignment > `SLAB_SIZE` | 2026-06-12 | Resolved by taking the other path: `mm::dma::DmaBuffer` allocates from the buddy. No remaining client wants it from `kmalloc`. |
+| Kernel host-side unit tests | Phase 1 | The kernel is `lib + bin`; `cargo xtask test` runs the host suite (780+ tests across kernel and userspace). |
+| `cargo xtask test` subcommand | Phase 1 | Exists and runs the whole host suite. |
+| fs-server block I/O in 4 KiB blocks | 2026-07-23 | `DiskReader`'s transfer unit is the 4 KiB block — ~8× fewer device round trips. |
+| Image assembly + QEMU smoke in CI | 2026-07-24 | A second CI job runs `xtask test-qemu` (which builds the image), with OVMF/gdisk/mtools/e2fsprogs installed. It had been deferred "until there is meaningful regression surface"; every Milestone 1 regression was caught by this gate and none would have failed the other jobs. |
+| `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
+
 ## How to use this document
 
 When you encounter something that seems unimplemented or absent, check this document first. If it's listed here, the absence is intentional; the reasoning is preserved. If it's not listed here and you think it should be, consider adding an entry — the document is append-only-with-revisions, not a static snapshot.
 
-If you're triggering a deferred item (starting work on TCP/IP, beginning aarch64 port, etc.), update this document at the same time. The deferred entry should either be removed (if the work is being done) or updated with a status note.
+If you're triggering a deferred item (starting work on TCP/IP, beginning aarch64 port, etc.), update this document at the same time. The deferred entry should **move to the Resolved table**, not be left in place with a status note appended — an open section that mixes finished work with owed work cannot be scanned, which is how three deferrals went unnoticed until a consumer tripped over them (the 2026-07-24 audit).
+
+**A deferral only exists if it is in this document.** The three gaps that cost the most to
+rediscover — exit-time handle reclamation, the wall clock, file truncate — were each
+"recorded" somewhere else: a sentence in an architecture doc promising a later slice, a
+`TODO(...)` in the syscall table, a bullet in a crate's `CLAUDE.md`. None was in this list,
+so none was ever reviewed. If you write a stub, a `TODO`, or prose that promises future
+work, mirror it here. `cargo xtask check-deferrals` enforces the `TODO(tag)` half of that
+mechanically.
 
 The decision log (`history/decision-log.md`) is the place to record the actual decision when a deferred item moves into active work — what triggered it, what the implementation approach is, when the decision was made.
-
-**ELF-image load: copy vs. mapping the frames into a kernel VMA.** `sys_process_spawn` receives the program image as a `MemoryObject` handle, but the in-kernel ELF loader (`load_elf`) needs one **contiguous** `&[u8]`, while a `MemoryObject`'s frames are one-per-page and physically discontiguous. Today `MemoryObject::copy_to_kvec` copies the object's pages into a contiguous heap buffer, which `load_elf` then consumes + frees. **Preferred long-term (the maintainer's stated preference):** map the object's frames into a temporary contiguous **kernel VMA** and load from that view, avoiding the copy. Deferred because the copy is simple and cheap at slice scope (program ELFs are tens of KB; spawn is not a hot path), and the map path wants a small kernel-side temporary-mapping helper (kvmap of an arbitrary frame list) that doesn't exist yet. Trigger: large images make the copy visible, or the kvmap helper lands for another reason.
-
-**Demand-paged, file-backed ELF loading (shared text + copy-on-write data).** Today `sys_process_spawn` materializes a program image **eagerly**: `MemoryObject::copy_to_kvec` / `FileObject::read_to_kvec` read the *whole* file into a contiguous kernel buffer, and `load_elf` then `copy_nonoverlapping`s each `PT_LOAD` segment into freshly-allocated **`Anonymous`** child frames. So a store program's bytes are copied twice after the disk read, every page is loaded whether touched or not, and every instance gets its own private copy of even read-only text. The real model (what `execve`/`mmap` do) is **demand-paged, file-backed segments**: map each `PT_LOAD` as a VMA in the child that faults in from the store file lazily — read-only **text** as a *shared* `FileBacked` mapping (all instances share one copy of the `FileObject`'s cache frames; untouched pages never load), **data** as a *private copy-on-write* mapping (initial contents from the file; the first write faults and detaches a private page, so a process cannot corrupt the read-only store or other instances), with the `p_filesz`→`p_memsz` **BSS** tail zero-filled. `MappingKind::FileBacked` already exists (and `sys_memory_map` of a `FileObject` builds one), so shared text is within reach; the gap is **copy-on-write** — `MappingKind` has only `Anonymous`/`FileBacked`, no private/CoW kind — a substantial VMM feature (a CoW fault path + refcounted shared frames). Independent of fs-server RW (the store is read-only either way). Deferred because the eager copy is correct and adequate while binaries are small (tens of KB) and few processes run — the shared-text / lazy-load wins only bite under real memory pressure. **Trigger:** many concurrent instances of one program (a real shell/session spawning commands) or larger binaries make sharing + laziness pay off; it naturally bundles with the other process-memory-model deferrals — **user-stack guard page + grow-down stacks** and **per-process rlimits** above — since they all extend the AS/fault machinery. Stated as the target by the maintainer (store/profile design, 2026-07). Supersedes the narrower "ELF-image load: copy vs. mapping into a kernel VMA" note above — demand-paging removes the kernel-side read entirely.
-
-**fs-server block I/O in 4 KiB filesystem blocks, not 512-byte sectors — DONE (2026-07-23).** The fs-server's `DiskReader`/`BlockWriter` (`userspace/fs-server-ext4/src/main.rs`) issue one `sys_io_submit` + `sys_wait` **per 512-byte sector** (`const SECTOR = 512`; `read_sector`/`write_sector`), and `write_at` does a per-sector read-modify-write for partial sectors. But the filesystem block size is already **4 KiB** (`mke2fs -b 4096`) and the AHCI controller can transfer a whole 4 KiB block in one command — so reading one filesystem block costs **8** device round trips (and 8 completion wakes), and a metadata mutation fans out to dozens. This is what made the same-CPU IRQ-wake-latency bug so visible on a 1-vCPU guest (decision log 2026-07-23): the per-op cost scaled with sector count. Batching the transfer unit up to the 4 KiB filesystem block (aligned reads/writes; read-modify-write at block granularity, or none for a full-block write) cuts wake round trips ~8× on every metadata path. This is also **how real OS block layers behave**: the *addressing* unit stays the device's logical sector (512 bytes on most "512e" Advanced-Format drives, and Linux keeps `sector_t` in 512-byte units), but *actual I/O* is done in page/filesystem-block-sized, block-aligned chunks — both to avoid the read-modify-write penalty an Advanced-Format drive pays on a sub-4 KiB or unaligned write, and for raw efficiency (one 4 KiB transfer beats eight 512-byte ones). Deferred because the fix at 2026-07-23 (a scheduling point at the device-IRQ tail) already collapsed the latency (~128 s → 5.5 s on the stress); the batching is a throughput/efficiency win, not a correctness fix. **Done (2026-07-23, on `phase-4/dir-ops`):** `DiskReader`'s transfer unit is now the 4 KiB block (`IO_BLOCK`), one `sys_io_submit` per block for both read and the write read-modify-write. Verified: `test-qemu` PASS (mount + resolve reads, `usersh` write+verify to `/home`, the mutation demo), KVM boot-loop 10/10. Flagged by Fable 5 during the 2026-07-23 investigation.
