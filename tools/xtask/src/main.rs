@@ -7,6 +7,7 @@
 //!   qemu-debug      build + launch QEMU paused for GDB on :1234
 //!   test            host-side unit tests (kernel lib + tools workspace)
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
+//!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
@@ -97,6 +98,7 @@ fn main() -> ExitCode {
         Some("test-qemu") => cmd_test_qemu(),
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
+        Some("check-deferrals") => cmd_check_deferrals(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -130,6 +132,7 @@ fn print_help() {
            test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
+           check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
            help          show this message\n\
@@ -720,6 +723,83 @@ fn cmd_check_nightly() -> R<()> {
     }
 }
 
+/// Every `TODO(tag)` in the shipping source must have a matching entry in
+/// `docs/rationale/deferred-decisions.md`.
+///
+/// This exists because of a specific, repeated failure: the three deferrals that cost the
+/// most to rediscover (exit-time handle reclamation, the wall clock, file truncate) were
+/// each recorded *somewhere other than* the canonical list — one in an architecture doc,
+/// one as a `TODO` tag in the kernel's syscall table, one in a crate `CLAUDE.md` — so none was
+/// ever reviewed, and each surfaced only when a consumer tripped over it (audit,
+/// 2026-07-24). A `TODO` is a deferral; this makes the code half of that mechanical.
+///
+/// The document must name the tag **literally** — `TODO(msi)`, not just the word "msi" —
+/// because a bare short tag (`mm`) matches half the prose in any technical document, which
+/// would make the check pass without recording anything. Naming it also makes the entry
+/// searchable from the code and vice versa.
+fn cmd_check_deferrals() -> R<()> {
+    let doc_path = repo_root()
+        .join("docs")
+        .join("rationale")
+        .join("deferred-decisions.md");
+    let doc = fs::read_to_string(&doc_path)
+        .map_err(|e| format!("read {}: {e}", doc_path.display()))?
+        .to_lowercase();
+
+    let mut violations: Vec<String> = Vec::new();
+    let mut tags: Vec<String> = Vec::new();
+    for ws in ["kernel/src", "userspace", "tools/xtask/src"] {
+        let src_root = repo_root().join(ws);
+        visit_rs_files_skipping(&src_root, &["target"], &mut |path| {
+            let text = fs::read_to_string(path)?;
+            for (i, line) in text.lines().enumerate() {
+                let Some(rest) = line.split_once("TODO(") else {
+                    continue;
+                };
+                let Some((tag, _)) = rest.1.split_once(')') else {
+                    continue;
+                };
+                // A tag has to be a plain word to be searchable; anything else is prose
+                // that happens to contain the marker.
+                if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+                    continue;
+                }
+                if !tags.iter().any(|t| t == tag) {
+                    tags.push(tag.to_string());
+                }
+                if !doc.contains(&format!("todo({})", tag.to_lowercase())) {
+                    violations.push(format!(
+                        "{}:{}: TODO({tag}) has no entry in deferred-decisions.md",
+                        path.display(),
+                        i + 1
+                    ));
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    if violations.is_empty() {
+        println!(
+            "check-deferrals: {} TODO tag(s) — every one is recorded in deferred-decisions.md ✓",
+            tags.len()
+        );
+        Ok(())
+    } else {
+        let mut msg = String::from(
+            "every `TODO(tag)` must have a matching entry in \
+             docs/rationale/deferred-decisions.md — a deferral only exists if it is in the \
+             canonical list (see that document's closing section):\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        Err(msg.into())
+    }
+}
+
 fn cmd_check_arch() -> R<()> {
     let kernel_src = repo_root().join("kernel").join("src");
     let arch_dir = kernel_src.join("arch");
@@ -1244,6 +1324,15 @@ fn locate_ovmf() -> R<Firmware> {
         (
             "/usr/share/qemu/edk2-x86_64-code.fd",
             "/usr/share/qemu/edk2-i386-vars.fd",
+        ),
+        // Debian/Ubuntu's `ovmf` package has shipped the 4 MB build under these names
+        // since 22.04, and on current releases they are the *only* ones present — the
+        // unsuffixed pair below is older layouts (and the `/usr/share/ovmf/OVMF.fd`
+        // single image at the end is older still). Ordered newest-first so a machine
+        // with both prefers the split pair, which gives a writable VARS store.
+        (
+            "/usr/share/OVMF/OVMF_CODE_4M.fd",
+            "/usr/share/OVMF/OVMF_VARS_4M.fd",
         ),
         (
             "/usr/share/OVMF/OVMF_CODE.fd",

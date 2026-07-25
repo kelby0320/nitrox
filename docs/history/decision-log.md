@@ -8354,3 +8354,73 @@ was captured from it. Host load is an unconvincing explanation — a healthy boo
 about 5 s against a 90 s ceiling, a 20× margin. So it is unattributed, not benign: if a
 hang recurs around the write path, this is the first datapoint, and the boot-loop scripts
 keep the serial log on any non-pass exit.
+
+## 2026-07-24 — The deferral audit: a canonical list, a guard, and CI that runs the gate
+
+**Why.** Three consecutive slices (exit-time handle reclamation, the wall clock, file
+truncate) were spent on gaps a coreutil tripped over. That prompted an audit of every
+deferral across `deferred-decisions.md`, the decision log, the planning docs, and the
+code's `TODO(...)` tags.
+
+**Finding 1 — the gaps that bit us were never recorded as deferrals.** None of the three
+was in the canonical list. Handle reclamation lived as a sentence in `handle-system.md`
+("the `Process` slice wires it up"), the wall clock as a `TODO` in the syscall table,
+truncate as a bullet in `fs-server-ext4/CLAUDE.md`. So the canonical-list *discipline* is
+fine; the leak is **implicit deferrals** — a stub, a TODO, or prose promising a later slice
+— which never reach the list and therefore never get reviewed.
+
+**Finding 2 — the list could not be scanned for what was owed.** Roughly 17 of 96 entries
+described finished work, interleaved with open ones and marked four different ways
+(`DONE`, `RESOLVED`, `Done in essence`, or a paragraph appended). Two were discovered stale
+only by reading the code, after an initial triage that trusted the prose got them wrong:
+
+- **x2APIC** — the entry describes an unbuilt "dual-mode with auto-detection" plan. The
+  kernel has been **x2APIC-only** since 2026-06-26, deliberately carrying no xAPIC
+  fallback. (The maintainer caught this; the triage from the doc had it as "stay deferred".)
+- **Forwarded-lookup concurrency (N = 1)** — `US_PENDING_MAX = 8` for some time.
+
+Also corrected: writeback IRPs (built), the range-TLB entry (the *shootdown* is built; only
+`flush_tlb_range` is missing), the AHCI single-command entry (its stated workaround was
+lifted and `PendingRing` superseded it — only NCQ remains), and per-CPU slab caching (its
+"SMP bring-up" trigger fired and it was not done, so it now carries a performance trigger).
+
+**Changes.**
+
+1. **`deferred-decisions.md` is now open-only**, with a **Resolved** table at the bottom
+   (18 rows). The rule is recorded in the document: a triggered entry *moves* to that table
+   rather than being annotated in place.
+2. **`cargo xtask check-deferrals`** — every `TODO(tag)` in shipping source must have an
+   entry naming that tag literally. It found **four unrecorded deferrals on its first run**,
+   which is the point: `TODO(sched-acct)` (per-thread CPU accounting for the
+   `ProcessCpu`/`ThreadCpu` clocks), `TODO(mm)` (`sys_memory_unmap` **ignores its `size`**
+   and unmaps the whole VMA — the caller asks for less and silently gets more),
+   `TODO(smp)` (explicit grace-tracker quiescence on the syscall path — worth a look now
+   that exit-time handle reclamation added a writer there), and a stray example in xtask's
+   own docs. The literal-tag match is deliberate: a bare short tag like `mm` matches half
+   the prose in a technical document, so a loose check would pass while recording nothing.
+3. **CI runs the QEMU gate.** A second job builds the image and runs `xtask test-qemu`.
+   Until now CI ran only `check-arch`, `check-nightly`, `build`, `test` — so *every*
+   regression caught during coreutils Milestone 1 would have passed CI. `locate_ovmf` also
+   gained the `OVMF_CODE_4M.fd`/`OVMF_VARS_4M.fd` pair, which is the only one current
+   Debian/Ubuntu ships; without it the job would depend on a legacy fallback existing.
+4. **The four process-memory-model entries are bundled into one** (CoW data, lazy
+   `MemoryObject`, rlimits, stack guard pages) — they extend the same AS/fault machinery,
+   and as separate entries each read as waiting on the others.
+
+**Copy-on-write is now scheduled rather than open-ended.** Without `fork`, CoW's only
+consumer is the ELF data segment; after shared read-only text (planned as B4a of the
+pre-CLI hardening pass) the sole remaining eager copy is `.data`, a few KB for a coreutil,
+since a Rust static binary is dominated by `.text`/`.rodata`. It therefore lands with the
+**GUI toolkit / desktop-apps milestone**, alongside the rest of the bundle — or earlier if
+a profile shows spawn latency or RSS bound. A constraint that surfaced while scheduling it:
+every resolve mints a **fresh `FileObject` with its own page cache**, so shared text shares
+nothing unless the spawner reuses one image handle per program.
+
+**The plan this feeds** is recorded in `docs/planning/phase-4-desktop.md` § Pre-CLI
+substrate hardening: four slices before coreutils Milestone 2 — (A) this one, (B) the
+demand-fault path, (C) fs/ext4 completeness for M2, (D) the cheap now-triggered items
+including debug-build lock-ordering enforcement.
+
+*Verified:* `check-deferrals` green (5 tags, all recorded); host suite 782 green;
+`test-qemu` PASS (including through the new `locate_ovmf` ordering); `check-arch` /
+`check-nightly` green.
