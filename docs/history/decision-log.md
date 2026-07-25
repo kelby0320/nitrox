@@ -8476,3 +8476,60 @@ library would otherwise be resident more than once.
 **Process note:** dynamic linking was itself an *implicit* deferral — recorded in the Phase 4
 plan and the decision log but **not** in `deferred-decisions.md`, which is precisely the
 pattern the same-day audit flagged. It now has an entry.
+
+## 2026-07-24 — CI runs the QEMU gate under KVM, and `xtask` preflights the x2APIC floor
+
+The first CI run of the new integration job failed with a guest kernel panic:
+
+```
+*** KERNEL PANIC *** at src/arch/x86_64/apic.rs:141:5
+CPU lacks x2APIC (CPUID.01H:ECX.21) — required.
+```
+
+**Not a kernel bug — a host-tooling floor.** The kernel is x2APIC-only by decision
+(2026-06-26), and QEMU's **TCG only emulates x2APIC from 9.0**. GitHub's `ubuntu-latest`
+ships QEMU **8.2**, so the runner's TCG cannot provide it. The dev box runs 11.0.2, which
+is why this never appeared locally.
+
+**Fix: `xtask … --kvm`, and CI uses it.** KVM's in-kernel APIC has supported x2APIC for
+years, so hardware virtualisation sidesteps the QEMU-version floor entirely — and is
+several times faster, which also serves the boot-loop campaigns the project runs for
+scheduler/fault/lifecycle changes (previously done with an ad-hoc script). The flag applies
+to `qemu`, `qemu-debug` and `test-qemu`; TCG uses `-cpu max`, KVM `-enable-kvm -cpu host`.
+This is precisely the remedy the old x2APIC deferral entry anticipated ("a QEMU-floor bump
+or an opt-in `xtask qemu --kvm`") before that entry went stale.
+
+**And a preflight, so the failure explains itself.** `preflight_accel` runs *before*
+launching: under TCG it parses `qemu-system-x86_64 --version` and refuses below 9.0 with
+the reason; under `--kvm` it requires `/dev/kvm`. A confusing guest panic becomes an
+actionable host message. The CI job also installs `qemu-kvm` and a udev rule widening
+`/dev/kvm` permissions (the runner user is not in the `kvm` group, and a group change would
+not apply to the already-running shell).
+
+`locate_ovmf` additionally learned the `OVMF_CODE_4M.fd` / `OVMF_VARS_4M.fd` split pair,
+which is the only one current Debian/Ubuntu ships.
+
+### A second sighting of the intermittent boot hang
+
+The first `test-qemu --kvm` run **hung** (no verdict, 90 s), then passed twice immediately
+after. This is the **second** sighting of an unexplained intermittent — the first was
+during the truncate slice (2026-07-24), under TCG. What is known:
+
+- **It is not a regression from this branch**, which changes no guest code at all (docs,
+  `xtask`, CI only). Both sightings sit on kernel/userspace trees that otherwise boot
+  cleanly hundreds of times.
+- **It does not reproduce in a loop.** 30 boots with the *exact* argument set that hung
+  (KVM, split firmware, `-m 256M`, `-smp 4`) were clean, on top of ~100 earlier KVM boots
+  and 67 TCG boots across the preceding slices.
+- **Both sightings were the first boot after a rebuild**, which is suggestive but not
+  evidence — the 20× margin between a ~5 s healthy boot and the 90 s ceiling makes plain
+  host load an unconvincing explanation on its own.
+- **Where it stopped:** the KVM hang's last serial line was
+  `service-mgr: parsed service 'heartbeat'` — i.e. deep in userspace, with the filesystem
+  mounted and services starting, so it is not firmware or early boot.
+
+Recorded rather than chased: the observed rate (~2 in ~200 boots) means CI will flake
+occasionally, and if it does, the serial log printed on timeout is the first evidence to
+collect — specifically the last line of progress. A targeted investigation belongs with the
+Slice B fault-path work, which touches the same fs/page-fill machinery the hang's last
+progress point implicates.

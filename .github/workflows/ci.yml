@@ -94,17 +94,28 @@ jobs:
           rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' userspace/rust-toolchain.toml)" \
             --profile minimal --component rust-src --no-self-update
 
-      # The image build needs the GPT/FAT tooling and OVMF firmware; the boot needs
-      # QEMU >= 9.0, because the kernel is x2APIC-only and TCG only emulates x2APIC
-      # from 9.0 (decision log, 2026-06-26). ubuntu-latest currently ships a new
-      # enough QEMU; the version is printed below so a regression is visible in the
-      # log rather than as a mysterious boot failure.
+      # The image build needs the GPT/FAT tooling and OVMF firmware.
+      #
+      # The boot runs under **KVM**, not TCG, and that is a requirement rather than an
+      # optimisation: the kernel is x2APIC-only (decision log, 2026-06-26) and QEMU's
+      # TCG only emulates x2APIC from 9.0, while ubuntu-latest ships 8.2 — under TCG
+      # the guest panics with "CPU lacks x2APIC". KVM's in-kernel APIC has no such
+      # limit, and it is also several times faster. `xtask test-qemu --kvm` preflights
+      # /dev/kvm and fails with that explanation if it is missing.
+      #
+      # The udev rule widens /dev/kvm permissions: the runner user is not in the `kvm`
+      # group, and a group change would not apply to the already-running shell.
       - name: Install QEMU, OVMF and image tooling
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 ovmf gdisk mtools e2fsprogs
+            qemu-system-x86 qemu-kvm ovmf gdisk mtools e2fsprogs
           qemu-system-x86_64 --version
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm-writable.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+          ls -l /dev/kvm
 
       - name: Cache cargo registry and build outputs
         uses: actions/cache@v4
@@ -127,5 +138,5 @@ jobs:
       # unit tests structurally cannot — every regression found during coreutils
       # Milestone 1 was caught here, and none of them would have failed the jobs
       # above. See docs/conventions/qemu-integration-tests.md.
-      - name: cargo xtask test-qemu
-        run: cargo xtask test-qemu
+      - name: cargo xtask test-qemu --kvm
+        run: cargo xtask test-qemu --kvm

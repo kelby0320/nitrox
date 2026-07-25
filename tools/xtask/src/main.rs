@@ -82,7 +82,20 @@ fn main() -> ExitCode {
     // (kernel `boot_selftest` + init's demo chain); without it the build boots straight
     // to userspace. Strip it out before forwarding the rest to QEMU.
     let selftest = rest.iter().any(|a| a == "--selftest");
-    let qargs: Vec<String> = rest.iter().filter(|a| *a != "--selftest").cloned().collect();
+    // `--kvm` runs the guest under hardware virtualisation instead of TCG. Two reasons to
+    // reach for it: speed (a boot loop runs in a fraction of the time), and hosts whose
+    // QEMU predates 9.0 and therefore cannot emulate the x2APIC this kernel requires —
+    // KVM has no such limit. Stripped before the rest is forwarded to QEMU.
+    let accel = if rest.iter().any(|a| a == "--kvm") {
+        Accel::Kvm
+    } else {
+        Accel::Tcg
+    };
+    let qargs: Vec<String> = rest
+        .iter()
+        .filter(|a| *a != "--selftest" && *a != "--kvm")
+        .cloned()
+        .collect();
     let mode = if selftest {
         BuildMode::Selftest
     } else {
@@ -92,10 +105,10 @@ fn main() -> ExitCode {
     let result = match cmd.as_deref() {
         Some("build") => cmd_build(mode),
         Some("image") => cmd_image(mode),
-        Some("qemu") => cmd_qemu(false, mode, &qargs),
-        Some("qemu-debug") => cmd_qemu(true, mode, &qargs),
+        Some("qemu") => cmd_qemu(false, mode, accel, &qargs),
+        Some("qemu-debug") => cmd_qemu(true, mode, accel, &qargs),
         Some("test") => cmd_test(),
-        Some("test-qemu") => cmd_test_qemu(),
+        Some("test-qemu") => cmd_test_qemu(accel),
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
@@ -139,6 +152,9 @@ fn print_help() {
          \n\
          `--selftest` (build/image/qemu) compiles + runs the boot self-tests / demos;\n         \
          without it the build boots straight to userspace.\n         \
+         `--kvm` (qemu/qemu-debug/test-qemu) runs under hardware virtualisation instead\n         \
+         of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG emulates\n         \
+         x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
          Other args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
     );
 }
@@ -352,7 +368,67 @@ fn cmd_image(mode: BuildMode) -> R<()> {
 
 /// Append the machine / CPU / memory / UEFI-firmware flags shared by every QEMU
 /// launch (`qemu`, `qemu-debug`, `test-qemu`) to `qemu`.
-fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
+/// How the guest CPU is executed.
+///
+/// The kernel is **x2APIC-only** (decision log, 2026-06-26), which sets a hard floor on
+/// the host side: QEMU's TCG only emulates x2APIC from **9.0**, so an older QEMU boots to
+/// a kernel panic ("CPU lacks x2APIC"). KVM has no such limit — the in-kernel APIC has
+/// supported x2APIC for years — so `--kvm` is both the fast path and the way to run on a
+/// host whose QEMU is too old to emulate it.
+#[derive(Clone, Copy, PartialEq)]
+enum Accel {
+    /// Pure emulation. Requires QEMU ≥ 9.0 for x2APIC.
+    Tcg,
+    /// Hardware virtualisation (`-enable-kvm -cpu host`). Needs `/dev/kvm`.
+    Kvm,
+}
+
+/// The host QEMU's `(major, minor)` version, or `None` if it could not be parsed.
+fn qemu_version() -> Option<(u32, u32)> {
+    let out = Command::new("qemu-system-x86_64").arg("--version").output().ok()?;
+    let text = String::from_utf8_lossy(&out.stdout);
+    // "QEMU emulator version 9.2.0 (…)" — take the first dotted number.
+    let ver = text.split_whitespace().find(|w| w.contains('.') && w.starts_with(|c: char| c.is_ascii_digit()))?;
+    let mut parts = ver.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next().unwrap_or("0").parse().unwrap_or(0);
+    Some((major, minor))
+}
+
+/// Fail *before* launching if the host cannot give the guest what the kernel requires, so
+/// the operator sees an actionable message instead of a kernel panic from inside QEMU.
+///
+/// This check exists because the failure it replaces was genuinely confusing: a CI runner
+/// with QEMU 8.2 booted to `*** KERNEL PANIC *** CPU lacks x2APIC`, which reads like a
+/// kernel bug and is actually a host-tooling floor.
+fn preflight_accel(accel: Accel) -> R<()> {
+    match accel {
+        Accel::Kvm => {
+            if !Path::new("/dev/kvm").exists() {
+                return Err("`--kvm` requested but /dev/kvm is absent — no hardware \
+                     virtualisation available (nested virt off, or the kvm module is not \
+                     loaded). Drop `--kvm` to use TCG, which needs QEMU >= 9.0."
+                    .into());
+            }
+        }
+        Accel::Tcg => {
+            if let Some((major, minor)) = qemu_version() {
+                if major < 9 {
+                    return Err(format!(
+                        "QEMU {major}.{minor} is too old: TCG only emulates x2APIC from 9.0, \
+                         and this kernel is x2APIC-only (decision log 2026-06-26), so the \
+                         guest would panic with \"CPU lacks x2APIC\". Use `--kvm` (needs \
+                         /dev/kvm) or install QEMU >= 9.0."
+                    )
+                    .into());
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware, accel: Accel) -> R<()> {
     qemu.arg("-M")
         .arg("q35")
         // CPU model = QEMU's `max`: every feature the emulator can provide,
@@ -370,10 +446,20 @@ fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
         // emulates the whole XSAVE path and boots clean. The real hardware path
         // is additionally proven under KVM (`-cpu host`); see the decision log
         // (2026-07-21 floating-point). x2APIC needs QEMU ≥ 9.0. SMP runs `-smp N`.
-        .arg("-cpu")
-        .arg("max")
         .arg("-m")
         .arg("256M");
+    // `max` (TCG) is every feature the emulator can provide; `host` (KVM) is every
+    // feature the physical CPU has. Both are strict supersets of what the kernel asks
+    // for, and both carry x2APIC — under TCG only from QEMU 9.0, which `preflight_accel`
+    // checks before we get here.
+    match accel {
+        Accel::Tcg => {
+            qemu.arg("-cpu").arg("max");
+        }
+        Accel::Kvm => {
+            qemu.arg("-enable-kvm").arg("-cpu").arg("host");
+        }
+    }
     // UEFI firmware pflash drive(s) — split CODE+VARS on modern QEMU, or a
     // single combined image on legacy setups (see `locate_ovmf`).
     for a in firmware_pflash_args(ovmf)? {
@@ -382,11 +468,12 @@ fn qemu_base_args(qemu: &mut Command, ovmf: &Firmware) -> R<()> {
     Ok(())
 }
 
-fn cmd_qemu(debug: bool, mode: BuildMode, extra_args: &[String]) -> R<()> {
+fn cmd_qemu(debug: bool, mode: BuildMode, accel: Accel, extra_args: &[String]) -> R<()> {
+    preflight_accel(accel)?;
     cmd_image(mode)?;
     let ovmf = locate_ovmf()?;
     let mut qemu = Command::new("qemu-system-x86_64");
-    qemu_base_args(&mut qemu, &ovmf)?;
+    qemu_base_args(&mut qemu, &ovmf, accel)?;
     qemu.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-serial")
@@ -408,7 +495,8 @@ fn cmd_qemu(debug: bool, mode: BuildMode, extra_args: &[String]) -> R<()> {
 /// verdict to the `isa-debug-exit` device (init on success/failure, or the kernel
 /// panic handler); QEMU then exits `(verdict << 1) | 1`. A hung boot is caught by a
 /// wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
-fn cmd_test_qemu() -> R<()> {
+fn cmd_test_qemu(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
     let ovmf = locate_ovmf()?;
 
@@ -425,7 +513,7 @@ fn cmd_test_qemu() -> R<()> {
     // fires from outside its process group.
     cmd.arg("--foreground").arg(TIMEOUT_SECS.to_string());
     cmd.arg("qemu-system-x86_64");
-    qemu_base_args(&mut cmd, &ovmf)?;
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
     cmd.arg("-drive")
         .arg(format!("format=raw,file={}", image_path().display()))
         // The guest ends the run by writing its verdict to this port.

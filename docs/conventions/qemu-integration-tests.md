@@ -62,13 +62,35 @@ no emulator-exit backdoor in a shipping build, and it is not in the ABI hash.
 ## Running it
 
 ```
-cargo xtask test-qemu      # exit 0 = pass, nonzero = fail; serial echoed to stdout
+cargo xtask test-qemu        # exit 0 = pass, nonzero = fail; serial echoed to stdout
+cargo xtask test-qemu --kvm  # same, under hardware virtualisation
 ```
 
 It builds a `test-harness` image, runs QEMU with `-smp 4` (so the SMP
 distribution/affinity self-tests are meaningful), `-display none`,
 `-serial stdio`, `-no-reboot`, and the `isa-debug-exit` device, all under a
 `timeout(1)` ceiling.
+
+### Host requirement: x2APIC
+
+The kernel is **x2APIC-only** (decision log, 2026-06-26 — the ≈2014 baseline
+guarantees it, so no xAPIC fallback is carried), which puts a floor on the host:
+
+| Accelerator | Requirement |
+|---|---|
+| TCG (default) | **QEMU ≥ 9.0** — TCG only emulates x2APIC from 9.0 |
+| KVM (`--kvm`) | `/dev/kvm`; any QEMU, since KVM's in-kernel APIC has long supported x2APIC |
+
+On an older QEMU under TCG the guest panics with `CPU lacks x2APIC`, which reads
+like a kernel bug and is not one. `xtask` **preflights** this: it checks the QEMU
+version (TCG) or `/dev/kvm` (KVM) *before* launching and fails with an actionable
+message instead. This is why CI runs `--kvm` — GitHub's `ubuntu-latest` ships
+QEMU 8.2.
+
+`--kvm` is also the fast path, which matters for boot-loop campaigns: the project
+convention for a change touching the scheduler, the fault path, or process
+lifecycle is a KVM boot loop (0/60 has been the bar) on top of a single
+`test-qemu`.
 
 ## Adding coverage
 
