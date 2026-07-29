@@ -107,6 +107,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `32` | `sys_file_grow` |
 | `33` | `sys_file_create` |
 | `34` | `sys_file_truncate` |
+| `35` | `sys_file_rename` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 

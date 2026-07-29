@@ -2024,6 +2024,216 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     code
 }
 
+/// **`rename` — re-pointing a name instead of copying it** (Slice C2).
+///
+/// `copy_demo` proved the filesystem can be *written*; this proves a name can be
+/// **re-pointed**, which is what `move` needs and what copy-then-unlink only approximates.
+/// No file data moves at all: a directory entry changes which inode it names, so a reader
+/// sees either the old name or the new one and never a half-written duplicate.
+///
+/// Checks, in order:
+///
+/// 1. **Within one directory** — the plain case. The new name has the content *and* the old
+///    name is gone; checking only the first would pass for a copy.
+/// 2. **Across directories** — the case `move` actually needs, and the one the ext4 layer
+///    grew `dir_repoint` for: the entry leaves one directory's block and enters another's.
+/// 3. **An occupied destination is refused** without `RENAME_REPLACE` — and, the part that
+///    matters, *both* paths survive untouched. A refusal that had already unlinked the
+///    source would be worse than no refusal.
+/// 4. **`RENAME_REPLACE` overwrites**, and the replaced file's content is really gone.
+/// 5. **A missing source fails** rather than conjuring a destination.
+/// 6. **A cross-filesystem destination is refused** with `Unsupported` rather than attempted.
+///    This one is the *kernel's* check, not the server's: `/system` is the ext4 mount and
+///    `/initramfs` is a different binding, so the request must never reach a server at all.
+///    It is also what tells `move` to fall back to copy + unlink (POSIX spells it `EXDEV`).
+fn rename_demo(root_ns: u64) {
+    use librsproto::namespace::RENAME_REPLACE;
+    kprint(b"test-harness: rename demo (re-point a name, don't copy it)\n");
+
+    // --- fixture: /system/nx-ren/{a.txt, b.txt, sub/} ------------------------
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: rename fixture open FAIL\n"),
+    };
+    if sys.mkdir(b"nx-ren").is_err() {
+        return_fail(b"test-harness: rename fixture mkdir FAIL\n");
+    }
+    sys.close();
+    {
+        let mut b2 = [0u8; 4096];
+        let mut d = match Dir::open(root_ns, b"/system/nx-ren", &mut b2) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: rename fixture reopen FAIL\n"),
+        };
+        if d.mkdir(b"sub").is_err() {
+            return_fail(b"test-harness: rename fixture subdir FAIL\n");
+        }
+        d.close();
+    }
+    write_file(root_ns, b"/system/nx-ren/a.txt", RENAME_CONTENT_A);
+    write_file(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_B);
+
+    // --- 1. within one directory ---------------------------------------------
+    if rename_wait(root_ns, b"/system/nx-ren/a.txt", b"/system/nx-ren/a2.txt", 0) != 0 {
+        return_fail(b"test-harness: rename within a directory FAILED\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/a2.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: renamed file has the wrong content\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/a.txt") {
+        return_fail(b"test-harness: rename left the old name behind (it copied)\n");
+    }
+
+    // --- 2. across directories ------------------------------------------------
+    if rename_wait(root_ns, b"/system/nx-ren/a2.txt", b"/system/nx-ren/sub/a3.txt", 0) != 0 {
+        return_fail(b"test-harness: cross-directory rename FAILED\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/sub/a3.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: cross-directory rename lost the content\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/a2.txt") {
+        return_fail(b"test-harness: cross-directory rename left the source behind\n");
+    }
+
+    // --- 3. an occupied destination is refused, and both paths survive --------
+    let st = rename_wait(root_ns, b"/system/nx-ren/sub/a3.txt", b"/system/nx-ren/b.txt", 0);
+    if st == 0 {
+        return_fail(b"test-harness: rename over an existing file wrongly succeeded\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_B) {
+        return_fail(b"test-harness: refused rename still clobbered the destination\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/sub/a3.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: refused rename still removed the source\n");
+    }
+
+    // --- 4. RENAME_REPLACE overwrites ----------------------------------------
+    let st = rename_wait(
+        root_ns,
+        b"/system/nx-ren/sub/a3.txt",
+        b"/system/nx-ren/b.txt",
+        RENAME_REPLACE as u64,
+    );
+    if st != 0 {
+        return_fail(b"test-harness: RENAME_REPLACE FAILED\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: RENAME_REPLACE did not replace the destination\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/sub/a3.txt") {
+        return_fail(b"test-harness: RENAME_REPLACE left the source behind\n");
+    }
+
+    // --- 5. a missing source fails -------------------------------------------
+    if rename_wait(root_ns, b"/system/nx-ren/nope.txt", b"/system/nx-ren/c.txt", 0) == 0 {
+        return_fail(b"test-harness: rename of a missing source wrongly succeeded\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/c.txt") {
+        return_fail(b"test-harness: failed rename created the destination anyway\n");
+    }
+
+    // --- 6. a cross-filesystem destination is refused, not attempted ----------
+    let st = rename_wait(root_ns, b"/system/nx-ren/b.txt", b"/initramfs/b.txt", 0);
+    if st != KERR_UNSUPPORTED {
+        return_fail(b"test-harness: cross-filesystem rename was not refused with Unsupported\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: refused cross-filesystem rename disturbed the source\n");
+    }
+    // …and with the *source* off the filesystem, which takes a different path through the
+    // kernel: the source resolves to a kernel server, so there is no forwarding arm to
+    // catch the verdict.
+    let st = rename_wait(root_ns, b"/initramfs/sbin/copy", b"/system/nx-ren/copy", 0);
+    if st != KERR_UNSUPPORTED {
+        return_fail(b"test-harness: rename off a non-filesystem source was not refused\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/copy") {
+        return_fail(b"test-harness: refused rename created a destination\n");
+    }
+
+    // --- teardown -------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-ren", &[b"b.txt"]);
+    {
+        let mut b3 = [0u8; 4096];
+        let mut d = match Dir::open(root_ns, b"/system/nx-ren", &mut b3) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: rename teardown open FAIL\n"),
+        };
+        if d.rmdir(b"sub").is_err() {
+            return_fail(b"test-harness: rename teardown rmdir FAIL\n");
+        }
+        d.close();
+    }
+    let mut b4 = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut b4) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: rename teardown FAIL\n"),
+    };
+    if sys.rmdir(b"nx-ren").is_err() {
+        return_fail(b"test-harness: rename teardown rmdir FAIL\n");
+    }
+    sys.close();
+    kprint(b"test-harness: rename ok (same dir, cross dir, replace, refusals)\n");
+}
+
+/// Fixture contents for [`rename_demo`]. Different lengths, so a check that the content
+/// followed the name cannot pass by accident on a same-size file.
+const RENAME_CONTENT_A: &[u8] = b"alpha, the file that moves.\n";
+const RENAME_CONTENT_B: &[u8] = b"bravo, the destination that is already occupied.\n";
+
+/// `KError::Unsupported`, the status a cross-filesystem rename completes with.
+const KERR_UNSUPPORTED: i32 = -52;
+
+/// Issue a `sys_file_rename` and wait for its completion, returning the status. A rename
+/// resolves to no object, so there is no handle to install or close.
+fn rename_wait(ns: u64, src: &[u8], dst: &[u8], flags: u64) -> i32 {
+    // SAFETY: two valid path slices + a namespace handle.
+    let po = unsafe {
+        syscall6(
+            SYS_FILE_RENAME,
+            ns,
+            src.as_ptr() as u64,
+            src.len() as u64,
+            dst.as_ptr() as u64,
+            dst.len() as u64,
+            flags,
+        )
+    };
+    if po < 0 {
+        return po as i32;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        );
+    }
+    // SAFETY: the wait wrote one 24-byte `IoResult`; `status` is at offset 8.
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    // SAFETY: closing our own PO handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+    status
+}
+
+/// Does `path` resolve? The "old name is gone" half of a rename check — [`file_matches`]
+/// cannot tell *absent* from *present with different content*, and both would be bugs.
+fn path_exists(ns: u64, path: &[u8]) -> bool {
+    let (st, h) = ns_lookup_wait(ns, path, RIGHT_MAP_READ);
+    if h != 0 {
+        // SAFETY: closing a handle just installed into our table.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
+    st == 0 && h != 0
+}
+
 /// Create `path` with exactly `content` (the fixture writer).
 fn write_file(ns: u64, path: &[u8], content: &[u8]) {
     let size = content.len() as u64;
@@ -2714,6 +2924,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5. `copy` — the mutation side of the filesystem, including the two cases it must
     //      refuse rather than get wrong (existing destination; no-truncate overwrite).
     copy_demo(root_ns, notif);
+
+    // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
+    //       (occupied destination, missing source, and either end off the filesystem).
+    rename_demo(root_ns);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

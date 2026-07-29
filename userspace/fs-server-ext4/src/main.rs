@@ -36,9 +36,9 @@ use librsproto::file::{
     parse_name_request, parse_read_dir_request, parse_rename_request,
 };
 use librsproto::namespace::{
-    OBJECT_KIND_CHANNEL, RESOLVE_CREATE, RESOLVE_GROW, RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE,
-    parse_resolve_grow_size,
-    parse_resolve_request, resolve_reply,
+    OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_CREATE, RESOLVE_GROW,
+    RESOLVE_RENAME, RESOLVE_REPLY_LEN, RESOLVE_TRUNCATE, parse_resolve_grow_size,
+    parse_resolve_rename, parse_resolve_request, resolve_reply,
 };
 use librsproto::{
     OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_UNLINK, OP_NS_RESOLVE,
@@ -523,6 +523,108 @@ fn try_resolve_directory<R: BlockReader + BlockWriter>(reader: &R) -> Option<(u6
     Some((request_id, dir_ino))
 }
 
+/// If the forwarded request in `RECV_MSG` is a `RESOLVE_RENAME`, perform the rename and
+/// reply. `true` if it was handled — the caller must not fall through to the paths that
+/// resolve to an object.
+///
+/// Rename is the one resolve that mutates the tree and hands back **nothing**: the reply is
+/// `OBJECT_KIND_NONE`, status-only. Both suffixes are mount-relative and the kernel has
+/// already established that they share this binding (and that the caller holds write
+/// authority over both), so the server never sees a cross-filesystem move — it just joins
+/// each suffix to the mount root and calls [`ext4::rename_path`].
+///
+/// This runs **before** the directory-session path deliberately: that path infers "this is
+/// a directory open" from the suffix naming a directory, and renaming a directory names one
+/// too. Without the ordering, `move` on a directory would silently open a session instead.
+fn try_resolve_rename<RW: BlockReader + BlockWriter>(reader: &RW, serve_end: u64) -> bool {
+    let mut src = [0u8; MAX_SUFFIX + 1];
+    let mut dst = [0u8; MAX_SUFFIX + 1];
+    src[0] = b'/';
+    dst[0] = b'/';
+    // SAFETY: `RECV_MSG` holds a just-received message; the request slice is bounded by the
+    // recorded payload length, itself clamped to the buffer. `src`/`dst` are local, and the
+    // reply helpers touch only the disjoint `REPLY_*` statics.
+    let parsed: Option<(u64, usize, usize, u16)> = unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        let Ok(m) = librsproto::decode(req) else {
+            return false;
+        };
+        if m.op != OP_NS_RESOLVE {
+            return false;
+        }
+        let Some(r) = parse_resolve_request(m.body) else {
+            return false;
+        };
+        if r.flags & RESOLVE_RENAME == 0 {
+            return false;
+        }
+        // Past here the request *is* a rename, so every exit replies rather than falling
+        // through — a fall-through would resolve the source path as an ordinary open and
+        // hand back an object the caller never asked for.
+        match parse_resolve_rename(m.body) {
+            Some((dest, f))
+                if !r.suffix.is_empty()
+                    && !dest.is_empty()
+                    && r.suffix.len() <= MAX_SUFFIX
+                    && dest.len() <= MAX_SUFFIX =>
+            {
+                src[1..1 + r.suffix.len()].copy_from_slice(r.suffix);
+                dst[1..1 + dest.len()].copy_from_slice(dest);
+                Some((m.request_id, r.suffix.len(), dest.len(), f))
+            }
+            _ => {
+                reply_resolve_error(serve_end, m.request_id, KError::InvalidArgument.as_i32());
+                None
+            }
+        }
+    };
+    let Some((request_id, src_len, dst_len, flags)) = parsed else {
+        return true; // malformed rename — the error reply went out above
+    };
+
+    let done = ext4::rename_path(
+        reader,
+        &src[..1 + src_len],
+        &dst[..1 + dst_len],
+        flags & RENAME_REPLACE != 0,
+        now_secs(),
+    );
+    match done {
+        Ok(()) => reply_resolve_none(serve_end, request_id),
+        Err(e) => reply_resolve_error(serve_end, request_id, fs_kerror(e)),
+    }
+    true
+}
+
+/// Reply to a completed mutating resolve: success, `OBJECT_KIND_NONE`, no transferred
+/// handle. The kernel completes the caller's pending lookup with status `0` and installs
+/// nothing.
+fn reply_resolve_none(serve_end: u64, request_id: u64) {
+    let mut body = [0u8; RESOLVE_REPLY_LEN];
+    let _ = resolve_reply(&mut body, OBJECT_KIND_NONE, 0);
+    // SAFETY: REPLY_MSG is a valid buffer; the rsproto reply goes at offset PAYLOAD_OFF.
+    let count = unsafe {
+        let rs_len = match librsproto::encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            OP_NS_RESOLVE,
+            request_id,
+            RS_FLAG_REPLY,
+            &body,
+            0,
+        ) {
+            Some(n) => n,
+            None => return,
+        };
+        stage_reply(rs_len, None)
+    };
+    send_reply(serve_end, count);
+}
+
 /// Free directory-session slot `slot`: close the server endpoint and mark it empty.
 fn free_session_at(slot: usize) {
     // SAFETY: `slot < MAX_SESSIONS`; closing our own endpoint handle.
@@ -881,6 +983,12 @@ fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
     serve_end: u64,
     device: u64,
 ) {
+    // A mutating resolve first: it replies status-only and must not be mistaken for a
+    // directory open (see `try_resolve_rename`).
+    if try_resolve_rename(reader, serve_end) {
+        return;
+    }
+
     if let Some((request_id, dir_ino)) = try_resolve_directory(reader) {
         open_dir_session(serve_end, request_id, dir_ino);
         return;

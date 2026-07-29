@@ -365,7 +365,21 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
   fragments it into a fresh extent each time. That residual limit is the inline extent
   header (4 leaves); tree splitting stays deferred, now with a number attached. Also
   surfaced that bulk creation is O(N²) block reads (`deferred-decisions.md`).
-- [ ] **C2 — cross-directory and overwrite `rename`.** Blocks `move`.
+- [x] **C2 — cross-directory and overwrite `rename`** ✅ (2026-07-29). `move` is unblocked.
+  Three parts: the ext4 `rename_path` (repoint the destination → remove the source →
+  release a replaced inode's link, in that order, so a crash leaves a duplicate name rather
+  than an orphan); `sys_file_rename` (syscall 35) plus the `ResolveOp` enum that replaced
+  the widening tuple of `Option`s `Namespace::Resolve` had grown one side effect at a time;
+  and the fs-server dispatch, which runs *before* the directory-session path because that
+  path infers "directory open" from the suffix naming a directory, and renaming a directory
+  names one too. The kernel reduces both paths to one mount-relative suffix and refuses a
+  cross-binding rename with `Unsupported` (the `move` → copy + unlink cue; POSIX `EXDEV`).
+  Two things the in-guest check caught: the refusal only guarded the *forwarding* arm, so a
+  source that was not on a filesystem resolved normally and returned a handle — reporting a
+  rename that never happened; and an attempted `MAP_WRITE` check on both bindings failed
+  against a live mount, because a userspace-server binding's rights are the *endpoint
+  handle's*, not the files' — which is a system-wide gap, now filed as
+  `TODO(mount-write-authority)`, not something rename should have solved unilaterally.
 - [ ] **C3 — the `MAX_SESSIONS = 7` cap.** Each pipeline stage holding a directory session
   makes seven concurrent sessions a normal working set, not a stress case.
 - [ ] **C4 — `mtime` on an in-place overwrite.** Model A hides a same-length rewrite from

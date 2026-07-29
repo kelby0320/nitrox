@@ -11,11 +11,14 @@
 
 use alloc::string::String;
 use libkern::abi::HandleInfo;
+use libkern::error::KError;
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
-    SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1, syscall2, syscall4, syscall5,
+    SYS_FILE_CREATE, SYS_FILE_RENAME, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE,
+    SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
+    syscall2, syscall4, syscall5, syscall6,
 };
+use librsproto::namespace::RENAME_REPLACE;
 
 /// What a file operation can fail with.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -29,6 +32,10 @@ pub enum FileError {
     TruncateFailed,
     /// The file exceeds [`MAX_COPY`].
     TooLarge,
+    /// A [`rename`]'s destination lives on a different filesystem, so the kernel cannot do
+    /// it as one operation. Not a failure to report as-is — the caller falls back to
+    /// [`copy_file`] + unlink, which is what `mv` does across devices.
+    CrossDevice,
     /// A syscall failed; the payload is its negative return.
     Io(i32),
 }
@@ -218,6 +225,55 @@ fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {
         return Err(FileError::Io(status));
     }
     Ok(handle)
+}
+
+/// Rename `src` to `dst`, both absolute namespace paths. With `replace`, an existing
+/// destination is unlinked as part of the rename; without it, an existing destination
+/// fails.
+///
+/// This is the whole operation in one syscall — no data moves and nothing is mapped, so it
+/// is atomic from a reader's point of view in a way copy-then-unlink is not. It only works
+/// **within one filesystem**: a destination under a different binding returns
+/// [`FileError::CrossDevice`], which is a caller's cue to fall back to
+/// [`copy_file`] + unlink rather than an error to report.
+pub fn rename(ns: u64, src: &[u8], dst: &[u8], replace: bool) -> Result<(), FileError> {
+    let flags = if replace { RENAME_REPLACE as u64 } else { 0 };
+    // SAFETY: two valid path slices + a namespace handle.
+    let po = unsafe {
+        syscall6(
+            SYS_FILE_RENAME,
+            ns,
+            src.as_ptr() as u64,
+            src.len() as u64,
+            dst.as_ptr() as u64,
+            dst.len() as u64,
+            flags,
+        )
+    };
+    if po < 0 {
+        return Err(map_rename_error(po as i32));
+    }
+    // Status-only: a rename resolves to no object, so a nonzero handle would be a bug.
+    let (status, _) = po_wait(po as u64);
+    if status != 0 {
+        return Err(map_rename_error(status));
+    }
+    Ok(())
+}
+
+/// Pick out the one rename failure a caller acts on differently — a cross-filesystem
+/// destination, which means "fall back to copy + unlink", not "report an error".
+///
+/// An *occupied* destination is deliberately not distinguished here: the server maps it to
+/// `InvalidArgument`, which a malformed request also produces, so a caller that wants to
+/// refuse an existing destination should test for it with [`file_size`] first (which is
+/// what `copy` does) rather than infer it from this status.
+fn map_rename_error(status: i32) -> FileError {
+    match KError::from_i32(status) {
+        KError::Unsupported => FileError::CrossDevice,
+        KError::NotFound => FileError::NotFound,
+        _ => FileError::Io(status),
+    }
 }
 
 /// Resolve `path` to a handle with `rights`.

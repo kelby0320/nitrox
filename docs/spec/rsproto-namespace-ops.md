@@ -45,6 +45,7 @@ pub struct ResolveRequest {
 | `RESOLVE_GROW` | `1 << 2` | **Grow** the file to the `new_size` appended after the suffix (allocate blocks, extend the extent tree) before replying its map. For `sys_file_grow`. |
 | `RESOLVE_CREATE` | `1 << 3` | **Create** the file in its parent directory if absent, before growing. Combined with `RESOLVE_GROW`. For `sys_file_create`. |
 | `RESOLVE_TRUNCATE` | `1 << 4` | **Shrink** the file to the `new_size` appended after the suffix, freeing the blocks past the new end, before replying its map. For `sys_file_truncate`. |
+| `RESOLVE_RENAME` | `1 << 5` | **Rename** the resolved path to a second path carried after the suffix, and reply status-only (`OBJECT_KIND_NONE`) rather than an object. For `sys_file_rename`. |
 
 With `RESOLVE_FILE_LAZY` the server reports the file size and does not materialise
 content up front; pages are pulled later by `File::ReadRange`. Without it the
@@ -66,6 +67,31 @@ name-addressed mutations live — because **the kernel owns the page cache**. A 
 the kernel never observed would leave it holding a stale size and stale pages for the
 file.
 
+### Renaming resolves
+
+`RESOLVE_RENAME` appends, immediately after the suffix, a `dest_len: u16`, a `flags: u16`,
+and `dest_len` bytes of destination suffix. `flags` currently defines one bit —
+`RENAME_REPLACE` (`1 << 0`), permitting an existing destination to be unlinked as part of
+the rename; without it an occupied destination fails.
+
+**Both suffixes are mount-relative, and the kernel has already established that they share
+one binding.** A destination on a different binding — or either end not on a userspace
+filesystem at all — is refused by the kernel with `Unsupported` and never reaches a server,
+so a server may assume the two paths are its own. `Unsupported` is also the signal a caller
+needs to fall back to copy + unlink (POSIX spells this case `EXDEV`).
+
+Rename is the one resolve that mutates the tree and returns **no object**: the success reply
+is `OBJECT_KIND_NONE` with no transferred handle, and the kernel completes the caller's
+`PendingOperation` with status `0` and a null result. It sits on the resolve path rather
+than the directory session because it names **two** directories, and a session is scoped to
+exactly one inode by construction — expressing a cross-directory move over sessions would
+require holding two and correlating them, which is precisely the confinement the session
+design is there to provide.
+
+Like the size-changing resolves, a rename must be observed by the kernel: it owns the page
+cache keyed to the resolved file, and a path re-pointed behind its back would leave a stale
+mapping reachable under the old name.
+
 ### Reply body (success)
 
 `RsFlags::REPLY` set, `handle_count = 1` (the resource in `IpcMsg.handles[0]`):
@@ -86,6 +112,7 @@ Body length = 8.
 
 | Kind | Value | `handles[0]` | Phase 2 |
 |---|---|---|---|
+| `NONE` | `0` | **none** — the request mutated the filesystem and resolves to no object (`RESOLVE_RENAME`). `content_len` is unused. | ✅ |
 | `MEMOBJ` | `1` | a read-only `MemoryObject` of the file content | ✅ |
 | `DIRECTORY` | `2` | (a directory resource) | deferred |
 | `SUBNAMESPACE` | `3` | (a nested namespace) | deferred |

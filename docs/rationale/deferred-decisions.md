@@ -250,6 +250,23 @@ Phase-3 storage-hardening pass.)
 
 ### Filesystems
 
+**Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
+namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
+it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC
+channel, not the files behind it — which is why the forwarding path in `sys_ns_lookup`
+ignores `binding_rights` entirely. The consequence: **no mutating resolve is rights-checked
+by the kernel.** `RESOLVE_CREATE`/`GROW`/`TRUNCATE`/`RENAME` all gate on nothing but
+`LOOKUP` on the namespace handle, so a process that can resolve a path in a mount can
+write it. Today that is contained by *namespace construction* — a sandbox that must not
+write a filesystem is not given a binding to it at all, which is the architecture's
+intended mechanism (`docs/architecture/namespace-and-resource-servers.md`) — so this is a
+missing *refinement*, not an open hole. It surfaced writing `sys_file_rename` (2026-07-29),
+where an attempt to check `MAP_WRITE` on both bindings failed against a live mount because
+the bits are not what the name suggests. Doing it properly means deciding where per-mount
+authority lives: rights on the binding independent of the endpoint handle's, a read-only
+mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
+writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block

@@ -283,6 +283,9 @@ fn describe(src: &[u8], dst: &[u8], e: FileError) -> String {
              leave a corrupt tail\n"
         }
         FileError::TooLarge => ": file is too large to copy in one mapping\n",
+        // `copy` never renames, so this cannot arise here; named rather than folded into
+        // a wildcard so that adding a `FileError` still breaks this match loudly.
+        FileError::CrossDevice => ": destination is on a different filesystem\n",
         FileError::Io(_) => ": I/O error\n",
     });
     s

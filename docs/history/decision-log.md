@@ -8582,3 +8582,62 @@ a grown directory emptied again, including refusing to `rmdir` a non-empty subdi
 that lives in a *later* block, which only works if the emptiness scan reaches past block 0.
 `test-qemu` PASS with a new in-guest growth check on the real image; 10/10 KVM;
 `check-arch` / `check-nightly` / `check-deferrals` green.
+
+## 2026-07-29 — Slice C2: `rename`, and what testing it found in the syscall
+
+`move` was blocked on a rename that could only change a name within one directory and could
+never replace anything. It is now a whole operation: cross-directory, optionally replacing
+the destination, and refusing what it cannot do atomically.
+
+**Three parts, one per layer.**
+
+- **`ext4::rename_path`** does the mutation in a deliberate order: repoint the destination
+  entry → remove the source entry → release a replaced inode's link. A crash between steps
+  therefore leaves a *duplicate name*, which `e2fsck` repairs, rather than an orphaned inode
+  or an entry pointing at freed space. Directory renames get a cheap guard against moving a
+  directory into its own subtree, which would detach it from the tree entirely.
+- **`sys_file_rename` (syscall 35)** resolves *both* paths before any `PendingOperation`
+  exists, so a malformed destination fails synchronously, and reduces them to one
+  mount-relative suffix plus a verdict. Both must land on the same server *and* the same
+  subtree base; anything else is `Unsupported`, which is precisely the cue `move` needs to
+  fall back to copy + unlink (POSIX spells it `EXDEV`).
+- **The fs-server dispatch** replies `OBJECT_KIND_NONE` — the first resolve that mutates the
+  tree and hands back nothing. It runs **before** the directory-session path, which is not
+  incidental: that path infers "this is a directory open" from the suffix naming a
+  directory, and renaming a directory names one too, so the other order would silently open
+  a session instead of moving anything.
+
+**The `ResolveOp` enum.** `Namespace::Resolve` had accumulated side effects one at a time —
+create, grow, truncate — carried as a widening tuple of `Option`s; rename would have been
+the fourth. They are now one enum, so each call site names exactly one intent and the next
+side effect costs a variant rather than another parameter.
+
+**Two things the in-guest check found that the host tests structurally could not.**
+
+1. **The refusal only guarded the forwarding arm.** `rename_verdict` was consulted inside
+   the `UserspaceServer` branch of the resolve, so a rename whose *source* was not on a
+   userspace filesystem (`/initramfs/x`) skipped it entirely, resolved normally, and handed
+   back a handle to the source — reporting success for a rename that never happened. The
+   verdict now short-circuits the resolve outright. The check that catches it is the
+   deliberate mirror of the cross-filesystem case: same refusal, opposite end.
+2. **The write-authority check was checking the wrong bits.** The first cut required
+   `MAP_WRITE` on both bindings, reasoning that a rename returns no handle so the usual
+   "attenuate the returned rights" mechanism has nothing to act on. It failed against a live
+   mount with `NoAccess`: a userspace-server binding carries the rights of the **endpoint
+   handle** it was bound with (`sys_ns_bind` takes them from the target), which describe the
+   IPC channel, not the files behind it — which is exactly why the forwarding path ignores
+   `binding_rights`. The check was removed rather than patched: the mutating resolves that
+   already existed (`CREATE`/`GROW`/`TRUNCATE`) gate on nothing but `LOOKUP` either, so
+   rename matches them instead of inventing a stricter rule a caller could not satisfy.
+   The real gap — no per-mount write authority anywhere, contained today by *namespace
+   construction* rather than by rights — is filed as `TODO(mount-write-authority)` with the
+   trigger that will force it (the first read-only mount of a writable filesystem).
+
+*Verified:* host suite **788** green; `test-qemu` PASS with a six-case in-guest check on the
+real image (same-directory, cross-directory, refusing an occupied destination *with both
+paths intact*, `RENAME_REPLACE`, a missing source, and a cross-filesystem destination from
+either end). **Negative controls run**, since a rename check passes trivially if it only
+looks at the destination: a no-op rename that reports success fails check 1 (the old name
+survives) — and, separately, reverting the verdict to its buggy position fails the
+non-filesystem-source case, which is the bug it was written for. `check-arch` /
+`check-nightly` / `check-deferrals` green.

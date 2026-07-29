@@ -1485,8 +1485,15 @@ pub fn sys_ns_lookup(
     // would cross a filesystem: that is reported as `Unsupported`, which is the signal a
     // caller needs to fall back to copy + unlink (POSIX spells it `EXDEV`).
     //
-    // Write authority is checked explicitly on **both** bindings: a rename returns no
-    // handle, so the usual "attenuate the returned rights" mechanism has nothing to act on.
+    // No *write*-authority check happens here, deliberately. A binding's rights on a
+    // userspace-server mount are the rights of the endpoint **handle** it was bound with
+    // (`sys_ns_bind` takes them from the target), so they describe the channel, not the
+    // files behind it — which is exactly why the forwarding arm below ignores them. The
+    // mutating resolves that already exist (`RESOLVE_CREATE`/`GROW`/`TRUNCATE`) gate on
+    // nothing but `LOOKUP` on the namespace for the same reason, and rename matches them
+    // rather than inventing a stricter rule that a caller could not satisfy. Giving a
+    // namespace binding real per-mount write authority is a system-wide change, filed as
+    // TODO(mount-write-authority) in docs/rationale/deferred-decisions.md.
     let mut dest_buf = [0u8; NS_PATH_MAX];
     let mut dest_len = 0usize;
     let mut rename_verdict: Option<KError> = None;
@@ -1500,12 +1507,10 @@ pub fn sys_ns_lookup(
         let nsr = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
         rename_verdict = match (nsr.resolve(path), nsr.resolve(&dcopy[..dcopy_len])) {
             (
-                Some((ResolvedTarget::UserspaceServer(sreg, sbase), srights, _)),
-                Some((ResolvedTarget::UserspaceServer(dreg, dbase), drights, dsuffix)),
+                Some((ResolvedTarget::UserspaceServer(sreg, sbase), _, _)),
+                Some((ResolvedTarget::UserspaceServer(dreg, dbase), _, dsuffix)),
             ) => {
                 let same = sreg.as_ptr() == dreg.as_ptr() && sbase.as_path() == dbase.as_path();
-                let writable =
-                    srights.contains(Rights::MAP_WRITE) && drights.contains(Rights::MAP_WRITE);
                 let joined = if dbase.as_path().is_empty() {
                     dest_buf[..dsuffix.len()].copy_from_slice(dsuffix);
                     Some(dsuffix.len())
@@ -1519,11 +1524,10 @@ pub fn sys_ns_lookup(
                 };
                 drop(sreg);
                 drop(dreg);
-                match (same, writable, joined) {
-                    (false, _, _) => Some(KError::Unsupported),
-                    (_, false, _) => Some(KError::NoAccess),
-                    (_, _, None) => Some(KError::TooLarge),
-                    (true, true, Some(n)) => {
+                match (same, joined) {
+                    (false, _) => Some(KError::Unsupported),
+                    (_, None) => Some(KError::TooLarge),
+                    (true, Some(n)) => {
                         dest_len = n;
                         None
                     }
@@ -1583,6 +1587,18 @@ pub fn sys_ns_lookup(
     // The resolution outcome: `Some((status, result))` completes the PO now (the
     // synchronous direct-handle / kernel-server paths); `None` leaves it **pending**
     // (a forwarded userspace lookup — the server's reply completes it later).
+    //
+    // A refused rename short-circuits the resolve entirely. This has to happen *before*
+    // it, not inside the forwarding arm: when the source is not on a userspace filesystem
+    // (`/initramfs/x`, or a direct-handle binding) the resolve below would succeed and
+    // hand back a handle to the source — reporting a rename that never happened.
+    if let Some(e) = rename_verdict {
+        // Same shape as the `Some(outcome)` arm at the end: pre-signal the PO (no waiters
+        // yet) and hand back its handle. `ns_ok` / `po_ref` are still held, so nothing
+        // drops an `ObjectRef` under `SCHED`.
+        crate::sched::complete_pending_op(po_ptr, e as i32, 0);
+        return Ok(po_h.bits() as isize);
+    }
     let outcome: Option<(i32, u64)> = match ns.resolve(path) {
         None => Some((KError::NotFound as i32, 0)),
         Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
@@ -1619,10 +1635,7 @@ pub fn sys_ns_lookup(
             // Both `base` (validated at bind) and `suffix` (the lookup path was
             // `validate_path`d above) are free of `.`/`..`, so the join cannot escape
             // the subtree.
-            if let Some(e) = rename_verdict {
-                drop(reg);
-                Some((e as i32, 0))
-            } else if base.is_empty() {
+            if base.is_empty() {
                 forward_userspace_lookup(
                     reg, &po_ref, pid, requested, suffix, op, &dest_buf[..dest_len],
                 )

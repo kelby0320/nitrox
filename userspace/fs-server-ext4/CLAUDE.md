@@ -40,7 +40,11 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   `BlockRun` map + transfers a device handle, a `RESOLVE_GROW` request grows the file
   (`maybe_grow` → `grow_file`), and a `RESOLVE_CREATE` request first creates it
   (`maybe_grow` → `create_file`, splitting the suffix into parent-dir + leaf name) before
-  mapping. **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
+  mapping. A `RESOLVE_RENAME` request is handled by `try_resolve_rename` **before** anything
+  else: it is the one resolve that mutates the tree and replies with no object at all
+  (`OBJECT_KIND_NONE`), and it must run ahead of the directory-session path, which infers
+  "directory open" from the suffix naming a directory — renaming a directory names one too.
+  **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
 
 ## Scope
 
