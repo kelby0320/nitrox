@@ -272,9 +272,12 @@ so twice while D4 landed — first `Leaf` under `Leaf` (a DPC drain at an interr
 inside a shootdown window), then `Sched` under it (a timer tick doing the same) — and both
 were correct behaviour, not bugs.
 
-It is therefore the one lock marked `LockRank::IrqEnabledHold`, which neither records nor
-checks; its actual discipline is the documented "no other lock held when taken" contract,
-which ranking cannot verify. The fix is what Linux's lockdep does: save the held set at
+It is therefore the one lock marked `LockRank::IrqEnabledHold`, which is exempt from the
+*ordering* check. It is **not** unchecked, though: its own documented contract — no other
+lock held when it is taken — turns out to be verifiable with exactly the same machinery, so
+that is asserted instead, and it holds on a live boot including SMP shootdowns. What the
+exemption actually costs is coverage of locks taken *underneath* it, in interrupt context —
+which is precisely what the deferred work below would restore. The fix is what Linux's lockdep does: save the held set at
 interrupt entry and restore it at exit, giving handlers a fresh scope, after which this
 lock can be ranked normally and the leaf reasoning stops needing a caveat. Deferred
 because it means hooking *every* interrupt entry and exit (timer, device, TLB-shootdown

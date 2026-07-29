@@ -8891,9 +8891,14 @@ order and the code, none of them anticipated:
    the kind of thing a checker finds and a reviewer does not.
 3. **`DEVICES` and `PARTITIONS` are not leaves.** Both push or reserve a `KVec` *inside*
    their critical section, so they must rank above the allocators; they got a new `Registry`
-   rank. `device.rs`'s own comment says `snapshot` exists so callers can "allocate without
-   holding the device lock across a lock-ordering boundary" — while `snapshot` itself
-   reserved under it. The hazard was known and still present.
+   rank. This is a **mis-ranking, not a hazard**: allocating under a non-`SCHED` lock is
+   explicitly correct here (§ The Namespace binding lock — "the no-allocation rule applies
+   only to the rank-1 `SCHED` lock"), so `Registry` → allocator is the same legal descent
+   `Namespace::bind` makes. What was wrong was calling these locks leaves, which asserted
+   they take nothing while held. With the rank corrected there is nothing further to fix.
+   (`device.rs`'s comment about `snapshot` existing so callers can "allocate without holding
+   the device lock across a lock-ordering boundary" is about a *caller* doing arbitrary work
+   — possibly reaching a higher-ranked lock — which `snapshot` still correctly prevents.)
 4. **`tlb::LOCK` cannot be ranked at all.** It is held with interrupts *enabled* — that is
    the F1 fix — so interrupt work legitimately runs beneath it. The tracker said so in two
    steps: `Leaf` under `Leaf` (a DPC drain at an interrupt tail inside a shootdown window),

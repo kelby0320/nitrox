@@ -172,10 +172,19 @@ mod tracker {
     /// Called *after* the lock is held, so the report can name a real acquisition rather
     /// than a speculative one — and so a failed `try_lock` records nothing.
     pub fn acquired(rank: LockRank) {
-        // Exempt: held with interrupts enabled, so interrupt work legitimately nests
-        // beneath it with its own ordering. Recording it would make every such nesting
-        // look like an inversion. See `LockRank::IrqEnabledHold`.
+        // Exempt from *ordering*, because interrupt work legitimately nests beneath it and
+        // recording it would make every such nesting look like an inversion. But its own
+        // documented contract — **no other lock held when it is taken** — is checkable with
+        // exactly this machinery, so check that instead of checking nothing. This is the
+        // part of the coverage lost to the exemption that can be recovered without
+        // per-interrupt-context tracking (`TODO(lockdep-irq-context)`).
         if matches!(rank, LockRank::IrqEnabledHold) {
+            let cpu = this_cpu();
+            let held = DEPTH[cpu].load(Ordering::Relaxed);
+            if held != 0 {
+                let inner = HELD[cpu][held.min(MAX_HELD) - 1].load(Ordering::Relaxed);
+                report_contract(inner);
+            }
             return;
         }
         let cpu = this_cpu();
@@ -235,6 +244,24 @@ mod tracker {
             90 => "Leaf",
             _ => "unknown",
         }
+    }
+
+    /// Report an `IrqEnabledHold` lock taken with something already held — a breach of its
+    /// caller contract rather than of the rank order, hence its own message.
+    #[cold]
+    #[inline(never)]
+    fn report_contract(held: u8) {
+        if REPORTING.swap(1, Ordering::SeqCst) != 0 {
+            return;
+        }
+        panic!(
+            "lock contract violation: took an IrqEnabledHold lock while holding {} \
+             (rank {}) — such a lock is held with interrupts enabled, so its contract is \
+             that no other lock is held when it is taken; see \
+             kernel/docs/lock-ordering.md",
+            rank_name(held),
+            held
+        );
     }
 
     #[cold]

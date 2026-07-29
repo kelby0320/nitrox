@@ -38,7 +38,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | 7.5  | Kernel log ring (`KLOG`, **`IrqSpinLock`**)  | live as of Phase 2; **below `SERIAL`** — it is teed from inside the serial `write_str`, so `SERIAL` is held when it is taken. (Its `try_lock` is for a different hazard: re-entry from a fault that strikes mid-push.) |
 | leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); see § The DPC queue lock |
 | leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); see § The entropy lock |
-| leaf | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. Taken with **no other lock held** by contract (see § F1); holds only atomics + IPIs under it |
+| —    | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. **Unrankable**, and exempt from the ordering check: it is held with interrupts *enabled* (the F1 fix), so interrupt work legitimately nests beneath it with its own full ordering, and no single rank can express "the order restarts here". Marked `LockRank::IrqEnabledHold`. Its own contract — **no other lock held when taken** — *is* asserted in debug builds. Restoring the coverage it gives up needs per-interrupt-context tracking: `TODO(lockdep-irq-context)` |
 | leaf | Device registry (`DEVICES`)                  | live as of Phase 2; a registry that takes nothing while held |
 | leaf | GPT partition table (`PARTITIONS`)           | live as of Phase 2; as `DEVICES` |
 | leaf | Console input buffer (`CONSOLE`, **`IrqSpinLock`**)| live as of Phase 2; filled from the COM1 receive IRQ |

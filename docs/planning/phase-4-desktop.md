@@ -454,8 +454,9 @@ Slice C follows directly; it has actual Milestone 2 blockers.
   **mandatory** rather than optional is what did the work: it surfaced six live locks that
   were missing from the rank table entirely, and the armed boot then disagreed with the
   documented order four times — `dpc::init` and `entropy::init` both allocating under a
-  leaf-ranked lock, `DEVICES`/`PARTITIONS` not being leaves at all (they push a `KVec` while
-  held), and `tlb::LOCK` being unrankable because it is held with interrupts enabled (the F1
+  leaf-ranked lock, `DEVICES`/`PARTITIONS` being mis-ranked as leaves when they push a `KVec`
+  while held (a legal descent to the allocators, just not a leaf), and `tlb::LOCK` being
+  unrankable because it is held with interrupts enabled (the F1
   fix), so interrupt work legitimately nests beneath it. The last is exempt with its reason
   written down; the general fix is `TODO(lockdep-irq-context)`. Two bugs in the tracker
   itself also came out of running it — the per-CPU model is invalid under host `cfg(test)`
