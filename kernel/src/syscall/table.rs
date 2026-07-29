@@ -18,6 +18,24 @@ use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
+
+/// What a resolve is being asked to do beyond resolving.
+///
+/// `Namespace::Resolve` began as a pure lookup and has grown side effects — create, grow,
+/// truncate, now rename — because each names a path, and the namespace is where path
+/// authority lives. One enum rather than a widening tuple of `Option`s keeps every call
+/// site naming exactly one intent.
+#[derive(Copy, Clone)]
+pub enum ResolveOp {
+    /// A plain lookup.
+    Plain,
+    /// Change the file's size first (`sys_file_create` / `_grow` / `_truncate`).
+    Size(u32, SizeChange),
+    /// Rename the resolved path to `dest_ptr`/`dest_len` (`sys_file_rename`). Both paths
+    /// must resolve through the **same binding**, checked below, so a server never sees a
+    /// cross-filesystem rename.
+    Rename { dest_ptr: u64, dest_len: usize, flags: u16 },
+}
 use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
@@ -123,6 +141,9 @@ pub const SYS_FILE_GROW: u64 = 32;
 pub const SYS_FILE_CREATE: u64 = 33;
 /// `sys_file_truncate` — resolve a file, shrinking it to a target size first (a5 = new size).
 pub const SYS_FILE_TRUNCATE: u64 = 34;
+/// `sys_file_rename` — rename a path to another path in the same filesystem
+/// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags).
+pub const SYS_FILE_RENAME: u64 = 35;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -171,15 +192,22 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_NS_CREATE => encode(sys_ns_create()),
-        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None)),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Grow))))
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
         }
         SYS_FILE_CREATE => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Create))))
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Create)))
         }
+        SYS_FILE_RENAME => encode(sys_ns_lookup(
+            a0,
+            a1,
+            a2 as usize,
+            crate::libkern::handle::Rights::MAP_READ.bits(),
+            ResolveOp::Rename { dest_ptr: a3, dest_len: a4 as usize, flags: a5 as u16 },
+        )),
         SYS_FILE_TRUNCATE => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Truncate))))
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Truncate)))
         }
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
@@ -1441,7 +1469,7 @@ pub fn sys_ns_lookup(
     path_ptr: u64,
     path_len: usize,
     rights_bits: u64,
-    size_change: Option<(u32, SizeChange)>,
+    op: ResolveOp,
 ) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     // --- synchronous validation (no PO created on these) ---
@@ -1450,6 +1478,61 @@ pub fn sys_ns_lookup(
     let mut buf = [0u8; NS_PATH_MAX];
     let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
     validate_path(path).map_err(|_| KError::InvalidArgument)?;
+
+    // A rename resolves *two* paths. Reduce them here — before any PO exists, so a
+    // malformed destination fails synchronously — to one mount-relative suffix plus a
+    // verdict. Both must land on the same server and the same subtree base, or the rename
+    // would cross a filesystem: that is reported as `Unsupported`, which is the signal a
+    // caller needs to fall back to copy + unlink (POSIX spells it `EXDEV`).
+    //
+    // Write authority is checked explicitly on **both** bindings: a rename returns no
+    // handle, so the usual "attenuate the returned rights" mechanism has nothing to act on.
+    let mut dest_buf = [0u8; NS_PATH_MAX];
+    let mut dest_len = 0usize;
+    let mut rename_verdict: Option<KError> = None;
+    if let ResolveOp::Rename { dest_ptr, dest_len: dlen, .. } = op {
+        let d = copy_ns_path(dest_ptr, dlen, &mut dest_buf)?;
+        validate_path(d).map_err(|_| KError::InvalidArgument)?;
+        let dcopy_len = d.len();
+        let mut dcopy = [0u8; NS_PATH_MAX];
+        dcopy[..dcopy_len].copy_from_slice(d);
+        // SAFETY: live `Namespace` (type verified by `lookup_typed` above).
+        let nsr = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+        rename_verdict = match (nsr.resolve(path), nsr.resolve(&dcopy[..dcopy_len])) {
+            (
+                Some((ResolvedTarget::UserspaceServer(sreg, sbase), srights, _)),
+                Some((ResolvedTarget::UserspaceServer(dreg, dbase), drights, dsuffix)),
+            ) => {
+                let same = sreg.as_ptr() == dreg.as_ptr() && sbase.as_path() == dbase.as_path();
+                let writable =
+                    srights.contains(Rights::MAP_WRITE) && drights.contains(Rights::MAP_WRITE);
+                let joined = if dbase.as_path().is_empty() {
+                    dest_buf[..dsuffix.len()].copy_from_slice(dsuffix);
+                    Some(dsuffix.len())
+                } else {
+                    let mut jb = [0u8; NS_PATH_MAX];
+                    join_subtree(dbase.as_path(), dsuffix, &mut jb).map(|j| {
+                        let n = j.len();
+                        dest_buf[..n].copy_from_slice(j);
+                        n
+                    })
+                };
+                drop(sreg);
+                drop(dreg);
+                match (same, writable, joined) {
+                    (false, _, _) => Some(KError::Unsupported),
+                    (_, false, _) => Some(KError::NoAccess),
+                    (_, _, None) => Some(KError::TooLarge),
+                    (true, true, Some(n)) => {
+                        dest_len = n;
+                        None
+                    }
+                }
+            }
+            // Anything not served by a userspace filesystem cannot be renamed.
+            _ => Some(KError::Unsupported),
+        };
+    }
 
     // Create the PO and its handle FIRST, so every *resolution* outcome (success
     // or not-found) is delivered through the PO; only the pre-PO failures above
@@ -1536,13 +1619,18 @@ pub fn sys_ns_lookup(
             // Both `base` (validated at bind) and `suffix` (the lookup path was
             // `validate_path`d above) are free of `.`/`..`, so the join cannot escape
             // the subtree.
-            if base.is_empty() {
-                forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, size_change)
+            if let Some(e) = rename_verdict {
+                drop(reg);
+                Some((e as i32, 0))
+            } else if base.is_empty() {
+                forward_userspace_lookup(
+                    reg, &po_ref, pid, requested, suffix, op, &dest_buf[..dest_len],
+                )
             } else {
                 let mut jbuf = [0u8; NS_PATH_MAX];
                 match join_subtree(base.as_path(), suffix, &mut jbuf) {
                     Some(joined) => forward_userspace_lookup(
-                        reg, &po_ref, pid, requested, joined, size_change,
+                        reg, &po_ref, pid, requested, joined, op, &dest_buf[..dest_len],
                     ),
                     None => {
                         // The joined path overflows the buffer — drop the forwarding
@@ -1609,7 +1697,8 @@ fn forward_userspace_lookup(
     pid: u32,
     requested: Rights,
     suffix: &[u8],
-    size_change: Option<(u32, SizeChange)>,
+    op: ResolveOp,
+    dest: &[u8],
 ) -> Option<(i32, u64)> {
     // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
     // request (`sys_file_grow`/`sys_file_create`) additionally carries the target size +
@@ -1618,15 +1707,24 @@ fn forward_userspace_lookup(
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
-    let built = match size_change {
-        Some((new_size, change)) => crate::rsproto::build_resolve_request_sized(
+    let built = match op {
+        ResolveOp::Size(new_size, change) => crate::rsproto::build_resolve_request_sized(
             &mut msg.payload,
             requested.bits(),
             suffix,
             new_size,
             change,
         ),
-        None => crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix),
+        ResolveOp::Rename { flags, .. } => crate::rsproto::build_resolve_request_rename(
+            &mut msg.payload,
+            requested.bits(),
+            suffix,
+            dest,
+            flags,
+        ),
+        ResolveOp::Plain => {
+            crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix)
+        }
     };
     let body_len = match built {
         Some(n) => n,
