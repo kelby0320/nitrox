@@ -503,16 +503,6 @@ today). Scheduled as **D3 of the pre-CLI substrate-hardening pass**
 
 ### Runtime libraries
 
-**`cargo xtask abi-sync-check`.** `userspace/libkern` is the canonical userspace
-mirror of the kernel ABI (syscall numbers, `#[repr(C)]` layouts, `Rights`/`KError`/
-`KObjectType` values). A checker that parses both sides and verifies they agree is
-deferred: the compile-time `offset_of!`/`size_of` asserts on both the kernel and
-`libkern` sides, plus a green `cargo xtask qemu` (the demos exercise nearly the whole
-syscall surface against the live kernel), give most of the protection for far less
-cost. Build the real checker when a second non-demo consumer (eshell, fs-server) makes
-drift likelier. Until then, changing an ABI type means editing both copies by hand.
-Trigger: that second consumer, or a drift bug.
-
 **TypedRecord support for enums.** The `#[derive(TypedRecord)]` macro initially supports primitive scalars, `String`, `Vec<T>` of TypedRecord, nested structs, `Option<T>`, and `RawHandle`. Enums (tagged unions) are deferred; they require wire-format extensions and more complex derive code. Trigger: a concrete need; not foreseen as urgent.
 
 **TypedRecord support for generics beyond `Vec<T>`.** Same reasoning. Deferred until a concrete need.
@@ -659,6 +649,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| `cargo xtask abi-sync-check` | 2026-07-29 | Built (Slice D2) and wired into CI. Compares the four hand-mirrored ABI families — syscall numbers, `KError`/`KObjectType` discriminants, `Rights` bits — plus individually-paired shared limits (`MAX_WAIT_HANDLES`, `IPC_HANDLE_MAX`), 91 values in all. `#[repr(C)]` layouts stay out of it: both sides already assert their own offsets and sizes at compile time, which is stronger and fails earlier. |
 | x2APIC | 2026-06-26 | Built — and **x2APIC-only**, not dual-mode: the ≈2014 baseline guarantees it, so no xAPIC fallback is carried. The dev loop runs QEMU ≥ 9.0. |
 | Concurrent direct-block + forwarded-lookup hang | 2026-07-20 | Not the block/forwarding path — a missing cross-CPU wake; fixed by the reschedule IPI. |
 | Writeback IRPs | Phase 3 | Dirty-page writeback landed with read-write `fs-server-ext4` (`FileObject::writeback` / `sys_file_sync`). |

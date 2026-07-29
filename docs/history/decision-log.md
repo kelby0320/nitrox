@@ -8973,3 +8973,42 @@ overflow, ring keeps newest and reports the gap, a write longer than the whole r
 only its tail, `snapshot_len` agreeing with what the copy produces, and wrapped content
 returning in write order). `test-qemu` PASS; `check-arch` / `check-nightly` /
 `check-deferrals` green.
+
+## 2026-07-29 — Slice D2: `abi-sync-check`, and a guard against the check disabling itself
+
+`userspace/libkern` is a **hand-maintained** mirror of the kernel ABI: syscall numbers,
+`KError` and `KObjectType` discriminants, `Rights` bits, and a handful of shared limits.
+Nothing in the build ties the two sides together, so an edit to one is invisible until
+something misbehaves at runtime. The deferral's trigger was "a second non-demo consumer
+makes drift likelier"; there are now six or seven, and Slice C supplied direct evidence by
+hand-copying `SYS_FILE_RENAME` and `MAX_WAIT_HANDLES` across the boundary.
+
+**What it checks.** Four families where both sides happen to use the *same* line shape —
+which is what makes a line-based comparison sound here instead of needing a Rust parser —
+plus individually-named pairs for constants that mirror under different names or in
+unrelated files (`MAX_WAIT_HANDLES`, `IPC_HANDLE_MAX`). 91 values. It reports a value
+mismatch, and a name the kernel has that userspace lacks, with both files and both values
+named — enough to fix without opening either file.
+
+**What it deliberately does not check.** `#[repr(C)]` layouts. Both sides already carry
+`offset_of!`/`size_of` compile-time asserts, which is a *stronger* guarantee than text
+comparison and fails at build time rather than in a lint step. Adding a weaker duplicate
+check would only create a second thing to keep in sync.
+
+**The guard that earned its place immediately.** A pattern-matching checker has a
+characteristic failure mode: the pattern goes stale, extracts nothing, and passes — so the
+check reports success while checking nothing at all, which is worse than not having it. So
+each family fails loudly if it extracts *zero* constants from the kernel side. That guard
+fired on the very first run against my own `Rights` pattern (it took digits before trimming
+the space after `1 <<`, so every bit silently failed to parse), and on a wrong file path for
+`IPC_HANDLE_MAX`. Without it the check would have shipped reporting "✓" over two dead
+families.
+
+A one-sided name is a finding unless it is listed with a reason — currently only
+`SYS_TEST_EXIT`, which exists in test-harness kernels. Keeping that explicit is what stops
+the check from becoming noisy enough to disable.
+
+*Verified:* 91 values agree on the current tree; **four negative controls** — a wrong
+syscall number, a deleted syscall, a shifted `Rights` bit, and the exact Slice C case of
+`MAX_WAIT_HANDLES` drifting on one side — each caught, with a message naming the constant,
+both values and both files. Host suite **795** green; wired into CI ahead of the build step.

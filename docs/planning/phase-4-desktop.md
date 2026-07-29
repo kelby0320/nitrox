@@ -451,8 +451,15 @@ Slice C follows directly; it has actual Milestone 2 blockers.
   system), which is what set the 8 KiB prefix at >2× the measured need. The snapshot layout
   is defined in exactly one place that both the production copy and the six new host tests
   walk, so the tests cannot pass against a layout production does not use.
-- [ ] **D2 — `cargo xtask abi-sync-check`.** Its trigger was "a second non-demo consumer";
-  there are now five or six.
+- [x] **D2 — `cargo xtask abi-sync-check`** ✅ (2026-07-29). Compares the hand-mirrored ABI
+  between the kernel and `userspace/libkern` — syscall numbers, `KError` and `KObjectType`
+  discriminants, `Rights` bits, plus individually-paired shared limits (`MAX_WAIT_HANDLES`,
+  `IPC_HANDLE_MAX`): **91 values**, in CI. Slice C supplied the motivating evidence, having
+  hand-copied two of them. `#[repr(C)]` layouts are deliberately out of scope — both sides
+  already assert their own offsets and sizes at compile time, which is stronger than text
+  comparison and fails earlier. The checker fails loudly if a family's pattern extracts
+  *nothing*, because a silently-disabled check is worse than no check; that guard caught its
+  own author's stale `Rights` pattern on the first run.
 - [ ] **D3 — a listable `/dev`.** `list /dev` is a day-one shell command. `sys_ns_enumerate`
   exists with no consumer; needs a design call on how `list` chooses namespace enumeration
   versus an fs-server directory session.

@@ -66,6 +66,14 @@ jobs:
       - name: cargo xtask check-deferrals
         run: cargo xtask check-deferrals
 
+      # `userspace/libkern` is a hand-maintained mirror of the kernel ABI — syscall
+      # numbers, KError/KObjectType discriminants, Rights bits, shared limits — with
+      # nothing in the build tying the two sides together. This compares them. Its
+      # trigger was "a second non-demo consumer"; there are now six or seven, and two
+      # values (SYS_FILE_RENAME, MAX_WAIT_HANDLES) were hand-copied during Slice C.
+      - name: cargo xtask abi-sync-check
+        run: cargo xtask abi-sync-check
+
       # Builds the kernel ELF for x86_64-unknown-none.
       - name: cargo xtask build
         run: cargo xtask build
