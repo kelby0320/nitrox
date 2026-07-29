@@ -2024,6 +2024,48 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     code
 }
 
+/// **`list /dev` — a kernel-served directory is listable** (Slice D3).
+///
+/// Nothing is *mounted* at `/dev`: its contents are namespace bindings the kernel serves
+/// (`entropy`, `blk`, `console`, `log`). `list` used to fail there, because it only knew how
+/// to open an fs-server directory session. It now takes the union of the filesystem under a
+/// path and the bindings directly beneath it — which is how mount points have always shown
+/// up in a parent listing — so `/dev` needs no special case.
+///
+/// Checks:
+///
+/// 1. **`list /dev` succeeds and names a known binding.** The interesting half: there is no
+///    filesystem here at all, so every row comes from namespace enumeration.
+/// 2. **`list /` still shows filesystem entries**, so adding the binding source did not
+///    replace the fs one. Without this the demo would pass against a `list` that had
+///    stopped reading filesystems entirely.
+fn dev_listing_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: dev-listing demo (a kernel-served directory is listable)\n");
+
+    let dev = run_list(root_ns, notif, &["list", "/dev"], true);
+    if !contains(&dev, b"entropy") {
+        return_fail(b"test-harness: list /dev did not name the entropy binding\n");
+    }
+
+    // `/` is the case that genuinely needs both sources: the root filesystem's own entries
+    // plus the bindings alongside them.
+    let root = run_list(root_ns, notif, &["list", "/"], true);
+    if !contains(&root, b"system") {
+        return_fail(b"test-harness: list / lost its filesystem entries\n");
+    }
+    if !contains(&root, b"dev") {
+        return_fail(b"test-harness: list / did not show the /dev binding\n");
+    }
+
+    kprint(b"test-harness: dev-listing ok (/dev from bindings, / from both sources)\n");
+}
+
+/// Is `needle` a subsequence of contiguous bytes in `hay`? The listing arrives as a TSM1
+/// stream; a name appears in it verbatim, which is enough to assert on without decoding.
+fn contains(hay: &[u8], needle: &[u8]) -> bool {
+    hay.windows(needle.len()).any(|w| w == needle)
+}
+
 /// **`mtime` survives an in-place overwrite** (Slice C4).
 ///
 /// The timestamp gap users actually notice. Under Model A the kernel owns the file-data
@@ -3196,6 +3238,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5d. An in-place, same-length overwrite is invisible to the fs-server under Model A
     //       — prove the kernel now tells it, so mtime stops reporting the file's creation.
     mtime_overwrite_demo(root_ns);
+
+    // 0a5e. `/dev` is kernel-served, not mounted — prove `list` can list it.
+    dev_listing_demo(root_ns, notif);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

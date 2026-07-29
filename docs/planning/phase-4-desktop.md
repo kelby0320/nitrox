@@ -460,9 +460,17 @@ Slice C follows directly; it has actual Milestone 2 blockers.
   comparison and fails earlier. The checker fails loudly if a family's pattern extracts
   *nothing*, because a silently-disabled check is worse than no check; that guard caught its
   own author's stale `Rights` pattern on the first run.
-- [ ] **D3 — a listable `/dev`.** `list /dev` is a day-one shell command. `sys_ns_enumerate`
-  exists with no consumer; needs a design call on how `list` chooses namespace enumeration
-  versus an fs-server directory session.
+- [x] **D3 — a listable `/dev`** ✅ (2026-07-29). The design call the entry asked for
+  **dissolved rather than being answered**: `list` does not choose between namespace
+  enumeration and a directory session, it takes the **union** of the filesystem under a path
+  and the namespace bindings directly beneath it — which is simply how mount points have
+  always appeared in a parent directory's listing. `/dev` is then unremarkable (all
+  bindings, no filesystem), `/system` is unremarkable the other way, and `/` is the case
+  that genuinely needs both. Bindings shadow same-named filesystem entries, as a mount point
+  shadows the directory it covers. `sys_ns_enumerate` finally has its consumer. Stated
+  limitation: a kernel server owning a *subtree* (`/dev/blk/<n>`) is one binding, so `blk`
+  lists as an empty directory — the kernel generates those children on demand and there is
+  no way to ask it what it would serve.
 - [x] **D4 — debug-build lock-ordering enforcement** ✅ (2026-07-29). Every lock declares a
   rank at construction (`SpinLock::new(LockRank::Buddy, …)`); a per-CPU held-rank stack
   checks each acquire in debug builds and compiles away in release. Making the rank

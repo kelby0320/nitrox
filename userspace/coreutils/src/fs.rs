@@ -9,14 +9,16 @@
 //! Kept here rather than in `librsproto` because there is no protocol involved: these are
 //! namespace + memory syscalls.
 
-use alloc::string::String;
-use libkern::abi::HandleInfo;
+use alloc::string::{String, ToString};
+use alloc::vec::Vec;
+use librsproto::file::{DIRENT_KIND_DIR, DIRENT_KIND_FILE};
+use libkern::abi::{HandleInfo, NS_ENTRY_PATH_MAX, NS_KIND_MOUNT, NsEntry};
 use libkern::error::KError;
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ, RIGHT_MAP_WRITE};
 use libkern::syscall::{
     SYS_FILE_CREATE, SYS_FILE_RENAME, SYS_FILE_SYNC, SYS_FILE_TRUNCATE, SYS_HANDLE_CLOSE,
-    SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_LOOKUP, SYS_WAIT, syscall1,
-    syscall2, syscall4, syscall5, syscall6,
+    SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NS_ENUMERATE, SYS_NS_LOOKUP,
+    SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6,
 };
 use librsproto::namespace::RENAME_REPLACE;
 
@@ -225,6 +227,79 @@ fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {
         return Err(FileError::Io(status));
     }
     Ok(handle)
+}
+
+/// The namespace bindings immediately beneath `path`, as `(name, kind)` pairs.
+///
+/// A path's listing is the **union** of two things: whatever filesystem lies under it, and
+/// the namespace bindings directly beneath it. That is not a special case bolted on for
+/// `/dev` — it is how mount points have always appeared in a parent directory's listing.
+/// Framing it as a union is what removes the question the plan posed ("how does `list`
+/// choose between namespace enumeration and a directory session?"): it does not choose.
+/// It asks both and merges, and each source answers for the part it owns.
+///
+/// `/dev` is then unremarkable — nothing is mounted there, so its listing is entirely
+/// bindings (`entropy`, `blk`, `console`, `log`). `/system` is equally unremarkable in the
+/// other direction: nothing is bound beneath it, so its listing is entirely files. `/` is
+/// the interesting one, and the union is exactly right there — the root filesystem's own
+/// entries plus the mount points and kernel servers bound alongside them.
+///
+/// Enumeration is local and cheap (no IPC — the kernel walks the caller's own namespace),
+/// so doing it unconditionally costs a syscall loop over a handful of bindings.
+///
+/// **Limitation, stated rather than hidden:** a kernel server that owns a *subtree*
+/// (`/dev/blk/<n>`) appears as one binding, so `blk` is reported as a directory that then
+/// lists as empty. The kernel generates those children on demand and the namespace has no
+/// way to ask "what would you serve?" — enumerating them needs a protocol that does not
+/// exist yet.
+pub fn ns_children(ns: u64, path: &[u8]) -> Vec<(String, u8)> {
+    // `path` with exactly one trailing slash, so a prefix test is unambiguous.
+    let mut base = String::from_utf8_lossy(path).into_owned();
+    while base.ends_with('/') {
+        base.pop();
+    }
+    base.push('/');
+
+    let mut out: Vec<(String, u8)> = Vec::new();
+    let mut entry = NsEntry::zeroed();
+    for index in 0u64.. {
+        // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
+        let r = unsafe {
+            syscall3(
+                SYS_NS_ENUMERATE,
+                ns,
+                index,
+                (&raw mut entry) as *mut NsEntry as u64,
+            )
+        };
+        if r != 0 {
+            break; // NotFound ends the walk
+        }
+        let len = (entry.path_len as usize).min(NS_ENTRY_PATH_MAX);
+        let bound = String::from_utf8_lossy(&entry.path[..len]).into_owned();
+        let Some(rest) = bound.strip_prefix(&base) else {
+            continue;
+        };
+        if rest.is_empty() {
+            continue; // the binding *is* this path, not a child of it
+        }
+        // The first component, and whether the binding continues past it.
+        let (name, deeper) = match rest.split_once('/') {
+            Some((head, _)) => (head.to_string(), true),
+            None => (rest.to_string(), false),
+        };
+        // An intermediate component is a directory by construction; a leaf binding is a
+        // directory only if it is a filesystem mount.
+        let kind = if deeper || entry.kind == NS_KIND_MOUNT {
+            DIRENT_KIND_DIR
+        } else {
+            DIRENT_KIND_FILE
+        };
+        if !out.iter().any(|(n, _)| *n == name) {
+            out.push((name, kind));
+        }
+    }
+    out
 }
 
 /// Rename `src` to `dst`, both absolute namespace paths. With `replace`, an existing

@@ -138,18 +138,42 @@ fn collect(
         stage.diag(b"list: maximum recursion depth exceeded\n");
         return Err(DirError::Protocol);
     }
-    let mut buf = [0u8; 4096];
-    let mut dir = Dir::open(stage.namespace, path, &mut buf)?;
+    // A path's listing is the **union** of the filesystem under it and the namespace
+    // bindings directly beneath it — which is just how mount points appear in a parent's
+    // listing. So there is no "which mechanism?" decision: ask both, merge, and let each
+    // answer for the part it owns. `/dev` is then unremarkable (all bindings, no
+    // filesystem); `/system` is unremarkable the other way; `/` genuinely needs both.
+    let ns_entries = coreutils::fs::ns_children(stage.namespace, path);
 
     let mut entries: Vec<OwnedEntry> = Vec::new();
-    let r = dir.read_dir(|e| {
-        if e.name != b"." && e.name != b".." {
-            entries.push(OwnedEntry::from_entry(e));
+    let mut buf = [0u8; 4096];
+    match Dir::open(stage.namespace, path, &mut buf) {
+        Ok(mut dir) => {
+            let r = dir.read_dir(|e| {
+                if e.name != b"." && e.name != b".." {
+                    entries.push(OwnedEntry::from_entry(e));
+                }
+                true
+            });
+            dir.close();
+            r?;
         }
-        true
-    });
-    dir.close();
-    r?;
+        // No filesystem here. That is an error only if the namespace has nothing beneath
+        // this path either — otherwise it is an ordinary kernel-served directory like
+        // `/dev`, and the bindings below are the whole answer.
+        Err(e) => {
+            if ns_entries.is_empty() {
+                return Err(e);
+            }
+        }
+    }
+
+    // Bindings shadow same-named filesystem entries, as a mount point shadows the
+    // directory it covers.
+    for (name, kind) in &ns_entries {
+        entries.retain(|e| e.name() != name.as_bytes());
+        entries.push(OwnedEntry::binding(name.as_bytes(), *kind));
+    }
 
     for e in &entries {
         out.push((reported(prefix, e.name()), *e));

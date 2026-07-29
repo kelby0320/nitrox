@@ -9012,3 +9012,49 @@ the check from becoming noisy enough to disable.
 syscall number, a deleted syscall, a shifted `Rights` bit, and the exact Slice C case of
 `MAX_WAIT_HANDLES` drifting on one side — each caught, with a message naming the constant,
 both values and both files. Host suite **795** green; wired into CI ahead of the build step.
+
+## 2026-07-29 — Slice D3: `/dev` is listable, and the design call dissolved
+
+The deferral asked for a decision: "how does a listing tool choose between *namespace
+enumeration* (what `/dev` needs — it is kernel-served) and an *fs-server directory session*
+(what `list` uses today)?" It turned out to be the wrong question, and noticing that was the
+whole of the work.
+
+**A path's listing is the union of both sources.** Whatever filesystem lies under the path,
+plus the namespace bindings directly beneath it. `list` does not choose; it asks both and
+merges, and each source answers for the part it owns. That is not a special case invented
+for `/dev` — it is how mount points have always appeared in a parent directory's listing.
+
+With that framing every case falls out without branching on anything:
+
+- **`/dev`** — nothing mounted, so the listing is entirely bindings (`entropy`, `blk`,
+  `console`, `log`). Previously `list` failed here outright.
+- **`/system`** — nothing bound beneath it, so the listing is entirely files. Unchanged.
+- **`/`** — genuinely both: the root filesystem's own entries *plus* the mount points and
+  kernel servers bound alongside them. This is the case a "choose one mechanism" design
+  could not have served correctly at all.
+
+Bindings shadow same-named filesystem entries, matching mount semantics. A missing
+filesystem is an error only when the namespace has nothing beneath the path either —
+otherwise it is an ordinary kernel-served directory. Enumeration is local and cheap (the
+kernel walks the caller's own namespace, no IPC), so doing it unconditionally costs a short
+syscall loop, which is why it can be unconditional and the code needs no mode flag.
+
+A namespace binding is not a file, so its reported `inode`, `mode`, `size` and `mtime` are
+all zero — `OwnedEntry::binding` exists to make that explicit rather than have a listing
+invent plausible-looking values for fields that do not apply.
+
+**Stated limitation.** A kernel server that owns a *subtree* — `/dev/blk/<n>` — appears as a
+single binding, so `blk` is reported as a directory that then lists as empty. The kernel
+synthesises those children on demand and the namespace has no way to ask "what would you
+serve?"; enumerating them needs a protocol that does not exist. Written down in
+`coreutils::fs::ns_children` rather than left for someone to rediscover.
+
+`sys_ns_enumerate` has existed with no consumer since Phase 2. It has one now.
+
+*Verified:* host suite **795** green; `test-qemu` PASS with an in-guest check that `list
+/dev` names a binding **and** that `list /` still shows filesystem entries — the second half
+so the check cannot pass against a `list` that had stopped reading filesystems altogether.
+**Both controls run**: removing the namespace source fails the first assertion (that is
+exactly the pre-D3 behaviour), and removing the filesystem source fails the second. All four
+static checks green.
