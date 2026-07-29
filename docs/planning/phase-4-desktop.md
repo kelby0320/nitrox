@@ -496,6 +496,16 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 ### Display + input
 
+- [ ] **Per-interrupt-context lock-order tracking — `TODO(lockdep-irq-context)`.** Scheduled
+  here, first, and deliberately *ahead* of the handlers below (decision 2026-07-29). The D4
+  tracker orders locks on a per-CPU held-rank stack, which cannot express "the order restarts
+  in interrupt context" — so `tlb::LOCK`, held with interrupts enabled by the F1 fix, is
+  exempt (its own no-lock-held contract *is* asserted; what is unchecked is anything taken
+  beneath it in interrupt context). That gap is narrow while there are three interrupt
+  handlers the boot exercises end to end. This slice adds real ones — keyboard, mouse, and a
+  display path — which is when interrupt-context locking stops being enumerable by hand.
+  Needs every interrupt entry **and** exit hooked; missing one corrupts the tracker silently
+  rather than failing loudly, so it wants its own negative controls.
 - [ ] Display server over the persisted **boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind; firmware-fixed resolution, one linear framebuffer, no acceleration)
 - [ ] Input routing: keyboard + mouse (PS/2 under QEMU; USB HID later — see below)
 - [ ] Font rasterization (a `no_std`-friendly Rust crate, e.g. `fontdue`/`ab_glyph`) + a text/ANSI render path

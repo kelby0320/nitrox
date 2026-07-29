@@ -283,8 +283,12 @@ lock can be ranked normally and the leaf reasoning stops needing a caveat. Defer
 because it means hooking *every* interrupt entry and exit (timer, device, TLB-shootdown
 IPI, reschedule IPI), and missing one would silently corrupt the tracker rather than fail
 loudly — so it wants its own change with its own verification, not an append to the one
-that introduced the tracker. Trigger: a second lock that needs to be held with interrupts
-enabled, or a real inversion suspected in interrupt context.
+that introduced the tracker. **Scheduled to the display + input slice**
+(`docs/planning/phase-4-desktop.md` § Display + input), as its first item and ahead of the
+handlers it protects: that slice adds keyboard, mouse and display interrupt handlers, which
+is the point at which interrupt-context locking stops being three paths one can enumerate.
+Earlier triggers that would pull it forward: a second lock needing to be held with
+interrupts enabled, or a real inversion suspected in interrupt context.
 
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
 (IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
