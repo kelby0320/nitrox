@@ -179,7 +179,11 @@ commands at once across the command list. The software queue's depth is already
 `PENDING_DEPTH = 32`, so it converts to NCQ slots cleanly. Trigger: an I/O-latency-bound
 workload (an SSD, or many concurrent readers).
 
-**Stateless `File::ReadRange` fill (slice 8 Part 3).** A page-cache fill names its
+**Stateless `File::ReadRange` fill — Model B only, no shipping consumer.** Every
+filesystem shipping today is Model A (the kernel reads the device directly from a block
+map), so this costs nothing at present; it applies when a **non-block** filesystem exists —
+a network or synthetic server. Recorded because the shape is real when it arrives. A
+page-cache fill names its
 file by re-sending the path `suffix` on every `ReadRange` (the same suffix the lazy
 `Resolve` used), so the fs-server re-resolves the path per fill rather than handing
 back an open-file cookie at resolve time. Simple and correct for the milestone; the
@@ -205,34 +209,41 @@ per-fault re-resolution showing up in profiles. The page cache is built behind a
 **fill-producer seam** so the **Model-A** extent fill (Phase 3, zero-copy block reads)
 slots in *alongside* `ReadRange` without a redesign.
 
-**Demand-fault fill latency — single-page fills, no read-ahead (slice 8; measured
-slice 9).** The kernel fills **exactly one 4 KiB page per fault**
-(`FileObject::fault_in_page` reserves a single index), and each fill is a full
-stateless round-trip: park the faulter → `File::ReadRange` IPC → the fs-server
-re-reads the superblock, re-resolves the path, and re-walks the extent tree from
-disk (~6–8 emulated AHCI reads) → reply → fill → resume. Measured under QEMU at
-**~325 ms per page**; the 64-page `large.bin` milestone fixture made boot a ~20 s
-silent wait. Two independent Phase-3 levers close this, and they compose:
-- **Kernel read-ahead (clustered fill)** — on a `FileBacked` fault, fill a cluster
-  of pages in **one** `ReadRange` (e.g. the rest of the file capped at N pages),
-  turning *pages* round-trips into *⌈pages/N⌉*. The single biggest lever; it is the
-  natural completion of the slice-8 page cache and needs only the fault path +
-  `reserve`/`start_fill` to span a page range (the wire op already carries
-  `offset`/`len`).
-- **fs-server open-file cookie** — the stateless-fill entry above; makes each
-  `ReadRange` O(1) instead of a full re-resolve.
+**Demand-fault fill: one page per fault, no read-ahead.** The kernel fills **exactly one
+4 KiB page per fault** (`FileObject::fault_in_page` reserves a single index). What that
+costs depends on which data path the filesystem uses, and the two are very different:
 
-Deferred to Phase 3 rather than pulled forward: both are optimizations of a path
-that is *correct* today, and the milestone only needs to **prove** multi-page
-demand-faulting, not do it fast. As a stopgap the fixture was trimmed **64 → 8
-pages** (still spans 8 position-sensitive pages; boot ~2.8 s instead of ~20 s) — see
-the decision log (2026-06-26, Phase 2 close). Trigger to implement: the first
-workload that demand-pages a genuinely large file on the boot path, or this latency
-showing up in a profile. (Note: read-ahead also multiplies the per-fill disk I/O,
-which interacts with the AHCI single-command limit above — both want the same
-Phase-3 storage-hardening pass.)
+- **Model A — every filesystem shipping today (ext4).** The fs-server hands the kernel the
+  file's `BlockRun` map at resolve, and a fault reads the page **zero-copy straight from
+  the device** with one block IRP. There is **no fs-server IPC in the fill path at all**.
+  Read-ahead here is therefore a *purely kernel-side* change: the run map is already in
+  hand, so filling N contiguous pages is one IRP covering N × PAGE bytes (the AHCI driver
+  issues a multi-sector transfer as a single command), turning *pages* IRPs and wakes into
+  *⌈pages/N⌉*.
+- **Model B — no shipping consumer.** A non-block filesystem fills via a stateless
+  `File::ReadRange` per page, and the server re-resolves the path per range. That is the
+  expensive shape the slice-8/9 notes describe.
 
-### Networking
+**Measured 2026-07-29** (the old ~325 ms-per-page figure was Model B, before the 4 KiB
+block batching and the device-IRQ scheduling fix; it does not describe this system). A
+whole adjudicated boot performs **43 fills** at **~137–204 µs** each — **0.5 % of boot** —
+with **zero** concurrent-faulter spins. Nearly every program is spawned from the initramfs,
+which resolves to a `MemoryObject` copy and never touches the page cache; the 43 are the
+ext4-backed reads. Read-ahead would therefore optimise half a percent of boot, so it is
+**deferred on measurement rather than on assumption**.
+
+The counters behind those numbers are permanent (`file_object::fill_stats`,
+`syscall::table::spawn_stats`, printed at the end of a `test-harness` run), so the trigger
+is observable: **fill count climbing out of the tens**, which is what large binaries or
+file-backed program text would cause. That is the same inflection as CoW and dynamic
+linking — see the process-memory-model bundle.
+
+**Two scheduled revisits**, rather than waiting for a profile to volunteer: **after the
+typed shell + coreutils subproject** (a shell spawns per pipeline stage and drives real
+filesystem traffic from userspace, unlike init's fixed boot sequence), and **after the
+desktop UI MVP** (large binaries, many concurrent instances, fonts and images loaded from
+files). At each, re-read the counters from a `test-qemu` boot: if fills have climbed out of
+the tens, or image materialisation past a few milliseconds, this stops being deferred.
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
 
