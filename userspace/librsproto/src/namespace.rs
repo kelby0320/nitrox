@@ -29,10 +29,29 @@ pub const RESOLVE_CREATE: u32 = 1 << 3;
 /// separate flag rather than "grow to a smaller size" because the two do opposite things
 /// to the block allocator and a caller must not get one when it asked for the other.
 pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
+/// `RESOLVE_RENAME` — **rename** the resolved path to a second path carried in the same
+/// request, and reply status-only ([`OBJECT_KIND_NONE`]) rather than an object.
+///
+/// A rename inherently names *two* directories, which a directory session — bound to one
+/// inode, addressing entries by name — structurally cannot express; so it rides the
+/// path-addressed resolve surface alongside `RESOLVE_CREATE`/`GROW`/`TRUNCATE`, with the
+/// **namespace** as the confinement boundary (a process can only name what its supervisor
+/// bound into it). The kernel additionally guarantees both paths resolve through the *same*
+/// binding, so a server never sees a cross-filesystem rename. See the decision log
+/// (2026-07-29).
+pub const RESOLVE_RENAME: u32 = 1 << 5;
+
+/// `RENAME_REPLACE` — the rename flag permitting an existing destination to be replaced.
+/// Absent, a taken destination fails; the primitive does not guess.
+pub const RENAME_REPLACE: u16 = 1 << 0;
 
 // --- object_kind values (reply) ---------------------------------------------
 
 /// The reply's `handles[0]` is a read-only `MemoryObject` of file content.
+/// The request completed and produced **no object** — a status-only success, used by the
+/// mutating resolves (`RESOLVE_RENAME`) that change the filesystem rather than resolve to
+/// something. The reply carries no handle and the lookup completes with result `0`.
+pub const OBJECT_KIND_NONE: u16 = 0;
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
 /// A directory resource. The fs-server does not use this kind on the wire — the kernel has
 /// no "directory" reply kind, so an **open directory handle** is returned as an
@@ -191,4 +210,23 @@ mod tests {
         assert!(parse_resolve_request(&buf).is_none());
         assert!(parse_resolve_reply(&[0u8; 4]).is_none());
     }
+}
+
+/// The destination suffix + flags a [`RESOLVE_RENAME`] request carries after its primary
+/// suffix: `dest_len: u16`, `flags: u16`, then `dest_len` bytes.
+///
+/// Laid out after the suffix for the same reason the size-changing resolves put `new_size`
+/// there — the fixed prefix stays one shape for every resolve, and only the tail varies.
+pub fn parse_resolve_rename(body: &[u8]) -> Option<(&[u8], u16)> {
+    let r = parse_resolve_request(body)?;
+    let tail = RESOLVE_REQUEST_PREFIX_LEN + r.suffix.len();
+    if body.len() < tail + 4 {
+        return None;
+    }
+    let dest_len = u16::from_le_bytes([body[tail], body[tail + 1]]) as usize;
+    let flags = u16::from_le_bytes([body[tail + 2], body[tail + 3]]);
+    if body.len() < tail + 4 + dest_len {
+        return None;
+    }
+    Some((&body[tail + 4..tail + 4 + dest_len], flags))
 }

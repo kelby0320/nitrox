@@ -45,6 +45,9 @@ const RESOLVE_FILE_AS_MEMOBJ: u32 = 1 << 0;
 pub const RESOLVE_FILE_LAZY: u32 = 1 << 1;
 
 /// Reply `object_kind`: `handles[0]` is a read-only `MemoryObject` of file content.
+/// Status-only success: the request mutated the filesystem and produced no object (the
+/// mutating resolves, e.g. `RESOLVE_RENAME`). No handle rides the reply.
+pub const OBJECT_KIND_NONE: u16 = 0;
 pub const OBJECT_KIND_MEMOBJ: u16 = 1;
 /// Reply `object_kind`: a lazily-filled file — `content_len` is the total file
 /// size and `handles[0]` is empty; the kernel builds the page-cache object,
@@ -158,6 +161,11 @@ pub const RESOLVE_CREATE: u32 = 1 << 3;
 /// separate flag rather than "grow to a smaller size" because the two do opposite things to
 /// the block allocator and a caller must not get one when it asked for the other.
 pub const RESOLVE_TRUNCATE: u32 = 1 << 4;
+/// `RESOLVE_RENAME` — rename the resolved path to a second path carried after the suffix,
+/// replying status-only (`OBJECT_KIND_NONE`). A rename names two directories, which a
+/// directory session cannot express; the namespace is the confinement boundary, and the
+/// kernel guarantees both paths share a binding. See the decision log (2026-07-29).
+pub const RESOLVE_RENAME: u32 = 1 << 5;
 
 /// Which size change a resolve carries. The size itself rides after the suffix.
 #[derive(Copy, Clone, PartialEq, Eq, Debug)]
@@ -216,6 +224,46 @@ pub fn build_resolve_request_sized(
     let s = b + RESOLVE_REQUEST_PREFIX_LEN;
     out[s..s + suffix.len()].copy_from_slice(suffix);
     put_u32(out, s + suffix.len(), new_size);
+    Some(total)
+}
+
+/// Build a `RESOLVE_RENAME` request: the source suffix as usual, then `dest_len: u16`,
+/// `flags: u16`, and the destination suffix. Both suffixes are **mount-relative** — the
+/// caller has already established that they share a binding.
+pub fn build_resolve_request_rename(
+    out: &mut [u8],
+    requested_rights: u64,
+    suffix: &[u8],
+    dest: &[u8],
+    flags: u16,
+) -> Option<usize> {
+    if suffix.len() > u16::MAX as usize || dest.len() > u16::MAX as usize {
+        return None;
+    }
+    let body_len = RESOLVE_REQUEST_PREFIX_LEN + suffix.len() + 4 + dest.len();
+    let total = RS_HEADER_LEN + body_len;
+    if out.len() < total {
+        return None;
+    }
+    put_u32(out, 0, RS_MAGIC);
+    put_u16(out, 4, RS_VERSION);
+    put_u16(out, 6, OP_NS_RESOLVE);
+    put_u64(out, REQUEST_ID_OFFSET, 0);
+    put_u32(out, 16, 0);
+    put_u32(out, 20, body_len as u32);
+    put_u16(out, 24, 0);
+    put_u16(out, 26, 0);
+    let b = RS_HEADER_LEN;
+    put_u64(out, b, requested_rights);
+    put_u32(out, b + 8, RESOLVE_FILE_LAZY | RESOLVE_RENAME);
+    put_u16(out, b + 12, suffix.len() as u16);
+    put_u16(out, b + 14, 0);
+    let sfx = b + RESOLVE_REQUEST_PREFIX_LEN;
+    out[sfx..sfx + suffix.len()].copy_from_slice(suffix);
+    let tail = sfx + suffix.len();
+    put_u16(out, tail, dest.len() as u16);
+    put_u16(out, tail + 2, flags);
+    out[tail + 4..tail + 4 + dest.len()].copy_from_slice(dest);
     Some(total)
 }
 

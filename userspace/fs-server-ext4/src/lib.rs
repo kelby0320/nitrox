@@ -255,6 +255,114 @@ mod tests {
     }
 
     #[test]
+    fn rename_path_moves_a_file_across_directories_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        ext4::mkdir_at(&rw, sys, b"dst", TEST_NOW).unwrap();
+        ext4::create_file(&rw, b"/system", b"mover", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/mover", 1500, TEST_NOW).unwrap();
+
+        ext4::rename_path(&rw, b"/system/mover", b"/system/dst/moved", false, TEST_NOW).unwrap();
+
+        // Gone from the source, present at the destination, and still the same file —
+        // the size proves the inode moved rather than a fresh empty one being created.
+        assert_eq!(ext4::stat_file(&rw, b"/system/mover"), Err(FsError::NotFound));
+        assert_eq!(ext4::stat_file(&rw, b"/system/dst/moved"), Ok(1500));
+        assert_e2fsck_clean(&rw.0.into_inner(), "rename-cross");
+    }
+
+    #[test]
+    fn rename_path_replaces_an_existing_file_only_when_asked() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        ext4::create_file(&rw, b"/system", b"src", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/src", 1200, TEST_NOW).unwrap();
+        ext4::create_file(&rw, b"/system", b"victim", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/victim", 3000, TEST_NOW).unwrap();
+
+        // Without `replace` the destination is untouched — fail loud, as everywhere else.
+        assert_eq!(
+            ext4::rename_path(&rw, b"/system/src", b"/system/victim", false, TEST_NOW),
+            Err(FsError::Exists)
+        );
+        assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(3000));
+        assert_eq!(ext4::stat_file(&rw, b"/system/src"), Ok(1200));
+
+        // With it, the destination becomes the source and the replaced inode is freed.
+        let free_before = free_inodes(&rw);
+        ext4::rename_path(&rw, b"/system/src", b"/system/victim", true, TEST_NOW).unwrap();
+        assert_eq!(ext4::stat_file(&rw, b"/system/victim"), Ok(1200));
+        assert_eq!(ext4::stat_file(&rw, b"/system/src"), Err(FsError::NotFound));
+        assert_eq!(
+            free_inodes(&rw),
+            free_before + 1,
+            "the replaced inode must be freed, not orphaned"
+        );
+        assert_e2fsck_clean(&rw.0.into_inner(), "rename-replace");
+    }
+
+    #[test]
+    fn rename_path_moves_a_directory_and_fixes_its_parent_link() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        ext4::mkdir_at(&rw, sys, b"outer", TEST_NOW).unwrap();
+        ext4::mkdir_at(&rw, sys, b"target", TEST_NOW).unwrap();
+        let outer = ext4::resolve_dir(&rw, b"/system/outer").unwrap();
+        ext4::create_file(&rw, b"/system/outer", b"payload", TEST_NOW).unwrap();
+        let _ = outer;
+
+        ext4::rename_path(&rw, b"/system/outer", b"/system/target/inner", false, TEST_NOW)
+            .unwrap();
+
+        // The directory and its contents moved wholesale…
+        assert!(ext4::resolve_dir(&rw, b"/system/target/inner").is_ok());
+        assert_eq!(ext4::stat_file(&rw, b"/system/target/inner/payload"), Ok(0));
+        assert!(ext4::resolve_dir(&rw, b"/system/outer").is_err());
+        // …and `..` now names the new parent, which is what `e2fsck` checks link counts
+        // against — a stale `..` shows up as a link-count mismatch on both directories.
+        assert_e2fsck_clean(&rw.0.into_inner(), "rename-dir");
+    }
+
+    #[test]
+    fn rename_path_refuses_the_cases_that_would_corrupt() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        ext4::mkdir_at(&rw, sys, b"d", TEST_NOW).unwrap();
+        ext4::mkdir_at(&rw, sys, b"e", TEST_NOW).unwrap();
+        ext4::create_file(&rw, b"/system", b"f", TEST_NOW).unwrap();
+
+        // Moving a directory inside itself would detach the subtree from the root.
+        assert_eq!(
+            ext4::rename_path(&rw, b"/system/d", b"/system/d/self", false, TEST_NOW),
+            Err(FsError::Unsupported)
+        );
+        // Replacing a directory needs rmdir's emptiness + link bookkeeping; deferred.
+        assert_eq!(
+            ext4::rename_path(&rw, b"/system/f", b"/system/e", true, TEST_NOW),
+            Err(FsError::Unsupported)
+        );
+        // A missing source is NotFound, not a silent success.
+        assert_eq!(
+            ext4::rename_path(&rw, b"/system/ghost", b"/system/g", false, TEST_NOW),
+            Err(FsError::NotFound)
+        );
+        // Renaming onto itself is a no-op, and must not unlink the file.
+        ext4::rename_path(&rw, b"/system/f", b"/system/f", false, TEST_NOW).unwrap();
+        assert_eq!(ext4::stat_file(&rw, b"/system/f"), Ok(0));
+        assert_e2fsck_clean(&rw.0.into_inner(), "rename-refuse");
+    }
+
+    /// The superblock's free-inode count — proves a replaced inode was actually freed
+    /// rather than merely unlinked.
+    fn free_inodes(rw: &RwImage) -> u32 {
+        let img = rw.0.borrow();
+        u32::from_le_bytes(img[1024 + 16..1024 + 20].try_into().unwrap())
+    }
+
+    #[test]
     fn a_directory_grows_past_its_first_block_and_stays_e2fsck_clean() {
         use std::cell::RefCell;
         // 1 KiB blocks and 200-byte names, so each record costs ~208 bytes and four fill

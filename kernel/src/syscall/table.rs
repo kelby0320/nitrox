@@ -2188,6 +2188,7 @@ fn complete_resolve_reply(
 ) -> SysResult {
     use crate::rsproto::{
         OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ,
+        OBJECT_KIND_NONE,
         ReplyKind, parse_reply,
     };
 
@@ -2221,6 +2222,8 @@ fn complete_resolve_reply(
         {
             build_and_install_file_blocks(&pl, content_len, &bounce.payload[..payload_len], transfers)
         }
+        // A mutating resolve (rename): the work is done and there is nothing to install.
+        ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
         ReplyKind::Success { object_kind, .. }
             if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
         {

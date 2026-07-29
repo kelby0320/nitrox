@@ -1388,6 +1388,174 @@ pub fn rmdir_at<RW: BlockReader + BlockWriter>(
     Ok(())
 }
 
+/// Point the existing entry `name` in `dir_inode` at a different inode, in place.
+///
+/// One block write, no record shuffling — which is what makes an overwriting rename's
+/// crash window benign: after this, both the old and new names refer to the source inode
+/// and the replaced inode is merely unreferenced (its link count still ≥ 1), so a crash
+/// leaves work for `e2fsck` rather than a lost file. Removing the destination entry first
+/// and re-inserting would open a window with *no* name for either.
+fn dir_repoint<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    dir_inode: &[u8; 256],
+    name: &[u8],
+    new_ino: u32,
+    new_ft: u8,
+) -> Result<u32, FsError> {
+    let bs = sb.block_size as usize;
+    let size = rd_u32(dir_inode, 4) as u64;
+    let nblocks = size.div_ceil(sb.block_size as u64);
+    let mut buf = [0u8; MAX_BLOCK];
+    for lb in 0..nblocks {
+        let phys = extent_find(rw, sb, &dir_inode[40..100], lb)?;
+        if phys == 0 {
+            continue;
+        }
+        rw.read_at(phys * sb.block_size as u64, &mut buf[..bs])?;
+        let mut off = 0;
+        while off + 8 <= bs {
+            let e_ino = rd_u32(&buf, off);
+            let rec_len = rd_u16(&buf, off + 4) as usize;
+            let name_len = buf[off + 6] as usize;
+            if rec_len < 8 || off + rec_len > bs {
+                break;
+            }
+            if e_ino != 0 && name_len == name.len() && &buf[off + 8..off + 8 + name_len] == name {
+                let old = e_ino;
+                buf[off..off + 4].copy_from_slice(&new_ino.to_le_bytes());
+                buf[off + 7] = new_ft;
+                rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
+                return Ok(old);
+            }
+            off += rec_len;
+        }
+    }
+    Err(FsError::NotFound)
+}
+
+/// Split an absolute path into `(parent, leaf)` — `"/a/b/c"` → `("/a/b", "c")`.
+fn split_parent(path: &[u8]) -> Option<(&[u8], &[u8])> {
+    let slash = path.iter().rposition(|&c| c == b'/')?;
+    let leaf = &path[slash + 1..];
+    if leaf.is_empty() || leaf == b"." || leaf == b".." {
+        return None;
+    }
+    Some((if slash == 0 { b"/" } else { &path[..slash] }, leaf))
+}
+
+/// Rename `old_path` to `new_path` **anywhere within this filesystem**, optionally
+/// replacing an existing destination.
+///
+/// The path-addressed counterpart to [`rename_at`] (which is name-addressed within one
+/// directory session). A cross-directory rename inherently names two directories, which a
+/// session — bound to exactly one inode — cannot express; see the decision log
+/// (2026-07-29).
+///
+/// Ordering is chosen so that a crash cannot lose the **source**, since no journal exists:
+///
+/// 1. Point the destination name at the source inode — repointing an existing entry when
+///    replacing, otherwise inserting a new one.
+/// 2. Remove the source's old entry.
+/// 3. Release the replaced inode's link (freeing it if that was the last).
+///
+/// A crash between 1 and 2 leaves the file reachable under *both* names; between 2 and 3 it
+/// leaves the replaced inode unreferenced with a positive link count. `e2fsck` repairs both
+/// (the latter into `lost+found`), and neither loses the file being moved.
+///
+/// Moving a **directory** additionally repoints its `..` and shifts one link from the old
+/// parent to the new. Replacing a directory is refused (`Unsupported`) — that needs the
+/// emptiness check and link bookkeeping of `rmdir` folded in, and nothing needs it yet.
+pub fn rename_path<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    old_path: &[u8],
+    new_path: &[u8],
+    replace: bool,
+    now: i64,
+) -> Result<(), FsError> {
+    let sb = read_superblock(rw)?;
+    let (old_parent_path, old_name) = split_parent(old_path).ok_or(FsError::Unsupported)?;
+    let (new_parent_path, new_name) = split_parent(new_path).ok_or(FsError::Unsupported)?;
+    let (old_dir_ino, old_dir) = resolve_path_ino(rw, &sb, old_parent_path)?;
+    let (new_dir_ino, mut new_dir) = resolve_path_ino(rw, &sb, new_parent_path)?;
+    if rd_u16(&old_dir, 0) & S_IFMT != S_IFDIR || rd_u16(&new_dir, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    // A no-op rename must not unlink anything.
+    if old_dir_ino == new_dir_ino && old_name == new_name {
+        return Ok(());
+    }
+
+    let src_ino = dir_lookup(rw, &sb, &old_dir, old_name)?;
+    let src = read_inode(rw, &sb, src_ino)?;
+    let src_is_dir = rd_u16(&src, 0) & S_IFMT == S_IFDIR;
+    let src_ft = if src_is_dir { EXT4_FT_DIR } else { EXT4_FT_REG_FILE };
+
+    // Moving a directory into its own subtree would detach it from the tree entirely
+    // (its `..` would point into the cycle). Cheap guard: refuse the parent-into-child
+    // case, which is the reachable one — a full ancestor walk is deferred with the rest
+    // of the deep-tree work.
+    if src_is_dir && new_parent_path.starts_with(old_path) {
+        return Err(FsError::Unsupported);
+    }
+
+    // Step 1: make the destination name refer to the source.
+    let replaced = match dir_lookup(rw, &sb, &new_dir, new_name) {
+        Ok(dest_ino) => {
+            if !replace {
+                return Err(FsError::Exists);
+            }
+            let dest = read_inode(rw, &sb, dest_ino)?;
+            if rd_u16(&dest, 0) & S_IFMT == S_IFDIR {
+                return Err(FsError::Unsupported); // replacing a directory is deferred
+            }
+            dir_repoint(rw, &sb, &new_dir, new_name, src_ino, src_ft)?;
+            Some(dest_ino)
+        }
+        Err(FsError::NotFound) => {
+            dir_insert(rw, &sb, new_dir_ino, &mut new_dir, new_name, src_ino, src_ft, now)?;
+            None
+        }
+        Err(e) => return Err(e),
+    };
+
+    // Step 2: drop the source's old name. Re-read the old parent — `dir_insert` may have
+    // grown it (when both paths share a parent), which rewrote its inode.
+    let (_, old_dir) = resolve_path_ino(rw, &sb, old_parent_path)?;
+    dir_remove(rw, &sb, &old_dir, old_name)?;
+
+    // Step 3: release the inode the destination name used to hold.
+    if let Some(dest_ino) = replaced {
+        let dest = read_inode(rw, &sb, dest_ino)?;
+        let links = rd_u16(&dest, 26).wrapping_sub(1);
+        if links == 0 {
+            free_inode_blocks(rw, &sb, &dest)?;
+            free_inode(rw, &sb, dest_ino, false, now)?;
+        } else {
+            let off = inode_offset(rw, &sb, dest_ino)?;
+            let mut d = dest;
+            d[26..28].copy_from_slice(&links.to_le_bytes());
+            stamp(&mut d, now, sb.inode_size, Stamp::MetadataOnly);
+            rw.write_at(off, &d[..(sb.inode_size as usize).min(256)])?;
+        }
+    }
+
+    // A directory carries a link to its parent through `..`, so a move between parents
+    // shifts one link and rewrites that entry.
+    if src_is_dir && old_dir_ino != new_dir_ino {
+        let src_dir = read_inode(rw, &sb, src_ino)?;
+        dir_repoint(rw, &sb, &src_dir, b"..", new_dir_ino, EXT4_FT_DIR)?;
+        adjust_links(rw, &sb, old_dir_ino, -1)?;
+        adjust_links(rw, &sb, new_dir_ino, 1)?;
+    }
+
+    touch_inode(rw, &sb, old_dir_ino, now, Stamp::Modified)?;
+    if new_dir_ino != old_dir_ino {
+        touch_inode(rw, &sb, new_dir_ino, now, Stamp::Modified)?;
+    }
+    Ok(())
+}
+
 /// Rename `old` to `new` **within** directory inode `dir_ino` (the session's bound
 /// directory): move the entry, preserving its target inode + type. `new` must not already
 /// exist (overwrite is deferred). Cross-directory rename needs a second handle and is
