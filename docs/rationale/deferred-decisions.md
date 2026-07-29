@@ -261,6 +261,28 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 ### Filesystems
 
+**Per-interrupt-context lock-order tracking — `TODO(lockdep-irq-context)`.** The debug
+lock-order tracker (Slice D4) models every lock in one total order on a per-CPU held-rank
+stack. That is sound for thread context, where a holder cannot migrate, but it cannot
+express **"the order restarts in interrupt context"** — and one lock needs exactly that.
+`tlb::LOCK` is held with interrupts *enabled* (the F1 fix: a shootdown initiator spinning
+for acknowledgements must keep taking incoming shootdown IPIs, or two initiators deadlock),
+so interrupt work legitimately runs beneath it with its own full ordering. The tracker said
+so twice while D4 landed — first `Leaf` under `Leaf` (a DPC drain at an interrupt tail
+inside a shootdown window), then `Sched` under it (a timer tick doing the same) — and both
+were correct behaviour, not bugs.
+
+It is therefore the one lock marked `LockRank::IrqEnabledHold`, which neither records nor
+checks; its actual discipline is the documented "no other lock held when taken" contract,
+which ranking cannot verify. The fix is what Linux's lockdep does: save the held set at
+interrupt entry and restore it at exit, giving handlers a fresh scope, after which this
+lock can be ranked normally and the leaf reasoning stops needing a caveat. Deferred
+because it means hooking *every* interrupt entry and exit (timer, device, TLB-shootdown
+IPI, reschedule IPI), and missing one would silently corrupt the tracker rather than fail
+loudly — so it wants its own change with its own verification, not an append to the one
+that introduced the tracker. Trigger: a second lock that needs to be held with interrupts
+enabled, or a real inversion suspected in interrupt context.
+
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
 (IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
 and reschedule IPIs, and every registered device handler — is configured with **IST0, i.e.

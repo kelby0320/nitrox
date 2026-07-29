@@ -56,11 +56,12 @@ use crate::arch::smp::ArchSmp;
 use crate::arch::{Cpu, MAX_CPUS, Paging, Smp, send_shootdown_ipi};
 use crate::libkern::SpinLock;
 use crate::mm::VirtAddr;
+use crate::libkern::lockrank::LockRank;
 
 /// Serialises shootdown initiators: only one request is in flight system-wide, so
 /// the single global request block below is unambiguous. A **plain** spinlock (not
 /// IRQ-masking) so a CPU spinning for acknowledgements still takes shootdown IPIs.
-static LOCK: SpinLock<()> = SpinLock::new(());
+static LOCK: SpinLock<()> = SpinLock::new(LockRank::IrqEnabledHold, ());
 
 /// `true` for a whole-TLB flush (CR3 reload), `false` for a single-page `invlpg`.
 static REQUEST_ALL: AtomicBool = AtomicBool::new(false);

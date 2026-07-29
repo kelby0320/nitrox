@@ -27,6 +27,7 @@
 //! kernel is `#![no_std]`. A spin lock is also a better fit for a
 //! single-CPU bring-up where blocking has no scheduler to yield to.
 
+use crate::libkern::lockrank::LockRank;
 use core::cell::UnsafeCell;
 use core::ops::{Deref, DerefMut};
 use core::sync::atomic::{AtomicBool, Ordering};
@@ -40,6 +41,9 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// `static` when `T` is const-constructible.
 pub struct SpinLock<T> {
     locked: AtomicBool,
+    /// Where this lock sits in the acquisition order. Checked on every acquire in debug
+    /// builds; inert in release builds. See `kernel/docs/lock-ordering.md`.
+    rank: LockRank,
     data: UnsafeCell<T>,
 }
 
@@ -55,10 +59,16 @@ unsafe impl<T: Send> Sync for SpinLock<T> {}
 unsafe impl<T: Send> Send for SpinLock<T> {}
 
 impl<T> SpinLock<T> {
-    /// Construct a new lock around `value`. Available in `const` context.
-    pub const fn new(value: T) -> Self {
+    /// Construct a new lock around `value` at `rank`. Available in `const` context.
+    ///
+    /// The rank is **mandatory**, not defaulted: a lock with no declared position in the
+    /// order is a lock nobody has reasoned about, and the point of the check is to make
+    /// that reasoning explicit at the definition site. Picking one is the first step of
+    /// `kernel/docs/lock-ordering.md` § Adding a new lock.
+    pub const fn new(rank: LockRank, value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            rank,
             data: UnsafeCell::new(value),
         }
     }
@@ -86,6 +96,7 @@ impl<T> SpinLock<T> {
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                crate::libkern::lockrank::acquired(self.rank);
                 return SpinLockGuard { lock: self };
             }
             // Spin without bus-locking the cacheline: a relaxed read plus
@@ -128,6 +139,9 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
 
 impl<T> Drop for SpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        // Drop the rank first: `preempt_enable` below can replay a deferred reschedule,
+        // which takes `SCHED` — that acquire must not see this lock still recorded.
+        crate::libkern::lockrank::releasing(self.lock.rank);
         // Release first, then re-enable preemption: a deferred reschedule
         // replayed by `preempt_enable` must not run while this lock is held.
         self.lock.release();
@@ -187,6 +201,8 @@ mod irq_backend {
 /// argument.
 pub struct IrqSpinLock<T> {
     locked: AtomicBool,
+    /// Where this lock sits in the acquisition order (see `SpinLock::rank`).
+    rank: LockRank,
     data: UnsafeCell<T>,
 }
 
@@ -198,10 +214,12 @@ unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
 unsafe impl<T: Send> Send for IrqSpinLock<T> {}
 
 impl<T> IrqSpinLock<T> {
-    /// Construct a new lock around `value`. Available in `const` context.
-    pub const fn new(value: T) -> Self {
+    /// Construct a new lock around `value` at `rank`. Available in `const` context.
+    /// The rank is mandatory for the reason given on [`SpinLock::new`].
+    pub const fn new(rank: LockRank, value: T) -> Self {
         Self {
             locked: AtomicBool::new(false),
+            rank,
             data: UnsafeCell::new(value),
         }
     }
@@ -221,6 +239,7 @@ impl<T> IrqSpinLock<T> {
                 .compare_exchange_weak(false, true, Ordering::Acquire, Ordering::Relaxed)
                 .is_ok()
             {
+                crate::libkern::lockrank::acquired(self.rank);
                 return IrqSpinLockGuard { lock: self, prev_if };
             }
             while self.locked.load(Ordering::Relaxed) {
@@ -241,6 +260,7 @@ impl<T> IrqSpinLock<T> {
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             .is_ok()
         {
+            crate::libkern::lockrank::acquired(self.rank);
             Some(IrqSpinLockGuard { lock: self, prev_if })
         } else {
             // Contended: restore the interrupt state we masked above and give up.
@@ -277,6 +297,10 @@ impl<'a, T> IrqSpinLockGuard<'a, T> {
     /// the interrupt state once the switch completes (on resume).
     pub fn release_keeping_irqs_masked(self) -> bool {
         let prev = self.prev_if;
+        // This path deliberately skips `Drop`, so it must drop the rank itself — missing
+        // it would leak a held rank on every context switch and make the tracker report
+        // phantom inversions from then on.
+        crate::libkern::lockrank::releasing(self.lock.rank);
         self.lock.release();
         // Skip the `Drop` so interrupts are NOT restored here.
         core::mem::forget(self);
@@ -302,6 +326,9 @@ impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
 
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
+        // Drop the rank before the lock, so an IRQ taken the instant interrupts come back
+        // sees an accurate held set.
+        crate::libkern::lockrank::releasing(self.lock.rank);
         // Release the lock FIRST, then restore interrupts: if we restored IF
         // first, an IRQ could fire and legitimately take this same lock while
         // we still hold it — a self-deadlock on single-CPU.
@@ -316,7 +343,7 @@ mod tests {
 
     #[test]
     fn lock_grants_exclusive_access_in_single_thread() {
-        let lock = SpinLock::new(0u32);
+        let lock = SpinLock::new(LockRank::Leaf, 0u32);
         {
             let mut g = lock.lock();
             *g = 42;
@@ -327,7 +354,7 @@ mod tests {
 
     #[test]
     fn guard_drop_releases_lock() {
-        let lock = SpinLock::new(());
+        let lock = SpinLock::new(LockRank::Leaf, ());
         let g = lock.lock();
         drop(g);
         // Must not deadlock — the previous guard's Drop released the bit.
@@ -336,7 +363,7 @@ mod tests {
 
     #[test]
     fn mutates_through_deref_mut() {
-        let lock = SpinLock::new([0u8; 4]);
+        let lock = SpinLock::new(LockRank::Leaf, [0u8; 4]);
         {
             let mut g = lock.lock();
             g[0] = 1;
@@ -348,7 +375,7 @@ mod tests {
 
     #[test]
     fn const_constructs_in_static() {
-        static S: SpinLock<u32> = SpinLock::new(7);
+        static S: SpinLock<u32> = SpinLock::new(LockRank::Leaf, 7);
         let g = S.lock();
         assert_eq!(*g, 7);
     }
@@ -379,7 +406,7 @@ mod tests {
     #[test]
     fn irq_lock_masks_while_held_and_restores_on_drop() {
         reset_mock_if(true);
-        let lock = IrqSpinLock::new(0u32);
+        let lock = IrqSpinLock::new(LockRank::Leaf, 0u32);
         {
             let mut g = lock.lock();
             // Interrupts masked for the whole critical section.
@@ -397,7 +424,7 @@ mod tests {
     fn irq_lock_restores_masked_when_prior_was_masked() {
         // If interrupts were already off at acquire, drop must leave them off.
         reset_mock_if(false);
-        let lock = IrqSpinLock::new(());
+        let lock = IrqSpinLock::new(LockRank::Leaf, ());
         {
             let _g = lock.lock();
             assert!(!mock_if());
@@ -408,7 +435,7 @@ mod tests {
     #[test]
     fn irq_lock_guard_drop_releases() {
         reset_mock_if(true);
-        let lock = IrqSpinLock::new(());
+        let lock = IrqSpinLock::new(LockRank::Leaf, ());
         let g = lock.lock();
         drop(g);
         // Must not deadlock — the bit was released.
@@ -418,7 +445,7 @@ mod tests {
     #[test]
     fn release_keeping_irqs_masked_frees_lock_but_keeps_if_masked() {
         reset_mock_if(true);
-        let lock = IrqSpinLock::new(5u32);
+        let lock = IrqSpinLock::new(LockRank::Leaf, 5u32);
         let prev = {
             let g = lock.lock();
             assert!(!mock_if());
@@ -439,7 +466,7 @@ mod tests {
     #[test]
     fn irq_lock_mutates_through_deref_mut_and_const_in_static() {
         reset_mock_if(true);
-        static S: IrqSpinLock<u32> = IrqSpinLock::new(3);
+        static S: IrqSpinLock<u32> = IrqSpinLock::new(LockRank::Leaf, 3);
         {
             let mut g = S.lock();
             *g += 4;

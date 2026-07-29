@@ -25,6 +25,7 @@
 
 use crate::libkern::IrqSpinLock;
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
+use crate::libkern::lockrank::LockRank;
 
 /// Capacity of the kernel log buffer (bytes). 16 KiB = 4 pages — ample for a boot
 /// log; output past it is dropped (the early log is retained).
@@ -37,7 +38,7 @@ struct Klog {
     len: usize,
 }
 
-static KLOG: IrqSpinLock<Klog> = IrqSpinLock::new(Klog { buf: [0; KLOG_CAP], len: 0 });
+static KLOG: IrqSpinLock<Klog> = IrqSpinLock::new(LockRank::Klog, Klog { buf: [0; KLOG_CAP], len: 0 });
 
 /// Append `bytes` to the kernel log (called from the serial `write_str` tee). Drops
 /// the bytes if the buffer is full, and **skips silently if the lock is contended**

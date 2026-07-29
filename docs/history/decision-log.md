@@ -8858,3 +8858,68 @@ overwrites in place, and asserts three things: the content changed, `mtime` adva
 the **size did not** — the last so the check cannot pass by accidentally taking the
 grow/truncate path, which would have stamped `mtime` the old way. **Negative control**:
 dropping the notification fails it with "in-place overwrite left mtime stale".
+
+## 2026-07-29 — Slice D4: lock ordering is enforced now, and it disagreed four times
+
+`kernel/docs/lock-ordering.md` has defined a total order over every kernel lock since
+Phase 1, closing with "debug builds will eventually track acquisition order and panic on
+violations. That mechanism is not yet implemented — for now the order is enforced by code
+review." Code review then missed three deadlocks (F1, F2, F12 — 2026-07-21), each found by
+hand or by bisecting a boot loop that hung one time in three. The mechanism now exists.
+
+**Shape.** Every lock declares its rank at construction — `SpinLock::new(LockRank::Buddy,
+…)` — and a per-CPU held-rank stack checks each acquire: the new rank must be strictly
+greater than everything already held, which catches both inversions and the same-rank
+nesting the document separately forbids. Debug builds only; release compiles it away.
+
+The rank is a **mandatory constructor argument**, not an optional annotation. That is the
+design decision that did the work: a lock with no declared position is a lock nobody has
+reasoned about, and requiring one immediately surfaced **six live locks missing from the
+rank table entirely** (`KLOG`, `tlb::LOCK`, `DEVICES`, `PARTITIONS`, `CONSOLE`, the AHCI
+pending ring).
+
+**What it found on the way to a clean boot.** Four disagreements between the documented
+order and the code, none of them anticipated:
+
+1. **`dpc::init` allocated under the DPC queue lock** — `try_reserve` inside the critical
+   section, i.e. slab (rank 6a) under a leaf. Once, at boot, on one CPU with interrupts
+   masked, so harmless in itself; but the lock is only *honestly* a leaf if nothing under it
+   ever allocates, and that is the property the whole DPC path leans on. Fixed by reserving
+   outside the lock and moving the list in.
+2. **`entropy::init` did the identical thing** with its seed-waiter list. Same fix. Two
+   independent instances of one pattern — "pre-reserve under the lock at init" — which is
+   the kind of thing a checker finds and a reviewer does not.
+3. **`DEVICES` and `PARTITIONS` are not leaves.** Both push or reserve a `KVec` *inside*
+   their critical section, so they must rank above the allocators; they got a new `Registry`
+   rank. `device.rs`'s own comment says `snapshot` exists so callers can "allocate without
+   holding the device lock across a lock-ordering boundary" — while `snapshot` itself
+   reserved under it. The hazard was known and still present.
+4. **`tlb::LOCK` cannot be ranked at all.** It is held with interrupts *enabled* — that is
+   the F1 fix — so interrupt work legitimately runs beneath it. The tracker said so in two
+   steps: `Leaf` under `Leaf` (a DPC drain at an interrupt tail inside a shootdown window),
+   then `Sched` under it (a timer tick doing the same). Both correct behaviour. No single
+   number expresses "the order restarts here", so it is marked `IrqEnabledHold` and exempt,
+   with its real discipline being the documented no-lock-held caller contract. The general
+   fix is per-interrupt-context tracking (Linux's lockdep hardirq contexts):
+   `TODO(lockdep-irq-context)`, deferred because it needs every interrupt entry/exit hooked
+   and missing one would corrupt the tracker silently rather than fail loudly.
+
+**Two bugs in the tracker itself, both found by running it.** The per-CPU model is invalid
+under host `cfg(test)` — `cargo test` runs test functions on many OS threads that all report
+the same `current_cpu()`, so unrelated threads shared one rank stack and manufactured
+inversions; it hung the host suite with two binaries spinning at >800 % CPU. It is now
+compiled out there, which is a correctness requirement rather than a cost saving. And the
+"already reporting" path spun forever instead of returning, which would have replaced a
+diagnosable panic with a hang.
+
+**On the document's own claim.** It promised "one exception" to the same-rank rule and never
+named one; both places it discusses nesting say *never* nested. The rule is enforced without
+an exception, so a legitimate one would now surface as a panic naming both ranks rather than
+as an assertion nobody can check.
+
+*Verified:* host suite **789** green; release build clean (tracker absent); `test-qemu` PASS
+with the tracker armed through the full boot — kernel → SMP → init → ext4 → the Slice C
+checks → login; 3/3 KVM boots. **Negative control**: deliberately mis-ranking the namespace
+lock trips it immediately with "acquiring Sched (rank 10) while holding HandleTable (rank
+30)", naming both locks. `check-deferrals` caught the new `TODO` before I filed it, which is
+the check working on its author.

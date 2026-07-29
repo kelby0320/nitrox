@@ -65,6 +65,7 @@ use crate::object::{
     Thread, ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
+use crate::libkern::lockrank::LockRank;
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -588,7 +589,7 @@ struct SchedState {
     deferred_drops: KVec<ObjectRef>,
 }
 
-static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
+static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(LockRank::Sched, SchedState {
     ready: [const { KVec::new() }; MAX_CPUS],
     cpu_online: [false; MAX_CPUS],
     current: [const { None }; MAX_CPUS],

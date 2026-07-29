@@ -31,6 +31,7 @@ use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::object::ObjectRef;
 use crate::object::header::KObjectHeader;
 use crate::object::kernel_server::KernelServerId;
+use crate::libkern::lockrank::LockRank;
 
 /// Maximum namespace path length in bytes (see the design doc § Path grammar).
 pub const NS_PATH_MAX: usize = 1024;
@@ -196,7 +197,7 @@ impl Namespace {
         KBox::try_new(Self {
             header: KObjectHeader::new(KObjectType::Namespace),
             magic: Self::MAGIC,
-            inner: SpinLock::new(Inner { bindings: KVec::new(), cache }),
+            inner: SpinLock::new(LockRank::KernelObject, Inner { bindings: KVec::new(), cache }),
         })
     }
 

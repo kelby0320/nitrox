@@ -7,9 +7,19 @@ inverts the order and risks deadlock. The kernel's CLAUDE.md references
 this document; the architecture overview alludes to the ranking but does
 not enumerate it.
 
-Debug builds will eventually track acquisition order and panic on
-violations. That mechanism is not yet implemented — for now the order is
-enforced by code review.
+**Debug builds now track acquisition order and panic on violations**
+(`kernel/src/libkern/lockrank.rs`, Slice D4). Every lock declares its rank at
+construction — `SpinLock::new(LockRank::Buddy, …)` — and a per-CPU held-rank stack
+checks each acquire. Release builds compile the whole thing away. Code review is no
+longer the only line of defence, which matters because it already missed three
+deadlocks (F1, F2, F12 — decision log 2026-07-21), each found by hand or by
+bisecting a boot loop that hung one time in three.
+
+The rank is a **mandatory** constructor argument rather than an optional
+annotation: a lock with no declared position is a lock nobody has reasoned about.
+Requiring it is what surfaced the six live locks that were missing from the table
+below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
+`CONSOLE`, and the AHCI pending ring).
 
 ## Ranks (top to bottom acquisition)
 
@@ -25,16 +35,36 @@ enforced by code review.
 | 6c   | Kernel-half PML4 template (`KERNEL_TEMPLATE`)| live as of Phase 1 slice 5 (item 5)      |
 | 6d   | Kernel vmap bump pointer (`VMAP_NEXT`)       | live as of Phase 1 slice 5 (item 6)      |
 | 7    | Serial port (`SERIAL`, **`IrqSpinLock`**)    | live as of Phase 1 slice 4 (diagnostics) |
-| leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); a **leaf** — held alone, see § The DPC queue lock |
-| leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); a **leaf** — held alone, see § The entropy lock |
+| 7.5  | Kernel log ring (`KLOG`, **`IrqSpinLock`**)  | live as of Phase 2; **below `SERIAL`** — it is teed from inside the serial `write_str`, so `SERIAL` is held when it is taken. (Its `try_lock` is for a different hazard: re-entry from a fault that strikes mid-push.) |
+| leaf | DPC queue (`DPC_QUEUE`, **`IrqSpinLock`**)   | live as of Phase 2 (DPC); see § The DPC queue lock |
+| leaf | Entropy pool/CSPRNG (`ENTROPY`, **`IrqSpinLock`**)| live as of Phase 2 (entropy); see § The entropy lock |
+| leaf | TLB-shootdown serialiser (`tlb::LOCK`)       | live as of Phase 4 Part B. Taken with **no other lock held** by contract (see § F1); holds only atomics + IPIs under it |
+| leaf | Device registry (`DEVICES`)                  | live as of Phase 2; a registry that takes nothing while held |
+| leaf | GPT partition table (`PARTITIONS`)           | live as of Phase 2; as `DEVICES` |
+| leaf | Console input buffer (`CONSOLE`, **`IrqSpinLock`**)| live as of Phase 2; filled from the COM1 receive IRQ |
+| leaf | AHCI pending ring (per-port, **`IrqSpinLock`**)| live as of Phase 2; IRQ-side completion bookkeeping |
 
-`SCHED`, `SERIAL`, `DPC_QUEUE`, and `ENTROPY` are [`IrqSpinLock`]s (they mask
-interrupts while held); every other lock is a plain `SpinLock`. See § Interrupt
+**Why the leaves are the bottom of a total order, not "held alone".** The tracker
+models every lock in one total order with the leaves last, and an interrupt handler
+may therefore take a leaf while it has interrupted a holder of anything above. That
+is legal — the handler releases before the interrupted section resumes — but a
+tracker enforcing strict aloneness would call it an inversion. Modelling interrupt
+context separately (as Linux's lockdep does) is a lot of machinery for a
+distinction that buys nothing here.
+
+`SCHED`, `SERIAL`, `KLOG`, `DPC_QUEUE`, `ENTROPY`, `CONSOLE`, and the AHCI pending
+ring are [`IrqSpinLock`]s (they mask interrupts while held); every other lock is a
+plain `SpinLock`. See § Interrupt
 semantics for why these need it.
 
 A lock at a lower rank may not be taken while a lock at a higher rank is
 held. Locks at the same rank are independent — they may not be nested in
-either order — with one exception, called out below.
+either order.
+
+(An earlier revision of this document promised "one exception, called out below"
+and never named one; both places it discusses nesting say *never* nested. The
+tracker enforces the rule without an exception, so if a legitimate one exists it
+will surface as a panic naming both ranks rather than as a claim nobody can check.)
 
 ## Scheduler runqueue lock is dropped before every context switch
 

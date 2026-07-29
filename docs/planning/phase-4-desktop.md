@@ -448,9 +448,18 @@ Slice C follows directly; it has actual Milestone 2 blockers.
 - [ ] **D3 — a listable `/dev`.** `list /dev` is a day-one shell command. `sys_ns_enumerate`
   exists with no consumer; needs a design call on how `list` chooses namespace enumeration
   versus an fs-server directory session.
-- [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
-  violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
-  boot-loop bisection; this turns that class into an immediate, located failure.
+- [x] **D4 — debug-build lock-ordering enforcement** ✅ (2026-07-29). Every lock declares a
+  rank at construction (`SpinLock::new(LockRank::Buddy, …)`); a per-CPU held-rank stack
+  checks each acquire in debug builds and compiles away in release. Making the rank
+  **mandatory** rather than optional is what did the work: it surfaced six live locks that
+  were missing from the rank table entirely, and the armed boot then disagreed with the
+  documented order four times — `dpc::init` and `entropy::init` both allocating under a
+  leaf-ranked lock, `DEVICES`/`PARTITIONS` not being leaves at all (they push a `KVec` while
+  held), and `tlb::LOCK` being unrankable because it is held with interrupts enabled (the F1
+  fix), so interrupt work legitimately nests beneath it. The last is exempt with its reason
+  written down; the general fix is `TODO(lockdep-irq-context)`. Two bugs in the tracker
+  itself also came out of running it — the per-CPU model is invalid under host `cfg(test)`
+  (many threads, one reported CPU) and the re-entrant report path spun instead of returning.
 - [x] **D5 — kernel-stack watermark** ✅ (2026-07-29, landed early alongside C3 because C3's
   sizing argument depended on it). `test-harness` builds paint each stack and sample the
   high-water mark at context-switch-out — O(1) unless a record moves, and it covers blocked
