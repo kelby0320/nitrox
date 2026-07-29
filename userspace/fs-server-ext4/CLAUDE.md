@@ -40,7 +40,11 @@ generic contract) and `docs/architecture/ext4-fs-server-rw.md` (this server's wr
   `BlockRun` map + transfers a device handle, a `RESOLVE_GROW` request grows the file
   (`maybe_grow` → `grow_file`), and a `RESOLVE_CREATE` request first creates it
   (`maybe_grow` → `create_file`, splitting the suffix into parent-dir + leaf name) before
-  mapping. **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
+  mapping. A `RESOLVE_RENAME` request is handled by `try_resolve_rename` **before** anything
+  else: it is the one resolve that mutates the tree and replies with no object at all
+  (`OBJECT_KIND_NONE`), and it must run ahead of the directory-session path, which infers
+  "directory open" from the suffix naming a directory — renaming a directory names one too.
+  **Alloc-free** — fixed `.bss` buffers, no `#[global_allocator]`.
 
 ## Scope
 
@@ -53,13 +57,17 @@ bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, AC
 symlinks, checksums. htree directories need no special handling (the linear walk is
 backward-compatible).
 
-**Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`): extent-tree
-splitting / index nodes (depth > 0), cross-group inode/block allocation (creation is
-**group 0 only**), new-directory-block growth on a full parent directory (yields
-`TooLarge`), truncate / delete / rename, `metadata_csum` checksums, and jbd2 journaling +
-replay (the fixtures are `^has_journal`). Overwrite is data-only (no metadata change) and
-is the kernel's writeback; the server allocates on growth + creation but never touches file
-data (Model A).
+**Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
+`docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a
+deferral recorded only in a crate `CLAUDE.md` is one nobody reviews): extent-tree splitting
+/ index nodes (depth > 0), cross-group inode/block allocation (creation is **group 0
+only**), `metadata_csum` checksums, and jbd2 journaling + replay (the fixtures are
+`^has_journal`). Overwrite is data-only (no metadata change) and is the kernel's writeback;
+the server allocates on growth + creation but never touches file data (Model A).
+
+**Now implemented** (was deferred): truncate (2026-07-24), rename, delete, and
+**growing a full directory** (2026-07-29) — a directory whose blocks are all full gains
+another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries.
 
 ## Capability discipline
 

@@ -384,16 +384,60 @@ or image materialisation has grown past a few milliseconds, Slice B stops being 
 
 Slice C follows directly; it has actual Milestone 2 blockers.
 
-#### Slice C — fs/ext4 completeness for Milestone 2
+#### Slice C — fs/ext4 completeness for Milestone 2 *(branch `phase-4/fs-completeness`)*
 
-- [ ] **C1 — grow a full directory.** A directory whose single block fills returns
-  `TooLarge`; `mkdir`/`touch` at any scale hits it (a Milestone 1 test fixture had to be
-  sized around it).
-- [ ] **C2 — cross-directory and overwrite `rename`.** Blocks `move`.
-- [ ] **C3 — the `MAX_SESSIONS = 7` cap.** Each pipeline stage holding a directory session
-  makes seven concurrent sessions a normal working set, not a stress case.
-- [ ] **C4 — `mtime` on an in-place overwrite.** Model A hides a same-length rewrite from
-  the server; the hook is `sys_file_sync` notifying it. The timestamp gap users notice.
+- [x] **C1 — grow a full directory** ✅ (2026-07-29). A directory whose blocks are all full
+  now gains another: `dir_insert` appends a block, formats it as one free record spanning
+  it (what a block looks like after everything in it is deleted, so nothing downstream
+  changes), and updates the parent's size/blocks/mtime. The extent-append logic is now
+  shared with `grow_file` rather than duplicated. **Measured ceiling**: on 4 KiB blocks,
+  creating *files* in one directory is unbounded in practice (2000+ tested — the parent's
+  growth blocks stay contiguous, so one extent covers them), while *subdirectories* stop at
+  **~814**, since each `mkdir` allocates the child's block between the parent's and so
+  fragments it into a fresh extent each time. That residual limit is the inline extent
+  header (4 leaves); tree splitting stays deferred, now with a number attached. Also
+  surfaced that bulk creation is O(N²) block reads (`deferred-decisions.md`).
+- [x] **C2 — cross-directory and overwrite `rename`** ✅ (2026-07-29). `move` is unblocked.
+  Three parts: the ext4 `rename_path` (repoint the destination → remove the source →
+  release a replaced inode's link, in that order, so a crash leaves a duplicate name rather
+  than an orphan); `sys_file_rename` (syscall 35) plus the `ResolveOp` enum that replaced
+  the widening tuple of `Option`s `Namespace::Resolve` had grown one side effect at a time;
+  and the fs-server dispatch, which runs *before* the directory-session path because that
+  path infers "directory open" from the suffix naming a directory, and renaming a directory
+  names one too. The kernel reduces both paths to one mount-relative suffix and refuses a
+  cross-binding rename with `Unsupported` (the `move` → copy + unlink cue; POSIX `EXDEV`).
+  Two things the in-guest check caught: the refusal only guarded the *forwarding* arm, so a
+  source that was not on a filesystem resolved normally and returned a handle — reporting a
+  rename that never happened; and an attempted `MAP_WRITE` check on both bindings failed
+  against a live mount, because a userspace-server binding's rights are the *endpoint
+  handle's*, not the files' — which is a system-wide gap, now filed as
+  `TODO(mount-write-authority)`, not something rename should have solved unilaterally.
+- [x] **C3 — the `MAX_SESSIONS = 7` cap** ✅ (2026-07-29). It was never an fs-server number:
+  a server waiting on one endpoint per client is capped by the kernel's `MAX_WAIT_HANDLES`,
+  and `logging-service` carried the identical, separately-written `7`. Raised **8 → 32** (31
+  concurrent clients), with both servers now *deriving* their cap from the constant so it
+  cannot drift again, and a compile-time kernel-stack budget check — the wait path holds
+  several arrays of that width on a 16 KiB stack, so the limit cannot simply keep growing;
+  the build now fails before the stack does. The in-guest check found a second, subtler
+  problem: the server drained its serving endpoint *before* the session endpoints in a wait
+  batch, so a batch containing both a closed session and a new open answered the open while
+  the freed slots still read as occupied — a spurious `WouldBlock` in exactly the pattern a
+  shell pipeline produces (stage N exits as stage N+1 starts). Sessions are now reclaimed
+  first. The structural fix — a readiness mechanism, one wait slot for any number of clients
+  — is filed as `TODO(server-fanout)` with the desktop compositor as its trigger.
+- [x] **C4 — `mtime` on an in-place overwrite** ✅ (2026-07-29). A same-length rewrite goes
+  from the page cache to the device with no resolve and no IPC, so the server could not see
+  it: a file edited repeatedly in place reported the timestamp of its last *size* change,
+  usually its creation. Fixed with `File::Touch` (`0x0606`) — after a successful
+  `sys_file_sync` of a Model A file the kernel sends the server the file's suffix and the
+  server stamps `mtime` **from its own clock**, so no timestamp rides the wire and a writer
+  cannot choose when its write appears to have happened. No reply and nothing registered
+  pending: the data is already durable, so a dropped notification costs a stale timestamp
+  rather than a failed sync, and ordering still holds because the message enters the same
+  endpoint ring as forwarded resolves. To name the file at all, Model A's producer now
+  carries its `(registration, suffix)` — fields the data path never reads, which is the
+  point. Stamps on *sync* rather than on the write itself, since there is no per-page dirty
+  bit (`TODO(page-dirty-tracking)`).
 
 #### Slice D — cheap, now-triggered hygiene
 
@@ -407,6 +451,15 @@ Slice C follows directly; it has actual Milestone 2 blockers.
 - [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
   violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
   boot-loop bisection; this turns that class into an immediate, located failure.
+- [x] **D5 — kernel-stack watermark** ✅ (2026-07-29, landed early alongside C3 because C3's
+  sizing argument depended on it). `test-harness` builds paint each stack and sample the
+  high-water mark at context-switch-out — O(1) unless a record moves, and it covers blocked
+  threads that a run-queue walk would miss. **Measured: 6264 B of 16384 (38%)**, identical
+  across boots, versus the paper estimate that had been standing in for it. Two things
+  filed off the back of it: `TODO(irq-stack)` (only `#DF` has a dedicated stack — every
+  other interrupt nests onto the current thread stack, where Linux at the same 16 KiB uses
+  a separate per-CPU IRQ stack) and `TODO(stack-attribution)` (the mark names *who* went
+  deep, not *where*).
 
 **Staying deferred** (verified against the code, triggers intact): MSI/MSI-X, IOMMU and
 userspace drivers, NVMe, Tier-2 modules, filter drivers, IRP cancellation, networking,

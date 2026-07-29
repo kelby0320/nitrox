@@ -148,6 +148,14 @@ across all of them, a record's identity is *which channel it arrived on* — est
 once, at connect. There is no per-record identity field to forge. Everything else falls
 out of ordinary namespace attenuation:
 
+> **Concurrent sources are bounded by the wait width.** Waiting across all the read ends
+> means one `sys_wait` slot per source, so the service reads from at most
+> `MAX_WAIT_HANDLES - 1` (31, since 2026-07-29; 7 before) at once — `MAX_SOURCES` is
+> derived from the kernel constant rather than restated. `fs-server-ext4` has the identical
+> ceiling for the identical reason. Removing it rather than raising it is
+> `TODO(server-fanout)` in
+> [`docs/rationale/deferred-decisions.md`](../rationale/deferred-decisions.md).
+
 | Tier | Endpoint from | Guard |
 |---|---|---|
 | **Kernel** | the kernel `klog`/audit rings (not resolved) | intrinsic; a future source the logging service may ingest |

@@ -8589,3 +8589,272 @@ code changed the plan — B1 was Model-B work, the fill cost was a thousandfold 
 initramfs/`MemoryObject` path meant the workload barely touches the cache at all. Measuring
 before building cost one afternoon and saved an entire slice. Slice C (fs/ext4 completeness)
 follows directly; unlike B, it has actual Milestone 2 blockers.
+
+## 2026-07-29 — Slice C1: a full directory grows, and the residual ceiling gets a number
+
+A directory whose blocks were all full returned `TooLarge`: `dir_insert` looked for a record
+with enough slack and gave up if none existed. Every file coreutil hits that — `mkdir`,
+`touch`, `copy` into a populated directory — and a Milestone 1 test fixture had to be sized
+around it.
+
+**The fix.** `dir_insert` now appends a block when no existing one has room, formats it as a
+single free record spanning the block — exactly what a block looks like after everything in
+it is deleted, so no reader needs to know the difference — and updates the parent's size,
+block count and mtime. The extent-append logic (allocate, extend the last extent if the
+allocation happened to be contiguous, else add a leaf) was **factored out of `grow_file`**
+and is now shared; the duplicate was most of what made this look like a bigger job than it
+is. `dir_insert` gained the directory's inode number and a mutable inode buffer so it can
+write the growth back; the common path (slack exists) still touches no inode field.
+
+**The residual ceiling, measured rather than described.** Growth stops where the inline
+extent header does — `i_block` holds four leaves, and depth > 0 is deferred. Whether that
+bites depends entirely on fragmentation, and the two cases differ sharply (4 KiB blocks):
+
+- **Creating files**: unbounded in practice, 2000+ tested. Nothing allocates between the
+  parent's growth blocks, so they are contiguous and one extent covers them all.
+- **Creating subdirectories**: **~814**. Each `mkdir` allocates the child's own data block
+  *between* the parent's, so every parent block starts a fresh extent and the fourth
+  exhausts the header.
+
+Both are far beyond anything on the path to a shell or a desktop, so extent-tree splitting
+stays deferred — but with a number attached instead of "some limit". The ext4 write-path
+deferrals were also **mirrored into `deferred-decisions.md`**: they had lived only in the
+crate's `CLAUDE.md`, which is exactly where file truncate had been hiding.
+
+**A cost this surfaced.** `dir_insert` scans every existing block for slack before
+appending, and the server caches nothing between calls, so filling a directory with N
+entries re-reads its blocks N times — **O(N²)**. An in-guest check of 40 entries plus a
+lookup per entry pushed a `test-qemu` run past its 90 s ceiling; the same check sized to
+16 entries (just over one 4 KiB block, with 250-byte names) costs ~2 s. The guest check is
+now sized to *cross the boundary*, not to stress it — the host tests do the exhaustive work
+against `e2fsck`. Recorded as its own deferral with the standard fixes (an htree index, or
+just a per-directory "first block with room" hint) and a real trigger: bulk creation, such
+as `copy -r` of a large tree or unpacking a package into the store.
+
+*Verified:* host suite **784** green — two new tests, both **e2fsck-clean**: 40 files with
+200-byte names forcing several growths, each name present exactly once through the
+paginated walk *and* findable by lookup (enumeration alone would not prove the second); and
+a grown directory emptied again, including refusing to `rmdir` a non-empty subdirectory
+that lives in a *later* block, which only works if the emptiness scan reaches past block 0.
+`test-qemu` PASS with a new in-guest growth check on the real image; 10/10 KVM;
+`check-arch` / `check-nightly` / `check-deferrals` green.
+
+## 2026-07-29 — Slice C2: `rename`, and what testing it found in the syscall
+
+`move` was blocked on a rename that could only change a name within one directory and could
+never replace anything. It is now a whole operation: cross-directory, optionally replacing
+the destination, and refusing what it cannot do atomically.
+
+**Three parts, one per layer.**
+
+- **`ext4::rename_path`** does the mutation in a deliberate order: repoint the destination
+  entry → remove the source entry → release a replaced inode's link. A crash between steps
+  therefore leaves a *duplicate name*, which `e2fsck` repairs, rather than an orphaned inode
+  or an entry pointing at freed space. Directory renames get a cheap guard against moving a
+  directory into its own subtree, which would detach it from the tree entirely.
+- **`sys_file_rename` (syscall 35)** resolves *both* paths before any `PendingOperation`
+  exists, so a malformed destination fails synchronously, and reduces them to one
+  mount-relative suffix plus a verdict. Both must land on the same server *and* the same
+  subtree base; anything else is `Unsupported`, which is precisely the cue `move` needs to
+  fall back to copy + unlink (POSIX spells it `EXDEV`).
+- **The fs-server dispatch** replies `OBJECT_KIND_NONE` — the first resolve that mutates the
+  tree and hands back nothing. It runs **before** the directory-session path, which is not
+  incidental: that path infers "this is a directory open" from the suffix naming a
+  directory, and renaming a directory names one too, so the other order would silently open
+  a session instead of moving anything.
+
+**The `ResolveOp` enum.** `Namespace::Resolve` had accumulated side effects one at a time —
+create, grow, truncate — carried as a widening tuple of `Option`s; rename would have been
+the fourth. They are now one enum, so each call site names exactly one intent and the next
+side effect costs a variant rather than another parameter.
+
+**Two things the in-guest check found that the host tests structurally could not.**
+
+1. **The refusal only guarded the forwarding arm.** `rename_verdict` was consulted inside
+   the `UserspaceServer` branch of the resolve, so a rename whose *source* was not on a
+   userspace filesystem (`/initramfs/x`) skipped it entirely, resolved normally, and handed
+   back a handle to the source — reporting success for a rename that never happened. The
+   verdict now short-circuits the resolve outright. The check that catches it is the
+   deliberate mirror of the cross-filesystem case: same refusal, opposite end.
+2. **The write-authority check was checking the wrong bits.** The first cut required
+   `MAP_WRITE` on both bindings, reasoning that a rename returns no handle so the usual
+   "attenuate the returned rights" mechanism has nothing to act on. It failed against a live
+   mount with `NoAccess`: a userspace-server binding carries the rights of the **endpoint
+   handle** it was bound with (`sys_ns_bind` takes them from the target), which describe the
+   IPC channel, not the files behind it — which is exactly why the forwarding path ignores
+   `binding_rights`. The check was removed rather than patched: the mutating resolves that
+   already existed (`CREATE`/`GROW`/`TRUNCATE`) gate on nothing but `LOOKUP` either, so
+   rename matches them instead of inventing a stricter rule a caller could not satisfy.
+   The real gap — no per-mount write authority anywhere, contained today by *namespace
+   construction* rather than by rights — is filed as `TODO(mount-write-authority)` with the
+   trigger that will force it (the first read-only mount of a writable filesystem).
+
+*Verified:* host suite **788** green; `test-qemu` PASS with a six-case in-guest check on the
+real image (same-directory, cross-directory, refusing an occupied destination *with both
+paths intact*, `RENAME_REPLACE`, a missing source, and a cross-filesystem destination from
+either end). **Negative controls run**, since a rename check passes trivially if it only
+looks at the destination: a no-op rename that reports success fails check 1 (the old name
+survives) — and, separately, reverting the verdict to its buggy position fails the
+non-filesystem-source case, which is the bug it was written for. `check-arch` /
+`check-nightly` / `check-deferrals` green.
+
+## 2026-07-29 — Slice C3: the session cap was never an fs-server number
+
+`fs-server-ext4` capped concurrent directory sessions at 7. The plan called that an
+fs-server constant to raise; it is not one. The server waits on a single `sys_wait` set
+holding its serving endpoint plus one slot per live session, so the ceiling is the kernel's
+`MAX_WAIT_HANDLES` less one — and `logging-service` carried the **identical, separately
+written `7`** for the identical reason. This is the fan-out limit of *every* resource
+server, present and future.
+
+**Raised 8 → 32**, and both servers now **derive** their cap (`MAX_WAIT_HANDLES - 1`)
+instead of restating it, so the next change moves them together rather than leaving two
+numbers to drift. Userspace gets the constant from `libkern::abi` rather than a literal.
+
+**Why 32 and not more.** The kernel side is a fixed per-thread array — fixed precisely so
+registering a wait cannot allocate under the rank-1 scheduler lock — so the cost is paid by
+every thread whether it waits or not. At 32 that is 288 B against the 1 KiB `ArchFpuState`
+every thread already carries: noise. The binding constraint is elsewhere and sharper: the
+wait path holds **several** arrays of that width on the **kernel stack** (copied handles,
+resolved `ObjectRef`s, object addresses, types, the `IoResult` output, the scheduler's
+snapshots) — roughly 3 KiB at 32, against a 4-page 16 KiB stack, growing linearly. A bump
+to 256 would put ~24 KiB of frame on a 16 KiB stack. A guard page makes that a fault rather
+than corruption, but a fault is a poor way to learn it, so there is now a **compile-time
+budget check** in `thread.rs` that fails the build at about a quarter of the stack.
+Verified by setting the constant to 256 and confirming the build fails with that message.
+
+**What the in-guest check found.** Writing a test that opens the whole table and then
+*uses* a session well past the old 7 — a handle can exist without the server ever waiting
+on it — turned up a second problem the constant hid. The serve loop drained its serving
+endpoint **before** the session endpoints in a wait batch. One batch routinely contains
+both a closed session and a new resolve, so the server answered the new
+`RESOLVE_DIR_OPEN` while the just-closed slots still read as occupied: a spurious
+`WouldBlock` with the table freed a few instructions later. That is precisely the pattern a
+shell pipeline produces as stage N exits while stage N+1 starts. Sessions are now processed
+first, in two passes over the batch.
+
+**What is unchanged, and filed rather than fixed.** The ceiling is still fixed; a client
+that opens a session and then stalls still pins a slot for as long as it lives. The shape
+that removes the limit is a readiness mechanism — register a channel so becoming readable
+posts a keyed notification, and the server waits on **one** handle regardless of client
+count, reusing the notification queue that already exists for async events. Its sharp edge
+is designed-in, not bolted on: the queue drops on overflow, and a dropped readiness wakeup
+is a permanently stuck client unless `NotificationsDropped` means "rescan everything".
+`TODO(server-fanout)`, triggered by the desktop compositor (a channel per *window*, held
+open, is a different regime from a channel per short-lived listing).
+
+*Verified:* host suite **788** green; `test-qemu` PASS with a four-part in-guest check —
+the full table open at once, a real `ReadDir` on the last session, the next open refused
+cleanly with `WouldBlock`, and the slots reclaimed after close (without which the check
+would pass just as well against a server that leaked every slot). Everything in it is
+derived from `MAX_WAIT_HANDLES`, so it tracks the constant instead of pinning today's
+number. 5/5 KVM boots; `check-arch` / `check-nightly` / `check-deferrals` green.
+
+## 2026-07-29 — Kernel-stack watermark: replacing the estimate with a number
+
+Sizing `MAX_WAIT_HANDLES` in Slice C3 rested on a stack-usage figure I had *summed on
+paper* — array widths added up, not measured. That is exactly the kind of number that is
+wrong quietly, so the wait-path budget check it justified deserved a real measurement
+behind it.
+
+**How.** `test-harness` builds paint each fresh kernel stack with a poison word, so the
+deepest point any thread ever reached is simply the lowest address that is no longer
+poison. The mark is sampled at **context-switch-out**, which covers every thread that runs
+— including servers that spend their lives blocked and so never appear in a run queue,
+which a walk of the ready lists would have missed. The sample is **O(1)** in the common
+case: it reads only the word just below the standing record, and walks further only when a
+record is actually being set, which happens a handful of times per boot. Production builds
+are untouched.
+
+**The number, and what it immediately caught.** The first reading was **9584 B of 16384 —
+58%**, bit-for-bit identical across boots, so
+it is a deterministic deep path rather than interrupt-timing luck. That was materially more
+than the paper estimate implied — and it turned out to be measuring a bug rather than a
+budget.
+
+Chasing it found **`KBox::try_new(StoredMsg::zeroed())`** in four places. `try_new` takes
+its argument **by value**, so each of those built a 4 KiB IPC message in the *caller's
+frame* and then copied it to the heap. One of the call sites carried the comment "a
+heap-bounced message (4 KiB — never on the kernel stack)", which is what the author
+intended and not what the code did; the optimiser may elide such a temporary, and here it
+demonstrably did not. Adding a fourth on the `sys_file_sync` path (Slice C4) pushed the
+mark to **83%** — 2.7 KiB of headroom on a stack that interrupts also nest onto.
+
+With a `KBox::try_new_zeroed` that zeroes the allocation in place, the mark is **6264 B —
+38%**, better than the figure that started the investigation. Three of the four sites were
+pre-existing, so this was a latent problem the instrumentation surfaced rather than one the
+new work introduced. The lesson is narrow and worth keeping: **a stack budget must not rest
+on whether the optimiser elides a temporary.**
+
+**Attribution, and what it bought.** The mark also records the owning pid. The pid *varies*
+run to run while the depth is constant — so the deep path is something every spawned
+process does, not one pathological thread. Recording *where* rather than *who* needs a
+return-address capture; filed as `TODO(stack-attribution)` for when the goal becomes
+reducing the figure rather than watching it.
+
+**On the stack size itself.** 16 KiB is exactly Linux x86_64's `THREAD_SIZE` (raised from
+8 KiB in v3.15, 2014, when deep stacked-block-device paths overflowed). Nitrox stays there:
+the call chains that forced Linux's bump — filesystem, nested block layers, the network
+stack — are all *userspace* here by architectural rule, and growing every thread's stack to
+hold one syscall's scratch arrays would be treating the symptom. If more wait slots are
+ever wanted, the arrays move off the stack instead.
+
+**But the comparison is not as clean as it looks, and that is the real finding.** Nitrox
+gives a dedicated stack to `#DF` only (IST1); the timer, the TLB-shootdown and reschedule
+IPIs, and every device handler run on **IST0 — no IST** — so they nest onto the current
+thread stack. Linux, at the same 16 KiB, keeps interrupts off it entirely with a separate
+per-CPU IRQ stack. So our 16 KiB carries strictly more than the number it is being matched
+against, and the 38% above already includes interrupt frames. The fix is a per-CPU IRQ
+stack — 16 KiB × CPUs, not × threads — filed as `TODO(irq-stack)` with the watermark
+climbing, or a first guard-page fault, as its trigger.
+
+## 2026-07-29 — Slice C4: telling the filesystem about a write it cannot see
+
+Model A puts the *kernel* on the file-data path, which is the whole point — reads and
+writes go zero-copy against the device and the fs-server never touches file bytes. The
+cost, unnoticed until now: a **same-length in-place overwrite** involves no resolve and no
+IPC whatsoever, so the server has no way to learn the file changed. Its `mtime` kept
+reporting the last thing that *did* reach the server — the file's last size change, which
+for most files is its creation. A file edited ten times in place looked untouched.
+
+**`File::Touch` (`0x0606`).** After a successful `sys_file_sync` of a Model A file, the
+kernel sends the server that file's mount-relative suffix and the server stamps `mtime`.
+Three properties are deliberate:
+
+- **No timestamp on the wire.** The server reads its own clock. A time supplied by whoever
+  wrote the file is a time the *writer* chooses, and timestamps are not the writer's to
+  choose — the same reasoning that put the wall clock behind a syscall rather than a caller
+  argument (2026-07-22).
+- **No reply, nothing registered pending.** `sys_file_sync` already blocks per page on
+  device I/O; adding a second blocking round trip to bless a timestamp would be a poor
+  trade, especially on a path already among the kernel's deepest. The data is durable before
+  the message is sent, so a dropped notification costs a stale timestamp — precisely the
+  behaviour it replaces — rather than a failed sync.
+- **Ordering comes free where it matters.** The message enters the same endpoint ring as
+  forwarded resolves, so a subsequent lookup of that file is processed after it. "Fire and
+  forget" does not mean "racy" here; it means "unwaited".
+
+**What it cost structurally.** The kernel could not previously *name* a Model A file to its
+server: `Producer::FsServerBlocks` held only the device and the block map, deliberately, in
+contrast to Model B which already carried `(reg, suffix)` for its per-page fills. It now
+carries them too — read by nothing on the data path, which is the point of the design and
+worth stating in the type rather than leaving as an absence.
+
+**One honest limitation.** The stamp happens on **sync**, not on the write, because the
+kernel keeps no per-page dirty bit — `writeback` flushes every *resident* page and cannot
+distinguish a modified one. So a caller that maps `MAP_WRITE`, changes nothing, and syncs
+anyway will move the timestamp. In practice the two coincide (`sys_file_sync` requires
+`MAP_WRITE`, and callers reach for it after writing), so it is a fidelity gap rather than a
+wrong answer. Filed as `TODO(page-dirty-tracking)` alongside the writeback daemon that
+needs the same machinery. The stale "the fs-server stays read-only, an overwrite changes no
+metadata" note in `ext4-fs-server-rw.md` — true of the data, wrong about the consequence —
+is corrected in place.
+
+*Verified:* host suite **789** green, including a new `e2fsck`-clean test that a touch moves
+`mtime`, leaves the size alone, and reports `NotFound` for a path that is not there.
+`test-qemu` PASS with an in-guest check that crosses a wall-clock second (ext4 stores whole
+seconds, so an overwrite inside one second is genuinely indistinguishable from none),
+overwrites in place, and asserts three things: the content changed, `mtime` advanced, and
+the **size did not** — the last so the check cannot pass by accidentally taking the
+grow/truncate path, which would have stamped `mtime` the old way. **Negative control**:
+dropping the notification fails it with "in-place overwrite left mtime stale".

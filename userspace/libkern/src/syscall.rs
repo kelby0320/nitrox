@@ -85,6 +85,12 @@ pub const SYS_FILE_GROW: u64 = 32;
 pub const SYS_FILE_CREATE: u64 = 33;
 /// `sys_file_truncate` — resolve a file, **shrinking** it to a target size first.
 pub const SYS_FILE_TRUNCATE: u64 = 34;
+/// `sys_file_rename` — rename a path to another path **within the same filesystem**
+/// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags). Returns a
+/// `PendingOperation`; the completion carries status only, no handle. A destination on a
+/// different binding fails with `Unsupported` — the caller's cue to fall back to
+/// copy-then-unlink, the way `mv` does across devices.
+pub const SYS_FILE_RENAME: u64 = 35;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: end the QEMU run with a harness verdict (the argument's

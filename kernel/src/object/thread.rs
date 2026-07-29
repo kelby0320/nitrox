@@ -35,7 +35,47 @@ use crate::object::ObjectRef;
 /// Maximum number of handles one `sys_wait` call may block on. Bounds the
 /// per-thread wait arrays (so registration never allocates under the scheduler
 /// lock) and the `count` a caller may pass.
-pub const MAX_WAIT_HANDLES: usize = 8;
+///
+/// **This is the fan-out limit of every resource server.** A server holding a channel per
+/// client waits on its serving endpoint plus one slot per client, so it serves at most
+/// `MAX_WAIT_HANDLES - 1` at once — which is why raising it from 8 to 32 was a Slice C3
+/// change rather than a tuning knob (decision log, 2026-07-29). Userspace mirrors the value
+/// as `libkern::abi::MAX_WAIT_HANDLES`, and both fan-out servers derive their caps from it.
+///
+/// The arrays are fixed rather than allocated precisely so registration cannot allocate
+/// under rank-1 `SCHED`, so the cost is per-thread and paid whether waiting or not: at 32
+/// the two arrays are 288 B, against the 1 KiB `ArchFpuState` every thread already carries.
+/// That ratio is what makes 32 cheap and what would make, say, 256 not. Escaping the limit
+/// rather than raising it is `TODO(server-fanout)` in `docs/rationale/deferred-decisions.md`.
+pub const MAX_WAIT_HANDLES: usize = 32;
+
+/// The second cost of raising [`MAX_WAIT_HANDLES`], and the one that bites rather than
+/// merely adds up: `sys_wait` and the scheduler below it hold **several** arrays of this
+/// width on the **kernel stack** — the copied handles, the resolved `ObjectRef`s, the
+/// object addresses, the types, the `IoResult` output, and the scheduler's signaled
+/// snapshots. At 32 that is roughly 3 KiB against a `KERNEL_STACK_PAGES` (4-page, 16 KiB)
+/// stack; the growth is linear, so a careless bump to 256 would put ~24 KiB of frame on a
+/// 16 KiB stack and simply run off it.
+///
+/// A guard page below each stack means that would fault rather than corrupt, but a fault
+/// is a poor way to learn it. This budget check fails the **build** instead. Raising the
+/// limit past it is a real decision: either grow `KERNEL_STACK_PAGES` to match, or move the
+/// wait arrays off the stack.
+const _: () = {
+    // Bytes of kernel stack the wait path may spend on `MAX_WAIT_HANDLES`-wide arrays.
+    // A quarter of the stack, leaving the rest for the syscall frame and everything the
+    // wait path calls into.
+    const WAIT_STACK_BUDGET: usize = (crate::mm::kstack::KERNEL_STACK_BYTES as usize) / 4;
+    // Per element, summed over the arrays that are simultaneously live across the call:
+    // handles (8) + copied bytes (8) + refs (16) + objs (8) + types (1) + IoResult out (24)
+    // + the scheduler's `(usize, bool)` snapshot (16) + signaled bits (1).
+    const PER_HANDLE: usize = 8 + 8 + 16 + 8 + 1 + 24 + 16 + 1;
+    assert!(
+        MAX_WAIT_HANDLES * PER_HANDLE <= WAIT_STACK_BUDGET,
+        "MAX_WAIT_HANDLES too large for the kernel stack — grow KERNEL_STACK_PAGES or \
+         move the wait arrays off the stack"
+    );
+};
 
 /// A kernel thread's entry point. `extern "C"` so the
 /// [`thread_trampoline`](crate::arch::thread_trampoline) → `thread_enter`
@@ -814,6 +854,19 @@ impl Thread {
         // SAFETY: read the Option<KernelStack> by reference (not by value —
         // KernelStack is not Copy and owns mappings) and project to its top.
         unsafe { (*(&raw const (*p).stack)).as_ref().map(|s| s.top().as_u64()) }
+    }
+
+    /// This thread's owning process id, or `0` for a kernel/boot thread. Raw-pointer
+    /// form of [`Thread::owner_pid`], for the scheduler's stack-watermark attribution —
+    /// a depth figure is only actionable if it names whose thread reached it.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    #[cfg(feature = "test-harness")]
+    pub(crate) unsafe fn owner_pid_of(obj: *mut ()) -> u32 {
+        let p = obj as *mut Thread;
+        // SAFETY: `obj` is a pinned live `Thread` under the accessor contract.
+        unsafe { (*p).owner_pid() }
     }
 
     // --- Wait bookkeeping (scheduler-only; same accessor contract) ------

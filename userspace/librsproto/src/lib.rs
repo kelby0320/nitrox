@@ -73,6 +73,14 @@ pub const OP_FILE_UNLINK: u16 = 0x0603;
 pub const OP_FILE_RMDIR: u16 = 0x0604;
 /// `File::Rename` — rename `old` to `new` **within** the open directory handle.
 pub const OP_FILE_RENAME: u16 = 0x0605;
+/// `File::Touch` — stamp the named file's modification time as "now".
+///
+/// The odd one out among the `File::*` ops: it is addressed by **suffix on the server's
+/// forwarding endpoint**, not by name on a directory session, and it carries **no reply**.
+/// Both follow from who sends it — the *kernel*, after flushing a Model A file's dirty
+/// pages, to tell the server about a write it structurally could not have seen. See
+/// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
+pub const OP_FILE_TOUCH: u16 = 0x0606;
 /// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
 pub const OP_AUTHENTICATE: u16 = 0x0800;
 

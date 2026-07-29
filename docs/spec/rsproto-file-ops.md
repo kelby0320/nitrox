@@ -15,6 +15,7 @@ transports differ:
 | Op | Client | Transport |
 |---|---|---|
 | `ReadRange` (`0x0600`) | the **kernel** (page-cache fill) | the server's forwarding channel; the kernel hand-codes the request/reply in `kernel/src/rsproto.rs` |
+| `Touch` (`0x0606`) | the **kernel** (post-writeback `mtime`) | the server's forwarding channel; **no reply** |
 | `ReadDir` (`0x0601`), `Mkdir` (`0x0602`), `Unlink` (`0x0603`), `Rmdir` (`0x0604`), `Rename` (`0x0605`) | an ordinary **userspace process** | a **directory session channel** — direct client↔server RPC, no kernel involvement |
 
 `librsproto` (`userspace/librsproto/src/file.rs`) is the userspace mirror for both
@@ -155,7 +156,38 @@ reply; failure is the standard error reply.
 
 Request body: `old_len: u16` + the old name + `new_len: u16` + the new name (each
 length immediately precedes its own name). Both names are resolved **within this
-directory** — cross-directory rename is not yet supported.
+directory**; a rename that crosses directories goes through `RESOLVE_RENAME` on the
+resolve path instead (`rsproto-namespace-ops.md`), because it names two directories and a
+session is scoped to one by construction.
+
+### Touch (`0x0606`)
+
+Request body: `suffix_len: u16`, two reserved bytes, then the suffix naming the file under
+the mount. **No reply**, and `request_id` is `0` — nothing correlates it.
+
+The odd one out of the `File` ops on three counts, all following from who sends it. It
+comes from the **kernel**, on the **forwarding channel** rather than a directory session,
+and it asks for nothing back.
+
+It exists because of Model A. The kernel owns the file-data path, so an in-place,
+**same-length** overwrite travels from the page cache to the device with no resolve and no
+IPC at all: the server has no way to observe that the file changed, and its `mtime` would
+keep reporting the last *size* change. After flushing such a file (`sys_file_sync`), the
+kernel names it to the server, and the server stamps the modification time.
+
+Two properties are deliberate:
+
+- **No timestamp on the wire.** The server reads its own clock. A time supplied by whoever
+  wrote the file would be a time the writer gets to choose, and timestamps are not the
+  writer's to choose — the same reasoning that put the wall clock behind a syscall rather
+  than a caller-supplied argument.
+- **No reply, nothing pending.** The data is already durable when this is sent, so there is
+  nothing for a caller to wait on and a lost notification costs only a stale timestamp.
+  Ordering still holds where it matters: the request enters the same endpoint ring as
+  forwarded resolves, so a subsequent lookup of that file is processed after it.
+
+The stamp is applied on **sync**, not on the individual write, because the kernel keeps no
+per-page dirty bit (`TODO(page-dirty-tracking)`).
 
 ## Versioning
 

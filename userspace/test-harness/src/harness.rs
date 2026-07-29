@@ -1305,6 +1305,11 @@ fn return_fail(msg: &[u8]) -> ! {
     exit(1)
 }
 
+/// Entries the dir-growth check creates. At 250-byte names (~258 bytes per record) that is
+/// ~4.1 KB — just past one 4 KiB directory block, so the directory must grow, without
+/// paying for a sweep the host e2fsck tests already cover.
+const GROW_ENTRIES: usize = 16;
+
 /// **Directory mutation over the direct-RPC transport** (dir-ops Part B). On the same kind
 /// of open directory session as `dir_list_demo`, exercises the name-addressed mutations end
 /// to end: mkdir a temp subdir, confirm it appears, rename it, confirm the rename, then
@@ -1343,6 +1348,44 @@ fn dir_mutate_demo(root_ns: u64) {
         Err(_) => return_fail(b"test-harness: rmdir(missing) reported a transport fault\n"),
         Ok(()) => return_fail(b"test-harness: rmdir(missing) wrongly succeeded\n"),
     }
+    // Fill the directory past one block's worth of entries, on the **real** on-disk
+    // filesystem rather than the host tests' synthetic fixture. `/system` has 4 KiB
+    // blocks, and a 250-byte name costs ~258 bytes per record, so 16 entries is ~4.1 KB
+    // — just over one block, which is the point. Before directory growth landed
+    // (2026-07-29) this failed partway with `TooLarge`.
+    //
+    // Sized to *cross the boundary*, not to stress: each entry is several block
+    // read-modify-writes through the fs-server, and a bigger sweep pushed the TCG run
+    // past the harness timeout while proving nothing the host e2fsck tests do not.
+    let mut name = [b'g'; 250];
+    for i in 0..GROW_ENTRIES {
+        name[0] = b'0' + (i / 10) as u8;
+        name[1] = b'0' + (i % 10) as u8;
+        if dir.mkdir(&name).is_err() {
+            return_fail(b"test-harness: dir-grow mkdir FAIL (directory did not grow?)\n");
+        }
+    }
+    // One enumeration, counting ours: the added blocks must be reachable through the
+    // paginated ReadDir, not merely written. (Per-entry lookups would be 16 more full
+    // walks for no extra coverage.)
+    let mut seen = 0u32;
+    let walked = dir.read_dir(|e| {
+        if e.name.len() == 250 && e.name[2] == b'g' {
+            seen += 1;
+        }
+        true
+    });
+    if walked.is_err() || seen != GROW_ENTRIES as u32 {
+        return_fail(b"test-harness: dir-grow FAIL (entries missing after growth)\n");
+    }
+    for i in 0..GROW_ENTRIES {
+        name[0] = b'0' + (i / 10) as u8;
+        name[1] = b'0' + (i % 10) as u8;
+        if dir.rmdir(&name).is_err() {
+            return_fail(b"test-harness: dir-grow rmdir FAIL\n");
+        }
+    }
+
     // rmdir nx-tmp2 → confirm it is gone.
     if dir.rmdir(b"nx-tmp2").is_err() {
         return_fail(b"test-harness: rmdir FAIL\n");
@@ -1979,6 +2022,476 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
         syscall1(SYS_HANDLE_CLOSE, setup_shell);
     }
     code
+}
+
+/// **`mtime` survives an in-place overwrite** (Slice C4).
+///
+/// The timestamp gap users actually notice. Under Model A the kernel owns the file-data
+/// path, so a **same-length** rewrite — map the file, change the bytes, `sys_file_sync` —
+/// reaches the device with no resolve and no IPC. The fs-server never hears about it, so
+/// before C4 nothing moved the inode's `mtime`: a file edited ten times in place still
+/// reported the moment it was *created*.
+///
+/// The check has to cross a wall-clock second, because ext4 second-granularity `mtime`
+/// cannot show a change finer than that. So: create, note `mtime`, wait for the clock's
+/// second to tick over, overwrite in place, and re-read.
+///
+/// Checks, in order:
+///
+/// 1. **The content really changed** — otherwise a stale-`mtime` bug and a
+///    silently-failed-write bug look identical, and the interesting one is hidden.
+/// 2. **`mtime` advanced** — the actual fix.
+/// 3. **The size did not change** — proving this went through the in-place path and not
+///    an accidental grow/truncate, which would have stamped `mtime` the old way and made
+///    the check pass for the wrong reason.
+fn mtime_overwrite_demo(root_ns: u64) {
+    kprint(b"test-harness: mtime demo (an in-place overwrite is not invisible)\n");
+
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: mtime fixture open FAIL\n"),
+    };
+    if sys.mkdir(b"nx-mtime").is_err() {
+        return_fail(b"test-harness: mtime fixture mkdir FAIL\n");
+    }
+    sys.close();
+    write_file(root_ns, b"/system/nx-mtime/f.txt", MTIME_BEFORE);
+
+    let (before_mtime, before_size) = stat_entry(root_ns, b"/system/nx-mtime", b"f.txt");
+    if before_mtime == 0 {
+        return_fail(b"test-harness: fixture has no mtime (wall clock unset?)\n");
+    }
+
+    // Cross a wall-clock second: ext4 stores whole seconds, so an overwrite inside the
+    // same second is genuinely indistinguishable from no overwrite at all.
+    wait_for_next_second();
+
+    // The case under test: same length, written straight into the mapping, flushed.
+    overwrite_in_place(root_ns, b"/system/nx-mtime/f.txt", MTIME_AFTER);
+
+    // --- 1. the content really changed ---------------------------------------
+    if !file_matches(root_ns, b"/system/nx-mtime/f.txt", MTIME_AFTER) {
+        return_fail(b"test-harness: in-place overwrite did not take\n");
+    }
+
+    // --- 2 + 3. mtime moved, size did not ------------------------------------
+    let (after_mtime, after_size) = stat_entry(root_ns, b"/system/nx-mtime", b"f.txt");
+    if after_mtime <= before_mtime {
+        return_fail(b"test-harness: in-place overwrite left mtime stale\n");
+    }
+    if after_size != before_size {
+        return_fail(b"test-harness: overwrite changed the size, not the in-place path\n");
+    }
+
+    // --- teardown -------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-mtime", &[b"f.txt"]);
+    let mut b2 = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut b2) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: mtime teardown FAIL\n"),
+    };
+    if sys.rmdir(b"nx-mtime").is_err() {
+        return_fail(b"test-harness: mtime teardown rmdir FAIL\n");
+    }
+    sys.close();
+    kprint(b"test-harness: mtime ok (in-place overwrite moved mtime, size unchanged)\n");
+}
+
+/// Fixture contents for [`mtime_overwrite_demo`] — **the same length on purpose**. A
+/// different length would resize the file, which reaches the server through the ordinary
+/// resolve path and would stamp `mtime` even without C4.
+const MTIME_BEFORE: &[u8] = b"the original contents, fixed.\n";
+const MTIME_AFTER: &[u8] = b"the rewritten contents, same.\n";
+
+/// `(mtime, size)` of `name` inside directory `dir`, via a `ReadDir` listing.
+fn stat_entry(ns: u64, dir: &[u8], name: &[u8]) -> (i64, u64) {
+    let mut buf = [0u8; 4096];
+    let mut d = match Dir::open(ns, dir, &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: stat open FAIL\n"),
+    };
+    let mut found = (0i64, 0u64);
+    let r = d.read_dir(|e| {
+        if e.name == name {
+            found = (e.mtime, e.size);
+            return false; // stop early
+        }
+        true
+    });
+    d.close();
+    if r.is_err() {
+        return_fail(b"test-harness: stat ReadDir FAIL\n");
+    }
+    found
+}
+
+/// Block until the realtime clock's *second* changes, so a subsequent write lands in a
+/// second distinguishable from the previous one. Bounded — if the clock is not running,
+/// the caller's check fails on its own rather than hanging here.
+fn wait_for_next_second() {
+    let start = realtime_secs();
+    for _ in 0..40 {
+        if realtime_secs() != start {
+            return;
+        }
+        timer_sleep_ms(100);
+    }
+}
+
+/// The realtime clock, in whole seconds (`0` if unset).
+fn realtime_secs() -> i64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut CLOCK_BUF) as u64) };
+    if r != 0 {
+        return 0;
+    }
+    // SAFETY: the syscall wrote 8 bytes.
+    (unsafe { (&raw const CLOCK_BUF).read() } / 1_000_000_000) as i64
+}
+
+/// Overwrite `path` with `content` **in place**: resolve it (no size change at all), map it
+/// writable, write the bytes, and `sys_file_sync`. `content` must be the file's current
+/// length — the point is to exercise the path that never reaches the server.
+fn overwrite_in_place(ns: u64, path: &[u8], content: &[u8]) {
+    let size = content.len() as u64;
+    let (st, fh) = ns_lookup_wait(ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
+    if st != 0 || fh == 0 {
+        return_fail(b"test-harness: in-place resolve FAIL\n");
+    }
+    // SAFETY: mapping our own writable file handle.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        return_fail(b"test-harness: in-place map FAIL\n");
+    }
+    for (i, b) in content.iter().enumerate() {
+        // SAFETY: `i` is within the `size`-byte mapping.
+        unsafe { ((addr as u64 + i as u64) as *mut u8).write_volatile(*b) };
+    }
+    // SAFETY: flushing, unmapping, and closing our own handle.
+    let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
+    // SAFETY: as above.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+        syscall1(SYS_HANDLE_CLOSE, fh);
+    }
+    if synced != 0 {
+        return_fail(b"test-harness: in-place sync FAIL\n");
+    }
+}
+
+/// **Server fan-out: more concurrent directory sessions than the old cap** (Slice C3).
+///
+/// `fs-server-ext4` waits on one `sys_wait` set holding its serving endpoint plus every
+/// live directory session, so the kernel's `MAX_WAIT_HANDLES` *is* its client ceiling. It
+/// was 8, giving 7 sessions — which a shell pipeline reaches in normal use, not under
+/// stress. Raising it is only meaningful if the server genuinely serves the extra ones, so
+/// this opens the full set at once and then *uses* one from well past the old limit.
+///
+/// Everything here is derived from [`MAX_WAIT_HANDLES`] rather than written out, so the
+/// check tracks the constant instead of pinning yesterday's number.
+///
+/// Checks, in order:
+///
+/// 1. **All `MAX_SESSIONS` open concurrently** — every one of them, held simultaneously.
+/// 2. **One past the old cap of 7 actually works** — a real `ReadDir` on a late session.
+///    Opening a handle proves nothing on its own; the wait set has to cover it too.
+/// 3. **The cap is still enforced** — the next open past the table is refused, and refused
+///    *cleanly* (`WouldBlock`), not by wedging the server.
+/// 4. **Slots come back on close** — after closing them all, a fresh open succeeds. Without
+///    this, the test would pass just as well against a server that leaked every slot.
+fn session_fanout_demo(root_ns: u64) {
+    use librsproto::session::DIR_SESSION_RIGHTS;
+    kprint(b"test-harness: session fan-out demo (past the old 7-session cap)\n");
+
+    /// The server's ceiling: its wait set is `serve_end` + one slot per session.
+    const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 1;
+    /// The limit this replaced — the point of the check is to work well beyond it.
+    const OLD_CAP: usize = 7;
+
+    let mut held = [0u64; MAX_SESSIONS];
+
+    // --- 1. open the whole table at once -------------------------------------
+    for (i, slot) in held.iter_mut().enumerate() {
+        let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+        if st != 0 || h == 0 {
+            // Report how far we got: "stopped at 7" and "stopped at 20" are very
+            // different failures, and the count is the whole diagnosis.
+            kprint(b"test-harness: session fan-out stopped early at session ");
+            kprint_hex(i as u64);
+            kprint(b"\n");
+            return_fail(b"test-harness: could not open the full session table\n");
+        }
+        *slot = h;
+    }
+
+    // --- 2. a session past the old cap is really served ----------------------
+    // The one that matters. A handle can exist without the server ever waiting on it, in
+    // which case this round trip is what hangs (and the run's wall-clock timeout catches
+    // it) rather than returning wrong data.
+    {
+        let mut buf = [0u8; 4096];
+        let late = held[MAX_SESSIONS - 1];
+        let mut d = match Dir::from_endpoint(late, &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: wrapping a late session FAILED\n"),
+        };
+        let mut seen = 0usize;
+        if d.read_dir(|_| {
+            seen += 1;
+            true
+        })
+        .is_err()
+        {
+            return_fail(b"test-harness: ReadDir on a session past the old cap FAILED\n");
+        }
+        if seen == 0 {
+            return_fail(b"test-harness: late session listed nothing (/system is not empty)\n");
+        }
+        // `from_endpoint` took ownership; hand it back so the teardown below closes once.
+        core::mem::forget(d);
+    }
+    if MAX_SESSIONS <= OLD_CAP {
+        return_fail(b"test-harness: session cap did not actually move past 7\n");
+    }
+
+    // --- 3. one past the table is refused cleanly ----------------------------
+    let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+    if st == 0 && h != 0 {
+        return_fail(b"test-harness: opening past the session table wrongly succeeded\n");
+    }
+    if st != KERR_WOULD_BLOCK {
+        return_fail(b"test-harness: a full session table did not report WouldBlock\n");
+    }
+
+    // --- 4. closing frees the slots ------------------------------------------
+    for h in held.iter() {
+        // SAFETY: closing session handles this process owns.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
+    }
+    // The server reclaims a slot when it observes `PeerClosed` on that endpoint, which it
+    // does on its next wait — so a fresh open has to work again.
+    let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+    if st != 0 || h == 0 {
+        return_fail(b"test-harness: session slots were not reclaimed on close\n");
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+
+    kprint(b"test-harness: session fan-out ok (full table open, served, refused, reclaimed)\n");
+}
+
+/// `KError::WouldBlock`, the status a full session table reports.
+const KERR_WOULD_BLOCK: i32 = -11;
+
+/// **`rename` — re-pointing a name instead of copying it** (Slice C2).
+///
+/// `copy_demo` proved the filesystem can be *written*; this proves a name can be
+/// **re-pointed**, which is what `move` needs and what copy-then-unlink only approximates.
+/// No file data moves at all: a directory entry changes which inode it names, so a reader
+/// sees either the old name or the new one and never a half-written duplicate.
+///
+/// Checks, in order:
+///
+/// 1. **Within one directory** — the plain case. The new name has the content *and* the old
+///    name is gone; checking only the first would pass for a copy.
+/// 2. **Across directories** — the case `move` actually needs, and the one the ext4 layer
+///    grew `dir_repoint` for: the entry leaves one directory's block and enters another's.
+/// 3. **An occupied destination is refused** without `RENAME_REPLACE` — and, the part that
+///    matters, *both* paths survive untouched. A refusal that had already unlinked the
+///    source would be worse than no refusal.
+/// 4. **`RENAME_REPLACE` overwrites**, and the replaced file's content is really gone.
+/// 5. **A missing source fails** rather than conjuring a destination.
+/// 6. **A cross-filesystem destination is refused** with `Unsupported` rather than attempted.
+///    This one is the *kernel's* check, not the server's: `/system` is the ext4 mount and
+///    `/initramfs` is a different binding, so the request must never reach a server at all.
+///    It is also what tells `move` to fall back to copy + unlink (POSIX spells it `EXDEV`).
+fn rename_demo(root_ns: u64) {
+    use librsproto::namespace::RENAME_REPLACE;
+    kprint(b"test-harness: rename demo (re-point a name, don't copy it)\n");
+
+    // --- fixture: /system/nx-ren/{a.txt, b.txt, sub/} ------------------------
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: rename fixture open FAIL\n"),
+    };
+    if sys.mkdir(b"nx-ren").is_err() {
+        return_fail(b"test-harness: rename fixture mkdir FAIL\n");
+    }
+    sys.close();
+    {
+        let mut b2 = [0u8; 4096];
+        let mut d = match Dir::open(root_ns, b"/system/nx-ren", &mut b2) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: rename fixture reopen FAIL\n"),
+        };
+        if d.mkdir(b"sub").is_err() {
+            return_fail(b"test-harness: rename fixture subdir FAIL\n");
+        }
+        d.close();
+    }
+    write_file(root_ns, b"/system/nx-ren/a.txt", RENAME_CONTENT_A);
+    write_file(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_B);
+
+    // --- 1. within one directory ---------------------------------------------
+    if rename_wait(root_ns, b"/system/nx-ren/a.txt", b"/system/nx-ren/a2.txt", 0) != 0 {
+        return_fail(b"test-harness: rename within a directory FAILED\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/a2.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: renamed file has the wrong content\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/a.txt") {
+        return_fail(b"test-harness: rename left the old name behind (it copied)\n");
+    }
+
+    // --- 2. across directories ------------------------------------------------
+    if rename_wait(root_ns, b"/system/nx-ren/a2.txt", b"/system/nx-ren/sub/a3.txt", 0) != 0 {
+        return_fail(b"test-harness: cross-directory rename FAILED\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/sub/a3.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: cross-directory rename lost the content\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/a2.txt") {
+        return_fail(b"test-harness: cross-directory rename left the source behind\n");
+    }
+
+    // --- 3. an occupied destination is refused, and both paths survive --------
+    let st = rename_wait(root_ns, b"/system/nx-ren/sub/a3.txt", b"/system/nx-ren/b.txt", 0);
+    if st == 0 {
+        return_fail(b"test-harness: rename over an existing file wrongly succeeded\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_B) {
+        return_fail(b"test-harness: refused rename still clobbered the destination\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/sub/a3.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: refused rename still removed the source\n");
+    }
+
+    // --- 4. RENAME_REPLACE overwrites ----------------------------------------
+    let st = rename_wait(
+        root_ns,
+        b"/system/nx-ren/sub/a3.txt",
+        b"/system/nx-ren/b.txt",
+        RENAME_REPLACE as u64,
+    );
+    if st != 0 {
+        return_fail(b"test-harness: RENAME_REPLACE FAILED\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: RENAME_REPLACE did not replace the destination\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/sub/a3.txt") {
+        return_fail(b"test-harness: RENAME_REPLACE left the source behind\n");
+    }
+
+    // --- 5. a missing source fails -------------------------------------------
+    if rename_wait(root_ns, b"/system/nx-ren/nope.txt", b"/system/nx-ren/c.txt", 0) == 0 {
+        return_fail(b"test-harness: rename of a missing source wrongly succeeded\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/c.txt") {
+        return_fail(b"test-harness: failed rename created the destination anyway\n");
+    }
+
+    // --- 6. a cross-filesystem destination is refused, not attempted ----------
+    let st = rename_wait(root_ns, b"/system/nx-ren/b.txt", b"/initramfs/b.txt", 0);
+    if st != KERR_UNSUPPORTED {
+        return_fail(b"test-harness: cross-filesystem rename was not refused with Unsupported\n");
+    }
+    if !file_matches(root_ns, b"/system/nx-ren/b.txt", RENAME_CONTENT_A) {
+        return_fail(b"test-harness: refused cross-filesystem rename disturbed the source\n");
+    }
+    // …and with the *source* off the filesystem, which takes a different path through the
+    // kernel: the source resolves to a kernel server, so there is no forwarding arm to
+    // catch the verdict.
+    let st = rename_wait(root_ns, b"/initramfs/sbin/copy", b"/system/nx-ren/copy", 0);
+    if st != KERR_UNSUPPORTED {
+        return_fail(b"test-harness: rename off a non-filesystem source was not refused\n");
+    }
+    if path_exists(root_ns, b"/system/nx-ren/copy") {
+        return_fail(b"test-harness: refused rename created a destination\n");
+    }
+
+    // --- teardown -------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-ren", &[b"b.txt"]);
+    {
+        let mut b3 = [0u8; 4096];
+        let mut d = match Dir::open(root_ns, b"/system/nx-ren", &mut b3) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: rename teardown open FAIL\n"),
+        };
+        if d.rmdir(b"sub").is_err() {
+            return_fail(b"test-harness: rename teardown rmdir FAIL\n");
+        }
+        d.close();
+    }
+    let mut b4 = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut b4) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: rename teardown FAIL\n"),
+    };
+    if sys.rmdir(b"nx-ren").is_err() {
+        return_fail(b"test-harness: rename teardown rmdir FAIL\n");
+    }
+    sys.close();
+    kprint(b"test-harness: rename ok (same dir, cross dir, replace, refusals)\n");
+}
+
+/// Fixture contents for [`rename_demo`]. Different lengths, so a check that the content
+/// followed the name cannot pass by accident on a same-size file.
+const RENAME_CONTENT_A: &[u8] = b"alpha, the file that moves.\n";
+const RENAME_CONTENT_B: &[u8] = b"bravo, the destination that is already occupied.\n";
+
+/// `KError::Unsupported`, the status a cross-filesystem rename completes with.
+const KERR_UNSUPPORTED: i32 = -52;
+
+/// Issue a `sys_file_rename` and wait for its completion, returning the status. A rename
+/// resolves to no object, so there is no handle to install or close.
+fn rename_wait(ns: u64, src: &[u8], dst: &[u8], flags: u64) -> i32 {
+    // SAFETY: two valid path slices + a namespace handle.
+    let po = unsafe {
+        syscall6(
+            SYS_FILE_RENAME,
+            ns,
+            src.as_ptr() as u64,
+            src.len() as u64,
+            dst.as_ptr() as u64,
+            dst.len() as u64,
+            flags,
+        )
+    };
+    if po < 0 {
+        return po as i32;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    unsafe {
+        WAIT_HANDLES[0] = po as u64;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        );
+    }
+    // SAFETY: the wait wrote one 24-byte `IoResult`; `status` is at offset 8.
+    let status = unsafe {
+        i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
+    };
+    // SAFETY: closing our own PO handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
+    status
+}
+
+/// Does `path` resolve? The "old name is gone" half of a rename check — [`file_matches`]
+/// cannot tell *absent* from *present with different content*, and both would be bugs.
+fn path_exists(ns: u64, path: &[u8]) -> bool {
+    let (st, h) = ns_lookup_wait(ns, path, RIGHT_MAP_READ);
+    if h != 0 {
+        // SAFETY: closing a handle just installed into our table.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
+    st == 0 && h != 0
 }
 
 /// Create `path` with exactly `content` (the fixture writer).
@@ -2671,6 +3184,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5. `copy` — the mutation side of the filesystem, including the two cases it must
     //      refuse rather than get wrong (existing destination; no-truncate overwrite).
     copy_demo(root_ns, notif);
+
+    // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
+    //       (occupied destination, missing source, and either end off the filesystem).
+    rename_demo(root_ns);
+
+    // 0a5c. Server fan-out: the concurrent-session ceiling is the kernel's wait width, so
+    //       prove the server serves a session well past the old 7 — not just opens one.
+    session_fanout_demo(root_ns);
+
+    // 0a5d. An in-place, same-length overwrite is invisible to the fs-server under Model A
+    //       — prove the kernel now tells it, so mtime stops reporting the file's creation.
+    mtime_overwrite_demo(root_ns);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

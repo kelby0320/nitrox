@@ -125,6 +125,17 @@ impl KernelStack {
         // CPU has a cached translation for it), and the PD/PT are installed into
         // the shared-by-reference vmap hierarchy, so every address space sees them.
         // (Matches Linux, which shoots down only on unmap / permission-restrict.)
+
+        // Paint the fresh stack so its high-water mark is measurable later (see
+        // `watermark`). Instrumentation only — a production stack is left as the buddy
+        // handed it over.
+        #[cfg(feature = "test-harness")]
+        // SAFETY: the whole `[base, top)` range was just mapped writable above, and no
+        // thread runs on this stack until the caller installs it.
+        unsafe {
+            watermark::paint(base, KERNEL_STACK_BYTES);
+        }
+
         Ok(KernelStack {
             top,
             base,
@@ -151,6 +162,98 @@ impl KernelStack {
     /// page-faults — that's the overflow detector.
     pub fn guard_page(&self) -> VirtAddr {
         VirtAddr::new(self.base.as_u64() - PAGE_SIZE as u64)
+    }
+}
+
+/// Kernel-stack high-water measurement (`test-harness` builds only).
+///
+/// Exists because the kernel stack budget was being reasoned about from *estimates* — the
+/// `MAX_WAIT_HANDLES` sizing argument (Slice C3) summed array widths on paper. This
+/// replaces that with a number.
+///
+/// Fresh stacks are painted with [`POISON`]; the deepest point any thread has ever reached
+/// is then just the lowest address whose word is no longer poison. Sampling that at
+/// context-switch-out covers **every** thread that actually runs, including servers that
+/// spend their lives blocked and so never appear in a run queue.
+///
+/// The sample is **O(1) in the common case**: it only reads the word immediately below the
+/// standing record, and walks further down only when that word has been overwritten — i.e.
+/// only when a new record is genuinely being set, which happens a handful of times per
+/// boot. The mark is monotonic, so a thread that ran deep and returned still counts.
+#[cfg(feature = "test-harness")]
+pub mod watermark {
+    use super::{KERNEL_STACK_BYTES, VirtAddr};
+    use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+
+    /// Fill word for an untouched stack. Chosen to be implausible as a real value: not a
+    /// canonical address, not a small integer.
+    pub const POISON: u64 = 0x5041_494e_5445_4421; // "PAINTED!"
+
+    /// Deepest number of bytes any kernel stack has been observed to use.
+    static DEEPEST: AtomicU64 = AtomicU64::new(0);
+    /// Owning pid of the thread that set the standing record (`0` = a kernel thread).
+    /// A depth on its own says "something went deep"; this says *who*, which is the
+    /// difference between a number and a lead.
+    static DEEPEST_PID: AtomicU32 = AtomicU32::new(0);
+
+    /// Paint `bytes` of freshly-mapped stack starting at `base`.
+    ///
+    /// # Safety
+    /// `[base, base + bytes)` must be mapped writable and not in use by any thread.
+    pub unsafe fn paint(base: VirtAddr, bytes: u64) {
+        let p = base.as_u64() as *mut u64;
+        for i in 0..(bytes / 8) {
+            // SAFETY: within the caller-guaranteed mapped, unused range.
+            unsafe { p.add(i as usize).write(POISON) };
+        }
+    }
+
+    /// Update the mark from a stack whose exclusive top is `top`.
+    ///
+    /// Called with the *outgoing* thread's stack at a context switch. Cheap enough for that
+    /// path: one load unless the record actually moves.
+    ///
+    /// # Safety
+    /// `top` must be the exclusive top of a live, painted kernel stack — so
+    /// `[top - KERNEL_STACK_BYTES, top)` is mapped and readable.
+    pub unsafe fn sample(top: u64, pid: u32) {
+        let base = top - KERNEL_STACK_BYTES;
+        let record = DEEPEST.load(Ordering::Relaxed);
+        // The word just below the standing record. Still poison ⇒ nothing new; this is the
+        // whole cost on all but a few switches per boot.
+        let probe = top - record - 8;
+        if probe < base {
+            return; // the record already reaches the guard page
+        }
+        // SAFETY: `probe` is inside the mapped stack (checked against `base`).
+        if unsafe { (probe as *const u64).read_volatile() } == POISON {
+            return;
+        }
+        // A new record: walk down to the first still-poison word.
+        let mut addr = probe;
+        while addr > base {
+            // SAFETY: `addr` stays within `[base, top)` by the loop condition.
+            if unsafe { (addr as *const u64).read_volatile() } == POISON {
+                break;
+            }
+            addr -= 8;
+        }
+        let used = top - addr - 8;
+        // Record the pid only if this sample actually won, so the two stay consistent.
+        if DEEPEST.fetch_max(used, Ordering::Relaxed) < used {
+            DEEPEST_PID.store(pid, Ordering::Relaxed);
+        }
+    }
+
+    /// Deepest kernel-stack usage observed so far: `(bytes, percent of one stack, pid of
+    /// the thread that reached it)`. All zero before any sample.
+    pub fn deepest() -> (u64, u64, u32) {
+        let used = DEEPEST.load(Ordering::Relaxed);
+        (
+            used,
+            used * 100 / KERNEL_STACK_BYTES,
+            DEEPEST_PID.load(Ordering::Relaxed),
+        )
     }
 }
 

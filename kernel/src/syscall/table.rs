@@ -18,6 +18,24 @@ use crate::handle::global;
 use crate::handle::table::{HandleError, HandleTable, LookupOk};
 use crate::libkern::clock::ClockId;
 use crate::rsproto::SizeChange;
+
+/// What a resolve is being asked to do beyond resolving.
+///
+/// `Namespace::Resolve` began as a pure lookup and has grown side effects — create, grow,
+/// truncate, now rename — because each names a path, and the namespace is where path
+/// authority lives. One enum rather than a widening tuple of `Option`s keeps every call
+/// site naming exactly one intent.
+#[derive(Copy, Clone)]
+pub enum ResolveOp {
+    /// A plain lookup.
+    Plain,
+    /// Change the file's size first (`sys_file_create` / `_grow` / `_truncate`).
+    Size(u32, SizeChange),
+    /// Rename the resolved path to `dest_ptr`/`dest_len` (`sys_file_rename`). Both paths
+    /// must resolve through the **same binding**, checked below, so a server never sees a
+    /// cross-filesystem rename.
+    Rename { dest_ptr: u64, dest_len: usize, flags: u16 },
+}
 use crate::libkern::handle::{HandleInfo, KObjectType, NsEntry, RawHandle, Rights};
 use crate::libkern::ipc::{IPC_DEFAULT_QUEUE_DEPTH, IPC_HANDLE_MAX, IPC_MAX_QUEUE_DEPTH, IPC_PAYLOAD_SIZE};
 use crate::libkern::spawn::{SPAWN_MAX_HANDLES, SpawnArgs};
@@ -204,6 +222,9 @@ pub const SYS_FILE_GROW: u64 = 32;
 pub const SYS_FILE_CREATE: u64 = 33;
 /// `sys_file_truncate` — resolve a file, shrinking it to a target size first (a5 = new size).
 pub const SYS_FILE_TRUNCATE: u64 = 34;
+/// `sys_file_rename` — rename a path to another path in the same filesystem
+/// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags).
+pub const SYS_FILE_RENAME: u64 = 35;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -252,15 +273,22 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
         SYS_NS_CREATE => encode(sys_ns_create()),
-        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, None)),
+        SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Grow))))
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Grow)))
         }
         SYS_FILE_CREATE => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Create))))
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Create)))
         }
+        SYS_FILE_RENAME => encode(sys_ns_lookup(
+            a0,
+            a1,
+            a2 as usize,
+            crate::libkern::handle::Rights::MAP_READ.bits(),
+            ResolveOp::Rename { dest_ptr: a3, dest_len: a4 as usize, flags: a5 as u16 },
+        )),
         SYS_FILE_TRUNCATE => {
-            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, Some((a4 as u32, SizeChange::Truncate))))
+            encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Size(a4 as u32, SizeChange::Truncate)))
         }
         SYS_NS_BIND => encode(sys_ns_bind(a0, a1, a2 as usize, a3, a4, a5 as usize)),
         SYS_NS_UNBIND => encode(sys_ns_unbind(a0, a1, a2 as usize)),
@@ -276,9 +304,10 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         #[cfg(feature = "test-harness")]
         SYS_TEST_EXIT => {
             // Every adjudicated run ends here, so it is the one place guaranteed to see
-            // the whole boot's page-cache behaviour. Printed rather than exposed through
-            // `/proc` because the consumer is a measurement, not a program.
+            // the whole boot's behaviour. Printed rather than exposed through `/proc`
+            // because the consumer is a measurement, not a program.
             report_fill_stats();
+            report_stack_watermark();
             crate::arch::debug_exit(a0 as u32)
         }
         // These diverge into the scheduler; they never return to dispatch/sysret.
@@ -719,6 +748,27 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
 /// and write them to the serial console. Debug-only. Returns the number of
 /// bytes written.
 ///
+/// Print the deepest kernel-stack usage observed over the run, as bytes and as a
+/// percentage of one stack. Emitted just before the integration run ends, so the number is
+/// in the serial log of every `xtask test-qemu`.
+///
+/// Its purpose is to keep the stack budget honest with a *measurement*: the
+/// `MAX_WAIT_HANDLES` sizing argument (Slice C3) was reasoned from summed array widths,
+/// and this is what turns that estimate into a number. It also covers the fact that
+/// interrupts have no separate stack here — device IRQs and IPIs nest onto whatever
+/// thread stack is current (`TODO(irq-stack)`), so their frames are included in the mark.
+#[cfg(feature = "test-harness")]
+fn report_stack_watermark() {
+    let (used, pct, pid) = crate::mm::kstack::watermark::deepest();
+    crate::kprintln!(
+        "kstack: deepest {} B of {} ({}%), by pid {}",
+        used,
+        crate::mm::kstack::KERNEL_STACK_BYTES,
+        pct,
+        pid
+    );
+}
+
 /// The validation/bounds checks are ordered so the `len == 0` and
 /// `len > KPRINT_MAX` paths are reachable without touching user memory or
 /// the serial port (host-testable); the copy + serial write are exercised
@@ -1546,7 +1596,7 @@ pub fn sys_ns_lookup(
     path_ptr: u64,
     path_len: usize,
     rights_bits: u64,
-    size_change: Option<(u32, SizeChange)>,
+    op: ResolveOp,
 ) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     // --- synchronous validation (no PO created on these) ---
@@ -1555,6 +1605,65 @@ pub fn sys_ns_lookup(
     let mut buf = [0u8; NS_PATH_MAX];
     let path = copy_ns_path(path_ptr, path_len, &mut buf)?;
     validate_path(path).map_err(|_| KError::InvalidArgument)?;
+
+    // A rename resolves *two* paths. Reduce them here — before any PO exists, so a
+    // malformed destination fails synchronously — to one mount-relative suffix plus a
+    // verdict. Both must land on the same server and the same subtree base, or the rename
+    // would cross a filesystem: that is reported as `Unsupported`, which is the signal a
+    // caller needs to fall back to copy + unlink (POSIX spells it `EXDEV`).
+    //
+    // No *write*-authority check happens here, deliberately. A binding's rights on a
+    // userspace-server mount are the rights of the endpoint **handle** it was bound with
+    // (`sys_ns_bind` takes them from the target), so they describe the channel, not the
+    // files behind it — which is exactly why the forwarding arm below ignores them. The
+    // mutating resolves that already exist (`RESOLVE_CREATE`/`GROW`/`TRUNCATE`) gate on
+    // nothing but `LOOKUP` on the namespace for the same reason, and rename matches them
+    // rather than inventing a stricter rule that a caller could not satisfy. Giving a
+    // namespace binding real per-mount write authority is a system-wide change, filed as
+    // TODO(mount-write-authority) in docs/rationale/deferred-decisions.md.
+    let mut dest_buf = [0u8; NS_PATH_MAX];
+    let mut dest_len = 0usize;
+    let mut rename_verdict: Option<KError> = None;
+    if let ResolveOp::Rename { dest_ptr, dest_len: dlen, .. } = op {
+        let d = copy_ns_path(dest_ptr, dlen, &mut dest_buf)?;
+        validate_path(d).map_err(|_| KError::InvalidArgument)?;
+        let dcopy_len = d.len();
+        let mut dcopy = [0u8; NS_PATH_MAX];
+        dcopy[..dcopy_len].copy_from_slice(d);
+        // SAFETY: live `Namespace` (type verified by `lookup_typed` above).
+        let nsr = unsafe { &*(ns_ok.object.as_ptr() as *const Namespace) };
+        rename_verdict = match (nsr.resolve(path), nsr.resolve(&dcopy[..dcopy_len])) {
+            (
+                Some((ResolvedTarget::UserspaceServer(sreg, sbase), _, _)),
+                Some((ResolvedTarget::UserspaceServer(dreg, dbase), _, dsuffix)),
+            ) => {
+                let same = sreg.as_ptr() == dreg.as_ptr() && sbase.as_path() == dbase.as_path();
+                let joined = if dbase.as_path().is_empty() {
+                    dest_buf[..dsuffix.len()].copy_from_slice(dsuffix);
+                    Some(dsuffix.len())
+                } else {
+                    let mut jb = [0u8; NS_PATH_MAX];
+                    join_subtree(dbase.as_path(), dsuffix, &mut jb).map(|j| {
+                        let n = j.len();
+                        dest_buf[..n].copy_from_slice(j);
+                        n
+                    })
+                };
+                drop(sreg);
+                drop(dreg);
+                match (same, joined) {
+                    (false, _) => Some(KError::Unsupported),
+                    (_, None) => Some(KError::TooLarge),
+                    (true, Some(n)) => {
+                        dest_len = n;
+                        None
+                    }
+                }
+            }
+            // Anything not served by a userspace filesystem cannot be renamed.
+            _ => Some(KError::Unsupported),
+        };
+    }
 
     // Create the PO and its handle FIRST, so every *resolution* outcome (success
     // or not-found) is delivered through the PO; only the pre-PO failures above
@@ -1605,6 +1714,18 @@ pub fn sys_ns_lookup(
     // The resolution outcome: `Some((status, result))` completes the PO now (the
     // synchronous direct-handle / kernel-server paths); `None` leaves it **pending**
     // (a forwarded userspace lookup — the server's reply completes it later).
+    //
+    // A refused rename short-circuits the resolve entirely. This has to happen *before*
+    // it, not inside the forwarding arm: when the source is not on a userspace filesystem
+    // (`/initramfs/x`, or a direct-handle binding) the resolve below would succeed and
+    // hand back a handle to the source — reporting a rename that never happened.
+    if let Some(e) = rename_verdict {
+        // Same shape as the `Some(outcome)` arm at the end: pre-signal the PO (no waiters
+        // yet) and hand back its handle. `ns_ok` / `po_ref` are still held, so nothing
+        // drops an `ObjectRef` under `SCHED`.
+        crate::sched::complete_pending_op(po_ptr, e as i32, 0);
+        return Ok(po_h.bits() as isize);
+    }
     let outcome: Option<(i32, u64)> = match ns.resolve(path) {
         None => Some((KError::NotFound as i32, 0)),
         Some((ResolvedTarget::DirectHandle(target), binding_rights, suffix)) => {
@@ -1642,12 +1763,14 @@ pub fn sys_ns_lookup(
             // `validate_path`d above) are free of `.`/`..`, so the join cannot escape
             // the subtree.
             if base.is_empty() {
-                forward_userspace_lookup(reg, &po_ref, pid, requested, suffix, size_change)
+                forward_userspace_lookup(
+                    reg, &po_ref, pid, requested, suffix, op, &dest_buf[..dest_len],
+                )
             } else {
                 let mut jbuf = [0u8; NS_PATH_MAX];
                 match join_subtree(base.as_path(), suffix, &mut jbuf) {
                     Some(joined) => forward_userspace_lookup(
-                        reg, &po_ref, pid, requested, joined, size_change,
+                        reg, &po_ref, pid, requested, joined, op, &dest_buf[..dest_len],
                     ),
                     None => {
                         // The joined path overflows the buffer — drop the forwarding
@@ -1714,24 +1837,36 @@ fn forward_userspace_lookup(
     pid: u32,
     requested: Rights,
     suffix: &[u8],
-    size_change: Option<(u32, SizeChange)>,
+    op: ResolveOp,
+    dest: &[u8],
 ) -> Option<(i32, u64)> {
     // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
     // request (`sys_file_grow`/`sys_file_create`) additionally carries the target size +
     // `RESOLVE_GROW` (+ `RESOLVE_CREATE`) so the server creates/grows before replying its map.
-    let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
+    // in place so the 4 KiB message never lands in this frame (see `try_new_zeroed`).
+    let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
-    let built = match size_change {
-        Some((new_size, change)) => crate::rsproto::build_resolve_request_sized(
+    let built = match op {
+        ResolveOp::Size(new_size, change) => crate::rsproto::build_resolve_request_sized(
             &mut msg.payload,
             requested.bits(),
             suffix,
             new_size,
             change,
         ),
-        None => crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix),
+        ResolveOp::Rename { flags, .. } => crate::rsproto::build_resolve_request_rename(
+            &mut msg.payload,
+            requested.bits(),
+            suffix,
+            dest,
+            flags,
+        ),
+        ResolveOp::Plain => {
+            crate::rsproto::build_resolve_request(&mut msg.payload, requested.bits(), suffix)
+        }
     };
     let body_len = match built {
         Some(n) => n,
@@ -2133,7 +2268,10 @@ pub fn sys_channel_send(
 
     // Bounce the 4096-byte message in from user memory (outside any lock — a
     // user copy may fault). One heap slot per send; optimisation target later.
-    let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
+    // in place — a stack temporary here would be 4 KiB on every send.
+    let mut bounce =
+        unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
     if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
         return Err(KError::InvalidArgument);
@@ -2293,6 +2431,7 @@ fn complete_resolve_reply(
 ) -> SysResult {
     use crate::rsproto::{
         OBJECT_KIND_CHANNEL, OBJECT_KIND_FILE, OBJECT_KIND_FILE_BLOCKS, OBJECT_KIND_MEMOBJ,
+        OBJECT_KIND_NONE,
         ReplyKind, parse_reply,
     };
 
@@ -2324,8 +2463,10 @@ fn complete_resolve_reply(
         ReplyKind::Success { object_kind, content_len }
             if object_kind == OBJECT_KIND_FILE_BLOCKS =>
         {
-            build_and_install_file_blocks(&pl, content_len, &bounce.payload[..payload_len], transfers)
+            build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
         }
+        // A mutating resolve (rename): the work is done and there is nothing to install.
+        ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
         ReplyKind::Success { object_kind, .. }
             if object_kind != OBJECT_KIND_MEMOBJ && object_kind != OBJECT_KIND_CHANNEL =>
         {
@@ -2391,11 +2532,50 @@ fn complete_resolve_reply(
 fn sys_file_sync(handle: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)?;
-    if crate::object::FileObject::writeback(&ok.object) {
-        Ok(0)
-    } else {
-        Err(KError::IoError)
+    if !crate::object::FileObject::writeback(&ok.object) {
+        return Err(KError::IoError);
     }
+    // The data is on the device, but under Model A the *server* has no idea it happened:
+    // an in-place, same-length overwrite never resolves anything, so nothing would move the
+    // inode's `mtime`. Tell it. Best-effort and unwaited — see `us_forward_notify`.
+    notify_file_touched(&ok.object);
+    Ok(0)
+}
+
+/// Send `File::Touch` for a just-flushed Model A file, so its server can stamp `mtime`.
+///
+/// Stamps on **sync**, not on the individual write, because the kernel has no per-page
+/// dirty bit — `writeback` flushes every resident page, so "was this page actually
+/// modified?" is not a question it can answer today (`TODO(page-dirty-tracking)`). In
+/// practice the two coincide: `sys_file_sync` requires `MAP_WRITE` and a caller reaches for
+/// it precisely after writing.
+///
+/// Silent on any failure. The file's data is already durable; a dropped touch costs a stale
+/// timestamp, which is exactly the status quo this replaces — not worth failing a
+/// successful sync over.
+fn notify_file_touched(file_obj: &ObjectRef) {
+    use crate::libkern::KBox;
+    use crate::object::FileObject;
+
+    let Some((reg, suffix)) = FileObject::fs_server_name(file_obj) else {
+        return; // not a Model A file — nothing to notify
+    };
+    // Build in a heap-bounced message: a 4 KiB `StoredMsg` has no business on a kernel
+    // stack whose budget is measured, not assumed (decision log, 2026-07-29).
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
+    // place — the by-value form would put 4 KiB in this frame, on a sync path that is
+    // already among the deepest in the kernel.
+    let Ok(mut msg) = (unsafe { KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() })
+    else {
+        return;
+    };
+    let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, suffix.as_bytes())
+    else {
+        return;
+    };
+    msg.header.payload_len = body_len as u32;
+    msg.header.handle_count = 0;
+    crate::sched::us_forward_notify(reg.as_ptr(), &mut msg);
 }
 
 fn build_and_install_file(
@@ -2457,12 +2637,13 @@ fn build_and_install_file(
 /// page zero-copy from the device. `content_len` is the file size; `reply_msg` is the rsproto
 /// reply message (envelope + body). Returns `(0, handle)` or `(kerror, 0)`.
 fn build_and_install_file_blocks(
+    reg: *mut (),
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
-    use crate::libkern::KVec;
+    use crate::libkern::{KString, KVec};
     use crate::object::{BlockRun, FileObject, Producer};
     use crate::rsproto::{file_blocks_reply_header, file_blocks_run, reply_body};
 
@@ -2494,9 +2675,26 @@ fn build_and_install_file_blocks(
         let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
     }
 
+    // Name the file back to its server, for the post-writeback `File::Touch` (the data
+    // path never uses these — see `Producer::FsServerBlocks`).
+    let Some(suffix_bytes) = pl.suffix() else {
+        return (KError::TooLarge as i32, 0);
+    };
+    let Ok(suffix_str) = core::str::from_utf8(suffix_bytes) else {
+        return (KError::InvalidArgument as i32, 0);
+    };
+    let Ok(suffix) = KString::try_from_str(suffix_str) else {
+        return (KError::OutOfMemory as i32, 0);
+    };
+    // SAFETY: `reg` addresses the live `UserspaceServerReg` this reply arrived through.
+    let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) })
+    else {
+        return (KError::KernelError as i32, 0);
+    };
+
     let fobj = match FileObject::try_new(
         content_len as usize,
-        Producer::FsServerBlocks { device, runs, block_size },
+        Producer::FsServerBlocks { device, runs, block_size, reg: reg_ref, suffix },
     ) {
         Ok(f) => f,
         Err(_) => return (KError::OutOfMemory as i32, 0),
@@ -2634,7 +2832,10 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
         RecvState::PeerClosed => return Err(KError::PeerClosed),
         RecvState::HasMsg => {}
     }
-    let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
+    // place — a stack temporary here would be 4 KiB on every recv.
+    let mut bounce =
+        unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     // Popping frees a ring slot, so a held blocking sender may be promoted into
     // it; `_promoted_po` is that sender's now-completed `PendingOperation`, and

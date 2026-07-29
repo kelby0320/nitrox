@@ -261,7 +261,121 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 ### Filesystems
 
+**A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
+(IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
+and reschedule IPIs, and every registered device handler — is configured with **IST0, i.e.
+no IST**, so it nests onto whichever kernel stack is current. Linux x86_64, at the *same*
+16 KiB thread-stack size, keeps interrupts off it entirely with a dedicated 16 KiB IRQ
+stack (plus ISTs for NMI/MCE/debug), so Nitrox's 16 KiB is carrying strictly more than the
+number it is matched against.
+
+Measurement (2026-07-29, via the stack watermark below): the deepest any kernel stack has
+gone during a full integration boot is **6264 B of 16384 — 38%**, leaving ~10 KiB for a
+nested interrupt on top of the deepest syscall. That figure is only that comfortable
+*because* measuring it immediately found 4 KiB of avoidable stack in the IPC paths — the
+first reading was 58%, and 83% once a fourth `KBox::try_new(StoredMsg::zeroed())` landed on
+the sync path, each of those materialising a 4 KiB message in the caller's frame before
+copying it to the heap. With those converted to `KBox::try_new_zeroed`, the headroom is
+real rather than notional. The guard page turns an overflow into a loud fault rather than
+corruption either way. The fix here is a **per-CPU** IRQ stack, which
+costs 16 KiB × CPUs rather than × threads — much cheaper than growing every thread's stack,
+and it is what the precedent actually is. Trigger: the watermark climbing further (device
+drivers with real interrupt work are the likely cause — the current device set is thin), or
+the first guard-page fault.
+
+**Attributing the watermark to a call path — `TODO(stack-attribution)`.** The watermark
+records how deep and *whose* thread, and that was enough to learn something: the pid varies
+run to run while the depth is bit-for-bit constant, so the deep path is something every
+spawned process does rather than one pathological thread. It does not record *where*, which
+is the next question and needs a return-address capture at the moment the record is set.
+Trigger: wanting to actually reduce the figure above, rather than just watch it.
+
+**Resource-server fan-out beyond the `sys_wait` width — `TODO(server-fanout)`.** A server
+that holds a channel per client waits on its serving endpoint plus one slot per client, so
+`MAX_WAIT_HANDLES` is the number of clients it can serve at once — for *every* server, not
+one of them. Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
+(`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
+concurrent clients to 31, and made both derive their cap from the constant rather than
+restate it. That is a bigger number, not a different shape, and three things are unchanged:
+the ceiling is still fixed; a client that opens a session and then stalls pins a slot for
+as long as it lives, which no cap fixes; and the kernel arrays are on the **kernel stack**,
+so the limit cannot simply keep growing (a compile-time budget check in `thread.rs` fails
+the build at roughly a quarter of the 16 KiB stack).
+
+The shape that removes the limit is a **readiness mechanism**: register a channel so that
+becoming readable posts a notification carrying a server-chosen key, and the server waits
+on **one** handle — its notification queue — regardless of client count. The notification
+queue already exists and is the architecture's answer to async events, so this is a natural
+extension rather than a new concept. The sharp edge is that the queue drops on overflow
+(`KIND_NOTIFICATIONS_DROPPED`), and a dropped readiness wakeup is a permanently stuck
+client unless the server treats that notification as "rescan everything" — which means the
+mechanism has to be designed with the fallback, not have it bolted on. Trigger: a server
+that genuinely needs more than ~31 concurrent clients, or the first time a stalled client
+starving others is observed rather than theorised — most likely the desktop, where a
+compositor holds a channel per window rather than per short-lived listing.
+
+**Per-page dirty tracking — `TODO(page-dirty-tracking)`.** `FileObject::writeback` flushes
+every *resident* page, not every *modified* one — the kernel keeps no per-page dirty bit,
+so it cannot tell the difference. Two consequences, both currently benign. Writeback does
+more device I/O than it needs to on a file that was mostly read. And `File::Touch`
+(Slice C4) therefore stamps `mtime` on **sync**, not on write: a caller that maps a file
+`MAP_WRITE`, changes nothing, and syncs anyway will move the timestamp. In practice the two
+coincide — `sys_file_sync` requires `MAP_WRITE` and callers reach for it precisely after
+writing — so this is a fidelity gap, not a wrong answer. The fix is to harvest the PTE
+dirty bits (and re-protect pages read-only after each writeback so re-dirtying is
+observable), which is the same machinery a periodic writeback daemon needs. Trigger: a
+writeback daemon, a file large enough that flushing clean pages costs real time, or a
+consumer that actually depends on `mtime` meaning "content changed".
+
+**Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
+namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
+it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC
+channel, not the files behind it — which is why the forwarding path in `sys_ns_lookup`
+ignores `binding_rights` entirely. The consequence: **no mutating resolve is rights-checked
+by the kernel.** `RESOLVE_CREATE`/`GROW`/`TRUNCATE`/`RENAME` all gate on nothing but
+`LOOKUP` on the namespace handle, so a process that can resolve a path in a mount can
+write it. Today that is contained by *namespace construction* — a sandbox that must not
+write a filesystem is not given a binding to it at all, which is the architecture's
+intended mechanism (`docs/architecture/namespace-and-resource-servers.md`) — so this is a
+missing *refinement*, not an open hole. It surfaced writing `sys_file_rename` (2026-07-29),
+where an attempt to check `MAP_WRITE` on both bindings failed against a live mount because
+the bits are not what the name suggests. Doing it properly means deciding where per-mount
+authority lives: rights on the binding independent of the endpoint handle's, a read-only
+mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
+writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
+
+**Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
+of a directory for a record with enough slack before appending a new block, and the server
+caches nothing between calls — so filling a directory with N entries re-reads its blocks N
+times. Fine at the scales anything currently does (16 entries costs ~2 s of a TCG boot),
+but it is quadratic: a sweep of 40 entries plus a lookup per entry pushed a `test-qemu` run
+past its 90 s ceiling (2026-07-29), which is what sized the in-guest check down to
+crossing the block boundary rather than stressing it. The fixes are the standard ones —
+an htree directory index, or simply a per-directory "first block with room" hint carried
+across inserts. Trigger: bulk directory creation on a real path — `copy -r` of a large
+tree, or unpacking a package into the store.
+
+**ext4 write-path gaps (`fs-server-ext4`).** The write path is deliberately partial, and
+these are the pieces still missing. They were previously recorded only in the crate's
+`CLAUDE.md` — which is precisely how three other deferrals went unreviewed (the 2026-07-24
+audit) — so they are mirrored here.
+
+- **Extent-tree splitting / index nodes (depth > 0).** `i_block` holds four inline leaf
+  extents; a file or directory needing a fifth non-contiguous extent gets `Unsupported`.
+  Measured boundary on 4 KiB blocks (2026-07-29): creating **files** in one directory is
+  unbounded in practice (2000+ tested — the parent's growth blocks stay contiguous, so one
+  extent covers them), while creating **subdirectories** stops at **~814**, because each
+  `mkdir` allocates the child's own block between the parent's and so fragments it. Both
+  are far past anything the shell or desktop needs. Trigger: a directory or file that
+  genuinely needs a deeper tree — very large files, or a directory of thousands of
+  subdirectories.
+- **Cross-group inode/block allocation.** Creation is group 0 only. Trigger: a filesystem
+  large or full enough that group 0 runs out.
+- **`metadata_csum` checksums** and **jbd2 journaling + replay.** The fixtures are built
+  `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
+  media where an unclean shutdown matters.
 
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 

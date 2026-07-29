@@ -107,6 +107,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `32` | `sys_file_grow` |
 | `33` | `sys_file_create` |
 | `34` | `sys_file_truncate` |
+| `35` | `sys_file_rename` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -213,7 +214,15 @@ fn sys_wait(
 ```
 Blocks until at least one handle in `handles[0..count]` signals, or until `deadline` (absolute monotonic nanoseconds) passes. Special deadline values: `0` = poll, `u64::MAX` = no timeout. Writes one `IoResult` per signaled handle to `results`. Returns the count of signaled handles (positive), `TimedOut` if the deadline elapsed with nothing signaled, or `WouldBlock` for a poll (`deadline == 0`) that found nothing ready. (Syscall number `10`.)
 
-**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, and `PendingOperation` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (8). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly. `IoResult` carries a `result: u64` payload word (added with the namespace slice, at a stable offset past `status`/`reserved`) for completions that return a value rather than just a status — e.g. a namespace lookup's resolved handle; edge-style waitables report `result = 0`.
+**Implemented for `Timer`, `NotificationChannel`, `IpcChannel`, and `PendingOperation` handles** (a notification channel is signaled when its queue is non-empty; an IPC endpoint when its receive ring is non-empty or its peer has closed; a `PendingOperation` when its operation completes — its completion `status` is written to the `IoResult`); `Process` (exit) returns `Unsupported` until its slice lands. `count` is capped at `MAX_WAIT_HANDLES` (**32** since 2026-07-29; 8 before). That constant is
+the **fan-out limit of every resource server**: a server holding a channel per client waits
+on its serving endpoint plus one slot per client, so it serves at most `MAX_WAIT_HANDLES - 1`
+of them at once. It is a fixed per-thread array (so registering a wait never allocates under
+the scheduler lock) and the wait path holds several arrays of that width on the 16 KiB kernel
+stack, so it cannot simply keep growing — a compile-time budget check fails the build well
+before the stack does. Escaping the limit rather than raising it (a readiness mechanism, one
+wait slot for any number of clients) is `TODO(server-fanout)` in
+[`docs/rationale/deferred-decisions.md`](../rationale/deferred-decisions.md). Deadlines resolve on the periodic scheduler tick (~10 ms granularity), not exactly. `IoResult` carries a `result: u64` payload word (added with the namespace slice, at a stable offset past `status`/`reserved`) for completions that return a value rather than just a status — e.g. a namespace lookup's resolved handle; edge-style waitables report `result = 0`.
 
 ### Namespace
 

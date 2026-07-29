@@ -37,10 +37,15 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// Kernel `MAX_WAIT_HANDLES` is 8; one slot is the serving endpoint, so we can wait on at
-/// most this many per-principal log channels at once. Scaling past this (an aggregate
-/// waitable / raised limit) is deferred — see `docs/architecture/logging.md`.
-const MAX_SOURCES: usize = 7;
+/// The most per-principal log channels the server reads from at once.
+///
+/// **Derived, not chosen**: the server waits on one set holding the serving endpoint plus
+/// every source, so the ceiling is the kernel's fan-out limit less that one slot. Written
+/// this way rather than restating the number so that raising [`MAX_WAIT_HANDLES`] moves it
+/// — this and `fs-server-ext4`'s session cap were separately-written `7`s until Slice C3.
+/// Escaping the limit rather than raising it is `TODO(server-fanout)`; see
+/// `docs/architecture/logging.md`.
+const MAX_SOURCES: usize = MAX_WAIT_HANDLES - 1;
 /// In-memory keep-recent ring capacity (records).
 const RING_CAP: usize = 256;
 
@@ -49,8 +54,9 @@ static mut RECV_HANDLES: [u64; 8] = [0; 8];
 static mut RECV_COUNT: usize = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_RESULTS: [u8; 8 * 24] = [0; 8 * 24];
+static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE] =
+    [0; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE];
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut SRC_OUT0: u64 = 0;
@@ -527,7 +533,8 @@ fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
     loop {
         // Build the wait set: [serve_end] + each source read end.
         let n_src = sources.len();
-        // SAFETY: WAIT_HANDLES has 8 slots; 1 + n_src <= 1 + MAX_SOURCES = 8.
+        // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots, and `n_src` is capped at
+        // MAX_SOURCES, so `1 + n_src <= MAX_WAIT_HANDLES` by construction.
         unsafe {
             WAIT_HANDLES[0] = serve_end;
             for i in 0..n_src {
@@ -535,7 +542,7 @@ fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
             }
         }
         let count = 1 + n_src;
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count` <= 8.
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count`.
         let waited = unsafe {
             syscall4(
                 SYS_WAIT,
@@ -551,7 +558,7 @@ fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
         // Each signaled handle is one 24-byte IoResult (handle @0); drain it.
         for j in 0..(waited as usize) {
             let off = j * 24;
-            // SAFETY: `waited` records were written; `off + 8 <= 8*24`.
+            // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
             let h = unsafe {
                 u64::from_le_bytes([
                     WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
