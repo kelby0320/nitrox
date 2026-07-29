@@ -224,13 +224,19 @@ costs depends on which data path the filesystem uses, and the two are very diffe
   `File::ReadRange` per page, and the server re-resolves the path per range. That is the
   expensive shape the slice-8/9 notes describe.
 
-**The old ~325 ms-per-page measurement (slice 9) was Model B**, before the 4 KiB block
-batching and the device-IRQ scheduling fix (both 2026-07-23). It does not describe the
-current system and should not be quoted as if it did; a fresh measurement belongs *before*
-the optimisation, not after. Trigger: spawn or page-in latency showing up in a profile —
-most plausibly when programs get large (a GUI toolkit binary faults hundreds of pages where
-a coreutil faults tens). Scheduled as **B2 of the pre-CLI substrate-hardening pass**
-(`docs/planning/phase-4-desktop.md`).
+**Measured 2026-07-29** (the old ~325 ms-per-page figure was Model B, before the 4 KiB
+block batching and the device-IRQ scheduling fix; it does not describe this system). A
+whole adjudicated boot performs **43 fills** at **~137–204 µs** each — **0.5 % of boot** —
+with **zero** concurrent-faulter spins. Nearly every program is spawned from the initramfs,
+which resolves to a `MemoryObject` copy and never touches the page cache; the 43 are the
+ext4-backed reads. Read-ahead would therefore optimise half a percent of boot, so it is
+**deferred on measurement rather than on assumption**.
+
+The counters behind those numbers are permanent (`file_object::fill_stats`,
+`syscall::table::spawn_stats`, printed at the end of a `test-harness` run), so the trigger
+is observable: **fill count climbing out of the tens**, which is what large binaries or
+file-backed program text would cause. That is the same inflection as CoW and dynamic
+linking — see the process-memory-model bundle.
 
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
 

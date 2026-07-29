@@ -311,53 +311,60 @@ single-command entry (its stated workaround was lifted and `PendingRing` superse
 The pass below lands **before coreutils Milestone 2** — a solid kernel/system underneath
 the userspace work, rather than discovering each gap from a coreutil.
 
-#### Slice A — trustworthy docs, and CI that catches things
+#### Slice A — trustworthy docs, and CI that catches things ✅ (2026-07-24, PR #120)
 
-- [ ] Split `deferred-decisions.md` into **Open** and **Resolved**; delete the superseded
-  ELF-copy entry; correct the five verified-stale entries; bundle the four
-  process-memory-model entries (lazy `MemoryObject`, rlimits, stack guard pages, CoW) into
-  one, since they extend the same AS/fault machinery.
-- [ ] `cargo xtask check-deferrals` — every `TODO(tag)` in `kernel/`/`userspace/` must have
-  a matching entry in `deferred-decisions.md`, in the spirit of `check-arch`/`check-nightly`.
-  Four tags today (`msi`, `smp`, `sched-acct`, `mm`), so it is cheap to satisfy.
-- [ ] **CI runs `xtask image` + `xtask test-qemu`.** Today CI runs only `check-arch`,
-  `check-nightly`, `build`, `test` — the integration gate that caught every regression in
-  the Milestone 1 work does not run there at all.
+- [x] `deferred-decisions.md` split into **Open** and a **Resolved** table (18 rows); the
+  superseded ELF-copy entry deleted; the verified-stale entries corrected (x2APIC —
+  actually built and x2APIC-only; forwarded-lookup N=1; writeback IRPs; the AHCI
+  single-command entry; range-TLB); the four process-memory-model entries bundled into one.
+  The rule is written into the document: a triggered entry *moves* to Resolved rather than
+  being annotated in place.
+- [x] `cargo xtask check-deferrals` — every `TODO(tag)` must be named literally in
+  `deferred-decisions.md`. **Found four unrecorded deferrals on its first run**, including
+  that `sys_memory_unmap` ignores its `size` argument and unmaps the whole VMA.
+- [x] **CI runs `xtask image` + `xtask test-qemu`** — in a second job, under **`--kvm`**:
+  the kernel is x2APIC-only and GitHub's runner ships QEMU 8.2, whose TCG cannot emulate
+  x2APIC (it only does from 9.0). `xtask` now preflights that floor and fails with an
+  actionable message instead of a guest panic.
 
-#### Slice B — the demand-fault path
+#### Slice B — the demand-fault path ⏸ **measured, then deferred** (2026-07-29)
 
-**Re-scoped 2026-07-29, before writing code.** The original plan led with an fs-server
-open-file cookie, on the strength of a deferral entry describing each page fill as a
-stateless `File::ReadRange` round trip that re-reads the superblock and re-walks the extent
-tree. **That describes Model B, and every filesystem we ship is Model A**: ext4 replies
-`OBJECT_KIND_FILE_BLOCKS`, the kernel gets the file's `BlockRun` map at resolve, and a fault
-reads the page zero-copy straight from the device with one block IRP — *no fs-server IPC in
-the fill path at all*. B1 as written would have been dead work. (Third time an audit-era
-lesson repeated: verify the deferral against the code before planning from it.)
+Re-scoped once before writing code (B1 was Model-B work with no shipping consumer), then
+**measured before building anything else — and the measurement says don't**. Counters were
+added to the fill and spawn paths and printed at the end of every adjudicated run.
 
-- **B1 — fs-server open-file cookie: dropped, re-deferred.** Model B only; no shipping
-  consumer. Trigger restated in `deferred-decisions.md`: a non-block filesystem exists.
-- [ ] **B2 — clustered fill (read-ahead), Model A.** Purely kernel-side: the run map is
-  already in hand, so filling N contiguous pages is one IRP covering N × PAGE bytes (AHCI
-  issues a multi-sector transfer as one command), turning *pages* IRPs and wakes into
-  *⌈pages/N⌉*. **Measure first** — the ~325 ms/page figure in the old entry was Model B
-  before the 4 KiB batching and the IRQ-scheduling fix, so the current cost is unknown and
-  the win should be quantified, not assumed.
-- [ ] **B3 — block the second faulter.** Store the fill `PendingOperation` in the cache page
-  so a concurrent faulter blocks on it instead of `yield_now`-spinning. Reachable under SMP
-  today; ordinary once `std::thread` lands.
-- [ ] **B4a — shared, file-backed read-only text.** Map read-only `PT_LOAD` segments as
-  `FileBacked` VMAs against the image `FileObject` instead of copying them; writable
-  segments keep the eager copy; the BSS tail uses the existing demand-zero anonymous path.
-  **Requires the spawner to reuse one image handle per program** — every resolve mints a
-  fresh `FileObject` with its own page cache, so without handle reuse "shared text" shares
-  nothing. The linker script already guarantees the `p_vaddr ≡ p_offset (mod PAGE)` the
-  mapping needs.
-- **B4b — copy-on-write data: deliberately not in this pass.** Without `fork`, CoW's only
-  consumer is the ELF data segment, and after B4a the sole remaining eager copy is `.data`
-  — a few KB for a coreutil, since a Rust static binary is dominated by `.text`/`.rodata`.
-  **Scheduled with the GUI toolkit / desktop-apps milestone** (stepping stones 5–7),
-  alongside dynamic linking and the rest of the process-memory-model bundle.
+| | TCG | KVM |
+|---|---|---|
+| Page-cache fills | 43 · 204 µs avg · 2.8 ms max · **0.5 % of a 1.75 s boot** | 43 · 137 µs avg · **0.5 % of a 1.0 s boot** |
+| Concurrent-faulter spins | **0** | **0** |
+| Spawns | 40 · 774 µs avg · **1.7 % of boot** | 40 · 122 µs avg · **0.4 % of boot** |
+| Image materialisation | 5.5 ms · **17 % of spawn** | 3.8 ms · **78 % of spawn** |
+| Image bytes | 1.94 MB over 40 spawns (~48 KB each) | same |
+
+What the numbers mean:
+
+- **Read-ahead (B2) would optimise ~0.5 % of boot.** The old entry's ~325 ms-per-page
+  figure is dead — a fill now costs ~0.1–0.2 ms, and there are only 43 in a whole boot.
+  Nearly every program is spawned from the **initramfs**, which resolves to a `MemoryObject`
+  copy and never touches the page cache at all; the 43 fills are the ext4-backed reads.
+- **B3 is not exercised: zero spins.** The concurrent-faulter path is real but unreached —
+  and the thing that would reach it is **B4a itself** (many processes sharing one image
+  `FileObject` fault the same text pages), so B3 belongs *with* B4a, never before it.
+- **B4a would remove a real cost, but a small one.** Materialisation is 78 % of spawn under
+  KVM — impressive-looking, but spawn is 0.4 % of boot, so the whole prize is ~4 ms. A
+  four-stage shell pipeline costs ~0.5 ms of spawn today. **The shell does not need this.**
+
+**Deferred with measured triggers**, and the counters stay in so the triggers are
+*observable* rather than guessed:
+
+- Large binaries. At ~48 KB average the copy is ~100 µs; a 2–5 MB GUI toolkit app is 40–100×
+  that per launch, *plus* a private copy per instance. That is the same inflection as
+  dynamic linking and CoW — one process-memory-model pass, at the toolkit milestone.
+- Fill count climbing out of the tens — which B4a itself causes, by routing spawns through
+  the page cache.
+- `std::thread` (for B3, independently).
+
+Slice C follows directly; it has actual Milestone 2 blockers.
 
 #### Slice C — fs/ext4 completeness for Milestone 2
 
