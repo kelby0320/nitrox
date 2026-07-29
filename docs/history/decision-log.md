@@ -8641,3 +8641,55 @@ looks at the destination: a no-op rename that reports success fails check 1 (the
 survives) — and, separately, reverting the verdict to its buggy position fails the
 non-filesystem-source case, which is the bug it was written for. `check-arch` /
 `check-nightly` / `check-deferrals` green.
+
+## 2026-07-29 — Slice C3: the session cap was never an fs-server number
+
+`fs-server-ext4` capped concurrent directory sessions at 7. The plan called that an
+fs-server constant to raise; it is not one. The server waits on a single `sys_wait` set
+holding its serving endpoint plus one slot per live session, so the ceiling is the kernel's
+`MAX_WAIT_HANDLES` less one — and `logging-service` carried the **identical, separately
+written `7`** for the identical reason. This is the fan-out limit of *every* resource
+server, present and future.
+
+**Raised 8 → 32**, and both servers now **derive** their cap (`MAX_WAIT_HANDLES - 1`)
+instead of restating it, so the next change moves them together rather than leaving two
+numbers to drift. Userspace gets the constant from `libkern::abi` rather than a literal.
+
+**Why 32 and not more.** The kernel side is a fixed per-thread array — fixed precisely so
+registering a wait cannot allocate under the rank-1 scheduler lock — so the cost is paid by
+every thread whether it waits or not. At 32 that is 288 B against the 1 KiB `ArchFpuState`
+every thread already carries: noise. The binding constraint is elsewhere and sharper: the
+wait path holds **several** arrays of that width on the **kernel stack** (copied handles,
+resolved `ObjectRef`s, object addresses, types, the `IoResult` output, the scheduler's
+snapshots) — roughly 3 KiB at 32, against a 4-page 16 KiB stack, growing linearly. A bump
+to 256 would put ~24 KiB of frame on a 16 KiB stack. A guard page makes that a fault rather
+than corruption, but a fault is a poor way to learn it, so there is now a **compile-time
+budget check** in `thread.rs` that fails the build at about a quarter of the stack.
+Verified by setting the constant to 256 and confirming the build fails with that message.
+
+**What the in-guest check found.** Writing a test that opens the whole table and then
+*uses* a session well past the old 7 — a handle can exist without the server ever waiting
+on it — turned up a second problem the constant hid. The serve loop drained its serving
+endpoint **before** the session endpoints in a wait batch. One batch routinely contains
+both a closed session and a new resolve, so the server answered the new
+`RESOLVE_DIR_OPEN` while the just-closed slots still read as occupied: a spurious
+`WouldBlock` with the table freed a few instructions later. That is precisely the pattern a
+shell pipeline produces as stage N exits while stage N+1 starts. Sessions are now processed
+first, in two passes over the batch.
+
+**What is unchanged, and filed rather than fixed.** The ceiling is still fixed; a client
+that opens a session and then stalls still pins a slot for as long as it lives. The shape
+that removes the limit is a readiness mechanism — register a channel so becoming readable
+posts a keyed notification, and the server waits on **one** handle regardless of client
+count, reusing the notification queue that already exists for async events. Its sharp edge
+is designed-in, not bolted on: the queue drops on overflow, and a dropped readiness wakeup
+is a permanently stuck client unless `NotificationsDropped` means "rescan everything".
+`TODO(server-fanout)`, triggered by the desktop compositor (a channel per *window*, held
+open, is a different regime from a channel per short-lived listing).
+
+*Verified:* host suite **788** green; `test-qemu` PASS with a four-part in-guest check —
+the full table open at once, a real `ReadDir` on the last session, the next open refused
+cleanly with `WouldBlock`, and the slots reclaimed after close (without which the check
+would pass just as well against a server that leaked every slot). Everything in it is
+derived from `MAX_WAIT_HANDLES`, so it tracks the constant instead of pinning today's
+number. 5/5 KVM boots; `check-arch` / `check-nightly` / `check-deferrals` green.

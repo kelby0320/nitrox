@@ -72,18 +72,26 @@ static mut REPLY_MSG: [u8; 4096] = [0; 4096];
 static mut REPLY_HANDLES: [u64; 8] = [0; 8];
 /// Scratch for the file content (the 64 KiB read-model cap).
 static mut CONTENT: [u8; ext4::MAX_FILE] = [0; ext4::MAX_FILE];
-/// `sys_wait` scratch: the forwarding endpoint plus every open directory session. The
-/// kernel's `MAX_WAIT_HANDLES` is 8; one slot is `serve_end`, so up to [`MAX_SESSIONS`]
-/// directory sessions can be waited on at once. Each result is a 24-byte `IoResult`.
-static mut WAIT_HANDLES: [u64; 8] = [0; 8];
-static mut WAIT_RESULTS: [u8; 8 * 24] = [0; 8 * 24];
+/// `sys_wait` scratch: the forwarding endpoint plus every open directory session. One slot
+/// is `serve_end`, so up to [`MAX_SESSIONS`] directory sessions can be waited on at once.
+/// Each result is a 24-byte `IoResult`.
+static mut WAIT_HANDLES: [u64; MAX_WAIT_HANDLES] = [0; MAX_WAIT_HANDLES];
+static mut WAIT_RESULTS: [u8; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE] =
+    [0; MAX_WAIT_HANDLES * WAIT_RESULT_SIZE];
 
-/// The most open directory-handle sessions the server serves concurrently (one `sys_wait`
-/// slot is reserved for `serve_end`). Sessions are short-lived — a client opens a
-/// directory, reads it, and closes — so this bounds concurrent *in-flight* listings, not
-/// total clients. Lifting it (an aggregate wait, or a multi-endpoint receive) is a later
-/// refinement; a full slot table returns `WouldBlock` on `RESOLVE_DIR_OPEN`.
-const MAX_SESSIONS: usize = 7;
+/// The most open directory-handle sessions the server serves concurrently.
+///
+/// **Derived, not chosen**: the server waits on one `sys_wait` set holding `serve_end` plus
+/// every live session, so the ceiling is the kernel's fan-out limit less that one slot.
+/// Writing it this way rather than restating the number means raising
+/// [`MAX_WAIT_HANDLES`] moves this with it — the two were separately-written `7`s until
+/// Slice C3, which is how they would have drifted apart.
+///
+/// Sessions are short-lived — a client opens a directory, reads it, and closes — so this
+/// bounds concurrent *in-flight* listings, not total clients. A full table returns
+/// `WouldBlock` on `RESOLVE_DIR_OPEN`; a client that opens a session and then stalls still
+/// pins a slot for as long as it lives, which no cap fixes and `TODO(server-fanout)` does.
+const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 1;
 /// Per-session state: the kept (server) endpoint (`0` = free slot) and the directory inode
 /// the session is bound to. A session addresses entries by name, never path, so it can
 /// only ever touch this inode's directory (structural confinement).
@@ -926,7 +934,7 @@ fn reply_session_error(session_ch: u64, request_id: u64, op: u16, kerror: i32) {
 fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: u64) -> ! {
     loop {
         // Wait set: the forwarding endpoint plus every open directory session (mirrors the
-        // logging service). `count ≤ 1 + MAX_SESSIONS = 8 = MAX_WAIT_HANDLES`.
+        // logging service). `count ≤ 1 + MAX_SESSIONS = MAX_WAIT_HANDLES` by construction.
         // SAFETY: single-threaded build of the wait array.
         let count = unsafe {
             WAIT_HANDLES[0] = serve_end;
@@ -939,7 +947,7 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
             }
             n
         };
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count ≤ 8`.
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid buffers sized for `count`.
         let waited = unsafe {
             syscall4(
                 SYS_WAIT,
@@ -953,23 +961,36 @@ fn serve_loop<R: BlockReader + BlockWriter>(reader: &R, serve_end: u64, device: 
             continue;
         }
         // Each signaled handle yields one 24-byte `IoResult` (the handle at offset 0).
-        for j in 0..(waited as usize) {
-            // SAFETY: `waited` records were written; `off + 8 ≤ 8*24`.
-            let h = unsafe {
-                let off = j * 24;
-                u64::from_le_bytes([
-                    WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
-                    WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
-                    WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
-                ])
-            };
-            if h == serve_end {
-                // Drain every queued forwarded request on the kernel endpoint.
-                while recv_on(serve_end) == 0 {
-                    handle_forwarded_resolve(reader, serve_end, device);
+        //
+        // **Sessions before `serve_end`, in two passes.** One batch routinely contains both
+        // a closed session and a new resolve — a shell pipeline does exactly that as stage
+        // N exits while stage N+1 starts. Draining `serve_end` first would answer the new
+        // `RESOLVE_DIR_OPEN` while the just-closed slots still read as occupied, so a
+        // client would see a spurious `WouldBlock` with the table about to be freed a few
+        // instructions later. Reclaiming first costs one extra walk of a ≤ 32-entry array
+        // and makes a slot's release visible to the open that is waiting for it.
+        for pass in 0..2 {
+            for j in 0..(waited as usize) {
+                // SAFETY: `waited` records were written; `off + 8` stays inside WAIT_RESULTS.
+                let h = unsafe {
+                    let off = j * WAIT_RESULT_SIZE;
+                    u64::from_le_bytes([
+                        WAIT_RESULTS[off], WAIT_RESULTS[off + 1], WAIT_RESULTS[off + 2],
+                        WAIT_RESULTS[off + 3], WAIT_RESULTS[off + 4], WAIT_RESULTS[off + 5],
+                        WAIT_RESULTS[off + 6], WAIT_RESULTS[off + 7],
+                    ])
+                };
+                match (pass, h == serve_end) {
+                    // Pass 0: session traffic, including the `PeerClosed` that frees a slot.
+                    (0, false) => serve_session(reader, h),
+                    // Pass 1: drain every queued forwarded request on the kernel endpoint.
+                    (1, true) => {
+                        while recv_on(serve_end) == 0 {
+                            handle_forwarded_resolve(reader, serve_end, device);
+                        }
+                    }
+                    _ => {}
                 }
-            } else {
-                serve_session(reader, h);
             }
         }
     }

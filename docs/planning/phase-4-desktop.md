@@ -380,8 +380,19 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
   against a live mount, because a userspace-server binding's rights are the *endpoint
   handle's*, not the files' — which is a system-wide gap, now filed as
   `TODO(mount-write-authority)`, not something rename should have solved unilaterally.
-- [ ] **C3 — the `MAX_SESSIONS = 7` cap.** Each pipeline stage holding a directory session
-  makes seven concurrent sessions a normal working set, not a stress case.
+- [x] **C3 — the `MAX_SESSIONS = 7` cap** ✅ (2026-07-29). It was never an fs-server number:
+  a server waiting on one endpoint per client is capped by the kernel's `MAX_WAIT_HANDLES`,
+  and `logging-service` carried the identical, separately-written `7`. Raised **8 → 32** (31
+  concurrent clients), with both servers now *deriving* their cap from the constant so it
+  cannot drift again, and a compile-time kernel-stack budget check — the wait path holds
+  several arrays of that width on a 16 KiB stack, so the limit cannot simply keep growing;
+  the build now fails before the stack does. The in-guest check found a second, subtler
+  problem: the server drained its serving endpoint *before* the session endpoints in a wait
+  batch, so a batch containing both a closed session and a new open answered the open while
+  the freed slots still read as occupied — a spurious `WouldBlock` in exactly the pattern a
+  shell pipeline produces (stage N exits as stage N+1 starts). Sessions are now reclaimed
+  first. The structural fix — a readiness mechanism, one wait slot for any number of clients
+  — is filed as `TODO(server-fanout)` with the desktop compositor as its trigger.
 - [ ] **C4 — `mtime` on an in-place overwrite.** Model A hides a same-length rewrite from
   the server; the hook is `sys_file_sync` notifying it. The timestamp gap users notice.
 

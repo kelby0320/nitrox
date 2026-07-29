@@ -2024,6 +2024,110 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     code
 }
 
+/// **Server fan-out: more concurrent directory sessions than the old cap** (Slice C3).
+///
+/// `fs-server-ext4` waits on one `sys_wait` set holding its serving endpoint plus every
+/// live directory session, so the kernel's `MAX_WAIT_HANDLES` *is* its client ceiling. It
+/// was 8, giving 7 sessions — which a shell pipeline reaches in normal use, not under
+/// stress. Raising it is only meaningful if the server genuinely serves the extra ones, so
+/// this opens the full set at once and then *uses* one from well past the old limit.
+///
+/// Everything here is derived from [`MAX_WAIT_HANDLES`] rather than written out, so the
+/// check tracks the constant instead of pinning yesterday's number.
+///
+/// Checks, in order:
+///
+/// 1. **All `MAX_SESSIONS` open concurrently** — every one of them, held simultaneously.
+/// 2. **One past the old cap of 7 actually works** — a real `ReadDir` on a late session.
+///    Opening a handle proves nothing on its own; the wait set has to cover it too.
+/// 3. **The cap is still enforced** — the next open past the table is refused, and refused
+///    *cleanly* (`WouldBlock`), not by wedging the server.
+/// 4. **Slots come back on close** — after closing them all, a fresh open succeeds. Without
+///    this, the test would pass just as well against a server that leaked every slot.
+fn session_fanout_demo(root_ns: u64) {
+    use librsproto::session::DIR_SESSION_RIGHTS;
+    kprint(b"test-harness: session fan-out demo (past the old 7-session cap)\n");
+
+    /// The server's ceiling: its wait set is `serve_end` + one slot per session.
+    const MAX_SESSIONS: usize = MAX_WAIT_HANDLES - 1;
+    /// The limit this replaced — the point of the check is to work well beyond it.
+    const OLD_CAP: usize = 7;
+
+    let mut held = [0u64; MAX_SESSIONS];
+
+    // --- 1. open the whole table at once -------------------------------------
+    for (i, slot) in held.iter_mut().enumerate() {
+        let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+        if st != 0 || h == 0 {
+            // Report how far we got: "stopped at 7" and "stopped at 20" are very
+            // different failures, and the count is the whole diagnosis.
+            kprint(b"test-harness: session fan-out stopped early at session ");
+            kprint_hex(i as u64);
+            kprint(b"\n");
+            return_fail(b"test-harness: could not open the full session table\n");
+        }
+        *slot = h;
+    }
+
+    // --- 2. a session past the old cap is really served ----------------------
+    // The one that matters. A handle can exist without the server ever waiting on it, in
+    // which case this round trip is what hangs (and the run's wall-clock timeout catches
+    // it) rather than returning wrong data.
+    {
+        let mut buf = [0u8; 4096];
+        let late = held[MAX_SESSIONS - 1];
+        let mut d = match Dir::from_endpoint(late, &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: wrapping a late session FAILED\n"),
+        };
+        let mut seen = 0usize;
+        if d.read_dir(|_| {
+            seen += 1;
+            true
+        })
+        .is_err()
+        {
+            return_fail(b"test-harness: ReadDir on a session past the old cap FAILED\n");
+        }
+        if seen == 0 {
+            return_fail(b"test-harness: late session listed nothing (/system is not empty)\n");
+        }
+        // `from_endpoint` took ownership; hand it back so the teardown below closes once.
+        core::mem::forget(d);
+    }
+    if MAX_SESSIONS <= OLD_CAP {
+        return_fail(b"test-harness: session cap did not actually move past 7\n");
+    }
+
+    // --- 3. one past the table is refused cleanly ----------------------------
+    let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+    if st == 0 && h != 0 {
+        return_fail(b"test-harness: opening past the session table wrongly succeeded\n");
+    }
+    if st != KERR_WOULD_BLOCK {
+        return_fail(b"test-harness: a full session table did not report WouldBlock\n");
+    }
+
+    // --- 4. closing frees the slots ------------------------------------------
+    for h in held.iter() {
+        // SAFETY: closing session handles this process owns.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
+    }
+    // The server reclaims a slot when it observes `PeerClosed` on that endpoint, which it
+    // does on its next wait — so a fresh open has to work again.
+    let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+    if st != 0 || h == 0 {
+        return_fail(b"test-harness: session slots were not reclaimed on close\n");
+    }
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+
+    kprint(b"test-harness: session fan-out ok (full table open, served, refused, reclaimed)\n");
+}
+
+/// `KError::WouldBlock`, the status a full session table reports.
+const KERR_WOULD_BLOCK: i32 = -11;
+
 /// **`rename` — re-pointing a name instead of copying it** (Slice C2).
 ///
 /// `copy_demo` proved the filesystem can be *written*; this proves a name can be
@@ -2928,6 +3032,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).
     rename_demo(root_ns);
+
+    // 0a5c. Server fan-out: the concurrent-session ceiling is the kernel's wait width, so
+    //       prove the server serves a session well past the old 7 — not just opens one.
+    session_fanout_demo(root_ns);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

@@ -250,6 +250,30 @@ Phase-3 storage-hardening pass.)
 
 ### Filesystems
 
+**Resource-server fan-out beyond the `sys_wait` width — `TODO(server-fanout)`.** A server
+that holds a channel per client waits on its serving endpoint plus one slot per client, so
+`MAX_WAIT_HANDLES` is the number of clients it can serve at once — for *every* server, not
+one of them. Slice C3 (2026-07-29) raised it 8 → 32, taking both fan-out servers
+(`fs-server-ext4`'s directory sessions, `logging-service`'s per-principal sources) from 7
+concurrent clients to 31, and made both derive their cap from the constant rather than
+restate it. That is a bigger number, not a different shape, and three things are unchanged:
+the ceiling is still fixed; a client that opens a session and then stalls pins a slot for
+as long as it lives, which no cap fixes; and the kernel arrays are on the **kernel stack**,
+so the limit cannot simply keep growing (a compile-time budget check in `thread.rs` fails
+the build at roughly a quarter of the 16 KiB stack).
+
+The shape that removes the limit is a **readiness mechanism**: register a channel so that
+becoming readable posts a notification carrying a server-chosen key, and the server waits
+on **one** handle — its notification queue — regardless of client count. The notification
+queue already exists and is the architecture's answer to async events, so this is a natural
+extension rather than a new concept. The sharp edge is that the queue drops on overflow
+(`KIND_NOTIFICATIONS_DROPPED`), and a dropped readiness wakeup is a permanently stuck
+client unless the server treats that notification as "rescan everything" — which means the
+mechanism has to be designed with the fallback, not have it bolted on. Trigger: a server
+that genuinely needs more than ~31 concurrent clients, or the first time a stalled client
+starving others is observed rather than theorised — most likely the desktop, where a
+compositor holds a channel per window rather than per short-lived listing.
+
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
 it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC

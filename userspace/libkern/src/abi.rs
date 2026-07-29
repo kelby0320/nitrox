@@ -165,6 +165,29 @@ pub const IPC_HANDLE_MAX: usize = 8;
 /// Bytes of inline payload per message.
 pub const IPC_PAYLOAD_SIZE: usize = IPC_MSG_SIZE - IPC_HEADER_SIZE - IPC_HANDLE_MAX * 8;
 
+// --- sys_wait --------------------------------------------------------------
+
+/// Maximum handles one `sys_wait` call may block on — the kernel's
+/// `MAX_WAIT_HANDLES`. A larger `count` is rejected with `InvalidArgument`.
+///
+/// This is the **fan-out limit of every resource server**: a server that keeps a channel
+/// per client waits on its serving endpoint plus one slot per client, so it serves at most
+/// `MAX_WAIT_HANDLES - 1` of them at once. Both servers that do this (`fs-server-ext4`'s
+/// directory sessions, `logging-service`'s per-principal sources) derive their cap from
+/// this constant rather than restating the number, so raising it is one edit.
+///
+/// The kernel side is a **fixed per-thread array**, sized rather than allocated so that
+/// registering a wait never allocates under the rank-1 scheduler lock. That is what makes
+/// this a constant instead of a parameter, and what bounds how far it can sensibly be
+/// raised — the cost is paid by every thread, waiting or not.
+///
+/// Escaping the limit entirely (a readiness mechanism, so one wait slot covers any number
+/// of clients) is `TODO(server-fanout)` in `docs/rationale/deferred-decisions.md`.
+pub const MAX_WAIT_HANDLES: usize = 32;
+
+/// Bytes one `sys_wait` writes per signaled handle (an `IoResult`).
+pub const WAIT_RESULT_SIZE: usize = 24;
+
 /// `SendMode::Block` — block (return a `PendingOperation`) if the ring is full.
 pub const SENDMODE_BLOCK: u64 = 0;
 /// `SendMode::NoBlock` — fail with `WouldBlock` if the ring is full.
