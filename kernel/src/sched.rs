@@ -1910,6 +1910,22 @@ unsafe fn switch_into(
     next_obj: *mut (),
 ) {
     g.stats[SchedState::this_cpu()].switches += 1;
+    // Sample the **outgoing** thread's kernel-stack high-water mark. Every thread that
+    // runs passes through here, including servers that spend their lives blocked and so
+    // never sit in a run queue — which is why this is the sample point rather than a walk
+    // of the ready lists. Instrumentation only, and O(1) unless the record actually moves.
+    #[cfg(feature = "test-harness")]
+    // SAFETY: `out_obj` is the pinned outgoing thread and `SCHED` is held, satisfying the
+    // `Thread` accessor contract; `kstack_top` yields the top of its live painted stack
+    // (`None` for a thread with no kernel stack of its own).
+    if let Some(top) = unsafe { Thread::kstack_top(out_obj) } {
+        // SAFETY: `out_obj` is pinned under `SCHED` (accessor contract), and `top` is that
+        // live stack's exclusive top, as `sample` requires.
+        unsafe {
+            let pid = Thread::owner_pid_of(out_obj);
+            crate::mm::kstack::watermark::sample(top, pid);
+        }
+    }
     // Wait out the incoming thread's mid-switch-out guard before touching its
     // parked context. A waker can re-home a thread to a **third** CPU's queue
     // (an affinity-diverted wake/resume) in the window between its old CPU

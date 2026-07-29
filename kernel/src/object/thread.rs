@@ -856,6 +856,19 @@ impl Thread {
         unsafe { (*(&raw const (*p).stack)).as_ref().map(|s| s.top().as_u64()) }
     }
 
+    /// This thread's owning process id, or `0` for a kernel/boot thread. Raw-pointer
+    /// form of [`Thread::owner_pid`], for the scheduler's stack-watermark attribution —
+    /// a depth figure is only actionable if it names whose thread reached it.
+    ///
+    /// # Safety
+    /// See the accessor contract above.
+    #[cfg(feature = "test-harness")]
+    pub(crate) unsafe fn owner_pid_of(obj: *mut ()) -> u32 {
+        let p = obj as *mut Thread;
+        // SAFETY: `obj` is a pinned live `Thread` under the accessor contract.
+        unsafe { (*p).owner_pid() }
+    }
+
     // --- Wait bookkeeping (scheduler-only; same accessor contract) ------
 
     /// Register `objs` (type-erased object addresses, `len <= MAX_WAIT_HANDLES`)

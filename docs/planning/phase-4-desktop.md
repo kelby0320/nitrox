@@ -408,6 +408,15 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
 - [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
   violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
   boot-loop bisection; this turns that class into an immediate, located failure.
+- [x] **D5 — kernel-stack watermark** ✅ (2026-07-29, landed early alongside C3 because C3's
+  sizing argument depended on it). `test-harness` builds paint each stack and sample the
+  high-water mark at context-switch-out — O(1) unless a record moves, and it covers blocked
+  threads that a run-queue walk would miss. **Measured: 9584 B of 16384 (58%)**, identical
+  across boots, versus the paper estimate that had been standing in for it. Two things
+  filed off the back of it: `TODO(irq-stack)` (only `#DF` has a dedicated stack — every
+  other interrupt nests onto the current thread stack, where Linux at the same 16 KiB uses
+  a separate per-CPU IRQ stack) and `TODO(stack-attribution)` (the mark names *who* went
+  deep, not *where*).
 
 **Staying deferred** (verified against the code, triggers intact): MSI/MSI-X, IOMMU and
 userspace drivers, NVMe, Tier-2 modules, filter drivers, IRP cancellation, networking,

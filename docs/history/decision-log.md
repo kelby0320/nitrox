@@ -8693,3 +8693,46 @@ cleanly with `WouldBlock`, and the slots reclaimed after close (without which th
 would pass just as well against a server that leaked every slot). Everything in it is
 derived from `MAX_WAIT_HANDLES`, so it tracks the constant instead of pinning today's
 number. 5/5 KVM boots; `check-arch` / `check-nightly` / `check-deferrals` green.
+
+## 2026-07-29 — Kernel-stack watermark: replacing the estimate with a number
+
+Sizing `MAX_WAIT_HANDLES` in Slice C3 rested on a stack-usage figure I had *summed on
+paper* — array widths added up, not measured. That is exactly the kind of number that is
+wrong quietly, so the wait-path budget check it justified deserved a real measurement
+behind it.
+
+**How.** `test-harness` builds paint each fresh kernel stack with a poison word, so the
+deepest point any thread ever reached is simply the lowest address that is no longer
+poison. The mark is sampled at **context-switch-out**, which covers every thread that runs
+— including servers that spend their lives blocked and so never appear in a run queue,
+which a walk of the ready lists would have missed. The sample is **O(1)** in the common
+case: it reads only the word just below the standing record, and walks further only when a
+record is actually being set, which happens a handful of times per boot. Production builds
+are untouched.
+
+**The number: 9584 B of 16384 — 58%** — and it is bit-for-bit identical across boots, so
+it is a deterministic deep path rather than interrupt-timing luck. That is materially more
+than the paper estimate implied. It does **not** change the conclusion that 16 KiB stays
+(see below), but it does mean the margin is ~6.8 KiB, not "plenty".
+
+**Attribution, and what it bought.** The mark also records the owning pid. The pid *varies*
+run to run while the depth is constant — so the deep path is something every spawned
+process does, not one pathological thread. Recording *where* rather than *who* needs a
+return-address capture; filed as `TODO(stack-attribution)` for when the goal becomes
+reducing the figure rather than watching it.
+
+**On the stack size itself.** 16 KiB is exactly Linux x86_64's `THREAD_SIZE` (raised from
+8 KiB in v3.15, 2014, when deep stacked-block-device paths overflowed). Nitrox stays there:
+the call chains that forced Linux's bump — filesystem, nested block layers, the network
+stack — are all *userspace* here by architectural rule, and growing every thread's stack to
+hold one syscall's scratch arrays would be treating the symptom. If more wait slots are
+ever wanted, the arrays move off the stack instead.
+
+**But the comparison is not as clean as it looks, and that is the real finding.** Nitrox
+gives a dedicated stack to `#DF` only (IST1); the timer, the TLB-shootdown and reschedule
+IPIs, and every device handler run on **IST0 — no IST** — so they nest onto the current
+thread stack. Linux, at the same 16 KiB, keeps interrupts off it entirely with a separate
+per-CPU IRQ stack. So our 16 KiB carries strictly more than the number it is being matched
+against, and the 58% above already includes interrupt frames. The fix is a per-CPU IRQ
+stack — 16 KiB × CPUs, not × threads — filed as `TODO(irq-stack)` with the watermark
+climbing, or a first guard-page fault, as its trigger.

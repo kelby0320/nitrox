@@ -250,6 +250,31 @@ Phase-3 storage-hardening pass.)
 
 ### Filesystems
 
+**A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
+(IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
+and reschedule IPIs, and every registered device handler — is configured with **IST0, i.e.
+no IST**, so it nests onto whichever kernel stack is current. Linux x86_64, at the *same*
+16 KiB thread-stack size, keeps interrupts off it entirely with a dedicated 16 KiB IRQ
+stack (plus ISTs for NMI/MCE/debug), so Nitrox's 16 KiB is carrying strictly more than the
+number it is matched against.
+
+Measurement (2026-07-29, via the stack watermark below): the deepest any kernel stack has
+gone during a full integration boot is **9584 B of 16384 — 58%**, leaving ~6.8 KiB for a
+nested interrupt on top of the deepest syscall. Not alarming, and the guard page turns an
+overflow into a loud fault rather than corruption, but not the comfortable margin the
+"we match Linux" comparison implies on its own. The fix is a **per-CPU** IRQ stack, which
+costs 16 KiB × CPUs rather than × threads — much cheaper than growing every thread's stack,
+and it is what the precedent actually is. Trigger: the watermark climbing further (device
+drivers with real interrupt work are the likely cause — the current device set is thin), or
+the first guard-page fault.
+
+**Attributing the watermark to a call path — `TODO(stack-attribution)`.** The watermark
+records how deep and *whose* thread, and that was enough to learn something: the pid varies
+run to run while the depth is bit-for-bit constant, so the deep path is something every
+spawned process does rather than one pathological thread. It does not record *where*, which
+is the next question and needs a return-address capture at the moment the record is set.
+Trigger: wanting to actually reduce the figure above, rather than just watch it.
+
 **Resource-server fan-out beyond the `sys_wait` width — `TODO(server-fanout)`.** A server
 that holds a channel per client waits on its serving endpoint plus one slot per client, so
 `MAX_WAIT_HANDLES` is the number of clients it can serve at once — for *every* server, not

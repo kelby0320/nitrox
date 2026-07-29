@@ -221,7 +221,10 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         // Integration-test build only: end the QEMU run with the caller's verdict.
         // Diverges (QEMU exits); never returns to dispatch/sysret.
         #[cfg(feature = "test-harness")]
-        SYS_TEST_EXIT => crate::arch::debug_exit(a0 as u32),
+        SYS_TEST_EXIT => {
+            report_stack_watermark();
+            crate::arch::debug_exit(a0 as u32)
+        }
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
         SYS_THREAD_EXIT => sys_thread_exit(a0 as i32),
@@ -642,6 +645,27 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
 /// and write them to the serial console. Debug-only. Returns the number of
 /// bytes written.
 ///
+/// Print the deepest kernel-stack usage observed over the run, as bytes and as a
+/// percentage of one stack. Emitted just before the integration run ends, so the number is
+/// in the serial log of every `xtask test-qemu`.
+///
+/// Its purpose is to keep the stack budget honest with a *measurement*: the
+/// `MAX_WAIT_HANDLES` sizing argument (Slice C3) was reasoned from summed array widths,
+/// and this is what turns that estimate into a number. It also covers the fact that
+/// interrupts have no separate stack here — device IRQs and IPIs nest onto whatever
+/// thread stack is current (`TODO(irq-stack)`), so their frames are included in the mark.
+#[cfg(feature = "test-harness")]
+fn report_stack_watermark() {
+    let (used, pct, pid) = crate::mm::kstack::watermark::deepest();
+    crate::kprintln!(
+        "kstack: deepest {} B of {} ({}%), by pid {}",
+        used,
+        crate::mm::kstack::KERNEL_STACK_BYTES,
+        pct,
+        pid
+    );
+}
+
 /// The validation/bounds checks are ordered so the `len == 0` and
 /// `len > KPRINT_MAX` paths are reachable without touching user memory or
 /// the serial port (host-testable); the copy + serial write are exercised
