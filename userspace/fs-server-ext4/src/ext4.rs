@@ -740,52 +740,8 @@ pub fn grow_file<RW: BlockReader + BlockWriter>(
     let cur_blocks = cur_size.div_ceil(bs);
     let new_blocks = new_size.div_ceil(bs);
 
-    // Parse the depth-0 extent header + leaf entries from `i_block` (inode[40..100]).
-    let eh = 40; // extent header offset in the inode
-    if rd_u16(&inode, eh) != EXTENT_MAGIC {
-        return Err(FsError::Corrupt);
-    }
-    if rd_u16(&inode, eh + 6) != 0 {
-        return Err(FsError::Unsupported); // index nodes (depth > 0) are deferred
-    }
-    let mut entries = rd_u16(&inode, eh + 2) as usize;
-    let max_entries = rd_u16(&inode, eh + 4) as usize;
-    // Last extent (highest ee_block) — the append point. Empty file → no extents yet.
-    let ent = |i: usize| eh + 12 + i * 12; // i-th leaf entry offset
-    let (mut last_log_end, mut last_phys_end) = if entries == 0 {
-        (0u64, 0u64)
-    } else {
-        let e = ent(entries - 1);
-        let ee_block = rd_u32(&inode, e) as u64;
-        let ee_len = (rd_u16(&inode, e + 4) & 0x7FFF) as u64;
-        let phys = rd_u32(&inode, e + 8) as u64 | ((rd_u16(&inode, e + 6) as u64) << 32);
-        (ee_block + ee_len, phys + ee_len)
-    };
-
     for lb in cur_blocks..new_blocks {
-        let goal = if last_phys_end != 0 { last_phys_end } else { sb.first_data_block as u64 };
-        let phys = alloc_block(rw, &sb, goal)?;
-        let contiguous = entries > 0 && lb as u64 == last_log_end && phys == last_phys_end;
-        if contiguous {
-            // Extend the last extent: bump its ee_len.
-            let e = ent(entries - 1);
-            let new_len = (rd_u16(&inode, e + 4) & 0x7FFF) + 1;
-            inode[e + 4..e + 6].copy_from_slice(&new_len.to_le_bytes());
-        } else {
-            // Add a new leaf extent, if the inline header has room.
-            if entries >= max_entries {
-                return Err(FsError::Unsupported); // needs a tree split (deferred)
-            }
-            let e = ent(entries);
-            inode[e..e + 4].copy_from_slice(&(lb as u32).to_le_bytes()); // ee_block
-            inode[e + 4..e + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len
-            inode[e + 6..e + 8].copy_from_slice(&((phys >> 32) as u16).to_le_bytes()); // start_hi
-            inode[e + 8..e + 12].copy_from_slice(&(phys as u32).to_le_bytes()); // start_lo
-            entries += 1;
-            inode[eh + 2..eh + 4].copy_from_slice(&(entries as u16).to_le_bytes()); // eh_entries
-        }
-        last_log_end = lb as u64 + 1;
-        last_phys_end = phys + 1;
+        append_block(rw, &sb, &mut inode, lb as u64)?;
     }
 
     // Update inode size (i_size_lo @4, hi @108) + block count (i_blocks_lo @28, 512-B units).
@@ -847,13 +803,44 @@ fn alloc_inode<RW: BlockReader + BlockWriter>(rw: &RW, sb: &Superblock) -> Resul
 /// splitting the slack of an existing entry (the last entry in a block carries the free
 /// tail as extra `rec_len`). `TooLarge` if no block has room (allocating a new directory
 /// block is deferred). Writes the modified block via the `BlockWriter`.
+/// Insert `name` → `ino` into directory `dir_ino`, **growing the directory by a block when
+/// every existing one is full**.
+///
+/// `dir_inode` is the caller's copy of the directory inode and is updated in place (extent
+/// tree, size, block count) and written back **only if the directory grew** — the common
+/// path finds slack in an existing block and touches no inode field at all.
+///
+/// ext4 stores a directory as a list of blocks, each a self-contained chain of
+/// `ext4_dir_entry_2` records whose `rec_len` covers its own slack; an insert either splits
+/// a record with enough spare room or claims a deleted slot. When neither exists in any
+/// block, a new block is appended and formatted as one free record spanning it — which is
+/// exactly what a block looks like after everything in it is deleted, so nothing
+/// downstream needs to know the difference.
+///
+/// ## The remaining ceiling, measured
+///
+/// Growth stops where the **inline extent header** does: `i_block` holds four leaf
+/// extents, and depth > 0 (an index node) is deferred. Whether that bites depends on
+/// fragmentation, and the two cases differ sharply — measured on a 4 KiB-block fixture:
+///
+/// - **Creating files**: unbounded in practice (2000+ tested). Nothing allocates between
+///   the parent's growth blocks, so they are contiguous and one extent covers them all.
+/// - **Creating subdirectories**: **~814**. Each `mkdir` allocates the child's own data
+///   block *between* the parent's, so every parent block starts a new extent and the
+///   fourth exhausts the header.
+///
+/// Both are far beyond anything on the path to a shell or a desktop, so the extent-tree
+/// split stays deferred — but the number is recorded rather than left as "some limit".
+/// See `deferred-decisions.md`.
 fn dir_insert<RW: BlockReader + BlockWriter>(
     rw: &RW,
     sb: &Superblock,
-    dir_inode: &[u8; 256],
+    dir_ino: u32,
+    dir_inode: &mut [u8; 256],
     name: &[u8],
     ino: u32,
     file_type: u8,
+    now: i64,
 ) -> Result<(), FsError> {
     let bs = sb.block_size as usize;
     let size = rd_u32(dir_inode, 4) as u64;
@@ -893,7 +880,29 @@ fn dir_insert<RW: BlockReader + BlockWriter>(
             off += rec_len;
         }
     }
-    Err(FsError::TooLarge) // no room; new directory block allocation is deferred
+
+    // Every block is full: append one and put the entry at its head.
+    let phys = append_block(rw, sb, dir_inode, nblocks)?;
+    // A fresh directory block is a single **unused** record spanning it: inode 0,
+    // `rec_len` = block size. Zero the rest so no stale bytes are read as entries.
+    buf[..bs].fill(0);
+    buf[4..6].copy_from_slice(&(bs as u16).to_le_bytes()); // rec_len covers the block
+    buf[..4].copy_from_slice(&ino.to_le_bytes());
+    buf[6] = name.len() as u8;
+    buf[7] = file_type;
+    buf[8..8 + name.len()].copy_from_slice(name);
+    rw.write_at(phys * sb.block_size as u64, &buf[..bs])?;
+
+    // The directory is one block longer. `i_size` for a directory is always a whole
+    // number of blocks, and `i_blocks` counts 512-byte units.
+    let new_size = size + bs as u64;
+    dir_inode[4..8].copy_from_slice(&(new_size as u32).to_le_bytes());
+    let i_blocks = rd_u32(dir_inode, 28).wrapping_add((bs / 512) as u32);
+    dir_inode[28..32].copy_from_slice(&i_blocks.to_le_bytes());
+    stamp(dir_inode, now, sb.inode_size, Stamp::Modified);
+    let off = inode_offset(rw, sb, dir_ino)?;
+    rw.write_at(off, &dir_inode[..(sb.inode_size as usize).min(256)])?;
+    Ok(())
 }
 
 /// Create an empty regular file `name` in the directory at `parent_path`: allocate + init
@@ -933,12 +942,13 @@ pub fn create_file<RW: BlockReader + BlockWriter>(
     let off = inode_offset(rw, &sb, ino)?;
     rw.write_at(off, &inode[..(sb.inode_size as usize).min(256)])?;
 
-    // Link it into the parent directory. (On failure the inode is allocated-but-unlinked;
-    // acceptable for slice-1 fixtures, which always have directory slack.)
-    dir_insert(rw, &sb, &parent_inode, name, ino, EXT4_FT_REG_FILE)?;
+    // Link it into the parent directory, growing it by a block if it is full. (On
+    // failure the inode is allocated-but-unlinked — acceptable here; a full
+    // orphan-reclaim pass is a separate concern.)
+    let (parent_ino, mut parent_inode) = resolve_path_ino(rw, &sb, parent_path)?;
+    dir_insert(rw, &sb, parent_ino, &mut parent_inode, name, ino, EXT4_FT_REG_FILE, now)?;
     // The parent's contents changed, so its own mtime/ctime move even though nothing
     // about its inode's other fields did.
-    let (parent_ino, _) = resolve_path_ino(rw, &sb, parent_path)?;
     touch_inode(rw, &sb, parent_ino, now, Stamp::Modified)?;
     Ok(ino)
 }
@@ -957,6 +967,67 @@ const DELETION_TIME: u32 = 1_700_000_000;
 /// Clear a bitmap bit (mark a block/inode free).
 fn bit_unset(map: &mut [u8], i: usize) {
     map[i / 8] &= !(1 << (i % 8));
+}
+
+/// Allocate one block and attach it to `inode` as logical block `next_lb`, extending the
+/// last extent when the allocation happens to be contiguous and adding a leaf otherwise.
+/// Returns the physical block.
+///
+/// Shared by [`grow_file`] (appending file data) and [`dir_insert`] (appending a directory
+/// block when every existing one is full) — the extent bookkeeping is identical, and the
+/// duplicate was what made "grow a full directory" look like a bigger job than it is.
+///
+/// The caller owns `inode`: this mutates the in-memory copy (extent tree only) and writes
+/// nothing back, because both callers have further inode fields to update — size, block
+/// count, timestamps — and one write is better than three.
+fn append_block<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    sb: &Superblock,
+    inode: &mut [u8; 256],
+    next_lb: u64,
+) -> Result<u64, FsError> {
+    let eh = 40; // extent header at i_block
+    if rd_u16(inode, eh) != EXTENT_MAGIC {
+        return Err(FsError::Corrupt);
+    }
+    if rd_u16(inode, eh + 6) != 0 {
+        return Err(FsError::Unsupported); // index nodes (depth > 0) are deferred
+    }
+    let mut entries = rd_u16(inode, eh + 2) as usize;
+    let max_entries = rd_u16(inode, eh + 4) as usize;
+    let ent = |i: usize| eh + 12 + i * 12;
+
+    // The append point: the end of the last extent, logical and physical.
+    let (last_log_end, last_phys_end) = if entries == 0 {
+        (0u64, 0u64)
+    } else {
+        let e = ent(entries - 1);
+        let ee_block = rd_u32(inode, e) as u64;
+        let ee_len = (rd_u16(inode, e + 4) & 0x7FFF) as u64;
+        let phys = rd_u32(inode, e + 8) as u64 | ((rd_u16(inode, e + 6) as u64) << 32);
+        (ee_block + ee_len, phys + ee_len)
+    };
+
+    let goal = if last_phys_end != 0 { last_phys_end } else { sb.first_data_block as u64 };
+    let phys = alloc_block(rw, sb, goal)?;
+    if entries > 0 && next_lb == last_log_end && phys == last_phys_end {
+        // Contiguous with the last extent — just lengthen it.
+        let e = ent(entries - 1);
+        let new_len = (rd_u16(inode, e + 4) & 0x7FFF) + 1;
+        inode[e + 4..e + 6].copy_from_slice(&new_len.to_le_bytes());
+    } else {
+        if entries >= max_entries {
+            return Err(FsError::Unsupported); // needs a tree split (deferred)
+        }
+        let e = ent(entries);
+        inode[e..e + 4].copy_from_slice(&(next_lb as u32).to_le_bytes()); // ee_block
+        inode[e + 4..e + 6].copy_from_slice(&1u16.to_le_bytes()); // ee_len
+        inode[e + 6..e + 8].copy_from_slice(&((phys >> 32) as u16).to_le_bytes()); // start_hi
+        inode[e + 8..e + 12].copy_from_slice(&(phys as u32).to_le_bytes()); // start_lo
+        entries += 1;
+        inode[eh + 2..eh + 4].copy_from_slice(&(entries as u16).to_le_bytes()); // eh_entries
+    }
+    Ok(phys)
 }
 
 /// Free inode `ino`: clear its inode-bitmap bit and increment the group-descriptor +
@@ -1227,7 +1298,8 @@ pub fn mkdir_at<RW: BlockReader + BlockWriter>(
     rw.write_at(gd_off, &gd[..dsz])?;
 
     // Link into the parent + bump the parent's link count (the new dir's `..`).
-    dir_insert(rw, &sb, &parent, name, new_ino, EXT4_FT_DIR)?;
+    let mut parent = parent;
+    dir_insert(rw, &sb, dir_ino, &mut parent, name, new_ino, EXT4_FT_DIR, now)?;
     adjust_links(rw, &sb, dir_ino, 1)?;
     touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;
     Ok(())
@@ -1342,7 +1414,8 @@ pub fn rename_at<RW: BlockReader + BlockWriter>(
     // parent bytes between the two: `dir_remove` rewrote a directory block, but the parent
     // *inode* (extent map) is unchanged, so the cached bytes still locate the blocks.
     let (ino, ft) = dir_remove(rw, &sb, &parent, old)?;
-    dir_insert(rw, &sb, &parent, new, ino, ft)?;
+    let mut parent = parent;
+    dir_insert(rw, &sb, dir_ino, &mut parent, new, ino, ft, now)?;
     // The directory's contents changed. The renamed inode is untouched — its name
     // is not part of it, it lives in the directory entry.
     touch_inode(rw, &sb, dir_ino, now, Stamp::Modified)?;

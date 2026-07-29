@@ -53,13 +53,17 @@ bigalloc, inline-data inodes, 64-bit block numbers, ≥ 8 KiB blocks, xattrs, AC
 symlinks, checksums. htree directories need no special handling (the linear walk is
 backward-compatible).
 
-**Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`): extent-tree
-splitting / index nodes (depth > 0), cross-group inode/block allocation (creation is
-**group 0 only**), new-directory-block growth on a full parent directory (yields
-`TooLarge`), truncate / delete / rename, `metadata_csum` checksums, and jbd2 journaling +
-replay (the fixtures are `^has_journal`). Overwrite is data-only (no metadata change) and
-is the kernel's writeback; the server allocates on growth + creation but never touches file
-data (Model A).
+**Write path deferred** (see `docs/architecture/ext4-fs-server-rw.md`, and
+`docs/rationale/deferred-decisions.md` — every item here is mirrored there, because a
+deferral recorded only in a crate `CLAUDE.md` is one nobody reviews): extent-tree splitting
+/ index nodes (depth > 0), cross-group inode/block allocation (creation is **group 0
+only**), `metadata_csum` checksums, and jbd2 journaling + replay (the fixtures are
+`^has_journal`). Overwrite is data-only (no metadata change) and is the kernel's writeback;
+the server allocates on growth + creation but never touches file data (Model A).
+
+**Now implemented** (was deferred): truncate (2026-07-24), rename, delete, and
+**growing a full directory** (2026-07-29) — a directory whose blocks are all full gains
+another, so `mkdir`/`touch`/`copy` no longer stop at one block's worth of entries.
 
 ## Capability discipline
 

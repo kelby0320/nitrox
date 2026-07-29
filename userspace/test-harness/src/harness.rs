@@ -1305,6 +1305,11 @@ fn return_fail(msg: &[u8]) -> ! {
     exit(1)
 }
 
+/// Entries the dir-growth check creates. At 250-byte names (~258 bytes per record) that is
+/// ~4.1 KB — just past one 4 KiB directory block, so the directory must grow, without
+/// paying for a sweep the host e2fsck tests already cover.
+const GROW_ENTRIES: usize = 16;
+
 /// **Directory mutation over the direct-RPC transport** (dir-ops Part B). On the same kind
 /// of open directory session as `dir_list_demo`, exercises the name-addressed mutations end
 /// to end: mkdir a temp subdir, confirm it appears, rename it, confirm the rename, then
@@ -1343,6 +1348,44 @@ fn dir_mutate_demo(root_ns: u64) {
         Err(_) => return_fail(b"test-harness: rmdir(missing) reported a transport fault\n"),
         Ok(()) => return_fail(b"test-harness: rmdir(missing) wrongly succeeded\n"),
     }
+    // Fill the directory past one block's worth of entries, on the **real** on-disk
+    // filesystem rather than the host tests' synthetic fixture. `/system` has 4 KiB
+    // blocks, and a 250-byte name costs ~258 bytes per record, so 16 entries is ~4.1 KB
+    // — just over one block, which is the point. Before directory growth landed
+    // (2026-07-29) this failed partway with `TooLarge`.
+    //
+    // Sized to *cross the boundary*, not to stress: each entry is several block
+    // read-modify-writes through the fs-server, and a bigger sweep pushed the TCG run
+    // past the harness timeout while proving nothing the host e2fsck tests do not.
+    let mut name = [b'g'; 250];
+    for i in 0..GROW_ENTRIES {
+        name[0] = b'0' + (i / 10) as u8;
+        name[1] = b'0' + (i % 10) as u8;
+        if dir.mkdir(&name).is_err() {
+            return_fail(b"test-harness: dir-grow mkdir FAIL (directory did not grow?)\n");
+        }
+    }
+    // One enumeration, counting ours: the added blocks must be reachable through the
+    // paginated ReadDir, not merely written. (Per-entry lookups would be 16 more full
+    // walks for no extra coverage.)
+    let mut seen = 0u32;
+    let walked = dir.read_dir(|e| {
+        if e.name.len() == 250 && e.name[2] == b'g' {
+            seen += 1;
+        }
+        true
+    });
+    if walked.is_err() || seen != GROW_ENTRIES as u32 {
+        return_fail(b"test-harness: dir-grow FAIL (entries missing after growth)\n");
+    }
+    for i in 0..GROW_ENTRIES {
+        name[0] = b'0' + (i / 10) as u8;
+        name[1] = b'0' + (i % 10) as u8;
+        if dir.rmdir(&name).is_err() {
+            return_fail(b"test-harness: dir-grow rmdir FAIL\n");
+        }
+    }
+
     // rmdir nx-tmp2 → confirm it is gone.
     if dir.rmdir(b"nx-tmp2").is_err() {
         return_fail(b"test-harness: rmdir FAIL\n");

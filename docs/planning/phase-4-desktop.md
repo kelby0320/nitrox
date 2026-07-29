@@ -354,9 +354,17 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
 
 #### Slice C — fs/ext4 completeness for Milestone 2
 
-- [ ] **C1 — grow a full directory.** A directory whose single block fills returns
-  `TooLarge`; `mkdir`/`touch` at any scale hits it (a Milestone 1 test fixture had to be
-  sized around it).
+- [x] **C1 — grow a full directory** ✅ (2026-07-29). A directory whose blocks are all full
+  now gains another: `dir_insert` appends a block, formats it as one free record spanning
+  it (what a block looks like after everything in it is deleted, so nothing downstream
+  changes), and updates the parent's size/blocks/mtime. The extent-append logic is now
+  shared with `grow_file` rather than duplicated. **Measured ceiling**: on 4 KiB blocks,
+  creating *files* in one directory is unbounded in practice (2000+ tested — the parent's
+  growth blocks stay contiguous, so one extent covers them), while *subdirectories* stop at
+  **~814**, since each `mkdir` allocates the child's block between the parent's and so
+  fragments it into a fresh extent each time. That residual limit is the inline extent
+  header (4 leaves); tree splitting stays deferred, now with a number attached. Also
+  surfaced that bulk creation is O(N²) block reads (`deferred-decisions.md`).
 - [ ] **C2 — cross-directory and overwrite `rename`.** Blocks `move`.
 - [ ] **C3 — the `MAX_SESSIONS = 7` cap.** Each pipeline stage holding a directory session
   makes seven concurrent sessions a normal working set, not a stress case.

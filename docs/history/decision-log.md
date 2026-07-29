@@ -8533,3 +8533,52 @@ occasionally, and if it does, the serial log printed on timeout is the first evi
 collect — specifically the last line of progress. A targeted investigation belongs with the
 Slice B fault-path work, which touches the same fs/page-fill machinery the hang's last
 progress point implicates.
+
+## 2026-07-29 — Slice C1: a full directory grows, and the residual ceiling gets a number
+
+A directory whose blocks were all full returned `TooLarge`: `dir_insert` looked for a record
+with enough slack and gave up if none existed. Every file coreutil hits that — `mkdir`,
+`touch`, `copy` into a populated directory — and a Milestone 1 test fixture had to be sized
+around it.
+
+**The fix.** `dir_insert` now appends a block when no existing one has room, formats it as a
+single free record spanning the block — exactly what a block looks like after everything in
+it is deleted, so no reader needs to know the difference — and updates the parent's size,
+block count and mtime. The extent-append logic (allocate, extend the last extent if the
+allocation happened to be contiguous, else add a leaf) was **factored out of `grow_file`**
+and is now shared; the duplicate was most of what made this look like a bigger job than it
+is. `dir_insert` gained the directory's inode number and a mutable inode buffer so it can
+write the growth back; the common path (slack exists) still touches no inode field.
+
+**The residual ceiling, measured rather than described.** Growth stops where the inline
+extent header does — `i_block` holds four leaves, and depth > 0 is deferred. Whether that
+bites depends entirely on fragmentation, and the two cases differ sharply (4 KiB blocks):
+
+- **Creating files**: unbounded in practice, 2000+ tested. Nothing allocates between the
+  parent's growth blocks, so they are contiguous and one extent covers them all.
+- **Creating subdirectories**: **~814**. Each `mkdir` allocates the child's own data block
+  *between* the parent's, so every parent block starts a fresh extent and the fourth
+  exhausts the header.
+
+Both are far beyond anything on the path to a shell or a desktop, so extent-tree splitting
+stays deferred — but with a number attached instead of "some limit". The ext4 write-path
+deferrals were also **mirrored into `deferred-decisions.md`**: they had lived only in the
+crate's `CLAUDE.md`, which is exactly where file truncate had been hiding.
+
+**A cost this surfaced.** `dir_insert` scans every existing block for slack before
+appending, and the server caches nothing between calls, so filling a directory with N
+entries re-reads its blocks N times — **O(N²)**. An in-guest check of 40 entries plus a
+lookup per entry pushed a `test-qemu` run past its 90 s ceiling; the same check sized to
+16 entries (just over one 4 KiB block, with 250-byte names) costs ~2 s. The guest check is
+now sized to *cross the boundary*, not to stress it — the host tests do the exhaustive work
+against `e2fsck`. Recorded as its own deferral with the standard fixes (an htree index, or
+just a per-directory "first block with room" hint) and a real trigger: bulk creation, such
+as `copy -r` of a large tree or unpacking a package into the store.
+
+*Verified:* host suite **784** green — two new tests, both **e2fsck-clean**: 40 files with
+200-byte names forcing several growths, each name present exactly once through the
+paginated walk *and* findable by lookup (enumeration alone would not prove the second); and
+a grown directory emptied again, including refusing to `rmdir` a non-empty subdirectory
+that lives in a *later* block, which only works if the emptiness scan reaches past block 0.
+`test-qemu` PASS with a new in-guest growth check on the real image; 10/10 KVM;
+`check-arch` / `check-nightly` / `check-deferrals` green.

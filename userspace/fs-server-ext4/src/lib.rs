@@ -255,6 +255,96 @@ mod tests {
     }
 
     #[test]
+    fn a_directory_grows_past_its_first_block_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        // 1 KiB blocks and 200-byte names, so each record costs ~208 bytes and four fill
+        // a block: 40 entries force the directory to grow several times. Before growth
+        // existed this returned `TooLarge` on the fifth entry.
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let name_of = |i: usize| {
+            let mut n = std::format!("f{i:03}");
+            while n.len() < 200 {
+                n.push('x');
+            }
+            n
+        };
+
+        for i in 0..40 {
+            ext4::create_file(&rw, b"/system", name_of(i).as_bytes(), TEST_NOW)
+                .unwrap_or_else(|e| panic!("create {i} failed: {e:?}"));
+        }
+
+        // Every name present exactly once, through the paginated walk the server's
+        // `ReadDir` uses — so the added blocks are reachable, not merely written.
+        let listed = list_dir(&ImageReader(rw.0.borrow().clone()), b"/system");
+        for i in 0..40 {
+            let want = name_of(i);
+            let seen = listed.iter().filter(|(n, _)| *n == want).count();
+            assert_eq!(seen, 1, "entry {i} appears {seen} times, want 1");
+        }
+        // And `dir_lookup`'s multi-block walk finds them, which enumeration does not prove.
+        for i in [0usize, 17, 39] {
+            let path = std::format!("/system/{}", name_of(i));
+            assert_eq!(
+                ext4::stat_file(&rw, path.as_bytes()),
+                Ok(0),
+                "lookup of entry {i} failed after the directory grew"
+            );
+        }
+
+        assert_e2fsck_clean(&rw.0.into_inner(), "dirgrow");
+    }
+
+    #[test]
+    fn a_grown_directory_still_removes_cleanly() {
+        use std::cell::RefCell;
+        // Growing is half of it: `rmdir`'s emptiness scan and `unlink` must walk the added
+        // blocks too, and the directory has to survive being emptied again.
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        let sys = ext4::resolve_dir(&rw, b"/system").unwrap();
+        let name_of = |i: usize| {
+            let mut n = std::format!("g{i:03}");
+            while n.len() < 200 {
+                n.push('y');
+            }
+            n
+        };
+        // 12 subdirectories at ~208 bytes each spans three 1 KiB blocks, and stays inside
+        // the inline extent header's four entries (see `dir_insert` on that ceiling —
+        // each `mkdir` allocates the child's own block between the parent's, so a parent
+        // block costs an extent).
+        for i in 0..12 {
+            ext4::mkdir_at(&rw, sys, name_of(i).as_bytes(), TEST_NOW)
+                .unwrap_or_else(|e| panic!("mkdir {i} failed: {e:?}"));
+        }
+        // A non-empty subdirectory living in a *later* block must still be refused, which
+        // only works if the emptiness scan reaches past block 0.
+        let outer = ext4::resolve_dir(&rw, name_path(&name_of(11)).as_bytes()).unwrap();
+        ext4::mkdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
+        assert_eq!(
+            ext4::rmdir_at(&rw, sys, name_of(11).as_bytes(), TEST_NOW),
+            Err(FsError::NotEmpty)
+        );
+        ext4::rmdir_at(&rw, outer, b"inner", TEST_NOW).unwrap();
+
+        for i in 0..12 {
+            ext4::rmdir_at(&rw, sys, name_of(i).as_bytes(), TEST_NOW)
+                .unwrap_or_else(|e| panic!("rmdir {i} failed: {e:?}"));
+        }
+        let listed = list_dir(&ImageReader(rw.0.borrow().clone()), b"/system");
+        assert!(
+            !listed.iter().any(|(n, _)| n.starts_with('g')),
+            "entries survived removal: {listed:?}"
+        );
+        assert_e2fsck_clean(&rw.0.into_inner(), "dirgrow-rm");
+    }
+
+    /// `/system/<name>` — the absolute path of an entry in the fixture's directory.
+    fn name_path(name: &str) -> String {
+        std::format!("/system/{name}")
+    }
+
+    #[test]
     fn creating_a_file_stamps_it_and_its_parent_directory() {
         use std::cell::RefCell;
         // The whole point of threading a clock into the mutation ops: a new inode

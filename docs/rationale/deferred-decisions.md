@@ -252,6 +252,37 @@ Phase-3 storage-hardening pass.)
 
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
+**Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
+of a directory for a record with enough slack before appending a new block, and the server
+caches nothing between calls — so filling a directory with N entries re-reads its blocks N
+times. Fine at the scales anything currently does (16 entries costs ~2 s of a TCG boot),
+but it is quadratic: a sweep of 40 entries plus a lookup per entry pushed a `test-qemu` run
+past its 90 s ceiling (2026-07-29), which is what sized the in-guest check down to
+crossing the block boundary rather than stressing it. The fixes are the standard ones —
+an htree directory index, or simply a per-directory "first block with room" hint carried
+across inserts. Trigger: bulk directory creation on a real path — `copy -r` of a large
+tree, or unpacking a package into the store.
+
+**ext4 write-path gaps (`fs-server-ext4`).** The write path is deliberately partial, and
+these are the pieces still missing. They were previously recorded only in the crate's
+`CLAUDE.md` — which is precisely how three other deferrals went unreviewed (the 2026-07-24
+audit) — so they are mirrored here.
+
+- **Extent-tree splitting / index nodes (depth > 0).** `i_block` holds four inline leaf
+  extents; a file or directory needing a fifth non-contiguous extent gets `Unsupported`.
+  Measured boundary on 4 KiB blocks (2026-07-29): creating **files** in one directory is
+  unbounded in practice (2000+ tested — the parent's growth blocks stay contiguous, so one
+  extent covers them), while creating **subdirectories** stops at **~814**, because each
+  `mkdir` allocates the child's own block between the parent's and so fragments it. Both
+  are far past anything the shell or desktop needs. Trigger: a directory or file that
+  genuinely needs a deeper tree — very large files, or a directory of thousands of
+  subdirectories.
+- **Cross-group inode/block allocation.** Creation is group 0 only. Trigger: a filesystem
+  large or full enough that group 0 runs out.
+- **`metadata_csum` checksums** and **jbd2 journaling + replay.** The fixtures are built
+  `^has_journal`; a crash mid-mutation is not recoverable by replay. Trigger: running on
+  media where an unclean shutdown matters.
+
 **btrfs, NTFS, XFS, ZFS, etc.** Each is a userspace fs-server binary. None are in initial scope. Trigger: specific deployment needs.
 
 **Encrypted root (LUKS).** Architecture accommodates this — LUKS is a block device filter driver in initramfs; init invokes it before spawning fs-server. Not in initial scope. Trigger: encrypted-root deployment.
