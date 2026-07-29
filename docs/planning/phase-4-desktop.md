@@ -364,6 +364,24 @@ What the numbers mean:
   the page cache.
 - `std::thread` (for B3, independently).
 
+**Scheduled revisits — do not wait for a profile to volunteer.** Today's workload barely
+touches the filesystem: 43 fills, and nearly every program loaded from the initramfs rather
+than through the page cache. Two upcoming milestones change that materially, and each is a
+checkpoint where these numbers should be re-read:
+
+1. **After the typed shell + coreutils subproject.** A shell spawns a process per pipeline
+   stage, runs scripts that open and rewrite files, and puts `list`/`copy`/`save` on real
+   trees — far more filesystem traffic than a boot self-test, and from *userspace* rather
+   than from init's fixed sequence.
+2. **After the desktop UI MVP** (compositor + toolkit + GUI terminal). Large binaries, many
+   concurrent instances, fonts and images loaded from files — the case B4a, CoW and dynamic
+   linking all share, and the first workload likely to move these counters by an order of
+   magnitude.
+
+The review is deliberately cheap: the counters are permanent, so it is "boot `test-qemu`
+and read the `page-cache fills:` / `spawns:` lines". If fills have climbed out of the tens,
+or image materialisation has grown past a few milliseconds, Slice B stops being deferred.
+
 Slice C follows directly; it has actual Milestone 2 blockers.
 
 #### Slice C — fs/ext4 completeness for Milestone 2

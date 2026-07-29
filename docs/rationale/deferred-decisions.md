@@ -238,6 +238,13 @@ is observable: **fill count climbing out of the tens**, which is what large bina
 file-backed program text would cause. That is the same inflection as CoW and dynamic
 linking — see the process-memory-model bundle.
 
+**Two scheduled revisits**, rather than waiting for a profile to volunteer: **after the
+typed shell + coreutils subproject** (a shell spawns per pipeline stage and drives real
+filesystem traffic from userspace, unlike init's fixed boot sequence), and **after the
+desktop UI MVP** (large binaries, many concurrent instances, fonts and images loaded from
+files). At each, re-read the counters from a `test-qemu` boot: if fills have climbed out of
+the tens, or image materialisation past a few milliseconds, this stops being deferred.
+
 **TCP/IP networking.** The architecture is committed: userspace netstack server, network drivers as Tier 1 or Tier 2 modules, sockets as namespace resources. Implementation is deferred. Trigger: a concrete need (wanting to SSH into the system, wanting to download files, etc.). Implementation is a major effort (~15-50K lines depending on whether smoltcp is ported or a stack is written from scratch); deferring keeps the initial system simple while not foreclosing the work.
 
 **Network booting (PXE) by the kernel.** Limine handles PXE before the kernel runs. The kernel itself doesn't need network for PXE. Network-mounted root filesystems can use the same userspace fs-server architecture as local mounts; this is gated on the netstack being implemented.
