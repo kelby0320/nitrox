@@ -759,6 +759,15 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
 /// thread stack is current (`TODO(irq-stack)`), so their frames are included in the mark.
 #[cfg(feature = "test-harness")]
 fn report_stack_watermark() {
+    let (prefix, ring, elided) = crate::klog::stats();
+    crate::kprintln!(
+        "klog: boot prefix {} B of {}, ring {} B of {}, elided {} B",
+        prefix,
+        crate::klog::PREFIX_CAP,
+        ring,
+        crate::klog::RING_CAP,
+        elided
+    );
     let (used, pct, pid) = crate::mm::kstack::watermark::deepest();
     crate::kprintln!(
         "kstack: deepest {} B of {} ({}%), by pid {}",

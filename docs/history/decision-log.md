@@ -8928,3 +8928,48 @@ checks → login; 3/3 KVM boots. **Negative control**: deliberately mis-ranking 
 lock trips it immediately with "acquiring Sched (rank 10) while holding HandleTable (rank
 30)", naming both locks. `check-deferrals` caught the new `TODO` before I filed it, which is
 the check working on its author.
+
+## 2026-07-29 — Slice D1: the klog buffer keeps both ends, and the measurement reframed it
+
+The kernel log was a linear append buffer: capture from boot until 16 KiB is full, then
+drop. The plan called for a keep-recent ring, on the grounds that a linear buffer "stops
+capturing once 16 KiB of boot log fills — i.e. exactly when a long-running system gets
+interesting."
+
+**Measuring first changed the framing.** A full integration boot — kernel → SMP → init →
+ext4 → userspace demos → login — captures **3801 bytes and drops zero**. So the buffer is
+not overflowing today; it uses under a quarter of its capacity. The defect is real but
+*prospective*: it bites a system that runs long enough to fill 16 KiB, which the boot-and-
+exit harness never does.
+
+That matters because the naive fix would have been a regression. The old comment justified
+the linear design: it keeps "the early boot/failure context, which is what an emergency
+inspection wants". A pure wrap-around ring keeps the newest output and throws exactly that
+away. Two goals, opposed, and the measurement showed there was room to satisfy both.
+
+**Keep both ends.** A **frozen prefix** (8 KiB) captures from boot and is then never
+overwritten, and a **keep-recent ring** (8 KiB) takes everything after it. What is lost is
+the *middle* — and the snapshot says so, with a `[klog: N bytes elided]` notice between the
+two regions, because a gap the reader cannot see is a log that lies about being complete.
+The 8 KiB prefix is >2× the measured boot log, so there is real headroom before any of it
+is at risk, and the `klog:` line in every `test-harness` run makes an outgrown prefix
+visible rather than silent.
+
+**A testing smell caught on the way.** The first version of the host tests linearised the
+snapshot with a helper written *in the test module* — a second implementation of the
+ordering logic. If it and `copy_into_frames` had disagreed, the tests would have passed
+while `/dev/log` returned garbage. The layout now lives in one `Klog::runs` that both the
+production copy and the tests walk. Worth stating as a general rule: **a test that
+re-derives the thing it is checking is checking itself.**
+
+Coverage is stated rather than implied: the host tests reach the layout but not the
+page-wise copy into physical frames (that needs HHDM memory). A boot exercises the copy for
+the prefix-only case every run; the wrapped case is covered to the frame boundary and no
+further. A synthetic in-guest fill would close it at the cost of dirtying the real log with
+test bytes — not worth it while the arithmetic is shared with the single-run path.
+
+*Verified:* host suite **795** green (six new klog tests: prefix-only, prefix freeze +
+overflow, ring keeps newest and reports the gap, a write longer than the whole ring keeping
+only its tail, `snapshot_len` agreeing with what the copy produces, and wrapped content
+returning in write order). `test-qemu` PASS; `check-arch` / `check-nightly` /
+`check-deferrals` green.

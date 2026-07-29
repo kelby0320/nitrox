@@ -441,8 +441,16 @@ Slice C follows directly; it has actual Milestone 2 blockers.
 
 #### Slice D — cheap, now-triggered hygiene
 
-- [ ] **D1 — klog keep-recent ring.** Still a linear append buffer that stops capturing
-  once 16 KiB of boot log fills — i.e. exactly when a long-running system gets interesting.
+- [x] **D1 — klog keep-recent ring** ✅ (2026-07-29). Two regions rather than one: a
+  **frozen boot prefix** (8 KiB) that is never overwritten, plus a **keep-recent ring**
+  (8 KiB) for everything after it, so neither early-boot context nor recent output is
+  traded away — what is lost is the *middle*, and the reader is told how much by a
+  `[klog: N bytes elided]` notice in the snapshot. **Measured before sizing**: a full
+  integration boot captures **3801 B and drops nothing**, so the old 16 KiB linear buffer
+  was never actually overflowing today — the defect was prospective (a long-running
+  system), which is what set the 8 KiB prefix at >2× the measured need. The snapshot layout
+  is defined in exactly one place that both the production copy and the six new host tests
+  walk, so the tests cannot pass against a layout production does not use.
 - [ ] **D2 — `cargo xtask abi-sync-check`.** Its trigger was "a second non-demo consumer";
   there are now five or six.
 - [ ] **D3 — a listable `/dev`.** `list /dev` is a day-one shell command. `sys_ns_enumerate`
