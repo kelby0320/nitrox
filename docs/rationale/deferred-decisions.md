@@ -299,6 +299,19 @@ that genuinely needs more than ~31 concurrent clients, or the first time a stall
 starving others is observed rather than theorised — most likely the desktop, where a
 compositor holds a channel per window rather than per short-lived listing.
 
+**Per-page dirty tracking — `TODO(page-dirty-tracking)`.** `FileObject::writeback` flushes
+every *resident* page, not every *modified* one — the kernel keeps no per-page dirty bit,
+so it cannot tell the difference. Two consequences, both currently benign. Writeback does
+more device I/O than it needs to on a file that was mostly read. And `File::Touch`
+(Slice C4) therefore stamps `mtime` on **sync**, not on write: a caller that maps a file
+`MAP_WRITE`, changes nothing, and syncs anyway will move the timestamp. In practice the two
+coincide — `sys_file_sync` requires `MAP_WRITE` and callers reach for it precisely after
+writing — so this is a fidelity gap, not a wrong answer. The fix is to harvest the PTE
+dirty bits (and re-protect pages read-only after each writeback so re-dirtying is
+observable), which is the same machinery a periodic writeback daemon needs. Trigger: a
+writeback daemon, a file large enough that flushing clean pages costs real time, or a
+consumer that actually depends on `mtime` meaning "content changed".
+
 **Per-mount write authority in a namespace binding — `TODO(mount-write-authority)`.** A
 namespace binding to a userspace filesystem carries the rights of the **endpoint handle**
 it was bound with (`sys_ns_bind` takes them from the target), so they describe the IPC

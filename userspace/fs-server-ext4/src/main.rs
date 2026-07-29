@@ -33,7 +33,7 @@ use fs_server_ext4::serve::{MAX_SUFFIX, Served, encode_error, serve};
 use fs_server_ext4::{BlockReader, BlockWriter, FsError, ext4};
 use librsproto::file::{
     DIRENT_KIND_DIR, DIRENT_KIND_FILE, DIRENT_KIND_SYMLINK, DIRENT_KIND_UNKNOWN, DirReplyWriter,
-    parse_name_request, parse_read_dir_request, parse_rename_request,
+    parse_name_request, parse_read_dir_request, parse_rename_request, parse_touch_request,
 };
 use librsproto::namespace::{
     OBJECT_KIND_CHANNEL, OBJECT_KIND_NONE, RENAME_REPLACE, RESOLVE_CREATE, RESOLVE_GROW,
@@ -41,7 +41,8 @@ use librsproto::namespace::{
     parse_resolve_rename, parse_resolve_request, resolve_reply,
 };
 use librsproto::{
-    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_UNLINK, OP_NS_RESOLVE,
+    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH,
+    OP_FILE_UNLINK, OP_NS_RESOLVE,
     RS_FLAG_REPLY,
 };
 use libkern::*;
@@ -531,6 +532,54 @@ fn try_resolve_directory<R: BlockReader + BlockWriter>(reader: &R) -> Option<(u6
     Some((request_id, dir_ino))
 }
 
+/// If the message in `RECV_MSG` is a `File::Touch`, stamp the named file's `mtime` and
+/// return `true`. **No reply** — the kernel sends this fire-and-forget.
+///
+/// This is the server learning about a write it structurally cannot see. Under Model A the
+/// kernel owns the file-data path, so an in-place, same-length overwrite goes from the page
+/// cache straight to the device: no resolve, no IPC, nothing here to stamp. Without this
+/// the file's `mtime` would keep reporting its last *size* change — a file edited ten times
+/// in place would look untouched since it was created.
+///
+/// The timestamp is [`now_secs`], our own clock read. The wire carries only the path, so a
+/// writer cannot pick the time its write appears to have happened.
+///
+/// A failure is dropped silently: the data is already durable, and there is no caller
+/// waiting on this. The cost of losing one is a stale timestamp — exactly the behaviour
+/// this replaces.
+fn try_touch<RW: BlockReader + BlockWriter>(reader: &RW) -> bool {
+    let mut path = [0u8; MAX_SUFFIX + 1];
+    path[0] = b'/';
+    // SAFETY: `RECV_MSG` holds a just-received message; the slice is bounded by the
+    // recorded payload length, itself clamped to the buffer.
+    let len = unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        let Ok(m) = librsproto::decode(req) else {
+            return false;
+        };
+        if m.op != OP_FILE_TOUCH {
+            return false;
+        }
+        // From here it *is* a touch, so every exit returns `true` (consumed) even on a
+        // malformed body — falling through would hand it to the resolve path, which would
+        // try to answer a message that has no pending lookup behind it.
+        match parse_touch_request(m.body) {
+            Some(s) if !s.is_empty() && s.len() <= MAX_SUFFIX => {
+                path[1..1 + s.len()].copy_from_slice(s);
+                s.len()
+            }
+            _ => return true,
+        }
+    };
+    let _ = ext4::touch_path(reader, &path[..1 + len], now_secs());
+    true
+}
+
 /// If the forwarded request in `RECV_MSG` is a `RESOLVE_RENAME`, perform the rename and
 /// reply. `true` if it was handled — the caller must not fall through to the paths that
 /// resolve to an object.
@@ -1004,6 +1053,12 @@ fn handle_forwarded_resolve<R: BlockReader + BlockWriter>(
     serve_end: u64,
     device: u64,
 ) {
+    // `File::Touch` is not a resolve at all — the kernel telling us a Model A write
+    // happened, which we could not otherwise observe. No reply.
+    if try_touch(reader) {
+        return;
+    }
+
     // A mutating resolve first: it replies status-only and must not be mistaken for a
     // directory open (see `try_resolve_rename`).
     if try_resolve_rename(reader, serve_end) {

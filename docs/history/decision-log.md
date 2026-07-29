@@ -8736,3 +8736,54 @@ per-CPU IRQ stack. So our 16 KiB carries strictly more than the number it is bei
 against, and the 58% above already includes interrupt frames. The fix is a per-CPU IRQ
 stack — 16 KiB × CPUs, not × threads — filed as `TODO(irq-stack)` with the watermark
 climbing, or a first guard-page fault, as its trigger.
+
+## 2026-07-29 — Slice C4: telling the filesystem about a write it cannot see
+
+Model A puts the *kernel* on the file-data path, which is the whole point — reads and
+writes go zero-copy against the device and the fs-server never touches file bytes. The
+cost, unnoticed until now: a **same-length in-place overwrite** involves no resolve and no
+IPC whatsoever, so the server has no way to learn the file changed. Its `mtime` kept
+reporting the last thing that *did* reach the server — the file's last size change, which
+for most files is its creation. A file edited ten times in place looked untouched.
+
+**`File::Touch` (`0x0606`).** After a successful `sys_file_sync` of a Model A file, the
+kernel sends the server that file's mount-relative suffix and the server stamps `mtime`.
+Three properties are deliberate:
+
+- **No timestamp on the wire.** The server reads its own clock. A time supplied by whoever
+  wrote the file is a time the *writer* chooses, and timestamps are not the writer's to
+  choose — the same reasoning that put the wall clock behind a syscall rather than a caller
+  argument (2026-07-22).
+- **No reply, nothing registered pending.** `sys_file_sync` already blocks per page on
+  device I/O; adding a second blocking round trip to bless a timestamp would be a poor
+  trade, especially against a kernel stack now measured at 58%. The data is durable before
+  the message is sent, so a dropped notification costs a stale timestamp — precisely the
+  behaviour it replaces — rather than a failed sync.
+- **Ordering comes free where it matters.** The message enters the same endpoint ring as
+  forwarded resolves, so a subsequent lookup of that file is processed after it. "Fire and
+  forget" does not mean "racy" here; it means "unwaited".
+
+**What it cost structurally.** The kernel could not previously *name* a Model A file to its
+server: `Producer::FsServerBlocks` held only the device and the block map, deliberately, in
+contrast to Model B which already carried `(reg, suffix)` for its per-page fills. It now
+carries them too — read by nothing on the data path, which is the point of the design and
+worth stating in the type rather than leaving as an absence.
+
+**One honest limitation.** The stamp happens on **sync**, not on the write, because the
+kernel keeps no per-page dirty bit — `writeback` flushes every *resident* page and cannot
+distinguish a modified one. So a caller that maps `MAP_WRITE`, changes nothing, and syncs
+anyway will move the timestamp. In practice the two coincide (`sys_file_sync` requires
+`MAP_WRITE`, and callers reach for it after writing), so it is a fidelity gap rather than a
+wrong answer. Filed as `TODO(page-dirty-tracking)` alongside the writeback daemon that
+needs the same machinery. The stale "the fs-server stays read-only, an overwrite changes no
+metadata" note in `ext4-fs-server-rw.md` — true of the data, wrong about the consequence —
+is corrected in place.
+
+*Verified:* host suite **789** green, including a new `e2fsck`-clean test that a touch moves
+`mtime`, leaves the size alone, and reports `NotFound` for a path that is not there.
+`test-qemu` PASS with an in-guest check that crosses a wall-clock second (ext4 stores whole
+seconds, so an overwrite inside one second is genuinely indistinguishable from none),
+overwrites in place, and asserts three things: the content changed, `mtime` advanced, and
+the **size did not** — the last so the check cannot pass by accidentally taking the
+grow/truncate path, which would have stamped `mtime` the old way. **Negative control**:
+dropping the notification fails it with "in-place overwrite left mtime stale".

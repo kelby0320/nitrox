@@ -393,8 +393,19 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
   shell pipeline produces (stage N exits as stage N+1 starts). Sessions are now reclaimed
   first. The structural fix — a readiness mechanism, one wait slot for any number of clients
   — is filed as `TODO(server-fanout)` with the desktop compositor as its trigger.
-- [ ] **C4 — `mtime` on an in-place overwrite.** Model A hides a same-length rewrite from
-  the server; the hook is `sys_file_sync` notifying it. The timestamp gap users notice.
+- [x] **C4 — `mtime` on an in-place overwrite** ✅ (2026-07-29). A same-length rewrite goes
+  from the page cache to the device with no resolve and no IPC, so the server could not see
+  it: a file edited repeatedly in place reported the timestamp of its last *size* change,
+  usually its creation. Fixed with `File::Touch` (`0x0606`) — after a successful
+  `sys_file_sync` of a Model A file the kernel sends the server the file's suffix and the
+  server stamps `mtime` **from its own clock**, so no timestamp rides the wire and a writer
+  cannot choose when its write appears to have happened. No reply and nothing registered
+  pending: the data is already durable, so a dropped notification costs a stale timestamp
+  rather than a failed sync, and ordering still holds because the message enters the same
+  endpoint ring as forwarded resolves. To name the file at all, Model A's producer now
+  carries its `(registration, suffix)` — fields the data path never reads, which is the
+  point. Stamps on *sync* rather than on the write itself, since there is no per-page dirty
+  bit (`TODO(page-dirty-tracking)`).
 
 #### Slice D — cheap, now-triggered hygiene
 

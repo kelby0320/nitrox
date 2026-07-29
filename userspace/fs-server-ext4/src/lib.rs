@@ -254,6 +254,54 @@ mod tests {
             "root must contain the `system` subdirectory, got {names:?}");
     }
 
+    /// `(mtime, size)` of `name` inside the directory `dir`, via the stat-bearing walk.
+    fn entry_stat(r: &RwImage, dir: &[u8], name: &[u8]) -> (i64, u64) {
+        let dir_ino = ext4::resolve_dir(r, dir).unwrap();
+        let mut found = None;
+        let mut cursor = 0u64;
+        loop {
+            let next = ext4::read_dir_stat(r, dir_ino, cursor, |_ino, _ft, n, st| {
+                if n == name {
+                    found = Some((st.mtime, st.size));
+                }
+                true
+            })
+            .unwrap();
+            if next == 0 {
+                break;
+            }
+            cursor = next;
+        }
+        found.unwrap_or_else(|| panic!("no entry {:?} in {:?}", name, dir))
+    }
+
+    #[test]
+    fn touch_path_moves_mtime_without_touching_content_and_stays_e2fsck_clean() {
+        use std::cell::RefCell;
+        let rw = RwImage(RefCell::new(fixture(1024, b"gen\n")));
+        ext4::create_file(&rw, b"/system", b"edited", TEST_NOW).unwrap();
+        ext4::grow_file(&rw, b"/system/edited", 1500, TEST_NOW).unwrap();
+        assert_eq!(entry_stat(&rw, b"/system", b"edited"), (TEST_NOW, 1500));
+
+        // The Model A case: the kernel wrote the bytes itself and is telling us so. No
+        // size change, no structural change — only the timestamp moves.
+        const LATER: i64 = TEST_NOW + 100;
+        ext4::touch_path(&rw, b"/system/edited", LATER).unwrap();
+
+        assert_eq!(
+            entry_stat(&rw, b"/system", b"edited"),
+            (LATER, 1500),
+            "touch must move mtime and leave the size alone"
+        );
+        // A touch of something that is not there is an error, not a silent no-op — the
+        // kernel names the file by the suffix it resolved, so a miss means they disagree.
+        assert_eq!(
+            ext4::touch_path(&rw, b"/system/no-such-file", LATER),
+            Err(FsError::NotFound)
+        );
+        assert_e2fsck_clean(&rw.0.into_inner(), "touch");
+    }
+
     #[test]
     fn rename_path_moves_a_file_across_directories_and_stays_e2fsck_clean() {
         use std::cell::RefCell;

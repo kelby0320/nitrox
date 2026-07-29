@@ -2024,6 +2024,162 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     code
 }
 
+/// **`mtime` survives an in-place overwrite** (Slice C4).
+///
+/// The timestamp gap users actually notice. Under Model A the kernel owns the file-data
+/// path, so a **same-length** rewrite — map the file, change the bytes, `sys_file_sync` —
+/// reaches the device with no resolve and no IPC. The fs-server never hears about it, so
+/// before C4 nothing moved the inode's `mtime`: a file edited ten times in place still
+/// reported the moment it was *created*.
+///
+/// The check has to cross a wall-clock second, because ext4 second-granularity `mtime`
+/// cannot show a change finer than that. So: create, note `mtime`, wait for the clock's
+/// second to tick over, overwrite in place, and re-read.
+///
+/// Checks, in order:
+///
+/// 1. **The content really changed** — otherwise a stale-`mtime` bug and a
+///    silently-failed-write bug look identical, and the interesting one is hidden.
+/// 2. **`mtime` advanced** — the actual fix.
+/// 3. **The size did not change** — proving this went through the in-place path and not
+///    an accidental grow/truncate, which would have stamped `mtime` the old way and made
+///    the check pass for the wrong reason.
+fn mtime_overwrite_demo(root_ns: u64) {
+    kprint(b"test-harness: mtime demo (an in-place overwrite is not invisible)\n");
+
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: mtime fixture open FAIL\n"),
+    };
+    if sys.mkdir(b"nx-mtime").is_err() {
+        return_fail(b"test-harness: mtime fixture mkdir FAIL\n");
+    }
+    sys.close();
+    write_file(root_ns, b"/system/nx-mtime/f.txt", MTIME_BEFORE);
+
+    let (before_mtime, before_size) = stat_entry(root_ns, b"/system/nx-mtime", b"f.txt");
+    if before_mtime == 0 {
+        return_fail(b"test-harness: fixture has no mtime (wall clock unset?)\n");
+    }
+
+    // Cross a wall-clock second: ext4 stores whole seconds, so an overwrite inside the
+    // same second is genuinely indistinguishable from no overwrite at all.
+    wait_for_next_second();
+
+    // The case under test: same length, written straight into the mapping, flushed.
+    overwrite_in_place(root_ns, b"/system/nx-mtime/f.txt", MTIME_AFTER);
+
+    // --- 1. the content really changed ---------------------------------------
+    if !file_matches(root_ns, b"/system/nx-mtime/f.txt", MTIME_AFTER) {
+        return_fail(b"test-harness: in-place overwrite did not take\n");
+    }
+
+    // --- 2 + 3. mtime moved, size did not ------------------------------------
+    let (after_mtime, after_size) = stat_entry(root_ns, b"/system/nx-mtime", b"f.txt");
+    if after_mtime <= before_mtime {
+        return_fail(b"test-harness: in-place overwrite left mtime stale\n");
+    }
+    if after_size != before_size {
+        return_fail(b"test-harness: overwrite changed the size, not the in-place path\n");
+    }
+
+    // --- teardown -------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-mtime", &[b"f.txt"]);
+    let mut b2 = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut b2) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: mtime teardown FAIL\n"),
+    };
+    if sys.rmdir(b"nx-mtime").is_err() {
+        return_fail(b"test-harness: mtime teardown rmdir FAIL\n");
+    }
+    sys.close();
+    kprint(b"test-harness: mtime ok (in-place overwrite moved mtime, size unchanged)\n");
+}
+
+/// Fixture contents for [`mtime_overwrite_demo`] — **the same length on purpose**. A
+/// different length would resize the file, which reaches the server through the ordinary
+/// resolve path and would stamp `mtime` even without C4.
+const MTIME_BEFORE: &[u8] = b"the original contents, fixed.\n";
+const MTIME_AFTER: &[u8] = b"the rewritten contents, same.\n";
+
+/// `(mtime, size)` of `name` inside directory `dir`, via a `ReadDir` listing.
+fn stat_entry(ns: u64, dir: &[u8], name: &[u8]) -> (i64, u64) {
+    let mut buf = [0u8; 4096];
+    let mut d = match Dir::open(ns, dir, &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: stat open FAIL\n"),
+    };
+    let mut found = (0i64, 0u64);
+    let r = d.read_dir(|e| {
+        if e.name == name {
+            found = (e.mtime, e.size);
+            return false; // stop early
+        }
+        true
+    });
+    d.close();
+    if r.is_err() {
+        return_fail(b"test-harness: stat ReadDir FAIL\n");
+    }
+    found
+}
+
+/// Block until the realtime clock's *second* changes, so a subsequent write lands in a
+/// second distinguishable from the previous one. Bounded — if the clock is not running,
+/// the caller's check fails on its own rather than hanging here.
+fn wait_for_next_second() {
+    let start = realtime_secs();
+    for _ in 0..40 {
+        if realtime_secs() != start {
+            return;
+        }
+        timer_sleep_ms(100);
+    }
+}
+
+/// The realtime clock, in whole seconds (`0` if unset).
+fn realtime_secs() -> i64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    let r = unsafe { syscall2(SYS_CLOCK_READ, CLOCK_REALTIME, (&raw mut CLOCK_BUF) as u64) };
+    if r != 0 {
+        return 0;
+    }
+    // SAFETY: the syscall wrote 8 bytes.
+    (unsafe { (&raw const CLOCK_BUF).read() } / 1_000_000_000) as i64
+}
+
+/// Overwrite `path` with `content` **in place**: resolve it (no size change at all), map it
+/// writable, write the bytes, and `sys_file_sync`. `content` must be the file's current
+/// length — the point is to exercise the path that never reaches the server.
+fn overwrite_in_place(ns: u64, path: &[u8], content: &[u8]) {
+    let size = content.len() as u64;
+    let (st, fh) = ns_lookup_wait(ns, path, RIGHT_MAP_READ | RIGHT_MAP_WRITE);
+    if st != 0 || fh == 0 {
+        return_fail(b"test-harness: in-place resolve FAIL\n");
+    }
+    // SAFETY: mapping our own writable file handle.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, fh, 0, size, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if addr < 0 {
+        return_fail(b"test-harness: in-place map FAIL\n");
+    }
+    for (i, b) in content.iter().enumerate() {
+        // SAFETY: `i` is within the `size`-byte mapping.
+        unsafe { ((addr as u64 + i as u64) as *mut u8).write_volatile(*b) };
+    }
+    // SAFETY: flushing, unmapping, and closing our own handle.
+    let synced = unsafe { syscall1(SYS_FILE_SYNC, fh) };
+    // SAFETY: as above.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+        syscall1(SYS_HANDLE_CLOSE, fh);
+    }
+    if synced != 0 {
+        return_fail(b"test-harness: in-place sync FAIL\n");
+    }
+}
+
 /// **Server fan-out: more concurrent directory sessions than the old cap** (Slice C3).
 ///
 /// `fs-server-ext4` waits on one `sys_wait` set holding its serving endpoint plus every
@@ -3036,6 +3192,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5c. Server fan-out: the concurrent-session ceiling is the kernel's wait width, so
     //       prove the server serves a session well past the old 7 — not just opens one.
     session_fanout_demo(root_ns);
+
+    // 0a5d. An in-place, same-length overwrite is invisible to the fs-server under Model A
+    //       — prove the kernel now tells it, so mtime stops reporting the file's creation.
+    mtime_overwrite_demo(root_ns);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

@@ -1480,6 +1480,36 @@ pub enum ForwardOutcome {
 /// `PeerClosed` the reserved slot is rolled back and its `po` clone dropped
 /// outside `SCHED`. `reg` is the [`UserspaceServerReg`] the lookup resolved to;
 /// the caller pins it (and `po`) for the call.
+/// Push a **fire-and-forget** message into a registration's server inbox: no pending slot,
+/// no `request_id`, no reply expected. `true` if it was queued.
+///
+/// The sibling of [`us_forward_originate`] for the one message the kernel sends a server
+/// without asking it anything — `File::Touch` after a Model A writeback. Nothing is
+/// reserved, so nothing needs rolling back: a full ring or a dead server just drops the
+/// notification, which degrades to the behaviour that existed before it (a stale `mtime`)
+/// rather than failing the caller's `sys_file_sync`, whose data is already on the device.
+pub fn us_forward_notify(reg: *mut (), msg: &mut StoredMsg) -> bool {
+    let mut g = SCHED.lock();
+    // SAFETY: `reg` is a live `UserspaceServerReg` pinned by the caller; `SCHED` held, so
+    // the registration's kernel endpoint is pinned with it.
+    let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
+    let mut no_transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
+    // SAFETY: `endpoint` is the registration's live kernel endpoint; `SCHED` held.
+    match unsafe { IpcChannel::send_push(endpoint, msg, &mut no_transfers) } {
+        SendOutcome::Sent { woke_edge } => {
+            if woke_edge {
+                // SAFETY: a successful send proves the peer is non-null; `SCHED` held.
+                let peer = unsafe { IpcChannel::peer_of(endpoint) };
+                if !peer.is_null() {
+                    signal_ipc_endpoint(&mut g, peer);
+                }
+            }
+            true
+        }
+        SendOutcome::Full | SendOutcome::PeerClosed => false,
+    }
+}
+
 pub fn us_forward_originate(
     reg: *mut (),
     msg: &mut StoredMsg,

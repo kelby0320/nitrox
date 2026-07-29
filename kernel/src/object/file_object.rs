@@ -64,7 +64,20 @@ pub enum Producer {
     /// reads the page's block **zero-copy** straight from `device` into the cache frame via
     /// a block IRP. `device` pins the block `DeviceNode`. `block_size` is the filesystem
     /// block size. See `docs/architecture/filesystem-data-path.md`.
-    FsServerBlocks { device: ObjectRef, runs: KVec<BlockRun>, block_size: u32 },
+    ///
+    /// `reg` + `suffix` name the file back to its server. They are unused by the data path
+    /// — that is the whole point of Model A — and exist for the one thing the server
+    /// cannot otherwise learn: that the file was **written**. An in-place, same-length
+    /// overwrite never reaches the server (no resolve, no IPC), so without these its
+    /// `mtime` would silently stay at whatever the last size change set it to. See
+    /// [`FileObject::writeback`] and `sys_file_sync`.
+    FsServerBlocks {
+        device: ObjectRef,
+        runs: KVec<BlockRun>,
+        block_size: u32,
+        reg: ObjectRef,
+        suffix: KString,
+    },
 }
 
 /// One contiguous mapping from a file's blocks to the device (the kernel-side mirror of
@@ -320,7 +333,9 @@ impl FileObject {
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         // The producer is immutable; borrow its device + run map for the whole flush.
         let (device, runs, block_size) = match &fo.producer {
-            Producer::FsServerBlocks { device, runs, block_size } => (device.clone(), runs, *block_size),
+            Producer::FsServerBlocks { device, runs, block_size, .. } => {
+                (device.clone(), runs, *block_size)
+            }
             _ => return false,
         };
         // Snapshot the resident pages `(index, frame)` under the lock; do I/O unlocked.
@@ -377,6 +392,24 @@ impl FileObject {
         true
     }
 
+    /// The `(registration, suffix)` naming this file to its filesystem server, for a
+    /// Model A (block) file; `None` for any other producer.
+    ///
+    /// Exists for the post-writeback `File::Touch` — the only thing in the system that has
+    /// to tell a Model A server something about a file *without* a resolve. The clone pins
+    /// the registration across the send.
+    pub fn fs_server_name(file_obj: &ObjectRef) -> Option<(ObjectRef, KString)> {
+        debug_assert_eq!(file_obj.object_type(), KObjectType::FileObject);
+        // SAFETY: `file_obj` pins a live `FileObject` (header at offset 0).
+        let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
+        match &fo.producer {
+            Producer::FsServerBlocks { reg, suffix, .. } => {
+                Some((reg.clone(), KString::try_from_str(suffix.as_str()).ok()?))
+            }
+            _ => None,
+        }
+    }
+
     /// Materialize the whole file into a fresh contiguous heap buffer (page-rounded
     /// [`size`](Self::size) bytes; the tail past the real data stays zero). Drives the
     /// producer via [`fault_in_page`](Self::fault_in_page) page by page — **blocking on
@@ -429,7 +462,7 @@ impl FileObject {
             Producer::FsServer { reg, suffix } => {
                 self.fs_server_start_fill(file_obj, index, frame, po, reg, suffix)
             }
-            Producer::FsServerBlocks { device, runs, block_size } => {
+            Producer::FsServerBlocks { device, runs, block_size, .. } => {
                 self.model_a_start_fill(file_obj, index, frame, po, device, runs, *block_size)
             }
         }

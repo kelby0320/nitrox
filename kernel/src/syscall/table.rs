@@ -2355,7 +2355,7 @@ fn complete_resolve_reply(
         ReplyKind::Success { object_kind, content_len }
             if object_kind == OBJECT_KIND_FILE_BLOCKS =>
         {
-            build_and_install_file_blocks(&pl, content_len, &bounce.payload[..payload_len], transfers)
+            build_and_install_file_blocks(reg, &pl, content_len, &bounce.payload[..payload_len], transfers)
         }
         // A mutating resolve (rename): the work is done and there is nothing to install.
         ReplyKind::Success { object_kind, .. } if object_kind == OBJECT_KIND_NONE => (0, 0),
@@ -2424,11 +2424,46 @@ fn complete_resolve_reply(
 fn sys_file_sync(handle: u64) -> SysResult {
     let pid = crate::sched::current_owner_pid();
     let ok = lookup_typed(handle, pid, Rights::MAP_WRITE, KObjectType::FileObject)?;
-    if crate::object::FileObject::writeback(&ok.object) {
-        Ok(0)
-    } else {
-        Err(KError::IoError)
+    if !crate::object::FileObject::writeback(&ok.object) {
+        return Err(KError::IoError);
     }
+    // The data is on the device, but under Model A the *server* has no idea it happened:
+    // an in-place, same-length overwrite never resolves anything, so nothing would move the
+    // inode's `mtime`. Tell it. Best-effort and unwaited — see `us_forward_notify`.
+    notify_file_touched(&ok.object);
+    Ok(0)
+}
+
+/// Send `File::Touch` for a just-flushed Model A file, so its server can stamp `mtime`.
+///
+/// Stamps on **sync**, not on the individual write, because the kernel has no per-page
+/// dirty bit — `writeback` flushes every resident page, so "was this page actually
+/// modified?" is not a question it can answer today (`TODO(page-dirty-tracking)`). In
+/// practice the two coincide: `sys_file_sync` requires `MAP_WRITE` and a caller reaches for
+/// it precisely after writing.
+///
+/// Silent on any failure. The file's data is already durable; a dropped touch costs a stale
+/// timestamp, which is exactly the status quo this replaces — not worth failing a
+/// successful sync over.
+fn notify_file_touched(file_obj: &ObjectRef) {
+    use crate::libkern::KBox;
+    use crate::object::FileObject;
+
+    let Some((reg, suffix)) = FileObject::fs_server_name(file_obj) else {
+        return; // not a Model A file — nothing to notify
+    };
+    // Build in a heap-bounced message: a 4 KiB `StoredMsg` has no business on a kernel
+    // stack already measured at 58% (decision log, 2026-07-29).
+    let Ok(mut msg) = KBox::try_new(crate::object::ipc_channel::StoredMsg::zeroed()) else {
+        return;
+    };
+    let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, suffix.as_bytes())
+    else {
+        return;
+    };
+    msg.header.payload_len = body_len as u32;
+    msg.header.handle_count = 0;
+    crate::sched::us_forward_notify(reg.as_ptr(), &mut msg);
 }
 
 fn build_and_install_file(
@@ -2490,12 +2525,13 @@ fn build_and_install_file(
 /// page zero-copy from the device. `content_len` is the file size; `reply_msg` is the rsproto
 /// reply message (envelope + body). Returns `(0, handle)` or `(kerror, 0)`.
 fn build_and_install_file_blocks(
+    reg: *mut (),
     pl: &crate::object::userspace_server::PendingLookup,
     content_len: u32,
     reply_msg: &[u8],
     transfers: &mut [Option<TransferRef>; IPC_HANDLE_MAX],
 ) -> (i32, u64) {
-    use crate::libkern::KVec;
+    use crate::libkern::{KString, KVec};
     use crate::object::{BlockRun, FileObject, Producer};
     use crate::rsproto::{file_blocks_reply_header, file_blocks_run, reply_body};
 
@@ -2527,9 +2563,26 @@ fn build_and_install_file_blocks(
         let _ = runs.try_push(BlockRun { file_block, device_lba, length, flags });
     }
 
+    // Name the file back to its server, for the post-writeback `File::Touch` (the data
+    // path never uses these — see `Producer::FsServerBlocks`).
+    let Some(suffix_bytes) = pl.suffix() else {
+        return (KError::TooLarge as i32, 0);
+    };
+    let Ok(suffix_str) = core::str::from_utf8(suffix_bytes) else {
+        return (KError::InvalidArgument as i32, 0);
+    };
+    let Ok(suffix) = KString::try_from_str(suffix_str) else {
+        return (KError::OutOfMemory as i32, 0);
+    };
+    // SAFETY: `reg` addresses the live `UserspaceServerReg` this reply arrived through.
+    let Some(reg_ref) = (unsafe { ObjectRef::try_acquire(reg, KObjectType::UserspaceServerReg) })
+    else {
+        return (KError::KernelError as i32, 0);
+    };
+
     let fobj = match FileObject::try_new(
         content_len as usize,
-        Producer::FsServerBlocks { device, runs, block_size },
+        Producer::FsServerBlocks { device, runs, block_size, reg: reg_ref, suffix },
     ) {
         Ok(f) => f,
         Err(_) => return (KError::OutOfMemory as i32, 0),

@@ -633,6 +633,26 @@ fn resolve_path_ino<R: BlockReader>(
 }
 
 /// The absolute device byte offset of inode `ino` (for writing it back).
+/// Stamp `path`'s modification time as `now` — the `File::Touch` entry point.
+///
+/// The one filesystem mutation that changes **no** content and no structure. It exists
+/// because Model A puts the kernel, not this server, on the file-data path: a same-length
+/// in-place overwrite reaches the device without any resolve, so nothing here would
+/// otherwise learn the file changed and `mtime` would keep reporting the last *size*
+/// change. The kernel sends this after flushing such a write.
+///
+/// `now` comes from the server's own clock reading, never from the wire — a writer does not
+/// get to choose what time it wrote.
+pub fn touch_path<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    path: &[u8],
+    now: i64,
+) -> Result<(), FsError> {
+    let sb = read_superblock(rw)?;
+    let (ino, _) = resolve_path_ino(rw, &sb, path)?;
+    touch_inode(rw, &sb, ino, now, Stamp::Modified)
+}
+
 /// Re-stamp an existing inode in place — read it, write its timestamps, write it
 /// back.
 ///

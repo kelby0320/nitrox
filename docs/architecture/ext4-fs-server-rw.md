@@ -77,9 +77,24 @@ Each part builds on proven machinery and is independently verifiable.
   8-page `large.bin`) — the hardest new machinery de-risked before any write correctness.
   (The standalone `MapRange` op is deferred; the resolve reply carries the initial map.)
 - **Part C — overwrite-in-place** ✅. `MAP_WRITE` mappings + `sys_file_sync` + kernel write
-  IRPs to **existing** LBAs (`FileObject::writeback`). The fs-server stays read-only (an
-  overwrite changes no metadata). Writing back all resident pages is correct for overwrite;
-  per-page dirty tracking is deferred.
+  IRPs to **existing** LBAs (`FileObject::writeback`). Writing back all resident pages is
+  correct for overwrite; per-page dirty tracking is deferred.
+
+  The original note here said "the fs-server stays read-only (an overwrite changes no
+  metadata)". That was true of the *data* and wrong about the consequence: an overwrite
+  changes `mtime`, and this is exactly the path on which the server cannot see it happen.
+  A same-length rewrite goes from the page cache to the device with no resolve and no IPC,
+  so before Slice C4 a file edited repeatedly in place still reported the timestamp of its
+  last **size** change — usually its creation. Fixed by `File::Touch`: after a successful
+  `sys_file_sync` of a Model A file, the kernel sends the server the file's suffix, and the
+  server stamps `mtime` **from its own clock** (no timestamp on the wire — a writer does
+  not choose the time its write appears to have happened). It carries no reply and is
+  registered as nothing pending: the data is already durable, so a dropped notification
+  costs a stale timestamp rather than a failed sync. Ordering still holds where it matters,
+  because it enters the same endpoint ring as forwarded resolves — a subsequent lookup of
+  that file is processed after it. To carry the file's name at all, Model A's producer had
+  to start holding its `(registration, suffix)`; those fields are used by nothing on the
+  data path, which is the point.
 - **Part D — file growth** ✅. `grow_file` (block-bitmap allocation + extent-tree extension +
   inode size/block-count) — **`e2fsck`-verified**. Triggered by grow-on-resolve
   (`RESOLVE_GROW` + `sys_file_grow`): the server grows the file, then replies its map; the

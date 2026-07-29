@@ -368,6 +368,50 @@ const READ_RANGE_REQUEST_PREFIX_LEN: usize = 16;
 /// Wire length of a success `ReadRangeReply` body.
 const READ_RANGE_REPLY_LEN: usize = 8;
 
+/// `File::Touch` — stamp the named file's modification time as "now".
+const OP_FILE_TOUCH: u16 = 0x0606;
+
+/// Build a `File::Touch` request into `out`: the envelope plus a `suffix_len: u16`,
+/// two reserved bytes, and the suffix naming the file under its mount.
+///
+/// Sent by the kernel after flushing a Model A file's pages, because that write is
+/// otherwise **invisible** to the server: an in-place, same-length overwrite goes
+/// straight from the page cache to the device with no resolve and no IPC, so nothing
+/// would ever move the inode's `mtime`.
+///
+/// Deliberately carries **no timestamp** — the server reads its own clock. A time supplied
+/// by whoever wrote the file would be a time the writer could choose, and timestamps are
+/// not the writer's to choose (the same reasoning that put the wall clock behind a syscall
+/// rather than a caller argument; decision log 2026-07-22).
+///
+/// It also expects **no reply**: `request_id` stays `0` and nothing is registered as
+/// pending. That keeps `sys_file_sync` off a second blocking round trip, and ordering
+/// still holds where it matters — the request goes into the same endpoint ring as
+/// forwarded resolves, so a subsequent lookup of that file is processed after it.
+pub fn build_touch_request(out: &mut [u8], suffix: &[u8]) -> Option<usize> {
+    if suffix.len() > u16::MAX as usize {
+        return None;
+    }
+    let body_len = 4 + suffix.len();
+    let total = RS_HEADER_LEN + body_len;
+    if out.len() < total {
+        return None;
+    }
+    put_u32(out, 0, RS_MAGIC);
+    put_u16(out, 4, RS_VERSION);
+    put_u16(out, 6, OP_FILE_TOUCH);
+    put_u64(out, REQUEST_ID_OFFSET, 0); // no reply is correlated
+    put_u32(out, 16, 0); // flags: a request
+    put_u32(out, 20, body_len as u32);
+    put_u16(out, 24, 0); // handle_count
+    put_u16(out, 26, 0); // _reserved
+    let b = RS_HEADER_LEN;
+    put_u16(out, b, suffix.len() as u16);
+    put_u16(out, b + 2, 0); // _reserved
+    out[b + 4..total].copy_from_slice(suffix);
+    Some(total)
+}
+
 /// Build a `File::ReadRange` request (envelope + body) into `out`, returning the
 /// total byte length, or `None` if `out` is too small or `suffix` exceeds
 /// `u16::MAX`. The kernel sends this to fill one page of a lazily-resolved file:

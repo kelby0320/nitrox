@@ -141,6 +141,26 @@ pub fn parse_read_dir_request(body: &[u8]) -> Option<ReadDirRequest> {
     Some(ReadDirRequest { cursor: get_u64(body, 0) })
 }
 
+/// Parse a `File::Touch` request body: `suffix_len: u16`, two reserved bytes, then the
+/// suffix naming the file under the mount. Returns the suffix.
+///
+/// Unlike every other `File::*` op this arrives on the server's **forwarding endpoint**
+/// rather than a directory session, is sent by the **kernel** rather than a client, and
+/// expects **no reply**. All three follow from what it is for: a Model A write is invisible
+/// to the server (the kernel moves the data straight to the device), so after a flush the
+/// kernel tells it the file changed, and the server stamps `mtime` from **its own** clock —
+/// the timestamp is deliberately not on the wire. See `docs/spec/rsproto-file-ops.md`.
+pub fn parse_touch_request(body: &[u8]) -> Option<&[u8]> {
+    if body.len() < 4 {
+        return None;
+    }
+    let n = u16::from_le_bytes([body[0], body[1]]) as usize;
+    if body.len() < 4 + n {
+        return None;
+    }
+    Some(&body[4..4 + n])
+}
+
 /// Fixed header of a `ReadDirReply` body, before the packed entries.
 pub const READ_DIR_REPLY_HEADER_LEN: usize = 12;
 /// Fixed prefix of each packed directory entry, before its name bytes:
