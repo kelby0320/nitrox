@@ -36,6 +36,7 @@
 use core::ptr::NonNull;
 
 use crate::dpc::Dpc;
+use crate::arch::timer::ArchTimer;
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
@@ -149,6 +150,77 @@ struct Inner {
     /// slice-8 file sizes (a sorted index / tree is a later optimization if profiles
     /// demand it). Each entry **owns** its frame (freed in [`FileObject::drop`]).
     pages: KVec<CachePage>,
+}
+
+/// Page-cache fill counters — the measurement behind the read-ahead decision (Slice B2).
+///
+/// Two atomic adds per fill, which is nothing beside the block read they bracket, so these
+/// are always on rather than feature-gated: the same numbers are what a `/proc` page-cache
+/// surface would report, and a decision to cluster fills should rest on measurement rather
+/// than on the stale ~325 ms/page figure from the Model-B era (`deferred-decisions.md`).
+/// What starting a fill actually did — the caller needs to tell a real device round trip
+/// from a hole that completed synchronously, both to account for it and (for a hole) to
+/// know no I/O latency was involved.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+enum FillStart {
+    /// A producer request was issued; the faulter will park until it completes.
+    Io,
+    /// A hole / unmapped range: the zeroed frame is already correct and the PO was
+    /// completed synchronously.
+    Hole,
+    /// The fill could not be started (allocation failure); the caller rolls back.
+    Failed,
+}
+
+pub mod fill_stats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    /// Fills that issued a real producer request (a block IRP under Model A).
+    pub static FILLS: AtomicU64 = AtomicU64::new(0);
+    /// Fills that resolved to a hole / unmapped range — the zeroed frame was already
+    /// correct, so the PO completed synchronously with no device I/O. Counted apart
+    /// because averaging them in would flatter the real cost.
+    pub static HOLE_FILLS: AtomicU64 = AtomicU64::new(0);
+    /// Total nanoseconds spent inside fills that issued I/O (reserve → page Ready).
+    pub static FILL_NS: AtomicU64 = AtomicU64::new(0);
+    /// The slowest single such fill, in nanoseconds.
+    pub static FILL_MAX_NS: AtomicU64 = AtomicU64::new(0);
+    /// Faults that found the page already resident (the cache hit path).
+    pub static HITS: AtomicU64 = AtomicU64::new(0);
+    /// Faults that found the page mid-fill and `yield_now`-spun waiting for it — the
+    /// number that says whether B3 (block the second faulter) is theoretical or real.
+    pub static SPINS: AtomicU64 = AtomicU64::new(0);
+
+    /// A snapshot of the counters.
+    #[derive(Copy, Clone, Debug, Default)]
+    pub struct Snapshot {
+        pub fills: u64,
+        pub hole_fills: u64,
+        pub fill_ns: u64,
+        pub fill_max_ns: u64,
+        pub hits: u64,
+        pub spins: u64,
+    }
+
+    /// Read the counters. Relaxed throughout: these are statistics, and a torn read
+    /// across counters would at worst misreport by one fill.
+    pub fn snapshot() -> Snapshot {
+        Snapshot {
+            fills: FILLS.load(Ordering::Relaxed),
+            hole_fills: HOLE_FILLS.load(Ordering::Relaxed),
+            fill_ns: FILL_NS.load(Ordering::Relaxed),
+            fill_max_ns: FILL_MAX_NS.load(Ordering::Relaxed),
+            hits: HITS.load(Ordering::Relaxed),
+            spins: SPINS.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Record one completed fill that issued I/O.
+    pub(crate) fn record_fill(ns: u64) {
+        FILLS.fetch_add(1, Ordering::Relaxed);
+        FILL_NS.fetch_add(ns, Ordering::Relaxed);
+        FILL_MAX_NS.fetch_max(ns, Ordering::Relaxed);
+    }
 }
 
 impl FileObject {
@@ -277,8 +349,15 @@ impl FileObject {
         let fo: &FileObject = unsafe { &*(file_obj.as_ptr() as *const FileObject) };
         loop {
             match fo.reserve(index) {
-                Reserve::Ready(frame) => return Some(frame),
+                Reserve::Ready(frame) => {
+                    fill_stats::HITS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    return Some(frame);
+                }
                 Reserve::New(frame) => {
+                    // Timed from just before the producer starts to the page being
+                    // `Ready`: the whole park → I/O → wake → resume round trip a faulting
+                    // thread actually waits through.
+                    let started = crate::arch::Timer::read_ns();
                     // The fill's PendingOperation: this thread blocks on it; the
                     // producer completes it when the page's bytes have arrived.
                     let po = match PendingOperation::try_new() {
@@ -294,7 +373,8 @@ impl FileObject {
                             return None;
                         }
                     };
-                    if !fo.start_fill(file_obj, index, frame, &po) {
+                    let started_kind = fo.start_fill(file_obj, index, frame, &po);
+                    if started_kind == FillStart::Failed {
                         // Could not start the fill (allocation failure); roll the
                         // reserved page back so a retry is clean.
                         fo.cancel_reserve(index);
@@ -309,10 +389,21 @@ impl FileObject {
                     if fo.fill_needs_ready_mark() {
                         fo.mark_ready(index);
                     }
+                    // A hole completes its PO synchronously with no device I/O; counting
+                    // it as a fill would understate what a real fill costs.
+                    if started_kind == FillStart::Hole {
+                        fill_stats::HOLE_FILLS
+                            .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+                    } else {
+                        fill_stats::record_fill(
+                            crate::arch::Timer::read_ns().saturating_sub(started),
+                        );
+                    }
                     // Loop: the page is now `Ready` → return its frame.
                 }
                 Reserve::Loading(_) => {
                     // Another fault is filling this page; let it (and its DPC) run.
+                    fill_stats::SPINS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
                     crate::sched::yield_now();
                 }
                 Reserve::Oom => return None,
@@ -456,11 +547,21 @@ impl FileObject {
         index: usize,
         frame: PhysAddr,
         po: &ObjectRef,
-    ) -> bool {
+    ) -> FillStart {
         match &self.producer {
-            Producer::Stub { base } => stub_start_fill(file_obj, index, frame, po, *base),
+            Producer::Stub { base } => {
+                if stub_start_fill(file_obj, index, frame, po, *base) {
+                    FillStart::Io
+                } else {
+                    FillStart::Failed
+                }
+            }
             Producer::FsServer { reg, suffix } => {
-                self.fs_server_start_fill(file_obj, index, frame, po, reg, suffix)
+                if self.fs_server_start_fill(file_obj, index, frame, po, reg, suffix) {
+                    FillStart::Io
+                } else {
+                    FillStart::Failed
+                }
             }
             Producer::FsServerBlocks { device, runs, block_size, .. } => {
                 self.model_a_start_fill(file_obj, index, frame, po, device, runs, *block_size)
@@ -489,7 +590,7 @@ impl FileObject {
         device: &ObjectRef,
         runs: &KVec<BlockRun>,
         block_size: u32,
-    ) -> bool {
+    ) -> FillStart {
         // The page's first filesystem block (block_size == PAGE_SIZE for slice-1 fixtures,
         // so this is `index`; the general form handles bs | PAGE where a page's blocks are
         // contiguous within one run).
@@ -507,7 +608,7 @@ impl FileObject {
                 // Hole or unmapped: the zeroed frame is already correct. Complete the PO
                 // synchronously so the parked faulter wakes at once (no IRP).
                 crate::sched::complete_pending_op(po.as_ptr(), 0, 0);
-                true
+                FillStart::Hole
             }
             Some(dev_block) => {
                 let dev_offset = dev_block * block_size as u64;
@@ -522,7 +623,7 @@ impl FileObject {
                     dev_offset,
                     PAGE_SIZE as u64,
                 )
-                .is_ok()
+                .map_or(FillStart::Failed, |()| FillStart::Io)
             }
         }
     }
@@ -546,9 +647,11 @@ impl FileObject {
         let offset = (index * PAGE_SIZE) as u64;
         let remaining = self.size.saturating_sub(index * PAGE_SIZE);
         let len = remaining.min(PAGE_SIZE) as u32;
-        // Build the ReadRange request in a heap-bounced message (4 KiB — never on
-        // the kernel stack), exactly as the forwarded lookup does.
-        let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
+        // Build the ReadRange request in a heap-bounced message (4 KiB, allocated
+        // zeroed **in place** — `try_new(StoredMsg::zeroed())` would build it in this
+        // frame first, which is 4 KiB of kernel stack), as the forwarded lookup does.
+        // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value.
+        let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
             Ok(m) => m,
             Err(_) => return false,
         };

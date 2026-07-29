@@ -8534,6 +8534,62 @@ collect — specifically the last line of progress. A targeted investigation bel
 Slice B fault-path work, which touches the same fs/page-fill machinery the hang's last
 progress point implicates.
 
+## 2026-07-29 — Slice B measured, then deferred: the demand-fault path is not the problem
+
+Slice B (the demand-fault path) was the largest item of the pre-CLI hardening pass. It was
+re-scoped once before any code — B1, an fs-server open-file cookie, turned out to optimise
+a Model-B round trip that **no shipping filesystem makes** (ext4 is Model A: the kernel gets
+a `BlockRun` map at resolve and reads the device directly, with no fs-server IPC in the fill
+path). Rather than proceed on the remaining assumptions, the path was **instrumented and
+measured first**.
+
+**The measurement.** Permanent counters on the fill path (`file_object::fill_stats`) and the
+spawn path (`syscall::table::spawn_stats`), printed at the end of every adjudicated run:
+
+| | TCG | KVM |
+|---|---|---|
+| Page-cache fills | 43 · 204 µs avg · 2.8 ms max · **0.5 % of a 1.75 s boot** | 43 · 137 µs avg · **0.5 % of a 1.0 s boot** |
+| Concurrent-faulter spins | **0** | **0** |
+| Spawns | 40 · 774 µs avg · **1.7 % of boot** | 40 · 122 µs avg · **0.4 % of boot** |
+| Image materialisation | 5.5 ms · **17 % of spawn** | 3.8 ms · **78 % of spawn** |
+| Image bytes | 1.94 MB across 40 spawns (~48 KB each) | same |
+
+**What it says.**
+
+1. **Read-ahead (B2) would optimise ~0.5 % of boot.** The deferral entry justified it with
+   a **~325 ms-per-page** figure; a fill now costs **~0.1–0.2 ms**, roughly a thousandfold
+   better, from the 4 KiB block batching and the device-IRQ scheduling fix (2026-07-23)
+   plus Model A. Building read-ahead on that stale number would have been optimising a cost
+   that no longer exists.
+2. **Only 43 fills happen in an entire boot**, because nearly every program is spawned from
+   the **initramfs**, which resolves to a `MemoryObject` copy and never touches the page
+   cache. The 43 are the ext4-backed reads.
+3. **B3 is unreached — zero spins.** The concurrent-faulter path is real but never taken,
+   and the thing that *would* take it is **B4a itself**: many processes sharing one image
+   `FileObject` fault the same text pages. So B3 belongs with B4a, and never before it.
+4. **B4a's prize is real but small.** Image materialisation is 78 % of spawn under KVM,
+   which sounds decisive until spawn is 0.4 % of boot — the whole prize is ~4 ms. A
+   four-stage shell pipeline spends ~0.5 ms in spawn. **The shell does not need this**,
+   which was the original argument for doing Slice B before the shell.
+
+**Decision: defer all of Slice B**, with measured triggers rather than guesses — large
+binaries (at ~48 KB the copy is ~100 µs; a 2–5 MB toolkit app is 40–100× that per launch,
+plus a private copy per instance), fill count climbing out of the tens (which B4a itself
+causes), and `std::thread` for B3. That is the same inflection as CoW and dynamic linking,
+so B4a folds into the **process-memory-model pass at the GUI toolkit milestone** rather than
+standing alone.
+
+**The counters stay.** Two to four relaxed atomic adds per fill/spawn is nothing beside the
+device round trip they bracket, and keeping them is what makes the deferral honest: the
+trigger is now *observable* instead of a prediction. They are also the natural seed of a
+`/proc` page-cache surface.
+
+**Process note.** This is the third consecutive time that verifying a deferral against the
+code changed the plan — B1 was Model-B work, the fill cost was a thousandfold stale, and the
+initramfs/`MemoryObject` path meant the workload barely touches the cache at all. Measuring
+before building cost one afternoon and saved an entire slice. Slice C (fs/ext4 completeness)
+follows directly; unlike B, it has actual Milestone 2 blockers.
+
 ## 2026-07-29 — Slice C1: a full directory grows, and the residual ceiling gets a number
 
 A directory whose blocks were all full returned `TooLarge`: `dir_insert` looked for a record
@@ -8710,10 +8766,25 @@ case: it reads only the word just below the standing record, and walks further o
 record is actually being set, which happens a handful of times per boot. Production builds
 are untouched.
 
-**The number: 9584 B of 16384 — 58%** — and it is bit-for-bit identical across boots, so
-it is a deterministic deep path rather than interrupt-timing luck. That is materially more
-than the paper estimate implied. It does **not** change the conclusion that 16 KiB stays
-(see below), but it does mean the margin is ~6.8 KiB, not "plenty".
+**The number, and what it immediately caught.** The first reading was **9584 B of 16384 —
+58%**, bit-for-bit identical across boots, so
+it is a deterministic deep path rather than interrupt-timing luck. That was materially more
+than the paper estimate implied — and it turned out to be measuring a bug rather than a
+budget.
+
+Chasing it found **`KBox::try_new(StoredMsg::zeroed())`** in four places. `try_new` takes
+its argument **by value**, so each of those built a 4 KiB IPC message in the *caller's
+frame* and then copied it to the heap. One of the call sites carried the comment "a
+heap-bounced message (4 KiB — never on the kernel stack)", which is what the author
+intended and not what the code did; the optimiser may elide such a temporary, and here it
+demonstrably did not. Adding a fourth on the `sys_file_sync` path (Slice C4) pushed the
+mark to **83%** — 2.7 KiB of headroom on a stack that interrupts also nest onto.
+
+With a `KBox::try_new_zeroed` that zeroes the allocation in place, the mark is **6264 B —
+38%**, better than the figure that started the investigation. Three of the four sites were
+pre-existing, so this was a latent problem the instrumentation surfaced rather than one the
+new work introduced. The lesson is narrow and worth keeping: **a stack budget must not rest
+on whether the optimiser elides a temporary.**
 
 **Attribution, and what it bought.** The mark also records the owning pid. The pid *varies*
 run to run while the depth is constant — so the deep path is something every spawned
@@ -8733,7 +8804,7 @@ gives a dedicated stack to `#DF` only (IST1); the timer, the TLB-shootdown and r
 IPIs, and every device handler run on **IST0 — no IST** — so they nest onto the current
 thread stack. Linux, at the same 16 KiB, keeps interrupts off it entirely with a separate
 per-CPU IRQ stack. So our 16 KiB carries strictly more than the number it is being matched
-against, and the 58% above already includes interrupt frames. The fix is a per-CPU IRQ
+against, and the 38% above already includes interrupt frames. The fix is a per-CPU IRQ
 stack — 16 KiB × CPUs, not × threads — filed as `TODO(irq-stack)` with the watermark
 climbing, or a first guard-page fault, as its trigger.
 
@@ -8756,7 +8827,7 @@ Three properties are deliberate:
   argument (2026-07-22).
 - **No reply, nothing registered pending.** `sys_file_sync` already blocks per page on
   device I/O; adding a second blocking round trip to bless a timestamp would be a poor
-  trade, especially against a kernel stack now measured at 58%. The data is durable before
+  trade, especially on a path already among the kernel's deepest. The data is durable before
   the message is sent, so a dropped notification costs a stale timestamp — precisely the
   behaviour it replaces — rather than a failed sync.
 - **Ordering comes free where it matters.** The message enters the same endpoint ring as

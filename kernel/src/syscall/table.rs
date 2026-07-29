@@ -84,6 +84,87 @@ pub const SYS_MEMORY_CREATE: u64 = 4;
 pub const SYS_MEMORY_MAP: u64 = 5;
 /// `sys_memory_unmap` — unmap a region of the caller's address space.
 pub const SYS_MEMORY_UNMAP: u64 = 6;
+/// Print the page-cache fill counters at the end of an adjudicated run.
+///
+/// `test-harness` only — it is called from the verdict path, which is itself gated.
+///
+/// The numbers the read-ahead decision (Slice B2) rests on: how many pages the boot
+/// actually faults in, what a fill costs end to end (park → device round trip → wake →
+/// resume), and whether the concurrent-faulter spin path is ever taken. Averages are
+/// integer-divided; nanoseconds, so a TCG run and a KVM run are directly comparable.
+/// Spawn counters — the other half of the demand-fault measurement (Slice B4a).
+///
+/// `sys_process_spawn` materialises the program image into one contiguous kernel buffer
+/// before loading it: a `MemoryObject` copy for an initramfs program, a per-page fill loop
+/// for a store/fs-backed one. `IMAGE_NS` isolates that materialisation from the rest of
+/// spawn (ELF parse, address-space construction, thread creation), which is what says
+/// whether mapping segments file-backed instead of copying them is worth building.
+pub mod spawn_stats {
+    use core::sync::atomic::{AtomicU64, Ordering};
+
+    pub static SPAWNS: AtomicU64 = AtomicU64::new(0);
+    /// Total nanoseconds in `sys_process_spawn`, entry to return.
+    pub static SPAWN_NS: AtomicU64 = AtomicU64::new(0);
+    /// Of that, nanoseconds spent materialising the image bytes.
+    pub static IMAGE_NS: AtomicU64 = AtomicU64::new(0);
+    /// Total image bytes materialised.
+    pub static IMAGE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+    pub(crate) fn record(spawn_ns: u64, image_ns: u64, image_bytes: u64) {
+        SPAWNS.fetch_add(1, Ordering::Relaxed);
+        SPAWN_NS.fetch_add(spawn_ns, Ordering::Relaxed);
+        IMAGE_NS.fetch_add(image_ns, Ordering::Relaxed);
+        IMAGE_BYTES.fetch_add(image_bytes, Ordering::Relaxed);
+    }
+
+    /// `(spawns, spawn_ns, image_ns, image_bytes)`.
+    pub fn snapshot() -> (u64, u64, u64, u64) {
+        (
+            SPAWNS.load(Ordering::Relaxed),
+            SPAWN_NS.load(Ordering::Relaxed),
+            IMAGE_NS.load(Ordering::Relaxed),
+            IMAGE_BYTES.load(Ordering::Relaxed),
+        )
+    }
+}
+
+#[cfg(feature = "test-harness")]
+fn report_fill_stats() {
+    let s = crate::object::file_object::fill_stats::snapshot();
+    let boot_ns = Timer::read_ns();
+    let avg = if s.fills > 0 { s.fill_ns / s.fills } else { 0 };
+    // Permille rather than percent: a fill total well under 1% of boot still wants a
+    // digit, and the kernel has no float formatting.
+    let permille = if boot_ns > 0 { s.fill_ns * 1000 / boot_ns } else { 0 };
+    crate::kprintln!(
+        "page-cache fills: {} io ({} ns avg, {} ns max, {} ns total = {}/1000 of {} ns boot), \
+         {} holes, {} hits, {} spins",
+        s.fills,
+        avg,
+        s.fill_max_ns,
+        s.fill_ns,
+        permille,
+        boot_ns,
+        s.hole_fills,
+        s.hits,
+        s.spins,
+    );
+    let (spawns, spawn_ns, image_ns, image_bytes) = spawn_stats::snapshot();
+    let spawn_avg = if spawns > 0 { spawn_ns / spawns } else { 0 };
+    let image_share = if spawn_ns > 0 { image_ns * 100 / spawn_ns } else { 0 };
+    crate::kprintln!(
+        "spawns: {} ({} ns avg, {} ns total = {}/1000 of boot); image materialise {} ns \
+         ({}% of spawn) for {} bytes",
+        spawns,
+        spawn_avg,
+        spawn_ns,
+        if boot_ns > 0 { spawn_ns * 1000 / boot_ns } else { 0 },
+        image_ns,
+        image_share,
+        image_bytes,
+    );
+}
+
 /// `sys_clock_read` — read a clock's value (nanoseconds) into user memory.
 pub const SYS_CLOCK_READ: u64 = 7;
 /// `sys_timer_create` — create a `Timer` kernel object, return its handle.
@@ -222,6 +303,10 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         // Diverges (QEMU exits); never returns to dispatch/sysret.
         #[cfg(feature = "test-harness")]
         SYS_TEST_EXIT => {
+            // Every adjudicated run ends here, so it is the one place guaranteed to see
+            // the whole boot's behaviour. Printed rather than exposed through `/proc`
+            // because the consumer is a measurement, not a program.
+            report_fill_stats();
             report_stack_watermark();
             crate::arch::debug_exit(a0 as u32)
         }
@@ -284,6 +369,18 @@ fn spawn_rollback_child_handles(
 /// every child-side allocation and leaves the parent's handles untouched (moves
 /// close the parent's source handle only after the spawn commits).
 pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
+    let spawn_started = Timer::read_ns();
+    let r = sys_process_spawn_inner(args_ptr, spawn_started);
+    // Record even a failed spawn: a spawn that fails after materialising the image has
+    // still paid for it, and hiding those would flatter the average.
+    spawn_stats::SPAWN_NS.fetch_add(
+        Timer::read_ns().saturating_sub(spawn_started),
+        core::sync::atomic::Ordering::Relaxed,
+    );
+    r
+}
+
+fn sys_process_spawn_inner(args_ptr: u64, _spawn_started: u64) -> SysResult {
     let aptr = UserPtr::<SpawnArgs>::new(args_ptr).map_err(from_user_access)?;
     let args = copy_from_user(aptr).map_err(from_user_access)?;
     let count = args.handle_count as usize;
@@ -302,6 +399,7 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
     // The ELF loader needs one contiguous slice; materialize the image's bytes into one.
     // (A `MemoryObject`'s frames are page-fragmented; a `FileObject`'s pages are filled
     // on demand. Deferred: map the frames into a temporary kernel VMA instead of copying.)
+    let image_started = Timer::read_ns();
     let img_bytes = match img.object.object_type() {
         // SAFETY: type checked above; `img.object` pins it live.
         KObjectType::MemoryObject => unsafe { &*(img.object.as_ptr() as *const MemoryObject) }
@@ -314,6 +412,11 @@ pub fn sys_process_spawn(args_ptr: u64) -> SysResult {
         }
         _ => return Err(KError::InvalidArgument),
     };
+    spawn_stats::record(
+        0, // the whole-call duration is added by the wrapper
+        Timer::read_ns().saturating_sub(image_started),
+        img_bytes.len() as u64,
+    );
 
     // Build the child address space from the image. Unlike a trusted kernel-embedded
     // image, a spawner-supplied ELF is untrusted userspace input, so a malformed one is
@@ -1740,7 +1843,9 @@ fn forward_userspace_lookup(
     // Build the request in a heap-bounced message (4 KiB — never on the stack). A grow
     // request (`sys_file_grow`/`sys_file_create`) additionally carries the target size +
     // `RESOLVE_GROW` (+ `RESOLVE_CREATE`) so the server creates/grows before replying its map.
-    let mut msg = match KBox::try_new(StoredMsg::zeroed()) {
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
+    // in place so the 4 KiB message never lands in this frame (see `try_new_zeroed`).
+    let mut msg = match unsafe { KBox::<StoredMsg>::try_new_zeroed() } {
         Ok(m) => m,
         Err(_) => return Some((KError::OutOfMemory as i32, 0)),
     };
@@ -2163,7 +2268,10 @@ pub fn sys_channel_send(
 
     // Bounce the 4096-byte message in from user memory (outside any lock — a
     // user copy may fault). One heap slot per send; optimisation target later.
-    let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed
+    // in place — a stack temporary here would be 4 KiB on every send.
+    let mut bounce =
+        unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     copy_slice_from_user(bounce.as_bytes_mut(), mptr).map_err(from_user_access)?;
     if bounce.header.payload_len as usize > IPC_PAYLOAD_SIZE {
         return Err(KError::InvalidArgument);
@@ -2453,8 +2561,12 @@ fn notify_file_touched(file_obj: &ObjectRef) {
         return; // not a Model A file — nothing to notify
     };
     // Build in a heap-bounced message: a 4 KiB `StoredMsg` has no business on a kernel
-    // stack already measured at 58% (decision log, 2026-07-29).
-    let Ok(mut msg) = KBox::try_new(crate::object::ipc_channel::StoredMsg::zeroed()) else {
+    // stack whose budget is measured, not assumed (decision log, 2026-07-29).
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
+    // place — the by-value form would put 4 KiB in this frame, on a sync path that is
+    // already among the deepest in the kernel.
+    let Ok(mut msg) = (unsafe { KBox::<crate::object::ipc_channel::StoredMsg>::try_new_zeroed() })
+    else {
         return;
     };
     let Some(body_len) = crate::rsproto::build_touch_request(&mut msg.payload, suffix.as_bytes())
@@ -2720,7 +2832,10 @@ pub fn sys_channel_recv(ch: u64, msg: u64, handles: u64, count: u64) -> SysResul
         RecvState::PeerClosed => return Err(KError::PeerClosed),
         RecvState::HasMsg => {}
     }
-    let mut bounce = KBox::try_new(StoredMsg::zeroed()).map_err(|_| KError::OutOfMemory)?;
+    // SAFETY: `StoredMsg` is plain `#[repr(C)]` data; all-zero is a valid value. Zeroed in
+    // place — a stack temporary here would be 4 KiB on every recv.
+    let mut bounce =
+        unsafe { KBox::<StoredMsg>::try_new_zeroed() }.map_err(|_| KError::OutOfMemory)?;
     let mut transfers: [Option<TransferRef>; IPC_HANDLE_MAX] = core::array::from_fn(|_| None);
     // Popping frees a ring slot, so a held blocking sender may be promoted into
     // it; `_promoted_po` is that sender's now-completed `PendingOperation`, and
