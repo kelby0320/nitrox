@@ -49,7 +49,6 @@
 //! syscall context and blocks on the lock normally.
 
 use crate::libkern::IrqSpinLock;
-use crate::libkern::lockrank::LockRank;
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 
 /// Total capacity of the kernel log buffer (bytes). 16 KiB = 4 pages.
@@ -207,17 +206,14 @@ fn format_notice(elided: usize, out: &mut [u8; NOTICE_MAX]) -> usize {
     n
 }
 
-static KLOG: IrqSpinLock<Klog> = IrqSpinLock::new(
-    LockRank::Klog,
-    Klog {
+static KLOG: IrqSpinLock<Klog> = IrqSpinLock::new(Klog {
         prefix: [0; PREFIX_CAP],
         prefix_len: 0,
         ring: [0; RING_CAP],
         head: 0,
         ring_len: 0,
         elided: 0,
-    },
-);
+});
 
 /// Append `bytes` to the kernel log (called from the serial `write_str` tee).
 ///

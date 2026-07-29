@@ -20,7 +20,6 @@ use crate::arch::paging::{ArchPaging, MapError, PageFlags, UnmapError};
 use crate::arch::x86_64::regs;
 use crate::libkern::SpinLock;
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
-use crate::libkern::lockrank::LockRank;
 
 /// Entries per page table at every level. A 4 KiB frame of 8-byte entries.
 const PAGE_TABLE_ENTRIES: usize = 512;
@@ -262,7 +261,7 @@ const KERNEL_PML4_COUNT: usize = PAGE_TABLE_ENTRIES - KERNEL_PML4_BASE;
 /// inert data (they only become live page-table references when
 /// the array is copied into a PML4 frame and that frame is loaded
 /// into `CR3`).
-static KERNEL_TEMPLATE: SpinLock<Option<[u64; KERNEL_PML4_COUNT]>> = SpinLock::new(LockRank::KernelPmlTemplate, None);
+static KERNEL_TEMPLATE: SpinLock<Option<[u64; KERNEL_PML4_COUNT]>> = SpinLock::new(None);
 
 /// Read entries `256..512` from the PML4 at `root` into a fresh array.
 ///

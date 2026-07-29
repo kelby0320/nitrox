@@ -32,7 +32,6 @@ use crate::arch::Paging;
 use crate::arch::paging::{ArchPaging, PageFlags};
 use crate::libkern::{AllocError, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
-use crate::libkern::lockrank::LockRank;
 
 /// Inclusive lower bound of the kernel vmap region per
 /// `docs/architecture/overview.md`.
@@ -44,7 +43,7 @@ pub const KERNEL_VMAP_END: u64 = 0xFFFF_D000_0000_0000;
 /// the next virtual byte to hand out. Acquired briefly per allocation
 /// and never nested with other locks — sits at lock rank 6d alongside
 /// the allocator leaves.
-static VMAP_NEXT: SpinLock<u64> = SpinLock::new(LockRank::KernelVmap, KERNEL_VMAP_START);
+static VMAP_NEXT: SpinLock<u64> = SpinLock::new(KERNEL_VMAP_START);
 
 /// Boot-time setup: pre-allocate kernel-vmap intermediate page tables
 /// in the live PML4 so the kernel template captures their pointers.

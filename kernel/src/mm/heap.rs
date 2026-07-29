@@ -23,10 +23,9 @@ use crate::libkern::SpinLock;
 use crate::limine::MemoryMapResponse;
 use crate::mm::PhysAddr;
 use crate::mm::buddy::BuddyAllocator;
-use crate::libkern::lockrank::LockRank;
 
 /// The single global buddy allocator. `None` until [`init_buddy`].
-static BUDDY: SpinLock<Option<BuddyAllocator>> = SpinLock::new(LockRank::Buddy, None);
+static BUDDY: SpinLock<Option<BuddyAllocator>> = SpinLock::new(None);
 
 /// HHDM offset captured at init time. Read-only after [`init_buddy`].
 ///

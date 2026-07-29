@@ -261,35 +261,6 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 ### Filesystems
 
-**Per-interrupt-context lock-order tracking — `TODO(lockdep-irq-context)`.** The debug
-lock-order tracker (Slice D4) models every lock in one total order on a per-CPU held-rank
-stack. That is sound for thread context, where a holder cannot migrate, but it cannot
-express **"the order restarts in interrupt context"** — and one lock needs exactly that.
-`tlb::LOCK` is held with interrupts *enabled* (the F1 fix: a shootdown initiator spinning
-for acknowledgements must keep taking incoming shootdown IPIs, or two initiators deadlock),
-so interrupt work legitimately runs beneath it with its own full ordering. The tracker said
-so twice while D4 landed — first `Leaf` under `Leaf` (a DPC drain at an interrupt tail
-inside a shootdown window), then `Sched` under it (a timer tick doing the same) — and both
-were correct behaviour, not bugs.
-
-It is therefore the one lock marked `LockRank::IrqEnabledHold`, which is exempt from the
-*ordering* check. It is **not** unchecked, though: its own documented contract — no other
-lock held when it is taken — turns out to be verifiable with exactly the same machinery, so
-that is asserted instead, and it holds on a live boot including SMP shootdowns. What the
-exemption actually costs is coverage of locks taken *underneath* it, in interrupt context —
-which is precisely what the deferred work below would restore. The fix is what Linux's lockdep does: save the held set at
-interrupt entry and restore it at exit, giving handlers a fresh scope, after which this
-lock can be ranked normally and the leaf reasoning stops needing a caveat. Deferred
-because it means hooking *every* interrupt entry and exit (timer, device, TLB-shootdown
-IPI, reschedule IPI), and missing one would silently corrupt the tracker rather than fail
-loudly — so it wants its own change with its own verification, not an append to the one
-that introduced the tracker. **Scheduled to the display + input slice**
-(`docs/planning/phase-4-desktop.md` § Display + input), as its first item and ahead of the
-handlers it protects: that slice adds keyboard, mouse and display interrupt handlers, which
-is the point at which interrupt-context locking stops being three paths one can enumerate.
-Earlier triggers that would pull it forward: a second lock needing to be held with
-interrupts enabled, or a real inversion suspected in interrupt context.
-
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
 (IST1, per-CPU, set up in `gdt.rs`). Every other interrupt — the timer, the TLB-shootdown
 and reschedule IPIs, and every registered device handler — is configured with **IST0, i.e.

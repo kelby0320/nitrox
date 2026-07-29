@@ -27,7 +27,6 @@ use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::{ChaCha20Rng, IrqSpinLock, KVec};
 use crate::object::ObjectRef;
-use crate::libkern::lockrank::LockRank;
 
 /// Pool size in bytes. Sized to one ChaCha key — the pool *is* the CSPRNG key
 /// material once conditioned by the key schedule.
@@ -204,7 +203,7 @@ impl EntropyState {
 }
 
 /// The single global entropy state (a leaf `IrqSpinLock`; see the module docs).
-static ENTROPY: IrqSpinLock<EntropyState> = IrqSpinLock::new(LockRank::Leaf, EntropyState::new());
+static ENTROPY: IrqSpinLock<EntropyState> = IrqSpinLock::new(EntropyState::new());
 
 /// Initialize the entropy subsystem once at boot: draw a hardware burst, mix in
 /// early jitter, key the CSPRNG, and latch `seeded` if the gate was crossed.
@@ -220,16 +219,11 @@ pub fn init() {
 
     let source = crate::arch::Entropy::source();
     let mut hw = 0usize;
-    // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates under the
-    // lock — and do the reserving **outside** it, because allocating (slab, rank 6a) while
-    // holding this leaf-ranked lock is itself the inversion we are trying to avoid. The
-    // debug lock-order tracker rejects it (Slice D4 found this and the identical pattern in
-    // `dpc::init`). Best-effort: a failed reserve just means no waiters can be queued
-    // (they'll be told to retry), which only matters on no-HW-RNG boots.
-    let mut waiters = KVec::new();
-    let _ = waiters.try_reserve(SEED_WAITERS_MAX);
     let mut g = ENTROPY.lock();
-    g.seed_waiters = waiters;
+    // Pre-reserve the seed-waiter list so `register_seed_waiter` never allocates
+    // under the lock. Best-effort: a failed reserve just means no waiters can be
+    // queued (they'll be told to retry), which only matters on no-HW-RNG boots.
+    let _ = g.seed_waiters.try_reserve(SEED_WAITERS_MAX);
     // Hardware burst: each successful draw is absorbed and credited its full width.
     for _ in 0..HW_DRAWS {
         if let Some(v) = crate::arch::Entropy::try_seed_u64() {

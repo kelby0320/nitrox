@@ -20,7 +20,6 @@ use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 use crate::object::{Namespace, ObjectRef};
-use crate::libkern::lockrank::LockRank;
 
 const SECTOR: u64 = 512;
 /// GPT header signature ("EFI PART").
@@ -40,7 +39,7 @@ struct PartEntry {
 
 /// Partitions discovered across all disks, for [`bind_partition_names`]. Written
 /// at boot by [`init`]; read once when init's namespace is built.
-static PARTITIONS: SpinLock<KVec<PartEntry>> = SpinLock::new(LockRank::Registry, KVec::new());
+static PARTITIONS: SpinLock<KVec<PartEntry>> = SpinLock::new(KVec::new());
 
 /// Parse `disk`'s GPT and publish its partitions. No-op (with a log) if the disk
 /// has no valid GPT. Boot-time, interrupts masked (reads are polled).

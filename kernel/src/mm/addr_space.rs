@@ -57,7 +57,6 @@ use crate::libkern::{AllocError, KBox, KVec, SpinLock};
 use crate::mm::vmm::{FaultAccess, MappingKind, Protection, VAddrRange, Vma, VmaTree};
 use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr, heap};
 use crate::object::{MemoryObject, ObjectRef};
-use crate::libkern::lockrank::LockRank;
 
 /// Base of the `hint == 0` ("anywhere") mapping window for
 /// [`AddressSpace::find_free_range`]: above the ELF image (loaded at
@@ -155,7 +154,7 @@ impl AddressSpace {
             Paging::inherit_kernel_mappings(root);
         }
         Ok(AddressSpace {
-            inner: SpinLock::new(LockRank::KernelObject, Inner {
+            inner: SpinLock::new(Inner {
                 vma_tree: VmaTree::new(),
                 root,
             }),

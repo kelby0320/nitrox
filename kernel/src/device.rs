@@ -12,11 +12,10 @@
 use crate::libkern::{KVec, SpinLock};
 use crate::object::ObjectRef;
 use crate::object::device_node::{DeviceClass, DeviceNode};
-use crate::libkern::lockrank::LockRank;
 
 /// The discovered devices. Written once at boot by [`init`]; read thereafter.
 /// Lock rank: a leaf — never held across another lock.
-static DEVICES: SpinLock<KVec<ObjectRef>> = SpinLock::new(LockRank::Registry, KVec::new());
+static DEVICES: SpinLock<KVec<ObjectRef>> = SpinLock::new(KVec::new());
 
 /// Enumerate hardware and populate the device table. Boot-time; call once, after
 /// the allocators, the HHDM, the kvmap, and `arch::Platform::init` are up.

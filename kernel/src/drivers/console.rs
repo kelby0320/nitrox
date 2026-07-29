@@ -36,7 +36,6 @@ use crate::mm::{PAGE_SIZE, heap};
 use crate::object::device_node::{CharBackend, ResourceDescriptor};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
-use crate::libkern::lockrank::LockRank;
 
 /// Capacity of the RX ring — ample for an interactive command line; excess input
 /// (rare) is dropped rather than blocking the ISR.
@@ -87,7 +86,7 @@ impl Inner {
     }
 }
 
-static CONSOLE: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new());
+static CONSOLE: IrqSpinLock<Inner> = IrqSpinLock::new(Inner::new());
 
 /// Completes the parked read after the ISR deposits bytes (queued by the ISR).
 static CONSOLE_DPC: Dpc = Dpc::new(console_intr_dpc, core::ptr::null_mut());

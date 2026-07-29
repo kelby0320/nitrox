@@ -471,19 +471,27 @@ Slice C follows directly; it has actual Milestone 2 blockers.
   limitation: a kernel server owning a *subtree* (`/dev/blk/<n>`) is one binding, so `blk`
   lists as an empty directory — the kernel generates those children on demand and there is
   no way to ask it what it would serve.
-- [x] **D4 — debug-build lock-ordering enforcement** ✅ (2026-07-29). Every lock declares a
-  rank at construction (`SpinLock::new(LockRank::Buddy, …)`); a per-CPU held-rank stack
-  checks each acquire in debug builds and compiles away in release. Making the rank
-  **mandatory** rather than optional is what did the work: it surfaced six live locks that
-  were missing from the rank table entirely, and the armed boot then disagreed with the
-  documented order four times — `dpc::init` and `entropy::init` both allocating under a
-  leaf-ranked lock, `DEVICES`/`PARTITIONS` being mis-ranked as leaves when they push a `KVec`
-  while held (a legal descent to the allocators, just not a leaf), and `tlb::LOCK` being
-  unrankable because it is held with interrupts enabled (the F1
-  fix), so interrupt work legitimately nests beneath it. The last is exempt with its reason
-  written down; the general fix is `TODO(lockdep-irq-context)`. Two bugs in the tracker
-  itself also came out of running it — the per-CPU model is invalid under host `cfg(test)`
-  (many threads, one reported CPU) and the re-entrant report path spun instead of returning.
+- [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
+  violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
+  boot-loop bisection; this turns that class into an immediate, located failure.
+
+  **Attempted and withdrawn (2026-07-29) — read this before trying again.** A working
+  tracker was built and *did* find four real problems (two `init` paths reserving under a
+  leaf-ranked lock, two registries mis-ranked as leaves, and six locks missing from the rank
+  table entirely). It was pulled from the Slice D PR because it panics intermittently, and
+  the reason is structural rather than a bug to patch: **a per-CPU held-rank stack cannot
+  model interrupt context.** Every plain `SpinLock` is held with interrupts *enabled*, so a
+  timer tick or IPI can land on a thread holding, say, `Buddy` or `HandleTable`, and the
+  handler legitimately takes `SCHED` — which reads as a rank inversion. Observed exactly
+  that: `Sched (10) while holding Buddy (62)` and `Sched (10) while holding HandleTable
+  (30)`, roughly 1 boot in 3 under load, clean locally on quiet runs.
+
+  So **`TODO(lockdep-irq-context)` is a prerequisite, not a later refinement** — save the
+  held set at interrupt entry and restore it at exit so handlers get a fresh scope, then the
+  ranking works and `tlb::LOCK` needs no exemption either. Land the two together. The
+  withdrawn work is on `phase-4/hygiene` history (reverted in one commit, so `git revert` of
+  that revert restores it), including an interrupt-window fix for the tracker's own
+  non-atomic per-CPU update, saved separately.
 - [x] **D5 — kernel-stack watermark** ✅ (2026-07-29, landed early alongside C3 because C3's
   sizing argument depended on it). `test-harness` builds paint each stack and sample the
   high-water mark at context-switch-out — O(1) unless a record moves, and it covers blocked
@@ -519,16 +527,6 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 ### Display + input
 
-- [ ] **Per-interrupt-context lock-order tracking — `TODO(lockdep-irq-context)`.** Scheduled
-  here, first, and deliberately *ahead* of the handlers below (decision 2026-07-29). The D4
-  tracker orders locks on a per-CPU held-rank stack, which cannot express "the order restarts
-  in interrupt context" — so `tlb::LOCK`, held with interrupts enabled by the F1 fix, is
-  exempt (its own no-lock-held contract *is* asserted; what is unchecked is anything taken
-  beneath it in interrupt context). That gap is narrow while there are three interrupt
-  handlers the boot exercises end to end. This slice adds real ones — keyboard, mouse, and a
-  display path — which is when interrupt-context locking stops being enumerable by hand.
-  Needs every interrupt entry **and** exit hooked; missing one corrupts the tracker silently
-  rather than failing loudly, so it wants its own negative controls.
 - [ ] Display server over the persisted **boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind; firmware-fixed resolution, one linear framebuffer, no acceleration)
 - [ ] Input routing: keyboard + mouse (PS/2 under QEMU; USB HID later — see below)
 - [ ] Font rasterization (a `no_std`-friendly Rust crate, e.g. `fontdue`/`ab_glyph`) + a text/ANSI render path

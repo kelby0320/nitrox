@@ -24,7 +24,6 @@ use core::fmt;
 
 use crate::arch::x86_64::regs;
 use crate::libkern::IrqSpinLock;
-use crate::libkern::lockrank::LockRank;
 
 /// COM1 base I/O port. Fixed by the PC platform.
 const COM1_BASE: u16 = 0x3F8;
@@ -163,7 +162,7 @@ impl fmt::Write for SerialPort {
 /// The kernel's COM1 serial port behind a spin lock. The `kprint!` /
 /// `kprintln!` macros drive this; the panic and exception handlers use
 /// [`emergency_writer`] instead (see the module docs).
-pub static SERIAL: IrqSpinLock<SerialPort> = IrqSpinLock::new(LockRank::Serial, SerialPort::new(COM1_BASE));
+pub static SERIAL: IrqSpinLock<SerialPort> = IrqSpinLock::new(SerialPort::new(COM1_BASE));
 
 /// Initialise the COM1 UART. Call once, early in boot, before the first
 /// `kprintln!`.

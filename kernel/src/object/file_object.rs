@@ -42,7 +42,6 @@ use crate::libkern::{AllocError, KBox, KString, KVec, SpinLock};
 use crate::mm::{PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::KObjectHeader;
 use crate::object::{ObjectRef, PendingOperation, StoredMsg};
-use crate::libkern::lockrank::LockRank;
 
 /// How a [`FileObject`] **fills** a cache page on a fault — the producer behind the
 /// page cache's fill seam. The real producer is [`FsServer`](Producer::FsServer)
@@ -237,7 +236,7 @@ impl FileObject {
             magic: Self::MAGIC,
             size,
             producer,
-            inner: SpinLock::new(LockRank::KernelObject, Inner { pages: KVec::new() }),
+            inner: SpinLock::new(Inner { pages: KVec::new() }),
         })
     }
 
