@@ -326,18 +326,26 @@ the userspace work, rather than discovering each gap from a coreutil.
 
 #### Slice B — the demand-fault path
 
-The shell is what makes this hurt: a pipeline spawns a process per stage, and each spawn
-currently reads the **whole** ELF into a kernel buffer and copies every `PT_LOAD` into
-fresh anonymous frames. Page fills compound it — one 4 KiB `ReadRange` per fault, each
-re-reading the superblock, re-resolving the path, and re-walking the extent tree.
+**Re-scoped 2026-07-29, before writing code.** The original plan led with an fs-server
+open-file cookie, on the strength of a deferral entry describing each page fill as a
+stateless `File::ReadRange` round trip that re-reads the superblock and re-walks the extent
+tree. **That describes Model B, and every filesystem we ship is Model A**: ext4 replies
+`OBJECT_KIND_FILE_BLOCKS`, the kernel gets the file's `BlockRun` map at resolve, and a fault
+reads the page zero-copy straight from the device with one block IRP — *no fs-server IPC in
+the fill path at all*. B1 as written would have been dead work. (Third time an audit-era
+lesson repeated: verify the deferral against the code before planning from it.)
 
-- [ ] **B1 — fs-server open-file cookie.** Resolve returns a cookie; `ReadRange` carries
-  it. Each fill becomes O(1) instead of a full re-resolve.
-- [ ] **B2 — clustered fill (read-ahead).** One `ReadRange` per N pages: *pages* round
-  trips become *⌈pages/N⌉*. The biggest single lever; B1 makes each remaining one cheaper.
-- [ ] **B3 — block the second faulter.** Store the fill `PendingOperation` in the cache
-  page so a concurrent faulter blocks on it instead of `yield_now`-spinning. Reachable now
-  under SMP; mandatory before `std::thread`.
+- **B1 — fs-server open-file cookie: dropped, re-deferred.** Model B only; no shipping
+  consumer. Trigger restated in `deferred-decisions.md`: a non-block filesystem exists.
+- [ ] **B2 — clustered fill (read-ahead), Model A.** Purely kernel-side: the run map is
+  already in hand, so filling N contiguous pages is one IRP covering N × PAGE bytes (AHCI
+  issues a multi-sector transfer as one command), turning *pages* IRPs and wakes into
+  *⌈pages/N⌉*. **Measure first** — the ~325 ms/page figure in the old entry was Model B
+  before the 4 KiB batching and the IRQ-scheduling fix, so the current cost is unknown and
+  the win should be quantified, not assumed.
+- [ ] **B3 — block the second faulter.** Store the fill `PendingOperation` in the cache page
+  so a concurrent faulter blocks on it instead of `yield_now`-spinning. Reachable under SMP
+  today; ordinary once `std::thread` lands.
 - [ ] **B4a — shared, file-backed read-only text.** Map read-only `PT_LOAD` segments as
   `FileBacked` VMAs against the image `FileObject` instead of copying them; writable
   segments keep the eager copy; the BSS tail uses the existing demand-zero anonymous path.
@@ -348,9 +356,8 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
 - **B4b — copy-on-write data: deliberately not in this pass.** Without `fork`, CoW's only
   consumer is the ELF data segment, and after B4a the sole remaining eager copy is `.data`
   — a few KB for a coreutil, since a Rust static binary is dominated by `.text`/`.rodata`.
-  **Scheduled with the GUI toolkit / desktop-apps milestone** (stepping stones 5–7), where
-  several apps link one toolkit and carry real `.data`/`.bss`, or earlier if a profile
-  shows spawn/RSS bound. It lands with the process-memory-model bundle, not alone.
+  **Scheduled with the GUI toolkit / desktop-apps milestone** (stepping stones 5–7),
+  alongside dynamic linking and the rest of the process-memory-model bundle.
 
 #### Slice C — fs/ext4 completeness for Milestone 2
 
