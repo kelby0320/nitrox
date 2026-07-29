@@ -352,7 +352,7 @@ re-reading the superblock, re-resolving the path, and re-walking the extent tree
   several apps link one toolkit and carry real `.data`/`.bss`, or earlier if a profile
   shows spawn/RSS bound. It lands with the process-memory-model bundle, not alone.
 
-#### Slice C — fs/ext4 completeness for Milestone 2
+#### Slice C — fs/ext4 completeness for Milestone 2 *(branch `phase-4/fs-completeness`)*
 
 - [x] **C1 — grow a full directory** ✅ (2026-07-29). A directory whose blocks are all full
   now gains another: `dir_insert` appends a block, formats it as one free record spanning

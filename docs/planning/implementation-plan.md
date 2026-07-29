@@ -82,10 +82,10 @@ Things that need ongoing attention across all phases, not phase-specific:
 
 ### Testing
 
-- [ ] Host-side unit tests for everything that doesn't require the kernel runtime (allocators, parsers, data structures, ABI encoding)
-- [ ] QEMU integration tests via `isa-debug-exit` for everything that does
-- [ ] CI runs both on every push
-- [ ] Add a test for any non-trivial bug fix
+- [x] Host-side unit tests for everything that doesn't require the kernel runtime (allocators, parsers, data structures, ABI encoding) — 784 and growing, via `cargo xtask test`
+- [x] QEMU integration tests via `isa-debug-exit` for everything that does — `cargo xtask test-qemu` adjudicates the whole boot (`docs/conventions/qemu-integration-tests.md`)
+- [x] CI runs both on every push (2026-07-24, PR #120) — a second job builds the image and runs `test-qemu` under `--kvm`, since the kernel is x2APIC-only and the runner's QEMU predates TCG x2APIC support
+- [x] Add a test for any non-trivial bug fix — established practice; each fix lands with the test that fails without it, and the boot-loop campaigns cover what unit tests structurally cannot
 
 ### Documentation
 
