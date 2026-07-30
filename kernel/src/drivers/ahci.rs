@@ -28,6 +28,7 @@ use crate::object::device_node::{
     BarWindow, BlockGeometry, DeviceIdentity, DeviceNode, InterruptSpec, ResourceDescriptor,
 };
 use crate::object::{InterruptObject, ObjectRef};
+use crate::libkern::lockrank::LockRank;
 
 // --- HBA / port register offsets (AHCI 1.3) ---------------------------------
 
@@ -274,7 +275,7 @@ pub fn init(controller: &ObjectRef) -> bool {
         cmd_table,
         sectors: 0,
         inflight: AtomicPtr::new(core::ptr::null_mut()),
-        pending: IrqSpinLock::new(PendingRing::new()),
+        pending: IrqSpinLock::new(LockRank::Leaf, PendingRing::new()),
         intr: intr_ptr,
     };
     let disk = match KBox::try_new(disk) {

@@ -21,6 +21,7 @@ use super::type_rights::is_rights_compatible;
 use super::{
     DIRECTORY_LEN, SEGMENT_LEN, current_ctx_id, release_refcount, try_acquire_refcount,
 };
+use crate::libkern::lockrank::LockRank;
 
 /// Number of deferred-close entries the per-table ring can hold
 /// between drain calls. Each entry is 16 bytes (handle + epoch) so
@@ -272,7 +273,7 @@ impl HandleTable {
             directory: [const { AtomicPtr::new(ptr::null_mut()) }; DIRECTORY_LEN],
             next_segment_hint: AtomicU32::new(0),
             grace: GraceTracker::new(),
-            inner: SpinLock::new(Inner {
+            inner: SpinLock::new(LockRank::HandleTable, Inner {
                 segment_meta: [SegmentMeta::empty(); DIRECTORY_LEN],
                 segments_count: 0,
                 defer_ring,

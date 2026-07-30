@@ -151,6 +151,33 @@ const _: () = assert!(core::mem::offset_of!(ExceptionFrame, vector) == 15 * 8);
 const _: () = assert!(core::mem::offset_of!(ExceptionFrame, error_code) == 16 * 8);
 const _: () = assert!(core::mem::offset_of!(ExceptionFrame, rip) == 17 * 8);
 
+/// Define an interrupt/exception **dispatcher** — the `extern "C"` function a naked entry
+/// stub `call`s.
+///
+/// Every dispatcher must open a lock-ordering scope on entry, because the acquisition order
+/// restarts at an interrupt boundary: a handler that takes `SCHED` while it has interrupted
+/// a thread holding an allocator lock is correct, and reads as an inversion to a flat
+/// tracker. See `crate::libkern::lockrank` § Interrupt scopes.
+///
+/// Missing one would not fail loudly — that vector would just start reporting phantom
+/// inversions — so the scope is not left to the author of the next dispatcher. This macro
+/// is the only way to define one, and `cargo xtask check-irq-scope` fails the build if a
+/// naked stub's `dispatch = sym …` names a function this macro did not generate.
+///
+/// The guard is skipped on the diverging paths out of a dispatcher (`dump_and_halt`, a
+/// `Terminate` disposition exiting the thread). That is sound because both are reachable
+/// only from a context holding nothing — a ring-3 fault, or a kernel fault that is halting
+/// the machine — so the scope it would restore is the empty one.
+macro_rules! irq_dispatcher {
+    ($(#[$attr:meta])* fn $name:ident($frame:ident: *mut ExceptionFrame) $body:block) => {
+        $(#[$attr])*
+        extern "C" fn $name($frame: *mut ExceptionFrame) {
+            let _lock_scope = crate::libkern::lockrank::enter_interrupt();
+            $body
+        }
+    };
+}
+
 /// Define a naked exception-entry stub.
 ///
 /// The `noerr` form pushes a dummy `0` error code first; the `err` form
@@ -278,6 +305,7 @@ extern "C" fn vec14() {
     );
 }
 
+irq_dispatcher! {
 /// `#PF` dispatcher. Looks up the faulting RIP in the user-access
 /// exception table; on a match, patches `frame.rip` to the recovery PC
 /// and returns so the stub can `iretq` to it. On a miss, calls
@@ -290,7 +318,7 @@ extern "C" fn vec14() {
 ///
 /// Reached only from [`vec14`] via `call`; `extern "C"` matches the
 /// stub's `mov rdi, rsp` argument pass.
-extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
+fn pf_dispatch(frame: *mut ExceptionFrame) {
     // SAFETY: the naked stub built a complete `ExceptionFrame` at the
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
@@ -324,6 +352,7 @@ extern "C" fn pf_dispatch(frame: *mut ExceptionFrame) {
     }
 
     dump_and_halt(f);
+}
 }
 
 /// Try to demand-fault the page at `cr2` into the running process's address
@@ -431,6 +460,7 @@ extern "C" fn spurious_stub() {
     ::core::arch::naked_asm!("iretq");
 }
 
+irq_dispatcher! {
 /// Timer IRQ dispatcher. Signals end-of-interrupt **first** — the handler may
 /// switch away via [`crate::sched::on_timer_tick`] and not return to this frame
 /// for a long time, so EOI-ing late would block all further timer delivery —
@@ -441,7 +471,7 @@ extern "C" fn spurious_stub() {
 ///
 /// `*mut ExceptionFrame` matches the stub's `mov rdi, rsp`; the frame is read
 /// only for future use (frame patching) and is otherwise unused today.
-extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
+fn timer_dispatch(_frame: *mut ExceptionFrame) {
     // Sample interrupt-timing jitter into the entropy pool (the fine low bits of
     // the cycle counter at IRQ-arrival time). Cheap and lock-bounded; see
     // `crate::entropy`. Sampled first, before the EOI/DPC/tick work perturbs it.
@@ -453,6 +483,7 @@ extern "C" fn timer_dispatch(_frame: *mut ExceptionFrame) {
     // DPC woke are already in `ready` when `on_timer_tick` picks the next one.
     crate::dpc::run_pending();
     crate::sched::on_timer_tick();
+}
 }
 
 // --- TLB-shootdown IPI stub (vector 0x40) -------------------------------
@@ -488,13 +519,15 @@ extern "C" fn tlb_shootdown_stub() {
     );
 }
 
+irq_dispatcher! {
 /// TLB-shootdown IPI dispatcher: invalidate + acknowledge (in [`crate::tlb`]),
 /// then EOI. The frame is unused. Never reschedules or blocks.
-extern "C" fn tlb_shootdown_dispatch(_frame: *mut ExceptionFrame) {
+fn tlb_shootdown_dispatch(_frame: *mut ExceptionFrame) {
     crate::tlb::on_ipi();
     // SAFETY: ring-0 IPI context; a single write acknowledges the local APIC.
     // `Irq::init` has run on this CPU (IPIs arrive only after bring-up).
     unsafe { crate::arch::Irq::eoi() };
+}
 }
 
 // --- Reschedule IPI stub (vector 0x41) ----------------------------------
@@ -531,13 +564,15 @@ extern "C" fn reschedule_ipi_stub() {
     );
 }
 
+irq_dispatcher! {
 /// Reschedule IPI dispatcher: EOI **first** (the tick may switch away via
 /// [`crate::sched::on_reschedule_ipi`] and not return here promptly, so a late
 /// EOI would stall further IPIs), then drive the scheduler. The frame is unused.
-extern "C" fn reschedule_ipi_dispatch(_frame: *mut ExceptionFrame) {
+fn reschedule_ipi_dispatch(_frame: *mut ExceptionFrame) {
     // SAFETY: ring-0 IPI context; a single write acknowledges the local APIC.
     unsafe { crate::arch::Irq::eoi() };
     crate::sched::on_reschedule_ipi();
+}
 }
 
 // --- Device-IRQ vectors (external interrupts routed by the IOAPIC) ----------
@@ -562,11 +597,12 @@ static DEVICE_HANDLERS: [AtomicUsize; DEVICE_IRQ_COUNT] =
 /// Next free device-vector slot, handed out by [`register_device_handler`].
 static NEXT_DEVICE_SLOT: AtomicUsize = AtomicUsize::new(0);
 
+irq_dispatcher! {
 /// Shared dispatcher for every device-IRQ vector. Runs the registered handler,
 /// then signals end-of-interrupt to the local controller. Edge-triggered only
 /// for now (the PIT bring-up source and the level-triggered IOAPIC-EOI path
 /// land with the first level-triggered device).
-extern "C" fn device_irq_dispatch(frame: *mut ExceptionFrame) {
+fn device_irq_dispatch(frame: *mut ExceptionFrame) {
     // Sample interrupt-timing jitter into the entropy pool (see `timer_dispatch`).
     crate::entropy::on_irq_sample(regs::rdtsc());
     // SAFETY: `frame` is the stub-built `ExceptionFrame` in RDI; `vector` is the
@@ -599,6 +635,7 @@ extern "C" fn device_irq_dispatch(frame: *mut ExceptionFrame) {
     // frame-parking stub, so a delayed return resumes into its epilogue and `iretq`s,
     // exactly like the timer/resched stubs.
     crate::sched::resched_if_idle();
+}
 }
 
 /// Register `handler` for the next free device-IRQ vector and return that
@@ -698,6 +735,7 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
+irq_dispatcher! {
 /// Common handler for every CPU exception except `#PF`. A **ring-3** fault
 /// suspends the faulting thread (delivering a [`Notification`] to its process)
 /// and acts on the supervisor's disposition via [`user_fault`] — returning here
@@ -708,7 +746,7 @@ fn vector_name(vector: u64) -> &'static str {
 /// `*mut ExceptionFrame` (not `*const`): the `Resume` path leaves the frame in
 /// place for the stub to `iretq`, and matches [`pf_dispatch`]. Reached only from
 /// a naked stub via `call`; `extern "C"` matches the stub's `mov rdi, rsp`.
-extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
+fn exception_dispatch(frame: *mut ExceptionFrame) {
     // SAFETY: the naked stub built a complete `ExceptionFrame` at the
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
@@ -720,6 +758,7 @@ extern "C" fn exception_dispatch(frame: *mut ExceptionFrame) {
     }
     // Ring-0 (kernel) fault: unrecoverable — dump and halt.
     dump_and_halt(f);
+}
 }
 
 /// Shared ring-3 fault handler for every exception vector: suspend the faulting

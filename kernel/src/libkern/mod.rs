@@ -24,6 +24,7 @@ pub mod io_op;
 pub mod io_result;
 pub mod ipc;
 pub mod kbox;
+pub mod lockrank;
 pub mod kstring;
 pub mod kvec;
 pub mod memory;

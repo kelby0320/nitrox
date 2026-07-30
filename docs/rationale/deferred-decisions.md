@@ -636,6 +636,7 @@ decision log entry for the date shown.
 | `cargo xtask test` subcommand | Phase 1 | Exists and runs the whole host suite. |
 | fs-server block I/O in 4 KiB blocks | 2026-07-23 | `DiskReader`'s transfer unit is the 4 KiB block — ~8× fewer device round trips. |
 | Image assembly + QEMU smoke in CI | 2026-07-24 | A second CI job runs `xtask test-qemu` (which builds the image), with OVMF/gdisk/mtools/e2fsprogs installed. It had been deferred "until there is meaningful regression surface"; every Milestone 1 regression was caught by this gate and none would have failed the other jobs. |
+| Per-interrupt-context lock-order tracking | 2026-07-29 | `lockrank::enter_interrupt` gives every interrupt handler a fresh view of the held-rank stack, so the order restarts at an interrupt boundary as it actually does. This was a *prerequisite* for the tracker, not a refinement — flat ranking panicked about one boot in three. `tlb::LOCK` is now ranked normally and needs no exemption; `cargo xtask check-irq-scope` keeps every entry stub scoped. |
 | `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
 
 ## How to use this document
