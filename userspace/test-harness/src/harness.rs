@@ -2312,8 +2312,31 @@ fn session_fanout_demo(root_ns: u64) {
         unsafe { syscall1(SYS_HANDLE_CLOSE, *h) };
     }
     // The server reclaims a slot when it observes `PeerClosed` on that endpoint, which it
-    // does on its next wait — so a fresh open has to work again.
-    let (st, h) = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+    // does on its **next wait** — so reclamation is eventual, not synchronous, and closing
+    // then immediately re-opening races the server. This check used to assert the eventual
+    // property on the first attempt and lost that race roughly one boot in twenty under
+    // host load, reporting a reclamation failure that had not happened. (The two-pass serve
+    // loop orders reclaims ahead of new opens *within one wait batch*; it cannot help when
+    // the close notifications and the open land in different batches.)
+    //
+    // Retry on `WouldBlock`, sleeping between attempts so the server is actually scheduled
+    // rather than spun against. This costs nothing on the happy path — the first attempt
+    // normally succeeds and never sleeps — and a genuinely broken reclamation still fails,
+    // just after the full budget instead of immediately.
+    let (mut st, mut h) = (KERR_WOULD_BLOCK, 0u64);
+    for attempt in 0..RECLAIM_ATTEMPTS {
+        let r = ns_lookup_wait(root_ns, b"/system", DIR_SESSION_RIGHTS);
+        st = r.0;
+        h = r.1;
+        // Any other status is a real answer (success or a genuine error) — stop and judge
+        // it below rather than burning the budget.
+        if st != KERR_WOULD_BLOCK {
+            break;
+        }
+        if attempt + 1 < RECLAIM_ATTEMPTS {
+            timer_sleep_ms(RECLAIM_POLL_MS);
+        }
+    }
     if st != 0 || h == 0 {
         return_fail(b"test-harness: session slots were not reclaimed on close\n");
     }
@@ -2325,6 +2348,15 @@ fn session_fanout_demo(root_ns: u64) {
 
 /// `KError::WouldBlock`, the status a full session table reports.
 const KERR_WOULD_BLOCK: i32 = -11;
+
+/// Budget for the server to reclaim closed session slots: attempts, and the pause
+/// between them. ~2 s in total — orders of magnitude more than the server needs (it
+/// reclaims on its very next wait), while still failing in bounded time if reclamation
+/// is genuinely broken rather than merely not-yet-happened.
+const RECLAIM_ATTEMPTS: u32 = 40;
+/// Pause between reclamation retries. Long enough that the fs-server is scheduled and
+/// drains its close notifications, rather than the harness spinning against it.
+const RECLAIM_POLL_MS: u64 = 50;
 
 /// **`rename` — re-pointing a name instead of copying it** (Slice C2).
 ///
