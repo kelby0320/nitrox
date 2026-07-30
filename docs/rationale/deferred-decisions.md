@@ -397,6 +397,35 @@ place without changing its length.
 
 ### Userspace
 
+**Where a Tier-0 program's output goes — `TODO(tier0-output-sink)`.** A coreutil spawned without a
+shell has no `stdout` (stream handles arrive in the setup message, which the shell sends), so it
+currently falls back to plain text via `kprint` — i.e. into the **kernel log**. That is fine as
+debugging scaffolding and wrong as a design: `kprint` is a kernel *diagnostic* facility, the klog
+is a bounded ring (8 KiB boot prefix + 8 KiB recent, Slice D1), and program output written there
+**evicts kernel diagnostics**. It is also a layering inversion — a userspace program's normal
+output should not travel through a kernel debug path.
+
+Two candidate shapes, and the choice is about whose job it is to supply a sink:
+
+1. **The program falls back to `/dev/console`** instead of `kprint`, opening it through its own
+   namespace. Minimal change, keeps "no stdout" as a state programs handle, and the machinery
+   already exists — the console is a kernel server bound at `/dev/console` in the root namespace,
+   and session-mgr already re-binds it into session namespaces.
+2. **The spawner always supplies streams**, so Tier 0 stops meaning "no streams" and starts meaning
+   "streams the spawner chose". Init would construct a minimal setup message with `stdout` bound to
+   a console handle (or explicitly to nothing, meaning *discard*). This removes the fallback path
+   entirely rather than redirecting it, leaving one output path instead of two — at the cost of
+   giving every spawner that job.
+
+Option 2 is the cleaner architecture and the larger change; option 1 is a strictly better placeholder
+than the status quo. Note that whichever is chosen, "discard" must stay expressible: a program whose
+output nobody wants should not be forced to write to a console.
+
+Trigger: raised 2026-07-30 while planning coreutils Milestone 2 — acceptable while init and the test
+harness are the only spawners, but it should not survive the shell (Milestone 3), which is the point
+at which Tier 0 stops being the common case and the current behaviour would start filling the klog
+during ordinary use.
+
 **Shell grammar specification.** The shell's data model is committed (typed structured streams, port-based wiring, the display verb, model-view decomposition). The exact syntax is deferred to shell implementation. Trigger: when shell implementation begins.
 
 **`std` port for Nitrox target (now a Phase 4 target, 2026-07-20).** Reframed from "deferred

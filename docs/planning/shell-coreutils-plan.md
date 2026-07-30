@@ -216,6 +216,13 @@ Two things hold for every part, and are not repeated in each:
   log via `kprint` instead of a TSM1 table. Plain text rather than the same bytes elsewhere,
   because the reader in that position is a person on the serial console, not a decoder.
 
+  **The kernel log is the wrong destination long-term, and this is scaffolding**
+  (`TODO(tier0-output-sink)`, `deferred-decisions.md`). `kprint` is a kernel *diagnostic* path
+  and the klog is a bounded ring, so program output evicts kernel diagnostics. It is acceptable
+  while init and the test harness are the only spawners; it should not survive the shell. New
+  utilities should follow `list`'s existing shape for now rather than inventing a second answer
+  — one fallback to change later is better than eight.
+
   `PeerClosed` on the output side is a **clean** exit, not an error.
 - **Flags follow the declarative `coreutils::args` conventions** (GNU §10f, no bare `-`), and the
   mutating verbs take `--force` with the same meaning `copy` gave it.
