@@ -8,6 +8,7 @@
 //!   test            host-side unit tests (kernel lib + tools workspace)
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
 //!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
+//!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
@@ -114,6 +115,7 @@ fn main() -> ExitCode {
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
+        Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
@@ -149,6 +151,7 @@ fn print_help() {
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry\n  \
+           check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
            abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
@@ -1130,6 +1133,162 @@ fn cmd_check_deferrals() -> R<()> {
             "every `TODO(tag)` must have a matching entry in \
              docs/rationale/deferred-decisions.md — a deferral only exists if it is in the \
              canonical list (see that document's closing section):\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        Err(msg.into())
+    }
+}
+
+/// `cargo xtask check-irq-scope` — every interrupt entry opens a lock-ordering scope.
+///
+/// The kernel's lock-rank tracker (`kernel/src/libkern/lockrank.rs`) models interrupt
+/// context by having each handler start from an empty view of the held-rank stack, because
+/// the acquisition order genuinely restarts at an interrupt boundary — a tick that lands on
+/// a thread holding an allocator lock and takes `SCHED` is correct, and reads as an
+/// inversion otherwise. That is not a refinement: it is what makes the tracker sound, and
+/// getting it wrong is what got the first attempt withdrawn (decision log 2026-07-29).
+///
+/// A dispatcher that forgets the scope does not fail loudly. It just starts reporting
+/// phantom inversions from its own vector, days later, in whoever's boot log. So the scope
+/// is not left to the author of the next dispatcher:
+///
+/// 1. every `dispatch = sym NAME` in a naked entry stub must name a function defined by the
+///    `irq_dispatcher!` macro, which opens the scope itself; and
+/// 2. that macro must in fact still call `enter_interrupt` — otherwise rule 1 checks that
+///    everyone went through a door that no longer leads anywhere.
+///
+/// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it
+/// exists rather than the day someone remembers this check.
+fn cmd_check_irq_scope() -> R<()> {
+    let arch_dir = repo_root().join("kernel").join("src").join("arch");
+    // Dispatchers named by a naked stub, as (file:line, name).
+    let mut called: Vec<(String, String)> = Vec::new();
+    // Dispatchers the macro generated.
+    let mut generated: Vec<String> = Vec::new();
+    // Dispatchers that are not interrupts and take the ring-3 entry discipline instead
+    // (see `assert_user_entry_safe`): the order begins there rather than restarting.
+    let mut user_entry: Vec<String> = Vec::new();
+    // Files that define the macro, and whether the definition still opens a scope.
+    let mut macro_defs: Vec<(String, bool)> = Vec::new();
+
+    visit_rs_files(&arch_dir, &mut |path| {
+        let text = fs::read_to_string(path)?;
+        let lines: Vec<&str> = text.lines().collect();
+        // `irq_dispatcher! {` … `fn NAME(` — the docs sit between the two.
+        let mut pending_macro_body = false;
+        for (i, line) in lines.iter().enumerate() {
+            let trimmed = line.trim();
+
+            if let Some(rest) = line.split("dispatch = sym").nth(1) {
+                let name: String = rest
+                    .trim()
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                if !name.is_empty() {
+                    called.push((format!("{}:{}", path.display(), i + 1), name));
+                }
+            }
+
+            if trimmed.starts_with("irq_dispatcher!") {
+                pending_macro_body = true;
+            } else if pending_macro_body && trimmed.starts_with("fn ") {
+                let name: String = trimmed[3..]
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                generated.push(name);
+                pending_macro_body = false;
+            }
+
+            // A plain `fn NAME(` whose body asserts the ring-3 entry invariant. Scanned to
+            // the next column-0 `}`, which ends a top-level function.
+            if let Some(after) = trimmed.strip_prefix("fn ").or_else(|| {
+                trimmed
+                    .strip_prefix("unsafe extern \"C\" fn ")
+                    .or_else(|| trimmed.strip_prefix("extern \"C\" fn "))
+            }) {
+                let name: String = after
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
+                    .collect();
+                let body_end = lines[i..]
+                    .iter()
+                    .position(|l| *l == "}")
+                    .map(|o| i + o)
+                    .unwrap_or(lines.len());
+                if lines[i..body_end]
+                    .iter()
+                    .any(|l| l.contains("assert_user_entry_safe"))
+                {
+                    user_entry.push(name);
+                }
+            }
+
+            if trimmed.starts_with("macro_rules! irq_dispatcher") {
+                // The expansion is short; the scope call is within a few lines.
+                let end = (i + 12).min(lines.len());
+                let opens = lines[i..end].iter().any(|l| l.contains("enter_interrupt"));
+                macro_defs.push((format!("{}:{}", path.display(), i + 1), opens));
+            }
+        }
+        Ok(())
+    })?;
+
+    let mut violations: Vec<String> = Vec::new();
+
+    // A check that silently finds nothing to check is worse than no check — it reads as a
+    // pass. (The `abi-sync-check` guard, for the same reason.)
+    if called.is_empty() {
+        violations.push(
+            "found no `dispatch = sym …` entry stubs under kernel/src/arch — either the \
+             entry path was restructured (update this check) or the scan is broken"
+                .to_string(),
+        );
+    }
+    if macro_defs.is_empty() {
+        violations.push(
+            "found no `macro_rules! irq_dispatcher` definition — the macro every dispatcher \
+             is required to go through does not exist"
+                .to_string(),
+        );
+    }
+    for (site, opens) in &macro_defs {
+        if !opens {
+            violations.push(format!(
+                "{site}: `irq_dispatcher!` no longer calls `enter_interrupt` — dispatchers \
+                 go through it precisely so they get a lock-ordering scope"
+            ));
+        }
+    }
+    for (site, name) in &called {
+        if !generated.iter().any(|g| g == name) && !user_entry.iter().any(|u| u == name) {
+            violations.push(format!(
+                "{site}: entry stub dispatches to `{name}`, which is neither defined by \
+                 `irq_dispatcher!` nor asserts `assert_user_entry_safe()` — it would run \
+                 without a lock-ordering scope"
+            ));
+        }
+    }
+
+    if violations.is_empty() {
+        println!(
+            "check-irq-scope: {} entry stub(s) → {} scoped dispatcher(s) + {} ring-3 \
+             entry point(s) ✓",
+            called.len(),
+            generated.len(),
+            user_entry.len()
+        );
+        Ok(())
+    } else {
+        let mut msg = String::from(
+            "every interrupt entry must open a lock-ordering scope — define the dispatcher \
+             with the `irq_dispatcher!` macro (see kernel/src/libkern/lockrank.rs \
+             § Interrupt scopes):\n",
         );
         for v in &violations {
             msg.push_str("  ");

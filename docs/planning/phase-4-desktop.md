@@ -471,27 +471,29 @@ Slice C follows directly; it has actual Milestone 2 blockers.
   limitation: a kernel server owning a *subtree* (`/dev/blk/<n>`) is one binding, so `blk`
   lists as an empty directory — the kernel generates those children on demand and there is
   no way to ask it what it would serve.
-- [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
-  violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
-  boot-loop bisection; this turns that class into an immediate, located failure.
+- [x] **D4 — debug-build lock-ordering enforcement** ✅ (2026-07-29). Every lock declares a
+  rank at construction (`SpinLock::new(LockRank::Buddy, …)`); a per-CPU held-rank stack
+  checks each acquire in debug builds and compiles away in release. Making the rank
+  **mandatory** rather than optional is what did the work: it surfaced six live locks that
+  were missing from the rank table entirely, and the armed boot then disagreed with the
+  documented order four times — `dpc::init` and `entropy::init` both allocating under a
+  leaf-ranked lock, `DEVICES`/`PARTITIONS` being mis-ranked as leaves when they push a `KVec`
+  while held (a legal descent to the allocators, just not a leaf), and `tlb::LOCK` being
+  held with interrupts enabled (the F1 fix), so interrupt work legitimately nests beneath
+  it. Two bugs in the tracker itself also came out of running it — the per-CPU model is
+  invalid under host `cfg(test)` (many threads, one reported CPU) and the re-entrant report
+  path spun instead of returning.
 
-  **Attempted and withdrawn (2026-07-29) — read this before trying again.** A working
-  tracker was built and *did* find four real problems (two `init` paths reserving under a
-  leaf-ranked lock, two registries mis-ranked as leaves, and six locks missing from the rank
-  table entirely). It was pulled from the Slice D PR because it panics intermittently, and
-  the reason is structural rather than a bug to patch: **a per-CPU held-rank stack cannot
-  model interrupt context.** Every plain `SpinLock` is held with interrupts *enabled*, so a
-  timer tick or IPI can land on a thread holding, say, `Buddy` or `HandleTable`, and the
-  handler legitimately takes `SCHED` — which reads as a rank inversion. Observed exactly
-  that: `Sched (10) while holding Buddy (62)` and `Sched (10) while holding HandleTable
-  (30)`, roughly 1 boot in 3 under load, clean locally on quiet runs.
-
-  So **`TODO(lockdep-irq-context)` is a prerequisite, not a later refinement** — save the
-  held set at interrupt entry and restore it at exit so handlers get a fresh scope, then the
-  ranking works and `tlb::LOCK` needs no exemption either. Land the two together. The
-  withdrawn work is on `phase-4/hygiene` history (reverted in one commit, so `git revert` of
-  that revert restores it), including an interrupt-window fix for the tracker's own
-  non-atomic per-CPU update, saved separately.
+  **Withdrawn once, then re-landed with interrupt scoping (2026-07-29).** The first version
+  was pulled from the Slice D PR: it panicked about one boot in three under load, and the
+  cause was structural rather than a bug to patch. A flat per-CPU held-rank stack cannot
+  model interrupt context — every plain `SpinLock` is held with interrupts *enabled*, so a
+  tick or IPI lands on a thread holding `Buddy` or `HandleTable` and the handler
+  legitimately takes `SCHED`, the top rank. The mis-scoping was mine: I had treated "the
+  order restarts in interrupt context" as a quirk of `tlb::LOCK`, the one lock documented as
+  held with IF=1, when it is a property of *every* plain lock — `tlb::LOCK` was just the
+  instance that fired deterministically. The fix (`enter_interrupt`, below) was therefore a
+  prerequisite for the tracker being sound at all, and the two landed together.
 - [x] **D5 — kernel-stack watermark** ✅ (2026-07-29, landed early alongside C3 because C3's
   sizing argument depended on it). `test-harness` builds paint each stack and sample the
   high-water mark at context-switch-out — O(1) unless a record moves, and it covers blocked
@@ -527,6 +529,23 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 ### Display + input
 
+- [x] **Per-interrupt-context lock-order tracking** ✅ (2026-07-29). Was scheduled here,
+  ahead of the handlers it protects; pulled forward instead, because it turned out to be a
+  prerequisite for the D4 tracker rather than a refinement of it — flat ranking panicked
+  about one boot in three and D4 had to be withdrawn until this existed. Each CPU now keeps
+  a **floor** alongside its held-rank stack: `enter_interrupt` raises it to the current
+  depth at every interrupt entry and its guard lowers it at the return, so a handler is
+  checked in full against its own acquisitions and not at all against the context it
+  interrupted. `tlb::LOCK` is an ordinary rank again (its stricter no-lock-held contract is
+  still asserted separately). The "missing one entry silently corrupts the tracker" worry is
+  answered structurally rather than by care: dispatchers are defined by an
+  `irq_dispatcher!` macro that opens the scope itself, and `cargo xtask check-irq-scope`
+  fails the build if an entry stub dispatches to anything else — it found the one entry I
+  had missed (the `syscall` stub, which wants the *stronger* empty-set assertion, since the
+  order begins at a ring-3 entry rather than restarting). Verified: 9 host tests over the
+  scope arithmetic, 15/15 boots under 8-way host load, and three negative controls — an
+  injected inversion panics with both lock names, an un-scoped dispatcher fails the check,
+  and disabling *only* the floor-raising reproduces the withdrawn failure 6/6.
 - [ ] Display server over the persisted **boot framebuffer** Limine hands us (GOP-style, no modesetting — GPUs are too opaque to modeset blind; firmware-fixed resolution, one linear framebuffer, no acceleration)
 - [ ] Input routing: keyboard + mouse (PS/2 under QEMU; USB HID later — see below)
 - [ ] Font rasterization (a `no_std`-friendly Rust crate, e.g. `fontdue`/`ab_glyph`) + a text/ANSI render path

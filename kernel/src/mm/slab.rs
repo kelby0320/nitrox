@@ -54,6 +54,7 @@ use crate::libkern::SpinLock;
 use crate::mm::buddy::BuddyAllocator;
 use crate::mm::heap::{BuddyPager, HeapBuddy};
 use crate::mm::{PAGE_SIZE, PhysAddr};
+use crate::libkern::lockrank::LockRank;
 
 /// Bytes per slab. Matches `PAGE_SIZE` — every slab is exactly one buddy
 /// order-0 block.
@@ -140,7 +141,7 @@ impl SlabCache {
     /// called before [`SlabCache::alloc`] or [`SlabCache::free`].
     pub const fn new() -> Self {
         Self {
-            state: SpinLock::new(SlabCacheState {
+            state: SpinLock::new(LockRank::SlabCache, SlabCacheState {
                 partial: ptr::null_mut(),
                 full: ptr::null_mut(),
                 obj_size: 0,

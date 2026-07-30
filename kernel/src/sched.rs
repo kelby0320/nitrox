@@ -65,6 +65,7 @@ use crate::object::{
     Thread, ThreadEntry, ThreadState, Timer, TransferRef, UserspaceServerReg,
 };
 use crate::object::userspace_server::{PendingFill, PendingLookup, US_PENDING_MAX};
+use crate::libkern::lockrank::LockRank;
 
 // `Timer` above is the kernel object (`crate::object::Timer`); the hardware
 // monotonic clock is reached via the full path `crate::arch::Timer::read_ns()`
@@ -588,7 +589,7 @@ struct SchedState {
     deferred_drops: KVec<ObjectRef>,
 }
 
-static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(SchedState {
+static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(LockRank::Sched, SchedState {
     ready: [const { KVec::new() }; MAX_CPUS],
     cpu_online: [false; MAX_CPUS],
     current: [const { None }; MAX_CPUS],
@@ -2067,6 +2068,13 @@ unsafe fn switch_into(
     // Drop the lock but keep interrupts masked across the switch. `saved_if`
     // is this thread's prior interrupt state, restored when it next resumes.
     let saved_if = g.release_keeping_irqs_masked();
+    // Every context switch in the kernel passes through here, which makes this the one
+    // place that can check the lock tracker's per-CPU model still holds: a thread may only
+    // be switched away with nothing held and no interrupt scope open. That is already true
+    // by construction (a plain-lock holder has preemption disabled, an `IrqSpinLock` holder
+    // has interrupts masked, and blocking with a lock held is forbidden) — this is what
+    // turns "already true" into "checked". Debug builds only; inert otherwise.
+    crate::libkern::lockrank::assert_switch_safe();
     // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
     unsafe { arm_kernel_stack_for(next_obj) };
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root

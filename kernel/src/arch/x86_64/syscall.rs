@@ -229,6 +229,13 @@ const _: () = assert!(offset_of!(SyscallFrame, user_rsp) == 15 * 8);
 /// `frame` must point at a fully-initialised [`SyscallFrame`] on the current
 /// kernel stack — exactly what the entry stub builds.
 unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
+    // A ring-3 entry is not an interrupt and opens no lock-ordering scope: the acquisition
+    // order does not restart here, it begins. The calling thread was in user mode, so it
+    // holds no kernel lock — which makes this the one boundary where the tracker's held set
+    // is known to be empty, and therefore the cheapest place to catch a leaked acquire
+    // before it misattributes itself to a later, innocent one. Debug builds only.
+    // (`cargo xtask check-irq-scope` knows this entry is exempt for this reason.)
+    crate::libkern::lockrank::assert_user_entry_safe();
     // SAFETY: the stub built a complete frame at the kernel stack top and
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };

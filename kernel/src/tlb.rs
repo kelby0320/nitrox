@@ -56,11 +56,19 @@ use crate::arch::smp::ArchSmp;
 use crate::arch::{Cpu, MAX_CPUS, Paging, Smp, send_shootdown_ipi};
 use crate::libkern::SpinLock;
 use crate::mm::VirtAddr;
+use crate::libkern::lockrank::LockRank;
 
 /// Serialises shootdown initiators: only one request is in flight system-wide, so
 /// the single global request block below is unambiguous. A **plain** spinlock (not
 /// IRQ-masking) so a CPU spinning for acknowledgements still takes shootdown IPIs.
-static LOCK: SpinLock<()> = SpinLock::new(());
+///
+/// Interrupt work therefore runs beneath this lock — a DPC drain at an interrupt tail, a
+/// timer tick taking `SCHED`. That is ordinary rather than exceptional: the rank order
+/// restarts at an interrupt boundary (see `libkern::lockrank` § Interrupt scopes), so this
+/// is an ordinary rank and not, as it was when it first landed, an exemption. The caller
+/// contract above — **no other lock held** — is stricter than the rank and is asserted
+/// separately in debug builds.
+static LOCK: SpinLock<()> = SpinLock::new(LockRank::TlbShootdown, ());
 
 /// `true` for a whole-TLB flush (CR3 reload), `false` for a single-page `invlpg`.
 static REQUEST_ALL: AtomicBool = AtomicBool::new(false);
