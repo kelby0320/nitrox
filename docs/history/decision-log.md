@@ -9213,7 +9213,35 @@ without the code it guards**: disabling the clearing fails the first, and removi
 identity guard fails the second — the latter covering a wrong implementation (clear
 unconditionally) that nothing else would have caught.
 
-## 2026-07-30 — The CI failure was never QEMU: an AMD `SYSRET` erratum, and a null stack segment
+## 2026-07-30 — The CI failure was never QEMU: it is AMD-specific, and the first mechanism was wrong
+
+**Correction (same day).** The section below identified the CPU vendor correctly and
+the *mechanism* incorrectly. It attributed the fault to `X86_BUG_SYSRET_SS_ATTRS` —
+`SYSRET` executing with `SS == 0` — and fixed it by forcing `SS` at the context
+switch, mirroring Linux's `__switch_to`. That fix changed nothing, and symbolizing the
+faulting RIP against CI's own uploaded binary says why: the faulting instruction is the
+**`iretq` at the tail of the `#PF` entry stub** (`idt::vec14`), returning to ring 3 —
+not a `SYSRET` path at all. In Nitrox `SS` is already `0x10` at `SYSRET` (the CPU sets
+it on `SYSCALL`), so the Linux workaround was a no-op here. The `SS` load has been
+reverted; a fix whose mechanism is disproved should not stay in the tree.
+
+What survives: the vendor split is real and reproduced (below), and `iretq` fails to
+load a selector whose index is 3 — the user data segment. What is still unknown is the
+`SS` *value* in the frame that `iretq` is consuming, which no capture had printed: the
+stack scan filters for kernel-text values and an `iretq` frame contains none, so it
+came back empty every time. The dump now prints those five words verbatim.
+
+Two process notes worth more than the wrong guess. Symbolizing needed **CI's own
+binary** — a local rebuild of the same commit resolved the address to
+`from_raw_parts::precondition_check`, pure noise, because the layouts differ; uploading
+the ELF as a failure-only artifact is what made the diagnosis possible. And the fix was
+verified *present* in the binary (`mov $0x10,%eax; mov %ax,%ss` in `switch_into`)
+before concluding it had not worked — otherwise "the fix didn't help" and "the fix
+wasn't built" are indistinguishable.
+
+---
+
+## 2026-07-30 — (superseded above) The CI failure was never QEMU: an AMD `SYSRET` erratum, and a null stack segment
 
 The `QEMU integration` job had failed on **every** run since it was added at #120 — never
 once green — while 35+ local KVM boots passed. The standing theory was the environment,

@@ -258,42 +258,6 @@ unsafe fn reload_segments() {
     }
 }
 
-/// Re-establish a non-null stack segment on this CPU, so a later return to ring 3
-/// cannot inherit a null one.
-///
-/// **Why this exists — the AMD `SYSRET` SS erratum.** Entering ring 0 from ring 3 via
-/// an interrupt sets `SS` to the null selector; that is architectural, not a bug. `SS`
-/// is a CPU register, though, not per-thread state, and `context_switch` neither saves
-/// nor restores it — so a thread that entered via `syscall` (where the CPU set
-/// `SS = 0x10`) can be switched out, have `SS` nulled by a *different* thread's
-/// interrupt entry, and then execute `sysretq` with `SS == 0`.
-///
-/// On Intel that is harmless. On AMD, `SYSRET` does **not** reinitialise the `SS`
-/// descriptor, so userspace resumes with an `SS` whose *selector* looks like the user
-/// data segment but whose cached attributes are unusable. The next interrupt from that
-/// context pushes the broken `SS`, and the entry stub's `iretq` back to ring 3 faults
-/// `#GP` with the `SS` selector as its error code. Linux carries the same erratum as
-/// `X86_BUG_SYSRET_SS_ATTRS` and fixes it the same way — in `__switch_to`.
-///
-/// Applied unconditionally rather than gated on an AMD check: it is one segment load
-/// per context switch, and vendor detection is a thing to get wrong for no benefit.
-///
-/// This is what made `cargo xtask test-qemu --kvm` fail every time CI landed on an
-/// AMD EPYC runner and pass on an Intel one — see the decision log, 2026-07-30.
-pub fn arm_user_return_state() {
-    // SAFETY: ring-0, and `KERNEL_DATA_SELECTOR` indexes this CPU's live GDT (loaded by
-    // `init` before any thread runs). Loading `SS` cannot fault for a valid selector,
-    // and `mov ss` inhibits interrupts for the following instruction, which is harmless
-    // here — the caller already holds interrupts masked across the switch.
-    unsafe {
-        asm!(
-            "mov ss, {data:x}",
-            data = in(reg) KERNEL_DATA_SELECTOR as u64,
-            options(nostack, preserves_flags),
-        );
-    }
-}
-
 /// Execute `ltr` to load the task register with the TSS selector.
 ///
 /// # Safety
