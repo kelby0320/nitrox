@@ -95,7 +95,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let force = args.has("force");
     let (sources, dest) = args.operands.split_at(args.operands.len() - 1);
     let dest = dest[0].as_bytes();
-    let dest_is_dir = is_dir(stage.namespace, dest);
+    let dest_is_dir = fs::is_dir(stage.namespace, dest);
 
     // Several sources only make sense into a directory: with a file destination they
     // would each overwrite the last, which is never what was meant.
@@ -144,7 +144,7 @@ fn copy_any(
     if depth > MAX_DEPTH {
         stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE);
     }
-    if is_dir(stage.namespace, src) {
+    if fs::is_dir(stage.namespace, src) {
         copy_dir(stage, src, dst, force, depth, done);
     } else {
         match fs::copy_file(stage.namespace, src, dst, force) {
@@ -184,7 +184,7 @@ fn copy_dir(
     if let Err(e) = made {
         // An existing destination directory is only acceptable under --force: merging
         // into someone else's tree is exactly the surprise the fail-loud default avoids.
-        if !(force && matches!(e, DirError::Server(_)) && is_dir(stage.namespace, dst)) {
+        if !(force && matches!(e, DirError::Server(_)) && fs::is_dir(stage.namespace, dst)) {
             stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE);
         }
     }
@@ -221,16 +221,6 @@ fn copy_dir(
 
 /// Whether `path` names a directory — it resolves to a directory *session*, which a file
 /// never does.
-fn is_dir(ns: u64, path: &[u8]) -> bool {
-    let mut buf = [0u8; 4096];
-    match Dir::open(ns, path, &mut buf) {
-        Ok(d) => {
-            d.close();
-            true
-        }
-        Err(_) => false,
-    }
-}
 
 /// Write the report as a TSM1 table on `stdout`. As in `list`, a closed consumer is a
 /// clean end, not a failure (design §1).

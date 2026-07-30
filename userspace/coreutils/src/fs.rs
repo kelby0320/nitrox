@@ -21,6 +21,7 @@ use libkern::syscall::{
     SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6,
 };
 use librsproto::namespace::RENAME_REPLACE;
+use librsproto::session::Dir;
 
 /// What a file operation can fail with.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -389,6 +390,24 @@ fn po_wait(po: u64) -> (i32, u64) {
 /// The final component of `path` (`"/a/b/c"` → `"c"`), or the whole path if it has no
 /// separator. A trailing separator is ignored (`"/a/b/"` → `"b"`), so a caller that writes
 /// a directory with a trailing slash still gets a usable name.
+/// Does `path` name a directory?
+///
+/// Answered by *opening a session on it*, because that is the only question the
+/// directory protocol answers directly: a session opens on a directory and fails on
+/// anything else. Cheap enough for the uses here (one open + close), and it avoids
+/// inferring a type from an error code — see the note on `FsError::Exists` and
+/// `FsError::NotEmpty` both arriving as `InvalidArgument`.
+pub fn is_dir(ns: u64, path: &[u8]) -> bool {
+    let mut buf = [0u8; 4096];
+    match Dir::open(ns, path, &mut buf) {
+        Ok(d) => {
+            d.close();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
 pub fn basename(path: &[u8]) -> &[u8] {
     let end = match path.iter().rposition(|&c| c != b'/') {
         Some(i) => i + 1,

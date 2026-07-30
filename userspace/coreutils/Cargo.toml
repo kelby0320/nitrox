@@ -29,3 +29,11 @@ path = "src/bin/list.rs"
 [[bin]]
 name = "copy"
 path = "src/bin/copy.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/bin/mkdir.rs"
+
+[[bin]]
+name = "remove"
+path = "src/bin/remove.rs"

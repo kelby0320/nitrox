@@ -1972,13 +1972,117 @@ const COPY_CONTENT_LONG: &[u8] =
 
 /// Spawn `copy` with `argv` as a Tier-1 stage (stdout wired, so its report table is
 /// produced and drained) and return its exit code.
+/// **Milestone 2 Part A — `mkdir` and `remove`.**
+///
+/// The directory verbs, driven as real Tier-1 stages. Both need operands, so neither can
+/// be exercised by a bare Tier-0 spawn — `argv` only arrives in a setup message.
+///
+/// The cases here are the ones where an implementation can look right and be wrong:
+/// `--parents` idempotence (which cannot be decided from the error code, since the
+/// filesystem reports "already exists" and "not empty" identically), the `--recursive`
+/// safety rail, `--force` suppressing *only* absence, and — the one with teeth —
+/// `remove` refusing a **namespace binding**, so that a recursive delete can never
+/// unbind a mount point.
+fn mkdir_remove_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: mkdir/remove demo (Milestone 2 Part A)\n");
+    const MK: &[u8] = b"/initramfs/sbin/mkdir";
+    const RM: &[u8] = b"/initramfs/sbin/remove";
+
+    // --- 1. mkdir creates, and refuses an existing path ----------------------
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "/system/nx-a"]) != 0 {
+        return_fail(b"test-harness: mkdir exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-a") {
+        return_fail(b"test-harness: mkdir did not create the directory\n");
+    }
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "/system/nx-a"]) == 0 {
+        return_fail(b"test-harness: mkdir over an existing path wrongly succeeded\n");
+    }
+
+    // --- 2. --parents builds a chain, and is idempotent ----------------------
+    // Two assertions in one: intermediates get created, and re-running is a success
+    // rather than an error. The second is the reason the flag relaxes the exists check
+    // and not only the parent check.
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "--parents", "/system/nx-a/b/c"]) != 0 {
+        return_fail(b"test-harness: mkdir --parents exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-a/b/c") {
+        return_fail(b"test-harness: mkdir --parents did not build the chain\n");
+    }
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "--parents", "/system/nx-a/b/c"]) != 0 {
+        return_fail(b"test-harness: mkdir --parents was not idempotent\n");
+    }
+
+    // --- 3. remove refuses a directory without --recursive, and leaves it ----
+    if run_coreutil(root_ns, notif, RM, &["remove", "/system/nx-a"]) == 0 {
+        return_fail(b"test-harness: remove of a directory wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-a") {
+        return_fail(b"test-harness: refused remove still deleted the directory\n");
+    }
+
+    // --- 4. remove takes a file ----------------------------------------------
+    write_file(root_ns, b"/system/nx-a/f.txt", b"part a\n");
+    if run_coreutil(root_ns, notif, RM, &["remove", "/system/nx-a/f.txt"]) != 0 {
+        return_fail(b"test-harness: remove file exited non-zero\n");
+    }
+    if path_exists(root_ns, b"/system/nx-a/f.txt") {
+        return_fail(b"test-harness: remove did not delete the file\n");
+    }
+
+    // --- 5. a missing path: an error, unless --force -------------------------
+    if run_coreutil(root_ns, notif, RM, &["remove", "/system/nx-a/gone.txt"]) == 0 {
+        return_fail(b"test-harness: remove of a missing path wrongly succeeded\n");
+    }
+    if run_coreutil(root_ns, notif, RM, &["remove", "--force", "/system/nx-a/gone.txt"]) != 0 {
+        return_fail(b"test-harness: remove --force on a missing path failed\n");
+    }
+
+    // --- 6. a namespace binding is refused ----------------------------------
+    // The property that keeps a recursive delete from unbinding a mount point.
+    //
+    // `/dev` is the case that **isolates** the check, and picking it took a second
+    // attempt: `/dev/console` fails with or without the check, because `/dev` is not a
+    // filesystem directory to open — so asserting on it proves nothing about the check
+    // itself. `/dev` *is* a binding directly beneath a real filesystem directory (`/`),
+    // so without the refusal it classifies as "missing", and `--force` turns that into a
+    // silent exit 0: a no-op reported as success. With the refusal it is a named error.
+    if run_coreutil(root_ns, notif, RM, &["remove", "--force", "/dev"]) == 0 {
+        return_fail(b"test-harness: remove of a namespace binding wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/dev/console") {
+        return_fail(b"test-harness: refused remove disturbed the console binding\n");
+    }
+
+    // --- 7. --recursive takes the whole tree ---------------------------------
+    write_file(root_ns, b"/system/nx-a/b/c/deep.txt", b"deep\n");
+    if run_coreutil(root_ns, notif, RM, &["remove", "--recursive", "/system/nx-a"]) != 0 {
+        return_fail(b"test-harness: remove --recursive exited non-zero\n");
+    }
+    if path_exists(root_ns, b"/system/nx-a") {
+        return_fail(b"test-harness: remove --recursive left the tree behind\n");
+    }
+
+    kprint(b"test-harness: mkdir/remove ok (created, refused, forced, recursed, binding safe)\n");
+}
+
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
+    run_coreutil(root_ns, notif, b"/initramfs/sbin/copy", argv)
+}
+
+/// Spawn a coreutil as a **Tier-1 stage** — setup message, `argv`, a `stdout` pipe — and
+/// return its exit status.
+///
+/// Tier 1 rather than a bare spawn because most coreutils are meaningless without
+/// operands, and `argv` only arrives in the setup message. Generic over the image path
+/// so `copy`, `mkdir` and `remove` share one spawn rather than three copies of it.
+fn run_coreutil(root_ns: u64, notif: u64, image: &[u8], argv: &[&str]) -> i32 {
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
 
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/copy", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, image, RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        return_fail(b"test-harness: copy image FAIL\n");
+        return_fail(b"test-harness: coreutil image FAIL\n");
     }
     let (rx, stdout) = match pipe(4) {
         Ok(p) => p,
@@ -3258,6 +3362,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5. `copy` — the mutation side of the filesystem, including the two cases it must
     //      refuse rather than get wrong (existing destination; no-truncate overwrite).
     copy_demo(root_ns, notif);
+    mkdir_remove_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

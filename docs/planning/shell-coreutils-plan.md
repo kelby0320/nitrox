@@ -229,7 +229,7 @@ Two things hold for every part, and are not repeated in each:
 
 Parts, in order (tick as they land):
 
-- [ ] **Part A — `mkdir`, `remove`** (directory verbs; thin wrappers over existing session ops)
+- [x] **Part A — `mkdir`, `remove`** ✅ (2026-07-30)
 - [ ] **Part B — `rename`, `move`** (`move` = `rename` + the `CrossDevice` copy/unlink fallback)
 - [ ] **Part C — `touch`** (create-if-absent + `mtime` stamp; likely needs `File::Touch` exposed)
 - [ ] **Part D — `date`, `sleep`** (no filesystem; mostly host-testable formatting and parsing)
@@ -245,7 +245,29 @@ wall clock landed in PR #118; `librsproto::session::Dir` already exposes `mkdir`
 what Milestone 1 did — it turned up no-truncate, no-wall-clock and unreclaimed handles, all of
 which became their own fixes — and it is the main reason to build breadth before the interpreter.
 
-#### Part A — the directory verbs: `mkdir`, `remove`
+#### Part A — the directory verbs: `mkdir`, `remove` ✅ (2026-07-30)
+
+**Landed.** Both are Tier-1 stages emitting tables (`Table<{path, created: Bool}>` and
+`Table<{path, kind}>`), with `fs::is_dir` hoisted out of `copy` as the third caller. Three things
+the part turned up, none of them the ones the sketch below predicted:
+
+- **The filesystem collapses `Exists` and `NotEmpty` into `InvalidArgument`**, so neither utility can
+  branch on the error to decide whether a path already exists. Both establish the fact directly
+  instead — `mkdir --parents` tests each component with `is_dir`, `remove` establishes emptiness by
+  listing. Filed as `TODO(fs-error-granularity)`; fixing it is an ABI change.
+- **`remove` must walk the filesystem only, never the namespace union.** `list`'s descent merges
+  namespace bindings with filesystem entries, which is right for looking and wrong for deleting: a
+  binding is a mount point, and `remove --recursive /` must not unbind `/dev/console`. So the
+  descent was *not* hoisted from `list`, contrary to the guess below — the semantics differ at
+  exactly the point that matters.
+- **The first two negative controls were vacuous, and nearly passed as verification.** Asserting
+  that `remove --force /dev/console` is refused proves nothing: it fails with or without the binding
+  check, because `/dev` is not a filesystem directory to open. The isolating case is `/dev` itself —
+  a binding directly beneath a real filesystem directory, which without the check classifies as
+  "missing" and turns into a silent `--force` success. Re-designed until each control actually
+  failed the demo.
+
+The original sketch, kept for the record:
 
 Both are thin wrappers over session ops that already exist, which makes this the natural first
 part: it exercises the `Dir` client on the *mutating* side without needing anything new.

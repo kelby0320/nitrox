@@ -344,6 +344,24 @@ authority lives: rights on the binding independent of the endpoint handle's, a r
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
 
+**The filesystem collapses distinct errors into `InvalidArgument` — `TODO(fs-error-granularity)`.**
+`fs-server-ext4` distinguishes `FsError::Exists` (POSIX `EEXIST`) from `FsError::NotEmpty`
+(`ENOTEMPTY`) internally, but both map to `KError::InvalidArgument` on the wire, because the kernel's
+`KError` set has neither. A client therefore cannot tell "already exists" from "directory not empty"
+from a genuinely malformed argument.
+
+The cost is that clients must re-derive what the server already knew. `mkdir --parents` cannot treat
+"already exists" as success by inspecting the error, so it tests each component with `is_dir` first;
+`remove` cannot report "directory not empty" accurately, so it establishes emptiness by listing.
+Both work, and both are an extra round trip plus a small race window against a concurrent mutator —
+acceptable at Milestone 2, where the alternative is guessing.
+
+Fixing it means adding discriminants (`AlreadyExists`, `NotEmpty`) to `KError`, which is an **ABI
+change**: it moves the ABI version hash and must be mirrored in `userspace/libkern`
+(`cargo xtask abi-sync-check` enforces the mirror). That is why it is not folded into a coreutils
+part. Trigger: a third client needing the distinction, or the first case where the extra round trip
+is not merely inelegant but wrong — a mutation that must be atomic with respect to the check.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
