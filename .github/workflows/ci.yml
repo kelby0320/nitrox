@@ -144,8 +144,11 @@ jobs:
       - name: Install QEMU, OVMF and image tooling
         run: |
           sudo apt-get update
+          # `qemu-kvm` is a transitional metapackage and 26.04 dropped it
+          # ("has no installation candidate"); `qemu-system-x86` is the real package
+          # and provides `-enable-kvm` on both images, so it is the only one needed.
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-kvm ovmf gdisk mtools e2fsprogs
+            qemu-system-x86 ovmf gdisk mtools e2fsprogs
           qemu-system-x86_64 --version
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm-writable.rules
