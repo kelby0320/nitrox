@@ -194,6 +194,105 @@ hides from the fs-server (`deferred-decisions.md`).
 The rest of §10c: `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` (resolve
 B2 here). Each native, each a TSM1 stage. Aliasing (§10e) is namespace-bind data, not a program.
 
+Milestone 1 proved one pipeline end to end — a reader (`list`) and a mutator (`copy`) over a real
+pipe. Milestone 2 is deliberately *not* another integration proof; it is **breadth on a substrate
+that is now finished**, and the parts below are ordered so the mechanical ones land first and the
+one genuine design question lands last.
+
+Two things hold for every part, and are not repeated in each:
+
+- **Each utility is a TSM1 stage that must also work at Tier 0.** A coreutil has to be spawnable
+  before the shell exists, so every one needs the `coreutils::stage` prologue and a plain-text
+  fallback when there is no `stdout` — exactly as `list` does. `PeerClosed` on the output side is
+  a **clean** exit, not an error.
+- **Flags follow the declarative `coreutils::args` conventions** (GNU §10f, no bare `-`), and the
+  mutating verbs take `--force` with the same meaning `copy` gave it.
+
+Parts, in order (tick as they land):
+
+- [ ] **Part A — `mkdir`, `remove`** (directory verbs; thin wrappers over existing session ops)
+- [ ] **Part B — `rename`, `move`** (`move` = `rename` + the `CrossDevice` copy/unlink fallback)
+- [ ] **Part C — `touch`** (create-if-absent + `mtime` stamp; likely needs `File::Touch` exposed)
+- [ ] **Part D — `date`, `sleep`** (no filesystem; mostly host-testable formatting and parsing)
+- [ ] **Part E — `whoami`** (blocked on open question B2 — a design call, deliberately last)
+
+The substrate these lean on is in place: Slice C delivered cross-directory + overwrite `rename`
+(which is what unblocks `move`), full-directory growth, and `mtime` on in-place overwrite; the
+wall clock landed in PR #118; `librsproto::session::Dir` already exposes `mkdir` / `unlink` /
+`rmdir` / `rename` / `read_dir`; `coreutils::fs` already has `copy_file`, `rename`, `file_size`,
+`ns_children` and the `basename`/`parent`/`join` helpers.
+
+**Expect each part to surface substrate gaps, and file them rather than paper over them.** That is
+what Milestone 1 did — it turned up no-truncate, no-wall-clock and unreclaimed handles, all of
+which became their own fixes — and it is the main reason to build breadth before the interpreter.
+
+#### Part A — the directory verbs: `mkdir`, `remove`
+
+Both are thin wrappers over session ops that already exist, which makes this the natural first
+part: it exercises the `Dir` client on the *mutating* side without needing anything new.
+
+- `mkdir` — `Dir::mkdir`, plus `--parents` (create intermediate components, succeed if the leaf
+  already exists). Emits `Table<{path, created}>` so a pipeline can tell "made it" from "already
+  there".
+- `remove` — `Dir::unlink` for files, `Dir::rmdir` for empty directories, `--recursive` to walk
+  and remove depth-first, `--force` to ignore a missing target. Emits `Table<{path, kind}>` of
+  what was actually removed.
+
+The interesting case is `remove --recursive`: `rmdir` only removes an *empty* directory, so the
+walk order is load-bearing, and the natural implementation re-uses `list`'s recursive descent.
+Worth checking whether that descent belongs in `coreutils::fs` rather than being written twice.
+
+#### Part B — `rename` and `move`
+
+`rename` is the thin one — `coreutils::fs::rename` already exists and Slice C2 made it work across
+directories and over an existing destination. It emits `Table<{from, to}>`.
+
+`move` is `rename` plus the fallback: when the two paths are on different mounts the kernel reports
+`CrossDevice`, which `coreutils::fs` already documents as *"a caller's cue to fall back to
+`copy_file` + unlink rather than an error to report"*. So `move` is the first utility that composes
+two existing helpers rather than wrapping one, and the first whose correctness depends on a
+failure path — which means the harness demo must exercise the cross-mount case, not just the
+same-mount one. If there is no second mount in the test image, that is itself the finding.
+
+#### Part C — `touch`
+
+Two behaviours in one verb: create the file if absent, and stamp `mtime` to "now" if present.
+
+Creation is `SYS_FILE_CREATE`. The stamp is `File::Touch`, which **already exists on the wire and
+in the fs-server** — Slice C4 added it so the kernel could report a Model A in-place overwrite —
+but its only caller today is the kernel's post-writeback path, and `librsproto::session::Dir` has
+no client wrapper for it. So this part probably starts by exposing an existing op rather than
+designing a new one. Confirm that before writing the utility; if the op turns out to be
+kernel-only by construction, that is a gap to file, not to work around.
+
+#### Part D — `date` and `sleep`
+
+Neither touches the filesystem, which makes them the two most host-testable utilities in the set —
+and the first that are mostly *formatting and arithmetic*, so the bulk of each should be unit
+tests rather than boot demos.
+
+- `date` — reads `CLOCK_REALTIME` via `SYS_CLOCK_READ` (live since PR #118) and formats it. There
+  is no `std`, so civil-from-days conversion is hand-rolled and is exactly the kind of code that
+  earns a host test table (epoch, leap years, the 2100 non-leap case). Emits a `Record` rather than
+  a bare string so a pipeline can select fields.
+- `sleep` — `SYS_TIMER_CREATE` + `SYS_TIMER_SET` + `sys_wait`, the pattern the test harness's
+  `timer_sleep_ms` already uses. The parsing (`5`, `1.5s`, `200ms`) is the testable part; the
+  waiting is three syscalls. Emits nothing.
+
+#### Part E — `whoami`, and open question B2
+
+**Deferred to when the part is reached, deliberately.** Nitrox has no kernel user identity —
+authority is held in handles, not derived from a UID — so identity is a *session* concept that
+session-mgr constructs along with the per-user namespace and home. The likely answer is that
+`whoami` asks **session-svc**, which is the component that actually knows; the alternative shape is
+a namespace-bound `/proc/self/user` that session-mgr populates per session, which keeps the
+utility a plain reader and puts the knowledge in the namespace where the rest of the system already
+looks.
+
+Both are consistent with the capability model, and the choice is about where the truth lives rather
+than about `whoami` itself, so it is worth a short design discussion at the time rather than a
+guess now. Nothing else in Milestone 2 depends on it, which is why it is last.
+
 ### Milestone 3 — the interpreter (C5/C6)
 
 Lexer → parser (grammar §8/§9) → tree-walker → generic operators → `Value` tree. Deliver **non-
