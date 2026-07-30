@@ -2687,6 +2687,35 @@ fn error_granularity_demo(root_ns: u64) {
     kprint(b"test-harness: error granularity ok (AlreadyExists and NotEmpty cross both boundaries)\n");
 }
 
+
+/// **Milestone 3 Part B — the language runs in ring 3.**
+///
+/// The lexer, parser and evaluator are exercised properly by the host suite (85 tests),
+/// which is the point of keeping the language free of syscalls. What a host test cannot
+/// claim is that the same code path works *here*: on the custom target, against the real
+/// heap, with hardware `f64`. So this asserts the one thing that is genuinely different —
+/// a script that parses, evaluates, does mixed Int/Float arithmetic and renders its
+/// result, all inside a spawned process.
+fn nxsh_language_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: nxsh language demo (Milestone 3 Part B)\n");
+    const NXSH: &[u8] = b"/initramfs/sbin/nxsh";
+
+    // `EXIT_UNIMPLEMENTED` (70), not 0: the shell deliberately reports that it cannot run
+    // a pipeline yet. Asserting on the *specific* status rather than "non-zero" is what
+    // makes this fail if the binary starts crashing instead — a crash and a
+    // not-implemented exit are both non-zero and mean very different things.
+    //
+    // And the status is *earned*: the binary compares its own evaluation against the
+    // expected rendering and exits 1 on a mismatch, so this catches a wrong answer and
+    // not merely a failure to start. Checking only "it ran" would assert nothing about
+    // the language.
+    let status = run_coreutil(root_ns, notif, NXSH, &["nxsh"]);
+    if status != 70 {
+        return_fail(b"test-harness: nxsh did not evaluate its script in ring 3\n");
+    }
+    kprint(b"test-harness: nxsh ok (parsed + evaluated in ring 3)\n");
+}
+
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.
 fn publish_session_user(ns: u64, name: &[u8]) {
     // SAFETY: a page-sized anonymous object.
@@ -4102,6 +4131,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     date_sleep_demo(root_ns, notif);
     whoami_demo(root_ns, notif);
     error_granularity_demo(root_ns);
+    nxsh_language_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

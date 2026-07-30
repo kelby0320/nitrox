@@ -248,9 +248,14 @@ impl<'a> Parser<'a> {
                 self.bump()?;
                 let binding = self.ident("expected a loop variable")?;
                 self.expect(&Tok::In, "expected `in`")?;
-                // §9b: the iterable is `or_expr`, below `|`, so a piped iterable must be
-                // parenthesised. Structural rather than conventional.
-                let iterable = self.or_expr()?;
+                // §9b restricts the iterable so that a bare `|` cannot appear at its top
+                // level — otherwise `{ … }` is ambiguous between the loop body and a
+                // trailing closure argument. It names `or_expr`, but that tier also
+                // excludes **ranges**, and `for i in 0..5` is the commonest loop there
+                // is. `range_expr` is the tier that removes exactly the ambiguity §9b
+                // describes and nothing else, so the iterable is parsed there; a piped
+                // iterable still needs its parens.
+                let iterable = self.range_expr()?;
                 let body = self.block()?;
                 Ok(Stmt::For { binding, iterable, body })
             }
@@ -808,6 +813,14 @@ impl<'a> Parser<'a> {
         self.head_ok = false;
         let name = self.ident("expected a command or a name")?;
 
+        // An `=` immediately after the head makes this an assignment target, whatever
+        // the name would otherwise resolve to. Operator names are not reserved words:
+        // `last` is a §10b operator and a perfectly ordinary variable name, and
+        // `last = 2` has to be an assignment rather than a call to `last`.
+        if self.peek()? == Tok::Eq {
+            return Ok(Expr::Ident(name));
+        }
+
         // A `(` immediately after the head is the parens/named-argument convention
         // (§5b) — a `def` call, or an operator written in call form.
         if self.peek()? == Tok::LParen {
@@ -1001,6 +1014,13 @@ impl<'a> Parser<'a> {
             match self.peek()? {
                 Tok::Pipe | Tok::Newline | Tok::Eof | Tok::RParen | Tok::RBrace
                 | Tok::RBracket | Tok::Comma => break,
+                // `=` never begins an argument, so an operator name followed by one is an
+                // assignment to a binding that happens to share the name. Found by a test
+                // that used `last` as a variable — which is both a §10b operator and an
+                // entirely reasonable name for one. Operator names are not reserved
+                // words, and this is what keeps them from behaving like reserved words at
+                // the head of a statement.
+                Tok::Eq => break,
                 // A `{` after an operator is a closure argument only for the operators
                 // that take one; everywhere else it is the block of an enclosing `for`
                 // or `if`. `for line in open ./log.txt { … }` is the case that needs

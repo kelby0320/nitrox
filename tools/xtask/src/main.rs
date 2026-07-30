@@ -1660,6 +1660,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         "date",
         "sleep",
         "whoami",
+        "nxsh",
     ];
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.

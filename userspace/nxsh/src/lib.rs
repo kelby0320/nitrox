@@ -20,8 +20,12 @@
 extern crate alloc;
 
 pub mod ast;
+pub mod eval;
 pub mod lex;
 pub mod parse;
+pub mod value;
 
+pub use eval::{EvalError, Interp};
 pub use lex::{LexError, Lexer, Mode, Tok};
 pub use parse::{ParseError, Parser, parse_script};
+pub use value::Val;
