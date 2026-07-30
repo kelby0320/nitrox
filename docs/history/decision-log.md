@@ -9212,3 +9212,156 @@ host tests green; every xtask guard passes. Two regression tests, each **proven 
 without the code it guards**: disabling the clearing fails the first, and removing the
 identity guard fails the second — the latter covering a wrong implementation (clear
 unconditionally) that nothing else would have caught.
+
+## 2026-07-30 — `sysretq` on AMD does not put RPL 3 in `SS`, and the STAR base has to carry it
+
+**Root cause, confirmed from the faulting frame.** CI's integration job had never once
+been green since it was added at #120. The fault is `#GP` with error `0x18` at the
+`iretq` ending the `#PF` entry stub, returning to ring 3. Printing the five words that
+`iretq` was about to consume settled it:
+
+    cs = 0x23      RPL 3, correct
+    ss = 0x18      RPL 0, wrong — should be 0x1B
+
+Returning to CPL 3 requires `SS.RPL == CS.RPL == 3`, so the `iretq` faults and names the
+offending selector: `0x18`.
+
+The bad `SS` comes from `sysretq`. `STAR[63:48]` was `0x10`, so the CPU computes
+`SS = base + 8 = 0x18` and `CS = base + 16 = 0x20`. **Intel forces RPL 3 into both;
+AMD forces it into `CS` only**, leaving `SS` as the raw `0x18`. Every `sysretq` on AMD
+therefore returned to userspace with a ring-0-RPL stack selector; nothing noticed until
+the next interrupt from ring 3 pushed that `SS` and the stub's `iretq` tried to restore
+it.
+
+The fix is to carry the RPL in the base: `STAR[63:48] = 0x13`, giving `SS = 0x1B` and
+`CS = 0x23` by construction on either vendor. This is what Linux does — its `MSR_STAR`
+takes `__USER32_CS`, which is itself RPL-3-tagged. One constant.
+
+The host test that covered `STAR` masked the RPL off before comparing
+(`sysret_base + 8 == USER_DATA_SELECTOR & !3`), which is exactly why the original
+encoding looked correct: the assertion could not see the bits that mattered. It now
+compares the full selectors.
+
+**How it was found, and two wrong turns worth keeping.**
+
+The job failed identically on four straight runs, so it looked deterministic; it is not,
+it is *runner-dependent*. A matrix over two runner images plus a step printing each
+runner's CPU produced the decisive table — same QEMU, different CPU, different outcome —
+and killed the standing "CI ships QEMU 8.2.2" theory. Under KVM the failing instruction
+executes on the physical CPU, so the QEMU version was never a likely cause.
+
+*Wrong turn 1: `X86_BUG_SYSRET_SS_ATTRS`.* The AMD/`SYSRET`/`SS` shape matched a real
+Linux erratum, and the fix (force `SS` at context switch, as `__switch_to` does) was
+applied and changed nothing — because Nitrox already has `SS = 0x10` at `sysretq`, so
+the workaround was a no-op. Reverted. The right instinct in hindsight: that erratum is
+about `SS` *attributes*, and the evidence pointed at the *selector*.
+
+*Wrong turn 2: an uninitialised per-CPU GDT on an AP.* Plausible, matched the selector
+index, disproved in minutes — `adopt_dense_index()` writes `IA32_TSC_AUX` before
+`ap_cpu_init()` calls `gdt::init()`, and an AP with an unbound APIC id halts.
+
+**Tooling that made the difference.** Symbolizing required **CI's own binary** — a local
+rebuild of the same commit resolved the address to `from_raw_parts::precondition_check`,
+noise — so the ELF is uploaded as a failure-only artifact. And the stack dump only
+printed values in the kernel-text range, which an `iretq` frame contains none of, so it
+came back empty for three runs; printing the first five words verbatim is what produced
+the `ss = 0x18` that ended the investigation. A diagnostic that filters out the answer is
+worse than none, because it reads as evidence of absence.
+
+Finally, the fix was verified *present in the compiled binary* before the previous
+attempt was declared ineffective. "The fix didn't help" and "the fix wasn't built" look
+identical from a red check.
+
+## 2026-07-30 — The CI failure was never QEMU: it is AMD-specific, and the first mechanism was wrong
+
+**Correction (same day).** The section below identified the CPU vendor correctly and
+the *mechanism* incorrectly. It attributed the fault to `X86_BUG_SYSRET_SS_ATTRS` —
+`SYSRET` executing with `SS == 0` — and fixed it by forcing `SS` at the context
+switch, mirroring Linux's `__switch_to`. That fix changed nothing, and symbolizing the
+faulting RIP against CI's own uploaded binary says why: the faulting instruction is the
+**`iretq` at the tail of the `#PF` entry stub** (`idt::vec14`), returning to ring 3 —
+not a `SYSRET` path at all. In Nitrox `SS` is already `0x10` at `SYSRET` (the CPU sets
+it on `SYSCALL`), so the Linux workaround was a no-op here. The `SS` load has been
+reverted; a fix whose mechanism is disproved should not stay in the tree.
+
+What survives: the vendor split is real and reproduced (below), and `iretq` fails to
+load a selector whose index is 3 — the user data segment. What is still unknown is the
+`SS` *value* in the frame that `iretq` is consuming, which no capture had printed: the
+stack scan filters for kernel-text values and an `iretq` frame contains none, so it
+came back empty every time. The dump now prints those five words verbatim.
+
+Two process notes worth more than the wrong guess. Symbolizing needed **CI's own
+binary** — a local rebuild of the same commit resolved the address to
+`from_raw_parts::precondition_check`, pure noise, because the layouts differ; uploading
+the ELF as a failure-only artifact is what made the diagnosis possible. And the fix was
+verified *present* in the binary (`mov $0x10,%eax; mov %ax,%ss` in `switch_into`)
+before concluding it had not worked — otherwise "the fix didn't help" and "the fix
+wasn't built" are indistinguishable.
+
+---
+
+## 2026-07-30 — (superseded above) The CI failure was never QEMU: an AMD `SYSRET` erratum, and a null stack segment
+
+The `QEMU integration` job had failed on **every** run since it was added at #120 — never
+once green — while 35+ local KVM boots passed. The standing theory was the environment,
+specifically that GitHub's `ubuntu-latest` ships QEMU 8.2.2 against a documented
+"TCG needs ≥ 9.0" note. That theory was wrong, and the way it was tested is the reusable
+part.
+
+**The experiment.** One commit, a matrix over two runner images, plus a step printing each
+runner's CPU. Two runs produced three of the four cells:
+
+| QEMU | CPU | Result |
+|---|---|---|
+| 10.2.1 | Intel Xeon Platinum 8573C | **pass** |
+| 10.2.1 | AMD EPYC 7763 | **fail** |
+| 8.2.2 | AMD EPYC 7763 | **fail** |
+
+Same QEMU, different CPU, different outcome. The QEMU version is irrelevant; the failure
+follows the **CPU vendor**. (The second run happened to place *both* legs on AMD, which is
+what de-confounded the two variables — the image bump moves QEMU, the host kernel and the
+silicon together, so the first run alone could not have decided it.) Both runners clear
+the kernel's documented x86-64-v2 + SMEP/SMAP floor, so it is not a missing feature.
+
+**The bug.** Entering ring 0 from ring 3 via an interrupt sets `SS` to the null selector —
+architectural, not a defect. But `SS` is a **CPU** register, not per-thread state, and
+`context_switch` neither saves nor restores it. So a thread that entered through `syscall`
+(where the CPU sets `SS = 0x10`) can be switched out, have `SS` nulled by a *different*
+thread's interrupt entry, and then execute `sysretq` with `SS == 0`.
+
+On Intel that is harmless. On AMD, `SYSRET` does not reinitialise the `SS` descriptor, so
+userspace resumes with an `SS` whose *selector* looks like the user data segment but whose
+cached attributes are unusable; the next interrupt from that context pushes the broken
+`SS`, and the entry stub's `iretq` back to ring 3 raises `#GP` with the `SS` selector as
+its error code. Linux carries this as `X86_BUG_SYSRET_SS_ATTRS` and fixes it in
+`__switch_to`; `sched::switch_into` now does the same, unconditionally — one segment load
+per context switch, and no vendor detection to get wrong.
+
+**Reading the evidence took three corrections, each worth remembering.**
+
+*Decode, don't recognise.* The error code `0x18` is not a value to pattern-match; bits 3-15
+are the selector **index**, so `0x18` is index 3 with RPL stripped — selector `0x1b`, the
+user data segment. That single decode turned "some #GP" into "a failed `SS` load at a
+ring-3 transition" and is what made the rest tractable.
+
+*The dump already contained the answer.* `ss 0x0000` was printed in the very first capture,
+five days before anyone read it as meaningful. A null stack segment in a ring-0 frame is
+the precondition for the entire erratum.
+
+*A hypothesis that survives is not a hypothesis that was tested.* An earlier guess — that
+an AP's per-CPU GDT was uninitialised — was plausible, matched the selector index, and was
+**wrong**: `adopt_dense_index()` writes `IA32_TSC_AUX` before `ap_cpu_init()` calls
+`gdt::init()`, and an AP with an unbound APIC id halts rather than guessing. Checking it
+cost minutes; carrying it would have cost the investigation.
+
+**A tooling bug found on the way.** The stack-scanning backtrace added in #125 walked
+*up* from `RSP` — but a kernel stack's guard page is at the **bottom**, so it ran past the
+stack top into unmapped vmap, printed nothing, and took a second `#PF` whose `CR2` was the
+page above `RSP`. It now probes each page with `Paging::translate` and stops at the first
+unmapped one. Its output then proved the point: five qwords above `RSP`, none of them
+kernel text — an `iretq` frame, not a call chain — with the GPRs holding restored *user*
+values (`r12 = 0x65767265732d7366`, i.e. `"fs-serve"`).
+
+*Verified:* host suite green, `test-qemu` PASS under TCG and KVM locally (Intel, where the
+bug never reproduced), all five guards pass. The fix can only be confirmed on CI's AMD
+runners — which is also the first time this gate will have been green on main.

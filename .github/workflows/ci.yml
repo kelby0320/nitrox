@@ -124,14 +124,35 @@ jobs:
       - name: Install QEMU, OVMF and image tooling
         run: |
           sudo apt-get update
+          # `qemu-kvm` is a transitional metapackage and 26.04 dropped it
+          # ("has no installation candidate"); `qemu-system-x86` is the real package
+          # and provides `-enable-kvm` on both images, so it is the only one needed.
           sudo apt-get install -y --no-install-recommends \
-            qemu-system-x86 qemu-kvm ovmf gdisk mtools e2fsprogs
+            qemu-system-x86 ovmf gdisk mtools e2fsprogs
           qemu-system-x86_64 --version
           echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
             | sudo tee /etc/udev/rules.d/99-kvm-writable.rules
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
+
+      # Which CPU this run actually got. Kept because runner silicon is luck-of-the-draw
+      # and the kernel has already had one vendor-specific bug here: `sysretq` leaves
+      # `SS` at RPL 0 on AMD but not Intel, which made this job fail for every run
+      # between #120 and its fix (decision log, 2026-07-30) and look deterministic when
+      # it was really "whichever pool answered". A red run that does not say which
+      # vendor it was on costs a whole round-trip to find out.
+      - name: Report environment
+        run: |
+          echo "=== runner ==="
+          uname -a
+          qemu-system-x86_64 --version | head -1
+          echo "--- CPU ---"
+          lscpu | grep -iE "^(Architecture|Vendor ID|Model name|CPU\(s\)|Hypervisor|Virtualization)" || true
+          echo "--- baseline-relevant flags (missing ones print nothing) ---"
+          for f in smep smap x2apic xsave xsaveopt avx avx2 fsgsbase umip la57 invpcid rdtscp constant_tsc nonstop_tsc hypervisor; do
+            grep -qw "$f" /proc/cpuinfo && echo "  have $f" || echo "  MISSING $f"
+          done
 
       - name: Cache cargo registry and build outputs
         uses: actions/cache@v4
@@ -156,3 +177,16 @@ jobs:
       # above. See docs/conventions/qemu-integration-tests.md.
       - name: cargo xtask test-qemu --kvm
         run: cargo xtask test-qemu --kvm
+
+      # The fault dump prints raw addresses, and a local rebuild of the same commit
+      # does **not** reproduce CI's code layout — symbolizing CI addresses against a
+      # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve
+      # the faulting RIP and the return-address candidates from the run that produced
+      # them. Failure-only: this is diagnostic weight, not something to carry on green.
+      - name: Upload kernel ELF for symbolization
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: nitrox-kernel
+          path: kernel/target/x86_64-unknown-none/debug/nitrox-kernel
+          if-no-files-found: warn
