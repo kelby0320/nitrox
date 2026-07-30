@@ -21,7 +21,8 @@ use libkern::syscall::{
     SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5, syscall6,
 };
 use librsproto::namespace::RENAME_REPLACE;
-use librsproto::session::Dir;
+use librsproto::file::OwnedEntry;
+use librsproto::session::{Dir, DirError};
 
 /// What a file operation can fail with.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -498,5 +499,181 @@ mod tests {
         assert_eq!(join(b"/a", b"b"), "/a/b");
         assert_eq!(join(b"/a/", b"b"), "/a/b");
         assert_eq!(join(b"/", b"system"), "/system");
+    }
+}
+
+// --- recursive tree walks ---------------------------------------------------
+//
+// `copy`, `remove` and `move` all walk trees, and they walked three separate copies of
+// the same loop until `move` needed the recursive cross-mount case (2026-07-30). The
+// walks live here now, one each, because the parts that are easy to get subtly wrong are
+// not the loop — they are the session discipline and what the descent is allowed to see,
+// and neither should be re-derived per utility.
+
+/// Deepest tree either walk will descend. Not a resource limit — a runaway guard, since
+/// a cycle cannot occur (no hard links to directories, no symlinks) but a bug could.
+pub const MAX_TREE_DEPTH: u32 = 32;
+
+/// Why a tree walk stopped. Each names the step that failed, so a caller can report
+/// something truer than "it went wrong" without inspecting the tree itself.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum TreeError {
+    /// [`MAX_TREE_DEPTH`] exceeded.
+    TooDeep,
+    /// A directory session could not be opened.
+    OpenDir,
+    /// A directory could not be enumerated.
+    ReadDir,
+    /// A destination directory could not be created.
+    MakeDir,
+    /// A file copy failed.
+    Copy(FileError),
+    /// An entry could not be unlinked.
+    Unlink,
+    /// A directory could not be removed once emptied. `NotEmpty` here means something
+    /// added an entry during the walk — see `remove`'s handling.
+    Rmdir(i32),
+}
+
+/// Enumerate `path`'s children, closing the session before returning.
+///
+/// **Filesystem entries only — deliberately not [`ns_children`].** A binding beneath a
+/// path is a mount point, not content: a descent that followed one would copy or delete
+/// *through* a mount into another server's tree. Every recursive walker in the coreutils
+/// depends on this being the only enumeration it does.
+///
+/// The session is closed before the caller recurses because a session is a scarce server
+/// resource (`MAX_SESSIONS`); holding one per level would cap the depth at the session
+/// table rather than at [`MAX_TREE_DEPTH`].
+fn children(ns: u64, path: &[u8]) -> Result<Vec<OwnedEntry>, TreeError> {
+    let mut entries: Vec<OwnedEntry> = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut dir = Dir::open(ns, path, &mut buf).map_err(|_| TreeError::OpenDir)?;
+    let r = dir.read_dir(|e| {
+        if e.name != b"." && e.name != b".." {
+            entries.push(OwnedEntry::from_entry(e));
+        }
+        true
+    });
+    dir.close();
+    r.map_err(|_| TreeError::ReadDir)?;
+    Ok(entries)
+}
+
+/// Copy `src` to `dst`, recursing if `src` is a directory.
+///
+/// `on_file` is called for each **file** copied, with `(src, dst, bytes)` — directories
+/// are structure, not content, and a caller that wants to report them can see them in the
+/// paths. `force` permits copying *into* an existing destination directory; without it a
+/// pre-existing destination is an error, because merging into someone else's tree is
+/// exactly the surprise a fail-loud default should not spring.
+pub fn copy_tree(
+    ns: u64,
+    src: &[u8],
+    dst: &[u8],
+    force: bool,
+    on_file: &mut impl FnMut(&[u8], &[u8], u64),
+) -> Result<(), TreeError> {
+    copy_tree_at(ns, src, dst, force, 0, on_file)
+}
+
+fn copy_tree_at(
+    ns: u64,
+    src: &[u8],
+    dst: &[u8],
+    force: bool,
+    depth: u32,
+    on_file: &mut impl FnMut(&[u8], &[u8], u64),
+) -> Result<(), TreeError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(TreeError::TooDeep);
+    }
+    if !is_dir(ns, src) {
+        let bytes = copy_file(ns, src, dst, force).map_err(TreeError::Copy)?;
+        on_file(src, dst, bytes);
+        return Ok(());
+    }
+
+    // Create the destination directory through its parent's session: directory ops are
+    // name-addressed, so making `/a/b` means opening `/a` and asking for `b`.
+    {
+        let mut pbuf = [0u8; 4096];
+        let mut pdir = Dir::open(ns, parent(dst), &mut pbuf).map_err(|_| TreeError::OpenDir)?;
+        let made = pdir.mkdir(basename(dst));
+        pdir.close();
+        if made.is_err() && !(force && is_dir(ns, dst)) {
+            return Err(TreeError::MakeDir);
+        }
+    }
+
+    for e in &children(ns, src)? {
+        let child_src = join(src, e.name());
+        let child_dst = join(dst, e.name());
+        copy_tree_at(ns, child_src.as_bytes(), child_dst.as_bytes(), force, depth + 1, on_file)?;
+    }
+    Ok(())
+}
+
+/// Remove `path` and everything under it, depth-first.
+///
+/// `on_entry` is called for each entry removed, with `(path, is_dir)`, in the order they
+/// go — children before their parent, which is the order the removal actually happens and
+/// therefore the order a report should show.
+///
+/// The caller is responsible for refusing a `path` that is a **namespace binding**: this
+/// walks what is beneath a path, and cannot tell whether the path itself was handed to it
+/// by mistake. See `remove`'s operand check.
+pub fn remove_tree(
+    ns: u64,
+    path: &[u8],
+    on_entry: &mut impl FnMut(&[u8], bool),
+) -> Result<(), TreeError> {
+    remove_tree_at(ns, path, 0, on_entry)
+}
+
+fn remove_tree_at(
+    ns: u64,
+    path: &[u8],
+    depth: u32,
+    on_entry: &mut impl FnMut(&[u8], bool),
+) -> Result<(), TreeError> {
+    if depth > MAX_TREE_DEPTH {
+        return Err(TreeError::TooDeep);
+    }
+    for e in &children(ns, path)? {
+        let child = join(path, e.name());
+        if e.kind == DIRENT_KIND_DIR {
+            remove_tree_at(ns, child.as_bytes(), depth + 1, on_entry)?;
+        } else {
+            unlink_at(ns, child.as_bytes())?;
+            on_entry(child.as_bytes(), false);
+        }
+    }
+    rmdir_at(ns, path)?;
+    on_entry(path, true);
+    Ok(())
+}
+
+/// `unlink` the entry named by `path`, via its parent's session.
+pub fn unlink_at(ns: u64, path: &[u8]) -> Result<(), TreeError> {
+    let mut buf = [0u8; 4096];
+    let mut dir = Dir::open(ns, parent(path), &mut buf).map_err(|_| TreeError::OpenDir)?;
+    let r = dir.unlink(basename(path));
+    dir.close();
+    r.map_err(|_| TreeError::Unlink)
+}
+
+/// `rmdir` the (empty) directory named by `path`, via its parent's session. The payload
+/// on failure is the server's `KError`, so a caller can tell `NotEmpty` — which after a
+/// completed descent means a concurrent mutator — from anything else.
+fn rmdir_at(ns: u64, path: &[u8]) -> Result<(), TreeError> {
+    let mut buf = [0u8; 4096];
+    let mut dir = Dir::open(ns, parent(path), &mut buf).map_err(|_| TreeError::OpenDir)?;
+    let r = dir.rmdir(basename(path));
+    dir.close();
+    match r {
+        Ok(()) => Ok(()),
+        Err(DirError::Server(k)) => Err(TreeError::Rmdir(k)),
+        Err(_) => Err(TreeError::Rmdir(0)),
     }
 }

@@ -295,13 +295,18 @@ differ in cost and in whether the file keeps its identity, and it is the only wa
 same-mount path is not silently copying — an assertion on "the file arrived" would pass an
 implementation that copied every time.
 
-The predicted finding held: **the test image has exactly one writable mount**, so no cross-mount move
-runs end to end. `/initramfs` (a read-only kernel server) gives the *detection* path a target, and
-the demo asserts the half that is testable and most worth protecting — a failed move leaves the
-source intact. The successful fallback has never executed. A cross-mount *directory* move is
-therefore refused rather than written blind; both are filed as `TODO(cross-mount-move)`, whose
-trigger is a second writable mount (a second binding of the existing server at its own subtree base
-would do — `us_forward_existing_reg` already supports one endpoint under many names).
+The predicted finding held: **the test image had exactly one writable mount**, so no cross-mount move
+ran end to end. `/initramfs` (a read-only kernel server) gave the *detection* path a target, and the
+demo asserted the half that was testable and most worth protecting — a failed move leaves the source
+intact. The successful fallback had never executed, so a cross-mount *directory* move was refused
+rather than written blind.
+
+**Closed 2026-07-30.** The trigger was met the cheap way the entry predicted: binding the one
+fs-server a second time at `/scratch` with its own subtree base, which the kernel classifies as
+another mount (`same server && same subtree base` is the rename test) while both sides stay
+writable. The successful file fallback and the recursive directory case are both exercised now, on
+`fs::copy_tree`/`fs::remove_tree` — the walks hoisted out of `copy` and `remove` so there is one of
+each rather than three.
 
 The original sketch, kept for the record:
 
@@ -431,8 +436,10 @@ which is what makes `AlreadyExists`/`NotEmpty` kernel errors rather than filesys
 further arms of the server's error mapping were already reaching for a vaguer error than existed;
 and `libkern` had never decoded `IoError` at all. See the decision log, 2026-07-30.
 
-One item is still owed: `TODO(cross-mount-move)` waits on a second writable mount, without which no
-cross-mount move can be exercised end to end at all. It is a missing fixture, not an ABI gap.
+**`cross-mount-move` closed the same day**, which clears the last item Milestone 2 owed. The blocker
+was the fixture rather than the feature — a second writable mount, met by binding the existing
+fs-server again at its own subtree base — and with somewhere to test it, the recursive directory
+case took shared tree walks rather than a third copy of the loop.
 
 ### Milestone 3 — the interpreter (C5/C6)
 

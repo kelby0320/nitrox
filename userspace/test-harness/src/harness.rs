@@ -2197,8 +2197,114 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: failed cross-mount move destroyed the source\n");
     }
 
+    // --- 6. a cross-mount move that SUCCEEDS ---------------------------------
+    // The half that had never run. Until `/scratch` existed, the only cross-mount
+    // destination was a read-only kernel server, so case 5 could prove the detection and
+    // the source-survives rule but never that the fallback *works* — the copy always
+    // failed. `/scratch` is the same fs-server bound a second time with its own subtree
+    // base, which is exactly what the kernel's rename test keys on.
+    let bytes = run_coreutil_capture(
+        root_ns,
+        notif,
+        MV,
+        &["move", "/system/nx-b2/moved.txt", "/scratch/landed.txt"],
+        true,
+    );
+    // `method = "copy"`, and specifically *not* "rename": if the second binding failed to
+    // register as a distinct mount, the kernel would rename and this would still relocate
+    // the file — passing while testing nothing.
+    let mut copied = false;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if matches!(&vals[2], Value::Str(s) if s == "copy") {
+                    copied = true;
+                }
+            }
+        }
+    }
+    if !copied {
+        return_fail(b"test-harness: cross-mount move did not report method=copy\n");
+    }
+    if path_exists(root_ns, b"/system/nx-b2/moved.txt") {
+        return_fail(b"test-harness: cross-mount move left the original behind\n");
+    }
+    if !path_exists(root_ns, b"/scratch/landed.txt") {
+        return_fail(b"test-harness: cross-mount move did not land the copy\n");
+    }
+    // The content has to survive too — a move that arrives empty is not a move, and
+    // nothing above would have noticed.
+    if !file_matches(root_ns, b"/scratch/landed.txt", b"part b\n") {
+        return_fail(b"test-harness: cross-mount move corrupted the contents\n");
+    }
+
+    // --- 7. a cross-mount move of a whole TREE -------------------------------
+    // Refused outright until there was somewhere to test it. Build a two-level tree with
+    // a file at each level, move it across the mount, and require that the structure and
+    // the contents arrive and that nothing is left behind — a recursive copy that dropped
+    // the nested level would still satisfy "the destination exists".
+    {
+        let mut tb = [0u8; 4096];
+        if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut tb) {
+            let _ = d.mkdir(b"nx-tree");
+            d.close();
+        }
+        let mut tb2 = [0u8; 4096];
+        if let Ok(mut d) = Dir::open(root_ns, b"/system/nx-tree", &mut tb2) {
+            let _ = d.mkdir(b"inner");
+            d.close();
+        }
+    }
+    write_file(root_ns, b"/system/nx-tree/top.txt", b"top\n");
+    write_file(root_ns, b"/system/nx-tree/inner/deep.txt", b"deep\n");
+
+    if run_coreutil(root_ns, notif, MV, &["move", "/system/nx-tree", "/scratch/tree"]) != 0 {
+        return_fail(b"test-harness: cross-mount directory move exited non-zero\n");
+    }
+    if !file_matches(root_ns, b"/scratch/tree/top.txt", b"top\n")
+        || !file_matches(root_ns, b"/scratch/tree/inner/deep.txt", b"deep\n")
+    {
+        return_fail(b"test-harness: cross-mount directory move did not carry the tree\n");
+    }
+    // …and the original is gone, all of it. Checking only the root would pass an
+    // implementation that removed the top directory and orphaned what was under it.
+    if path_exists(root_ns, b"/system/nx-tree/inner/deep.txt")
+        || path_exists(root_ns, b"/system/nx-tree/top.txt")
+        || is_dir_present(root_ns, b"/system/nx-tree")
+    {
+        return_fail(b"test-harness: cross-mount directory move left the source behind\n");
+    }
+
+    // --- 8. a namespace binding is refused as a source -----------------------
+    // `move` can now delete a tree, so the rule `remove` states has to hold here too: a
+    // binding is a mount point, and recursing into one would copy *through* a mount and
+    // then remove another server's tree.
+    //
+    // The operand is `/subtreetest`, not `/dev`, and the difference is the whole test.
+    // `/dev` is not a filesystem directory, so a move of it fails with or without the
+    // refusal — asserting on it proves nothing, which a control caught after it passed
+    // with the check deleted. `/subtreetest` is a binding that *is* an openable directory
+    // (the fs-server again, based at `/system`), so without the refusal `move` would
+    // happily recurse into it — and then delete `/system`. It is the case where the rule
+    // is load-bearing rather than incidental.
+    if run_coreutil(root_ns, notif, MV, &["move", "/subtreetest", "/scratch/st"]) == 0 {
+        return_fail(b"test-harness: move of a namespace binding wrongly succeeded\n");
+    }
+    // The assertion with teeth: the destination was never even started. An exit code
+    // alone cannot tell "refused" from "tried and failed partway".
+    if is_dir_present(root_ns, b"/scratch/st") {
+        return_fail(b"test-harness: move of a binding copied through the mount\n");
+    }
+    // …and the mount itself is intact.
+    if !path_exists(root_ns, b"/subtreetest/current-generation") {
+        return_fail(b"test-harness: refused move of a binding damaged it\n");
+    }
+
     // --- teardown ------------------------------------------------------------
-    unlink_all(root_ns, b"/system/nx-b2", &[b"moved.txt"]);
+    // Only `/scratch/landed.txt`: case 6 relocated `/system/nx-b2/moved.txt` there, so
+    // the old unlink of the source would now be removing a file that is gone.
+    unlink_all(root_ns, b"/scratch", &[b"landed.txt"]);
+    remove_tree_best_effort(root_ns, b"/scratch/tree");
     let mut b3 = [0u8; 4096];
     if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut b3) {
         let _ = d.rmdir(b"nx-b");
@@ -2206,7 +2312,7 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
         d.close();
     }
 
-    kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount safe)\n");
+    kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount file + tree, binding safe)\n");
 }
 
 /// **Milestone 2 Part C — `touch`.**
@@ -3315,6 +3421,75 @@ fn file_matches(ns: u64, path: &[u8], expect: &[u8]) -> bool {
         syscall1(SYS_HANDLE_CLOSE, fh);
     }
     ok
+}
+
+/// Does `path` name a directory that is present? A directory does not resolve to a
+/// mappable object, so `path_exists` says nothing about one — this opens a session
+/// instead, which only a live directory answers.
+fn is_dir_present(ns: u64, path: &[u8]) -> bool {
+    let mut buf = [0u8; 4096];
+    match Dir::open(ns, path, &mut buf) {
+        Ok(d) => {
+            d.close();
+            true
+        }
+        Err(_) => false,
+    }
+}
+
+/// Tear down a tree without asserting: teardown must not turn a passing run into a
+/// failure over a directory a failed case never created.
+fn remove_tree_best_effort(ns: u64, path: &[u8]) {
+    let mut names: alloc::vec::Vec<alloc::vec::Vec<u8>> = alloc::vec::Vec::new();
+    let mut kinds: alloc::vec::Vec<u8> = alloc::vec::Vec::new();
+    {
+        let mut buf = [0u8; 4096];
+        let Ok(mut d) = Dir::open(ns, path, &mut buf) else { return };
+        let _ = d.read_dir(|e| {
+            if e.name != b"." && e.name != b".." {
+                names.push(e.name.to_vec());
+                kinds.push(e.kind);
+            }
+            true
+        });
+        d.close();
+    }
+    for (i, n) in names.iter().enumerate() {
+        let mut child = alloc::vec::Vec::from(path);
+        child.push(b'/');
+        child.extend_from_slice(n);
+        if kinds[i] == librsproto::file::DIRENT_KIND_DIR {
+            remove_tree_best_effort(ns, &child);
+        } else {
+            let mut buf = [0u8; 4096];
+            if let Ok(mut d) = Dir::open(ns, path, &mut buf) {
+                let _ = d.unlink(n);
+                d.close();
+            }
+        }
+    }
+    let mut buf = [0u8; 4096];
+    if let Ok(mut d) = Dir::open(ns, parent_of(path), &mut buf) {
+        let _ = d.rmdir(basename_of(path));
+        d.close();
+    }
+}
+
+/// The path up to the last separator (`/a/b` → `/a`), for the teardown helper.
+fn parent_of(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&c| c == b'/') {
+        Some(0) => b"/",
+        Some(i) => &path[..i],
+        None => b".",
+    }
+}
+
+/// The final component of a path (`/a/b` → `b`).
+fn basename_of(path: &[u8]) -> &[u8] {
+    match path.iter().rposition(|&c| c == b'/') {
+        Some(i) => &path[i + 1..],
+        None => path,
+    }
 }
 
 /// Remove the named entries from `dir` (fixture teardown).

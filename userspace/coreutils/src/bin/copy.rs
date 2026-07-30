@@ -35,12 +35,10 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs::{self, FileError};
+use coreutils::fs::{self, FileError, TreeError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
-use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
-use librsproto::session::{Dir, DirError};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -61,9 +59,6 @@ const HELP: &[u8] = b"usage: copy [--force] SOURCE... DEST\n\
           --version show version information and exit\n";
 
 const VERSION: &[u8] = b"copy (nitrox coreutils) 0.1.0\n";
-
-/// Depth cap, as in `list`: a pathological tree must stop rather than run forever.
-const MAX_DEPTH: u32 = 32;
 
 /// One completed file copy, as reported on stdout.
 struct Copied {
@@ -116,7 +111,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         if target.as_bytes() == src {
             stage.die(b"copy: source and destination are the same file\n", EXIT_USAGE);
         }
-        copy_any(&stage, src, target.as_bytes(), force, 0, &mut done);
+        copy_any(&stage, src, target.as_bytes(), force, &mut done);
     }
 
     match stage.streams.stdout {
@@ -130,92 +125,38 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     exit(EXIT_OK)
 }
 
-/// Copy `src` to `dst`, dispatching on what `src` is. Any failure is fatal and exits —
-/// a partially-completed copy is reported by the rows already emitted, but the run is not
-/// silently called a success.
-fn copy_any(
-    stage: &Stage,
-    src: &[u8],
-    dst: &[u8],
-    force: bool,
-    depth: u32,
-    done: &mut Vec<Copied>,
-) {
-    if depth > MAX_DEPTH {
-        stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE);
-    }
-    if fs::is_dir(stage.namespace, src) {
-        copy_dir(stage, src, dst, force, depth, done);
-    } else {
-        match fs::copy_file(stage.namespace, src, dst, force) {
-            Ok(bytes) => done.push(Copied {
-                source: String::from_utf8_lossy(src).into_owned(),
-                destination: String::from_utf8_lossy(dst).into_owned(),
-                bytes,
-            }),
-            Err(e) => stage.die(describe(src, dst, e).as_bytes(), EXIT_FAILURE),
-        }
-    }
-}
-
-/// Copy a directory: create the destination, then copy every entry into it.
+/// Copy `src` to `dst` — a file, or a directory and everything under it.
 ///
-/// Entries are collected and the source session **closed before recursing**, so a deep
-/// tree holds one session at a time rather than one per level (`MAX_SESSIONS` is small).
-fn copy_dir(
-    stage: &Stage,
-    src: &[u8],
-    dst: &[u8],
-    force: bool,
-    depth: u32,
-    done: &mut Vec<Copied>,
-) {
-    // Create the destination directory via its parent's session — directory ops are
-    // name-addressed, so making `/a/b` means opening `/a` and asking for `b`.
-    let parent = fs::parent(dst);
-    let name = fs::basename(dst);
-    let mut pbuf = [0u8; 4096];
-    let mut pdir = match Dir::open(stage.namespace, parent, &mut pbuf) {
-        Ok(d) => d,
-        Err(_) => stage.die(b"copy: cannot open the destination's parent directory\n", EXIT_FAILURE),
-    };
-    let made = pdir.mkdir(name);
-    pdir.close();
-    if let Err(e) = made {
-        // An existing destination directory is only acceptable under --force: merging
-        // into someone else's tree is exactly the surprise the fail-loud default avoids.
-        if !(force && matches!(e, DirError::Server(_)) && fs::is_dir(stage.namespace, dst)) {
-            stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE);
-        }
-    }
-
-    let mut entries: Vec<OwnedEntry> = Vec::new();
-    {
-        let mut sbuf = [0u8; 4096];
-        let mut sdir = match Dir::open(stage.namespace, src, &mut sbuf) {
-            Ok(d) => d,
-            Err(_) => stage.die(b"copy: cannot read the source directory\n", EXIT_FAILURE),
-        };
-        let r = sdir.read_dir(|e| {
-            if e.name != b"." && e.name != b".." {
-                entries.push(OwnedEntry::from_entry(e));
-            }
-            true
+/// The walk itself is [`fs::copy_tree`], shared with `move`'s cross-mount fallback: it was
+/// duplicated here until `move` needed the recursive case, and a recursive walker is not a
+/// thing to keep two of. What stays here is this program's *reporting* — one row per file,
+/// and the message each failure earns.
+fn copy_any(stage: &Stage, src: &[u8], dst: &[u8], force: bool, done: &mut Vec<Copied>) {
+    let r = fs::copy_tree(stage.namespace, src, dst, force, &mut |s, d, bytes| {
+        done.push(Copied {
+            source: String::from_utf8_lossy(s).into_owned(),
+            destination: String::from_utf8_lossy(d).into_owned(),
+            bytes,
         });
-        sdir.close();
-        if r.is_err() {
-            stage.die(b"copy: cannot enumerate the source directory\n", EXIT_FAILURE);
+    });
+    // A partial copy is reported by the rows already emitted; the run is not silently
+    // called a success.
+    match r {
+        Ok(()) => {}
+        Err(TreeError::TooDeep) => {
+            stage.die(b"copy: maximum recursion depth exceeded\n", EXIT_FAILURE)
         }
-    }
-
-    for e in &entries {
-        let child_src = fs::join(src, e.name());
-        let child_dst = fs::join(dst, e.name());
-        if e.kind == DIRENT_KIND_DIR {
-            copy_dir(stage, child_src.as_bytes(), child_dst.as_bytes(), force, depth + 1, done);
-        } else {
-            copy_any(stage, child_src.as_bytes(), child_dst.as_bytes(), force, depth + 1, done);
+        Err(TreeError::Copy(e)) => stage.die(describe(src, dst, e).as_bytes(), EXIT_FAILURE),
+        Err(TreeError::MakeDir) => {
+            stage.die(b"copy: cannot create the destination directory\n", EXIT_FAILURE)
         }
+        Err(TreeError::OpenDir) => {
+            stage.die(b"copy: cannot open a directory on the path\n", EXIT_FAILURE)
+        }
+        Err(TreeError::ReadDir) => {
+            stage.die(b"copy: cannot enumerate the source directory\n", EXIT_FAILURE)
+        }
+        Err(_) => stage.die(b"copy: cannot copy\n", EXIT_FAILURE),
     }
 }
 

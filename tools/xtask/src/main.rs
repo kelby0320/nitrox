@@ -1762,6 +1762,14 @@ fn assemble_image(
     //    file the Part-6 init loop reads.
     let staging = work.join("rootfs");
     fs::create_dir_all(staging.join("system"))?;
+    // `/scratch` — the backing directory for the **second writable mount**. The kernel
+    // calls a rename cross-filesystem when the two paths resolve to a different (server,
+    // subtree base) pair, so binding this one server a second time with base `/scratch`
+    // yields a destination that is genuinely cross-mount to `/system` while staying
+    // writable. That combination did not exist before (2026-07-30): `/initramfs` is
+    // cross-mount but read-only, so only the *detection* half of `move`'s fallback could
+    // ever run. Empty here; init binds it under `selftest` and the harness populates it.
+    fs::create_dir_all(staging.join("scratch"))?;
     fs::write(
         staging.join("system").join("current-generation"),
         b"nitrox-rootfs generation 1\n",
