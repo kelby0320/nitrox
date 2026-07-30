@@ -1,6 +1,6 @@
 # Nitrox Shell & Coreutils — Subproject Plan
 
-**Status:** 🚧 active (started 2026-07-24, Milestone 1). The three CLI substrate prereqs (§1C) are
+**Status:** 🚧 active (started 2026-07-24; Milestones 1–2 complete, Milestone 3 planned 2026-07-30). The three CLI substrate prereqs (§1C) are
 all in, so the milestones below are unblocked. This is a large, multi-slice subproject running in
 its own Claude Code session(s); this document is the entry point for that work.
 
@@ -441,13 +441,193 @@ was the fixture rather than the feature — a second writable mount, met by bind
 fs-server again at its own subtree base — and with somewhere to test it, the recursive directory
 case took shared tree walks rather than a third copy of the loop.
 
-### Milestone 3 — the interpreter (C5/C6)
+### Milestone 3 — the interpreter (`nxsh`)
 
-Lexer → parser (grammar §8/§9) → tree-walker → generic operators → `Value` tree. Deliver **non-
-interactive script execution** first (`nx script.nx`), plus a **minimal** line-reader on the raw
-console for a basic interactive loop (no reverse-search/Shift-Enter). Float formatting (C6) lands
-here. Resolve B3 (env) and B5 (`save`/`open` formats, starting with `.tsm`/`.txt`) as they come up;
-scope B4 (regex for `~=`) explicitly as its own piece rather than absorbing it silently.
+Lexer → parser (§8/§9) → tree-walking evaluator → generic operators → the process boundary → a
+minimal REPL. Float formatting (C6) lands here. This is the largest milestone in the subproject and
+is broken into seven parts, sequenced so that **a real script runs at Part C** rather than at the
+end.
+
+#### Names — settled 2026-07-30
+
+**Binary `nxsh`, scripts `.nx`.** §9h left the extension explicitly undecided, so both were checked
+for collisions before committing:
+
+- **`nx` as a binary was rejected.** [Nx](https://nx.dev) is a widely-used monorepo build system
+  whose CLI is exactly `nx` — plausibly on a developer's `$PATH`, and it dominates every search for
+  "nx shell" or "nx scripting".
+- **`nxsh` collides only with an obscure package** — the Next Scripting Framework's Tcl-based
+  `nxsh(1)` in Debian/Ubuntu, plus a GUI terminal client called NxShell. Same category, exact name,
+  negligible traffic. A small collision traded for a large one, and it reads as "Nitrox Shell".
+- **`nsh` was struck**: it is NuttShell, the NuttX RTOS's shell — same name, same category, an OS
+  shell, which is the worst kind of collision available.
+- **`.nx` collides only outside our domain** (MapleStory packages, LowRes NX game files, a PKG4
+  archive format). Nothing a developer would confuse with a script, no tooling conflict, and it
+  reads like a language extension (`.rs`, `.py`, `.go`) rather than a shell one — which matches
+  §3's insistence that this is a real scripting language, not a command launcher. It also leaves
+  every `use "./lib/utils.nx"` example in the design doc correct as written.
+
+#### Shape: one crate, and a `Host` trait so the language is host-tested
+
+`userspace/nxsh/`, lib + bin, following `fs-server-ext4`'s split exactly:
+
+- **`src/lib.rs` and friends — the language.** Lexer, parser, AST, evaluator, `Value` operations,
+  generic operators, the regex engine. `no_std` + `alloc`, **no syscalls**, 100% host-tested.
+- **`src/main.rs` — the host.** `_start`, the syscall plumbing, spawning stages, wiring pipes via
+  `libstream::setup`, the console line-reader.
+
+The seam is a **`Host` trait** covering everything the evaluator does that touches the OS — spawn a
+stage, open a path, read a stream, resolve a name. This is the same move that made the ext4 parser
+testable behind `BlockReader`/`BlockWriter`, and it is worth more here than there: an interpreter
+is mostly pure logic, and pure logic tested on the host is tested in a second rather than a
+90-second boot. The mock host also makes pipeline *semantics* (ordering, backpressure, error
+propagation) testable without a kernel.
+
+#### Ordering rationale
+
+Parse **all** of §8/§9 in Part A, then let evaluation catch up. The alternative — finish the whole
+language in-process, wire the process boundary last — layers more cleanly on paper but puts the
+riskiest work at the end. The process boundary is where Milestones 1 and 2 both produced their real
+surprises (the Tier-0/Tier-1 split, the fs-server ABI gaps, the session-reclaim flake), and it is
+the part with the least precedent to lean on.
+
+---
+
+#### Decisions owed, with proposed resolutions
+
+These are gaps the design doc leaves open that the *implementation* cannot leave open. Each is
+resolved in the part that first needs it; the proposals here are the starting position, not a
+settled answer.
+
+**D1 — word mode vs expression mode. The big one, and it must be settled in Part A.**
+
+§8b says `filter size > 1000` desugars to `filter { |it| it.size > 1000 }`, so `size` is an
+expression. §5b says `list --long /some/path` passes barewords to an external program, so
+`/some/path` is a string. These cannot both be parsed by one rule:
+
+- `README.md` as an external argument is a filename; as an expression it is field access on
+  `README`.
+- `/system` as an external argument is a path; as an expression it is a division operator with no
+  left operand.
+
+**Proposal: the head token's category selects the argument grammar, resolved at parse time.**
+§3's four-way categorization is already a parse-relevant distinction, not just documentation. The
+parser holds the closed set of keywords, shell-state builtins and generic operators, plus the
+`def`s visible in the file (which are hoisted per §5a, so they *are* known at parse time). A head
+token in that set takes **expression-mode** arguments; anything else is an external program and
+takes **word-mode** arguments, where barewords lex as strings and operators are not special. `^`
+forces word mode (§3).
+
+Residual risk to watch: §5c says the generic-operator category is deliberately *open* — a
+user-defined `def` doing generic dispatch gets the same capability. That stays true semantically,
+but such a `def` is called with the parens convention (§5b), which is syntactically distinct, so
+the open category does not need to be open *at parse time*. If that turns out to be wrong, this is
+the decision to revisit first.
+
+**D2 — newline policy.** The grammar is newline-delimited with no semicolons (§9a), which the
+design doc states but never specifies. Proposal: a newline terminates a statement, **except**
+after a trailing `|`, `&&`, `||`, `,` or an open delimiter, and **except** when the next
+non-comment token is `|` — the last being what makes leading-pipe style parse in a file, which
+§11b asserts but does not explain. Inside `(`/`[` a newline is plain whitespace.
+
+**D3 — path and regex literals share a lexer hazard.** Both start with `/` in prefix position:
+`list /system` and `name ~= /\.rs$/`. Proposal: **a regex literal is lexed only immediately after
+`~=`** — the only operator that takes one — and a prefix `/` anywhere else begins a path word.
+`./` and `../` are unambiguous already, since `.` is otherwise strictly infix. This is the same
+shape of fix JS uses for regex-vs-divide, but with a far narrower trigger.
+
+**D4 — command resolution order.** Proposal: keyword → shell-state builtin → generic operator →
+`def` in scope → external program, with `^` skipping straight to external. Resolution failure is a
+fail-loud error naming what was searched, not a silent fallthrough to "command not found".
+
+**D5 — recursion depth.** A recursive-descent parser and a tree-walking evaluator both recurse on
+user input, on a userspace stack. Both need an explicit depth bound with a clean error, the same
+discipline `MAX_TREE_DEPTH` applies in the coreutils. A deeply-nested expression must not be a
+stack overflow.
+
+**D6 — env (B3), and its `/session/*` coupling.** Due in Part E. The design's anchor is "env vars
+as namespace-scoped resources" (§5a). Milestone 2 Part E found this is *the same problem* as
+`/session/*` metadata, one milestone earlier: mutable, namespace-scoped values behind a path.
+`TODO(session-metadata-server)` records the coupling. **Design B3 with `/session/*` in view and
+migrate it onto whatever B3 builds** — two mechanisms and two migrations is the outcome to avoid.
+
+**D7 — a script's exit status.** Proposal: the status of the last statement if it is a pipeline,
+`0` otherwise; an uncaught error exits non-zero with the error rendered on `stderr`. Needs stating
+because `nxsh script.nx` will be adjudicated by `test-qemu` exit codes.
+
+**D8 — auto-display differs by mode** (§11e): the REPL appends `| display` to an unassigned
+top-level pipeline; a script discards it silently. One flag on the evaluator, decided in Part C and
+honoured from then on, not bolted on at Part F.
+
+---
+
+#### The parts
+
+- [ ] **Part A — lexer, AST, and parser (all of §8/§9)**
+      Tokens including path words, regex literals, `#` comments, `1_000_000`/`0x`/`0b` numerics.
+      Full expression grammar with §8a precedence, statement grammar, patterns, `type_expr`.
+      Resolves **D1**, **D2**, **D3**, **D5**. Host tests: a corpus of every example in §7–§11 of
+      the design doc must parse, plus fail-loud cases for each ambiguity D1–D3 names.
+      *Deliverable: the design doc's own examples parse. Nothing evaluates yet.*
+
+- [ ] **Part B — evaluator core, in-process**
+      `Value` (already complete in `libstream::wire` — `List`/`Record`/`Table` are `Arc`-shared and
+      persistent, so C2 is genuinely done), scopes, `let`/`mut`/`const`, assignment and
+      field/index mutation (§9d), arithmetic/comparison/logical/range operators, `++`, blocks as
+      expressions, `if`/`for`/`while`. Float formatting (C6) lands here.
+      *Deliverable: `nxsh -c 'let x = 2 + 3'` computes. Host-tested end to end.*
+
+- [ ] **Part C — the process boundary. First real script.**
+      Pipelines: spawn a stage per external command, wire `Streams` via `libstream::setup::pipe`,
+      stream TSM1 between them, collect `StageStatus`/`PipelineStatus` (§1). `stderr` routed
+      separately from the pipe. Early-consumer cancellation via `PeerClosed`. `strict { }` blocks
+      terminating remaining stages through handles the shell already holds. Resolves **D4**, **D7**,
+      **D8**.
+      *Deliverable: `nxsh script.nx` runs `list /system | ...` end to end. First in-guest demo.*
+
+- [ ] **Part D — generic value operators**
+      `filter`, `sort`, `select`, `take`, `last`, `skip`, `dedupe`, `each`, `map`, `count`,
+      `display`, `format`, `expect`, `assert`, `save`, `open`. Generic dispatch over `Value` shape
+      (§5c) — these run in-process, so the dense middle of a pipeline costs no spawns.
+      **B5 lands here as `.tsm` + `.txt` only**; `.csv`/`.json` are separate, later, and neither is
+      free. Ascription/`expect` checks a §6 schema against a TSM1 header — once, at header-read
+      time, not per row.
+      *Deliverable: `list | filter size > 1000 | sort size | take 5 | display` works.*
+
+- [ ] **Part E — functions, closures, match, null handling, modules**
+      `def` with defaults evaluated per call, variadics, named args, the `_` pipeline-fill rule
+      (§5b); closures capturing by value at creation; `def` hoisting for mutual recursion;
+      `match` with guards, or-patterns, ranges, `@` capture, record subset patterns (§9f);
+      `T?`/`?.`/`??` (§9e); `try`/`catch` and `?` propagation (§2); `use` imports (§9h). Resolves
+      **D6** (env).
+      *Deliverable: the §7 illustrative sketch runs verbatim.*
+
+- [ ] **Part F — minimal REPL**
+      A line-reader on the raw console: read, parse, evaluate, print. Automatic continuation on the
+      *provable* cases only (unclosed delimiter, trailing `|`) per §11b. `$last` (§11d), `cd`/`exit`
+      builtins, auto-display. **No** reverse-search, Shift-Enter, completion, or job control —
+      those are the deferred rich REPL below, gated on the console/tty server.
+      *Deliverable: an interactive prompt. `nxsh` can replace `usersh` as the login leaf.*
+
+- [ ] **Part G — the regex engine and `~=`** (B4)
+      Predicate-only, since §10b never asks `~=` for anything but a boolean — which removes
+      submatch extraction, the largest source of complexity in a regex implementation. Pattern
+      parser → instruction program → **Pike VM** (Thompson NFA): linear time, no backtracking, no
+      catastrophic blowup.
+      **Supported:** literals, `.`, `*`, `+`, `?`, `|`, `()`, `[abc]`/`[a-z]`/`[^…]`, `^`/`$`,
+      escapes, `\d`/`\w`/`\s`. **Rejected loudly at compile time:** backreferences (they are
+      precisely what would force backtracking — excluding them is what *permits* the Pike VM, the
+      same call Go's `regexp` and RE2 make), `{n,m}`, lazy quantifiers, lookaround.
+      The property that matters: **no pattern's meaning ever changes when the engine grows.** Every
+      excluded construct is an error today, not a silently-different match — which is why literal
+      substring matching was rejected as a starting point.
+      *Deliverable: `list | filter name ~= /\.rs$/` works. Closes the `grep` story (§10a).*
+
+#### What Milestone 3 does not do
+
+`.csv`/`.json` for `save`/`open` (B5 beyond `.tsm`/`.txt`), the rich REPL (§11), job control,
+schema-aware completion, and everything in §12. `usersh` stays the login leaf until Part F proves
+`nxsh` in-guest; switching `session-mgr` over is the last step, not the first.
 
 ### Deferred — the rich REPL (§11) and its dependencies
 

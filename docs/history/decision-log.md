@@ -9507,3 +9507,62 @@ already applied to files, extended rather than reinvented.
 *Verified:* 814 host tests green, `test-qemu` PASS under TCG and KVM, all five guards,
 `check-deferrals` down to 11 tags. Each of the three properties — the tree arrives, the
 source is removed entirely, a binding is refused — fails the demo when removed.
+
+---
+
+## 2026-07-30 — Milestone 3 planned: `nxsh`, and the gaps the design doc could leave open but the implementation cannot
+
+Three things were settled with the maintainer before planning, then the plan was written into
+`docs/planning/shell-coreutils-plan.md`.
+
+**Names: binary `nxsh`, scripts `.nx`.** §9h had flagged the extension as a placeholder, so both
+candidates were collision-checked rather than picked. `nx` as a binary was rejected outright — Nx
+is a widely-used monorepo build system whose CLI is exactly `nx`, plausibly on a developer's
+`$PATH` and dominating every relevant search. `nxsh` collides only with the Next Scripting
+Framework's obscure `nxsh(1)`, which is a small collision traded for a large one. `nsh` was struck
+on inspection: it is NuttShell, the NuttX RTOS's shell — same name, same category, an OS shell.
+`.nx` collides only with game and archive formats, nothing a developer would confuse with a script,
+and it reads like a language extension rather than a shell one, which matches §3's insistence that
+this is a real scripting language. It also leaves every `use "./lib/utils.nx"` example correct as
+written.
+
+**Ordering: parse everything, evaluate incrementally.** The full §8/§9 grammar lands in Part A, and
+evaluation catches up part by part, so a real script runs at Part C rather than at the end. The
+alternative layers more cleanly on paper but puts the process boundary last — and that is where
+Milestones 1 and 2 both produced their real surprises, with the least precedent to lean on.
+
+**Regex: a predicate-only engine, inside the milestone.** The scoping insight is that §10b never
+asks `~=` for anything but a boolean, which removes submatch extraction — the largest source of
+complexity in a regex implementation. What remains is a pattern parser, an instruction program and
+a Pike VM, on the order of 400 lines of pure host-tested code. Backreferences are excluded because
+they are precisely what would force backtracking; excluding them is what *permits* the linear-time
+VM, the same call Go's `regexp` and RE2 make. Literal-substring-matching-first was rejected on one
+property: it silently changes the meaning of `.` when the real engine arrives, and every excluded
+construct here is a loud compile error instead.
+
+**The plan's real content is the decisions the design doc leaves open.** Chief among them:
+
+*Word mode vs expression mode (D1).* §8b parses `filter size > 1000` as an expression; §5b parses
+`list --long /some/path` as barewords. One rule cannot do both — `README.md` is a filename or a
+field access, `/system` is a path or a division with no left operand. The proposal is that **the
+head token's category selects the argument grammar, at parse time**: §3's four-way categorization
+is already a parse-relevant distinction rather than documentation. §5c's "the generic-operator
+category is open" survives, because a user `def` doing generic dispatch is called with the parens
+convention and is therefore syntactically distinct.
+
+*Newline policy (D2)* — stated nowhere, though §9a depends on it and §11b asserts that leading-pipe
+style parses in a file without explaining why. *Path-vs-regex lexing (D3)* — both start with a
+prefix `/`, resolved by lexing a regex literal only immediately after `~=`. *Recursion bounds
+(D5)* — a recursive-descent parser and a tree-walking evaluator both recurse on user input, and
+neither may turn a deeply-nested expression into a stack overflow.
+
+**The `Host` trait is the structural bet.** Everything the evaluator does that touches the OS —
+spawn a stage, open a path, read a stream — sits behind a trait, exactly as the ext4 parser sits
+behind `BlockReader`. It is worth more here than there: an interpreter is mostly pure logic, and
+pure logic tested on the host is tested in a second rather than a 90-second boot. It also makes
+pipeline *semantics* — ordering, backpressure, error propagation — testable without a kernel.
+
+**One coupling carried forward.** B3 (env) is due in Part E, and Milestone 2 Part E established
+that it is the same problem as `/session/*` metadata: mutable, namespace-scoped values behind a
+path. B3 is to be designed with `/session/*` in view and that binding migrated onto whatever B3
+builds, rather than producing two mechanisms and two migrations.
