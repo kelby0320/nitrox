@@ -1235,11 +1235,19 @@ fn namespace_rights() -> Rights {
         | Rights::INSPECT
 }
 
-/// Map a [`NsError`] to the user-facing [`KError`]. `AlreadyBound`/`InvalidPath`
-/// are caller errors (`InvalidArgument`); `NotBound` is `NotFound`.
+/// Map a [`NsError`] to the user-facing [`KError`]. `InvalidPath` is a caller
+/// error (`InvalidArgument`); `NotBound` is `NotFound`; `AlreadyBound` is
+/// `AlreadyExists`.
+///
+/// `AlreadyBound` shared `InvalidArgument` with `InvalidPath` until
+/// `KError::AlreadyExists` landed (2026-07-30), which meant a supervisor could
+/// not tell "that path is taken" from "that path is malformed" — the same
+/// collapse the fs-server had, and the reason `AlreadyExists` is a kernel error
+/// rather than a filesystem one.
 fn map_ns_err(e: NsError) -> KError {
     match e {
-        NsError::InvalidPath | NsError::AlreadyBound => KError::InvalidArgument,
+        NsError::InvalidPath => KError::InvalidArgument,
+        NsError::AlreadyBound => KError::AlreadyExists,
         NsError::NotBound => KError::NotFound,
         NsError::OutOfMemory => KError::OutOfMemory,
     }
@@ -3107,7 +3115,13 @@ mod tests {
     #[test]
     fn map_ns_err_maps_each_variant() {
         assert_eq!(map_ns_err(NsError::InvalidPath), KError::InvalidArgument);
-        assert_eq!(map_ns_err(NsError::AlreadyBound), KError::InvalidArgument);
+        // Distinct from `InvalidPath`: a bind onto a taken path is a well-formed
+        // request the namespace already answers, not a malformed one.
+        assert_eq!(map_ns_err(NsError::AlreadyBound), KError::AlreadyExists);
+        assert_ne!(
+            map_ns_err(NsError::AlreadyBound),
+            map_ns_err(NsError::InvalidPath)
+        );
         assert_eq!(map_ns_err(NsError::NotBound), KError::NotFound);
         assert_eq!(map_ns_err(NsError::OutOfMemory), KError::OutOfMemory);
     }

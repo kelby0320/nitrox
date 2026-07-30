@@ -10,6 +10,13 @@
 //! v5.1 error space (`docs/history/os-design-v5.1.md`) is filled in as
 //! syscalls that need them land. The numeric values are the contract and
 //! must not change once userspace mirrors them.
+//!
+//! **The v5.1 numbering is not the implemented numbering.** That document
+//! reserved `-11` for `AlreadyExists` and put the blocking errors at `-20`;
+//! the implementation instead placed `WouldBlock`/`TimedOut`/`PeerClosed` at
+//! `-11..-13`, so `-11` is taken and `AlreadyExists` is `-14`. Read the
+//! catalogue in `docs/reference/error-codes.md`, not the design doc, before
+//! assigning a new discriminant.
 
 use crate::mm::user_access::UserAccessError;
 
@@ -36,6 +43,22 @@ pub enum KError {
     /// An IPC channel's peer endpoint has closed: no further messages can be
     /// sent or received on this endpoint.
     PeerClosed = -13,
+    /// The name the operation would create is already taken (`sys_ns_bind` on
+    /// an occupied path; a resource server's create/rename onto an existing
+    /// entry). Distinct from [`InvalidArgument`](Self::InvalidArgument): the
+    /// request was well-formed, the namespace simply already answers to it —
+    /// which is what lets a caller treat it as success (`mkdir --parents`)
+    /// instead of re-deriving the fact with a second round trip.
+    ///
+    /// **`-14`, not the `-11` reserved in the v5.1 design** — see the module
+    /// docs.
+    AlreadyExists = -14,
+    /// A container still has members and the operation requires it to be empty
+    /// (`rmdir` of a populated directory). Its value to a caller is largely in
+    /// the *race*: a recursive remove that emptied a directory and then failed
+    /// to remove it learns that something else added an entry, rather than
+    /// reporting an unexplained failure.
+    NotEmpty = -15,
     /// An argument was malformed or out of range.
     InvalidArgument = -30,
     /// A user buffer was inaccessible (bad address or page fault).
@@ -97,7 +120,13 @@ mod tests {
         assert_eq!(KError::WouldBlock.as_isize(), -11);
         assert_eq!(KError::TimedOut.as_isize(), -12);
         assert_eq!(KError::PeerClosed.as_isize(), -13);
+        // -14/-15, *not* the v5.1 document's -11: the blocking errors took the
+        // -11..-13 slots first. Pinned here so the divergence is caught rather
+        // than rediscovered.
+        assert_eq!(KError::AlreadyExists.as_isize(), -14);
+        assert_eq!(KError::NotEmpty.as_isize(), -15);
         assert_eq!(KError::FaultFromUser.as_isize(), -31);
+        assert_eq!(KError::IoError.as_isize(), -40);
         assert_eq!(KError::TooLarge.as_isize(), -32);
         assert_eq!(KError::Unsupported.as_isize(), -52);
         assert_eq!(KError::KernelError.as_isize(), -255);

@@ -880,13 +880,30 @@ fn now_secs() -> i64 {
 }
 
 /// Map an `FsError` to the `KError` discriminant carried in a reply.
+///
+/// Four of these arms were wrong or lossy until the 2026-07-30 ABI pass, and the
+/// pattern in all four was the same: a `KError` that said what happened existed,
+/// and the mapping reached for a vaguer one anyway. `Exists`/`NotEmpty` collapsed
+/// into `InvalidArgument` (the documented `fs-error-granularity` deferral), but also
+/// `TooLarge` reported `OutOfMemory` — the kernel is not out of memory, the file
+/// exceeded the caller's buffer, and `KError::TooLarge` has meant exactly that
+/// since the beginning — and `Io` reported `KernelError`, so a failing disk was
+/// indistinguishable from a bug in the server.
+///
+/// `Corrupt` still shares `IoError` with `Io`: from a client's side both mean "the
+/// medium did not yield what it should have", and neither changes what the client
+/// can do. The distinction is real but it is *server-specific*, which is what the
+/// wire's `server_code` field is for (`docs/spec/rsproto-wire-format.md`); it is
+/// left unpopulated until something consumes it, rather than spending a kernel
+/// discriminant on a difference only this server can observe.
 fn fs_kerror(e: FsError) -> i32 {
     match e {
         FsError::NotFound => KError::NotFound.as_i32(),
         FsError::Unsupported => KError::Unsupported.as_i32(),
-        FsError::TooLarge => KError::OutOfMemory.as_i32(),
-        FsError::Exists | FsError::NotEmpty => KError::InvalidArgument.as_i32(),
-        FsError::Corrupt | FsError::Io => KError::KernelError.as_i32(),
+        FsError::TooLarge => KError::TooLarge.as_i32(),
+        FsError::Exists => KError::AlreadyExists.as_i32(),
+        FsError::NotEmpty => KError::NotEmpty.as_i32(),
+        FsError::Corrupt | FsError::Io => KError::IoError.as_i32(),
     }
 }
 

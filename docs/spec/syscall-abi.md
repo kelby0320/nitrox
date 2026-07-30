@@ -41,7 +41,7 @@ This follows Linux's aarch64 convention.
 
 All syscalls return a single `isize` value:
 
-- **Negative values** are `KError` discriminants. See the `KError` enum in `kernel/src/syscall/error.rs` (the canonical source until a `docs/reference/error-codes.md` catalogue is written) for the complete list.
+- **Negative values** are `KError` discriminants. The complete set, with what each means and who produces it, is catalogued in [error-codes.md](../reference/error-codes.md); `kernel/src/syscall/error.rs` remains the canonical source. **Do not assign a new discriminant from the v5.1 design document** — its numbering and the implemented numbering diverge in the `-1x` range, and the catalogue explains where.
 - **Non-negative values** are operation-specific. Common patterns: a count of bytes transferred, a handle value, or `0` for "success with no value."
 
 Userspace code typically wraps this as `Result<NonNegative, KError>`:
@@ -520,6 +520,6 @@ After v1.0, syscall numbers and the existing signatures become a stability commi
 - [IPC message format](ipc-message-format.md)
 - [Notification format](notification-format.md)
 - [IoOp](io-operation.md) / [IRP layout](irp-layout.md) / [DeviceNode](device-node.md)
-- `kernel/src/syscall/error.rs` — the `KError` enum (canonical error-code source)
+- [Error codes](../reference/error-codes.md) — the `KError` catalogue (`kernel/src/syscall/error.rs` is the canonical source)
 - [Process spawn args](process-spawn-args.md)
 - [Why async-first syscalls](../rationale/why-async-syscalls.md)

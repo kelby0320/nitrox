@@ -14,11 +14,13 @@
 //! - **`--parents` makes an existing leaf a success, not an error.** That is the whole
 //!   point of the flag — "ensure this path exists" — and it is why the flag also relaxes
 //!   the exists check rather than only creating intermediates.
-//! - **Existence is tested by opening, not inferred from an error code.** The filesystem
-//!   reports "already exists" and "directory not empty" as the *same* `InvalidArgument`
-//!   (`FsError::Exists` and `FsError::NotEmpty` both collapse there — see
-//!   `TODO(fs-error-granularity)`), so a client that branched on the error would be
-//!   guessing. [`fs::is_dir`] asks the question directly.
+//! - **Existence is learned from the attempt, and only its *kind* is asked about.** The
+//!   server answers a colliding create with `KError::AlreadyExists` (since the 2026-07-30
+//!   ABI pass; it was indistinguishable from a malformed request before), so the common
+//!   path — the component is missing — is one round trip rather than a probe and a
+//!   create. What the code *cannot* infer is whether the occupant is a directory, and
+//!   `--parents` accepts only a directory, so [`fs::is_dir`] is asked exactly there: on
+//!   the collision, not ahead of every component.
 //! - **A failure stops the run**, as in `copy`. The rows already emitted say what was
 //!   created before the failure; the exit status says the run did not succeed. Fail
 //!   loud, don't fail silent (§1).
@@ -38,8 +40,9 @@ use coreutils::args::{Flag, parse};
 use coreutils::fs;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
+use libkern::error::KError;
 use libkern::{exit, kprint};
-use librsproto::session::Dir;
+use librsproto::session::{Dir, DirError};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -124,31 +127,33 @@ fn make_one(stage: &Stage, path: &[u8]) -> bool {
     };
     let r = dir.mkdir(name);
     dir.close();
-    if r.is_err() {
-        // Could be "already exists", could be a real failure — the filesystem reports
-        // both as `InvalidArgument`. Distinguish by asking, so the message is true.
-        if fs::is_dir(stage.namespace, path) {
-            stage.die(b"mkdir: path already exists (use --parents to allow it)\n", EXIT_FAILURE);
+    match r {
+        Ok(()) => true,
+        // The server says the name is taken, so the message can say so without a
+        // confirming round trip — which is the whole point of the error existing.
+        Err(e) if is_already_exists(&e) => {
+            stage.die(b"mkdir: path already exists (use --parents to allow it)\n", EXIT_FAILURE)
         }
-        stage.die(b"mkdir: cannot create directory\n", EXIT_FAILURE);
+        Err(_) => stage.die(b"mkdir: cannot create directory\n", EXIT_FAILURE),
     }
-    true
+}
+
+/// Whether a directory-op failure is the server reporting an occupied name.
+fn is_already_exists(e: &DirError) -> bool {
+    matches!(e, DirError::Server(k) if *k == KError::AlreadyExists.as_i32())
 }
 
 /// Create `path` and any missing components above it. Returns whether the **leaf** was
 /// created by this run (`false` when it already existed). Diverges on failure.
 fn make_parents(stage: &Stage, path: &[u8]) -> bool {
-    // Walk the prefixes shortest-first, creating the ones that are missing. Testing each
-    // with `is_dir` rather than creating-and-ignoring-the-error keeps this honest about
-    // *why* a component was skipped, and is the only way to be sure given that "exists"
-    // is indistinguishable from a real failure at the wire.
+    // Walk the prefixes shortest-first and just try to create each one. A component that
+    // is already there answers `AlreadyExists`, which is the ordinary case for the upper
+    // prefixes and costs nothing extra; the probe is spent only on that answer, to check
+    // the occupant is a directory. (Before the error existed this had to probe *every*
+    // component first, because a collision could not be told from a real failure.)
     let mut created_leaf = false;
     for end in component_ends(path) {
         let prefix = &path[..end];
-        if fs::is_dir(stage.namespace, prefix) {
-            created_leaf = false;
-            continue;
-        }
         let parent = fs::parent(prefix);
         let name = fs::basename(prefix);
         if name.is_empty() {
@@ -161,10 +166,22 @@ fn make_parents(stage: &Stage, path: &[u8]) -> bool {
         };
         let r = dir.mkdir(name);
         dir.close();
-        if r.is_err() && !fs::is_dir(stage.namespace, prefix) {
-            stage.die(b"mkdir: cannot create directory\n", EXIT_FAILURE);
-        }
-        created_leaf = true;
+        created_leaf = match r {
+            Ok(()) => true,
+            Err(e) if is_already_exists(&e) => {
+                // `--parents` means "ensure this path exists as a directory". A file
+                // wearing the name does not satisfy that, and silently continuing would
+                // report success for a tree that was never built.
+                if !fs::is_dir(stage.namespace, prefix) {
+                    stage.die(
+                        b"mkdir: path exists and is not a directory\n",
+                        EXIT_FAILURE,
+                    );
+                }
+                false
+            }
+            Err(_) => stage.die(b"mkdir: cannot create directory\n", EXIT_FAILURE),
+        };
     }
     created_leaf
 }

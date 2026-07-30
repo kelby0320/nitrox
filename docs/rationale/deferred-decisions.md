@@ -344,32 +344,6 @@ authority lives: rights on the binding independent of the endpoint handle's, a r
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
 
-**The filesystem collapses distinct errors into `InvalidArgument` — `TODO(fs-error-granularity)`.**
-`fs-server-ext4` distinguishes `FsError::Exists` (POSIX `EEXIST`) from `FsError::NotEmpty`
-(`ENOTEMPTY`) internally, but both map to `KError::InvalidArgument` on the wire, because the kernel's
-`KError` set has neither. A client therefore cannot tell "already exists" from "directory not empty"
-from a genuinely malformed argument.
-
-The cost is that clients must re-derive what the server already knew. `mkdir --parents` cannot treat
-"already exists" as success by inspecting the error, so it tests each component with `is_dir` first;
-`remove` cannot report "directory not empty" accurately, so it establishes emptiness by listing.
-Both work, and both are an extra round trip plus a small race window against a concurrent mutator —
-acceptable at Milestone 2, where the alternative is guessing.
-
-Fixing it means adding discriminants (`AlreadyExists`, `NotEmpty`) to `KError`, which is an **ABI
-change**: it moves the ABI version hash and must be mirrored in `userspace/libkern`
-(`cargo xtask abi-sync-check` enforces the mirror). That is why it is not folded into a coreutils
-part.
-
-**Scheduled (2026-07-30): a batched fs-server ABI pass, immediately after the Milestone 2 coreutils
-land.** Deliberately batched rather than taken now — an ABI change moves the version hash and forces
-every mirror to be re-checked, so paying that once for several corrections beats paying it per
-utility. Milestone 2 is also the first time the filesystem interface has had this many clients at
-once, which makes it the right moment to collect the corrections and the wrong moment to keep
-patching around them one at a time. Any further ABI gaps found while building the remaining parts
-join this pass; anything that turns out to *block* a part gets reassessed at that point rather than
-deferred on principle.
-
 **Cross-mount `move` of a directory, and the missing second mount — `TODO(cross-mount-move)`.**
 `move` falls back to copy-then-remove when the kernel reports a rename as cross-device, and that
 fallback handles a **regular file** only; a directory operand is refused. Two reasons, and the second
@@ -756,6 +730,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Filesystem errors collapsed into `InvalidArgument` (`fs-error-granularity`) | 2026-07-30 | `KError` gained `AlreadyExists` (-14) and `NotEmpty` (-15), and the batched ABI pass found the collapse was not the fs-server's alone: `sys_ns_bind` on an occupied path had the identical one, which is what makes these kernel errors rather than filesystem ones. Three further arms of `fs_kerror` were also reaching for a vaguer error than existed — `TooLarge`→`OutOfMemory`, `Io`→`KernelError`. Separately, `libkern`'s `from_i32` had never decoded `IoError`, so every device error read as `KernelError`; `abi-sync-check` now derives the decode table from the kernel's enum. See [error-codes.md](../reference/error-codes.md). |
 | `cargo xtask abi-sync-check` | 2026-07-29 | Built (Slice D2) and wired into CI. Compares the four hand-mirrored ABI families — syscall numbers, `KError`/`KObjectType` discriminants, `Rights` bits — plus individually-paired shared limits (`MAX_WAIT_HANDLES`, `IPC_HANDLE_MAX`), 91 values in all. `#[repr(C)]` layouts stay out of it: both sides already assert their own offsets and sizes at compile time, which is stronger and fails earlier. |
 | x2APIC | 2026-06-26 | Built — and **x2APIC-only**, not dual-mode: the ≈2014 baseline guarantees it, so no xAPIC fallback is carried. The dev loop runs QEMU ≥ 9.0. |
 | Concurrent direct-block + forwarded-lookup hang | 2026-07-20 | Not the block/forwarding path — a missing cross-CPU wake; fixed by the reschedule IPI. |

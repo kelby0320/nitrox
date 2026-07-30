@@ -66,6 +66,13 @@ pub enum ErrorKind {
     TimedOut,
     /// An IPC peer closed ([`KError::PeerClosed`]).
     BrokenPipe,
+    /// The name the operation would create is already taken
+    /// ([`KError::AlreadyExists`]). Same name as `std::io::ErrorKind::AlreadyExists`.
+    AlreadyExists,
+    /// A container the operation requires to be empty is not
+    /// ([`KError::NotEmpty`]). Named for `std::io::ErrorKind::DirectoryNotEmpty`,
+    /// which is what a `std` facade would map this onto.
+    DirectoryNotEmpty,
     /// A malformed handle / argument / buffer.
     InvalidInput,
     /// The kernel heap or handle table was exhausted.
@@ -84,6 +91,8 @@ impl ErrorKind {
             KError::WouldBlock => ErrorKind::WouldBlock,
             KError::TimedOut => ErrorKind::TimedOut,
             KError::PeerClosed => ErrorKind::BrokenPipe,
+            KError::AlreadyExists => ErrorKind::AlreadyExists,
+            KError::NotEmpty => ErrorKind::DirectoryNotEmpty,
             KError::InvalidHandle
             | KError::InvalidArgument
             | KError::FaultFromUser

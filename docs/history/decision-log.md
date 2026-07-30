@@ -9365,3 +9365,82 @@ values (`r12 = 0x65767265732d7366`, i.e. `"fs-serve"`).
 *Verified:* host suite green, `test-qemu` PASS under TCG and KVM locally (Intel, where the
 bug never reproduced), all five guards pass. The fix can only be confirmed on CI's AMD
 runners — which is also the first time this gate will have been green on main.
+
+---
+
+## 2026-07-30 — The batched fs-server ABI pass: `AlreadyExists`, `NotEmpty`, and three arms that were already wrong
+
+Staged deliberately after Milestone 2's coreutils landed (2026-07-29 entry), on the
+reasoning that an ABI change forces every hand-mirrored surface to be re-checked and it is
+better to pay that once for several corrections than per utility. The batch turned out to
+be worth more than the one item that scheduled it.
+
+**The scheduled item.** `fs-server-ext4` distinguished `FsError::Exists` from
+`FsError::NotEmpty` internally and mapped both to `KError::InvalidArgument`, because the
+kernel error space had neither. Clients re-derived what the server already knew:
+`mkdir --parents` probed every path component with `is_dir` before creating it, because a
+collision could not be told from a real failure; `remove` could not report "not empty"
+accurately at all. `KError` gains `AlreadyExists = -14` and `NotEmpty = -15`.
+
+**The finding that changed the shape of the fix.** These read like filesystem concepts,
+and the reasonable objection is that the kernel — which has no filesystem — should not
+carry them. It has the identical collapse: `sys_ns_bind` onto an occupied path is
+`NsError::AlreadyBound`, and it shared `InvalidArgument` with a *malformed path*, so a
+supervisor could not tell "that name is taken" from "that name is nonsense". Two
+independent components needing the same distinction is what makes it system-wide, and it
+converts the change from "add filesystem errors to the kernel" into "the kernel was
+missing an error it needed".
+
+That gives the rule for the next such question, now written into
+`docs/reference/error-codes.md`: **a `KError` is for a condition more than one component
+can produce and any client can act on; everything else belongs in `server_code`**, which
+the rsproto `ErrorBody` has carried since it was specified. `FsError::Corrupt` is the
+standing example of the other side — it shares `IoError` with a real device failure
+because no client can act on the difference.
+
+**Three arms were already wrong, and nothing had noticed.** Auditing `fs_kerror` for the
+scheduled fix found the same reflex elsewhere: `TooLarge` reported `OutOfMemory` (the
+kernel is not out of memory — a file exceeded the caller's buffer, which is what
+`KError::TooLarge` has meant since the beginning), and `Io` reported `KernelError`, making
+a failing disk indistinguishable from a bug in the server. Both had a correct discriminant
+available and reached past it. Batching is what surfaced them: nobody re-reads a mapping
+function to fix one arm.
+
+**A silent mirror bug, and the guard that would not have caught it.** `libkern`'s
+`from_i32` had no arm for `IoError`, so every device error decoded as `KernelError` — from
+2026-06 until now. `abi-sync-check` passed throughout, because the *enums* agreed
+perfectly; `from_i32` is a second hand-written copy of the same table, and its deliberate
+`_ => KernelError` forward-compat arm makes a missing entry indistinguishable from an
+unknown code at runtime. The round-trip test in `error.rs` missed it too, for the reason
+such tests usually do: it enumerates the variants by hand, so the same oversight that
+omitted the arm omitted the assertion.
+
+The fix is not "add the arm". `abi-sync-check` now derives the expected decode set from
+the **kernel's** enum and fails on any variant `from_i32` cannot decode — a list that
+cannot be kept in step by the same oversight that made it wrong. Both failure modes were
+confirmed by control: deleting the `IoError` arm and mis-mapping `-15` each produce a
+precise, correct message.
+
+**Verification.** The host tests pin the discriminants and the guard pins the mirror, but
+neither runs a syscall or a wire round trip, and this pass is entirely about a value
+surviving one. `error_granularity_demo` checks both boundaries where they actually happen
+— the kernel's `isize` return for a duplicate `sys_ns_bind`, and the server's `ErrorBody`
+marshalled and parsed back for a colliding `mkdir` and a populated `rmdir` — with a
+malformed-path bind alongside as the contrast, so the assertion cannot pass on a build
+that still collapses everything.
+
+Each of the three mappings was reverted in turn and the run re-adjudicated. Two failed with
+the expected assertion. The third failed *earlier and harder*: with `Exists` back on
+`InvalidArgument`, `mkdir --parents` itself stops working, because the client now genuinely
+depends on the error rather than working around its absence. That is the outcome worth
+noting — the measure of the change is that removing it breaks a utility, not just a test.
+
+*Verified:* 812 host tests green, `test-qemu` PASS under TCG and KVM, all five guards
+(`abi-sync-check` now compares 109 values), `check-deferrals` at 12 tags.
+
+**Also landed:** `docs/reference/error-codes.md`, the catalogue `syscall-abi.md` had been
+promising in a parenthetical. It exists mainly to carry one warning: the v5.1 design
+document reserved `-11` for `AlreadyExists` and put the blocking errors at `-20`, while
+the implementation put `WouldBlock`/`TimedOut`/`PeerClosed` at `-11..-13`. Anyone reading
+the design doc for a free value would collide with `WouldBlock`. The design doc is
+history; the catalogue is the reservation table.

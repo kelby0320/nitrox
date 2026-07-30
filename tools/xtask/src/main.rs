@@ -1049,6 +1049,11 @@ fn cmd_abi_sync_check() -> R<()> {
         }
     }
 
+    match check_kerror_decode_table(&root) {
+        Ok(n) => compared += n,
+        Err(mut found) => problems.append(&mut found),
+    }
+
     for (kf, kn, uf, un) in ABI_PAIRS {
         let kt = fs::read_to_string(root.join(kf)).map_err(|e| format!("read {kf}: {e}"))?;
         let ut = fs::read_to_string(root.join(uf)).map_err(|e| format!("read {uf}: {e}"))?;
@@ -1078,6 +1083,92 @@ fn cmd_abi_sync_check() -> R<()> {
     }
     println!("abi-sync-check: {compared} ABI value(s) agree between the kernel and libkern ✓");
     Ok(())
+}
+
+/// Verify `libkern::KError::from_i32` decodes **every** kernel `KError` variant.
+///
+/// Mirroring the enum is not enough. `from_i32` is a second, hand-written copy of the
+/// same table, and its `_ => KernelError` catch-all — deliberate forward-compat, so a
+/// newer kernel's error does not panic an older `libkern` — means a *missing* arm is
+/// indistinguishable from an unknown code at runtime. `IoError` sat in both enums with
+/// matching discriminants and no arm here from 2026-06 to 2026-07-30: every device error
+/// silently decoded as `KernelError`, `abi-sync-check` passed, and the round-trip test in
+/// `error.rs` missed it because that test enumerates variants by hand too.
+///
+/// So this derives the expected set from the **kernel's** enum. A variant added to the
+/// kernel and mirrored into the userspace enum but forgotten here is now a guard failure,
+/// which is the only place in the chain that does not depend on someone remembering.
+fn check_kerror_decode_table(root: &Path) -> Result<usize, Vec<String>> {
+    const KERNEL: &str = "kernel/src/syscall/error.rs";
+    const USER: &str = "userspace/libkern/src/error.rs";
+
+    let read = |p: &str| {
+        fs::read_to_string(root.join(p)).map_err(|e| vec![format!("KError decode: read {p}: {e}")])
+    };
+    let kt = read(KERNEL)?;
+    let ut = read(USER)?;
+
+    let kernel = extract_consts(&kt, AbiShape::EnumVariant);
+    if kernel.is_empty() {
+        return Err(vec![format!(
+            "KError decode: extracted no variants from {KERNEL} — the checker's pattern has \
+             gone stale, which silently disables this check"
+        )]);
+    }
+
+    // `    -40 => KError::IoError,` → (-40, "IoError"). The wildcard arm and every other
+    // line shape fall out on the integer parse.
+    let mut arms: BTreeMap<i128, String> = BTreeMap::new();
+    // The variant the `_` arm yields. It needs no explicit arm of its own: an unlisted
+    // code already lands on it, including its own. Every *other* variant does.
+    let mut catch_all: Option<String> = None;
+    for line in ut.lines() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        let Some((lhs, rhs)) = t.split_once("=>") else { continue };
+        let Some(name) = rhs.trim().trim_end_matches(',').strip_prefix("KError::") else {
+            continue;
+        };
+        match lhs.trim() {
+            "_" => catch_all = Some(name.to_string()),
+            n => {
+                let Ok(code) = n.parse::<i128>() else { continue };
+                arms.insert(code, name.to_string());
+            }
+        }
+    }
+    if arms.is_empty() {
+        return Err(vec![format!(
+            "KError decode: found no `<int> => KError::Name` arms in {USER} — either \
+             `from_i32` was rewritten in another shape, or the checker's pattern has gone \
+             stale. Either way this check is no longer checking anything"
+        )]);
+    }
+
+    let mut problems = Vec::new();
+    for (name, value) in &kernel {
+        if catch_all.as_deref() == Some(name.as_str()) {
+            continue;
+        }
+        match arms.get(value) {
+            Some(mapped) if mapped == name => {}
+            Some(mapped) => problems.push(format!(
+                "KError decode: {USER} decodes {value} as {mapped}, but {KERNEL} defines \
+                 {value} as {name}"
+            )),
+            None => problems.push(format!(
+                "KError decode: {KERNEL} defines {name} = {value}, but {USER}'s `from_i32` \
+                 has no arm for it — it would decode as KernelError, silently"
+            )),
+        }
+    }
+    if problems.is_empty() {
+        Ok(kernel.len())
+    } else {
+        Err(problems)
+    }
 }
 
 fn cmd_check_deferrals() -> R<()> {
