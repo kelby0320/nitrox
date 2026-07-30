@@ -1651,6 +1651,56 @@ pub fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
     if reg.is_null() { None } else { Some(reg) }
 }
 
+/// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything
+/// still outstanding on it. Called from that type's `Drop`, before its fields drop.
+///
+/// Two jobs, both of which must happen while the registration is still intact:
+///
+/// 1. **Complete outstanding forwarded lookups** `PeerClosed`, so their waiters wake
+///    rather than hang. The endpoint is still alive here, so the wake is well-formed.
+/// 2. **Clear the endpoint's back-pointer to us.** `IpcChannel.us_reg` is raw and
+///    uncounted (a counted edge would cycle with the registration's ownership of the
+///    endpoint), and until this existed nothing ever cleared it — so an endpoint that
+///    outlived its registration left every consumer of that pointer reading freed
+///    memory. See the `Drop` impl for the full list.
+///
+/// Takes `SCHED`, which is sound for the same reason `ipc_endpoint_closing` may:
+/// registration references are released only outside `SCHED`.
+pub fn us_reg_detach(reg: *mut ()) {
+    let mut g = SCHED.lock();
+    // SAFETY: called from `Drop` with the last reference gone but the object whole;
+    // `SCHED` held, satisfying the accessor contract.
+    let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
+    // Bounded by the pending table's size, so the drain cannot overrun this.
+    let mut orphans: [Option<ObjectRef>; US_PENDING_MAX] = core::array::from_fn(|_| None);
+    let mut n_orphans = 0usize;
+    // SAFETY: as above; `SCHED` held.
+    while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
+        signal_pending_op(
+            &mut g,
+            pl.po.as_ptr(),
+            crate::syscall::error::KError::PeerClosed as i32,
+        );
+        orphans[n_orphans] = Some(pl.po);
+        n_orphans += 1;
+    }
+    if !endpoint.is_null() {
+        // Clear only a pointer that still names *this* registration. `us_server_attach`
+        // can retarget an endpoint at a different one, and stomping a live successor's
+        // pointer would silently break its reply routing.
+        // SAFETY: `endpoint` is pinned by the reference this registration still holds
+        // (released by the field drops that follow this call); `SCHED` held.
+        if unsafe { IpcChannel::us_reg_of(endpoint) } == reg {
+            // SAFETY: as above.
+            unsafe { IpcChannel::set_us_reg(endpoint, core::ptr::null_mut()) };
+        }
+    }
+    // Release `SCHED` before dropping the orphaned references: an `ObjectRef` drop can
+    // reach the allocator, which must not happen under the rank-1 lock.
+    drop(g);
+    drop(orphans);
+}
+
 /// Record the endpoint → registration back-pointer that makes `endpoint` the
 /// kernel's end of a Userspace Server channel: a reply sent to it (by the server,
 /// on its peer) is then completed inline rather than enqueued. Called by
@@ -1677,13 +1727,20 @@ pub fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
     if reg.is_null() {
         return None;
     }
-    // `reg` is a live `UserspaceServerReg`: the existing binding that installed the
-    // back-pointer still holds a reference (refcount ≥ 1), and `SCHED` serialises
-    // against its teardown. Bump the header count and adopt a new owned ref.
-    // SAFETY: `reg` addresses a live object with an outstanding reference; `SCHED` held.
+    // Acquire rather than `bump`: the old code asserted "the existing binding still
+    // holds a reference (refcount >= 1)" and incremented unconditionally, which
+    // resurrects an object whose count has already reached zero — handing out an owned
+    // reference to memory that is being destroyed. `try_acquire` refuses at zero, which
+    // is the `Arc::upgrade` semantics this lookup actually needs. (`us_reg_detach` now
+    // clears the back-pointer at teardown, so reaching a dead registration here should
+    // be impossible; this makes the race unrepresentable rather than merely unlikely.)
+    // SAFETY: `reg` addresses a `UserspaceServerReg` whose header is at offset 0;
+    // `SCHED` held.
     let header = unsafe { &*(reg as *const crate::object::header::KObjectHeader) };
-    header.bump();
-    // SAFETY: the `bump` above balances this adoption of a new reference.
+    if !header.try_acquire() {
+        return None;
+    }
+    // SAFETY: the successful `try_acquire` above balances this adoption.
     Some(unsafe { ObjectRef::from_raw(reg, KObjectType::UserspaceServerReg) })
 }
 

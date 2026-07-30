@@ -8988,3 +8988,70 @@ so the check cannot pass against a `list` that had stopped reading filesystems a
 **Both controls run**: removing the namespace source fails the first assertion (that is
 exactly the pre-D3 behaviour), and removing the filesystem source fails the second. All four
 static checks green.
+
+## 2026-07-29 — A raw back-pointer nothing cleared, and three rounds of instrumenting the wrong function
+
+Stress-testing PR #124 under TCG plus host load — harder than the KVM loops CI runs —
+turned up a crash on merged main: `#GP`/`#PF` in `sched::signal_pending_op_with_result`
+dereferencing a `PendingOperation` that was not one. About one boot in four; **6 of 20
+on unfixed main**. It predated #124 (same fault, same line, and main failed *more*), so
+it was split out to its own change.
+
+**The bug.** `IpcChannel.us_reg` is a raw back-pointer to the endpoint's
+`UserspaceServerReg`. Uncounted by necessity — the registration owns the endpoint, so a
+counted edge the other way is a cycle — and, until now, **never cleared**. Ordinary
+teardown hides it: the registration owns the endpoint, and `Inner` declares `endpoint`
+before `pending`, so the endpoint's `Drop` reaches `ipc_endpoint_closing` while the
+pending table is still intact, which is exactly what makes the drain there correct. But
+when anything else holds a reference to that endpoint — a server handle, a blocked
+waiter — the registration is freed *first* and the endpoint later follows a dangling
+pointer. Four consumers did: `ipc_endpoint_closing`'s two drains,
+`us_forward_reg_for_send`, and `us_forward_existing_reg`.
+
+That last one was worse than the crash and entirely silent. It called `header.bump()`
+— an unconditional increment, 0 → 1 — on a registration reached through the stale
+pointer, then handed out an owned `ObjectRef` to it. Its comment asserted "the existing
+binding that installed the back-pointer still holds a reference (refcount ≥ 1)", which
+is precisely the premise that fails. A destroyed object, resurrected.
+
+**The fix.** `UserspaceServerReg` gains a `Drop` that calls `sched::us_reg_detach`
+before its fields drop — the window where the pending table is still populated and
+`endpoint` is still a live reference. It completes outstanding lookups `PeerClosed` (so
+their waiters wake rather than hang) and clears the back-pointer, but only where the
+pointer still names *that* registration: `us_server_attach` can retarget an endpoint,
+and a dying predecessor must not stomp a live successor's reply routing. `Drop` then
+poisons the `magic` sentinel, and `us_forward_existing_reg` switches to `try_acquire`,
+which refuses at zero.
+
+**On the sentinel.** `UserspaceServerReg::MAGIC` was written at construction and read by
+nothing — its own doc says "a live object always reads UsSrvRg!" and no code ever asked.
+Wiring it up was tried *first*, as the whole fix, and it is not enough: a sentinel
+detects **reuse**, not **death**. Freed-but-untouched memory still reads the magic, and
+partial reuse can overwrite `pending` while leaving `magic` at offset 8 intact — which is
+what the surviving failure showed. Poisoning it in `Drop` is what makes the check sound;
+it is kept as defence in depth behind the real fix, not as the fix.
+
+**Two mistakes worth recording, because both cost real time.**
+
+*Reading a constant from memory.* `rdx = 0xfffffff3` was read as `KError::TimedOut`.
+`TimedOut = -12`; `PeerClosed = -13`. That single unverified discriminant pointed three
+rounds of instrumentation at the `BlockBounded` deadline arm, which was never involved —
+each round correctly reporting nothing wrong. The bug was also *filed* under that wrong
+name; the harness's `blocking send timed out` line merely prints just before the teardown
+that crashes. A one-line `grep` of the enum would have saved all of it.
+
+*Measuring in the hot path.* Three successive probes in the code under investigation each
+changed the crash's incidence, the last taking it from 4-in-18 to **0-in-18** — a clean
+run that meant only that the probe had suppressed what it was measuring. Moving the
+instrumentation to the **dying** path fixed that: stack-scan backtraces in `dump_and_halt`
+and the panic handler, which run on an already-halting kernel and cannot perturb timing.
+That named the faulting caller in a single run. The kernel has no unwind tables, but a
+`call` leaves its return address on the stack, so scanning raw words for kernel-text
+values recovers the chain. Both backtraces are kept — the kernel had none before.
+
+*Verified:* **45/45 boots clean** under TCG + 8-way host load (20 + 25), against 6/20 on
+unfixed main — if the rate were unchanged, that is p ≈ 2e-7. `test-qemu --kvm` PASS; 797
+host tests green; every xtask guard passes. Two regression tests, each **proven to fail
+without the code it guards**: disabling the clearing fails the first, and removing the
+identity guard fails the second — the latter covering a wrong implementation (clear
+unconditionally) that nothing else would have caught.

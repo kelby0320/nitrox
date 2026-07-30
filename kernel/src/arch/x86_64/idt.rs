@@ -875,10 +875,12 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
 /// stale slots — hence "candidates" rather than "backtrace").
 ///
 /// Deliberately placed **here**, on the dying path, rather than as a check in the
-/// code being investigated. Every hot-path probe tried against
-/// `TODO(blockbounded-deadline-crash)` changed the crash's incidence — the last one
-/// took it from 4-in-18 to 0-in-18 — because the bug is timing-sensitive. Code that
-/// runs only after the fault cannot perturb what it is measuring.
+/// code being investigated. Hunting the stale-`us_reg` teardown crash (decision log,
+/// 2026-07-29), every probe placed in the *hot* path changed the crash's incidence —
+/// the last took it from 4-in-18 to 0-in-18 — because the bug was timing-sensitive
+/// enough to be destroyed by measuring it. Code that runs only after the fault cannot
+/// perturb what it is measuring, and this named the faulting caller in one run after
+/// three rounds of hot-path probes had found nothing.
 fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
     // Kernel text: the higher-half image base up to a generous bound. Values
     // outside this are data, not return addresses.
