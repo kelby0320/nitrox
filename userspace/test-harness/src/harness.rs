@@ -2197,8 +2197,51 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: failed cross-mount move destroyed the source\n");
     }
 
+    // --- 6. a cross-mount move that SUCCEEDS ---------------------------------
+    // The half that had never run. Until `/scratch` existed, the only cross-mount
+    // destination was a read-only kernel server, so case 5 could prove the detection and
+    // the source-survives rule but never that the fallback *works* — the copy always
+    // failed. `/scratch` is the same fs-server bound a second time with its own subtree
+    // base, which is exactly what the kernel's rename test keys on.
+    let bytes = run_coreutil_capture(
+        root_ns,
+        notif,
+        MV,
+        &["move", "/system/nx-b2/moved.txt", "/scratch/landed.txt"],
+        true,
+    );
+    // `method = "copy"`, and specifically *not* "rename": if the second binding failed to
+    // register as a distinct mount, the kernel would rename and this would still relocate
+    // the file — passing while testing nothing.
+    let mut copied = false;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if matches!(&vals[2], Value::Str(s) if s == "copy") {
+                    copied = true;
+                }
+            }
+        }
+    }
+    if !copied {
+        return_fail(b"test-harness: cross-mount move did not report method=copy\n");
+    }
+    if path_exists(root_ns, b"/system/nx-b2/moved.txt") {
+        return_fail(b"test-harness: cross-mount move left the original behind\n");
+    }
+    if !path_exists(root_ns, b"/scratch/landed.txt") {
+        return_fail(b"test-harness: cross-mount move did not land the copy\n");
+    }
+    // The content has to survive too — a move that arrives empty is not a move, and
+    // nothing above would have noticed.
+    if !file_matches(root_ns, b"/scratch/landed.txt", b"part b\n") {
+        return_fail(b"test-harness: cross-mount move corrupted the contents\n");
+    }
+
     // --- teardown ------------------------------------------------------------
-    unlink_all(root_ns, b"/system/nx-b2", &[b"moved.txt"]);
+    // Only `/scratch/landed.txt`: case 6 relocated `/system/nx-b2/moved.txt` there, so
+    // the old unlink of the source would now be removing a file that is gone.
+    unlink_all(root_ns, b"/scratch", &[b"landed.txt"]);
     let mut b3 = [0u8; 4096];
     if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut b3) {
         let _ = d.rmdir(b"nx-b");
@@ -2206,7 +2249,7 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
         d.close();
     }
 
-    kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount safe)\n");
+    kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount copy lands)\n");
 }
 
 /// **Milestone 2 Part C — `touch`.**

@@ -440,6 +440,36 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
         if r != 0 {
             kprint(b"init: subtree test bind FAIL\n");
         }
+        // A **second writable mount**, for the cross-mount half of `move`
+        // (`TODO(cross-mount-move)`). Same endpoint again, scoped to base `/scratch`, so
+        // the kernel's rename test — same server *and* same subtree base — calls
+        // `/system/x → /scratch/y` cross-filesystem while both sides remain writable.
+        //
+        // Two bindings of one server rather than a second filesystem: the kernel already
+        // shares one registration across many names (bind-mount semantics, as
+        // `/subtreetest` above relies on), and what `move`'s fallback needs is a
+        // destination the kernel *classifies* as another mount, which this is. A real
+        // second ext4 would add an image partition and a second server process without
+        // exercising one further line of the path under test.
+        //
+        // Selftest-only: it is a fixture, not a system mount. The backing `/scratch`
+        // directory is staged into the image unconditionally (harmless when empty).
+        let scratch = b"/scratch";
+        // SAFETY: valid namespace handle, path/base pointers, and endpoint handle.
+        let r = unsafe {
+            syscall6(
+                SYS_NS_BIND,
+                root_ns,
+                scratch.as_ptr() as u64,
+                scratch.len() as u64,
+                endpoint,
+                scratch.as_ptr() as u64,
+                scratch.len() as u64,
+            )
+        };
+        if r != 0 {
+            kprint(b"init: scratch mount bind FAIL\n");
+        }
     }
     // The root fs-server's forwarding endpoint is handed down to service-mgr (→
     // session-mgr, which binds it as each login's `/home` subtree — bind-mount
