@@ -8,6 +8,7 @@
 //!   test            host-side unit tests (kernel lib + tools workspace)
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
 //!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
+//!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
 //!   clean           remove all build outputs and caches
 //!
@@ -17,6 +18,7 @@
 
 use std::env;
 use std::error::Error;
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -112,6 +114,7 @@ fn main() -> ExitCode {
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
+        Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
         Some("clean") => cmd_clean(),
         Some("help") | Some("--help") | Some("-h") | None => {
@@ -146,6 +149,7 @@ fn print_help() {
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry\n  \
+           abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
            clean         remove build outputs and caches\n  \
            help          show this message\n\
@@ -825,6 +829,254 @@ fn cmd_check_nightly() -> R<()> {
 /// because a bare short tag (`mm`) matches half the prose in any technical document, which
 /// would make the check pass without recording anything. Naming it also makes the entry
 /// searchable from the code and vice versa.
+/// One family of ABI constants mirrored between the kernel and `userspace/libkern`.
+///
+/// `pattern` is matched per line on both sides; capture group semantics are handled by
+/// [`extract_consts`] (name, then value). The two sides use the *same* shape within a
+/// family — `pub const SYS_X: u64 = N;` on both, `Name = -N,` enum variants on both — which
+/// is what makes a line-based comparison sound here rather than needing a Rust parser.
+struct AbiFamily {
+    /// Human name for the report.
+    what: &'static str,
+    kernel_file: &'static str,
+    user_file: &'static str,
+    /// Which line shape to extract. See [`extract_consts`].
+    shape: AbiShape,
+    /// Names legitimately present on **one** side only, each with the reason. An
+    /// unexplained one-sided name is a finding; a listed one is a documented asymmetry.
+    /// Keeping this explicit is what stops the check from being noisy enough to disable.
+    one_sided: &'static [(&'static str, &'static str)],
+}
+
+#[derive(Copy, Clone, PartialEq)]
+enum AbiShape {
+    /// `pub const NAME: u64 = <int>;`
+    U64Const,
+    /// `    Name = <int>,` — an enum variant with an explicit discriminant.
+    EnumVariant,
+    /// `pub const NAME: Rights = Rights(1 << k);`
+    RightsBit,
+}
+
+/// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
+/// silently drift. Layout of `#[repr(C)]` types is deliberately **not** here: both sides
+/// already carry `offset_of!`/`size_of` compile-time asserts, which is a stronger check than
+/// text comparison and fails at build time.
+const ABI_FAMILIES: &[AbiFamily] = &[
+    AbiFamily {
+        what: "syscall numbers",
+        kernel_file: "kernel/src/syscall/table.rs",
+        user_file: "userspace/libkern/src/syscall.rs",
+        shape: AbiShape::U64Const,
+        one_sided: &[
+            ("SYS_TEST_EXIT", "kernel test-harness builds only; userspace mirrors it for the harness"),
+        ],
+    },
+    AbiFamily {
+        what: "KError discriminants",
+        kernel_file: "kernel/src/syscall/error.rs",
+        user_file: "userspace/libkern/src/error.rs",
+        shape: AbiShape::EnumVariant,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "Rights bits",
+        kernel_file: "kernel/src/libkern/handle.rs",
+        user_file: "userspace/libkern/src/handle.rs",
+        shape: AbiShape::RightsBit,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "KObjectType discriminants",
+        kernel_file: "kernel/src/libkern/handle.rs",
+        user_file: "userspace/libkern/src/handle.rs",
+        shape: AbiShape::EnumVariant,
+        one_sided: &[],
+    },
+];
+
+/// Individually-named constants that mirror across the boundary under *different* names or
+/// in unrelated files, so a family sweep cannot pair them. Each is `(kernel file, kernel
+/// name, userspace file, userspace name)`.
+///
+/// These are the ones that bit in practice: `MAX_WAIT_HANDLES` and the IPC limits are
+/// hand-copied values with no compile-time tie between the two sides at all.
+const ABI_PAIRS: &[(&str, &str, &str, &str)] = &[
+    (
+        "kernel/src/object/thread.rs",
+        "MAX_WAIT_HANDLES",
+        "userspace/libkern/src/abi.rs",
+        "MAX_WAIT_HANDLES",
+    ),
+    (
+        "kernel/src/libkern/ipc.rs",
+        "IPC_HANDLE_MAX",
+        "userspace/libkern/src/abi.rs",
+        "IPC_HANDLE_MAX",
+    ),
+];
+
+/// Pull `name -> value` pairs of one `shape` out of a source file.
+fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
+    let mut out = BTreeMap::new();
+    for line in text.lines() {
+        let t = line.trim();
+        if t.starts_with("//") {
+            continue;
+        }
+        match shape {
+            AbiShape::U64Const => {
+                // pub const NAME: u64 = <int>;
+                let Some(rest) = t.strip_prefix("pub const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                let Some((ty, val)) = tail.split_once('=') else { continue };
+                if ty.trim() != "u64" {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::EnumVariant => {
+                // Name = <int>,
+                let Some(body) = t.strip_suffix(',') else { continue };
+                let Some((name, val)) = body.split_once('=') else { continue };
+                let name = name.trim();
+                if name.is_empty()
+                    || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.to_string(), v);
+                }
+            }
+            AbiShape::RightsBit => {
+                // pub const NAME: Rights = Rights(1 << k);
+                let Some(rest) = t.strip_prefix("pub const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                if !tail.contains("Rights(") {
+                    continue;
+                }
+                let Some((_, shifted)) = tail.split_once("1 <<") else { continue };
+                let digits: String =
+                    shifted.trim_start().chars().take_while(|c| c.is_ascii_digit()).collect();
+                if let Ok(k) = digits.parse::<u32>() {
+                    out.insert(name.trim().to_string(), 1i128 << k);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Parse a trailing integer literal (decimal or `0x`), tolerating `_` and a `;`/`,` tail.
+fn parse_int(s: &str) -> Option<i128> {
+    let t = s.trim().trim_end_matches([';', ',']).trim().replace('_', "");
+    if let Some(hex) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        return i128::from_str_radix(hex, 16).ok();
+    }
+    t.parse::<i128>().ok()
+}
+
+/// Find `pub const NAME: <ty> = <int>;` for one specific name, whatever the type.
+fn extract_named(text: &str, want: &str) -> Option<i128> {
+    for line in text.lines() {
+        let t = line.trim();
+        let Some(rest) = t.strip_prefix("pub const ") else { continue };
+        let Some((name, tail)) = rest.split_once(':') else { continue };
+        if name.trim() != want {
+            continue;
+        }
+        let Some((_, val)) = tail.split_once('=') else { continue };
+        return parse_int(val);
+    }
+    None
+}
+
+/// `cargo xtask abi-sync-check` — verify `userspace/libkern` still mirrors the kernel ABI.
+///
+/// `libkern` is a **hand-maintained** copy of the kernel's syscall numbers, error and object
+/// discriminants, rights bits, and shared limits. Nothing in the build ties the two together,
+/// so an edit to one side is invisible until something misbehaves at runtime. This compares
+/// them and fails on a mismatch, a name the kernel has and userspace lacks, or a one-sided
+/// name that is not documented as such.
+///
+/// Deliberately **not** checked here: `#[repr(C)]` layouts. Both sides already assert their
+/// own field offsets and sizes at compile time, which is stronger than text comparison and
+/// fails earlier.
+fn cmd_abi_sync_check() -> R<()> {
+    let root = repo_root();
+    let mut problems: Vec<String> = Vec::new();
+    let mut compared = 0usize;
+
+    for fam in ABI_FAMILIES {
+        let kt = fs::read_to_string(root.join(fam.kernel_file))
+            .map_err(|e| format!("read {}: {e}", fam.kernel_file))?;
+        let ut = fs::read_to_string(root.join(fam.user_file))
+            .map_err(|e| format!("read {}: {e}", fam.user_file))?;
+        let k = extract_consts(&kt, fam.shape);
+        let u = extract_consts(&ut, fam.shape);
+        if k.is_empty() {
+            problems.push(format!(
+                "{}: extracted nothing from {} — the checker's pattern has gone stale, \
+                 which silently disables this family",
+                fam.what, fam.kernel_file
+            ));
+            continue;
+        }
+        for (name, kv) in &k {
+            match u.get(name) {
+                Some(uv) if uv == kv => compared += 1,
+                Some(uv) => problems.push(format!(
+                    "{}: {} is {} in {} but {} in {}",
+                    fam.what, name, kv, fam.kernel_file, uv, fam.user_file
+                )),
+                None => {
+                    if !fam.one_sided.iter().any(|(n, _)| n == name) {
+                        problems.push(format!(
+                            "{}: {} exists in {} but not in {} — mirror it, or record it in \
+                             the checker's `one_sided` list with a reason",
+                            fam.what, name, fam.kernel_file, fam.user_file
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    for (kf, kn, uf, un) in ABI_PAIRS {
+        let kt = fs::read_to_string(root.join(kf)).map_err(|e| format!("read {kf}: {e}"))?;
+        let ut = fs::read_to_string(root.join(uf)).map_err(|e| format!("read {uf}: {e}"))?;
+        match (extract_named(&kt, kn), extract_named(&ut, un)) {
+            (Some(a), Some(b)) if a == b => compared += 1,
+            (Some(a), Some(b)) => problems.push(format!(
+                "shared limit: {kn} is {a} in {kf} but {un} is {b} in {uf}"
+            )),
+            (a, _) => problems.push(format!(
+                "shared limit: could not read {} — the checker's pattern has gone stale",
+                if a.is_none() { format!("{kn} in {kf}") } else { format!("{un} in {uf}") }
+            )),
+        }
+    }
+
+    if !problems.is_empty() {
+        let mut msg = String::from(
+            "userspace/libkern must mirror the kernel ABI exactly (docs/spec/syscall-abi.md); \
+             these disagree:\n",
+        );
+        for p in &problems {
+            msg.push_str("  ");
+            msg.push_str(p);
+            msg.push('\n');
+        }
+        return Err(msg.into());
+    }
+    println!("abi-sync-check: {compared} ABI value(s) agree between the kernel and libkern ✓");
+    Ok(())
+}
+
 fn cmd_check_deferrals() -> R<()> {
     let doc_path = repo_root()
         .join("docs")

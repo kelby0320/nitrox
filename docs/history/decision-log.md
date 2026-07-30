@@ -8858,3 +8858,133 @@ overwrites in place, and asserts three things: the content changed, `mtime` adva
 the **size did not** — the last so the check cannot pass by accidentally taking the
 grow/truncate path, which would have stamped `mtime` the old way. **Negative control**:
 dropping the notification fails it with "in-place overwrite left mtime stale".
+
+## 2026-07-29 — Slice D1: the klog buffer keeps both ends, and the measurement reframed it
+
+The kernel log was a linear append buffer: capture from boot until 16 KiB is full, then
+drop. The plan called for a keep-recent ring, on the grounds that a linear buffer "stops
+capturing once 16 KiB of boot log fills — i.e. exactly when a long-running system gets
+interesting."
+
+**Measuring first changed the framing.** A full integration boot — kernel → SMP → init →
+ext4 → userspace demos → login — captures **3801 bytes and drops zero**. So the buffer is
+not overflowing today; it uses under a quarter of its capacity. The defect is real but
+*prospective*: it bites a system that runs long enough to fill 16 KiB, which the boot-and-
+exit harness never does.
+
+That matters because the naive fix would have been a regression. The old comment justified
+the linear design: it keeps "the early boot/failure context, which is what an emergency
+inspection wants". A pure wrap-around ring keeps the newest output and throws exactly that
+away. Two goals, opposed, and the measurement showed there was room to satisfy both.
+
+**Keep both ends.** A **frozen prefix** (8 KiB) captures from boot and is then never
+overwritten, and a **keep-recent ring** (8 KiB) takes everything after it. What is lost is
+the *middle* — and the snapshot says so, with a `[klog: N bytes elided]` notice between the
+two regions, because a gap the reader cannot see is a log that lies about being complete.
+The 8 KiB prefix is >2× the measured boot log, so there is real headroom before any of it
+is at risk, and the `klog:` line in every `test-harness` run makes an outgrown prefix
+visible rather than silent.
+
+**A testing smell caught on the way.** The first version of the host tests linearised the
+snapshot with a helper written *in the test module* — a second implementation of the
+ordering logic. If it and `copy_into_frames` had disagreed, the tests would have passed
+while `/dev/log` returned garbage. The layout now lives in one `Klog::runs` that both the
+production copy and the tests walk. Worth stating as a general rule: **a test that
+re-derives the thing it is checking is checking itself.**
+
+Coverage is stated rather than implied: the host tests reach the layout but not the
+page-wise copy into physical frames (that needs HHDM memory). A boot exercises the copy for
+the prefix-only case every run; the wrapped case is covered to the frame boundary and no
+further. A synthetic in-guest fill would close it at the cost of dirtying the real log with
+test bytes — not worth it while the arithmetic is shared with the single-run path.
+
+*Verified:* host suite **795** green (six new klog tests: prefix-only, prefix freeze +
+overflow, ring keeps newest and reports the gap, a write longer than the whole ring keeping
+only its tail, `snapshot_len` agreeing with what the copy produces, and wrapped content
+returning in write order). `test-qemu` PASS; `check-arch` / `check-nightly` /
+`check-deferrals` green.
+
+## 2026-07-29 — Slice D2: `abi-sync-check`, and a guard against the check disabling itself
+
+`userspace/libkern` is a **hand-maintained** mirror of the kernel ABI: syscall numbers,
+`KError` and `KObjectType` discriminants, `Rights` bits, and a handful of shared limits.
+Nothing in the build ties the two sides together, so an edit to one is invisible until
+something misbehaves at runtime. The deferral's trigger was "a second non-demo consumer
+makes drift likelier"; there are now six or seven, and Slice C supplied direct evidence by
+hand-copying `SYS_FILE_RENAME` and `MAX_WAIT_HANDLES` across the boundary.
+
+**What it checks.** Four families where both sides happen to use the *same* line shape —
+which is what makes a line-based comparison sound here instead of needing a Rust parser —
+plus individually-named pairs for constants that mirror under different names or in
+unrelated files (`MAX_WAIT_HANDLES`, `IPC_HANDLE_MAX`). 91 values. It reports a value
+mismatch, and a name the kernel has that userspace lacks, with both files and both values
+named — enough to fix without opening either file.
+
+**What it deliberately does not check.** `#[repr(C)]` layouts. Both sides already carry
+`offset_of!`/`size_of` compile-time asserts, which is a *stronger* guarantee than text
+comparison and fails at build time rather than in a lint step. Adding a weaker duplicate
+check would only create a second thing to keep in sync.
+
+**The guard that earned its place immediately.** A pattern-matching checker has a
+characteristic failure mode: the pattern goes stale, extracts nothing, and passes — so the
+check reports success while checking nothing at all, which is worse than not having it. So
+each family fails loudly if it extracts *zero* constants from the kernel side. That guard
+fired on the very first run against my own `Rights` pattern (it took digits before trimming
+the space after `1 <<`, so every bit silently failed to parse), and on a wrong file path for
+`IPC_HANDLE_MAX`. Without it the check would have shipped reporting "✓" over two dead
+families.
+
+A one-sided name is a finding unless it is listed with a reason — currently only
+`SYS_TEST_EXIT`, which exists in test-harness kernels. Keeping that explicit is what stops
+the check from becoming noisy enough to disable.
+
+*Verified:* 91 values agree on the current tree; **four negative controls** — a wrong
+syscall number, a deleted syscall, a shifted `Rights` bit, and the exact Slice C case of
+`MAX_WAIT_HANDLES` drifting on one side — each caught, with a message naming the constant,
+both values and both files. Host suite **795** green; wired into CI ahead of the build step.
+
+## 2026-07-29 — Slice D3: `/dev` is listable, and the design call dissolved
+
+The deferral asked for a decision: "how does a listing tool choose between *namespace
+enumeration* (what `/dev` needs — it is kernel-served) and an *fs-server directory session*
+(what `list` uses today)?" It turned out to be the wrong question, and noticing that was the
+whole of the work.
+
+**A path's listing is the union of both sources.** Whatever filesystem lies under the path,
+plus the namespace bindings directly beneath it. `list` does not choose; it asks both and
+merges, and each source answers for the part it owns. That is not a special case invented
+for `/dev` — it is how mount points have always appeared in a parent directory's listing.
+
+With that framing every case falls out without branching on anything:
+
+- **`/dev`** — nothing mounted, so the listing is entirely bindings (`entropy`, `blk`,
+  `console`, `log`). Previously `list` failed here outright.
+- **`/system`** — nothing bound beneath it, so the listing is entirely files. Unchanged.
+- **`/`** — genuinely both: the root filesystem's own entries *plus* the mount points and
+  kernel servers bound alongside them. This is the case a "choose one mechanism" design
+  could not have served correctly at all.
+
+Bindings shadow same-named filesystem entries, matching mount semantics. A missing
+filesystem is an error only when the namespace has nothing beneath the path either —
+otherwise it is an ordinary kernel-served directory. Enumeration is local and cheap (the
+kernel walks the caller's own namespace, no IPC), so doing it unconditionally costs a short
+syscall loop, which is why it can be unconditional and the code needs no mode flag.
+
+A namespace binding is not a file, so its reported `inode`, `mode`, `size` and `mtime` are
+all zero — `OwnedEntry::binding` exists to make that explicit rather than have a listing
+invent plausible-looking values for fields that do not apply.
+
+**Stated limitation.** A kernel server that owns a *subtree* — `/dev/blk/<n>` — appears as a
+single binding, so `blk` is reported as a directory that then lists as empty. The kernel
+synthesises those children on demand and the namespace has no way to ask "what would you
+serve?"; enumerating them needs a protocol that does not exist. Written down in
+`coreutils::fs::ns_children` rather than left for someone to rediscover.
+
+`sys_ns_enumerate` has existed with no consumer since Phase 2. It has one now.
+
+*Verified:* host suite **795** green; `test-qemu` PASS with an in-guest check that `list
+/dev` names a binding **and** that `list /` still shows filesystem entries — the second half
+so the check cannot pass against a `list` that had stopped reading filesystems altogether.
+**Both controls run**: removing the namespace source fails the first assertion (that is
+exactly the pre-D3 behaviour), and removing the filesystem source fails the second. All four
+static checks green.

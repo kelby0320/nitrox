@@ -223,6 +223,25 @@ impl OwnedEntry {
     ///
     /// A name is capped at [`MAX_NAME`], which is also the longest a wire entry can
     /// express (`name_len` is a `u8`), so no name a server can legally send is truncated.
+    /// An entry that is **not** a filesystem object: a namespace binding surfaced in a
+    /// listing. Every file field is zero because none of them applies — a binding has no
+    /// inode, no size, and no modification time — and reporting a plausible-looking `0`
+    /// is honest where inventing a value would not be.
+    pub fn binding(name: &[u8], kind: u8) -> OwnedEntry {
+        let mut buf = [0u8; MAX_NAME];
+        let n = name.len().min(MAX_NAME);
+        buf[..n].copy_from_slice(&name[..n]);
+        OwnedEntry {
+            inode: 0,
+            kind,
+            mode: 0,
+            size: 0,
+            mtime: 0,
+            name: buf,
+            name_len: n as u8,
+        }
+    }
+
     pub fn from_entry(e: &DirEntry<'_>) -> OwnedEntry {
         let mut name = [0u8; MAX_NAME];
         let n = e.name.len().min(MAX_NAME);

@@ -441,16 +441,57 @@ Slice C follows directly; it has actual Milestone 2 blockers.
 
 #### Slice D — cheap, now-triggered hygiene
 
-- [ ] **D1 — klog keep-recent ring.** Still a linear append buffer that stops capturing
-  once 16 KiB of boot log fills — i.e. exactly when a long-running system gets interesting.
-- [ ] **D2 — `cargo xtask abi-sync-check`.** Its trigger was "a second non-demo consumer";
-  there are now five or six.
-- [ ] **D3 — a listable `/dev`.** `list /dev` is a day-one shell command. `sys_ns_enumerate`
-  exists with no consumer; needs a design call on how `list` chooses namespace enumeration
-  versus an fs-server directory session.
+- [x] **D1 — klog keep-recent ring** ✅ (2026-07-29). Two regions rather than one: a
+  **frozen boot prefix** (8 KiB) that is never overwritten, plus a **keep-recent ring**
+  (8 KiB) for everything after it, so neither early-boot context nor recent output is
+  traded away — what is lost is the *middle*, and the reader is told how much by a
+  `[klog: N bytes elided]` notice in the snapshot. **Measured before sizing**: a full
+  integration boot captures **3801 B and drops nothing**, so the old 16 KiB linear buffer
+  was never actually overflowing today — the defect was prospective (a long-running
+  system), which is what set the 8 KiB prefix at >2× the measured need. The snapshot layout
+  is defined in exactly one place that both the production copy and the six new host tests
+  walk, so the tests cannot pass against a layout production does not use.
+- [x] **D2 — `cargo xtask abi-sync-check`** ✅ (2026-07-29). Compares the hand-mirrored ABI
+  between the kernel and `userspace/libkern` — syscall numbers, `KError` and `KObjectType`
+  discriminants, `Rights` bits, plus individually-paired shared limits (`MAX_WAIT_HANDLES`,
+  `IPC_HANDLE_MAX`): **91 values**, in CI. Slice C supplied the motivating evidence, having
+  hand-copied two of them. `#[repr(C)]` layouts are deliberately out of scope — both sides
+  already assert their own offsets and sizes at compile time, which is stronger than text
+  comparison and fails earlier. The checker fails loudly if a family's pattern extracts
+  *nothing*, because a silently-disabled check is worse than no check; that guard caught its
+  own author's stale `Rights` pattern on the first run.
+- [x] **D3 — a listable `/dev`** ✅ (2026-07-29). The design call the entry asked for
+  **dissolved rather than being answered**: `list` does not choose between namespace
+  enumeration and a directory session, it takes the **union** of the filesystem under a path
+  and the namespace bindings directly beneath it — which is simply how mount points have
+  always appeared in a parent directory's listing. `/dev` is then unremarkable (all
+  bindings, no filesystem), `/system` is unremarkable the other way, and `/` is the case
+  that genuinely needs both. Bindings shadow same-named filesystem entries, as a mount point
+  shadows the directory it covers. `sys_ns_enumerate` finally has its consumer. Stated
+  limitation: a kernel server owning a *subtree* (`/dev/blk/<n>`) is one binding, so `blk`
+  lists as an empty directory — the kernel generates those children on demand and there is
+  no way to ask it what it would serve.
 - [ ] **D4 — debug-build lock-ordering enforcement.** A rank tracker that panics on
   violations in debug builds. Three deadlocks (F1, F2, F12) were found by hand and by
   boot-loop bisection; this turns that class into an immediate, located failure.
+
+  **Attempted and withdrawn (2026-07-29) — read this before trying again.** A working
+  tracker was built and *did* find four real problems (two `init` paths reserving under a
+  leaf-ranked lock, two registries mis-ranked as leaves, and six locks missing from the rank
+  table entirely). It was pulled from the Slice D PR because it panics intermittently, and
+  the reason is structural rather than a bug to patch: **a per-CPU held-rank stack cannot
+  model interrupt context.** Every plain `SpinLock` is held with interrupts *enabled*, so a
+  timer tick or IPI can land on a thread holding, say, `Buddy` or `HandleTable`, and the
+  handler legitimately takes `SCHED` — which reads as a rank inversion. Observed exactly
+  that: `Sched (10) while holding Buddy (62)` and `Sched (10) while holding HandleTable
+  (30)`, roughly 1 boot in 3 under load, clean locally on quiet runs.
+
+  So **`TODO(lockdep-irq-context)` is a prerequisite, not a later refinement** — save the
+  held set at interrupt entry and restore it at exit so handlers get a fresh scope, then the
+  ranking works and `tlb::LOCK` needs no exemption either. Land the two together. The
+  withdrawn work is on `phase-4/hygiene` history (reverted in one commit, so `git revert` of
+  that revert restores it), including an interrupt-window fix for the tracker's own
+  non-atomic per-CPU update, saved separately.
 - [x] **D5 — kernel-stack watermark** ✅ (2026-07-29, landed early alongside C3 because C3's
   sizing argument depended on it). `test-harness` builds paint each stack and sample the
   high-water mark at context-switch-out — O(1) unless a record moves, and it covers blocked
