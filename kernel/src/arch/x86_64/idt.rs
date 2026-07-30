@@ -945,6 +945,25 @@ fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
     // an empty candidate list, immediately followed by a `#PF` whose CR2 was the page
     // above RSP. Stop at the first unmapped page instead.
     let root = PhysAddr::new(regs::read_cr3() & !0xFFF);
+    // The first five words verbatim. When the faulting instruction is the `iretq` at the
+    // tail of an entry stub, these *are* the frame it is trying to consume — RIP, CS,
+    // RFLAGS, RSP, SS — and the `SS` value is the one thing that distinguishes the
+    // candidate causes of a `#GP` naming a data selector. Printed raw rather than
+    // filtered, because none of them are kernel text and the filtered scan below drops
+    // them all (which is exactly how the first capture came back empty).
+    let _ = writeln!(w, "  words at rsp (iretq frame if the fault is a stub tail):");
+    for i in 0..5usize {
+        let addr = sp + (i as u64) * 8;
+        let page = addr & !(PAGE_SIZE as u64 - 1);
+        // SAFETY: `root` is the live page-table root; `translate` only walks it.
+        if unsafe { Paging::translate(root, VirtAddr::new(page)) }.is_none() {
+            break;
+        }
+        // SAFETY: the containing page was just confirmed mapped.
+        let val = unsafe { (addr as *const u64).read_volatile() };
+        let label = ["rip", "cs", "rflags", "rsp", "ss"][i];
+        let _ = writeln!(w, "    [rsp+{:#04x}] {label:>6} = {val:#018x}", i * 8);
+    }
     let _ = writeln!(w, "  return-address candidates (innermost first):");
     let mut probed_page = u64::MAX;
     for i in 0..WORDS {
