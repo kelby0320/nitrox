@@ -96,8 +96,28 @@ jobs:
         run: cargo xtask test
 
   integration:
-    name: QEMU integration (image + boot self-test)
-    runs-on: ubuntu-latest
+    # DIAGNOSTIC (2026-07-30): this job has failed on **every** run since it was added
+    # at #120 — never once green on main — with a `#GP` carrying error code `0x18`,
+    # i.e. a failed load of the user-data selector at a ring-3 entry. It does not
+    # reproduce locally in 35+ KVM boots (QEMU 11.0.2, Comet Lake), including with the
+    # guest pinned to 2 host cores to mimic the runner's 4-vCPU-on-2-core
+    # oversubscription. So the difference is the environment, and the matrix below
+    # splits the two candidates in one run:
+    #
+    #   ubuntu-latest (24.04) → QEMU 8.2.2   — the current, always-red configuration
+    #   ubuntu-26.04          → QEMU 10.2.1  — past the 9.0 line, near the local version
+    #
+    # Caveat when reading the result: the image changes QEMU *and* the host kernel/KVM
+    # *and* possibly the runner silicon together, so a green 26.04 leg says "a newer
+    # environment works", not "QEMU was the cause". The `Report environment` step below
+    # prints each runner's CPU so the two can be told apart afterwards.
+    name: QEMU integration (${{ matrix.image }})
+    runs-on: ${{ matrix.image }}
+    strategy:
+      # Both legs must report — the whole point is comparing them.
+      fail-fast: false
+      matrix:
+        image: [ubuntu-latest, ubuntu-26.04]
 
     steps:
       - uses: actions/checkout@v4
@@ -132,6 +152,23 @@ jobs:
           sudo udevadm control --reload-rules
           sudo udevadm trigger --name-match=kvm
           ls -l /dev/kvm
+
+      # What the guest is actually running on. The kernel's documented floor is
+      # x86-64-v2 + SMEP/SMAP (decision log, 2026-06-11); `-cpu host` under KVM passes
+      # the runner's features straight through, so a runner that misses something the
+      # kernel assumes would show up here. `hypervisor` confirms the runner is itself a
+      # VM, which is why `-cpu host` may expose less than bare metal.
+      - name: Report environment
+        run: |
+          echo "=== image: ${{ matrix.image }} ==="
+          uname -a
+          qemu-system-x86_64 --version | head -1
+          echo "--- CPU ---"
+          lscpu | grep -iE "^(Architecture|Vendor ID|Model name|CPU\(s\)|Hypervisor|Virtualization)" || true
+          echo "--- baseline-relevant flags (missing ones print nothing) ---"
+          for f in smep smap x2apic xsave xsaveopt avx avx2 fsgsbase umip la57 invpcid rdtscp constant_tsc nonstop_tsc hypervisor; do
+            grep -qw "$f" /proc/cpuinfo && echo "  have $f" || echo "  MISSING $f"
+          done
 
       - name: Cache cargo registry and build outputs
         uses: actions/cache@v4
