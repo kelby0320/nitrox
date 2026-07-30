@@ -2077,6 +2077,15 @@ unsafe fn switch_into(
     crate::libkern::lockrank::assert_switch_safe();
     // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
     unsafe { arm_kernel_stack_for(next_obj) };
+    // Re-establish a valid stack segment for the incoming thread. On x86-64 the stack
+    // segment is a **CPU** register that `context_switch` does not save or restore, and
+    // entering ring 0 from ring 3 via an interrupt nulls it — so without this, a thread
+    // that entered through `syscall` can be switched out, have the register nulled by a
+    // *different* thread's interrupt entry, and return to user mode with a null stack
+    // segment. AMD hardware leaves such a return in an unusable state and faults on the
+    // next ring-3 re-entry (see `arch::arm_user_return_state`); Intel does not, which is
+    // why this only ever showed up on CI's AMD runners. Mirrors Linux's `__switch_to`.
+    crate::arch::arm_user_return_state();
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
     // with the kernel half inherited); all kernel stacks are mapped in every
     // root, so switching CR3 before the stack swap is sound. Loading it before

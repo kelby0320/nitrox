@@ -154,6 +154,12 @@ pub use x86_64::syscall::{
     arm_user_entry_cpu_base, enter_user, init_syscall_entry, set_syscall_kernel_stack,
 };
 
+/// Re-establish a valid stack segment before a thread can return to user mode. See
+/// [`x86_64::gdt::arm_user_return_state`] for the AMD `SYSRET` erratum this exists for;
+/// architectures without segmentation implement it as a no-op.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::gdt::arm_user_return_state;
+
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::paging::X86Paging as Paging;
 

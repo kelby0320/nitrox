@@ -9212,3 +9212,69 @@ host tests green; every xtask guard passes. Two regression tests, each **proven 
 without the code it guards**: disabling the clearing fails the first, and removing the
 identity guard fails the second — the latter covering a wrong implementation (clear
 unconditionally) that nothing else would have caught.
+
+## 2026-07-30 — The CI failure was never QEMU: an AMD `SYSRET` erratum, and a null stack segment
+
+The `QEMU integration` job had failed on **every** run since it was added at #120 — never
+once green — while 35+ local KVM boots passed. The standing theory was the environment,
+specifically that GitHub's `ubuntu-latest` ships QEMU 8.2.2 against a documented
+"TCG needs ≥ 9.0" note. That theory was wrong, and the way it was tested is the reusable
+part.
+
+**The experiment.** One commit, a matrix over two runner images, plus a step printing each
+runner's CPU. Two runs produced three of the four cells:
+
+| QEMU | CPU | Result |
+|---|---|---|
+| 10.2.1 | Intel Xeon Platinum 8573C | **pass** |
+| 10.2.1 | AMD EPYC 7763 | **fail** |
+| 8.2.2 | AMD EPYC 7763 | **fail** |
+
+Same QEMU, different CPU, different outcome. The QEMU version is irrelevant; the failure
+follows the **CPU vendor**. (The second run happened to place *both* legs on AMD, which is
+what de-confounded the two variables — the image bump moves QEMU, the host kernel and the
+silicon together, so the first run alone could not have decided it.) Both runners clear
+the kernel's documented x86-64-v2 + SMEP/SMAP floor, so it is not a missing feature.
+
+**The bug.** Entering ring 0 from ring 3 via an interrupt sets `SS` to the null selector —
+architectural, not a defect. But `SS` is a **CPU** register, not per-thread state, and
+`context_switch` neither saves nor restores it. So a thread that entered through `syscall`
+(where the CPU sets `SS = 0x10`) can be switched out, have `SS` nulled by a *different*
+thread's interrupt entry, and then execute `sysretq` with `SS == 0`.
+
+On Intel that is harmless. On AMD, `SYSRET` does not reinitialise the `SS` descriptor, so
+userspace resumes with an `SS` whose *selector* looks like the user data segment but whose
+cached attributes are unusable; the next interrupt from that context pushes the broken
+`SS`, and the entry stub's `iretq` back to ring 3 raises `#GP` with the `SS` selector as
+its error code. Linux carries this as `X86_BUG_SYSRET_SS_ATTRS` and fixes it in
+`__switch_to`; `sched::switch_into` now does the same, unconditionally — one segment load
+per context switch, and no vendor detection to get wrong.
+
+**Reading the evidence took three corrections, each worth remembering.**
+
+*Decode, don't recognise.* The error code `0x18` is not a value to pattern-match; bits 3-15
+are the selector **index**, so `0x18` is index 3 with RPL stripped — selector `0x1b`, the
+user data segment. That single decode turned "some #GP" into "a failed `SS` load at a
+ring-3 transition" and is what made the rest tractable.
+
+*The dump already contained the answer.* `ss 0x0000` was printed in the very first capture,
+five days before anyone read it as meaningful. A null stack segment in a ring-0 frame is
+the precondition for the entire erratum.
+
+*A hypothesis that survives is not a hypothesis that was tested.* An earlier guess — that
+an AP's per-CPU GDT was uninitialised — was plausible, matched the selector index, and was
+**wrong**: `adopt_dense_index()` writes `IA32_TSC_AUX` before `ap_cpu_init()` calls
+`gdt::init()`, and an AP with an unbound APIC id halts rather than guessing. Checking it
+cost minutes; carrying it would have cost the investigation.
+
+**A tooling bug found on the way.** The stack-scanning backtrace added in #125 walked
+*up* from `RSP` — but a kernel stack's guard page is at the **bottom**, so it ran past the
+stack top into unmapped vmap, printed nothing, and took a second `#PF` whose `CR2` was the
+page above `RSP`. It now probes each page with `Paging::translate` and stops at the first
+unmapped one. Its output then proved the point: five qwords above `RSP`, none of them
+kernel text — an `iretq` frame, not a call chain — with the GPRs holding restored *user*
+values (`r12 = 0x65767265732d7366`, i.e. `"fs-serve"`).
+
+*Verified:* host suite green, `test-qemu` PASS under TCG and KVM locally (Intel, where the
+bug never reproduced), all five guards pass. The fix can only be confirmed on CI's AMD
+runners — which is also the first time this gate will have been green on main.
