@@ -232,7 +232,7 @@ Parts, in order (tick as they land):
 - [x] **Part A — `mkdir`, `remove`** ✅ (2026-07-30)
 - [x] **Part B — `rename`, `move`** ✅ (2026-07-30)
 - [x] **Part C — `touch`** ✅ (2026-07-30)
-- [ ] **Part D — `date`, `sleep`** (no filesystem; mostly host-testable formatting and parsing)
+- [x] **Part D — `date`, `sleep`** ✅ (2026-07-30)
 - [ ] **Part E — `whoami`** (blocked on open question B2 — a design call, deliberately last)
 
 The substrate these lean on is in place: Slice C delivered cross-directory + overwrite `rename`
@@ -343,7 +343,32 @@ no client wrapper for it. So this part probably starts by exposing an existing o
 designing a new one. Confirm that before writing the utility; if the op turns out to be
 kernel-only by construction, that is a gap to file, not to work around.
 
-#### Part D — `date` and `sleep`
+#### Part D — `date` and `sleep` ✅ (2026-07-30)
+
+**Landed, and the plan's instinct about where the tests belong held.** The two pieces that can be
+wrong without a kernel — civil-from-days and duration parsing — went into `coreutils::time` and are
+covered by six **host** tests; the boot demo only carries the halves that touch syscalls. The leap
+table pins the epoch, an ordinary leap year, 2000 (leap, divisible by 400), and **2100** (*not*
+leap, divisible by 100 but not 400) — the case a hand-written rule usually gets wrong, and the
+reason the implementation is Hinnant's era arithmetic rather than a chain of special cases.
+
+Two design points worth recording, both about refusing to invent:
+
+- **`date` emits fields, not a string** — `Table<{unix, year, month, day, hour, minute, second}>` —
+  because a formatted string forces every consumer to parse it back apart, which is the Unix habit
+  the typed-stream model exists to avoid. `--unix` *narrows the schema* to one field rather than
+  emitting all seven and letting the consumer pick.
+- **No `--format` and no timezone**, and **no `--date` on `touch`** for the same family of reason:
+  there is no tz database and no locale, so an offset would be a fiction. An unset clock is an
+  error rather than a printed 1970.
+
+`sleep` arms an **absolute** monotonic deadline computed once, so time between the clock read and
+the arm is inside the wait rather than added to it. Its demo asserts a lower bound only —
+deliberately: a `sleep` that returned immediately would still exit zero, so the bound is the whole
+assertion, while an upper bound under TCG on a loaded host would be a flaky test rather than a real
+property.
+
+The original sketch, kept for the record:
 
 Neither touches the filesystem, which makes them the two most host-testable utilities in the set —
 and the first that are mostly *formatting and arithmetic*, so the bulk of each should be unit

@@ -2267,6 +2267,103 @@ fn touch_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: touch ok (created, stamped, --no-create skipped, directory refused)\n");
 }
 
+/// **Milestone 2 Part D — `date` and `sleep`.**
+///
+/// Most of Part D is tested on the *host*: the civil-from-days conversion and the
+/// duration parser live in `coreutils::time` with a unit-test table (the epoch, leap
+/// years, and the 2100 non-leap case that a hand-written leap rule usually gets wrong).
+/// What cannot be tested there is the half that touches the kernel, which is all this
+/// demo covers:
+///
+/// - `date` reads a clock that is actually set, and publishes fields that agree with the
+///   harness's own reading of the same clock;
+/// - `sleep` genuinely **waits**. That is the assertion with teeth: exiting zero proves
+///   nothing, since a `sleep` that returned immediately would do that too.
+fn date_sleep_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::Value;
+
+    kprint(b"test-harness: date/sleep demo (Milestone 2 Part D)\n");
+    const DATE: &[u8] = b"/initramfs/sbin/date";
+    const SLEEP: &[u8] = b"/initramfs/sbin/sleep";
+
+    // --- 1. date publishes fields that agree with our own clock reading ------
+    let ours = realtime_secs();
+    if ours == 0 {
+        return_fail(b"test-harness: wall clock unset, cannot check date\n");
+    }
+    let bytes = run_coreutil_capture(root_ns, notif, DATE, &["date"], true);
+    let mut unix_field = 0i64;
+    let mut year_field = 0i64;
+    let mut fields = 0usize;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        fields = tr.schema().fields.len();
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if let Value::Int(u) = vals[0] {
+                    unix_field = u;
+                }
+                if let Value::Int(y) = vals[1] {
+                    year_field = y;
+                }
+            }
+        }
+    }
+    if fields != 7 {
+        return_fail(b"test-harness: date schema is not the seven expected fields\n");
+    }
+    // Agreement rather than equality: the two readings are seconds apart at most, and
+    // demanding equality would be a flaky assertion about scheduling.
+    let skew = if unix_field > ours { unix_field - ours } else { ours - unix_field };
+    if skew > 60 {
+        return_fail(b"test-harness: date disagrees with our own clock reading\n");
+    }
+    // The calendar arithmetic is host-tested; here we only need it to be plausibly wired
+    // — a year of 1970 would mean the epoch fell through unconverted.
+    if year_field < 2020 {
+        return_fail(b"test-harness: date reported an implausible year\n");
+    }
+
+    // --- 2. --unix narrows the schema ---------------------------------------
+    let bytes = run_coreutil_capture(root_ns, notif, DATE, &["date", "--unix"], true);
+    if let Ok(tr) = TableReader::new(&bytes) {
+        if tr.schema().fields.len() != 1 {
+            return_fail(b"test-harness: date --unix did not narrow the schema\n");
+        }
+    } else {
+        return_fail(b"test-harness: date --unix produced no readable table\n");
+    }
+
+    // --- 3. sleep actually waits --------------------------------------------
+    // The lower bound is the whole assertion: a `sleep` that returned immediately would
+    // still exit zero. There is deliberately no upper bound — under TCG with a loaded
+    // host, scheduling delay is unbounded and any ceiling would be a flaky test rather
+    // than a real property.
+    let before = monotonic_ns();
+    if run_coreutil(root_ns, notif, SLEEP, &["sleep", "200ms"]) != 0 {
+        return_fail(b"test-harness: sleep exited non-zero\n");
+    }
+    let elapsed = monotonic_ns().saturating_sub(before);
+    if elapsed < 200_000_000 {
+        return_fail(b"test-harness: sleep returned before its duration elapsed\n");
+    }
+
+    // --- 4. a malformed duration is a usage error, not a no-op --------------
+    if run_coreutil(root_ns, notif, SLEEP, &["sleep", "5x"]) == 0 {
+        return_fail(b"test-harness: sleep accepted a malformed duration\n");
+    }
+
+    kprint(b"test-harness: date/sleep ok (fields agree, schema narrows, wait observed)\n");
+}
+
+/// The monotonic clock in nanoseconds — for measuring that `sleep` waited.
+fn monotonic_ns() -> u64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: written by the syscall above.
+    unsafe { (&raw const CLOCK_BUF).read() }
+}
+
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     run_coreutil(root_ns, notif, b"/initramfs/sbin/copy", argv)
 }
@@ -3566,6 +3663,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     mkdir_remove_demo(root_ns, notif);
     rename_move_demo(root_ns, notif);
     touch_demo(root_ns, notif);
+    date_sleep_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

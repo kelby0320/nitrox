@@ -49,3 +49,11 @@ path = "src/bin/move.rs"
 [[bin]]
 name = "touch"
 path = "src/bin/touch.rs"
+
+[[bin]]
+name = "date"
+path = "src/bin/date.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/bin/sleep.rs"
