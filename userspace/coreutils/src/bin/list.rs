@@ -271,6 +271,12 @@ fn finish_write(stage: &Stage, e: libstream::wire::WireError) -> ! {
 
 /// Render the rows as plain text to the kernel log — the Tier-0 path, where the program
 /// was spawned without a shell and so has no `stdout` stream to write a table to.
+///
+/// `TODO(tier0-output-sink)`: the kernel log is the wrong destination for program output.
+/// `kprint` is a kernel *diagnostic* path and the klog is a bounded ring, so this evicts
+/// kernel diagnostics to print a directory listing. Acceptable while init and the test
+/// harness are the only spawners; it should not survive the shell. See
+/// `docs/rationale/deferred-decisions.md`.
 fn emit_text(rows: &[(String, OwnedEntry)]) {
     for (name, e) in rows {
         let mut line = String::new();

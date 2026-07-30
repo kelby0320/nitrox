@@ -29,3 +29,35 @@ path = "src/bin/list.rs"
 [[bin]]
 name = "copy"
 path = "src/bin/copy.rs"
+
+[[bin]]
+name = "mkdir"
+path = "src/bin/mkdir.rs"
+
+[[bin]]
+name = "remove"
+path = "src/bin/remove.rs"
+
+[[bin]]
+name = "rename"
+path = "src/bin/rename.rs"
+
+[[bin]]
+name = "move"
+path = "src/bin/move.rs"
+
+[[bin]]
+name = "touch"
+path = "src/bin/touch.rs"
+
+[[bin]]
+name = "date"
+path = "src/bin/date.rs"
+
+[[bin]]
+name = "sleep"
+path = "src/bin/sleep.rs"
+
+[[bin]]
+name = "whoami"
+path = "src/bin/whoami.rs"

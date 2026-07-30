@@ -1631,13 +1631,42 @@ fn list_pipeline_demo(root_ns: u64, notif: u64) {
 /// the read end immediately to exercise early-consumer close. Requires the stage to exit
 /// `0` either way. Returns the received bytes (empty when not consuming).
 fn run_list(root_ns: u64, notif: u64, argv: &[&str], consume: bool) -> alloc::vec::Vec<u8> {
+    run_coreutil_capture(root_ns, notif, b"/initramfs/sbin/list", argv, consume)
+}
+
+/// Spawn a coreutil as a Tier-1 stage and **return its stdout stream**, so a demo can
+/// assert on the table it published rather than only on its exit status.
+///
+/// Same spawn as [`run_coreutil`], but the pipe is depth 1 — the smallest ring there is,
+/// so a stream of more than one message cannot complete without the consumer draining.
+/// That is what makes `list`'s backpressure assertion meaningful, and it costs the other
+/// callers nothing.
+fn run_coreutil_capture(
+    root_ns: u64,
+    notif: u64,
+    image: &[u8],
+    argv: &[&str],
+    consume: bool,
+) -> alloc::vec::Vec<u8> {
+    run_coreutil_capture_in(root_ns, notif, image, argv, consume, 0)
+}
+
+/// As [`run_coreutil_capture`], but the child runs in `child_ns` (`0` = inherit).
+fn run_coreutil_capture_in(
+    root_ns: u64,
+    notif: u64,
+    image: &[u8],
+    argv: &[&str],
+    consume: bool,
+    child_ns: u64,
+) -> alloc::vec::Vec<u8> {
     use alloc::vec::Vec;
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
 
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/list", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, image, RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        return_fail(b"test-harness: list image FAIL\n");
+        return_fail(b"test-harness: coreutil image FAIL\n");
     }
     // Depth 1: the smallest ring there is, so a stream of more than one message cannot
     // complete without the consumer draining — real backpressure, not a big buffer.
@@ -1654,7 +1683,10 @@ fn run_list(root_ns: u64, notif: u64, argv: &[&str], consume: bool) -> alloc::ve
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
-        spawn(&*(&raw const SPAWN_LIST))
+        SPAWN_LIST.namespace = child_ns;
+        let p = spawn(&*(&raw const SPAWN_LIST));
+        SPAWN_LIST.namespace = 0;
+        p
     } {
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: list spawn FAIL\n"),
@@ -1972,13 +2004,512 @@ const COPY_CONTENT_LONG: &[u8] =
 
 /// Spawn `copy` with `argv` as a Tier-1 stage (stdout wired, so its report table is
 /// produced and drained) and return its exit code.
+/// **Milestone 2 Part A — `mkdir` and `remove`.**
+///
+/// The directory verbs, driven as real Tier-1 stages. Both need operands, so neither can
+/// be exercised by a bare Tier-0 spawn — `argv` only arrives in a setup message.
+///
+/// The cases here are the ones where an implementation can look right and be wrong:
+/// `--parents` idempotence (which cannot be decided from the error code, since the
+/// filesystem reports "already exists" and "not empty" identically), the `--recursive`
+/// safety rail, `--force` suppressing *only* absence, and — the one with teeth —
+/// `remove` refusing a **namespace binding**, so that a recursive delete can never
+/// unbind a mount point.
+fn mkdir_remove_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: mkdir/remove demo (Milestone 2 Part A)\n");
+    const MK: &[u8] = b"/initramfs/sbin/mkdir";
+    const RM: &[u8] = b"/initramfs/sbin/remove";
+
+    // --- 1. mkdir creates, and refuses an existing path ----------------------
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "/system/nx-a"]) != 0 {
+        return_fail(b"test-harness: mkdir exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-a") {
+        return_fail(b"test-harness: mkdir did not create the directory\n");
+    }
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "/system/nx-a"]) == 0 {
+        return_fail(b"test-harness: mkdir over an existing path wrongly succeeded\n");
+    }
+
+    // --- 2. --parents builds a chain, and is idempotent ----------------------
+    // Two assertions in one: intermediates get created, and re-running is a success
+    // rather than an error. The second is the reason the flag relaxes the exists check
+    // and not only the parent check.
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "--parents", "/system/nx-a/b/c"]) != 0 {
+        return_fail(b"test-harness: mkdir --parents exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-a/b/c") {
+        return_fail(b"test-harness: mkdir --parents did not build the chain\n");
+    }
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "--parents", "/system/nx-a/b/c"]) != 0 {
+        return_fail(b"test-harness: mkdir --parents was not idempotent\n");
+    }
+
+    // --- 3. remove refuses a directory without --recursive, and leaves it ----
+    if run_coreutil(root_ns, notif, RM, &["remove", "/system/nx-a"]) == 0 {
+        return_fail(b"test-harness: remove of a directory wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-a") {
+        return_fail(b"test-harness: refused remove still deleted the directory\n");
+    }
+
+    // --- 4. remove takes a file ----------------------------------------------
+    write_file(root_ns, b"/system/nx-a/f.txt", b"part a\n");
+    if run_coreutil(root_ns, notif, RM, &["remove", "/system/nx-a/f.txt"]) != 0 {
+        return_fail(b"test-harness: remove file exited non-zero\n");
+    }
+    if path_exists(root_ns, b"/system/nx-a/f.txt") {
+        return_fail(b"test-harness: remove did not delete the file\n");
+    }
+
+    // --- 5. a missing path: an error, unless --force -------------------------
+    if run_coreutil(root_ns, notif, RM, &["remove", "/system/nx-a/gone.txt"]) == 0 {
+        return_fail(b"test-harness: remove of a missing path wrongly succeeded\n");
+    }
+    if run_coreutil(root_ns, notif, RM, &["remove", "--force", "/system/nx-a/gone.txt"]) != 0 {
+        return_fail(b"test-harness: remove --force on a missing path failed\n");
+    }
+
+    // --- 6. a namespace binding is refused ----------------------------------
+    // The property that keeps a recursive delete from unbinding a mount point.
+    //
+    // `/dev` is the case that **isolates** the check, and picking it took a second
+    // attempt: `/dev/console` fails with or without the check, because `/dev` is not a
+    // filesystem directory to open — so asserting on it proves nothing about the check
+    // itself. `/dev` *is* a binding directly beneath a real filesystem directory (`/`),
+    // so without the refusal it classifies as "missing", and `--force` turns that into a
+    // silent exit 0: a no-op reported as success. With the refusal it is a named error.
+    if run_coreutil(root_ns, notif, RM, &["remove", "--force", "/dev"]) == 0 {
+        return_fail(b"test-harness: remove of a namespace binding wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/dev/console") {
+        return_fail(b"test-harness: refused remove disturbed the console binding\n");
+    }
+
+    // --- 7. --recursive takes the whole tree ---------------------------------
+    write_file(root_ns, b"/system/nx-a/b/c/deep.txt", b"deep\n");
+    if run_coreutil(root_ns, notif, RM, &["remove", "--recursive", "/system/nx-a"]) != 0 {
+        return_fail(b"test-harness: remove --recursive exited non-zero\n");
+    }
+    if path_exists(root_ns, b"/system/nx-a") {
+        return_fail(b"test-harness: remove --recursive left the tree behind\n");
+    }
+
+    kprint(b"test-harness: mkdir/remove ok (created, refused, forced, recursed, binding safe)\n");
+}
+
+/// **Milestone 2 Part B — `rename` and `move`.**
+///
+/// `rename` is thin; `move` is the first coreutil whose correctness lives on a *failure*
+/// path, since the fallback only runs once the cheap operation has been refused. So the
+/// cases that matter are the ones about **which** operation ran, not merely whether the
+/// file ended up in the right place:
+///
+/// - a same-mount `move` must report `method = "rename"`. Asserting only that the file
+///   moved would pass just as happily if it silently copied every time — which is the
+///   whole behaviour `move` exists to avoid.
+/// - a cross-mount `move` must *detect* the case and not destroy the source when the
+///   fallback cannot complete.
+fn rename_move_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::Value;
+
+    kprint(b"test-harness: rename/move demo (Milestone 2 Part B)\n");
+    const RN: &[u8] = b"/initramfs/sbin/rename";
+    const MV: &[u8] = b"/initramfs/sbin/move";
+
+    // --- fixture -------------------------------------------------------------
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: rename fixture open FAIL\n"),
+    };
+    let _ = sys.mkdir(b"nx-b");
+    let _ = sys.mkdir(b"nx-b2");
+    sys.close();
+    write_file(root_ns, b"/system/nx-b/one.txt", b"part b\n");
+
+    // --- 1. rename within a directory ----------------------------------------
+    if run_coreutil(root_ns, notif, RN, &["rename", "/system/nx-b/one.txt", "/system/nx-b/two.txt"]) != 0 {
+        return_fail(b"test-harness: rename exited non-zero\n");
+    }
+    if path_exists(root_ns, b"/system/nx-b/one.txt") || !path_exists(root_ns, b"/system/nx-b/two.txt") {
+        return_fail(b"test-harness: rename did not re-point the name\n");
+    }
+
+    // --- 2. rename across directories (what Slice C2 unblocked) --------------
+    if run_coreutil(root_ns, notif, RN, &["rename", "/system/nx-b/two.txt", "/system/nx-b2/three.txt"]) != 0 {
+        return_fail(b"test-harness: cross-directory rename exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-b2/three.txt") {
+        return_fail(b"test-harness: cross-directory rename lost the file\n");
+    }
+
+    // --- 3. an existing destination is refused, and --force replaces ---------
+    write_file(root_ns, b"/system/nx-b/keep.txt", b"keep\n");
+    if run_coreutil(root_ns, notif, RN, &["rename", "/system/nx-b2/three.txt", "/system/nx-b/keep.txt"]) == 0 {
+        return_fail(b"test-harness: rename over an existing name wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-b2/three.txt") {
+        return_fail(b"test-harness: refused rename still moved the source\n");
+    }
+    if run_coreutil(root_ns, notif, RN, &["rename", "--force", "/system/nx-b2/three.txt", "/system/nx-b/keep.txt"]) != 0 {
+        return_fail(b"test-harness: rename --force exited non-zero\n");
+    }
+
+    // --- 4. a same-mount move re-points; it does NOT copy --------------------
+    // The assertion with teeth: read the published table and require
+    // `method = "rename"`. Checking only that the file arrived would pass an
+    // implementation that copied every time.
+    let bytes = run_coreutil_capture(
+        root_ns,
+        notif,
+        MV,
+        &["move", "/system/nx-b/keep.txt", "/system/nx-b2/moved.txt"],
+        true,
+    );
+    let mut method_seen = false;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if matches!(&vals[2], Value::Str(s) if s == "rename") {
+                    method_seen = true;
+                }
+            }
+        }
+    }
+    if !method_seen {
+        return_fail(b"test-harness: same-mount move did not report method=rename\n");
+    }
+    if path_exists(root_ns, b"/system/nx-b/keep.txt") || !path_exists(root_ns, b"/system/nx-b2/moved.txt") {
+        return_fail(b"test-harness: move did not relocate the file\n");
+    }
+
+    // --- 5. a cross-mount move is detected, and the source survives ----------
+    // `/initramfs` is a kernel server, not the ext4 mount, so the kernel reports the
+    // rename as cross-device and `move` falls back to copy. The copy then fails (that
+    // server is read-only), which is the correct outcome — and the property that matters
+    // is that a failed move leaves the original where it was.
+    if run_coreutil(root_ns, notif, MV, &["move", "/system/nx-b2/moved.txt", "/initramfs/moved.txt"]) == 0 {
+        return_fail(b"test-harness: cross-mount move into a read-only server wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-b2/moved.txt") {
+        return_fail(b"test-harness: failed cross-mount move destroyed the source\n");
+    }
+
+    // --- teardown ------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-b2", &[b"moved.txt"]);
+    let mut b3 = [0u8; 4096];
+    if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut b3) {
+        let _ = d.rmdir(b"nx-b");
+        let _ = d.rmdir(b"nx-b2");
+        d.close();
+    }
+
+    kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount safe)\n");
+}
+
+/// **Milestone 2 Part C — `touch`.**
+///
+/// The assertion that matters is case 2: stamping an *existing* file must move its
+/// `mtime` forward. That is the half of `touch` that could not be built at all until this
+/// part gave `File::Touch` a session-scoped form — it previously existed only on the
+/// kernel control channel, path-addressed and fire-and-forget, so a client session got
+/// `Unsupported`. Asserting only that `touch` creates files would pass an implementation
+/// with no stamping in it whatsoever.
+///
+/// The one-second wait is not padding: ext4 stores `mtime` in whole seconds, so a stamp
+/// applied within the same second as the fixture write is indistinguishable from no stamp
+/// at all. This mirrors `mtime_overwrite_demo`.
+fn touch_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: touch demo (Milestone 2 Part C)\n");
+    const TOUCH: &[u8] = b"/initramfs/sbin/touch";
+
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: touch fixture open FAIL\n"),
+    };
+    let _ = sys.mkdir(b"nx-c");
+    sys.close();
+
+    // --- 1. creates an absent file -------------------------------------------
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "/system/nx-c/new.txt"]) != 0 {
+        return_fail(b"test-harness: touch exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-c/new.txt") {
+        return_fail(b"test-harness: touch did not create the file\n");
+    }
+
+    // --- 2. stamps an existing file, moving mtime forward --------------------
+    write_file(root_ns, b"/system/nx-c/old.txt", b"part c\n");
+    let (before, _) = stat_entry(root_ns, b"/system/nx-c", b"old.txt");
+    if before == 0 {
+        return_fail(b"test-harness: touch fixture has no timestamp (wall clock unset?)\n");
+    }
+    // ext4 stores mtime in whole seconds; without crossing a second boundary a correct
+    // stamp is indistinguishable from none.
+    wait_for_next_second();
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "/system/nx-c/old.txt"]) != 0 {
+        return_fail(b"test-harness: touch on an existing file exited non-zero\n");
+    }
+    let (after, _) = stat_entry(root_ns, b"/system/nx-c", b"old.txt");
+    if after <= before {
+        return_fail(b"test-harness: touch did not advance mtime\n");
+    }
+
+    // --- 3. --no-create skips a missing path rather than failing -------------
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "--no-create", "/system/nx-c/absent.txt"]) != 0 {
+        return_fail(b"test-harness: touch --no-create on a missing path failed\n");
+    }
+    if path_exists(root_ns, b"/system/nx-c/absent.txt") {
+        return_fail(b"test-harness: touch --no-create created the file anyway\n");
+    }
+
+    // --- 4. a directory is refused -------------------------------------------
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "/system/nx-c"]) == 0 {
+        return_fail(b"test-harness: touch on a directory wrongly succeeded\n");
+    }
+
+    // --- teardown ------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-c", &[b"new.txt", b"old.txt"]);
+    let mut b2 = [0u8; 4096];
+    if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut b2) {
+        let _ = d.rmdir(b"nx-c");
+        d.close();
+    }
+
+    kprint(b"test-harness: touch ok (created, stamped, --no-create skipped, directory refused)\n");
+}
+
+/// **Milestone 2 Part D — `date` and `sleep`.**
+///
+/// Most of Part D is tested on the *host*: the civil-from-days conversion and the
+/// duration parser live in `coreutils::time` with a unit-test table (the epoch, leap
+/// years, and the 2100 non-leap case that a hand-written leap rule usually gets wrong).
+/// What cannot be tested there is the half that touches the kernel, which is all this
+/// demo covers:
+///
+/// - `date` reads a clock that is actually set, and publishes fields that agree with the
+///   harness's own reading of the same clock;
+/// - `sleep` genuinely **waits**. That is the assertion with teeth: exiting zero proves
+///   nothing, since a `sleep` that returned immediately would do that too.
+fn date_sleep_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::Value;
+
+    kprint(b"test-harness: date/sleep demo (Milestone 2 Part D)\n");
+    const DATE: &[u8] = b"/initramfs/sbin/date";
+    const SLEEP: &[u8] = b"/initramfs/sbin/sleep";
+
+    // --- 1. date publishes fields that agree with our own clock reading ------
+    let ours = realtime_secs();
+    if ours == 0 {
+        return_fail(b"test-harness: wall clock unset, cannot check date\n");
+    }
+    let bytes = run_coreutil_capture(root_ns, notif, DATE, &["date"], true);
+    let mut unix_field = 0i64;
+    let mut year_field = 0i64;
+    let mut fields = 0usize;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        fields = tr.schema().fields.len();
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if let Value::Int(u) = vals[0] {
+                    unix_field = u;
+                }
+                if let Value::Int(y) = vals[1] {
+                    year_field = y;
+                }
+            }
+        }
+    }
+    if fields != 7 {
+        return_fail(b"test-harness: date schema is not the seven expected fields\n");
+    }
+    // Agreement rather than equality: the two readings are seconds apart at most, and
+    // demanding equality would be a flaky assertion about scheduling.
+    let skew = if unix_field > ours { unix_field - ours } else { ours - unix_field };
+    if skew > 60 {
+        return_fail(b"test-harness: date disagrees with our own clock reading\n");
+    }
+    // The calendar arithmetic is host-tested; here we only need it to be plausibly wired
+    // — a year of 1970 would mean the epoch fell through unconverted.
+    if year_field < 2020 {
+        return_fail(b"test-harness: date reported an implausible year\n");
+    }
+
+    // --- 2. --unix narrows the schema ---------------------------------------
+    let bytes = run_coreutil_capture(root_ns, notif, DATE, &["date", "--unix"], true);
+    if let Ok(tr) = TableReader::new(&bytes) {
+        if tr.schema().fields.len() != 1 {
+            return_fail(b"test-harness: date --unix did not narrow the schema\n");
+        }
+    } else {
+        return_fail(b"test-harness: date --unix produced no readable table\n");
+    }
+
+    // --- 3. sleep actually waits --------------------------------------------
+    // The lower bound is the whole assertion: a `sleep` that returned immediately would
+    // still exit zero. There is deliberately no upper bound — under TCG with a loaded
+    // host, scheduling delay is unbounded and any ceiling would be a flaky test rather
+    // than a real property.
+    let before = monotonic_ns();
+    if run_coreutil(root_ns, notif, SLEEP, &["sleep", "200ms"]) != 0 {
+        return_fail(b"test-harness: sleep exited non-zero\n");
+    }
+    let elapsed = monotonic_ns().saturating_sub(before);
+    if elapsed < 200_000_000 {
+        return_fail(b"test-harness: sleep returned before its duration elapsed\n");
+    }
+
+    // --- 4. a malformed duration is a usage error, not a no-op --------------
+    if run_coreutil(root_ns, notif, SLEEP, &["sleep", "5x"]) == 0 {
+        return_fail(b"test-harness: sleep accepted a malformed duration\n");
+    }
+
+    kprint(b"test-harness: date/sleep ok (fields agree, schema narrows, wait observed)\n");
+}
+
+/// The monotonic clock in nanoseconds — for measuring that `sleep` waited.
+fn monotonic_ns() -> u64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: written by the syscall above.
+    unsafe { (&raw const CLOCK_BUF).read() }
+}
+
+/// **Milestone 2 Part E — `whoami`.**
+///
+/// Identity in Nitrox is not a kernel fact: authority is capabilities, so there is no UID
+/// to report, and identity is a *session* concept published by `session-mgr` at
+/// `/session/user` when it constructs the session namespace. `whoami` therefore reads the
+/// namespace, and the two cases that matter are symmetric:
+///
+/// - given a namespace with `/session/user` bound, it reports that name;
+/// - given one **without** it, it fails rather than inventing a default. Reporting `root`,
+///   or an empty name, would be a fabricated fact — the same reason `date` refuses to
+///   print 1970 when the clock is unset.
+///
+/// The namespaces are built here rather than borrowed from `session-mgr` because that one
+/// belongs to the login flow; constructing both shapes is also the only way to test the
+/// absent case at all.
+fn whoami_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::Value;
+
+    kprint(b"test-harness: whoami demo (Milestone 2 Part E)\n");
+    const WHOAMI: &[u8] = b"/initramfs/sbin/whoami";
+    const NAME: &[u8] = b"harness-user";
+
+    // --- a namespace that looks like a session -------------------------------
+    let ns = unsafe { syscall0(SYS_NS_CREATE) };
+    if ns < 0 {
+        return_fail(b"test-harness: whoami ns_create FAIL\n");
+    }
+    let ns = ns as u64;
+    publish_session_user(ns, NAME);
+    // Nothing else is bound, deliberately. The child never resolves its own image — the
+    // spawn hands it an image *handle* the harness resolved — so a session namespace
+    // holding only `/session/user` is a complete environment for this test. That is the
+    // capability model in miniature: the program is given what it needs rather than
+    // going to look for it.
+
+    // --- 1. it reports the bound name ---------------------------------------
+    let bytes = run_coreutil_capture_in(root_ns, notif, WHOAMI, &["whoami"], true, ns);
+    let mut got_name = false;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        if tr.schema().fields.len() != 1 || tr.schema().fields[0].name != "user" {
+            return_fail(b"test-harness: whoami schema is not a single `user` field\n");
+        }
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if matches!(&vals[0], Value::Str(s) if s.as_bytes() == NAME) {
+                    got_name = true;
+                }
+            }
+        }
+    }
+    if !got_name {
+        return_fail(b"test-harness: whoami did not report the bound session user\n");
+    }
+
+    // --- 2. no session → an error, not a fabricated default ------------------
+    let bare = unsafe { syscall0(SYS_NS_CREATE) };
+    if bare < 0 {
+        return_fail(b"test-harness: whoami bare ns_create FAIL\n");
+    }
+    let bare = bare as u64;
+    if run_coreutil_in(root_ns, notif, WHOAMI, &["whoami"], bare) == 0 {
+        return_fail(b"test-harness: whoami without a session wrongly succeeded\n");
+    }
+
+    // SAFETY: closing namespaces this demo created.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, ns);
+        syscall1(SYS_HANDLE_CLOSE, bare);
+    }
+    kprint(b"test-harness: whoami ok (reported the session user; no session is an error)\n");
+}
+
+/// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.
+fn publish_session_user(ns: u64, name: &[u8]) {
+    // SAFETY: a page-sized anonymous object.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    if mem < 0 {
+        return_fail(b"test-harness: session user create FAIL\n");
+    }
+    let mem = mem as u64;
+    // SAFETY: maps the object just created, read/write.
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if base < 0 {
+        return_fail(b"test-harness: session user map FAIL\n");
+    }
+    // SAFETY: `base` is a live one-page writable mapping; `name` is far shorter.
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(base as *mut u8, 4096);
+        dst[..name.len()].copy_from_slice(name);
+        dst[name.len()] = 0;
+        syscall4(SYS_MEMORY_UNMAP, base as u64, 4096, 0, 0);
+    }
+    let path = b"/session/user";
+    // SAFETY: valid namespace handle, path, and object handle (direct-handle bind).
+    let br = unsafe {
+        syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0)
+    };
+    // SAFETY: closing our own handle; the bind cloned its own reference.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    if br != 0 {
+        return_fail(b"test-harness: session user bind FAIL\n");
+    }
+}
+
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
+    run_coreutil(root_ns, notif, b"/initramfs/sbin/copy", argv)
+}
+
+/// Spawn a coreutil as a **Tier-1 stage** — setup message, `argv`, a `stdout` pipe — and
+/// return its exit status.
+///
+/// Tier 1 rather than a bare spawn because most coreutils are meaningless without
+/// operands, and `argv` only arrives in the setup message. Generic over the image path
+/// so `copy`, `mkdir` and `remove` share one spawn rather than three copies of it.
+fn run_coreutil(root_ns: u64, notif: u64, image: &[u8], argv: &[&str]) -> i32 {
+    run_coreutil_in(root_ns, notif, image, argv, 0)
+}
+
+/// As [`run_coreutil`], but the child runs in `child_ns` (`0` = inherit).
+///
+/// Needed because some behaviour is a property of the *namespace a process was given*,
+/// not of the program — `whoami` reads `/session/user`, which exists only in a session
+/// namespace, so testing it means constructing one.
+fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_ns: u64) -> i32 {
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
 
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/copy", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, image, RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        return_fail(b"test-harness: copy image FAIL\n");
+        return_fail(b"test-harness: coreutil image FAIL\n");
     }
     let (rx, stdout) = match pipe(4) {
         Ok(p) => p,
@@ -1994,10 +2525,13 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
-        spawn(&*(&raw const SPAWN_LIST))
+        SPAWN_LIST.namespace = child_ns;
+        let p = spawn(&*(&raw const SPAWN_LIST));
+        SPAWN_LIST.namespace = 0; // restore the shared default for later spawns
+        p
     } {
         Ok(p) => p,
-        Err(_) => return_fail(b"test-harness: copy spawn FAIL\n"),
+        Err(_) => return_fail(b"test-harness: coreutil spawn FAIL\n"),
     };
     let streams = Streams {
         stdin: None,
@@ -3258,6 +3792,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5. `copy` — the mutation side of the filesystem, including the two cases it must
     //      refuse rather than get wrong (existing destination; no-truncate overwrite).
     copy_demo(root_ns, notif);
+    mkdir_remove_demo(root_ns, notif);
+    rename_move_demo(root_ns, notif);
+    touch_demo(root_ns, notif);
+    date_sleep_demo(root_ns, notif);
+    whoami_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

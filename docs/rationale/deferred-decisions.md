@@ -344,6 +344,54 @@ authority lives: rights on the binding independent of the endpoint handle's, a r
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
 
+**The filesystem collapses distinct errors into `InvalidArgument` — `TODO(fs-error-granularity)`.**
+`fs-server-ext4` distinguishes `FsError::Exists` (POSIX `EEXIST`) from `FsError::NotEmpty`
+(`ENOTEMPTY`) internally, but both map to `KError::InvalidArgument` on the wire, because the kernel's
+`KError` set has neither. A client therefore cannot tell "already exists" from "directory not empty"
+from a genuinely malformed argument.
+
+The cost is that clients must re-derive what the server already knew. `mkdir --parents` cannot treat
+"already exists" as success by inspecting the error, so it tests each component with `is_dir` first;
+`remove` cannot report "directory not empty" accurately, so it establishes emptiness by listing.
+Both work, and both are an extra round trip plus a small race window against a concurrent mutator —
+acceptable at Milestone 2, where the alternative is guessing.
+
+Fixing it means adding discriminants (`AlreadyExists`, `NotEmpty`) to `KError`, which is an **ABI
+change**: it moves the ABI version hash and must be mirrored in `userspace/libkern`
+(`cargo xtask abi-sync-check` enforces the mirror). That is why it is not folded into a coreutils
+part.
+
+**Scheduled (2026-07-30): a batched fs-server ABI pass, immediately after the Milestone 2 coreutils
+land.** Deliberately batched rather than taken now — an ABI change moves the version hash and forces
+every mirror to be re-checked, so paying that once for several corrections beats paying it per
+utility. Milestone 2 is also the first time the filesystem interface has had this many clients at
+once, which makes it the right moment to collect the corrections and the wrong moment to keep
+patching around them one at a time. Any further ABI gaps found while building the remaining parts
+join this pass; anything that turns out to *block* a part gets reassessed at that point rather than
+deferred on principle.
+
+**Cross-mount `move` of a directory, and the missing second mount — `TODO(cross-mount-move)`.**
+`move` falls back to copy-then-remove when the kernel reports a rename as cross-device, and that
+fallback handles a **regular file** only; a directory operand is refused. Two reasons, and the second
+is the one that matters.
+
+The first is scope: a recursive cross-mount relocation is copy-a-tree plus remove-a-tree with a
+partial-failure story in the middle (what is the correct state when the copy succeeds and the removal
+does not, halfway down?), which is a design question rather than a few lines.
+
+The second is that **the test image has exactly one writable filesystem mount**, so no
+cross-mount move can currently be exercised end to end at all — not for directories, and not for
+files either. The `/initramfs` kernel server gives the *detection* path a target (the kernel reports
+`Unsupported`, `move` falls back, the copy then fails because that server is read-only), and the
+demo asserts the valuable half of it: a failed move leaves the source intact. But the successful
+fallback — copy lands, original is removed, `method = "copy"` is reported — has never run. Writing
+the recursive version against a path that cannot be tested would be writing it blind.
+
+Trigger: a second writable mount, whether from a real second filesystem or a second binding of the
+existing server at its own subtree base (`us_forward_existing_reg` already supports one endpoint
+under many names). That is the point at which both the file and directory cases become testable, and
+it should come before, not after, the recursive implementation.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
@@ -396,6 +444,94 @@ place without changing its length.
 **Runtime reconfiguration of critical-path mounts.** Currently requires reboot through eshell. Live remounting of `/`, `/home`, etc., is not supported. Trigger: deployment scenarios where it matters.
 
 ### Userspace
+
+**A resource server behind `/session/*` — `TODO(session-metadata-server)`.** Nitrox has no kernel
+user identity: authority is held in handles, so there is nothing for the kernel to report and
+identity is a *session* concept. `session-mgr` authenticates a login and then constructs the
+session's namespace, so it is both the component that knows and the component that already tells a
+process about its world by construction — the shell does not ask where home is, it sees `/home`.
+`whoami` therefore reads `/session/user`, a binding, rather than calling a service (which would be
+closer to ambient lookup than to capabilities) or a syscall (which has nothing to return).
+
+**Today that binding is a direct handle to a memory object — a snapshot.** That is correct for a
+fact immutable for the session's lifetime, and a session's user qualifies: changing user means a new
+session, not a mutated one. It is *silently wrong* for anything mutable, because a client would read
+stale bytes with no indication that they are stale. Hence the rule, which is a checkable condition
+rather than a judgement call:
+
+> Direct-handle binds are for facts immutable for the session. **The first genuinely mutable
+> `/session/*` member is the trigger** to put a resource server behind the prefix.
+
+**The migration does not touch any client.** A userspace-server binding answers a resolve with
+`OBJECT_KIND_MEMOBJ`, which the kernel cross-context-installs — so `lookup + map + read` is
+byte-identical whether the path is a direct handle or a server. The namespace exists precisely to
+hide that difference (it is the same reason `/home` can be a server subtree while `/dev/console` is a
+direct handle, and no client cares). The cost of the migration falls entirely on `session-mgr`.
+
+**Watch the coupling with B3 (env), which arrives first.** The shell subproject's open question B3 —
+*"env vars as namespace-scoped resources"* — is the same problem one milestone earlier: mutable,
+namespace-scoped values, due in Milestone 3 when the interpreter needs env. Whatever mechanism B3
+builds for that is very likely what `/session/*` should migrate onto, rather than a bespoke session
+server. Designing B3 without `/session/*` in view risks two mechanisms for one problem and two
+migrations instead of one.
+
+Expected timing, from the roadmap: the *hard* trigger is the console/tty server and the compositor
+terminal (stepping-stones 5-6), where a tty and job control are mutable session state with several
+consumers needing one consistent answer — the rich REPL is already recorded as gated on exactly
+that. So the snapshot has roughly two milestones of runway, and B3 in Milestone 3 is the design
+checkpoint.
+
+
+
+**Where a Tier-0 program's output goes — `TODO(tier0-output-sink)`.** A coreutil spawned without a
+shell has no `stdout` (stream handles arrive in the setup message, which the shell sends), so it
+currently falls back to plain text via `kprint` — i.e. into the **kernel log**. That is fine as
+debugging scaffolding and wrong as a design: `kprint` is a kernel *diagnostic* facility, the klog
+is a bounded ring (8 KiB boot prefix + 8 KiB recent, Slice D1), and program output written there
+**evicts kernel diagnostics**. It is also a layering inversion — a userspace program's normal
+output should not travel through a kernel debug path.
+
+Two candidate shapes, and the choice is about whose job it is to supply a sink:
+
+1. **The program falls back to `/dev/console`** instead of `kprint`, opening it through its own
+   namespace. Minimal change, keeps "no stdout" as a state programs handle, and the machinery
+   already exists — the console is a kernel server bound at `/dev/console` in the root namespace,
+   and session-mgr already re-binds it into session namespaces.
+2. **The spawner always supplies streams**, so Tier 0 stops meaning "no streams" and starts meaning
+   "streams the spawner chose". Init would construct a minimal setup message with `stdout` bound to
+   a console handle (or explicitly to nothing, meaning *discard*). This removes the fallback path
+   entirely rather than redirecting it, leaving one output path instead of two — at the cost of
+   giving every spawner that job.
+
+**Option 2, on the Linux precedent (checked 2026-07-30, empirically and against the kernel source).**
+Linux coreutils have **no fallback at all**. `ls` with fd 1 closed prints
+`ls: write error: Bad file descriptor` and exits 2 — the same when exec'd directly with 0/1/2 closed
+and no shell involved. The program writes to fd 1; if it is not open, `write()` returns `EBADF` and
+the program fails loudly. It never invents a destination.
+
+The guarantee lives entirely outside the program, in four places: the kernel opens `/dev/console`
+and dups it to 0/1/2 for **PID 1** (`console_on_rootfs()` in `init/main.c`); every other process
+**inherits** 0/1/2 across fork/exec; detaching daemons explicitly redirect to `/dev/null`; and for a
+**setuid** exec the kernel plugs `/dev/null` into any unallocated 0/1/2. That last one is a security
+measure rather than a convenience — a setuid program that opens a file would otherwise be handed
+fd 1 and could be tricked into writing to it — and note it plugs `/dev/null`, not a console: the
+kernel ensures the descriptor *exists* and never decides the output should be seen.
+
+So the precedent endorses option 2, and pushes it further than "fall back to something better": the
+end state is that a stage **has no fallback** and fails when it has no `stdout`, exactly as `ls`
+does. "Discard" stays expressible as an explicit `/dev/null` equivalent, which is also the daemon
+idiom.
+
+**The one place the analogy breaks, and the actual cost of option 2 here.** Linux gets "the spawner
+supplies" almost free, because descriptors are *inherited* — a spawner that does nothing still
+passes its own along. Nitrox has no inheritance: authority is explicit handles and a spawned process
+gets exactly what the setup message carries. So what Linux obtains by default, init and every future
+spawner must do deliberately. That, rather than the choice of sink, is the part to design.
+
+Trigger: raised 2026-07-30 while planning coreutils Milestone 2 — acceptable while init and the test
+harness are the only spawners, but it should not survive the shell (Milestone 3), which is the point
+at which Tier 0 stops being the common case and the current behaviour would start filling the klog
+during ordinary use.
 
 **Shell grammar specification.** The shell's data model is committed (typed structured streams, port-based wiring, the display verb, model-view decomposition). The exact syntax is deferred to shell implementation. Trigger: when shell implementation begins.
 

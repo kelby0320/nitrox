@@ -24,6 +24,7 @@ extern crate alloc;
 pub mod args;
 pub mod fs;
 pub mod stage;
+pub mod time;
 
 pub use args::{ArgError, Args, Flag, parse};
 pub use stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};

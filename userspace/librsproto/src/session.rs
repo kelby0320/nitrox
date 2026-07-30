@@ -27,7 +27,8 @@ use crate::file::{
     rename_request,
 };
 use crate::{
-    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_UNLINK, RS_HEADER_LEN,
+    OP_FILE_MKDIR, OP_FILE_READ_DIR, OP_FILE_RENAME, OP_FILE_RMDIR, OP_FILE_TOUCH,
+    OP_FILE_UNLINK, RS_HEADER_LEN,
 };
 use libkern::abi::{IPC_MSG_SIZE, SENDMODE_NOBLOCK};
 use libkern::handle::{RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT};
@@ -194,6 +195,18 @@ impl<'a> Dir<'a> {
     /// Remove the empty subdirectory `name`.
     pub fn rmdir(&mut self, name: &[u8]) -> Result<()> {
         self.name_op(OP_FILE_RMDIR, name)
+    }
+
+    /// Stamp `name`'s modification time as "now", where *now* is the **server's** clock.
+    ///
+    /// A caller cannot supply the time: one it could choose would be forgeable metadata,
+    /// so the filesystem is its own authority for it. (The `File::Touch` on the kernel
+    /// control channel is a different thing wearing the same opcode — the kernel telling
+    /// the server about a Model A write it could not otherwise observe, fire-and-forget
+    /// and with no client behind it. This one is name-addressed inside a session and
+    /// returns a status, like the other mutations here.)
+    pub fn touch(&mut self, name: &[u8]) -> Result<()> {
+        self.name_op(OP_FILE_TOUCH, name)
     }
 
     /// Rename `old` to `new`, both within this directory.

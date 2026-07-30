@@ -194,6 +194,238 @@ hides from the fs-server (`deferred-decisions.md`).
 The rest of §10c: `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` (resolve
 B2 here). Each native, each a TSM1 stage. Aliasing (§10e) is namespace-bind data, not a program.
 
+Milestone 1 proved one pipeline end to end — a reader (`list`) and a mutator (`copy`) over a real
+pipe. Milestone 2 is deliberately *not* another integration proof; it is **breadth on a substrate
+that is now finished**, and the parts below are ordered so the mechanical ones land first and the
+one genuine design question lands last.
+
+Two things hold for every part, and are not repeated in each:
+
+- **Each utility is a TSM1 stage that must also work at Tier 0.** Every one uses the
+  `coreutils::stage` prologue, which reports which tier it was spawned in. **Tier 1** is the
+  shell-spawned case: `arg0` marks a setup message pending, and that message carries `argv` and
+  the three stream handles, so the utility writes its `Table`/`Record` as TSM1 to the `stdout`
+  channel. **Tier 0** is everything else — today init and the test harness, since the shell is
+  not built until Milestone 3 — where `Stage::enter` yields no `argv` and all three streams
+  `None`.
+
+  Two consequences, and they are separate. First, a Tier-0 stage has no `argv`, so it can only
+  run its argument-free default; harness demos are limited to that. Second, it has no `stdout`
+  to put a typed stream on, so it needs a **plain-text fallback**: `list` matches on
+  `stage.streams.stdout` and, for `None`, renders one human-readable line per row to the kernel
+  log via `kprint` instead of a TSM1 table. Plain text rather than the same bytes elsewhere,
+  because the reader in that position is a person on the serial console, not a decoder.
+
+  **The kernel log is the wrong destination long-term, and this is scaffolding**
+  (`TODO(tier0-output-sink)`, `deferred-decisions.md`). `kprint` is a kernel *diagnostic* path
+  and the klog is a bounded ring, so program output evicts kernel diagnostics. It is acceptable
+  while init and the test harness are the only spawners; it should not survive the shell. New
+  utilities should follow `list`'s existing shape for now rather than inventing a second answer
+  — one fallback to change later is better than eight.
+
+  `PeerClosed` on the output side is a **clean** exit, not an error.
+- **Flags follow the declarative `coreutils::args` conventions** (GNU §10f, no bare `-`), and the
+  mutating verbs take `--force` with the same meaning `copy` gave it.
+
+Parts, in order (tick as they land):
+
+- [x] **Part A — `mkdir`, `remove`** ✅ (2026-07-30)
+- [x] **Part B — `rename`, `move`** ✅ (2026-07-30)
+- [x] **Part C — `touch`** ✅ (2026-07-30)
+- [x] **Part D — `date`, `sleep`** ✅ (2026-07-30)
+- [x] **Part E — `whoami`** ✅ (2026-07-30) — B2 resolved
+
+The substrate these lean on is in place: Slice C delivered cross-directory + overwrite `rename`
+(which is what unblocks `move`), full-directory growth, and `mtime` on in-place overwrite; the
+wall clock landed in PR #118; `librsproto::session::Dir` already exposes `mkdir` / `unlink` /
+`rmdir` / `rename` / `read_dir`; `coreutils::fs` already has `copy_file`, `rename`, `file_size`,
+`ns_children` and the `basename`/`parent`/`join` helpers.
+
+**Expect each part to surface substrate gaps, and file them rather than paper over them.** That is
+what Milestone 1 did — it turned up no-truncate, no-wall-clock and unreclaimed handles, all of
+which became their own fixes — and it is the main reason to build breadth before the interpreter.
+
+#### Part A — the directory verbs: `mkdir`, `remove` ✅ (2026-07-30)
+
+**Landed.** Both are Tier-1 stages emitting tables (`Table<{path, created: Bool}>` and
+`Table<{path, kind}>`), with `fs::is_dir` hoisted out of `copy` as the third caller. Three things
+the part turned up, none of them the ones the sketch below predicted:
+
+- **The filesystem collapses `Exists` and `NotEmpty` into `InvalidArgument`**, so neither utility can
+  branch on the error to decide whether a path already exists. Both establish the fact directly
+  instead — `mkdir --parents` tests each component with `is_dir`, `remove` establishes emptiness by
+  listing. Filed as `TODO(fs-error-granularity)`; fixing it is an ABI change.
+- **`remove` must walk the filesystem only, never the namespace union.** `list`'s descent merges
+  namespace bindings with filesystem entries, which is right for looking and wrong for deleting: a
+  binding is a mount point, and `remove --recursive /` must not unbind `/dev/console`. So the
+  descent was *not* hoisted from `list`, contrary to the guess below — the semantics differ at
+  exactly the point that matters.
+- **The first two negative controls were vacuous, and nearly passed as verification.** Asserting
+  that `remove --force /dev/console` is refused proves nothing: it fails with or without the binding
+  check, because `/dev` is not a filesystem directory to open. The isolating case is `/dev` itself —
+  a binding directly beneath a real filesystem directory, which without the check classifies as
+  "missing" and turns into a silent `--force` success. Re-designed until each control actually
+  failed the demo.
+
+The original sketch, kept for the record:
+
+Both are thin wrappers over session ops that already exist, which makes this the natural first
+part: it exercises the `Dir` client on the *mutating* side without needing anything new.
+
+- `mkdir` — `Dir::mkdir`, plus `--parents` (create intermediate components, succeed if the leaf
+  already exists). Emits `Table<{path, created}>` so a pipeline can tell "made it" from "already
+  there".
+- `remove` — `Dir::unlink` for files, `Dir::rmdir` for empty directories, `--recursive` to walk
+  and remove depth-first, `--force` to ignore a missing target. Emits `Table<{path, kind}>` of
+  what was actually removed.
+
+The interesting case is `remove --recursive`: `rmdir` only removes an *empty* directory, so the
+walk order is load-bearing, and the natural implementation re-uses `list`'s recursive descent.
+Worth checking whether that descent belongs in `coreutils::fs` rather than being written twice.
+
+#### Part B — `rename` and `move` ✅ (2026-07-30)
+
+**Landed.** `rename` is the thin one and deliberately has *no* fallback — a cross-mount rename is an
+error, so a caller who wants the cheap identity-preserving operation can ask for it and be told when
+it is impossible. `move` adds the fallback and **reports which method it used**
+(`Table<{from, to, method}>`, `method` ∈ `rename` | `copy`). That field is not decoration: the two
+differ in cost and in whether the file keeps its identity, and it is the only way to *prove* the
+same-mount path is not silently copying — an assertion on "the file arrived" would pass an
+implementation that copied every time.
+
+The predicted finding held: **the test image has exactly one writable mount**, so no cross-mount move
+runs end to end. `/initramfs` (a read-only kernel server) gives the *detection* path a target, and
+the demo asserts the half that is testable and most worth protecting — a failed move leaves the
+source intact. The successful fallback has never executed. A cross-mount *directory* move is
+therefore refused rather than written blind; both are filed as `TODO(cross-mount-move)`, whose
+trigger is a second writable mount (a second binding of the existing server at its own subtree base
+would do — `us_forward_existing_reg` already supports one endpoint under many names).
+
+The original sketch, kept for the record:
+
+`rename` is the thin one — `coreutils::fs::rename` already exists and Slice C2 made it work across
+directories and over an existing destination. It emits `Table<{from, to}>`.
+
+`move` is `rename` plus the fallback: when the two paths are on different mounts the kernel reports
+`CrossDevice`, which `coreutils::fs` already documents as *"a caller's cue to fall back to
+`copy_file` + unlink rather than an error to report"*. So `move` is the first utility that composes
+two existing helpers rather than wrapping one, and the first whose correctness depends on a
+failure path — which means the harness demo must exercise the cross-mount case, not just the
+same-mount one. If there is no second mount in the test image, that is itself the finding.
+
+#### Part C — `touch` ✅ (2026-07-30)
+
+**Landed, and the prediction was right in outline and wrong in degree.** `File::Touch` did already
+exist — but *kernel-only by construction*, not merely un-wrapped: it lives on the kernel↔server
+control channel, is path-addressed, and is fire-and-forget with no reply, because its one caller is
+the kernel reporting a Model A write the server cannot otherwise observe. A client session sending
+it got `Unsupported`. So this was not "expose an existing op" but "give an existing opcode a
+session-scoped *form*": `ext4::touch_at(dir_ino, name)` beside `mkdir_at`/`unlink_at`/`rmdir_at`, one
+arm in the session dispatch, and `Dir::touch`. Name-addressed inside an open directory, so
+confinement stays structural, and it returns a status like the other mutations.
+
+Worth noting what it is *not*: an rsproto addition, entirely in userspace. No `KError` discriminants,
+no ABI hash move, `abi-sync-check` untouched — so it did not belong in the batched kernel-ABI pass,
+which is why it was taken now rather than deferred with `fs-error-granularity`.
+
+The utility itself has no `--date`, and that is deliberate rather than unfinished: the wire carries
+no timestamp because one a caller could choose would be forgeable metadata, so the server reads its
+own clock. `touch` therefore cannot express "set mtime to X" and does not pretend to.
+
+The original sketch, kept for the record:
+
+Two behaviours in one verb: create the file if absent, and stamp `mtime` to "now" if present.
+
+Creation is `SYS_FILE_CREATE`. The stamp is `File::Touch`, which **already exists on the wire and
+in the fs-server** — Slice C4 added it so the kernel could report a Model A in-place overwrite —
+but its only caller today is the kernel's post-writeback path, and `librsproto::session::Dir` has
+no client wrapper for it. So this part probably starts by exposing an existing op rather than
+designing a new one. Confirm that before writing the utility; if the op turns out to be
+kernel-only by construction, that is a gap to file, not to work around.
+
+#### Part D — `date` and `sleep` ✅ (2026-07-30)
+
+**Landed, and the plan's instinct about where the tests belong held.** The two pieces that can be
+wrong without a kernel — civil-from-days and duration parsing — went into `coreutils::time` and are
+covered by six **host** tests; the boot demo only carries the halves that touch syscalls. The leap
+table pins the epoch, an ordinary leap year, 2000 (leap, divisible by 400), and **2100** (*not*
+leap, divisible by 100 but not 400) — the case a hand-written rule usually gets wrong, and the
+reason the implementation is Hinnant's era arithmetic rather than a chain of special cases.
+
+Two design points worth recording, both about refusing to invent:
+
+- **`date` emits fields, not a string** — `Table<{unix, year, month, day, hour, minute, second}>` —
+  because a formatted string forces every consumer to parse it back apart, which is the Unix habit
+  the typed-stream model exists to avoid. `--unix` *narrows the schema* to one field rather than
+  emitting all seven and letting the consumer pick.
+- **No `--format` and no timezone**, and **no `--date` on `touch`** for the same family of reason:
+  there is no tz database and no locale, so an offset would be a fiction. An unset clock is an
+  error rather than a printed 1970.
+
+`sleep` arms an **absolute** monotonic deadline computed once, so time between the clock read and
+the arm is inside the wait rather than added to it. Its demo asserts a lower bound only —
+deliberately: a `sleep` that returned immediately would still exit zero, so the bound is the whole
+assertion, while an upper bound under TCG on a loaded host would be a flaky test rather than a real
+property.
+
+The original sketch, kept for the record:
+
+Neither touches the filesystem, which makes them the two most host-testable utilities in the set —
+and the first that are mostly *formatting and arithmetic*, so the bulk of each should be unit
+tests rather than boot demos.
+
+- `date` — reads `CLOCK_REALTIME` via `SYS_CLOCK_READ` (live since PR #118) and formats it. There
+  is no `std`, so civil-from-days conversion is hand-rolled and is exactly the kind of code that
+  earns a host test table (epoch, leap years, the 2100 non-leap case). Emits a `Record` rather than
+  a bare string so a pipeline can select fields.
+- `sleep` — `SYS_TIMER_CREATE` + `SYS_TIMER_SET` + `sys_wait`, the pattern the test harness's
+  `timer_sleep_ms` already uses. The parsing (`5`, `1.5s`, `200ms`) is the testable part; the
+  waiting is three syscalls. Emits nothing.
+
+#### Part E — `whoami` ✅ (2026-07-30) — B2 resolved
+
+**Resolved in favour of the namespace.** `session-mgr` publishes `/session/user` when it builds the
+session namespace; `whoami` reads it. Not a syscall (the kernel has no identity to report) and not a
+service call (which would be closer to ambient lookup than to capabilities). The deciding argument
+was consistency: the namespace is already how this system answers questions of this shape — the
+shell does not ask where home is, it sees `/home` — and identity is the same kind of fact, known by
+the same component, at the same moment.
+
+**Absence is an error, not a default.** A process outside any session has nothing bound there and
+`whoami` says so and exits non-zero. Reporting `root` or an empty name would be a fabricated fact,
+the same reason `date` refuses to print 1970 when the clock is unset.
+
+**Staged deliberately, with a checkable trigger.** The binding is a direct handle to a memory object
+— a snapshot, correct because a session's user is immutable for its lifetime. Session metadata will
+grow toward tty and job state, and *the first genuinely mutable member* is the trigger to put a
+resource server behind `/session/*`. That migration touches no client: a server answers a resolve
+with `OBJECT_KIND_MEMOBJ`, so `lookup + map + read` is byte-identical either way, and the namespace
+is precisely what hides the difference. Filed as `TODO(session-metadata-server)`, along with the
+coupling worth watching — **B3 (env) is the same problem one milestone earlier** (mutable,
+namespace-scoped values, due in Milestone 3), so `/session/*` should probably migrate onto whatever
+B3 builds rather than onto a bespoke session server.
+
+The original sketch, kept for the record:
+
+**Deferred to when the part is reached, deliberately.** Nitrox has no kernel user identity —
+authority is held in handles, not derived from a UID — so identity is a *session* concept that
+session-mgr constructs along with the per-user namespace and home. The likely answer is that
+`whoami` asks **session-svc**, which is the component that actually knows; the alternative shape is
+a namespace-bound `/proc/self/user` that session-mgr populates per session, which keeps the
+utility a plain reader and puts the knowledge in the namespace where the rest of the system already
+looks.
+
+Both are consistent with the capability model, and the choice is about where the truth lives rather
+than about `whoami` itself, so it is worth a short design discussion at the time rather than a
+guess now. Nothing else in Milestone 2 depends on it, which is why it is last.
+
+**Milestone 2 is complete** (2026-07-30): `mkdir`, `remove`, `rename`, `move`, `touch`, `date`,
+`sleep`, `whoami`. Two items are owed and filed rather than forgotten —
+`TODO(fs-error-granularity)` (the filesystem collapses `Exists` and `NotEmpty` into
+`InvalidArgument`, so clients re-derive what the server already knew) is scheduled into the batched
+fs-server ABI pass, and `TODO(cross-mount-move)` waits on a second writable mount, without which no
+cross-mount move can be exercised end to end at all.
+
 ### Milestone 3 — the interpreter (C5/C6)
 
 Lexer → parser (grammar §8/§9) → tree-walker → generic operators → `Value` tree. Deliver **non-
