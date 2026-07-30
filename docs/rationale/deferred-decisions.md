@@ -344,28 +344,6 @@ authority lives: rights on the binding independent of the endpoint handle's, a r
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
 
-**Cross-mount `move` of a directory, and the missing second mount — `TODO(cross-mount-move)`.**
-`move` falls back to copy-then-remove when the kernel reports a rename as cross-device, and that
-fallback handles a **regular file** only; a directory operand is refused. Two reasons, and the second
-is the one that matters.
-
-The first is scope: a recursive cross-mount relocation is copy-a-tree plus remove-a-tree with a
-partial-failure story in the middle (what is the correct state when the copy succeeds and the removal
-does not, halfway down?), which is a design question rather than a few lines.
-
-The second is that **the test image has exactly one writable filesystem mount**, so no
-cross-mount move can currently be exercised end to end at all — not for directories, and not for
-files either. The `/initramfs` kernel server gives the *detection* path a target (the kernel reports
-`Unsupported`, `move` falls back, the copy then fails because that server is read-only), and the
-demo asserts the valuable half of it: a failed move leaves the source intact. But the successful
-fallback — copy lands, original is removed, `method = "copy"` is reported — has never run. Writing
-the recursive version against a path that cannot be tested would be writing it blind.
-
-Trigger: a second writable mount, whether from a real second filesystem or a second binding of the
-existing server at its own subtree base (`us_forward_existing_reg` already supports one endpoint
-under many names). That is the point at which both the file and directory cases become testable, and
-it should come before, not after, the recursive implementation.
-
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
@@ -730,6 +708,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Cross-mount `move` of a directory, and the missing second mount (`cross-mount-move`) | 2026-07-30 | The blocker was the fixture, not the feature: with one writable mount, no cross-mount move could be exercised end to end at all, so the recursive case was refused rather than written blind. Binding the one fs-server a second time with base `/scratch` gives a destination the kernel classifies as another mount while staying writable — the kernel's rename test is `same server && same subtree base`. The recursive case then landed on shared `fs::copy_tree`/`fs::remove_tree` walks, hoisted out of `copy` and `remove` so there is one of each rather than three. |
 | Filesystem errors collapsed into `InvalidArgument` (`fs-error-granularity`) | 2026-07-30 | `KError` gained `AlreadyExists` (-14) and `NotEmpty` (-15), and the batched ABI pass found the collapse was not the fs-server's alone: `sys_ns_bind` on an occupied path had the identical one, which is what makes these kernel errors rather than filesystem ones. Three further arms of `fs_kerror` were also reaching for a vaguer error than existed — `TooLarge`→`OutOfMemory`, `Io`→`KernelError`. Separately, `libkern`'s `from_i32` had never decoded `IoError`, so every device error read as `KernelError`; `abi-sync-check` now derives the decode table from the kernel's enum. See [error-codes.md](../reference/error-codes.md). |
 | `cargo xtask abi-sync-check` | 2026-07-29 | Built (Slice D2) and wired into CI. Compares the four hand-mirrored ABI families — syscall numbers, `KError`/`KObjectType` discriminants, `Rights` bits — plus individually-paired shared limits (`MAX_WAIT_HANDLES`, `IPC_HANDLE_MAX`), 91 values in all. `#[repr(C)]` layouts stay out of it: both sides already assert their own offsets and sizes at compile time, which is stronger and fails earlier. |
 | x2APIC | 2026-06-26 | Built — and **x2APIC-only**, not dual-mode: the ≈2014 baseline guarantees it, so no xAPIC fallback is carried. The dev loop runs QEMU ≥ 9.0. |

@@ -9444,3 +9444,66 @@ document reserved `-11` for `AlreadyExists` and put the blocking errors at `-20`
 the implementation put `WouldBlock`/`TimedOut`/`PeerClosed` at `-11..-13`. Anyone reading
 the design doc for a free value would collide with `WouldBlock`. The design doc is
 history; the catalogue is the reservation table.
+
+---
+
+## 2026-07-30 — `cross-mount-move`: the blocker was the fixture, not the feature
+
+`move`'s copy-then-unlink fallback had existed since Milestone 2 Part B with **half of it
+never executed**. The image had one writable mount, so the only cross-mount destination
+was `/initramfs` — a read-only kernel server. The demo could prove the detection (the
+kernel reports the rename cross-device) and the safety rule (a failed move leaves the
+source intact), but the copy always failed, so whether a cross-mount move actually
+relocates anything was untested. The recursive *directory* case was refused outright, and
+the recorded reason was not that it was hard: writing it against a path that could not be
+run once was worse than refusing it.
+
+**The second mount is a second binding of the one fs-server.** The kernel calls a rename
+cross-filesystem when the two paths resolve to a different `(server, subtree base)` pair,
+so binding the same endpoint again with base `/scratch` produces a destination that is
+genuinely cross-mount while staying writable. The kernel already shares one registration
+across many names — `/subtreetest` and session-mgr's `/home` both depend on it. A real
+second ext4 would have meant another image partition and another server process without
+exercising one further line of the path under test.
+
+Selftest-only, because it is a fixture and not a system mount. The *deferral entry itself*
+had proposed exactly this, which is the argument for writing the trigger down when
+deferring: the work was cheap once someone looked, and what had been missing was not an
+idea but a record that the idea was already had.
+
+**The recursive case landed on shared walks, not a third copy of the loop.** `copy` and
+`remove` each had their own tree walk; `move` needed both. `fs::copy_tree` and
+`fs::remove_tree` are now the single implementation of each, with the three utilities
+supplying only their reporting and their error messages. The property worth centralising
+is not the loop — it is that the descent enumerates **filesystem entries only**, never
+`ns_children`, so it cannot copy or delete *through* a mount point. That is now stated
+once, where the descent is, instead of in three places that could drift apart.
+
+The operand-level check stays per-utility, because a walker cannot tell whether the path
+it was handed was a mistake. `move` gained one: it can delete a tree now, so it refuses a
+namespace binding as a source exactly as `remove` does.
+
+**A control caught a vacuous test, again.** The binding-refusal case first used `/dev` as
+its operand — and deleting the refusal from `move` left the demo passing, because `/dev`
+is not a filesystem directory and a move of it fails either way. This is the same trap
+Part A hit and documented, arrived at from a different direction. The operand is now
+`/subtreetest`: a binding that *is* an openable directory, so without the refusal `move`
+recurses into it and then deletes `/system`. The assertion is that the destination was
+never created, since an exit code alone cannot tell "refused" from "tried and failed
+partway".
+
+Two lessons already in the log got a second confirmation each: *a control that passes is a
+bug in the control*, and *the case that isolates a check is rarely the first one that comes
+to mind*.
+
+**Partial-failure semantics, the design question the deferral flagged.** A tree copy that
+fails partway leaves the partial destination where it fell rather than cleaning up:
+removing it would delete whatever of the destination already existed. The source is
+untouched, which is the property that matters. Once the copy has landed, a failed removal
+is reported as "both now exist" — the honest description and the useful one, since it tells
+an operator that re-running is safe and nothing was lost. The rule is the one `move`
+already applied to files, extended rather than reinvented.
+
+*Verified:* 814 host tests green, `test-qemu` PASS under TCG and KVM, all five guards,
+`check-deferrals` down to 11 tags. Each of the three properties — the tree arrives, the
+source is removed entirely, a binding is refused — fails the demo when removed.

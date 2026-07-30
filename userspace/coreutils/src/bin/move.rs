@@ -26,10 +26,17 @@
 //!   removing the source does not, the result is a duplicate, not a move. That is
 //!   reported as a failure rather than papered over: the exit status is non-zero and the
 //!   row is not emitted, so nothing downstream is told the move happened.
-//! - **A cross-mount *directory* move is refused.** The fallback copies a regular file;
-//!   recursive cross-mount relocation is a larger operation and there is currently no
-//!   second writable mount to exercise it against (see the Milestone 2 notes). Refusing
-//!   is honest; silently copying half a tree is not.
+//! - **A cross-mount *directory* move copies the tree, then removes it.** Both halves are
+//!   [`fs::copy_tree`] / [`fs::remove_tree`] — the same walks `copy` and `remove` use, not
+//!   a third copy of the loop. This was refused until 2026-07-30, not because it was hard
+//!   but because the image had no second writable mount to test it against, and writing it
+//!   blind was worse than refusing it.
+//! - **A partial copy is left where it fell.** Cleaning it up would mean deleting whatever
+//!   of the destination already existed. The source is untouched, which is the property
+//!   that matters, and the exit status says the move did not happen.
+//! - **A namespace binding is refused as a source**, as in `remove`: a binding is a mount
+//!   point, so recursing into one would copy *through* a mount and then delete another
+//!   server's tree.
 
 #![no_std]
 #![no_main]
@@ -44,7 +51,6 @@ use coreutils::fs::{self, FileError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::{exit, kprint};
-use librsproto::session::Dir;
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -148,32 +154,48 @@ fn move_one(stage: &Stage, src: &[u8], dst: &[u8], force: bool) -> &'static str 
     }
 
     // --- the fallback: copy, then remove the original ------------------------
-    if fs::is_dir(stage.namespace, src) {
-        // `TODO(cross-mount-move)`: the fallback copies a regular file. A recursive
-        // cross-mount relocation is a larger operation, and there is currently no second
-        // writable mount to exercise it against — so it is refused rather than written
-        // blind. See `docs/rationale/deferred-decisions.md`.
+    // A namespace binding is a mount point, not content. Recursing into one would copy
+    // *through* a mount and then delete another server's tree, so it is refused at the
+    // operand — the same rule `remove` states, and it has to be stated here too because a
+    // tree walker cannot tell whether the path it was handed was a mistake.
+    if is_binding(stage, src) {
+        stage.die(b"move: source is a namespace binding, not a file\n", EXIT_FAILURE);
+    }
+
+    let is_dir = fs::is_dir(stage.namespace, src);
+    if fs::copy_tree(stage.namespace, src, dst, force, &mut |_, _, _| {}).is_err() {
+        // The copy failed partway. The source is untouched, which is the property that
+        // matters; a partial destination is left where it fell rather than cleaned up,
+        // because removing it would delete whatever of the destination already existed.
+        stage.die(b"move: cross-mount copy failed\n", EXIT_FAILURE);
+    }
+
+    // The copy landed. From here a failure leaves *two* copies, which is not a move — so
+    // it is reported as a failure and no row is emitted for it. Saying which state the
+    // filesystem is in is the whole value of the message: "both now exist" tells an
+    // operator that re-running is safe, and that nothing was lost.
+    let removed = if is_dir {
+        fs::remove_tree(stage.namespace, src, &mut |_, _| {}).is_ok()
+    } else {
+        fs::unlink_at(stage.namespace, src).is_ok()
+    };
+    if !removed {
         stage.die(
-            b"move: cross-mount directory move is not supported (copy then remove)\n",
+            b"move: copied, but could not remove the original (both now exist)\n",
             EXIT_FAILURE,
         );
     }
-    if fs::copy_file(stage.namespace, src, dst, force).is_err() {
-        stage.die(b"move: cross-mount copy failed\n", EXIT_FAILURE);
-    }
-    // The copy landed. From here a failure leaves *two* copies, which is not a move — so
-    // it is reported as a failure and no row is emitted for it.
-    let mut buf = [0u8; 4096];
-    let mut dir = match Dir::open(stage.namespace, fs::parent(src), &mut buf) {
-        Ok(d) => d,
-        Err(_) => stage.die(b"move: copied, but cannot open the source directory to remove it\n", EXIT_FAILURE),
-    };
-    let r = dir.unlink(fs::basename(src));
-    dir.close();
-    if r.is_err() {
-        stage.die(b"move: copied, but could not remove the original (both now exist)\n", EXIT_FAILURE);
-    }
     "copy"
+}
+
+/// Is `path` a namespace binding rather than a filesystem entry? Asked of the parent's
+/// bindings, which is where a mount point appears. Mirrors `remove`'s check, and for the
+/// same reason: this program can now delete a tree.
+fn is_binding(stage: &Stage, path: &[u8]) -> bool {
+    let name = fs::basename(path);
+    fs::ns_children(stage.namespace, fs::parent(path))
+        .iter()
+        .any(|(n, _)| n.as_bytes() == name)
 }
 
 /// Write the rows as a TSM1 table on the `stdout` stream.

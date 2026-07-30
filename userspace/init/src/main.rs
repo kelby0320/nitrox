@@ -441,7 +441,8 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             kprint(b"init: subtree test bind FAIL\n");
         }
         // A **second writable mount**, for the cross-mount half of `move`
-        // (`TODO(cross-mount-move)`). Same endpoint again, scoped to base `/scratch`, so
+        // (the `cross-mount-move` deferral, closed 2026-07-30). Same endpoint again, scoped
+        // to base `/scratch`, so
         // the kernel's rename test — same server *and* same subtree base — calls
         // `/system/x → /scratch/y` cross-filesystem while both sides remain writable.
         //

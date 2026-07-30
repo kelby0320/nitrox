@@ -39,13 +39,11 @@ use alloc::string::String;
 use alloc::vec::Vec;
 
 use coreutils::args::{Flag, parse};
-use coreutils::fs;
+use coreutils::fs::{self, TreeError};
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
 use libkern::error::KError;
 use libkern::{exit, kprint};
-use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
-use librsproto::session::{Dir, DirError};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -68,10 +66,6 @@ const HELP: &[u8] = b"usage: remove [--recursive] [--force] PATH...\n\
           --version   show version information and exit\n";
 
 const VERSION: &[u8] = b"remove (nitrox coreutils) 0.1.0\n";
-
-/// Depth cap, as in `list` and `copy`: a pathological tree must stop rather than run
-/// forever.
-const MAX_DEPTH: u32 = 32;
 
 /// One entry this run removed.
 struct Removed {
@@ -135,7 +129,7 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
                 if !recursive {
                     stage.die(b"remove: path is a directory (use --recursive)\n", EXIT_USAGE);
                 }
-                remove_tree(&stage, path, 0, &mut removed);
+                remove_tree(&stage, path, &mut removed);
             }
         }
     }
@@ -153,88 +147,42 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
 /// Remove `path` and everything under it, depth-first, appending a row per entry.
 /// Diverges on failure.
-fn remove_tree(stage: &Stage, path: &[u8], depth: u32, out: &mut Vec<Removed>) {
-    if depth > MAX_DEPTH {
-        stage.die(b"remove: maximum recursion depth exceeded\n", EXIT_FAILURE);
-    }
-
-    // Read the children first and close the session before recursing: a session is a
-    // scarce server resource (`MAX_SESSIONS`), and holding one open per level would cap
-    // the depth at the session table rather than at `MAX_DEPTH`.
-    //
-    // Filesystem entries only — deliberately *not* `fs::ns_children`. See the module
-    // docs: a binding beneath this path is a mount point, and unbinding is not this
-    // program's job.
-    let mut entries: Vec<OwnedEntry> = Vec::new();
-    {
-        let mut buf = [0u8; 4096];
-        let mut dir = match Dir::open(stage.namespace, path, &mut buf) {
-            Ok(d) => d,
-            Err(_) => stage.die(b"remove: cannot open directory\n", EXIT_FAILURE),
-        };
-        let r = dir.read_dir(|e| {
-            if e.name != b"." && e.name != b".." {
-                entries.push(OwnedEntry::from_entry(e));
-            }
-            true
+///
+/// The walk is [`fs::remove_tree`], shared with `move`'s cross-mount fallback. The
+/// property this program depends on lives there: the descent enumerates **filesystem
+/// entries only**, never `ns_children`, so it cannot delete through a mount point. The
+/// check that `path` *itself* is not a binding stays here, at the operand — a walker
+/// cannot tell whether the path it was handed was a mistake.
+fn remove_tree(stage: &Stage, path: &[u8], out: &mut Vec<Removed>) {
+    let r = fs::remove_tree(stage.namespace, path, &mut |p, is_dir| {
+        out.push(Removed {
+            path: as_string(p),
+            kind: if is_dir { "directory" } else { "file" },
         });
-        dir.close();
-        if r.is_err() {
-            stage.die(b"remove: cannot read directory\n", EXIT_FAILURE);
+    });
+    match r {
+        Ok(()) => {}
+        Err(TreeError::TooDeep) => {
+            stage.die(b"remove: maximum recursion depth exceeded\n", EXIT_FAILURE)
         }
+        Err(TreeError::OpenDir) => stage.die(b"remove: cannot open directory\n", EXIT_FAILURE),
+        Err(TreeError::ReadDir) => stage.die(b"remove: cannot read directory\n", EXIT_FAILURE),
+        Err(TreeError::Unlink) => stage.die(b"remove: cannot remove file\n", EXIT_FAILURE),
+        // This descent emptied the directory before asking for it, so `NotEmpty` is not
+        // "you forgot --recursive" — something else added an entry while the walk was in
+        // progress. Naming the race beats reporting an unexplained failure.
+        Err(TreeError::Rmdir(k)) if k == KError::NotEmpty.as_i32() => stage.die(
+            b"remove: directory was refilled while being emptied\n",
+            EXIT_FAILURE,
+        ),
+        Err(_) => stage.die(b"remove: cannot remove directory\n", EXIT_FAILURE),
     }
-
-    for e in &entries {
-        let child = fs::join(path, e.name());
-        if e.kind == DIRENT_KIND_DIR {
-            remove_tree(stage, child.as_bytes(), depth + 1, out);
-        } else {
-            unlink_one(stage, child.as_bytes());
-            out.push(Removed { path: child, kind: "file" });
-        }
-    }
-
-    // Now empty, so `rmdir` can take it.
-    rmdir_one(stage, path);
-    out.push(Removed { path: as_string(path), kind: "directory" });
 }
 
 /// `unlink` the entry named by `path`. Diverges on failure.
 fn unlink_one(stage: &Stage, path: &[u8]) {
-    let mut buf = [0u8; 4096];
-    let mut dir = match Dir::open(stage.namespace, fs::parent(path), &mut buf) {
-        Ok(d) => d,
-        Err(_) => stage.die(b"remove: cannot open parent directory\n", EXIT_FAILURE),
-    };
-    let r = dir.unlink(fs::basename(path));
-    dir.close();
-    if r.is_err() {
+    if fs::unlink_at(stage.namespace, path).is_err() {
         stage.die(b"remove: cannot remove file\n", EXIT_FAILURE);
-    }
-}
-
-/// `rmdir` the (now empty) directory named by `path`. Diverges on failure.
-fn rmdir_one(stage: &Stage, path: &[u8]) {
-    let mut buf = [0u8; 4096];
-    let mut dir = match Dir::open(stage.namespace, fs::parent(path), &mut buf) {
-        Ok(d) => d,
-        Err(_) => stage.die(b"remove: cannot open parent directory\n", EXIT_FAILURE),
-    };
-    let r = dir.rmdir(fs::basename(path));
-    dir.close();
-    match r {
-        Ok(()) => {}
-        // This descent emptied the directory before asking for it, so `NotEmpty` here is
-        // not "you forgot --recursive" — it means something else added an entry while the
-        // walk was in progress. Naming the race beats reporting an unexplained failure,
-        // and it is the reason `NotEmpty` is worth a discriminant to a client that never
-        // deliberately removes a populated directory.
-        Err(e) if matches!(e, DirError::Server(k) if k == KError::NotEmpty.as_i32()) => stage
-            .die(
-                b"remove: directory was refilled while being emptied\n",
-                EXIT_FAILURE,
-            ),
-        Err(_) => stage.die(b"remove: cannot remove directory\n", EXIT_FAILURE),
     }
 }
 
