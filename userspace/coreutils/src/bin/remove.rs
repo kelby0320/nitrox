@@ -42,9 +42,10 @@ use coreutils::args::{Flag, parse};
 use coreutils::fs;
 use coreutils::stage::{EXIT_FAILURE, EXIT_OK, EXIT_USAGE, Stage};
 use libkern::abi::IPC_PAYLOAD_SIZE;
+use libkern::error::KError;
 use libkern::{exit, kprint};
 use librsproto::file::{DIRENT_KIND_DIR, OwnedEntry};
-use librsproto::session::Dir;
+use librsproto::session::{Dir, DirError};
 use libstream::channel::{ChannelSink, IpcPort};
 use libstream::table::TableWriter;
 use libstream::{Schema, StreamFlags, TypeModifiers, TypeTag, Value};
@@ -221,8 +222,19 @@ fn rmdir_one(stage: &Stage, path: &[u8]) {
     };
     let r = dir.rmdir(fs::basename(path));
     dir.close();
-    if r.is_err() {
-        stage.die(b"remove: cannot remove directory\n", EXIT_FAILURE);
+    match r {
+        Ok(()) => {}
+        // This descent emptied the directory before asking for it, so `NotEmpty` here is
+        // not "you forgot --recursive" — it means something else added an entry while the
+        // walk was in progress. Naming the race beats reporting an unexplained failure,
+        // and it is the reason `NotEmpty` is worth a discriminant to a client that never
+        // deliberately removes a populated directory.
+        Err(e) if matches!(e, DirError::Server(k) if k == KError::NotEmpty.as_i32()) => stage
+            .die(
+                b"remove: directory was refilled while being emptied\n",
+                EXIT_FAILURE,
+            ),
+        Err(_) => stage.die(b"remove: cannot remove directory\n", EXIT_FAILURE),
     }
 }
 

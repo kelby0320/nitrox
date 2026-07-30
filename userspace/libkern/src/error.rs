@@ -25,6 +25,12 @@ pub enum KError {
     TimedOut = -12,
     /// An IPC channel's peer endpoint has closed.
     PeerClosed = -13,
+    /// The name the operation would create is already taken. Well-formed
+    /// request, occupied name — which is why `mkdir --parents` can treat it as
+    /// success instead of asking a second time.
+    AlreadyExists = -14,
+    /// A container still has members and the operation requires it to be empty.
+    NotEmpty = -15,
     /// An argument was malformed or out of range.
     InvalidArgument = -30,
     /// A user buffer was inaccessible (bad address or page fault).
@@ -43,6 +49,12 @@ impl KError {
     /// Decode a raw negative syscall return into a `KError`. An unrecognised
     /// value maps to [`KError::KernelError`] (forward-compat: a kernel newer than
     /// this `libkern` may return an error this build doesn't name).
+    ///
+    /// **Every variant above must have an arm here.** The forward-compat fallback
+    /// means an omission is silent — `IoError` was missing from 2026-06 until
+    /// 2026-07-30, so every device error decoded as `KernelError` while the enum
+    /// itself matched the kernel perfectly. `cargo xtask abi-sync-check` now
+    /// checks this table against the kernel's variants for exactly that reason.
     pub const fn from_i32(v: i32) -> KError {
         match v {
             -1 => KError::InvalidHandle,
@@ -53,9 +65,12 @@ impl KError {
             -11 => KError::WouldBlock,
             -12 => KError::TimedOut,
             -13 => KError::PeerClosed,
+            -14 => KError::AlreadyExists,
+            -15 => KError::NotEmpty,
             -30 => KError::InvalidArgument,
             -31 => KError::FaultFromUser,
             -32 => KError::TooLarge,
+            -40 => KError::IoError,
             -52 => KError::Unsupported,
             _ => KError::KernelError,
         }
@@ -95,6 +110,14 @@ mod tests {
         assert_eq!(KError::from_i32(-9999), KError::KernelError);
     }
 
+    /// Every variant must survive `as_i32` → `from_i32`.
+    ///
+    /// This list is only as good as its completeness, which is how `IoError` sat
+    /// undecodable for a month: it was in the enum, absent from `from_i32`, and
+    /// absent from here too, so nothing failed. The enumeration is duplicated in
+    /// `xtask abi-sync-check`, which derives it from the *kernel's* enum rather
+    /// than from this file — a list that cannot be kept in step by the same
+    /// oversight that made it wrong.
     #[test]
     fn discriminants_round_trip() {
         for e in [
@@ -106,13 +129,34 @@ mod tests {
             KError::WouldBlock,
             KError::TimedOut,
             KError::PeerClosed,
+            KError::AlreadyExists,
+            KError::NotEmpty,
             KError::InvalidArgument,
             KError::FaultFromUser,
             KError::TooLarge,
+            KError::IoError,
             KError::Unsupported,
             KError::KernelError,
         ] {
             assert_eq!(KError::from_i32(e.as_i32()), e);
         }
+    }
+
+    /// The regression proper: a device error must not read as an internal one.
+    #[test]
+    fn io_error_decodes_as_itself() {
+        assert_eq!(KError::from_i32(-40), KError::IoError);
+        assert_ne!(KError::from_i32(-40), KError::KernelError);
+    }
+
+    /// The two errors this pass exists to make visible are distinguishable from
+    /// each other and from the `InvalidArgument` they used to share.
+    #[test]
+    fn create_and_empty_errors_are_distinct() {
+        assert_eq!(from_raw(-14), Err(KError::AlreadyExists));
+        assert_eq!(from_raw(-15), Err(KError::NotEmpty));
+        assert_ne!(KError::AlreadyExists, KError::InvalidArgument);
+        assert_ne!(KError::NotEmpty, KError::InvalidArgument);
+        assert_ne!(KError::AlreadyExists, KError::NotEmpty);
     }
 }

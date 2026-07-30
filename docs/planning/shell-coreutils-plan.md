@@ -252,9 +252,11 @@ which became their own fixes — and it is the main reason to build breadth befo
 the part turned up, none of them the ones the sketch below predicted:
 
 - **The filesystem collapses `Exists` and `NotEmpty` into `InvalidArgument`**, so neither utility can
-  branch on the error to decide whether a path already exists. Both establish the fact directly
-  instead — `mkdir --parents` tests each component with `is_dir`, `remove` establishes emptiness by
-  listing. Filed as `TODO(fs-error-granularity)`; fixing it is an ABI change.
+  branch on the error to decide whether a path already exists. Both established the fact directly
+  instead — `mkdir --parents` tested each component with `is_dir`, `remove` established emptiness by
+  listing. Filed as `fs-error-granularity`; fixing it was an ABI change. **Fixed 2026-07-30** in the
+  batched ABI pass: `KError` gained `AlreadyExists`/`NotEmpty`, and `mkdir` now probes only on a
+  collision rather than ahead of every component.
 - **`remove` must walk the filesystem only, never the namespace union.** `list`'s descent merges
   namespace bindings with filesystem entries, which is right for looking and wrong for deleting: a
   binding is a mount point, and `remove --recursive /` must not unbind `/dev/console`. So the
@@ -420,11 +422,17 @@ than about `whoami` itself, so it is worth a short design discussion at the time
 guess now. Nothing else in Milestone 2 depends on it, which is why it is last.
 
 **Milestone 2 is complete** (2026-07-30): `mkdir`, `remove`, `rename`, `move`, `touch`, `date`,
-`sleep`, `whoami`. Two items are owed and filed rather than forgotten —
-`TODO(fs-error-granularity)` (the filesystem collapses `Exists` and `NotEmpty` into
-`InvalidArgument`, so clients re-derive what the server already knew) is scheduled into the batched
-fs-server ABI pass, and `TODO(cross-mount-move)` waits on a second writable mount, without which no
-cross-mount move can be exercised end to end at all.
+`sleep`, `whoami`.
+
+**The batched fs-server ABI pass landed the same day**, closing `fs-error-granularity`. It ran wider
+than the one scheduled item: the same collapse turned out to exist in the *kernel*
+(`sys_ns_bind` on an occupied path was `InvalidArgument`, indistinguishable from a malformed path),
+which is what makes `AlreadyExists`/`NotEmpty` kernel errors rather than filesystem ones; three
+further arms of the server's error mapping were already reaching for a vaguer error than existed;
+and `libkern` had never decoded `IoError` at all. See the decision log, 2026-07-30.
+
+One item is still owed: `TODO(cross-mount-move)` waits on a second writable mount, without which no
+cross-mount move can be exercised end to end at all. It is a missing fixture, not an ABI gap.
 
 ### Milestone 3 — the interpreter (C5/C6)
 

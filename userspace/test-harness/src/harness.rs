@@ -2452,6 +2452,135 @@ fn whoami_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: whoami ok (reported the session user; no session is an error)\n");
 }
 
+/// The 2026-07-30 ABI pass: `AlreadyExists` and `NotEmpty` must arrive **as themselves**
+/// across both boundaries that carry a `KError`.
+///
+/// Host tests pin the discriminants and `abi-sync-check` pins the mirror, but neither runs
+/// a syscall or a wire round trip, and this pass is precisely about a value surviving one.
+/// The two paths are genuinely different: the kernel returns its error in a syscall's
+/// `isize`, while the fs-server marshals one into an `ErrorBody` that the client parses
+/// back — so each is checked where it actually happens.
+fn error_granularity_demo(root_ns: u64) {
+    kprint(b"test-harness: error-granularity demo (ABI pass)\n");
+
+    // --- 1. kernel: a second bind at an occupied path -------------------------
+    // `NsError::AlreadyBound` shared `InvalidArgument` with a malformed path until this
+    // pass, which left a supervisor unable to tell a name collision from a bad name.
+    // SAFETY: a page-sized anonymous object, and a fresh namespace to bind it into.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    let ns = unsafe { syscall4(SYS_NS_CREATE, 0, 0, 0, 0) };
+    if mem < 0 || ns < 0 {
+        return_fail(b"test-harness: error-granularity setup FAIL\n");
+    }
+    let (mem, ns) = (mem as u64, ns as u64);
+    let path = b"/thing";
+    let bind = |p: &[u8]| {
+        // SAFETY: valid namespace handle, path, and object handle (direct-handle bind).
+        unsafe { syscall6(SYS_NS_BIND, ns, p.as_ptr() as u64, p.len() as u64, mem, 0, 0) }
+    };
+    if bind(path) != 0 {
+        return_fail(b"test-harness: error-granularity first bind FAIL\n");
+    }
+    let again = bind(path);
+    if again != KError::AlreadyExists.as_i32() as i64 {
+        return_fail(b"test-harness: duplicate ns_bind did not report AlreadyExists\n");
+    }
+    // The contrast that gives the value meaning: a *malformed* path must still be
+    // `InvalidArgument`. Were both still collapsed, the assertion above would pass on a
+    // build that had learned nothing.
+    if bind(b"no-leading-slash") != KError::InvalidArgument.as_i32() as i64 {
+        return_fail(b"test-harness: a malformed bind path did not report InvalidArgument\n");
+    }
+    // SAFETY: closing handles this demo created.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, mem);
+        syscall1(SYS_HANDLE_CLOSE, ns);
+    }
+
+    // --- 2. fs-server: a collision and a populated directory ------------------
+    // A session op is name-addressed *inside* one open directory — no separators in a
+    // name — so the child is created through its own session on `nx-eg` rather than by
+    // naming a path from `/system`.
+    {
+        let mut buf = [0u8; 4096];
+        let mut dir = match Dir::open(root_ns, b"/system", &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: error-granularity open FAIL\n"),
+        };
+        if dir.mkdir(b"nx-eg").is_err() {
+            return_fail(b"test-harness: error-granularity mkdir FAIL\n");
+        }
+        // Creating over a name that is taken.
+        match dir.mkdir(b"nx-eg") {
+            Err(DirError::Server(k)) if k == KError::AlreadyExists.as_i32() => {}
+            Err(DirError::Server(k)) if k == KError::InvalidArgument.as_i32() => {
+                return_fail(b"test-harness: mkdir collision still collapses to InvalidArgument\n")
+            }
+            _ => return_fail(
+                b"test-harness: mkdir over an existing name did not report AlreadyExists\n",
+            ),
+        }
+        dir.close();
+    }
+    {
+        let mut buf = [0u8; 4096];
+        let mut kid = match Dir::open(root_ns, b"/system/nx-eg", &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: error-granularity child open FAIL\n"),
+        };
+        let made = kid.mkdir(b"kid");
+        kid.close();
+        if made.is_err() {
+            return_fail(b"test-harness: error-granularity child mkdir FAIL\n");
+        }
+    }
+    {
+        let mut buf = [0u8; 4096];
+        let mut dir = match Dir::open(root_ns, b"/system", &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: error-granularity reopen FAIL\n"),
+        };
+        match dir.rmdir(b"nx-eg") {
+            Err(DirError::Server(k)) if k == KError::NotEmpty.as_i32() => {}
+            Err(DirError::Server(k)) if k == KError::InvalidArgument.as_i32() => {
+                return_fail(b"test-harness: rmdir of a populated directory still collapses\n")
+            }
+            _ => return_fail(
+                b"test-harness: rmdir of a populated directory did not report NotEmpty\n",
+            ),
+        }
+        dir.close();
+    }
+    // Tidy up, and incidentally confirm the same rmdir succeeds once the directory is
+    // genuinely empty — so the error above was about the contents, not about the
+    // directory or the caller.
+    {
+        let mut buf = [0u8; 4096];
+        let mut kid = match Dir::open(root_ns, b"/system/nx-eg", &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: error-granularity cleanup open FAIL\n"),
+        };
+        let gone = kid.rmdir(b"kid");
+        kid.close();
+        if gone.is_err() {
+            return_fail(b"test-harness: error-granularity cleanup FAIL\n");
+        }
+    }
+    {
+        let mut buf = [0u8; 4096];
+        let mut dir = match Dir::open(root_ns, b"/system", &mut buf) {
+            Ok(d) => d,
+            Err(_) => return_fail(b"test-harness: error-granularity final open FAIL\n"),
+        };
+        let gone = dir.rmdir(b"nx-eg");
+        dir.close();
+        if gone.is_err() {
+            return_fail(b"test-harness: emptied directory still would not rmdir\n");
+        }
+    }
+    kprint(b"test-harness: error granularity ok (AlreadyExists and NotEmpty cross both boundaries)\n");
+}
+
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.
 fn publish_session_user(ns: u64, name: &[u8]) {
     // SAFETY: a page-sized anonymous object.
@@ -3797,6 +3926,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     touch_demo(root_ns, notif);
     date_sleep_demo(root_ns, notif);
     whoami_demo(root_ns, notif);
+    error_granularity_demo(root_ns);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).
