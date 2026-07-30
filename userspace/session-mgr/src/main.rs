@@ -185,7 +185,7 @@ fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> 
 /// absence is the sandbox. Proves `BIND_NAMESPACE` + subtree scoping + shared-
 /// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
 /// `root_ns` is session-mgr's inherited namespace (to resolve the console).
-fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8]) -> u64 {
+fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8], user: &[u8]) -> u64 {
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -214,6 +214,22 @@ fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8]) -> u64 {
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
         return 0;
     }
+    // `/session/user` → who this session belongs to.
+    //
+    // Nitrox has no kernel user identity — authority is capabilities, so there is nothing
+    // for the kernel to report and identity is a session concept. We are the component
+    // that authenticated the login, so we are the one that knows, and the way a process is
+    // told about its world here is *namespace construction*: the shell does not ask us
+    // where home is, it sees `/home`. "Who am I" is the same shape of question.
+    //
+    // A direct-handle bind of a memory object, i.e. a snapshot — correct because a
+    // session's user is immutable for its lifetime (changing user means a new session).
+    // The first genuinely *mutable* `/session/*` member is the trigger to put a resource
+    // server behind this prefix instead; clients do not change when that happens, because
+    // a server answers a resolve with a memory object too. See
+    // `TODO(session-metadata-server)`.
+    bind_session_user(ns, user);
+
     // `/dev/console` → a direct-handle bind of the console device (resolved from our own
     // namespace), so the shell can do console I/O within its sandbox. Non-fatal if
     // absent (the test-harness shell does not read the console).
@@ -233,6 +249,51 @@ fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8]) -> u64 {
         }
     }
     ns
+}
+
+/// Publish `user` at `/session/user` in `ns`, as a read-only memory object.
+///
+/// Non-fatal: a session whose identity could not be published is still a usable session,
+/// and failing the login over it would trade a working shell for a missing `whoami`.
+fn bind_session_user(ns: u64, user: &[u8]) {
+    // SAFETY: a page-sized anonymous object; the syscall returns a handle or a negative
+    // error.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    if mem < 0 {
+        kprint(b"session-mgr: /session/user create FAIL\n");
+        return;
+    }
+    let mem = mem as u64;
+    // SAFETY: maps the object we just created, read/write, at a kernel-chosen address.
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if base < 0 {
+        kprint(b"session-mgr: /session/user map FAIL\n");
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return;
+    }
+    let n = user.len().min(255);
+    // SAFETY: `base` is a live writable mapping of one page; `n` is bounded well inside
+    // it, and the trailing NUL is the terminator a reader stops at.
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(base as *mut u8, 4096);
+        dst[..n].copy_from_slice(&user[..n]);
+        dst[n] = 0;
+        syscall4(SYS_MEMORY_UNMAP, base as u64, 4096, 0, 0);
+    }
+    // Bind read-only: a session's user is something to be told, not something to edit.
+    let path = b"/session/user";
+    // SAFETY: valid namespace handle, path pointer, and object handle (a direct-handle
+    // bind — no subtree base).
+    let br = unsafe {
+        syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0)
+    };
+    // The bind cloned its own reference; drop ours either way.
+    // SAFETY: closing our own handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    if br != 0 {
+        kprint(b"session-mgr: /session/user bind FAIL (whoami will report no identity)\n");
+    }
 }
 
 /// Resolve `path` in `ns` with `rights`, waiting the PO; returns `(status, handle)`.
@@ -329,12 +390,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // the shell into it, and reap it. (Part D auto-logs-in the demo user for a
     // deterministic verdict; the interactive path reads the credential from console.)
     let mut home = [0u8; 256];
-    match login(root_ns, auth_ch, &mut home) {
-        Some(hl) => {
+    let mut user = [0u8; 64];
+    match login(root_ns, auth_ch, &mut home, &mut user) {
+        Some((hl, ul)) => {
             kprint(b"session-mgr: login ok -> home=");
             kprint(&home[..hl]);
             kprint(b"\n");
-            let session_ns = build_session_namespace(root_ns, fs_endpoint, &home[..hl]);
+            let session_ns = build_session_namespace(root_ns, fs_endpoint, &home[..hl], &user[..ul]);
             if session_ns == 0 {
                 verdict(false);
                 idle();
@@ -361,12 +423,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     idle();
 }
 
-/// Authenticate a user, returning their home path (copied into `home_out`) length, or
-/// `None` if denied. **test-harness**: a wrong-password sanity check, then auto-login of
+/// Authenticate a user, returning `(home_len, user_len)` with the home path copied into
+/// `home_out` and the authenticated name into `user_out`, or `None` if denied.
+///
+/// The name comes back because the session namespace publishes it at `/session/user`:
+/// we are the component that authenticated, so we are the one that knows who this is. **test-harness**: a wrong-password sanity check, then auto-login of
 /// the demo user (deterministic verdict). **interactive**: prompt username + password on
 /// the console (up to a few attempts).
 #[cfg(feature = "test-harness")]
-fn login(_root_ns: u64, auth_ch: u64, home_out: &mut [u8]) -> Option<usize> {
+fn login(_root_ns: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
     // Sanity: a wrong password must be denied (no enumeration/timing oracle upstream).
     let mut scratch = [0u8; 256];
     if authenticate(auth_ch, DEMO_USER, b"not-the-password", &mut scratch).is_some() {
@@ -374,11 +439,14 @@ fn login(_root_ns: u64, auth_ch: u64, home_out: &mut [u8]) -> Option<usize> {
         return None;
     }
     kprint(b"session-mgr: wrong password correctly denied\n");
-    authenticate(auth_ch, DEMO_USER, DEMO_PASSWORD, home_out)
+    let hl = authenticate(auth_ch, DEMO_USER, DEMO_PASSWORD, home_out)?;
+    let ul = DEMO_USER.len().min(user_out.len());
+    user_out[..ul].copy_from_slice(&DEMO_USER[..ul]);
+    Some((hl, ul))
 }
 
 #[cfg(not(feature = "test-harness"))]
-fn login(root_ns: u64, auth_ch: u64, home_out: &mut [u8]) -> Option<usize> {
+fn login(root_ns: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
     let (cst, console) = ns_lookup(root_ns, b"/dev/console", RIGHT_READ);
     if cst != 0 || console == 0 {
         kprint(b"session-mgr: no console for login\n");
@@ -404,7 +472,9 @@ fn login(root_ns: u64, auth_ch: u64, home_out: &mut [u8]) -> Option<usize> {
         let plen = read_line(console, buf_h, buf_addr, &mut pass, false);
         kprint(b"\r\n");
         if let Some(hl) = authenticate(auth_ch, &user[..ulen], &pass[..plen], home_out) {
-            return Some(hl);
+            let ul = ulen.min(user_out.len());
+            user_out[..ul].copy_from_slice(&user[..ul]);
+            return Some((hl, ul));
         }
         kprint(b"login incorrect\r\n");
     }

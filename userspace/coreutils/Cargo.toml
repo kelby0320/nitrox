@@ -57,3 +57,7 @@ path = "src/bin/date.rs"
 [[bin]]
 name = "sleep"
 path = "src/bin/sleep.rs"
+
+[[bin]]
+name = "whoami"
+path = "src/bin/whoami.rs"

@@ -1648,6 +1648,18 @@ fn run_coreutil_capture(
     argv: &[&str],
     consume: bool,
 ) -> alloc::vec::Vec<u8> {
+    run_coreutil_capture_in(root_ns, notif, image, argv, consume, 0)
+}
+
+/// As [`run_coreutil_capture`], but the child runs in `child_ns` (`0` = inherit).
+fn run_coreutil_capture_in(
+    root_ns: u64,
+    notif: u64,
+    image: &[u8],
+    argv: &[&str],
+    consume: bool,
+    child_ns: u64,
+) -> alloc::vec::Vec<u8> {
     use alloc::vec::Vec;
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
@@ -1671,7 +1683,10 @@ fn run_coreutil_capture(
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
-        spawn(&*(&raw const SPAWN_LIST))
+        SPAWN_LIST.namespace = child_ns;
+        let p = spawn(&*(&raw const SPAWN_LIST));
+        SPAWN_LIST.namespace = 0;
+        p
     } {
         Ok(p) => p,
         Err(_) => return_fail(b"test-harness: list spawn FAIL\n"),
@@ -2364,6 +2379,111 @@ fn monotonic_ns() -> u64 {
     unsafe { (&raw const CLOCK_BUF).read() }
 }
 
+/// **Milestone 2 Part E — `whoami`.**
+///
+/// Identity in Nitrox is not a kernel fact: authority is capabilities, so there is no UID
+/// to report, and identity is a *session* concept published by `session-mgr` at
+/// `/session/user` when it constructs the session namespace. `whoami` therefore reads the
+/// namespace, and the two cases that matter are symmetric:
+///
+/// - given a namespace with `/session/user` bound, it reports that name;
+/// - given one **without** it, it fails rather than inventing a default. Reporting `root`,
+///   or an empty name, would be a fabricated fact — the same reason `date` refuses to
+///   print 1970 when the clock is unset.
+///
+/// The namespaces are built here rather than borrowed from `session-mgr` because that one
+/// belongs to the login flow; constructing both shapes is also the only way to test the
+/// absent case at all.
+fn whoami_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::Value;
+
+    kprint(b"test-harness: whoami demo (Milestone 2 Part E)\n");
+    const WHOAMI: &[u8] = b"/initramfs/sbin/whoami";
+    const NAME: &[u8] = b"harness-user";
+
+    // --- a namespace that looks like a session -------------------------------
+    let ns = unsafe { syscall0(SYS_NS_CREATE) };
+    if ns < 0 {
+        return_fail(b"test-harness: whoami ns_create FAIL\n");
+    }
+    let ns = ns as u64;
+    publish_session_user(ns, NAME);
+    // Nothing else is bound, deliberately. The child never resolves its own image — the
+    // spawn hands it an image *handle* the harness resolved — so a session namespace
+    // holding only `/session/user` is a complete environment for this test. That is the
+    // capability model in miniature: the program is given what it needs rather than
+    // going to look for it.
+
+    // --- 1. it reports the bound name ---------------------------------------
+    let bytes = run_coreutil_capture_in(root_ns, notif, WHOAMI, &["whoami"], true, ns);
+    let mut got_name = false;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        if tr.schema().fields.len() != 1 || tr.schema().fields[0].name != "user" {
+            return_fail(b"test-harness: whoami schema is not a single `user` field\n");
+        }
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if matches!(&vals[0], Value::Str(s) if s.as_bytes() == NAME) {
+                    got_name = true;
+                }
+            }
+        }
+    }
+    if !got_name {
+        return_fail(b"test-harness: whoami did not report the bound session user\n");
+    }
+
+    // --- 2. no session → an error, not a fabricated default ------------------
+    let bare = unsafe { syscall0(SYS_NS_CREATE) };
+    if bare < 0 {
+        return_fail(b"test-harness: whoami bare ns_create FAIL\n");
+    }
+    let bare = bare as u64;
+    if run_coreutil_in(root_ns, notif, WHOAMI, &["whoami"], bare) == 0 {
+        return_fail(b"test-harness: whoami without a session wrongly succeeded\n");
+    }
+
+    // SAFETY: closing namespaces this demo created.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, ns);
+        syscall1(SYS_HANDLE_CLOSE, bare);
+    }
+    kprint(b"test-harness: whoami ok (reported the session user; no session is an error)\n");
+}
+
+/// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.
+fn publish_session_user(ns: u64, name: &[u8]) {
+    // SAFETY: a page-sized anonymous object.
+    let mem = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    if mem < 0 {
+        return_fail(b"test-harness: session user create FAIL\n");
+    }
+    let mem = mem as u64;
+    // SAFETY: maps the object just created, read/write.
+    let base = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
+    if base < 0 {
+        return_fail(b"test-harness: session user map FAIL\n");
+    }
+    // SAFETY: `base` is a live one-page writable mapping; `name` is far shorter.
+    unsafe {
+        let dst = core::slice::from_raw_parts_mut(base as *mut u8, 4096);
+        dst[..name.len()].copy_from_slice(name);
+        dst[name.len()] = 0;
+        syscall4(SYS_MEMORY_UNMAP, base as u64, 4096, 0, 0);
+    }
+    let path = b"/session/user";
+    // SAFETY: valid namespace handle, path, and object handle (direct-handle bind).
+    let br = unsafe {
+        syscall6(SYS_NS_BIND, ns, path.as_ptr() as u64, path.len() as u64, mem, 0, 0)
+    };
+    // SAFETY: closing our own handle; the bind cloned its own reference.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+    if br != 0 {
+        return_fail(b"test-harness: session user bind FAIL\n");
+    }
+}
+
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     run_coreutil(root_ns, notif, b"/initramfs/sbin/copy", argv)
 }
@@ -2375,6 +2495,15 @@ fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
 /// operands, and `argv` only arrives in the setup message. Generic over the image path
 /// so `copy`, `mkdir` and `remove` share one spawn rather than three copies of it.
 fn run_coreutil(root_ns: u64, notif: u64, image: &[u8], argv: &[&str]) -> i32 {
+    run_coreutil_in(root_ns, notif, image, argv, 0)
+}
+
+/// As [`run_coreutil`], but the child runs in `child_ns` (`0` = inherit).
+///
+/// Needed because some behaviour is a property of the *namespace a process was given*,
+/// not of the program — `whoami` reads `/session/user`, which exists only in a session
+/// namespace, so testing it means constructing one.
+fn run_coreutil_in(root_ns: u64, notif: u64, image: &[u8], argv: &[&str], child_ns: u64) -> i32 {
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
 
@@ -2396,10 +2525,13 @@ fn run_coreutil(root_ns: u64, notif: u64, image: &[u8], argv: &[&str]) -> i32 {
         SPAWN_LIST.image = img;
         SPAWN_LIST.handles[0] = setup_stage;
         SPAWN_LIST.arg0 = bootstrap_arg0(true);
-        spawn(&*(&raw const SPAWN_LIST))
+        SPAWN_LIST.namespace = child_ns;
+        let p = spawn(&*(&raw const SPAWN_LIST));
+        SPAWN_LIST.namespace = 0; // restore the shared default for later spawns
+        p
     } {
         Ok(p) => p,
-        Err(_) => return_fail(b"test-harness: copy spawn FAIL\n"),
+        Err(_) => return_fail(b"test-harness: coreutil spawn FAIL\n"),
     };
     let streams = Streams {
         stdin: None,
@@ -3664,6 +3796,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     rename_move_demo(root_ns, notif);
     touch_demo(root_ns, notif);
     date_sleep_demo(root_ns, notif);
+    whoami_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

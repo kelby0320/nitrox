@@ -364,6 +364,19 @@ fn map_rename_error(status: i32) -> FileError {
     }
 }
 
+/// Resolve `path` to a handle with `rights`, returning `(status, handle)`.
+///
+/// The public form of [`lookup`], for callers that resolve something which is not a file
+/// — `whoami` reading the session's `/session/user` binding, for instance. A binding may
+/// be a direct handle or a userspace server that answers with one; this cannot tell, and
+/// deliberately does not need to.
+pub fn lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
+    match lookup(ns, path, rights) {
+        Ok(h) => (0, h),
+        Err(e) => (e, 0),
+    }
+}
+
 /// Resolve `path` to a handle with `rights`.
 fn lookup(ns: u64, path: &[u8], rights: u64) -> Result<u64, i32> {
     // SAFETY: valid path slice + namespace handle.

@@ -445,6 +445,44 @@ place without changing its length.
 
 ### Userspace
 
+**A resource server behind `/session/*` — `TODO(session-metadata-server)`.** Nitrox has no kernel
+user identity: authority is held in handles, so there is nothing for the kernel to report and
+identity is a *session* concept. `session-mgr` authenticates a login and then constructs the
+session's namespace, so it is both the component that knows and the component that already tells a
+process about its world by construction — the shell does not ask where home is, it sees `/home`.
+`whoami` therefore reads `/session/user`, a binding, rather than calling a service (which would be
+closer to ambient lookup than to capabilities) or a syscall (which has nothing to return).
+
+**Today that binding is a direct handle to a memory object — a snapshot.** That is correct for a
+fact immutable for the session's lifetime, and a session's user qualifies: changing user means a new
+session, not a mutated one. It is *silently wrong* for anything mutable, because a client would read
+stale bytes with no indication that they are stale. Hence the rule, which is a checkable condition
+rather than a judgement call:
+
+> Direct-handle binds are for facts immutable for the session. **The first genuinely mutable
+> `/session/*` member is the trigger** to put a resource server behind the prefix.
+
+**The migration does not touch any client.** A userspace-server binding answers a resolve with
+`OBJECT_KIND_MEMOBJ`, which the kernel cross-context-installs — so `lookup + map + read` is
+byte-identical whether the path is a direct handle or a server. The namespace exists precisely to
+hide that difference (it is the same reason `/home` can be a server subtree while `/dev/console` is a
+direct handle, and no client cares). The cost of the migration falls entirely on `session-mgr`.
+
+**Watch the coupling with B3 (env), which arrives first.** The shell subproject's open question B3 —
+*"env vars as namespace-scoped resources"* — is the same problem one milestone earlier: mutable,
+namespace-scoped values, due in Milestone 3 when the interpreter needs env. Whatever mechanism B3
+builds for that is very likely what `/session/*` should migrate onto, rather than a bespoke session
+server. Designing B3 without `/session/*` in view risks two mechanisms for one problem and two
+migrations instead of one.
+
+Expected timing, from the roadmap: the *hard* trigger is the console/tty server and the compositor
+terminal (stepping-stones 5-6), where a tty and job control are mutable session state with several
+consumers needing one consistent answer — the rich REPL is already recorded as gated on exactly
+that. So the snapshot has roughly two milestones of runway, and B3 in Milestone 3 is the design
+checkpoint.
+
+
+
 **Where a Tier-0 program's output goes — `TODO(tier0-output-sink)`.** A coreutil spawned without a
 shell has no `stdout` (stream handles arrive in the setup message, which the shell sends), so it
 currently falls back to plain text via `kprint` — i.e. into the **kernel log**. That is fine as

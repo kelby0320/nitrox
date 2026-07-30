@@ -233,7 +233,7 @@ Parts, in order (tick as they land):
 - [x] **Part B — `rename`, `move`** ✅ (2026-07-30)
 - [x] **Part C — `touch`** ✅ (2026-07-30)
 - [x] **Part D — `date`, `sleep`** ✅ (2026-07-30)
-- [ ] **Part E — `whoami`** (blocked on open question B2 — a design call, deliberately last)
+- [x] **Part E — `whoami`** ✅ (2026-07-30) — B2 resolved
 
 The substrate these lean on is in place: Slice C delivered cross-directory + overwrite `rename`
 (which is what unblocks `move`), full-directory growth, and `mtime` on in-place overwrite; the
@@ -382,7 +382,30 @@ tests rather than boot demos.
   `timer_sleep_ms` already uses. The parsing (`5`, `1.5s`, `200ms`) is the testable part; the
   waiting is three syscalls. Emits nothing.
 
-#### Part E — `whoami`, and open question B2
+#### Part E — `whoami` ✅ (2026-07-30) — B2 resolved
+
+**Resolved in favour of the namespace.** `session-mgr` publishes `/session/user` when it builds the
+session namespace; `whoami` reads it. Not a syscall (the kernel has no identity to report) and not a
+service call (which would be closer to ambient lookup than to capabilities). The deciding argument
+was consistency: the namespace is already how this system answers questions of this shape — the
+shell does not ask where home is, it sees `/home` — and identity is the same kind of fact, known by
+the same component, at the same moment.
+
+**Absence is an error, not a default.** A process outside any session has nothing bound there and
+`whoami` says so and exits non-zero. Reporting `root` or an empty name would be a fabricated fact,
+the same reason `date` refuses to print 1970 when the clock is unset.
+
+**Staged deliberately, with a checkable trigger.** The binding is a direct handle to a memory object
+— a snapshot, correct because a session's user is immutable for its lifetime. Session metadata will
+grow toward tty and job state, and *the first genuinely mutable member* is the trigger to put a
+resource server behind `/session/*`. That migration touches no client: a server answers a resolve
+with `OBJECT_KIND_MEMOBJ`, so `lookup + map + read` is byte-identical either way, and the namespace
+is precisely what hides the difference. Filed as `TODO(session-metadata-server)`, along with the
+coupling worth watching — **B3 (env) is the same problem one milestone earlier** (mutable,
+namespace-scoped values, due in Milestone 3), so `/session/*` should probably migrate onto whatever
+B3 builds rather than onto a bespoke session server.
+
+The original sketch, kept for the record:
 
 **Deferred to when the part is reached, deliberately.** Nitrox has no kernel user identity —
 authority is held in handles, not derived from a UID — so identity is a *session* concept that
@@ -395,6 +418,13 @@ looks.
 Both are consistent with the capability model, and the choice is about where the truth lives rather
 than about `whoami` itself, so it is worth a short design discussion at the time rather than a
 guess now. Nothing else in Milestone 2 depends on it, which is why it is last.
+
+**Milestone 2 is complete** (2026-07-30): `mkdir`, `remove`, `rename`, `move`, `touch`, `date`,
+`sleep`, `whoami`. Two items are owed and filed rather than forgotten —
+`TODO(fs-error-granularity)` (the filesystem collapses `Exists` and `NotEmpty` into
+`InvalidArgument`, so clients re-derive what the server already knew) is scheduled into the batched
+fs-server ABI pass, and `TODO(cross-mount-move)` waits on a second writable mount, without which no
+cross-mount move can be exercised end to end at all.
 
 ### Milestone 3 — the interpreter (C5/C6)
 
