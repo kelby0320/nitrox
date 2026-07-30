@@ -231,7 +231,7 @@ Parts, in order (tick as they land):
 
 - [x] **Part A — `mkdir`, `remove`** ✅ (2026-07-30)
 - [x] **Part B — `rename`, `move`** ✅ (2026-07-30)
-- [ ] **Part C — `touch`** (create-if-absent + `mtime` stamp; likely needs `File::Touch` exposed)
+- [x] **Part C — `touch`** ✅ (2026-07-30)
 - [ ] **Part D — `date`, `sleep`** (no filesystem; mostly host-testable formatting and parsing)
 - [ ] **Part E — `whoami`** (blocked on open question B2 — a design call, deliberately last)
 
@@ -313,7 +313,26 @@ two existing helpers rather than wrapping one, and the first whose correctness d
 failure path — which means the harness demo must exercise the cross-mount case, not just the
 same-mount one. If there is no second mount in the test image, that is itself the finding.
 
-#### Part C — `touch`
+#### Part C — `touch` ✅ (2026-07-30)
+
+**Landed, and the prediction was right in outline and wrong in degree.** `File::Touch` did already
+exist — but *kernel-only by construction*, not merely un-wrapped: it lives on the kernel↔server
+control channel, is path-addressed, and is fire-and-forget with no reply, because its one caller is
+the kernel reporting a Model A write the server cannot otherwise observe. A client session sending
+it got `Unsupported`. So this was not "expose an existing op" but "give an existing opcode a
+session-scoped *form*": `ext4::touch_at(dir_ino, name)` beside `mkdir_at`/`unlink_at`/`rmdir_at`, one
+arm in the session dispatch, and `Dir::touch`. Name-addressed inside an open directory, so
+confinement stays structural, and it returns a status like the other mutations.
+
+Worth noting what it is *not*: an rsproto addition, entirely in userspace. No `KError` discriminants,
+no ABI hash move, `abi-sync-check` untouched — so it did not belong in the batched kernel-ABI pass,
+which is why it was taken now rather than deferred with `fs-error-granularity`.
+
+The utility itself has no `--date`, and that is deliberate rather than unfinished: the wire carries
+no timestamp because one a caller could choose would be forgeable metadata, so the server reads its
+own clock. `touch` therefore cannot express "set mtime to X" and does not pretend to.
+
+The original sketch, kept for the record:
 
 Two behaviours in one verb: create the file if absent, and stamp `mtime` to "now" if present.
 

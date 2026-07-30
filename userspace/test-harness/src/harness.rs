@@ -2194,6 +2194,79 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount safe)\n");
 }
 
+/// **Milestone 2 Part C — `touch`.**
+///
+/// The assertion that matters is case 2: stamping an *existing* file must move its
+/// `mtime` forward. That is the half of `touch` that could not be built at all until this
+/// part gave `File::Touch` a session-scoped form — it previously existed only on the
+/// kernel control channel, path-addressed and fire-and-forget, so a client session got
+/// `Unsupported`. Asserting only that `touch` creates files would pass an implementation
+/// with no stamping in it whatsoever.
+///
+/// The one-second wait is not padding: ext4 stores `mtime` in whole seconds, so a stamp
+/// applied within the same second as the fixture write is indistinguishable from no stamp
+/// at all. This mirrors `mtime_overwrite_demo`.
+fn touch_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: touch demo (Milestone 2 Part C)\n");
+    const TOUCH: &[u8] = b"/initramfs/sbin/touch";
+
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: touch fixture open FAIL\n"),
+    };
+    let _ = sys.mkdir(b"nx-c");
+    sys.close();
+
+    // --- 1. creates an absent file -------------------------------------------
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "/system/nx-c/new.txt"]) != 0 {
+        return_fail(b"test-harness: touch exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-c/new.txt") {
+        return_fail(b"test-harness: touch did not create the file\n");
+    }
+
+    // --- 2. stamps an existing file, moving mtime forward --------------------
+    write_file(root_ns, b"/system/nx-c/old.txt", b"part c\n");
+    let (before, _) = stat_entry(root_ns, b"/system/nx-c", b"old.txt");
+    if before == 0 {
+        return_fail(b"test-harness: touch fixture has no timestamp (wall clock unset?)\n");
+    }
+    // ext4 stores mtime in whole seconds; without crossing a second boundary a correct
+    // stamp is indistinguishable from none.
+    wait_for_next_second();
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "/system/nx-c/old.txt"]) != 0 {
+        return_fail(b"test-harness: touch on an existing file exited non-zero\n");
+    }
+    let (after, _) = stat_entry(root_ns, b"/system/nx-c", b"old.txt");
+    if after <= before {
+        return_fail(b"test-harness: touch did not advance mtime\n");
+    }
+
+    // --- 3. --no-create skips a missing path rather than failing -------------
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "--no-create", "/system/nx-c/absent.txt"]) != 0 {
+        return_fail(b"test-harness: touch --no-create on a missing path failed\n");
+    }
+    if path_exists(root_ns, b"/system/nx-c/absent.txt") {
+        return_fail(b"test-harness: touch --no-create created the file anyway\n");
+    }
+
+    // --- 4. a directory is refused -------------------------------------------
+    if run_coreutil(root_ns, notif, TOUCH, &["touch", "/system/nx-c"]) == 0 {
+        return_fail(b"test-harness: touch on a directory wrongly succeeded\n");
+    }
+
+    // --- teardown ------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-c", &[b"new.txt", b"old.txt"]);
+    let mut b2 = [0u8; 4096];
+    if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut b2) {
+        let _ = d.rmdir(b"nx-c");
+        d.close();
+    }
+
+    kprint(b"test-harness: touch ok (created, stamped, --no-create skipped, directory refused)\n");
+}
+
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
     run_coreutil(root_ns, notif, b"/initramfs/sbin/copy", argv)
 }
@@ -3492,6 +3565,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     copy_demo(root_ns, notif);
     mkdir_remove_demo(root_ns, notif);
     rename_move_demo(root_ns, notif);
+    touch_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

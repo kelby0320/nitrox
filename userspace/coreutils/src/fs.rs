@@ -206,6 +206,18 @@ fn truncate(ns: u64, path: &[u8], size: u64) -> Result<(), FileError> {
     Ok(())
 }
 
+/// Create `path` as an empty file if it is not already there, then release the handle.
+///
+/// The underlying create is idempotent, so this is safe to call on a path that exists —
+/// but callers that care about the distinction should test first, because this cannot
+/// report which happened.
+pub fn create_file(ns: u64, path: &[u8]) -> Result<(), FileError> {
+    let handle = create(ns, path, 0)?;
+    // SAFETY: closing a handle this function just created and owns.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+    Ok(())
+}
+
 /// Create (or open, idempotently) `path` and grow it to `size`, returning a read-write
 /// handle.
 fn create(ns: u64, path: &[u8], size: u64) -> Result<u64, FileError> {

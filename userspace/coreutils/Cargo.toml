@@ -45,3 +45,7 @@ path = "src/bin/rename.rs"
 [[bin]]
 name = "move"
 path = "src/bin/move.rs"
+
+[[bin]]
+name = "touch"
+path = "src/bin/touch.rs"

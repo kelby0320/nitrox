@@ -830,12 +830,17 @@ fn serve_session<R: BlockReader + BlockWriter>(reader: &R, session_ch: u64) {
             }
             // The name-addressed mutations: each names an entry in the bound directory, so a
             // handle can never mutate outside it.
-            OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR => {
+            OP_FILE_MKDIR | OP_FILE_UNLINK | OP_FILE_RMDIR | OP_FILE_TOUCH => {
                 let r = match parse_name_request(body) {
                     Some(name) => match op {
                         OP_FILE_MKDIR => ext4::mkdir_at(reader, dir_ino, name, now_secs()),
                         OP_FILE_UNLINK => ext4::unlink_at(reader, dir_ino, name, now_secs()),
-                        _ => ext4::rmdir_at(reader, dir_ino, name, now_secs()),
+                        OP_FILE_RMDIR => ext4::rmdir_at(reader, dir_ino, name, now_secs()),
+                        // Session-scoped touch. The *path*-scoped form on the control
+                        // channel stays as it is: that one is the kernel reporting a
+                        // Model A write it just flushed, is fire-and-forget, and has no
+                        // client behind it to receive a status.
+                        _ => ext4::touch_at(reader, dir_ino, name, now_secs()),
                     },
                     None => Err(FsError::Unsupported),
                 };

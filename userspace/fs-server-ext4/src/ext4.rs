@@ -643,6 +643,33 @@ fn resolve_path_ino<R: BlockReader>(
 ///
 /// `now` comes from the server's own clock reading, never from the wire — a writer does not
 /// get to choose what time it wrote.
+/// Stamp the modification time of `name` inside `dir_ino`, the **session-scoped**
+/// counterpart of [`touch_path`].
+///
+/// The path form exists for the kernel, which names a file absolutely when it reports a
+/// Model A write it has just flushed. A client cannot use that: it holds a *session* on
+/// one directory, and the whole point of the session design is that a handle addresses
+/// entries **by name** inside it, so confinement is structural rather than checked. This
+/// is the same shape as [`mkdir_at`] / [`unlink_at`] / [`rmdir_at`] for exactly that
+/// reason.
+///
+/// `now` comes from the server, never from the caller — a timestamp a client could
+/// choose would be forgeable metadata.
+pub fn touch_at<RW: BlockReader + BlockWriter>(
+    rw: &RW,
+    dir_ino: u32,
+    name: &[u8],
+    now: i64,
+) -> Result<(), FsError> {
+    let sb = read_superblock(rw)?;
+    let parent = read_inode(rw, &sb, dir_ino)?;
+    if rd_u16(&parent, 0) & S_IFMT != S_IFDIR {
+        return Err(FsError::NotFound);
+    }
+    let target_ino = dir_lookup(rw, &sb, &parent, name)?;
+    touch_inode(rw, &sb, target_ino, now, Stamp::Modified)
+}
+
 pub fn touch_path<RW: BlockReader + BlockWriter>(
     rw: &RW,
     path: &[u8],
