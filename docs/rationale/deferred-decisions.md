@@ -417,9 +417,30 @@ Two candidate shapes, and the choice is about whose job it is to supply a sink:
    entirely rather than redirecting it, leaving one output path instead of two — at the cost of
    giving every spawner that job.
 
-Option 2 is the cleaner architecture and the larger change; option 1 is a strictly better placeholder
-than the status quo. Note that whichever is chosen, "discard" must stay expressible: a program whose
-output nobody wants should not be forced to write to a console.
+**Option 2, on the Linux precedent (checked 2026-07-30, empirically and against the kernel source).**
+Linux coreutils have **no fallback at all**. `ls` with fd 1 closed prints
+`ls: write error: Bad file descriptor` and exits 2 — the same when exec'd directly with 0/1/2 closed
+and no shell involved. The program writes to fd 1; if it is not open, `write()` returns `EBADF` and
+the program fails loudly. It never invents a destination.
+
+The guarantee lives entirely outside the program, in four places: the kernel opens `/dev/console`
+and dups it to 0/1/2 for **PID 1** (`console_on_rootfs()` in `init/main.c`); every other process
+**inherits** 0/1/2 across fork/exec; detaching daemons explicitly redirect to `/dev/null`; and for a
+**setuid** exec the kernel plugs `/dev/null` into any unallocated 0/1/2. That last one is a security
+measure rather than a convenience — a setuid program that opens a file would otherwise be handed
+fd 1 and could be tricked into writing to it — and note it plugs `/dev/null`, not a console: the
+kernel ensures the descriptor *exists* and never decides the output should be seen.
+
+So the precedent endorses option 2, and pushes it further than "fall back to something better": the
+end state is that a stage **has no fallback** and fails when it has no `stdout`, exactly as `ls`
+does. "Discard" stays expressible as an explicit `/dev/null` equivalent, which is also the daemon
+idiom.
+
+**The one place the analogy breaks, and the actual cost of option 2 here.** Linux gets "the spawner
+supplies" almost free, because descriptors are *inherited* — a spawner that does nothing still
+passes its own along. Nitrox has no inheritance: authority is explicit handles and a spawned process
+gets exactly what the setup message carries. So what Linux obtains by default, init and every future
+spawner must do deliberately. That, rather than the choice of sink, is the part to design.
 
 Trigger: raised 2026-07-30 while planning coreutils Milestone 2 — acceptable while init and the test
 harness are the only spawners, but it should not survive the shell (Milestone 3), which is the point
