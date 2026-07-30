@@ -193,12 +193,38 @@ impl UserspaceServerReg {
     // by an `ObjectRef` the caller holds), and the caller holds `SCHED`, which —
     // single-CPU — serialises all access to `inner`.
 
+    /// Is `reg` a live registration? Reads the [`MAGIC`](Self::MAGIC) sentinel.
+    ///
+    /// The sentinel existed but was never read by anything, which is how a
+    /// dangling back-pointer went unnoticed: `IpcChannel.us_reg` is a raw pointer
+    /// nothing clears, so an endpoint that outlives its registration follows it
+    /// into freed memory. `ipc_endpoint_closing` checks this before draining.
+    ///
+    /// # Safety
+    /// `reg` must be non-null and point at readable memory (a freed-but-mapped
+    /// kernel-heap allocation qualifies — telling that case apart is the point).
+    pub(crate) unsafe fn is_live(reg: *mut ()) -> bool {
+        // SAFETY: the caller guarantees readable memory; `magic` sits at a fixed
+        // offset in the `#[repr(C)]` header layout, and any bit pattern is a valid
+        // `u64`, so this cannot form an invalid value.
+        let magic = unsafe {
+            core::ptr::addr_of!((*(reg as *const UserspaceServerReg)).magic).read_volatile()
+        };
+        magic == Self::MAGIC
+    }
+
     /// Borrow the interior mutably (no aliasing; `SCHED` held).
     ///
     /// # Safety
     /// See the accessor contract above.
     #[allow(clippy::mut_from_ref)]
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
+        // The sentinel is cheap and catches a stale back-pointer at the moment it is
+        // followed, rather than as garbage read out of the pending table.
+        debug_assert!(
+            unsafe { Self::is_live(reg) },
+            "UserspaceServerReg accessor on a dead/stale registration"
+        );
         // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
         // then a `&mut Inner` through it, is the interior-mutability contract —
         // sound while `SCHED` serialises access.

@@ -1833,7 +1833,23 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     let mut n_orphans = 0usize;
     // SAFETY: `endpoint` is valid memory; `SCHED` held.
     let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
-    if !reg_self.is_null() {
+    // `us_reg` is a raw back-pointer that **nothing clears**, so non-null does not
+    // mean live. In the ordinary teardown the registration owns this endpoint and is
+    // mid-drop right now — its `Inner` declares `endpoint` before `pending`, so the
+    // endpoint's `Drop` lands here with the pending table still intact, which is what
+    // makes the drain below correct. But when anything else holds a reference to this
+    // endpoint (a server handle, a blocked waiter), the registration is freed *first*
+    // and this pointer dangles; draining it then reads a recycled allocation and hands
+    // `signal_pending_op` a `po` built from whatever now occupies that memory —
+    // observed as the kernel-stack paint poison, log text, and x86 instruction bytes,
+    // crashing with `#GP`/`#PF` about one boot in four under load.
+    //
+    // The `magic` sentinel was written for exactly this and had never been read.
+    // A stale registration fails it, and skipping the drain is the correct response:
+    // that registration's `pending` array was dropped with it, so its lookups have
+    // already been released — there is nothing left here to complete.
+    // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
+    if !reg_self.is_null() && unsafe { UserspaceServerReg::is_live(reg_self) } {
         // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
         // is being dropped *because* the registration is — `reg_self` is still
         // valid memory mid-drop); `SCHED` held.
@@ -1850,7 +1866,11 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
         signal_ipc_endpoint(&mut g, peer);
         // SAFETY: `peer` is the live surviving endpoint; `SCHED` held.
         let reg_peer = unsafe { IpcChannel::us_reg_of(peer) };
-        if !reg_peer.is_null() {
+        // Same unchecked back-pointer as `reg_self` above: `peer` being live says
+        // nothing about *its* registration still existing, since nothing clears the
+        // pointer when a registration is destroyed.
+        // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
+        if !reg_peer.is_null() && unsafe { UserspaceServerReg::is_live(reg_peer) } {
             // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
             // `SCHED` held.
             while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg_peer) } {
