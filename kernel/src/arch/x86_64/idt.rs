@@ -860,9 +860,50 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "  r11 {:#018x}  r12 {:#018x}", f.r11, f.r12);
     let _ = writeln!(w, "  r13 {:#018x}  r14 {:#018x}", f.r13, f.r14);
     let _ = writeln!(w, "  r15 {:#018x}", f.r15);
+    dump_return_addresses(f, &mut w);
     let _ = writeln!(w, "halting.");
 
     Cpu::halt_loop()
+}
+
+/// Scan the faulting stack for values that look like kernel-text addresses and
+/// print them, innermost first — a poor man's backtrace.
+///
+/// The kernel has no frame-pointer walker and no unwind tables, but a `call`
+/// leaves its return address on the stack, so scanning raw words for anything in
+/// the kernel text range recovers the call chain (with some false positives from
+/// stale slots — hence "candidates" rather than "backtrace").
+///
+/// Deliberately placed **here**, on the dying path, rather than as a check in the
+/// code being investigated. Every hot-path probe tried against
+/// `TODO(blockbounded-deadline-crash)` changed the crash's incidence — the last one
+/// took it from 4-in-18 to 0-in-18 — because the bug is timing-sensitive. Code that
+/// runs only after the fault cannot perturb what it is measuring.
+fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
+    // Kernel text: the higher-half image base up to a generous bound. Values
+    // outside this are data, not return addresses.
+    const TEXT_LO: u64 = 0xffff_ffff_8000_0000;
+    const TEXT_HI: u64 = 0xffff_ffff_8100_0000;
+    /// Stack words to scan. The interesting frames are within a few hundred bytes.
+    const WORDS: usize = 64;
+
+    // A ring-0 fault keeps the faulting stack (long mode always pushes SS:RSP), so
+    // `f.rsp` is where that context's stack continues.
+    let sp = f.rsp;
+    if sp < TEXT_LO && !(0xffff_8000_0000_0000..0xffff_ffff_8000_0000).contains(&sp) {
+        let _ = writeln!(w, "  (stack pointer {sp:#018x} not scannable)");
+        return;
+    }
+    let _ = writeln!(w, "  return-address candidates (innermost first):");
+    for i in 0..WORDS {
+        let addr = sp + (i as u64) * 8;
+        // SAFETY: reading within the faulting kernel stack, which is mapped. The
+        // kernel is already halting, so even a bad read only changes the diagnostic.
+        let val = unsafe { (addr as *const u64).read_volatile() };
+        if (TEXT_LO..TEXT_HI).contains(&val) {
+            let _ = writeln!(w, "    [rsp+{:#05x}] {:#018x}", i * 8, val);
+        }
+    }
 }
 
 /// Build and load the IDT. Call once, early in boot, after
