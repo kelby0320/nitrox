@@ -359,8 +359,38 @@ acceptable at Milestone 2, where the alternative is guessing.
 Fixing it means adding discriminants (`AlreadyExists`, `NotEmpty`) to `KError`, which is an **ABI
 change**: it moves the ABI version hash and must be mirrored in `userspace/libkern`
 (`cargo xtask abi-sync-check` enforces the mirror). That is why it is not folded into a coreutils
-part. Trigger: a third client needing the distinction, or the first case where the extra round trip
-is not merely inelegant but wrong — a mutation that must be atomic with respect to the check.
+part.
+
+**Scheduled (2026-07-30): a batched fs-server ABI pass, immediately after the Milestone 2 coreutils
+land.** Deliberately batched rather than taken now — an ABI change moves the version hash and forces
+every mirror to be re-checked, so paying that once for several corrections beats paying it per
+utility. Milestone 2 is also the first time the filesystem interface has had this many clients at
+once, which makes it the right moment to collect the corrections and the wrong moment to keep
+patching around them one at a time. Any further ABI gaps found while building the remaining parts
+join this pass; anything that turns out to *block* a part gets reassessed at that point rather than
+deferred on principle.
+
+**Cross-mount `move` of a directory, and the missing second mount — `TODO(cross-mount-move)`.**
+`move` falls back to copy-then-remove when the kernel reports a rename as cross-device, and that
+fallback handles a **regular file** only; a directory operand is refused. Two reasons, and the second
+is the one that matters.
+
+The first is scope: a recursive cross-mount relocation is copy-a-tree plus remove-a-tree with a
+partial-failure story in the middle (what is the correct state when the copy succeeds and the removal
+does not, halfway down?), which is a design question rather than a few lines.
+
+The second is that **the test image has exactly one writable filesystem mount**, so no
+cross-mount move can currently be exercised end to end at all — not for directories, and not for
+files either. The `/initramfs` kernel server gives the *detection* path a target (the kernel reports
+`Unsupported`, `move` falls back, the copy then fails because that server is read-only), and the
+demo asserts the valuable half of it: a failed move leaves the source intact. But the successful
+fallback — copy lands, original is removed, `method = "copy"` is reported — has never run. Writing
+the recursive version against a path that cannot be tested would be writing it blind.
+
+Trigger: a second writable mount, whether from a real second filesystem or a second binding of the
+existing server at its own subtree base (`us_forward_existing_reg` already supports one endpoint
+under many names). That is the point at which both the file and directory cases become testable, and
+it should come before, not after, the recursive implementation.
 
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 

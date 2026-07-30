@@ -1631,13 +1631,30 @@ fn list_pipeline_demo(root_ns: u64, notif: u64) {
 /// the read end immediately to exercise early-consumer close. Requires the stage to exit
 /// `0` either way. Returns the received bytes (empty when not consuming).
 fn run_list(root_ns: u64, notif: u64, argv: &[&str], consume: bool) -> alloc::vec::Vec<u8> {
+    run_coreutil_capture(root_ns, notif, b"/initramfs/sbin/list", argv, consume)
+}
+
+/// Spawn a coreutil as a Tier-1 stage and **return its stdout stream**, so a demo can
+/// assert on the table it published rather than only on its exit status.
+///
+/// Same spawn as [`run_coreutil`], but the pipe is depth 1 — the smallest ring there is,
+/// so a stream of more than one message cannot complete without the consumer draining.
+/// That is what makes `list`'s backpressure assertion meaningful, and it costs the other
+/// callers nothing.
+fn run_coreutil_capture(
+    root_ns: u64,
+    notif: u64,
+    image: &[u8],
+    argv: &[&str],
+    consume: bool,
+) -> alloc::vec::Vec<u8> {
     use alloc::vec::Vec;
     use libstream::channel::{ChannelReceiver, IpcPort};
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup};
 
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/list", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, image, RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        return_fail(b"test-harness: list image FAIL\n");
+        return_fail(b"test-harness: coreutil image FAIL\n");
     }
     // Depth 1: the smallest ring there is, so a stream of more than one message cannot
     // complete without the consumer draining — real backpressure, not a big buffer.
@@ -2064,6 +2081,117 @@ fn mkdir_remove_demo(root_ns: u64, notif: u64) {
     }
 
     kprint(b"test-harness: mkdir/remove ok (created, refused, forced, recursed, binding safe)\n");
+}
+
+/// **Milestone 2 Part B — `rename` and `move`.**
+///
+/// `rename` is thin; `move` is the first coreutil whose correctness lives on a *failure*
+/// path, since the fallback only runs once the cheap operation has been refused. So the
+/// cases that matter are the ones about **which** operation ran, not merely whether the
+/// file ended up in the right place:
+///
+/// - a same-mount `move` must report `method = "rename"`. Asserting only that the file
+///   moved would pass just as happily if it silently copied every time — which is the
+///   whole behaviour `move` exists to avoid.
+/// - a cross-mount `move` must *detect* the case and not destroy the source when the
+///   fallback cannot complete.
+fn rename_move_demo(root_ns: u64, notif: u64) {
+    use libstream::table::{Item, TableReader};
+    use libstream::Value;
+
+    kprint(b"test-harness: rename/move demo (Milestone 2 Part B)\n");
+    const RN: &[u8] = b"/initramfs/sbin/rename";
+    const MV: &[u8] = b"/initramfs/sbin/move";
+
+    // --- fixture -------------------------------------------------------------
+    let mut buf = [0u8; 4096];
+    let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
+        Ok(d) => d,
+        Err(_) => return_fail(b"test-harness: rename fixture open FAIL\n"),
+    };
+    let _ = sys.mkdir(b"nx-b");
+    let _ = sys.mkdir(b"nx-b2");
+    sys.close();
+    write_file(root_ns, b"/system/nx-b/one.txt", b"part b\n");
+
+    // --- 1. rename within a directory ----------------------------------------
+    if run_coreutil(root_ns, notif, RN, &["rename", "/system/nx-b/one.txt", "/system/nx-b/two.txt"]) != 0 {
+        return_fail(b"test-harness: rename exited non-zero\n");
+    }
+    if path_exists(root_ns, b"/system/nx-b/one.txt") || !path_exists(root_ns, b"/system/nx-b/two.txt") {
+        return_fail(b"test-harness: rename did not re-point the name\n");
+    }
+
+    // --- 2. rename across directories (what Slice C2 unblocked) --------------
+    if run_coreutil(root_ns, notif, RN, &["rename", "/system/nx-b/two.txt", "/system/nx-b2/three.txt"]) != 0 {
+        return_fail(b"test-harness: cross-directory rename exited non-zero\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-b2/three.txt") {
+        return_fail(b"test-harness: cross-directory rename lost the file\n");
+    }
+
+    // --- 3. an existing destination is refused, and --force replaces ---------
+    write_file(root_ns, b"/system/nx-b/keep.txt", b"keep\n");
+    if run_coreutil(root_ns, notif, RN, &["rename", "/system/nx-b2/three.txt", "/system/nx-b/keep.txt"]) == 0 {
+        return_fail(b"test-harness: rename over an existing name wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-b2/three.txt") {
+        return_fail(b"test-harness: refused rename still moved the source\n");
+    }
+    if run_coreutil(root_ns, notif, RN, &["rename", "--force", "/system/nx-b2/three.txt", "/system/nx-b/keep.txt"]) != 0 {
+        return_fail(b"test-harness: rename --force exited non-zero\n");
+    }
+
+    // --- 4. a same-mount move re-points; it does NOT copy --------------------
+    // The assertion with teeth: read the published table and require
+    // `method = "rename"`. Checking only that the file arrived would pass an
+    // implementation that copied every time.
+    let bytes = run_coreutil_capture(
+        root_ns,
+        notif,
+        MV,
+        &["move", "/system/nx-b/keep.txt", "/system/nx-b2/moved.txt"],
+        true,
+    );
+    let mut method_seen = false;
+    if let Ok(mut tr) = TableReader::new(&bytes) {
+        while let Some(Ok(item)) = tr.next() {
+            if let Item::Row(vals) = item {
+                if matches!(&vals[2], Value::Str(s) if s == "rename") {
+                    method_seen = true;
+                }
+            }
+        }
+    }
+    if !method_seen {
+        return_fail(b"test-harness: same-mount move did not report method=rename\n");
+    }
+    if path_exists(root_ns, b"/system/nx-b/keep.txt") || !path_exists(root_ns, b"/system/nx-b2/moved.txt") {
+        return_fail(b"test-harness: move did not relocate the file\n");
+    }
+
+    // --- 5. a cross-mount move is detected, and the source survives ----------
+    // `/initramfs` is a kernel server, not the ext4 mount, so the kernel reports the
+    // rename as cross-device and `move` falls back to copy. The copy then fails (that
+    // server is read-only), which is the correct outcome — and the property that matters
+    // is that a failed move leaves the original where it was.
+    if run_coreutil(root_ns, notif, MV, &["move", "/system/nx-b2/moved.txt", "/initramfs/moved.txt"]) == 0 {
+        return_fail(b"test-harness: cross-mount move into a read-only server wrongly succeeded\n");
+    }
+    if !path_exists(root_ns, b"/system/nx-b2/moved.txt") {
+        return_fail(b"test-harness: failed cross-mount move destroyed the source\n");
+    }
+
+    // --- teardown ------------------------------------------------------------
+    unlink_all(root_ns, b"/system/nx-b2", &[b"moved.txt"]);
+    let mut b3 = [0u8; 4096];
+    if let Ok(mut d) = Dir::open(root_ns, b"/system", &mut b3) {
+        let _ = d.rmdir(b"nx-b");
+        let _ = d.rmdir(b"nx-b2");
+        d.close();
+    }
+
+    kprint(b"test-harness: rename/move ok (re-pointed, refused, forced, method=rename, cross-mount safe)\n");
 }
 
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
@@ -3363,6 +3491,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //      refuse rather than get wrong (existing destination; no-truncate overwrite).
     copy_demo(root_ns, notif);
     mkdir_remove_demo(root_ns, notif);
+    rename_move_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

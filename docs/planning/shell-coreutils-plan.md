@@ -230,7 +230,7 @@ Two things hold for every part, and are not repeated in each:
 Parts, in order (tick as they land):
 
 - [x] **Part A — `mkdir`, `remove`** ✅ (2026-07-30)
-- [ ] **Part B — `rename`, `move`** (`move` = `rename` + the `CrossDevice` copy/unlink fallback)
+- [x] **Part B — `rename`, `move`** ✅ (2026-07-30)
 - [ ] **Part C — `touch`** (create-if-absent + `mtime` stamp; likely needs `File::Touch` exposed)
 - [ ] **Part D — `date`, `sleep`** (no filesystem; mostly host-testable formatting and parsing)
 - [ ] **Part E — `whoami`** (blocked on open question B2 — a design call, deliberately last)
@@ -283,7 +283,25 @@ The interesting case is `remove --recursive`: `rmdir` only removes an *empty* di
 walk order is load-bearing, and the natural implementation re-uses `list`'s recursive descent.
 Worth checking whether that descent belongs in `coreutils::fs` rather than being written twice.
 
-#### Part B — `rename` and `move`
+#### Part B — `rename` and `move` ✅ (2026-07-30)
+
+**Landed.** `rename` is the thin one and deliberately has *no* fallback — a cross-mount rename is an
+error, so a caller who wants the cheap identity-preserving operation can ask for it and be told when
+it is impossible. `move` adds the fallback and **reports which method it used**
+(`Table<{from, to, method}>`, `method` ∈ `rename` | `copy`). That field is not decoration: the two
+differ in cost and in whether the file keeps its identity, and it is the only way to *prove* the
+same-mount path is not silently copying — an assertion on "the file arrived" would pass an
+implementation that copied every time.
+
+The predicted finding held: **the test image has exactly one writable mount**, so no cross-mount move
+runs end to end. `/initramfs` (a read-only kernel server) gives the *detection* path a target, and
+the demo asserts the half that is testable and most worth protecting — a failed move leaves the
+source intact. The successful fallback has never executed. A cross-mount *directory* move is
+therefore refused rather than written blind; both are filed as `TODO(cross-mount-move)`, whose
+trigger is a second writable mount (a second binding of the existing server at its own subtree base
+would do — `us_forward_existing_reg` already supports one endpoint under many names).
+
+The original sketch, kept for the record:
 
 `rename` is the thin one — `coreutils::fs::rename` already exists and Slice C2 made it work across
 directories and over an existing destination. It emits `Table<{from, to}>`.

@@ -37,3 +37,11 @@ path = "src/bin/mkdir.rs"
 [[bin]]
 name = "remove"
 path = "src/bin/remove.rs"
+
+[[bin]]
+name = "rename"
+path = "src/bin/rename.rs"
+
+[[bin]]
+name = "move"
+path = "src/bin/move.rs"
