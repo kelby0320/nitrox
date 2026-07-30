@@ -223,6 +223,10 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // The coreutils (`list`, …) — real programs, present in release images. One crate,
     // a bin per program, so the crate directory is named separately from the bins.
     build_userspace_crate("coreutils", &["list", "copy", "mkdir", "remove", "rename", "move", "touch", "date", "sleep", "whoami"], None)?;
+    // `nxsh` — the shell. Milestone 3 Part A ships the *language* (lexer + parser, tested
+    // on the host); this builds its bin for the bare target so the language cannot
+    // quietly stop being part of the OS while it is being written.
+    build_userspace_bin("nxsh", None)?;
     build_userspace_bin("profile-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
@@ -760,6 +764,17 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("coreutils")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `nxsh` language tests — lexer and parser (Milestone 3 Part A). The whole language
+    // is a library with no syscalls in it precisely so it can be tested here, in a
+    // second, rather than through a 90-second boot. `--lib` skips the bare-target bin.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("nxsh")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

@@ -1,0 +1,25 @@
+[package]
+name = "nxsh"
+version = "0.1.0"
+edition = "2024"
+
+# `nxsh` — the Nitrox shell (design `docs/history/nitrox-shell-design-v1.1.md`).
+# Scripts are `.nx`. Plan: `docs/planning/shell-coreutils-plan.md` § Milestone 3.
+#
+# Split the way `fs-server-ext4` is: the **language** is a library — lexer, parser,
+# evaluator, generic operators, regex — with no syscalls in it, so the whole thing is
+# host-tested (`cargo test -p nxsh --lib`) in a second rather than a 90-second boot. The
+# `[[bin]]` is the *host*: `_start`, spawning stages, wiring pipes, the console reader.
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto", features = ["io"] }
+libstream = { path = "../libstream", features = ["io"] }
+
+[lib]
+name = "nxsh"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nxsh"
+path = "src/main.rs"

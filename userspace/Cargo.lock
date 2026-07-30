@@ -117,6 +117,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxsh"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "librsproto",
+ "libstream",
+]
+
+[[package]]
 name = "profile-server"
 version = "0.1.0"
 dependencies = [
