@@ -811,6 +811,31 @@ impl<'a> Parser<'a> {
         // One head per statement or stage: everything nested below is an operand.
         let at_head = self.head_ok;
         self.head_ok = false;
+
+        // A **hyphenated** name at head position is one command name, not a subtraction.
+        // Real programs here are called `fs-server-ext4` and `test-stage`; reading the
+        // head in expression mode would take `fs` and leave `- server - ext4` behind, and
+        // the resulting "`fs` is not a program" is a baffling way to report a typo in a
+        // name that does exist. Arithmetic at the head of a statement is written with
+        // spaces (`a - b`) or parens, which is how it is written anyway.
+        if at_head || forced_external {
+            let w = self.lx.peek(crate::lex::Mode::Word)?;
+            if let Tok::Word(text) = &w.tok {
+                if text.contains('-')
+                    && text.as_bytes().first().is_some_and(|c| c.is_ascii_alphabetic())
+                {
+                    let name = text.clone();
+                    self.lx.bump(crate::lex::Mode::Word)?;
+                    let args = self.word_args()?;
+                    return Ok(Expr::Call(Box::new(Call {
+                        name,
+                        kind: CallKind::External,
+                        args,
+                        forced_external,
+                    })));
+                }
+            }
+        }
         let name = self.ident("expected a command or a name")?;
 
         // An `=` immediately after the head makes this an assignment target, whatever
@@ -1347,6 +1372,20 @@ mod tests {
         assert_eq!(c.kind, CallKind::External);
         assert_eq!(c.args[0], Arg::Flag("long".into(), None));
         assert_eq!(c.args[1], Arg::Positional(Expr::Word("README.md".into())));
+    }
+
+    /// Real programs here are called `fs-server-ext4` and `test-stage`. Reading the head
+    /// in expression mode would take `fs` and leave `- server - ext4` behind, reporting a
+    /// typo in a name that exists.
+    #[test]
+    fn a_hyphenated_command_name_is_one_name() {
+        let e = one_expr("fs-server-ext4 --check /dev/disk");
+        let Expr::Call(c) = e else { panic!("expected a call") };
+        assert_eq!(c.name, "fs-server-ext4");
+        assert_eq!(c.kind, CallKind::External);
+        assert_eq!(c.args[0], Arg::Flag("check".into(), None));
+        // …and arithmetic with spaces is still arithmetic.
+        assert!(matches!(one_expr("a - b"), Expr::Binary(BinOp::Sub, _, _)));
     }
 
     /// The case that motivated D1 in the plan: a bare path as an external argument.
