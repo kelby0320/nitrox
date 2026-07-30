@@ -201,10 +201,22 @@ one genuine design question lands last.
 
 Two things hold for every part, and are not repeated in each:
 
-- **Each utility is a TSM1 stage that must also work at Tier 0.** A coreutil has to be spawnable
-  before the shell exists, so every one needs the `coreutils::stage` prologue and a plain-text
-  fallback when there is no `stdout` — exactly as `list` does. `PeerClosed` on the output side is
-  a **clean** exit, not an error.
+- **Each utility is a TSM1 stage that must also work at Tier 0.** Every one uses the
+  `coreutils::stage` prologue, which reports which tier it was spawned in. **Tier 1** is the
+  shell-spawned case: `arg0` marks a setup message pending, and that message carries `argv` and
+  the three stream handles, so the utility writes its `Table`/`Record` as TSM1 to the `stdout`
+  channel. **Tier 0** is everything else — today init and the test harness, since the shell is
+  not built until Milestone 3 — where `Stage::enter` yields no `argv` and all three streams
+  `None`.
+
+  Two consequences, and they are separate. First, a Tier-0 stage has no `argv`, so it can only
+  run its argument-free default; harness demos are limited to that. Second, it has no `stdout`
+  to put a typed stream on, so it needs a **plain-text fallback**: `list` matches on
+  `stage.streams.stdout` and, for `None`, renders one human-readable line per row to the kernel
+  log via `kprint` instead of a TSM1 table. Plain text rather than the same bytes elsewhere,
+  because the reader in that position is a person on the serial console, not a decoder.
+
+  `PeerClosed` on the output side is a **clean** exit, not an error.
 - **Flags follow the declarative `coreutils::args` conventions** (GNU §10f, no bare `-`), and the
   mutating verbs take `--force` with the same meaning `copy` gave it.
 
