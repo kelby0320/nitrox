@@ -8859,6 +8859,81 @@ the **size did not** — the last so the check cannot pass by accidentally takin
 grow/truncate path, which would have stamped `mtime` the old way. **Negative control**:
 dropping the notification fails it with "in-place overwrite left mtime stale".
 
+## 2026-07-29 — Slice D4: lock ordering is enforced now, and it disagreed four times
+
+`kernel/docs/lock-ordering.md` has defined a total order over every kernel lock since
+Phase 1, closing with "debug builds will eventually track acquisition order and panic on
+violations. That mechanism is not yet implemented — for now the order is enforced by code
+review." Code review then missed three deadlocks (F1, F2, F12 — 2026-07-21), each found by
+hand or by bisecting a boot loop that hung one time in three. The mechanism now exists.
+
+**Shape.** Every lock declares its rank at construction — `SpinLock::new(LockRank::Buddy,
+…)` — and a per-CPU held-rank stack checks each acquire: the new rank must be strictly
+greater than everything already held, which catches both inversions and the same-rank
+nesting the document separately forbids. Debug builds only; release compiles it away.
+
+The rank is a **mandatory constructor argument**, not an optional annotation. That is the
+design decision that did the work: a lock with no declared position is a lock nobody has
+reasoned about, and requiring one immediately surfaced **six live locks missing from the
+rank table entirely** (`KLOG`, `tlb::LOCK`, `DEVICES`, `PARTITIONS`, `CONSOLE`, the AHCI
+pending ring).
+
+**What it found on the way to a clean boot.** Four disagreements between the documented
+order and the code, none of them anticipated:
+
+1. **`dpc::init` allocated under the DPC queue lock** — `try_reserve` inside the critical
+   section, i.e. slab (rank 6a) under a leaf. Once, at boot, on one CPU with interrupts
+   masked, so harmless in itself; but the lock is only *honestly* a leaf if nothing under it
+   ever allocates, and that is the property the whole DPC path leans on. Fixed by reserving
+   outside the lock and moving the list in.
+2. **`entropy::init` did the identical thing** with its seed-waiter list. Same fix. Two
+   independent instances of one pattern — "pre-reserve under the lock at init" — which is
+   the kind of thing a checker finds and a reviewer does not.
+3. **`DEVICES` and `PARTITIONS` are not leaves.** Both push or reserve a `KVec` *inside*
+   their critical section, so they must rank above the allocators; they got a new `Registry`
+   rank. This is a **mis-ranking, not a hazard**: allocating under a non-`SCHED` lock is
+   explicitly correct here (§ The Namespace binding lock — "the no-allocation rule applies
+   only to the rank-1 `SCHED` lock"), so `Registry` → allocator is the same legal descent
+   `Namespace::bind` makes. What was wrong was calling these locks leaves, which asserted
+   they take nothing while held. With the rank corrected there is nothing further to fix.
+   (`device.rs`'s comment about `snapshot` existing so callers can "allocate without holding
+   the device lock across a lock-ordering boundary" is about a *caller* doing arbitrary work
+   — possibly reaching a higher-ranked lock — which `snapshot` still correctly prevents.)
+4. **`tlb::LOCK` cannot be ranked at all.** It is held with interrupts *enabled* — that is
+   the F1 fix — so interrupt work legitimately runs beneath it. The tracker said so in two
+   steps: `Leaf` under `Leaf` (a DPC drain at an interrupt tail inside a shootdown window),
+   then `Sched` under it (a timer tick doing the same). Both correct behaviour. No single
+   number expresses "the order restarts here", so it is marked `IrqEnabledHold` and exempt,
+   with its real discipline being the documented no-lock-held caller contract. The general
+   fix is per-interrupt-context tracking (Linux's lockdep hardirq contexts):
+   `TODO(lockdep-irq-context)`, deferred because it needs every interrupt entry/exit hooked
+   and missing one would corrupt the tracker silently rather than fail loudly.
+
+   **Superseded** — see "the order restarts at every interrupt", below. This diagnosis was
+   scoped wrongly: the restart is a property of *every* plain `SpinLock`, not of `tlb::LOCK`,
+   which was merely the instance that fired deterministically. The exemption did not save the
+   tracker, and D4 was withdrawn from the Slice D PR before re-landing with interrupt scoping.
+
+**Two bugs in the tracker itself, both found by running it.** The per-CPU model is invalid
+under host `cfg(test)` — `cargo test` runs test functions on many OS threads that all report
+the same `current_cpu()`, so unrelated threads shared one rank stack and manufactured
+inversions; it hung the host suite with two binaries spinning at >800 % CPU. It is now
+compiled out there, which is a correctness requirement rather than a cost saving. And the
+"already reporting" path spun forever instead of returning, which would have replaced a
+diagnosable panic with a hang.
+
+**On the document's own claim.** It promised "one exception" to the same-rank rule and never
+named one; both places it discusses nesting say *never* nested. The rule is enforced without
+an exception, so a legitimate one would now surface as a panic naming both ranks rather than
+as an assertion nobody can check.
+
+*Verified:* host suite **789** green; release build clean (tracker absent); `test-qemu` PASS
+with the tracker armed through the full boot — kernel → SMP → init → ext4 → the Slice C
+checks → login; 3/3 KVM boots. **Negative control**: deliberately mis-ranking the namespace
+lock trips it immediately with "acquiring Sched (rank 10) while holding HandleTable (rank
+30)", naming both locks. `check-deferrals` caught the new `TODO` before I filed it, which is
+the check working on its author.
+
 ## 2026-07-29 — Slice D1: the klog buffer keeps both ends, and the measurement reframed it
 
 The kernel log was a linear append buffer: capture from boot until 16 KiB is full, then
@@ -8988,3 +9063,86 @@ so the check cannot pass against a `list` that had stopped reading filesystems a
 **Both controls run**: removing the namespace source fails the first assertion (that is
 exactly the pre-D3 behaviour), and removing the filesystem source fails the second. All four
 static checks green.
+
+## 2026-07-29 — The order restarts at every interrupt: scoping the lock tracker, and re-landing D4
+
+D4 (the debug lock-order tracker) shipped, then came back out. It panicked roughly one boot
+in three under load — `Sched (10) while holding Buddy (62)` and `Sched (10) while holding
+HandleTable (30)` — clean on quiet runs, which is why 3/3 local boots passed before CI
+failed. It was withdrawn from the Slice D PR rather than patched, because the cause was
+structural. This is the follow-up that fixes it; the two now land together.
+
+**What was actually wrong.** A per-CPU held-rank stack cannot model interrupt context. Every
+plain `SpinLock` is held with interrupts *enabled* — F12 disables preemption, not
+interruption — so a timer tick or an IPI routinely lands on a thread holding an allocator or
+handle-table lock, and the handler goes on to take `SCHED`, the *top* rank. That is not an
+inversion: the handler releases everything it takes before the interrupted section resumes,
+so the two nestings never interleave and neither can wait on the other. A flat order has no
+way to say that.
+
+I had scoped this wrongly when D4 landed. I treated "interrupt context restarts the order" as
+a quirk of `tlb::LOCK` — the one lock *documented* as held with IF=1 — and exempted it. But
+`tlb::LOCK` was only the instance that fired deterministically at SMP bring-up; the property
+belongs to every plain lock, and the exemption addressed one symptom of a general fact. So
+`TODO(lockdep-irq-context)` was never a later refinement to a working tracker. It was a
+prerequisite for the tracker being sound at all.
+
+**The fix.** Each CPU keeps a **floor** alongside its held-rank stack. `enter_interrupt`
+raises the floor to the current depth; its guard lowers it at the handler's return. The
+ordering check only looks at entries at or above the floor, so a handler starts from an empty
+view and is checked in full against *its own* acquisitions, while the interrupted context's
+holds stay recorded and stay enforced once it resumes. Nested interrupts fall out of the same
+arithmetic (the guard saves and restores the previous floor), and a handler that returns at a
+different depth than it entered — a leaked acquire — panics rather than corrupting the stack.
+
+`tlb::LOCK` is an ordinary rank again (8). Its *stricter* contract, which the ranking cannot
+express — no other lock held when it is taken — is still asserted separately, because that
+check is free with this machinery and strictly stronger than the rank.
+
+**Why the per-CPU model is sound, stated as a check rather than a claim.** A context switch
+is the one thing that could move a thread out from under its CPU's rank stack. It cannot,
+because a thread may only be switched away holding nothing: a plain-lock holder has
+preemption disabled, an `IrqSpinLock` holder has interrupts masked, and blocking with a lock
+held is forbidden. That was already true by construction; it is now *checked*, at
+`sched::switch_into` — the single point every switch passes through — right after `SCHED` is
+released. If it ever stops being true, the tracker says so instead of quietly corrupting.
+This is also what makes the interrupt guard safe to drop on a different CPU than it was
+created on (a tick that reschedules, resuming later elsewhere): the values it restores are
+zero exactly when that can happen.
+
+**"Missing one entry corrupts the tracker silently" — answered structurally, not carefully.**
+That risk was the reason this wanted its own change, and care is a poor answer to it: a
+forgotten scope produces phantom inversions from that vector days later, not a clean failure.
+So dispatchers are now defined by an `irq_dispatcher!` macro that opens the scope itself, and
+`cargo xtask check-irq-scope` fails the build if a naked entry stub's `dispatch = sym …`
+names a function that macro did not generate — plus it verifies the macro still calls
+`enter_interrupt`, so rule one cannot check that everyone went through a door that no longer
+leads anywhere. It walks `kernel/src/arch`, so an aarch64 entry path is covered the day it
+exists rather than the day someone remembers.
+
+It earned itself immediately: it found the entry I had missed. The `syscall` stub also
+dispatches through a naked stub, and I had only been thinking about the IDT. It does not want
+a scope — a ring-3 entry is not an interrupt, and the order *begins* there rather than
+restarting — so it takes the stronger discipline instead: assert the held set is empty. That
+is the one boundary where emptiness is known ground truth (the caller was in user mode and
+can hold nothing), which makes it the cheapest place to catch a leaked acquire before it
+misattributes itself to some later, innocent one.
+
+**On testing the part that got it wrong.** The tracker is compiled out under host
+`cfg(test)` — the per-CPU model is invalid where many OS threads report one CPU. That is
+correct, and it also meant the scope arithmetic, the thing I had reasoned about badly, would
+have shipped untested. It is now unit-tested host-side against a plain local struct with the
+same update rules: 9 tests, including the exact regression (a tick taking `SCHED` under a
+held `Buddy`), that a handler is still ordered against its own acquisitions, that nested
+scopes restore in order, and that a handler's unbalanced release cannot eat the interrupted
+context's entries.
+
+*Verified:* host suite green (9 new); `check-irq-scope` reports 7 entry stubs → 6 scoped
+dispatchers + 1 ring-3 entry; `test-qemu` PASS; **15/15 KVM boots under 8-way host load**,
+against a withdrawn version that failed about 1 in 3. **Three negative controls**, because a
+tracker that reports nothing looks exactly like a tracker that is switched off: (a) an
+injected inversion panics with `acquiring Sched (rank 10) while holding Buddy (rank 62)`,
+proving the tracker is live in the booted build; (b) un-scoping one dispatcher, and
+separately gutting the macro, each fail `check-irq-scope`; (c) disabling *only* the
+floor-raising — leaving everything else in place — reproduces the withdrawn failure 6/6
+deterministically, which is what shows the scoping is load-bearing rather than incidental.

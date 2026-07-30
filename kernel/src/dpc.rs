@@ -24,6 +24,7 @@
 use core::sync::atomic::{AtomicBool, Ordering};
 
 use crate::libkern::{AllocError, IrqSpinLock, KVec};
+use crate::libkern::lockrank::LockRank;
 
 /// Capacity of the DPC queue. Bounded by the number of distinct `Dpc` objects
 /// (each is queued at most once, via its `queued` flag), so a small fixed
@@ -65,14 +66,23 @@ impl Dpc {
 /// docs). A leaf `IrqSpinLock`: only ever held alone (push on enqueue; the drain
 /// snapshots-and-clears under it, then runs handlers with it **released**), so
 /// it never nests with `SCHED`. See `kernel/docs/lock-ordering.md`.
-static DPC_QUEUE: IrqSpinLock<KVec<usize>> = IrqSpinLock::new(KVec::new());
+static DPC_QUEUE: IrqSpinLock<KVec<usize>> = IrqSpinLock::new(LockRank::Leaf, KVec::new());
 
 /// Reserve the DPC queue's backing storage. Call once at boot, after the
 /// allocator is up and **before** interrupts are armed (the first ISR may
 /// `enqueue`). The only allocation the queue ever makes — `enqueue` stays within
 /// the reserve, so it never allocates in interrupt context.
 pub fn init() -> Result<(), AllocError> {
-    DPC_QUEUE.lock().try_reserve(DPC_RESERVE)
+    // Reserve **outside** the queue lock, then move the reserved list in. Reserving under
+    // the lock would allocate (slab, rank 6a) while holding a leaf-ranked lock — an order
+    // inversion the debug tracker correctly rejects (Slice D4 found it here on the first
+    // armed boot). Benign in itself, being once at boot on one CPU with interrupts still
+    // masked, but the lock is only *honestly* a leaf if nothing under it ever allocates —
+    // and that is the property the rest of the DPC path depends on.
+    let mut reserved = KVec::new();
+    reserved.try_reserve(DPC_RESERVE)?;
+    *DPC_QUEUE.lock() = reserved;
+    Ok(())
 }
 
 /// Queue `dpc` to run at the next [`run_pending`]. Idempotent — a `Dpc` already
@@ -142,7 +152,7 @@ mod tests {
 
     fn fresh_queue() -> IrqSpinLock<KVec<usize>> {
         init_global_heap();
-        let q = IrqSpinLock::new(KVec::new());
+        let q = IrqSpinLock::new(LockRank::Leaf, KVec::new());
         q.lock().try_reserve(DPC_RESERVE).unwrap();
         q
     }

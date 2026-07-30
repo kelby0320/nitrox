@@ -66,6 +66,14 @@ jobs:
       - name: cargo xtask check-deferrals
         run: cargo xtask check-deferrals
 
+      # The lock-order tracker gives every interrupt handler a fresh scope, because the
+      # acquisition order genuinely restarts at an interrupt boundary. A dispatcher that
+      # skips the scope does not fail loudly — it reports phantom inversions from its own
+      # vector — so this checks every entry stub goes through the macro that opens one.
+      # Getting this wrong is what got the tracker withdrawn once (2026-07-29).
+      - name: cargo xtask check-irq-scope
+        run: cargo xtask check-irq-scope
+
       # `userspace/libkern` is a hand-maintained mirror of the kernel ABI — syscall
       # numbers, KError/KObjectType discriminants, Rights bits, shared limits — with
       # nothing in the build tying the two sides together. This compares them. Its
