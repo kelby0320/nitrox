@@ -193,12 +193,42 @@ impl UserspaceServerReg {
     // by an `ObjectRef` the caller holds), and the caller holds `SCHED`, which —
     // single-CPU — serialises all access to `inner`.
 
+    /// Is `reg` a live registration? Reads the [`MAGIC`](Self::MAGIC) sentinel.
+    ///
+    /// The raw-pointer counterpart of [`magic_ok`](Self::magic_ok), for the case that
+    /// method cannot serve: when all you hold is a pointer that *might* be dangling,
+    /// forming the `&self` it needs is already unsound.
+    ///
+    /// The sentinel existed but was never read by anything, which is how a
+    /// dangling back-pointer went unnoticed: `IpcChannel.us_reg` is a raw pointer
+    /// nothing clears, so an endpoint that outlives its registration follows it
+    /// into freed memory. `ipc_endpoint_closing` checks this before draining.
+    ///
+    /// # Safety
+    /// `reg` must be non-null and point at readable memory (a freed-but-mapped
+    /// kernel-heap allocation qualifies — telling that case apart is the point).
+    pub(crate) unsafe fn is_live(reg: *mut ()) -> bool {
+        // SAFETY: the caller guarantees readable memory; `magic` sits at a fixed
+        // offset in the `#[repr(C)]` header layout, and any bit pattern is a valid
+        // `u64`, so this cannot form an invalid value.
+        let magic = unsafe {
+            core::ptr::addr_of!((*(reg as *const UserspaceServerReg)).magic).read_volatile()
+        };
+        magic == Self::MAGIC
+    }
+
     /// Borrow the interior mutably (no aliasing; `SCHED` held).
     ///
     /// # Safety
     /// See the accessor contract above.
     #[allow(clippy::mut_from_ref)]
     unsafe fn inner<'a>(reg: *mut ()) -> &'a mut Inner {
+        // The sentinel is cheap and catches a stale back-pointer at the moment it is
+        // followed, rather than as garbage read out of the pending table.
+        debug_assert!(
+            unsafe { Self::is_live(reg) },
+            "UserspaceServerReg accessor on a dead/stale registration"
+        );
         // SAFETY: forming a shared `&UserspaceServerReg` to reach the `UnsafeCell`,
         // then a `&mut Inner` through it, is the interior-mutability contract —
         // sound while `SCHED` serialises access.
@@ -330,12 +360,37 @@ impl UserspaceServerReg {
     }
 }
 
-// No `Drop` impl: the `KBox` drop (run by `dispatch_destroy`, outside any lock)
-// drops `inner` → the owned `endpoint` `ObjectRef` (releasing the kernel endpoint,
-// whose `IpcChannel::drop` unlinks its peer under `SCHED` — sound because this
-// runs outside `SCHED`), any pending lookup `po`, and any pending fill's `po` /
-// `file_obj`. A lookup or fill still pending at teardown simply never completes
-// (the binding is going away — typically with its client).
+impl Drop for UserspaceServerReg {
+    /// Detach from the endpoint that points back at this registration, and complete
+    /// anything still outstanding on it — both while the registration is still whole.
+    ///
+    /// `IpcChannel.us_reg` is a raw, uncounted back-pointer. It has to be uncounted:
+    /// the registration owns the endpoint, so a counted edge the other way would be a
+    /// reference cycle. But nothing used to clear it, and an endpoint can outlive its
+    /// registration (a server handle, a blocked waiter still holds a reference), which
+    /// left **four** consumers dereferencing freed memory — `ipc_endpoint_closing`'s
+    /// two drains, `us_forward_reg_for_send`, and `us_forward_existing_reg`, the last
+    /// of which would resurrect a dead object's refcount and hand out an owned
+    /// reference to it. Clearing the pointer here is what makes all four safe, instead
+    /// of each having to recognise a corpse.
+    ///
+    /// This runs **before** the fields drop, which is exactly the window needed: the
+    /// pending table is still populated (so its waiters can be woken `PeerClosed`
+    /// rather than left hanging), and `endpoint` is still a live reference (so the
+    /// back-pointer can be cleared before anything can follow it). The field drops
+    /// that follow then release the endpoint, and if that is its last reference
+    /// `ipc_endpoint_closing` runs and correctly finds nothing to drain.
+    fn drop(&mut self) {
+        crate::sched::us_reg_detach(self as *mut Self as *mut ());
+        // Poison the sentinel last, once nothing here needs the accessors. A dangling
+        // pointer that survives this — via a path not yet known — then fails
+        // `is_live` and is caught at the dereference, instead of reading a recycled
+        // allocation. Poisoning is what makes that check sound: a *reused* allocation
+        // fails the magic by luck, whereas a freed-but-untouched one would still
+        // read `UsSrvRg!` and sail through.
+        self.magic = 0;
+    }
+}
 
 #[cfg(test)]
 mod tests {
@@ -381,6 +436,91 @@ mod tests {
                 KObjectType::UserspaceServerReg,
             )
         }
+    }
+
+    /// The regression this file's `Drop` exists for. An endpoint can outlive its
+    /// registration — a server handle or a blocked waiter still holds a reference —
+    /// and the endpoint's `us_reg` back-pointer is raw and uncounted. Before the
+    /// `Drop` impl nothing cleared it, so four consumers went on to dereference freed
+    /// memory; on hardware that surfaced as `#GP`/`#PF` in `signal_pending_op` with a
+    /// `po` made of recycled bytes, about one boot in four under load.
+    #[test]
+    fn dropping_a_registration_clears_its_endpoints_back_pointer() {
+        init_global_heap();
+        let ep_ref = endpoint();
+        let ep = ep_ref.as_ptr();
+
+        // Hold the endpoint independently of the registration — this is what a server
+        // handle or a parked waiter does, and it is the case that used to dangle.
+        // SAFETY: `ep` is a live `IpcChannel`; the bump balances the adopted ref.
+        let keepalive = unsafe {
+            (*(ep as *const crate::object::header::KObjectHeader)).bump();
+            ObjectRef::from_raw(ep, KObjectType::IpcChannel)
+        };
+
+        let r = UserspaceServerReg::try_new(ep_ref).unwrap();
+        // SAFETY: `into_raw` yields the single creation reference; adopt it.
+        let reg_ref = unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(r).as_ptr() as *mut (),
+                KObjectType::UserspaceServerReg,
+            )
+        };
+        // Wire the back-pointer the way `us_server_attach` does at bind time.
+        // SAFETY: both objects are live and this test is single-threaded.
+        unsafe { IpcChannel::set_us_reg(ep, reg_ref.as_ptr()) };
+        assert_eq!(unsafe { IpcChannel::us_reg_of(ep) }, reg_ref.as_ptr());
+
+        drop(reg_ref); // last registration reference; the endpoint survives
+
+        // SAFETY: `ep` is still live, pinned by `keepalive`.
+        assert!(
+            unsafe { IpcChannel::us_reg_of(ep) }.is_null(),
+            "a dying registration must clear its endpoint's back-pointer, or every \
+             consumer of it is reading freed memory"
+        );
+        drop(keepalive);
+    }
+
+    /// Only a pointer that still names *this* registration may be cleared:
+    /// `us_server_attach` can retarget an endpoint, and a dying predecessor must not
+    /// stomp its live successor's reply routing.
+    #[test]
+    fn a_dying_registration_leaves_a_successors_back_pointer_alone() {
+        init_global_heap();
+        let ep_ref = endpoint();
+        let ep = ep_ref.as_ptr();
+        // SAFETY: `ep` is live; the bump balances the adopted ref.
+        let keepalive = unsafe {
+            (*(ep as *const crate::object::header::KObjectHeader)).bump();
+            ObjectRef::from_raw(ep, KObjectType::IpcChannel)
+        };
+
+        let old = UserspaceServerReg::try_new(ep_ref).unwrap();
+        // SAFETY: adopt the creation reference.
+        let old_ref = unsafe {
+            ObjectRef::from_raw(
+                KBox::into_raw(old).as_ptr() as *mut (),
+                KObjectType::UserspaceServerReg,
+            )
+        };
+        // A successor takes over the endpoint's back-pointer.
+        let successor = 0xdead_beef_usize as *mut ();
+        // SAFETY: single-threaded test; the value is only compared, never dereferenced.
+        unsafe { IpcChannel::set_us_reg(ep, successor) };
+
+        drop(old_ref);
+
+        // SAFETY: `ep` is still live, pinned by `keepalive`.
+        assert_eq!(
+            unsafe { IpcChannel::us_reg_of(ep) },
+            successor,
+            "the predecessor cleared a pointer that no longer named it"
+        );
+        // Leave the endpoint without a stale pointer for the drop below.
+        // SAFETY: as above.
+        unsafe { IpcChannel::set_us_reg(ep, core::ptr::null_mut()) };
+        drop(keepalive);
     }
 
     #[test]

@@ -1652,6 +1652,56 @@ pub fn us_forward_reg_for_send(send_endpoint: *mut ()) -> Option<*mut ()> {
     if reg.is_null() { None } else { Some(reg) }
 }
 
+/// Detach a dying [`UserspaceServerReg`] from its endpoint, completing anything
+/// still outstanding on it. Called from that type's `Drop`, before its fields drop.
+///
+/// Two jobs, both of which must happen while the registration is still intact:
+///
+/// 1. **Complete outstanding forwarded lookups** `PeerClosed`, so their waiters wake
+///    rather than hang. The endpoint is still alive here, so the wake is well-formed.
+/// 2. **Clear the endpoint's back-pointer to us.** `IpcChannel.us_reg` is raw and
+///    uncounted (a counted edge would cycle with the registration's ownership of the
+///    endpoint), and until this existed nothing ever cleared it — so an endpoint that
+///    outlived its registration left every consumer of that pointer reading freed
+///    memory. See the `Drop` impl for the full list.
+///
+/// Takes `SCHED`, which is sound for the same reason `ipc_endpoint_closing` may:
+/// registration references are released only outside `SCHED`.
+pub fn us_reg_detach(reg: *mut ()) {
+    let mut g = SCHED.lock();
+    // SAFETY: called from `Drop` with the last reference gone but the object whole;
+    // `SCHED` held, satisfying the accessor contract.
+    let endpoint = unsafe { UserspaceServerReg::endpoint_ptr(reg) };
+    // Bounded by the pending table's size, so the drain cannot overrun this.
+    let mut orphans: [Option<ObjectRef>; US_PENDING_MAX] = core::array::from_fn(|_| None);
+    let mut n_orphans = 0usize;
+    // SAFETY: as above; `SCHED` held.
+    while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg) } {
+        signal_pending_op(
+            &mut g,
+            pl.po.as_ptr(),
+            crate::syscall::error::KError::PeerClosed as i32,
+        );
+        orphans[n_orphans] = Some(pl.po);
+        n_orphans += 1;
+    }
+    if !endpoint.is_null() {
+        // Clear only a pointer that still names *this* registration. `us_server_attach`
+        // can retarget an endpoint at a different one, and stomping a live successor's
+        // pointer would silently break its reply routing.
+        // SAFETY: `endpoint` is pinned by the reference this registration still holds
+        // (released by the field drops that follow this call); `SCHED` held.
+        if unsafe { IpcChannel::us_reg_of(endpoint) } == reg {
+            // SAFETY: as above.
+            unsafe { IpcChannel::set_us_reg(endpoint, core::ptr::null_mut()) };
+        }
+    }
+    // Release `SCHED` before dropping the orphaned references: an `ObjectRef` drop can
+    // reach the allocator, which must not happen under the rank-1 lock.
+    drop(g);
+    drop(orphans);
+}
+
 /// Record the endpoint → registration back-pointer that makes `endpoint` the
 /// kernel's end of a Userspace Server channel: a reply sent to it (by the server,
 /// on its peer) is then completed inline rather than enqueued. Called by
@@ -1678,13 +1728,20 @@ pub fn us_forward_existing_reg(endpoint: *mut ()) -> Option<ObjectRef> {
     if reg.is_null() {
         return None;
     }
-    // `reg` is a live `UserspaceServerReg`: the existing binding that installed the
-    // back-pointer still holds a reference (refcount ≥ 1), and `SCHED` serialises
-    // against its teardown. Bump the header count and adopt a new owned ref.
-    // SAFETY: `reg` addresses a live object with an outstanding reference; `SCHED` held.
+    // Acquire rather than `bump`: the old code asserted "the existing binding still
+    // holds a reference (refcount >= 1)" and incremented unconditionally, which
+    // resurrects an object whose count has already reached zero — handing out an owned
+    // reference to memory that is being destroyed. `try_acquire` refuses at zero, which
+    // is the `Arc::upgrade` semantics this lookup actually needs. (`us_reg_detach` now
+    // clears the back-pointer at teardown, so reaching a dead registration here should
+    // be impossible; this makes the race unrepresentable rather than merely unlikely.)
+    // SAFETY: `reg` addresses a `UserspaceServerReg` whose header is at offset 0;
+    // `SCHED` held.
     let header = unsafe { &*(reg as *const crate::object::header::KObjectHeader) };
-    header.bump();
-    // SAFETY: the `bump` above balances this adoption of a new reference.
+    if !header.try_acquire() {
+        return None;
+    }
+    // SAFETY: the successful `try_acquire` above balances this adoption.
     Some(unsafe { ObjectRef::from_raw(reg, KObjectType::UserspaceServerReg) })
 }
 
@@ -1834,7 +1891,23 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
     let mut n_orphans = 0usize;
     // SAFETY: `endpoint` is valid memory; `SCHED` held.
     let reg_self = unsafe { IpcChannel::us_reg_of(endpoint) };
-    if !reg_self.is_null() {
+    // `us_reg` is a raw back-pointer that **nothing clears**, so non-null does not
+    // mean live. In the ordinary teardown the registration owns this endpoint and is
+    // mid-drop right now — its `Inner` declares `endpoint` before `pending`, so the
+    // endpoint's `Drop` lands here with the pending table still intact, which is what
+    // makes the drain below correct. But when anything else holds a reference to this
+    // endpoint (a server handle, a blocked waiter), the registration is freed *first*
+    // and this pointer dangles; draining it then reads a recycled allocation and hands
+    // `signal_pending_op` a `po` built from whatever now occupies that memory —
+    // observed as the kernel-stack paint poison, log text, and x86 instruction bytes,
+    // crashing with `#GP`/`#PF` about one boot in four under load.
+    //
+    // The `magic` sentinel was written for exactly this and had never been read.
+    // A stale registration fails it, and skipping the drain is the correct response:
+    // that registration's `pending` array was dropped with it, so its lookups have
+    // already been released — there is nothing left here to complete.
+    // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
+    if !reg_self.is_null() && unsafe { UserspaceServerReg::is_live(reg_self) } {
         // SAFETY: `reg_self` is this endpoint's owning registration (the endpoint
         // is being dropped *because* the registration is — `reg_self` is still
         // valid memory mid-drop); `SCHED` held.
@@ -1851,7 +1924,11 @@ pub fn ipc_endpoint_closing(endpoint: *mut ()) {
         signal_ipc_endpoint(&mut g, peer);
         // SAFETY: `peer` is the live surviving endpoint; `SCHED` held.
         let reg_peer = unsafe { IpcChannel::us_reg_of(peer) };
-        if !reg_peer.is_null() {
+        // Same unchecked back-pointer as `reg_self` above: `peer` being live says
+        // nothing about *its* registration still existing, since nothing clears the
+        // pointer when a registration is destroyed.
+        // SAFETY: non-null and, being a kernel-heap allocation, mapped and readable.
+        if !reg_peer.is_null() && unsafe { UserspaceServerReg::is_live(reg_peer) } {
             // SAFETY: `reg_peer` is pinned by the live `peer` (its owned endpoint);
             // `SCHED` held.
             while let Some(pl) = unsafe { UserspaceServerReg::take_pending_next(reg_peer) } {

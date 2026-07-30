@@ -976,6 +976,27 @@ fn panic(info: &PanicInfo) -> ! {
         let _ = writeln!(w, "  at {}:{}:{}", loc.file(), loc.line(), loc.column());
     }
     let _ = writeln!(w, "  {}", info.message());
+    // Scan the panicking stack for kernel-text addresses — a poor man's backtrace,
+    // the same technique the exception dump uses. The kernel has no unwind tables,
+    // but a `call` leaves its return address behind, so this recovers the call chain
+    // (with stale-slot false positives, hence "candidates"). Costs nothing: the
+    // kernel is already dying.
+    {
+        const TEXT_LO: u64 = 0xffff_ffff_8000_0000;
+        const TEXT_HI: u64 = 0xffff_ffff_8100_0000;
+        let sp: u64;
+        // SAFETY: reading the stack pointer; no memory is touched.
+        unsafe { core::arch::asm!("mov {}, rsp", out(reg) sp, options(nomem, nostack)) };
+        let _ = writeln!(w, "  return-address candidates (innermost first):");
+        for i in 0..96usize {
+            let addr = sp + (i as u64) * 8;
+            // SAFETY: reading within the current kernel stack, which is mapped.
+            let val = unsafe { (addr as *const u64).read_volatile() };
+            if (TEXT_LO..TEXT_HI).contains(&val) {
+                let _ = writeln!(w, "    [rsp+{:#05x}] {:#018x}", i * 8, val);
+            }
+        }
+    }
     // Under the integration-test build, a kernel panic is a test failure: end the
     // QEMU run with the fail verdict so the runner reports it (instead of hanging
     // until the wall-clock timeout). `0x11` → QEMU exit 35 → the runner maps to fail.
