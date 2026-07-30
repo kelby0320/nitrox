@@ -563,19 +563,24 @@ honoured from then on, not bolted on at Part F.
 
 #### The parts
 
-- [ ] **Part A — lexer, AST, and parser (all of §8/§9)**
+- [x] **Part A — lexer, AST, and parser (all of §8/§9)** ✅ (2026-07-30)
       Tokens including path words, regex literals, `#` comments, `1_000_000`/`0x`/`0b` numerics.
       Full expression grammar with §8a precedence, statement grammar, patterns, `type_expr`.
       Resolves **D1**, **D2**, **D3**, **D5**. Host tests: a corpus of every example in §7–§11 of
       the design doc must parse, plus fail-loud cases for each ambiguity D1–D3 names.
       *Deliverable: the design doc's own examples parse. Nothing evaluates yet.*
 
-- [ ] **Part B — evaluator core, in-process**
+- [x] **Part B — evaluator core, in-process** ✅ (2026-07-30)
       `Value` (already complete in `libstream::wire` — `List`/`Record`/`Table` are `Arc`-shared and
       persistent, so C2 is genuinely done), scopes, `let`/`mut`/`const`, assignment and
       field/index mutation (§9d), arithmetic/comparison/logical/range operators, `++`, blocks as
       expressions, `if`/`for`/`while`. Float formatting (C6) lands here.
-      *Deliverable: `nxsh -c 'let x = 2 + 3'` computes. Host-tested end to end.*
+      *Deliverable met: 85 host tests, and the binary parses + evaluates a mixed
+      Int/Float script in ring 3, checking its own result so a wrong answer fails the
+      boot.* Two decisions landed here that the design implies rather than states: **there
+      is no truthiness** (a non-`Bool` condition is an error, per §6's fail-loud rule), and
+      **overflow and division by zero are errors, not wrapped values or `inf`** — a
+      fabricated number is the thing this system keeps refusing to produce.
 
 - [ ] **Part C — the process boundary. First real script.**
       Pipelines: spawn a stage per external command, wire `Streams` via `libstream::setup::pipe`,
