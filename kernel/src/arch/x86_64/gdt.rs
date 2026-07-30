@@ -62,11 +62,26 @@ const USER_CODE: u64 = 0x00AF_FA00_0000_FFFF;
 ///
 /// - `STAR[47:32]` (the `syscall` base) = `0x08`: `syscall` loads
 ///   `CS = 0x08` (kernel code) and `SS = 0x08 + 8 = 0x10` (kernel data).
-/// - `STAR[63:48]` (the `sysret` base) = `0x10`: `sysretq` loads
-///   `SS = 0x10 + 8 = 0x18` and `CS = 0x10 + 16 = 0x20` (each with RPL
-///   forced to 3, giving `0x1B` / `0x23`). This is *why* the GDT places
-///   user data at `0x18` and user code at `0x20`, in that order.
-pub const STAR_VALUE: u64 = (0x0010u64 << 48) | (0x0008u64 << 32);
+/// - `STAR[63:48]` (the `sysret` base) = `0x13` — the user-data selector **minus 8**,
+///   *including its RPL-3 bits*. `sysretq` computes `SS = base + 8 = 0x1B` and
+///   `CS = base + 16 = 0x23`, which is why the GDT places user data at index 3 and
+///   user code at index 4, in that order.
+///
+///   **The RPL bits in the base are load-bearing, and this is vendor-specific.** The
+///   obvious encoding is a base of `0x10` (the bare selectors, `0x18` / `0x20`),
+///   relying on the CPU to force RPL 3 into both. Intel does. **AMD forces RPL 3 into
+///   `CS` only and leaves `SS` as the raw `base + 8`** — so with a `0x10` base,
+///   userspace resumes from every `sysretq` with `SS = 0x18`, i.e. RPL 0. Nothing
+///   notices until the next ring-3 interrupt: the CPU pushes that `SS`, and the entry
+///   stub's `iretq` back to ring 3 raises `#GP(0x18)`, because returning to CPL 3
+///   requires `SS.RPL == CS.RPL == 3`.
+///
+///   Carrying the RPL in the base makes the result correct on both vendors — it is
+///   what Linux does (`MSR_STAR` gets `__USER32_CS`, itself RPL-3-tagged). Diagnosed
+///   from CI: green on Intel runners, `#GP(0x18)` on AMD ones, with the offending
+///   `ss = 0x18` read straight out of the faulting `iretq` frame. See the decision
+///   log, 2026-07-30.
+pub const STAR_VALUE: u64 = (0x0013u64 << 48) | (0x0008u64 << 32);
 
 /// GDT slot count: null + kernel code + kernel data + user data + user
 /// code + TSS descriptor (two slots).
@@ -332,7 +347,11 @@ mod tests {
         assert_eq!(syscall_base + 8, KERNEL_DATA_SELECTOR as u64);
         // sysretq: SS = base + 8, CS = base + 16 → user data / user code
         // (RPL stripped; the hardware forces RPL 3 on load).
-        assert_eq!(sysret_base + 8, (USER_DATA_SELECTOR & !3) as u64);
-        assert_eq!(sysret_base + 16, (USER_CODE_SELECTOR & !3) as u64);
+        // Compared against the **full** selectors, RPL included: the base carries the
+        // RPL-3 bits precisely so `sysretq` yields `0x1B` / `0x23` on AMD as well as
+        // Intel. Masking the RPL off here is what let the original encoding look
+        // correct while `SS` came back RPL 0 on AMD.
+        assert_eq!(sysret_base + 8, USER_DATA_SELECTOR as u64);
+        assert_eq!(sysret_base + 16, USER_CODE_SELECTOR as u64);
     }
 }
