@@ -52,7 +52,10 @@ use crate::arch::Cpu;
 use crate::arch::cpu::ArchCpu;
 use crate::arch::irq::{ArchIrq, SPURIOUS_VECTOR, TIMER_VECTOR};
 use crate::arch::x86_64::gdt::KERNEL_CODE_SELECTOR;
+use crate::arch::paging::ArchPaging;
 use crate::arch::x86_64::regs;
+use crate::arch::Paging;
+use crate::mm::{PAGE_SIZE, PhysAddr, VirtAddr};
 use crate::arch::x86_64::serial;
 use crate::libkern::notification::{
     FaultKind, KIND_DIVIDE_BY_ZERO, KIND_ILLEGAL_INSN, KIND_SEG_FAULT, Notification,
@@ -935,11 +938,28 @@ fn dump_return_addresses(f: &ExceptionFrame, w: &mut impl Write) {
         let _ = writeln!(w, "  (stack pointer {sp:#018x} not scannable)");
         return;
     }
+    // Probe each page before reading it. A kernel stack's guard page is at the
+    // *bottom*, so walking **up** from RSP leaves the mapped region at the stack top
+    // and lands in unmapped vmap — which turns this diagnostic into a second fault and
+    // prints nothing. That is exactly what the first CI capture did: a `#GP` dump with
+    // an empty candidate list, immediately followed by a `#PF` whose CR2 was the page
+    // above RSP. Stop at the first unmapped page instead.
+    let root = PhysAddr::new(regs::read_cr3() & !0xFFF);
     let _ = writeln!(w, "  return-address candidates (innermost first):");
+    let mut probed_page = u64::MAX;
     for i in 0..WORDS {
         let addr = sp + (i as u64) * 8;
-        // SAFETY: reading within the faulting kernel stack, which is mapped. The
-        // kernel is already halting, so even a bad read only changes the diagnostic.
+        let page = addr & !(PAGE_SIZE as u64 - 1);
+        if page != probed_page {
+            // SAFETY: `root` is the live page-table root read from CR3; `translate`
+            // only walks it and returns whether the address resolves.
+            if unsafe { Paging::translate(root, VirtAddr::new(page)) }.is_none() {
+                let _ = writeln!(w, "    (stack ends at {page:#018x} — stopping)");
+                return;
+            }
+            probed_page = page;
+        }
+        // SAFETY: the containing page was just confirmed mapped.
         let val = unsafe { (addr as *const u64).read_volatile() };
         if (TEXT_LO..TEXT_HI).contains(&val) {
             let _ = writeln!(w, "    [rsp+{:#05x}] {:#018x}", i * 8, val);
