@@ -2810,7 +2810,23 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: nxsh repl-line evaluation failed\n");
     }
 
-    kprint(b"test-harness: nxsh ok (evaluated, spawned, operators, save/open, def+match+try, repl)\n");
+    // 9. **Part G**: `filter … ~= /…/` over a real directory listing — §10a's claim that
+    //    `grep`'s job was a missing *operator*, not a missing program.
+    let re = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &[
+            "nxsh",
+            "-c",
+            "let all = list /system | count\nlet some = list /system | filter name ~= /^nx-/ | count\nif some >= all { bad }",
+        ],
+    );
+    if re != 0 {
+        return_fail(b"test-harness: nxsh regex filter failed\n");
+    }
+
+    kprint(b"test-harness: nxsh ok (evaluated, spawned, operators, save/open, def+match+try, repl, regex)\n");
 }
 
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.

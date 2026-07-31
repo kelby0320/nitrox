@@ -650,7 +650,7 @@ honoured from then on, not bolted on at Part F.
       Continuation is decided by **lexing, not counting** — a brace inside a string or a
       comment opens nothing, and getting that wrong hangs the prompt on a finished command.
 
-- [ ] **Part G — the regex engine and `~=`** (B4)
+- [x] **Part G — the regex engine and `~=`** ✅ (2026-07-30) — B4 closed
       Predicate-only, since §10b never asks `~=` for anything but a boolean — which removes
       submatch extraction, the largest source of complexity in a regex implementation. Pattern
       parser → instruction program → **Pike VM** (Thompson NFA): linear time, no backtracking, no
@@ -662,13 +662,75 @@ honoured from then on, not bolted on at Part F.
       The property that matters: **no pattern's meaning ever changes when the engine grows.** Every
       excluded construct is an error today, not a silently-different match — which is why literal
       substring matching was rejected as a starting point.
-      *Deliverable: `list | filter name ~= /\.rs$/` works. Closes the `grep` story (§10a).*
+      *Deliverable met, in guest.* One bug worth recording: the first compiler let a
+      fragment's exit be patched by **overwriting** the instruction slot with a `Jump`,
+      which destroyed the `AssertStart` it was patching — so `^bc` became `Jump; b; c` and
+      matched anywhere. Instructions now carry their successor explicitly, making an exit a
+      *field to fill* rather than an instruction to clobber. It passed several simpler
+      tests first, which is why anchors and the pathological-pattern case both earn their
+      place.
+
+**Milestone 3 is complete** (Parts A–G). `nxsh` parses and evaluates the language, spawns
+and pipes real programs, runs the generic operators in-process, and matches with `~=`. What
+it does **not** do is `cd` — see Milestone 3.5 below, which is where the `usersh` swap
+also lands.
 
 #### What Milestone 3 does not do
 
 `.csv`/`.json` for `save`/`open` (B5 beyond `.tsm`/`.txt`), the rich REPL (§11), job control,
 schema-aware completion, and everything in §12. `usersh` stays the login leaf until Part F proves
 `nxsh` in-guest; switching `session-mgr` over is the last step, not the first.
+
+### Milestone 3.5 — what a child inherits (B3 + `/session/*` + `cd`)
+
+**Sequenced here with the maintainer (2026-07-30), after Part G rather than inside
+Milestone 3.** B3 was nominally Milestone 3 scope ("resolve as it comes up") and never came
+up — nothing needed env. Giving it its own slice beats squeezing it into a part, and by the
+time Part G lands there are *three* filed items that turn out to be the same question asked
+from different directions:
+
+| Filed as | Surfaced in | What it wanted |
+|---|---|---|
+| B3 (env) | design §5a, passim | env vars as namespace-scoped resources |
+| `TODO(session-metadata-server)` | M2 Part E (`whoami`) | mutable `/session/*` behind a server |
+| `TODO(shell-cwd)` | M3 Part F (`cd`) | a position spawned stages agree with |
+
+Each arrived independently, and each is a case of **something a child must inherit,
+addressed by a namespace path**. Solved separately they would produce three mechanisms and
+three migrations — which is precisely what `TODO(session-metadata-server)` was filed to
+prevent.
+
+#### The split this slice must respect
+
+They are not all one mechanism, and assuming they are is the way to get this wrong.
+
+- **env and `/session/*` are the same thing**: named *values* behind a namespace path,
+  mutable, read by whoever holds the path. One mechanism covers both, and `/session/user`
+  migrates onto it — a migration that touches no client, since a server answers a resolve
+  with `OBJECT_KIND_MEMOBJ` and `lookup + map + read` is byte-identical either way.
+- **`cd` is a *position*, not a value.** The Unix answer — a `PWD` variable programs
+  consult — is ambient state of exactly the kind this system rejects everywhere else. The
+  capability-correct answer is that a spawned stage receives a **namespace** rooted or
+  biased at the position, which is a spawn-contract change rather than a value-passing one.
+
+So the expected output is **one value mechanism and one namespace decision**, not one
+mechanism for three problems.
+
+#### The question to decide explicitly, not by accident
+
+Does `cd` change *the shell's* namespace only, or does the position ride the spawn contract
+to every stage?
+
+The first is easy and half-useful: the shell's own `open ./x` would follow the position and
+a spawned `list .` would not, which is the split-brain `TODO(shell-cwd)` describes. The
+second is what makes them agree, and it touches
+[`pipeline-stdio.md`](../spec/pipeline-stdio.md). This is the slice's real design work; the
+env mechanism is the comparatively mechanical half.
+
+#### Unblocks
+
+`nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken — a
+shell without `cd` is not a better login shell than the throwaway it would replace.
 
 ### Deferred — the rich REPL (§11) and its dependencies
 

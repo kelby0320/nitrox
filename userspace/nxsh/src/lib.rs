@@ -25,6 +25,7 @@ pub mod host;
 pub mod lex;
 pub mod ops;
 pub mod parse;
+pub mod regex;
 pub mod repl;
 pub mod value;
 
