@@ -97,7 +97,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let mut done: Vec<Touched> = Vec::new();
 
     for operand in &args.operands {
-        let path = operand.as_bytes();
+        let resolved = stage.path(operand.as_bytes());
+        let path = resolved.as_slice();
         if path.is_empty() {
             stage.die(b"touch: empty path\n", EXIT_USAGE);
         }

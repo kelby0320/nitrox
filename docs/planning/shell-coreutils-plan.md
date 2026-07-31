@@ -837,20 +837,33 @@ message, which keeps it host-testable and gives every sender the same refusal.
 deliberately has no dependencies; a `const` assertion under the `io` feature makes drift
 from `IPC_PAYLOAD_SIZE` a compile error.
 
-#### Part B — relative paths resolve
+#### Part B — relative paths resolve ✅ (2026-07-31)
 
-- [ ] `coreutils::fs::resolve(cwd, path) -> String`: absolute passes through; relative
+- [x] `coreutils::fs::resolve(cwd, path) -> String`: absolute passes through; relative
       joins; `.` drops; `..` pops lexically.
-- [ ] `..` above the root is an **error**, not a silent clamp to `/` — a path that escapes
+- [x] `..` above the root is an **error**, not a silent clamp to `/` — a path that escapes
       is a mistake worth hearing about, and clamping would let `../../..` mean `/`.
-- [ ] Route the existing helpers through it (`lookup_wait`, `Dir::open`, `create_file`,
+- [x] Route the existing helpers through it (`lookup_wait`, `Dir::open`, `create_file`,
       `rename`), so the convention has one enforcement point rather than per-program
       discipline.
-- [ ] Host tests: absolute, `./x`, `../x`, `a/../b`, escape-above-root, and a path that is
+- [x] Host tests: absolute, `./x`, `../x`, `a/../b`, escape-above-root, and a path that is
       exactly `.`.
 
-*Deliverable: `open ./data.csv` resolves — closing the gap where design §4 and §7 use
-relative paths that do not work in guest.*
+*Deliverable adjusted, honestly.* The mechanism is in and fully host-tested, but nothing
+sets `PWD` until Part D — so `open ./data.csv` cannot yet *succeed* in guest, and claiming
+otherwise would be claiming a test that does not exist. What Part B asserts in guest is the
+other half: a relative path with no working directory **fails loud** with a usage error
+rather than being resolved against an arbitrary root, because guessing `/` would make
+`remove ./x` delete something in a directory the caller never named.
+
+Two placements worth carrying forward. The resolver lives in **`librsproto::path`**, not
+`coreutils::fs` — `nxsh` needs it too and does not depend on `coreutils`, and `librsproto`
+is the one crate both already share. It is **buffer-based** because `librsproto` is
+`core`-only with no `alloc`; that constraint turned out to suit the problem, since
+resolution is a fold and `..` is a truncation, so it needs no component stack at all.
+Resolution happens **once, where a path enters from `argv`** (`Stage::path`), not threaded
+through every filesystem helper — one place per program, which is also the right place to
+report a bad path.
 
 #### Part C — `nxsh`: `$env`, `cd`, and passing it down
 

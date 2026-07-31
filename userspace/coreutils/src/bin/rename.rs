@@ -74,7 +74,9 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"rename: need exactly OLD and NEW (try --help)\n", EXIT_USAGE);
     }
 
-    let from = args.operands[0].as_bytes();
+    // Resolved at the boundary: this is where a user-typed path enters (M3.5 Part B).
+    let from_owned = stage.path(args.operands[0].as_bytes());
+    let from = from_owned.as_slice();
     let to = args.operands[1].as_bytes();
     if from == to {
         stage.die(b"rename: source and destination are the same name\n", EXIT_USAGE);

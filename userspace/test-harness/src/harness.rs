@@ -2095,7 +2095,19 @@ fn mkdir_remove_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: remove --recursive left the tree behind\n");
     }
 
-    kprint(b"test-harness: mkdir/remove ok (created, refused, forced, recursed, binding safe)\n");
+    // --- 7. a relative path with no working directory fails loud -------------
+    // Milestone 3.5 Part B. Nothing sets `PWD` until Part D, so a coreutil here has no
+    // working directory — and a relative path must say so rather than be resolved against
+    // an arbitrary root. Guessing `/` would make `remove ./x` delete something in a
+    // directory the caller never named.
+    //
+    // The assertion is the *specific* status — `EXIT_USAGE` (2), not a crash and not a
+    // success. "Non-zero" would pass on a segfault.
+    if run_coreutil(root_ns, notif, MK, &["mkdir", "relative-name"]) != 2 {
+        return_fail(b"test-harness: a relative path without PWD did not fail as a usage error\n");
+    }
+
+    kprint(b"test-harness: mkdir/remove ok (created, refused, forced, recursed, binding safe, relative refused)\n");
 }
 
 /// **Milestone 2 Part B — `rename` and `move`.**

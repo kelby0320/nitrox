@@ -94,7 +94,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let parents = args.has("parents");
     let mut made: Vec<Made> = Vec::new();
     for operand in &args.operands {
-        let path = trim_trailing_slashes(operand.as_bytes());
+        let resolved = stage.path(operand.as_bytes());
+        let path = trim_trailing_slashes(&resolved);
         if path.is_empty() {
             stage.die(b"mkdir: empty path\n", EXIT_USAGE);
         }
