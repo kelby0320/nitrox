@@ -12,12 +12,32 @@ service-mgr) and the building-block endpoints it composes sessions from — the 
 forwarding endpoint, the profile-server forwarding endpoint, and a channel to auth-service.
 See `docs/architecture/session-and-auth.md`.
 
-**Part D (current):** the plumbing — receive the handed-over endpoints, authenticate
-the demo user over the auth channel, and construct the session namespace binding
-`/home` as a subtree of the fs-server (proving `BIND_NAMESPACE` + subtree scoping +
-shared-registration bind-mount). session-mgr fires the self-test boot verdict.
-**Part E:** replace the hardcoded round-trip with an interactive `login:` prompt and
-spawn the user shell into the constructed namespace.
+## The session loop
+
+It is a real loop as of 2026-07-31: prompt, authenticate, build the namespace, run the
+shell, **tear the session down, prompt again**. It was a single pass before, so typing
+`exit` parked the supervisor forever and left a machine with no prompt and no way back
+short of a reboot.
+
+Three things the loop has to get right, all of which only matter once it *is* a loop:
+
+- **Close the session namespace after the shell is reaped.** That drops the last reference
+  and with it every binding — `/home`, `/bin`, the `/session/user` snapshot. Leaking one
+  per logout is invisible while there is exactly one login per boot.
+- **The long-lived endpoints are not per-session.** The fs, profile and auth endpoints are
+  received once at startup and must survive every session; only the namespace is per-login.
+- **One verdict per boot.** Under `test-harness` the loop must not reach a second
+  iteration — the verdict fires and the run ends there.
+
+A denied login **re-prompts** rather than locking out: a serial console has no second way
+in, so a lockout bricks the machine. The pause before re-prompting is what keeps repeated
+failure from being a free brute-force oracle.
+
+**Never spin to wait.** `idle` parks on the notification channel and the panic path sleeps
+in long hops. A `pause` loop here does not merely waste a CPU — a run queue that is never
+empty starves the idle thread, which is where deferred handle reclamation runs, so a
+spinning supervisor stops *every* exited process on the system from being reclaimed. That
+is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystems away.
 
 ## Discipline (init/supervisor family)
 
