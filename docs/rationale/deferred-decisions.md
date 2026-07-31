@@ -387,33 +387,6 @@ but it is a grammar change and belongs with a considered pass over §9c rather t
 side effect of Part E.
 
 
-**No regression cover for reclamation starvation — `TODO(idle-starvation-test)`.**
-The 2026-07-31 `logging-service` spin is fixed, but nothing would catch its return. The
-failure chain is long — a busy-looping service keeps the run queue non-empty → the idle
-thread never runs → `reap_pending` never runs → no exited process is reclaimed → a dead
-stage's pipe never closes → an unrelated reader hangs — and every link is invisible to the
-existing suite.
-
-An attempt was made and **thrown away rather than kept**: a harness demo that opened a log
-source, closed it, and asserted the scheduler went quiet over a sleeping second. It passed
-with the bug deliberately reinstated, so it tested nothing. Explicitly closing a client's
-write end does not reproduce what a *process exit* does, and the difference is not yet
-understood — that is the thing to work out first, not to paper over. A control that passes
-is a bug in the control; keeping it would have been worse than having none.
-
-Two candidate shapes, neither built:
-- **Switch-rate probe.** The right assertion (a quiet system costs ~3 switches/second; a
-  spinning one is preempted every tick) but it needs a trigger that genuinely reproduces a
-  source dying by process exit.
-- **Idle-reachability assertion.** More direct: assert `reap_pending` runs within a bounded
-  interval on a quiet system. Needs a counter the guest can read — `/proc/sched/stats` has
-  no such field today.
-
-The deeper issue the fix does *not* address: deferred reclamation has exactly one home on a
-quiet system, and any busy userspace process disables it. That is a fragile contract
-independent of this bug. Trigger: the next time a service is found spinning, or before
-anything ships that can legitimately keep a CPU busy.
-
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
 `service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,
@@ -804,6 +777,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| No regression cover for reclamation starvation (`idle-starvation-test`) | 2026-07-31 | Built, after the first attempt was thrown away for passing with the bug reinstated. The failed version asserted a low **switch rate**; a lone spinner is preempted back to itself, which barely moves that counter. The working version asserts **occupancy** — `/proc/sched/stats` reports `idle=` per CPU, and a spin permanently costs one. Sampled ten times across a second, taking the best sample (one busy instant is not a spin), and compared against `cpus_online - 1` because the sampling thread's own CPU never reads idle. Verified both ways: 3 of 4 CPUs idle with the fix on three consecutive runs, 2 of 4 and a failed run with the fix disabled. |
 | A login session can see no programs (`session-program-namespace`) | 2026-07-31 | Both halves, because either alone is inert. The store gained a `coreutils` package (the ten coreutils plus `nxsh`) and the system profile a second `[[package]]` — before that `/bin` was bound and projected exactly `heartbeat`. Then init retains the profile server's endpoint and hands it down to session-mgr, which binds it at `/bin` in each session namespace, sharing init's registration exactly as `/home` shares the fs-server's. Binding `/initramfs/sbin` was the quick alternative and was refused: it hands a session the boot image instead of a profile. Handing a *second* endpoint down needed a channel — only `handles[0]` reaches a child — so service-mgr's `rdx` is now a handoff channel rather than one endpoint. |
 | `nxsh` could not parse `list /` | 2026-07-31 | Found by typing it at a real prompt, one command after the `/bin` bind made programs reachable. A lone `/` after a command head was read as division; `/system` was never affected because it lexes as a single path word, which is why every test passed. A lone `Slash` in argument position means the next thing is whitespace or a closer, so there is no right operand and division is impossible — the root path is the only reading left. |
 | Cross-mount `move` of a directory, and the missing second mount (`cross-mount-move`) | 2026-07-30 | The blocker was the fixture, not the feature: with one writable mount, no cross-mount move could be exercised end to end at all, so the recursive case was refused rather than written blind. Binding the one fs-server a second time with base `/scratch` gives a destination the kernel classifies as another mount while staying writable — the kernel's rename test is `same server && same subtree base`. The recursive case then landed on shared `fs::copy_tree`/`fs::remove_tree` walks, hoisted out of `copy` and `remove` so there is one of each rather than three. |

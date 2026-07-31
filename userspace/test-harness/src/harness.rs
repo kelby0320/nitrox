@@ -3094,6 +3094,121 @@ fn bin_projection_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: bin-projection ok (11 programs via the store, unknown names still miss)\n");
 }
 
+/// **A log source whose writer is gone must be retired, not waited on forever.**
+///
+/// The bug this pins down looked nothing like logging. `logging-service` multi-waits on its
+/// serving endpoint plus every per-principal source channel. A channel whose peer has
+/// closed is *permanently* `signaled`, so once a principal exited, `sys_wait` returned
+/// instantly on that handle, every time — the service spun at 100% of a CPU.
+///
+/// The spin was not the damage. Deferred handle reclamation (`reap_pending` →
+/// `close_all_owned_by`) has exactly one home on an otherwise-quiet system: the **idle
+/// thread**. A run queue that is never empty means the CPU never idles, so *no exited
+/// process is ever reclaimed* and every pipe they held stays open. The visible symptom was
+/// three subsystems away — `list /bin` at the shell prompt hung forever, because a dead
+/// stage's stdout pipe never closed and its reader never saw `PeerClosed`.
+///
+/// **The assertion is "a CPU goes idle", not "switches stay low".** A switch-rate probe was
+/// written first and *passed with the bug reinstated*: a lone spinner is preempted back to
+/// itself, which barely moves the counter. Occupancy is what a spin actually costs, and
+/// `/proc/sched/stats` reports it per CPU.
+fn dead_log_source_demo(root_ns: u64) {
+    kprint(b"test-harness: dead-log-source demo (a closed source must be retired)\n");
+
+    // 1. Register a source and close the write end — what a principal that logs and then
+    //    exits leaves behind. The sleep matters: a source the service has not yet
+    //    registered cannot be one it fails to retire.
+    let (st, h) = ns_lookup_wait(root_ns, b"/log/system/nx-probe", RIGHT_SEND | RIGHT_TRANSFER);
+    if st != 0 || h == 0 {
+        return_fail(b"test-harness: could not open a log source\n");
+    }
+    timer_sleep_ms(200);
+    // SAFETY: closing our own write end; the service holds the read end.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+
+    // 2. Sample occupancy across a second. This thread is running while it samples, so its
+    //    own CPU never reads idle — hence `online - 1` rather than `online`. Take the best
+    //    sample rather than any single one: a healthy system may momentarily have another
+    //    service awake, and one busy instant is not a spin.
+    let online = cpus_online(root_ns);
+    if online < 2 {
+        kprint(b"test-harness: dead-log-source skipped (needs >= 2 CPUs)\n");
+        return;
+    }
+    let mut best = 0u64;
+    for _ in 0..10 {
+        timer_sleep_ms(100);
+        let idle = idle_cpus(root_ns);
+        if idle > best {
+            best = idle;
+        }
+    }
+    if best + 1 < online {
+        kprint(b"test-harness: only ");
+        kprint_u64(best);
+        kprint(b" of ");
+        kprint_u64(online);
+        kprint(b" CPUs ever went idle\n");
+        return_fail(b"test-harness: a closed log source left a CPU spinning\n");
+    }
+    kprint(b"test-harness: dead-log-source ok (");
+    kprint_u64(best);
+    kprint(b" of ");
+    kprint_u64(online);
+    kprint(b" CPUs idle -- the service let go)\n");
+}
+
+/// Read `/proc/sched/stats` into `f` as text. `false` if it could not be read.
+fn with_sched_stats(root_ns: u64, f: &mut dyn FnMut(&[u8])) -> bool {
+    let (st, mem) = ns_lookup_wait(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        return false;
+    }
+    // SAFETY: `mem` is a MemoryObject handle carrying MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return false;
+    }
+    // SAFETY: `addr` is a MAP_READ page holding the stats text, zero-padded.
+    let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
+    f(text);
+    // SAFETY: unmapping the page we mapped (`text` is dead here) + closing our handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
+    true
+}
+
+/// How many CPUs currently report `idle=1`.
+fn idle_cpus(root_ns: u64) -> u64 {
+    let mut n = 0;
+    with_sched_stats(root_ns, &mut |text| {
+        for line in text.split(|&b| b == b'\n') {
+            if line.starts_with(b"cpu=") && parse_field(line, b"idle=") == Some(1) {
+                n += 1;
+            }
+        }
+    });
+    n
+}
+
+/// How many CPUs are online, per the stats header.
+fn cpus_online(root_ns: u64) -> u64 {
+    let mut n = 0;
+    with_sched_stats(root_ns, &mut |text| {
+        for line in text.split(|&b| b == b'\n') {
+            if let Some(v) = parse_field(line, b"cpus_online=") {
+                n = v;
+                return;
+            }
+        }
+    });
+    n
+}
+
 /// Is `needle` a subsequence of contiguous bytes in `hay`? The listing arrives as a TSM1
 /// stream; a name appears in it verbatim, which is enough to assert on without decoding.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -4387,6 +4502,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5f. The coreutils are reachable through the profile, not only the initramfs —
     //       the thing that makes a session namespace able to run anything at all.
     bin_projection_demo(root_ns, notif);
+
+    // 0a5g. A log source whose writer exited must be retired — otherwise the service
+    //       spins, the CPU never idles, and nothing on the system is ever reclaimed.
+    dead_log_source_demo(root_ns);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

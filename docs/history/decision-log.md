@@ -9772,3 +9772,30 @@ in the control; this is the fifth time that rule has earned its place in this pr
 **The standing fragility this exposes, and does not fix:** reclamation depends on some CPU
 reaching idle. Any process legitimately busy-looping disables reclamation system-wide. The
 fix removes today's spinner; it does not make the contract sound.
+
+## 2026-07-31 — The regression test for the spin: occupancy, not switch rate
+
+`TODO(idle-starvation-test)`, closed the same day it was filed. The first attempt was kept
+out of the tree for passing with the bug reinstated; this records why the second works, so
+the distinction survives.
+
+**The failed version asserted a low switch rate** over a sleeping second. It reported 2–3
+switches whether or not `logging-service` was spinning. The reason is worth remembering: a
+spinning service that is the *only* runnable thread on its CPU is preempted back to itself,
+so the counter barely moves. Switch rate measures contention, and a lone spinner has none.
+
+**The working version asserts occupancy.** A spin costs a CPU — permanently — and
+`/proc/sched/stats` already reports `idle=` per CPU. The check samples ten times across a
+second and takes the *best* sample, because one busy instant on a healthy system is not a
+spin; and it compares against `cpus_online - 1`, because the sampling thread is itself
+running and its own CPU never reads idle.
+
+Verified in both directions, which is the only thing that made either version trustworthy:
+3 of 4 CPUs idle with the fix, on three consecutive runs; 2 of 4 and a failed run with the
+fix disabled.
+
+**The trigger needed care too.** The probe opens a log source and closes the write end, but
+only after a 200 ms sleep: a source the service has not yet registered cannot be one it
+fails to retire, and an earlier version closed too early and tested nothing. That the
+service really does see the death was confirmed directly (a temporary print in the retire
+path) before trusting the timing.
