@@ -304,6 +304,14 @@ impl Host for NitroxHost {
     }
 
     fn exists(&mut self, path: &str) -> bool {
+        // The root of a namespace exists by construction — it is what bindings hang off,
+        // and `list /` enumerates it. Neither probe below can see that: nothing is bound
+        // *at* `/`, so the lookup misses, and no single server owns it, so `Dir::open`
+        // misses too. Without this, `cd /` and `cd ..` out of `/home` both reported that
+        // the root does not exist.
+        if path == "/" {
+            return true;
+        }
         match lookup(self.namespace, path.as_bytes()) {
             Some(h) => {
                 // SAFETY: closing a handle just installed into our table.
@@ -634,20 +642,16 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
                         continue;
                     }
                     // `exit` is a shell-state builtin (§3): it must change *this* process,
-                    // which an external program structurally cannot do.
+                    // which an external program structurally cannot do — and it must end
+                    // *this loop*, which is the one thing `run_line` cannot do for it.
+                    //
+                    // **It is the only line this loop may intercept.** A `cd` guard sat
+                    // here too, left from before `cd` existed, and went on refusing a
+                    // builtin the interpreter had implemented — the script path called
+                    // `run_line` and worked, the interactive path never reached it. Every
+                    // other line goes to `run_line` unread.
                     if src.trim() == "exit" {
                         return EXIT_OK;
-                    }
-                    // `cd` is deliberately absent, not forgotten: a shell-side cwd would
-                    // apply to the shell's own lookups and silently not to the programs it
-                    // spawns, since each resolves its own `argv` in its own namespace. See
-                    // `TODO(shell-cwd)`.
-                    if src.trim() == "cd" || src.trim().starts_with("cd ") {
-                        kprint_crlf(
-                            "nxsh: `cd` is not implemented — a shell-side position would                              not apply to spawned programs, which resolve paths in their                              own namespace. See TODO(shell-cwd).\n",
-                        );
-                        kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
-                        continue;
                     }
                     match interp.run_line(&src) {
                         Ok(Some(text)) => kprint_crlf(&text),

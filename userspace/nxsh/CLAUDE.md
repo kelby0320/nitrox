@@ -53,6 +53,14 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
   decides, because only the operator knows.
 - **A builtin's argument is a path, not an expression.** `cd ..` and `cd /system` both
   choke in expression mode, where `..` is a range and `/system` a division.
+- **The interactive loop in `main.rs` may intercept exactly one line: `exit`.** It must end
+  the loop, which `run_line` cannot do. A `cd` guard sat beside it, left from before `cd`
+  existed, and went on refusing a builtin the interpreter had implemented — for weeks,
+  because the script path calls `run_line` and the interactive path never got there. Any
+  new special case here is a second implementation of the language.
+- **`Host::exists("/")` is true by construction.** A namespace root has nothing bound *at*
+  it and no server owning it, so both of `exists`'s probes miss — yet `list /` enumerates
+  it. `cd /` and `cd ..` out of `/home` were both refused until this was special-cased.
 - **The shell does not rewrite a spawned stage's paths.** It passes `argv` through as
   written and hands over the same `PWD`, so both sides resolve identically. Pre-resolving
   would reintroduce the split-brain the environment design exists to prevent.
