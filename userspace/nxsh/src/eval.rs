@@ -86,6 +86,12 @@ pub struct Interp {
     /// a handful of names and linear scan beats hashing at that size — and it keeps
     /// shadowing order explicit.
     scopes: Vec<Vec<(String, Slot)>>,
+    /// The environment: a TSM1 `Record`, handed to every stage this shell spawns.
+    ///
+    /// Also bound as `$env`, so it is an ordinary value — `display $env`, `$env.PWD` and
+    /// `env.EDITOR = "vi"` need no machinery beyond field access and the operators that
+    /// already exist (§6: `Value` is exactly what TSM1 can represent).
+    env: Record,
     /// Hoisted `def` bindings, visible from inside any call.
     ///
     /// §5a says a named function does not capture its enclosing scope — its parameter
@@ -116,11 +122,67 @@ impl Interp {
     pub fn with_host(host: alloc::boxed::Box<dyn Host>, mode: Mode) -> Interp {
         Interp {
             scopes: alloc::vec![Vec::new()],
+            env: Record::default(),
             functions: Vec::new(),
             host,
             mode,
             strict: false,
         }
+    }
+
+    /// Install the environment this shell was started with, and bind `$env`.
+    pub fn set_env(&mut self, env: Record) {
+        self.env = env;
+        self.rebind_env();
+    }
+
+    /// The working directory, from the environment's conventional `PWD` entry.
+    ///
+    /// A *conventional* entry rather than a distinct field (Milestone 3.5): Unix has two
+    /// sources of truth for this — `$PWD` and `getcwd()` — and the interesting bugs live
+    /// in the gap. There is no kernel cwd here, so this is the truth and has nothing to
+    /// disagree with.
+    pub fn cwd(&self) -> Option<&str> {
+        let i = self.env.schema.fields.iter().position(|f| f.name == "PWD")?;
+        self.env.values.get(i)?.as_str()
+    }
+
+    /// Resolve a path the *shell itself* will use, against `PWD`.
+    ///
+    /// Only for the shell's own lookups — `open`, `save`, a script path. A spawned stage's
+    /// arguments are passed through as written; see [`Host::run`].
+    fn resolve_path(&self, path: &str) -> Result<alloc::string::String> {
+        let mut buf = [0u8; 1024];
+        let out = librsproto::path::resolve(
+            self.cwd().map(str::as_bytes),
+            path.as_bytes(),
+            &mut buf,
+        )
+        .map_err(|e| EvalError::new(alloc::format!("`{path}`: {}", e.message())))?;
+        Ok(alloc::string::String::from_utf8_lossy(out).into_owned())
+    }
+
+    /// Re-publish `$env` after a change, so the binding and the record never disagree.
+    fn rebind_env(&mut self) {
+        let v = Val::Data(Value::Record(Arc::new(self.env.clone())));
+        if let Some(slot) = self.lookup_mut("$env") {
+            slot.val = v;
+            return;
+        }
+        let _ = self.bind("$env", v, true, false);
+    }
+
+    /// Set a conventional environment entry, replacing it if present.
+    fn set_env_entry(&mut self, name: &str, value: Value) {
+        match self.env.schema.fields.iter().position(|f| f.name == name) {
+            Some(i) => self.env.values[i] = value,
+            None => {
+                let tag = value.type_tag().unwrap_or(libstream::wire::TypeTag::Null);
+                self.env.schema = self.env.schema.clone().field(name, tag, TypeModifiers::NONE);
+                self.env.values.push(value);
+            }
+        }
+        self.rebind_env();
     }
 
     /// The host, for a driver that needs to flush or inspect it after a run.
@@ -679,6 +741,9 @@ impl Interp {
                 if c.kind == CallKind::Def {
                     return self.call_def(c, None);
                 }
+                if c.kind == CallKind::Builtin {
+                    return self.apply_builtin(c);
+                }
                 Err(unavailable(c))
             }
         }
@@ -1132,6 +1197,57 @@ impl Interp {
         }
     }
 
+    /// §3's shell-state builtins: they mutate *this* process, which an external program
+    /// structurally cannot do.
+    fn apply_builtin(&mut self, c: &Call) -> Result<Val> {
+        match c.name.as_str() {
+            "cd" => {
+                let target = match c.args.first() {
+                    Some(Arg::Positional(e)) => match e {
+                        // A bare path argument, unevaluated — `cd /system`, `cd ..`.
+                        Expr::Word(w) | Expr::Str(w) | Expr::Ident(w) => w.clone(),
+                        other => self.eval(other)?.render(),
+                    },
+                    // `cd` with no argument goes home, and says so if there is no home
+                    // rather than silently doing nothing.
+                    None => match self.env_str("HOME") {
+                        Some(h) => h,
+                        None => {
+                            return Err(EvalError::new(
+                                "`cd` with no argument goes to HOME, and HOME is not set",
+                            ));
+                        }
+                    },
+                    Some(_) => return Err(EvalError::new("`cd` takes one path")),
+                };
+                let resolved = self.resolve_path(&target)?;
+                // **Resolve first, set second.** The invariant is "PWD named something
+                // real when you went there", not "PWD is whatever you typed" — otherwise
+                // every later relative path fails somewhere far from the mistake.
+                if !self.path_exists(&resolved) {
+                    return Err(EvalError::new(alloc::format!(
+                        "`{resolved}` does not exist, so PWD was left alone"
+                    )));
+                }
+                self.set_env_entry("PWD", Value::Str(resolved));
+                Ok(Val::NULL)
+            }
+            // `exit` is handled by the driver, which owns the process.
+            "exit" => Err(EvalError::new("`exit` is handled by the shell's driver")),
+            _ => Err(unavailable(c)),
+        }
+    }
+
+    fn env_str(&self, name: &str) -> Option<alloc::string::String> {
+        let i = self.env.schema.fields.iter().position(|f| f.name == name)?;
+        self.env.values.get(i)?.as_str().map(alloc::string::String::from)
+    }
+
+    /// Whether `path` resolves — used by `cd` before it commits.
+    fn path_exists(&mut self, path: &str) -> bool {
+        self.host.exists(path)
+    }
+
     /// Apply a generic operator to the value arriving on its left.
     ///
     /// `operand` is `None` when the operator was written outside a pipeline. Most need
@@ -1307,6 +1423,7 @@ impl Interp {
                 let Some(path) = field_names.first().cloned() else {
                     return Err(EvalError::new("`save` needs a path"));
                 };
+                let path = self.resolve_path(&path)?;
                 let bytes = ops::encode_for(&path, &v).map_err(EvalError::new)?;
                 self.host.write_file(&path, &bytes).map_err(EvalError::new)?;
                 Ok(Val::NULL)
@@ -1320,8 +1437,9 @@ impl Interp {
                 // `cat` rather than adding a second near-identical verb.
                 let mut acc: Option<Val> = None;
                 for path in &paths {
-                    let bytes = self.host.read_file(path).map_err(EvalError::new)?;
-                    let v = ops::decode_from(path, &bytes).map_err(EvalError::new)?;
+                    let path = self.resolve_path(path)?;
+                    let bytes = self.host.read_file(&path).map_err(EvalError::new)?;
+                    let v = ops::decode_from(&path, &bytes).map_err(EvalError::new)?;
                     acc = Some(match acc {
                         None => v,
                         Some(prev) => ops::concat(prev, v).map_err(EvalError::new)?,
@@ -1382,7 +1500,7 @@ impl Interp {
                 let strict = self.strict;
                 let outcome = self
                     .host
-                    .run(&run, input.as_deref(), strict)
+                    .run(&run, input.as_deref(), strict, &self.env)
                     .map_err(EvalError::new)?;
                 carried = decode_output(&outcome)?;
                 statuses.extend(outcome.stages.iter().cloned());
@@ -2615,12 +2733,14 @@ x"), "5");
     /// B5: `save` then `open` round-trips through the host.
     #[test]
     fn save_and_open_round_trip() {
+        // These use relative paths, so they need a working directory — which is the
+        // behaviour Part C introduced, not a change of intent.
         let host = MockHost::new().with_program("src", Some(stream("n", &[7, 8])));
-        let (r, _log) = run_with(host, "src | save ./out.tsm");
+        let (r, _log) = run_env(host, env_with(&[("PWD", "/tmp")]), "src | save ./out.tsm");
         r.expect("saves");
 
-        let host = MockHost::new().with_file("./notes.txt", "alpha\nbeta\n");
-        let (r, _log) = run_with(host, "open ./notes.txt | count");
+        let host = MockHost::new().with_file("/tmp/notes.txt", "alpha\nbeta\n");
+        let (r, _log) = run_env(host, env_with(&[("PWD", "/tmp")]), "open ./notes.txt | count");
         assert_eq!(r.expect("opens").render(), "2");
     }
 
@@ -2628,9 +2748,9 @@ x"), "5");
     #[test]
     fn open_concatenates_several_paths() {
         let host = MockHost::new()
-            .with_file("./a.txt", "one\n")
-            .with_file("./b.txt", "two\nthree\n");
-        let (r, _log) = run_with(host, "open ./a.txt ./b.txt | count");
+            .with_file("/tmp/a.txt", "one\n")
+            .with_file("/tmp/b.txt", "two\nthree\n");
+        let (r, _log) = run_env(host, env_with(&[("PWD", "/tmp")]), "open ./a.txt ./b.txt | count");
         assert_eq!(r.expect("opens").render(), "3");
     }
 
@@ -2821,6 +2941,119 @@ x"), "5");
     fn a_malformed_pattern_is_a_loud_error() {
         assert!(err("\"x\" ~= /(a/").contains("unclosed"));
         assert!(err("\"x\" ~= /a{2}/").contains("counted repetition"));
+    }
+
+
+    // --- environment and `cd` (Milestone 3.5 Part C) ------------------------
+
+    fn env_with(pairs: &[(&str, &str)]) -> libstream::wire::Record {
+        let mut schema = Schema::new();
+        let mut values = Vec::new();
+        for (k, v) in pairs {
+            schema = schema.field(k, libstream::wire::TypeTag::String, TypeModifiers::NONE);
+            values.push(Value::Str(alloc::string::String::from(*v)));
+        }
+        Record { schema, values }
+    }
+
+    fn run_env(
+        host: MockHost,
+        env: libstream::wire::Record,
+        src: &str,
+    ) -> (
+        core::result::Result<Val, EvalError>,
+        alloc::rc::Rc<core::cell::RefCell<crate::host::MockLog>>,
+    ) {
+        let log = host.log();
+        let script = crate::parse_script(src).expect("parses");
+        let mut interp = Interp::with_host(Box::new(host), Mode::Script);
+        interp.set_env(env);
+        let r = interp.run(&script);
+        (r, log)
+    }
+
+    /// §6 makes `Value` exactly what TSM1 can represent, so the environment is an
+    /// ordinary value: field access and assignment already work, with no new machinery.
+    #[test]
+    fn the_environment_is_an_ordinary_value() {
+        let (r, _l) = run_env(MockHost::new(), env_with(&[("PWD", "/home/alice")]), "$env.PWD");
+        assert_eq!(r.expect("reads").render(), "/home/alice");
+    }
+
+    /// **The property this whole slice exists for.** The shell passes a stage's arguments
+    /// through *as written* and hands it the same `PWD`, so both sides resolve a relative
+    /// path identically. Pre-resolving in the shell would put the shell's reading into a
+    /// program that might read it differently.
+    #[test]
+    fn a_spawned_stage_receives_the_environment_and_unrewritten_arguments() {
+        let host = MockHost::new().with_program("list", None);
+        let (r, log) = run_env(host, env_with(&[("PWD", "/system")]), "list .");
+        r.expect("runs");
+        let log = log.borrow();
+        assert_eq!(log.runs[0][0].argv, alloc::vec!["list", "."], "argv passed through");
+        let env = &log.envs[0];
+        let i = env.schema.fields.iter().position(|f| f.name == "PWD").expect("PWD");
+        assert_eq!(env.values[i].as_str(), Some("/system"), "same PWD handed over");
+    }
+
+    /// `cd` resolves **first** and sets `PWD` only if the path is real, so the invariant
+    /// is "PWD named something that existed" rather than "PWD is what you typed".
+    #[test]
+    fn cd_commits_only_to_a_path_that_exists() {
+        let host = MockHost::new().with_dir("/system");
+        let (r, _l) = run_env(host, env_with(&[("PWD", "/")]), "cd /system\n$env.PWD");
+        assert_eq!(r.expect("cd works").render(), "/system");
+
+        let host = MockHost::new().with_dir("/system");
+        let (r, _l) = run_env(host, env_with(&[("PWD", "/")]), "cd /nope");
+        let e = r.expect_err("a missing directory is refused");
+        assert!(e.message.contains("does not exist"), "{}", e.message);
+        assert!(e.message.contains("PWD was left alone"), "{}", e.message);
+    }
+
+    /// …and a relative `cd` resolves against the current `PWD`, `..` included.
+    #[test]
+    fn cd_accepts_a_relative_path() {
+        let host = MockHost::new().with_dir("/home");
+        let (r, _l) = run_env(host, env_with(&[("PWD", "/home/alice")]), "cd ..\n$env.PWD");
+        assert_eq!(r.expect("cd ..").render(), "/home");
+    }
+
+    /// `cd` with no argument goes to `HOME`, and says so when there is none rather than
+    /// silently doing nothing.
+    #[test]
+    fn bare_cd_goes_home_or_explains() {
+        let host = MockHost::new().with_dir("/home/alice");
+        let (r, _l) = run_env(
+            host,
+            env_with(&[("PWD", "/"), ("HOME", "/home/alice")]),
+            "cd\n$env.PWD",
+        );
+        assert_eq!(r.expect("cd home").render(), "/home/alice");
+
+        let (r, _l) = run_env(MockHost::new(), env_with(&[("PWD", "/")]), "cd");
+        assert!(r.expect_err("no HOME").message.contains("HOME is not set"));
+    }
+
+    /// The shell's *own* lookups resolve against `PWD` — which is what closes the gap
+    /// where design §4 and §7 write `open ./data.csv`.
+    #[test]
+    fn the_shell_resolves_its_own_relative_paths() {
+        let host = MockHost::new().with_file("/home/alice/notes.txt", "one\ntwo\n");
+        let (r, _l) = run_env(
+            host,
+            env_with(&[("PWD", "/home/alice")]),
+            "open ./notes.txt | count",
+        );
+        assert_eq!(r.expect("opens").render(), "2");
+    }
+
+    /// With no `PWD`, a relative path fails rather than being resolved against `/`.
+    #[test]
+    fn without_a_pwd_a_relative_path_is_refused() {
+        let host = MockHost::new().with_file("/notes.txt", "x\n");
+        let (r, _l) = run_env(host, Record::default(), "open ./notes.txt");
+        assert!(r.expect_err("no PWD").message.contains("no working directory"));
     }
 
     #[test]

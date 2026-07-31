@@ -888,10 +888,27 @@ impl<'a> Parser<'a> {
 
         let is_operator = at_head && !forced_external && OPERATORS.contains(&name.as_str());
         let is_builtin = at_head && !forced_external && BUILTINS.contains(&name.as_str());
-        if is_operator || is_builtin {
-            let kind = if is_operator { CallKind::Operator } else { CallKind::Builtin };
+        if is_builtin {
+            // A builtin takes a **path**, not an expression: `cd ..` and `cd /system` are
+            // both things `operator_args` would choke on, because `..` is a range operator
+            // and `/system` a division. Word mode is the same reading an external program
+            // gets, which is the right one for a path.
+            let args = self.word_args()?;
+            return Ok(Expr::Call(Box::new(Call {
+                name,
+                kind: CallKind::Builtin,
+                args,
+                forced_external,
+            })));
+        }
+        if is_operator {
             let args = self.operator_args(&name)?;
-            return Ok(Expr::Call(Box::new(Call { name, kind, args, forced_external })));
+            return Ok(Expr::Call(Box::new(Call {
+                name,
+                kind: CallKind::Operator,
+                args,
+                forced_external,
+            })));
         }
 
         // Not a keyword, builtin or operator: either a variable or an external command,
@@ -943,11 +960,13 @@ impl<'a> Parser<'a> {
             {
                 false
             }
-            // Every other infix operator continues an expression.
+            // Every other infix operator continues an expression. The postfix set is
+            // deliberately absent here: pressed against the name they were handled above,
+            // and *separated* by a space they begin an argument — `list .` names the
+            // current directory, and `list [x]` is a path, not an index.
             Tok::Plus | Tok::PlusPlus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Lt
             | Tok::Le | Tok::Gt | Tok::Ge | Tok::EqEq | Tok::Ne | Tok::Match_ | Tok::Eq
-            | Tok::QuestionQuestion | Tok::DotDot | Tok::DotDotEq | Tok::Dot
-            | Tok::LBracket | Tok::LParen | Tok::Question | Tok::QuestionDot => false,
+            | Tok::QuestionQuestion | Tok::DotDot | Tok::DotDotEq => false,
             // The one that needs spacing to disambiguate.
             Tok::Minus => {
                 let flagged = self.lx.peek(Mode::Word)?;

@@ -37,6 +37,7 @@
 
 use alloc::rc::Rc;
 use alloc::string::{String, ToString};
+use libstream::wire::Record;
 use alloc::vec::Vec;
 use core::cell::RefCell;
 
@@ -100,14 +101,29 @@ pub trait Host {
     /// resolve, a pipe that cannot be created). A stage that ran and failed is a
     /// successful `Ok` with a non-zero [`StageStatus`] — the distinction matters, because
     /// only the first is the shell's own fault.
-    fn run(&mut self, stages: &[StageSpec], input: Option<&[u8]>, strict: bool)
-    -> Result<PipelineRun, String>;
+    /// `env` is handed to **every** stage in the chain, unchanged.
+    ///
+    /// The shell does *not* pre-resolve a stage's paths: it passes the arguments as
+    /// written and passes the same `PWD`, so both sides resolve identically. Rewriting
+    /// them here would put the shell's reading of a relative path into a program that
+    /// might read it differently — which is the split-brain this whole slice exists to
+    /// prevent.
+    fn run(
+        &mut self,
+        stages: &[StageSpec],
+        input: Option<&[u8]>,
+        strict: bool,
+        env: &Record,
+    ) -> Result<PipelineRun, String>;
 
     /// Read a file — a script, or `open`'s operand.
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String>;
 
     /// Write a file, for `save`.
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String>;
+
+    /// Whether `path` resolves. Used by `cd` before it commits to a new `PWD`.
+    fn exists(&mut self, path: &str) -> bool;
 
     /// Diagnostics — §1's second error category. Bypasses the pipe entirely and goes to
     /// the shell's own `stderr`, which is why it is a separate method and not something
@@ -131,6 +147,7 @@ impl Host for NullHost {
         _stages: &[StageSpec],
         _input: Option<&[u8]>,
         _strict: bool,
+        _env: &Record,
     ) -> Result<PipelineRun, String> {
         Err(String::from(
             "this interpreter has no host attached, so it cannot run a program",
@@ -143,6 +160,10 @@ impl Host for NullHost {
 
     fn write_file(&mut self, _path: &str, _bytes: &[u8]) -> Result<(), String> {
         Err(String::from("this interpreter has no host attached"))
+    }
+
+    fn exists(&mut self, _path: &str) -> bool {
+        false
     }
 
     fn diag(&mut self, _text: &str) {}
@@ -162,6 +183,8 @@ pub struct MockHost {
     pub crashing: Vec<String>,
     /// Files the mock can read.
     pub files: Vec<(String, Vec<u8>)>,
+    /// Directories the mock reports as existing, for `cd`.
+    pub dirs: Vec<String>,
     /// What the host was asked to do, shared so a test can still read it after the
     /// interpreter has taken ownership of the host.
     log: Rc<RefCell<MockLog>>,
@@ -178,6 +201,8 @@ pub struct MockLog {
     pub diagnostics: Vec<String>,
     /// Everything written to `stdout`.
     pub output: Vec<String>,
+    /// The environment handed to each run.
+    pub envs: Vec<Record>,
 }
 
 impl Default for MockHost {
@@ -192,6 +217,7 @@ impl MockHost {
             programs: Vec::new(),
             crashing: Vec::new(),
             files: Vec::new(),
+            dirs: Vec::new(),
             log: Rc::new(RefCell::new(MockLog::default())),
         }
     }
@@ -224,6 +250,11 @@ impl MockHost {
         self
     }
 
+    pub fn with_dir(mut self, path: &str) -> MockHost {
+        self.dirs.push(String::from(path));
+        self
+    }
+
     fn lookup(&self, name: &str) -> Option<(i32, Option<Vec<u8>>)> {
         self.programs
             .iter()
@@ -238,11 +269,13 @@ impl Host for MockHost {
         stages: &[StageSpec],
         input: Option<&[u8]>,
         strict: bool,
+        env: &Record,
     ) -> Result<PipelineRun, String> {
         {
             let mut log = self.log.borrow_mut();
             log.runs.push(stages.to_vec());
             log.inputs.push(input.map(|b| b.to_vec()));
+            log.envs.push(env.clone());
         }
 
         let mut statuses = Vec::new();
@@ -302,6 +335,10 @@ impl Host for MockHost {
     fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
         self.files.push((String::from(path), bytes.to_vec()));
         Ok(())
+    }
+
+    fn exists(&mut self, path: &str) -> bool {
+        self.files.iter().any(|(p, _)| p == path) || self.dirs.iter().any(|d| d == path)
     }
 
     fn diag(&mut self, text: &str) {

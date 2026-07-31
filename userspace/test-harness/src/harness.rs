@@ -2838,7 +2838,31 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: nxsh regex filter failed\n");
     }
 
-    kprint(b"test-harness: nxsh ok (evaluated, spawned, operators, save/open, def+match+try, repl, regex)\n");
+    // 10. **Milestone 3.5 Part C — the property the slice exists for.**
+    //
+    //     `cd /system`, then a *relative* path used two ways: by the shell itself
+    //     (`open ./nx-c.tsm`) and by a spawned program (`list .`, resolved inside `list`
+    //     against the PWD the shell handed it). They must agree.
+    //
+    //     The shell does not rewrite `list`'s argument — it passes `.` through and passes
+    //     the same PWD. If it pre-resolved, this would still pass while proving nothing
+    //     about the program's own resolution, which is the half that can disagree.
+    let agree = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &[
+            "nxsh",
+            "-c",
+            "cd /system\nlet here = list . | count\nlet root = list /system | count\nif here != root { bad }\nlist /system | take 1 | save ./nx-c.tsm\nif (open ./nx-c.tsm | count) != 1 { bad }",
+        ],
+    );
+    if agree != 0 {
+        return_fail(b"test-harness: nxsh cd/relative-path agreement failed\n");
+    }
+    unlink_all(root_ns, b"/system", &[b"nx-c.tsm"]);
+
+    kprint(b"test-harness: nxsh ok (evaluated, spawned, operators, save/open, def+match+try, repl, regex, cd)\n");
 }
 
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.

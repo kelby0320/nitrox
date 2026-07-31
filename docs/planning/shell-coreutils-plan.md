@@ -865,21 +865,33 @@ Resolution happens **once, where a path enters from `argv`** (`Stage::path`), no
 through every filesystem helper — one place per program, which is also the right place to
 report a bad path.
 
-#### Part C — `nxsh`: `$env`, `cd`, and passing it down
+#### Part C — `nxsh`: `$env`, `cd`, and passing it down ✅ (2026-07-31)
 
-- [ ] Read env from the shell's own setup message at startup; bind it as `$env` (a `mut`
+- [x] Read env from the shell's own setup message at startup; bind it as `$env` (a `mut`
       Record).
-- [ ] `cd PATH` as a shell-state builtin: **resolve first, set `PWD` only if it resolved**
+- [x] `cd PATH` as a shell-state builtin: **resolve first, set `PWD` only if it resolved**
       — so the invariant is "PWD named something real", not "PWD is what you typed".
-- [ ] `cd` with no argument goes to `HOME`, and says so if `HOME` is unset rather than
+- [x] `cd` with no argument goes to `HOME`, and says so if `HOME` is unset rather than
       silently doing nothing.
-- [ ] Pass `$env` in `send_setup` for every spawned stage, so a child inherits *explicitly*
+- [x] Pass `$env` in `send_setup` for every spawned stage, so a child inherits *explicitly*
       what the parent chose to hand it.
-- [ ] The prompt shows `PWD` (§11a already reserves the position).
-- [ ] In-guest demo: `cd /system` then `list .` and `open ./x` **agree** — the split-brain
+- [x] The prompt shows `PWD` (§11a already reserves the position).
+- [x] In-guest demo: `cd /system` then `list .` and `open ./x` **agree** — the split-brain
       the whole design exists to prevent, asserted directly.
 
-*Deliverable: `cd` works, and both sides of a spawn resolve a relative path the same way.*
+*Deliverable met, in guest.* Three findings. **`$` had to become an identifier start
+character** — Part F bound `$last` and nothing could name it, because the lexer could not
+produce that token: a silent dead end. Fixing it exposed a second bug, that `scan_ident`
+started at the first byte and so made no progress on a start character that is not also a
+continue character — an infinite loop, which showed up as a hung test run rather than a
+failure. And **a builtin's argument is a path, not an expression**: `cd ..` and `cd /system`
+both choke on expression mode, where `..` is a range and `/system` a division, so builtins
+take word-mode arguments like an external program does.
+
+The shell **does not rewrite a stage's arguments**. It passes `.` through as written and
+hands over the same `PWD`, so `list` resolves it in its own process against the same
+directory. Pre-resolving would make the in-guest demo pass while proving nothing about the
+half that can actually disagree.
 
 #### Part D — `session-mgr` seeds the session
 

@@ -42,7 +42,7 @@ use libkern::syscall::{
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelReceiver, ChannelSink, IpcPort};
 use libstream::wire::ByteSink;
-use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup};
+use libstream::setup::{Streams, bootstrap, bootstrap_arg0, pipe, send_setup_env};
 use nxsh::host::{Host, PipelineRun, StageSpec, StageStatus};
 use nxsh::{Interp, RunMode};
 
@@ -119,6 +119,7 @@ impl Host for NitroxHost {
         stages: &[StageSpec],
         input: Option<&[u8]>,
         strict: bool,
+        env: &libstream::wire::Record,
     ) -> Result<PipelineRun, String> {
         if stages.is_empty() {
             return Ok(PipelineRun::default());
@@ -172,7 +173,10 @@ impl Host for NitroxHost {
                 stderr: None,
             };
             let argv: Vec<&str> = spec.argv.iter().map(|s| s.as_str()).collect();
-            send_setup(setup_shell, &streams, &argv)
+            // The same environment to every stage, arguments passed through as written:
+            // both sides then resolve a relative path identically, which is the property
+            // this slice exists for.
+            send_setup_env(setup_shell, &streams, &argv, env)
                 .map_err(|_| alloc::format!("could not hand `{}` its streams", spec.program))?;
             // SAFETY: closing our ends; the stage holds its own.
             unsafe {
@@ -299,6 +303,28 @@ impl Host for NitroxHost {
         Ok(())
     }
 
+    fn exists(&mut self, path: &str) -> bool {
+        match lookup(self.namespace, path.as_bytes()) {
+            Some(h) => {
+                // SAFETY: closing a handle just installed into our table.
+                unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+                true
+            }
+            // A *directory* does not resolve to a mappable object, so a failed lookup is
+            // not proof of absence — a directory session is what answers for one.
+            None => {
+                let mut buf = [0u8; 4096];
+                match librsproto::session::Dir::open(self.namespace, path.as_bytes(), &mut buf) {
+                    Ok(d) => {
+                        d.close();
+                        true
+                    }
+                    Err(_) => false,
+                }
+            }
+        }
+    }
+
     fn diag(&mut self, text: &str) {
         kprint(text.as_bytes());
     }
@@ -421,7 +447,7 @@ fn po_wait(po: u64) -> (i32, u64) {
     }
 }
 
-fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
+fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record) -> i64 {
     let mut host = NitroxHost { namespace, notif };
 
     let source = match argv.get(1).map(|s| s.as_str()) {
@@ -436,6 +462,7 @@ fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
             host.out("usage: nxsh [SCRIPT.nx | -c SOURCE]\n");
             return EXIT_OK;
         }
+        // A script path is the shell's own lookup, so it resolves against `PWD`.
         Some(path) => match host.read_file(path) {
             Ok(bytes) => match String::from_utf8(bytes) {
                 Ok(s) => s,
@@ -452,7 +479,7 @@ fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
             }
         },
         // No script: the interactive loop (§11).
-        None => return repl(notif, namespace),
+        None => return repl(notif, namespace, env),
     };
 
     let script = match nxsh::parse_script(&source) {
@@ -471,6 +498,7 @@ fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
     // §11e: a script discards a bare top-level value. The REPL's opposite default lands
     // with the REPL in Part F — the difference belongs to the driver, not the language.
     let mut interp = Interp::with_host(alloc::boxed::Box::new(host), RunMode::Script);
+    interp.set_env(env);
     match interp.run(&script) {
         Ok(_) => EXIT_OK,
         Err(e) => {
@@ -491,7 +519,7 @@ fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
 /// completion, no job control: those are §11's rich REPL, gated on the console/tty server
 /// and the compositor terminal, and building them against a raw character device would be
 /// a dependency inversion.
-fn repl(notif: u64, namespace: u64) -> i64 {
+fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
     let Some(console) = lookup(namespace, b"/dev/console") else {
         kprint(b"nxsh: /dev/console not found\r\n");
         return EXIT_USAGE;
@@ -522,12 +550,13 @@ fn repl(notif: u64, namespace: u64) -> i64 {
         alloc::boxed::Box::new(NitroxHost { namespace, notif }),
         RunMode::Repl,
     );
+    interp.set_env(env);
     kprint(b"\r\nnxsh: interactive shell (Ctrl-D or `exit` to leave)\r\n");
 
     // `pending` accumulates across continuation lines; `line` is the one being typed.
     let mut pending = String::new();
     let mut line: Vec<u8> = Vec::new();
-    kprint(nxsh::repl::prompt("/").as_bytes());
+    kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
 
     loop {
         let op = libkern::abi::IoOp {
@@ -575,7 +604,7 @@ fn repl(notif: u64, namespace: u64) -> i64 {
 
                     let src = core::mem::take(&mut pending);
                     if src.trim().is_empty() {
-                        kprint(nxsh::repl::prompt("/").as_bytes());
+                        kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
                         continue;
                     }
                     // `exit` is a shell-state builtin (§3): it must change *this* process,
@@ -591,7 +620,7 @@ fn repl(notif: u64, namespace: u64) -> i64 {
                         kprint_crlf(
                             "nxsh: `cd` is not implemented — a shell-side position would                              not apply to spawned programs, which resolve paths in their                              own namespace. See TODO(shell-cwd).\n",
                         );
-                        kprint(nxsh::repl::prompt("/").as_bytes());
+                        kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
                         continue;
                     }
                     match interp.run_line(&src) {
@@ -604,7 +633,7 @@ fn repl(notif: u64, namespace: u64) -> i64 {
                             kprint_crlf(&msg);
                         }
                     }
-                    kprint(nxsh::repl::prompt("/").as_bytes());
+                    kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
                 }
                 0x08 | 0x7f => {
                     if line.pop().is_some() {
@@ -635,11 +664,13 @@ fn kprint_crlf(text: &str) {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let boot = bootstrap(notif, ns, endpoint, arg0);
-    let argv = match boot.setup() {
-        Some(Ok(s)) => s.argv,
-        _ => Vec::new(),
+    // The shell's own environment arrives the same way every stage's does — there is one
+    // mechanism, not a special case for the shell.
+    let (argv, env) = match boot.setup() {
+        Some(Ok(s)) => (s.argv, s.env),
+        _ => (Vec::new(), libstream::wire::Record::default()),
     };
-    exit(run(notif, ns, &argv))
+    exit(run(notif, ns, &argv, env))
 }
 
 #[panic_handler]
