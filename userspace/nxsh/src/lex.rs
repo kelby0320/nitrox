@@ -292,6 +292,32 @@ impl<'a> Lexer<'a> {
         Ok(t)
     }
 
+    /// After a peeked token, is there **nothing left that could be its right operand**?
+    ///
+    /// Pure lookahead over the raw source from just past the cached token: horizontal
+    /// whitespace and comments are skipped, then the answer is yes at end of input, at a
+    /// newline, and at each closer that ends an argument list (`|`, `)`, `]`, `}`, `,`).
+    ///
+    /// This exists for one decision — a bare `/` (see [`Parser::starts_an_argument`]) —
+    /// and deliberately does **not** skip newlines. A binary operator at end of line is
+    /// mid-production under D2, so "the line ended" is a real answer here, not a gap to
+    /// look past.
+    pub fn no_operand_follows(&self) -> bool {
+        let mut i = self.pos;
+        loop {
+            match self.at(i) {
+                b' ' | b'\t' | b'\r' => i += 1,
+                b'#' => {
+                    while i < self.src.len() && self.at(i) != b'\n' {
+                        i += 1;
+                    }
+                }
+                _ => break,
+            }
+        }
+        matches!(self.at(i), 0 | b'\n' | b'|' | b')' | b']' | b'}' | b',')
+    }
+
     /// Tokenize the whole input in [`Mode::Expr`]. Only useful for tests and for the
     /// lexer's own diagnostics — real parsing is pull-driven, since mode is contextual.
     pub fn tokenize_expr(src: &str) -> Result<Vec<Tok>> {

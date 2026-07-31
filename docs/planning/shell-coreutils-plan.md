@@ -959,6 +959,91 @@ Plain bullets, not checkboxes: these are decisions to *not* build, not work owed
 
 `nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken.
 
+#### Part F — the session can reach its programs ✅ (2026-07-31)
+
+Parts A–E gave a login a real shell with a real environment, and driving one interactively
+found the thing that made it a *toy*: every external command failed with "`list` is not a
+program". The session namespace held the user's home and `/dev/console` and nothing else.
+
+The fix is namespace construction, not a shell change, and the shape was a real decision.
+Binding `/initramfs/sbin` would be one line and wrong — it hands a session the boot image
+rather than a profile, and "absence is the sandbox" stops meaning anything once every
+session sees every binary. So: the profile server's `/bin`, which is the design's intended
+answer (`docs/architecture/profiles-and-namespace-projection.md`).
+
+**System profile only.** Per-user profiles are the eventual shape, but nothing yet needs two
+users to see different programs, and building the projection before the requirement would be
+guessing at it.
+
+**Step 1 — package the coreutils** ✅ (2026-07-31)
+
+The binding is useless while the profile projects nothing a shell can run: before this,
+`/bin` was bound and contained exactly `heartbeat`. The coreutils existed only in the
+initramfs.
+
+- [x] One `coreutils` store package holding all ten coreutils **plus `nxsh`** — a shell
+      that cannot invoke itself is a strange thing to hand someone.
+- [x] A second `[[package]]` in the generated system-profile manifest.
+- [x] The package hash covers **every** ELF in it, not the first. A content-addressed path
+      that moves when one of eleven binaries changes is worth something; one that tracks
+      `list` alone would let the other ten change under a path claiming they had not.
+- [x] One list (`COREUTILS` + `profile_programs()`) feeding the build, the initramfs, and
+      the store, so a new coreutil cannot be built-but-unreachable or packaged-but-unbuilt.
+- [x] `bin_projection_demo`: all eleven resolve through the real forwarding chain, and an
+      unknown name still misses.
+
+**The negative control is the load-bearing half.** "`/bin/list` resolved" says nothing about
+projection unless some `/bin/<name>` fails to resolve — a `/bin` answering everything would
+pass the positive check while projecting nothing. Verified the demo is not vacuous the only
+way that counts: removed the `coreutils` entry from the manifest, confirmed the run fails at
+"a profiled program did not resolve on /bin", and restored it.
+
+**Step 2 — hand the endpoint down and bind it** ✅ (2026-07-31)
+
+- [x] init keeps a duplicate of the profile-server endpoint *before* binding `/bin`, so a
+      failure is a failure to bind rather than a bound `/bin` no session can be given.
+- [x] init → service-mgr → session-mgr; `build_session_namespace` binds it at `/bin`,
+      whole-tree, sharing init's registration as `/home` shares the fs-server's.
+- [x] The login proof script runs `list .` — not a builtin, and the session holds no
+      `/initramfs`, so only `/bin/list` can satisfy it.
+- [x] Driven at a real interactive prompt: `list /`, `whoami`, `date`.
+
+**The hand-down needed a channel, and that is the one contract this touched.** Only
+`handles[0]` reaches a child — the kernel seeds `rdx` with it, and there is no register
+left for `handles[1]` nor any documented way to learn its handle value. Rather than invent
+one, service-mgr's `rdx` became a **handoff channel**: the mechanism the boot chain already
+used one link further down, where service-mgr hands *its* children endpoints over a control
+channel. A third endpoint is now one more `send_handle`, not another ABI question.
+
+A zero handle sends an **empty message** rather than nothing, at both links. The receives
+are positional, so a skipped send would shift every later handoff up a slot and quietly
+hand session-mgr the auth channel where it expects the profile endpoint.
+
+Verified the bind is load-bearing by removing it: the run fails with
+"``list`` is not a program" — the same sentence a real user hit at the prompt. That run
+also caught a log line announcing a `/bin` that was not there; it now reports what it
+actually bound.
+
+**Step 3 — `list /` did not parse** ✅ (2026-07-31)
+
+Not planned work. It surfaced one command after step 2 made programs reachable, which is
+the point: the first thing anyone types at a new shell is `list /`, and it died with
+"expected an expression".
+
+A lone `/` after a command head was read as division. `/system` was never affected — it
+lexes as a single path word — so every existing test passed. The rule is decidable rather
+than a preference: a lone `Slash` in argument position means what follows is whitespace or
+a closer, so there is no right operand and division is *impossible*.
+
+- [x] `Lexer::no_operand_follows` — lookahead that deliberately does not skip newlines.
+- [x] `starts_an_argument` reads a spaced `/` with nothing after it as the root path.
+- [x] Host tests for both halves, and an in-guest pair: `list /` **and** `6 / 2 != 3`. A
+      rule that made every `/` a path would pass the first and break arithmetic.
+
+*Deliverable met: a login session can run the programs its profile gives it, and only
+those. `list /` at the prompt shows `home`, `bin`, `session`, `dev` — the four bindings
+the session was built with, and nothing else.*
+
 ### Deferred — the rich REPL (§11) and its dependencies
 
 Gated on the console/tty server + compositor terminal (later in Phase 4). Covers reverse-search,

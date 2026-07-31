@@ -2736,6 +2736,28 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: nxsh could not run a real pipeline stage\n");
     }
 
+    // 2b. **`list /` — the root directory is a path, not a division sign.** The first
+    //     thing anyone types at a new shell, and it did not parse until Part F: `/system`
+    //     lexes as one path word, but a lone `/` after a command head was read as
+    //     division and the line died with "expected an expression". Found by typing it at
+    //     a real prompt, which is the only place it had ever been typed.
+    let root = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &["nxsh", "-c", "if (list / | count) < 1 { bad }"],
+    );
+    if root != 0 {
+        return_fail(b"test-harness: nxsh could not list the root directory\n");
+    }
+
+    // 2c. The control for it: `/` must still divide. A rule that made every `/` a path
+    //     would pass 2b and break arithmetic, so the two checks only mean something
+    //     together.
+    if run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "if 6 / 2 != 3 { bad }"]) != 0 {
+        return_fail(b"test-harness: nxsh stopped treating `/` as division\n");
+    }
+
     // 3. A failing stage fails the script (§1: fail loud, don't fail silent). `remove` on
     //    a path that does not exist exits non-zero, and that must reach the exit code
     //    rather than being swallowed.
@@ -3005,6 +3027,71 @@ fn dev_listing_demo(root_ns: u64, notif: u64) {
     }
 
     kprint(b"test-harness: dev-listing ok (/dev from bindings, / from both sources)\n");
+}
+
+/// **The profile projects the coreutils into `/bin`** (Milestone 3.5 Part F).
+///
+/// Until the `coreutils` store package existed, the programs a shell runs lived *only* in
+/// the initramfs — so a session namespace could reach them only by being handed the whole
+/// boot image, which is exactly the ambient authority the namespace design exists to
+/// refuse. `/bin` was bound and projected precisely one package: `heartbeat`.
+///
+/// This resolves through the real chain — `sys_ns_lookup` on the root namespace → the
+/// kernel forwards to the profile server bound at `/bin` → it probes each manifest package
+/// for `<store>/bin/<name>` → it re-exports the store `FileObject`. Nothing here is
+/// simulated, so the demo fails if any link is wrong: a stale manifest hash, an unstaged
+/// binary, a package listed but not built.
+///
+/// The **negative control matters more than the positive one**. "`/bin/list` resolved" is
+/// a claim about projection only if some `/bin/<name>` does *not* resolve; a `/bin` that
+/// answered everything would pass check 1 while projecting nothing.
+fn bin_projection_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: bin-projection demo (the profile puts the coreutils on /bin)\n");
+
+    // --- 1. the negative control, first -------------------------------------
+    // If this resolves, every later check in this demo is worthless, so it runs before
+    // them rather than after.
+    let (st, h) = ns_lookup_wait(root_ns, b"/bin/definitely-not-a-program", RIGHT_MAP_READ);
+    if st == 0 && h != 0 {
+        // SAFETY: closing the handle we were wrongly given.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+        return_fail(b"test-harness: /bin resolved a program that does not exist\n");
+    }
+
+    // --- 2. every profiled program resolves ---------------------------------
+    // Not just one: a manifest can be right about the package and wrong about a member,
+    // and a missing `whoami` should fail here rather than at a user's prompt.
+    for prog in [
+        b"/bin/list".as_slice(),
+        b"/bin/copy",
+        b"/bin/mkdir",
+        b"/bin/remove",
+        b"/bin/rename",
+        b"/bin/move",
+        b"/bin/touch",
+        b"/bin/date",
+        b"/bin/sleep",
+        b"/bin/whoami",
+        b"/bin/nxsh",
+    ] {
+        let (st, h) = ns_lookup_wait(root_ns, prog, RIGHT_MAP_READ);
+        if st != 0 || h == 0 {
+            return_fail(b"test-harness: a profiled program did not resolve on /bin\n");
+        }
+        // SAFETY: closing our own resolved handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
+
+    // --- 3. the handle is the program, not merely a handle ------------------
+    // A resolve that returns *something* proves the plumbing, not the payload. Spawning
+    // it and reading its table is what distinguishes "the store served `list`" from "the
+    // store served whatever happened to be first in the package".
+    let out = run_coreutil_capture(root_ns, notif, b"/bin/list", &["list", "/"], true);
+    if !contains(&out, b"system") {
+        return_fail(b"test-harness: /bin/list did not produce a listing\n");
+    }
+
+    kprint(b"test-harness: bin-projection ok (11 programs via the store, unknown names still miss)\n");
 }
 
 /// Is `needle` a subsequence of contiguous bytes in `hay`? The listing arrives as a TSM1
@@ -4296,6 +4383,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 0a5e. `/dev` is kernel-served, not mounted — prove `list` can list it.
     dev_listing_demo(root_ns, notif);
+
+    // 0a5f. The coreutils are reachable through the profile, not only the initramfs —
+    //       the thing that makes a session namespace able to run anything at all.
+    bin_projection_demo(root_ns, notif);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

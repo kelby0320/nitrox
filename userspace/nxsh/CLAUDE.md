@@ -58,9 +58,18 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
   existed, and went on refusing a builtin the interpreter had implemented — for weeks,
   because the script path calls `run_line` and the interactive path never got there. Any
   new special case here is a second implementation of the language.
-- **`Host::exists("/")` is true by construction.** A namespace root has nothing bound *at*
-  it and no server owning it, so both of `exists`'s probes miss — yet `list /` enumerates
-  it. `cd /` and `cd ..` out of `/home` were both refused until this was special-cased.
+- **`Host::exists` and `list` must ask the namespace the same question.** A path can be
+  real in three ways: it names a binding (or sits above one), it resolves to an object, or
+  a directory session opens it. `exists` had only the last two, so `cd /` and `cd /bin`
+  were refused while `list` showed both — `list` walks the bindings (`SYS_NS_ENUMERATE`)
+  and `cd` did not. The ancestor test compares against `path + "/"`, or `/bin` would make
+  `cd /binary` succeed.
+- **`list /` is the root directory, not a division sign.** `/system` lexes as one path
+  word, so only a *lone* `/` reaches the parser as `Tok::Slash` — which is why this parsed
+  as division through every test until someone typed it at a real prompt. A lone `Slash` in
+  argument position means the next thing is whitespace or a closer, so there is no right
+  operand and division is impossible. Whenever you touch `starts_an_argument`, the test for
+  `list /` and the test for `6 / 2` only mean something as a pair.
 - **The shell does not rewrite a spawned stage's paths.** It passes `argv` through as
   written and hands over the same `PWD`, so both sides resolve identically. Pre-resolving
   would reintroduce the split-brain the environment design exists to prevent.

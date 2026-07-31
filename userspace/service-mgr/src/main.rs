@@ -515,11 +515,71 @@ fn wait_ready(ctrl: u64) -> u64 {
     endpoint
 }
 
+/// Receive one handle from init's handoff channel: an empty message carrying at most one
+/// transferred handle. Returns `0` if the message was empty (init had that endpoint
+/// missing) or the receive failed.
+///
+/// **Bounded, not indefinite.** init sends both handoffs before service-mgr's first
+/// instruction runs, so they are already in the ring; a wait that could not end would
+/// mean a supervisor hung on a message that is either there or never coming. The same
+/// deadline the `Ready` handshake uses is more than enough.
+fn recv_handoff(ctrl: u64) -> u64 {
+    // SAFETY: `&now` is a valid u64 out-param.
+    let mut now: u64 = 0;
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    let deadline = now.saturating_add(READY_TIMEOUT_NS);
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS valid; one waiter, bounded deadline.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = ctrl;
+        syscall4(SYS_WAIT, (&raw const WAIT_HANDLES) as u64, 1, (&raw mut WAIT_RESULTS) as u64, deadline)
+    };
+    if waited < 1 {
+        kprint(b"service-mgr: handoff timeout\n");
+        return 0;
+    }
+    // SAFETY: valid recv out-params; the kernel installs any transferred handle at [0].
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ctrl,
+            (&raw mut RDY_MSG) as u64,
+            (&raw mut RDY_HANDLES) as u64,
+            (&raw mut RDY_COUNT) as u64,
+        )
+    };
+    let count = unsafe { (&raw const RDY_COUNT).read() };
+    if rr != 0 || count < 1 {
+        return 0;
+    }
+    // SAFETY: the kernel installed the transferred handle at handles[0].
+    unsafe { (&raw const RDY_HANDLES[0]).read() }
+}
+
+/// Close whichever endpoints we still hold. Used on the login-chain abort paths, where
+/// both are ours and neither has moved.
+///
+/// # Safety
+/// Single-threaded service-mgr; both are its own handles, closed at most once.
+unsafe fn close_endpoints(fs_endpoint: u64, profile_endpoint: u64) {
+    // SAFETY: closing our own handles.
+    unsafe {
+        syscall1(SYS_HANDLE_CLOSE, fs_endpoint);
+        if profile_endpoint != 0 {
+            syscall1(SYS_HANDLE_CLOSE, profile_endpoint);
+        }
+    }
+}
+
 /// Transfer a single `handle` to a child over its control channel (`ctrl`) — an IPC
 /// message with one moved handle and no payload (the child receives it as its next
 /// control message). On failure the handle did not move; it is closed.
+///
+/// A zero `handle` sends **an empty message**, not nothing. The receiver reads the
+/// handoffs positionally, so skipping the send would shift every later one up a slot and
+/// hand session-mgr the auth channel where it expects the profile endpoint.
 fn send_handle(ctrl: u64, handle: u64) {
-    // SAFETY: SEND_MSG/SEND_HANDLES valid; transfer one handle, empty payload.
+    let count = if handle == 0 { 0 } else { 1 };
+    // SAFETY: SEND_MSG/SEND_HANDLES valid; transfer `count` handles, empty payload.
     let sr = unsafe {
         (&raw mut SEND_MSG.header.payload_len).write(0);
         SEND_HANDLES[0] = handle;
@@ -528,11 +588,11 @@ fn send_handle(ctrl: u64, handle: u64) {
             ctrl,
             (&raw const SEND_MSG) as u64,
             (&raw const SEND_HANDLES) as u64,
-            1,
+            count,
             SENDMODE_NOBLOCK,
         )
     };
-    if sr != 0 {
+    if sr != 0 && handle != 0 {
         // SAFETY: the transfer failed; reclaim the handle.
         unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
     }
@@ -540,19 +600,35 @@ fn send_handle(ctrl: u64, handle: u64) {
 
 /// Bring up the login chain: spawn `auth-service` (await its `Meta::Ready` → the auth
 /// client channel), then spawn `session-mgr` with re-delegated `BIND_NAMESPACE` and hand
-/// it the fs-server endpoint + the auth channel over its control channel. `fs_endpoint`
-/// is init's root fs-server forwarding endpoint (moved in at service-mgr's `rdx`).
-fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64) {
+/// it the fs-server endpoint, the profile-server endpoint, and the auth channel over its
+/// control channel. Both endpoints come from init over the handoff channel at `rdx`.
+///
+/// service-mgr does not *use* either endpoint. It is a courier: neither the fs-server's
+/// `/home` nor the profile's `/bin` is service-mgr's to bind, and holding them any longer
+/// than the trip down would be authority it has no use for.
+fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64) {
     if fs_endpoint == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
+        // A profile endpoint without an fs endpoint is no more usable — a session with
+        // programs but no home is not a session. Don't retain it.
+        if profile_endpoint != 0 {
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, profile_endpoint) };
+        }
         return;
+    }
+    // Not fatal: a session without `/bin` is the pre-Part-F shell — usable for the
+    // in-process language, unable to spawn. Losing the login entirely over it would be a
+    // worse trade, so this reports and continues.
+    if profile_endpoint == 0 {
+        kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
     }
     // 1. auth-service — spawn + Ready handshake → the client channel session-mgr uses.
     let (auth_h, auth_ctrl) = spawn_with_control(root_ns, b"/initramfs/sbin/auth-service", &raw mut SPAWN_AUTH);
     if auth_h < 0 || auth_ctrl == 0 {
         kprint(b"service-mgr: auth-service spawn FAIL\n");
-        // SAFETY: closing our own fs endpoint (login chain aborted).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fs_endpoint) };
+        // SAFETY: closing our own endpoints (login chain aborted).
+        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
         return;
     }
     let auth_client = wait_ready(auth_ctrl);
@@ -564,8 +640,8 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64) {
     }
     if auth_client == 0 {
         kprint(b"service-mgr: auth-service Ready timeout/invalid\n");
-        // SAFETY: closing our own fs endpoint (login chain aborted).
-        unsafe { syscall1(SYS_HANDLE_CLOSE, fs_endpoint) };
+        // SAFETY: closing our own endpoints (login chain aborted).
+        unsafe { close_endpoints(fs_endpoint, profile_endpoint) };
         return;
     }
     kprint(b"service-mgr: auth-service ready\n");
@@ -576,13 +652,17 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64) {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
         // SAFETY: closing our own handles (nothing handed off).
         unsafe {
-            syscall1(SYS_HANDLE_CLOSE, fs_endpoint);
+            close_endpoints(fs_endpoint, profile_endpoint);
             syscall1(SYS_HANDLE_CLOSE, auth_client);
         }
         return;
     }
-    // Handoffs, in order: (1) the fs-server endpoint, (2) the auth channel.
+    // Handoffs, in order: (1) the fs-server endpoint, (2) the profile-server endpoint,
+    // (3) the auth channel. session-mgr receives them positionally, so the order is the
+    // contract — a reorder here silently makes a session bind its home over IPC to the
+    // profile server.
     send_handle(sess_ctrl, fs_endpoint);
+    send_handle(sess_ctrl, profile_endpoint);
     send_handle(sess_ctrl, auth_client);
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
     // handle are no longer needed for Part D (session-mgr runs independently).
@@ -595,13 +675,31 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64) {
 }
 
 /// Bootstrap registers (see init's `_start`): `rdi` = notification channel, `rsi` =
-/// namespace handle (delegated by init), `rdx` = the fs-server forwarding endpoint init
-/// moved in (handed to session-mgr), `rcx` unused.
+/// namespace handle (delegated by init), `rdx` = the **handoff channel** init moved in,
+/// `rcx` unused.
+///
+/// `rdx` carried the fs-server endpoint directly until the profile server's endpoint
+/// needed the same trip: only `handles[0]` reaches a child, so a second endpoint needs a
+/// channel rather than a second register. `0` means init had nothing to hand over — a
+/// service-mgr **restart**, since the endpoints moved to the first one and cannot move
+/// twice. That is a degraded but running system (services supervised, no new logins), not
+/// a reason to refuse to start.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(notif: u64, root_ns: u64, fs_endpoint: u64, _arg0: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> ! {
     kprint(b"service-mgr: up\n");
+    // The handoffs, in init's send order: the fs-server endpoint, then the profile
+    // server's. Positional — see `bring_up_login_chain`.
+    let (fs_endpoint, profile_endpoint) = if handoff == 0 {
+        (0, 0)
+    } else {
+        let fs = recv_handoff(handoff);
+        let profile = recv_handoff(handoff);
+        // SAFETY: closing our own handoff-channel end; both handoffs are in hand.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
+        (fs, profile)
+    };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
-    bring_up_login_chain(root_ns, fs_endpoint);
+    bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint);
     match load_declaration(root_ns) {
         Some(decl) => {
             let (h, ctrl) = spawn_service(root_ns, &decl);

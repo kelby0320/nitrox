@@ -36,8 +36,8 @@ use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ};
 use libkern::syscall::{
     SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_IO_SUBMIT,
     SYS_MEMORY_CREATE, SYS_MEMORY_MAP,
-    SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, syscall1,
-    syscall2, syscall4, syscall5,
+    SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN,
+    SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelReceiver, ChannelSink, IpcPort};
@@ -304,22 +304,26 @@ impl Host for NitroxHost {
     }
 
     fn exists(&mut self, path: &str) -> bool {
-        // The root of a namespace exists by construction — it is what bindings hang off,
-        // and `list /` enumerates it. Neither probe below can see that: nothing is bound
-        // *at* `/`, so the lookup misses, and no single server owns it, so `Dir::open`
-        // misses too. Without this, `cd /` and `cd ..` out of `/home` both reported that
-        // the root does not exist.
-        if path == "/" {
+        // A namespace path can be real in three different ways, and `cd` has to accept
+        // all three or it refuses places you can plainly see.
+        //
+        // 1. It names a binding, or sits above one. `/` and `/bin` are both like this:
+        //    nothing resolves *at* them and no single server owns them, so neither probe
+        //    below can see them — yet `list` shows them, because `list` asks the namespace
+        //    what is bound. Asking the same question is what keeps `cd` and `list`
+        //    agreeing about which places exist.
+        if binding_at_or_under(self.namespace, path) {
             return true;
         }
+        // 2. It resolves to an object — an ordinary file.
         match lookup(self.namespace, path.as_bytes()) {
             Some(h) => {
                 // SAFETY: closing a handle just installed into our table.
                 unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
                 true
             }
-            // A *directory* does not resolve to a mappable object, so a failed lookup is
-            // not proof of absence — a directory session is what answers for one.
+            // 3. A *directory* does not resolve to a mappable object, so a failed lookup
+            //    is not proof of absence — a directory session is what answers for one.
             None => {
                 let mut buf = [0u8; 4096];
                 match librsproto::session::Dir::open(self.namespace, path.as_bytes(), &mut buf) {
@@ -679,6 +683,45 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
             }
         }
     }
+}
+
+/// Is `path` a binding in `ns`, or an ancestor of one?
+///
+/// The namespace walk `list` uses (`SYS_NS_ENUMERATE`), asked as a yes/no question. Local
+/// and cheap — the kernel walks the caller's own namespace, no IPC — over a handful of
+/// bindings.
+///
+/// `/` is true by construction: it is what bindings hang off, and a shell can always be at
+/// the root of its own namespace even if nothing is bound in it yet.
+fn binding_at_or_under(ns: u64, path: &str) -> bool {
+    if path == "/" {
+        return true;
+    }
+    let exact = path.trim_end_matches('/');
+    // One trailing slash, so "is an ancestor of" is a prefix test that cannot match
+    // `/binary` when the question was about `/bin`.
+    let mut prefix = String::from(exact);
+    prefix.push('/');
+
+    let mut entry = libkern::abi::NsEntry::zeroed();
+    for index in 0u64.. {
+        // SAFETY: `entry` is a valid writable out-param of exactly `NsEntry`'s layout.
+        let r = unsafe { syscall3(SYS_NS_ENUMERATE, ns, index, (&raw mut entry) as *mut _ as u64) };
+        if r != 0 {
+            return false; // NotFound ends the walk
+        }
+        let len = (entry.path_len as usize).min(libkern::abi::NS_ENTRY_PATH_MAX);
+        // SAFETY: the kernel wrote the binding path; `len` is clamped to the buffer.
+        let bound =
+            unsafe { core::slice::from_raw_parts((&raw const entry.path) as *const u8, len) };
+        let Ok(bound) = core::str::from_utf8(bound) else {
+            continue;
+        };
+        if bound == exact || bound.starts_with(&prefix) {
+            return true;
+        }
+    }
+    false
 }
 
 /// Write `text` with `\n` expanded to `\r\n` — a raw console needs both.
