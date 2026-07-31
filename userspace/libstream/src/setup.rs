@@ -27,6 +27,19 @@ use alloc::sync::Arc;
 use alloc::vec;
 use alloc::vec::Vec;
 
+/// The largest setup payload that fits one IPC message: `IPC_MSG_SIZE` (4096) less the
+/// header (24) and the handle slots (8 × 8).
+///
+/// Defined here rather than imported because the wire core deliberately has **no
+/// dependencies** — that is what lets it host-test cleanly, and reaching for `libkern` to
+/// get one number would spend that property. The `const` assertion below keeps the two
+/// from drifting: under the `io` feature, where a real message is actually sent, a
+/// mismatch is a compile error.
+pub const SETUP_PAYLOAD_MAX: usize = 4096 - 24 - 8 * 8;
+
+#[cfg(feature = "io")]
+const _: () = assert!(SETUP_PAYLOAD_MAX == libkern::abi::IPC_PAYLOAD_SIZE);
+
 use crate::wire::{
     ByteSource, Record, Result, Schema, TypeModifiers, TypeTag, Value, WireError, read_value,
     write_value,
@@ -130,36 +143,68 @@ impl Streams {
 
 // --- The setup-message payload ---------------------------------------------
 
-/// The decoded setup-message payload: the stream presence [`bitmap`](Streams::bitmap)
-/// and `argv`. The stream *handles* are carried out-of-band as transferred IPC handles
-/// and reunited with the bitmap via [`Streams::from_bitmap`].
-#[derive(Clone, PartialEq, Eq, Debug, Default)]
+/// The decoded setup-message payload: the stream presence [`bitmap`](Streams::bitmap),
+/// `argv`, and the environment. The stream *handles* are carried out-of-band as
+/// transferred IPC handles and reunited with the bitmap via [`Streams::from_bitmap`].
+#[derive(Clone, PartialEq, Debug, Default)]
 pub struct SetupPayload {
     /// The stream presence bitmap (matches the packed transferred handles).
     pub streams: u32,
     /// Command-line arguments; `argv[0]` is the program name by convention.
     pub argv: Vec<String>,
+    /// The environment, as a TSM1 `Record` — **not** `key=value` strings.
+    ///
+    /// Typed, which removes a bug class rather than merely being tidier: `PATH` is a
+    /// `List<String>` instead of a colon-joined string, so a path *containing* a colon is
+    /// representable and no two readers can disagree about how to split it. A reader that
+    /// expects the wrong type gets a schema mismatch rather than a silent misparse.
+    ///
+    /// `cwd` is a conventional entry, as `PWD` is in Unix — and safer here, because there
+    /// is no second source of truth (no `getcwd`) for it to disagree with.
+    ///
+    /// Empty for a sender that has none, so "no environment" is not a special case.
+    /// See `docs/planning/shell-coreutils-plan.md` § Milestone 3.5 and the decision log,
+    /// 2026-07-30.
+    pub env: Record,
 }
 
 impl SetupPayload {
-    /// Encode as a TSM1 `Record { streams: Int, argv: List<String> }`.
+    /// Encode as a TSM1 `Record { streams: Int, argv: List<String>, env: Record }`.
+    ///
+    /// `env` is **appended**, never inserted: [`decode`](Self::decode) reads by position,
+    /// so an existing stage keeps reading fields 0 and 1 and ignores the rest. Reordering
+    /// these fields would break every stage in the image at once.
     pub fn encode(&self) -> Result<Vec<u8>> {
         let schema = Schema::new()
             .field("streams", TypeTag::Int, TypeModifiers::NONE)
-            .field("argv", TypeTag::List, TypeModifiers::NONE);
+            .field("argv", TypeTag::List, TypeModifiers::NONE)
+            .field("env", TypeTag::Record, TypeModifiers::NONE);
         let argv: Vec<Value> = self.argv.iter().map(|s| Value::Str(s.clone())).collect();
         let record = Record {
             schema,
-            values: vec![Value::Int(self.streams as i64), Value::List(Arc::from(argv))],
+            values: vec![
+                Value::Int(self.streams as i64),
+                Value::List(Arc::from(argv)),
+                Value::Record(Arc::new(self.env.clone())),
+            ],
         };
         let mut buf = Vec::new();
         write_value(&mut buf, &Value::Record(Arc::new(record)))?;
+        // The size limit is a property of the *message*, so it is checked here rather
+        // than at the send site: that keeps it testable without a kernel, and means every
+        // sender gets the same refusal.
+        if buf.len() > SETUP_PAYLOAD_MAX {
+            return Err(WireError::SetupTooLarge);
+        }
         Ok(buf)
     }
 
-    /// Decode a payload written by [`encode`](Self::encode). Reads the first two fields
-    /// by position (`streams`, `argv`) and ignores any later ones, so a newer sender can
-    /// append `env` without breaking an older reader.
+    /// Decode a payload written by [`encode`](Self::encode).
+    ///
+    /// Reads by **position**, and treats every field past `argv` as optional. That is what
+    /// makes the format extensible in one direction: a newer sender may append fields an
+    /// older reader ignores, and an older sender's message still decodes here — `env`
+    /// simply comes back empty. Both directions are tested.
     pub fn decode(bytes: &[u8]) -> Result<SetupPayload> {
         let mut src = ByteSource::new(bytes);
         let value = read_value(&mut src, TypeTag::Record)?;
@@ -173,7 +218,14 @@ impl SetupPayload {
         for item in list {
             argv.push(String::from(item.as_str().ok_or(WireError::SchemaMismatch)?));
         }
-        Ok(SetupPayload { streams, argv })
+        // Absent `env` ⇒ empty, so an older sender is not an error case.
+        let env = record
+            .values
+            .get(2)
+            .and_then(|v| v.as_record())
+            .cloned()
+            .unwrap_or_default();
+        Ok(SetupPayload { streams, argv, env })
     }
 }
 
@@ -189,7 +241,7 @@ pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup};
 #[cfg(feature = "io")]
 mod io_stage {
     use super::{SetupPayload, Streams, setup_is_pending};
-    use crate::wire::{Result, WireError};
+    use crate::wire::{Record, Result, WireError};
     use alloc::boxed::Box;
     use alloc::string::String;
     use alloc::vec::Vec;
@@ -238,15 +290,29 @@ mod io_stage {
     /// endpoint): transfer the present stream handles (canonical order) and carry `argv`.
     /// The stream handles are **moved** to the stage.
     pub fn send_setup(channel: u64, streams: &Streams, argv: &[&str]) -> Result<()> {
+        send_setup_env(channel, streams, argv, &Record::default())
+    }
+
+    /// As [`send_setup`], with an environment (Milestone 3.5 Part A).
+    ///
+    /// Kept as a separate entry point so every existing caller stays correct without
+    /// edits — a spawn that has no environment to pass is not obliged to say so.
+    pub fn send_setup_env(
+        channel: u64,
+        streams: &Streams,
+        argv: &[&str],
+        env: &Record,
+    ) -> Result<()> {
         let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
         let payload = SetupPayload {
             streams: streams.bitmap(),
             argv: owned,
+            env: env.clone(),
         }
+        // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge` — deliberately
+        // not `SinkFull`, since a full channel is a transport condition a caller may retry
+        // and this never will be.
         .encode()?;
-        if payload.len() > IPC_PAYLOAD_SIZE {
-            return Err(WireError::SinkFull);
-        }
         let handles = streams.ordered();
         let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
         buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
@@ -302,6 +368,12 @@ mod io_stage {
         pub streams: Streams,
         /// The command-line arguments (`argv[0]` is the program name).
         pub argv: Vec<String>,
+        /// The environment this stage was given (empty if none).
+        ///
+        /// **Tier 0 has no environment, for the same reason it has no `argv`**: there is
+        /// no setup message. That is not a gap — a process spawned without one was given
+        /// nothing to start from, which is the whole meaning of the tier.
+        pub env: Record,
     }
 
     /// Wrap a process's four bootstrap registers (as received by `_start`).
@@ -387,6 +459,7 @@ mod io_stage {
             Ok(Setup {
                 streams,
                 argv: payload.argv,
+                env: payload.env,
             })
         }
     }
@@ -394,6 +467,115 @@ mod io_stage {
 
 #[cfg(test)]
 mod tests {
+
+
+    /// The refusal is its own error, and it is asserted — an earlier pass added the
+    /// variant with a justification and nothing that checked it, which a control caught by
+    /// passing.
+    #[test]
+    fn an_oversized_environment_is_refused_by_name() {
+        let mut schema = Schema::new();
+        let mut values = Vec::new();
+        for i in 0..400 {
+            let name = alloc::format!("VAR_{i}");
+            schema = schema.field(&name, TypeTag::String, TypeModifiers::NONE);
+            values.push(Value::Str(String::from("0123456789012345")));
+        }
+        let p = SetupPayload {
+            streams: 0,
+            argv: alloc::vec![String::from("x")],
+            env: Record { schema, values },
+        };
+        match p.encode() {
+            Err(WireError::SetupTooLarge) => {}
+            Err(e) => panic!("expected SetupTooLarge, got {e:?}"),
+            Ok(b) => panic!("expected a refusal, encoded {} bytes", b.len()),
+        }
+    }
+
+    // --- env on the wire (Milestone 3.5 Part A) -----------------------------
+
+    fn env_record() -> Record {
+        let schema = Schema::new()
+            .field("PWD", TypeTag::String, TypeModifiers::NONE)
+            .field("PATH", TypeTag::List, TypeModifiers::NONE);
+        let path: Vec<Value> = alloc::vec![
+            Value::Str(String::from("/bin")),
+            Value::Str(String::from("/initramfs/sbin")),
+        ];
+        Record {
+            schema,
+            values: alloc::vec![
+                Value::Str(String::from("/home/alice")),
+                Value::List(Arc::from(path)),
+            ],
+        }
+    }
+
+    #[test]
+    fn env_round_trips_as_a_typed_record() {
+        let p = SetupPayload {
+            streams: 0b011,
+            argv: alloc::vec![String::from("list"), String::from("--long")],
+            env: env_record(),
+        };
+        let back = SetupPayload::decode(&p.encode().expect("encodes")).expect("decodes");
+        assert_eq!(back.streams, p.streams);
+        assert_eq!(back.argv, p.argv);
+        assert_eq!(back.env, p.env);
+        // The point of typing it: `PATH` comes back as a list, not a string to split.
+        let path = back.env.values[1].as_list().expect("PATH is a List");
+        assert_eq!(path.len(), 2);
+        assert_eq!(path[0].as_str(), Some("/bin"));
+    }
+
+    /// A sender with nothing to pass produces an empty env, not a special case.
+    #[test]
+    fn an_absent_environment_is_empty_not_an_error() {
+        let p = SetupPayload {
+            streams: 0,
+            argv: alloc::vec![String::from("x")],
+            env: Record::default(),
+        };
+        let back = SetupPayload::decode(&p.encode().expect("encodes")).expect("decodes");
+        assert!(back.env.values.is_empty());
+    }
+
+    /// **The compatibility claim, asserted rather than reasoned about.**
+    ///
+    /// The format extends in one direction only: appending is safe because `decode` reads
+    /// by position and treats anything past `argv` as optional. This builds a payload in
+    /// the *old* two-field shape by hand and decodes it with the current reader — which is
+    /// what every stage in the image is doing until it is rebuilt.
+    #[test]
+    fn an_old_two_field_payload_still_decodes() {
+        let schema = Schema::new()
+            .field("streams", TypeTag::Int, TypeModifiers::NONE)
+            .field("argv", TypeTag::List, TypeModifiers::NONE);
+        let argv: Vec<Value> = alloc::vec![Value::Str(String::from("old"))];
+        let old = Record {
+            schema,
+            values: alloc::vec![Value::Int(0b101), Value::List(Arc::from(argv))],
+        };
+        let mut buf = Vec::new();
+        write_value(&mut buf, &Value::Record(Arc::new(old))).expect("encodes");
+
+        let back = SetupPayload::decode(&buf).expect("an old payload must still decode");
+        assert_eq!(back.streams, 0b101);
+        assert_eq!(back.argv, alloc::vec![String::from("old")]);
+        assert!(back.env.values.is_empty(), "no env is empty, not garbage");
+    }
+
+    /// …and the converse: a *truncated* payload is still refused, so the tolerance above
+    /// is "later fields are optional", not "any record will do".
+    #[test]
+    fn a_payload_missing_argv_is_still_rejected() {
+        let schema = Schema::new().field("streams", TypeTag::Int, TypeModifiers::NONE);
+        let short = Record { schema, values: alloc::vec![Value::Int(1)] };
+        let mut buf = Vec::new();
+        write_value(&mut buf, &Value::Record(Arc::new(short))).expect("encodes");
+        assert!(SetupPayload::decode(&buf).is_err());
+    }
     use super::*;
 
     #[test]
@@ -445,7 +627,7 @@ mod tests {
             vec![String::from("copy"), String::from("/a"), String::from("/b")],
             vec![String::from("echo"), String::from(""), String::from("héllo")],
         ] {
-            let p = SetupPayload { streams: STREAM_STDOUT | STREAM_STDERR, argv };
+            let p = SetupPayload { streams: STREAM_STDOUT | STREAM_STDERR, argv, env: Record::default() };
             let bytes = p.encode().unwrap();
             assert_eq!(SetupPayload::decode(&bytes).unwrap(), p);
         }

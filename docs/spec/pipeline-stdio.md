@@ -95,10 +95,43 @@ message is one structured value, not a data stream:
 |---|---|---|
 | `streams` | `Int` | Presence bitmap: bit 0 `stdin`, bit 1 `stdout`, bit 2 `stderr`. Set bits, ascending, index the packed transferred handles. |
 | `argv` | `List<String>` | Command-line arguments; `argv[0]` is the program name by convention. |
+| `env` | `Record` | The environment. Typed, not `key=value` strings. Empty when the spawner has none. |
 
-`env` is reserved as a future field; readers tolerate extra fields (C2 subset-match),
-so it can be added without a version bump. The exact record schema is pinned in
-`libos` (the sender) and consumed by `libos::bootstrap().setup()` (the receiver).
+The exact record schema is pinned in `libstream::setup` (the sender,
+[`send_setup_env`]) and consumed by `bootstrap().setup()` (the receiver).
+
+**Fields are read by position, and may only be appended.** `SetupPayload::decode` takes
+`streams` and `argv` positionally and treats everything after them as optional, which is
+what lets a newer spawner add a field without rebuilding every stage in the image.
+Reordering or inserting a field breaks every stage at once, and nothing would report it as
+anything but a schema mismatch — so appending is the only safe edit. Both directions are
+covered by tests in `libstream::setup`: a new payload decoded by the current reader, and an
+**old two-field payload** decoded by it too.
+
+**A payload that does not fit `IPC_PAYLOAD_SIZE` is refused with `SetupTooLarge`**, which
+is deliberately not `SinkFull`: a full channel is a transport condition a caller may retry,
+while this is a configuration problem — usually an environment that outgrew the message —
+and retrying will never help. The escape, when it starts to matter, is a memory object
+carrying the block; this message already transfers handles.
+
+### The environment
+
+A TSM1 `Record`, so it is **typed**. That removes a bug class rather than being merely
+tidier: `PATH` is a `List<String>` rather than a colon-joined string, so a path *containing*
+a colon is representable and no two readers can disagree about how to split it. A reader
+expecting the wrong type gets a schema mismatch instead of a silent misparse.
+
+`cwd` is a conventional entry, as `PWD` is in Unix — and safer here, because there is no
+second source of truth (no `getcwd`) for it to disagree with. A shell sets it only after
+verifying the path resolves.
+
+**Tier 0 has no environment, for the same reason it has no `argv`**: there is no setup
+message. That is not a gap. A process spawned without one was handed nothing to start
+from, which is the whole meaning of the tier.
+
+Rationale for carrying the environment here rather than binding it in the namespace —
+including why identity (`/session/user`) deliberately stays a namespace binding — is in
+`docs/planning/shell-coreutils-plan.md` § Milestone 3.5 and the decision log, 2026-07-30.
 
 ## Pipe semantics (kernel-provided)
 
