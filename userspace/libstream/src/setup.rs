@@ -232,7 +232,7 @@ impl SetupPayload {
 // --- Syscall-backed stage runtime (Tier-1 spawn + bootstrap) ----------------
 
 #[cfg(feature = "io")]
-pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup};
+pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env};
 
 /// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
 /// the setup message, over real IPC. Gated behind `io` so the pure protocol above stays

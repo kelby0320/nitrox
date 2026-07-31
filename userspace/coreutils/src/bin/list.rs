@@ -94,10 +94,22 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     // No operand: list the default directory. Several operands list each in turn, into
     // one stream — a pipeline stage emits one table, not one per argument.
+    // Resolved at the boundary, against this stage's own `PWD` (M3.5 Part B) — the shell
+    // passes the argument through as written and hands over the working directory, so
+    // `list .` means the same thing here as `open ./x` does in the shell.
     let mut paths: Vec<String> = args.operands.clone();
     if paths.is_empty() {
-        paths.push(owned(DEFAULT_PATH));
+        // With no operand, the default is the working directory when there is one — which
+        // is what makes a bare `list` mean "here" rather than always meaning the root.
+        paths.push(match &stage.cwd {
+            Some(cwd) => cwd.clone(),
+            None => owned(DEFAULT_PATH),
+        });
     }
+    let paths: Vec<String> = paths
+        .iter()
+        .map(|p| String::from_utf8_lossy(&stage.path(p.as_bytes())).into_owned())
+        .collect();
 
     let mut rows: Vec<(String, OwnedEntry)> = Vec::new();
     for path in &paths {

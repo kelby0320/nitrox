@@ -554,7 +554,12 @@ impl<'a> Lexer<'a> {
     // --- literals -----------------------------------------------------------
 
     fn scan_ident(&mut self, start: usize) -> &'a str {
-        let mut i = start;
+        // Start past the first byte: the caller has already checked `is_ident_start`, and
+        // a start character need not also be a *continue* character. `$` is exactly that
+        // case — scanning from `start` consumed nothing and made no progress, so the outer
+        // loop spun forever. An infinite loop, not a wrong token, which is why it showed
+        // up as a hung test run rather than a failure.
+        let mut i = start + 1;
         while i < self.src.len() && is_ident_char(self.at(i)) {
             i += 1;
         }
@@ -721,8 +726,16 @@ impl<'a> Lexer<'a> {
 
 // --- character classes ------------------------------------------------------
 
+/// What may begin an identifier.
+///
+/// `$` is included so the REPL's own bindings — `$last` (§11d) and `$env` — are nameable
+/// from source at all. Part F bound `$last` and nothing could refer to it, because the
+/// lexer had no way to produce that token: a silent dead end rather than an error.
+///
+/// It is deliberately *only* a start character, so `a$b` is not one identifier and `$` has
+/// no meaning mid-word. Nothing else in the grammar uses it.
 fn is_ident_start(c: u8) -> bool {
-    c.is_ascii_alphabetic() || c == b'_'
+    c.is_ascii_alphabetic() || c == b'_' || c == b'$'
 }
 
 fn is_ident_char(c: u8) -> bool {
@@ -1138,6 +1151,21 @@ mod tests {
     fn an_integer_that_does_not_fit_is_an_error() {
         assert!(Lexer::tokenize_expr("99999999999999999999").is_err());
         assert!(Lexer::tokenize_expr("0x").is_err());
+    }
+
+    /// §11d writes `$last`, so it has to lex. Part F bound it and nothing could name it.
+    #[test]
+    fn a_dollar_may_begin_an_identifier() {
+        assert_eq!(toks("$last"), vec![Tok::Ident("$last".into()), Tok::Eof]);
+        assert_eq!(
+            toks("$env.PWD"),
+            vec![Tok::Ident("$env".into()), Tok::Dot, Tok::Ident("PWD".into()), Tok::Eof]
+        );
+        // …but only at the start: `a$b` is not one name.
+        assert_eq!(
+            toks("a$b"),
+            vec![Tok::Ident("a".into()), Tok::Ident("$b".into()), Tok::Eof]
+        );
     }
 
     #[test]
