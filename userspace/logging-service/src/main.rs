@@ -46,6 +46,10 @@ const MSG_LEN: usize = 4096;
 /// Escaping the limit rather than raising it is `TODO(server-fanout)`; see
 /// `docs/architecture/logging.md`.
 const MAX_SOURCES: usize = MAX_WAIT_HANDLES - 1;
+/// `KError::PeerClosed` — the writer of a source channel is gone. Distinguished from
+/// `WouldBlock` because the two demand opposite responses: wait again, or stop waiting
+/// **forever**. See [`drain_source`].
+const E_PEER_CLOSED: i64 = -13;
 /// In-memory keep-recent ring capacity (records).
 const RING_CAP: usize = 256;
 
@@ -476,13 +480,30 @@ fn format_typed_row(schema: &libstream::Schema, values: &[libstream::Value]) -> 
 
 /// Drain and stamp every queued `LogRecord` on the source channel `h`, routing each to
 /// the sinks. `seq` is the global monotonic sequence counter.
-fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &mut u64) {
+fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &mut u64) -> bool {
     let (principal, tier, chan_label) = match sources.iter().find(|s| s.handle == h) {
         Some(s) => (s.principal.clone(), s.tier, s.label.clone()),
-        None => return, // unknown handle (shouldn't happen)
+        // An unknown handle is not a live source, so reporting it dead is also what gets
+        // it out of the wait set rather than leaving it to be re-signaled forever.
+        None => return true,
     };
     loop {
-        if recv(h) != 0 {
+        let rc = recv(h);
+        if rc == E_PEER_CLOSED {
+            // The principal holding the write end exited. **Terminal, and it has to be
+            // acted on** — this is the one recv outcome that must not be retried.
+            //
+            // A closed peer is permanently `signaled`, so a dead handle left in the wait
+            // set makes `sys_wait` return instantly, every time, forever: this service
+            // spins at 100% of a CPU. The cost is not the wasted cycles. Deferred handle
+            // reclamation runs in the **idle thread**, and a run queue that is never
+            // empty means the CPU never idles — so *no exited process on the system is
+            // ever reclaimed*, and every pipe they held stays open. One coreutil leaving
+            // a log channel behind hung the shell on an unrelated pipe, three subsystems
+            // away. See the 2026-07-31 decision-log entry.
+            return true;
+        }
+        if rc != 0 {
             break; // WouldBlock: drained
         }
         // SAFETY: read payload_len, then a bounded read-only slice over RECV_MSG.
@@ -522,6 +543,7 @@ fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &m
             sink.write(&rec);
         }
     }
+    false // drained, still live
 }
 
 /// The serve loop: multi-wait on the serving endpoint + every per-principal channel;
@@ -529,6 +551,7 @@ fn drain_source(h: u64, sources: &[Source], sinks: &mut [Box<dyn Sink>], seq: &m
 fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
     kprint(b"logging-service: serving\n");
     let mut sources: Vec<Source> = Vec::new();
+    let mut dead: Vec<u64> = Vec::new();
     let mut seq: u64 = 0;
     loop {
         // Build the wait set: [serve_end] + each source read end.
@@ -571,9 +594,16 @@ fn serve_loop(serve_end: u64, sinks: &mut [Box<dyn Sink>]) -> ! {
                 while recv(serve_end) == 0 {
                     process_resolve(serve_end, &mut sources);
                 }
-            } else {
-                drain_source(h, &sources, sinks, &mut seq);
+            } else if drain_source(h, &sources, sinks, &mut seq) {
+                dead.push(h);
             }
+        }
+        // Retire dead sources *after* the sweep — `drain_source` borrows `sources`, and a
+        // source removed mid-iteration would shift the handles the results still name.
+        for h in dead.drain(..) {
+            sources.retain(|s| s.handle != h);
+            // SAFETY: closing our own read end; nothing references it once retired.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
         }
     }
 }

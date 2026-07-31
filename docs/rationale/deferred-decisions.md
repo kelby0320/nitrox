@@ -387,6 +387,33 @@ but it is a grammar change and belongs with a considered pass over §9c rather t
 side effect of Part E.
 
 
+**No regression cover for reclamation starvation — `TODO(idle-starvation-test)`.**
+The 2026-07-31 `logging-service` spin is fixed, but nothing would catch its return. The
+failure chain is long — a busy-looping service keeps the run queue non-empty → the idle
+thread never runs → `reap_pending` never runs → no exited process is reclaimed → a dead
+stage's pipe never closes → an unrelated reader hangs — and every link is invisible to the
+existing suite.
+
+An attempt was made and **thrown away rather than kept**: a harness demo that opened a log
+source, closed it, and asserted the scheduler went quiet over a sleeping second. It passed
+with the bug deliberately reinstated, so it tested nothing. Explicitly closing a client's
+write end does not reproduce what a *process exit* does, and the difference is not yet
+understood — that is the thing to work out first, not to paper over. A control that passes
+is a bug in the control; keeping it would have been worse than having none.
+
+Two candidate shapes, neither built:
+- **Switch-rate probe.** The right assertion (a quiet system costs ~3 switches/second; a
+  spinning one is preempted every tick) but it needs a trigger that genuinely reproduces a
+  source dying by process exit.
+- **Idle-reachability assertion.** More direct: assert `reap_pending` runs within a bounded
+  interval on a quiet system. Needs a counter the guest can read — `/proc/sched/stats` has
+  no such field today.
+
+The deeper issue the fix does *not* address: deferred reclamation has exactly one home on a
+quiet system, and any busy userspace process disables it. That is a fragile contract
+independent of this bug. Trigger: the next time a service is found spinning, or before
+anything ships that can legitimately keep a CPU busy.
+
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
 `service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,
