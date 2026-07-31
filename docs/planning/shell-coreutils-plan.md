@@ -670,6 +670,57 @@ honoured from then on, not bolted on at Part F.
 schema-aware completion, and everything in §12. `usersh` stays the login leaf until Part F proves
 `nxsh` in-guest; switching `session-mgr` over is the last step, not the first.
 
+### Milestone 3.5 — what a child inherits (B3 + `/session/*` + `cd`)
+
+**Sequenced here with the maintainer (2026-07-30), after Part G rather than inside
+Milestone 3.** B3 was nominally Milestone 3 scope ("resolve as it comes up") and never came
+up — nothing needed env. Giving it its own slice beats squeezing it into a part, and by the
+time Part G lands there are *three* filed items that turn out to be the same question asked
+from different directions:
+
+| Filed as | Surfaced in | What it wanted |
+|---|---|---|
+| B3 (env) | design §5a, passim | env vars as namespace-scoped resources |
+| `TODO(session-metadata-server)` | M2 Part E (`whoami`) | mutable `/session/*` behind a server |
+| `TODO(shell-cwd)` | M3 Part F (`cd`) | a position spawned stages agree with |
+
+Each arrived independently, and each is a case of **something a child must inherit,
+addressed by a namespace path**. Solved separately they would produce three mechanisms and
+three migrations — which is precisely what `TODO(session-metadata-server)` was filed to
+prevent.
+
+#### The split this slice must respect
+
+They are not all one mechanism, and assuming they are is the way to get this wrong.
+
+- **env and `/session/*` are the same thing**: named *values* behind a namespace path,
+  mutable, read by whoever holds the path. One mechanism covers both, and `/session/user`
+  migrates onto it — a migration that touches no client, since a server answers a resolve
+  with `OBJECT_KIND_MEMOBJ` and `lookup + map + read` is byte-identical either way.
+- **`cd` is a *position*, not a value.** The Unix answer — a `PWD` variable programs
+  consult — is ambient state of exactly the kind this system rejects everywhere else. The
+  capability-correct answer is that a spawned stage receives a **namespace** rooted or
+  biased at the position, which is a spawn-contract change rather than a value-passing one.
+
+So the expected output is **one value mechanism and one namespace decision**, not one
+mechanism for three problems.
+
+#### The question to decide explicitly, not by accident
+
+Does `cd` change *the shell's* namespace only, or does the position ride the spawn contract
+to every stage?
+
+The first is easy and half-useful: the shell's own `open ./x` would follow the position and
+a spawned `list .` would not, which is the split-brain `TODO(shell-cwd)` describes. The
+second is what makes them agree, and it touches
+[`pipeline-stdio.md`](../spec/pipeline-stdio.md). This is the slice's real design work; the
+env mechanism is the comparatively mechanical half.
+
+#### Unblocks
+
+`nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken — a
+shell without `cd` is not a better login shell than the throwaway it would replace.
+
 ### Deferred — the rich REPL (§11) and its dependencies
 
 Gated on the console/tty server + compositor terminal (later in Phase 4). Covers reverse-search,
