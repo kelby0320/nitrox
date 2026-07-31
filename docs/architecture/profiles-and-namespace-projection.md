@@ -43,6 +43,25 @@ A profile server is a **userspace resource server** (like the fs-server):
   profile a process's namespace includes, and with what rights, is decided when the
   namespace is built, not by the profile server.
 
+### The index
+
+Resolve and readdir are served from **one** merged view, built lazily on first use and kept.
+
+Caching it is sound *by construction*, not by invalidation: a store path is
+content-addressed, so `/store/<hash>-coreutils-0.1.0/bin/` cannot change contents — different
+contents would be a different hash and so a different path. What can change is which packages
+a profile names, and the server reads its manifest exactly once at startup, so it cannot
+observe that either. Making an installed package visible without a logout is
+`TODO(profile-generation-refresh)`.
+
+Building it lazily rather than at startup keeps a boot with no `/bin` consumer from paying
+one directory read per package over IPC. Serving *both* paths from it also retires the
+original probe, which cost one `sys_ns_lookup` per package per program spawn — invisible at
+two packages, fifty round trips at fifty.
+
+A package whose `bin/` cannot be read is skipped rather than fatal: a profile naming one
+broken package should lose that package, not all of `/bin`.
+
 ### How a lookup resolves — resolve-by-probe
 
 The profile server is bound at a projected root (`/bin`) and receives the **suffix**
@@ -58,7 +77,11 @@ lookup /bin/foo  (forwarded to the profile server bound at /bin)
 ```
 
 **Probing, not enumeration** — this deliberately needs only *lookup*, never directory
-listing (`readdir` is a deferred fs-server op). The union `/bin` emerges from probing.
+listing — so since 2026-07-31 the profile server **mints a directory session** for `/bin`
+itself (an empty forwarded suffix) and answers `OP_FILE_READ_DIR` from a merged index it
+builds by reading each package's `bin/` back through the fs-server's own `readdir`. The
+union `/bin` therefore both resolves *and* lists, from one index, so a listing cannot drift
+from what a spawn would find.
 Name collisions resolve by **order**, on two axes: *within* a profile, manifest order
 (first package listed wins); *across* layered profiles, layer order — a per-user
 profile is probed before the system profile, so **the user's package overrides the

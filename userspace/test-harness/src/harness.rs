@@ -3209,6 +3209,50 @@ fn cpus_online(root_ns: u64) -> u64 {
     n
 }
 
+/// **`/bin` is listable, and the listing agrees with what a spawn would find.**
+///
+/// `/bin` is not a directory. It is a *view*: the union of every profile package's `bin/`,
+/// merged in manifest order, first provider wins. No filesystem directory holds that union,
+/// so the profile server has to mint a directory session and answer `READ_DIR` itself —
+/// reading each package's `bin/` back through the fs-server's own `readdir`. Until it did,
+/// `/bin` resolved every program correctly and still reported "filesystem unreachable" to
+/// anything trying to list it.
+///
+/// The check that matters is not "the listing is non-empty" but **the listing and resolve
+/// agree**. They are served from one index precisely so they cannot drift; a program that
+/// lists but will not spawn, or spawns but does not list, is the failure this guards.
+fn bin_listing_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: bin-listing demo (the projected /bin is a real directory)\n");
+
+    let out = run_coreutil_capture(root_ns, notif, b"/bin/list", &["list", "/bin"], true);
+
+    // 1. Every program the profile provides is listed. Checking one name would pass on a
+    //    listing that lost a whole package.
+    for prog in [
+        b"list".as_slice(), b"copy", b"mkdir", b"remove", b"rename", b"move",
+        b"touch", b"date", b"sleep", b"whoami", b"nxsh",
+    ] {
+        if !contains(&out, prog) {
+            return_fail(b"test-harness: a profiled program is missing from `list /bin`\n");
+        }
+    }
+
+    // 2. **The union spans packages.** `heartbeat` and the coreutils are separate store
+    //    packages, so a listing containing both is the whole point — one that showed only
+    //    the coreutils would satisfy check 1 and still prove nothing about merging.
+    if !contains(&out, b"heartbeat") {
+        return_fail(b"test-harness: `list /bin` did not merge across packages\n");
+    }
+
+    // 3. The negative control. A listing that named everything would pass 1 and 2 while
+    //    meaning nothing.
+    if contains(&out, b"definitely-not-a-program") {
+        return_fail(b"test-harness: `list /bin` invented an entry\n");
+    }
+
+    kprint(b"test-harness: bin-listing ok (both packages merged, nothing invented)\n");
+}
+
 /// Is `needle` a subsequence of contiguous bytes in `hay`? The listing arrives as a TSM1
 /// stream; a name appears in it verbatim, which is enough to assert on without decoding.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -4506,6 +4550,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5g. A log source whose writer exited must be retired — otherwise the service
     //       spins, the CPU never idles, and nothing on the system is ever reclaimed.
     dead_log_source_demo(root_ns);
+
+    // 0a5g. `/bin` is a projected view, not a directory — prove it is listable anyway,
+    //       and that the listing matches what resolve would hand back.
+    bin_listing_demo(root_ns, notif);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

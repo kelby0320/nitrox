@@ -6,7 +6,9 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
-librsproto = { path = "../librsproto" }
+# `io` for `session::Dir`: building the `/bin` index makes this server a *client*
+# of the fs-server's readdir, over the store.
+librsproto = { path = "../librsproto", features = ["io"] }
 
 # A library + binary split (mirroring init/service-mgr): the library holds the
 # host-testable profile-manifest parser; the binary is the bare-target resource

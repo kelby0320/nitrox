@@ -387,6 +387,37 @@ but it is a grammar change and belongs with a considered pass over §9c rather t
 side effect of Part E.
 
 
+**A profile's contents are fixed at server startup — `TODO(profile-generation-refresh)`.**
+`profile-server` reads its manifest once, at startup, from the initramfs, and never looks
+again. Installing a package therefore cannot become visible to a running session: the new
+generation's manifest exists on disk, and every process already holding `/bin` keeps
+resolving against the old package list until the server is restarted — which in practice
+means logging out and back in.
+
+The intended behaviour is the opposite: install a package, bump the profile's generation,
+and see it in `/bin` **without** logout/login. Nothing needs it today, so it is not built.
+
+Two halves, and the second is the harder one:
+
+- **The index.** Whatever readdir caches must be *rebuildable and swappable* rather than
+  scattered through the resolve path, and must carry the generation it was built from. This
+  costs nothing to honour now and is why the readdir work keeps a single owned index serving
+  both resolve and readdir.
+- **The trigger.** The server has to be *told*. It holds no `BIND_NAMESPACE` and should not
+  be watching the filesystem for manifest changes — that would be a resource server
+  reaching for authority over its own registration, which is the thing
+  `why-supervisor-registration.md` refuses. So the shape is a control op on its endpoint,
+  sent by whichever supervisor installed the package. That in turn implies the profile
+  server keeps a control channel past startup, which today it does not.
+
+Note the store's immutability does **not** make this stale-cache problem: a package's
+contents can never change under a fixed store path, so a cached listing for a given package
+is correct forever. What changes is *which packages the profile names* — membership, not
+contents.
+
+Trigger: a package manager that can install at runtime, or the first time a user has to log
+out to see a program they just installed.
+
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
 `service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,

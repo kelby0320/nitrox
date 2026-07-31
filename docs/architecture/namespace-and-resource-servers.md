@@ -174,6 +174,57 @@ A **direct handle** is a supervisor binding a concrete object — a `MemoryObjec
 *computed per lookup* (e.g. `/proc/self/process`, which depends on *who* is asking)
 without spinning up a userspace process — see "In-kernel resource servers" below.
 
+## A directory handle is a session, and the server decides
+
+There is **no "open directory" syscall**. A directory handle is an IPC **session channel**
+the owning server mints and transfers, returned from an ordinary `sys_ns_lookup`.
+`librsproto::session::Dir::open` is nothing but a lookup; the endpoint it gets back speaks
+`OP_FILE_READ_DIR`, `OP_FILE_MKDIR`, `OP_FILE_UNLINK` and friends.
+
+**The server chooses object-or-session, from what the path denotes** — not the kernel, and
+not the requested rights. The fs-server runs `ext4::resolve_dir` on the suffix first: a
+suffix naming a directory inode gets a session (`OBJECT_KIND_CHANNEL`, the channel in
+`handles[0]`); anything else falls through to the file path and gets a `FileObject`.
+
+The client's requested rights are a *separate* axis. `DIR_SESSION_RIGHTS`
+(`SEND | RECV | WAIT`) are the rights appropriate to a channel, and the returned handle is
+attenuated to them — but asking for them does not *make* the answer a session, and a
+server that returns an object regardless is not violating anything the kernel enforces.
+
+Two consequences worth stating, because both have already bitten:
+
+- **Answering resolves is not enough to make your subtree listable.** A server that only
+  handles the object case leaves `Dir::open` failing at the transport level, and every
+  listing of its subtree reports the filesystem as unreachable. That is exactly what the
+  profile server does at `/bin` today.
+- **Ordering between the two paths matters.** The fs-server checks `rename` *before* the
+  directory-session path, because that path infers "this is a directory" from the same
+  resolve — without the ordering, `move` on a directory would silently open a session
+  instead of renaming.
+
+## A listing is the union of two sources
+
+No single component knows what is "in" a path, because two different things put names
+there. A listing is therefore the union of:
+
+1. **The bindings beneath the path** — `sys_ns_enumerate` walks the caller's own
+   namespace. Local and cheap: no IPC, the kernel is reading a list it already holds.
+2. **The filesystem under the path** — `Dir::open` + `OP_FILE_READ_DIR` to whichever
+   server owns it.
+
+Bindings **shadow** same-named filesystem entries, exactly as a mount point shadows the
+directory it covers.
+
+This is why `/` genuinely needs both (the root filesystem's own entries *plus* `/dev`,
+`/bin`, `/log` alongside them), while `/dev` is all bindings and no filesystem, and
+`/system` is the other way round. A path with neither is a real error; a path with only
+bindings is an ordinary kernel-served directory, not a failure.
+
+A caller that asks only one source gets a confidently wrong answer rather than an error,
+which is why the coreutils merge both and why `coreutils::fs::children` — used by the
+recursive tree walks — deliberately uses **filesystem entries only**: descending into a
+binding would walk out of the tree being copied or removed.
+
 ## Lookup is asynchronous
 
 `sys_ns_lookup` returns a **`PendingOperation`** (`docs/architecture/`… the
