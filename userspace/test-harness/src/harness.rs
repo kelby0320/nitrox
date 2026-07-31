@@ -2793,7 +2793,24 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: nxsh def/match/try did not run\n");
     }
 
-    kprint(b"test-harness: nxsh ok (evaluated, spawned a stage, operators, save/open, def+match+try)\n");
+    // 8. **Part F**: the REPL's language side. The console loop itself needs a device and
+    //    a person, but everything that decides *what the loop does* — continuation, the
+    //    auto-display rule, `$last` — is language logic, and that is what runs here.
+    let repl = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &[
+            "nxsh",
+            "-c",
+            "let n = list /system | count\nif n < 1 { bad }",
+        ],
+    );
+    if repl != 0 {
+        return_fail(b"test-harness: nxsh repl-line evaluation failed\n");
+    }
+
+    kprint(b"test-harness: nxsh ok (evaluated, spawned, operators, save/open, def+match+try, repl)\n");
 }
 
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.

@@ -141,6 +141,57 @@ impl Interp {
         }
     }
 
+    /// Run one interactive line: execute it, bind `$last`, and return what the REPL
+    /// should print (§11d, §11e).
+    ///
+    /// `$last` is deliberately a small `Record` of **both** halves. §2 left it ambiguous
+    /// whether a pipeline's "value" and its `PipelineStatus` were the same thing; §11d
+    /// settles that they are not and should not be conflated — `$last.value` is what you
+    /// just computed, `$last.status` is whether it worked. Purely REPL bookkeeping: it is
+    /// not visible inside a function or a script, so real code still has no ambient state
+    /// to read.
+    pub fn run_line(&mut self, src: &str) -> Result<Option<alloc::string::String>> {
+        let script = crate::parse_script(src)
+            .map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
+        let mut out = None;
+        for stmt in &script.stmts {
+            let value = match self.exec(stmt)? {
+                Flow::Normal(v) | Flow::Return(v) => v,
+            };
+            self.bind_last(&value)?;
+            if crate::repl::should_display(stmt) && !value.is_null() {
+                out = Some(crate::ops::display(&value));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Bind `$last` — REPL-only, per §2 and §11d.
+    fn bind_last(&mut self, value: &Val) -> Result<()> {
+        if self.mode != Mode::Repl {
+            return Ok(());
+        }
+        let status = self
+            .lookup("__status")
+            .map(|s| s.val.clone())
+            .unwrap_or(Val::NULL);
+        let schema = Schema::new()
+            .field("value", value.as_data().and_then(|v| v.type_tag()).unwrap_or(libstream::wire::TypeTag::Null), TypeModifiers::NONE)
+            .field("status", libstream::wire::TypeTag::Record, TypeModifiers::NONE);
+        let values = alloc::vec![
+            value.as_data().cloned().unwrap_or(Value::Null),
+            status.as_data().cloned().unwrap_or(Value::Null),
+        ];
+        let rec = Val::Data(Value::Record(Arc::new(Record { schema, values })));
+        // `$last` is rebound every line, so it is a `mut` slot rather than a fresh
+        // binding stacking up in the scope.
+        if let Some(slot) = self.lookup_mut("$last") {
+            slot.val = rec;
+            return Ok(());
+        }
+        self.bind("$last", rec, true, false)
+    }
+
     /// Convenience for tests and `nxsh -c`: parse and run.
     pub fn eval_str(src: &str) -> Result<Val> {
         let script = crate::parse_script(src)
