@@ -9566,3 +9566,78 @@ pipeline *semantics* — ordering, backpressure, error propagation — testable 
 that it is the same problem as `/session/*` metadata: mutable, namespace-scoped values behind a
 path. B3 is to be designed with `/session/*` in view and that binding migrated onto whatever B3
 builds, rather than producing two mechanisms and two migrations.
+
+---
+
+## 2026-07-30 — Env and `cd` ride the setup message, not the namespace (a recorded divergence from §5a)
+
+Designed with the maintainer after Milestone 3 completed. Three items filed independently —
+B3 (env), `TODO(session-metadata-server)` from `whoami`, and `TODO(shell-cwd)` from the
+REPL — turned out to be one question: **what does a child inherit, and how is it named?**
+
+**The framing that got there was wrong twice, and both corrections came from the
+maintainer.** The first attempt split env from `cd` on the grounds that a cwd is ambient
+state. That conflates two things the system treats very differently: ambient *authority* is
+rejected absolutely and enforced by the capability model, while ambient *data* — env, `$?`
+— is rejected on **legibility** grounds (§5a: a thing that reads from wherever it happened
+to be defined cannot be understood from its signature). Env and PWD are the same category
+under that rule, so the split had no basis.
+
+The second attempt proposed modelling `cd` as rebinding the shell's namespace. The
+maintainer's objection — namespace construction is about *restriction*, and `cd
+/system/sub` must not make `/home` unreachable — is correct, and it kills the idea:
+expressing position with a restriction mechanism conflates position with authority.
+
+**The constraint that settles it was in the kernel the whole time.** `sys_process_spawn`:
+"The child **always** gets a LOOKUP-only handle — it resolves names but cannot rebind its
+root." Unconditional. A process that is not a supervisor can never bind into its own
+namespace, and the login shell is spawned with `syscaps: 0` precisely so it is not one. So
+no shell-mutable namespace entry is possible, and `cd`-as-rebinding was never on the table.
+
+**"The spawn contract" is two contracts, and only one is an ABI event.** `SpawnArgs` is
+`#[repr(C)]`, offset-asserted, mirrored in `libkern`, covered by `abi-sync-check` and the
+ABI hash. The Tier-1 **setup message** is pure userspace TSM1, already carrying `streams`
+and `argv`, invisible to the kernel. Env and cwd belong in the second, which is the channel
+that already answers "what does this stage start with". The maintainer's stated nervousness
+about changing the spawn contract was well-founded and pointed at the right answer.
+
+**The line is capability versus configuration**, not session state versus process state. A
+namespace binding is how you hold something *unforgeable* — a process cannot fabricate one
+because it cannot bind at all — and that is worth a lookup for things that must not be lied
+about. `/session/user` stays there because it is **identity**: if `USER` were an env string
+any process could hand a child a different one. `PATH`/`EDITOR` are configuration, and
+handing a child a different `EDITOR` is the point of env, not an attack.
+
+**The IPC objection was real but misattributed.** `/session/user` is a direct-handle bind
+today — lookup plus map, no server, no round trip. What makes `/session/*` expensive is the
+migration to a userspace server, whose trigger is the first *mutable* member. Env is
+mutable, so putting it there would not merely pay that cost, it would create it for
+everything else under `/session`.
+
+**Env is a TSM1 `Record`, not `key=value`.** The setup payload is already a Record, so this
+is one more field rather than a new encoding. `PATH` becomes `List<String>`, which removes
+the colon-splitting bug class outright. Types become part of the contract, so a mismatch is
+§6's schema diff rather than a silent misparse. And because §6 makes `Value` exactly what
+TSM1 can represent, the shell needs no new machinery: `display $env`, `$env.PATH` and
+`env.EDITOR = "vi"` all fall out of Part B's field assignment and Part D's operators. The
+universality argument for `key=value` does not apply when every program already links
+`libstream`.
+
+`cwd` is a conventional entry in that record, as `PWD` is in Unix — and safer, because Unix
+has two sources of truth (`$PWD` and `getcwd()`) and the interesting bugs live in the gap.
+There is no kernel cwd here, so the entry is the truth and has nothing to disagree with.
+`cd` verifies the path resolves before setting it.
+
+**Recorded as a divergence, not drift.** §5a's anchor is "env vars as namespace-scoped
+resources", and this is not that. What §5a actually objects to — *implicit* inheritance, a
+child silently getting whatever the parent had — is preserved: a setup-message field is
+explicitly constructed by the parent, per spawn, visible in the contract. The reasoning
+survives; the mechanism does not.
+
+**Consequences.** `TODO(session-metadata-server)` shrinks to tty and job state — handles,
+genuinely shared-mutable — and env leaves that story, which also removes what would have
+forced the server migration. Relative-path expansion becomes a wrapper in
+`coreutils::fs`/`libos` rather than a kernel change; lexical `..` normalisation is correct
+here only because Nitrox has no symlinks. And a gap surfaced on the way: `open ./data.csv`,
+used throughout design §4 and §7, does not work in guest today — Part D's test passed
+against a mock and the in-guest demo used absolute paths, so the claim went untested.
