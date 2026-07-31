@@ -30,6 +30,7 @@ use libstream::wire::{Record, Schema, TypeModifiers, Value};
 
 use crate::ast::*;
 use crate::host::{Host, PipelineRun, StageSpec, StageStatus};
+use crate::ops;
 use crate::value::{Func, Val, render_i64};
 
 /// A runtime failure. The message is built for a person: it names the operation and the
@@ -517,8 +518,26 @@ impl Interp {
             }
             Expr::Match { .. } => Err(EvalError::new("`match` is evaluated in Part E")),
             Expr::Try(_) => Err(EvalError::new("`?` propagation is evaluated in Part E")),
-            Expr::Expect(_, _) => Err(EvalError::new("`expect` is evaluated in Part D")),
-            Expr::Assert(_) => Err(EvalError::new("`assert` is evaluated in Part D")),
+            // §6: `expect` is ascription in expression position, and `assert` its sibling
+            // for a *content* predicate. Deliberately separate keywords rather than one
+            // verb overloaded on argument type, so the message says "shape mismatch" or
+            // "assertion failed" rather than merging two jobs into one.
+            Expr::Expect(inner, t) => {
+                let v = self.eval(inner)?;
+                check_type(&v, t)?;
+                Ok(v)
+            }
+            Expr::Assert(pred) => {
+                let v = self.eval(pred)?;
+                match v.as_bool() {
+                    Some(true) => Ok(Val::NULL),
+                    Some(false) => Err(EvalError::new("assertion failed")),
+                    None => Err(EvalError::new(alloc::format!(
+                        "`assert` needs a Bool predicate, got {}",
+                        v.type_name()
+                    ))),
+                }
+            }
             Expr::Pipeline(stages) => self.pipeline(stages),
             Expr::Call(c) => {
                 // D4: a **local binding wins** over a command name for a bare,
@@ -536,11 +555,265 @@ impl Interp {
                 if c.kind == CallKind::External {
                     return self.pipeline(core::slice::from_ref(e));
                 }
+                if c.kind == CallKind::Operator {
+                    return self.apply_operator(c, None);
+                }
                 Err(unavailable(c))
             }
         }
     }
 
+
+
+    // --- generic value operators (Part D) -----------------------------------
+
+    /// Invoke a closure with one argument.
+    ///
+    /// Part D needs this because §8b's sugar *is* a closure: `filter size > 1000` desugars
+    /// to `filter { |it| it.size > 1000 }`, so an operator that could not call one could
+    /// not implement the design's commonest spelling. Part E extends the same primitive
+    /// with `def`'s named arguments, defaults and variadics.
+    ///
+    /// The closure runs in a scope built from its **captured snapshot** (§5a), not from
+    /// the caller's scope: capture is by value at creation, so what a closure sees is what
+    /// was visible when it was written.
+    pub fn call_closure(&mut self, f: &Func, args: &[Val]) -> Result<Val> {
+        if args.len() != f.params.len() {
+            return Err(EvalError::new(alloc::format!(
+                "this closure takes {} argument(s), given {}",
+                render_i64(f.params.len() as i64),
+                render_i64(args.len() as i64)
+            )));
+        }
+        // A fresh scope stack: a closure cannot see the caller's locals, only its own
+        // capture. Anything else would make `filter` able to read the pipeline's
+        // internals by accident.
+        let saved = core::mem::replace(&mut self.scopes, alloc::vec![Vec::new()]);
+        for (n, v) in &f.captured {
+            let _ = self.bind(n, v.clone(), false, false);
+        }
+        self.push_scope();
+        for (p, v) in f.params.iter().zip(args) {
+            let _ = self.bind(&p.name, v.clone(), false, false);
+        }
+        let r = self.exec_block(&f.body);
+        self.pop_scope();
+        self.scopes = saved;
+        match r? {
+            Flow::Normal(v) | Flow::Return(v) => Ok(v),
+        }
+    }
+
+    /// Apply a generic operator to the value arriving on its left.
+    ///
+    /// `operand` is `None` when the operator was written outside a pipeline. Most need
+    /// one — `filter` with nothing to filter is a mistake, not an empty result — and the
+    /// message says so rather than quietly answering for an empty stream.
+    fn apply_operator(&mut self, c: &Call, operand: Option<Val>) -> Result<Val> {
+        let name = c.name.as_str();
+        // Positional arguments, evaluated once.
+        let mut flags: Vec<&str> = Vec::new();
+        let mut closures: Vec<Val> = Vec::new();
+        // Positional arguments are kept **unevaluated** and interpreted per operator.
+        //
+        // The two readings genuinely differ: `sort size` names a *column* (the same
+        // reading §8b gives a bare identifier inside a predicate, where `size` means
+        // `it.size`), while `display files` names a *binding*. A single global rule gets
+        // one of them wrong — routing every bare name to a field name broke `display
+        // files`, and evaluating every one broke `sort size` with "`size` is not a
+        // program". So the operator decides, because only the operator knows.
+        let mut raw: Vec<&Expr> = Vec::new();
+        for a in &c.args {
+            match a {
+                Arg::Positional(Expr::Closure { params, body }) => {
+                    closures.push(self.eval(&Expr::Closure {
+                        params: params.clone(),
+                        body: body.clone(),
+                    })?);
+                }
+                Arg::Positional(e) => raw.push(e),
+                Arg::Flag(f, None) => flags.push(f.as_str()),
+                Arg::Flag(f, Some(e)) => {
+                    flags.push(f.as_str());
+                    raw.push(e);
+                }
+                Arg::ShortFlags(f) => {
+                    for ch in f.chars() {
+                        // Short flags map to their long form, the GNU convention §10f
+                        // adopts.
+                        if ch == 'r' {
+                            flags.push("reverse");
+                        }
+                    }
+                }
+                Arg::Named(n, _) => {
+                    return Err(EvalError::new(alloc::format!(
+                        "`{name}` is a generic operator and takes bareword arguments, so \
+                         `{n}:` does not apply — named arguments are the `def` convention \
+                         (§5b)"
+                    )));
+                }
+                Arg::PipeFill => {}
+            }
+        }
+        let reverse = flags.contains(&"reverse");
+
+        let need = |o: Option<Val>| -> Result<Val> {
+            o.ok_or_else(|| {
+                EvalError::new(alloc::format!(
+                    "`{name}` needs an operand — it works on the value arriving from the \
+                     left of a pipe"
+                ))
+            })
+        };
+        let wrap = |r: core::result::Result<Val, alloc::string::String>| -> Result<Val> {
+            r.map_err(EvalError::new)
+        };
+        // A bare name read as a **column**, not evaluated.
+        let field_names: Vec<alloc::string::String> = raw
+            .iter()
+            .filter_map(|e| match e {
+                Expr::Ident(n) | Expr::Word(n) | Expr::Str(n) => Some(n.clone()),
+                _ => None,
+            })
+            .collect();
+
+        match name {
+            "count" => wrap(ops::count(&need(operand)?)),
+            "dedupe" => wrap(ops::dedupe(&need(operand)?)),
+            "take" | "skip" | "last" => {
+                let v = need(operand)?;
+                let first = match raw.first() {
+                    Some(e) => Some(self.eval(e)?),
+                    None => None,
+                };
+                let n = match first.as_ref().and_then(|a| a.as_data()) {
+                    Some(Value::Int(n)) => *n,
+                    _ => {
+                        return Err(EvalError::new(alloc::format!(
+                            "`{name}` needs a row count"
+                        )));
+                    }
+                };
+                wrap(match name {
+                    "take" => ops::take(&v, n),
+                    "skip" => ops::skip(&v, n),
+                    _ => ops::last(&v, n),
+                })
+            }
+            "select" => {
+                let v = need(operand)?;
+                wrap(ops::select(&v, &field_names))
+            }
+            "sort" => {
+                let v = need(operand)?;
+                wrap(ops::sort(&v, field_names.first().map(|s| s.as_str()), reverse))
+            }
+            "filter" => {
+                let v = need(operand)?;
+                let f = self.one_closure(&closures, name)?;
+                let mut kept = Vec::new();
+                for row in ops::rows(&v).map_err(EvalError::new)? {
+                    let keep = self.call_closure(&f, &[row.clone()])?;
+                    match keep.as_bool() {
+                        Some(true) => kept.push(row),
+                        Some(false) => {}
+                        None => {
+                            return Err(EvalError::new(alloc::format!(
+                                "a `filter` predicate must return Bool, got {}",
+                                keep.type_name()
+                            )));
+                        }
+                    }
+                }
+                wrap(ops::rebuild(&v, kept))
+            }
+            "map" => {
+                let v = need(operand)?;
+                let f = self.one_closure(&closures, name)?;
+                let mut out = Vec::new();
+                for row in ops::rows(&v).map_err(EvalError::new)? {
+                    out.push(self.call_closure(&f, &[row])?);
+                }
+                wrap(ops::table_from_records(out))
+            }
+            "each" => {
+                // `each` is for effects, so it returns its input unchanged — a chain does
+                // not narrow just because something looked at every row.
+                let v = need(operand)?;
+                let f = self.one_closure(&closures, name)?;
+                for row in ops::rows(&v).map_err(EvalError::new)? {
+                    self.call_closure(&f, &[row])?;
+                }
+                Ok(v)
+            }
+            "format" => {
+                let mut vals = Vec::with_capacity(raw.len());
+                for e in &raw {
+                    vals.push(self.eval(e)?);
+                }
+                let Some(t) = vals.first() else {
+                    return Err(EvalError::new("`format` needs a template"));
+                };
+                let template = t.render();
+                wrap(ops::format(&template, &vals[1..]).map(Val::str))
+            }
+            "display" => {
+                // §7 writes `display files` as well as `… | display`, so an explicit
+                // operand stands in for a piped one.
+                let v = match operand {
+                    Some(v) => v,
+                    None => match raw.first() {
+                        Some(e) => self.eval(e)?,
+                        None => need(None)?,
+                    },
+                };
+                let text = ops::display(&v);
+                self.host.out(&text);
+                // A terminal operator: the chain ends here, so it yields Null rather than
+                // passing the value on to be displayed twice.
+                Ok(Val::NULL)
+            }
+            "save" => {
+                let v = need(operand)?;
+                let Some(path) = field_names.first().cloned() else {
+                    return Err(EvalError::new("`save` needs a path"));
+                };
+                let bytes = ops::encode_for(&path, &v).map_err(EvalError::new)?;
+                self.host.write_file(&path, &bytes).map_err(EvalError::new)?;
+                Ok(Val::NULL)
+            }
+            "open" => {
+                let paths = field_names.clone();
+                if paths.is_empty() {
+                    return Err(EvalError::new("`open` needs at least one path"));
+                }
+                // §4: several paths concatenate into one stream, which is what absorbs
+                // `cat` rather than adding a second near-identical verb.
+                let mut acc: Option<Val> = None;
+                for path in &paths {
+                    let bytes = self.host.read_file(path).map_err(EvalError::new)?;
+                    let v = ops::decode_from(path, &bytes).map_err(EvalError::new)?;
+                    acc = Some(match acc {
+                        None => v,
+                        Some(prev) => ops::concat(prev, v).map_err(EvalError::new)?,
+                    });
+                }
+                Ok(acc.unwrap_or(Val::NULL))
+            }
+            _ => Err(unavailable(c)),
+        }
+    }
+
+    fn one_closure(&mut self, closures: &[Val], name: &str) -> Result<Arc<Func>> {
+        match closures.first() {
+            Some(Val::Func(f)) => Ok(Arc::clone(f)),
+            _ => Err(EvalError::new(alloc::format!(
+                "`{name}` needs a predicate — either `{name} field > value` or \
+                 `{name} {{ |row| … }}`"
+            ))),
+        }
+    }
 
     // --- pipelines (Part C) -------------------------------------------------
 
@@ -588,8 +861,17 @@ impl Interp {
                 continue;
             }
 
-            // An in-process stage. Part D's operators plug in here; until then the only
-            // legal non-external stage is the *first*, supplying a value to pipe onward.
+            // An in-process stage: a generic operator running on the `Value` tree with no
+            // spawn at all (§5c). This is the common case, not the exception — the dense
+            // middle of a pipeline never crosses a process boundary.
+            if let Expr::Call(c) = &stages[i] {
+                if matches!(c.kind, CallKind::Operator) {
+                    carried = Some(self.apply_operator(c, carried.take())?);
+                    i += 1;
+                    continue;
+                }
+            }
+            // The head stage may be an ordinary value supplying the pipeline's input.
             if i == 0 && !matches!(&stages[0], Expr::Call(_)) {
                 carried = Some(self.eval(&stages[0])?);
                 i += 1;
@@ -1500,7 +1782,6 @@ mod tests {
     /// and not a panic.
     #[test]
     fn later_parts_report_themselves_rather_than_misbehaving() {
-        assert!(err("1 | display").contains("Part D"));
         // With no host attached, a command says so rather than pretending to run.
         assert!(err("ls").contains("no host attached"));
         assert!(err("match 1 { _ => 2 }").contains("Part E"));
@@ -1690,6 +1971,112 @@ mod tests {
         // mock knows), the run would have succeeded and proved nothing.
         let e = r.expect_err("an Int cannot be piped into a program");
         assert!(e.message.contains("only a Table can be piped"), "{}", e.message);
+    }
+
+
+    // --- generic value operators, end to end (Part D) -----------------------
+
+    /// The plan's stated Part D deliverable, with a mock supplying the one external stage.
+    #[test]
+    fn the_deliverable_pipeline_runs() {
+        let host = MockHost::new().with_program("list", Some(stream("size", &[5, 200, 3000])));
+        let (r, log) = run_with(host, "list | filter size > 100 | sort size | take 5 | display");
+        r.expect("runs");
+        let out = log.borrow().output.concat();
+        // Two rows survived the filter, in ascending order, laid out as a table.
+        let lines: Vec<&str> = out.lines().collect();
+        assert_eq!(lines[0], "size");
+        assert_eq!(lines[1], "200");
+        assert_eq!(lines[2], "3000");
+    }
+
+    /// §8b's sugar reaches the operator as a closure, and the closure is *called*.
+    #[test]
+    fn a_bareword_predicate_filters() {
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2, 3])));
+        let (r, _log) = run_with(host, "src | filter n > 1 | count");
+        assert_eq!(r.expect("runs").render(), "2");
+    }
+
+    /// …and the explicit closure form does the same thing, since one desugars to the other.
+    #[test]
+    fn an_explicit_closure_filters_identically() {
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2, 3])));
+        let (r, _log) = run_with(host, "src | filter { |row| row.n > 1 } | count");
+        assert_eq!(r.expect("runs").render(), "2");
+    }
+
+    /// §5a: capture is by value at creation, so a closure written in a pipeline can reach
+    /// a local — which the *sugared* form deliberately cannot, since a bare name there is
+    /// a field on `it` (§8b).
+    #[test]
+    fn an_explicit_closure_can_close_over_a_local() {
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 5, 9])));
+        let (r, _log) = run_with(
+            host,
+            "let threshold = 4
+src | filter { |row| row.n > threshold } | count",
+        );
+        assert_eq!(r.expect("runs").render(), "2");
+    }
+
+    /// §5c's headline, made concrete: only the first stage is a process. Everything after
+    /// it runs on the `Value` tree, so the host is asked to spawn exactly once.
+    #[test]
+    fn only_the_external_stage_costs_a_spawn() {
+        let host = MockHost::new().with_program("list", Some(stream("n", &[1, 2, 3])));
+        let (r, log) = run_with(host, "list | filter n > 0 | sort n | take 2 | count");
+        assert_eq!(r.expect("runs").render(), "2");
+        assert_eq!(log.borrow().runs.len(), 1, "one spawn for the whole pipeline");
+        assert_eq!(log.borrow().runs[0].len(), 1);
+    }
+
+    /// An operator with nothing on its left is a mistake, not an empty answer.
+    #[test]
+    fn an_operator_without_an_operand_says_so() {
+        let e = err("count");
+        assert!(e.contains("needs an operand"), "{e}");
+    }
+
+    /// `each` is for effects, so the chain does not narrow just because something looked
+    /// at every row.
+    #[test]
+    fn each_passes_its_input_through() {
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2])));
+        let (r, _log) = run_with(host, "src | each { |row| row } | count");
+        assert_eq!(r.expect("runs").render(), "2");
+    }
+
+    /// §6: `expect` checks shape, `assert` checks content, and they are separate keywords
+    /// so the message says which kind of thing went wrong.
+    #[test]
+    fn expect_and_assert_are_different_checks() {
+        assert_eq!(rendered("let x: Int = 5
+x"), "5");
+        assert!(err("assert (1 == 2)").contains("assertion failed"));
+        assert!(err("assert (5)").contains("needs a Bool"));
+    }
+
+    /// B5: `save` then `open` round-trips through the host.
+    #[test]
+    fn save_and_open_round_trip() {
+        let host = MockHost::new().with_program("src", Some(stream("n", &[7, 8])));
+        let (r, _log) = run_with(host, "src | save ./out.tsm");
+        r.expect("saves");
+
+        let host = MockHost::new().with_file("./notes.txt", "alpha\nbeta\n");
+        let (r, _log) = run_with(host, "open ./notes.txt | count");
+        assert_eq!(r.expect("opens").render(), "2");
+    }
+
+    /// §4: several paths concatenate into one stream — which is what absorbed `cat`.
+    #[test]
+    fn open_concatenates_several_paths() {
+        let host = MockHost::new()
+            .with_file("./a.txt", "one\n")
+            .with_file("./b.txt", "two\nthree\n");
+        let (r, _log) = run_with(host, "open ./a.txt ./b.txt | count");
+        assert_eq!(r.expect("opens").render(), "3");
     }
 
     #[test]

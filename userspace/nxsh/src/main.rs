@@ -34,8 +34,9 @@ use alloc::vec::Vec;
 use libkern::abi::{HandleInfo, SPAWN_MAX_HANDLES, SpawnArgs};
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ};
 use libkern::syscall::{
-    SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV,
-    SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, syscall1, syscall2, syscall4,
+    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
+    SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, syscall1,
+    syscall2, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelReceiver, ChannelSink, IpcPort};
@@ -241,6 +242,60 @@ impl Host for NitroxHost {
             syscall1(SYS_HANDLE_CLOSE, h);
         }
         Ok(bytes)
+    }
+
+    /// Create `path` at exactly `bytes.len()` and write it (`save`, B5).
+    ///
+    /// `sys_file_create` sizes the file up front, so this is one create, one mapping and
+    /// one copy — the Model A data path, with the kernel moving the bytes rather than the
+    /// server.
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        let size = bytes.len() as u64;
+        // SAFETY: valid namespace handle and path slice.
+        let po = unsafe {
+            syscall5(
+                SYS_FILE_CREATE,
+                self.namespace,
+                path.as_ptr() as u64,
+                path.len() as u64,
+                RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE,
+                size,
+            )
+        };
+        if po < 0 {
+            return Err(alloc::format!("cannot create {path}"));
+        }
+        let (st, fh) = po_wait(po as u64);
+        if st != 0 || fh == 0 {
+            return Err(alloc::format!("cannot create {path}"));
+        }
+        // SAFETY: mapping our own writable file handle for exactly its length.
+        let addr = unsafe {
+            syscall4(
+                SYS_MEMORY_MAP,
+                fh,
+                0,
+                size,
+                RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE,
+            )
+        };
+        if addr < 0 {
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
+            return Err(alloc::format!("cannot map {path}"));
+        }
+        // SAFETY: `addr` is a live writable mapping of exactly `size` bytes.
+        unsafe {
+            core::slice::from_raw_parts_mut(addr as *mut u8, bytes.len())
+                .copy_from_slice(bytes);
+        }
+        // SAFETY: flush, unmap and close what we created.
+        unsafe {
+            syscall2(SYS_FILE_SYNC, fh, 0);
+            syscall2(SYS_MEMORY_UNMAP, addr as u64, size);
+            syscall1(SYS_HANDLE_CLOSE, fh);
+        }
+        Ok(())
     }
 
     fn diag(&mut self, text: &str) {

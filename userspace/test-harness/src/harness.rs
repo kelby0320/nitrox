@@ -2688,14 +2688,14 @@ fn error_granularity_demo(root_ns: u64) {
 }
 
 
-/// **Milestone 3 Part C — `nxsh` runs a real script against real processes.**
+/// **Milestone 3 Parts C and D — `nxsh` runs a real script against real processes.**
 ///
 /// The language is exercised by the host suite (95 tests) and pipeline *semantics* — stage
 /// ordering, per-stage status, the strict abort — by the mock host. What neither can claim
 /// is the part this asserts: that `nxsh` resolves a program image, creates pipes, spawns a
 /// process, reads a TSM1 stream back and turns it into a value, on the real kernel.
 fn nxsh_demo(root_ns: u64, notif: u64) {
-    kprint(b"test-harness: nxsh demo (Milestone 3 Part C)\n");
+    kprint(b"test-harness: nxsh demo (Milestone 3 Parts C+D)\n");
     const NXSH: &[u8] = b"/initramfs/sbin/nxsh";
 
     // 1. The language, evaluated in ring 3. The script computes with mixed Int/Float and
@@ -2742,7 +2742,40 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: an unknown command wrongly succeeded\n");
     }
 
-    kprint(b"test-harness: nxsh ok (evaluated, spawned a stage, read its stream, failed loud)\n");
+    // 5. **The Part D deliverable**: one external stage at the head, then the whole dense
+    //    middle in-process — filter, sort, take, display — on a real `list` of `/system`.
+    //    §5c's claim made concrete: exactly one process boundary for the whole chain.
+    let piped = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &[
+            "nxsh",
+            "-c",
+            "let n = list /system | filter size > 0 | sort size | take 2 | count\nif n != 2 { bad }",
+        ],
+    );
+    if piped != 0 {
+        return_fail(b"test-harness: nxsh generic-operator pipeline failed\n");
+    }
+
+    // 6. `save` then `open` round-trips through the real filesystem (B5, `.tsm`).
+    let saved = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &[
+            "nxsh",
+            "-c",
+            "list /system | take 1 | save /system/nx-d.tsm\nlet back = open /system/nx-d.tsm\nif (back | count) != 1 { bad }",
+        ],
+    );
+    if saved != 0 {
+        return_fail(b"test-harness: nxsh save/open round trip failed\n");
+    }
+    unlink_all(root_ns, b"/system", &[b"nx-d.tsm"]);
+
+    kprint(b"test-harness: nxsh ok (evaluated, spawned a stage, piped through operators, saved + reopened)\n");
 }
 
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.

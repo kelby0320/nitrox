@@ -23,6 +23,7 @@ pub mod ast;
 pub mod eval;
 pub mod host;
 pub mod lex;
+pub mod ops;
 pub mod parse;
 pub mod value;
 

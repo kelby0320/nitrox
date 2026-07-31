@@ -103,8 +103,11 @@ pub trait Host {
     fn run(&mut self, stages: &[StageSpec], input: Option<&[u8]>, strict: bool)
     -> Result<PipelineRun, String>;
 
-    /// Read a script.
+    /// Read a file — a script, or `open`'s operand.
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String>;
+
+    /// Write a file, for `save`.
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String>;
 
     /// Diagnostics — §1's second error category. Bypasses the pipe entirely and goes to
     /// the shell's own `stderr`, which is why it is a separate method and not something
@@ -135,6 +138,10 @@ impl Host for NullHost {
     }
 
     fn read_file(&mut self, _path: &str) -> Result<Vec<u8>, String> {
+        Err(String::from("this interpreter has no host attached"))
+    }
+
+    fn write_file(&mut self, _path: &str, _bytes: &[u8]) -> Result<(), String> {
         Err(String::from("this interpreter has no host attached"))
     }
 
@@ -290,6 +297,11 @@ impl Host for MockHost {
             .find(|(p, _)| p == path)
             .map(|(_, b)| b.clone())
             .ok_or_else(|| alloc::format!("no such file: {path}"))
+    }
+
+    fn write_file(&mut self, path: &str, bytes: &[u8]) -> Result<(), String> {
+        self.files.push((String::from(path), bytes.to_vec()));
+        Ok(())
     }
 
     fn diag(&mut self, text: &str) {

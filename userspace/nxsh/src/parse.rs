@@ -62,6 +62,13 @@ const BUILTINS: &[&str] = &["cd", "exit"];
 /// implicit `{ |it| … }` closure (§8b).
 const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map"];
 
+/// Operators that take **no** arguments at all.
+///
+/// Knowing this at parse time is what lets `(count > 0)` read as a comparison rather than
+/// as `count` applied to `> 0`. Without it a paren could not open a pipeline whose first
+/// stage is a command — `(list /system | …)` — because the fix for one broke the other.
+const NULLARY_OPERATORS: &[&str] = &["count", "dedupe"];
+
 /// Deepest nesting the parser will descend (D5). A recursive-descent parser recurses on
 /// user input on a fixed userspace stack, so a pathological expression must be an error
 /// rather than an overflow — the same discipline `MAX_TREE_DEPTH` applies in the
@@ -652,10 +659,11 @@ impl<'a> Parser<'a> {
             Tok::LParen => {
                 self.bump()?;
                 // §3's expression-position escape hatch: a full pipeline inside parens.
-                // A `(` is not a command position — `(count > 0)` is a comparison, not the
-                // `count` operator applied to `> 0` — but a `|` *inside* re-opens one, via
-                // `stage`. That is what makes `(files | count) > 0` read correctly.
-                self.head_ok = false;
+                // A `(` opens a fresh expression, which may be a whole pipeline whose
+                // first stage is a command: `(list /system | filter …)`. So it *is* a
+                // command position. `(count > 0)` still reads as a comparison because
+                // `count` is nullary and takes no arguments to swallow the `>`.
+                self.head_ok = true;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "expected `)`")?;
                 Ok(e)
@@ -1034,6 +1042,9 @@ impl<'a> Parser<'a> {
     /// representation downstream.
     fn operator_args(&mut self, name: &str) -> Result<Vec<Arg>> {
         let mut args = Vec::new();
+        if NULLARY_OPERATORS.contains(&name) {
+            return Ok(args);
+        }
         self.in_op_args += 1;
         loop {
             match self.peek()? {
@@ -1493,6 +1504,21 @@ mod tests {
 
     /// The ambiguity §9b removes structurally: with a bare pipeline allowed in a
     /// condition, `{ … }` could be the `if` body or a trailing closure argument.
+    /// A paren may open a pipeline whose first stage is a command, *and* `(count > 0)`
+    /// must still be a comparison. Both work because the nullary operators take no
+    /// arguments to swallow the operator that follows.
+    #[test]
+    fn a_paren_can_open_a_pipeline_or_hold_a_comparison() {
+        let e = one_expr("(list /system | count)");
+        let Expr::Pipeline(stages) = e else { panic!("expected a pipeline") };
+        assert_eq!(stages.len(), 2);
+        let Expr::Call(c) = &stages[0] else { panic!("expected a call") };
+        assert_eq!(c.name, "list");
+        assert_eq!(c.args[0], Arg::Positional(Expr::Word("/system".into())));
+
+        assert!(matches!(one_expr("(count > 0)"), Expr::Binary(BinOp::Gt, _, _)));
+    }
+
     #[test]
     fn a_piped_condition_must_be_parenthesised() {
         // Parenthesised: fine.
