@@ -410,6 +410,31 @@ in practice is the first person to use the shell for more than one directory. Li
 with **B3 (env)**, since "what a child inherits about where it is" and "what a child
 inherits about its environment" are the same question.
 
+**A login session can see no programs — `TODO(session-program-namespace)`.**
+`session-mgr` builds a session namespace containing the user's home at `/home` and
+`/dev/console`, and nothing else. That was right when the login leaf was `usersh`, which ran
+one hardcoded proof and exited. It is wrong now that the leaf is `nxsh`: at the prompt,
+every external command fails with "`list` is not a program", because neither `/bin` nor
+`/initramfs/sbin` is reachable from inside the session.
+
+Found by driving a real interactive login over the serial port (2026-07-31), which is also
+how the console-rights bug in the same session was found — the interactive path had never
+been exercised end to end.
+
+The shell is not useless without it: keywords, the generic operators, `$env`, `cd`,
+`save`/`open` and the whole language work, since those are in-process. What does not work is
+anything that spawns — which is most of what a shell is for.
+
+The fix is namespace construction, not a shell change, and the shape is a real decision:
+binding the profile server's `/bin` into each session gives a user the projected profile
+(`docs/architecture/profiles-and-namespace-projection.md`), which is the design's intended
+answer and needs session-mgr to hold that endpoint. Binding `/initramfs/sbin` instead would
+be quicker and wrong — it hands a session the boot image rather than a profile, and
+"absence is the sandbox" stops meaning anything if every session sees every binary.
+
+Trigger: immediately — this is the next thing that makes the shell usable, and it is the
+last gap between "the login leaf is real" and "you can do something at the prompt".
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
