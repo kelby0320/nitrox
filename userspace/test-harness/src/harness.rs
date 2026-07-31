@@ -2688,32 +2688,61 @@ fn error_granularity_demo(root_ns: u64) {
 }
 
 
-/// **Milestone 3 Part B — the language runs in ring 3.**
+/// **Milestone 3 Part C — `nxsh` runs a real script against real processes.**
 ///
-/// The lexer, parser and evaluator are exercised properly by the host suite (85 tests),
-/// which is the point of keeping the language free of syscalls. What a host test cannot
-/// claim is that the same code path works *here*: on the custom target, against the real
-/// heap, with hardware `f64`. So this asserts the one thing that is genuinely different —
-/// a script that parses, evaluates, does mixed Int/Float arithmetic and renders its
-/// result, all inside a spawned process.
-fn nxsh_language_demo(root_ns: u64, notif: u64) {
-    kprint(b"test-harness: nxsh language demo (Milestone 3 Part B)\n");
+/// The language is exercised by the host suite (95 tests) and pipeline *semantics* — stage
+/// ordering, per-stage status, the strict abort — by the mock host. What neither can claim
+/// is the part this asserts: that `nxsh` resolves a program image, creates pipes, spawns a
+/// process, reads a TSM1 stream back and turns it into a value, on the real kernel.
+fn nxsh_demo(root_ns: u64, notif: u64) {
+    kprint(b"test-harness: nxsh demo (Milestone 3 Part C)\n");
     const NXSH: &[u8] = b"/initramfs/sbin/nxsh";
 
-    // `EXIT_UNIMPLEMENTED` (70), not 0: the shell deliberately reports that it cannot run
-    // a pipeline yet. Asserting on the *specific* status rather than "non-zero" is what
-    // makes this fail if the binary starts crashing instead — a crash and a
-    // not-implemented exit are both non-zero and mean very different things.
-    //
-    // And the status is *earned*: the binary compares its own evaluation against the
-    // expected rendering and exits 1 on a mismatch, so this catches a wrong answer and
-    // not merely a failure to start. Checking only "it ran" would assert nothing about
-    // the language.
-    let status = run_coreutil(root_ns, notif, NXSH, &["nxsh"]);
-    if status != 70 {
-        return_fail(b"test-harness: nxsh did not evaluate its script in ring 3\n");
+    // 1. The language, evaluated in ring 3. The script computes with mixed Int/Float and
+    //    compares its own answer, so a wrong result is a non-zero exit rather than a
+    //    passing run that asserted nothing.
+    let ok = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &["nxsh", "-c", "let x = 2 + 3\nlet y = x * 1.5\nif y != 7.5 { bad }"],
+    );
+    if ok != 0 {
+        return_fail(b"test-harness: nxsh -c did not evaluate correctly\n");
     }
-    kprint(b"test-harness: nxsh ok (parsed + evaluated in ring 3)\n");
+
+    // 2. A real external stage: `nxsh` resolves `list`, spawns it, wires a pipe, reads
+    //    the TSM1 stream back, and the script indexes into the resulting table. Every
+    //    step of the process boundary is load-bearing for the exit code.
+    let ran = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &["nxsh", "-c", "let t = list /system\nif (t[0]).name == \"\" { bad }"],
+    );
+    if ran != 0 {
+        return_fail(b"test-harness: nxsh could not run a real pipeline stage\n");
+    }
+
+    // 3. A failing stage fails the script (§1: fail loud, don't fail silent). `remove` on
+    //    a path that does not exist exits non-zero, and that must reach the exit code
+    //    rather than being swallowed.
+    let failed = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &["nxsh", "-c", "remove /system/nx-does-not-exist"],
+    );
+    if failed == 0 {
+        return_fail(b"test-harness: a failing stage did not fail the script\n");
+    }
+
+    // 4. A name that is neither a binding nor a program is an error, not a silent skip.
+    if run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "definitely-not-a-program"]) == 0 {
+        return_fail(b"test-harness: an unknown command wrongly succeeded\n");
+    }
+
+    kprint(b"test-harness: nxsh ok (evaluated, spawned a stage, read its stream, failed loud)\n");
 }
 
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.
@@ -4131,7 +4160,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     date_sleep_demo(root_ns, notif);
     whoami_demo(root_ns, notif);
     error_granularity_demo(root_ns);
-    nxsh_language_demo(root_ns, notif);
+    nxsh_demo(root_ns, notif);
 
     // 0a5b. `rename` — the move that moves no data, and the four cases it must refuse
     //       (occupied destination, missing source, and either end off the filesystem).

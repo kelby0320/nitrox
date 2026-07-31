@@ -21,11 +21,13 @@ extern crate alloc;
 
 pub mod ast;
 pub mod eval;
+pub mod host;
 pub mod lex;
 pub mod parse;
 pub mod value;
 
-pub use eval::{EvalError, Interp};
-pub use lex::{LexError, Lexer, Mode, Tok};
+pub use eval::{EvalError, Interp, Mode as RunMode};
+pub use host::{Host, MockHost, MockLog, NullHost, PipelineRun, StageSpec, StageStatus};
+pub use lex::{LexError, Lexer, Mode as LexMode, Tok};
 pub use parse::{ParseError, Parser, parse_script};
 pub use value::Val;

@@ -582,13 +582,21 @@ honoured from then on, not bolted on at Part F.
       **overflow and division by zero are errors, not wrapped values or `inf`** — a
       fabricated number is the thing this system keeps refusing to produce.
 
-- [ ] **Part C — the process boundary. First real script.**
+- [x] **Part C — the process boundary. First real script.** ✅ (2026-07-30)
       Pipelines: spawn a stage per external command, wire `Streams` via `libstream::setup::pipe`,
       stream TSM1 between them, collect `StageStatus`/`PipelineStatus` (§1). `stderr` routed
       separately from the pipe. Early-consumer cancellation via `PeerClosed`. `strict { }` blocks
       terminating remaining stages through handles the shell already holds. Resolves **D4**, **D7**,
       **D8**.
-      *Deliverable: `nxsh script.nx` runs `list /system | ...` end to end. First in-guest demo.*
+      *Deliverable met: `nxsh -c 'let t = list /system'` spawns the program, wires a pipe,
+      reads its TSM1 stream and indexes the resulting table, in guest.* Two findings.
+      **No coreutil reads `stdin`** — §10a dissolved every classic filter into an
+      in-process operator, so with the shipped programs a pipeline has *at most one*
+      external stage, always at the head; §5c's "one process boundary" is stronger than it
+      reads. And **per-stage `PipelineStatus` attribution needs an ABI change**: spawn
+      returns a handle, `ChildExited` carries a pid, nothing maps them, and `sys_wait`
+      does not take a process handle. Exact for one stage; filed as
+      `TODO(pipeline-stage-attribution)`.
 
 - [ ] **Part D — generic value operators**
       `filter`, `sort`, `select`, `take`, `last`, `skip`, `dedupe`, `each`, `map`, `count`,

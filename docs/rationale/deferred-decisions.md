@@ -344,6 +344,32 @@ authority lives: rights on the binding independent of the endpoint handle's, a r
 mount flag, or an explicit attenuation at bind time. Trigger: a read-only mount of a
 writable filesystem — the first one is likely a sandboxed profile or a shared `/store`.
 
+**Per-stage attribution in `PipelineStatus` — `TODO(pipeline-stage-attribution)`.**
+§1 makes `PipelineStatus` a headline: a composite exit status with one `StageStatus` per stage, in
+pipeline order, so a script can ask *which* stage failed rather than making do with a bash-style
+scalar. `nxsh` builds it (Milestone 3 Part C) and it is exact for a **one-stage** chain, which is
+every pipeline the standard coreutils can form. For a longer chain the per-stage entries are not
+trustworthy, and the reason is an ABI gap rather than an implementation shortcut.
+
+`sys_process_spawn` returns a **handle**. `ChildExited` carries a **ProcessId**. Nothing maps one
+to the other, and `sys_wait` does not accept a process handle (`Timer`, `NotificationChannel`,
+`IpcChannel`, `PendingOperation`, `InterruptObject` only). So a shell holding four child handles and
+receiving four exit notifications cannot say which notification belongs to which stage.
+
+The shell therefore reports the aggregate truthfully — a failure anywhere fails the pipeline, which
+is what §1's fail-loud default actually needs — and does not claim per-stage attribution it cannot
+support. An incomplete report beats a confidently wrong one.
+
+Fixing it is small but it is an **ABI change**: either a `pid` field on `HandleInfo` for a process
+handle, or a handle alongside the pid in the `ChildExited` body. Making `sys_wait` accept a process
+handle would also do it and is arguably the better shape, since it lets a supervisor await a
+specific child rather than draining a queue — but it is a bigger change to the wait path.
+
+Trigger: the first pipeline with more than one external stage that anyone wants a per-stage report
+from. Not urgent — §10a dissolved every classic filter into an in-process generic operator, so with
+the shipped programs a pipeline has at most one external stage — but it should be batched into the
+next ABI pass rather than rediscovered.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
