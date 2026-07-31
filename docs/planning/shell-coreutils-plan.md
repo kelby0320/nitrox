@@ -598,14 +598,20 @@ honoured from then on, not bolted on at Part F.
       does not take a process handle. Exact for one stage; filed as
       `TODO(pipeline-stage-attribution)`.
 
-- [ ] **Part D — generic value operators**
+- [x] **Part D — generic value operators** ✅ (2026-07-30)
       `filter`, `sort`, `select`, `take`, `last`, `skip`, `dedupe`, `each`, `map`, `count`,
       `display`, `format`, `expect`, `assert`, `save`, `open`. Generic dispatch over `Value` shape
       (§5c) — these run in-process, so the dense middle of a pipeline costs no spawns.
       **B5 lands here as `.tsm` + `.txt` only**; `.csv`/`.json` are separate, later, and neither is
       free. Ascription/`expect` checks a §6 schema against a TSM1 header — once, at header-read
       time, not per row.
-      *Deliverable: `list | filter size > 1000 | sort size | take 5 | display` works.*
+      *Deliverable met, in guest against a real `list /system`.* One finding worth
+      carrying: **an operator's bareword argument means different things per operator**.
+      `sort size` names a *column* (§8b's reading, where a bare name is a field on `it`)
+      while `display files` names a *binding*. A single global rule gets one of them
+      wrong — both were tried — so arguments are kept unevaluated and each operator
+      decides. Part D also needed **closure invocation**, since §8b's sugar *is* a
+      closure; Part E extends the same primitive with `def`'s named args and defaults.
 
 - [ ] **Part E — functions, closures, match, null handling, modules**
       `def` with defaults evaluated per call, variadics, named args, the `_` pipeline-fill rule
