@@ -103,7 +103,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let force = args.has("force");
     let (sources, dest) = args.operands.split_at(args.operands.len() - 1);
-    let dest = dest[0].as_bytes();
+    let dest_owned = stage.path(dest[0].as_bytes());
+    let dest = dest_owned.as_slice();
     let dest_is_dir = fs::is_dir(stage.namespace, dest);
 
     // As in `copy`: several sources only make sense into a directory, since with a file
@@ -114,7 +115,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
 
     let mut done: Vec<Moved> = Vec::new();
     for source in sources {
-        let src = source.as_bytes();
+        let src_owned = stage.path(source.as_bytes());
+        let src = src_owned.as_slice();
         let target = if dest_is_dir {
             fs::join(dest, fs::basename(src))
         } else {

@@ -105,7 +105,8 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let mut removed: Vec<Removed> = Vec::new();
 
     for operand in &args.operands {
-        let path = trim_trailing_slashes(operand.as_bytes());
+        let resolved = stage.path(operand.as_bytes());
+        let path = trim_trailing_slashes(&resolved);
         if path.is_empty() || path == b"/" {
             stage.die(b"remove: refusing to remove the root directory\n", EXIT_USAGE);
         }

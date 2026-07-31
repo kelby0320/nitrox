@@ -40,8 +40,22 @@ pub struct Stage {
     pub streams: Streams,
     /// `argv`, with `argv[0]` the program name. Empty in Tier 0.
     pub argv: Vec<String>,
+    /// The working directory from the environment's `PWD`, if it has one.
+    ///
+    /// `None` in Tier 0, and in Tier 1 when the spawner passed no `PWD`. A relative path
+    /// then fails rather than resolving against `/` — see [`Stage::path`].
+    pub cwd: Option<String>,
     /// Whether a setup message was received (Tier 1).
     pub from_shell: bool,
+}
+
+/// Pull `PWD` out of an environment record.
+///
+/// `PWD` is a *conventional* entry (Milestone 3.5), not a distinct field: there is no
+/// second source of truth for it to disagree with, unlike Unix's `$PWD` versus `getcwd()`.
+fn cwd_of(env: &libstream::wire::Record) -> Option<String> {
+    let i = env.schema.fields.iter().position(|f| f.name == "PWD")?;
+    env.values.get(i)?.as_str().map(String::from)
 }
 
 impl Stage {
@@ -56,19 +70,46 @@ impl Stage {
                 namespace,
                 streams: s.streams,
                 argv: s.argv,
+                cwd: cwd_of(&s.env),
                 from_shell: true,
             },
             Some(Err(_)) => {
                 kprint(b"coreutil: malformed setup message\n");
                 exit(EXIT_FAILURE);
             }
+            // Tier 0: no setup message, so no `argv` and — for the same reason — no
+            // environment and no working directory. A relative path then fails, which is
+            // the honest outcome: this process was handed nothing to resolve against.
             None => Stage {
                 notif,
                 namespace,
                 streams: Streams::default(),
                 argv: Vec::new(),
+                cwd: None,
                 from_shell: false,
             },
+        }
+    }
+
+    /// Resolve a user-supplied path against this stage's working directory.
+    ///
+    /// Called **once, where a path enters from `argv`** — the boundary — rather than
+    /// threaded through every filesystem helper. That keeps one place per program where a
+    /// relative path becomes absolute, and it is the same place a bad path should be
+    /// reported.
+    ///
+    /// Diverges with a message on failure, since a path the caller typed that cannot be
+    /// resolved is a usage error, not something to carry on past.
+    pub fn path(&self, operand: &[u8]) -> Vec<u8> {
+        let mut buf = [0u8; 1024];
+        match librsproto::path::resolve(self.cwd.as_deref().map(str::as_bytes), operand, &mut buf) {
+            Ok(p) => p.to_vec(),
+            Err(e) => {
+                let mut msg = Vec::from(&b"path: "[..]);
+                msg.extend_from_slice(e.message().as_bytes());
+                msg.push(b'\n');
+                self.die(&msg, EXIT_USAGE);
+            }
         }
     }
 

@@ -25,6 +25,7 @@ pub mod file;
 pub mod log;
 pub mod meta;
 pub mod namespace;
+pub mod path;
 #[cfg(feature = "io")]
 pub mod session;
 
