@@ -205,6 +205,12 @@ fn limine_conf() -> PathBuf {
 
 // --- Subcommands --------------------------------------------------------
 
+/// The coreutils: one crate, a bin per program. Built, packed into the initramfs, and
+/// packaged into the store from this single list — see [`profile_programs`].
+const COREUTILS: &[&str] = &[
+    "list", "copy", "mkdir", "remove", "rename", "move", "touch", "date", "sleep", "whoami",
+];
+
 fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
@@ -222,7 +228,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("heartbeat", None)?;
     // The coreutils (`list`, …) — real programs, present in release images. One crate,
     // a bin per program, so the crate directory is named separately from the bins.
-    build_userspace_crate("coreutils", &["list", "copy", "mkdir", "remove", "rename", "move", "touch", "date", "sleep", "whoami"], None)?;
+    build_userspace_crate("coreutils", COREUTILS, None)?;
     // `nxsh` — the shell. Milestone 3 Part A ships the *language* (lexer + parser, tested
     // on the host); this builds its bin for the bare target so the language cannot
     // quietly stop being part of the OS while it is being written.
@@ -1621,9 +1627,37 @@ fn store_hash(bytes: &[u8]) -> String {
 /// its ELF's content hash. A pure function of the ELF, so the ext4 store build and the
 /// initramfs profile manifest derive the same path independently — no value threaded.
 fn store_path_for(bin: &str, name: &str, version: &str) -> R<String> {
-    let bytes = fs::read(userspace_bin_path(bin))
-        .map_err(|e| format!("read {bin} ELF for store hash: {e}"))?;
+    store_path_for_all(&[bin], name, version)
+}
+
+/// A store path for a package containing several programs.
+///
+/// The hash covers **every** ELF in the package, concatenated in the given order, so
+/// changing any one of them moves the whole package — which is the property that makes a
+/// content-addressed path mean anything. Hashing only the first would let nine of the ten
+/// coreutils change under a path that claims they did not.
+fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
+    let mut bytes = Vec::new();
+    for b in bins {
+        bytes.extend_from_slice(
+            &fs::read(userspace_bin_path(b))
+                .map_err(|e| format!("read {b} ELF for store hash: {e}"))?,
+        );
+    }
     Ok(format!("/store/{}-{}-{}", store_hash(&bytes), name, version))
+}
+
+/// The programs a session gets through its profile: the coreutils, plus `nxsh`.
+///
+/// `nxsh` is here as well as being the login leaf — a user should be able to run a nested
+/// shell, and one that cannot invoke itself is a strange thing to hand someone.
+///
+/// One list, three consumers (the build, the initramfs, the store package), so a new
+/// coreutil cannot end up built-but-unreachable or packaged-but-unbuilt.
+fn profile_programs() -> Vec<&'static str> {
+    let mut v = COREUTILS.to_vec();
+    v.push("nxsh");
+    v
 }
 
 /// Pack the initramfs CPIO `newc` archive at `out`: the config manifests, the `init`
@@ -1646,18 +1680,9 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         "logging-service",
         "auth-service",
         "session-mgr",
-        "list",
-        "copy",
-        "mkdir",
-        "remove",
-        "rename",
-        "move",
-        "touch",
-        "date",
-        "sleep",
-        "whoami",
         "nxsh",
     ];
+    programs.extend_from_slice(COREUTILS);
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.
     if mode.features().is_some() {
@@ -1677,6 +1702,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     // the store path, whose hash is content-derived at build time (must match the ext4
     // store dir). See `docs/architecture/profiles-and-namespace-projection.md`.
     let hb_store = store_path_for("heartbeat", "heartbeat", "0.1.0")?;
+    let cu_store = store_path_for_all(&profile_programs(), "coreutils", "0.1.0")?;
     let system_profile = format!(
         "# System profile manifest (generation 1).\n\
          [profile]\n\
@@ -1686,7 +1712,12 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
          [[package]]\n\
          name = \"heartbeat\"\n\
          version = \"0.1.0\"\n\
-         path = \"{hb_store}\"\n"
+         path = \"{hb_store}\"\n\
+         \n\
+         [[package]]\n\
+         name = \"coreutils\"\n\
+         version = \"0.1.0\"\n\
+         path = \"{cu_store}\"\n"
     );
     cpio_entry(&mut buf, ino, "etc/profiles/system.toml", system_profile.as_bytes());
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
@@ -1853,6 +1884,26 @@ fn assemble_image(
     fs::create_dir_all(&hb_bin)?;
     fs::copy(userspace_bin_path("heartbeat"), hb_bin.join("heartbeat"))?;
     println!("xtask: store package {hb_store}/bin/heartbeat");
+
+    // The `coreutils` package: the programs a shell can actually run. One package rather
+    // than one per binary — they version and ship together, and ten manifest entries would
+    // claim an independence they do not have.
+    //
+    // Until this existed, the coreutils lived *only* in the initramfs, so a session could
+    // not reach them at all without being handed the whole boot image. See
+    // `TODO(initramfs-minimisation)`.
+    let programs = profile_programs();
+    let cu_store = store_path_for_all(&programs, "coreutils", "0.1.0")?;
+    let cu_bin = staging.join(cu_store.trim_start_matches('/')).join("bin");
+    fs::create_dir_all(&cu_bin)?;
+    for prog in &programs {
+        fs::copy(userspace_bin_path(prog), cu_bin.join(prog))
+            .map_err(|e| format!("stage {prog} into the store: {e}"))?;
+    }
+    println!(
+        "xtask: store package {cu_store}/bin/ ({} programs)",
+        programs.len()
+    );
     let rootfs = work.join("rootfs.ext4");
     let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
     run(Command::new("mke2fs")

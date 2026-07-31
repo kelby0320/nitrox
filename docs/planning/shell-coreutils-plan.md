@@ -959,6 +959,54 @@ Plain bullets, not checkboxes: these are decisions to *not* build, not work owed
 
 `nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken.
 
+#### Part F — the session can reach its programs (`TODO(session-program-namespace)`)
+
+Parts A–E gave a login a real shell with a real environment, and driving one interactively
+found the thing that made it a *toy*: every external command failed with "`list` is not a
+program". The session namespace held the user's home and `/dev/console` and nothing else.
+
+The fix is namespace construction, not a shell change, and the shape was a real decision.
+Binding `/initramfs/sbin` would be one line and wrong — it hands a session the boot image
+rather than a profile, and "absence is the sandbox" stops meaning anything once every
+session sees every binary. So: the profile server's `/bin`, which is the design's intended
+answer (`docs/architecture/profiles-and-namespace-projection.md`).
+
+**System profile only.** Per-user profiles are the eventual shape, but nothing yet needs two
+users to see different programs, and building the projection before the requirement would be
+guessing at it.
+
+**Step 1 — package the coreutils** ✅ (2026-07-31)
+
+The binding is useless while the profile projects nothing a shell can run: before this,
+`/bin` was bound and contained exactly `heartbeat`. The coreutils existed only in the
+initramfs.
+
+- [x] One `coreutils` store package holding all ten coreutils **plus `nxsh`** — a shell
+      that cannot invoke itself is a strange thing to hand someone.
+- [x] A second `[[package]]` in the generated system-profile manifest.
+- [x] The package hash covers **every** ELF in it, not the first. A content-addressed path
+      that moves when one of eleven binaries changes is worth something; one that tracks
+      `list` alone would let the other ten change under a path claiming they had not.
+- [x] One list (`COREUTILS` + `profile_programs()`) feeding the build, the initramfs, and
+      the store, so a new coreutil cannot be built-but-unreachable or packaged-but-unbuilt.
+- [x] `bin_projection_demo`: all eleven resolve through the real forwarding chain, and an
+      unknown name still misses.
+
+**The negative control is the load-bearing half.** "`/bin/list` resolved" says nothing about
+projection unless some `/bin/<name>` fails to resolve — a `/bin` answering everything would
+pass the positive check while projecting nothing. Verified the demo is not vacuous the only
+way that counts: removed the `coreutils` entry from the manifest, confirmed the run fails at
+"a profiled program did not resolve on /bin", and restored it.
+
+**Step 2 — hand the endpoint down and bind it**
+
+- [ ] init keeps the profile-server endpoint and passes it to `service-mgr`, which passes it
+      to `session-mgr`.
+- [ ] `build_session_namespace` binds it at `/bin`.
+- [ ] In-guest proof at the prompt: `list /` in a login session.
+
+*Deliverable: a login session can run the programs its profile gives it, and only those.*
+
 ### Deferred — the rich REPL (§11) and its dependencies
 
 Gated on the console/tty server + compositor terminal (later in Phase 4). Covers reverse-search,
