@@ -9799,3 +9799,42 @@ only after a 200 ms sleep: a source the service has not yet registered cannot be
 fails to retire, and an earlier version closed too early and tested nothing. That the
 service really does see the death was confirmed directly (a temporary print in the retire
 path) before trusting the timing.
+
+## 2026-07-31 — The session loop was not a loop, and `idle` was a spin
+
+Reported from the prompt: typing `exit` printed "shell verified its environment + wrote to
+home (login proven)" and never returned a `login:` prompt. Two separate faults behind one
+symptom, plus a third found while fixing them.
+
+**The message was the harness's proof text.** `spawn_user_shell` returns the shell's exit
+code, and session-mgr printed that sentence unconditionally on zero. It describes the script
+the shell runs under `test-harness`; in an interactive session it asserted a check that
+never ran. Now the harness text stays in the harness path and the interactive path says what
+actually happened — the shell exited, with its code.
+
+**The loop was a single `match`.** The comment called it "the session loop"; it logged in
+once, ran a shell, and parked. A login that cannot be repeated is not a login, and the
+misnamed comment is probably why it went unnoticed — it read as done. Making it a real loop
+brought in the work that only matters once you go round twice: the session namespace has to
+be closed after the shell is reaped (otherwise every logout leaks a namespace and all its
+bindings), the long-lived fs/profile/auth endpoints must *not* be, and the harness verdict
+must stay one-shot.
+
+**A denied login re-prompts rather than locking out.** A serial console has no second way
+in, so a lockout bricks the machine; a pause before re-prompting is what keeps repeated
+failure from being a free brute-force oracle. Three attempts per round remain, but a round
+is no longer terminal.
+
+**And `idle` was a `pause` loop.** Found while giving it a notification handle to park on.
+This is the same defect class as the `logging-service` spin fixed hours earlier: a busy
+supervisor keeps the run queue non-empty, the idle thread never runs, and deferred handle
+reclamation lives there — so *no exited process on the system is reclaimed* and their pipes
+never close. Before this change, typing `exit` put the machine into exactly that state. It
+now parks on the notification channel, and the panic path sleeps in long hops rather than
+spinning.
+
+That makes two spins found in one day, both of them supervisors, both of them starving
+reclamation. The recurring hazard is worth naming: **reclamation depends on some CPU
+reaching idle, so any process that spins disables it system-wide.** Splitting peer-death
+from reclamation would remove the dependency; until then, a `pause` loop in a long-lived
+process is a system-wide correctness bug, not a local inefficiency.

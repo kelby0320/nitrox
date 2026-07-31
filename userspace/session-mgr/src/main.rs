@@ -117,12 +117,56 @@ fn kprint(msg: &[u8]) {
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// Spin forever (session-mgr has nothing more to do in Part D once the checks run;
-/// Part E adds the login loop).
-fn idle() -> ! {
+/// Park forever. Reached only when this supervisor cannot usefully continue — no
+/// endpoints, or a verdict already fired.
+///
+/// **Parks, never spins.** This was a `pause` loop, which burns a CPU for as long as the
+/// machine is up. The cost is not the cycles: a run queue that is never empty means the
+/// idle thread never runs, and deferred handle reclamation lives there — so a spinning
+/// supervisor stops *every* exited process on the system from being reclaimed, and their
+/// pipes from ever closing. That is exactly the `logging-service` bug of 2026-07-31,
+/// which took an afternoon to find from a hung shell three subsystems away.
+fn idle(notif: u64) -> ! {
     loop {
-        // SAFETY: `pause` is always valid in ring 3 with no effects.
-        unsafe { core::arch::asm!("pause", options(nomem, nostack)) };
+        wait_one(notif);
+    }
+}
+
+/// Park forever without a handle to wait on — the panic path, which has no notification
+/// channel in scope. Sleeps in long hops rather than spinning, for the reason [`idle`]
+/// gives: a spinning process starves deferred reclamation system-wide.
+fn park() -> ! {
+    loop {
+        sleep_ms(60_000);
+    }
+}
+
+/// Sleep `ms` milliseconds on a one-shot timer. Best-effort: on any failure it returns
+/// immediately (every caller is pacing, not depending on the delay).
+fn sleep_ms(ms: u64) {
+    // SAFETY: a valid syscall; returns a handle (>= 0) or a negative KError.
+    let th = unsafe { syscall1(SYS_TIMER_CREATE, 0) };
+    if th < 0 {
+        return;
+    }
+    let th = th as u64;
+    let mut now: u64 = 0;
+    // SAFETY: `now` is a valid writable u64 out-param.
+    unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+    let fire_at = now + ms * 1_000_000;
+    // SAFETY: arming our own timer handle (absolute monotonic, one-shot).
+    unsafe { syscall4(SYS_TIMER_SET, th, fire_at, 0, 0) };
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+    unsafe {
+        WAIT_HANDLES[0] = th;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            fire_at + 1_000_000_000,
+        );
+        syscall1(SYS_HANDLE_CLOSE, th);
     }
 }
 
@@ -524,7 +568,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     if fs_endpoint == 0 || auth_ch == 0 {
         kprint(b"session-mgr: endpoint handoff FAIL\n");
         verdict(false);
-        idle();
+        idle(notif);
     }
     // A session without `/bin` is the pre-Part-F shell: the language works, nothing
     // spawns. Degraded, not broken — worth reporting and worth not failing the login over.
@@ -538,6 +582,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // deterministic verdict; the interactive path reads the credential from console.)
     let mut home = [0u8; 256];
     let mut user = [0u8; 64];
+    // **The session loop.** It was a single `match` — log in once, run a shell, then park
+    // forever — so typing `exit` left a machine with no prompt and no way back short of a
+    // reboot. A login that cannot be repeated is not a login.
+    loop {
     match login(root_ns, auth_ch, &mut home, &mut user) {
         Some((hl, ul)) => {
             kprint(b"session-mgr: login ok -> home=");
@@ -551,8 +599,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 &user[..ul],
             );
             if session_ns == 0 {
-                verdict(false);
-                idle();
+                kprint(b"session-mgr: session namespace FAIL\n");
+                // Under the harness this is a failed run. Interactively it is one bad
+                // session: go back to the prompt rather than bricking the console, since
+                // a permanent park is a worse answer than letting someone try again.
+                #[cfg(feature = "test-harness")]
+                {
+                    verdict(false);
+                    idle(notif);
+                }
+                #[cfg(not(feature = "test-harness"))]
+                continue;
             }
             kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
             // Named separately because it is the one member that can be absent, and a
@@ -564,23 +621,61 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.
             let code = spawn_user_shell(root_ns, session_ns, notif);
-            let ok = code == 0;
-            if ok {
-                kprint(b"session-mgr: shell verified its environment + wrote to home (login proven)\n");
-            } else {
-                kprint(b"session-mgr: user shell failed\n");
+
+            // Tear the session down. The shell has been reaped, so this drops the last
+            // reference to the namespace and with it every binding in it — the `/home`
+            // and `/bin` registrations and the `/session/user` snapshot. Without it each
+            // logout would leak a namespace, which is only harmless while there is
+            // exactly one login per boot.
+            // SAFETY: closing the namespace we created for this session.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
+
+            #[cfg(feature = "test-harness")]
+            {
+                let ok = code == 0;
+                if ok {
+                    kprint(b"session-mgr: shell verified its environment + wrote to home (login proven)\n");
+                } else {
+                    kprint(b"session-mgr: user shell failed\n");
+                }
+                // The clause-3 sched gate runs at the single PASS point (see
+                // `sched_gate`): login proving alone must not PASS a boot whose
+                // SMP substrate is dead. One verdict per boot — the loop must not
+                // reach a second.
+                verdict(ok && sched_gate(root_ns) && fp_gate());
+                idle(notif);
             }
-            // The clause-3 sched gate runs at the single PASS point (see
-            // `sched_gate`): login proving alone must not PASS a boot whose
-            // SMP substrate is dead.
-            verdict(ok && sched_gate(root_ns) && fp_gate());
+            // Interactive: the shell exited because the user asked it to. Say what
+            // happened and nothing more — the message here used to be the harness's
+            // proof text ("verified its environment + wrote to home"), which claimed a
+            // check that an interactive session never ran.
+            #[cfg(not(feature = "test-harness"))]
+            {
+                kprint(b"session-mgr: session ended (shell exit ");
+                if code < 0 {
+                    kprint(b"-");
+                    libkern::debug::kprint_u64((-(code as i64)) as u64);
+                } else {
+                    libkern::debug::kprint_u64(code as u64);
+                }
+                kprint(b")\n");
+            }
         }
         None => {
             kprint(b"session-mgr: login denied\n");
-            verdict(false);
+            #[cfg(feature = "test-harness")]
+            {
+                verdict(false);
+                idle(notif);
+            }
+            // Re-prompt rather than locking out. A serial console has no second way in,
+            // so a lockout bricks the machine; the pause is what keeps repeated failure
+            // from being a free brute-force oracle.
+            #[cfg(not(feature = "test-harness"))]
+            sleep_ms(2000);
         }
     }
-    idle();
+    }
 }
 
 /// Authenticate a user, returning `(home_len, user_len)` with the home path copied into
@@ -934,18 +1029,6 @@ fn sched_gate(root_ns: u64) -> bool {
     }
 }
 
-/// Interactive/normal boots have no verdict to gate.
-#[cfg(not(feature = "test-harness"))]
-fn sched_gate(_root_ns: u64) -> bool {
-    true
-}
-
-/// Interactive/normal boots have no verdict to gate.
-#[cfg(not(feature = "test-harness"))]
-fn fp_gate() -> bool {
-    true
-}
-
 /// Fire the boot verdict under `test-harness` (terminates QEMU via `SYS_TEST_EXIT`);
 /// a no-op otherwise. session-mgr is the final gate of the self-test boot in Part D.
 #[cfg(feature = "test-harness")]
@@ -968,5 +1051,5 @@ fn verdict(_ok: bool) {}
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
     kprint(b"session-mgr: PANIC\n");
-    idle();
+    park();
 }
