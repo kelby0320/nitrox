@@ -6,6 +6,8 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 librsproto = { path = "../librsproto" }
+libstream = { path = "../libstream", features = ["io"] }
+libheap = { path = "../libheap" }
 
 [features]
 # Mirror the build modes xtask passes (via `mode.features()`). `test-harness` lets
