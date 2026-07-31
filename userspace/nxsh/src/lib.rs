@@ -25,10 +25,12 @@ pub mod host;
 pub mod lex;
 pub mod ops;
 pub mod parse;
+pub mod repl;
 pub mod value;
 
 pub use eval::{EvalError, Interp, Mode as RunMode};
 pub use host::{Host, MockHost, MockLog, NullHost, PipelineRun, StageSpec, StageStatus};
 pub use lex::{LexError, Lexer, Mode as LexMode, Tok};
 pub use parse::{ParseError, Parser, parse_script};
+pub use repl::{Continue, needs_continuation};
 pub use value::Val;

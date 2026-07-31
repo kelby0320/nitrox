@@ -34,7 +34,8 @@ use alloc::vec::Vec;
 use libkern::abi::{HandleInfo, SPAWN_MAX_HANDLES, SpawnArgs};
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
+    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_IO_SUBMIT,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP,
     SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, syscall1,
     syscall2, syscall4, syscall5,
 };
@@ -450,11 +451,8 @@ fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
                 return EXIT_PARSE_ERROR;
             }
         },
-        // Part F turns this into the interactive loop.
-        None => {
-            host.out("nxsh: no script given; the interactive loop arrives in Part F\n");
-            return EXIT_USAGE;
-        }
+        // No script: the interactive loop (§11).
+        None => return repl(notif, namespace),
     };
 
     let script = match nxsh::parse_script(&source) {
@@ -482,6 +480,155 @@ fn run(notif: u64, namespace: u64, argv: &[String]) -> i64 {
             interp.host_mut().diag(&msg);
             EXIT_SCRIPT_FAILED
         }
+    }
+}
+
+
+/// The interactive loop (§11) — the *minimal* one.
+///
+/// Read, parse, evaluate, print. Continuation only where the parser can prove a statement
+/// incomplete (§11b, decided in `nxsh::repl`). No reverse-search, no Shift-Enter, no
+/// completion, no job control: those are §11's rich REPL, gated on the console/tty server
+/// and the compositor terminal, and building them against a raw character device would be
+/// a dependency inversion.
+fn repl(notif: u64, namespace: u64) -> i64 {
+    let Some(console) = lookup(namespace, b"/dev/console") else {
+        kprint(b"nxsh: /dev/console not found\r\n");
+        return EXIT_USAGE;
+    };
+    // A one-page read buffer the kernel writes input into.
+    // SAFETY: register-only syscall.
+    let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
+    if buf_h < 0 {
+        kprint(b"nxsh: read buffer alloc failed\r\n");
+        return EXIT_USAGE;
+    }
+    // SAFETY: a fresh MemoryObject with full MAP rights.
+    let buf_addr = unsafe {
+        syscall4(
+            SYS_MEMORY_MAP,
+            buf_h as u64,
+            0,
+            4096,
+            RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE,
+        )
+    };
+    if buf_addr < 0 {
+        kprint(b"nxsh: read buffer map failed\r\n");
+        return EXIT_USAGE;
+    }
+
+    let mut interp = Interp::with_host(
+        alloc::boxed::Box::new(NitroxHost { namespace, notif }),
+        RunMode::Repl,
+    );
+    kprint(b"\r\nnxsh: interactive shell (Ctrl-D or `exit` to leave)\r\n");
+
+    // `pending` accumulates across continuation lines; `line` is the one being typed.
+    let mut pending = String::new();
+    let mut line: Vec<u8> = Vec::new();
+    kprint(nxsh::repl::prompt("/").as_bytes());
+
+    loop {
+        let op = libkern::abi::IoOp {
+            opcode: libkern::abi::IO_OPCODE_READ,
+            flags: 0,
+            buffer: buf_h as u64,
+            buf_offset: 0,
+            offset: 0,
+            length: 64,
+        };
+        // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
+        let po = unsafe {
+            syscall2(SYS_IO_SUBMIT, console, (&op as *const libkern::abi::IoOp) as u64)
+        };
+        if po < 0 {
+            continue;
+        }
+        let (status, n) = po_wait(po as u64);
+        if status != 0 {
+            continue;
+        }
+        for i in 0..(n as usize).min(64) {
+            // SAFETY: within the mapped one-page read buffer.
+            let b = unsafe { ((buf_addr as u64 + i as u64) as *const u8).read_volatile() };
+            match b {
+                // Ctrl-D at an empty prompt is `exit` (§11f, universal convention).
+                0x04 if line.is_empty() && pending.is_empty() => {
+                    kprint(b"\r\n");
+                    return EXIT_OK;
+                }
+                b'\r' | b'\n' => {
+                    kprint(b"\r\n");
+                    let typed = String::from_utf8_lossy(&line).into_owned();
+                    line.clear();
+                    pending.push_str(&typed);
+
+                    if matches!(
+                        nxsh::needs_continuation(&pending),
+                        nxsh::Continue::Unclosed | nxsh::Continue::TrailingPipe
+                    ) {
+                        pending.push('\n');
+                        kprint(nxsh::repl::continuation_prompt().as_bytes());
+                        continue;
+                    }
+
+                    let src = core::mem::take(&mut pending);
+                    if src.trim().is_empty() {
+                        kprint(nxsh::repl::prompt("/").as_bytes());
+                        continue;
+                    }
+                    // `exit` is a shell-state builtin (§3): it must change *this* process,
+                    // which an external program structurally cannot do.
+                    if src.trim() == "exit" {
+                        return EXIT_OK;
+                    }
+                    // `cd` is deliberately absent, not forgotten: a shell-side cwd would
+                    // apply to the shell's own lookups and silently not to the programs it
+                    // spawns, since each resolves its own `argv` in its own namespace. See
+                    // `TODO(shell-cwd)`.
+                    if src.trim() == "cd" || src.trim().starts_with("cd ") {
+                        kprint_crlf(
+                            "nxsh: `cd` is not implemented — a shell-side position would                              not apply to spawned programs, which resolve paths in their                              own namespace. See TODO(shell-cwd).\n",
+                        );
+                        kprint(nxsh::repl::prompt("/").as_bytes());
+                        continue;
+                    }
+                    match interp.run_line(&src) {
+                        Ok(Some(text)) => kprint_crlf(&text),
+                        Ok(None) => {}
+                        Err(e) => {
+                            let mut msg = String::from("nxsh: ");
+                            msg.push_str(&e.message);
+                            msg.push('\n');
+                            kprint_crlf(&msg);
+                        }
+                    }
+                    kprint(nxsh::repl::prompt("/").as_bytes());
+                }
+                0x08 | 0x7f => {
+                    if line.pop().is_some() {
+                        kprint(b"\x08 \x08");
+                    }
+                }
+                0x20..=0x7e => {
+                    line.push(b);
+                    // SAFETY: a single printable byte.
+                    kprint(unsafe { core::slice::from_raw_parts(&b, 1) });
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Write `text` with `\n` expanded to `\r\n` — a raw console needs both.
+fn kprint_crlf(text: &str) {
+    for chunk in text.split('\n') {
+        if !chunk.is_empty() {
+            kprint(chunk.as_bytes());
+        }
+        kprint(b"\r\n");
     }
 }
 

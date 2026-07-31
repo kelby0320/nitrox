@@ -386,6 +386,30 @@ add `try` to `primary` alongside `if` and `match`, which are already expressions
 but it is a grammar change and belongs with a considered pass over §9c rather than as a
 side effect of Part E.
 
+**`cd` as a shell-state builtin — `TODO(shell-cwd)`.**
+§3 lists `cd` among the shell-state builtins, alongside `exit`, on the grounds that it must
+mutate the shell's own process state. `exit` landed with the minimal REPL (Milestone 3
+Part F); `cd` did not, and the reason is worth stating rather than filing as unfinished.
+
+In a capability system there is no ambient cwd for `cd` to change. A path is resolved
+against a **namespace**, and every coreutil resolves its own arguments in *its own*
+namespace — the shell hands a stage `argv`, not resolved handles. So a shell-side "current
+directory" would apply to the shell's own lookups and silently **not** apply to the
+programs it spawns: `cd /system` then `list .` would disagree with `cd /system` then
+`open ./x`, depending on which side did the resolving. That is precisely the class of
+split-brain the namespace model exists to prevent.
+
+The real `cd` is therefore not a string the shell prepends. It is either a per-session
+namespace the shell *rebinds* as the position moves, or a convention the spawn contract
+carries so a stage inherits the position explicitly. Both are design work, and the second
+touches `docs/spec/pipeline-stdio.md`.
+
+The prompt already shows a position (§11a), so the shape is there. Trigger: the first
+session that wants relative paths to mean the same thing on both sides of a spawn — which
+in practice is the first person to use the shell for more than one directory. Likely lands
+with **B3 (env)**, since "what a child inherits about where it is" and "what a child
+inherits about its environment" are the same question.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block

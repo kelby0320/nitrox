@@ -634,12 +634,21 @@ honoured from then on, not bolted on at Part F.
 
       **D6 (env) is not resolved here** — see the entry below.
 
-- [ ] **Part F — minimal REPL**
+- [x] **Part F — minimal REPL** ✅ (2026-07-30)
       A line-reader on the raw console: read, parse, evaluate, print. Automatic continuation on the
       *provable* cases only (unclosed delimiter, trailing `|`) per §11b. `$last` (§11d), `cd`/`exit`
       builtins, auto-display. **No** reverse-search, Shift-Enter, completion, or job control —
       those are the deferred rich REPL below, gated on the console/tty server.
-      *Deliverable: an interactive prompt. `nxsh` can replace `usersh` as the login leaf.*
+      *Deliverable met for the prompt; the `usersh` swap is deliberately **not** taken
+      here.* `nxsh` needs `cd` before it is a better login leaf than the throwaway it would
+      replace, and `cd` turned out to be a design question rather than a builtin — a
+      shell-side position would apply to the shell's own lookups and silently not to the
+      programs it spawns, which each resolve `argv` in their own namespace. Filed as
+      `TODO(shell-cwd)`; likely lands with B3, since "what a child inherits about where it
+      is" and "what it inherits about its environment" are one question.
+
+      Continuation is decided by **lexing, not counting** — a brace inside a string or a
+      comment opens nothing, and getting that wrong hangs the prompt on a finished command.
 
 - [ ] **Part G — the regex engine and `~=`** (B4)
       Predicate-only, since §10b never asks `~=` for anything but a boolean — which removes
