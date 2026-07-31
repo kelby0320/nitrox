@@ -3253,6 +3253,65 @@ fn bin_listing_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: bin-listing ok (both packages merged, nothing invented)\n");
 }
 
+/// **The reaper thread is alive and being scheduled.**
+///
+/// Deferred reclamation used to run only at `exit_*`/`yield_now`/`suspend_with_fault` and
+/// in the idle loop, so a single busy-looping service — which starves the idle thread —
+/// stopped every exited process on the machine from being reclaimed. Their pipes stayed
+/// open, and peers blocked forever on a `PeerClosed` that reclamation alone can deliver.
+/// That hung a shell twice in one day from three subsystems away.
+///
+/// The fix is a kernel thread that closes exited processes' handle tables, so reclamation
+/// no longer depends on some CPU reaching idle. **Its failure mode is silence**: if the
+/// wake ever broke, the reaper would park forever and the pre-existing per-CPU sweep would
+/// quietly cover for it — right up until a system busy enough to starve that sweep hung
+/// something. `reaper_closed` in `/proc/sched/stats` is what makes "it is running" an
+/// assertion rather than an assumption.
+///
+/// By the time this runs the harness has spawned and reaped many children, so a reaper
+/// that is being scheduled at all cannot still be at zero.
+fn reaper_demo(root_ns: u64) {
+    kprint(b"test-harness: reaper demo (deferred reclamation has a thread of its own)\n");
+    let closed = reaper_closed(root_ns);
+    if closed == 0 {
+        return_fail(b"test-harness: the reaper has closed nothing -- parked, or never woken\n");
+    }
+    kprint(b"test-harness: reaper ok (handle tables closed: ");
+    kprint_u64(closed);
+    kprint(b")\n");
+}
+
+/// `reaper_closed=` from `/proc/sched/stats`. `0` if unreadable, which the caller treats
+/// as a failure rather than a pass.
+fn reaper_closed(root_ns: u64) -> u64 {
+    let (st, mem) = ns_lookup_wait(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
+    if st != 0 || mem == 0 {
+        return 0;
+    }
+    // SAFETY: `mem` is a MemoryObject handle carrying MAP_READ.
+    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, PAGE, RIGHT_MAP_READ) };
+    if addr < 0 {
+        // SAFETY: closing our own handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
+        return 0;
+    }
+    // SAFETY: `addr` is a MAP_READ page holding the stats text, zero-padded.
+    let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
+    let mut out = 0u64;
+    for line in text.split(|&b| b == b'\n') {
+        if let Some(v) = parse_field(line, b"reaper_closed=") {
+            out = v;
+            break;
+        }
+    }
+    // SAFETY: unmapping the page we mapped (`text` is dead here) + closing our handle.
+    unsafe {
+        syscall2(SYS_MEMORY_UNMAP, addr as u64, PAGE);
+        syscall1(SYS_HANDLE_CLOSE, mem);
+    }
+    out
+}
+
 /// Is `needle` a subsequence of contiguous bytes in `hay`? The listing arrives as a TSM1
 /// stream; a name appears in it verbatim, which is enough to assert on without decoding.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -4600,6 +4659,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // against spawn, the login chain, and each other (substrate-hardening
     // regression cover — see `exit_storm_demo`).
     exit_storm_demo(root_ns, notif);
+
+    // 4b. Deferred reclamation must not depend on a CPU reaching idle: prove the reaper
+    //     thread is alive and has actually closed handle tables.
+    reaper_demo(root_ns);
 
     // 5. The sched-stats milestone check runs LAST, after the spawn/IPC demos
     // above have put real work on multiple CPUs (and the login chain has been

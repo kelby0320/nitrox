@@ -9838,3 +9838,48 @@ reclamation. The recurring hazard is worth naming: **reclamation depends on some
 reaching idle, so any process that spins disables it system-wide.** Splitting peer-death
 from reclamation would remove the dependency; until then, a `pause` loop in a long-lived
 process is a system-wide correctness bug, not a local inefficiency.
+## 2026-07-31 — Deferred reclamation gets a thread, because it was depending on luck
+
+Twice in one day a spinning userspace process hung an unrelated shell. Both times the chain
+was the same: a busy-looping service keeps the run queue non-empty → the idle thread never
+runs → `reap_pending` never runs → no exited process is reclaimed → a dead stage's pipe
+never closes → its reader blocks forever on a `PeerClosed` that only reclamation delivers.
+
+The individual spins are fixed. The structural fault is that **reclamation ran only where
+somebody happened to call it**: `exit_thread`, `exit_process`, `yield_now`,
+`suspend_with_fault`, and the idle loop. On a system where nothing exits or yields and no
+CPU idles, nothing ran it at all. That is a liveness bug wearing a leak's clothing.
+
+**What Linux does, and what we took from it.** The bulk of Linux's teardown is synchronous
+in the dying task — `do_exit` → `exit_files` → `close_files` walks the fd table and closes
+each file in process context. Only the last references are deferred, to RCU callbacks
+drained by dedicated kernel threads (`ksoftirqd`, `rcuo`, `kworker`). Nitrox has the
+deferred half and not the synchronous half, because `exit_process` holds `SCHED` and never
+returns. So the first fix is the kernel thread; doing teardown in the exiting task's own
+syscall context is filed as `TODO(exit-context-teardown)`.
+
+**One reaper, not one per CPU, and the reason is the reap list's rule.** Reaped *threads*
+must be dropped by the CPU they died on: a thread parks itself in `reap[cpu]` and then
+switches off its own stack, so freeing it from elsewhere is a use-after-free. Closing a
+*handle table* is keyed on pid and touches no stack, so any CPU may do it. Splitting those
+two jobs is what allows a single machine-wide reaper: it drains `ended_pids`, and the
+per-CPU stack path is untouched.
+
+The reaper owns `ended_pids` exclusively. An earlier draft also drained it opportunistically
+from `reap_pending`, which would have been harmless and slightly faster — and would have
+made "did the reaper actually run?" unanswerable, because the opportunistic path could win
+every race. One mechanism, one deterministic answer.
+
+Parking re-checks the queue under `SCHED` before sleeping, which closes the lost-wakeup
+window: an exit that queues a pid between the reaper's last drain and its park would
+otherwise wake nothing.
+
+**Proved against the real failure, not a proxy.** With `logging-service`'s spin deliberately
+reinstated — the exact condition that hung the shell that morning — `list /nope` now
+completes and the prompt returns. Before the reaper, that hung forever.
+
+**And the failure mode is silence**, which is why `reaper_closed` is in
+`/proc/sched/stats`. A reaper that never woke would leave the pre-existing per-CPU
+`process_ended` sweep to cover for it, and everything would look fine until a system busy
+enough to starve that sweep hung something. The harness asserts the counter is non-zero (88
+on a normal self-test boot); with the wake disabled the run fails.
