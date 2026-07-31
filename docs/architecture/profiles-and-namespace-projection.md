@@ -58,7 +58,9 @@ lookup /bin/foo  (forwarded to the profile server bound at /bin)
 ```
 
 **Probing, not enumeration** — this deliberately needs only *lookup*, never directory
-listing (`readdir` is a deferred fs-server op). The union `/bin` emerges from probing.
+listing: the profile server answers resolves only, and `readdir` over the union is not
+built yet (the fs-server's `OP_FILE_READ_DIR` *does* exist — the gap is on the profile
+server's side, which mints no directory session). The union `/bin` emerges from probing.
 Name collisions resolve by **order**, on two axes: *within* a profile, manifest order
 (first package listed wins); *across* layered profiles, layer order — a per-user
 profile is probed before the system profile, so **the user's package overrides the

@@ -174,6 +174,50 @@ A **direct handle** is a supervisor binding a concrete object — a `MemoryObjec
 *computed per lookup* (e.g. `/proc/self/process`, which depends on *who* is asking)
 without spinning up a userspace process — see "In-kernel resource servers" below.
 
+## Requested rights select what you get back
+
+A lookup asks for rights, and for a userspace server those rights also choose the *kind*
+of thing the server answers with. This is not obvious and it is the entry point for
+directory listing, so it is worth stating plainly:
+
+| Requested | Server answers with | Used by |
+|---|---|---|
+| `MAP_READ` (etc.) | the **object** itself — a `FileObject`, a `MemoryObject` | opening a file, spawning a program |
+| `SEND \| RECV \| WAIT` (`DIR_SESSION_RIGHTS`) | a **session channel** — an IPC endpoint the caller then sends ops on | listing a directory |
+
+`librsproto::session::Dir::open` is nothing more than `sys_ns_lookup` with
+`DIR_SESSION_RIGHTS`; the endpoint it gets back speaks `OP_FILE_READ_DIR`,
+`OP_FILE_MKDIR`, `OP_FILE_UNLINK` and friends. There is no separate "open directory"
+syscall — the rights *are* the request.
+
+The consequence for anyone writing a resource server: **answering resolves is not enough
+to make your subtree listable.** A server that only handles the object case (as the
+profile server did when `/bin` first landed) leaves `Dir::open` failing at the transport
+level, and every listing of its subtree reports the filesystem as unreachable.
+
+## A listing is the union of two sources
+
+No single component knows what is "in" a path, because two different things put names
+there. A listing is therefore the union of:
+
+1. **The bindings beneath the path** — `sys_ns_enumerate` walks the caller's own
+   namespace. Local and cheap: no IPC, the kernel is reading a list it already holds.
+2. **The filesystem under the path** — `Dir::open` + `OP_FILE_READ_DIR` to whichever
+   server owns it.
+
+Bindings **shadow** same-named filesystem entries, exactly as a mount point shadows the
+directory it covers.
+
+This is why `/` genuinely needs both (the root filesystem's own entries *plus* `/dev`,
+`/bin`, `/log` alongside them), while `/dev` is all bindings and no filesystem, and
+`/system` is the other way round. A path with neither is a real error; a path with only
+bindings is an ordinary kernel-served directory, not a failure.
+
+A caller that asks only one source gets a confidently wrong answer rather than an error,
+which is why the coreutils merge both and why `coreutils::fs::children` — used by the
+recursive tree walks — deliberately uses **filesystem entries only**: descending into a
+binding would walk out of the tree being copied or removed.
+
 ## Lookup is asynchronous
 
 `sys_ns_lookup` returns a **`PendingOperation`** (`docs/architecture/`… the
