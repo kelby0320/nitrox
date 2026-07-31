@@ -650,7 +650,7 @@ honoured from then on, not bolted on at Part F.
       Continuation is decided by **lexing, not counting** — a brace inside a string or a
       comment opens nothing, and getting that wrong hangs the prompt on a finished command.
 
-- [ ] **Part G — the regex engine and `~=`** (B4)
+- [x] **Part G — the regex engine and `~=`** ✅ (2026-07-30) — B4 closed
       Predicate-only, since §10b never asks `~=` for anything but a boolean — which removes
       submatch extraction, the largest source of complexity in a regex implementation. Pattern
       parser → instruction program → **Pike VM** (Thompson NFA): linear time, no backtracking, no
@@ -662,7 +662,18 @@ honoured from then on, not bolted on at Part F.
       The property that matters: **no pattern's meaning ever changes when the engine grows.** Every
       excluded construct is an error today, not a silently-different match — which is why literal
       substring matching was rejected as a starting point.
-      *Deliverable: `list | filter name ~= /\.rs$/` works. Closes the `grep` story (§10a).*
+      *Deliverable met, in guest.* One bug worth recording: the first compiler let a
+      fragment's exit be patched by **overwriting** the instruction slot with a `Jump`,
+      which destroyed the `AssertStart` it was patching — so `^bc` became `Jump; b; c` and
+      matched anywhere. Instructions now carry their successor explicitly, making an exit a
+      *field to fill* rather than an instruction to clobber. It passed several simpler
+      tests first, which is why anchors and the pathological-pattern case both earn their
+      place.
+
+**Milestone 3 is complete** (Parts A–G). `nxsh` parses and evaluates the language, spawns
+and pipes real programs, runs the generic operators in-process, and matches with `~=`. What
+it does **not** do is `cd` — see Milestone 3.5 below, which is where the `usersh` swap
+also lands.
 
 #### What Milestone 3 does not do
 

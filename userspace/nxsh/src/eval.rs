@@ -506,9 +506,10 @@ impl Interp {
             Expr::Underscore => Err(EvalError::new(
                 "`_` is a pipeline placeholder and has no value on its own",
             )),
-            Expr::Regex(_) => Err(EvalError::new(
-                "regex literals are evaluated in Part G — `~=` parses already",
-            )),
+            // A `/pattern/` literal is its source text; `~=` compiles it. Keeping it a
+            // String means a pattern can equally be built at run time, which a filter over
+            // a user-supplied name needs.
+            Expr::Regex(p) => Ok(Val::str(p.clone())),
             // D4's resolution order, completed: a local binding first, then a command.
             // A bare name that is neither gets a message naming *both* searches, because
             // "not found" leaves a reader guessing which one they meant to satisfy.
@@ -1836,10 +1837,18 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
             s.push_str(&r.render());
             return Ok(Val::str(s));
         }
+        // §10b: the gap `grep` left was a missing *operator*, not a missing program.
         Match => {
-            return Err(EvalError::new(
-                "`~=` needs the regex engine, which arrives in Part G",
-            ));
+            let (Some(Value::Str(text)), Some(Value::Str(pattern))) = (l.as_data(), r.as_data())
+            else {
+                return Err(EvalError::new(alloc::format!(
+                    "`~=` matches a String against a pattern, got {} and {}",
+                    l.type_name(),
+                    r.type_name()
+                )));
+            };
+            let re = crate::regex::Regex::new(pattern).map_err(EvalError::new)?;
+            return Ok(Val::bool(re.is_match(text)));
         }
         And | Or | Coalesce => unreachable!("short-circuited before evaluation"),
         _ => {}
@@ -2331,7 +2340,7 @@ mod tests {
         // With no host attached, a command says so rather than pretending to run.
         assert!(err("ls").contains("no host attached"));
 
-        assert!(err("\"a\" ~= /b/").contains("Part G"));
+
     }
 
 
@@ -2774,6 +2783,45 @@ x"), "5");
         assert_eq!(r.expect("imports").render(), "8");
     }
 
+
+
+    // --- `~=` (Part G, §10b) ------------------------------------------------
+
+    #[test]
+    fn the_match_operator_works_end_to_end() {
+        assert_eq!(rendered("\"parse.rs\" ~= /\\.rs$/"), "true");
+        assert_eq!(rendered("\"parse.py\" ~= /\\.rs$/"), "false");
+        // A pattern may equally be a String built at run time.
+        assert_eq!(rendered("let p = \"^a\"\n\"abc\" ~= p"), "true");
+    }
+
+    /// §10a: `filter` plus `~=` covers `grep`'s job entirely — the gap was a missing
+    /// operator, not a missing program.
+    #[test]
+    fn filter_with_a_regex_replaces_grep() {
+        use libstream::wire::{StreamFlags, Table, TypeTag};
+        let schema = Schema::new().field("name", TypeTag::String, TypeModifiers::NONE);
+        let t = Table {
+            flags: StreamFlags::NONE,
+            schema,
+            rows: alloc::vec![
+                alloc::vec![Value::Str(alloc::string::String::from("parse.rs"))],
+                alloc::vec![Value::Str(alloc::string::String::from("notes.txt"))],
+                alloc::vec![Value::Str(alloc::string::String::from("lex.rs"))],
+            ],
+        };
+        let mut buf = alloc::vec::Vec::new();
+        t.encode(&mut buf).expect("encodes");
+        let host = MockHost::new().with_program("list", Some(buf));
+        let (r, _l) = run_with(host, "list | filter name ~= /\\.rs$/ | count");
+        assert_eq!(r.expect("runs").render(), "2");
+    }
+
+    #[test]
+    fn a_malformed_pattern_is_a_loud_error() {
+        assert!(err("\"x\" ~= /(a/").contains("unclosed"));
+        assert!(err("\"x\" ~= /a{2}/").contains("counted repetition"));
+    }
 
     #[test]
     fn the_deliverable_computes() {
