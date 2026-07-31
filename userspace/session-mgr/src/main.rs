@@ -235,7 +235,13 @@ fn authenticate(auth_ch: u64, user: &[u8], pass: &[u8], home_out: &mut [u8]) -> 
 /// absence is the sandbox. Proves `BIND_NAMESPACE` + subtree scoping + shared-
 /// registration bind-mount. Returns the session-namespace handle, or `0` on failure.
 /// `root_ns` is session-mgr's inherited namespace (to resolve the console).
-fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8], user: &[u8]) -> u64 {
+fn build_session_namespace(
+    root_ns: u64,
+    fs_endpoint: u64,
+    profile_endpoint: u64,
+    home: &[u8],
+    user: &[u8],
+) -> u64 {
     // A fresh, owned namespace (full rights — this is *our* namespace to compose).
     let ns = unsafe { syscall0(SYS_NS_CREATE) };
     if ns < 0 {
@@ -264,6 +270,35 @@ fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8], user: &[
         unsafe { syscall1(SYS_HANDLE_CLOSE, ns) };
         return 0;
     }
+    // `/bin` → the profile server, whole-tree (no subtree base): a lookup of `/bin/list`
+    // reaches it with suffix `list`, and it probes the system profile's packages in the
+    // store. The same endpoint init bound in the root namespace, so the kernel *shares*
+    // that registration rather than minting a rival — one server connection, two names,
+    // exactly as `/home` shares the fs-server's.
+    //
+    // **Why a profile and not `/initramfs/sbin`.** Binding the boot image would be one
+    // line and would work today. It also hands every session every binary the system
+    // booted with, which is precisely the ambient authority per-process namespaces exist
+    // to refuse — "absence is the sandbox" means nothing if absence is never arranged. A
+    // profile is a *choice* about what a user may run; the initramfs is an accident of
+    // what booting needed.
+    //
+    // Non-fatal: a session with no `/bin` still has the whole in-process language, and
+    // failing the login would trade a working shell for a missing `list`.
+    let mut has_bin = false;
+    if profile_endpoint != 0 {
+        let bin = b"/bin";
+        // SAFETY: valid namespace handle, path pointer, and endpoint handle; no subtree
+        // base (0/0) — the profile server is bound at its own root.
+        let pr = unsafe {
+            syscall6(SYS_NS_BIND, ns, bin.as_ptr() as u64, bin.len() as u64, profile_endpoint, 0, 0)
+        };
+        if pr != 0 {
+            kprint(b"session-mgr: /bin bind FAIL (session has no programs)\n");
+        }
+        has_bin = pr == 0;
+    }
+
     // `/session/user` → who this session belongs to.
     //
     // Nitrox has no kernel user identity — authority is capabilities, so there is nothing
@@ -298,8 +333,20 @@ fn build_session_namespace(root_ns: u64, fs_endpoint: u64, home: &[u8], user: &[
             kprint(b"session-mgr: /dev/console bind FAIL (shell has no console)\n");
         }
     }
+    // SAFETY: single-threaded session-mgr; one namespace is built at a time.
+    unsafe { SESSION_HAS_BIN = has_bin };
     ns
 }
+
+/// Whether the last-built session namespace got its `/bin`. Read only for the log line —
+/// nothing branches on it.
+fn session_has_bin() -> bool {
+    // SAFETY: single-threaded session-mgr.
+    unsafe { SESSION_HAS_BIN }
+}
+
+/// Set by [`build_session_namespace`]; see [`session_has_bin`].
+static mut SESSION_HAS_BIN: bool = false;
 
 /// Publish `user` at `/session/user` in `ns`, as a read-only memory object.
 ///
@@ -412,13 +459,20 @@ fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
     // rather than a stream it was handed.
     //
     // Under `test-harness` the shell runs a script instead of a prompt, so the boot has a
-    // deterministic verdict. The script is the login proof: it checks the environment
-    // arrived, that a relative path resolves against it, and that home is writable.
+    // deterministic verdict. The script is the login proof: the environment arrived, a
+    // relative path resolves against it, home is writable — and, since Part F, that the
+    // session can **run a program**.
+    //
+    // `list .` is the whole of Part F in one line. `list` is not a builtin, so the shell
+    // must resolve it as a program; the session namespace holds no `/initramfs`, so the
+    // only path that can find it is `/bin/list` → the profile server → the store. If the
+    // `/bin` bind is missing the script dies with "list is not a program", which is
+    // exactly the failure a real user hit at the prompt.
     #[cfg(feature = "test-harness")]
     let argv: &[&str] = &[
         "nxsh",
         "-c",
-        "if $env.PWD != $env.HOME { bad }\n         [1, 2] | save ./nx-login.txt\n         if (open ./nx-login.txt | count) != 2 { bad }",
+        "if $env.PWD != $env.HOME { bad }\n         [1, 2] | save ./nx-login.txt\n         if (open ./nx-login.txt | count) != 2 { bad }\n         if (list . | count) < 1 { bad }",
     ];
     #[cfg(not(feature = "test-harness"))]
     let argv: &[&str] = &["nxsh"];
@@ -461,15 +515,23 @@ fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"session-mgr: up\n");
-    // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) auth channel.
+    // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) profile
+    // server endpoint, (3) auth channel. Positional — service-mgr sends an empty message
+    // for an endpoint it does not have, so a missing one shortens no one's count.
     let fs_endpoint = recv_handoff(control);
+    let profile_endpoint = recv_handoff(control);
     let auth_ch = recv_handoff(control);
     if fs_endpoint == 0 || auth_ch == 0 {
         kprint(b"session-mgr: endpoint handoff FAIL\n");
         verdict(false);
         idle();
     }
-    kprint(b"session-mgr: received fs endpoint + auth channel\n");
+    // A session without `/bin` is the pre-Part-F shell: the language works, nothing
+    // spawns. Degraded, not broken — worth reporting and worth not failing the login over.
+    if profile_endpoint == 0 {
+        kprint(b"session-mgr: no profile endpoint -- sessions will have no /bin\n");
+    }
+    kprint(b"session-mgr: received fs + profile endpoints + auth channel\n");
 
     // The session loop: authenticate a user, construct their per-user namespace, spawn
     // the shell into it, and reap it. (Part D auto-logs-in the demo user for a
@@ -481,12 +543,25 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             kprint(b"session-mgr: login ok -> home=");
             kprint(&home[..hl]);
             kprint(b"\n");
-            let session_ns = build_session_namespace(root_ns, fs_endpoint, &home[..hl], &user[..ul]);
+            let session_ns = build_session_namespace(
+                root_ns,
+                fs_endpoint,
+                profile_endpoint,
+                &home[..hl],
+                &user[..ul],
+            );
             if session_ns == 0 {
                 verdict(false);
                 idle();
             }
-            kprint(b"session-mgr: session namespace built (/home subtree + /dev/console)\n");
+            kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
+            // Named separately because it is the one member that can be absent, and a
+            // run with the bind disabled proved the unconditional message would announce
+            // a `/bin` that was not there — the log has to be able to say "no".
+            if session_has_bin() {
+                kprint(b" + /bin");
+            }
+            kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.
             let code = spawn_user_shell(root_ns, session_ns, notif);
             let ok = code == 0;

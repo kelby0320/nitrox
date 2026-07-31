@@ -964,9 +964,19 @@ impl<'a> Parser<'a> {
             // deliberately absent here: pressed against the name they were handled above,
             // and *separated* by a space they begin an argument — `list .` names the
             // current directory, and `list [x]` is a path, not an index.
-            Tok::Plus | Tok::PlusPlus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Lt
+            Tok::Plus | Tok::PlusPlus | Tok::Star | Tok::Percent | Tok::Lt
             | Tok::Le | Tok::Gt | Tok::Ge | Tok::EqEq | Tok::Ne | Tok::Match_ | Tok::Eq
             | Tok::QuestionQuestion | Tok::DotDot | Tok::DotDotEq => false,
+            // `/` is division — except where division is impossible. `/system` already
+            // lexes as one path word, so a *lone* `Slash` here means the next thing is
+            // whitespace or a closer, and `list /` and `list / | count` have no right
+            // operand for a division to use. The only reading left is the root path,
+            // which is also what a person typing `list /` meant.
+            //
+            // Spacing matters for the same reason it does for `-`: `a/b` is division
+            // written the way division is written, and nothing should turn it into an
+            // argument.
+            Tok::Slash => s.space_before && self.lx.no_operand_follows(),
             // The one that needs spacing to disambiguate.
             Tok::Minus => {
                 let flagged = self.lx.peek(Mode::Word)?;
@@ -1397,6 +1407,40 @@ mod tests {
         match &s.stmts[0] {
             Stmt::Expr(e) => e.clone(),
             other => panic!("expected an expression statement, got {other:?}"),
+        }
+    }
+
+    /// **The root directory is a path, not a division sign.**
+    ///
+    /// `list /` is the first thing anyone types at a new shell, and it did not parse: a
+    /// lone `/` after a command head was read as division, so the line died with
+    /// "expected an expression". `/system` was never affected — it lexes as one path word
+    /// — which is exactly why the gap survived every test until someone typed `list /` at
+    /// a real prompt.
+    ///
+    /// The rule is decidable, not a preference: a lone `Slash` in argument position means
+    /// what follows is whitespace or a closer, so there is no right operand and division
+    /// is *impossible*. Reading it as the root path is the only reading left.
+    #[test]
+    fn a_lone_slash_in_argument_position_is_the_root_path() {
+        for src in ["list /", "list / | count", "(list /)", "list /\nlist /home"] {
+            assert!(parse_script(src).is_ok(), "{src} should parse");
+        }
+    }
+
+    /// The other half of the same rule, and the reason it is spelled in terms of "could
+    /// anything follow" rather than "is this a command": division must keep working, and
+    /// a test that only checked the new case would not notice if it stopped.
+    #[test]
+    fn division_is_still_division() {
+        for src in ["let x = 6 / 2", "let x = a / b", "let x = a/b", "let x = (a / b) / c"] {
+            assert!(parse_script(src).is_ok(), "{src} should parse");
+        }
+        // The shape that decides it: `a / b` is a division, not `a` called with two
+        // arguments. Checking it parses is not enough — both readings parse.
+        match one_expr("a / b") {
+            Expr::Binary(..) => {}
+            other => panic!("`a / b` should be a division, got {other:?}"),
         }
     }
 

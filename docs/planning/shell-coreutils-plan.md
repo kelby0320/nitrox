@@ -959,7 +959,7 @@ Plain bullets, not checkboxes: these are decisions to *not* build, not work owed
 
 `nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken.
 
-#### Part F — the session can reach its programs (`TODO(session-program-namespace)`)
+#### Part F — the session can reach its programs ✅ (2026-07-31)
 
 Parts A–E gave a login a real shell with a real environment, and driving one interactively
 found the thing that made it a *toy*: every external command failed with "`list` is not a
@@ -998,14 +998,51 @@ pass the positive check while projecting nothing. Verified the demo is not vacuo
 way that counts: removed the `coreutils` entry from the manifest, confirmed the run fails at
 "a profiled program did not resolve on /bin", and restored it.
 
-**Step 2 — hand the endpoint down and bind it**
+**Step 2 — hand the endpoint down and bind it** ✅ (2026-07-31)
 
-- [ ] init keeps the profile-server endpoint and passes it to `service-mgr`, which passes it
-      to `session-mgr`.
-- [ ] `build_session_namespace` binds it at `/bin`.
-- [ ] In-guest proof at the prompt: `list /` in a login session.
+- [x] init keeps a duplicate of the profile-server endpoint *before* binding `/bin`, so a
+      failure is a failure to bind rather than a bound `/bin` no session can be given.
+- [x] init → service-mgr → session-mgr; `build_session_namespace` binds it at `/bin`,
+      whole-tree, sharing init's registration as `/home` shares the fs-server's.
+- [x] The login proof script runs `list .` — not a builtin, and the session holds no
+      `/initramfs`, so only `/bin/list` can satisfy it.
+- [x] Driven at a real interactive prompt: `list /`, `whoami`, `date`.
 
-*Deliverable: a login session can run the programs its profile gives it, and only those.*
+**The hand-down needed a channel, and that is the one contract this touched.** Only
+`handles[0]` reaches a child — the kernel seeds `rdx` with it, and there is no register
+left for `handles[1]` nor any documented way to learn its handle value. Rather than invent
+one, service-mgr's `rdx` became a **handoff channel**: the mechanism the boot chain already
+used one link further down, where service-mgr hands *its* children endpoints over a control
+channel. A third endpoint is now one more `send_handle`, not another ABI question.
+
+A zero handle sends an **empty message** rather than nothing, at both links. The receives
+are positional, so a skipped send would shift every later handoff up a slot and quietly
+hand session-mgr the auth channel where it expects the profile endpoint.
+
+Verified the bind is load-bearing by removing it: the run fails with
+"``list`` is not a program" — the same sentence a real user hit at the prompt. That run
+also caught a log line announcing a `/bin` that was not there; it now reports what it
+actually bound.
+
+**Step 3 — `list /` did not parse** ✅ (2026-07-31)
+
+Not planned work. It surfaced one command after step 2 made programs reachable, which is
+the point: the first thing anyone types at a new shell is `list /`, and it died with
+"expected an expression".
+
+A lone `/` after a command head was read as division. `/system` was never affected — it
+lexes as a single path word — so every existing test passed. The rule is decidable rather
+than a preference: a lone `Slash` in argument position means what follows is whitespace or
+a closer, so there is no right operand and division is *impossible*.
+
+- [x] `Lexer::no_operand_follows` — lookahead that deliberately does not skip newlines.
+- [x] `starts_an_argument` reads a spaced `/` with nothing after it as the root path.
+- [x] Host tests for both halves, and an in-guest pair: `list /` **and** `6 / 2 != 3`. A
+      rule that made every `/` a path would pass the first and break arithmetic.
+
+*Deliverable met: a login session can run the programs its profile gives it, and only
+those. `list /` at the prompt shows `home`, `bin`, `session`, `dev` — the four bindings
+the session was built with, and nothing else.*
 
 ### Deferred — the rich REPL (§11) and its dependencies
 

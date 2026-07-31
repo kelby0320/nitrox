@@ -61,6 +61,15 @@ static mut CTRL1: u64 = 0;
 /// can hand it to service-mgr (→ session-mgr binds it as each login's `/home`
 /// subtree, sharing the one registration — Part B.2). `0` until the root is mounted.
 static mut FS_ENDPOINT: u64 = 0;
+/// The profile server's forwarding endpoint, retained after the `/bin` bind so init can
+/// hand it to service-mgr (→ session-mgr binds it as each login's `/bin`, sharing the one
+/// registration exactly as `/home` shares the fs-server's). `0` until `/bin` is bound.
+///
+/// A session cannot reach the store any other way. A `UserspaceServer` binding resolves to
+/// a kernel registration record, not to the endpoint, so a process holding a LOOKUP-only
+/// root namespace can *use* `/bin` but can never obtain the thing needed to bind it
+/// elsewhere. Retaining it here is what makes the projection delegable at all.
+static mut PROFILE_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -144,18 +153,24 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// slice A it supervises a leaf service and binds nothing yet; the bind-righted
 /// namespace handle (the second gate) and the `LOAD_MODULE`/`SYSTEM_CLOCK`
 /// pass-through caps arrive with the RS protocol + those services (slice B onward).
-/// `handles[0]` (the fs-server forwarding endpoint) is filled at spawn from
-/// `FS_ENDPOINT` and **moved** to service-mgr (it forwards it to session-mgr). The
-/// endpoint carries `TRANSFER` so service-mgr can hand it onward. Spawned in **both**
+/// `handles[0]` is a **handoff channel** end, moved to service-mgr, over which init sends
+/// the fs-server and profile-server forwarding endpoints (in that order) for service-mgr
+/// to carry down to session-mgr. It carries `TRANSFER` so those endpoints can be handed
+/// onward, and `SEND`/`RECV`/`WAIT` so the channel itself works. Spawned in **both**
 /// boots now (the selftest boot brings the login chain up after the demo chain reaps so
 /// it is exercised under `test-qemu`).
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/service-mgr
     handle_count: 1,
-    move_mask: 1, // move handle 0 (the fs endpoint) to service-mgr
+    move_mask: 1, // move handle 0 (the handoff channel) to service-mgr
     arg0: 0,
-    handles: [0; 4], // handles[0] = FS_ENDPOINT, set at spawn
-    rights: [RIGHT_TRANSFER | RIGHT_DUPLICATE, 0, 0, 0],
+    handles: [0; 4], // handles[0] = the handoff channel end, set at spawn
+    rights: [
+        RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER | RIGHT_DUPLICATE,
+        0,
+        0,
+        0,
+    ],
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
@@ -600,9 +615,28 @@ fn bind_profile_server(root_ns: u64) -> bool {
     // SAFETY: closing our own control endpoint.
     unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
 
-    // 4. Bind the forwarding endpoint at `/bin`. The kernel adopts the IpcChannel as a
+    // 4. Keep a second handle to the endpoint *before* binding, for service-mgr to carry
+    //    down to session-mgr. Duplicating first rather than after means a failure here is
+    //    a failure to bind at all, instead of a bound `/bin` that no session can ever be
+    //    given — the second being much harder to notice.
+    //
+    //    `TRANSFER | DUPLICATE` are the rights the hand-down needs and all it needs: this
+    //    copy is carried and re-bound, never sent on.
+    // SAFETY: duplicating our own endpoint handle with attenuated rights.
+    let retained = unsafe {
+        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+    };
+    if retained < 0 {
+        kprint(b"init: profile endpoint duplicate FAIL\n");
+        // SAFETY: closing our own endpoint handle.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+        return false;
+    }
+
+    // 5. Bind the forwarding endpoint at `/bin`. The kernel adopts the IpcChannel as a
     //    Userspace Server; the binding takes its own reference, so init closes its
-    //    endpoint handle after.
+    //    endpoint handle after. The retained duplicate keeps the *same* endpoint alive,
+    //    so a later bind of it shares this registration rather than minting a rival.
     // SAFETY: valid namespace handle + path pointer + endpoint handle.
     let br = unsafe {
         syscall4(SYS_NS_BIND, root_ns, b"/bin".as_ptr() as u64, 4, endpoint)
@@ -611,8 +645,12 @@ fn bind_profile_server(root_ns: u64) -> bool {
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     if br != 0 {
         kprint(b"init: profile-server bind FAIL at /bin\n");
+        // SAFETY: closing the retained duplicate; nothing will use it.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
         return false;
     }
+    // SAFETY: single-threaded init.
+    unsafe { PROFILE_ENDPOINT = retained as u64 };
 
     kprint(b"init: profile server bound at /bin\n");
     // init keeps `ps_h` (the long-lived server's process handle).
@@ -1135,24 +1173,129 @@ fn spawn_eshell(root_ns: u64) {
 /// Spawn the service manager — the normal boot handoff. init keeps a handle to it (it
 /// is init's child; service-mgr's death is a critical fault init must observe). Unlike
 /// `eshell`, this is *not* closed after spawn, so init's reap loop can see a
-/// `ChildExited` for it. Moves the retained fs-server endpoint (`FS_ENDPOINT`) to it
-/// as `handles[0]` so service-mgr can hand it to session-mgr. Returns the process
-/// handle, or a negative error.
+/// `ChildExited` for it. Returns the process handle, or a negative error.
+///
+/// **`handles[0]` is a handoff channel, not an endpoint.** It carried the fs-server
+/// endpoint directly until a second endpoint (the profile server's) needed to go the same
+/// way, and only `handles[0]` reaches a child — the kernel seeds `rdx` with it and there
+/// is no register left for `handles[1]`, nor any documented way to learn its handle value.
+/// Rather than invent one, this uses the mechanism the boot chain already uses one link
+/// further down: service-mgr hands *its* children endpoints over a control channel. Adding
+/// a third endpoint later is now one more `send_handle`, not another ABI question.
 fn spawn_service_mgr(root_ns: u64) -> i64 {
     kprint(b"init: handing off to service manager\n");
-    // SAFETY: single-threaded init; stamp the retained fs endpoint into the (moved)
-    // handle slot, then spawn. `move_mask`/`handle_count`/`rights` are set in the static.
+    // Nothing to hand over — a **restart**, since the endpoints moved to the first
+    // service-mgr and cannot move twice. Spawn with no `handles[0]` at all, so the child
+    // reads `rdx == 0` and takes its documented "no endpoints; skipping login chain" path.
+    // Handing it a live but permanently empty channel would leave it blocked on a handoff
+    // that is never coming, turning a degraded restart into a hung one.
+    // SAFETY: single-threaded init.
+    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 } {
+        kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
+        // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
+        return unsafe {
+            SPAWN_SERVICE_MGR.handles[0] = 0;
+            SPAWN_SERVICE_MGR.handle_count = 0;
+            SPAWN_SERVICE_MGR.move_mask = 0;
+            spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
+        };
+    }
+
+    // The handoff channel: depth 4, so both sends land in the ring without init ever
+    // blocking on a child that has not run yet.
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (mounts are long done).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        kprint(b"init: service-mgr handoff channel FAIL\n");
+        return -1;
+    }
+    let (init_end, child_end) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // SAFETY: single-threaded init; stamp the handoff end into the (moved) handle slot,
+    // then spawn. `move_mask`/`handle_count`/`rights` are set in the static.
     let h = unsafe {
-        SPAWN_SERVICE_MGR.handles[0] = FS_ENDPOINT;
+        SPAWN_SERVICE_MGR.handles[0] = child_end;
         spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
     };
     if h < 0 {
         kprint(b"init: service-mgr spawn FAIL\n");
-    } else {
-        // The endpoint moved to service-mgr; drop init's stale copy of the handle value.
-        unsafe { FS_ENDPOINT = 0 };
+        // Nothing moved (the spawn failed) — close both ends and the endpoints they
+        // were about to carry, so a failed handoff leaks nothing.
+        // SAFETY: closing our own handles.
+        unsafe {
+            syscall1(SYS_HANDLE_CLOSE, init_end);
+            syscall1(SYS_HANDLE_CLOSE, child_end);
+            close_retained_endpoints();
+        }
+        return h;
+    }
+
+    // The handoffs, in the order service-mgr receives them: the fs-server endpoint, then
+    // the profile server's. Both are queued in the child's inbox; it has not run yet.
+    // SAFETY: single-threaded init; each endpoint moves once, and the sends null the
+    // statics so a later path cannot close a handle it no longer owns.
+    unsafe {
+        send_handle(init_end, FS_ENDPOINT);
+        FS_ENDPOINT = 0;
+        send_handle(init_end, PROFILE_ENDPOINT);
+        PROFILE_ENDPOINT = 0;
+        syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
+}
+
+/// Transfer one `handle` to a child over a handoff channel — an IPC message with a single
+/// moved handle and no payload. On failure the handle did not move, so it is closed here:
+/// a supervisor that drops a server endpoint on the floor keeps the server alive with
+/// nothing able to reach it, which is worse than losing it outright.
+///
+/// A zero `handle` sends **an empty message**, not nothing. The receiver reads the
+/// handoffs positionally, so skipping a send would shift every later one up a slot and
+/// hand service-mgr the profile endpoint where it expects the fs-server's.
+fn send_handle(ctrl: u64, handle: u64) {
+    let count = if handle == 0 { 0 } else { 1 };
+    // SAFETY: IPC_MSG/IPC_HANDLES are valid buffers; transferring `count` handles with an
+    // empty payload. NoBlock: the ring is depth 4 and holds at most two handoffs.
+    let sr = unsafe {
+        IPC_MSG[4..8].copy_from_slice(&0u32.to_le_bytes());
+        IPC_HANDLES[0] = handle;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ctrl,
+            (&raw const IPC_MSG) as u64,
+            (&raw const IPC_HANDLES) as u64,
+            count,
+            SENDMODE_NOBLOCK,
+        )
+    };
+    if sr != 0 {
+        kprint(b"init: handoff send FAIL\n");
+        // SAFETY: the transfer did not happen; reclaim the handle.
+        if handle != 0 {
+            unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+        }
+    }
+}
+
+/// Close whichever server endpoints init is still holding for the handoff. Only reached
+/// when the handoff cannot happen at all.
+///
+/// # Safety
+/// Single-threaded init; the statics are init's own handles.
+unsafe fn close_retained_endpoints() {
+    // SAFETY: closing our own handles; the statics are nulled so no path closes twice.
+    unsafe {
+        if FS_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, FS_ENDPOINT);
+            FS_ENDPOINT = 0;
+        }
+        if PROFILE_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, PROFILE_ENDPOINT);
+            PROFILE_ENDPOINT = 0;
+        }
+    }
 }
 
 /// Run the integration test harness synchronously (selftest builds): spawn it, block

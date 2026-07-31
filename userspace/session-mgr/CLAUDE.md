@@ -8,9 +8,9 @@ Constraints for the session manager. Loaded when working under
 The Tier-5 supervisor that logs a user in and hands them a sandboxed shell: it
 authenticates a credential (via auth-service), constructs a **per-user namespace**,
 and spawns the user shell into it. It holds re-delegated `BIND_NAMESPACE` (from
-service-mgr) and the building-block endpoints it composes sessions from — the
-fs-server forwarding endpoint + a channel to auth-service. See
-`docs/architecture/session-and-auth.md`.
+service-mgr) and the building-block endpoints it composes sessions from — the fs-server
+forwarding endpoint, the profile-server forwarding endpoint, and a channel to auth-service.
+See `docs/architecture/session-and-auth.md`.
 
 **Part D (current):** the plumbing — receive the handed-over endpoints, authenticate
 the demo user over the auth channel, and construct the session namespace binding
@@ -49,9 +49,29 @@ spawn the user shell into the constructed namespace.
 
 service-mgr spawns session-mgr with a control channel (`rdx`) + re-delegated
 `BIND_NAMESPACE`, then transfers, in order: (1) the fs-server forwarding endpoint,
-(2) the auth channel. session-mgr `recv`s both before doing anything. The endpoints
-are handed over IPC (not the namespace) because constructing namespaces means binding
-*endpoint handles*.
+(2) the **profile-server** forwarding endpoint, (3) the auth channel. session-mgr `recv`s
+all three before doing anything. The endpoints are handed over IPC (not the namespace)
+because constructing namespaces means binding *endpoint handles* — and a `UserspaceServer`
+binding resolves to a kernel registration record, never back to the endpoint, so a process
+holding a LOOKUP-only root namespace can *use* `/bin` but can never obtain what it would
+take to bind it elsewhere.
+
+**The receives are positional.** A sender with an endpoint missing sends an *empty message*
+rather than skipping the send; skipping would shift every later handoff up a slot and land
+the auth channel where the profile endpoint belongs.
+
+## What a session namespace contains
+
+`/home` (the user's home, a subtree of the fs-server), `/bin` (the profile server,
+whole-tree), `/session/user`, `/dev/console`. Both server bindings **share** init's
+registration rather than minting a rival — the kernel's bind-mount semantics, one server
+connection under many names.
+
+That list is the sandbox. Nothing else is reachable: not `/system`, not `/store`, not
+`/initramfs`. Adding a member is granting every session that authority, so it is a design
+decision each time, not plumbing. In particular, **do not bind `/initramfs/sbin` to make
+programs reachable** — that hands a session the boot image instead of a profile, and
+"absence is the sandbox" stops meaning anything once every session sees every binary.
 
 ## Forbidden
 

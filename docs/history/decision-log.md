@@ -9641,3 +9641,87 @@ forced the server migration. Relative-path expansion becomes a wrapper in
 here only because Nitrox has no symlinks. And a gap surfaced on the way: `open ./data.csv`,
 used throughout design §4 and §7, does not work in guest today — Part D's test passed
 against a mock and the in-guest demo used absolute paths, so the claim went untested.
+
+---
+
+## 2026-07-31 — A session gets its programs from a profile, and the hand-down needed a channel
+
+`TODO(session-program-namespace)`, closed. `nxsh` became the login leaf on 2026-07-31 and
+driving a real login found it could not run anything: the session namespace held the user's
+home and `/dev/console`, so every external command died with "`list` is not a program".
+
+**The shape was a real decision, not plumbing.** Binding `/initramfs/sbin` into each session
+is one line and works today. It also hands every session every binary the system booted
+with, which is precisely the ambient authority per-process namespaces exist to refuse —
+"absence is the sandbox" means nothing if absence is never arranged. A profile is a *choice*
+about what a user may run; the initramfs is an accident of what booting needed. So: the
+profile server's `/bin`, which
+[`profiles-and-namespace-projection.md`](../architecture/profiles-and-namespace-projection.md)
+already named as the answer. System profile only; per-user overlays stay deferred, since
+nothing yet needs two users to see different programs.
+
+**The binding was inert without the packaging.** `/bin` had been bound since Phase 3 and
+projected exactly one package — `heartbeat` — because that was all the store held. The
+coreutils existed only in the initramfs. So this landed in two steps: a `coreutils` store
+package (the ten coreutils plus `nxsh`, since a shell that cannot invoke itself is a strange
+thing to hand someone) and a second manifest entry, then the endpoint hand-down.
+
+The package hash covers **every** ELF in it, not the first. A content-addressed path is a
+claim about content only if it moves when the content does; hashing `list` alone would let
+the other ten binaries change under a path asserting they had not.
+
+**What this changed in the boot chain.** Only `handles[0]` reaches a child — the kernel
+seeds `rdx` with it, and there is no register left for `handles[1]` nor any documented way
+to learn its handle value. Handing down a *second* endpoint therefore needed a channel.
+Rather than invent a convention, service-mgr's `rdx` became a **handoff channel**: the
+mechanism the chain already used one link further down, where service-mgr hands its own
+children endpoints over a control channel. A third endpoint is now one more `send_handle`.
+
+Two details that are easy to get subtly wrong and were:
+
+- init duplicates the endpoint **before** binding `/bin`, so a failure is a failure to bind
+  at all rather than a bound `/bin` that no session can ever be given — the second being
+  much harder to notice.
+- A zero handle sends an **empty message**, not nothing, at both links. The receives are
+  positional; skipping a send would shift every later handoff up a slot and hand session-mgr
+  the auth channel where it expects the profile endpoint.
+
+A service-mgr **restart** gets no handoff channel at all (`rdx == 0`), because the endpoints
+moved to the first one and cannot move twice. Handing it a live but permanently empty
+channel would leave it blocked on a message that is never coming — a degraded restart turned
+into a hung one.
+
+**Verification, and the control that carried it.** `bin_projection_demo` resolves all eleven
+programs through the real chain — `sys_ns_lookup` → the kernel forwards to the profile
+server → it probes each manifest package in the store → it re-exports the handle. The
+negative control is the load-bearing half: "`/bin/list` resolved" says nothing about
+projection unless some `/bin/<name>` fails to resolve, since a `/bin` answering everything
+would pass the positive check while projecting nothing.
+
+Both halves were then confirmed non-vacuous by breaking them: with the `coreutils` manifest
+entry removed the run fails at "a profiled program did not resolve on /bin"; with the
+session `/bin` bind disabled it fails with "`list` is not a program" — the same sentence the
+maintainer hit at the prompt. The second run also caught a log line announcing a `/bin` that
+was not there.
+
+## 2026-07-31 — `list /` did not parse, and the rule that fixes it is decidable
+
+Found by typing it at a real prompt one command after the above made programs reachable.
+The first thing anyone types at a new shell is `list /`, and it died with "expected an
+expression".
+
+A lone `/` after a command head was read as division. `/system` was never affected, because
+it lexes as a single path word — which is exactly why every test passed and why this had to
+be found by a person rather than a suite. The same class as the console-rights bug two days
+earlier: the interactive path is not a variation of the scripted one, it is the untested one.
+
+The fix is not a preference between readings. A lone `Slash` in argument position means the
+next thing is whitespace or a closer, so **there is no right operand and division is
+impossible** — the root path is the only reading left. `Lexer::no_operand_follows` does the
+lookahead, deliberately without skipping newlines: a binary operator at end of line is
+mid-production under D2, so "the line ended" is a real answer there, not a gap to look past.
+`starts_an_argument` keeps requiring a leading space for the same reason it does with `-`:
+`a/b` is division written the way division is written.
+
+The in-guest coverage is a pair — `list /` **and** `6 / 2 != 3`. A rule that made every `/`
+a path would pass the first and break arithmetic, so neither check means anything alone.

@@ -2736,6 +2736,28 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
         return_fail(b"test-harness: nxsh could not run a real pipeline stage\n");
     }
 
+    // 2b. **`list /` — the root directory is a path, not a division sign.** The first
+    //     thing anyone types at a new shell, and it did not parse until Part F: `/system`
+    //     lexes as one path word, but a lone `/` after a command head was read as
+    //     division and the line died with "expected an expression". Found by typing it at
+    //     a real prompt, which is the only place it had ever been typed.
+    let root = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &["nxsh", "-c", "if (list / | count) < 1 { bad }"],
+    );
+    if root != 0 {
+        return_fail(b"test-harness: nxsh could not list the root directory\n");
+    }
+
+    // 2c. The control for it: `/` must still divide. A rule that made every `/` a path
+    //     would pass 2b and break arithmetic, so the two checks only mean something
+    //     together.
+    if run_coreutil(root_ns, notif, NXSH, &["nxsh", "-c", "if 6 / 2 != 3 { bad }"]) != 0 {
+        return_fail(b"test-harness: nxsh stopped treating `/` as division\n");
+    }
+
     // 3. A failing stage fails the script (§1: fail loud, don't fail silent). `remove` on
     //    a path that does not exist exits non-zero, and that must reach the exit code
     //    rather than being swallowed.

@@ -61,6 +61,12 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
 - **`Host::exists("/")` is true by construction.** A namespace root has nothing bound *at*
   it and no server owning it, so both of `exists`'s probes miss — yet `list /` enumerates
   it. `cd /` and `cd ..` out of `/home` were both refused until this was special-cased.
+- **`list /` is the root directory, not a division sign.** `/system` lexes as one path
+  word, so only a *lone* `/` reaches the parser as `Tok::Slash` — which is why this parsed
+  as division through every test until someone typed it at a real prompt. A lone `Slash` in
+  argument position means the next thing is whitespace or a closer, so there is no right
+  operand and division is impossible. Whenever you touch `starts_an_argument`, the test for
+  `list /` and the test for `6 / 2` only mean something as a pair.
 - **The shell does not rewrite a spawned stage's paths.** It passes `argv` through as
   written and hands over the same `PWD`, so both sides resolve identically. Pre-resolving
   would reintroduce the split-brain the environment design exists to prevent.

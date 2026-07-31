@@ -144,9 +144,19 @@ profile's packages first, then the system profile's. Different users get differe
 profiles; a sandboxed app can be given a namespace with *no* `/bin` profile at all,
 only the specific store dependencies it needs.
 
-Slice 1 has the **system profile only**, bound by init. Overlays arrive with
-**session-mgr** (per-user namespaces, Phase 3 backlog item 5), which layers a user
-profile over the system profile when building a login session's namespace.
+Slice 1 has the **system profile only**, bound by init. Since 2026-07-31 session-mgr binds
+that same system profile into each login session's namespace at `/bin` — the endpoint is
+handed down init → service-mgr → session-mgr, and the kernel *shares* init's registration
+rather than minting a rival. A session's `/bin` is therefore the system profile exactly,
+with no overlay yet.
+
+Overlays remain the eventual shape: session-mgr layers a *user* profile over the system one
+when there is a reason for two users to see different programs. Nothing needs that yet, and
+building the layering before the requirement would be guessing at it.
+
+The store package a session actually runs from is `coreutils` (the ten coreutils plus
+`nxsh`). Before it existed, `/bin` projected exactly `heartbeat`, so binding it into a
+session would have granted access to nothing a person could type.
 
 ## Who binds what
 
@@ -154,7 +164,8 @@ profile over the system profile when building a login session's namespace.
 |---|---|---|
 | `/store` (`LOOKUP\|READ\|MAP_READ`) in the root ns | init | 1 |
 | system profile server at `/bin` (`+/lib` later) in the root ns | init | 1 |
-| per-user profile overlay + `/home`, `/tmp` in a session ns | session-mgr | later |
+| the **system** profile server at `/bin` in a session ns | session-mgr | 2026-07-31 |
+| per-user profile overlay + `/tmp` in a session ns | session-mgr | later |
 | the writer's `/store` (`BIND\|WRITE\|MAP_WRITE`) | supervisor → package manager | later |
 
 All via the standard Resource Server Startup Protocol (the supervisor spawns the RS
