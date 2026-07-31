@@ -802,15 +802,114 @@ used absolute paths, so the claim went untested.
   things that are *handles* and genuinely shared-mutable. Env leaves that story entirely,
   which also removes what would have forced the server migration.
 
-#### Unblocks
+#### Build order
 
-`nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken.
+The design above is settled. This is the order to build it in, sized so each part ends
+verified and committed on its own — the same slice convention Milestones 2 and 3 used.
+
+Two facts established by inspection, which shape the steps:
+
+- `SetupPayload::decode` reads **positionally** with a `len() < 2` guard, so **appending**
+  `env` is backward-compatible — every existing stage keeps working untouched.
+- `session-mgr` spawns the shell with `arg0: 0`, i.e. **Tier 0**. Giving the shell an env
+  means moving that spawn to Tier 1, which is a real step rather than a detail.
+
+#### Part A — `env` on the wire
+
+- [ ] Append `env: Record` to `SetupPayload` (append only — reordering breaks the
+      positional decode).
+- [ ] `send_setup` takes it; `Setup` exposes it. Absent field ⇒ empty Record, so a sender
+      that does not set env is not a special case.
+- [ ] Update [`pipeline-stdio.md`](../spec/pipeline-stdio.md): the payload's third field,
+      and the statement that Tier 0 has no env *because* it has no setup message — the
+      same reason it has no `argv`.
+- [ ] Host tests in `libstream`, including **an old-shaped payload decoding under the new
+      decoder** — the compatibility claim above, asserted rather than reasoned about.
+- [ ] Refuse a payload over `IPC_PAYLOAD_SIZE` with a message naming the limit, not
+      `SinkFull`.
+
+*Deliverable: a stage receives a typed env Record. Nothing uses it yet.*
+
+#### Part B — relative paths resolve
+
+- [ ] `coreutils::fs::resolve(cwd, path) -> String`: absolute passes through; relative
+      joins; `.` drops; `..` pops lexically.
+- [ ] `..` above the root is an **error**, not a silent clamp to `/` — a path that escapes
+      is a mistake worth hearing about, and clamping would let `../../..` mean `/`.
+- [ ] Route the existing helpers through it (`lookup_wait`, `Dir::open`, `create_file`,
+      `rename`), so the convention has one enforcement point rather than per-program
+      discipline.
+- [ ] Host tests: absolute, `./x`, `../x`, `a/../b`, escape-above-root, and a path that is
+      exactly `.`.
+
+*Deliverable: `open ./data.csv` resolves — closing the gap where design §4 and §7 use
+relative paths that do not work in guest.*
+
+#### Part C — `nxsh`: `$env`, `cd`, and passing it down
+
+- [ ] Read env from the shell's own setup message at startup; bind it as `$env` (a `mut`
+      Record).
+- [ ] `cd PATH` as a shell-state builtin: **resolve first, set `PWD` only if it resolved**
+      — so the invariant is "PWD named something real", not "PWD is what you typed".
+- [ ] `cd` with no argument goes to `HOME`, and says so if `HOME` is unset rather than
+      silently doing nothing.
+- [ ] Pass `$env` in `send_setup` for every spawned stage, so a child inherits *explicitly*
+      what the parent chose to hand it.
+- [ ] The prompt shows `PWD` (§11a already reserves the position).
+- [ ] In-guest demo: `cd /system` then `list .` and `open ./x` **agree** — the split-brain
+      the whole design exists to prevent, asserted directly.
+
+*Deliverable: `cd` works, and both sides of a spawn resolve a relative path the same way.*
+
+#### Part D — `session-mgr` seeds the session
+
+- [ ] Build the initial env Record at login: `HOME`, `PATH` (as `List<String>`, not a
+      joined string), `PWD` = the user's home.
+- [ ] **Not `USER`.** Identity stays at `/session/user`, where it cannot be forged — a
+      process handing a child a different `USER` is exactly what the namespace binding
+      prevents, and putting it in env would give that away for nothing.
+- [ ] Move the shell spawn from Tier 0 to Tier 1 (it is `arg0: 0` today).
+- [ ] In-guest demo: a login session starts with `PWD` = home, and `cd` from there works.
+
+*Deliverable: a real session begins with a real environment.*
+
+#### Part E — the `usersh` swap
+
+- [ ] `session-mgr` spawns `nxsh` as the login leaf.
+- [ ] Keep `usersh` in the tree until the boot verdict passes with `nxsh`, then remove it
+      in the same commit that proves the replacement — not before.
+- [ ] Update `userspace/session-mgr/CLAUDE.md` and `userspace/usersh/CLAUDE.md`.
+
+*Deliverable: login lands in the real shell. This is what Part F deliberately left
+untaken.*
+
+#### Decisions owed at build time
+
+Small, but they should be made deliberately rather than by whoever types first:
+
+- **Does `cd` accept a path that resolves to a file?** Refusing is consistent with `touch`
+  refusing a directory; accepting silently would make every later relative path fail.
+- **Is `PWD` writable directly (`env.PWD = "/x"`), or only through `cd`?** Direct writing
+  bypasses the resolve-first check, which is the only thing keeping `PWD` honest.
+- **What does a stage do with an env entry whose type it did not expect?** §6 says schema
+  diff and fail loud; worth confirming that is what actually happens rather than a
+  `SchemaMismatch` with no detail.
 
 #### Not doing yet, deliberately
 
-Binding `/env` in the namespace for discoverability. The Record already gives
-see-and-manipulate inside the shell; a binding would buy inspecting *another* session's
-env, and nothing wants that yet.
+Plain bullets, not checkboxes: these are decisions to *not* build, not work owed.
+
+- **Env larger than the payload.** The escape is a memory-object handle holding the block,
+  which the setup message can already transfer. Not built until something needs it — and
+  Part A's explicit refusal is what makes the limit visible rather than mysterious when it
+  arrives.
+- **`/env` as a namespace binding.** The Record already gives see-and-manipulate inside the
+  shell; a binding would buy inspecting *another* session's env, and nothing wants that
+  yet.
+
+#### Unblocks
+
+`nxsh` replacing `usersh` as the login leaf, which Part F deliberately left untaken.
 
 ### Deferred — the rich REPL (§11) and its dependencies
 
@@ -836,108 +935,3 @@ With the prereqs in, read, in order: this plan → `nitrox-shell-design-v1.1.md`
 `nitrox-ui-composition-model-v1.md` (for `form`/stdout only) → `docs/spec/typed-stream-format.md`
 (TSM1 wire) → `docs/spec/rsproto-*.md` (the protocol the fs-server speaks). Then start at
 **Milestone 1 (`list` + `copy`)** — the first integrated proof that the substrate composes.
-
----
-
-## Part 4 — Milestone 3.5 implementation steps
-
-The design above is settled. This is the order to build it in, sized so each part ends
-verified and committed on its own, per the project's slice convention.
-
-Two facts established by inspection, which shape the steps:
-
-- `SetupPayload::decode` reads **positionally** with a `len() < 2` guard, so **appending**
-  `env` is backward-compatible — every existing stage keeps working untouched.
-- `session-mgr` spawns the shell with `arg0: 0`, i.e. **Tier 0**. Giving the shell an env
-  means moving that spawn to Tier 1, which is a real step rather than a detail.
-
-### Part 1 — `env` on the wire
-
-- [ ] Append `env: Record` to `SetupPayload` (append only — reordering breaks the
-      positional decode).
-- [ ] `send_setup` takes it; `Setup` exposes it. Absent field ⇒ empty Record, so a sender
-      that does not set env is not a special case.
-- [ ] Update [`pipeline-stdio.md`](../spec/pipeline-stdio.md): the payload's third field,
-      and the statement that Tier 0 has no env *because* it has no setup message — the
-      same reason it has no `argv`.
-- [ ] Host tests in `libstream`, including **an old-shaped payload decoding under the new
-      decoder** — the compatibility claim above, asserted rather than reasoned about.
-- [ ] Refuse a payload over `IPC_PAYLOAD_SIZE` with a message naming the limit, not
-      `SinkFull`.
-
-*Deliverable: a stage receives a typed env Record. Nothing uses it yet.*
-
-### Part 2 — relative paths resolve
-
-- [ ] `coreutils::fs::resolve(cwd, path) -> String`: absolute passes through; relative
-      joins; `.` drops; `..` pops lexically.
-- [ ] `..` above the root is an **error**, not a silent clamp to `/` — a path that escapes
-      is a mistake worth hearing about, and clamping would let `../../..` mean `/`.
-- [ ] Route the existing helpers through it (`lookup_wait`, `Dir::open`, `create_file`,
-      `rename`), so the convention has one enforcement point rather than per-program
-      discipline.
-- [ ] Host tests: absolute, `./x`, `../x`, `a/../b`, escape-above-root, and a path that is
-      exactly `.`.
-
-*Deliverable: `open ./data.csv` resolves — closing the gap where design §4 and §7 use
-relative paths that do not work in guest.*
-
-### Part 3 — `nxsh`: `$env`, `cd`, and passing it down
-
-- [ ] Read env from the shell's own setup message at startup; bind it as `$env` (a `mut`
-      Record).
-- [ ] `cd PATH` as a shell-state builtin: **resolve first, set `PWD` only if it resolved**
-      — so the invariant is "PWD named something real", not "PWD is what you typed".
-- [ ] `cd` with no argument goes to `HOME`, and says so if `HOME` is unset rather than
-      silently doing nothing.
-- [ ] Pass `$env` in `send_setup` for every spawned stage, so a child inherits *explicitly*
-      what the parent chose to hand it.
-- [ ] The prompt shows `PWD` (§11a already reserves the position).
-- [ ] In-guest demo: `cd /system` then `list .` and `open ./x` **agree** — the split-brain
-      the whole design exists to prevent, asserted directly.
-
-*Deliverable: `cd` works, and both sides of a spawn resolve a relative path the same way.*
-
-### Part 4 — `session-mgr` seeds the session
-
-- [ ] Build the initial env Record at login: `HOME`, `PATH` (as `List<String>`, not a
-      joined string), `PWD` = the user's home.
-- [ ] **Not `USER`.** Identity stays at `/session/user`, where it cannot be forged — a
-      process handing a child a different `USER` is exactly what the namespace binding
-      prevents, and putting it in env would give that away for nothing.
-- [ ] Move the shell spawn from Tier 0 to Tier 1 (it is `arg0: 0` today).
-- [ ] In-guest demo: a login session starts with `PWD` = home, and `cd` from there works.
-
-*Deliverable: a real session begins with a real environment.*
-
-### Part 5 — the `usersh` swap
-
-- [ ] `session-mgr` spawns `nxsh` as the login leaf.
-- [ ] Keep `usersh` in the tree until the boot verdict passes with `nxsh`, then remove it
-      in the same commit that proves the replacement — not before.
-- [ ] Update `userspace/session-mgr/CLAUDE.md` and `userspace/usersh/CLAUDE.md`.
-
-*Deliverable: login lands in the real shell. This is what Part F deliberately left
-untaken.*
-
-### Deferred within the slice
-
-- [ ] **Env larger than the payload.** The escape is a memory-object handle holding the
-      block, which the setup message can already transfer. Not built until something needs
-      it; Part 1's explicit refusal is what makes the limit visible rather than mysterious
-      when it arrives.
-- [ ] **`/env` as a namespace binding.** The Record already gives see-and-manipulate inside
-      the shell; a binding would buy inspecting *another* session's env, and nothing wants
-      that yet.
-
-### Decisions owed at build time
-
-Small, but they should be made deliberately rather than by whoever types first:
-
-- **Does `cd` accept a path that resolves to a file?** Refusing is consistent with `touch`
-  refusing a directory; accepting silently would make every later relative path fail.
-- **Is `PWD` writable directly (`env.PWD = "/x"`), or only through `cd`?** Direct writing
-  bypasses the resolve-first check, which is the only thing keeping `PWD` honest.
-- **What does a stage do with an env entry whose type it did not expect?** §6 says schema
-  diff and fail loud; worth confirming that is what actually happens rather than a
-  `SchemaMismatch` with no detail.
