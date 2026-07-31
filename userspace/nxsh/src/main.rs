@@ -402,17 +402,22 @@ fn reap(notif: u64, stages: &[StageSpec], spawned: usize, strict: bool) -> Vec<S
     out
 }
 
-/// Resolve `path` to a readable handle.
+/// Resolve `path` to a handle with **file** rights — mapping and stat.
 fn lookup(ns: u64, path: &[u8]) -> Option<u64> {
+    lookup_rights(ns, path, RIGHT_MAP_READ | RIGHT_INSPECT)
+}
+
+/// Resolve `path` asking for `rights`.
+///
+/// A **char device is not a file.** `/dev/console` is read with `sys_io_submit`, which
+/// needs `READ` — not the `MAP_READ | INSPECT` a mappable object wants. Asking for the
+/// wrong ones yields a handle that resolves perfectly well and then fails on every read,
+/// which is exactly the bug this call site had: the REPL got a console it could not read
+/// from, and the read loop swallowed the failure into a busy wait.
+fn lookup_rights(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     // SAFETY: valid namespace handle and path slice.
     let po = unsafe {
-        syscall4(
-            SYS_NS_LOOKUP,
-            ns,
-            path.as_ptr() as u64,
-            path.len() as u64,
-            RIGHT_MAP_READ | RIGHT_INSPECT,
-        )
+        syscall4(SYS_NS_LOOKUP, ns, path.as_ptr() as u64, path.len() as u64, rights)
     };
     if po < 0 {
         return None;
@@ -520,7 +525,10 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 /// and the compositor terminal, and building them against a raw character device would be
 /// a dependency inversion.
 fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
-    let Some(console) = lookup(namespace, b"/dev/console") else {
+    // `RIGHT_READ`, not the file rights `lookup` asks for: the console is a char device
+    // read through `sys_io_submit`.
+    let Some(console) = lookup_rights(namespace, b"/dev/console", libkern::handle::RIGHT_READ)
+    else {
         kprint(b"nxsh: /dev/console not found\r\n");
         return EXIT_USAGE;
     };
@@ -558,6 +566,13 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
     let mut line: Vec<u8> = Vec::new();
     kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
 
+    // A read that keeps failing must **report**, not spin. The original loop did
+    // `if po < 0 { continue }`, which turned a wrong-rights handle into a silent busy
+    // loop: a prompt, no input, and a pegged CPU with nothing on the console to say why.
+    // A failure that hangs is worse than one that exits.
+    let mut consecutive_failures = 0u32;
+    const MAX_READ_FAILURES: u32 = 16;
+
     loop {
         let op = libkern::abi::IoOp {
             opcode: libkern::abi::IO_OPCODE_READ,
@@ -572,12 +587,23 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
             syscall2(SYS_IO_SUBMIT, console, (&op as *const libkern::abi::IoOp) as u64)
         };
         if po < 0 {
+            consecutive_failures += 1;
+            if consecutive_failures >= MAX_READ_FAILURES {
+                kprint(b"\r\nnxsh: cannot read the console (io_submit refused)\r\n");
+                return EXIT_USAGE;
+            }
             continue;
         }
         let (status, n) = po_wait(po as u64);
         if status != 0 {
+            consecutive_failures += 1;
+            if consecutive_failures >= MAX_READ_FAILURES {
+                kprint(b"\r\nnxsh: console read failed repeatedly\r\n");
+                return EXIT_USAGE;
+            }
             continue;
         }
+        consecutive_failures = 0;
         for i in 0..(n as usize).min(64) {
             // SAFETY: within the mapped one-page read buffer.
             let b = unsafe { ((buf_addr as u64 + i as u64) as *const u8).read_volatile() };
