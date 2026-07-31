@@ -2775,7 +2775,25 @@ fn nxsh_demo(root_ns: u64, notif: u64) {
     }
     unlink_all(root_ns, b"/system", &[b"nx-d.tsm"]);
 
-    kprint(b"test-harness: nxsh ok (evaluated, spawned a stage, piped through operators, saved + reopened)\n");
+    // 7. **Part E**: a `def` with a default and the `_` fill, `match`, and `try`/`catch`,
+    //    over a real pipeline — the language's own constructs on real data.
+    let lang = run_coreutil(
+        root_ns,
+        notif,
+        NXSH,
+        &[
+            "nxsh",
+            "-c",
+            // `try` is a *statement*, so the caught message lands in a `mut` rather than
+            // being bound directly — see the Part E notes.
+            "def rows(t: Table, least: Int = 1) -> Int { t | filter size > 0 | count }\nlet n = list /system | rows(_, least: 1)\nlet kind = match n { 0 => \"empty\"\n _ => \"some\" }\nmut msg = \"none\"\ntry { let z = 1 / 0 } catch (e) { msg = e.message }\nif kind != \"some\" { bad }\nif msg != \"division by zero\" { bad }",
+        ],
+    );
+    if lang != 0 {
+        return_fail(b"test-harness: nxsh def/match/try did not run\n");
+    }
+
+    kprint(b"test-harness: nxsh ok (evaluated, spawned a stage, operators, save/open, def+match+try)\n");
 }
 
 /// Publish `name` at `/session/user` in `ns`, the way `session-mgr` does for a login.

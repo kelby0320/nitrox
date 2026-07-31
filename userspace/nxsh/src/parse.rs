@@ -608,6 +608,23 @@ impl<'a> Parser<'a> {
                     self.expect(&Tok::RBracket, "expected `]`")?;
                     Expr::Index(Box::new(e), Box::new(idx))
                 }
+                // `utils.helper(…)` — a call on a **qualified name** (§9h's `use … as`).
+                // The alias binds `utils.helper` as one name rather than a record, since a
+                // module's exports are functions and a function is deliberately not
+                // TSM1-representable (§5c) — so there is no record to hold them.
+                Tok::LParen => {
+                    let Expr::Field(base, field) = &e else { return Ok(e) };
+                    let Expr::Ident(root) = base.as_ref() else { return Ok(e) };
+                    let name = alloc::format!("{root}.{field}");
+                    self.bump()?;
+                    let args = self.paren_args()?;
+                    Expr::Call(Box::new(Call {
+                        name,
+                        kind: CallKind::Def,
+                        args,
+                        forced_external: false,
+                    }))
+                }
                 Tok::Question => {
                     self.bump()?;
                     Expr::Try(Box::new(e))
