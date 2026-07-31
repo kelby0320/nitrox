@@ -80,7 +80,7 @@ Each crate has its own `CLAUDE.md` for crate-specific guidance:
 - `userspace/service-mgr/CLAUDE.md` — service supervisor
 - `userspace/auth-service/CLAUDE.md` — credential oracle (auth + session-mgr)
 - `userspace/session-mgr/CLAUDE.md` — session supervisor (login, per-user namespaces)
-- `userspace/usersh/CLAUDE.md` — throwaway sandboxed user shell (the login leaf)
+- `userspace/nxsh/CLAUDE.md` — the Nitrox shell; the login leaf since 2026-07-31
 
 Read the crate-specific `CLAUDE.md` before significant work in any of these.
 

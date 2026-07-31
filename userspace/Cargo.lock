@@ -147,8 +147,10 @@ dependencies = [
 name = "session-mgr"
 version = "0.1.0"
 dependencies = [
+ "libheap",
  "libkern",
  "librsproto",
+ "libstream",
 ]
 
 [[package]]
@@ -160,11 +162,4 @@ dependencies = [
  "libos",
  "librsproto",
  "libstream",
-]
-
-[[package]]
-name = "usersh"
-version = "0.1.0"
-dependencies = [
- "libkern",
 ]

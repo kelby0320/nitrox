@@ -1208,7 +1208,7 @@ fn run_test_harness(notif: u64, root_ns: u64) -> bool {
 /// `selftest`**, bring up the login chain (service-mgr → auth-service + session-mgr) and
 /// the Phase-1/2 demo chain (`parent`) **concurrently**, then supervise via [`reap_loop`].
 /// Running them together is deliberate: `parent`'s direct `/dev/blk` reads overlap the
-/// login chain's fs-mediated block I/O (session-mgr/usersh's forwarded `/home` reads), so
+/// login chain's fs-mediated block I/O (session-mgr/nxsh's forwarded `/home` reads), so
 /// the default test exercises concurrent direct + fs-mediated block I/O across all CPUs —
 /// the scenario that originally surfaced the cross-CPU-wake hang (now fixed by the
 /// reschedule IPI; see the 2026-07-20 decision log). The prior demo→login *sequencing* was

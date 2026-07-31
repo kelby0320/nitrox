@@ -21,11 +21,18 @@ spawn the user shell into the constructed namespace.
 
 ## Discipline (init/supervisor family)
 
-- **`#![no_std]` + `#![no_main]`, no `alloc`.** Fixed `.bss` buffers, no
-  `#[global_allocator]`. It is a supervisor (its death is a system fault), so keep it
-  minimal and robust.
-- **`libkern` + `librsproto`** (the Auth codec + rsproto envelope). No `libos`/`libheap`
-  unless a real need appears.
+- **`#![no_std]` + `#![no_main]`, with `alloc`.** The no-`alloc` rule was lifted on
+  2026-07-31: session-mgr hands each session its **environment**, and every step of that
+  needs a heap — a TSM1 `Record` holds `Vec`s, `send_setup` builds a `Vec<String>` of
+  `argv`, and encoding returns a `Vec<u8>`. The old rule's own escape clause was "unless a
+  real need appears", and this is one: without it the *parent* cannot give the child its
+  environment, which is the whole basis of Milestone 3.5. The alternative — a second,
+  allocation-free encoding path in `libstream` — would have cost more than it saved.
+  `#![no_std]`/`#![no_main]` stay: `std` is not ported, and there is no runtime to hand a
+  `main`.
+- **`libkern` + `librsproto` + `libstream` + `libheap`.** Still no `libos` unless a real
+  need appears. It remains a supervisor whose death is a system fault, so the *spirit* of
+  the rule — keep it minimal — still applies to everything else.
 - **No `panic!()` / `unwrap()`** in normal operation — degrade + log.
 - **Capability least-authority.** session-mgr holds `BIND_NAMESPACE` (to construct
   session namespaces) and no more. It spawns the user shell with **empty syscaps** and
@@ -48,7 +55,6 @@ are handed over IPC (not the namespace) because constructing namespaces means bi
 
 ## Forbidden
 
-- `alloc` / `#[global_allocator]`.
 - Storing or logging a password.
 - Holding more than `BIND_NAMESPACE`; granting a user shell any syscaps.
 - Investing in the throwaway demo/login path (the real shell + login are Phase 4 /

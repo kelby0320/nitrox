@@ -14,14 +14,24 @@
 //! hardcoded round-trip with an interactive `login:` prompt and spawns the user shell
 //! into the constructed namespace.
 //!
-//! `#![no_std]` + `#![no_main]`, **no `alloc`** — fixed `.bss` buffers, no
-//! `#[global_allocator]`. `libkern` + `librsproto` (the Auth codec + envelope).
+//! `#![no_std]` + `#![no_main]`, **with `alloc`**. The no-`alloc` rule was lifted on
+//! 2026-07-31 because session-mgr hands each session its environment, and every step of
+//! that needs a heap: a TSM1 `Record` holds `Vec`s, `send_setup` builds a `Vec<String>`,
+//! and encoding returns a `Vec<u8>`. Without it the *parent* cannot give the child its
+//! environment — which is what Milestone 3.5 is built on. `std` stays unported and there
+//! is no runtime to hand a `main`, so those two rules are unchanged.
 //! See `userspace/session-mgr/CLAUDE.md`.
 
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use libkern::*;
+
+/// `alloc` backing: the environment record and the setup-message codec both allocate.
+#[global_allocator]
+static ALLOC: libheap::Heap = libheap::Heap;
 use librsproto::auth::{build_authenticate_request, parse_authenticate_reply};
 use librsproto::{OP_AUTHENTICATE, decode, encode};
 
@@ -50,16 +60,56 @@ static mut NOTIF: Notification = Notification::zeroed();
 /// Spawn args for the user shell: run in the **constructed session namespace** with
 /// **empty syscaps** (a fully unprivileged sandbox). `image`/`namespace` are filled at
 /// spawn.
-static mut SPAWN_USERSH: SpawnArgs = SpawnArgs {
+static mut SPAWN_SHELL: SpawnArgs = SpawnArgs {
     image: 0,
-    handle_count: 0,
-    move_mask: 0,
+    // One handle: the setup channel. The shell is a **Tier-1** stage — it receives its
+    // `argv` and its **environment** the same way every pipeline stage does, rather than
+    // through a special case (Milestone 3.5 Part D).
+    handle_count: 1,
+    move_mask: 1,
     arg0: 0,
     handles: [0; 4],
-    rights: [0; 4],
+    rights: [u64::MAX; 4],
     namespace: 0, // set at spawn = the session namespace
     syscaps: 0,   // empty — the shell is sandboxed
 };
+
+/// The user's home *as seen from inside the session*.
+///
+/// session-mgr binds the user's home subtree at `/home`, so from within the session that
+/// path **is** the home directory — the outside path (`/home/alice`) is not nameable, and
+/// that is the point: absence is the sandbox.
+const SESSION_HOME: &str = "/home";
+
+/// Build the environment a session starts with.
+///
+/// A TSM1 `Record`, so it is typed: `PATH` is a `List<String>` rather than a colon-joined
+/// string, which makes a path *containing* a colon representable and leaves no room for two
+/// readers to split it differently.
+///
+/// **`USER` is deliberately absent.** Identity lives at `/session/user`, a namespace
+/// binding a process cannot forge because it cannot bind at all. Copying it into the
+/// environment would hand that property away for nothing: any process could then tell a
+/// child it was somebody else.
+fn session_env() -> libstream::wire::Record {
+    use libstream::wire::{Record, Schema, TypeModifiers, TypeTag, Value};
+    let schema = Schema::new()
+        .field("HOME", TypeTag::String, TypeModifiers::NONE)
+        .field("PWD", TypeTag::String, TypeModifiers::NONE)
+        .field("PATH", TypeTag::List, TypeModifiers::NONE);
+    let path: alloc::vec::Vec<Value> =
+        alloc::vec![Value::Str(alloc::string::String::from("/bin"))];
+    Record {
+        schema,
+        values: alloc::vec![
+            Value::Str(alloc::string::String::from(SESSION_HOME)),
+            // A session begins at home, which is also what makes a bare `list` mean
+            // something useful the moment you log in.
+            Value::Str(alloc::string::String::from(SESSION_HOME)),
+            Value::List(alloc::sync::Arc::from(path)),
+        ],
+    }
+}
 
 /// Emit `msg` to the serial console.
 fn kprint(msg: &[u8]) {
@@ -322,30 +372,65 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
     (status, handle)
 }
 
-/// Spawn the user shell (`/initramfs/sbin/usersh`) into `session_ns` (empty syscaps),
+/// Spawn the user shell (`/initramfs/sbin/nxsh`) into `session_ns` (empty syscaps),
 /// then block on `notif` for its `ChildExited` and return its exit code. `-1` if the
 /// shell could not be spawned. This is the login's payoff: an unprivileged process in a
 /// per-user namespace, reaped by session-mgr.
 fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
-    let image = ns_lookup(root_ns, b"/initramfs/sbin/usersh", RIGHT_MAP_READ).1;
+    use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
+
+    let image = ns_lookup(root_ns, b"/initramfs/sbin/nxsh", RIGHT_MAP_READ).1;
     if image == 0 {
-        kprint(b"session-mgr: usersh image not found\n");
+        kprint(b"session-mgr: nxsh image not found\n");
         return -1;
     }
-    // SAFETY: SPAWN_USERSH is a valid writable arg block; run in the session namespace.
+    let (setup_mgr, setup_shell) = match pipe(4) {
+        Ok(p) => p,
+        Err(_) => {
+            kprint(b"session-mgr: setup channel FAIL\n");
+            return -1;
+        }
+    };
+    // SAFETY: SPAWN_SHELL is a valid writable arg block; run in the session namespace.
     let h = unsafe {
-        SPAWN_USERSH.image = image;
-        SPAWN_USERSH.namespace = session_ns;
-        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_USERSH) as u64)
+        SPAWN_SHELL.image = image;
+        SPAWN_SHELL.namespace = session_ns;
+        SPAWN_SHELL.handles[0] = setup_shell;
+        SPAWN_SHELL.arg0 = bootstrap_arg0(true);
+        syscall1(SYS_PROCESS_SPAWN, (&raw const SPAWN_SHELL) as u64)
     };
     // The kernel copied the ELF during spawn; close our image handle.
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, image) };
     if h < 0 {
-        kprint(b"session-mgr: usersh spawn FAIL\n");
+        kprint(b"session-mgr: nxsh spawn FAIL\n");
         return -1;
     }
-    kprint(b"session-mgr: user shell spawned into the session namespace\n");
+
+    // Hand the shell its `argv` and its environment. No streams: an interactive shell
+    // reads `/dev/console` from its own namespace, which is a capability it was *given*
+    // rather than a stream it was handed.
+    //
+    // Under `test-harness` the shell runs a script instead of a prompt, so the boot has a
+    // deterministic verdict. The script is the login proof: it checks the environment
+    // arrived, that a relative path resolves against it, and that home is writable.
+    #[cfg(feature = "test-harness")]
+    let argv: &[&str] = &[
+        "nxsh",
+        "-c",
+        "if $env.PWD != $env.HOME { bad }\n         [1, 2] | save ./nx-login.txt\n         if (open ./nx-login.txt | count) != 2 { bad }",
+    ];
+    #[cfg(not(feature = "test-harness"))]
+    let argv: &[&str] = &["nxsh"];
+
+    let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
+    // SAFETY: closing our end of the setup channel; the shell holds its own.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_mgr) };
+    if sent.is_err() {
+        kprint(b"session-mgr: setup message FAIL\n");
+        return -1;
+    }
+    kprint(b"session-mgr: nxsh spawned into the session namespace with its environment\n");
     // Reap it: block on the notification channel for its ChildExited, then read the code.
     loop {
         if !wait_one(notif) {
@@ -406,7 +491,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             let code = spawn_user_shell(root_ns, session_ns, notif);
             let ok = code == 0;
             if ok {
-                kprint(b"session-mgr: user shell wrote to home + exited cleanly (login proven)\n");
+                kprint(b"session-mgr: shell verified its environment + wrote to home (login proven)\n");
             } else {
                 kprint(b"session-mgr: user shell failed\n");
             }

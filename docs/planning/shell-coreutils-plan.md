@@ -893,27 +893,43 @@ hands over the same `PWD`, so `list` resolves it in its own process against the 
 directory. Pre-resolving would make the in-guest demo pass while proving nothing about the
 half that can actually disagree.
 
-#### Part D — `session-mgr` seeds the session
+#### Parts D and E — `session-mgr` seeds the session, and `nxsh` becomes the login leaf ✅ (2026-07-31)
 
-- [ ] Build the initial env Record at login: `HOME`, `PATH` (as `List<String>`, not a
-      joined string), `PWD` = the user's home.
-- [ ] **Not `USER`.** Identity stays at `/session/user`, where it cannot be forged — a
-      process handing a child a different `USER` is exactly what the namespace binding
-      prevents, and putting it in env would give that away for nothing.
-- [ ] Move the shell spawn from Tier 0 to Tier 1 (it is `arg0: 0` today).
-- [ ] In-guest demo: a login session starts with `PWD` = home, and `cd` from there works.
+**Merged, and the merge is a finding.** The plan separated them, assuming Part D's
+deliverable — "a login session starts with env set" — was observable on its own. It is not:
+nothing consumes an environment until the shell that reads it *is* the login leaf, and
+proving D against `usersh` would have meant writing verification into a program about to be
+deleted.
 
-*Deliverable: a real session begins with a real environment.*
+- [x] Build the initial env Record: `HOME`, `PATH` (as `List<String>`), `PWD` = home.
+- [x] **Not `USER`.** Identity stays at `/session/user`, unforgeable because a process
+      cannot bind at all. Copying it into env would hand that away for nothing.
+- [x] Move the shell spawn from Tier 0 to Tier 1.
+- [x] `session-mgr` spawns `nxsh` as the login leaf.
+- [x] `usersh` removed, in the commit that proved the replacement.
+- [x] `userspace/session-mgr/CLAUDE.md` updated; `userspace/nxsh/CLAUDE.md` written.
 
-#### Part E — the `usersh` swap
+**A documented constraint had to be lifted, and it was the maintainer's call.**
+`session-mgr` was `no alloc` — fixed `.bss` buffers, no `#[global_allocator]` — because "it
+is a supervisor (its death is a system fault), so keep it minimal and robust". But handing
+a child an environment needs a heap at every step: a `Record` holds `Vec`s, `send_setup`
+builds a `Vec<String>`, encoding returns a `Vec<u8>`. The alternative was a second,
+allocation-free encoding path in `libstream` — a worse thing to own than an allocator, and
+exactly the duplication this project keeps designing away from. `#![no_std]`/`#![no_main]`
+stayed: `std` is unported and there is no runtime to hand a `main`.
 
-- [ ] `session-mgr` spawns `nxsh` as the login leaf.
-- [ ] Keep `usersh` in the tree until the boot verdict passes with `nxsh`, then remove it
-      in the same commit that proves the replacement — not before.
-- [ ] Update `userspace/session-mgr/CLAUDE.md` and `userspace/usersh/CLAUDE.md`.
+**The login proof is now a script**, which is a stronger proof than the one it replaced:
 
-*Deliverable: login lands in the real shell. This is what Part F deliberately left
-untaken.*
+```
+if $env.PWD != $env.HOME { bad }
+[1, 2] | save ./nx-login.txt
+if (open ./nx-login.txt | count) != 2 { bad }
+```
+
+The environment arrived, a relative path resolved against it, and home is writable — three
+properties `usersh`'s hardcoded home-write could not distinguish between.
+
+*Deliverable met: a login lands in the real shell, with a real environment.*
 
 #### Decisions owed at build time
 
