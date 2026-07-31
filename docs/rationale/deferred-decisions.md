@@ -370,6 +370,22 @@ from. Not urgent — §10a dissolved every classic filter into an in-process gen
 the shipped programs a pipeline has at most one external stage — but it should be batched into the
 next ABI pass rather than rediscovered.
 
+**`try`/`catch` in expression position — `TODO(try-in-expression-position)`.**
+§9a makes blocks expressions and §9f shows `try`/`catch` composing with `match`, so
+`let msg = try { … } catch (e) { e.message }` reads as though it should work. It does not:
+`try` is parsed as a statement (§9c's `statement` production lists `try_stmt`), so it is
+only usable at statement level, and a caught value reaches the outside through a `mut`.
+
+The grammar as written is self-consistent — §9c really does put `try` among the statements
+— so this is a gap between what the grammar says and what §9a's "blocks are expressions"
+spirit implies, not a bug against the spec. A block *ending* in `try` already yields its
+value, which covers the function-return case §9a actually argues for.
+
+Trigger: the first script that wants to bind a caught value directly. The fix is small —
+add `try` to `primary` alongside `if` and `match`, which are already expressions there —
+but it is a grammar change and belongs with a considered pass over §9c rather than as a
+side effect of Part E.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block

@@ -86,6 +86,15 @@ pub struct Interp {
     /// a handful of names and linear scan beats hashing at that size — and it keeps
     /// shadowing order explicit.
     scopes: Vec<Vec<(String, Slot)>>,
+    /// Hoisted `def` bindings, visible from inside any call.
+    ///
+    /// §5a says a named function does not capture its enclosing scope — its parameter
+    /// list is a complete account of its *inputs*. But it must still be able to **call**
+    /// other functions, or mutual recursion is impossible and every helper has to be
+    /// passed in. Declarations and values are different things, so they live in different
+    /// places: a `def` goes here and is always reachable, a `let` stays in `scopes` and is
+    /// not.
+    functions: Vec<(String, Val)>,
     /// Everything that touches the operating system (Part C's seam).
     host: alloc::boxed::Box<dyn Host>,
     mode: Mode,
@@ -107,6 +116,7 @@ impl Interp {
     pub fn with_host(host: alloc::boxed::Box<dyn Host>, mode: Mode) -> Interp {
         Interp {
             scopes: alloc::vec![Vec::new()],
+            functions: Vec::new(),
             host,
             mode,
             strict: false,
@@ -149,9 +159,18 @@ impl Interp {
     }
 
     fn lookup(&self, name: &str) -> Option<&Slot> {
-        self.scopes.iter().rev().find_map(|s| {
-            s.iter().rev().find(|(n, _)| n == name).map(|(_, slot)| slot)
-        })
+        self.scopes
+            .iter()
+            .rev()
+            .find_map(|s| s.iter().rev().find(|(n, _)| n == name).map(|(_, slot)| slot))
+    }
+
+    /// A binding, or failing that a hoisted function.
+    fn lookup_any(&self, name: &str) -> Option<Val> {
+        if let Some(s) = self.lookup(name) {
+            return Some(s.val.clone());
+        }
+        self.functions.iter().rev().find(|(n, _)| n == name).map(|(_, v)| v.clone())
     }
 
     fn lookup_mut(&mut self, name: &str) -> Option<&mut Slot> {
@@ -178,6 +197,7 @@ impl Interp {
     /// A block's value is its last statement's, if that statement is expression-shaped
     /// (§9a). Anything else — a `let`, a `for` — leaves the block evaluating to `Null`.
     fn exec_block(&mut self, stmts: &[Stmt]) -> Result<Flow> {
+        self.hoist_defs(stmts)?;
         let mut last = Val::NULL;
         for (i, s) in stmts.iter().enumerate() {
             match self.exec(s)? {
@@ -271,10 +291,41 @@ impl Interp {
                 Ok(Flow::Return(v))
             }
             Stmt::Expr(e) => Ok(Flow::Normal(self.eval(e)?)),
-            Stmt::Def { .. } => Err(EvalError::new(
-                "`def` is evaluated in Part E — the parser accepts it already",
-            )),
-            Stmt::Try { .. } => Err(EvalError::new("`try`/`catch` is evaluated in Part E")),
+            // Already bound by `hoist_defs` at block entry (§5a), so the declaration
+            // itself does nothing further.
+            Stmt::Def { .. } => Ok(Flow::Normal(Val::NULL)),
+            // Statement position only — `let x = try { … }` does not parse. See
+            // `TODO(try-in-expression-position)` in deferred-decisions.md.
+            //
+            // §2: sugar over branching on a failure, **not** stack unwinding across
+            // unrelated frames — consistent with the system's rejection of hidden
+            // non-local control flow everywhere else (no signals).
+            Stmt::Try { body, catch_binding, catch_body } => {
+                match self.scoped_block(body) {
+                    Ok(flow) => Ok(flow),
+                    Err(e) => {
+                        self.push_scope();
+                        if let Some(n) = catch_binding {
+                            // The error is an ordinary `Record`, so `match err { … }`
+                            // needs no new grammar (§9f's payoff).
+                            let schema = Schema::new()
+                                .field("kind", libstream::wire::TypeTag::String, TypeModifiers::NONE)
+                                .field("message", libstream::wire::TypeTag::String, TypeModifiers::NONE);
+                            let rec = Value::Record(Arc::new(Record {
+                                schema,
+                                values: alloc::vec![
+                                    Value::Str(alloc::string::String::from("Error")),
+                                    Value::Str(e.message.clone()),
+                                ],
+                            }));
+                            let _ = self.bind(n, Val::Data(rec), false, false);
+                        }
+                        let r = self.exec_block(catch_body);
+                        self.pop_scope();
+                        r
+                    }
+                }
+            }
             // §1: deliberately a local, visible block rather than a bash-`pipefail`-style
             // ambient mode switch — the same no-ambient-state stance as the rejection of
             // a global `$?` and of implicit env inheritance.
@@ -285,7 +336,10 @@ impl Interp {
                 self.strict = saved;
                 r
             }
-            Stmt::Use { .. } => Err(EvalError::new("`use` is evaluated in Part E")),
+            Stmt::Use { path, names, alias } => {
+                self.exec_use(path, names, alias)?;
+                Ok(Flow::Normal(Val::NULL))
+            }
         }
     }
 
@@ -407,8 +461,8 @@ impl Interp {
             // D4's resolution order, completed: a local binding first, then a command.
             // A bare name that is neither gets a message naming *both* searches, because
             // "not found" leaves a reader guessing which one they meant to satisfy.
-            Expr::Ident(name) => match self.lookup(name) {
-                Some(slot) => Ok(slot.val.clone()),
+            Expr::Ident(name) => match self.lookup_any(name) {
+                Some(v) => Ok(v),
                 None => {
                     let call = Expr::Call(Box::new(Call {
                         name: name.clone(),
@@ -516,8 +570,16 @@ impl Interp {
                 let k = self.index_of(idx)?;
                 index_of(&b, &k)
             }
-            Expr::Match { .. } => Err(EvalError::new("`match` is evaluated in Part E")),
-            Expr::Try(_) => Err(EvalError::new("`?` propagation is evaluated in Part E")),
+            Expr::Match { scrutinee, arms } => self.eval_match(scrutinee, arms),
+            // §2's `?`. In this interpreter an operation that fails raises, and a raise
+            // already exits the current function and reaches its caller — so `?` is the
+            // *default* behaviour rather than a change to it, and this is a pass-through.
+            //
+            // It becomes load-bearing the moment an operation returns a Result-shaped
+            // **value** instead of raising, which is what makes `?` distinct in Rust. None
+            // does yet. Recorded rather than pretended: writing `?` is accepted, means
+            // what §2 says, and costs nothing.
+            Expr::Try(inner) => self.eval(inner),
             // §6: `expect` is ascription in expression position, and `assert` its sibling
             // for a *content* predicate. Deliberately separate keywords rather than one
             // verb overloaded on argument type, so the message says "shape mismatch" or
@@ -547,9 +609,13 @@ impl Interp {
                 //
                 // Inside a pipeline the precedence is the other way round: a stage with a
                 // piped operand is unambiguously an invocation. See `pipeline`.
-                if c.args.is_empty() && !c.forced_external {
-                    if let Some(slot) = self.lookup(&c.name) {
-                        return Ok(slot.val.clone());
+                // A bare, argument-less *mention* prefers a local binding — but `f()` is
+                // a call with an empty list, not a mention, and a `Def`-kind call only
+                // ever comes from the parens form (§5b). Conflating the two made `f()`
+                // evaluate to the function itself instead of calling it.
+                if c.args.is_empty() && !c.forced_external && c.kind != CallKind::Def {
+                    if let Some(v) = self.lookup_any(&c.name) {
+                        return Ok(v);
                     }
                 }
                 if c.kind == CallKind::External {
@@ -558,12 +624,422 @@ impl Interp {
                 if c.kind == CallKind::Operator {
                     return self.apply_operator(c, None);
                 }
+                if c.kind == CallKind::Def {
+                    return self.call_def(c, None);
+                }
                 Err(unavailable(c))
             }
         }
     }
 
 
+
+
+    // --- functions (Part E) -------------------------------------------------
+
+    /// Bind every `def` in a block before executing any of it (§5a).
+    ///
+    /// Hoisting is not a convenience: mutual recursion needs it, and `let` deliberately
+    /// does *not* hoist because it is tied to evaluation order while a `def` is a
+    /// declaration.
+    fn hoist_defs(&mut self, stmts: &[Stmt]) -> Result<()> {
+        for s in stmts {
+            if let Stmt::Def { name, params, ret: _, body, .. } = s {
+                // A named function captures **nothing** (§5a): its parameter list is a
+                // complete, honest account of its inputs. Only a closure captures, and
+                // that is the deliberate exception.
+                let f = Val::Func(Arc::new(Func {
+                    name: Some(name.clone()),
+                    params: params.clone(),
+                    body: body.clone(),
+                    captured: Vec::new(),
+                }));
+                self.functions.retain(|(n, _)| n != name);
+                self.functions.push((name.clone(), f));
+            }
+        }
+        Ok(())
+    }
+
+    /// Call a `def` or a closure with the §5b convention: positional, then named, then
+    /// defaults, with an optional variadic tail.
+    fn call_function(
+        &mut self,
+        f: &Func,
+        positional: &[Val],
+        named: &[(String, Val)],
+        operand: Option<Val>,
+        fill: bool,
+    ) -> Result<Val> {
+        let mut positional = positional.to_vec();
+        // §5b's pipeline-fill rule: `_` marks where the piped value goes when an argument
+        // list is present; a bare, argument-free call fills its sole slot implicitly.
+        // Pure implicit-first-parameter fill was rejected on a correctness gap — nothing
+        // guarantees a function's first parameter is the data slot — so the explicit form
+        // is required whenever there is a list to be explicit in.
+        if let Some(v) = operand {
+            if fill {
+                positional.insert(0, v);
+            } else if positional.is_empty() && named.is_empty() {
+                positional.push(v);
+            } else {
+                return Err(EvalError::new(alloc::format!(
+                    "`{}` was given an argument list, so mark the piped value with `_` \
+                     (§5b) — the language will not guess which parameter it belongs to",
+                    f.name.as_deref().unwrap_or("this function")
+                )));
+            }
+        }
+
+        let variadic = f.params.last().is_some_and(|p| p.variadic);
+        let fixed = if variadic { f.params.len() - 1 } else { f.params.len() };
+        if positional.len() > fixed && !variadic {
+            return Err(EvalError::new(alloc::format!(
+                "`{}` takes {} argument(s), given {}",
+                f.name.as_deref().unwrap_or("this function"),
+                render_i64(fixed as i64),
+                render_i64(positional.len() as i64)
+            )));
+        }
+
+        let saved = core::mem::replace(&mut self.scopes, alloc::vec![Vec::new()]);
+        for (n, v) in &f.captured {
+            let _ = self.bind(n, v.clone(), false, false);
+        }
+        self.push_scope();
+
+        let mut result = Ok(());
+        for (i, p) in f.params.iter().enumerate() {
+            if p.variadic {
+                let rest: Vec<Val> = positional.iter().skip(i).cloned().collect();
+                match Val::list(rest) {
+                    Ok(v) => {
+                        let _ = self.bind(&p.name, v, false, false);
+                    }
+                    Err(e) => result = Err(EvalError::new(e)),
+                }
+                continue;
+            }
+            let supplied = positional
+                .get(i)
+                .cloned()
+                .or_else(|| named.iter().find(|(n, _)| n == &p.name).map(|(_, v)| v.clone()));
+            let value = match supplied {
+                Some(v) => v,
+                None => match &p.default {
+                    // §5b: defaults are evaluated **fresh per call, in the function's own
+                    // parameter scope**. That avoids Python's shared-mutable-default trap
+                    // and lets a later default reference an earlier parameter, since the
+                    // earlier one is already bound in this scope.
+                    Some(d) => match self.eval(d) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            result = Err(e);
+                            Val::NULL
+                        }
+                    },
+                    None => {
+                        result = Err(EvalError::new(alloc::format!(
+                            "`{}` needs an argument for `{}`",
+                            f.name.as_deref().unwrap_or("this function"),
+                            p.name
+                        )));
+                        Val::NULL
+                    }
+                },
+            };
+            if let (Some(t), Ok(())) = (&p.ty, &result) {
+                if let Err(e) = check_type(&value, t) {
+                    result = Err(EvalError::new(alloc::format!(
+                        "`{}` parameter `{}`: {}",
+                        f.name.as_deref().unwrap_or("this function"),
+                        p.name,
+                        e.message
+                    )));
+                }
+            }
+            let _ = self.bind(&p.name, value, false, false);
+        }
+
+        // An unknown named argument is an error, not silently ignored (§5b).
+        if result.is_ok() {
+            if let Some((n, _)) = named.iter().find(|(n, _)| !f.params.iter().any(|p| &p.name == n))
+            {
+                result = Err(EvalError::new(alloc::format!(
+                    "`{}` has no parameter `{n}`",
+                    f.name.as_deref().unwrap_or("this function")
+                )));
+            }
+        }
+
+        let out = match result {
+            Ok(()) => self.exec_block(&f.body).map(|flow| match flow {
+                Flow::Normal(v) | Flow::Return(v) => v,
+            }),
+            Err(e) => Err(e),
+        };
+        self.pop_scope();
+        self.scopes = saved;
+        out
+    }
+
+    /// Evaluate a `def` call site.
+    fn call_def(&mut self, c: &Call, operand: Option<Val>) -> Result<Val> {
+        let Some(v) = self.lookup_any(&c.name) else {
+            return Err(EvalError::new(alloc::format!("`{}` is not a function", c.name)));
+        };
+        let Val::Func(f) = v else {
+            return Err(EvalError::new(alloc::format!(
+                "`{}` is not something callable",
+                c.name
+            )));
+        };
+        let mut positional = Vec::new();
+        let mut named = Vec::new();
+        let mut fill = false;
+        for a in &c.args {
+            match a {
+                Arg::Positional(e) => positional.push(self.eval(e)?),
+                Arg::Named(n, e) => {
+                    let v = self.eval(e)?;
+                    named.push((n.clone(), v));
+                }
+                Arg::PipeFill => fill = true,
+                Arg::Flag(f, _) | Arg::ShortFlags(f) => {
+                    return Err(EvalError::new(alloc::format!(
+                        "`{}` is a script function, so `--{f}` does not apply — flags are \
+                         the external-program convention (§5b)",
+                        c.name
+                    )));
+                }
+            }
+        }
+        self.call_function(&f, &positional, &named, operand, fill)
+    }
+
+    // --- match (§9f) --------------------------------------------------------
+
+    fn eval_match(&mut self, scrutinee: &Expr, arms: &[MatchArm]) -> Result<Val> {
+        let v = self.eval(scrutinee)?;
+        for arm in arms {
+            let mut bindings: Vec<(String, Val)> = Vec::new();
+            if !self.pattern_matches(&arm.pattern, &v, &mut bindings)? {
+                continue;
+            }
+            self.push_scope();
+            for (n, bv) in &bindings {
+                let _ = self.bind(n, bv.clone(), false, false);
+            }
+            // A guard runs *with the arm's bindings in scope* — that is the whole point of
+            // `{ name, size } if size > 1000`.
+            let passed = match &arm.guard {
+                Some(g) => match self.eval(g)?.as_bool() {
+                    Some(b) => b,
+                    None => {
+                        self.pop_scope();
+                        return Err(EvalError::new("a match guard must be Bool"));
+                    }
+                },
+                None => true,
+            };
+            if !passed {
+                self.pop_scope();
+                continue;
+            }
+            let r = self.exec_block(&arm.body);
+            self.pop_scope();
+            return match r? {
+                Flow::Normal(v) | Flow::Return(v) => Ok(v),
+            };
+        }
+        // §9f: no static exhaustiveness check — there is no compiler pass to run one, and
+        // §6 already made that call for the type system generally. A value hitting no arm
+        // is a runtime `MatchError`, styled like a `TypeError`, rather than falling
+        // through silently.
+        Err(EvalError::new(alloc::format!(
+            "MatchError: no arm matched a {} value",
+            v.type_name()
+        )))
+    }
+
+    fn pattern_matches(
+        &mut self,
+        p: &Pattern,
+        v: &Val,
+        out: &mut Vec<(String, Val)>,
+    ) -> Result<bool> {
+        Ok(match p {
+            Pattern::Wildcard => true,
+            Pattern::Bind(n) => {
+                out.push((n.clone(), v.clone()));
+                true
+            }
+            Pattern::Capture(n, inner) => {
+                if self.pattern_matches(inner, v, out)? {
+                    out.push((n.clone(), v.clone()));
+                    true
+                } else {
+                    false
+                }
+            }
+            Pattern::Or(alts) => {
+                for a in alts {
+                    // Each alternative gets a fresh binding set, so a failed alternative
+                    // leaves nothing behind.
+                    let mut trial = Vec::new();
+                    if self.pattern_matches(a, v, &mut trial)? {
+                        out.extend(trial);
+                        return Ok(true);
+                    }
+                }
+                false
+            }
+            // §9f: variant patterns reuse the **ascription vocabulary** (§6) rather than
+            // inventing a second set of names for the same things.
+            Pattern::Variant(name, inner) => {
+                if v.type_name() != name {
+                    return Ok(false);
+                }
+                if inner.is_empty() {
+                    return Ok(true);
+                }
+                // `Int(n)` binds the value itself; a container destructures positionally.
+                match v {
+                    Val::Data(Value::List(items)) => {
+                        if inner.len() != items.len() {
+                            return Ok(false);
+                        }
+                        for (sub, item) in inner.iter().zip(items.iter()) {
+                            if !self.pattern_matches(sub, &Val::Data(item.clone()), out)? {
+                                return Ok(false);
+                            }
+                        }
+                        true
+                    }
+                    _ => {
+                        if inner.len() != 1 {
+                            return Ok(false);
+                        }
+                        self.pattern_matches(&inner[0], v, out)?
+                    }
+                }
+            }
+            // §6's subset match, for free: "is this a Record with at least these fields".
+            Pattern::Record(fields) => {
+                let Val::Data(Value::Record(rec)) = v else { return Ok(false) };
+                for (name, sub) in fields {
+                    let Some(idx) = rec.schema.fields.iter().position(|d| &d.name == name) else {
+                        return Ok(false);
+                    };
+                    let fv = Val::Data(rec.values.get(idx).cloned().unwrap_or(Value::Null));
+                    match sub {
+                        Some(sp) => {
+                            if !self.pattern_matches(sp, &fv, out)? {
+                                return Ok(false);
+                            }
+                        }
+                        None => out.push((name.clone(), fv)),
+                    }
+                }
+                true
+            }
+            Pattern::Literal(e) => {
+                let lit = self.eval(e)?;
+                values_equal(&lit, v)
+            }
+            Pattern::Range { start, end, inclusive } => {
+                let s = self.eval(start)?;
+                let e2 = self.eval(end)?;
+                let (Some(Value::Int(a)), Some(Value::Int(b)), Some(Value::Int(x))) =
+                    (s.as_data(), e2.as_data(), v.as_data())
+                else {
+                    return Ok(false);
+                };
+                if *inclusive { *x >= *a && *x <= *b } else { *x >= *a && *x < *b }
+            }
+        })
+    }
+
+    // --- modules (§9h) ------------------------------------------------------
+
+    /// `use "./lib/utils.nx" { helper }` / `… as utils`.
+    ///
+    /// Explicit relative path only, no search algorithm — §9h rejects `PATH`-like
+    /// resolution for the same reason the system rejects ambient env and ambient
+    /// authority: a name crossing a boundary should be visible at the crossing.
+    fn exec_use(&mut self, path: &str, names: &Option<Vec<String>>, alias: &Option<String>)
+    -> Result<()> {
+        let bytes = self.host.read_file(path).map_err(EvalError::new)?;
+        let src = alloc::string::String::from_utf8(bytes)
+            .map_err(|_| EvalError::new(alloc::format!("`{path}` is not valid UTF-8")))?;
+        let module = crate::parse_script(&src).map_err(|e| {
+            EvalError::new(alloc::format!("{path} line {}: {}", e.line, e.message))
+        })?;
+
+        // Run the module in a scope of its own, then take only what it exported. Its
+        // `def`s land in `functions` rather than the scope (see `hoist_defs`), so both
+        // have to be swept — and `functions` is snapshotted first so a module cannot
+        // export something the *caller* had already defined.
+        let before = self.functions.len();
+        self.push_scope();
+        let r = self.exec_block(&module.stmts);
+        let mut exported: Vec<(String, Val)> = {
+            let scope = self.scopes.last().expect("the module scope is open");
+            scope.iter().map(|(n, s)| (n.clone(), s.val.clone())).collect()
+        };
+        exported.extend(self.functions.iter().skip(before).cloned());
+        self.functions.truncate(before);
+        self.pop_scope();
+        r?;
+
+        // `pub` is what crosses the file boundary (§9h) — the same recurring rule as env
+        // vars crossing a process boundary or data crossing IPC.
+        let public: Vec<&String> = module
+            .stmts
+            .iter()
+            .filter_map(|s| match s {
+                Stmt::Def { name, public: true, .. } => Some(name),
+                Stmt::Bind { name, public: true, .. } => Some(name),
+                _ => None,
+            })
+            .collect();
+
+        match (names, alias) {
+            (Some(wanted), _) => {
+                for n in wanted {
+                    if !public.iter().any(|p| *p == n) {
+                        return Err(EvalError::new(alloc::format!(
+                            "`{path}` does not export `{n}` — mark it `pub` to let it cross \
+                             the file boundary"
+                        )));
+                    }
+                    let Some((_, v)) = exported.iter().find(|(en, _)| en == n) else {
+                        return Err(EvalError::new(alloc::format!("`{path}` has no `{n}`")));
+                    };
+                    self.bind(n, v.clone(), false, false)?;
+                }
+            }
+            (None, Some(a)) => {
+                // `use "…" as utils` binds `utils.helper`, not a record called `utils`.
+                //
+                // A module's exports are usually functions, and a function is deliberately
+                // not TSM1-representable (§5c) — so a `Record` could not hold one. The
+                // alias is therefore a *naming device* rather than a value, which also
+                // keeps `utils.helper(…)` reading as one qualified name.
+                for n in &public {
+                    if let Some((_, v)) = exported.iter().find(|(en, _)| &en == n) {
+                        self.bind(&alloc::format!("{a}.{n}"), v.clone(), false, false)?;
+                    }
+                }
+            }
+            (None, None) => {
+                return Err(EvalError::new(
+                    "`use` needs `{ names }` or `as alias` — there is no wildcard import",
+                ));
+            }
+        }
+        Ok(())
+    }
 
     // --- generic value operators (Part D) -----------------------------------
 
@@ -870,6 +1346,20 @@ impl Interp {
                     i += 1;
                     continue;
                 }
+                if matches!(c.kind, CallKind::Def) {
+                    carried = Some(self.call_def(c, carried.take())?);
+                    i += 1;
+                    continue;
+                }
+            }
+            // A bare name bound to a function: §5b's argument-free call form.
+            if let Expr::Ident(n) = &stages[i] {
+                if let Some(Val::Func(f)) = self.lookup_any(n) {
+                    let op = carried.take();
+                    carried = Some(self.call_function(&f, &[], &[], op, false)?);
+                    i += 1;
+                    continue;
+                }
             }
             // The head stage may be an ordinary value supplying the pipeline's input.
             if i == 0 && !matches!(&stages[0], Expr::Call(_)) {
@@ -924,6 +1414,11 @@ impl Interp {
         // equally be the value being piped onward. That asymmetry is D4 again: only a
         // stage with something arriving on its left is unambiguously an invocation.
         if let Expr::Ident(name) = stage {
+            // A bound *function* named bare in a stage is a call, not a value: `ls |
+            // summarize` is §5b's argument-free form, which fills the sole slot.
+            if matches!(self.lookup_any(name), Some(Val::Func(_))) {
+                return Ok(None);
+            }
             if at_head && self.lookup(name).is_some() {
                 return Ok(None);
             }
@@ -1784,7 +2279,7 @@ mod tests {
     fn later_parts_report_themselves_rather_than_misbehaving() {
         // With no host attached, a command says so rather than pretending to run.
         assert!(err("ls").contains("no host attached"));
-        assert!(err("match 1 { _ => 2 }").contains("Part E"));
+
         assert!(err("\"a\" ~= /b/").contains("Part G"));
     }
 
@@ -2078,6 +2573,156 @@ x"), "5");
         let (r, _log) = run_with(host, "open ./a.txt ./b.txt | count");
         assert_eq!(r.expect("opens").render(), "3");
     }
+
+
+    // --- functions (Part E, §5b) --------------------------------------------
+
+    #[test]
+    fn a_def_is_callable_with_positional_and_named_arguments() {
+        assert_eq!(
+            rendered("def greet(name: String, loud: Bool = false) -> String {\n                       if loud { name ++ \"!\" } else { name ++ \".\" }\n}\ngreet(\"a\")"),
+            "a."
+        );
+        assert_eq!(
+            rendered("def greet(name: String, loud: Bool = false) -> String {\n                       if loud { name ++ \"!\" } else { name ++ \".\" }\n}\n                      greet(\"a\", loud: true)"),
+            "a!"
+        );
+    }
+
+    /// §5b: defaults are evaluated fresh per call **in the function's own parameter
+    /// scope**, which is what lets a later default reference an earlier parameter — and
+    /// what avoids Python's shared-mutable-default trap.
+    #[test]
+    fn a_default_can_reference_an_earlier_parameter() {
+        assert_eq!(rendered("def f(a: Int, b: Int = a + 1) -> Int { b }\nf(5)"), "6");
+        assert_eq!(rendered("def f(a: Int, b: Int = a + 1) -> Int { b }\nf(5, b: 0)"), "0");
+    }
+
+    #[test]
+    fn arity_and_unknown_named_arguments_are_errors() {
+        let src = "def f(a: Int) -> Int { a }\n";
+        assert!(err(&alloc::format!("{src}f(1, 2)")).contains("takes 1"));
+        assert!(err(&alloc::format!("{src}f(1, nope: 2)")).contains("no parameter `nope`"));
+        assert!(err(&alloc::format!("{src}f()")).contains("needs an argument"));
+    }
+
+    #[test]
+    fn variadic_parameters_collect_the_rest() {
+        assert_eq!(
+            rendered("def n(...rest: List<Int>) -> Int { rest | count }\nn(1, 2, 3)"),
+            "3"
+        );
+    }
+
+    /// §5a: `def` bindings hoist, so two functions can call each other regardless of
+    /// textual order. `let` deliberately does not, being tied to evaluation.
+    #[test]
+    fn defs_hoist_so_mutual_recursion_works() {
+        let src = "def even(n: Int) -> Bool { if n == 0 { true } else { odd(n - 1) } }\n                   def odd(n: Int) -> Bool { if n == 0 { false } else { even(n - 1) } }\n                   even(4)";
+        assert_eq!(rendered(src), "true");
+    }
+
+    /// §5a: a named function captures **nothing** — its parameter list is a complete
+    /// account of its inputs, which is the same rule as no ambient env and no global `$?`.
+    #[test]
+    fn a_def_does_not_capture_its_enclosing_scope() {
+        let e = err("let outside = 1\ndef f() -> Int { outside }\nf()");
+        assert!(e.contains("not a binding"), "{e}");
+    }
+
+    /// §5b's pipeline-fill rule: `_` is required whenever an argument list is present,
+    /// because nothing guarantees a function's first parameter is the data slot.
+    #[test]
+    fn the_pipeline_fill_placeholder_is_explicit_when_a_list_is_present() {
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2])));
+        let (r, _l) = run_with(
+            host,
+            "def rows(t: Table, label: String = \"x\") -> Int { t | count }\n             src | rows(_, label: \"n\")",
+        );
+        assert_eq!(r.expect("runs").render(), "2");
+
+        // A bare call fills its sole slot without `_`.
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1, 2])));
+        let (r, _l) = run_with(host, "def rows(t: Table) -> Int { t | count }\nsrc | rows");
+        assert_eq!(r.expect("runs").render(), "2");
+
+        // …but an argument list without `_` is a refusal, not a guess.
+        let host = MockHost::new().with_program("src", Some(stream("n", &[1])));
+        let (r, _l) = run_with(
+            host,
+            "def rows(t: Table, label: String) -> Int { t | count }\n             src | rows(label: \"n\")",
+        );
+        assert!(r.expect_err("should refuse").message.contains("`_`"));
+    }
+
+    // --- match (§9f) --------------------------------------------------------
+
+    #[test]
+    fn match_covers_the_9f_pattern_forms() {
+        assert_eq!(rendered("match 5 { 0..3 => \"low\"\n _ => \"high\" }"), "high");
+        assert_eq!(rendered("match 1 { 1 | 2 => \"low\"\n _ => \"high\" }"), "low");
+        assert_eq!(rendered("match 7 { Int => \"an int\"\n _ => \"other\" }"), "an int");
+        assert_eq!(rendered("match 7 { n => n + 1 }"), "8");
+        assert_eq!(
+            rendered("match { name: \"a\", size: 2 } { { name } => name\n _ => \"?\" }"),
+            "a"
+        );
+    }
+
+    /// A guard runs with the arm's bindings in scope — the point of
+    /// `{ name, size } if size > 1000`.
+    #[test]
+    fn a_guard_sees_the_arms_bindings() {
+        let src = "match { name: \"big\", size: 2000 } {\n                   { name, size } if size > 1000 => name\n                   { name } => \"small\"\n}";
+        assert_eq!(rendered(src), "big");
+    }
+
+    /// §9f: no static exhaustiveness check, so an unmatched value is a runtime
+    /// `MatchError` styled like a `TypeError` — not a silent fallthrough.
+    #[test]
+    fn an_unmatched_value_is_a_match_error() {
+        let e = err("match 5 { 0 => 1 }");
+        assert!(e.contains("MatchError"), "{e}");
+    }
+
+    // --- try / catch (§2) ---------------------------------------------------
+
+    /// §2: sugar over branching on a failure, not stack unwinding — and the error arrives
+    /// as an ordinary `Record`, so `match err { … }` needs no new grammar.
+    #[test]
+    fn try_catch_binds_the_error_as_a_record() {
+        assert_eq!(rendered("try { 1 / 0 } catch (e) { e.message }"), "division by zero");
+        assert_eq!(rendered("try { 1 } catch (e) { 2 }"), "1");
+        // …and it composes with `match` for free (§9f's payoff).
+        let src = "try { 1 / 0 } catch (e) {\n                   match e { { kind: \"Error\" } => \"handled\"\n _ => \"?\" }\n}";
+        assert_eq!(rendered(src), "handled");
+    }
+
+    // --- modules (§9h) ------------------------------------------------------
+
+    #[test]
+    fn use_imports_only_what_is_exported() {
+        let host = MockHost::new()
+            .with_file("./lib.nx", "pub def helper(x: Int) -> Int { x + 1 }\ndef hidden() -> Int { 0 }\n");
+        let (r, _l) = run_with(host, "use \"./lib.nx\" { helper }\nhelper(1)");
+        assert_eq!(r.expect("imports").render(), "2");
+
+        // §9h: `pub` is what crosses the file boundary — the same recurring rule as env
+        // vars crossing a process boundary or data crossing IPC.
+        let host = MockHost::new()
+            .with_file("./lib.nx", "def hidden() -> Int { 0 }\n");
+        let (r, _l) = run_with(host, "use \"./lib.nx\" { hidden }\nhidden()");
+        assert!(r.expect_err("not exported").message.contains("pub"));
+    }
+
+    #[test]
+    fn use_as_binds_a_qualified_name() {
+        let host = MockHost::new()
+            .with_file("./lib.nx", "pub def helper(x: Int) -> Int { x * 2 }\n");
+        let (r, _l) = run_with(host, "use \"./lib.nx\" as utils\nutils.helper(4)");
+        assert_eq!(r.expect("imports").render(), "8");
+    }
+
 
     #[test]
     fn the_deliverable_computes() {

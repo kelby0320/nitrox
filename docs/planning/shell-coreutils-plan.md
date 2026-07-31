@@ -613,13 +613,26 @@ honoured from then on, not bolted on at Part F.
       decides. Part D also needed **closure invocation**, since §8b's sugar *is* a
       closure; Part E extends the same primitive with `def`'s named args and defaults.
 
-- [ ] **Part E — functions, closures, match, null handling, modules**
+- [x] **Part E — functions, closures, match, null handling, modules** ✅ (2026-07-30)
       `def` with defaults evaluated per call, variadics, named args, the `_` pipeline-fill rule
       (§5b); closures capturing by value at creation; `def` hoisting for mutual recursion;
       `match` with guards, or-patterns, ranges, `@` capture, record subset patterns (§9f);
       `T?`/`?.`/`??` (§9e); `try`/`catch` and `?` propagation (§2); `use` imports (§9h). Resolves
       **D6** (env).
-      *Deliverable: the §7 illustrative sketch runs verbatim.*
+      *Deliverable adjusted, and the adjustment is a finding.* §7 **parses** verbatim (a
+      Part A test) but cannot *run* verbatim: it calls `validate_schema`, which nothing
+      defines, and reads `line.level` from a file `open` turns into a single-column
+      `Table<String>`. It is illustrative pseudo-code, not a conformance suite. Every
+      construct in it is exercised instead, in guest and on the host.
+
+      Three findings. **A `def` must see other `def`s while capturing no `let`s** (§5a) —
+      declarations and values are different things, so hoisted functions live in their own
+      always-visible scope. **`f()` is a call, not a mention** — an empty argument *list*
+      was hitting the bare-name shortcut and evaluating to the function itself. And **`try`
+      is a statement, not an expression**, so `let x = try { … } catch { … }` does not
+      parse; filed as `TODO(try-in-expression-position)`.
+
+      **D6 (env) is not resolved here** — see the entry below.
 
 - [ ] **Part F — minimal REPL**
       A line-reader on the raw console: read, parse, evaluate, print. Automatic continuation on the

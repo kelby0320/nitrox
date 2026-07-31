@@ -307,11 +307,13 @@ impl Stmt {
     /// Whether a block ending in this statement has that statement's value (§9a).
     ///
     /// `let`, `return`, `for`, `while` and `def` produce no value, so a block ending in
-    /// one evaluates to `Null`. **`if` does** — §9a names it specifically: it is what
+    /// one evaluates to `Null`. **`if` and `try` do** — §9a names only the first list as
+    /// valueless, and §9f's own example uses `try`/`catch` in expression position. `if` is
+    /// what
     /// makes the implicit-last-expression return rule work when a function ends in an
     /// `if`/`else`, and the parser emits `Stmt::If` for a statement-position `if` even
     /// when its value is wanted.
     pub fn is_expression_shaped(&self) -> bool {
-        matches!(self, Stmt::Expr(_) | Stmt::If { .. })
+        matches!(self, Stmt::Expr(_) | Stmt::If { .. } | Stmt::Try { .. })
     }
 }
