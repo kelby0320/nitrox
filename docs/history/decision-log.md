@@ -9725,3 +9725,77 @@ mid-production under D2, so "the line ended" is a real answer there, not a gap t
 
 The in-guest coverage is a pair — `list /` **and** `6 / 2 != 3`. A rule that made every `/`
 a path would pass the first and break arithmetic, so neither check means anything alone.
+
+---
+
+## 2026-07-31 — A spinning log service stopped the whole system reclaiming anything
+
+`list /bin` hung at the shell prompt. The cause was four subsystems away, and every step
+between looked like something else.
+
+**The chain, shortest form.** `logging-service` multi-waits on its serving endpoint plus
+every per-principal source channel. A channel whose peer has closed is **permanently**
+`signaled`, so once a principal exited, `sys_wait` returned instantly on that handle,
+forever — the service spun at 100% of a CPU. The wasted cycles were not the damage.
+Deferred handle reclamation (`reap_pending` → `close_all_owned_by`) has exactly one home on
+an otherwise-quiet system: the **idle thread**. A run queue that is never empty means the
+CPU never idles, so *no exited process was ever reclaimed*, and every pipe they held stayed
+open. A `list` stage that exited without writing therefore never closed its stdout pipe,
+and `nxsh` blocked forever waiting for a `PeerClosed` that could not arrive.
+
+**The fix is one branch**: a `recv` returning `PeerClosed` retires the source instead of
+being treated as "drained". `WouldBlock` and `PeerClosed` had been collapsed into one
+`!= 0` test, and they demand opposite responses — wait again, or stop waiting forever.
+
+**What made this expensive to find was a false lead I generated myself.** Rate-limited
+instrumentation (`% 500`, `% 2000`) over an ~800-tick window showed no idle iterations, and
+I concluded the idle loop "runs once, ever" and reported it. It was an artifact of the
+sampling. Unfiltered counters showed the loop iterating normally and then stopping — which
+is a completely different fact, and the one that led to `pick_next` always finding a
+runnable thread. **Rate-limited instrumentation is not evidence of absence.** The counters
+existed to keep the log readable; they made the log lie.
+
+The measurement chain that did work, kept because each step ruled out a whole family:
+`recv` returns `-11` not `-13` after the stage is reaped (the peer is alive, so this is not
+a wake bug) → the sweep never runs for that pid (so it is reclamation, not IPC) →
+`reap_pending` is never called (so it is not the sweep's logic) → `block`/`preempt` tracing
+names pid4 (so the system is not idle at all) → pid4 is preempted 76 times without ever
+blocking (a userspace spinner) → `LDBG` shows `rc=-13` on one handle, hundreds of times.
+
+**No regression test landed, deliberately.** One was written — open a source, close it,
+assert the scheduler goes quiet — and it **passed with the bug reinstated**, so it was
+thrown away rather than kept. Explicitly closing a client's write end does not reproduce
+what a process exit does, and why is not yet understood. Filed as
+`TODO(idle-starvation-test)` with the two candidate shapes. A control that passes is a bug
+in the control; this is the fifth time that rule has earned its place in this project.
+
+**The standing fragility this exposes, and does not fix:** reclamation depends on some CPU
+reaching idle. Any process legitimately busy-looping disables reclamation system-wide. The
+fix removes today's spinner; it does not make the contract sound.
+
+## 2026-07-31 — The regression test for the spin: occupancy, not switch rate
+
+`TODO(idle-starvation-test)`, closed the same day it was filed. The first attempt was kept
+out of the tree for passing with the bug reinstated; this records why the second works, so
+the distinction survives.
+
+**The failed version asserted a low switch rate** over a sleeping second. It reported 2–3
+switches whether or not `logging-service` was spinning. The reason is worth remembering: a
+spinning service that is the *only* runnable thread on its CPU is preempted back to itself,
+so the counter barely moves. Switch rate measures contention, and a lone spinner has none.
+
+**The working version asserts occupancy.** A spin costs a CPU — permanently — and
+`/proc/sched/stats` already reports `idle=` per CPU. The check samples ten times across a
+second and takes the *best* sample, because one busy instant on a healthy system is not a
+spin; and it compares against `cpus_online - 1`, because the sampling thread is itself
+running and its own CPU never reads idle.
+
+Verified in both directions, which is the only thing that made either version trustworthy:
+3 of 4 CPUs idle with the fix, on three consecutive runs; 2 of 4 and a failed run with the
+fix disabled.
+
+**The trigger needed care too.** The probe opens a log source and closes the write end, but
+only after a 200 ms sleep: a source the service has not yet registered cannot be one it
+fails to retire, and an earlier version closed too early and tested nothing. That the
+service really does see the death was confirmed directly (a temporary print in the retire
+path) before trusting the timing.
