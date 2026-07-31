@@ -166,6 +166,14 @@ pub enum WireError {
     NestedTable,
     /// The sink refused the write (e.g. a fixed frame is full).
     SinkFull,
+    /// A Tier-1 setup message did not fit in one IPC payload.
+    ///
+    /// Deliberately distinct from [`SinkFull`](Self::SinkFull): a full channel is a
+    /// transport condition a caller may retry, while this is a *configuration* problem —
+    /// usually an environment that outgrew `IPC_PAYLOAD_SIZE` — and retrying will never
+    /// help. The escape, when it starts to matter, is a memory object carrying the block;
+    /// the setup message already transfers handles.
+    SetupTooLarge,
     /// The transport's peer closed its end mid-stream (a channel `ByteSink`/reader).
     /// Per the pipeline model (design §1), a producer treats this as "stop producing,
     /// exit cleanly" — the early-consumer-cancel case (`yes | head -1`). Never produced

@@ -814,21 +814,28 @@ Two facts established by inspection, which shape the steps:
 - `session-mgr` spawns the shell with `arg0: 0`, i.e. **Tier 0**. Giving the shell an env
   means moving that spawn to Tier 1, which is a real step rather than a detail.
 
-#### Part A — `env` on the wire
+#### Part A — `env` on the wire ✅ (2026-07-31)
 
-- [ ] Append `env: Record` to `SetupPayload` (append only — reordering breaks the
+- [x] Append `env: Record` to `SetupPayload` (append only — reordering breaks the
       positional decode).
-- [ ] `send_setup` takes it; `Setup` exposes it. Absent field ⇒ empty Record, so a sender
+- [x] `send_setup` takes it; `Setup` exposes it. Absent field ⇒ empty Record, so a sender
       that does not set env is not a special case.
-- [ ] Update [`pipeline-stdio.md`](../spec/pipeline-stdio.md): the payload's third field,
+- [x] Update [`pipeline-stdio.md`](../spec/pipeline-stdio.md): the payload's third field,
       and the statement that Tier 0 has no env *because* it has no setup message — the
       same reason it has no `argv`.
-- [ ] Host tests in `libstream`, including **an old-shaped payload decoding under the new
+- [x] Host tests in `libstream`, including **an old-shaped payload decoding under the new
       decoder** — the compatibility claim above, asserted rather than reasoned about.
-- [ ] Refuse a payload over `IPC_PAYLOAD_SIZE` with a message naming the limit, not
+- [x] Refuse a payload over `IPC_PAYLOAD_SIZE` with a message naming the limit, not
       `SinkFull`.
 
-*Deliverable: a stage receives a typed env Record. Nothing uses it yet.*
+*Deliverable met.* Two notes for the parts that follow. `send_setup_env` is a **separate
+entry point** rather than a changed signature, so every existing spawn site stayed correct
+without edits — a spawn with no environment to pass is not obliged to say so. And the size
+check lives in `SetupPayload::encode`, not at the send site: the limit is a property of the
+message, which keeps it host-testable and gives every sender the same refusal.
+`SETUP_PAYLOAD_MAX` is defined in `libstream` rather than imported, because the wire core
+deliberately has no dependencies; a `const` assertion under the `io` feature makes drift
+from `IPC_PAYLOAD_SIZE` a compile error.
 
 #### Part B — relative paths resolve
 
