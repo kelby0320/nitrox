@@ -115,10 +115,14 @@ const SWEEP_BATCH: usize = 16;
 ///
 /// Safe against pid reuse because pids are monotonic and never reused
 /// ([`alloc_pid`](crate::sched::alloc_pid)).
-pub fn close_all_owned_by(pid: u32) {
+/// Returns **how many handles it actually closed**, which is what distinguishes "this pid
+/// had nothing left" from "this never ran" — the difference between exit-context teardown
+/// working and silently not being on the path.
+pub fn close_all_owned_by(pid: u32) -> usize {
     use super::table::{ClosedObject, SweepCursor};
     use crate::object::ObjectRef;
 
+    let mut closed = 0usize;
     let mut cursor = SweepCursor::START;
     loop {
         let mut batch: [Option<ClosedObject>; SWEEP_BATCH] = [None; SWEEP_BATCH];
@@ -131,8 +135,9 @@ pub fn close_all_owned_by(pid: u32) {
             drop(unsafe { ObjectRef::from_raw(co.0, co.1) });
         }
         crate::sched::preempt_enable();
+        closed += n;
         if !more {
-            return;
+            return closed;
         }
     }
 }

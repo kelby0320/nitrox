@@ -324,6 +324,24 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
 /// (if any), then switches away and reaps this thread — releasing the last
 /// `Process` reference and freeing the address space. Never returns.
 fn sys_process_exit(status: i32) -> ! {
+    // **Close our own handle table first, here, in syscall context.** This is Linux's
+    // `do_exit` → `exit_files` position: no locks held, preemption normal, free to
+    // allocate and drop. `exit_process` cannot do it — it takes `SCHED` and never returns
+    // from `finish_exit`, so by then dropping anything is forbidden.
+    //
+    // It matters because closing a handle is what other processes are *waiting on*:
+    // dropping an IPC endpoint's last reference nulls its peer and wakes whoever is
+    // blocked there. Left to the reaper, a peer's `PeerClosed` arrives at the reaper's
+    // next turn rather than at the moment of exit — reliable since the reaper landed, but
+    // not prompt. Doing it here makes the common case immediate.
+    //
+    // The reaper still queues and closes this pid afterwards (`close_all_owned_by` finds
+    // an empty table and does nothing). That is deliberate: it stays the path for a
+    // process killed externally, which never runs this syscall at all.
+    if let Some((pid, _tid)) = crate::sched::current_pid_tid() {
+        let n = crate::handle::global::close_all_owned_by(pid);
+        crate::sched::EXIT_CLOSED.fetch_add(n as u64, core::sync::atomic::Ordering::Relaxed);
+    }
     crate::sched::exit_process(ExitStatus { kind: ExitKind::Normal as u32, code: status })
 }
 

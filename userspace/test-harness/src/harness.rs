@@ -3272,18 +3272,32 @@ fn bin_listing_demo(root_ns: u64, notif: u64) {
 /// that is being scheduled at all cannot still be at zero.
 fn reaper_demo(root_ns: u64) {
     kprint(b"test-harness: reaper demo (deferred reclamation has a thread of its own)\n");
-    let closed = reaper_closed(root_ns);
+    let closed = stats_field(root_ns, b"reaper_closed=");
     if closed == 0 {
         return_fail(b"test-harness: the reaper has closed nothing -- parked, or never woken\n");
     }
-    kprint(b"test-harness: reaper ok (handle tables closed: ");
+
+    // **Exit-context teardown is on the path.** A process closes its own handle table in
+    // its exit syscall, so a peer's `PeerClosed` arrives at the moment of exit rather than
+    // at the reaper's next turn. It is an optimisation over a mechanism that already
+    // works, which is exactly why it needs its own assertion: if it stopped running, the
+    // reaper would cover for it and nothing would look wrong — except that every peer
+    // would quietly go back to waiting.
+    let early = stats_field(root_ns, b"exit_closed=");
+    if early == 0 {
+        return_fail(b"test-harness: no handles closed in exit context -- teardown is not running\n");
+    }
+
+    kprint(b"test-harness: reaper ok (reaper pids: ");
     kprint_u64(closed);
+    kprint(b", handles closed at exit: ");
+    kprint_u64(early);
     kprint(b")\n");
 }
 
-/// `reaper_closed=` from `/proc/sched/stats`. `0` if unreadable, which the caller treats
-/// as a failure rather than a pass.
-fn reaper_closed(root_ns: u64) -> u64 {
+/// One `name=value` field from `/proc/sched/stats`. `0` if unreadable, which every caller
+/// treats as a failure rather than a pass.
+fn stats_field(root_ns: u64, key: &[u8]) -> u64 {
     let (st, mem) = ns_lookup_wait(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
     if st != 0 || mem == 0 {
         return 0;
@@ -3299,7 +3313,7 @@ fn reaper_closed(root_ns: u64) -> u64 {
     let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, PAGE as usize) };
     let mut out = 0u64;
     for line in text.split(|&b| b == b'\n') {
-        if let Some(v) = parse_field(line, b"reaper_closed=") {
+        if let Some(v) = parse_field(line, key) {
             out = v;
             break;
         }

@@ -128,6 +128,14 @@ const REAPER_TID: u32 = u32::MAX - 1;
 /// guest can read turns "the reaper is alive and being scheduled" into something a test
 /// can assert.
 pub static REAPER_CLOSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+/// Handles closed by a process **in its own exit syscall**, reported as `exit_closed=` in
+/// `/proc/sched/stats`.
+///
+/// The counterpart to [`REAPER_CLOSED`], and exposed for the same reason: exit-context
+/// teardown is an optimisation over a mechanism that already works, so if it silently
+/// stopped running the reaper would cover for it and nothing would look wrong — except
+/// that every peer's `PeerClosed` would quietly go back to arriving late.
+pub static EXIT_CLOSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by
 /// absolute monotonic ns, drained on each periodic tick. A pure binary heap in
@@ -347,6 +355,8 @@ pub mod stats {
         /// there is one reaper. Carried *in the snapshot* rather than read inside
         /// [`format`], which is documented pure and host-tested as such.
         pub reaper_closed: u64,
+        /// Handles closed by processes in their own exit syscall (exit-context teardown).
+        pub exit_closed: u64,
     }
 
     impl Snapshot {
@@ -364,6 +374,7 @@ pub mod stats {
     /// ```text
     /// cpus_online=2
     /// reaper_closed=17
+    /// exit_closed=214
     /// cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0
     /// cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1
     /// ```
@@ -374,6 +385,7 @@ pub mod stats {
         (|| -> Result<(), core::fmt::Error> {
             writeln!(out, "cpus_online={}", snap.cpus_online())?;
             writeln!(out, "reaper_closed={}", snap.reaper_closed)?;
+            writeln!(out, "exit_closed={}", snap.exit_closed)?;
             for (c, cpu) in snap.cpus.iter().enumerate() {
                 if !cpu.online {
                     continue;
@@ -1153,6 +1165,7 @@ pub fn stats_snapshot() -> stats::Snapshot {
     stats::Snapshot {
         cpus,
         reaper_closed: REAPER_CLOSED.load(Ordering::Relaxed),
+        exit_closed: EXIT_CLOSED.load(Ordering::Relaxed),
     }
 }
 
@@ -3837,6 +3850,7 @@ mod tests {
         let mut s = stats::Snapshot {
             cpus: [stats::CpuSnapshot::OFFLINE; MAX_CPUS],
             reaper_closed: 0,
+            exit_closed: 0,
         };
         for &(c, row) in rows {
             s.cpus[c] = row;
@@ -3885,6 +3899,7 @@ mod tests {
             text.as_str(),
             "cpus_online=2\n\
              reaper_closed=0\n\
+             exit_closed=0\n\
              cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0\n\
              cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1\n"
         );
@@ -3906,6 +3921,7 @@ mod tests {
             text.as_str(),
             "cpus_online=2\n\
              reaper_closed=0\n\
+             exit_closed=0\n\
              cpu=0 online=1 switches=0 steals=0 placed=0 ipis=0 ticks=0 ready=0 idle=1\n\
              cpu=2 online=1 switches=0 steals=0 placed=0 ipis=0 ticks=0 ready=0 idle=1\n"
         );
