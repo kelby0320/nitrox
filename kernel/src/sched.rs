@@ -112,6 +112,22 @@ const REAP_RESERVE: usize = 16;
 /// producer's burst (the entropy seed wake parks ≤ [`crate::entropy::SEED_WAITERS_MAX`]
 /// refs, once per boot); [`reap_pending`] drains it in thread context.
 const DEFERRED_DROP_RESERVE: usize = 2 * crate::entropy::SEED_WAITERS_MAX;
+/// Pre-reserved capacity for [`SchedState::ended_pids`]. Exit pushes into it under
+/// `SCHED`, so it must never allocate while held; the reaper drains it promptly, and the
+/// existing per-CPU sites drain it too, so the depth only has to cover a burst of exits
+/// between two scheduler entries.
+const ENDED_PIDS_RESERVE: usize = 64;
+/// Thread id of the reaper — like [`IDLE_TID`], an identity marker rather than a real tid.
+const REAPER_TID: u32 = u32::MAX - 1;
+/// Handle tables the [reaper](reaper_body) has closed, reported as `reaper_closed=` in
+/// `/proc/sched/stats`.
+///
+/// Exposed because the failure mode is **silence**: a reaper that never woke would leave
+/// the pre-existing per-CPU `process_ended` sweep to cover for it, and everything would
+/// look fine until a system busy enough to starve that sweep hung a shell. A counter the
+/// guest can read turns "the reaper is alive and being scheduled" into something a test
+/// can assert.
+pub static REAPER_CLOSED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
 
 /// The deadline min-heap: armed-timer and `sys_wait`-deadline expiries keyed by
 /// absolute monotonic ns, drained on each periodic tick. A pure binary heap in
@@ -327,6 +343,10 @@ pub mod stats {
     pub struct Snapshot {
         /// Per-CPU rows, indexed by dense CPU index.
         pub cpus: [CpuSnapshot; MAX_CPUS],
+        /// Handle tables the reaper has closed since boot. Machine-wide, not per-CPU —
+        /// there is one reaper. Carried *in the snapshot* rather than read inside
+        /// [`format`], which is documented pure and host-tested as such.
+        pub reaper_closed: u64,
     }
 
     impl Snapshot {
@@ -343,6 +363,7 @@ pub mod stats {
     ///
     /// ```text
     /// cpus_online=2
+    /// reaper_closed=17
     /// cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0
     /// cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1
     /// ```
@@ -352,6 +373,7 @@ pub mod stats {
         // (see `KString`'s `Write` impl).
         (|| -> Result<(), core::fmt::Error> {
             writeln!(out, "cpus_online={}", snap.cpus_online())?;
+            writeln!(out, "reaper_closed={}", snap.reaper_closed)?;
             for (c, cpu) in snap.cpus.iter().enumerate() {
                 if !cpu.online {
                     continue;
@@ -587,6 +609,19 @@ struct SchedState {
     /// [`DEFERRED_DROP_RESERVE`]); the only producer today is the entropy seed
     /// wake ([`wake_entropy_seed_waiters`]). Decision log 2026-07-21, F2.
     deferred_drops: KVec<ObjectRef>,
+    /// Processes whose last thread has exited and whose **handle table** still needs
+    /// closing. Pushed by [`exit_process`] under `SCHED`; drained by the
+    /// [reaper thread](reaper_body) and, opportunistically, by [`reap_pending`].
+    ///
+    /// **CPU-agnostic, unlike [`reap`](Self::reap).** That list is per-CPU because a
+    /// thread parks itself there and then switches off its own stack, so freeing it from
+    /// another CPU would be a use-after-free. Closing a *handle table* is keyed on pid and
+    /// touches no stack, so any CPU may do it — which is what lets one reaper thread serve
+    /// the whole machine.
+    ended_pids: KVec<u32>,
+    /// The reaper thread while it is parked. `None` while it is running or queued —
+    /// the same shape as [`idle`](Self::idle), and the reason a wake is a `take()`.
+    reaper: Option<ObjectRef>,
 }
 
 static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(LockRank::Sched, SchedState {
@@ -605,6 +640,8 @@ static SCHED: IrqSpinLock<SchedState> = IrqSpinLock::new(LockRank::Sched, SchedS
     deadlines: KVec::new(),
     stats: [stats::Counters::ZERO; MAX_CPUS],
     deferred_drops: KVec::new(),
+    ended_pids: KVec::new(),
+    reaper: None,
 });
 
 impl SchedState {
@@ -717,6 +754,16 @@ pub fn init() -> Result<(), AllocError> {
     let idle_ref = into_objref(idle);
     let idle_addr = idle_ref.as_ptr() as usize;
 
+    // The reaper: **one** for the machine, not one per CPU. It closes handle tables, which
+    // are keyed on pid and touch no thread stack, so any CPU may do it. (The per-CPU
+    // `reap` list is a different job with a different rule — see `reaper_body`.)
+    // Allocated outside the lock, like the idle thread; it starts runnable and parks
+    // itself the first time it finds nothing to do.
+    let reaper = Thread::try_new_runnable(REAPER_TID, 0, reaper_body, 0)?;
+    let reaper_ref = into_objref(reaper);
+    let mut ended_pids: KVec<u32> = KVec::new();
+    ended_pids.try_reserve(ENDED_PIDS_RESERVE)?;
+
     let mut g = SCHED.lock();
     g.ready[0] = ready; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
     g.cpu_online[0] = true; // the BSP; each AP sets its own bit in `ap_init`.
@@ -726,6 +773,8 @@ pub fn init() -> Result<(), AllocError> {
     g.reap[0] = reap;
     g.deadlines = deadlines;
     g.deferred_drops = deferred_drops;
+    g.ended_pids = ended_pids;
+    g.ready[0].try_push(reaper_ref).expect("run queue within reserve");
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
@@ -1101,7 +1150,10 @@ pub fn stats_snapshot() -> stats::Snapshot {
             counters: g.stats[c],
         };
     }
-    stats::Snapshot { cpus }
+    stats::Snapshot {
+        cpus,
+        reaper_closed: REAPER_CLOSED.load(Ordering::Relaxed),
+    }
 }
 
 /// Complete any `PendingOperation`s parked on the entropy pool becoming seeded (the
@@ -2666,6 +2718,16 @@ pub fn exit_process(status: ExitStatus) -> ! {
         // return from `finish_exit`.
         // SAFETY: `me_obj` is the running thread, pinned, lock held.
         unsafe { Thread::set_process_ended(me_obj) };
+        // Hand the handle table to the reaper. This is the half that peers are waiting
+        // on: closing an IPC endpoint is what nulls its peer and wakes anyone blocked
+        // there, so leaving it to "whenever some CPU next reaches idle" makes a blocked
+        // reader's liveness depend on unrelated scheduling. `set_process_ended` above
+        // still marks the thread, so the per-CPU sweep remains a correct fallback if the
+        // queue is full.
+        if st.ended_pids.len() < st.ended_pids.capacity() {
+            let _ = st.ended_pids.try_push(me_pid);
+            wake_reaper(st);
+        }
         deliver_child_exited(st, me_obj, status);
     }
 
@@ -3311,6 +3373,93 @@ pub fn current_thread() -> Option<ObjectRef> {
 /// Reaping here (outside any IRQ context, holding no other lock) is the safe
 /// home for draining the `reap` slot when the system would otherwise sit idle
 /// — e.g. the boot thread parked in `reap` after it `exit`s at end of boot.
+/// The reaper thread body: close the handle tables of processes that have exited, then
+/// park until there are more.
+///
+/// **Why a thread at all.** Deferred reclamation used to run only at
+/// `exit_*`/`yield_now`/`suspend_with_fault` and in the idle loop. On a system where no
+/// thread exits or yields and no CPU reaches idle — one busy-looping service is enough —
+/// nothing ran it, so no exited process was reclaimed and every pipe they held stayed
+/// open. That is not a leak, it is a liveness bug: a peer blocked on a channel waits for a
+/// `PeerClosed` that only reclamation can deliver. Twice in one day a spinning supervisor
+/// hung an unrelated shell that way.
+///
+/// A normal schedulable thread removes the dependency on scheduling luck: a spinner shares
+/// the CPU with the reaper instead of starving it. This is the shape Linux uses for the
+/// same problem — the bulk of teardown happens in the dying task, and what must be
+/// deferred is drained by dedicated kernel threads (`ksoftirqd`, `rcuo`, `kworker`) rather
+/// than by whoever happens along.
+///
+/// It closes **handle tables only**. Reaped threads' kernel stacks stay with the per-CPU
+/// [`reap`](SchedState::reap) path, because a thread parks itself there and then switches
+/// off its own stack — freeing that from another CPU is a use-after-free, and the reaper
+/// runs wherever it is scheduled.
+extern "C" fn reaper_body(_arg: usize) {
+    loop {
+        // Take one pid at a time: `close_all_owned_by` drops object references, which must
+        // happen with `SCHED` released, so the lock cannot be held across the close.
+        let next = {
+            let mut g = SCHED.lock();
+            g.ended_pids.pop()
+        };
+        match next {
+            Some(pid) => {
+                crate::handle::global::close_all_owned_by(pid);
+                REAPER_CLOSED.fetch_add(1, Ordering::Relaxed);
+            }
+            None => park_reaper(),
+        }
+    }
+}
+
+/// Park the reaper until [`wake_reaper`] runs. Re-checks the queue **under `SCHED`** before
+/// parking, which is what closes the lost-wakeup window: an exit that pushes a pid between
+/// the reaper's last drain and this park would otherwise wake nothing and leave the work
+/// sitting until some unrelated scheduler entry noticed it.
+fn park_reaper() {
+    let mut g = SCHED.lock();
+    if !g.ended_pids.is_empty() {
+        return; // work arrived while we were draining — go round again
+    }
+    let me = g.cur_slot().take().expect("current set");
+    let me_obj = me.as_ptr();
+    let next = match pick_next(&mut g) {
+        Some(n) => n,
+        None => g.idle_slot().take().expect("idle thread exists after init"),
+    };
+    let next_obj = next.as_ptr();
+    // SAFETY: both pinned (self parked in the reaper slot, next becoming current);
+    // `SCHED` held — the Thread accessor contract.
+    unsafe {
+        Thread::set_state(me_obj, ThreadState::Blocked);
+        Thread::set_state(next_obj, ThreadState::Running);
+    }
+    let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
+    // Park in the reaper slot — not `blocked`, so no generic waker can find it, and not
+    // `ready`, so it does not spin. `wake_reaper` is the only way back.
+    debug_assert!(g.reaper.is_none());
+    g.reaper = Some(me);
+    *g.cur_slot() = Some(next);
+    // Resumes here, lock-free, when `wake_reaper` re-queues us.
+    // SAFETY: `me_slot` is our own (now-parked) saved-SP slot; both threads pinned.
+    unsafe { switch_into(g, me_slot, me_obj, next_obj) };
+}
+
+/// Make the reaper runnable, if it is parked. Caller holds `SCHED`.
+///
+/// A no-op when it is already running or queued — the wake is level-triggered off
+/// [`SchedState::ended_pids`], so a missed edge costs nothing.
+fn wake_reaper(g: &mut SchedState) {
+    let Some(r) = g.reaper.take() else {
+        return;
+    };
+    // SAFETY: `r` is the parked reaper, pinned by the slot's reference; `SCHED` held.
+    unsafe { Thread::set_state(r.as_ptr(), ThreadState::Ready) };
+    let cpu = SchedState::this_cpu();
+    debug_assert!(g.ready[cpu].len() < g.ready[cpu].capacity());
+    g.ready[cpu].try_push(r).expect("run queue within reserve");
+}
+
 extern "C" fn idle_body(_arg: usize) {
     loop {
         reap_pending();
@@ -3419,6 +3568,8 @@ mod tests {
             deadlines: KVec::new(),
             stats: [stats::Counters::ZERO; MAX_CPUS],
             deferred_drops: KVec::new(),
+            ended_pids: KVec::new(),
+            reaper: None,
         }
     }
 
@@ -3685,6 +3836,7 @@ mod tests {
     fn snap_with(rows: &[(usize, stats::CpuSnapshot)]) -> stats::Snapshot {
         let mut s = stats::Snapshot {
             cpus: [stats::CpuSnapshot::OFFLINE; MAX_CPUS],
+            reaper_closed: 0,
         };
         for &(c, row) in rows {
             s.cpus[c] = row;
@@ -3732,6 +3884,7 @@ mod tests {
         assert_eq!(
             text.as_str(),
             "cpus_online=2\n\
+             reaper_closed=0\n\
              cpu=0 online=1 switches=1342 steals=3 placed=57 ipis=12 ticks=4096 ready=1 idle=0\n\
              cpu=1 online=1 switches=987 steals=11 placed=40 ipis=9 ticks=4080 ready=0 idle=1\n"
         );
@@ -3752,6 +3905,7 @@ mod tests {
         assert_eq!(
             text.as_str(),
             "cpus_online=2\n\
+             reaper_closed=0\n\
              cpu=0 online=1 switches=0 steals=0 placed=0 ipis=0 ticks=0 ready=0 idle=1\n\
              cpu=2 online=1 switches=0 steals=0 placed=0 ipis=0 ticks=0 ready=0 idle=1\n"
         );

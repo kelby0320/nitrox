@@ -417,6 +417,34 @@ contents.
 
 Trigger: a package manager that can install at runtime, or the first time a user has to log
 out to see a program they just installed.
+**Process teardown is deferred wholesale — `TODO(exit-context-teardown)`.**
+Linux does the bulk of teardown *synchronously in the dying task*: `do_exit` calls
+`exit_files`, which walks the fd table and closes each file right there, in ordinary process
+context with preemption on and no scheduler lock held. Only the last references — the
+`task_struct`, the stack — are deferred to RCU callbacks and drained by kernel threads.
+
+Nitrox has the deferred half and not the synchronous half. `exit_process` takes `SCHED` and
+never returns from `finish_exit`, so by the time it wants to release handles it holds the
+rank-1 lock and can drop nothing. Everything therefore goes on a queue, and until the reaper
+thread landed (2026-07-31) nothing was guaranteed to drain it.
+
+The reaper makes that queue reliably drained. What it does **not** do is make teardown
+prompt in the common case: a process that calls `sys_process_exit` starts in ordinary
+syscall context — no locks held, free to allocate and drop — and could close its own handle
+table right there, the way `exit_files` does. Peers would then observe `PeerClosed` at the
+moment of exit rather than at the reaper's next turn.
+
+What would remain deferred, and genuinely has to be: the thread's own kernel stack and
+address space (it is still running on them), and processes killed externally, which never
+run `sys_process_exit` at all.
+
+The care needed: "last thread out" semantics for a multi-threaded process, and not
+duplicating work the reaper may also do (`close_all_owned_by` is idempotent, so the risk is
+wasted effort rather than error).
+
+Trigger: when exit latency matters, or the next time a peer's liveness is found to depend on
+reclamation timing. Not urgent — the reaper removed the correctness dependency; this is
+about promptness.
 
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
