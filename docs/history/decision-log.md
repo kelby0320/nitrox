@@ -9915,3 +9915,38 @@ the reaper processes; with the early close disabled the run fails.
 Together with the reaper this closes the loop opened by two spinning supervisors: teardown
 happens promptly in the common case, reliably in every case, and neither depends on a CPU
 reaching idle.
+
+## 2026-07-31 — Two more interactive-only shell bugs, and the test seam that was missing
+
+Reported from the prompt: a `def` was accepted and then the next line said no such
+function. It is the third bug of exactly this shape this week, and the shape is the point.
+
+**`def` hoisting.** `exec` deliberately does nothing for `Stmt::Def` — definitions are
+registered by `hoist_defs`, which enables mutual recursion by binding every `def` in a block
+before executing any of it. `exec_block` had the only call. A whole script therefore hoisted
+and a REPL line did not, so a definition typed at a prompt parsed, evaluated to nothing, and
+disappeared. `run_line` now hoists, because a line *is* a block's worth of statements.
+
+**`if` at the prompt printed nothing.** `is_expression_shaped` counts `if` and `try` as
+value-producing (§9a — a block ending in one evaluates to it), but the REPL's
+`should_display` asked only for `Stmt::Expr`. The value was computed and dropped. The two
+are the same question asked twice and had drifted; they now share the predicate.
+
+**The common cause is a missing test seam, not carelessness.** Every evaluator test fed a
+whole script through `run`. Nothing exercised `run_line` at all — and `run_line` is the
+interactive path. So the class of bug "the scripted path does X, the interactive path
+forgets to" was invisible by construction.
+
+That is now closed at the layer where it is cheap: `repl(&[...])` drives a sequence of lines
+through one interpreter, host-side, in milliseconds. Writing it immediately found the second
+bug, which is the usual sign that the seam was the problem rather than the individual
+mistakes. A sweep of fifteen two-line interactions across closures, records, lists,
+pipelines, `$last`, and cross-line `def` calls found no others — the two known parse gaps it
+did surface (`try` in expression position, ranges through operators) are already filed and
+behave identically in a script, so they are not of this class.
+
+What still has no cover is `main.rs`'s console loop — byte reading, backspace, Ctrl-D, the
+`exit` interception. Filed as `TODO(nxsh-console-tests)`, with the observation that makes it
+tractable: `nxsh` takes its console as a **capability from its namespace**, so a test can
+bind a pipe at `/dev/console` and drive the real loop without QEMU or serial tricks. A
+design that refuses ambient authority turns out to be a design that is easy to test.

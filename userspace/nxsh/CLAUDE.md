@@ -53,6 +53,15 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
   decides, because only the operator knows.
 - **A builtin's argument is a path, not an expression.** `cd ..` and `cd /system` both
   choke in expression mode, where `..` is a range and `/system` a division.
+- **`run_line` is a block, and must be treated as one.** `exec` deliberately does nothing
+  for `Stmt::Def` — definitions are registered by `hoist_defs`, which only ran from
+  `exec_block`. So a whole script hoisted and a REPL line did not: a `def` typed at a
+  prompt vanished and the next line said no such function. Anything `exec_block` does to a
+  list of statements, `run_line` owes them too.
+- **`should_display` must agree with `is_expression_shaped`.** They are the same question
+  asked twice — "does this statement produce a value?" — and they disagreed: `if` and `try`
+  count for a block's value but were not echoed at the prompt, so the REPL computed a
+  result and dropped it. If you extend one, extend the other.
 - **The interactive loop in `main.rs` may intercept exactly one line: `exit`.** It must end
   the loop, which `run_line` cannot do. A `cd` guard sat beside it, left from before `cd`
   existed, and went on refusing a builtin the interpreter had implemented — for weeks,
@@ -73,6 +82,17 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
 - **The shell does not rewrite a spawned stage's paths.** It passes `argv` through as
   written and hands over the same `PWD`, so both sides resolve identically. Pre-resolving
   would reintroduce the split-brain the environment design exists to prevent.
+
+## Testing the interactive path
+
+`run_line` is library code, so a REPL *session* is host-testable: the `repl(&[...])` helper
+in `eval.rs`'s tests drives a sequence of lines through one interpreter, which is what a
+person at a prompt actually does. **Use it for anything that spans two lines.** Every test
+before it fed the evaluator a whole script through `run`, which is why three
+interactive-only bugs got in — the stale `cd` guard, `list /`, and `def` hoisting.
+
+What it does *not* cover is the console loop in `main.rs`: byte reading, backspace, Ctrl-D,
+the prompt itself. That needs a driven console — see `TODO(nxsh-console-tests)`.
 
 ## Forbidden patterns
 

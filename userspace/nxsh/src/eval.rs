@@ -215,6 +215,14 @@ impl Interp {
     pub fn run_line(&mut self, src: &str) -> Result<Option<alloc::string::String>> {
         let script = crate::parse_script(src)
             .map_err(|e| EvalError::new(alloc::format!("line {}: {}", e.line, e.message)))?;
+        // **Hoist, exactly as a block does.** `exec` treats `Stmt::Def` as a no-op because
+        // definitions are registered here, not executed (§5a — hoisting is what makes
+        // mutual recursion possible). `exec_block` had the only call, so a whole script
+        // hoisted and a REPL line did not: a `def` typed at a prompt parsed, evaluated to
+        // nothing, and vanished, and the next line reported no such function.
+        //
+        // A line is a block's worth of statements, so it gets a block's treatment.
+        self.hoist_defs(&script.stmts)?;
         let mut out = None;
         for stmt in &script.stmts {
             let value = match self.exec(stmt)? {
@@ -2954,6 +2962,82 @@ x"), "5");
             values.push(Value::Str(alloc::string::String::from(*v)));
         }
         Record { schema, values }
+    }
+
+    /// Drive a **sequence of REPL lines** through one interpreter, the way a person at a
+    /// prompt does — each `run_line` a separate parse and execute against state the last
+    /// one left behind.
+    ///
+    /// This helper is the point of the exercise. Every prior test fed the evaluator a
+    /// *whole script* through `run`, so nothing exercised `run_line` at all — and three
+    /// interactive-only bugs got in that way (the stale `cd` guard, `list /`, and the
+    /// `def` this covers). The interactive path is not a variation of the scripted one.
+    fn repl(lines: &[&str]) -> core::result::Result<Option<alloc::string::String>, EvalError> {
+        let mut interp = Interp::with_host(Box::new(MockHost::new()), Mode::Repl);
+        let mut last = None;
+        for l in lines {
+            last = interp.run_line(l)?;
+        }
+        // `display` terminates with a newline; the tests care about the value.
+        Ok(last.map(|s| alloc::string::String::from(s.trim_end())))
+    }
+
+    /// **A `def` typed at the prompt has to be callable on the next line.**
+    ///
+    /// It was not: `exec` treats `Stmt::Def` as a no-op because definitions are registered
+    /// by `hoist_defs`, which only ran from `exec_block`. A whole script therefore hoisted
+    /// and a REPL line did not, so the definition parsed, evaluated to nothing, and
+    /// vanished — "no such function" on the very next line.
+    #[test]
+    fn a_def_typed_at_the_prompt_is_callable_afterwards() {
+        let out = repl(&["def add(a, b) { a + b }", "add(1, 2)"]).expect("both lines run");
+        assert_eq!(out.as_deref(), Some("3"));
+    }
+
+    /// Hoisting inside one line still works, so a REPL line behaves like a script.
+    #[test]
+    fn defs_on_one_repl_line_hoist_like_a_script() {
+        let out = repl(&["def a(n) { b(n) + 1 }\ndef b(n) { n * 2 }", "a(3)"]).expect("runs");
+        assert_eq!(out.as_deref(), Some("7"));
+    }
+
+    /// Redefining replaces rather than shadowing-forever, which `hoist_defs`'s `retain`
+    /// already intends — worth pinning now that the REPL can reach it.
+    #[test]
+    fn redefining_a_function_at_the_prompt_takes_effect() {
+        let out = repl(&["def f() { 1 }", "def f() { 2 }", "f()"]).expect("runs");
+        assert_eq!(out.as_deref(), Some("2"));
+    }
+
+    /// **An `if` typed at the prompt shows its value.**
+    ///
+    /// §9a makes `if` expression-shaped — a block ending in one evaluates to it — but the
+    /// REPL's `should_display` asked only for `Stmt::Expr`, so the value was computed and
+    /// silently dropped. Same family as the `def` bug above: the language's rule and the
+    /// interactive path's rule had drifted apart, and only the scripted one was tested.
+    #[test]
+    fn an_if_expression_shows_its_value_at_the_prompt() {
+        let out = repl(&["let n = 5", "if n > 3 { \"big\" } else { \"small\" }"]).expect("runs");
+        assert_eq!(out.as_deref(), Some("big"));
+    }
+
+    /// The suppression that `should_display` exists for still holds: a chain ending in a
+    /// terminal operator must not echo, or the REPL prints what `display` already printed.
+    #[test]
+    fn a_terminal_operator_still_suppresses_the_echo() {
+        let out = repl(&["[1, 2] | display"]).expect("runs");
+        assert_eq!(out, None, "`display` already printed; the REPL must not print again");
+    }
+
+    /// `let` still does **not** hoist — it is tied to evaluation order, and the fix must
+    /// not have quietly made declarations of both kinds behave alike.
+    #[test]
+    fn let_still_does_not_hoist_across_repl_lines() {
+        let mut interp = Interp::with_host(Box::new(MockHost::new()), Mode::Repl);
+        assert!(interp.run_line("x").is_err(), "`x` is not bound yet");
+        interp.run_line("let x = 5").expect("binds");
+        let got = interp.run_line("x").expect("reads");
+        assert_eq!(got.as_deref().map(str::trim_end), Some("5"));
     }
 
     fn run_env(

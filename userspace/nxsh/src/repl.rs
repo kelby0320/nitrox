@@ -89,8 +89,19 @@ pub fn needs_continuation(src: &str) -> Continue {
 /// should print once, not twice — and an assignment prints nothing, since `let x = 5` is a
 /// binding rather than a question.
 pub fn should_display(stmt: &Stmt) -> bool {
-    let Stmt::Expr(e) = stmt else { return false };
-    !ends_in_terminal_operator(e)
+    // **The same predicate the language uses for a block's value.** `is_expression_shaped`
+    // counts `if` and `try` as value-producing (§9a), so a block ending in one evaluates to
+    // it — but this asked only for `Stmt::Expr`, and the REPL threw the rest away. Typing
+    // `if n > 3 { "big" } else { "small" }` at a prompt computed "big" and printed nothing.
+    if !stmt.is_expression_shaped() {
+        return false;
+    }
+    match stmt {
+        Stmt::Expr(e) => !ends_in_terminal_operator(e),
+        // An `if`/`try` cannot itself *be* a terminal operator; its branches are blocks,
+        // and a branch ending in `save` yields null, which the caller already suppresses.
+        _ => true,
+    }
 }
 
 /// Operators that consume a value and end the chain, so the REPL must not add another.
