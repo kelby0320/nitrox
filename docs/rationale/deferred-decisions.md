@@ -417,6 +417,27 @@ contents.
 
 Trigger: a package manager that can install at runtime, or the first time a user has to log
 out to see a program they just installed.
+**The shell's console loop has no automated cover — `TODO(nxsh-console-tests)`.**
+`nxsh`'s language is thoroughly host-tested, and since 2026-07-31 a REPL *session* is too
+(the `repl(&[...])` helper drives a sequence of `run_line` calls through one interpreter).
+That covers the great majority of interactive behaviour, because `run_line` is where it
+lives.
+
+What remains untested is `main.rs`'s console loop: reading bytes, backspace, Ctrl-D, the
+`exit` interception, the prompt, and multi-line continuation as actually typed. Four bugs
+have now come from that seam — console rights, `list /`, the stale `cd` guard, and `def`
+hoisting — every one found by a person at a prompt, because the scripted path calls
+`run_line` and the interactive path never got there.
+
+The shape of the fix is available and cheap, which is the argument for doing it: `nxsh`
+reads `/dev/console` **from its own namespace**. A test can therefore construct a namespace
+whose `/dev/console` is a *pipe the harness holds*, spawn `nxsh` into it, write lines, and
+read what comes back — no serial hackery, no QEMU driving, and it exercises the real loop
+including the parts `run_line` never sees. That the shell takes its console as a capability
+rather than a fixed device is what makes this possible at all.
+
+Trigger: the next interactive bug, or before anything else grows in that loop.
+
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
 `service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,
