@@ -9883,3 +9883,35 @@ completes and the prompt returns. Before the reaper, that hung forever.
 `process_ended` sweep to cover for it, and everything would look fine until a system busy
 enough to starve that sweep hung something. The harness asserts the counter is non-zero (88
 on a normal self-test boot); with the wake disabled the run fails.
+
+## 2026-07-31 — Exit-context teardown: the other half of what Linux does
+
+The reaper thread made reclamation *reliable*; it did not make it *prompt*. A peer's
+`PeerClosed` still arrived at the reaper's next turn rather than at the moment of exit,
+because everything a dying process owned went on a queue.
+
+`sys_process_exit` now closes the calling process's handle table itself, before entering
+the scheduler. That is Linux's `do_exit` → `exit_files` position and it is available for the
+same reason: the syscall entry is ordinary thread context — no locks held, preemption
+normal, free to allocate and drop. `exit_process` is not, and never can be: it takes `SCHED`
+and never returns from `finish_exit`, so by then dropping anything is forbidden. The whole
+reason teardown was deferred wholesale is that it had only ever been attempted from the
+wrong side of that lock.
+
+Closing a handle is precisely what other processes are waiting on — dropping an IPC
+endpoint's last reference nulls its peer and wakes whoever is blocked there — so this is the
+difference between a peer waking now and waking whenever the reaper next runs.
+
+**The reaper still queues and closes the pid afterwards**, finding an empty table. That is
+deliberate, not redundancy left in by accident: a process killed externally never runs
+`sys_process_exit` at all, so the queue remains the only path for it.
+
+**Measured, not assumed.** `exit_closed=` joins `reaper_closed=` in `/proc/sched/stats`
+because this is an optimisation over a mechanism that already works — if it silently stopped
+running, the reaper would cover for it and nothing would look wrong except that every peer
+went back to waiting. A self-test boot closes 421 handles in exit context against 89 pids
+the reaper processes; with the early close disabled the run fails.
+
+Together with the reaper this closes the loop opened by two spinning supervisors: teardown
+happens promptly in the common case, reliably in every case, and neither depends on a CPU
+reaching idle.

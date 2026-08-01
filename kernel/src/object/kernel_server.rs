@@ -412,7 +412,7 @@ mod tests {
                 // SAFETY: `obj` pins a live MemoryObject just created above.
                 let m = unsafe { &*(obj.as_ptr() as *const MemoryObject) };
                 assert_eq!(m.size(), PAGE_SIZE); // one page holds the header
-                let expected = b"cpus_online=0\nreaper_closed=0\n";
+                let expected = b"cpus_online=0\nreaper_closed=0\nexit_closed=0\n";
                 let base = (m.frames()[0].as_u64() + heap::hhdm_offset()) as *const u8;
                 for (i, &want) in expected.iter().enumerate() {
                     // SAFETY: a live MemoryObject's frame is HHDM-reachable;

@@ -417,35 +417,6 @@ contents.
 
 Trigger: a package manager that can install at runtime, or the first time a user has to log
 out to see a program they just installed.
-**Process teardown is deferred wholesale — `TODO(exit-context-teardown)`.**
-Linux does the bulk of teardown *synchronously in the dying task*: `do_exit` calls
-`exit_files`, which walks the fd table and closes each file right there, in ordinary process
-context with preemption on and no scheduler lock held. Only the last references — the
-`task_struct`, the stack — are deferred to RCU callbacks and drained by kernel threads.
-
-Nitrox has the deferred half and not the synchronous half. `exit_process` takes `SCHED` and
-never returns from `finish_exit`, so by the time it wants to release handles it holds the
-rank-1 lock and can drop nothing. Everything therefore goes on a queue, and until the reaper
-thread landed (2026-07-31) nothing was guaranteed to drain it.
-
-The reaper makes that queue reliably drained. What it does **not** do is make teardown
-prompt in the common case: a process that calls `sys_process_exit` starts in ordinary
-syscall context — no locks held, free to allocate and drop — and could close its own handle
-table right there, the way `exit_files` does. Peers would then observe `PeerClosed` at the
-moment of exit rather than at the reaper's next turn.
-
-What would remain deferred, and genuinely has to be: the thread's own kernel stack and
-address space (it is still running on them), and processes killed externally, which never
-run `sys_process_exit` at all.
-
-The care needed: "last thread out" semantics for a multi-threaded process, and not
-duplicating work the reaper may also do (`close_all_owned_by` is idempotent, so the risk is
-wasted effort rather than error).
-
-Trigger: when exit latency matters, or the next time a peer's liveness is found to depend on
-reclamation timing. Not urgent — the reaper removed the correctness dependency; this is
-about promptness.
-
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
 `service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,
@@ -836,6 +807,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Process teardown deferred wholesale (`exit-context-teardown`) | 2026-07-31 | `sys_process_exit` now closes the calling process's handle table in its own syscall context — Linux's `do_exit` → `exit_files` position: no locks held, free to allocate and drop. `exit_process` cannot, because it takes `SCHED` and never returns from `finish_exit`. Closing a handle is what other processes wait on (dropping an IPC endpoint's last reference nulls its peer and wakes whoever is blocked there), so this moves `PeerClosed` from "the reaper's next turn" to the moment of exit. The reaper still queues and closes the pid afterwards, finding an empty table: that path stays for processes killed externally, which never run the syscall. Measured rather than assumed — `exit_closed=` in `/proc/sched/stats`, 421 handles per self-test boot against 89 pids the reaper now finds already empty. |
 | No regression cover for reclamation starvation (`idle-starvation-test`) | 2026-07-31 | Built, after the first attempt was thrown away for passing with the bug reinstated. The failed version asserted a low **switch rate**; a lone spinner is preempted back to itself, which barely moves that counter. The working version asserts **occupancy** — `/proc/sched/stats` reports `idle=` per CPU, and a spin permanently costs one. Sampled ten times across a second, taking the best sample (one busy instant is not a spin), and compared against `cpus_online - 1` because the sampling thread's own CPU never reads idle. Verified both ways: 3 of 4 CPUs idle with the fix on three consecutive runs, 2 of 4 and a failed run with the fix disabled. |
 | A login session can see no programs (`session-program-namespace`) | 2026-07-31 | Both halves, because either alone is inert. The store gained a `coreutils` package (the ten coreutils plus `nxsh`) and the system profile a second `[[package]]` — before that `/bin` was bound and projected exactly `heartbeat`. Then init retains the profile server's endpoint and hands it down to session-mgr, which binds it at `/bin` in each session namespace, sharing init's registration exactly as `/home` shares the fs-server's. Binding `/initramfs/sbin` was the quick alternative and was refused: it hands a session the boot image instead of a profile. Handing a *second* endpoint down needed a channel — only `handles[0]` reaches a child — so service-mgr's `rdx` is now a handoff channel rather than one endpoint. |
 | `nxsh` could not parse `list /` | 2026-07-31 | Found by typing it at a real prompt, one command after the `/bin` bind made programs reachable. A lone `/` after a command head was read as division; `/system` was never affected because it lexes as a single path word, which is why every test passed. A lone `Slash` in argument position means the next thing is whitespace or a closer, so there is no right operand and division is impossible — the root path is the only reading left. |
