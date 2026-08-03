@@ -102,11 +102,37 @@ serial.
 `eshell` deliberately keeps `kprint`: it is the emergency path that runs when the filesystem —
 and therefore the tty server — may not exist.
 
-### One server, many ttys
+### One server, many ttys — and which channel gets bound
 
-Unlike the profile server, this needs no endpoint-per-consumer trick: a tty is *requested*, and
-the channel handed back is per-session by construction. `session-mgr` asks for a tty when it
-builds a session and binds the returned endpoint at `/dev/tty`.
+A tty is *requested*: resolving `/dev/tty` mints a fresh channel for the caller, exactly as
+resolving `/log/<principal>` does.
+
+**The distinction that cost an afternoon.** A channel plays one of two roles, and they are
+indistinguishable by type:
+
+| Role | Speaks | Who binds it |
+|---|---|---|
+| **forwarding endpoint** | `Namespace::Resolve`, sent by the kernel | init at `/dev/tty` in the root ns; session-mgr at `/dev/tty` in each session |
+| **minted tty channel** | `Tty::ReadLine` / `Write` / `SetMode` / `Close` | nobody — it is *held*, not bound |
+
+The kernel adopts **any** bound `IpcChannel` as a userspace server, so binding a minted tty
+channel produces a namespace entry that answers `Namespace::Resolve` with `Unsupported` — a
+`/dev/tty` that exists and cannot be opened. Both are `IpcChannel`s; only the role differs,
+and only the binder knows which it holds.
+
+So a session binds the **forwarding endpoint**, handed down init → service-mgr →
+session-mgr alongside the fs and profile endpoints, sharing init's registration exactly as
+`/home` shares the fs-server's. Every program in the session then resolves its own terminal.
+
+### What ends a terminal
+
+A program's terminal ends when the **program** exits: its handle closes, the server sees
+`PeerClosed`, and frees the tty. Exit-context teardown makes that prompt.
+
+`Tty::Close` remains for the case that needs it — a supervisor ending a terminal it holds,
+as `session-mgr` does with the one it used for the login prompt. It is the revocation point
+because a refcounted handle cannot be taken back; the server declining to serve is what
+ends the terminal regardless of who still holds the other end.
 
 ## Staging
 

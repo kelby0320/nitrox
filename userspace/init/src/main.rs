@@ -70,6 +70,15 @@ static mut FS_ENDPOINT: u64 = 0;
 /// root namespace can *use* `/bin` but can never obtain the thing needed to bind it
 /// elsewhere. Retaining it here is what makes the projection delegable at all.
 static mut PROFILE_ENDPOINT: u64 = 0;
+/// The tty server's **forwarding** endpoint, retained after the `/dev/tty` bind so init can
+/// hand it to service-mgr (→ session-mgr binds it into each session, sharing the one
+/// registration exactly as `/home` and `/bin` do).
+///
+/// A session must bind *this* — the channel the kernel forwards resolves down — and not a
+/// tty channel minted from it. Both are `IpcChannel`s and the kernel adopts any bound
+/// channel as a server, so binding a client channel silently produces a namespace entry
+/// that answers `Namespace::Resolve` with `Unsupported`.
+static mut TTY_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -779,7 +788,21 @@ fn bind_tty_server(root_ns: u64) -> bool {
 
     // 4. Bind the forwarding endpoint at `/log`.
     // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    // Keep a second handle *before* binding, for session-mgr to bind into each session.
+    // Duplicating first means a failure here is a failure to bind at all, rather than a
+    // bound `/dev/tty` no session can be given.
+    // SAFETY: duplicating our own endpoint handle with attenuated rights.
+    let retained = unsafe {
+        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+    };
     let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/tty".as_ptr() as u64, 8, endpoint) };
+    if br == 0 && retained >= 0 {
+        // SAFETY: single-threaded init.
+        unsafe { TTY_ENDPOINT = retained as u64 };
+    } else if retained >= 0 {
+        // SAFETY: the bind failed; nothing will use the duplicate.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
+    }
     // SAFETY: closing init's endpoint handle (the binding holds its own reference).
     unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     if br != 0 {
@@ -1266,7 +1289,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // Handing it a live but permanently empty channel would leave it blocked on a handoff
     // that is never coming, turning a degraded restart into a hung one.
     // SAFETY: single-threaded init.
-    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 } {
+    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 && TTY_ENDPOINT == 0 } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
         return unsafe {
@@ -1317,6 +1340,8 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         FS_ENDPOINT = 0;
         send_handle(init_end, PROFILE_ENDPOINT);
         PROFILE_ENDPOINT = 0;
+        send_handle(init_end, TTY_ENDPOINT);
+        TTY_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
@@ -1370,6 +1395,10 @@ unsafe fn close_retained_endpoints() {
         if PROFILE_ENDPOINT != 0 {
             syscall1(SYS_HANDLE_CLOSE, PROFILE_ENDPOINT);
             PROFILE_ENDPOINT = 0;
+        }
+        if TTY_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, TTY_ENDPOINT);
+            TTY_ENDPOINT = 0;
         }
     }
 }

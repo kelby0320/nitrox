@@ -29,6 +29,11 @@ pub enum Step {
     /// A line is complete. Its bytes (no terminator) are the payload; `echo` is what to
     /// write to move the cursor on, which is empty in no-echo mode.
     Line { bytes: Vec<u8>, echo: Vec<u8> },
+    /// End of input — Ctrl-D at an empty line. Distinct from an empty *line*, which is
+    /// what Enter on its own produces: one means "nothing this time", the other means
+    /// "nothing ever again", and a reader that conflates them either exits on a stray
+    /// Enter or cannot be exited at all.
+    Eof,
 }
 
 /// One terminal's editing state.
@@ -85,6 +90,16 @@ impl Discipline {
                 // shown, so the caller supplies its own newline when it is ready.
                 let echo = if self.echo { b"\r\n".to_vec() } else { Vec::new() };
                 Step::Line { bytes, echo }
+            }
+            // Ctrl-D. At an empty line it is end-of-input, the universal convention. With
+            // a partial line it does nothing: bash uses it to list completions there, and
+            // silently discarding what someone typed would be worse than ignoring a key.
+            0x04 => {
+                if self.line.is_empty() {
+                    Step::Eof
+                } else {
+                    Step::None
+                }
             }
             // Backspace and DEL both erase: terminals disagree about which they send.
             0x08 | 0x7f => {
@@ -168,6 +183,8 @@ mod tests {
                     lines.push(alloc::string::String::from_utf8_lossy(&bytes).into_owned());
                     echoed.push_str(&alloc::string::String::from_utf8_lossy(&echo));
                 }
+                // `drive` feeds ordinary input; a test that wants EOF asserts on `feed`.
+                Step::Eof => panic!("unexpected end-of-input"),
             }
         }
         (lines, echoed)
@@ -276,6 +293,38 @@ mod tests {
     }
 
     /// A stray control byte must not become part of a command.
+    /// Ctrl-D at an empty prompt is end-of-input — the convention the shell's own banner
+    /// promises ("Ctrl-D or `exit` to leave").
+    #[test]
+    fn ctrl_d_at_an_empty_line_is_end_of_input() {
+        let mut d = Discipline::new();
+        assert_eq!(d.feed(0x04), Step::Eof);
+    }
+
+    /// ...but not mid-line, where discarding what someone typed would be worse than
+    /// ignoring a key.
+    #[test]
+    fn ctrl_d_mid_line_does_nothing() {
+        let mut d = Discipline::new();
+        d.feed(b'a');
+        assert_eq!(d.feed(0x04), Step::None);
+        match d.feed(b'\n') {
+            Step::Line { bytes, .. } => assert_eq!(bytes, b"a"),
+            other => panic!("expected the line intact, got {other:?}"),
+        }
+    }
+
+    /// End of input and an empty line are different answers: one means "nothing this
+    /// time", the other "nothing ever again".
+    #[test]
+    fn an_empty_line_is_not_end_of_input() {
+        let mut d = Discipline::new();
+        match d.feed(b'\n') {
+            Step::Line { bytes, .. } => assert!(bytes.is_empty()),
+            other => panic!("expected an empty line, got {other:?}"),
+        }
+    }
+
     #[test]
     fn undefined_control_bytes_are_dropped() {
         let mut d = Discipline::new();

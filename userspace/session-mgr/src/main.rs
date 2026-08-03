@@ -283,7 +283,7 @@ fn build_session_namespace(
     root_ns: u64,
     fs_endpoint: u64,
     profile_endpoint: u64,
-    tty: u64,
+    tty_endpoint: u64,
     home: &[u8],
     user: &[u8],
 ) -> u64 {
@@ -361,16 +361,24 @@ fn build_session_namespace(
     // `TODO(session-metadata-server)`.
     bind_session_user(ns, user);
 
-    // `/dev/tty` → the session's terminal, a direct-handle bind of the channel the tty
-    // server minted for this login. The shell gets a *cooked* terminal it can also write
-    // to, and — since `/dev/console` is the server's alone once every client has moved —
-    // no way to reach the raw device at all.
-    if tty != 0 {
+    // `/dev/tty` → the terminal server, so a program in the session can obtain a *cooked*
+    // terminal it can also write to — and, once every client has moved, has no way to
+    // reach the raw device at all.
+    if tty_endpoint != 0 {
         let dev = b"/dev/tty";
-        // SAFETY: valid namespace handle, path pointer, and channel handle (a direct-handle
-        // bind; no subtree base).
+        // The tty server's **forwarding** endpoint — the channel the kernel sends resolves
+        // down — so a program in the session resolving `/dev/tty` gets its *own* terminal,
+        // freshly minted, exactly as session-mgr did for the login prompt.
+        //
+        // Binding a minted tty channel here instead would silently produce a namespace
+        // entry that answers `Namespace::Resolve` with `Unsupported`: the kernel adopts
+        // *any* bound channel as a server, and a client channel does not speak resolve.
+        // Both are `IpcChannel`s; only the role differs.
+        //
+        // Sharing init's registration, exactly as `/home` shares the fs-server's.
+        // SAFETY: valid namespace handle, path pointer, and endpoint handle; no base.
         let tr = unsafe {
-            syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, tty, 0, 0)
+            syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, tty_endpoint, 0, 0)
         };
         if tr != 0 {
             kprint(b"session-mgr: /dev/tty bind FAIL\n");
@@ -592,10 +600,11 @@ fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
 pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> ! {
     kprint(b"session-mgr: up\n");
     // Receive the handed-over endpoints, in order: (1) fs-server endpoint, (2) profile
-    // server endpoint, (3) auth channel. Positional — service-mgr sends an empty message
+    // server endpoint, (3) tty server endpoint, (4) auth channel. Positional — service-mgr sends an empty message
     // for an endpoint it does not have, so a missing one shortens no one's count.
     let fs_endpoint = recv_handoff(control);
     let profile_endpoint = recv_handoff(control);
+    let tty_endpoint = recv_handoff(control);
     let auth_ch = recv_handoff(control);
     if fs_endpoint == 0 || auth_ch == 0 {
         kprint(b"session-mgr: endpoint handoff FAIL\n");
@@ -634,7 +643,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 root_ns,
                 fs_endpoint,
                 profile_endpoint,
-                tty,
+                tty_endpoint,
                 &home[..hl],
                 &user[..ul],
             );

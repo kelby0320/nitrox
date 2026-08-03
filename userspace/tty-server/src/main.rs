@@ -306,6 +306,15 @@ fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
                 let rid = ttys[i].waiting.take().expect("waiting");
                 reply(ttys[i].ch, OP_TTY_READ_LINE, rid, &bytes);
             }
+            Step::Eof => {
+                // Ctrl-D at an empty prompt. Answered as an *error* rather than an empty
+                // line, because those are different answers and a reader that conflated
+                // them would either exit on a stray Enter or never exit at all.
+                // `PeerClosed` is the honest code: the input side has ended.
+                backend_write(b"\r\n");
+                let rid = ttys[i].waiting.take().expect("waiting");
+                reply_error(ttys[i].ch, OP_TTY_READ_LINE, rid, KError::PeerClosed.as_i32());
+            }
         }
     }
 }
