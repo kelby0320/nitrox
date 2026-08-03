@@ -417,31 +417,26 @@ contents.
 
 Trigger: a package manager that can install at runtime, or the first time a user has to log
 out to see a program they just installed.
-**The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
-The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
-`service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,
-`heartbeat`, all ten coreutils and `nxsh`. Only a few of those are needed to *reach*
-userspace and mount the root filesystem.
+**A crashed fs-server takes the system with it — `TODO(fs-server-restart)`.**
+`init` spawns `fs-server-ext4` once and never retains it for supervision, so nothing notices
+if it dies and nothing restarts it. Every process holding a forwarded endpoint or an open
+directory session would see `PeerClosed` and have no way back.
 
-The rule it should follow: the initramfs carries what is required to get from the bootloader
-to a mounted root, and nothing else — `init`, the filesystem server, and `eshell` as the
-recovery path when that fails. Everything after the mount should be read from the real
-filesystem, through the store and a profile, like any other program.
+The **root** fs-server has a bootstrap constraint that is easy to get wrong: its restart
+image can only ever come from the initramfs. `/store/<hash>-system-…/bin/fs-server-ext4`
+exists and is the right thing for a *non-root* mount, but it is unreadable without the very
+server being restarted. That is why the boot image keeps a copy even though the store has
+one, and why the initramfs must stay resident (nothing releases it today —
+`sys_release_initramfs` is referenced in the docs but does not exist).
 
-Raised (2026-07-31) while binding `/bin` into a session namespace, because the shortcut
-there would have been to bind `/initramfs/sbin` — which is only tempting *because* the
-initramfs is a complete program set. A smaller boot image would have made the wrong answer
-obviously wrong.
+Restarting the server is the smaller half. The harder half is that a remount invalidates
+every handle derived from the old one: forwarded endpoints, open sessions, mapped file
+pages in the page cache. Clients would need to re-resolve, and nothing in the RS protocol
+says how. Until that is designed, a restart would hand processes stale handles that fail in
+new ways.
 
-Why it is worth doing beyond tidiness: the initramfs is copied into memory at boot and held
-until `sys_release_initramfs`, so everything in it is resident memory nothing will use
-again; and a program that lives only in the boot image cannot be updated, versioned, or
-content-addressed the way a store package can. Moving the supervisors onto the filesystem is
-also what makes them ordinary packages rather than a special case.
-
-Trigger: not urgent, and deliberately not folded into the session-namespace work — it
-touches init's mount ordering (a supervisor read from the filesystem cannot be spawned
-before the filesystem is up), which is real sequencing rather than a file move.
+Trigger: a second filesystem (where the non-root case is real and the blast radius is
+small), or the first time an fs-server crash is observed in practice.
 
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
@@ -808,6 +803,7 @@ decision log entry for the date shown.
 | What was deferred | Resolved | How |
 |---|---|---|
 | The shell's console loop has no automated cover (`nxsh-console-tests`) | 2026-08-03 | Resolved by testing the *whole* interactive path rather than extracting the loop. `cargo xtask test-interactive` boots the **release image** — which nothing else boots; `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a fixed script — and drives login, a wrong password, a shell prompt, a spawned program, a failing stage, cross-line interpreter state, and `exit` → log in again. Expect-driven, so the guest paces it. The rejected alternative was extracting the byte loop into the library half: the continuation *decision* is already host-tested, leaving only ~60 lines of stable byte handling, and a refactor of the critical interactive path is its own risk — while the two bugs it could never have caught (console-lookup rights, session wiring) are precisely the ones that hurt. Non-vacuity checked by reverting the login-echo fix: the run fails at `\npassword:`. |
+| The initramfs carries more than boot needs (`initramfs-minimisation`) | 2026-08-03 | The boot image now carries only what is required to reach a mounted root: `init` (the kernel boot-loads it), `fs-server-ext4` (it *is* the mount, and is the only possible restart image for root), `eshell` (the recovery path *for a failed mount*, so it must not live on the filesystem it recovers), and `profile-server` — the one the original rule missed, because `/bin` does not exist until it runs. Everything else moved into a `system` store package and is spawned through `/bin` like any other program: service-mgr, session-mgr, auth-service, logging-service, heartbeat. 1,506,596 → 206,360 bytes, an 86% cut in memory held for the machine's uptime. The recovery path was verified deliberately rather than assumed — a forced mount failure still reaches `eshell>`. |
 | Process teardown deferred wholesale (`exit-context-teardown`) | 2026-07-31 | `sys_process_exit` now closes the calling process's handle table in its own syscall context — Linux's `do_exit` → `exit_files` position: no locks held, free to allocate and drop. `exit_process` cannot, because it takes `SCHED` and never returns from `finish_exit`. Closing a handle is what other processes wait on (dropping an IPC endpoint's last reference nulls its peer and wakes whoever is blocked there), so this moves `PeerClosed` from "the reaper's next turn" to the moment of exit. The reaper still queues and closes the pid afterwards, finding an empty table: that path stays for processes killed externally, which never run the syscall. Measured rather than assumed — `exit_closed=` in `/proc/sched/stats`, 421 handles per self-test boot against 89 pids the reaper now finds already empty. |
 | No regression cover for reclamation starvation (`idle-starvation-test`) | 2026-07-31 | Built, after the first attempt was thrown away for passing with the bug reinstated. The failed version asserted a low **switch rate**; a lone spinner is preempted back to itself, which barely moves that counter. The working version asserts **occupancy** — `/proc/sched/stats` reports `idle=` per CPU, and a spin permanently costs one. Sampled ten times across a second, taking the best sample (one busy instant is not a spin), and compared against `cpus_online - 1` because the sampling thread's own CPU never reads idle. Verified both ways: 3 of 4 CPUs idle with the fix on three consecutive runs, 2 of 4 and a failed run with the fix disabled. |
 | A login session can see no programs (`session-program-namespace`) | 2026-07-31 | Both halves, because either alone is inert. The store gained a `coreutils` package (the ten coreutils plus `nxsh`) and the system profile a second `[[package]]` — before that `/bin` was bound and projected exactly `heartbeat`. Then init retains the profile server's endpoint and hands it down to session-mgr, which binds it at `/bin` in each session namespace, sharing init's registration exactly as `/home` shares the fs-server's. Binding `/initramfs/sbin` was the quick alternative and was refused: it hands a session the boot image instead of a profile. Handing a *second* endpoint down needed a channel — only `handles[0]` reaches a child — so service-mgr's `rdx` is now a handoff channel rather than one endpoint. |

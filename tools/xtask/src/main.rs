@@ -212,6 +212,23 @@ const COREUTILS: &[&str] = &[
     "list", "copy", "mkdir", "remove", "rename", "move", "touch", "date", "sleep", "whoami",
 ];
 
+/// The system services, packaged into the store like any other program.
+///
+/// **`fs-server-ext4` is here *and* in the initramfs**, and the two copies serve different
+/// purposes. The store copy makes it versioned and content-addressed like everything else,
+/// and is what a **non-root** fs-server (a second mount) would be spawned from, since root
+/// is already up by then. The initramfs copy is the only one that can ever mount the root
+/// — and the only one that could ever *re*-mount it, because `/store` is unreadable without
+/// the very server being restarted. See `TODO(fs-server-restart)`.
+const SYSTEM_SERVICES: &[&str] = &[
+    "service-mgr",
+    "session-mgr",
+    "auth-service",
+    "logging-service",
+    "heartbeat",
+    "fs-server-ext4",
+];
+
 fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
@@ -1814,13 +1831,6 @@ fn store_hash(bytes: &[u8]) -> String {
     format!("{h:016x}")[..12].to_string()
 }
 
-/// The store path `/store/<hash>-<name>-<version>` for a built program `bin`, keyed on
-/// its ELF's content hash. A pure function of the ELF, so the ext4 store build and the
-/// initramfs profile manifest derive the same path independently — no value threaded.
-fn store_path_for(bin: &str, name: &str, version: &str) -> R<String> {
-    store_path_for_all(&[bin], name, version)
-}
-
 /// A store path for a package containing several programs.
 ///
 /// The hash covers **every** ELF in the package, concatenated in the given order, so
@@ -1861,19 +1871,21 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and
     // the spawners resolve their children by path (`/initramfs/sbin/<name>`), retiring
     // the kernel-embedded `ImageId` images. Built by `cmd_build` before this runs.
-    let mut programs = vec![
-        "init",
-        "service-mgr",
-        "heartbeat",
-        "fs-server-ext4",
-        "eshell",
-        "profile-server",
-        "logging-service",
-        "auth-service",
-        "session-mgr",
-        "nxsh",
-    ];
-    programs.extend_from_slice(COREUTILS);
+    // **Only what is required to get from the bootloader to a mounted root**, plus the two
+    // programs that cannot live on the filesystem they depend on:
+    //
+    // - `init` — the kernel boot-loads it from here.
+    // - `fs-server-ext4` — it *is* the mount; nothing else can provide it.
+    // - `eshell` — the recovery path *for a failed mount*, so it must not live on the
+    //   filesystem it exists to recover from.
+    // - `profile-server` — `/bin` does not exist until it runs, so it cannot come from
+    //   `/bin`. The alternative (teach `init` to read the manifest and spawn it by store
+    //   path) puts TOML parsing in the one process that must not fail; not worth it for
+    //   one small binary.
+    //
+    // Everything else is read from the real filesystem through the store and a profile,
+    // like any other program.
+    let mut programs = vec!["init", "fs-server-ext4", "eshell", "profile-server"];
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.
     if mode.features().is_some() {
@@ -1892,7 +1904,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     // packages' `bin/` into `/bin`. Generated (not a static const) because it references
     // the store path, whose hash is content-derived at build time (must match the ext4
     // store dir). See `docs/architecture/profiles-and-namespace-projection.md`.
-    let hb_store = store_path_for("heartbeat", "heartbeat", "0.1.0")?;
+    let sys_store = store_path_for_all(SYSTEM_SERVICES, "system", "0.1.0")?;
     let cu_store = store_path_for_all(&profile_programs(), "coreutils", "0.1.0")?;
     let system_profile = format!(
         "# System profile manifest (generation 1).\n\
@@ -1901,9 +1913,9 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
          generation = 1\n\
          \n\
          [[package]]\n\
-         name = \"heartbeat\"\n\
+         name = \"system\"\n\
          version = \"0.1.0\"\n\
-         path = \"{hb_store}\"\n\
+         path = \"{sys_store}\"\n\
          \n\
          [[package]]\n\
          name = \"coreutils\"\n\
@@ -2070,19 +2082,13 @@ fn assemble_image(
     // server projects into /bin. heartbeat is the first package. The store path (hash) is
     // derived from the ELF, matching the initramfs profile manifest. See
     // `docs/architecture/content-addressed-store.md`.
-    let hb_store = store_path_for("heartbeat", "heartbeat", "0.1.0")?;
-    let hb_bin = staging.join(hb_store.trim_start_matches('/')).join("bin");
-    fs::create_dir_all(&hb_bin)?;
-    fs::copy(userspace_bin_path("heartbeat"), hb_bin.join("heartbeat"))?;
-    println!("xtask: store package {hb_store}/bin/heartbeat");
-
     // The `coreutils` package: the programs a shell can actually run. One package rather
     // than one per binary — they version and ship together, and ten manifest entries would
     // claim an independence they do not have.
     //
     // Until this existed, the coreutils lived *only* in the initramfs, so a session could
-    // not reach them at all without being handed the whole boot image. See
-    // `TODO(initramfs-minimisation)`.
+    // not reach them at all without being handed the whole boot image. Since 2026-08-03
+    // the boot image no longer carries them at all.
     let programs = profile_programs();
     let cu_store = store_path_for_all(&programs, "coreutils", "0.1.0")?;
     let cu_bin = staging.join(cu_store.trim_start_matches('/')).join("bin");
@@ -2094,6 +2100,20 @@ fn assemble_image(
     println!(
         "xtask: store package {cu_store}/bin/ ({} programs)",
         programs.len()
+    );
+
+    // The `system` package: the services. Everything init and service-mgr spawn after the
+    // root is mounted now resolves through `/bin` like any other program.
+    let sys_store = store_path_for_all(SYSTEM_SERVICES, "system", "0.1.0")?;
+    let sys_bin = staging.join(sys_store.trim_start_matches('/')).join("bin");
+    fs::create_dir_all(&sys_bin)?;
+    for prog in SYSTEM_SERVICES {
+        fs::copy(userspace_bin_path(prog), sys_bin.join(prog))
+            .map_err(|e| format!("stage {prog} into the store: {e}"))?;
+    }
+    println!(
+        "xtask: store package {sys_store}/bin/ ({} services)",
+        SYSTEM_SERVICES.len()
     );
     let rootfs = work.join("rootfs.ext4");
     let blocks = (root_sectors * 512) / 4096; // 4 KiB block count

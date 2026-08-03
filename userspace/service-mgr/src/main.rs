@@ -624,7 +624,7 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64) {
         kprint(b"service-mgr: no profile endpoint; sessions will have no /bin\n");
     }
     // 1. auth-service — spawn + Ready handshake → the client channel session-mgr uses.
-    let (auth_h, auth_ctrl) = spawn_with_control(root_ns, b"/initramfs/sbin/auth-service", &raw mut SPAWN_AUTH);
+    let (auth_h, auth_ctrl) = spawn_with_control(root_ns, b"/bin/auth-service", &raw mut SPAWN_AUTH);
     if auth_h < 0 || auth_ctrl == 0 {
         kprint(b"service-mgr: auth-service spawn FAIL\n");
         // SAFETY: closing our own endpoints (login chain aborted).
@@ -647,7 +647,7 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64) {
     kprint(b"service-mgr: auth-service ready\n");
 
     // 2. session-mgr — spawn with BIND_NAMESPACE, then hand it the fs endpoint + auth channel.
-    let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/initramfs/sbin/session-mgr", &raw mut SPAWN_SESSION);
+    let (sess_h, sess_ctrl) = spawn_with_control(root_ns, b"/bin/session-mgr", &raw mut SPAWN_SESSION);
     if sess_h < 0 || sess_ctrl == 0 {
         kprint(b"service-mgr: session-mgr spawn FAIL\n");
         // SAFETY: closing our own handles (nothing handed off).

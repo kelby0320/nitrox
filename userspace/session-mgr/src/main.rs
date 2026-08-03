@@ -470,7 +470,7 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
 fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
     use libstream::setup::{Streams, bootstrap_arg0, pipe, send_setup_env};
 
-    let image = ns_lookup(root_ns, b"/initramfs/sbin/nxsh", RIGHT_MAP_READ).1;
+    let image = ns_lookup(root_ns, b"/bin/nxsh", RIGHT_MAP_READ).1;
     if image == 0 {
         kprint(b"session-mgr: nxsh image not found\n");
         return -1;
