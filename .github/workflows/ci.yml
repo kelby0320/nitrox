@@ -178,6 +178,17 @@ jobs:
       - name: cargo xtask test-qemu --kvm
         run: cargo xtask test-qemu --kvm
 
+      # The **release image**, which nothing else here boots. `test-qemu` runs the
+      # `test-harness` build, where session-mgr auto-logs-in and runs a fixed script — so
+      # the `login:` prompt, a typed password, a real shell prompt and `exit` are all
+      # `#[cfg(not(feature = "test-harness"))]` code that this workflow compiled and never
+      # executed. Every interactive bug the project has had lived exactly there: a console
+      # read with the wrong rights, a `cd` guard refusing a builtin that existed, a login
+      # that could not be repeated, a password prompt landing on the username's line.
+      # Expect-driven, so the guest paces it rather than guessed sleeps.
+      - name: cargo xtask test-interactive --kvm
+        run: cargo xtask test-interactive --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve

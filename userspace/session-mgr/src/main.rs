@@ -770,7 +770,19 @@ fn read_line(console: u64, buf: u64, buf_addr: u64, out: &mut [u8], echo: bool) 
             // SAFETY: `buf_addr + i` is within the mapped read buffer.
             let b = unsafe { ((buf_addr + i as u64) as *const u8).read_volatile() };
             match b {
-                b'\r' | b'\n' => return len,
+                b'\r' | b'\n' => {
+                    // Echo the newline too. Without it the cursor never leaves the line
+                    // the user typed on, so the *next* prompt lands against their input —
+                    // `alicepassword:` instead of a password prompt on its own line. An
+                    // echo that omits the Enter is not an echo of what was typed.
+                    //
+                    // Only when echoing: a password read prints nothing, and its caller
+                    // emits the newline once the (unechoed) line is in.
+                    if echo {
+                        kprint(b"\r\n");
+                    }
+                    return len;
+                }
                 0x08 | 0x7F => {
                     if len > 0 {
                         len -= 1;

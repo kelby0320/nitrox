@@ -112,6 +112,7 @@ fn main() -> ExitCode {
         Some("qemu-debug") => cmd_qemu(true, mode, accel, &qargs),
         Some("test") => cmd_test(),
         Some("test-qemu") => cmd_test_qemu(accel),
+        Some("test-interactive") => cmd_test_interactive(accel),
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
@@ -502,6 +503,196 @@ fn cmd_qemu(debug: bool, mode: BuildMode, accel: Accel, extra_args: &[String]) -
         qemu.arg(a);
     }
     run(&mut qemu)
+}
+
+/// **Interactive-session tests: drive the real login and shell over the serial console.**
+///
+/// This boots `BuildMode::Normal` — the **release image**, which nothing else ever boots.
+/// `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a
+/// fixed script; the `login:` prompt, a typed password, a real shell prompt and `exit` are
+/// all `#[cfg(not(feature = "test-harness"))]` code that CI compiled and never executed.
+/// Every interactive bug this project has had lived exactly there — the console read using
+/// the wrong rights, a `cd` guard refusing a builtin that existed, a login that could not
+/// be repeated, a password prompt landing on the username's line.
+///
+/// **Expect-driven, not sleep-driven.** Each step waits for the text that says the guest is
+/// ready for it, so the run is paced by the guest rather than by guessed delays. That is
+/// the difference between a test and a flake.
+///
+/// One boot serves every scenario: the shell returns to `login:`, so the session sequence
+/// continues rather than paying ~15 s of boot per case.
+fn cmd_test_interactive(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::Normal)?;
+    let ovmf = locate_ovmf()?;
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-serial")
+        .arg("stdio")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    println!("xtask: interactive session tests (release image, expect-driven)…\n");
+    let mut session = Session::spawn(cmd)?;
+    let result = run_interactive_scenarios(&mut session);
+    let transcript = session.finish();
+
+    match result {
+        Ok(n) => {
+            println!("\nxtask: interactive tests PASSED ({n} steps)");
+            Ok(())
+        }
+        Err(e) => {
+            // The transcript is the diagnosis — without it a failure says only "expected X".
+            println!("\n--- serial transcript ---\n{transcript}\n--- end ---");
+            Err(e)
+        }
+    }
+}
+
+/// The scenarios, in one boot. Returns the number of steps that passed.
+fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
+    let mut steps = 0usize;
+
+    // 1. The machine reaches a login prompt at all — the release image's first claim.
+    s.expect("nitrox login:")?;
+    steps += 1;
+
+    // 2. A wrong password is refused and the prompt comes back. Tested before the good
+    //    one so a broken denial cannot hide behind a successful login.
+    s.send("alice")?;
+    s.expect("password:")?;
+    s.send("wrong-password")?;
+    s.expect("login incorrect")?;
+    s.expect("nitrox login:")?;
+    steps += 1;
+
+    // 3. The password prompt begins its own line. `read_line` used to return on CR/LF
+    //    without echoing it, so the cursor never left the username's line and the prompt
+    //    rendered as `alicepassword:`.
+    s.send("alice")?;
+    s.expect("\npassword:")?;
+    steps += 1;
+
+    // 4. A correct password reaches a shell prompt.
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 5. A program from the profile runs — `/bin` is bound in the session namespace and
+    //    the shell can spawn through it.
+    s.send("whoami")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 6. A *failing* stage reports and returns to the prompt rather than hanging. This is
+    //    the shape that hung the shell for an afternoon: a stage that exits without
+    //    writing, whose pipe only closes once its process is reclaimed.
+    s.send("list /nope")?;
+    s.expect("filesystem unreachable")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 7. The interpreter keeps state across lines — a `def` typed at the prompt is
+    //    callable afterwards.
+    s.send("def add(a, b) { a + b }")?;
+    s.expect("/home>")?;
+    s.send("add(2, 3)")?;
+    s.expect("5")?;
+    steps += 1;
+
+    // 8. `exit` returns to the login prompt, and logging in again works. A login that
+    //    cannot be repeated is not a login.
+    s.send("exit")?;
+    s.expect("nitrox login:")?;
+    s.send("alice")?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    Ok(steps)
+}
+
+/// A driven QEMU serial session: write lines, wait for text.
+struct Session {
+    child: std::process::Child,
+    /// Everything the guest has printed, accumulated by a reader thread.
+    out: std::sync::Arc<std::sync::Mutex<String>>,
+    /// How far `expect` has already matched, so each step scans only new output and a
+    /// pattern cannot be satisfied by an earlier occurrence of itself.
+    cursor: usize,
+}
+
+impl Session {
+    fn spawn(mut cmd: Command) -> R<Session> {
+        let mut child = cmd.spawn().map_err(|e| format!("spawn qemu: {e}"))?;
+        let stdout = child.stdout.take().ok_or("qemu stdout")?;
+        let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
+        let sink = out.clone();
+        std::thread::spawn(move || {
+            use std::io::Read;
+            let mut r = stdout;
+            let mut buf = [0u8; 1024];
+            while let Ok(n) = r.read(&mut buf) {
+                if n == 0 {
+                    break;
+                }
+                if let Ok(mut g) = sink.lock() {
+                    g.push_str(&String::from_utf8_lossy(&buf[..n]));
+                }
+            }
+        });
+        Ok(Session { child, out, cursor: 0 })
+    }
+
+    /// Wait for `pat` in output not yet consumed. The guest paces the test.
+    fn expect(&mut self, pat: &str) -> R<()> {
+        const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
+        let deadline = std::time::Instant::now() + TIMEOUT;
+        loop {
+            {
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                if let Some(i) = g[self.cursor..].find(pat) {
+                    self.cursor += i + pat.len();
+                    println!("  ok: saw {pat:?}");
+                    return Ok(());
+                }
+            }
+            if std::time::Instant::now() > deadline {
+                return Err(format!("timed out after {TIMEOUT:?} waiting for {pat:?}").into());
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+
+    /// Type a line, Enter included.
+    fn send(&mut self, line: &str) -> R<()> {
+        use std::io::Write as _;
+        let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .map_err(|e| format!("write to guest: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        Ok(())
+    }
+
+    /// Kill the guest and hand back the transcript.
+    fn finish(mut self) -> String {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        self.out.lock().map(|g| g.clone()).unwrap_or_default()
+    }
 }
 
 /// Integration-test runner: build the `test-harness` image, boot it headless, and
