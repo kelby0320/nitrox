@@ -555,78 +555,170 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
         RunMode::Repl,
     );
     interp.set_env(env);
+
+    // **The shell edits its own input.** It reads raw keystrokes and runs the line
+    // discipline locally, which is what `bash` does when it clears `ICANON` — and for the
+    // same reason: history, and later completion, are the shell's knowledge, and they share
+    // one editing loop with backspace and kill. A terminal that returned finished lines
+    // could not offer them.
+    //
+    // The discipline is *linked*, not reimplemented. Three copies of this logic were
+    // deleted to build the tty server; this is the second deployment of the one that
+    // survived, not a fourth copy.
+    //
+    // Server-side echo goes off because the shell now echoes: it holds the buffer, so only
+    // it knows what the screen should show after a history recall.
+    tty_set_echo(tty, false);
+    let mut disc = tty_server::Discipline::new();
+
     tty_write(tty, b"\r\nnxsh: interactive shell (Ctrl-D or `exit` to leave)\r\n");
 
-    // `pending` accumulates across continuation lines. Deciding whether what has been
-    // typed is *complete input* stays here rather than moving into the tty: the server
-    // hands over lines, and only the shell knows whether a line finishes a statement.
+    // `pending` accumulates across continuation lines. Deciding whether what has been typed
+    // is *complete input* stays here rather than in the tty: the discipline hands over
+    // lines, and only the shell knows whether a line finishes a statement.
     let mut pending = String::new();
+    let mut history: History = History::new();
     tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
 
+    let mut chunk = [0u8; 64];
     loop {
-        let mut buf = [0u8; nxsh::repl::LINE_MAX];
-        let typed = match tty_read_line(tty, &mut buf) {
-            TtyLine::Line(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
-            // Ctrl-D at an empty prompt, as the banner promises.
-            TtyLine::Eof => return EXIT_OK,
+        let n = match tty_read(tty, &mut chunk) {
+            Some(n) => n,
             // The terminal is gone (the session ended under us). Leaving is the only
-            // sensible response; spinning on a dead channel is what the old byte loop's
-            // `if po < 0 { continue }` did, and it pegged a CPU with nothing to say why.
-            TtyLine::Failed => {
+            // sensible response; spinning on a dead channel would peg a CPU with nothing
+            // to say why.
+            None => {
                 kprint(b"nxsh: terminal closed\r\n");
                 return EXIT_OK;
             }
         };
-        pending.push_str(&typed);
+        for &b in &chunk[..n] {
+            match disc.feed(b) {
+                tty_server::Step::None => {}
+                tty_server::Step::Echo(e) => tty_write(tty, &e),
+                // Ctrl-D at an empty prompt, as the banner promises.
+                tty_server::Step::Eof => return EXIT_OK,
+                // History recall replaces the displayed line; the discipline says how to
+                // redraw because it is the half that knows what is on screen.
+                tty_server::Step::Key(k) => {
+                    let recalled = match k {
+                        tty_server::Key::Up => history.older(disc.line()),
+                        tty_server::Key::Down => history.newer(),
+                    };
+                    if let Some(text) = recalled {
+                        let redraw = disc.replace_line(text.as_bytes());
+                        tty_write(tty, &redraw);
+                    }
+                }
+                tty_server::Step::Line { bytes, echo } => {
+                    tty_write(tty, &echo);
+                    let typed = String::from_utf8_lossy(&bytes).into_owned();
+                    pending.push_str(&typed);
 
-        if matches!(
-            nxsh::needs_continuation(&pending),
-            nxsh::Continue::Unclosed | nxsh::Continue::TrailingPipe
-        ) {
-            pending.push('\n');
-            tty_write(tty, nxsh::repl::continuation_prompt().as_bytes());
-            continue;
-        }
+                    if matches!(
+                        nxsh::needs_continuation(&pending),
+                        nxsh::Continue::Unclosed | nxsh::Continue::TrailingPipe
+                    ) {
+                        pending.push('\n');
+                        tty_write(tty, nxsh::repl::continuation_prompt().as_bytes());
+                        continue;
+                    }
 
-        let src = core::mem::take(&mut pending);
-        if src.trim().is_empty() {
-            tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
-            continue;
-        }
-        // `exit` is a shell-state builtin (§3): it must change *this* process, which an
-        // external program structurally cannot do — and it must end *this loop*, which is
-        // the one thing `run_line` cannot do for it.
-        //
-        // **It is the only line this loop may intercept.** A `cd` guard sat here too, left
-        // from before `cd` existed, and went on refusing a builtin the interpreter had
-        // implemented — the script path called `run_line` and worked, the interactive path
-        // never reached it. Every other line goes to `run_line` unread.
-        if src.trim() == "exit" {
-            return EXIT_OK;
-        }
-        match interp.run_line(&src) {
-            Ok(Some(text)) => tty_write_crlf(tty, &text),
-            Ok(None) => {}
-            Err(e) => {
-                let mut msg = String::from("nxsh: ");
-                msg.push_str(&e.message);
-                msg.push('\n');
-                tty_write_crlf(tty, &msg);
+                    let src = core::mem::take(&mut pending);
+                    if src.trim().is_empty() {
+                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+                        continue;
+                    }
+                    history.push(&src);
+                    // `exit` is a shell-state builtin (§3): it must change *this* process,
+                    // which an external program structurally cannot do — and it must end
+                    // *this loop*, which is the one thing `run_line` cannot do for it.
+                    //
+                    // **It is the only line this loop may intercept.** A `cd` guard sat
+                    // here too, left from before `cd` existed, and went on refusing a
+                    // builtin the interpreter had implemented. Every other line goes to
+                    // `run_line` unread.
+                    if src.trim() == "exit" {
+                        return EXIT_OK;
+                    }
+                    match interp.run_line(&src) {
+                        Ok(Some(text)) => tty_write_crlf(tty, &text),
+                        Ok(None) => {}
+                        Err(e) => {
+                            let mut msg = String::from("nxsh: ");
+                            msg.push_str(&e.message);
+                            msg.push('\n');
+                            tty_write_crlf(tty, &msg);
+                        }
+                    }
+                    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+                }
             }
         }
-        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
     }
 }
 
-/// The outcome of asking the terminal for a line.
-enum TtyLine {
-    /// A line of `n` bytes was written into the caller's buffer.
-    Line(usize),
-    /// End of input — Ctrl-D at an empty prompt.
-    Eof,
-    /// The terminal is unusable.
-    Failed,
+/// Command history: a bounded ring, newest last, with a cursor for recall.
+struct History {
+    lines: Vec<String>,
+    /// How far back recall has walked. `0` means "at the prompt, not in history".
+    back: usize,
+    /// What was being typed when recall started, so Down can return to it.
+    stash: String,
 }
+
+/// How many lines are kept. Bounded because this is a shell in a fixed-size heap, and an
+/// unbounded history is a slow leak that only shows up after a long session.
+const HISTORY_MAX: usize = 128;
+
+impl History {
+    fn new() -> History {
+        History { lines: Vec::new(), back: 0, stash: String::new() }
+    }
+
+    /// Record a submitted line. Consecutive duplicates are not recorded — pressing Enter
+    /// twice on the same command should not cost two presses of Up to walk past.
+    fn push(&mut self, line: &str) {
+        let line = line.trim_end();
+        if line.is_empty() {
+            return;
+        }
+        if self.lines.last().map(|l| l.as_str()) != Some(line) {
+            if self.lines.len() == HISTORY_MAX {
+                self.lines.remove(0);
+            }
+            self.lines.push(String::from(line));
+        }
+        self.back = 0;
+    }
+
+    /// Walk one entry older. `current` is what is on the line now, stashed on the first
+    /// step so Down can restore it.
+    fn older(&mut self, current: &[u8]) -> Option<&str> {
+        if self.back == self.lines.len() {
+            return None; // already at the oldest
+        }
+        if self.back == 0 {
+            self.stash = String::from_utf8_lossy(current).into_owned();
+        }
+        self.back += 1;
+        self.lines.get(self.lines.len() - self.back).map(|s| s.as_str())
+    }
+
+    /// Walk one entry newer, ending at whatever was being typed before recall started.
+    fn newer(&mut self) -> Option<&str> {
+        if self.back == 0 {
+            return None; // already at the prompt
+        }
+        self.back -= 1;
+        if self.back == 0 {
+            Some(&self.stash)
+        } else {
+            self.lines.get(self.lines.len() - self.back).map(|s| s.as_str())
+        }
+    }
+}
+
 
 /// Send one tty request and wait for its reply; returns `(is_error, body_len)` with the
 /// body copied into `out`, or `None` if the exchange failed outright.
@@ -690,15 +782,22 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, u
     }
 }
 
-/// Ask for one edited line.
-fn tty_read_line(ch: u64, out: &mut [u8]) -> TtyLine {
-    match tty_request(ch, librsproto::OP_TTY_READ_LINE, &[], out) {
-        // An error reply to a read is end-of-input: the server answers Ctrl-D that way
-        // precisely so it cannot be confused with an empty line.
-        Some((true, _)) => TtyLine::Eof,
-        Some((false, n)) => TtyLine::Line(n),
-        None => TtyLine::Failed,
+/// Take whatever keystrokes are available. `None` if the terminal is unusable.
+fn tty_read(ch: u64, out: &mut [u8]) -> Option<usize> {
+    match tty_request(ch, librsproto::OP_TTY_READ, &[], out) {
+        Some((false, n)) => Some(n),
+        _ => None,
     }
+}
+
+/// Turn the terminal's own echo on or off.
+///
+/// The shell holds the line buffer, so only the shell knows what the screen should show
+/// after a history recall — server-side echo would fight it.
+fn tty_set_echo(ch: u64, on: bool) {
+    let flags = [if on { librsproto::TTY_MODE_ECHO } else { 0 }];
+    let mut scratch = [0u8; 1];
+    let _ = tty_request(ch, librsproto::OP_TTY_SET_MODE, &flags, &mut scratch);
 }
 
 /// Write to the terminal — through a handle this process holds.

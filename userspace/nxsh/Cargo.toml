@@ -13,6 +13,9 @@ edition = "2024"
 [dependencies]
 libkern = { path = "../libkern" }
 libheap = { path = "../libheap" }
+# The line discipline, *linked* rather than reimplemented — the shell edits its own
+# input (history needs it) but must not become a fourth copy of backspace and kill.
+tty-server = { path = "../tty-server" }
 librsproto = { path = "../librsproto", features = ["io"] }
 libstream = { path = "../libstream", features = ["io"] }
 

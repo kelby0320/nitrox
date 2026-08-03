@@ -158,6 +158,8 @@ right behaviour anyway.
    program resolves its own terminal and a terminal ends when its holder exits. See
    "What ends a terminal" below.)
 3. **History and reverse-search**, once there is one place that owns line state.
+   History ✅ 2026-08-03 — `nxsh` reads raw, links the discipline, and keeps its own ring.
+   Reverse-search still owed; the redraw primitive it needs (`replace_line`) now exists.
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input slice), terminal emulation (needs the compositor).
 

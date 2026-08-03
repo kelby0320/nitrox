@@ -328,6 +328,9 @@ fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
                 let (rid, _) = ttys[i].waiting.take().expect("waiting");
                 reply(ttys[i].ch, OP_TTY_READ_LINE, rid, &bytes);
             }
+            // Canonical mode has no history to recall, so a cursor key is nothing here.
+            // A client that wants them reads raw and runs the discipline itself.
+            Step::Key(_) => {}
             Step::Eof => {
                 // Ctrl-D at an empty prompt. Answered as an *error* rather than an empty
                 // line, because those are different answers and a reader that conflated
