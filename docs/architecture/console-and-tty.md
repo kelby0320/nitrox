@@ -153,11 +153,103 @@ right behaviour anyway.
 2. **Echo control as a request**, retiring the `echo: bool` parameter. Password entry becomes
    "the server is in no-echo mode", which a client cannot forget. ✅ 2026-08-03 —
    `session-mgr`'s login moved onto the tty and its copy of the line editor is deleted.
-   One terminal per session: it serves the login prompt, is bound at `/dev/tty` in the
-   session namespace, and is closed when the session ends.
+   (An earlier draft of this line said "one terminal per session, closed when the session
+   ends". Stage 1c changed that: the session binds the *forwarding endpoint*, so each
+   program resolves its own terminal and a terminal ends when its holder exits. See
+   "What ends a terminal" below.)
 3. **History and reverse-search**, once there is one place that owns line state.
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input slice), terminal emulation (needs the compositor).
+
+## Stage 3 — line editing, history, and where they belong
+
+Scoping pass, 2026-08-03. Stage 3 reads as "add history", and the interesting part is that
+deciding *where* it lives decides the shape of everything after it.
+
+### What Linux does
+
+Worth being precise, because the split is the useful part:
+
+- **The kernel's `N_TTY` line discipline** implements *canonical mode*: erase (backspace),
+  kill (`Ctrl-U`), word-erase (`Ctrl-W`), reprint (`Ctrl-R`), and returning completed lines.
+  That is the whole of it. It has no history, no arrow keys, no completion.
+- **History, reverse-search and completion live in userspace libraries** — GNU readline,
+  libedit — linked into the application. Not in the kernel, and not in a server.
+- **An interactive program turns canonical mode off.** `bash` clears `ICANON` and `ECHO` via
+  `termios` and does *all* editing itself: it wants the keystrokes, not the lines.
+- **Arrow keys are escape sequences** (`Up` = `ESC [ A`), parsed by the application against
+  terminfo. The kernel passes the bytes through untouched.
+
+One detail sharpens it: `Ctrl-R` means *reprint the line* to `N_TTY` and *reverse-search
+history* to readline. The same key means different things at the two layers because the
+layers do not overlap — the kernel's editing is what you get when the application does none.
+
+### What that maps to here
+
+Our `Discipline` is `N_TTY`: canonical mode, in the server, returning lines. The question is
+whether history joins it there or goes in the shell.
+
+**The decisive argument is completion, not history.** §11 wants *schema-aware* tab
+completion — completing on a command's typed parameters. That needs the shell's knowledge of
+commands, schemas and bindings, which the tty server does not have and should not acquire.
+And completion is not a separate feature bolted beside history: they are the same editing
+loop, dispatching on different keys against the same line buffer. Put history in the server
+and completion in the shell, and there are two editors fighting over one line.
+
+So the editing loop belongs where completion must be: **in the shell**. Which is exactly the
+conclusion Linux reached, for the same reason.
+
+### The obvious objection
+
+*Does that not recreate the fourth copy of line editing we just deleted?*
+
+No, and the distinction matters. The three copies we removed were three **implementations**.
+What Linux has is one implementation deployed as a **library**. We already have that: the
+discipline is a crate half with no syscalls in it, precisely so it can be linked rather than
+reimplemented. `nxsh` linking it is not a fourth copy; it is the second *deployment* of the
+first copy.
+
+Being honest about the residual cost: two deployments of one implementation can still
+diverge in *use* — canonical mode in the server for simple readers, raw mode in the shell
+for interactive ones — and a bug fixed in one call path is not automatically exercised in the
+other. The 16 host tests cover the discipline itself either way.
+
+### What it needs
+
+- **A raw mode** (`TTY_MODE_RAW` alongside `TTY_MODE_ECHO`) and a read that returns
+  *available bytes* rather than waiting for a line. The shell asks for raw, gets keystrokes,
+  and echoes through the write path it already has.
+- **Escape-sequence recognition.** `ESC [ A` is three bytes; the discipline currently drops
+  `ESC` as an undefined control byte. This is a small state machine, and it is the first step
+  toward terminal *input* parsing — worth deciding deliberately where that stops rather than
+  letting it grow.
+- **A redraw model.** Reverse-search rewrites the whole visible line repeatedly. Today the
+  discipline only ever appends a character or erases one, so it does not know what is
+  currently displayed. Redrawing needs it to.
+
+### The cheaper alternative, and why not
+
+**History in the server**: it keeps a per-terminal ring, handles `Up`/`Down` itself, and
+returns the recalled line. No raw mode, no client editing, no escape parsing in the shell —
+much less work, and it would deliver history and reverse-search now.
+
+It is rejected because it has to be **removed** when completion arrives: the editing loop
+moves to the shell at that point, and everything built server-side is thrown away. It also
+gives the server shell semantics it should not have, and leaves two shells on one terminal
+sharing a history that is not really theirs.
+
+Cheap-now-rewrite-later is the right trade when the later may never come. Here §11 names
+completion explicitly, so it will.
+
+### Scope
+
+Stage 3 is **raw mode + the editing loop moving into the shell, with history**.
+Reverse-search follows once the redraw model exists; completion is a separate piece needing
+the schema work. Splitting them keeps the first landing small enough to verify.
+
+Not in stage 3, unchanged: job control, key events needing modifiers (`Shift-Enter` cannot
+be expressed as a serial escape sequence — that waits on a real keyboard driver), and
+terminal emulation.
 
 ## Resolved (2026-08-03)
 
