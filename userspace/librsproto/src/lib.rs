@@ -87,6 +87,18 @@ pub const OP_FILE_TOUCH: u16 = 0x0606;
 /// (no terminator). Completes only when the user finishes a line, so a client may have at
 /// most one outstanding.
 pub const OP_TTY_READ_LINE: u16 = 0x0900;
+/// `Tty::Read` — take whatever input is available, **unedited**.
+///
+/// The raw counterpart to [`OP_TTY_READ_LINE`]: it completes as soon as any byte arrives
+/// rather than waiting for a finished line, and the server's line discipline is not
+/// consulted at all. An interactive shell reads this way and does its own editing, which is
+/// exactly what `bash` does when it clears `ICANON` — the difference being that here the
+/// choice is per read rather than a mode the terminal is left in.
+///
+/// **There is deliberately no `TTY_MODE_RAW`.** Two read ops say the same thing with less
+/// state: a client asks for what it wants, when it wants it, and cannot leave a terminal in
+/// a mode some later reader did not expect.
+pub const OP_TTY_READ: u16 = 0x0904;
 /// `Tty::Write` — write the body's bytes to the terminal. This is what makes terminal
 /// output a **capability**: a process writes because it holds a tty channel, not because
 /// it can reach an ambient debug syscall.
