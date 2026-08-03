@@ -157,7 +157,7 @@ A binding's `target` is one of:
 
 | Target | Meaning | Lands |
 |---|---|---|
-| **`DirectHandle`** | A bound kernel-object `ObjectRef` (a `MemoryObject`, an `IpcChannel` endpoint, …). Lookup returns the object directly. The leaf case. | **slice 1** |
+| **`DirectHandle`** | A bound kernel-object `ObjectRef` (a `MemoryObject`, a `DeviceNode`, …). Lookup returns the object directly. The leaf case. | **slice 1** |
 | **`KernelServer`** | A **Kernel Server**: a dispatch id/function the kernel calls during lookup. The server *computes* a handle synchronously (no IPC). Backs `/proc/self`, `/dev/entropy`, … | **slice 3** |
 | **`UserspaceServer`** | An IPC endpoint to a **Userspace Server**. Lookup forwards the suffix over IPC; the server answers with a handle. | slice 7 |
 | **`SubNamespace`** | Another `Namespace`, overlaid at the prefix — composition. Lookup recurses into it with the suffix. | later |
@@ -168,9 +168,29 @@ Slice 3 introduces the `BindingTarget` **enum** with the `KernelServer` variant
 (`DirectHandle` + `KernelServer`); `UserspaceServer` (IPC) lands in slice 7,
 `SubNamespace`/`Rewrite` later.
 
+### The kind is chosen by the kernel, from the resource's type
+
+You do not select a target. `sys_ns_bind` takes a resource handle and decides:
+
+> **An `IpcChannel` binds as a `UserspaceServer`. Every other object type binds as a
+> `DirectHandle`.**
+
+That is the whole rule, and it is worth stating because the table above reads as a menu.
+There is no way to bind a channel as a plain resource, and none is wanted — but the
+consequence catches people:
+
+**A channel has two roles, and they are indistinguishable by type.** A *forwarding
+endpoint* is the channel the kernel sends `Namespace::Resolve` down; a *client channel*,
+minted by a server in reply to such a resolve, speaks that server's own protocol. Binding
+the second one is silently wrong: the kernel adopts it as a server, so the path exists and
+every lookup through it comes back `Unsupported` from a peer that has never heard of
+`Namespace::Resolve`. The fix is always to bind the forwarding endpoint — see
+[console-and-tty.md](console-and-tty.md), where getting this backwards produced a
+`/dev/tty` that could not be opened.
+
 A **direct handle** is a supervisor binding a concrete object — a `MemoryObject` at
-`/store`, a channel endpoint, an `EntropyObject` — that lookup returns
-(rights-attenuated). A **`KernelServer`** is the answer for resources that must be
+`/store`, the console `DeviceNode` at `/dev/console`, an `EntropyObject` — that lookup
+returns (rights-attenuated). A **`KernelServer`** is the answer for resources that must be
 *computed per lookup* (e.g. `/proc/self/process`, which depends on *who* is asking)
 without spinning up a userspace process — see "In-kernel resource servers" below.
 
