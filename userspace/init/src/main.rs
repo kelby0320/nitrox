@@ -679,7 +679,7 @@ fn bind_logging_service(root_ns: u64) -> bool {
     // image from the initramfs, stamps it, spawns, and closes the image handle.
     let ls_h = unsafe {
         SPAWN_LOGGING.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/initramfs/sbin/logging-service", &raw mut SPAWN_LOGGING)
+        spawn_program(root_ns, b"/bin/logging-service", &raw mut SPAWN_LOGGING)
     };
     if ls_h < 0 {
         kprint(b"init: logging-service spawn FAIL\n");
@@ -1197,7 +1197,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
             SPAWN_SERVICE_MGR.handles[0] = 0;
             SPAWN_SERVICE_MGR.handle_count = 0;
             SPAWN_SERVICE_MGR.move_mask = 0;
-            spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
+            spawn_program(root_ns, b"/bin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
         };
     }
 
@@ -1217,7 +1217,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // then spawn. `move_mask`/`handle_count`/`rights` are set in the static.
     let h = unsafe {
         SPAWN_SERVICE_MGR.handles[0] = child_end;
-        spawn_program(root_ns, b"/initramfs/sbin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
+        spawn_program(root_ns, b"/bin/service-mgr", &raw mut SPAWN_SERVICE_MGR)
     };
     if h < 0 {
         kprint(b"init: service-mgr spawn FAIL\n");

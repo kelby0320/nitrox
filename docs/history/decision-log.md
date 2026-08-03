@@ -9992,3 +9992,48 @@ returned on CR/LF without echoing it, so the cursor never left the line the user
 An echo that omits the Enter is not an echo of what was typed. **That transcript had
 appeared several times in this session's own output and was read straight past**, which is
 the argument for a machine doing the reading.
+## 2026-08-03 — The boot image carries only what boot needs
+
+`TODO(initramfs-minimisation)`, closed. The initramfs held every userspace program —
+1,506,596 bytes of resident memory nothing would use again, since nothing releases it
+(`sys_release_initramfs` is referenced in the docs but does not exist). It now holds
+206,360: an 86% cut.
+
+**Four programs stay, and the rule as originally written was one short.** `init` (the
+kernel boot-loads it), `fs-server-ext4` (it *is* the mount), `eshell` (the recovery path
+*for a failed mount*, so it must not live on the filesystem it exists to recover), and
+`profile-server` — the one the rule missed, because `/bin` does not exist until it runs, so
+it cannot be spawned from `/bin`. The alternative was teaching `init` to read the profile
+manifest and spawn it by store path; that puts TOML parsing in the one process that must not
+fail, to save one small binary. Not a good trade.
+
+Everything else — service-mgr, session-mgr, auth-service, logging-service, heartbeat —
+moved into a `system` store package and is spawned through `/bin`. The ordering that makes
+this work already held: `/bin` is bound before the logging service and before service-mgr.
+`heartbeat` had been resolving through `/bin` since its `service.toml` was written, so the
+path was proven rather than theoretical.
+
+**`fs-server-ext4` is in both the boot image and the store**, at the maintainer's
+suggestion, and the two copies are not redundant. The store copy makes it versioned and
+content-addressed like everything else, and is what a *non-root* fs-server would be spawned
+from. The initramfs copy is the only one that can mount the root — and the only one that
+could ever remount it, because `/store` is unreadable without the server being restarted.
+That asymmetry is now recorded rather than implied. Restart itself is unbuilt and newly
+filed as `TODO(fs-server-restart)`: nothing supervises the fs-server, and a remount would
+invalidate every handle derived from the old one with nothing in the RS protocol saying how
+clients recover.
+
+**The recovery path was tested rather than assumed.** This is the change that could plausibly
+break it, so: a forced mount failure (a bogus partlabel) still reaches `eshell>`.
+
+The test harness moved with everything else — it spawns coreutils from `/bin` now, which
+is what a real consumer does. `test-stage` stays in the boot image, being test scaffolding
+rather than a shipped program.
+
+**A consequence to decide on, not a bug.** A session's `/bin` is the same projection as the
+root namespace's, so `list /bin` in a login session now shows 17 entries — the 11 user
+programs and the 6 system services. Nothing is exposed that a user could misuse (they spawn
+with empty syscaps and no handoff channel), but a user's `/bin` listing service binaries is
+noise at best. The clean answer is the per-user profile overlay that
+`profiles-and-namespace-projection.md` already designs and defers; this is the first
+concrete reason to build it.

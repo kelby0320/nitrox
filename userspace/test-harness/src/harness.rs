@@ -1433,7 +1433,7 @@ const LIST_FIXTURE_PATH_STR: &str = "/system/nx-list";
 
 /// Spawn args for a `list` stage: one moved handle (its bootstrap/setup endpoint).
 static mut SPAWN_LIST: SpawnArgs = SpawnArgs {
-    image: 0,     // resolved at spawn from /initramfs/sbin/list
+    image: 0,     // resolved at spawn from /bin/list
     handle_count: 1,
     move_mask: 1, // move handle 0 (the setup channel) to the stage
     arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
@@ -1631,7 +1631,7 @@ fn list_pipeline_demo(root_ns: u64, notif: u64) {
 /// the read end immediately to exercise early-consumer close. Requires the stage to exit
 /// `0` either way. Returns the received bytes (empty when not consuming).
 fn run_list(root_ns: u64, notif: u64, argv: &[&str], consume: bool) -> alloc::vec::Vec<u8> {
-    run_coreutil_capture(root_ns, notif, b"/initramfs/sbin/list", argv, consume)
+    run_coreutil_capture(root_ns, notif, b"/bin/list", argv, consume)
 }
 
 /// Spawn a coreutil as a Tier-1 stage and **return its stdout stream**, so a demo can
@@ -1825,7 +1825,7 @@ fn dead_stage_closes_its_pipe_demo(root_ns: u64, notif: u64) {
     use libstream::wire::WireError;
 
     kprint(b"test-harness: dead-stage pipe-close demo\n");
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/list", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, b"/bin/list", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
         return_fail(b"test-harness: dead-stage image FAIL\n");
     }
@@ -2017,8 +2017,8 @@ const COPY_CONTENT_LONG: &[u8] =
 /// unbind a mount point.
 fn mkdir_remove_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: mkdir/remove demo (Milestone 2 Part A)\n");
-    const MK: &[u8] = b"/initramfs/sbin/mkdir";
-    const RM: &[u8] = b"/initramfs/sbin/remove";
+    const MK: &[u8] = b"/bin/mkdir";
+    const RM: &[u8] = b"/bin/remove";
 
     // --- 1. mkdir creates, and refuses an existing path ----------------------
     if run_coreutil(root_ns, notif, MK, &["mkdir", "/system/nx-a"]) != 0 {
@@ -2127,8 +2127,8 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
     use libstream::Value;
 
     kprint(b"test-harness: rename/move demo (Milestone 2 Part B)\n");
-    const RN: &[u8] = b"/initramfs/sbin/rename";
-    const MV: &[u8] = b"/initramfs/sbin/move";
+    const RN: &[u8] = b"/bin/rename";
+    const MV: &[u8] = b"/bin/move";
 
     // --- fixture -------------------------------------------------------------
     let mut buf = [0u8; 4096];
@@ -2341,7 +2341,7 @@ fn rename_move_demo(root_ns: u64, notif: u64) {
 /// at all. This mirrors `mtime_overwrite_demo`.
 fn touch_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: touch demo (Milestone 2 Part C)\n");
-    const TOUCH: &[u8] = b"/initramfs/sbin/touch";
+    const TOUCH: &[u8] = b"/bin/touch";
 
     let mut buf = [0u8; 4096];
     let mut sys = match Dir::open(root_ns, b"/system", &mut buf) {
@@ -2417,8 +2417,8 @@ fn date_sleep_demo(root_ns: u64, notif: u64) {
     use libstream::Value;
 
     kprint(b"test-harness: date/sleep demo (Milestone 2 Part D)\n");
-    const DATE: &[u8] = b"/initramfs/sbin/date";
-    const SLEEP: &[u8] = b"/initramfs/sbin/sleep";
+    const DATE: &[u8] = b"/bin/date";
+    const SLEEP: &[u8] = b"/bin/sleep";
 
     // --- 1. date publishes fields that agree with our own clock reading ------
     let ours = realtime_secs();
@@ -2517,7 +2517,7 @@ fn whoami_demo(root_ns: u64, notif: u64) {
     use libstream::Value;
 
     kprint(b"test-harness: whoami demo (Milestone 2 Part E)\n");
-    const WHOAMI: &[u8] = b"/initramfs/sbin/whoami";
+    const WHOAMI: &[u8] = b"/bin/whoami";
     const NAME: &[u8] = b"harness-user";
 
     // --- a namespace that looks like a session -------------------------------
@@ -2708,7 +2708,7 @@ fn error_granularity_demo(root_ns: u64) {
 /// process, reads a TSM1 stream back and turns it into a value, on the real kernel.
 fn nxsh_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: nxsh demo (Milestone 3 Parts C+D)\n");
-    const NXSH: &[u8] = b"/initramfs/sbin/nxsh";
+    const NXSH: &[u8] = b"/bin/nxsh";
 
     // 1. The language, evaluated in ring 3. The script computes with mixed Int/Float and
     //    compares its own answer, so a wrong result is a non-zero exit rather than a
@@ -2920,7 +2920,7 @@ fn publish_session_user(ns: u64, name: &[u8]) {
 }
 
 fn run_copy(root_ns: u64, notif: u64, argv: &[&str]) -> i32 {
-    run_coreutil(root_ns, notif, b"/initramfs/sbin/copy", argv)
+    run_coreutil(root_ns, notif, b"/bin/copy", argv)
 }
 
 /// Spawn a coreutil as a **Tier-1 stage** — setup message, `argv`, a `stdout` pipe — and
@@ -3744,7 +3744,7 @@ fn rename_demo(root_ns: u64) {
     // …and with the *source* off the filesystem, which takes a different path through the
     // kernel: the source resolves to a kernel server, so there is no forwarding arm to
     // catch the verdict.
-    let st = rename_wait(root_ns, b"/initramfs/sbin/copy", b"/system/nx-ren/copy", 0);
+    let st = rename_wait(root_ns, b"/bin/copy", b"/system/nx-ren/copy", 0);
     if st != KERR_UNSUPPORTED {
         return_fail(b"test-harness: rename off a non-filesystem source was not refused\n");
     }
