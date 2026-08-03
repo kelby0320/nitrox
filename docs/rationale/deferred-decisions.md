@@ -438,6 +438,29 @@ new ways.
 Trigger: a second filesystem (where the non-root case is real and the blast radius is
 small), or the first time an fs-server crash is observed in practice.
 
+**Shell output bypasses the namespace — `TODO(tty-server)`.**
+`/dev/console` is a char `DeviceNode` a process must hold a handle to, so console *input* is a
+capability. Output is not: `CharBackend` has only `submit_read`, and every byte any program
+prints goes through `SYS_DEBUG_KPRINT`, an ambient debug syscall taking no handle. A process
+with an empty namespace can still write to the console, and nothing can redirect, pipe,
+capture or log a shell's output because there is no object to redirect.
+
+Three further consequences of the same gap: line editing is implemented separately in
+`eshell`, `session-mgr` and `nxsh` (and has already diverged — the `alicepassword:` prompt bug
+came from two of them disagreeing about echoing CR/LF); password entry is echo-suppression by a
+parameter each caller must remember; and the driver's single-reader assumption is now
+maintained only by session-mgr and nxsh happening not to read at the same time.
+
+Designed 2026-08-03 in [console-and-tty.md](../architecture/console-and-tty.md): a userspace
+resource server owning the line discipline and the raw device, handing each session an IPC
+channel bound at `/dev/tty`, so a session cannot reach `/dev/console` at all. Deliberately
+excludes job control (needs process groups, which do not exist, and cannot use signals), key
+events (need a real keyboard driver), and terminal emulation (belongs to the compositor).
+
+Trigger: it gates the rich REPL (§11) and is the trigger for
+`TODO(session-metadata-server)`; and the ambient output path is a hole in the capability story
+independent of either.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block
