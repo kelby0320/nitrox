@@ -577,7 +577,9 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
     // is *complete input* stays here rather than in the tty: the discipline hands over
     // lines, and only the shell knows whether a line finishes a statement.
     let mut pending = String::new();
-    let mut history: History = History::new();
+    let mut history = nxsh::history::History::new();
+    // Reverse-search state, `None` when not searching.
+    let mut search: Option<Search> = None;
     tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
 
     let mut chunk = [0u8; 64];
@@ -593,6 +595,67 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
             }
         };
         for &b in &chunk[..n] {
+            // While searching, the shell owns the keys: the discipline's line buffer is
+            // empty and the display is the search prompt, not a line being edited.
+            if let Some(st) = search.as_mut() {
+                match search_key(st, b, &history) {
+                    SearchStep::Redraw => {
+                        let out = st.redraw();
+                        tty_write(tty, &out);
+                    }
+                    SearchStep::Cancel => {
+                        let mut out = st.erase();
+                        out.extend_from_slice(&disc.replace_line(st.original.as_bytes()));
+                        tty_write(tty, &out);
+                        search = None;
+                    }
+                    SearchStep::Accept => {
+                        let mut out = st.erase();
+                        let chosen = st.matched.clone();
+                        out.extend_from_slice(&disc.replace_line(chosen.as_bytes()));
+                        out.extend_from_slice(b"\r\n");
+                        tty_write(tty, &out);
+                        search = None;
+                        // Fall through to submission by feeding the terminator the user
+                        // pressed, so an accepted search takes exactly the path a typed
+                        // line takes — no second copy of "what happens on Enter".
+                        if let tty_server::Step::Line { bytes, .. } = disc.feed(b'\n') {
+                            let src = String::from_utf8_lossy(&bytes).into_owned();
+                            pending.push_str(&src);
+                            let line = core::mem::take(&mut pending);
+                            history.push(&line);
+                            if line.trim() == "exit" {
+                                return EXIT_OK;
+                            }
+                            match interp.run_line(&line) {
+                                Ok(Some(text)) => tty_write_crlf(tty, &text),
+                                Ok(None) => {}
+                                Err(e) => {
+                                    let mut msg = String::from("nxsh: ");
+                                    msg.push_str(&e.message);
+                                    msg.push('\n');
+                                    tty_write_crlf(tty, &msg);
+                                }
+                            }
+                        }
+                        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+                    }
+                    SearchStep::None => {}
+                }
+                continue;
+            }
+            // Ctrl-R enters reverse-search. The line being typed is erased from the
+            // display and stashed, so cancelling restores exactly what was there.
+            if b == 0x12 {
+                let original = String::from_utf8_lossy(disc.line()).into_owned();
+                let cleared = disc.replace_line(b"");
+                let mut st = Search::new(original);
+                let mut out = cleared;
+                out.extend_from_slice(&st.redraw());
+                tty_write(tty, &out);
+                search = Some(st);
+                continue;
+            }
             match disc.feed(b) {
                 tty_server::Step::None => {}
                 tty_server::Step::Echo(e) => tty_write(tty, &e),
@@ -658,67 +721,93 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
     }
 }
 
-/// Command history: a bounded ring, newest last, with a cursor for recall.
-struct History {
-    lines: Vec<String>,
-    /// How far back recall has walked. `0` means "at the prompt, not in history".
-    back: usize,
-    /// What was being typed when recall started, so Down can return to it.
-    stash: String,
+
+
+/// Reverse-search state: the query, the current match, and what is on screen.
+///
+/// **The shell tracks its own display length here rather than reusing the discipline's.**
+/// `replace_line` erases exactly as many characters as the *line buffer* holds, and during
+/// a search what is displayed is `(reverse-i-search)'q': match` — longer than the line, and
+/// not the line at all. Erasing the wrong count leaves debris on a dumb terminal.
+struct Search {
+    query: String,
+    /// The entry currently matched, shown after the search prompt.
+    matched: String,
+    /// Index into the history of the current match, so `Ctrl-R` can continue past it.
+    at: Option<usize>,
+    /// What was being typed when the search started, restored on cancel.
+    original: String,
+    /// How many characters are currently displayed, so they can be erased exactly.
+    shown: usize,
 }
 
-/// How many lines are kept. Bounded because this is a shell in a fixed-size heap, and an
-/// unbounded history is a slow leak that only shows up after a long session.
-const HISTORY_MAX: usize = 128;
+/// What the caller should do after a key during a search.
+enum SearchStep {
+    None,
+    Redraw,
+    /// Leave the search, restoring the original line.
+    Cancel,
+    /// Take the match and submit it.
+    Accept,
+}
 
-impl History {
-    fn new() -> History {
-        History { lines: Vec::new(), back: 0, stash: String::new() }
+impl Search {
+    fn new(original: String) -> Search {
+        Search { query: String::new(), matched: String::new(), at: None, original, shown: 0 }
     }
 
-    /// Record a submitted line. Consecutive duplicates are not recorded — pressing Enter
-    /// twice on the same command should not cost two presses of Up to walk past.
-    fn push(&mut self, line: &str) {
-        let line = line.trim_end();
-        if line.is_empty() {
-            return;
+    /// Erase everything this search has drawn.
+    fn erase(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.shown * 3);
+        for _ in 0..self.shown {
+            out.extend_from_slice(b"\x08 \x08");
         }
-        if self.lines.last().map(|l| l.as_str()) != Some(line) {
-            if self.lines.len() == HISTORY_MAX {
-                self.lines.remove(0);
+        self.shown = 0;
+        out
+    }
+
+    /// Erase and redraw the search line, returning the bytes to write.
+    fn redraw(&mut self) -> Vec<u8> {
+        let mut out = self.erase();
+        let text = alloc::format!("(reverse-i-search)`{}': {}", self.query, self.matched);
+        out.extend_from_slice(text.as_bytes());
+        self.shown = text.chars().count();
+        out
+    }
+}
+
+/// Handle one key while searching.
+fn search_key(st: &mut Search, b: u8, history: &nxsh::history::History) -> SearchStep {
+    match b {
+        // Ctrl-R again: the next *older* match, so repeated presses walk through all of
+        // them rather than sticking on the newest.
+        0x12 => {
+            if let Some(i) = history.search_back(&st.query, st.at) {
+                st.at = Some(i);
+                st.matched = String::from(history.get(i).unwrap_or(""));
             }
-            self.lines.push(String::from(line));
+            SearchStep::Redraw
         }
-        self.back = 0;
-    }
-
-    /// Walk one entry older. `current` is what is on the line now, stashed on the first
-    /// step so Down can restore it.
-    fn older(&mut self, current: &[u8]) -> Option<&str> {
-        if self.back == self.lines.len() {
-            return None; // already at the oldest
+        b'\r' | b'\n' => SearchStep::Accept,
+        // Ctrl-G and ESC both abandon the search — the two keys people reach for.
+        0x07 | 0x1b => SearchStep::Cancel,
+        0x08 | 0x7f => {
+            st.query.pop();
+            // Re-search from the newest: shortening the query can match something more
+            // recent than the current position, and staying put would hide it.
+            st.at = history.search_back(&st.query, None);
+            st.matched = st.at.and_then(|i| history.get(i)).map(String::from).unwrap_or_default();
+            SearchStep::Redraw
         }
-        if self.back == 0 {
-            self.stash = String::from_utf8_lossy(current).into_owned();
+        0x20..=0x7e => {
+            st.query.push(b as char);
+            st.at = history.search_back(&st.query, None);
+            st.matched = st.at.and_then(|i| history.get(i)).map(String::from).unwrap_or_default();
+            SearchStep::Redraw
         }
-        self.back += 1;
-        self.lines.get(self.lines.len() - self.back).map(|s| s.as_str())
-    }
-
-    /// Walk one entry newer, ending at whatever was being typed before recall started.
-    fn newer(&mut self) -> Option<&str> {
-        if self.back == 0 {
-            return None; // already at the prompt
-        }
-        self.back -= 1;
-        if self.back == 0 {
-            Some(&self.stash)
-        } else {
-            self.lines.get(self.lines.len() - self.back).map(|s| s.as_str())
-        }
+        _ => SearchStep::None,
     }
 }
-
 
 /// Send one tty request and wait for its reply; returns `(is_error, body_len)` with the
 /// body copied into `out`, or `None` if the exchange failed outright.

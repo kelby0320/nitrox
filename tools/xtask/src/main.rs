@@ -653,7 +653,23 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 10. `exit` returns to the login prompt, and logging in again works. A login that
+    // 10. **Reverse-search.** `\x12` is Ctrl-R; the query narrows to `whoami`, and Enter
+    //     runs it. Asserting on the command's *output* again, not on the search prompt —
+    //     the redraw is erase-and-rewrite, which only a real terminal renders.
+    s.send("\x12whoa")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 11. **Cancelling a search restores what was being typed.** Type `date`, search for
+    //     something else, abandon it with Ctrl-G, press Enter — `date` must run. This is
+    //     the property that makes Ctrl-R safe to press by accident.
+    s.send("date\x12who\x07")?;
+    s.expect("unix")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 12. `exit` returns to the login prompt, and logging in again works. A login that
     //     cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;
