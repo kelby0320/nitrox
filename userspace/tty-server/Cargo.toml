@@ -1,0 +1,21 @@
+[package]
+name = "tty-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+
+# A library + binary split (mirroring profile-server): the library holds the
+# host-testable line discipline — the part with all the behaviour and none of the
+# syscalls. `cargo xtask test` runs `cargo test -p tty-server --lib`; the
+# `#![no_main]` bin can't build on host.
+[lib]
+name = "tty_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "tty-server"
+path = "src/main.rs"

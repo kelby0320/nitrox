@@ -3326,6 +3326,135 @@ fn stats_field(root_ns: u64, key: &[u8]) -> u64 {
     out
 }
 
+/// **`/dev/tty` is a capability, and writing to it is a request.**
+///
+/// Console *input* was already capability-gated — `/dev/console` is a char `DeviceNode` you
+/// must hold a handle to. Output was not: every program printed through
+/// `SYS_DEBUG_KPRINT`, an ambient syscall taking no handle, so a process with an empty
+/// namespace could still write to the console and nothing could redirect or capture a
+/// shell's output. The tty server closes that by owning the device and handing out
+/// channels.
+///
+/// This exercises the whole shape end to end: resolve, write, change a mode, close. The
+/// **negative control is that `/dev/tty/anything` must not resolve** — the server owns one
+/// name, and a server that answered any suffix would make the positive checks meaningless.
+fn tty_demo(root_ns: u64, notif: u64) {
+    let _ = notif;
+    kprint(b"test-harness: tty demo (terminal output is a capability)\n");
+
+    // 1. Resolving `/dev/tty` yields a fresh channel — not an object, and not the raw
+    //    device.
+    let (st, tty) = ns_lookup_wait(root_ns, b"/dev/tty", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if st != 0 || tty == 0 {
+        return_fail(b"test-harness: /dev/tty did not yield a channel\n");
+    }
+
+    // 2. A write is a request that is answered. The bytes land on the console through the
+    //    server's backend, which is what makes this the *capability* path rather than the
+    //    ambient one.
+    if !tty_request(tty, librsproto::OP_TTY_WRITE, 1, b"[tty demo wrote this]\r\n") {
+        return_fail(b"test-harness: tty write was not acknowledged\n");
+    }
+
+    // 3. Echo is the server's state, not a parameter each caller must remember — which is
+    //    what makes a password readable without every client getting it right.
+    if !tty_request(tty, librsproto::OP_TTY_SET_MODE, 2, &[0]) {
+        return_fail(b"test-harness: tty set-mode was not acknowledged\n");
+    }
+    if !tty_request(tty, librsproto::OP_TTY_SET_MODE, 3, &[librsproto::TTY_MODE_ECHO]) {
+        return_fail(b"test-harness: tty set-mode (echo on) was not acknowledged\n");
+    }
+
+    // 4. Close: the supervisor declaring the terminal finished. This is the revocation
+    //    point — handles are refcounted and cannot be taken back, so the server declining
+    //    to serve is what makes teardown a guarantee.
+    if !tty_request(tty, librsproto::OP_TTY_CLOSE, 4, &[]) {
+        return_fail(b"test-harness: tty close was not acknowledged\n");
+    }
+    // SAFETY: closing our own channel handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, tty) };
+
+    // 5. The control. One name, not any name.
+    let (st2, h2) = ns_lookup_wait(root_ns, b"/dev/tty/nope", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT);
+    if st2 == 0 && h2 != 0 {
+        // SAFETY: closing the handle we were wrongly given.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h2) };
+        return_fail(b"test-harness: /dev/tty resolved a name it does not own\n");
+    }
+
+    kprint(b"test-harness: tty ok (write + mode + close acknowledged, unknown name refused)\n");
+}
+
+/// Send one tty request and wait for its reply. `true` if the server acknowledged without
+/// an error flag.
+fn tty_request(ch: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
+    // SAFETY: TTY_MSG is a valid buffer; the rsproto message goes at offset 24.
+    let sent = unsafe {
+        let Some(rs_len) = librsproto::encode(&mut TTY_MSG[24..], op, request_id, 0, body, 0)
+        else {
+            return false;
+        };
+        TTY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        TTY_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ch,
+            (&raw const TTY_MSG) as u64,
+            (&raw const TTY_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    };
+    if !sent {
+        return false;
+    }
+    // Block until the reply lands.
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = ch;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    if waited < 1 {
+        return false;
+    }
+    // SAFETY: valid recv out-params.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut TTY_MSG) as u64,
+            (&raw mut TTY_HANDLES) as u64,
+            (&raw mut TTY_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        return false;
+    }
+    // SAFETY: bounded read-only slice over the reply.
+    unsafe {
+        let payload_len =
+            u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
+        let rep = core::slice::from_raw_parts(
+            ((&raw const TTY_MSG) as *const u8).add(24),
+            payload_len.min(4096 - 24),
+        );
+        match librsproto::decode(rep) {
+            Ok(m) => m.op == op && !m.is_error(),
+            Err(_) => false,
+        }
+    }
+}
+
+static mut TTY_MSG: [u8; 4096] = [0; 4096];
+static mut TTY_HANDLES: [u64; 8] = [0; 8];
+static mut TTY_COUNT: usize = 0;
+
 /// Is `needle` a subsequence of contiguous bytes in `hay`? The listing arrives as a TSM1
 /// stream; a name appears in it verbatim, which is enough to assert on without decoding.
 fn contains(hay: &[u8], needle: &[u8]) -> bool {
@@ -4627,6 +4756,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 0a5g. `/bin` is a projected view, not a directory — prove it is listable anyway,
     //       and that the listing matches what resolve would hand back.
     bin_listing_demo(root_ns, notif);
+
+    // 0a5h. Terminal output as a capability: resolve /dev/tty, write, set a mode, close.
+    tty_demo(root_ns, notif);
 
     // 0a6. A stage that dies without writing must close its pipe, so the peer sees
     //      `PeerClosed` instead of hanging (exit-time handle reclamation).

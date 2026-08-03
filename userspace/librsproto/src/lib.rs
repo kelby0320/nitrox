@@ -83,6 +83,30 @@ pub const OP_FILE_RENAME: u16 = 0x0605;
 /// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
 /// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
+/// `Tty::ReadLine` — ask the tty for one edited line. The reply body is the line's bytes
+/// (no terminator). Completes only when the user finishes a line, so a client may have at
+/// most one outstanding.
+pub const OP_TTY_READ_LINE: u16 = 0x0900;
+/// `Tty::Write` — write the body's bytes to the terminal. This is what makes terminal
+/// output a **capability**: a process writes because it holds a tty channel, not because
+/// it can reach an ambient debug syscall.
+pub const OP_TTY_WRITE: u16 = 0x0901;
+/// `Tty::SetMode` — one body byte of flags; bit 0 is echo.
+///
+/// Echo belongs to the server, not the caller. It was a `bool` each client passed to its
+/// own `read_line`, so reading a password safely depended on every caller remembering to
+/// pass `false`.
+pub const OP_TTY_SET_MODE: u16 = 0x0902;
+/// `Tty::Close` — the supervisor declaring this tty finished.
+///
+/// **Revocation, not release.** Handles are refcounted and this kernel has none, so
+/// closing a handle cannot take a capability back from a process that outlived its
+/// session. The server declining to serve the channel is what makes teardown a guarantee.
+pub const OP_TTY_CLOSE: u16 = 0x0903;
+
+/// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
+pub const TTY_MODE_ECHO: u8 = 1 << 0;
+
 pub const OP_AUTHENTICATE: u16 = 0x0800;
 
 /// A decoding/validation failure.

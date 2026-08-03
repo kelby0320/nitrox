@@ -227,6 +227,7 @@ const SYSTEM_SERVICES: &[&str] = &[
     "logging-service",
     "heartbeat",
     "fs-server-ext4",
+    "tty-server",
 ];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
@@ -252,6 +253,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // quietly stop being part of the OS while it is being written.
     build_userspace_bin("nxsh", None)?;
     build_userspace_bin("profile-server", None)?;
+    build_userspace_bin("tty-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
     // session-mgr fires the self-test verdict, so it takes the build-mode feature
@@ -986,6 +988,19 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("nxsh")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
+    // `tty-server`'s line discipline — the part with all the behaviour and none of the
+    // syscalls. Line editing existed three times before this server and the copies
+    // disagreed (the `alicepassword:` prompt bug), so the one implementation is tested
+    // where testing is cheap.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("tty-server")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

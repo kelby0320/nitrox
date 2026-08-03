@@ -107,6 +107,20 @@ static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
 /// control channel — in `handles[0]` (delivered in `rdx`). It resolves nothing (clients
 /// bring their own log endpoint), so its inherited LOOKUP-only namespace is unused; it
 /// answers forwarded `/log/...` resolves by minting per-principal log channels.
+/// Spawn args for the `tty-server`: one moved handle — the control channel — in
+/// `handles[0]`. It resolves `/dev/console` through its inherited LOOKUP-only root
+/// namespace and holds it exclusively thereafter.
+static mut SPAWN_TTY: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/tty-server
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
+
 static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/logging-service
     handle_count: 1,
@@ -712,6 +726,68 @@ fn bind_logging_service(root_ns: u64) -> bool {
     }
 
     kprint(b"init: logging service bound at /log\n");
+    // init keeps `ls_h` (the long-lived server's process handle).
+    let _ = ls_h;
+    true
+}
+
+/// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
+///
+/// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
+/// reach the raw device at all. A client resolving `/dev/tty` receives a fresh per-caller
+/// channel, the same shape the logging service uses. Non-critical: a boot without a
+/// terminal server still reaches `eshell`, which owns the raw device precisely because it
+/// runs when this does not. See `docs/architecture/console-and-tty.md`.
+fn bind_tty_server(root_ns: u64) -> bool {
+    // 1. Create the control channel (init keeps end 0, the server gets end 1).
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; mounts + profile bind
+    // already completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 2. Spawn the tty server, moving the control endpoint into it (in rdx).
+    // SAFETY: SPAWN_TTY is a valid writable arg block; spawn_program resolves the ELF
+    // image from the initramfs, stamps it, spawns, and closes the image handle.
+    let ls_h = unsafe {
+        SPAWN_TTY.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/tty-server", &raw mut SPAWN_TTY)
+    };
+    if ls_h < 0 {
+        kprint(b"init: tty-server spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: tty-server Ready timeout/invalid\n");
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // 4. Bind the forwarding endpoint at `/log`.
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/tty".as_ptr() as u64, 8, endpoint) };
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: tty-server bind FAIL at /dev/tty\n");
+        return false;
+    }
+
+    kprint(b"init: tty server bound at /dev/tty\n");
     // init keeps `ls_h` (the long-lived server's process handle).
     let _ = ls_h;
     true
@@ -1546,6 +1622,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // so services can resolve `/log/<tier>/<principal>` and log from launch. Critical-path.
     if !bind_logging_service(root_ns) {
         emergency(notif, root_ns);
+    }
+
+    // The terminal server, after `/bin` (it is spawned from there) and deliberately **not**
+    // critical-path: a boot without it still reaches `eshell`, which holds the raw console
+    // for exactly the case where this server is absent.
+    if !bind_tty_server(root_ns) {
+        kprint(b"init: no terminal server; sessions will have no /dev/tty\n");
     }
 
     supervise(notif, root_ns);

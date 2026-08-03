@@ -1,6 +1,7 @@
 # Console and TTY
 
-**Status: design, not built.** Written 2026-08-03 as a scoping pass, because "the console/tty
+**Status: stage 1a built (2026-08-03) — the server exists and `/dev/tty` is a capability.
+Its clients have not moved yet.** Written 2026-08-03 as a scoping pass, because "the console/tty
 server" is referenced as a gate in four documents without existing anywhere. This says what it
 owns, what it does not, and what has to be decided before it can be built.
 
@@ -109,7 +110,18 @@ builds a session and binds the returned endpoint at `/dev/tty`.
 
 ## Staging
 
-1. **The server, with the line discipline and a writable path.** `session-mgr` and `nxsh` move
+**A migration constraint discovered while building stage 1a, and it shapes the rest.** The
+console driver is single-reader, and until every client has moved onto this server,
+`session-mgr`'s login and `nxsh`'s REPL still read the device directly. A
+permanently-outstanding read in the server *steals their input* — the interactive login test
+timed out waiting for a password prompt whose keystrokes the server had swallowed.
+
+So the server submits a console read **only when a terminal is actually waiting for a
+line**. A terminal with no reader competes with nobody, which is what lets clients migrate
+one at a time instead of all at once. That is not a temporary hack: reading on demand is the
+right behaviour anyway.
+
+1. **The server, with the line discipline and a writable path.** ✅ 2026-08-03 `session-mgr` and `nxsh` move
    onto it; the three copies of line editing collapse into one. `eshell` stays on the raw device
    and `kprint`.
 2. **Echo control as a request**, retiring the `echo: bool` parameter. Password entry becomes
