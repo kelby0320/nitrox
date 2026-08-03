@@ -31,13 +31,13 @@ extern crate alloc;
 use alloc::string::String;
 use alloc::vec::Vec;
 
-use libkern::abi::{HandleInfo, SPAWN_MAX_HANDLES, SpawnArgs};
+use libkern::abi::{HandleInfo, SENDMODE_NOBLOCK, SPAWN_MAX_HANDLES, SpawnArgs};
 use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ};
 use libkern::syscall::{
-    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_IO_SUBMIT,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP,
-    SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE, SYS_NS_LOOKUP, SYS_PROCESS_SPAWN,
-    SYS_WAIT, syscall1, syscall2, syscall3, syscall4, syscall5,
+    SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
+    SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE,
+    SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, syscall1, syscall2,
+    syscall3, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
 use libstream::channel::{ChannelReceiver, ChannelSink, IpcPort};
@@ -537,153 +537,189 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 /// and the compositor terminal, and building them against a raw character device would be
 /// a dependency inversion.
 fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
-    // `RIGHT_READ`, not the file rights `lookup` asks for: the console is a char device
-    // read through `sys_io_submit`.
-    let Some(console) = lookup_rights(namespace, b"/dev/console", libkern::handle::RIGHT_READ)
-    else {
-        kprint(b"nxsh: /dev/console not found\r\n");
+    // The session's terminal. A **channel**, not the raw device: the line discipline —
+    // backspace, kill, echo, end-of-input — is the tty server's, and so is the write path,
+    // which is what makes this shell's output an object something could redirect rather
+    // than bytes shoved at an ambient debug syscall.
+    let Some(tty) = lookup_rights(
+        namespace,
+        b"/dev/tty",
+        libkern::handle::RIGHT_SEND | libkern::handle::RIGHT_RECV | libkern::handle::RIGHT_WAIT,
+    ) else {
+        kprint(b"nxsh: /dev/tty not found\r\n");
         return EXIT_USAGE;
     };
-    // A one-page read buffer the kernel writes input into.
-    // SAFETY: register-only syscall.
-    let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
-    if buf_h < 0 {
-        kprint(b"nxsh: read buffer alloc failed\r\n");
-        return EXIT_USAGE;
-    }
-    // SAFETY: a fresh MemoryObject with full MAP rights.
-    let buf_addr = unsafe {
-        syscall4(
-            SYS_MEMORY_MAP,
-            buf_h as u64,
-            0,
-            4096,
-            RIGHT_MAP_READ | libkern::handle::RIGHT_MAP_WRITE,
-        )
-    };
-    if buf_addr < 0 {
-        kprint(b"nxsh: read buffer map failed\r\n");
-        return EXIT_USAGE;
-    }
 
     let mut interp = Interp::with_host(
         alloc::boxed::Box::new(NitroxHost { namespace, notif }),
         RunMode::Repl,
     );
     interp.set_env(env);
-    kprint(b"\r\nnxsh: interactive shell (Ctrl-D or `exit` to leave)\r\n");
+    tty_write(tty, b"\r\nnxsh: interactive shell (Ctrl-D or `exit` to leave)\r\n");
 
-    // `pending` accumulates across continuation lines; `line` is the one being typed.
+    // `pending` accumulates across continuation lines. Deciding whether what has been
+    // typed is *complete input* stays here rather than moving into the tty: the server
+    // hands over lines, and only the shell knows whether a line finishes a statement.
     let mut pending = String::new();
-    let mut line: Vec<u8> = Vec::new();
-    kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
-
-    // A read that keeps failing must **report**, not spin. The original loop did
-    // `if po < 0 { continue }`, which turned a wrong-rights handle into a silent busy
-    // loop: a prompt, no input, and a pegged CPU with nothing on the console to say why.
-    // A failure that hangs is worse than one that exits.
-    let mut consecutive_failures = 0u32;
-    const MAX_READ_FAILURES: u32 = 16;
+    tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
 
     loop {
-        let op = libkern::abi::IoOp {
-            opcode: libkern::abi::IO_OPCODE_READ,
-            flags: 0,
-            buffer: buf_h as u64,
-            buf_offset: 0,
-            offset: 0,
-            length: 64,
-        };
-        // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
-        let po = unsafe {
-            syscall2(SYS_IO_SUBMIT, console, (&op as *const libkern::abi::IoOp) as u64)
-        };
-        if po < 0 {
-            consecutive_failures += 1;
-            if consecutive_failures >= MAX_READ_FAILURES {
-                kprint(b"\r\nnxsh: cannot read the console (io_submit refused)\r\n");
-                return EXIT_USAGE;
+        let mut buf = [0u8; nxsh::repl::LINE_MAX];
+        let typed = match tty_read_line(tty, &mut buf) {
+            TtyLine::Line(n) => String::from_utf8_lossy(&buf[..n]).into_owned(),
+            // Ctrl-D at an empty prompt, as the banner promises.
+            TtyLine::Eof => return EXIT_OK,
+            // The terminal is gone (the session ended under us). Leaving is the only
+            // sensible response; spinning on a dead channel is what the old byte loop's
+            // `if po < 0 { continue }` did, and it pegged a CPU with nothing to say why.
+            TtyLine::Failed => {
+                kprint(b"nxsh: terminal closed\r\n");
+                return EXIT_OK;
             }
+        };
+        pending.push_str(&typed);
+
+        if matches!(
+            nxsh::needs_continuation(&pending),
+            nxsh::Continue::Unclosed | nxsh::Continue::TrailingPipe
+        ) {
+            pending.push('\n');
+            tty_write(tty, nxsh::repl::continuation_prompt().as_bytes());
             continue;
         }
-        let (status, n) = po_wait(po as u64);
-        if status != 0 {
-            consecutive_failures += 1;
-            if consecutive_failures >= MAX_READ_FAILURES {
-                kprint(b"\r\nnxsh: console read failed repeatedly\r\n");
-                return EXIT_USAGE;
-            }
+
+        let src = core::mem::take(&mut pending);
+        if src.trim().is_empty() {
+            tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
             continue;
         }
-        consecutive_failures = 0;
-        for i in 0..(n as usize).min(64) {
-            // SAFETY: within the mapped one-page read buffer.
-            let b = unsafe { ((buf_addr as u64 + i as u64) as *const u8).read_volatile() };
-            match b {
-                // Ctrl-D at an empty prompt is `exit` (§11f, universal convention).
-                0x04 if line.is_empty() && pending.is_empty() => {
-                    kprint(b"\r\n");
-                    return EXIT_OK;
-                }
-                b'\r' | b'\n' => {
-                    kprint(b"\r\n");
-                    let typed = String::from_utf8_lossy(&line).into_owned();
-                    line.clear();
-                    pending.push_str(&typed);
-
-                    if matches!(
-                        nxsh::needs_continuation(&pending),
-                        nxsh::Continue::Unclosed | nxsh::Continue::TrailingPipe
-                    ) {
-                        pending.push('\n');
-                        kprint(nxsh::repl::continuation_prompt().as_bytes());
-                        continue;
-                    }
-
-                    let src = core::mem::take(&mut pending);
-                    if src.trim().is_empty() {
-                        kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
-                        continue;
-                    }
-                    // `exit` is a shell-state builtin (§3): it must change *this* process,
-                    // which an external program structurally cannot do — and it must end
-                    // *this loop*, which is the one thing `run_line` cannot do for it.
-                    //
-                    // **It is the only line this loop may intercept.** A `cd` guard sat
-                    // here too, left from before `cd` existed, and went on refusing a
-                    // builtin the interpreter had implemented — the script path called
-                    // `run_line` and worked, the interactive path never reached it. Every
-                    // other line goes to `run_line` unread.
-                    if src.trim() == "exit" {
-                        return EXIT_OK;
-                    }
-                    match interp.run_line(&src) {
-                        Ok(Some(text)) => kprint_crlf(&text),
-                        Ok(None) => {}
-                        Err(e) => {
-                            let mut msg = String::from("nxsh: ");
-                            msg.push_str(&e.message);
-                            msg.push('\n');
-                            kprint_crlf(&msg);
-                        }
-                    }
-                    kprint(nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
-                }
-                0x08 | 0x7f => {
-                    if line.pop().is_some() {
-                        kprint(b"\x08 \x08");
-                    }
-                }
-                0x20..=0x7e => {
-                    line.push(b);
-                    // SAFETY: a single printable byte.
-                    kprint(unsafe { core::slice::from_raw_parts(&b, 1) });
-                }
-                _ => {}
+        // `exit` is a shell-state builtin (§3): it must change *this* process, which an
+        // external program structurally cannot do — and it must end *this loop*, which is
+        // the one thing `run_line` cannot do for it.
+        //
+        // **It is the only line this loop may intercept.** A `cd` guard sat here too, left
+        // from before `cd` existed, and went on refusing a builtin the interpreter had
+        // implemented — the script path called `run_line` and worked, the interactive path
+        // never reached it. Every other line goes to `run_line` unread.
+        if src.trim() == "exit" {
+            return EXIT_OK;
+        }
+        match interp.run_line(&src) {
+            Ok(Some(text)) => tty_write_crlf(tty, &text),
+            Ok(None) => {}
+            Err(e) => {
+                let mut msg = String::from("nxsh: ");
+                msg.push_str(&e.message);
+                msg.push('\n');
+                tty_write_crlf(tty, &msg);
             }
         }
+        tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
     }
 }
+
+/// The outcome of asking the terminal for a line.
+enum TtyLine {
+    /// A line of `n` bytes was written into the caller's buffer.
+    Line(usize),
+    /// End of input — Ctrl-D at an empty prompt.
+    Eof,
+    /// The terminal is unusable.
+    Failed,
+}
+
+/// Send one tty request and wait for its reply; returns `(is_error, body_len)` with the
+/// body copied into `out`, or `None` if the exchange failed outright.
+fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, usize)> {
+    // SAFETY: TTY_MSG is a valid buffer; the rsproto message goes at the payload offset.
+    let sent = unsafe {
+        let rs_len = librsproto::encode(&mut TTY_MSG[24..], op, 1, 0, body, 0)?;
+        TTY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        TTY_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ch,
+            (&raw const TTY_MSG) as u64,
+            (&raw const TTY_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    };
+    if !sent {
+        return None;
+    }
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    let waited = unsafe {
+        WAIT_HANDLES[0] = ch;
+        syscall4(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            u64::MAX,
+        )
+    };
+    if waited < 1 {
+        return None;
+    }
+    // SAFETY: valid recv out-params.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut TTY_MSG) as u64,
+            (&raw mut TTY_HANDLES) as u64,
+            (&raw mut TTY_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        return None;
+    }
+    // SAFETY: bounded read-only slice over the reply.
+    unsafe {
+        let payload_len =
+            u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
+        let rep = core::slice::from_raw_parts(
+            ((&raw const TTY_MSG) as *const u8).add(24),
+            payload_len.min(4096 - 24),
+        );
+        let m = librsproto::decode(rep).ok()?;
+        let n = m.body.len().min(out.len());
+        out[..n].copy_from_slice(&m.body[..n]);
+        Some((m.is_error(), n))
+    }
+}
+
+/// Ask for one edited line.
+fn tty_read_line(ch: u64, out: &mut [u8]) -> TtyLine {
+    match tty_request(ch, librsproto::OP_TTY_READ_LINE, &[], out) {
+        // An error reply to a read is end-of-input: the server answers Ctrl-D that way
+        // precisely so it cannot be confused with an empty line.
+        Some((true, _)) => TtyLine::Eof,
+        Some((false, n)) => TtyLine::Line(n),
+        None => TtyLine::Failed,
+    }
+}
+
+/// Write to the terminal — through a handle this process holds.
+fn tty_write(ch: u64, text: &[u8]) {
+    let mut scratch = [0u8; 1];
+    let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
+}
+
+/// Write with `\n` expanded to `\r\n`, which a raw terminal needs.
+fn tty_write_crlf(ch: u64, text: &str) {
+    for chunk in text.split('\n') {
+        if !chunk.is_empty() {
+            tty_write(ch, chunk.as_bytes());
+        }
+        tty_write(ch, b"\r\n");
+    }
+}
+
+static mut TTY_MSG: [u8; 4096] = [0; 4096];
+static mut TTY_HANDLES: [u64; 8] = [0; 8];
+static mut TTY_COUNT: usize = 0;
 
 /// Is `path` a binding in `ns`, or an ancestor of one?
 ///
@@ -724,15 +760,6 @@ fn binding_at_or_under(ns: u64, path: &str) -> bool {
     false
 }
 
-/// Write `text` with `\n` expanded to `\r\n` — a raw console needs both.
-fn kprint_crlf(text: &str) {
-    for chunk in text.split('\n') {
-        if !chunk.is_empty() {
-            kprint(chunk.as_bytes());
-        }
-        kprint(b"\r\n");
-    }
-}
 
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {

@@ -104,6 +104,11 @@ pub fn should_display(stmt: &Stmt) -> bool {
     }
 }
 
+/// The longest line the REPL will accept from the terminal, matching the tty server's own
+/// limit. Sized here so the read buffer and the discipline cannot silently disagree about
+/// where a line stops.
+pub const LINE_MAX: usize = 1024;
+
 /// Operators that consume a value and end the chain, so the REPL must not add another.
 const TERMINAL_OPERATORS: &[&str] = &["display", "save"];
 

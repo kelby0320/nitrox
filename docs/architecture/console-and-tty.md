@@ -1,6 +1,7 @@
 # Console and TTY
 
-**Status: design, not built.** Written 2026-08-03 as a scoping pass, because "the console/tty
+**Status: stage 1a built (2026-08-03) — the server exists and `/dev/tty` is a capability.
+Its clients have not moved yet.** Written 2026-08-03 as a scoping pass, because "the console/tty
 server" is referenced as a gate in four documents without existing anywhere. This says what it
 owns, what it does not, and what has to be decided before it can be built.
 
@@ -101,19 +102,59 @@ serial.
 `eshell` deliberately keeps `kprint`: it is the emergency path that runs when the filesystem —
 and therefore the tty server — may not exist.
 
-### One server, many ttys
+### One server, many ttys — and which channel gets bound
 
-Unlike the profile server, this needs no endpoint-per-consumer trick: a tty is *requested*, and
-the channel handed back is per-session by construction. `session-mgr` asks for a tty when it
-builds a session and binds the returned endpoint at `/dev/tty`.
+A tty is *requested*: resolving `/dev/tty` mints a fresh channel for the caller, exactly as
+resolving `/log/<principal>` does.
+
+**The distinction that cost an afternoon.** A channel plays one of two roles, and they are
+indistinguishable by type:
+
+| Role | Speaks | Who binds it |
+|---|---|---|
+| **forwarding endpoint** | `Namespace::Resolve`, sent by the kernel | init at `/dev/tty` in the root ns; session-mgr at `/dev/tty` in each session |
+| **minted tty channel** | `Tty::ReadLine` / `Write` / `SetMode` / `Close` | nobody — it is *held*, not bound |
+
+The kernel adopts **any** bound `IpcChannel` as a userspace server, so binding a minted tty
+channel produces a namespace entry that answers `Namespace::Resolve` with `Unsupported` — a
+`/dev/tty` that exists and cannot be opened. Both are `IpcChannel`s; only the role differs,
+and only the binder knows which it holds.
+
+So a session binds the **forwarding endpoint**, handed down init → service-mgr →
+session-mgr alongside the fs and profile endpoints, sharing init's registration exactly as
+`/home` shares the fs-server's. Every program in the session then resolves its own terminal.
+
+### What ends a terminal
+
+A program's terminal ends when the **program** exits: its handle closes, the server sees
+`PeerClosed`, and frees the tty. Exit-context teardown makes that prompt.
+
+`Tty::Close` remains for the case that needs it — a supervisor ending a terminal it holds,
+as `session-mgr` does with the one it used for the login prompt. It is the revocation point
+because a refcounted handle cannot be taken back; the server declining to serve is what
+ends the terminal regardless of who still holds the other end.
 
 ## Staging
 
-1. **The server, with the line discipline and a writable path.** `session-mgr` and `nxsh` move
+**A migration constraint discovered while building stage 1a, and it shapes the rest.** The
+console driver is single-reader, and until every client has moved onto this server,
+`session-mgr`'s login and `nxsh`'s REPL still read the device directly. A
+permanently-outstanding read in the server *steals their input* — the interactive login test
+timed out waiting for a password prompt whose keystrokes the server had swallowed.
+
+So the server submits a console read **only when a terminal is actually waiting for a
+line**. A terminal with no reader competes with nobody, which is what lets clients migrate
+one at a time instead of all at once. That is not a temporary hack: reading on demand is the
+right behaviour anyway.
+
+1. **The server, with the line discipline and a writable path.** ✅ 2026-08-03 `session-mgr` and `nxsh` move
    onto it; the three copies of line editing collapse into one. `eshell` stays on the raw device
    and `kprint`.
 2. **Echo control as a request**, retiring the `echo: bool` parameter. Password entry becomes
-   "the server is in no-echo mode", which a client cannot forget.
+   "the server is in no-echo mode", which a client cannot forget. ✅ 2026-08-03 —
+   `session-mgr`'s login moved onto the tty and its copy of the line editor is deleted.
+   One terminal per session: it serves the login prompt, is bound at `/dev/tty` in the
+   session namespace, and is closed when the session ends.
 3. **History and reverse-search**, once there is one place that owns line state.
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input slice), terminal emulation (needs the compositor).

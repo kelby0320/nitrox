@@ -70,6 +70,15 @@ static mut FS_ENDPOINT: u64 = 0;
 /// root namespace can *use* `/bin` but can never obtain the thing needed to bind it
 /// elsewhere. Retaining it here is what makes the projection delegable at all.
 static mut PROFILE_ENDPOINT: u64 = 0;
+/// The tty server's **forwarding** endpoint, retained after the `/dev/tty` bind so init can
+/// hand it to service-mgr (→ session-mgr binds it into each session, sharing the one
+/// registration exactly as `/home` and `/bin` do).
+///
+/// A session must bind *this* — the channel the kernel forwards resolves down — and not a
+/// tty channel minted from it. Both are `IpcChannel`s and the kernel adopts any bound
+/// channel as a server, so binding a client channel silently produces a namespace entry
+/// that answers `Namespace::Resolve` with `Unsupported`.
+static mut TTY_ENDPOINT: u64 = 0;
 /// One IPC message + transferred-handle scratch for the setup send / Ready recv.
 static mut IPC_MSG: [u8; 4096] = [0; 4096];
 static mut IPC_HANDLES: [u64; 8] = [0; 8];
@@ -107,6 +116,20 @@ static mut SPAWN_PROFILE: SpawnArgs = SpawnArgs {
 /// control channel — in `handles[0]` (delivered in `rdx`). It resolves nothing (clients
 /// bring their own log endpoint), so its inherited LOOKUP-only namespace is unused; it
 /// answers forwarded `/log/...` resolves by minting per-principal log channels.
+/// Spawn args for the `tty-server`: one moved handle — the control channel — in
+/// `handles[0]`. It resolves `/dev/console` through its inherited LOOKUP-only root
+/// namespace and holds it exclusively thereafter.
+static mut SPAWN_TTY: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/tty-server
+    handle_count: 1,
+    move_mask: 1,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
+
 static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/logging-service
     handle_count: 1,
@@ -717,6 +740,82 @@ fn bind_logging_service(root_ns: u64) -> bool {
     true
 }
 
+/// Spawn the terminal server and bind its forwarding endpoint at `/dev/tty`.
+///
+/// It holds `/dev/console` exclusively from here on; a session gets `/dev/tty` and cannot
+/// reach the raw device at all. A client resolving `/dev/tty` receives a fresh per-caller
+/// channel, the same shape the logging service uses. Non-critical: a boot without a
+/// terminal server still reaches `eshell`, which owns the raw device precisely because it
+/// runs when this does not. See `docs/architecture/console-and-tty.md`.
+fn bind_tty_server(root_ns: u64) -> bool {
+    // 1. Create the control channel (init keeps end 0, the server gets end 1).
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params (reused; mounts + profile bind
+    // already completed).
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 2. Spawn the tty server, moving the control endpoint into it (in rdx).
+    // SAFETY: SPAWN_TTY is a valid writable arg block; spawn_program resolves the ELF
+    // image from the initramfs, stamps it, spawns, and closes the image handle.
+    let ls_h = unsafe {
+        SPAWN_TTY.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/bin/tty-server", &raw mut SPAWN_TTY)
+    };
+    if ls_h < 0 {
+        kprint(b"init: tty-server spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    // 3. Await Meta::Ready (bounded), then take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: tty-server Ready timeout/invalid\n");
+            // SAFETY: closing our own control endpoint.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing our own control endpoint (handshake done).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // 4. Bind the forwarding endpoint at `/log`.
+    // SAFETY: valid namespace handle + path pointer + endpoint handle.
+    // Keep a second handle *before* binding, for session-mgr to bind into each session.
+    // Duplicating first means a failure here is a failure to bind at all, rather than a
+    // bound `/dev/tty` no session can be given.
+    // SAFETY: duplicating our own endpoint handle with attenuated rights.
+    let retained = unsafe {
+        syscall2(SYS_HANDLE_DUPLICATE, endpoint, RIGHT_TRANSFER | RIGHT_DUPLICATE)
+    };
+    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/tty".as_ptr() as u64, 8, endpoint) };
+    if br == 0 && retained >= 0 {
+        // SAFETY: single-threaded init.
+        unsafe { TTY_ENDPOINT = retained as u64 };
+    } else if retained >= 0 {
+        // SAFETY: the bind failed; nothing will use the duplicate.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, retained as u64) };
+    }
+    // SAFETY: closing init's endpoint handle (the binding holds its own reference).
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: tty-server bind FAIL at /dev/tty\n");
+        return false;
+    }
+
+    kprint(b"init: tty server bound at /dev/tty\n");
+    // init keeps `ls_h` (the long-lived server's process handle).
+    let _ = ls_h;
+    true
+}
+
 /// The slice-7 milestone: look up `/system/current-generation` through the just-
 /// mounted root fs-server (the kernel forwards the lookup, the server reads the
 /// file and replies a `MemoryObject`), map it, and log its content — proving the
@@ -1190,7 +1289,7 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
     // Handing it a live but permanently empty channel would leave it blocked on a handoff
     // that is never coming, turning a degraded restart into a hung one.
     // SAFETY: single-threaded init.
-    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 } {
+    if unsafe { FS_ENDPOINT == 0 && PROFILE_ENDPOINT == 0 && TTY_ENDPOINT == 0 } {
         kprint(b"init: service-mgr restart -- no endpoints left to hand over\n");
         // SAFETY: SPAWN_SERVICE_MGR is our static; spawns are sequential.
         return unsafe {
@@ -1241,6 +1340,8 @@ fn spawn_service_mgr(root_ns: u64) -> i64 {
         FS_ENDPOINT = 0;
         send_handle(init_end, PROFILE_ENDPOINT);
         PROFILE_ENDPOINT = 0;
+        send_handle(init_end, TTY_ENDPOINT);
+        TTY_ENDPOINT = 0;
         syscall1(SYS_HANDLE_CLOSE, init_end);
     }
     h
@@ -1294,6 +1395,10 @@ unsafe fn close_retained_endpoints() {
         if PROFILE_ENDPOINT != 0 {
             syscall1(SYS_HANDLE_CLOSE, PROFILE_ENDPOINT);
             PROFILE_ENDPOINT = 0;
+        }
+        if TTY_ENDPOINT != 0 {
+            syscall1(SYS_HANDLE_CLOSE, TTY_ENDPOINT);
+            TTY_ENDPOINT = 0;
         }
     }
 }
@@ -1546,6 +1651,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // so services can resolve `/log/<tier>/<principal>` and log from launch. Critical-path.
     if !bind_logging_service(root_ns) {
         emergency(notif, root_ns);
+    }
+
+    // The terminal server, after `/bin` (it is spawned from there) and deliberately **not**
+    // critical-path: a boot without it still reaches `eshell`, which holds the raw console
+    // for exactly the case where this server is absent.
+    if !bind_tty_server(root_ns) {
+        kprint(b"init: no terminal server; sessions will have no /dev/tty\n");
     }
 
     supervise(notif, root_ns);

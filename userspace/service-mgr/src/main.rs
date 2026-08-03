@@ -606,7 +606,7 @@ fn send_handle(ctrl: u64, handle: u64) {
 /// service-mgr does not *use* either endpoint. It is a courier: neither the fs-server's
 /// `/home` nor the profile's `/bin` is service-mgr's to bind, and holding them any longer
 /// than the trip down would be authority it has no use for.
-fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64) {
+fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64, tty_endpoint: u64) {
     if fs_endpoint == 0 {
         kprint(b"service-mgr: no fs endpoint; skipping login chain\n");
         // A profile endpoint without an fs endpoint is no more usable — a session with
@@ -658,11 +658,13 @@ fn bring_up_login_chain(root_ns: u64, fs_endpoint: u64, profile_endpoint: u64) {
         return;
     }
     // Handoffs, in order: (1) the fs-server endpoint, (2) the profile-server endpoint,
-    // (3) the auth channel. session-mgr receives them positionally, so the order is the
+    // (3) the tty server's forwarding endpoint, (4) the auth channel. session-mgr
+    // receives them positionally, so the order is the
     // contract — a reorder here silently makes a session bind its home over IPC to the
     // profile server.
     send_handle(sess_ctrl, fs_endpoint);
     send_handle(sess_ctrl, profile_endpoint);
+    send_handle(sess_ctrl, tty_endpoint);
     send_handle(sess_ctrl, auth_client);
     // The handoffs are queued in session-mgr's inbox; the control channel + our process
     // handle are no longer needed for Part D (session-mgr runs independently).
@@ -689,17 +691,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, handoff: u64, _arg0: u64) -> 
     kprint(b"service-mgr: up\n");
     // The handoffs, in init's send order: the fs-server endpoint, then the profile
     // server's. Positional — see `bring_up_login_chain`.
-    let (fs_endpoint, profile_endpoint) = if handoff == 0 {
-        (0, 0)
+    let (fs_endpoint, profile_endpoint, tty_endpoint) = if handoff == 0 {
+        (0, 0, 0)
     } else {
         let fs = recv_handoff(handoff);
         let profile = recv_handoff(handoff);
-        // SAFETY: closing our own handoff-channel end; both handoffs are in hand.
+        let tty = recv_handoff(handoff);
+        // SAFETY: closing our own handoff-channel end; every handoff is in hand.
         unsafe { syscall1(SYS_HANDLE_CLOSE, handoff) };
-        (fs, profile)
+        (fs, profile, tty)
     };
     // Bring up the login chain (auth-service + session-mgr) before the service demo.
-    bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint);
+    bring_up_login_chain(root_ns, fs_endpoint, profile_endpoint, tty_endpoint);
     match load_declaration(root_ns) {
         Some(decl) => {
             let (h, ctrl) = spawn_service(root_ns, &decl);
