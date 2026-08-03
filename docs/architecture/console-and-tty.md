@@ -125,7 +125,10 @@ right behaviour anyway.
    onto it; the three copies of line editing collapse into one. `eshell` stays on the raw device
    and `kprint`.
 2. **Echo control as a request**, retiring the `echo: bool` parameter. Password entry becomes
-   "the server is in no-echo mode", which a client cannot forget.
+   "the server is in no-echo mode", which a client cannot forget. ✅ 2026-08-03 —
+   `session-mgr`'s login moved onto the tty and its copy of the line editor is deleted.
+   One terminal per session: it serves the login prompt, is bound at `/dev/tty` in the
+   session namespace, and is closed when the session ends.
 3. **History and reverse-search**, once there is one place that owns line state.
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input slice), terminal emulation (needs the compositor).

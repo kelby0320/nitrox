@@ -283,6 +283,7 @@ fn build_session_namespace(
     root_ns: u64,
     fs_endpoint: u64,
     profile_endpoint: u64,
+    tty: u64,
     home: &[u8],
     user: &[u8],
 ) -> u64 {
@@ -330,6 +331,7 @@ fn build_session_namespace(
     // Non-fatal: a session with no `/bin` still has the whole in-process language, and
     // failing the login would trade a working shell for a missing `list`.
     let mut has_bin = false;
+    let mut has_tty = false;
     if profile_endpoint != 0 {
         let bin = b"/bin";
         // SAFETY: valid namespace handle, path pointer, and endpoint handle; no subtree
@@ -359,6 +361,23 @@ fn build_session_namespace(
     // `TODO(session-metadata-server)`.
     bind_session_user(ns, user);
 
+    // `/dev/tty` → the session's terminal, a direct-handle bind of the channel the tty
+    // server minted for this login. The shell gets a *cooked* terminal it can also write
+    // to, and — since `/dev/console` is the server's alone once every client has moved —
+    // no way to reach the raw device at all.
+    if tty != 0 {
+        let dev = b"/dev/tty";
+        // SAFETY: valid namespace handle, path pointer, and channel handle (a direct-handle
+        // bind; no subtree base).
+        let tr = unsafe {
+            syscall6(SYS_NS_BIND, ns, dev.as_ptr() as u64, dev.len() as u64, tty, 0, 0)
+        };
+        if tr != 0 {
+            kprint(b"session-mgr: /dev/tty bind FAIL\n");
+        }
+        has_tty = tr == 0;
+    }
+
     // `/dev/console` → a direct-handle bind of the console device (resolved from our own
     // namespace), so the shell can do console I/O within its sandbox. Non-fatal if
     // absent (the test-harness shell does not read the console).
@@ -378,7 +397,10 @@ fn build_session_namespace(
         }
     }
     // SAFETY: single-threaded session-mgr; one namespace is built at a time.
-    unsafe { SESSION_HAS_BIN = has_bin };
+    unsafe {
+        SESSION_HAS_BIN = has_bin;
+        SESSION_HAS_TTY = has_tty;
+    }
     ns
 }
 
@@ -391,6 +413,16 @@ fn session_has_bin() -> bool {
 
 /// Set by [`build_session_namespace`]; see [`session_has_bin`].
 static mut SESSION_HAS_BIN: bool = false;
+
+/// Whether the last-built session namespace got a terminal. Read only for the log line —
+/// which has to be able to say "no", the same reason `/bin` is reported separately.
+fn session_has_tty() -> bool {
+    // SAFETY: single-threaded session-mgr.
+    unsafe { SESSION_HAS_TTY }
+}
+
+/// Set by [`build_session_namespace`]; see [`session_has_tty`].
+static mut SESSION_HAS_TTY: bool = false;
 
 /// Publish `user` at `/session/user` in `ns`, as a read-only memory object.
 ///
@@ -586,7 +618,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     // forever — so typing `exit` left a machine with no prompt and no way back short of a
     // reboot. A login that cannot be repeated is not a login.
     loop {
-    match login(root_ns, auth_ch, &mut home, &mut user) {
+    // One terminal per session: it serves the login prompt, is bound into the session's
+    // namespace for the shell, and is closed when the session ends.
+    #[cfg(not(feature = "test-harness"))]
+    let tty = tty_open(root_ns);
+    #[cfg(feature = "test-harness")]
+    let tty = 0u64;
+
+    match login(tty, auth_ch, &mut home, &mut user) {
         Some((hl, ul)) => {
             kprint(b"session-mgr: login ok -> home=");
             kprint(&home[..hl]);
@@ -595,6 +634,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
                 root_ns,
                 fs_endpoint,
                 profile_endpoint,
+                tty,
                 &home[..hl],
                 &user[..ul],
             );
@@ -618,6 +658,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             if session_has_bin() {
                 kprint(b" + /bin");
             }
+            if session_has_tty() {
+                kprint(b" + /dev/tty");
+            }
             kprint(b")\n");
             // The payoff: an unprivileged shell in the per-user namespace writes to home.
             let code = spawn_user_shell(root_ns, session_ns, notif);
@@ -629,6 +672,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // exactly one login per boot.
             // SAFETY: closing the namespace we created for this session.
             unsafe { syscall1(SYS_HANDLE_CLOSE, session_ns) };
+            // And the terminal. `Close` is the revocation — a process that outlived the
+            // session cannot have its handle taken back, so the server declining to serve
+            // is what ends the terminal.
+            #[cfg(not(feature = "test-harness"))]
+            if tty != 0 {
+                tty_close(tty);
+            }
 
             #[cfg(feature = "test-harness")]
             {
@@ -663,6 +713,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         }
         None => {
             kprint(b"session-mgr: login denied\n");
+            #[cfg(not(feature = "test-harness"))]
+            if tty != 0 {
+                tty_close(tty);
+            }
             #[cfg(feature = "test-harness")]
             {
                 verdict(false);
@@ -686,7 +740,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
 /// the demo user (deterministic verdict). **interactive**: prompt username + password on
 /// the console (up to a few attempts).
 #[cfg(feature = "test-harness")]
-fn login(_root_ns: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
+fn login(_tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
     // Sanity: a wrong password must be denied (no enumeration/timing oracle upstream).
     let mut scratch = [0u8; 256];
     if authenticate(auth_ch, DEMO_USER, b"not-the-password", &mut scratch).is_some() {
@@ -701,110 +755,142 @@ fn login(_root_ns: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) 
 }
 
 #[cfg(not(feature = "test-harness"))]
-fn login(root_ns: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
-    let (cst, console) = ns_lookup(root_ns, b"/dev/console", RIGHT_READ);
-    if cst != 0 || console == 0 {
-        kprint(b"session-mgr: no console for login\n");
+fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
+    if tty == 0 {
+        kprint(b"session-mgr: no terminal for login\n");
         return None;
     }
-    // A one-page read buffer for console input.
-    let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, 4096, 0, 0, 0) };
-    if buf_h < 0 {
-        return None;
-    }
-    let buf_h = buf_h as u64;
-    let buf_addr = unsafe { syscall4(SYS_MEMORY_MAP, buf_h, 0, 4096, RIGHT_MAP_READ | RIGHT_MAP_WRITE) };
-    if buf_addr < 0 {
-        return None;
-    }
-    let buf_addr = buf_addr as u64;
     for _ in 0..3 {
-        kprint(b"\r\nnitrox login: ");
+        tty_write(tty, b"\r\nnitrox login: ");
         let mut user = [0u8; 64];
-        let ulen = read_line(console, buf_h, buf_addr, &mut user, true);
-        kprint(b"password: ");
+        tty_set_echo(tty, true);
+        let ulen = tty_read_line(tty, &mut user);
+
+        tty_write(tty, b"password: ");
         let mut pass = [0u8; 128];
-        let plen = read_line(console, buf_h, buf_addr, &mut pass, false);
-        kprint(b"\r\n");
+        // The server stops echoing; this cannot be forgotten the way a `bool` argument
+        // could, and the discipline also stops *erasing* on screen, so a backspace in a
+        // password reveals nothing about its length.
+        tty_set_echo(tty, false);
+        let plen = tty_read_line(tty, &mut pass);
+        tty_set_echo(tty, true);
+        // Nothing was echoed for the password, so the newline the user typed was not shown
+        // either: supply it here so what follows starts on its own line.
+        tty_write(tty, b"\r\n");
+
         if let Some(hl) = authenticate(auth_ch, &user[..ulen], &pass[..plen], home_out) {
             let ul = ulen.min(user_out.len());
             user_out[..ul].copy_from_slice(&user[..ul]);
             return Some((hl, ul));
         }
-        kprint(b"login incorrect\r\n");
+        tty_write(tty, b"login incorrect\r\n");
     }
     None
 }
 
-/// Read a line from `console` into `out` (until CR/LF), echoing each byte iff `echo`.
-/// Returns the line length. `buf`/`buf_addr` are a shared one-page read buffer.
+/// Open a terminal: resolve `/dev/tty`, which yields a fresh per-caller channel.
+///
+/// One tty per session. It serves the login prompt first, is then bound into the session's
+/// namespace for the shell, and is closed when the session ends — the terminal belongs to
+/// the session, not to session-mgr.
 #[cfg(not(feature = "test-harness"))]
-fn read_line(console: u64, buf: u64, buf_addr: u64, out: &mut [u8], echo: bool) -> usize {
-    let mut len = 0usize;
-    loop {
-        let op = IoOp { opcode: IO_OPCODE_READ, flags: 0, buffer: buf, buf_offset: 0, offset: 0, length: 256 };
-        // SAFETY: `console` is a char DeviceNode with READ; `&op` is a valid IoOp.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, console, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            continue;
+fn tty_open(root_ns: u64) -> u64 {
+    let (st, ch) = ns_lookup(root_ns, b"/dev/tty", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER);
+    if st != 0 { 0 } else { ch }
+}
+
+/// Send one tty request and wait for its reply. Returns the reply body length written into
+/// `out` (`0` for the acknowledgement-only ops), or `None` on any failure.
+#[cfg(not(feature = "test-harness"))]
+fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
+    // SAFETY: SEND_MSG is a valid buffer; the rsproto message goes at offset 24.
+    let sent = unsafe {
+        let rs_len = encode(&mut SEND_MSG[PAYLOAD_OFF..], op, 1, 0, body, 0)?;
+        SEND_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        SEND_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            ch,
+            (&raw const SEND_MSG) as u64,
+            (&raw const SEND_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    };
+    if !sent || !wait_one(ch) {
+        return None;
+    }
+    // SAFETY: valid recv out-params.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        return None;
+    }
+    // SAFETY: bounded read-only slice over the reply.
+    unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let rep = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        let m = decode(rep).ok()?;
+        if m.op != op || m.is_error() {
+            return None;
         }
-        if !wait_one(po as u64) {
-            unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-            continue;
-        }
-        let (status, n) = unsafe {
-            (
-                i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
-                u64::from_le_bytes([
-                    WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                    WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
-                ]),
-            )
-        };
-        // SAFETY: closing our own PO.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, po as u64) };
-        if status != 0 {
-            continue;
-        }
-        for i in 0..(n as usize).min(256) {
-            // SAFETY: `buf_addr + i` is within the mapped read buffer.
-            let b = unsafe { ((buf_addr + i as u64) as *const u8).read_volatile() };
-            match b {
-                b'\r' | b'\n' => {
-                    // Echo the newline too. Without it the cursor never leaves the line
-                    // the user typed on, so the *next* prompt lands against their input —
-                    // `alicepassword:` instead of a password prompt on its own line. An
-                    // echo that omits the Enter is not an echo of what was typed.
-                    //
-                    // Only when echoing: a password read prints nothing, and its caller
-                    // emits the newline once the (unechoed) line is in.
-                    if echo {
-                        kprint(b"\r\n");
-                    }
-                    return len;
-                }
-                0x08 | 0x7F => {
-                    if len > 0 {
-                        len -= 1;
-                        if echo {
-                            kprint(b"\x08 \x08");
-                        }
-                    }
-                }
-                0x20..=0x7E => {
-                    if len < out.len() {
-                        out[len] = b;
-                        len += 1;
-                        if echo {
-                            kprint(&[b]);
-                        }
-                    }
-                }
-                _ => {}
-            }
-        }
+        let n = m.body.len().min(out.len());
+        out[..n].copy_from_slice(&m.body[..n]);
+        Some(n)
     }
 }
+
+/// Write `text` to the terminal. Output through a handle the process *holds* — not the
+/// ambient debug syscall every program used to print with.
+#[cfg(not(feature = "test-harness"))]
+fn tty_write(ch: u64, text: &[u8]) {
+    let mut scratch = [0u8; 1];
+    let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
+}
+
+/// Turn echo on or off.
+///
+/// **This is why the tty server exists.** It was a `bool` every caller of `read_line` had
+/// to remember to pass, so reading a password safely depended on each of them getting it
+/// right. Now it is the server's state and a client cannot forget it.
+#[cfg(not(feature = "test-harness"))]
+fn tty_set_echo(ch: u64, on: bool) {
+    let flags = [if on { librsproto::TTY_MODE_ECHO } else { 0 }];
+    let mut scratch = [0u8; 1];
+    let _ = tty_request(ch, librsproto::OP_TTY_SET_MODE, &flags, &mut scratch);
+}
+
+/// Read one edited line. The line discipline — backspace, kill, echo — is the server's,
+/// so this is a request rather than a byte loop.
+#[cfg(not(feature = "test-harness"))]
+fn tty_read_line(ch: u64, out: &mut [u8]) -> usize {
+    tty_request(ch, librsproto::OP_TTY_READ_LINE, &[], out).unwrap_or(0)
+}
+
+/// Tell the server this terminal is finished, then drop the handle.
+///
+/// **Revocation, not release.** Handles are refcounted and this kernel has none, so closing
+/// cannot take a tty back from a process that outlived the session. The server declining to
+/// serve the channel is what makes teardown a guarantee.
+#[cfg(not(feature = "test-harness"))]
+fn tty_close(ch: u64) {
+    let mut scratch = [0u8; 1];
+    let _ = tty_request(ch, librsproto::OP_TTY_CLOSE, &[], &mut scratch);
+    // SAFETY: closing our own channel handle.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
+}
+
 
 /// Find the first occurrence of `key` in `text` and parse the ASCII decimal
 /// run that follows it. `None` if the key is absent or not followed by a digit.
