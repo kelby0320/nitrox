@@ -118,17 +118,32 @@ builds a session and binds the returned endpoint at `/dev/tty`.
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input slice), terminal emulation (needs the compositor).
 
-## Open questions
+## Resolved (2026-08-03)
 
-- **Does the tty server outlive a session?** One server holding the single serial device, handing
-  out per-session channels, is simplest. But when a session ends, its tty must be revoked or the
-  next session inherits a live channel to the same device.
-- **Where does the raw device go when the compositor exists?** A serial console and a terminal
-  surface are two backends for one discipline. Deciding the backend seam now costs nothing;
-  discovering it later costs a rewrite.
-- **What arbitrates between eshell and the tty server?** Both want the one console. If eshell
-  runs because the filesystem failed, the tty server is not running, so in practice they never
-  overlap — but that is an argument, not a mechanism.
-- **Is `/dev/tty` the right name** given there is exactly one, and a session's tty is not the
-  system's console? `/dev/console` for the raw device and `/dev/tty` for the session's cooked
-  view mirrors Unix closely enough to be unsurprising.
+**One server; `session-mgr` closes the tty when the session ends.** It already closes the
+session namespace at logout, so this is the same shape: drop the binding, drop its own handle,
+and the endpoint's last reference goes with the shell's — the server sees `PeerClosed` and
+releases that session's state. Exit-context teardown makes that prompt rather than eventual.
+
+**With one refinement, because closing is not revoking.** Handles are refcounted and this
+kernel has no revocation — only `duplicate` and `restrict` — which is inherent to capabilities
+rather than a gap. So if any process outlives the session still holding a resolved `/dev/tty`
+handle (a background program the shell spawned, inheriting it through the namespace), closing
+session-mgr's copy does not take it away, and that orphan keeps a live channel to the console.
+
+The capability-consistent answer is that **the server is the revocation point**: `session-mgr`
+tells it the session is over, and it stops honouring that channel regardless of who still holds
+the other end. A resource holder declining to serve, not the kernel confiscating. That makes
+teardown a guarantee rather than a convention, and it costs one request.
+
+**Backend seam: serial now, compositor later.** The device side is pluggable from the start —
+the line discipline talks to a backend, and the backend is the serial console today and a
+terminal surface later. Building the seam now costs nothing; retrofitting it costs a rewrite.
+
+**`eshell` is separate, and has to be.** It is the path that runs when the filesystem failed,
+so the tty server does not exist when it matters. It keeps the raw `/dev/console` and
+`SYS_DEBUG_KPRINT`. The two never overlap because eshell's precondition is the server's
+absence — and that is now a stated invariant rather than an accident of timing.
+
+**`/dev/tty` is the name.** `/dev/console` stays the raw device, held by the server; `/dev/tty`
+is the session's cooked view. Close enough to Unix to be unsurprising.
