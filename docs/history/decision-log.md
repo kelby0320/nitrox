@@ -9950,3 +9950,45 @@ What still has no cover is `main.rs`'s console loop — byte reading, backspace,
 tractable: `nxsh` takes its console as a **capability from its namespace**, so a test can
 bind a pipe at `/dev/console` and drive the real loop without QEMU or serial tricks. A
 design that refuses ambient authority turns out to be a design that is easy to test.
+
+## 2026-08-03 — Test the release image, not the console loop
+
+`TODO(nxsh-console-tests)` is closed, but not the way it was proposed. The proposal was to
+bind a pipe at `/dev/console` and drive `nxsh` from the harness. **That does not work**, for
+two reasons found by reading the path rather than assuming it:
+
+- `sys_io_submit` requires `KObjectType::DeviceNode`. A pipe is an `IpcChannel`, so binding
+  one at `/dev/console` hands the shell a handle whose every read is rejected.
+- The shell's output never touches the namespace at all: every byte goes through `kprint` →
+  `SYS_DEBUG_KPRINT`, an ambient debug syscall. Even with input solved, nothing could be
+  captured.
+
+**The second candidate — extracting the byte loop into the library half — was rejected on
+value.** It is the natural move for this codebase (`nxsh/CLAUDE.md` already forbids syscalls
+in the library half for exactly this reason), but the continuation *decision* is already
+host-tested, which leaves ~60 lines of stable byte handling; and it is a refactor of the
+critical interactive path, which carries its own risk. Worse, it structurally cannot see the
+two bugs that actually cost the most: the console lookup using `RIGHT_MAP_READ` instead of
+`RIGHT_READ`, and a session loop that was not a loop.
+
+**What the residual risk actually was: CI compiles the release image and has never booted
+it.** `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a
+fixed proof script. So `login:`, a typed password, a real prompt, and `exit` are all
+`#[cfg(not(feature = "test-harness"))]` code that CI built and never executed — and every
+interactive bug this project has had lived there.
+
+So `cargo xtask test-interactive` boots the release image and drives it over the serial
+console, **expect-driven rather than sleep-driven**: each step waits for the text that says
+the guest is ready, so the guest paces the run. One boot serves every scenario, because the
+shell returns to `login:`.
+
+The known cost, stated rather than discovered later: it asserts on serial output, so it is
+coupled to prompt and message wording. Matching stable anchors (`nitrox login:`, `/home>`)
+keeps that manageable, but message changes will occasionally need it updated.
+
+Its first regression was found before it was written. The maintainer reported that typing a
+username left the password prompt on the same line — `alicepassword:` — because `read_line`
+returned on CR/LF without echoing it, so the cursor never left the line the user typed on.
+An echo that omits the Enter is not an echo of what was typed. **That transcript had
+appeared several times in this session's own output and was read straight past**, which is
+the argument for a machine doing the reading.

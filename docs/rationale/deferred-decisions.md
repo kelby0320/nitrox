@@ -417,27 +417,6 @@ contents.
 
 Trigger: a package manager that can install at runtime, or the first time a user has to log
 out to see a program they just installed.
-**The shell's console loop has no automated cover — `TODO(nxsh-console-tests)`.**
-`nxsh`'s language is thoroughly host-tested, and since 2026-07-31 a REPL *session* is too
-(the `repl(&[...])` helper drives a sequence of `run_line` calls through one interpreter).
-That covers the great majority of interactive behaviour, because `run_line` is where it
-lives.
-
-What remains untested is `main.rs`'s console loop: reading bytes, backspace, Ctrl-D, the
-`exit` interception, the prompt, and multi-line continuation as actually typed. Four bugs
-have now come from that seam — console rights, `list /`, the stale `cd` guard, and `def`
-hoisting — every one found by a person at a prompt, because the scripted path calls
-`run_line` and the interactive path never got there.
-
-The shape of the fix is available and cheap, which is the argument for doing it: `nxsh`
-reads `/dev/console` **from its own namespace**. A test can therefore construct a namespace
-whose `/dev/console` is a *pipe the harness holds*, spawn `nxsh` into it, write lines, and
-read what comes back — no serial hackery, no QEMU driving, and it exercises the real loop
-including the parts `run_line` never sees. That the shell takes its console as a capability
-rather than a fixed device is what makes this possible at all.
-
-Trigger: the next interactive bug, or before anything else grows in that loop.
-
 **The initramfs carries more than boot needs — `TODO(initramfs-minimisation)`.**
 The boot image currently holds every userspace program: `init`, `eshell`, `fs-server-ext4`,
 `service-mgr`, `session-mgr`, `profile-server`, `logging-service`, `auth-service`,
@@ -828,6 +807,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| The shell's console loop has no automated cover (`nxsh-console-tests`) | 2026-08-03 | Resolved by testing the *whole* interactive path rather than extracting the loop. `cargo xtask test-interactive` boots the **release image** — which nothing else boots; `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a fixed script — and drives login, a wrong password, a shell prompt, a spawned program, a failing stage, cross-line interpreter state, and `exit` → log in again. Expect-driven, so the guest paces it. The rejected alternative was extracting the byte loop into the library half: the continuation *decision* is already host-tested, leaving only ~60 lines of stable byte handling, and a refactor of the critical interactive path is its own risk — while the two bugs it could never have caught (console-lookup rights, session wiring) are precisely the ones that hurt. Non-vacuity checked by reverting the login-echo fix: the run fails at `\npassword:`. |
 | Process teardown deferred wholesale (`exit-context-teardown`) | 2026-07-31 | `sys_process_exit` now closes the calling process's handle table in its own syscall context — Linux's `do_exit` → `exit_files` position: no locks held, free to allocate and drop. `exit_process` cannot, because it takes `SCHED` and never returns from `finish_exit`. Closing a handle is what other processes wait on (dropping an IPC endpoint's last reference nulls its peer and wakes whoever is blocked there), so this moves `PeerClosed` from "the reaper's next turn" to the moment of exit. The reaper still queues and closes the pid afterwards, finding an empty table: that path stays for processes killed externally, which never run the syscall. Measured rather than assumed — `exit_closed=` in `/proc/sched/stats`, 421 handles per self-test boot against 89 pids the reaper now finds already empty. |
 | No regression cover for reclamation starvation (`idle-starvation-test`) | 2026-07-31 | Built, after the first attempt was thrown away for passing with the bug reinstated. The failed version asserted a low **switch rate**; a lone spinner is preempted back to itself, which barely moves that counter. The working version asserts **occupancy** — `/proc/sched/stats` reports `idle=` per CPU, and a spin permanently costs one. Sampled ten times across a second, taking the best sample (one busy instant is not a spin), and compared against `cpus_online - 1` because the sampling thread's own CPU never reads idle. Verified both ways: 3 of 4 CPUs idle with the fix on three consecutive runs, 2 of 4 and a failed run with the fix disabled. |
 | A login session can see no programs (`session-program-namespace`) | 2026-07-31 | Both halves, because either alone is inert. The store gained a `coreutils` package (the ten coreutils plus `nxsh`) and the system profile a second `[[package]]` — before that `/bin` was bound and projected exactly `heartbeat`. Then init retains the profile server's endpoint and hands it down to session-mgr, which binds it at `/bin` in each session namespace, sharing init's registration exactly as `/home` shares the fs-server's. Binding `/initramfs/sbin` was the quick alternative and was refused: it hands a session the boot image instead of a profile. Handing a *second* endpoint down needed a channel — only `handles[0]` reaches a child — so service-mgr's `rdx` is now a handoff channel rather than one endpoint. |
