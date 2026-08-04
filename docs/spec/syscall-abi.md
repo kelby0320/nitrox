@@ -108,6 +108,7 @@ The first stable numbers, allocated sequentially from `0`, are the handle operat
 | `33` | `sys_file_create` |
 | `34` | `sys_file_truncate` |
 | `35` | `sys_file_rename` |
+| `36` | `sys_process_terminate` |
 
 Numbers are assigned in landing order, not in the order syscalls appear below.
 
@@ -369,6 +370,29 @@ fn sys_exception_resume(thread: RawHandle, disposition: u64, code: u64) -> isize
 Acts on a thread **suspended on a fault**. `disposition` is `0` = **Resume** (re-enter the faulting instruction — without first fixing the fault's cause it simply re-faults) or `2` = **Terminate** (exit the thread with `code`); other values are reserved and return `Unsupported`. Requires `SIGNAL` right and a `Thread` handle; the thread must currently be suspended (else `InvalidArgument`). Returns `0`. (Syscall number `21`.)
 
 The exception model is **suspend + supervised resume/terminate**: a ring-3 fault suspends the faulting thread and delivers a `Notification` (`SegFault`/`IllegalInsn`/`DivideByZero`) to the faulting process's `NotificationChannel`; a supervisor (a sibling thread holding the faulter's handle) inspects it via `sys_thread_get_registers` and resumes or terminates it. **Deferred to Phase 2:** the `ResumeSkip` / `ModifyAndResume` dispositions (`1` / `3`), the 30 s auto-terminate timeout (`sys_exception_extend_timeout`), and the debugger exception-channel priority chain.
+
+```rust
+fn sys_process_terminate(process: RawHandle) -> isize
+```
+**Asks** a process to exit: enqueues a `TerminateRequested` notification (`0x0202`, empty
+body) on the target's own `NotificationChannel` and wakes anything blocked on it. Requires
+`SIGNAL` right and a `Process` handle. Returns `0`, or `Unsupported` if the target has no
+notification channel attached — it cannot be asked, and saying so beats succeeding at a
+message nobody will read. (Syscall number `36`.)
+
+**It is a request, and the kernel does nothing else.** No thread is stopped, no stack is
+unwound, and the target's execution is not touched — so there is no "safe point" question
+and no teardown path beside `sys_process_exit`. A process that listens exits itself; **a
+process that ignores it keeps running.** That is the whole contract: this system has no
+signals and no forcible kill, and cooperative shutdown over the notification queue is what
+it has instead of `SIGTERM`.
+
+Gated on `SIGNAL` rather than `TERMINATE` deliberately. `sys_process_spawn` grants both on
+every handle it returns, so the choice is invisible today — but this is a request, and
+leaving `TERMINATE` unspent keeps it available to gate a forcible kill if one is ever
+built. The authority is the handle itself: no syscall accepts a pid, so "you may terminate
+your own children" needs no rule — a child's handle is the only one you have unless a
+supervisor was *given* more, which is hand-down policy rather than a kernel check.
 
 ```rust
 fn sys_exception_extend_timeout(thread: RawHandle, additional_ns: u64) -> isize

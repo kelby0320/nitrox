@@ -1349,6 +1349,30 @@ unsafe fn obj_remove_waiter(obj: *mut (), th: *mut ()) {
 /// Wake every thread blocked on `channel` (its queue just went non-empty).
 /// Caller holds `SCHED`. No allocation, no blocking — safe from the fault path.
 /// Mirrors [`fire_timer`]'s waiter-drain.
+/// Ask `process` to exit: enqueue [`KIND_TERMINATE_REQUESTED`] on **its own**
+/// notification channel and wake anything blocked there (§11h).
+///
+/// **The kernel does nothing else.** It does not stop threads, unwind stacks, or touch the
+/// target's execution in any way — so there is no safe-point question and no second
+/// teardown path beside [`exit_process`]. A process that listens exits itself; one that
+/// does not keeps running, which is what "there is no forcible kill in this system" means
+/// in practice.
+///
+/// `false` when the target has no notification channel attached — it can never be asked,
+/// which the caller reports rather than silently succeeding at.
+pub fn request_terminate(process: *mut ()) -> bool {
+    let mut g = SCHED.lock();
+    // SAFETY: the caller pins `process` through its Process handle for this call.
+    let chan = unsafe { &*(process as *const crate::object::Process) }.notification_channel_ptr();
+    let Some(c) = chan else { return false };
+    let notif = Notification::terminate_requested();
+    // SAFETY: `c` is the channel that Process owns a reference on, so it outlives this
+    // call; `SCHED` held; the queue is pre-reserved, so no allocation happens here.
+    let _edge = unsafe { NotificationChannel::enqueue(c, notif) };
+    signal_channel(&mut g, c);
+    true
+}
+
 fn signal_channel(g: &mut SchedState, channel: *mut ()) {
     let mut buf = [core::ptr::null_mut(); NotificationChannel::MAX_WAITERS];
     // SAFETY: live channel, `SCHED` held — drains its waiter list.

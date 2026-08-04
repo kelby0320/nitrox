@@ -323,8 +323,6 @@ fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
         // guessed which was "foreground" would be inventing a concept this system does not
         // have yet (job control is §11g, and unbuilt).
         if pending.front() == Some(&0x03) {
-            kprint(b"tty-server: SAW CTRL-C
-");
             pending.pop_front();
             for t in ttys.iter_mut() {
                 reply(t.ch, OP_TTY_INTERRUPT, 0, &[]);

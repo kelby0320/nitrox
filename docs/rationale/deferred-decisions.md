@@ -478,6 +478,31 @@ the helper is worth deciding once rather than per site. **Trigger:** the next to
 costs debugging time, or any test that needs to assert on a multi-part log line — the
 interactive suite now asserts on the one line that was fixed.
 
+**`Ctrl-C` does not reach a running pipeline stage — `TODO(interrupt-reaches-a-stage)`.**
+Every piece is built and none of it is proven to connect. `sys_process_terminate` works and
+is tested; `sleep` waits on its notification channel and exits when asked; the shell keeps
+its stage handles and asks. What does **not** happen is the tty server emitting the
+interrupt event at all when `Ctrl-C` follows a line that starts a pipeline: instrumenting
+the branch shows it never fires for `sleep 60\n\x03`, while the identical shape fires for
+`while true { }\n\x03`. So the shell never wakes, never asks, and the sleep runs its full
+minute.
+
+What is known, so the next attempt starts from data rather than from scratch:
+
+- The event **is** emitted, and the whole path works, when the interrupt follows a line the
+  shell evaluates *in-process* — that is what §11h's shipped tests cover.
+- The shell blocks in **two** places during a pipeline, and both now watch the tty: the
+  capture read of the tail's output (`ChannelReceiver::receive`, which is where a long
+  pipeline actually waits) and `reap`. Neither wakes, which is consistent with the event
+  never being sent rather than with the shell missing it.
+- A raw read stops at `0x03` so the byte cannot be handed over as input, and that change is
+  verified by the prompt-level test.
+
+**Trigger: the next attempt at this**, which should start by confirming whether the byte
+reaches `pending` at all in the pipeline case — a probe on the console read completion,
+not on the interrupt branch. Until then, `Ctrl-C` interrupts the *shell* and not the
+*program it is running*, and `strict` asks stages to stop that will not hear it.
+
 **Control flow inside an expression — `TODO(control-flow-in-expression-position)`.**
 `eval` returns a *value*, so a block whose value is being taken has no channel for control
 flow to travel back through. Two consequences, one new and one pre-existing:

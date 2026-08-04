@@ -225,6 +225,9 @@ pub const SYS_FILE_TRUNCATE: u64 = 34;
 /// `sys_file_rename` — rename a path to another path in the same filesystem
 /// (a3/a4 = destination pointer/length, a5 = `RENAME_*` flags).
 pub const SYS_FILE_RENAME: u64 = 35;
+/// `sys_process_terminate` — **ask** a process to exit (§11h). Delivered as a
+/// `TerminateRequested` notification; nothing stops a process that ignores it.
+pub const SYS_PROCESS_TERMINATE: u64 = 36;
 
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
@@ -272,6 +275,7 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_THREAD_CREATE => encode(sys_thread_create(a0)),
         SYS_THREAD_GET_REGISTERS => encode(sys_thread_get_registers(a0, a1)),
         SYS_EXCEPTION_RESUME => encode(sys_exception_resume(a0, a1, a2)),
+        SYS_PROCESS_TERMINATE => encode(sys_process_terminate(a0)),
         SYS_NS_CREATE => encode(sys_ns_create()),
         SYS_NS_LOOKUP => encode(sys_ns_lookup(a0, a1, a2 as usize, a3, ResolveOp::Plain)),
         SYS_FILE_GROW => {
@@ -758,6 +762,31 @@ pub fn sys_exception_resume(thread_h: u64, disposition: u64, code: u64) -> SysRe
     if !crate::sched::resume_suspended(ok.object.as_ptr(), tag, code as i32) {
         // Not currently suspended (already resumed, or never faulted).
         return Err(KError::InvalidArgument);
+    }
+    Ok(0)
+}
+
+/// `sys_process_terminate(process)` — **ask** a process to exit (§11h).
+///
+/// Gated on `SIGNAL` rather than `TERMINATE`, deliberately. Both rights are granted on
+/// every handle `sys_process_spawn` returns, so today the choice is invisible — but this
+/// is a *request*, and naming it `SIGNAL` leaves `TERMINATE` free to gate a forcible kill
+/// if one is ever built. Spending the stronger right on the weaker operation would make
+/// that distinction unavailable later.
+///
+/// The authority is the handle. There is no way to name a process you were not given one
+/// for — no pid argument here or anywhere else in the syscall surface — so "you may
+/// terminate your own children" needs no check: it is the only handle you have. A
+/// supervisor with more reach is one that was *given* more handles, which is namespace and
+/// hand-down policy, not a kernel rule.
+///
+/// Returns `Unsupported` if the target has no notification channel: it cannot be asked,
+/// and reporting that is better than returning success for a message nobody will read.
+pub fn sys_process_terminate(process_h: u64) -> SysResult {
+    let pid = crate::sched::current_owner_pid();
+    let ok = lookup_typed(process_h, pid, Rights::SIGNAL, KObjectType::Process)?;
+    if !crate::sched::request_terminate(ok.object.as_ptr()) {
+        return Err(KError::Unsupported);
     }
     Ok(0)
 }

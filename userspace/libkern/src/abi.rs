@@ -120,6 +120,9 @@ pub const KIND_CHILD_EXITED: u32 = 0x0200;
 /// Process lifecycle: an IPC peer closed.
 pub const KIND_PEER_CLOSED: u32 = 0x0201;
 /// Resource: a handle was invalidated.
+/// A holder of this process's handle has asked it to exit (§11h). A request: nothing
+/// stops a process that ignores it, because there is no forcible kill.
+pub const KIND_TERMINATE_REQUESTED: u32 = 0x0202;
 pub const KIND_HANDLE_INVALIDATED: u32 = 0x0400;
 /// Resource: notifications were dropped due to queue overflow (synthetic).
 pub const KIND_NOTIFICATIONS_DROPPED: u32 = 0x0401;

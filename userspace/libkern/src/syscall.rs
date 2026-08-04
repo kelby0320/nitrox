@@ -91,6 +91,9 @@ pub const SYS_FILE_TRUNCATE: u64 = 34;
 /// different binding fails with `Unsupported` — the caller's cue to fall back to
 /// copy-then-unlink, the way `mv` does across devices.
 pub const SYS_FILE_RENAME: u64 = 35;
+/// `sys_process_terminate` — **ask** a process to exit; it is delivered as a
+/// `TerminateRequested` notification and nothing stops a process that ignores it (§11h).
+pub const SYS_PROCESS_TERMINATE: u64 = 36;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
 /// Integration-test only: end the QEMU run with a harness verdict (the argument's
