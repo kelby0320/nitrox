@@ -386,6 +386,13 @@ add `try` to `primary` alongside `if` and `match`, which are already expressions
 but it is a grammar change and belongs with a considered pass over §9c rather than as a
 side effect of Part E.
 
+**Triggered 2026-08-04, and scheduled.** Milestone 4 *is* that considered pass over §9c
+(it adds `break`/`continue`/`fail` there), and the trigger arrived from the other
+direction as well: retiring the `?` propagation operator leaves no way to default on
+failure in expression position, so the recovery form has to land in the same part. Design
+written up in §9c of the shell design doc (v1.2); built in **Milestone 4 Part C**, where
+this entry moves to Resolved.
+
 
 **A profile's contents are fixed at server startup — `TODO(profile-generation-refresh)`.**
 `profile-server` reads its manifest once, at startup, from the initramfs, and never looks
@@ -474,6 +481,40 @@ the same capability set the compositor terminal brings, not something the search
 missing — `History::search_back` already returns indices and can enumerate every match.
 
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
+
+**Bitwise operators, and the `0o` literal — `TODO(shell-bitwise)`.**
+Shell design §8e admits hex and binary literals and justifies them by
+"permissions/flags/addresses" — and the language has no way to test a bit. The gap is real; the
+deferral is deliberate for two reasons, both recorded in §8e so the next pass does not rediscover
+them. **Every conventional symbol is already taken by something more load-bearing**: `|` is the
+pipe, `&` is §11g's background suffix, `^` is §3's force-external prefix (which §3 itself flagged
+as an XOR collision when it chose it). So the C spelling is unavailable at any price and the
+realistic design is *named* operators — `band`/`bor`/`bxor`/`shl`/`shr` — landing with the `0o`
+literal §8e also left out. And **nothing in the system is a bit field yet**: `list` emits `kind`,
+not a mode word; capability rights never surface as a number. Designing five operators against a
+hypothetical is how a language acquires a vocabulary nobody uses.
+
+Trigger: the first real bit field reaching a `Value` — file modes on `list --long`, or a rights
+word made visible to a script.
+
+**Four smaller language deferrals from the v1.2 audit.** Each is in shell design §12 with the same
+trigger; recorded here because the canonical-list rule is that a deferral lives in this document,
+not only in the doc that decided it.
+
+- **Labelled `break`/`continue` — `TODO(shell-labelled-break)`.** Milestone 4 Part A adds the
+  unlabelled pair; labels need their own grammar (`'outer:`) and pay for themselves at a nesting
+  depth shell scripts rarely reach, and `return` already covers "get me out of all of this."
+  Trigger: real scripts with loops nested deeply enough to need to escape more than one level.
+- **Named regex capture groups — `TODO(regex-named-captures)`.** Part F lands positional
+  `capture`; names need a name table threaded through the compiler. Trigger: a pattern whose
+  groups outlive the line that wrote them — a config parser rather than a one-line filter.
+- **Regex-pattern replacement — `TODO(regex-replace)`.** `replace` is literal. The pattern form is
+  a separate verb and needs `capture`'s submatch slots to express `$1`-style references at all.
+  Trigger: the first script that wants a substitution rather than a whole-value swap.
+- **Unicode case folding — `TODO(unicode-case)`.** `upper`/`lower` are ASCII-only, said where a
+  user meets it rather than only in the design doc. Trigger: the tables arriving for some other
+  reason (text rendering in the compositor is the likely one), since carrying them for two shell
+  operators alone is not the trade.
 
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 

@@ -10037,3 +10037,135 @@ with empty syscaps and no handoff channel), but a user's `/bin` listing service 
 noise at best. The clean answer is the per-user profile overlay that
 `profiles-and-namespace-projection.md` already designs and defers; this is the first
 concrete reason to build it.
+
+## 2026-08-04 — The language audit: what a typed shell could not do, and design v1.2
+
+The maintainer stopped the tty work to ask about two suspected gaps in the shell language —
+no `String` → `Int`/`Float` conversion, and no `break`/`continue` — and asked for a sweep of
+the rest of the grammar. Both were real. The sweep found more, and the design doc is now
+**v1.2**, the first revision that changes semantics rather than correcting prose.
+
+**The method is why some of these exist at all.** The sweep was run by *driving the
+interpreter* — around forty probes through `Interp::run_line` in a scratch module, each
+finding a recorded transcript line rather than an inference — not by reading the grammar.
+Reading the doc finds gaps in the doc; reading the source finds gaps in the source; only
+running the thing finds the cases where **the two disagree**, and two of the largest
+findings are exactly that:
+
+- **§6's own examples do not parse.** `ls | filter … | expect Table<{…}>` and
+  `ls | assert (count > 0)` are how that section teaches ascription, and both come back "a
+  value cannot be a pipeline stage" — `expect`/`assert` were implemented as expression forms
+  only. The type system's one real mechanism was reachable at a binding site and a parameter,
+  the two places a shell script spends the least time.
+- **`PipelineStatus` is built and then discarded.** §2 dissolved `$?` on the grounds that
+  `let r = my_pipeline` puts the status in hand. It cannot: a pipeline's value is its *data*,
+  and on failure it fails loud and never reaches the `let`. The implementation split the
+  difference with an undocumented `__status` binding that the failure path then dropped —
+  the report exists for exactly one case and is destroyed in it.
+
+**The two named gaps, and why the second is worse than it looks.** Conversion ran one way
+only — `format`, `++` and `display` produce strings and nothing consumed one — so a number
+read from a file, emitted by a program, or typed at a prompt could never *be* a number. And
+with `return` the only early exit, "stop at the first match" cannot be written inside a loop.
+Then: **there is no `Ctrl-C`.** The line discipline handles Ctrl-D/U/W/R and never looks at
+`0x03`, so today an accidental `while true { }` at a prompt is a reboot. §11g settled job
+control and excluded Ctrl-Z with a structural argument; Ctrl-C is not mentioned anywhere in
+v1.1. There is no `SIGINT` in this system and nothing was put in its place.
+
+**Decisions taken with the maintainer:**
+
+- **`parse T`, chosen over `into T` (nushell) and `int(…)`.** It pairs with `expect T` and the
+  pairing is the argument: same type-expression grammar, same fail-loud contract, two verbs
+  that say which job is being done — `expect` asserts a value *is* a `T`, `parse` reads one
+  as a `T`. It also shares the lexer's numeric scanner, so "what a number looks like" has one
+  definition instead of two that drift.
+- **`?` is retired — a reversal, not a clarification.** It was specified as Rust-style
+  propagation and implemented as the identity function, which turns out to be the only thing
+  it could be: `?` earns its keep in Rust because the default is to *return* a `Result` the
+  caller must inspect, and §6's governing rule ("a value is exactly what TSM1 can represent")
+  forbids a `Result` value here. Propagation is already the default, so `?` had nothing to
+  mark. **`fail` is the half that was actually missing** — `try`/`catch` could catch an error
+  and nothing in the language could raise one; the only in-language failure was `assert`,
+  whose message is permanently "assertion failed".
+- **The pipeline report rides on the error value.** `catch (e)` gets `e.stages`, the §1 shape
+  delivered where the question is asked; `__status` is deleted.
+- **Bitwise operators deferred, with the analysis recorded rather than left to be
+  rediscovered.** §8e justified hex and binary literals by "permissions/flags/addresses" and
+  there is no way to test a bit — but every conventional symbol is taken by something more
+  load-bearing (`|` the pipe, `&` §11g's background suffix, `^` §3's force-external prefix,
+  which §3 already flagged as an XOR collision when it chose it). The realistic answer is
+  named operators; the reason to wait is that **no value in the system is a bit field yet**,
+  and designing five operators against a hypothetical is how a language acquires a vocabulary
+  nobody uses. Trigger recorded: the first one that is.
+- **`Ctrl-C` is a notification, not a signal** — the answer the system already gives for
+  asynchronous events. The tty server recognises `0x03` and delivers an out-of-band event to
+  the terminal's owner; the evaluator checks between statements and unwinds as
+  `kind: "Interrupted"`; a running pipeline is stopped by terminating the stages. **The reason
+  this is tractable is that §10a's hard question does not arise**: the shell spawned those
+  processes and already holds `Process` handles carrying `Rights::TERMINATE`.
+
+**And a kernel gap fell out of the last one.** `Rights::TERMINATE` is defined, granted on
+every spawned `Process` handle, and enforced by the type/rights table — **and no syscall
+consumes it.** The right was reserved and the operation never built; nothing in today's 36
+syscalls can terminate another process. That also explains a standing divergence nobody had
+connected: §1 has said since v1 that a failed stage under `strict` *terminates* the rest, and
+the implementation waits for every child to exit and then labels the later ones "cancelled".
+Accurate bookkeeping, no termination, because there was nothing to terminate with. One
+syscall closes both.
+
+**Sequenced as Milestone 4 (seven parts) in `shell-coreutils-plan.md`**: `break`/`continue`
+first, then `parse` + the keyword stages, then errors, then the operator families
+(reduction; strings/records/numbers/`in`), then `capture`, then interrupt. Errors come
+*before* the operator families deliberately — otherwise every operator added in between
+raises into a vocabulary that is about to change. Interrupt is last because it carries the
+kernel dependency, and because `break` removes the commonest way to need it.
+
+## 2026-08-04 — `?`, precisely: what retires, what does not, and `try` becomes an expression
+
+A follow-up with the maintainer on the entry above, and both halves are worth recording
+because the first was a misunderstanding my own wording invited.
+
+**`?` does five jobs in this grammar and only one retires.** The v1.2 text said the token
+"stays busy — `?.` and `??` are §9e's," which read as though those were the only survivors.
+They are not: **nullable ascription (`let a: Int?`) and the `size?: T` record-shape
+shorthand are `?` in *type* position** and are untouched. In the parser this is not a
+judgement call, it is a different arm — `parse.rs:1301/1316/1331` read `?` after a base
+type or a field name, `?.` and `??` are their own tokens, and only `:628`/`:1047` handle
+postfix `expr?`. Retiring the propagation operator is a two-arm change. The design doc now
+carries the five-way table rather than a sentence that has to be read carefully.
+
+**The maintainer declined the repurpose, and gave the better reason for it.** The offer was
+to redefine `expr?` as "on failure, evaluate to null," pairing with `??`. The answer: that
+scenario is really asking for `try`/`catch` where the catch branch supplies a default —
+**and not necessarily null**. That is right, and it reframes the gap: a shorthand operator
+can only ever produce one fallback value, while what is actually wanted is a *branch*.
+
+**Which turned out to be already filed.** `TODO(try-in-expression-position)` says
+`let x = try { … } catch (e) { e.message }` "reads as though it should work" and does not,
+names the fix — "add `try` to `primary` alongside `if` and `match`, which are already
+expressions there" — and defers it to "a considered pass over §9c." **Milestone 4 is that
+pass**, so the trigger arrived from two directions at once: the §9c work, and the fact that
+retiring `?` leaves no expression-position recovery form at all. It goes in Part C with
+`fail` and the error kinds, not after them.
+
+```
+let cfg  = try { open ./config.toml } catch { default_config() }
+let port = try { $env.PORT | parse Int } catch (e) { display e.message ; 8080 }
+```
+
+**No new syntax, which is the argument for this shape.** §9a already makes a block's value
+its last expression-shaped statement, so the catch branch supplies a value by *being a
+block*. Three alternatives were rejected: a postfix `expr catch <value>` (a second `catch`
+form, and its precedence against `|` is genuinely ambiguous — `open ./x | count catch 0`);
+an `or`/`else` fallback keyword (reads as boolean); and extending `??` to failures, which
+**conflates two different questions** — `rec.field ?? d` means the field is legitimately
+null, and "the open failed" is not that.
+
+**And a doc gap fell out of writing it.** §8c's `primary` production never listed `block`,
+`if` or `match`, all of which have been expressions since v1 — `let x = if c { 1 } else { 2 }`
+has always worked and §9a is built on it. That omission is why `try`'s absence from the same
+list looked like a decision rather than an oversight. `primary` is corrected in v1.2.
+
+One implementation note carried into Part C: retiring `?` frees the `Expr::Try` variant, so
+`try` collapses to **one** node with statement position becoming an `expr` statement. Two
+forms of one construct is precisely how the `run_line`/`exec_block` divergence happened.

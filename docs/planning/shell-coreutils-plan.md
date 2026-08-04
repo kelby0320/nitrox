@@ -1,6 +1,7 @@
 # Nitrox Shell & Coreutils — Subproject Plan
 
-**Status:** 🚧 active (started 2026-07-24; Milestones 1–2 complete, Milestone 3 planned 2026-07-30). The three CLI substrate prereqs (§1C) are
+**Status:** 🚧 active (started 2026-07-24; Milestones 1, 2, 3 and 3.5 complete — the shell is the
+login leaf as of 2026-07-31 — and **Milestone 4, language completeness, planned 2026-08-04**). The three CLI substrate prereqs (§1C) are
 all in, so the milestones below are unblocked. This is a large, multi-slice subproject running in
 its own Claude Code session(s); this document is the entry point for that work.
 
@@ -10,7 +11,7 @@ A build plan and gap analysis for the Nitrox shell + coreutils **language subpro
 interpreter, the coreutils, and the (minimal) REPL. Derived from the design docs and cross-checked
 against the implemented system:
 
-- **Design (semantics/grammar):** `docs/history/nitrox-shell-design-v1.1.md`
+- **Design (semantics/grammar):** `docs/history/nitrox-shell-design-v1.2.md`
 - **Design (UI composition, upstream where they touch):** `docs/history/nitrox-ui-composition-model-v1.md`
 - **This plan** sequences the subproject's own work (language → coreutils → minimal REPL) and
   records the design gaps it must resolve as it goes.
@@ -40,6 +41,11 @@ truth for *the order the shell/coreutils get built*.
 3. **The design doc is trustworthy as v1.1.** The two real inconsistencies found in v1 (the `librt`
    reference; §9d presenting the `Value` collection types as already-existing) are corrected there.
    This plan carries the full analysis.
+   **Amended 2026-08-04:** it is now v1.2, and that pass *did* change semantics. Auditing the built
+   language against the doc turned up gaps in the design itself (no conversion, no `break`, no way
+   to raise an error, no answer to `Ctrl-C`) and two places where a mechanism the doc specified was
+   unreachable in the implementation. Both directions were possible because v1.1 checked the doc
+   against the system by reading; this one checked by running. See Milestone 4.
 
 ## How this depends on work already done
 
@@ -1044,11 +1050,200 @@ a closer, so there is no right operand and division is *impossible*.
 those. `list /` at the prompt shows `home`, `bin`, `session`, `dev` — the four bindings
 the session was built with, and nothing else.*
 
+### Milestone 4 — language completeness (planned 2026-08-04)
+
+**Where this came from.** Not a feature wish-list: an audit of the *built* language against the
+design doc, run by driving the interpreter rather than reading the grammar — which is how items
+like "§6's own examples do not parse" surfaced at all. The design decisions it produced are
+recorded in `nitrox-shell-design-v1.2.md` (§2, §6, §8c/§8e, §9c, §10b, §11f, §11h); **this section
+is the build order, not the design.** Read the design first; the parts below assume it.
+
+**The through-line is two sentences.** The language could *test* values but not *transform* them —
+every conversion ran toward text and nothing consumed one — and it could not *finish a loop*, since
+`return` was the only early exit and it leaves the whole function. Everything here is one of those
+two, or a mechanism the design already specified that turned out to be unreachable from where it
+was meant to be used.
+
+**Ordering rationale.** A and B first: they are the two that make scripts *impossible* rather than
+awkward, and B is what lets a number read from a file be a number. C next, before the operator
+families, so that every operator added afterwards raises errors in the final vocabulary rather than
+being revised into it. D before E because E is breadth on the substrate D lays. F is isolated
+because it is the only part with real engine work behind it. G is last: it carries the only kernel
+dependency in the milestone, and A has by then removed the commonest way to need it.
+
+Two things hold for every part and are not repeated in each:
+
+- **The library half stays syscall-free and host-tested.** Anything spanning two prompt lines uses
+  the `repl(&[…])` helper — three interactive-only bugs got in before it existed (`userspace/nxsh/CLAUDE.md`).
+- **Each part ends green on all four gates**: `cargo xtask test`, `test-qemu`, `test-interactive`,
+  and the `check-*` gates. A part that changes the grammar re-runs the in-guest pair that pins
+  `list /` against `6 / 2` — the two only mean anything together.
+
+Parts, in order (tick as they land):
+
+- [ ] **Part A — `break` / `continue`**
+- [ ] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages**
+- [ ] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`**
+- [ ] **Part D — sequences generalise, and reduction**
+- [ ] **Part E — strings, records, numbers, `in`**
+- [ ] **Part F — `capture`: regex submatches**
+- [ ] **Part G — interrupt (`Ctrl-C`)** — also makes `strict` real
+
+**Expect each part to surface substrate gaps, and file them rather than paper over them** — the
+rule Milestone 2 earned. Part G already has one before it starts (below).
+
+#### Part A — `break` / `continue`
+
+New tokens, two statement forms (§9c), and a third and fourth variant beside `Normal`/`Return` in
+the evaluator's `Flow`. `for` and `while` consume them; every other construct propagates them the
+way it already propagates `Return`.
+
+- **The loop-only and closure-boundary rules are one mechanism**: the parser tracks loop depth and
+  **resets it on entering a `def` or closure body**. That reset *is* "`break` does not cross a
+  function boundary" — one line in the parser instead of a runtime check in the wrong place, and it
+  makes both errors parse-time, which is the better of the two available diagnostics.
+- **The trap is `Flow`**: every `match` on it is a place a `break` can be silently swallowed.
+  `exec_block`, `scoped_block`, the loop bodies and `call_function` all need to be revisited
+  together, not one at a time.
+- Tests: `break`/`continue` in both loop forms; inside a nested `if`; `break` inside
+  `filter { |it| … }` is a parse error; `break` at top level is a parse error; and a `def`
+  containing a loop containing a `break` still returns normally.
+
+#### Part B — `parse T`, and the keyword stages
+
+One parser change carries both halves: `pipeline_stage` admits `stage_keyword` (§8c), which is what
+makes `expect`, `assert` **and** `parse` legal mid-pipeline. `expect`/`assert` were specified that
+way in v1 and never worked; `parse` is new and would have had the same problem on day one.
+
+- **`parse` reuses the lexer's numeric scanner** rather than carrying a second one, so "what a
+  number looks like" has exactly one definition (§8e's `int_lit`/`float_lit`, hex/binary/`_`
+  included). Factor the scanner out; do not reimplement it.
+- Strict about surrounding whitespace, deliberately (§6) — `trim` arrives in Part E, so say so in
+  the error message until it does.
+- **Ordering note:** `ParseError` as a `kind` lands in Part C. Until then a parse failure is an
+  ordinary error with the right *message*; Part C gives it the right *kind*.
+- Tests: **§6's own examples, verbatim** — they are the thing that did not run, so they are the
+  regression. Plus round-trips (`42 | format("{}") | parse Int`), and each refusal:
+  `" 42 "`, `"abc"`, `"1.5" | parse Int`, `parse Bool` on `"yes"`.
+
+#### Part C — errors: `fail`, kinds, `e.stages`, `?` retired, `exit N`
+
+The part that makes the error path a designed surface rather than whatever the interpreter happened
+to produce.
+
+- **`fail <String>` / `fail <Record>`**, and one place that constructs an error record so the `kind`
+  vocabulary (§2) cannot drift between raising sites.
+- **`e.stages` on a failed pipeline**, and the undocumented `__status` binding is deleted with it.
+- **`?` loses its postfix-expression form only** — two parser arms. **Nullable ascription (`Int?`,
+  `Table<{…}>?`), the `size?: T` record shorthand, `?.` and `??` are untouched**; they are
+  type-position or their own tokens (§2's table). A bare postfix `?` becomes a parse error naming
+  §2 rather than silently accepting a no-op.
+- **`try`/`catch` becomes an expression** — `let cfg = try { … } catch { default_config() }`. This
+  is the recovery form that has to arrive *with* `?`'s retirement rather than after it, or the
+  language spends a release with no way to default on failure in expression position. Closes
+  `TODO(try-in-expression-position)`, which named this §9c pass as its trigger and the fix as "add
+  `try` to `primary`" — and it is exactly that: `parse.rs` already has `Tok::If` and `Tok::Match`
+  arms there and no `Tok::Try`.
+  **Collapse to one node while doing it**: retiring `?` frees `Expr::Try`, so statement-position
+  `try` becomes an `expr` statement and `Stmt::Try` goes away. Two forms of one construct is how
+  the `run_line`/`exec_block` divergence happened.
+  Tests: the binding case (`let x = try …`), a catch branch with no value yielding `Null`, `try` as
+  a pipeline head, and — the one that would have caught the original gap — a `catch` whose value is
+  used two lines later without a `mut`.
+- **`exit` becomes a real builtin**: `Flow::Exit(status)`, default `0`. The interactive driver stops
+  comparing the line against `"exit"` — after this, **the loop intercepts nothing**, and the
+  standing warning in `userspace/nxsh/CLAUDE.md` about the driver being a second implementation of
+  the language gets to be deleted rather than reworded.
+- **Decide and record: `try`/`catch` does not catch `exit`.** `Flow::Exit` is control flow, not an
+  error, so leaving is not something a `catch` can accidentally swallow. (Part G's `Interrupted`
+  *is* catchable, deliberately, so cleanup runs — the asymmetry is intentional and belongs in the
+  commit message.)
+- Tests: every raising site's `kind`; `e.stages` after a two-stage failure names the stage that
+  failed; `exit 3` really is the process's status (in-guest — this one cannot be host-tested).
+
+#### Part D — sequences generalise, and reduction
+
+- `rows()`/`rebuild()` accept a `String` (characters) and a `Range` (values), and rebuild in the
+  shape they were handed (§10b). This is where length, substring and slicing come from.
+- `sum`, `min`, `max`, `avg`, `reduce` (both forms), with the empty-input answers from §10b — each
+  one forced rather than chosen, and each one a test.
+- Two corrections ride along: **`sort` uses every key** it is given, and **`format` in stage
+  position formats its operand**.
+- **Trap:** `"abc" | count` currently *errors*, and after this it is `3`. Check nothing leans on the
+  refusal. Characters, not bytes — `"abc"[0]` already indexes characters, and two answers to "what
+  is an element of a String" is one too many.
+
+#### Part E — strings, records, numbers, `in`
+
+Breadth on Part D's substrate: `split`/`join`/`trim`/`replace`/`upper`/`lower`,
+`keys`/`values`/`merge`, `round`/`floor`/`ceil`/`trunc`/`abs`, and `in` as an infix comparison
+(§8a). The lexer already has `Tok::In`.
+
+- **Trap:** `for x in xs` and `if x in xs` in the same script, as one test. The `for` rule consumes
+  its own `in` before any expression is parsed (§8c), and that is exactly the kind of claim that is
+  true until someone reorders a parser function.
+- `upper`/`lower` are ASCII-only and say so where a user meets it, not only in the design doc.
+
+#### Part F — `capture`: regex submatches
+
+The only part with engine work behind it: submatch slots in the Pike VM — `(`/`)` compile to save
+instructions, and each thread carries its slot vector.
+
+- **Do not change what matches.** Slots record *where*; the existing semantics (and the deliberate
+  exclusions — no backreferences, no lookaround, §10b's `~=` note) stay exactly as they are. The
+  anchor bug the engine already has a regression test for is the reminder of what a "small" change
+  to instruction handling can do.
+- **`~=` must not pay for it.** It runs per row inside `filter`; keep the slot-free `is_match` path
+  and let only `capture` allocate.
+- Tests: groups; a non-participating group is `null`; no match is `null` overall; nested groups; and
+  the existing pathological-pattern case still terminates.
+
+#### Part G — interrupt (`Ctrl-C`) — and `strict` becomes real
+
+Three pieces, in this order, because the first is a prerequisite for the other two *and* fixes a
+standing divergence on its own (§1: `strict` claims to terminate the remaining stages and today
+only relabels them).
+
+1. **`sys_process_terminate` — a kernel gap this milestone surfaced.** `Rights::TERMINATE` is
+   defined, granted on every spawned `Process` handle, and enforced by the type/rights table; no
+   syscall consumes it. The right was reserved and the operation never built.
+   - It must reuse the existing exit path — the reaper thread and exit-context teardown — rather
+     than growing a second one. Reclamation is the area of the kernel that has cost the most to get
+     right; a parallel teardown is the way to undo that.
+   - **The real question to settle at build time:** the target may be blocked inside a syscall.
+     Terminating a thread mid-syscall is the classic hazard; the likely answer is to mark the
+     process terminated and tear it down at a safe point, which is a design decision to make
+     deliberately and record, not to discover.
+   - This is the riskiest single item in the milestone. It is also the one that makes `strict`
+     honest, so it earns its place either way.
+2. **An out-of-band interrupt event on the tty protocol.** Input is request/response today — a line
+   or raw bytes — so the server has no way to tell a client something it did not ask for, and the
+   *evaluating* shell is not reading. The design says notification (§11h); confirm that against the
+   tty server's actual shape before building.
+3. **`Host::interrupted()` and the evaluator's checkpoints** — between statements and between loop
+   iterations, unwinding as `kind: "Interrupted"`. The prompt-level half (Ctrl-C discards the line
+   being edited) is pure line discipline and can land first.
+
+Tests: host-side, a `MockHost` that reports an interrupt after N statements — the loop unwinds with
+the right kind and `try`/`catch` still runs. In guest, the one that matters: **`test-interactive`
+types `while true { }`, sends `0x03`, and expects the prompt back.** That test is unwritable today,
+which is the point.
+
+#### What Milestone 4 does not do
+
+Labelled `break`/`continue`, named capture groups, regex-pattern `replace`, bitwise operators and
+the `0o` literal, `.csv`/`.json` for `save`/`open`, schema-aware completion, and job control
+(`&`/`jobs`/`fg`). All are in design §12 or the deferred REPL section below, each with its trigger.
+
 ### Deferred — the rich REPL (§11) and its dependencies
 
 Gated on the console/tty server + compositor terminal (later in Phase 4). Covers reverse-search,
 Shift-Enter continuation (needs a key-event channel), job control's `fg`/`&`, schema-aware
 completion, and the prompt's live `PipelineStatus` glyph. Tracked but out of this subproject.
+**Partly delivered ahead of schedule** (2026-08-03): the console/tty server landed, and with it raw
+mode, history recall and reverse-search. What remains gated is completion (needs schema work),
+Shift-Enter (needs a key-event channel), and job control (needs process groups — and, as Milestone
+4 Part G found, a terminate syscall).
 
 ### Explicitly out of scope (design §10a/§13, carried forward)
 
@@ -1064,7 +1259,7 @@ with baked-in arguments, package system beyond single-file `use`, circular-impor
 Phase 4 *before* this subproject — check them off in [`phase-4-desktop.md`](phase-4-desktop.md).
 If they are not done, that is the work to do first, not this plan.
 
-With the prereqs in, read, in order: this plan → `nitrox-shell-design-v1.1.md` →
+With the prereqs in, read, in order: this plan → `nitrox-shell-design-v1.2.md` →
 `nitrox-ui-composition-model-v1.md` (for `form`/stdout only) → `docs/spec/typed-stream-format.md`
 (TSM1 wire) → `docs/spec/rsproto-*.md` (the protocol the fs-server speaks). Then start at
 **Milestone 1 (`list` + `copy`)** — the first integrated proof that the substrate composes.

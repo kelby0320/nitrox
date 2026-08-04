@@ -11,7 +11,7 @@
 //! that are not — pipeline ordering, backpressure, error propagation — become testable
 //! once the OS sits behind a trait.
 //!
-//! Design: `docs/history/nitrox-shell-design-v1.1.md` (§8 lexical/expression grammar, §9
+//! Design: `docs/history/nitrox-shell-design-v1.2.md` (§8 lexical/expression grammar, §9
 //! statements). Plan and the decisions it resolves: `docs/planning/shell-coreutils-plan.md`
 //! § Milestone 3.
 

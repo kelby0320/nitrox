@@ -1,4 +1,4 @@
-# Nitrox: Shell Design Notes (v1.1)
+# Nitrox: Shell Design Notes (v1.2)
 
 ## Status
 
@@ -10,6 +10,50 @@ language and shell. Update in place as the design progresses; don't treat this a
 Companion document: `nitrox-ui-composition-model-v1.md` (windows/widgets as resource servers,
 window-to-window composition) — present in `docs/history/`, upstream of this one where they touch
 (e.g. `form`'s mechanics), but this doc stands on its own for shell/language concerns.
+
+### Changes in v1.2 (2026-08-04, language-completeness pass)
+
+**Unlike v1.1, this pass does change semantics.** It comes out of an audit of the built language
+against this document, driven by running the interpreter rather than reading the grammar — which
+is why several items below are "the design says X and the implementation does Y," and the
+resolution is not always that the implementation is wrong.
+
+The through-line: the language could *test* values but not *transform* them, and could not finish
+a loop. Everything below is one of those two, or a mechanism this document already specified that
+turned out to be unreachable from where it was meant to be used.
+
+- **§2 — errors are now constructible, and `?` is retired.** There is no `Result` *value* in a
+  language whose values are exactly what TSM1 can represent, so `?` had nothing to mark and was a
+  no-op in the implementation from the start. `fail` replaces it as the missing half: a script can
+  now *raise* an error, not just catch one. The error value gains a `kind` vocabulary, and a
+  failed pipeline carries its per-stage status **on the error**, which is where §2's "the status is
+  in hand" claim actually lands.
+- **§6 — `parse T`, the converting sibling of `expect T`.** Conversion ran one way only: `format`
+  and `++` produce strings and nothing consumed them. Text read from a file or typed at a prompt
+  could never become a number.
+- **§6/§8c — `expect`, `assert` and `parse` are legal pipeline stages.** They were expression-only
+  in the implementation, so §6's own examples (`ls | filter … | expect Table<{…}>`) did not run.
+  The type system's one real mechanism was unreachable from the pipeline it was written for.
+- **§9c — `break` and `continue`.** Absent from the statement grammar in v1.1, and their absence
+  is load-bearing: with `return` the only early exit, "stop at the first match" cannot be written
+  inside a loop without draining it.
+- **§9c/§8c — `try`/`catch` is an expression**, so a failure can produce a fallback *value*
+  (`let cfg = try { … } catch { default_config() }`). It closes `TODO(try-in-expression-position)`,
+  which asked for exactly this and named this pass as the place to do it. Alongside it, §8c's
+  `primary` production is corrected: it never listed `block`, `if` or `match`, all of which have
+  been expressions since v1 — which is why `try`'s absence looked deliberate.
+- **§10b — the operator set grows** by the families that were missing rather than by taste:
+  reduction (`sum`/`min`/`max`/`avg`/`reduce`), strings (`split`/`join`/`trim`/`replace`/`upper`/
+  `lower`), records (`keys`/`values`/`merge`), numbers (`round`/`floor`/`ceil`/`trunc`/`abs`), and
+  `capture` for regex submatches. §10a's own dividing rule puts every one of them here rather than
+  in a program.
+- **§8a/§8c — `in` joins the comparison tier**, and the sequence operators accept a `String` (its
+  characters) and a `Range` (its values), which is where substring, slicing and length come from
+  without a second vocabulary.
+- **§8e — bitwise operators, deliberately deferred** with the collision analysis recorded, because
+  all three conventional symbols are already spoken for.
+- **§11f — `exit` takes a status.** **§11h (new) — interrupting**, the question §11g never asked:
+  the system has no `SIGINT` to inherit, and nothing replaced it.
 
 ### Changes in v1.1 (2026-07-22, consistency pass)
 
@@ -68,7 +112,10 @@ capture/no-global-`$?`/no-ambient-env stance used throughout. Inside the block, 
 failure causes the shell to terminate remaining stages immediately. Needs no new mechanism: the
 shell already holds process handles for every stage it spawned, so "abort the rest" is an ordinary
 capability-mediated terminate call on handles it already owns — not signal delivery, consistent
-with the system's no-signals stance. Composes independently with `try`/`catch` (`try { strict { a
+with the system's no-signals stance. (**That terminate call does not exist yet**: the right is
+granted on every spawned handle and no syscall consumes it, so `strict` currently labels the
+remaining stages cancelled rather than stopping them. Same missing piece as §11h, closed by the
+same syscall.) Composes independently with `try`/`catch` (`try { strict { a
 | b | c } } catch { ... }`) since they govern different things — `strict` changes behavior *during*
 execution, `try`/`catch` governs control flow *after* the pipeline resolves.
 
@@ -93,20 +140,97 @@ for scripts that want it.
 
 ## 2. Control flow and error handling
 
+- **`try`/`catch` is an expression (v1.2)** — `let x = try { … } catch { … }`, with the catch branch
+  supplying the fallback value. This is the recovery form that replaces what a propagation operator
+  would have offered, and it offers more: the branch sees the error, so the default can vary by
+  `kind`, log first, or re-raise with `fail`. Grammar and rationale in §9c; it closes
+  `TODO(try-in-expression-position)`.
 - **`try`/`catch`** — sugar over branching on a Result-shaped value, *not* real exception
   unwinding. No stack-unwinding across unrelated call frames. Consistent with the system's
   rejection of hidden non-local control flow (no signals) elsewhere.
-- **`?` operator** — Rust-style propagation. Exits the *current function*, returning the error to
-  its caller. Chosen deliberately over bash's silent-continue-by-default, and over a generic
-  exception model, given Rust is the explicit language inspiration and the implementation
-  language.
+- **`?` operator — retired in v1.2.** It was specified as Rust-style propagation (exit the current
+  function, hand the error to the caller) and was implemented as an identity function, which is
+  not an oversight so much as the only thing it could be. `?` earns its keep in Rust because the
+  *default* there is to return a `Result` **value** that the caller must inspect; `?` is what marks
+  the point where you decline to. This language has no `Result` value and cannot have one — §6's
+  governing rule is that a value is exactly what TSM1 can represent — so a failing expression does
+  not *return* anything to be unwrapped, it fails, and propagation is already the default. `?` had
+  nothing left to mark. Removing it costs no expressiveness and stops a decorative operator from
+  reading like a load-bearing one.
+
+  **This retires one of `?`'s five jobs and touches none of the others.** The token is doing a lot
+  of work in this grammar, and only the postfix-expression form is affected:
+
+  | Form | Meaning | Status |
+  |---|---|---|
+  | `let a: Int?` | nullable ascription — `a` is an `Int` **or** null (§6, §9e) | unchanged |
+  | `{ size?: Int }` | record-shape shorthand for `size: Int?` (§8c) | unchanged |
+  | `x?.field` | safe navigation (§9e) | unchanged |
+  | `a ?? b` | null coalescing (§9e) | unchanged |
+  | `expr?` | Result propagation | **retired** |
+
+  The first two are type-position and the next two are their own tokens (`?.`, `??`); in the parser
+  they are separate arms from the postfix one, so "retiring `?`" is a two-arm change and the
+  nullable type system is not part of it.
+- **`fail` — raising an error, the half that was missing.** `try`/`catch` could catch an error and
+  nothing in the language could produce one: the only in-language failure was `assert`, whose
+  message is permanently "assertion failed". So a `def` could validate its arguments and could not
+  say what was wrong with them — the diagnostic quality the rest of this design insists on was
+  available to the interpreter and not to the code written in it.
+  ```
+  def open_config(path: String) {
+      if !(path ~= /\.toml$/) { fail "config must be a .toml file, got: " ++ path }
+      ...
+  }
+  ```
+  `fail <String>` is the common form. `fail <Record>` raises that record as the error value, for a
+  caller that wants to `match` on more than a message (§9f) — it must carry at least
+  `message: String`, and a missing `kind` defaults to `"Error"`.
+- **The error value has a shape, and `kind` is a small vocabulary.** `catch (e)` binds an ordinary
+  `Record` — deliberately not a new kind of thing, so §9f's pattern matching needs no new grammar
+  to take it apart. Every error carries `{ kind: String, message: String }`; some carry more.
+
+  | `kind` | Raised by |
+  |---|---|
+  | `Error` | `fail` |
+  | `TypeError` | a failed ascription — `let x: T`, a parameter, `expect T` |
+  | `ParseError` | `parse T` on text that is not a `T` (§6) |
+  | `AssertionFailed` | `assert` |
+  | `PipelineFailed` | a stage exited non-zero, crashed, or was cancelled (§1) |
+  | `Interrupted` | the terminal's interrupt event (§11h) |
+
+  **Subset match (§6) is what keeps this extensible**: a `catch` that reads `e.message` keeps
+  working when a kind is added, and one that matches `{ kind: "ParseError" }` says exactly what it
+  meant. The vocabulary is expected to grow; it is closed at any given moment so that matching on
+  it is worth doing.
 - **No global `$?`.** Rejected as ambient state — invisible information flowing outside explicit
   data flow, the same category of thing (ambient authority, implicit env inheritance) rejected
   elsewhere in the system. Dissolved rather than worked around: pipelines are **expressions that
-  evaluate to a value** (nushell/PowerShell-style), so `let result = my_pipeline` puts the status
-  directly in hand — there's no separate "go check afterward" step for `$?` to exist for.
-  `PipelineStatus` (§1) is the real answer to "what's the status of a multi-stage pipeline,"
-  not a single scalar pretending to represent several stages.
+  evaluate to a value** (nushell/PowerShell-style), so there's no separate "go check afterward"
+  step for `$?` to exist for. `PipelineStatus` (§1) is the real answer to "what's the status of a
+  multi-stage pipeline," not a single scalar pretending to represent several stages.
+- **Where `PipelineStatus` actually arrives — corrected in v1.2.** v1.1 said `let result =
+  my_pipeline` "puts the status directly in hand." It does not, and cannot: a pipeline's *value*
+  is its **data** — that is the whole point of a stage's output being a stream — so the status has
+  nowhere to sit in the success case, and in the failure case the pipeline fails loud (§1) and
+  never reaches the `let` at all. The implementation split the difference by binding the status
+  record to an undocumented name in the current scope, where the failure path then discarded it
+  before anyone could read it: the report was built and thrown away in exactly the case it exists
+  for.
+
+  **Resolution: a failed pipeline carries its per-stage report on the error value.**
+  ```
+  try {
+      list ./src | count-lines | save ./out.tsm
+  } catch (e) {
+      # e.kind == "PipelineFailed", and:
+      e.stages | filter exit_status != 0 | display
+  }
+  ```
+  `e.stages` is `List<{command: String, exit_status: Int, crashed: Bool, cancelled: Bool}>` — the
+  §1 shape, unchanged, delivered where the question is asked. "Did it work" is the `try`/`catch`
+  itself; "which stage, and how" is one field away; and the success case stays what it always was,
+  the data. No ambient binding, nothing to discard.
 - **REPL-only convenience binding** (name TBD, e.g. `$last`): holds the most recent top-level
   pipeline's result, scoped only to the interactive session. Deliberately unavailable inside
   function bodies or scripts — same pattern as Python's `_` / IPython's `Out[]`. Gets back bash's
@@ -132,9 +256,9 @@ for scripts that want it.
 
   | Category | Examples | Why |
   |---|---|---|
-  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch` | Pure syntax, not commands at all |
+  | Language keywords | `if`, `for`, `let`, `def`, `try`/`catch`, `break`, `continue`, `fail` | Pure syntax, not commands at all |
   | Shell-state builtins | `cd`, `exit` | Must mutate the shell's own process state; an external process structurally can't reach back and do this |
-  | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `expect`, `assert`, `format`, `last`, `skip`, `dedupe` | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
+  | Generic value operators | `filter`, `sort`, `select`, `save`, `open`, `each`, `map`, `display`, `expect`, `assert`, `parse`, `format`, `last`, `skip`, `dedupe`, and the §10b families | Generic dispatch over `Value`'s structural shape — can't cross IPC without knowing the schema ahead of time; see §5c and §10b |
   | External programs | `list`, `copy`, `move`, `remove`, `mkdir`, `touch`, `rename`, `date`, `sleep`, `whoami` | Ordinary userspace programs speaking TSM1 on stdio for pipeline composability. **Not** resource servers — resource servers (`fs-server-ext4`, block/device drivers) are a distinct, narrower category of long-running service speaking `librsproto`; an external program may be a *client* of one, but implementing `librsproto` is not required to participate in a shell pipeline. Full scope and naming rationale in §10 |
 
 ## 4. I/O: `save` / `open` replace redirection
@@ -209,8 +333,8 @@ sort size --reverse
   fail-loud default used throughout (§1).
 - **Return: implicit last-expression value; `return` only for early exit.** Matches Rust, and
   matches "pipelines are expressions" (§2) — a function body is itself an expression producing a
-  value; `return` (and `?`) exist for exiting *before* the end, not as the normal way to hand back
-  a result.
+  value; `return` exists for exiting *before* the end, not as the normal way to hand back a result.
+  (v1.1 named `?` here too; it is retired — see §2.)
 - **Pipeline-fill placeholder — settled: explicit `_` required whenever an argument list is
   present; implicit fill only for the bare, argument-free call.** Pure implicit-first-param-fill
   was rejected on a concrete correctness gap: nothing enforces that a function's first parameter
@@ -291,12 +415,54 @@ the densest, most frequent chains no longer touch it at all.
   - Function parameter / return type annotations — same check, at a call boundary.
   - `expect T` — ascription usable mid-pipeline, in expression position: `ls | filter size > 1000
     | expect Table<{name: String, size: Int}> | display`.
-  - All three fail loud on mismatch, same underlying pass-or-throw pattern as `try`/`catch`/`?`.
+  - All three fail loud on mismatch, same underlying pass-or-throw pattern `try`/`catch` handles.
 - **`assert (predicate)` — a sibling to `expect`, not a fold into it.** `expect` checks *shape*
   (schema comparison); `assert` checks a *content* predicate (`ls | assert (count > 0)`). Same
   pipeline slot, same pass-or-throw contract, deliberately kept as separate keywords rather than
   one verb overloaded on argument type — keeps error messages specific ("shape mismatch" vs.
   "assertion failed") rather than merging two different jobs into one grammar rule.
+- **`parse T` — conversion, the mechanism v1.1 left out entirely (new in v1.2).** Every conversion
+  in v1.1 ran *away* from data and toward text: `format` and `++` and `display` produce strings,
+  and nothing consumed one. So a number read from a file (`open` gives `Table<String>` for `.txt`),
+  emitted by an external program, or typed at a prompt was stuck as a `String` permanently —
+  `"3.5" + 1` is an error and there was nothing to write instead. This is not a missing convenience;
+  it is a missing direction.
+
+  **`parse` is `expect`'s converting sibling, and the pairing is the point.** Both take a type
+  expression, both fail loud, and the two verbs say which job is being done: `expect T` asserts a
+  value already *is* a `T` and passes it through; `parse T` asserts a value can be *read as* a `T`
+  and produces one.
+  ```
+  let n = "42" | parse Int
+  let x = "3.5" | parse Float
+
+  open ./sizes.txt | map { |it| it.line | parse Int } | sum
+
+  try { "abc" | parse Int } catch (e) { display e.message }   # kind: "ParseError"
+  ```
+  - **What a number looks like to `parse` is what it looks like to the lexer.** `parse Int` accepts
+    exactly §8e's `int_lit` — decimal, `0x`, `0b`, `_` separators — and `parse Float` exactly
+    `float_lit`. One definition of "a numeric literal" for the whole language rather than a second
+    one that drifts.
+  - **Strict about surrounding whitespace**, deliberately: `" 42 " | parse Int` fails, because
+    `trim` exists (§10b) and silently ignoring the difference between `"42"` and `" 42"` is the
+    coercion this section spends its fail-loud rule on. The error names the character it choked on.
+  - **`parse Bool`** accepts `true`/`false` and nothing else. No `1`/`yes`/`on` — that list is
+    exactly where every configuration language has gone wrong.
+  - **`parse String` on `Bytes`** validates UTF-8 and fails loud on invalid input; the same verb
+    covers it because it is the same question ("can this be read as a `T`?").
+  - **`Float` → `Int` is not a `parse`.** It loses information, so it is spelled by the operator
+    that says *which way* it loses it: `round`, `floor`, `ceil`, `trunc` (§10b). A cast that
+    silently truncates is precisely the fabricated value §1 and §8a refuse elsewhere.
+  - **`Int` → `Float` is a `parse Float`** and is lossless. Arithmetic already widens on its own
+    (§8a), so this is for the case that wants the type without an arithmetic excuse.
+- **`expect`, `assert` and `parse` are pipeline stages — corrected in v1.2.** Every example in this
+  section is written mid-pipeline (`ls | filter size > 1000 | expect Table<{…}> | display`,
+  `ls | assert (count > 0)`), and none of them ran: the implementation parsed all three as
+  expression forms only, so a keyword in stage position was rejected as "a value cannot be a
+  pipeline stage". The type system's one real mechanism was reachable only at a binding site or a
+  parameter — the two places a shell script spends the least of its time. §8c's grammar now says
+  so explicitly rather than leaving it to be inferred from the examples.
 - **Escape hatch for external programs:** annotate loosely (`let result: Table = some_tool
   --flag`) or not at all — schema is genuinely unknowable ahead of time, checked only once the
   actual TSM1 header arrives at runtime.
@@ -355,7 +521,7 @@ parse. Statement/control-flow syntax, pattern matching, and remaining literal fo
 2. Unary           -x, !x
 3. Multiplicative  * / %
 4. Additive        + -   ++ (string concat)
-5. Comparison      < <= > >=
+5. Comparison      < <= > >=   in (membership, see §10b)
 6. Equality        == !=   ~= (regex match, see §10b)
 7. Logical AND     &&
 8. Logical OR      ||
@@ -372,7 +538,8 @@ ambiguity between "named argument" and "ascription" at call sites.
 
 `filter size > 1000` and `filter { |row| row.size > threshold }` aren't two mechanisms — the
 bareword form is sugar for an implicit single-parameter closure, the same "one real primitive,
-multiple spellings" pattern used for `try`/`catch`+`?` and ascription+`expect`. Reserved implicit
+multiple spellings" pattern ascription uses (`let x: T`, a parameter annotation, `expect T` — one
+check, three surfaces). Reserved implicit
 parameter name: **`it`**. Bare identifiers inside the bareword form resolve as field-shorthand on
 `it`:
 
@@ -390,7 +557,8 @@ always take a closure; the parser recognizes "bare expression, no `|params|`" as
 expr        := pipeline
 pipeline    := range_expr ( "|" pipeline_stage )*
 range_expr  := or_expr ( (".." "="?) or_expr )?
-pipeline_stage := call_expr | closure_lit
+pipeline_stage := call_expr | closure_lit | stage_keyword
+stage_keyword  := "expect" type_expr | "parse" type_expr | "assert" "(" expr ")"
 
 call_expr   := IDENT arg_list?
              | IDENT "(" (named_arg | expr | "_") ("," ...)? ")"   # def-function form
@@ -401,14 +569,34 @@ closure_lit := "{" "|" (param ("," param)*)? "|" statement* "}"   # pipes mandat
 or_expr     := and_expr ("||" and_expr)*
 and_expr    := eq_expr ("&&" eq_expr)*
 eq_expr     := cmp_expr (("==" | "!=") cmp_expr)*
-cmp_expr    := add_expr (("<" | "<=" | ">" | ">=") add_expr)*
+cmp_expr    := add_expr (("<" | "<=" | ">" | ">=" | "in") add_expr)*
 add_expr    := mul_expr (("+" | "-" | "++") mul_expr)*
 mul_expr    := unary (("*" | "/" | "%") unary)*
 unary       := ("-" | "!")? postfix
 postfix     := primary ("." IDENT | "[" expr "]")*
 primary     := literal | IDENT | "(" pipeline ")" | "_"
              | record_lit | list_lit | closure_lit
+             | block | if_expr | match_expr | try_expr        # corrected in v1.2
 ```
+
+**The last line corrects an omission, not a change.** `if` and `match` and a bare block have been
+expressions since v1 — §9a's "blocks are expressions" is built on it, and `let x = if c { 1 } else
+{ 2 }` has always worked — but §8c's `primary` never listed them, which is why `try`'s absence from
+the same list read as deliberate rather than as the oversight it was. See §9c for `try_expr`.
+
+**`stage_keyword` is new in v1.2** and is the grammar half of §6's correction. `expect`, `parse`
+and `assert` are keyword-headed rather than ordinary `call_expr`s — they take a `type_expr` or a
+parenthesised predicate, not an `arg_list` — so a pipeline rule that admits only `call_expr` and
+`closure_lit` silently excludes them. That is not a licence to add more: these three are the
+complete list, they are the ones §3 already files under generic value operators, and each is a
+*stage-shaped* check-or-convert on the value flowing past.
+
+**`in` is a comparison, not a keyword collision.** `for x in xs` consumes its `in` inside the
+`for_stmt` rule (§9c), before any expression is parsed, so the two never compete for the same
+token — the same structural argument §9b makes for keeping conditions below the pipe tier. It
+sits at the comparison tier because `x in xs == true` should read the way `x < y == true` does,
+and it is deliberately an infix operator rather than a `contains` operator: the pipeline form
+would be a second spelling of one idea, and this is the form that reads correctly inside an `if`.
 
 Ranges (`..`/`..=`) are language-only values, not `Value` variants and not TSM1-representable —
 same rule as closures (§5c): a range isn't something meant to stream over IPC, it'd be materialized
@@ -483,6 +671,23 @@ bare leading-zero octal (`010` silently meaning 8 is a real, well-known C/older-
 explicit `0o` prefix would be added later if octal is ever wanted. No integer-width suffixes
 (`i32`/`u8`): `Value::Int` is a single `i64`, nothing for a suffix to select between.
 
+**Bitwise operators: deferred in v1.2, with the reason recorded rather than rediscovered.** The
+paragraph above justifies hex and binary literals by "permissions/flags/addresses" and the
+language has no way to test a bit — a gap the audit turned up by reading those two facts together.
+It stays open on purpose, for two reasons.
+
+First, **every conventional symbol is already spoken for**, and by things far more load-bearing
+than bitwise arithmetic: `|` is the pipe, `&` is §11g's background suffix, and `^` is §3's
+force-external prefix — which §3 already flagged as an XOR collision risk when it chose it. So the
+C spelling is not available at any price, and the realistic design is *named* operators in the
+§10b generic set (`band`/`bor`/`bxor`/`shl`/`shr`), landing together with the `0o` literal.
+
+Second, and decisively: **the motivating value does not exist yet.** Nothing in the system hands
+the shell a bit field — `list` emits `kind`, not a mode word; capability rights never surface as a
+number; there is no octal literal to write a mask with. Designing five operators against a
+hypothetical is how a language acquires a vocabulary nobody uses. **Trigger:** the first real bit
+field reaching a `Value` — file modes on `list --long`, or a rights word made visible to a script.
+
 **List and record literals:**
 ```
 list_lit     := "[" (expr ("," expr)* ","?)? "]"
@@ -531,8 +736,8 @@ convention already used by hand throughout this document: `if (files | count) > 
 ```
 statement   := let_stmt | mut_stmt | const_stmt | assign_stmt
              | if_stmt | for_stmt | while_stmt
-             | def_stmt | try_stmt | strict_stmt
-             | return_stmt | expr
+             | def_stmt | strict_stmt
+             | return_stmt | break_stmt | continue_stmt | fail_stmt | expr
 
 block       := "{" statement* "}"          # value = last statement, if expression-shaped
 
@@ -551,15 +756,83 @@ def_stmt    := "pub"? "def" IDENT "(" param_list? ")" ("->" type_expr)? block
 param_list  := param ("," param)* ("," "..." IDENT ":" type_expr)?
 param       := IDENT (":" type_expr)? ("=" expr)?
 
-try_stmt    := "try" block "catch" ("(" IDENT ")")? block
+try_expr    := "try" block "catch" ("(" IDENT ")")? block   # an expression (§8c) — v1.2
 strict_stmt := "strict" block
 return_stmt := "return" expr?
+
+break_stmt    := "break"          # new in v1.2
+continue_stmt := "continue"       # new in v1.2
+fail_stmt     := "fail" expr      # new in v1.2 — see §2
 
 type_expr   := base_type "?"?
 base_type   := IDENT ("<" type_expr ("," type_expr)* ">")?     # Table<...>, List<T>
              | "{" field ("," field)* "}"                      # record shape
 field       := IDENT "?"? ":" type_expr
 ```
+
+**`break` and `continue` (new in v1.2), and why their absence was not cosmetic.** v1.1 shipped
+`for` and `while` with `return` as the only early exit — and `return` leaves the whole function, so
+"stop at the first match" could not be expressed *inside* a loop at all. The workaround is a
+sentinel variable and a loop that keeps running after it has its answer, which is both slower and a
+worse thing to read. At a REPL prompt, outside any function, there was no exit at all: an
+accidental `while true` was unrecoverable (§11h is the other half of that story).
+
+Three rules, all of them fail-loud and all of them decidable at parse time:
+
+- **Loop-only.** `break` or `continue` outside a `for`/`while` is a parse error, not a runtime one.
+  The parser knows whether it is inside a loop body; making the user find out at runtime would be
+  choosing the worse of two available diagnostics.
+- **They do not cross a function or closure boundary.** `break` inside `filter { |it| … }` is an
+  error, not a break of the enclosing loop. The closure is a function body (§5b), and the iteration
+  it is being called from belongs to the *operator*, not to the script — there is no loop there for
+  the script to break out of. Rust draws the same line for the same reason; here it is stronger,
+  because the loop on the other side is not even written in this language.
+- **Both are valueless** (§9a): a block ending in `break` evaluates to `Null`, joining `let`,
+  `return`, `for`, `while` and `def` on that list.
+
+**No labelled break/continue**, deliberately. Labels need their own grammar (`'outer:`), and they
+pay for themselves at a nesting depth shell scripts rarely reach; `return` already covers "get me
+out of all of this," which is the case that actually shows up. Revisit if real scripts turn up
+three-deep loops that need to escape more than one level.
+
+**`try` is an expression (v1.2) — which is how a failure gets a fallback *value*.** v1.1 put
+`try_stmt` among the statements, so a caught result could only reach the outside through a `mut`,
+and `let x = try { … } catch { … }` did not parse. That was self-consistent but at odds with §9a:
+blocks are expressions, `if` and `match` are already usable in expression position, and a block
+ending in `try` already yields its value. `try` was the odd one out.
+
+```
+let cfg = try { open ./config.toml } catch { default_config() }
+
+let port = try {
+    $env.PORT | parse Int
+} catch (e) {
+    display "bad PORT (" ++ e.message ++ "), using 8080"
+    8080
+}
+```
+
+**No new syntax was needed, and that is the argument for this shape over the alternatives.** The
+catch branch supplies the value by *being a block* (§9a), so there is nothing to learn beyond
+"`try` is an expression now." It is also strictly more capable than a shorthand operator would be:
+the branch sees `e`, so it can vary the default by `kind`, log first, or re-raise with `fail`.
+
+Three details, none of them a new rule:
+
+- **A catch branch that produces no value yields `Null`** — exactly what an `if` with no `else`
+  does in expression position.
+- **`try` is a `primary`, not a pipeline stage.** `try { … } catch { … } | display` parses
+  unambiguously (the pipe follows the closing brace), but mid-pipeline a `try` would need a fill
+  placeholder to say where the operand goes, and §8c's stage list stays closed.
+- **One node, not two.** With `?` retired (§2), statement-position `try` is simply an `expr`
+  statement — there is one `try` in the tree and one evaluator path, rather than a statement form
+  and an expression form that can drift apart.
+
+**Rejected**: a postfix `expr catch <value>` (Zig-shaped) — a second `catch` form whose precedence
+against `|` is genuinely ambiguous (`open ./x | count catch 0`); an `or`/`else` fallback keyword —
+new keyword that already reads as boolean; and **extending `??` to cover failures — which conflates
+two different questions.** `rec.field ?? d` means "this field is legitimately null"; "the open
+failed" is not that, and merging them would make `??` silently swallow errors (§9e).
 
 ### 9d. Mutability: `let` / `mut` / `const`, and field/index mutation
 
@@ -828,6 +1101,105 @@ generic-operator set, and belongs there instead.
   alongside `==`/`!=`. `ls | filter name ~= /\.rs$/` covers `grep`'s job entirely — the gap was a
   missing *operator*, not a missing *program*.
 
+#### The v1.2 families
+
+§10a's dividing rule sends every one of these here rather than to a program: none defines a schema
+from a live external source, none mutates anything outside the shell's own data flow. What they
+have in common is the shape of the gap they close — **the v1.1 set could narrow a stream
+(`filter`/`take`/`select`/`dedupe`) and display it, but could not summarise one or take a value
+apart.**
+
+**1. Sequences generalise: a `String` and a `Range` are sequences.** A String's elements are its
+characters, a Range's are its values, so `count`, `take`, `skip`, `last`, `filter`, `map`, `dedupe`
+and `sort` all accept them. This is where length, substring and slicing come from — without a
+second vocabulary for strings and a third for ranges:
+
+```
+name | count                  # length
+path | take 3                 # first three characters
+line | skip 2 | take 5        # the substring [2, 7)
+0..10 | filter { |it| it % 2 == 0 } | sum
+```
+
+The rebuild rule is the one already in force: **the result comes back in the shape it went in.**
+Filtering a String yields a String; mapping one to non-Strings yields a List, the same fallback a
+ragged Table already takes. `select` on either is an error, since it names fields and there are
+none. **A `Record` is still not a sequence** — "its keys or its pairs?" has no obviously right
+answer, and `keys`/`values` below answer both without the operator guessing. A Range materialises
+under the same iteration cap `for` uses, and remains language-only (§8c): it cannot cross a pipe to
+a program.
+
+**2. Reduction — `sum`, `min`, `max`, `avg`, `reduce`.** `count` was the only reducer in v1.1, so
+"the total size of these files" required a `mut` and a `for` loop — the exact shape a pipeline
+language exists to remove.
+
+```
+ls | sum size                 # column form on a Table: the `sort size` reading of a bareword
+[1, 2, 3] | sum               # argument-free on a List of numbers
+ls | filter kind == "file" | max modified
+lines | reduce { |acc, it| acc ++ ", " ++ it }
+lines | reduce --from "" { |acc, it| acc ++ it }
+```
+
+- `min`/`max` order Strings lexicographically, exactly as `<` does. **Mixed types are an error**,
+  not an ordering invented at the point of comparison.
+- `avg` yields a `Float` even for `Int` input. The alternative truncates silently.
+- **Empty input is where these differ, and each answer is forced**: `sum` of nothing is `0`;
+  `min`/`max`/`avg` of nothing are errors, because there is no minimum of an empty set and no
+  average without a divisor — the same refusal to fabricate a value that §8a makes for division by
+  zero.
+- `reduce` has two forms because they differ *precisely* on the empty case: the bare form seeds
+  from the first row and errors on empty input, while `--from` supplies a seed and returns it
+  unchanged.
+
+**3. Strings — `split`, `join`, `trim`, `replace`, `upper`, `lower`.** v1.1 could *test* text with
+`~=` and never take it apart; with `parse` also missing, text that arrived as text stayed that way
+forever. `split SEP` (String → `List<String>`) and `join SEP` (List → String) are the inverse pair;
+`trim` removes leading and trailing whitespace and is what makes `parse`'s strictness (§6)
+workable. `replace FROM TO` is **literal, not regex** — pattern replacement is a different verb and
+waits on the engine work in item 6. `upper`/`lower` are ASCII-only, said plainly rather than
+implied: full case folding needs Unicode tables this system does not carry, and a `lower` that
+quietly mangles non-ASCII is worse than one that documents its range.
+
+**4. Records — `keys`, `values`, `merge`.** A Record was constructible and readable by known field
+name only, so no script could walk a record it did not itself write — which also blocks any generic
+handling of a schema that arrived at runtime. `keys` and `values` return Lists in schema order (the
+schema *is* the order). `merge` takes two Records; the right operand wins a conflict and the result
+schema is the union.
+
+**5. Numbers — `round`, `floor`, `ceil`, `trunc`, `abs`.** The `Float` → `Int` direction, named by
+*which way* it loses information (§6). `round` is half-away-from-zero — stated because
+half-to-even is the other defensible answer, and leaving it unsaid would make it a coin flip
+settled by whoever writes the code.
+
+**6. `capture /pattern/` — regex submatches.** `~=` answers yes or no and the engine exposes
+nothing else, so text that matched could not be taken apart. `capture` returns a `List<String>`:
+element 0 is the whole match, then one element per group, with `null` for a group that did not
+participate — and `null` overall when there is no match, which `??` and `== null` already handle
+(§9e).
+
+```
+let g = line | capture /(\d+)-(\d+)/
+if g != null { let lo = g[1] | parse Int }
+```
+
+Named groups are deferred — they need a name table threaded through the compiler, and the
+positional form already covers what §10a's `grep` replacement asks for. **This is the only item in
+the list with real engine work behind it** (submatch slots in the Pike VM), which is why it is
+sequenced on its own rather than folded in with the string operators.
+
+**7. Membership is `in` (§8a), not an operator here.** The pipeline spelling (`xs | contains x`)
+would be a second way to say one thing, and the infix form is the one that reads correctly where
+the question is actually asked — inside an `if`.
+
+**8. Two corrections to operators that already exist.**
+
+- **`sort` uses every key it is given**: `sort dept name` sorts by department, then by name within
+  it. It took the first and silently discarded the rest — which is neither of the two acceptable
+  behaviours (sort by all of them, or refuse the extras).
+- **`format` in stage position formats its operand**: `… | format("{}")`. It ignored the value
+  arriving from the left and then reported the template's own `{}` as a missing argument.
+
 ### 10c. Final external program scope and naming
 
 ```
@@ -967,6 +1339,16 @@ usage: `Ctrl-D` at an empty prompt is treated identically to typing `exit` (univ
 With running background jobs (§11g), warn once rather than block — matches actual bash/zsh
 behavior, and avoids silently discarding state without being obstructive about it.
 
+**`exit` takes a status (clarified in v1.2): `exit` or `exit N`, defaulting to `0`.** In a script
+that status is the process's; at a prompt it ends the session. This needed saying because the
+implementation had no way to express it: the interactive driver compared the input line against the
+literal string `"exit"`, so `exit 1` missed the comparison, reached the interpreter, and came back
+as "`exit` is handled by the shell's driver" — a script could not set its own exit status at all.
+**`exit` is a builtin (§3), which means it is a control outcome of evaluation, not a string the
+REPL loop watches for.** A special case in the driver is a second implementation of the language,
+and this one had already produced a bug of exactly that shape (`cd`, guarded in the loop long after
+the interpreter implemented it).
+
 ### 11g. Job control — included, minus the one piece that doesn't fit this system
 
 `&` suffix to background a pipeline (`long_task | save ./out.tsm &`), `jobs` to list running
@@ -982,7 +1364,70 @@ finished; there's no "paused" state to reach for, and inventing one just to comp
 feature set would cut against the no-signals commitment for no real benefit — bash's own suspend
 often pauses execution at a moment the user didn't actually intend or expect anyway.
 
+### 11h. Interrupting — the question §11g didn't ask
+
+§11g settled job control and excluded `Ctrl-Z` with a structural argument: suspend rests on
+`SIGTSTP`, and this system has no signals. **`Ctrl-C` is not mentioned anywhere in v1.1** — and it
+is the one every user reaches for. Everywhere else it is `SIGINT`; here there is no `SIGINT` and
+nothing was put in its place. The consequences are live today: an accidental `while true { }` at a
+prompt is unrecoverable short of a reboot, and a runaway external stage cannot be stopped at all.
+
+**The answer is the one the system already gives for every asynchronous event — a notification, not
+a signal** (`docs/rationale/why-no-signals.md`). An interrupt here is *data on a channel* plus *a
+capability the shell already holds*, in four steps:
+
+1. **The tty server recognises `0x03` in its line discipline** and, instead of doing something to a
+   process, delivers an out-of-band **interrupt event** to the terminal's current owner. Who that
+   is remains the terminal's business; nothing else in the system learns a key was pressed.
+2. **At an idle prompt**, the shell discards the line being edited and redraws — bash's behaviour,
+   and the case that is pure line discipline.
+3. **While evaluating in-process**, the shell checks for a pending interrupt *between statements
+   and between loop iterations*. Finding one, the evaluation unwinds as an ordinary error with
+   `kind: "Interrupted"` (§2) — so `try`/`catch` can still clean up, and the REPL prints one line
+   and returns to the prompt. Checking on statement boundaries is what makes it cheap and what
+   guarantees it can never tear an assignment in half.
+4. **While a pipeline runs**, the shell terminates the stages it spawned. This is the step that
+   needs nothing new architecturally, and it is the reason `Ctrl-C` is tractable here at all:
+   §10a's hard question — how does a command legitimately acquire a capability handle to a process
+   it did not spawn — **does not arise**, because the shell *did* spawn them and is already holding
+   a `Process` handle with `Rights::TERMINATE` for each.
+
+**Three things have to be built, and one is a kernel gap:**
+
+- **`sys_process_terminate` does not exist.** `Rights::TERMINATE` is defined, is granted on every
+  spawned `Process` handle, and is enforced by the type/rights table — and no syscall consumes it.
+  The right was reserved and the operation never built. Nothing in the 36-syscall surface today can
+  terminate another process.
+- **The tty protocol has no out-of-band event.** Input is request/response — a line, or raw bytes —
+  with no way for the server to say something the client did not ask for.
+- **The evaluator needs an interrupt checkpoint**, which belongs on the `Host` trait so it stays
+  host-testable like the rest of the library half.
+
+**A side effect worth naming: this is also what makes `strict` real.** §1 says a failed stage under
+`strict` *terminates* the stages after it. The implementation waits for every child to exit and
+then labels the later ones "cancelled" — accurate bookkeeping and no termination, because there was
+no syscall to terminate with. The same `sys_process_terminate` closes both.
+
 ## 12. Open questions carried forward
+
+Added in v1.2 — each one deferred with its trigger named, so the next pass finds a decision rather
+than a rediscovery:
+
+- **Bitwise operators and the `0o` literal (§8e)** — deferred, not undecided: every conventional
+  symbol is taken, the answer would be named operators, and no value in the system is a bit field
+  yet. Trigger: the first one that is (file modes on `list --long`, or a rights word made visible).
+- **Labelled `break`/`continue` (§9c)** — no label grammar until scripts show up with loops nested
+  deeply enough to need one.
+- **Named regex capture groups (§10b)** — positional `capture` first; names need a table threaded
+  through the compiler.
+- **Regex-pattern replacement (§10b)** — `replace` is literal; the pattern form is a separate verb
+  and waits on `capture`'s engine work.
+- **Unicode case folding (§10b)** — `upper`/`lower` are ASCII-only until the system carries the
+  tables to do better honestly.
+- **`.csv` / `.json` for `save`/`open` (§4)** — §4 promises format inference from the extension;
+  only `.tsm` and `.txt` are built.
+
+Carried forward from v1.1:
 
 - Schema-aware tab completion (§11c) — flagged as a future nice-to-have, not designed.
 - Process management / how a shell command legitimately acquires a capability handle to a process
