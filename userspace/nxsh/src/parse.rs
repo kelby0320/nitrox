@@ -115,11 +115,42 @@ pub struct Parser<'a> {
     /// applying it everywhere would turn `let y = x -1` into a flag, and arithmetic is
     /// the commoner reading outside an argument list.
     in_op_args: u32,
+    /// How many `for`/`while` bodies enclose the statement being parsed — **within the
+    /// current function**.
+    ///
+    /// `break`/`continue` are legal only where this is non-zero, which makes both of §9c's
+    /// rules one mechanism. Loop-only is the counter itself. "Does not cross a function
+    /// boundary" is the *reset*: a `def` or closure body parses with the count at zero, so
+    /// a `break` inside `filter { |it| … }` cannot see the loop outside it — there is no
+    /// loop there to break, since the iteration belongs to the operator and is not even
+    /// written in this language.
+    ///
+    /// Doing it here rather than in the evaluator is what makes both diagnostics
+    /// parse-time. The parser already knows the answer; making the user run the script to
+    /// find out would be choosing the worse of two available errors.
+    loop_depth: u32,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Parser<'a> {
-        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0 }
+        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0, loop_depth: 0 }
+    }
+
+    /// Parse a loop body: `break`/`continue` are legal inside it.
+    fn loop_body(&mut self) -> Result<Vec<Stmt>> {
+        self.loop_depth += 1;
+        let body = self.block();
+        self.loop_depth -= 1;
+        body
+    }
+
+    /// Parse a function or closure body: enclosing loops are **not** visible from inside
+    /// it, so `break` there is an error rather than a jump across the boundary.
+    fn function_body(&mut self, f: impl FnOnce(&mut Self) -> Result<Vec<Stmt>>) -> Result<Vec<Stmt>> {
+        let saved = core::mem::replace(&mut self.loop_depth, 0);
+        let body = f(self);
+        self.loop_depth = saved;
+        body
     }
 
     // --- plumbing -----------------------------------------------------------
@@ -263,14 +294,29 @@ impl<'a> Parser<'a> {
                 // describes and nothing else, so the iterable is parsed there; a piped
                 // iterable still needs its parens.
                 let iterable = self.range_expr()?;
-                let body = self.block()?;
+                let body = self.loop_body()?;
                 Ok(Stmt::For { binding, iterable, body })
             }
             Tok::While => {
                 self.bump()?;
                 let cond = self.or_expr()?;
-                let body = self.block()?;
+                let body = self.loop_body()?;
                 Ok(Stmt::While { cond, body })
+            }
+            Tok::Break | Tok::Continue => {
+                let kw = self.bump()?;
+                if self.loop_depth == 0 {
+                    let name = if kw == Tok::Break { "break" } else { "continue" };
+                    return self.fail(if name == "break" {
+                        "`break` is only meaningful inside a `for` or `while` body — and \
+                         it does not reach a loop outside the enclosing `def` or closure"
+                    } else {
+                        "`continue` is only meaningful inside a `for` or `while` body — \
+                         and it does not reach a loop outside the enclosing `def` or \
+                         closure"
+                    });
+                }
+                Ok(if kw == Tok::Break { Stmt::Break } else { Stmt::Continue })
             }
             Tok::Try => {
                 self.bump()?;
@@ -353,7 +399,7 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::LParen, "expected `(` after a function name")?;
         let params = self.param_list()?;
         let ret = if self.eat(&Tok::Arrow)? { Some(self.type_expr()?) } else { None };
-        let body = self.block()?;
+        let body = self.function_body(|p| p.block())?;
         Ok(Stmt::Def { name, params, ret, body, public })
     }
 
@@ -762,17 +808,20 @@ impl<'a> Parser<'a> {
                 }
                 ps
             };
-            let mut body = Vec::new();
-            loop {
-                self.skip_newlines()?;
-                if self.eat(&Tok::RBrace)? {
-                    return Ok(Expr::Closure { params, body });
+            let body = self.function_body(|p| {
+                let mut body = Vec::new();
+                loop {
+                    p.skip_newlines()?;
+                    if p.eat(&Tok::RBrace)? {
+                        return Ok(body);
+                    }
+                    if p.peek()? == Tok::Eof {
+                        return p.fail("unclosed closure");
+                    }
+                    body.push(p.statement()?);
                 }
-                if self.peek()? == Tok::Eof {
-                    return self.fail("unclosed closure");
-                }
-                body.push(self.statement()?);
-            }
+            })?;
+            return Ok(Expr::Closure { params, body });
         }
         // A record literal. `{ name }` is shorthand for `{ name: name }` (§8e).
         let mut fields = Vec::new();
@@ -1844,5 +1893,46 @@ for line in open ./log.txt {
         assert_eq!(s.stmts.len(), 2);
         // …and running them together is an error rather than a silent join.
         assert!(parse_script("let a = 1 let b = 2").is_err());
+    }
+
+    // --- `break` / `continue` (§9c) -----------------------------------------
+
+    /// Both rules §9c states are one mechanism — a loop counter that **resets** at every
+    /// function boundary — so they are tested as a pair. Loop-only is the counter; "does
+    /// not cross a `def` or closure" is the reset.
+    #[test]
+    fn break_and_continue_are_legal_only_inside_a_loop() {
+        script("for x in 0..3 { break }");
+        script("for x in 0..3 { continue }");
+        script("while true { break }");
+        // …and inside a nested `if`, which is where they are actually written.
+        script("for x in 0..3 { if x == 1 { break } }");
+
+        for src in ["break", "continue", "if true { break }", "def f() { break }"] {
+            let e = parse_script(src).expect_err(src);
+            assert!(e.message.contains("`for` or `while`"), "{src}: {}", e.message);
+        }
+    }
+
+    /// A `break` inside a closure does **not** break the loop outside it: the closure is a
+    /// function body, and the iteration it is called from belongs to the operator — it is
+    /// not even written in this language.
+    #[test]
+    fn break_does_not_cross_a_closure_or_a_def() {
+        let e = parse_script("for x in 0..3 { let f = { || break } }").expect_err("closure");
+        assert!(e.message.contains("closure"), "{}", e.message);
+        let e = parse_script("for x in 0..3 { def f() { break } }").expect_err("def");
+        assert!(e.message.contains("`for` or `while`"), "{}", e.message);
+        // The reset restores, rather than clearing: a `break` after the closure is fine.
+        script("for x in 0..3 { let f = { || 1 }\n break }");
+    }
+
+    /// The counter has to come back down, or every statement after the first loop in a
+    /// file would accept a stray `break`.
+    #[test]
+    fn the_loop_counter_unwinds_after_the_body() {
+        script("for x in 0..3 { break }");
+        let e = parse_script("for x in 0..3 { }\nbreak").expect_err("after the loop");
+        assert!(e.message.contains("`for` or `while`"), "{}", e.message);
     }
 }

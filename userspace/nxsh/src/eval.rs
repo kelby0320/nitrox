@@ -54,6 +54,13 @@ type Result<T> = core::result::Result<T, EvalError>;
 enum Flow {
     Normal(Val),
     Return(Val),
+    /// `break` / `continue` (§9c), travelling out to the nearest enclosing loop.
+    ///
+    /// **Every `match` on `Flow` is a place one of these can be swallowed**, which is why
+    /// none of them uses a wildcard arm: an exhaustive match makes the compiler ask the
+    /// question at each site rather than letting a `break` quietly become a no-op.
+    Break,
+    Continue,
 }
 
 /// One binding.
@@ -106,6 +113,13 @@ pub struct Interp {
     mode: Mode,
     /// Whether the statement currently executing is inside a `strict { }` block (§1).
     strict: bool,
+    /// The runaway backstop, [`MAX_ITERATIONS`] in every build.
+    ///
+    /// A field rather than the constant read directly so the guard is **testable in
+    /// microseconds**: proving it fires otherwise means actually running ten million
+    /// iterations, which costs more wall-clock than the whole suite. Not user-facing and
+    /// not a resource policy — see the constant.
+    iteration_limit: u64,
 }
 
 impl Default for Interp {
@@ -127,6 +141,7 @@ impl Interp {
             host,
             mode,
             strict: false,
+            iteration_limit: MAX_ITERATIONS,
         }
     }
 
@@ -198,9 +213,7 @@ impl Interp {
     /// because it is what `nxsh -c` and the tests need to observe. The *auto-display*
     /// difference between REPL and script is Part C's, and lives at the driver, not here.
     pub fn run(&mut self, script: &Script) -> Result<Val> {
-        match self.exec_block(&script.stmts)? {
-            Flow::Normal(v) | Flow::Return(v) => Ok(v),
-        }
+        boundary_value(self.exec_block(&script.stmts)?)
     }
 
     /// Run one interactive line: execute it, bind `$last`, and return what the REPL
@@ -225,9 +238,7 @@ impl Interp {
         self.hoist_defs(&script.stmts)?;
         let mut out = None;
         for stmt in &script.stmts {
-            let value = match self.exec(stmt)? {
-                Flow::Normal(v) | Flow::Return(v) => v,
-            };
+            let value = boundary_value(self.exec(stmt)?)?;
             self.bind_last(&value)?;
             if crate::repl::should_display(stmt) && !value.is_null() {
                 out = Some(crate::ops::display(&value));
@@ -323,6 +334,10 @@ impl Interp {
         for (i, s) in stmts.iter().enumerate() {
             match self.exec(s)? {
                 Flow::Return(v) => return Ok(Flow::Return(v)),
+                // A block does not decide what these mean — the enclosing loop does, so
+                // they leave immediately and the statements after them do not run.
+                Flow::Break => return Ok(Flow::Break),
+                Flow::Continue => return Ok(Flow::Continue),
                 Flow::Normal(v) => {
                     last = if i + 1 == stmts.len() && s.is_expression_shaped() {
                         v
@@ -377,14 +392,16 @@ impl Interp {
                 let mut guard = 0u64;
                 while self.condition(cond)? {
                     guard += 1;
-                    if guard > MAX_ITERATIONS {
+                    if guard > self.iteration_limit {
                         return Err(EvalError::new(
                             "loop ran past the iteration limit — this is almost certainly \
                              a runaway condition",
                         ));
                     }
-                    if let Flow::Return(v) = self.scoped_block(body)? {
-                        return Ok(Flow::Return(v));
+                    match self.scoped_block(body)? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break => break,
+                        Flow::Continue | Flow::Normal(_) => {}
                     }
                 }
                 Ok(Flow::Normal(Val::NULL))
@@ -398,8 +415,11 @@ impl Interp {
                     self.bind(binding, item, false, false)?;
                     let r = self.exec_block(body);
                     self.pop_scope();
-                    if let Flow::Return(v) = r? {
-                        return Ok(Flow::Return(v));
+                    match r? {
+                        Flow::Return(v) => return Ok(Flow::Return(v)),
+                        Flow::Break => break,
+                        // `continue` is the loop's own business and stops here.
+                        Flow::Continue | Flow::Normal(_) => {}
                     }
                 }
                 Ok(Flow::Normal(Val::NULL))
@@ -411,6 +431,10 @@ impl Interp {
                 };
                 Ok(Flow::Return(v))
             }
+            // The parser has already established that these sit inside a loop body in
+            // this function (§9c), so there is nothing left to check here.
+            Stmt::Break => Ok(Flow::Break),
+            Stmt::Continue => Ok(Flow::Continue),
             Stmt::Expr(e) => Ok(Flow::Normal(self.eval(e)?)),
             // Already bound by `hoist_defs` at block entry (§5a), so the declaration
             // itself does nothing further.
@@ -488,7 +512,7 @@ impl Interp {
                 while i <= last {
                     out.push(Val::int(i));
                     i += 1;
-                    if out.len() as u64 > MAX_ITERATIONS {
+                    if out.len() as u64 > self.iteration_limit {
                         return Err(EvalError::new("range is too large to iterate"));
                     }
                 }
@@ -660,18 +684,12 @@ impl Interp {
                     captured,
                 })))
             }
-            Expr::Block(stmts) => match self.scoped_block(stmts)? {
-                Flow::Normal(v) | Flow::Return(v) => Ok(v),
-            },
+            Expr::Block(stmts) => expression_value(self.scoped_block(stmts)?),
             Expr::If { cond, then, otherwise } => {
                 if self.condition(cond)? {
-                    match self.scoped_block(then)? {
-                        Flow::Normal(v) | Flow::Return(v) => Ok(v),
-                    }
+                    expression_value(self.scoped_block(then)?)
                 } else if let Some(b) = otherwise {
-                    match self.scoped_block(b)? {
-                        Flow::Normal(v) | Flow::Return(v) => Ok(v),
-                    }
+                    expression_value(self.scoped_block(b)?)
                 } else {
                     Ok(Val::NULL)
                 }
@@ -898,9 +916,7 @@ impl Interp {
         }
 
         let out = match result {
-            Ok(()) => self.exec_block(&f.body).map(|flow| match flow {
-                Flow::Normal(v) | Flow::Return(v) => v,
-            }),
+            Ok(()) => self.exec_block(&f.body).and_then(boundary_value),
             Err(e) => Err(e),
         };
         self.pop_scope();
@@ -973,9 +989,7 @@ impl Interp {
             }
             let r = self.exec_block(&arm.body);
             self.pop_scope();
-            return match r? {
-                Flow::Normal(v) | Flow::Return(v) => Ok(v),
-            };
+            return expression_value(r?);
         }
         // §9f: no static exhaustiveness check — there is no compiler pass to run one, and
         // §6 already made that call for the type system generally. A value hitting no arm
@@ -1200,9 +1214,7 @@ impl Interp {
         let r = self.exec_block(&f.body);
         self.pop_scope();
         self.scopes = saved;
-        match r? {
-            Flow::Normal(v) | Flow::Return(v) => Ok(v),
-        }
+        boundary_value(r?)
     }
 
     /// §3's shell-state builtins: they mutate *this* process, which an external program
@@ -1920,6 +1932,47 @@ fn index_of(base: &Val, key: &IndexKey) -> Result<Val> {
             "cannot index a {} by name",
             b.type_name()
         ))),
+    }
+}
+
+/// The value of a block that has run to the end of a **function, closure or script**.
+///
+/// `break`/`continue` cannot legally arrive here: the parser refuses them outside a loop
+/// body and resets its loop count at every `def` and closure (§9c), so a loop on the far
+/// side of that boundary is invisible to them. The arm states the invariant rather than
+/// handling a case that runs — and says the rule, so that if some future construct ever
+/// builds this tree without going through the parser, the result is a sentence rather
+/// than a silent `Null`.
+fn boundary_value(flow: Flow) -> Result<Val> {
+    match flow {
+        Flow::Normal(v) | Flow::Return(v) => Ok(v),
+        Flow::Break | Flow::Continue => Err(EvalError::new(
+            "`break` and `continue` are only meaningful inside a `for` or `while` body, \
+             and they do not cross out of a `def` or a closure",
+        )),
+    }
+}
+
+/// The value of a block used **in expression position** — `let x = { … }`, an `if` whose
+/// value is taken, a `match` arm.
+///
+/// A `break` here is legal per §9c (it may well sit inside a loop) and still cannot work:
+/// `eval` returns a *value*, so there is no channel for control flow to travel back
+/// through, and the expression it is inside has to produce something. Refused with the
+/// fix in the message, because the statement-position form is what a person means anyway.
+///
+/// `return` reaches this same wall and *silently* yields its operand as the block's value
+/// instead of leaving the function — a pre-existing divergence from §5b, not something
+/// this change introduces. Both want the same mechanism; filed together as
+/// `TODO(control-flow-in-expression-position)`.
+fn expression_value(flow: Flow) -> Result<Val> {
+    match flow {
+        Flow::Normal(v) | Flow::Return(v) => Ok(v),
+        Flow::Break | Flow::Continue => Err(EvalError::new(
+            "`break` and `continue` cannot be used where a value is expected — this \
+             block's value is being taken, and they produce none. Put it in statement \
+             position instead: `if done { break }` on a line of its own",
+        )),
     }
 }
 
@@ -3144,5 +3197,94 @@ x"), "5");
     fn the_deliverable_computes() {
         // The plan's stated Part B deliverable.
         assert_eq!(rendered("let x = 2 + 3\nx"), "5");
+    }
+
+    // --- `break` / `continue` (§9c) -----------------------------------------
+
+    /// The motivating case, and the reason the gap was not cosmetic: **stop at the first
+    /// match.** Before `break`, this could only be written by letting the loop run to the
+    /// end with a sentinel — `return` was the sole early exit and it leaves the whole
+    /// function, which is not available at a prompt at all.
+    #[test]
+    fn break_stops_at_the_first_match() {
+        assert_eq!(
+            rendered("mut found = -1\nfor x in [4, 7, 9] {\n if x > 5 {\n found = x\n break\n }\n}\nfound"),
+            "7"
+        );
+    }
+
+    #[test]
+    fn break_and_continue_do_what_they_say() {
+        // `break`: 0 + 1 + 2, then out.
+        assert_eq!(
+            rendered("mut t = 0\nfor x in 0..10 {\n if x == 3 { break }\n t = t + x\n}\nt"),
+            "3"
+        );
+        // `continue`: the odd values only.
+        assert_eq!(
+            rendered("mut t = 0\nfor x in 0..5 {\n if x % 2 == 0 { continue }\n t = t + x\n}\nt"),
+            "4"
+        );
+        // …and in a `while`, where `break` is the only way out of `true`.
+        assert_eq!(rendered("mut i = 0\nwhile true {\n i = i + 1\n if i == 3 { break }\n}\ni"), "3");
+    }
+
+    /// `break` leaves **one** loop. No labels (§9c), so the outer loop keeps going —
+    /// which is the behaviour a reader assumes and therefore the one worth pinning.
+    #[test]
+    fn break_leaves_only_the_innermost_loop() {
+        assert_eq!(
+            rendered("mut n = 0\nfor x in 0..3 {\n for y in 0..3 { break }\n n = n + 1\n}\nn"),
+            "3"
+        );
+    }
+
+    /// The regression that matters for the `Flow` change: `return` still travels *past* a
+    /// loop to leave the function. Every `match` on `Flow` is a place that can be dropped.
+    #[test]
+    fn return_still_escapes_a_loop_and_its_function() {
+        assert_eq!(
+            rendered("def first_odd(xs) {\n for x in xs {\n if x % 2 == 1 { return x }\n }\n -1\n}\nfirst_odd([2, 4, 5, 6])"),
+            "5"
+        );
+        // …and a loop that never returns still falls through to the last expression.
+        assert_eq!(
+            rendered("def first_odd(xs) {\n for x in xs {\n if x % 2 == 1 { return x }\n }\n -1\n}\nfirst_odd([2, 4])"),
+            "-1"
+        );
+    }
+
+    /// A block whose *value* is being taken cannot also be a jump: `eval` returns a value
+    /// and has no channel for control flow. Refused with the fix in the message rather
+    /// than silently evaluating to `Null`. See `TODO(control-flow-in-expression-position)`.
+    #[test]
+    fn break_where_a_value_is_expected_is_refused() {
+        let e = err("for x in 0..3 {\n let y = if true { break } else { 1 }\n}");
+        assert!(e.contains("where a value is expected"), "{e}");
+        assert!(e.contains("statement position"), "{e}");
+    }
+
+    /// A `continue` that skips the increment is an infinite loop in every language that
+    /// has one. Here it hits the runaway backstop and says so, rather than hanging the
+    /// shell — which matters more than usual until `Ctrl-C` exists (§11h).
+    ///
+    /// The real assertion is that **`continue` still counts**: a guard incremented only on
+    /// a normally-completing body would let this run forever. The limit is lowered for the
+    /// test because proving it at ten million costs more wall-clock than the entire suite
+    /// — and this is the backstop's first coverage either way, `while`'s and the range's.
+    #[test]
+    fn a_continue_that_skips_the_increment_is_caught_not_hung() {
+        let mut i = Interp::new();
+        i.iteration_limit = 1_000;
+        let e = i
+            .run(&crate::parse::parse_script("mut i = 0\nwhile i < 3 {\n continue\n i = i + 1\n}").unwrap())
+            .expect_err("a loop with no way to advance");
+        assert!(e.message.contains("iteration limit"), "{}", e.message);
+
+        // The sibling guard, on materialising a range.
+        let e = i
+            .run(&crate::parse::parse_script("for x in 0..100000 { }").unwrap())
+            .expect_err("an absurd range");
+        assert!(e.message.contains("too large to iterate"), "{}", e.message);
     }
 }

@@ -286,6 +286,27 @@ had to weaken are restored and serving as their regression tests:
   size and stale pages. `copy --force` now overwrites a longer destination, shrinking first
   and verifying the shrink took. e2fsck-clean; negative-controlled.
 
+### Substrate gap surfaced by the language audit (2026-08-04)
+
+One, and it is a syscall that was designed and never built:
+
+- [ ] **`sys_process_terminate`.** `Rights::TERMINATE` is defined, granted on every `Process`
+  handle a spawn returns, and enforced by the type/rights table — **and no syscall consumes
+  it.** Nothing in the 36-syscall surface can terminate another process. Two things already
+  in the tree assume it exists: shell design §1 says a failed stage under `strict` terminates
+  the ones after it (the implementation waits for every child and then *labels* them
+  cancelled), and §11h's `Ctrl-C` needs it to stop a running pipeline. Both are the same
+  missing call, and neither raises §10a's "how does a command get a handle to a process it
+  didn't spawn" question, because the shell spawned them.
+
+  **Two things to settle when it is built, deliberately rather than by discovery:** it must
+  reuse the existing exit path (reaper thread + exit-context teardown, decision log
+  2026-07-31) rather than growing a second teardown — reclamation is the area that has cost
+  the most to get right; and a target blocked inside a syscall cannot simply be torn down
+  where it stands, so "mark terminated, tear down at a safe point" needs to be a recorded
+  decision. Scheduled inside **Milestone 4 Part G** of
+  [shell-coreutils-plan.md](shell-coreutils-plan.md), which is where it is first needed.
+
 ### Pre-CLI substrate hardening — the deferral audit (2026-07-24)
 
 Three consecutive slices (handle reclamation, the wall clock, file truncate) were spent
@@ -519,7 +540,7 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).
-- Design docs: [`docs/history/nitrox-shell-design-v1.1.md`](../history/nitrox-shell-design-v1.1.md)
+- Design docs: [`docs/history/nitrox-shell-design-v1.2.md`](../history/nitrox-shell-design-v1.2.md)
   (language/grammar) and [`docs/history/nitrox-ui-composition-model-v1.md`](../history/nitrox-ui-composition-model-v1.md)
   (windows/widgets as resource servers).
 - The **rich interactive REPL** (reverse-search, Shift-Enter key events, schema-aware completion —

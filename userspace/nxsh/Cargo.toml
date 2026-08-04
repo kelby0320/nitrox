@@ -3,7 +3,7 @@ name = "nxsh"
 version = "0.1.0"
 edition = "2024"
 
-# `nxsh` — the Nitrox shell (design `docs/history/nitrox-shell-design-v1.1.md`).
+# `nxsh` — the Nitrox shell (design `docs/history/nitrox-shell-design-v1.2.md`).
 # Scripts are `.nx`. Plan: `docs/planning/shell-coreutils-plan.md` § Milestone 3.
 #
 # Split the way `fs-server-ext4` is: the **language** is a library — lexer, parser,

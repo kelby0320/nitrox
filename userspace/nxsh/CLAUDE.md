@@ -10,7 +10,7 @@ the interactive loop. Scripts are `.nx`.
 **It is the login leaf** as of 2026-07-31 — `session-mgr` spawns it into the constructed
 session namespace with empty syscaps. It replaced the throwaway `usersh`, which is gone.
 
-- Design (semantics/grammar): `docs/history/nitrox-shell-design-v1.1.md`
+- Design (semantics/grammar): `docs/history/nitrox-shell-design-v1.2.md`
 - Build plan and the decisions it resolved: `docs/planning/shell-coreutils-plan.md`
 
 ## Structure — and the reason for it
@@ -79,6 +79,13 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
   argument position means the next thing is whitespace or a closer, so there is no right
   operand and division is impossible. Whenever you touch `starts_an_argument`, the test for
   `list /` and the test for `6 / 2` only mean something as a pair.
+- **A new token that can end a statement must join `Tok::ends_statement`.** It is a
+  whitelist of *enders*, so anything new defaults to "continues" — the lexer then swallows
+  the newline after it and the parser reports "expected a newline between statements" on
+  the *following* line. `break` and `continue` landed this way: `for x in xs { break }`
+  parsed (a `}` follows), and `break` on its own line did not. The default is the right one
+  — a wrong "ends" silently splits one statement into two — but it means the symptom points
+  one line past the cause.
 - **The shell does not rewrite a spawned stage's paths.** It passes `argv` through as
   written and hands over the same `PWD`, so both sides resolve identically. Pre-resolving
   would reintroduce the split-brain the environment design exists to prevent.

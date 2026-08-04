@@ -62,8 +62,11 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **CLI substrate prereqs** — directory ops, `Value` collection types, and the stdio/pipe
     convention (plus the `parent`/`child` retirement into a conforming test harness) — ✅ done
     (2026-07-23/24). See [phase-4-desktop.md](phase-4-desktop.md) → "CLI substrate prereqs".
-  - **The typed shell + coreutils subproject** — 🚧 active from 2026-07-24. **Milestone 1
-    (`list` + `copy`) complete** (PR #116). Tracked in
+  - **The typed shell + coreutils subproject** — 🚧 active from 2026-07-24. **Milestones 1,
+    2, 3 and 3.5 complete**: the coreutils, the `nxsh` interpreter, and the shell as the
+    login leaf (2026-07-31). **Milestone 4 — language completeness — planned 2026-08-04**
+    from an audit of the built language against the design doc (now v1.2); it carries one
+    kernel item, `sys_process_terminate`. Tracked in
     [shell-coreutils-plan.md](shell-coreutils-plan.md).
   - **Substrate gaps it surfaced** — exit-time handle reclamation, the wall clock, and file
     truncate — all ✅ (2026-07-24). See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
