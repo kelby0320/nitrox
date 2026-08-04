@@ -1087,7 +1087,8 @@ Parts, in order (tick as they land):
 - [x] **Part D — sequences generalise, and reduction** ✅ (2026-08-04)
 - [x] **Part E — strings, records, numbers, `in`** ✅ (2026-08-04)
 - [x] **Part F — `capture`: regex submatches** ✅ (2026-08-04)
-- [ ] **Part G — interrupt (`Ctrl-C`)** — also makes `strict` real
+- [x] **Part G1 — interrupt (`Ctrl-C`) in the shell** ✅ (2026-08-04)
+- [ ] **Part G2 — `sys_process_terminate`** — stops a running *stage*, and makes `strict` real
 
 **Expect each part to surface substrate gaps, and file them rather than paper over them** — the
 rule Milestone 2 earned. Part G already has one before it starts (below).
@@ -1309,6 +1310,20 @@ which is the pair D3 exists for.
 
 #### Part G — interrupt (`Ctrl-C`) — and `strict` becomes real
 
+**Split in two while building it, and the order reversed.** The plan put the kernel syscall first
+"because it is a prerequisite for the other two". That turned out to be wrong: the hazard §11h
+actually names — `while true { }` at a prompt, with no way out — is an **in-shell** loop, and
+stopping it needs no kernel work at all. G1 closes it; G2 is what stops a running external *stage*
+and makes `strict` honest.
+
+**G1 ✅ (2026-08-04) — the shell half.** The tty server sees `Ctrl-C` and sends an out-of-band
+event; the evaluator asks the host at statement boundaries and between loop iterations; an
+interrupt unwinds as `kind: "Interrupted"`, which `try`/`catch` can catch so cleanup runs. At a
+prompt the same event discards the line. Three things it turned up are below.
+
+**G2 — the kernel half, not built.** Design and the decision it carries are at the end of this
+section.
+
 Three pieces, in this order, because the first is a prerequisite for the other two *and* fixes a
 standing divergence on its own (§1: `strict` claims to terminate the remaining stages and today
 only relabels them).
@@ -1337,6 +1352,53 @@ Tests: host-side, a `MockHost` that reports an interrupt after N statements — 
 the right kind and `try`/`catch` still runs. In guest, the one that matters: **`test-interactive`
 types `while true { }`, sends `0x03`, and expects the prompt back.** That test is unwritable today,
 which is the point.
+
+**What G1 turned up.**
+
+- **The harness could never send `Ctrl-C`.** QEMU's `stdio` chardev defaults to `signal=on`, where
+  `0x03` on stdin is QEMU's own interrupt and never reaches the guest. It is now an explicit
+  `-chardev stdio,signal=off`; `-serial stdio` has no way to say it. Every key *except* the one
+  §11h is about had been reachable.
+- **A raw read swallowed the interrupt.** `Ctrl-C` is checked at the front of the input queue, but a
+  raw read takes everything available in one go — so when the byte arrived in the same chunk as the
+  keystrokes before it, the shell got it as ordinary input and the front-of-queue check never saw
+  it. A raw read now stops at an interrupt.
+- **An interrupt has to be able to end a read that has not started yet.** Arriving while nobody was
+  reading, the event was delivered and then nothing happened: the shell's *next* read blocked for a
+  keystroke that had not been typed, so `Ctrl-C` at a prompt only took effect once the user pressed
+  something else. The server now remembers it and completes the next read empty.
+- **The interrupt is edge-triggered, and that is a contract, not an implementation detail.** The
+  `catch` block handling an interrupt runs statements, so it reaches the checkpoint too — a host
+  that kept answering "yes" would interrupt the recovery as fast as it started. Found by a test that
+  expected the catch to run and watched it be interrupted instead.
+- **The in-guest test sends the loop and the interrupt in one write.** Separately it is a race the
+  test loses: an empty loop reaches the ten-million-iteration backstop in well under a second, so
+  the run ends on its own and the step passes without the interrupt ever arriving.
+
+#### Part G2 — `sys_process_terminate`, and the decision it carries
+
+Not built. What is known, so the decision is made rather than discovered:
+
+**The precedent is already in the tree.** `sys_exception_resume` terminates a *suspended* thread of
+another process, and it does not tear anything down from the caller: it sets a **disposition** on
+the target and makes it runnable, and the target reads that disposition and exits itself, at the
+point it was suspended. That is exactly the "mark it, let it tear itself down at a safe point"
+shape — already written, already tested.
+
+So `sys_process_terminate(handle)` should be: `lookup_typed(handle, pid, Rights::TERMINATE,
+KObjectType::Process)` — the whole authority check, since the right is granted only to a spawner —
+then mark the process terminated and make its threads run to notice.
+
+**The decision:** where the safe point is, and what happens to a thread that does not reach one.
+A thread parked in `sys_wait` or an IPC receive is the common case and is easy — wake it, and it
+observes the flag on its way out of the syscall. A thread spinning in ring 3 with no syscalls
+reaches a safe point only on a timer tick, which means the check belongs on the kernel-exit path.
+The narrower alternative is to terminate only what is parked and leave a spinning stage running,
+which is honest but means `Ctrl-C` sometimes does nothing.
+
+**Do not grow a second teardown.** `exit_process` already reaps sibling threads across every
+per-CPU queue and hands the handle table to the reaper; whatever terminate does must go through
+that, not beside it. Reclamation is the area of this kernel that has cost the most to get right.
 
 #### What Milestone 4 does not do
 

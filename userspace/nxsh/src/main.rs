@@ -94,6 +94,9 @@ static mut SPAWN: SpawnArgs = SpawnArgs {
 struct NitroxHost {
     namespace: u64,
     notif: u64,
+    /// The terminal, for §11h's interrupt checkpoint. `0` when there is none — a script,
+    /// or a Tier-0 stage — in which case the question is never asked of anyone.
+    tty: u64,
 }
 
 impl NitroxHost {
@@ -341,6 +344,48 @@ impl Host for NitroxHost {
         kprint(text.as_bytes());
     }
 
+    /// §11h. A **non-blocking** receive: this runs at every statement boundary, so it
+    /// must never park. Nothing else can be in flight at a checkpoint — evaluation is
+    /// sequential and each tty exchange completes before the next statement — so anything
+    /// waiting here is the unsolicited interrupt.
+    fn interrupted(&mut self) -> bool {
+        if self.tty == 0 {
+            return false;
+        }
+        // SAFETY: single-threaded shell; valid recv out-params.
+        unsafe {
+            loop {
+                let rr = syscall4(
+                    SYS_CHANNEL_RECV,
+                    self.tty,
+                    (&raw mut TTY_MSG) as u64,
+                    (&raw mut TTY_HANDLES) as u64,
+                    (&raw mut TTY_COUNT) as u64,
+                );
+                if rr != 0 {
+                    break; // WouldBlock: nothing queued, which is the common case
+                }
+                let payload_len =
+                    u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
+                let rep = core::slice::from_raw_parts(
+                    ((&raw const TTY_MSG) as *const u8).add(24),
+                    payload_len.min(4096 - 24),
+                );
+                if let Ok(m) = librsproto::decode(rep) {
+                    if m.op == librsproto::OP_TTY_INTERRUPT {
+                        INTERRUPTED = true;
+                    }
+                }
+            }
+            // **Consumed, not sticky** — see the trait: a `catch` handling the interrupt
+            // reaches this checkpoint too, and a host that kept answering "yes" would
+            // interrupt the recovery as fast as it started.
+            let hit = (&raw const INTERRUPTED).read();
+            (&raw mut INTERRUPTED).write(false);
+            hit
+        }
+    }
+
     fn out(&mut self, text: &str) {
         kprint(text.as_bytes());
     }
@@ -465,7 +510,8 @@ fn po_wait(po: u64) -> (i32, u64) {
 }
 
 fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record) -> i64 {
-    let mut host = NitroxHost { namespace, notif };
+    // Script mode has no terminal: §11h's checkpoint asks nobody.
+    let mut host = NitroxHost { namespace, notif, tty: 0 };
 
     let source = match argv.get(1).map(|s| s.as_str()) {
         Some("-c") => match argv.get(2) {
@@ -555,7 +601,7 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
     };
 
     let mut interp = Interp::with_host(
-        alloc::boxed::Box::new(NitroxHost { namespace, notif }),
+        alloc::boxed::Box::new(NitroxHost { namespace, notif, tty }),
         RunMode::Repl,
     );
     interp.set_env(env);
@@ -598,6 +644,22 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
                 return EXIT_OK;
             }
         };
+        // **`Ctrl-C` at a prompt discards the line** (§11h). The read came back empty
+        // because the byte became an event rather than input, so there is nothing to feed
+        // the discipline — abandon what was typed, say so, and start again. The same event
+        // mid-evaluation is the evaluator's checkpoint; what it *means* is the caller's
+        // decision, which is why the tty only reports it.
+        // SAFETY: single-threaded shell.
+        if unsafe { (&raw const INTERRUPTED).read() } {
+            // SAFETY: same.
+            unsafe { (&raw mut INTERRUPTED).write(false) };
+            search = None;
+            pending.clear();
+            disc.reset();
+            tty_write(tty, b"^C\r\n");
+            tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
+            continue;
+        }
         for &b in &chunk[..n] {
             // While searching, the shell owns the keys: the discipline's line buffer is
             // empty and the display is the search prompt, not a line being edited.
@@ -851,6 +913,14 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, u
     if !sent {
         return None;
     }
+    tty_await_reply(ch, out)
+}
+
+/// Wait for the reply to the request just sent, stepping over any interrupt event.
+///
+/// Split out so it can be re-entered: the interrupt is the one unsolicited message on this
+/// channel (§11h), and the reply this exchange is owed is still coming behind it.
+fn tty_await_reply(ch: u64, out: &mut [u8]) -> Option<(bool, usize)> {
     // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
     let waited = unsafe {
         WAIT_HANDLES[0] = ch;
@@ -887,6 +957,13 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<(bool, u
             payload_len.min(4096 - 24),
         );
         let m = librsproto::decode(rep).ok()?;
+        // The interrupt is unsolicited, so it can land where a reply was expected. Record
+        // it and keep waiting for the reply this request is owed — dropping the exchange
+        // here would leave the real reply queued for whoever asked next.
+        if m.op == librsproto::OP_TTY_INTERRUPT {
+            INTERRUPTED = true;
+            return tty_await_reply(ch, out);
+        }
         let n = m.body.len().min(out.len());
         out[..n].copy_from_slice(&m.body[..n]);
         Some((m.is_error(), n))
@@ -926,6 +1003,15 @@ fn tty_write_crlf(ch: u64, text: &str) {
         tty_write(ch, b"\r\n");
     }
 }
+
+/// Set when the terminal has reported `Ctrl-C` (§11h).
+///
+/// The interrupt is the one message the tty server sends unsolicited, so it can arrive in
+/// the middle of any request/reply exchange. Every path that receives from the tty channel
+/// records it here rather than acting on it: what an interrupt *means* depends on what the
+/// shell is doing — clear the line at a prompt, unwind an evaluation in progress — and only
+/// the caller knows which.
+static mut INTERRUPTED: bool = false;
 
 static mut TTY_MSG: [u8; 4096] = [0; 4096];
 static mut TTY_HANDLES: [u64; 8] = [0; 8];

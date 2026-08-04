@@ -551,8 +551,15 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
         .arg(format!("format=raw,file={}", image_path().display()))
         .arg("-display")
         .arg("none")
+        // **`signal=off` is what lets the guest see `Ctrl-C`.** QEMU's `stdio` chardev
+        // defaults to `signal=on`, where `0x03` on stdin is QEMU's own interrupt and never
+        // reaches the guest — so the harness could type every key except the one §11h is
+        // about. Spelled as an explicit chardev because `-serial stdio` has no way to say
+        // it.
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
         .arg("-serial")
-        .arg("stdio")
+        .arg("chardev:hostserial")
         .arg("-smp")
         .arg("4")
         .arg("-no-reboot")
@@ -754,7 +761,36 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 17. **`list [x]` returns a prompt instead of locking the shell.** The word-mode
+    // 17. **`Ctrl-C` interrupts a running evaluation** (§11h) — the hazard that section
+    //     exists for. `while true { }` has no exit and, on a system with no SIGINT, no way
+    //     to be stopped: it meant a reboot.
+    //
+    //     The loop and the interrupt go in **one write** deliberately. Sent separately it
+    //     is a race the test loses: an empty loop reaches the ten-million-iteration
+    //     backstop in well under a second, so the run would end on its own and the step
+    //     would pass without the interrupt ever arriving. One write puts the byte in the
+    //     guest before evaluation starts, and the tty holds it until the shell's next
+    //     checkpoint asks.
+    s.send_raw("while true { }\n\x03")?;
+    s.expect("interrupted")?;
+    s.expect("/home>")?;
+    // …and the shell is still usable afterwards, which is the actual claim.
+    s.send("format(\"alive={}\", 1 + 1)")?;
+    s.expect("alive=2")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 18. **`Ctrl-C` at a prompt discards the line** rather than leaving it half-typed —
+    //     the same event, and the shell decides what it means from what it was doing.
+    s.send_raw("garbage-that-should-vanish\x03")?;
+    s.expect("^C")?;
+    s.expect("/home>")?;
+    s.send("format(\"clean={}\", 2 + 2)")?;
+    s.expect("clean=4")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 19. **`list [x]` returns a prompt instead of locking the shell.** The word-mode
     //     scanner produced an empty token at `[` without advancing, so the argument loop
     //     bumped it forever — a user-reachable hang on a path that predates every part of
     //     Milestone 4, and one with no escape until Ctrl-C exists (§11h). It is asserted
@@ -764,7 +800,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 18. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
+    // 20. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
     //     observable rather than merely "the shell left". Before Part C the driver matched
     //     the literal line `exit`, so `exit 3` missed it entirely and came back as
     //     "`exit` is handled by the shell's driver".
@@ -777,7 +813,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 19. A bare `exit` still returns to the login prompt, and logging in again works. A
+    // 21. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;
@@ -843,6 +879,18 @@ impl Session {
     }
 
     /// Type a line, Enter included.
+    /// Send bytes with **no trailing newline** — for keys that are not a line.
+    ///
+    /// `Ctrl-C` is the case that needs it: appending `\n` would submit the line as well as
+    /// interrupt, and the two behaviours are exactly what the step is trying to tell apart.
+    fn send_raw(&mut self, bytes: &str) -> R<()> {
+        use std::io::Write as _;
+        let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
+        stdin.write_all(bytes.as_bytes()).map_err(|e| format!("write to guest: {e}"))?;
+        stdin.flush().map_err(|e| format!("flush: {e}"))?;
+        Ok(())
+    }
+
     fn send(&mut self, line: &str) -> R<()> {
         use std::io::Write as _;
         let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;

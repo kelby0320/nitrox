@@ -32,7 +32,7 @@ use libkern::*;
 use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
-    OP_NS_RESOLVE, OP_TTY_CLOSE, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE,
+    OP_NS_RESOLVE, OP_TTY_CLOSE, OP_TTY_INTERRUPT, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE,
     RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
 };
 use tty_server::{Discipline, Step};
@@ -97,6 +97,14 @@ struct Tty {
     disc: Discipline,
     /// The outstanding read, if the client is waiting for input.
     waiting: Option<(u64, ReadKind)>,
+    /// An interrupt arrived while **nobody was reading**, so the next read completes
+    /// empty immediately (§11h).
+    ///
+    /// Without this the event is delivered and then nothing happens: the client's next
+    /// read blocks for a keystroke that has not been typed, so `Ctrl-C` at a prompt would
+    /// only take effect once the user pressed something else. The interrupt has to be able
+    /// to *end a read that has not started yet*.
+    interrupt_pending: bool,
 }
 
 /// Resolve `path` in `ns` requesting `rights`; `0` on failure.
@@ -271,7 +279,12 @@ fn open_tty(serve_end: u64, request_id: u64, ttys: &mut Vec<Tty>) {
         ) == 0
     };
     if sent {
-        ttys.push(Tty { ch: server_end, disc: Discipline::new(), waiting: None });
+        ttys.push(Tty {
+            ch: server_end,
+            disc: Discipline::new(),
+            waiting: None,
+            interrupt_pending: false,
+        });
         kprint(b"tty-server: terminal opened\n");
     } else {
         // The reply did not go, so the client end never moved — reclaim both.
@@ -303,6 +316,38 @@ fn free_tty(ttys: &mut Vec<Tty>, i: usize) {
 /// ahead of a prompt is ordinary, and losing it would be a bug the user cannot see.
 fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
     while !pending.is_empty() {
+        // **`Ctrl-C` is taken before anything else, and never queues.** It is an event
+        // about the terminal rather than input to it (§11h), so it is answered whether or
+        // not anybody is reading — which is the whole point, since during an evaluation
+        // nobody is. Sent to every open terminal: a session has one, and a server that
+        // guessed which was "foreground" would be inventing a concept this system does not
+        // have yet (job control is §11g, and unbuilt).
+        if pending.front() == Some(&0x03) {
+            kprint(b"tty-server: SAW CTRL-C
+");
+            pending.pop_front();
+            for t in ttys.iter_mut() {
+                reply(t.ch, OP_TTY_INTERRUPT, 0, &[]);
+                // **An outstanding read is completed, empty.** Otherwise a client sitting
+                // at a prompt stays blocked on a read whose byte just became an event, and
+                // could not redraw until the user typed something else. A raw read
+                // otherwise only ever completes with at least one byte, so an empty
+                // completion is unambiguous: "your read ended because of the interrupt".
+                match t.waiting.take() {
+                    Some((rid, kind)) => {
+                        let op = match kind {
+                            ReadKind::Line => OP_TTY_READ_LINE,
+                            ReadKind::Raw => OP_TTY_READ,
+                        };
+                        reply(t.ch, op, rid, &[]);
+                    }
+                    // Nobody is reading *yet* — the shell is between prompts, or busy.
+                    None => t.interrupt_pending = true,
+                }
+                t.disc.reset();
+            }
+            continue;
+        }
         let Some(i) = ttys.iter().position(|t| t.waiting.is_some()) else {
             return; // nobody is reading; hold the bytes
         };
@@ -310,7 +355,16 @@ fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
         // doing its own editing, so the discipline must not consume, echo, or interpret a
         // single byte of it.
         if let Some((rid, ReadKind::Raw)) = ttys[i].waiting {
-            let n = pending.len().min(READ_CHUNK as usize);
+            // **Stop at an interrupt.** A raw read takes everything available in one go,
+            // which handed `Ctrl-C` to the client as an ordinary byte whenever it arrived
+            // in the same chunk as the keystrokes before it — the front-of-queue check
+            // above never saw it. Bytes typed *before* the interrupt are still input; the
+            // interrupt itself is picked up on the next turn of this loop.
+            let stop = pending.iter().position(|&b| b == 0x03).unwrap_or(pending.len());
+            let n = stop.min(READ_CHUNK as usize);
+            if n == 0 {
+                continue; // the interrupt is at the front; the branch above handles it
+            }
             let mut out = Vec::with_capacity(n);
             for _ in 0..n {
                 out.push(pending.pop_front().expect("non-empty"));
@@ -391,6 +445,12 @@ fn serve_tty(ttys: &mut Vec<Tty>, i: usize, pending: &mut VecDeque<u8>) -> bool 
                 // One outstanding read per terminal: two would race for the same input and
                 // there is no rule that says which should win.
                 reply_error(ch, op, request_id, KError::WouldBlock.as_i32());
+            } else if ttys[i].interrupt_pending {
+                // An interrupt arrived while nobody was reading: end this read before it
+                // starts, so `Ctrl-C` between prompts takes effect on the next read rather
+                // than on the next keystroke (§11h).
+                ttys[i].interrupt_pending = false;
+                reply(ch, op, request_id, &[]);
             } else {
                 // A partial line from a previous canonical read must not leak into a raw
                 // one, or the shell's first keystroke arrives with somebody else's prefix.
@@ -419,18 +479,21 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
     let mut read_po: u64 = 0;
 
     loop {
-        // Submit a console read **only when a terminal is actually waiting for a line.**
+        // **A console read is always outstanding.**
         //
-        // Not an optimisation. The console driver is single-reader, and until every client
-        // has moved onto this server, `session-mgr`'s login and `nxsh`'s REPL still read
-        // the device directly. A permanently-outstanding read here steals their input —
-        // which is precisely what happened: the interactive login test timed out waiting
-        // for a password prompt whose keystrokes this server had swallowed.
+        // It used to be submitted only while a terminal waited, because the console driver
+        // is single-reader and `session-mgr`'s login and `nxsh`'s REPL still read the
+        // device directly — a permanent read here swallowed their keystrokes, and the
+        // interactive login test timed out on a password prompt that never saw its input.
+        // That comment said the migration could then happen one client at a time, and it
+        // has: session-mgr reads through `tty_read_line` and the shell opens `/dev/tty`,
+        // so this server is the only reader of `/dev/console` in a live session.
         //
-        // Reading only on demand means a terminal with no reader competes with nobody, so
-        // the migration can happen one client at a time instead of all at once.
-        let anyone_waiting = ttys.iter().any(|t| t.waiting.is_some());
-        if read_po == 0 && anyone_waiting {
+        // Reading continuously is now required rather than merely allowed. `Ctrl-C` has to
+        // be seen **while the shell is busy** (§11h) — that is the entire point of an
+        // interrupt — and nobody is waiting for input at that moment. Bytes that arrive
+        // with no reader still queue, exactly as typing ahead of a prompt always did.
+        if read_po == 0 {
             let op = libkern::abi::IoOp {
                 opcode: libkern::abi::IO_OPCODE_READ,
                 flags: 0,

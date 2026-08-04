@@ -65,6 +65,10 @@ pub const TYPE_ERROR: &str = "TypeError";
 pub const PARSE_ERROR: &str = "ParseError";
 pub const ASSERTION_FAILED: &str = "AssertionFailed";
 pub const PIPELINE_FAILED: &str = "PipelineFailed";
+/// §11h. Catchable on purpose: a script gets to clean up after `Ctrl-C`, exactly as it
+/// does after any other failure. `exit` is the one that is *not* catchable, and the
+/// asymmetry is deliberate — leaving is a decision, being interrupted is an event.
+pub const INTERRUPTED: &str = "Interrupted";
 
 impl EvalError {
     fn new(message: impl Into<String>) -> EvalError {
@@ -403,6 +407,10 @@ impl Interp {
         self.hoist_defs(stmts)?;
         let mut last = Val::NULL;
         for (i, s) in stmts.iter().enumerate() {
+            // §11h's checkpoint. **Between statements**, which is what makes it cheap and
+            // what guarantees it can never tear an assignment in half: everything the
+            // interpreter was doing is finished, and the next thing has not started.
+            self.check_interrupt()?;
             match self.exec(s)? {
                 Flow::Return(v) => return Ok(Flow::Return(v)),
                 // A block does not decide what these mean — the enclosing loop does, so
@@ -462,6 +470,9 @@ impl Interp {
             Stmt::While { cond, body } => {
                 let mut guard = 0u64;
                 while self.condition(cond)? {
+                    // A loop body can be empty — `while true { }` is the case §11h exists
+                    // for — so the per-statement checkpoint is not enough on its own.
+                    self.check_interrupt()?;
                     guard += 1;
                     if guard > self.iteration_limit {
                         return Err(EvalError::new(
@@ -480,6 +491,7 @@ impl Interp {
             Stmt::For { binding, iterable, body } => {
                 let items = self.iterate(iterable)?;
                 for item in items {
+                    self.check_interrupt()?;
                     self.push_scope();
                     // The loop variable is immutable and fresh each turn, so a closure
                     // made in the body captures *this* iteration's value (§5a).
@@ -606,6 +618,18 @@ impl Interp {
         let r = self.exec_block(catch_body);
         self.pop_scope();
         r
+    }
+
+    /// Ask the host whether the terminal wants this evaluation to stop (§11h).
+    ///
+    /// An interrupt unwinds as an ordinary error, so `try`/`catch` still runs and the REPL
+    /// prints one line and returns to the prompt. It is *not* an `exit`: leaving is a
+    /// decision a script makes, being interrupted is something that happens to it.
+    fn check_interrupt(&mut self) -> Result<()> {
+        if self.host.interrupted() {
+            return Err(EvalError::of(INTERRUPTED, "interrupted"));
+        }
+        Ok(())
     }
 
     /// A condition must be a `Bool`. See the module docs: no truthiness, deliberately.
@@ -4360,5 +4384,54 @@ x"), "5");
         assert_eq!(rendered("\"x.rs\" ~= /\\.rs$/"), "true");
         // …and `capture` refuses what it cannot work on rather than guessing.
         assert!(err("42 | capture /x/").contains("works on a String"));
+    }
+
+    // --- interrupting an evaluation (§11h, Part G) --------------------------
+
+    fn interrupted_after(n: u32, src: &str) -> EvalError {
+        let mut i = Interp::with_host(Box::new(MockHost::new().with_interrupt_after(n)), Mode::Script);
+        i.run(&crate::parse::parse_script(src).unwrap()).expect_err("interrupted")
+    }
+
+    /// **The hazard §11h exists for.** `while true { }` has no exit and, until the tty
+    /// delivers an interrupt, no way to be stopped — on a system with no `SIGINT` that
+    /// meant a reboot.
+    #[test]
+    fn an_endless_loop_can_be_interrupted() {
+        let e = interrupted_after(5, "while true { }");
+        assert_eq!(e.kind, INTERRUPTED);
+        assert_eq!(e.message, "interrupted");
+    }
+
+    /// The checkpoint is at statement boundaries and between iterations, so a loop with an
+    /// **empty body** is still interruptible — the case a per-statement check alone misses.
+    #[test]
+    fn the_checkpoint_covers_both_loop_forms_and_empty_bodies() {
+        assert_eq!(interrupted_after(3, "while true { }").kind, INTERRUPTED);
+        assert_eq!(interrupted_after(3, "for x in 0..1000000 { }").kind, INTERRUPTED);
+        assert_eq!(interrupted_after(3, "mut n = 0\nwhile true {\n n = n + 1\n}").kind, INTERRUPTED);
+    }
+
+    /// It unwinds as an ordinary error, so a script still gets to clean up — being
+    /// interrupted is something that *happens to* a script, and `try`/`catch` is how a
+    /// script responds to things that happen to it.
+    #[test]
+    fn an_interrupt_is_catchable_unlike_exit() {
+        let mut i =
+            Interp::with_host(Box::new(MockHost::new().with_interrupt_after(4)), Mode::Script);
+        let v = i
+            .run(&crate::parse::parse_script("try { while true { } } catch (e) { e.kind }").unwrap())
+            .expect("the catch runs");
+        assert_eq!(v.render(), "Interrupted");
+    }
+
+    /// An evaluation that finishes before the interrupt arrives is unaffected — the
+    /// checkpoint is a question, not a poll that can fire late.
+    #[test]
+    fn an_evaluation_that_finishes_first_is_untouched() {
+        let mut i =
+            Interp::with_host(Box::new(MockHost::new().with_interrupt_after(1000)), Mode::Script);
+        let v = i.run(&crate::parse::parse_script("1 + 1").unwrap()).expect("no interrupt");
+        assert_eq!(v.render(), "2");
     }
 }
