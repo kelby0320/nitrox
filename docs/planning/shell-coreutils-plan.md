@@ -1083,7 +1083,7 @@ Parts, in order (tick as they land):
 
 - [x] **Part A — `break` / `continue`** ✅ (2026-08-04)
 - [x] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages** ✅ (2026-08-04)
-- [ ] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`**
+- [x] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`** ✅ (2026-08-04)
 - [ ] **Part D — sequences generalise, and reduction**
 - [ ] **Part E — strings, records, numbers, `in`**
 - [ ] **Part F — `capture`: regex submatches**
@@ -1203,6 +1203,23 @@ to produce.
   commit message.)
 - Tests: every raising site's `kind`; `e.stages` after a two-stage failure names the stage that
   failed; `exit 3` really is the process's status (in-guest — this one cannot be host-tested).
+
+**Three things the plan did not predict.**
+
+- **`try` needed one implementation with two entry points, not one node.** Making it an expression
+  would have silently broken `for x in xs { try { … } catch { continue } }` and a `return` inside a
+  `try` body, because control flow cannot leave an expression (Part A's wall). `exec_try` returns
+  `Flow`: `exec` propagates it, `eval` reduces it. Both directions are tests. This is exactly the
+  bite `TODO(control-flow-in-expression-position)` said to watch for here.
+- **`exit` travels the error channel.** It is not a failure, but that channel is the only one that
+  already crosses a `def`, a closure and a loop — and `catch` re-raising it is a one-line rule that
+  keeps "leave the shell" from being something a script prevents by accident. `exit 3`'s argument
+  arrives as a *bareword* (a builtin's argument is not an expression), so it is read with `parse`'s
+  scanner rather than a second one.
+- **The bare-name fallback was burying failures.** D4 wraps a failed bare name as "`x` is not a
+  binding, and running it as a program failed: …" — correct when the program is missing, wrong when
+  it ran and exited non-zero, and it flattened the error, losing the `kind` and the per-stage report
+  in the one case they exist for. It now propagates a `PipelineFailed` unchanged.
 
 #### Part D — sequences generalise, and reduction
 

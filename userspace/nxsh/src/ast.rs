@@ -106,8 +106,14 @@ pub enum Expr {
     TryField(Box<Expr>, String),
     /// `x[i]`.
     Index(Box<Expr>, Box<Expr>),
-    /// `x?` — Result propagation, exits the current function (§2).
-    Try(Box<Expr>),
+    /// `try { … } catch (e) { … }` — an **expression** (§9c, v1.2), so a failure can
+    /// produce a fallback *value*. Sugar over branching on a failure, not stack unwinding
+    /// (§2).
+    ///
+    /// This variant previously held `x?`, which retired in v1.2: propagation needs a
+    /// `Result` *value* to mark, §6 forbids one, and a raise already crosses every
+    /// boundary — so `?` had nothing to mark and was the identity function.
+    Try { body: Vec<Stmt>, catch_binding: Option<String>, catch_body: Vec<Stmt> },
 
     List(Vec<Expr>),
     Record(Vec<(String, Expr)>),
@@ -279,17 +285,14 @@ pub enum Stmt {
     /// here at all therefore means the check has already passed.
     Break,
     Continue,
-    /// `try { … } catch (e) { … }` — sugar over branching on a Result-shaped value, not
-    /// stack unwinding (§2).
-    Try {
-        body: Vec<Stmt>,
-        catch_binding: Option<String>,
-        catch_body: Vec<Stmt>,
-    },
     /// `strict { … }` — first stage failure terminates the rest (§1). Deliberately a
     /// local block rather than a global `pipefail`-style mode switch.
     Strict(Vec<Stmt>),
     Return(Option<Expr>),
+    /// `fail expr` (§2). A `String` is the message with the default `kind`; a `Record` is
+    /// raised as the error value itself, for a caller that wants to `match` on more than
+    /// a message (§9f).
+    Fail(Expr),
     /// `use "./lib/utils.nx" { helper }` or `… as utils` (§9h).
     Use {
         path: String,
@@ -315,13 +318,15 @@ impl Stmt {
     /// Whether a block ending in this statement has that statement's value (§9a).
     ///
     /// `let`, `return`, `for`, `while`, `def`, `break` and `continue` produce no value, so
-    /// a block ending in one evaluates to `Null`. **`if` and `try` do** — §9a names only the first list as
+    /// a block ending in one evaluates to `Null`. **`try` is no longer named here** — it
+    /// is an expression as of v1.2, so a block ending in one is a `Stmt::Expr` and covered
+    /// by the first arm. **`if` and `try` do** — §9a names only the first list as
     /// valueless, and §9f's own example uses `try`/`catch` in expression position. `if` is
     /// what
     /// makes the implicit-last-expression return rule work when a function ends in an
     /// `if`/`else`, and the parser emits `Stmt::If` for a statement-position `if` even
     /// when its value is wanted.
     pub fn is_expression_shaped(&self) -> bool {
-        matches!(self, Stmt::Expr(_) | Stmt::If { .. } | Stmt::Try { .. })
+        matches!(self, Stmt::Expr(_) | Stmt::If { .. })
     }
 }

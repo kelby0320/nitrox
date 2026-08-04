@@ -707,8 +707,35 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 14. `exit` returns to the login prompt, and logging in again works. A login that
-    //     cannot be repeated is not a login.
+    // 14. **Errors are constructible and recoverable, at a real prompt.** `fail` raises
+    //     with a message a script chose, `catch` binds it as an ordinary record, and `try`
+    //     in value position supplies a fallback — the three halves of §2 that did not
+    //     exist before Part C. `n=8080` rather than `8080` for the reason step 12 gives.
+    s.send("try { fail \"boom\" } catch (e) { e.message }")?;
+    s.expect("boom")?;
+    s.expect("/home>")?;
+    s.send("let n = try { \"x\" | parse Int } catch { 8080 }")?;
+    s.expect("/home>")?;
+    s.send("format(\"n={}\", n)")?;
+    s.expect("n=8080")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 15. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
+    //     observable rather than merely "the shell left". Before Part C the driver matched
+    //     the literal line `exit`, so `exit 3` missed it entirely and came back as
+    //     "`exit` is handled by the shell's driver".
+    s.send("exit 3")?;
+    s.expect("shell exit 3")?;
+    s.expect("nitrox login:")?;
+    s.send("alice")?;
+    s.expect("password:")?;
+    s.send(DEMO_PASSWORD)?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 16. A bare `exit` still returns to the login prompt, and logging in again works. A
+    //     login that cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;
     s.send("alice")?;

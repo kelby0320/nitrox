@@ -59,14 +59,18 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
   prompt vanished and the next line said no such function. Anything `exec_block` does to a
   list of statements, `run_line` owes them too.
 - **`should_display` must agree with `is_expression_shaped`.** They are the same question
-  asked twice — "does this statement produce a value?" — and they disagreed: `if` and `try`
-  count for a block's value but were not echoed at the prompt, so the REPL computed a
-  result and dropped it. If you extend one, extend the other.
-- **The interactive loop in `main.rs` may intercept exactly one line: `exit`.** It must end
-  the loop, which `run_line` cannot do. A `cd` guard sat beside it, left from before `cd`
-  existed, and went on refusing a builtin the interpreter had implemented — for weeks,
-  because the script path calls `run_line` and the interactive path never got there. Any
-  new special case here is a second implementation of the language.
+  asked twice — "does this statement produce a value?" — and they disagreed: `if` counted
+  for a block's value but was not echoed at the prompt, so the REPL computed a result and
+  dropped it. If you extend one, extend the other. (`try` used to be on both lists; it is
+  an expression as of v1.2, so it arrives as `Stmt::Expr` and needs no entry.)
+- **The interactive loop in `main.rs` intercepts nothing.** It used to match one line —
+  `exit` — because ending the loop was the one thing `run_line` could not do. That was
+  still a second implementation of the language, and it behaved like one: `exit 1` missed
+  the string comparison and came back as "`exit` is handled by the shell's driver", so a
+  script could not set its own status. A `cd` guard had sat beside it for weeks for the
+  same reason, refusing a builtin the interpreter had implemented. Since v1.2 `exit` is a
+  real builtin whose status travels the error channel (`EvalError::is_exit`), and the loop
+  hands every line to `run_line` unread. **Do not add a case here.**
 - **`Host::exists` and `list` must ask the namespace the same question.** A path can be
   real in three ways: it names a binding (or sits above one), it resolves to an object, or
   a directory session opens it. `exists` had only the last two, so `cd /` and `cd /bin`
