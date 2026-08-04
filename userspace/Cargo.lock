@@ -124,6 +124,7 @@ dependencies = [
  "libkern",
  "librsproto",
  "libstream",
+ "tty-server",
 ]
 
 [[package]]

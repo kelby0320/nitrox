@@ -158,6 +158,8 @@ right behaviour anyway.
    program resolves its own terminal and a terminal ends when its holder exits. See
    "What ends a terminal" below.)
 3. **History and reverse-search**, once there is one place that owns line state.
+   History ✅ 2026-08-03 — `nxsh` reads raw, links the discipline, and keeps its own ring.
+   Reverse-search still owed; the redraw primitive it needs (`replace_line`) now exists.
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input slice), terminal emulation (needs the compositor).
 
@@ -216,9 +218,13 @@ other. The 16 host tests cover the discipline itself either way.
 
 ### What it needs
 
-- **A raw mode** (`TTY_MODE_RAW` alongside `TTY_MODE_ECHO`) and a read that returns
-  *available bytes* rather than waiting for a line. The shell asks for raw, gets keystrokes,
-  and echoes through the write path it already has.
+- **A raw read** returning *available bytes* rather than waiting for a line. The shell reads
+  this way, gets keystrokes, and echoes through the write path it already has.
+
+  Built 2026-08-03 as `Tty::Read`, and **without** the `TTY_MODE_RAW` flag this section
+  first proposed: two read ops say the same thing with less state. A client asks for what it
+  wants per read, and cannot leave a terminal in a mode some later reader did not expect —
+  which is a hazard `termios` has and this does not need to inherit.
 - **Escape-sequence recognition.** `ESC [ A` is three bytes; the discipline currently drops
   `ESC` as an undefined control byte. This is a small state machine, and it is the first step
   toward terminal *input* parsing — worth deciding deliberately where that stops rather than

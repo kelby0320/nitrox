@@ -32,8 +32,8 @@ use libkern::*;
 use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
-    OP_NS_RESOLVE, OP_TTY_CLOSE, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, RS_FLAG_ERROR,
-    RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
+    OP_NS_RESOLVE, OP_TTY_CLOSE, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE,
+    RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
 };
 use tty_server::{Discipline, Step};
 
@@ -81,13 +81,22 @@ fn exit(code: i64) -> ! {
     }
 }
 
+/// What an outstanding read is waiting for.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum ReadKind {
+    /// `ReadLine`: completes when the discipline finishes a line.
+    Line,
+    /// `Read`: completes as soon as any byte is available, discipline not consulted.
+    Raw,
+}
+
 /// One terminal: its channel, its editing state, and the request it owes a reply to.
 struct Tty {
     /// The server-side endpoint. `0` marks a freed slot.
     ch: u64,
     disc: Discipline,
-    /// The `request_id` of an outstanding `ReadLine`, if the client is waiting for a line.
-    waiting: Option<u64>,
+    /// The outstanding read, if the client is waiting for input.
+    waiting: Option<(u64, ReadKind)>,
 }
 
 /// Resolve `path` in `ns` requesting `rights`; `0` on failure.
@@ -297,22 +306,38 @@ fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
         let Some(i) = ttys.iter().position(|t| t.waiting.is_some()) else {
             return; // nobody is reading; hold the bytes
         };
+        // A raw read takes everything available and returns immediately: the client is
+        // doing its own editing, so the discipline must not consume, echo, or interpret a
+        // single byte of it.
+        if let Some((rid, ReadKind::Raw)) = ttys[i].waiting {
+            let n = pending.len().min(READ_CHUNK as usize);
+            let mut out = Vec::with_capacity(n);
+            for _ in 0..n {
+                out.push(pending.pop_front().expect("non-empty"));
+            }
+            ttys[i].waiting = None;
+            reply(ttys[i].ch, OP_TTY_READ, rid, &out);
+            continue;
+        }
         let b = pending.pop_front().expect("non-empty");
         match ttys[i].disc.feed(b) {
             Step::None => {}
             Step::Echo(e) => backend_write(&e),
             Step::Line { bytes, echo } => {
                 backend_write(&echo);
-                let rid = ttys[i].waiting.take().expect("waiting");
+                let (rid, _) = ttys[i].waiting.take().expect("waiting");
                 reply(ttys[i].ch, OP_TTY_READ_LINE, rid, &bytes);
             }
+            // Canonical mode has no history to recall, so a cursor key is nothing here.
+            // A client that wants them reads raw and runs the discipline itself.
+            Step::Key(_) => {}
             Step::Eof => {
                 // Ctrl-D at an empty prompt. Answered as an *error* rather than an empty
                 // line, because those are different answers and a reader that conflated
                 // them would either exit on a stray Enter or never exit at all.
                 // `PeerClosed` is the honest code: the input side has ended.
                 backend_write(b"\r\n");
-                let rid = ttys[i].waiting.take().expect("waiting");
+                let (rid, _) = ttys[i].waiting.take().expect("waiting");
                 reply_error(ttys[i].ch, OP_TTY_READ_LINE, rid, KError::PeerClosed.as_i32());
             }
         }
@@ -360,13 +385,19 @@ fn serve_tty(ttys: &mut Vec<Tty>, i: usize, pending: &mut VecDeque<u8>) -> bool 
             ttys[i].disc.set_echo(flags & TTY_MODE_ECHO != 0);
             reply(ch, OP_TTY_SET_MODE, request_id, &[]);
         }
-        OP_TTY_READ_LINE => {
+        OP_TTY_READ_LINE | OP_TTY_READ => {
+            let kind = if op == OP_TTY_READ { ReadKind::Raw } else { ReadKind::Line };
             if ttys[i].waiting.is_some() {
-                // One outstanding read per terminal: two would race for the same line and
+                // One outstanding read per terminal: two would race for the same input and
                 // there is no rule that says which should win.
-                reply_error(ch, OP_TTY_READ_LINE, request_id, KError::WouldBlock.as_i32());
+                reply_error(ch, op, request_id, KError::WouldBlock.as_i32());
             } else {
-                ttys[i].waiting = Some(request_id);
+                // A partial line from a previous canonical read must not leak into a raw
+                // one, or the shell's first keystroke arrives with somebody else's prefix.
+                if kind == ReadKind::Raw {
+                    ttys[i].disc.reset();
+                }
+                ttys[i].waiting = Some((request_id, kind));
                 drive_input(pending, ttys);
             }
         }

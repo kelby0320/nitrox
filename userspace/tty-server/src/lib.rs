@@ -29,6 +29,10 @@ pub enum Step {
     /// A line is complete. Its bytes (no terminator) are the payload; `echo` is what to
     /// write to move the cursor on, which is empty in no-echo mode.
     Line { bytes: Vec<u8>, echo: Vec<u8> },
+    /// A key this discipline deliberately does not act on, reported for the caller to
+    /// decide. Arrow keys are the case that matters: recalling history means replacing the
+    /// line, and *what* to replace it with is the shell's business, not the terminal's.
+    Key(Key),
     /// End of input — Ctrl-D at an empty line. Distinct from an empty *line*, which is
     /// what Enter on its own produces: one means "nothing this time", the other means
     /// "nothing ever again", and a reader that conflates them either exits on a stray
@@ -36,11 +40,33 @@ pub enum Step {
     Eof,
 }
 
+/// A key with no meaning to the line discipline itself.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Key {
+    Up,
+    Down,
+}
+
+/// Where the escape-sequence parser is.
+///
+/// Arrow keys arrive as three bytes (`ESC [ A`), so recognising them needs state. Kept
+/// deliberately small: this parses *cursor keys and nothing else*, and unknown sequences are
+/// discarded rather than accumulated. It is the first step toward terminal input parsing,
+/// and the stopping point is chosen rather than discovered — anything richer belongs with a
+/// real keyboard driver, which can report modifiers a serial byte stream cannot express.
+#[derive(Copy, Clone, PartialEq, Eq)]
+enum EscState {
+    Ground,
+    Esc,
+    Csi,
+}
+
 /// One terminal's editing state.
 pub struct Discipline {
     line: Vec<u8>,
     echo: bool,
     max: usize,
+    esc: EscState,
 }
 
 /// The longest line accepted before further printable input is refused.
@@ -57,7 +83,7 @@ impl Default for Discipline {
 
 impl Discipline {
     pub fn new() -> Self {
-        Discipline { line: Vec::new(), echo: true, max: LINE_MAX }
+        Discipline { line: Vec::new(), echo: true, max: LINE_MAX, esc: EscState::Ground }
     }
 
     /// Whether typed characters are echoed. Off is how a password is read — and because it
@@ -75,11 +101,62 @@ impl Discipline {
     /// one inherits half of somebody else's input.
     pub fn reset(&mut self) {
         self.line.clear();
+        self.esc = EscState::Ground;
+    }
+
+    /// The line as typed so far.
+    pub fn line(&self) -> &[u8] {
+        &self.line
+    }
+
+    /// Replace the whole line, returning what to write so the display matches.
+    ///
+    /// This is the redraw primitive history recall needs, and the reason the line buffer
+    /// stays here rather than being reimplemented by every caller that wants a history: the
+    /// discipline knows what is on screen, so only it can say how to erase it.
+    ///
+    /// Erase-then-write, not a cursor-addressing sequence: a dumb terminal is the baseline,
+    /// and `\x08 \x08` per character is what works everywhere.
+    pub fn replace_line(&mut self, new: &[u8]) -> Vec<u8> {
+        let mut out = Vec::new();
+        if self.echo {
+            for _ in 0..self.line.len() {
+                out.extend_from_slice(b"\x08 \x08");
+            }
+            out.extend_from_slice(new);
+        }
+        self.line.clear();
+        self.line.extend_from_slice(&new[..new.len().min(self.max)]);
+        out
     }
 
     /// Feed one byte from the device.
     pub fn feed(&mut self, b: u8) -> Step {
+        // Mid-escape bytes are never text: a `[` after ESC is not a bracket the user typed.
+        match self.esc {
+            EscState::Ground => {}
+            EscState::Esc => {
+                self.esc = if b == b'[' { EscState::Csi } else { EscState::Ground };
+                return Step::None;
+            }
+            EscState::Csi => {
+                self.esc = EscState::Ground;
+                return match b {
+                    b'A' => Step::Key(Key::Up),
+                    b'B' => Step::Key(Key::Down),
+                    // Left/right and everything else: recognised as *ended*, so the
+                    // sequence cannot leak into the line, but not acted on.
+                    _ => Step::None,
+                };
+            }
+        }
         match b {
+            // ESC begins a sequence. Alone it does nothing, which is the right answer for a
+            // key with no meaning here.
+            0x1b => {
+                self.esc = EscState::Esc;
+                Step::None
+            }
             // CR and LF both end a line. A serial line may send either, and which one is
             // an accident of the terminal rather than a distinction worth carrying.
             b'\r' | b'\n' => {
@@ -185,6 +262,7 @@ mod tests {
                 }
                 // `drive` feeds ordinary input; a test that wants EOF asserts on `feed`.
                 Step::Eof => panic!("unexpected end-of-input"),
+                Step::Key(k) => panic!("unexpected key {k:?}"),
             }
         }
         (lines, echoed)
@@ -322,6 +400,81 @@ mod tests {
         match d.feed(b'\n') {
             Step::Line { bytes, .. } => assert!(bytes.is_empty()),
             other => panic!("expected an empty line, got {other:?}"),
+        }
+    }
+
+    /// Arrow keys are three bytes and must not appear in the line.
+    #[test]
+    fn cursor_keys_are_reported_not_typed() {
+        let mut d = Discipline::new();
+        assert_eq!(d.feed(0x1b), Step::None);
+        assert_eq!(d.feed(b'['), Step::None);
+        assert_eq!(d.feed(b'A'), Step::Key(Key::Up));
+        assert_eq!(d.feed(0x1b), Step::None);
+        assert_eq!(d.feed(b'['), Step::None);
+        assert_eq!(d.feed(b'B'), Step::Key(Key::Down));
+        match d.feed(b'\n') {
+            Step::Line { bytes, .. } => assert!(bytes.is_empty(), "got {bytes:?}"),
+            other => panic!("expected an empty line, got {other:?}"),
+        }
+    }
+
+    /// An unrecognised sequence is consumed to its end rather than leaking its bytes into
+    /// the line — the failure that would make a stray arrow key corrupt a command.
+    #[test]
+    fn an_unknown_escape_sequence_leaks_nothing() {
+        let mut d = Discipline::new();
+        for b in b"ab\x1b[Zcd\n" {
+            if let Step::Line { bytes, .. } = d.feed(*b) {
+                assert_eq!(bytes, b"abcd");
+                return;
+            }
+        }
+        panic!("no line produced");
+    }
+
+    /// A bare ESC is a key with no meaning here, and must not swallow what follows.
+    #[test]
+    fn a_bare_escape_does_not_eat_the_next_character() {
+        let mut d = Discipline::new();
+        d.feed(0x1b);
+        match d.feed(b'x') {
+            // ESC-then-`x` is a two-byte sequence we do not recognise; `x` ends it.
+            Step::None => {}
+            other => panic!("expected the sequence to end, got {other:?}"),
+        }
+        assert!(d.line().is_empty());
+    }
+
+    /// The redraw primitive: erase exactly what is displayed, then draw the new line.
+    #[test]
+    fn replacing_a_line_erases_what_was_shown() {
+        let mut d = Discipline::new();
+        drive(&mut d, "abc");
+        let out = d.replace_line(b"xy");
+        assert_eq!(out, b"\x08 \x08\x08 \x08\x08 \x08xy");
+        assert_eq!(d.line(), b"xy");
+    }
+
+    /// With nothing echoed there is nothing to erase, and nothing to draw.
+    #[test]
+    fn replacing_a_hidden_line_writes_nothing() {
+        let mut d = Discipline::new();
+        d.set_echo(false);
+        drive(&mut d, "secret");
+        assert_eq!(d.replace_line(b"x"), b"");
+        assert_eq!(d.line(), b"x", "the buffer still changed");
+    }
+
+    /// A recalled line then behaves as if typed.
+    #[test]
+    fn a_replaced_line_can_be_edited_and_submitted() {
+        let mut d = Discipline::new();
+        d.replace_line(b"list /");
+        d.feed(0x08); // backspace
+        match d.feed(b'\n') {
+            Step::Line { bytes, .. } => assert_eq!(bytes, b"list "),
+            other => panic!("expected a line, got {other:?}"),
         }
     }
 

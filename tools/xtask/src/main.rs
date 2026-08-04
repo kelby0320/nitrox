@@ -630,8 +630,31 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("5")?;
     steps += 1;
 
-    // 8. `exit` returns to the login prompt, and logging in again works. A login that
-    //    cannot be repeated is not a login.
+    // 8. **History.** `\x1b[A` is Up; `send` appends the Enter. Recalling `whoami` and
+    //    running it proves the *buffer* was replaced, which is the part that matters —
+    //    the erase-and-redraw is bytes on a wire that only a real terminal renders, so
+    //    asserting on appearance would assert on the capture rather than the shell.
+    s.send("whoami")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    s.send("\x1b[A")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 9. Two Ups walk further back: with `date` most recent, the second Up reaches
+    //    `whoami` again. This is what distinguishes a working cursor from a history that
+    //    only ever returns its newest entry.
+    s.send("date")?;
+    s.expect("unix")?;
+    s.expect("/home>")?;
+    s.send("\x1b[A\x1b[A")?;
+    s.expect("alice")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 10. `exit` returns to the login prompt, and logging in again works. A login that
+    //     cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;
     s.send("alice")?;
