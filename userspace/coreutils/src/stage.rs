@@ -20,8 +20,13 @@
 
 use alloc::string::String;
 use alloc::vec::Vec;
+use libkern::abi::{KIND_TERMINATE_REQUESTED, Notification};
+use libkern::syscall::{SYS_NOTIF_RECV, syscall4};
 use libkern::{exit, kprint};
 use libstream::setup::Streams;
+
+/// Out-param for [`Stage::terminate_requested`]'s drain.
+static mut NOTIF_BUF: Notification = Notification { kind: 0, body: [0; 60] };
 
 /// The program did its job. (`i64` — the width `sys_process_exit` takes.)
 pub const EXIT_OK: i64 = 0;
@@ -62,6 +67,34 @@ impl Stage {
     /// Receive the bootstrap: the four registers, plus the setup message when `arg0`
     /// marks one pending. A malformed setup message is fatal — a stage that cannot
     /// establish what it was asked to do must not guess.
+    /// Has someone asked this stage to exit? (§11h)
+    ///
+    /// A **non-blocking** drain of this process's notification channel, looking for
+    /// `TerminateRequested`. Nothing forces a stage to call it and nothing happens if it
+    /// does not — there is no forcible kill in this system, so "well-behaved" is a
+    /// property a program has by asking, and this is the asking.
+    ///
+    /// The place it belongs is a wait: a stage that blocks should put `notif` in its
+    /// `sys_wait` set and call this when the wait returns, which is what makes the request
+    /// take effect promptly rather than at the end of a job that was going to finish
+    /// anyway.
+    pub fn terminate_requested(&self) -> bool {
+        let mut hit = false;
+        // SAFETY: `NOTIF_BUF` is a valid 64-byte out-param; single-threaded stage.
+        unsafe {
+            loop {
+                let r = syscall4(SYS_NOTIF_RECV, self.notif, (&raw mut NOTIF_BUF) as u64, 0, 0);
+                if r != 0 {
+                    break; // WouldBlock: nothing queued
+                }
+                if (&raw const NOTIF_BUF.kind).read() == KIND_TERMINATE_REQUESTED {
+                    hit = true;
+                }
+            }
+        }
+        hit
+    }
+
     pub fn enter(notif: u64, namespace: u64, endpoint: u64, arg0: u64) -> Stage {
         let boot = libstream::setup::bootstrap(notif, namespace, endpoint, arg0);
         match boot.setup() {

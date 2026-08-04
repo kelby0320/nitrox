@@ -36,7 +36,7 @@ use libkern::handle::{RIGHT_INSPECT, RIGHT_MAP_READ};
 use libkern::syscall::{
     SYS_FILE_CREATE, SYS_FILE_SYNC, SYS_HANDLE_CLOSE, SYS_HANDLE_STAT, SYS_MEMORY_MAP,
     SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_MEMORY_UNMAP, SYS_NOTIF_RECV, SYS_NS_ENUMERATE,
-    SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_WAIT, syscall1, syscall2,
+    SYS_NS_LOOKUP, SYS_PROCESS_SPAWN, SYS_PROCESS_TERMINATE, SYS_WAIT, syscall1, syscall2,
     syscall3, syscall4, syscall5,
 };
 use libkern::{exit, kprint};
@@ -77,8 +77,10 @@ const EXIT_KIND_NORMAL: u32 = 0;
 // *kind* and reported every non-zero exit as a crash.
 static mut NOTIF: libkern::abi::Notification =
     libkern::abi::Notification { kind: 0, body: [0; 60] };
-static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// Two waiters: the notification channel, and the terminal — the pipeline wait watches
+/// both, so `Ctrl-C` is noticed while a *stage* is what is taking the time (§11h).
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 static mut SPAWN: SpawnArgs = SpawnArgs {
     image: 0,
     handle_count: 1,
@@ -143,6 +145,9 @@ impl Host for NitroxHost {
         }
 
         let mut spawned = 0usize;
+        // Handles to the stages, held until they are reaped — the authority `strict` and
+        // §11h's interrupt both need. Closed in `reap`, which is where they stop mattering.
+        let mut children: Vec<u64> = Vec::new();
         let mut capture: Option<u64> = None;
 
         for (i, spec) in stages.iter().enumerate() {
@@ -181,10 +186,16 @@ impl Host for NitroxHost {
             // this slice exists for.
             send_setup_env(setup_shell, &streams, &argv, env)
                 .map_err(|_| alloc::format!("could not hand `{}` its streams", spec.program))?;
-            // SAFETY: closing our ends; the stage holds its own.
+            // **Keep the process handle for the life of the pipeline.** It used to be
+            // closed here, which is why `strict` could only *relabel* the stages after a
+            // failure: §1 says the shell "already holds process handles for everything it
+            // spawned, so abort the rest is an ordinary capability-mediated call on
+            // handles it already owns" — and it did not hold them. The missing piece was
+            // never only the syscall (§11h); it was the authority to use it.
+            children.push(proc as u64);
+            // SAFETY: closing our end of the setup channel; the stage holds its own.
             unsafe {
                 syscall1(SYS_HANDLE_CLOSE, setup_shell);
-                syscall1(SYS_HANDLE_CLOSE, proc as u64);
             }
 
             if last {
@@ -208,6 +219,34 @@ impl Host for NitroxHost {
         // pipe's worth.
         let mut output: Option<Vec<u8>> = None;
         if let Some(rx) = capture {
+            // **The terminal is watched here, not only in `reap`** (§11h). This is where
+            // the shell actually spends a long pipeline: the tail's output does not close
+            // until the last stage exits, so `sleep 60 | …` blocks here for a minute and
+            // never reaches the reap loop. Waking on the tty, asking the stages to stop,
+            // and then reading is what makes `Ctrl-C` reach a *stage* at all.
+            if self.tty != 0 {
+                loop {
+                    // SAFETY: valid waiter buffers; two handles.
+                    let waited = unsafe {
+                        WAIT_HANDLES[0] = rx;
+                        WAIT_HANDLES[1] = self.tty;
+                        syscall4(
+                            SYS_WAIT,
+                            (&raw const WAIT_HANDLES) as u64,
+                            2,
+                            (&raw mut WAIT_RESULTS) as u64,
+                            u64::MAX,
+                        )
+                    };
+                    if waited < 1 || !drain_tty_interrupt(self.tty) {
+                        break; // the tail has something to say, or the wait failed
+                    }
+                    for &c in &children {
+                        // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+                        unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+                    }
+                }
+            }
             if let Ok(bytes) = ChannelReceiver::new(IpcPort::new(rx)).receive() {
                 if bytes.len() > MAX_CAPTURE {
                     return Err(String::from("a stage produced more output than nxsh will hold"));
@@ -220,7 +259,10 @@ impl Host for NitroxHost {
             unsafe { syscall1(SYS_HANDLE_CLOSE, rx) };
         }
 
-        Ok(PipelineRun { stages: reap(self.notif, stages, spawned, strict), output })
+        Ok(PipelineRun {
+            stages: reap(self.notif, self.tty, &children, stages, spawned, strict),
+            output,
+        })
     }
 
     fn read_file(&mut self, path: &str) -> Result<Vec<u8>, String> {
@@ -404,22 +446,50 @@ impl Host for NitroxHost {
 /// which — a report that is incomplete beats one that is confidently wrong. Filed as
 /// `TODO(pipeline-stage-attribution)`; the fix is a pid on `HandleInfo` for a process
 /// handle, or a handle in the notification, and it is an ABI change.
-fn reap(notif: u64, stages: &[StageSpec], spawned: usize, strict: bool) -> Vec<StageStatus> {
+fn reap(
+    notif: u64,
+    tty: u64,
+    children: &[u64],
+    stages: &[StageSpec],
+    spawned: usize,
+    strict: bool,
+) -> Vec<StageStatus> {
     let mut seen: Vec<(i32, bool)> = Vec::with_capacity(spawned);
+    let mut asked = false;
     while seen.len() < spawned {
-        // SAFETY: valid single-waiter buffers.
+        // **Wait on the terminal as well as the children.** The shell is blocked here for
+        // as long as the pipeline runs, so this is the only place `Ctrl-C` can be noticed
+        // while a *stage* is what is taking the time (§11h) — the evaluator's checkpoint
+        // does not run until this returns.
+        // SAFETY: valid waiter buffers; two handles when there is a terminal.
         let waited = unsafe {
             WAIT_HANDLES[0] = notif;
+            let n = if tty != 0 {
+                WAIT_HANDLES[1] = tty;
+                2
+            } else {
+                1
+            };
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                1,
+                n,
                 (&raw mut WAIT_RESULTS) as u64,
                 u64::MAX,
             )
         };
         if waited < 1 {
             continue;
+        }
+        // An interrupt from the terminal: ask every stage to stop, once. Each is a
+        // *request* — a stage that listens exits, one that does not keeps running and is
+        // still waited for, which is the contract `sys_process_terminate` states.
+        if tty != 0 && !asked && drain_tty_interrupt(tty) {
+            asked = true;
+            for &c in children {
+                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+            }
         }
         // SAFETY: `NOTIF` is a valid 64-byte out-param.
         let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
@@ -453,10 +523,57 @@ fn reap(notif: u64, stages: &[StageSpec], spawned: usize, strict: bool) -> Vec<S
         let (code, crashed) = seen.get(i).copied().unwrap_or((0, false));
         if strict && (code != 0 || crashed) {
             aborted = true;
+            // §1's eager abort, now an actual request rather than a label. The stages
+            // after this one are *asked* to stop; whether they do is theirs to decide.
+            for &c in children {
+                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+            }
         }
         out.push(StageStatus { command: s.program.clone(), exit_status: code, crashed, cancelled: false });
     }
+    // SAFETY: the shell's own handles, no longer needed now every stage has exited.
+    for &c in children {
+        unsafe { syscall1(SYS_HANDLE_CLOSE, c) };
+    }
     out
+}
+
+/// Take a pending `Ctrl-C` from the terminal without blocking, for the pipeline wait.
+///
+/// Sets the same flag the evaluator's checkpoint reads, so an interrupt that arrives while
+/// a stage is running is not lost when the pipeline finishes: it stops the stages *and*
+/// unwinds the evaluation.
+fn drain_tty_interrupt(tty: u64) -> bool {
+    let mut hit = false;
+    // SAFETY: single-threaded shell; valid recv out-params.
+    unsafe {
+        loop {
+            let rr = syscall4(
+                SYS_CHANNEL_RECV,
+                tty,
+                (&raw mut TTY_MSG) as u64,
+                (&raw mut TTY_HANDLES) as u64,
+                (&raw mut TTY_COUNT) as u64,
+            );
+            if rr != 0 {
+                break;
+            }
+            let payload_len =
+                u32::from_le_bytes([TTY_MSG[4], TTY_MSG[5], TTY_MSG[6], TTY_MSG[7]]) as usize;
+            let rep = core::slice::from_raw_parts(
+                ((&raw const TTY_MSG) as *const u8).add(24),
+                payload_len.min(4096 - 24),
+            );
+            if let Ok(m) = librsproto::decode(rep) {
+                if m.op == librsproto::OP_TTY_INTERRUPT {
+                    INTERRUPTED = true;
+                    hit = true;
+                }
+            }
+        }
+    }
+    hit
 }
 
 /// Resolve `path` to a handle with **file** rights — mapping and stat.

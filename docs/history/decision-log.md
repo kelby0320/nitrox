@@ -10512,3 +10512,52 @@ lexes where a pattern belongs (D3), so `capture` joined `~=` as a trigger; witho
 the new one captures a port number at a real prompt, converts it, and pins the alternation fix
 with `"b" ~= /a|b/`. Non-vacuity: starting the VM at zero again fails the alternation test,
 un-numbering the groups fails eight, and returning `""` for an absent group fails its own.
+
+## 2026-08-04 — Milestone 4 Part G2: terminate is a request, and the decision dissolved
+
+I brought the maintainer a fork — where the "safe point" for a terminated thread should be,
+syscall boundary or timer tick — and the answer was that the question was wrong.
+**Terminate is a notification.** A well-behaved process listens for it and exits; one that
+does not, does not stop; and that is acceptable because this system has never had a forcible
+kill. Reframed that way the fork disappears: the kernel enqueues an event and touches nothing
+else, so no thread has to be stopped at a safe point, no arch return hook is needed, and
+`exit_process` keeps its monopoly on teardown — which was the part of my own analysis I had
+been most worried about.
+
+The whole syscall is: check `SIGNAL` on a `Process` handle, enqueue `TerminateRequested` on
+the target's own notification channel, wake anything blocked there. Gated on `SIGNAL` rather
+than `TERMINATE` deliberately — spawn grants both, so it is invisible today, but a *request*
+is `SIGNAL`, and leaving `TERMINATE` unspent keeps it available for a forcible kill if one is
+ever built. The authority is the handle: no syscall takes a pid, so "you may terminate your
+own children" needs no rule, and a supervisor with more reach is one that was *given* more
+handles.
+
+**The build found that the shell was closing every stage handle immediately after spawning
+it.** §1 has said since v1 that the shell "already holds process handles for everything it
+spawned, so abort the rest is an ordinary capability-mediated call on handles it already
+owns." It did not hold them — one `close` per stage, right after the setup message. So
+`strict` could only ever relabel its stages, and the reason was **missing authority**, not a
+missing syscall. The syscall was the second half of a two-part gap and I had only seen the
+second half.
+
+**What is built and what is not, stated plainly.** The syscall works and is tested. `sleep`
+waits on its notification channel as well as its timer and exits when asked — the first stage
+in the system to listen, which is what makes "well-behaved" a property something actually
+has. The shell keeps its handles and asks, from both places it blocks during a pipeline (the
+capture read of the tail, which is where a long pipeline really waits, and `reap`).
+
+**And it does not connect end to end.** The tty server never emits the interrupt event when
+`Ctrl-C` follows a line that *starts a pipeline*, while the identical shape fires for
+`while true { }`. I instrumented both ends and the branch simply does not run; I did not root
+cause it. Filed as `TODO(interrupt-reaches-a-stage)` with the evidence and with what the next
+attempt should probe first (the console read completion, not the interrupt branch).
+
+**The in-guest test for it was removed rather than left green.** At `sleep 30` it passed
+whether or not the request worked — an ignored request just means the step takes thirty
+seconds and then reports the interrupt the shell had noticed all along. Raising it to
+`sleep 60`, past the harness's 45-second timeout, is what made it discriminate, and then it
+failed honestly. Keeping the thirty-second version would have been the fourth vacuous test of
+this milestone, and the first one I *knew* was vacuous when I wrote it.
+
+1105 host tests, `test-qemu` green, `test-interactive` green at 21 steps, all five gates
+including `abi-sync-check` for the new syscall.

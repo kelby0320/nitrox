@@ -36,6 +36,17 @@ pub const KIND_CHILD_EXITED: u32 = 0x0200;
 /// until IPC lands.**
 pub const KIND_PEER_CLOSED: u32 = 0x0201;
 /// Resource: a handle was invalidated.
+/// `TerminateRequested {}` — a holder of this process's handle has **asked it to
+/// exit** (§11h).
+///
+/// A request, not an act: the kernel delivers it and does nothing else. There is no
+/// forcible kill in this system, so a process that does not listen keeps running — which
+/// is a stated property rather than a gap. Cooperative shutdown is what the no-signals
+/// design has instead of `SIGTERM`, and the notification queue is where async events
+/// already arrive.
+pub const KIND_TERMINATE_REQUESTED: u32 = 0x0202;
+
+/// A handle this process holds was invalidated.
 pub const KIND_HANDLE_INVALIDATED: u32 = 0x0400;
 /// Resource: notifications were dropped due to queue overflow (synthetic).
 pub const KIND_NOTIFICATIONS_DROPPED: u32 = 0x0401;
@@ -156,6 +167,12 @@ impl Notification {
         n
     }
 
+    /// `TerminateRequested {}` — no body: the request carries no argument, and the
+    /// *reason* is the requester's business, not the kernel's.
+    pub fn terminate_requested() -> Self {
+        Self::zeroed(KIND_TERMINATE_REQUESTED)
+    }
+
     /// `NotificationsDropped { count }` — synthesized by a channel on overflow.
     pub fn notifications_dropped(count: u32) -> Self {
         let mut n = Self::zeroed(KIND_NOTIFICATIONS_DROPPED);
@@ -240,5 +257,27 @@ mod tests {
         assert!(!Notification::zeroed(KIND_UNKNOWN).is_exception());
         assert!(!Notification::zeroed(KIND_CHILD_EXITED).is_exception());
         assert!(!Notification::zeroed(KIND_NOTIFICATIONS_DROPPED).is_exception());
+    }
+
+    /// §11h: a request carries no argument — the *reason* is the requester's business,
+    /// not the kernel's, and there is nothing for a target to interpret beyond "you were
+    /// asked".
+    #[test]
+    fn terminate_requested_is_a_bare_kind() {
+        let n = Notification::terminate_requested();
+        assert_eq!(n.kind(), KIND_TERMINATE_REQUESTED);
+        assert!(n.body.iter().all(|b| *b == 0), "the request carries no body");
+        // It is not a fault, so nothing on the exception path should pick it up.
+        assert!(!n.is_exception());
+        // And it is distinct from every other kind a process may already be handling.
+        for other in [
+            KIND_CHILD_EXITED,
+            KIND_PEER_CLOSED,
+            KIND_HANDLE_INVALIDATED,
+            KIND_NOTIFICATIONS_DROPPED,
+            KIND_SEG_FAULT,
+        ] {
+            assert_ne!(KIND_TERMINATE_REQUESTED, other);
+        }
     }
 }

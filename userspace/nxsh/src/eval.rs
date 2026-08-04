@@ -1943,6 +1943,13 @@ impl Interp {
         // no global `$?` for it to live in — the two are kept apart deliberately (§11d).
         self.last_status = Some(pipeline_status(&statuses));
 
+        // **An interrupted pipeline reports as interrupted** (§11h). The host noticed the
+        // terminal while it was waiting for the stages and asked them to stop; without
+        // this the chain returns as though it had simply finished, and the *shell* only
+        // discovers the interrupt at its next prompt — reporting `^C` for something that
+        // cut a running command short. This is the one place that knows both.
+        self.check_interrupt()?;
+
         // Fail loud, don't fail silent (§1): a non-zero or crashed stage anywhere makes
         // the pipeline report as failed. Downstream stages are *not* torn down — they
         // still finish whatever they already received — which is why this is checked

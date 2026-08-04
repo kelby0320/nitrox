@@ -1088,7 +1088,7 @@ Parts, in order (tick as they land):
 - [x] **Part E — strings, records, numbers, `in`** ✅ (2026-08-04)
 - [x] **Part F — `capture`: regex submatches** ✅ (2026-08-04)
 - [x] **Part G1 — interrupt (`Ctrl-C`) in the shell** ✅ (2026-08-04)
-- [ ] **Part G2 — `sys_process_terminate`** — stops a running *stage*, and makes `strict` real
+- [x] **Part G2 — `sys_process_terminate`** ✅ (2026-08-04) — built; **not proven to reach a stage**, see `TODO(interrupt-reaches-a-stage)`
 
 **Expect each part to surface substrate gaps, and file them rather than paper over them** — the
 rule Milestone 2 earned. Part G already has one before it starts (below).
@@ -1321,8 +1321,18 @@ event; the evaluator asks the host at statement boundaries and between loop iter
 interrupt unwinds as `kind: "Interrupted"`, which `try`/`catch` can catch so cleanup runs. At a
 prompt the same event discards the line. Three things it turned up are below.
 
-**G2 — the kernel half, not built.** Design and the decision it carries are at the end of this
-section.
+**G2 ✅ (2026-08-04) — the kernel half.** Built as a **request**, at the maintainer's direction, and
+that reframing dissolved the decision the plan had been holding: if terminate is a notification the
+target handles, the kernel never touches the target's execution, so there is no safe point to pick
+and no second teardown path. `sys_process_terminate` enqueues `TerminateRequested` on the target's
+own notification channel and wakes it — that is the whole syscall.
+
+**It is not proven end to end.** The syscall, the stage-side listener (`sleep`) and the shell's
+asking all work in isolation; what does not happen is the tty emitting the interrupt event when
+`Ctrl-C` follows a line that starts a pipeline. Filed as `TODO(interrupt-reaches-a-stage)` with the
+evidence, and the in-guest step for it was **removed rather than left passing on a technicality** —
+at `sleep 30` it passed whether or not the request worked, because the sleep finished inside the
+timeout.
 
 Three pieces, in this order, because the first is a prerequisite for the other two *and* fixes a
 standing divergence on its own (§1: `strict` claims to terminate the remaining stages and today
@@ -1375,9 +1385,12 @@ which is the point.
   test loses: an empty loop reaches the ten-million-iteration backstop in well under a second, so
   the run ends on its own and the step passes without the interrupt ever arriving.
 
-#### Part G2 — `sys_process_terminate`, and the decision it carries
+#### Part G2 — `sys_process_terminate` ✅ (2026-08-04)
 
-Not built. What is known, so the decision is made rather than discovered:
+**The decision the plan was holding turned out not to exist**, once the maintainer reframed
+terminate as a *request*: the kernel enqueues a notification and does nothing else, so no thread is
+stopped, no safe point is needed, and `exit_process` keeps its monopoly on teardown. What follows is
+the analysis that led there, kept because the reasoning is the useful part:
 
 **The precedent is already in the tree.** `sys_exception_resume` terminates a *suspended* thread of
 another process, and it does not tear anything down from the caller: it sets a **disposition** on
@@ -1389,12 +1402,15 @@ So `sys_process_terminate(handle)` should be: `lookup_typed(handle, pid, Rights:
 KObjectType::Process)` — the whole authority check, since the right is granted only to a spawner —
 then mark the process terminated and make its threads run to notice.
 
-**The decision:** where the safe point is, and what happens to a thread that does not reach one.
-A thread parked in `sys_wait` or an IPC receive is the common case and is easy — wake it, and it
-observes the flag on its way out of the syscall. A thread spinning in ring 3 with no syscalls
-reaches a safe point only on a timer tick, which means the check belongs on the kernel-exit path.
-The narrower alternative is to terminate only what is parked and leave a spinning stage running,
-which is honest but means `Ctrl-C` sometimes does nothing.
+**The decision that dissolved:** where the safe point is. It only exists if the kernel has to stop a
+thread that is not cooperating. A request never does, so the question was an artifact of assuming
+forcible teardown — which this system does not have and did not ask for.
+
+**What the build did turn up: the shell was closing every stage handle immediately after spawn.**
+§1 says the shell "already holds process handles for everything it spawned, so abort the rest is an
+ordinary capability-mediated call on handles it already owns." It did not hold them. `strict` could
+only relabel because it had **no authority**, not because a syscall was missing — the syscall was
+the second half of a two-part gap, and the first half was one line of `close`.
 
 **Do not grow a second teardown.** `exit_process` already reaps sibling threads across every
 per-CPU queue and hands the handle table to the reaper; whatever terminate does must go through

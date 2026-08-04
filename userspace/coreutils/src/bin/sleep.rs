@@ -43,9 +43,11 @@ static ALLOC: libheap::Heap = libheap::Heap;
 
 /// Out-param for `sys_clock_read`.
 static mut CLOCK_BUF: u64 = 0;
-/// `sys_wait` in/out buffers — one handle, one completion record.
-static mut WAIT_HANDLES: [u64; 1] = [0; 1];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// `sys_wait` in/out buffers — **two** handles now: the timer, and this process's
+/// notification channel, so a request to stop is noticed while the sleep is in progress
+/// rather than after it (§11h).
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 
 const HELP: &[u8] = b"usage: sleep DURATION\n\
     \n\
@@ -106,24 +108,51 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
         stage.die(b"sleep: cannot arm the timer\n", EXIT_FAILURE);
     }
 
-    // SAFETY: `WAIT_HANDLES` / `WAIT_RESULTS` are valid buffers; the outer deadline is
-    // generous so the timer, not the deadline, is what wakes us.
-    let waited = unsafe {
-        WAIT_HANDLES[0] = th;
-        syscall4(
-            SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
-            1,
-            (&raw mut WAIT_RESULTS) as u64,
-            u64::MAX,
-        )
-    };
+    // **Wait on the notification channel as well as the timer** (§11h).
+    //
+    // `sleep` is the coreutil where "stop early" actually means something, so it is the
+    // first stage to listen: a `Ctrl-C` during `sleep 30` should return the prompt now
+    // rather than in thirty seconds. Waiting on the timer alone is what would make the
+    // request arrive and do nothing — the notification would sit in the queue, unread,
+    // until the sleep it was meant to cut short had finished anyway.
+    //
+    // A stage that ignores this is not broken, it is merely not interruptible. That is the
+    // contract `sys_process_terminate` states, and this is what honouring it looks like.
+    loop {
+        // SAFETY: valid wait buffers; two handles.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = th;
+            WAIT_HANDLES[1] = stage.notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                2,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
+            stage.die(b"sleep: the wait did not complete\n", EXIT_FAILURE);
+        }
+        if stage.terminate_requested() {
+            // SAFETY: closing our own handle.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
+            // Asked to stop, so stopping is success: the caller got what it wanted.
+            exit(EXIT_OK)
+        }
+        // Woken by something else — check whether the timer is what fired by asking the
+        // clock, since a notification wake says nothing about the deadline.
+        // SAFETY: valid clock out-param.
+        unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+        // SAFETY: written by the syscall above.
+        if unsafe { (&raw const CLOCK_BUF).read() } >= fire_at {
+            break;
+        }
+    }
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, th) };
-
-    if waited < 1 {
-        stage.die(b"sleep: the wait did not complete\n", EXIT_FAILURE);
-    }
     exit(EXIT_OK)
 }
 
