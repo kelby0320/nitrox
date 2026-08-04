@@ -132,6 +132,27 @@ pub trait Host {
 
     /// Ordinary output: what `display` and the REPL's auto-display write to.
     fn out(&mut self, text: &str);
+
+    /// Has the terminal asked this evaluation to stop? (§11h)
+    ///
+    /// Called at statement boundaries and between loop iterations, so it must be cheap —
+    /// the real implementation is a **non-blocking** receive on the tty channel, not a
+    /// syscall that can park. A default of `false` keeps every host that has no terminal
+    /// (a script, a test, a Tier-0 stage) out of the question entirely.
+    ///
+    /// This is the whole of the interrupt mechanism inside the language: there is no
+    /// signal, no ambient flag, and nothing the evaluator polls for on its own. An
+    /// interrupt is data the *host* saw, asked for at points where stopping is safe.
+    ///
+    /// **Edge-triggered: an interrupt is reported once and consumed.** A level-triggered
+    /// answer would make cleanup impossible — the `catch` block handling the interrupt
+    /// runs statements, so it reaches this checkpoint too, and a host that kept saying
+    /// "yes" would interrupt the recovery as fast as it started. Consuming the event is
+    /// what makes `try { … } catch { … }` a usable response to `Ctrl-C` rather than a
+    /// second thing to be interrupted.
+    fn interrupted(&mut self) -> bool {
+        false
+    }
 }
 
 /// A host that cannot do anything, for evaluating pure expressions.
@@ -188,6 +209,12 @@ pub struct MockHost {
     /// What the host was asked to do, shared so a test can still read it after the
     /// interpreter has taken ownership of the host.
     log: Rc<RefCell<MockLog>>,
+    /// Report an interrupt once this many checkpoints have gone by (§11h).
+    ///
+    /// A counter rather than a flag because the property under test is *when* the
+    /// evaluator asks: an interrupt that only ever arrives before the first statement
+    /// would prove nothing about a loop.
+    interrupt_after: Option<u32>,
 }
 
 /// What a [`MockHost`] was asked to do.
@@ -219,7 +246,14 @@ impl MockHost {
             files: Vec::new(),
             dirs: Vec::new(),
             log: Rc::new(RefCell::new(MockLog::default())),
+            interrupt_after: None,
         }
+    }
+
+    /// Interrupt the evaluation once `n` checkpoints have passed (§11h).
+    pub fn with_interrupt_after(mut self, n: u32) -> MockHost {
+        self.interrupt_after = Some(n);
+        self
     }
 
     /// A handle to the log, kept by the test while the interpreter owns the host.
@@ -264,6 +298,22 @@ impl MockHost {
 }
 
 impl Host for MockHost {
+    fn interrupted(&mut self) -> bool {
+        match &mut self.interrupt_after {
+            // Consumed, not sticky — the contract the trait documents, and the behaviour
+            // the real host has for free because it *receives* a message.
+            Some(0) => {
+                self.interrupt_after = None;
+                true
+            }
+            Some(n) => {
+                *n -= 1;
+                false
+            }
+            None => false,
+        }
+    }
+
     fn run(
         &mut self,
         stages: &[StageSpec],

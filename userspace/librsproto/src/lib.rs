@@ -116,6 +116,17 @@ pub const OP_TTY_SET_MODE: u16 = 0x0902;
 /// session. The server declining to serve the channel is what makes teardown a guarantee.
 pub const OP_TTY_CLOSE: u16 = 0x0903;
 
+/// **Interrupt** — the one message a terminal sends *unsolicited* (§11h).
+///
+/// Every other op is a request the client made. This one is an event: the terminal saw
+/// `Ctrl-C` and is telling whoever holds it. It is not a signal — it is data on a channel
+/// the client already holds, and what it *means* is entirely the client's decision (a
+/// shell clears the line at a prompt and unwinds an evaluation in progress).
+///
+/// A client that never looks for it is unaffected: it queues like any other message, and
+/// the shell drains it with a non-blocking receive at its own checkpoints.
+pub const OP_TTY_INTERRUPT: u16 = 0x0905;
+
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;
 
