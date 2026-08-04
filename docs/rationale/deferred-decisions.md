@@ -461,6 +461,20 @@ Trigger: it gates the rich REPL (§11) and is the trigger for
 `TODO(session-metadata-server)`; and the ambient output path is a hole in the capability story
 independent of either.
 
+**Reverse-search shows one match, not a list — `TODO(history-pager)`.**
+`Ctrl-R` narrows to a single match and `Ctrl-R` again walks to the next older one, blind:
+you cannot see the alternatives, only step through them. That is bash, zsh and PSReadLine's
+model. **fish and nushell went the other way** — both present a navigable *list* of matching
+entries and let you pick, which is plainly better when several commands share a prefix.
+
+Not built because it needs terminal capabilities we do not have. The current redraw model is
+erase-and-rewrite on a dumb terminal (`\x08 \x08` per character, no assumed width); a list
+needs multi-line output, cursor addressing, and a way to know the terminal's size. That is
+the same capability set the compositor terminal brings, not something the search logic is
+missing — `History::search_back` already returns indices and can enumerate every match.
+
+Trigger: the compositor terminal, or any terminal backend that can address the cursor.
+
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
 **Bulk directory creation is O(N²) block reads.** `dir_insert` scans every existing block

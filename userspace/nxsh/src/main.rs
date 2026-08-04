@@ -767,9 +767,27 @@ impl Search {
     }
 
     /// Erase and redraw the search line, returning the bytes to write.
+    ///
+    /// **Not bash's `` (reverse-i-search)`q': `` .** A query is arbitrary user text, so it
+    /// needs delimiting or `search: list /bin: whoami` is genuinely ambiguous about where
+    /// the query ends — quotes do that, and the arrow separates what was asked from what
+    /// came back. bash's mismatched `` `q' `` is an old GNU convention that reads like a
+    /// typo now, and copying it character-for-character would be inheriting a quirk rather
+    /// than a decision.
+    ///
+    /// A query with no match says so. Showing an empty match instead would look like a
+    /// search still in progress.
     fn redraw(&mut self) -> Vec<u8> {
         let mut out = self.erase();
-        let text = alloc::format!("(reverse-i-search)`{}': {}", self.query, self.matched);
+        let text = if self.query.is_empty() {
+            // Nothing searched for yet — "no match" would be a lie about a search that has
+            // not happened.
+            alloc::format!("search '' -> ")
+        } else if self.matched.is_empty() {
+            alloc::format!("search '{}' -> (no match)", self.query)
+        } else {
+            alloc::format!("search '{}' -> {}", self.query, self.matched)
+        };
         out.extend_from_slice(text.as_bytes());
         self.shown = text.chars().count();
         out
