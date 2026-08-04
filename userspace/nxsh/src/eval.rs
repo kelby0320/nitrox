@@ -1531,6 +1531,46 @@ impl Interp {
 
         match name {
             "count" => wrap(ops::count(&need(operand)?)),
+            // §10b's reductions. A bareword is a *column* — the `sort size` reading — and
+            // with none, the rows are the values.
+            "sum" | "min" | "max" | "avg" => {
+                let v = need(operand)?;
+                let field = field_names.first().map(|s| s.as_str());
+                wrap(match name {
+                    "sum" => ops::sum(&v, field),
+                    "min" => ops::min(&v, field),
+                    "max" => ops::max(&v, field),
+                    _ => ops::avg(&v, field),
+                })
+            }
+            // `reduce` lives here rather than in `ops` for the same reason `filter` does:
+            // it calls back into the interpreter, and a closure is not something the
+            // operator layer can run on its own (§5c).
+            "reduce" => {
+                let v = need(operand)?;
+                let f = self.one_closure(&closures, name)?;
+                let rows = ops::rows(&v).map_err(EvalError::new)?;
+                // **The two forms differ precisely on the empty case**, which is why both
+                // exist: seeded returns the seed, unseeded has nothing to return.
+                let mut acc = match raw.first() {
+                    Some(e) => Some(self.eval(e)?),
+                    None => None,
+                };
+                let mut rest = rows.into_iter();
+                if acc.is_none() {
+                    acc = Some(rest.next().ok_or_else(|| {
+                        EvalError::new(
+                            "`reduce` over nothing has no value — give it a starting value \
+                             with `--from`, which is what makes the empty case answerable",
+                        )
+                    })?);
+                }
+                let mut acc = acc.expect("seeded above");
+                for row in rest {
+                    acc = self.call_closure(&f, &[acc, row])?;
+                }
+                Ok(acc)
+            }
             "dedupe" => wrap(ops::dedupe(&need(operand)?)),
             "take" | "skip" | "last" => {
                 let v = need(operand)?;
@@ -1558,7 +1598,7 @@ impl Interp {
             }
             "sort" => {
                 let v = need(operand)?;
-                wrap(ops::sort(&v, field_names.first().map(|s| s.as_str()), reverse))
+                wrap(ops::sort(&v, &field_names, reverse))
             }
             "filter" => {
                 let v = need(operand)?;
@@ -1599,9 +1639,17 @@ impl Interp {
                 Ok(v)
             }
             "format" => {
-                let mut vals = Vec::with_capacity(raw.len());
+                let mut vals = Vec::with_capacity(raw.len() + 1);
                 for e in &raw {
                     vals.push(self.eval(e)?);
+                }
+                // **In stage position the value flowing past is the subject**, so it is
+                // argument 0: `… | format("{}")` renders what arrived. It used to be
+                // ignored, and the template's own `{}` was then reported as a missing
+                // argument. The template itself is `vals[0]` below, so the operand slots
+                // in right after it.
+                if let Some(v) = operand {
+                    vals.insert(1.min(vals.len()), v);
                 }
                 let Some(t) = vals.first() else {
                     return Err(EvalError::new("`format` needs a template"));
@@ -3909,5 +3957,123 @@ x"), "5");
     fn control_flow_inside_a_try_used_as_a_value_is_refused() {
         let e = err("for x in 0..3 {\n let y = try { fail \"x\" } catch { break }\n}");
         assert!(e.contains("where a value is expected"), "{e}");
+    }
+
+    // --- sequences and reduction (§10b, Part D) -----------------------------
+
+    /// **A String is a sequence of its characters**, which is where length, substring and
+    /// slicing come from — without a second vocabulary of string-only verbs.
+    #[test]
+    fn a_string_is_a_sequence_of_its_characters() {
+        assert_eq!(rendered("\"hello\" | count"), "5");
+        assert_eq!(rendered("\"hello\" | take 3"), "hel");
+        assert_eq!(rendered("\"hello\" | skip 2 | take 2"), "ll");
+        assert_eq!(rendered("\"hello\" | last 2"), "lo");
+        // The shape it went in is the shape it comes back: a filtered String is a String.
+        assert_eq!(rendered("\"banana\" | filter { |c| c != \"a\" }"), "bnn");
+        // …and mapping to something that is not text falls back to a List, the same rule a
+        // ragged table already takes.
+        assert_eq!(rendered("\"ab\" | map { |c| 1 }"), "[1, 1]");
+    }
+
+    /// A Range's elements are its values — so a range can be summed, filtered and counted
+    /// without first being written out as a list.
+    #[test]
+    fn a_range_is_a_sequence_of_its_values() {
+        assert_eq!(rendered("0..5 | count"), "5");
+        assert_eq!(rendered("0..=5 | count"), "6");
+        assert_eq!(rendered("1..=10 | sum"), "55");
+        assert_eq!(rendered("0..10 | filter { |n| n % 3 == 0 } | count"), "4");
+    }
+
+    /// A scalar is still not a sequence: silently treating `5` as `[5]` is the coercion §6
+    /// spends its fail-loud rule on.
+    #[test]
+    fn a_scalar_is_still_not_a_sequence() {
+        let e = err("5 | count");
+        assert!(e.contains("scalar is not one"), "{e}");
+        // A Record is one *thing*, not rows — "its keys or its pairs?" has no right answer,
+        // and `keys`/`values` (Part E) answer both without the operator guessing.
+        assert!(err("{ a: 1 } | count").contains("scalar is not one"));
+    }
+
+    /// The reductions `count` was alone in. Without them "the total size of these files"
+    /// needs a `mut` and a `for` loop.
+    #[test]
+    fn reductions_fold_a_sequence_to_a_value() {
+        assert_eq!(rendered("[1, 2, 3] | sum"), "6");
+        assert_eq!(rendered("[3, 1, 2] | min"), "1");
+        assert_eq!(rendered("[3, 1, 2] | max"), "3");
+        assert_eq!(rendered("[1, 2] | avg"), "1.5");
+        // A bareword names a column, the same reading `sort size` has.
+        let src = "[{ n: \"a\", size: 10 }, { n: \"b\", size: 32 }]";
+        assert_eq!(rendered(&alloc::format!("{src} | sum size")), "42");
+        assert_eq!(rendered(&alloc::format!("{src} | max size")), "32");
+        assert_eq!(rendered(&alloc::format!("{src} | avg size")), "21.0");
+    }
+
+    /// `avg` is always a Float, even over Ints — the alternative truncates silently — and
+    /// a sum that overflows is an error rather than a wrapped, fabricated total (§8a).
+    #[test]
+    fn reductions_do_not_fabricate_numbers() {
+        assert_eq!(rendered("[1, 2] | avg"), "1.5");
+        assert_eq!(rendered("[2, 4] | avg"), "3.0");
+        assert!(err("[9223372036854775807, 1] | sum").contains("overflows"));
+        assert!(err("[1, \"x\"] | sum").contains("needs numbers"));
+        // Mixed types are an error, not an ordering invented at the point of comparison.
+        assert!(err("[1, \"x\"] | max").contains("cannot order"));
+    }
+
+    /// **Empty input is where the reductions differ, and each answer is forced.**
+    #[test]
+    fn an_empty_sequence_reduces_only_where_that_means_something() {
+        assert_eq!(rendered("[] | sum"), "0");
+        assert!(err("[] | min").contains("no extreme"));
+        assert!(err("[] | max").contains("no extreme"));
+        assert!(err("[] | avg").contains("no divisor"));
+    }
+
+    /// `reduce` has two forms because they differ *precisely* on the empty case.
+    #[test]
+    fn reduce_folds_with_and_without_a_seed() {
+        assert_eq!(rendered("[1, 2, 3] | reduce { |a, b| a + b }"), "6");
+        assert_eq!(rendered("[1, 2, 3] | reduce --from 10 { |a, b| a + b }"), "16");
+        // Seeded returns the seed for an empty sequence; unseeded has nothing to return.
+        assert_eq!(rendered("[] | reduce --from 10 { |a, b| a + b }"), "10");
+        assert!(err("[] | reduce { |a, b| a + b }").contains("has no value"));
+        // …and it is not numeric-only: folding text is the same operation.
+        assert_eq!(
+            rendered("[\"a\", \"b\", \"c\"] | reduce { |a, b| a ++ \"-\" ++ b }"),
+            "a-b-c"
+        );
+    }
+
+    /// `sort` uses **every** key it is given: the second is a tie-break within the first.
+    /// Taking the first and discarding the rest is neither acceptable behaviour.
+    #[test]
+    fn sort_uses_every_key_it_is_given() {
+        let src = "[{ d: 2, n: \"b\" }, { d: 1, n: \"z\" }, { d: 2, n: \"a\" }]";
+        assert_eq!(
+            rendered(&alloc::format!("{src} | sort d n | map {{ |r| r.n }}")),
+            "[\"z\", \"a\", \"b\"]"
+        );
+        // **The pair is what makes this test mean anything.** With only the first key the
+        // sort is stable, so the two `d: 2` rows keep their input order — a different
+        // answer, and exactly the one the multi-key case would give if the second key were
+        // being silently dropped.
+        assert_eq!(
+            rendered(&alloc::format!("{src} | sort d | map {{ |r| r.n }}")),
+            "[\"z\", \"b\", \"a\"]"
+        );
+    }
+
+    /// `format` in stage position formats the value flowing past it. It used to ignore the
+    /// operand and then report the template's own `{}` as a missing argument.
+    #[test]
+    fn format_in_stage_position_formats_its_operand() {
+        assert_eq!(rendered("42 | format(\"n={}\")"), "n=42");
+        assert_eq!(rendered("[1, 2] | count | format(\"{} rows\")"), "2 rows");
+        // The explicit form is unchanged.
+        assert_eq!(rendered("format(\"{} {}\", 1, 2)"), "1 2");
     }
 }

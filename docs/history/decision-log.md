@@ -10345,3 +10345,47 @@ One process note: moving the resolved deferral into the Resolved table, the firs
 sliced from the entry to the wrong anchor and silently deleted three unrelated deferrals with
 it. `check-deferrals` caught it immediately — `TODO(fs-server-restart)` no longer had an entry
 — which is precisely the leak that gate was built for after the 2026-07-24 audit.
+
+## 2026-08-04 — Milestone 4 Part D: a String is a sequence, and `count` stops being the only reducer
+
+Two families, and the smaller one is the more interesting.
+
+**Sequences generalise.** `rows`/`rebuild` now accept a `String` (its characters) and a
+`Range` (its values), and rebuild in the shape they were handed. That single change is where
+length, substring and slicing come from — `name | count`, `path | take 3`,
+`line | skip 2 | take 5` — instead of a second vocabulary of string-only verbs, and it makes
+`0..10 | filter … | sum` work without writing the range out as a list first. A filtered
+String comes back a String; mapping one to something that is not text falls back to a List,
+which is the rule a ragged Table already took. A scalar is still not a sequence, and a
+`Record` deliberately still is not either: "its keys or its pairs?" has no right answer, and
+Part E's `keys`/`values` answer both without the operator guessing.
+
+The plan flagged a trap — `"abc" | count` errors today and would become `3`, so check nothing
+leans on the refusal. It was empty: the test pinning that rule uses `Val::int(5)`, which is
+still a scalar, so it passed unchanged and now documents the narrower rule it always meant.
+
+**Reduction.** `sum`, `min`, `max`, `avg`, `reduce`. §10a's dividing rule puts all of them in
+the language rather than in programs, and without them "the total size of these files" needs
+a `mut` and a `for` loop — the shape a pipeline language exists to remove. The forced answers
+are the ones worth having written down: `avg` is always a `Float` (the alternative truncates),
+a `sum` that overflows is an error rather than a wrapped total (§8a), mixed types are an
+ordering error rather than an order invented at the point of comparison, and the empty case
+differs per operator — `sum` is zero, `min`/`max`/`avg` are errors, because there is no
+minimum of an empty set and no average without a divisor. `reduce` has two forms for exactly
+that reason: seeded returns its seed on empty input, unseeded has nothing to return.
+
+**`sort` and the reductions now share one key extractor.** `sum size` and `sort size` ask the
+same question, so `key_of` answers it once and a row without that field fails identically for
+both.
+
+**A test that only means something as a pair.** Multi-key `sort d n` and single-key `sort d`
+over the same input give different answers — `["z","a","b"]` against `["z","b","a"]`, the
+second because a stable sort keeps input order within a tie. And the single-key answer is
+precisely what the multi-key case produces if the second key is silently dropped, which is the
+bug being fixed. Asserting either alone would pass against it. (I wrote the multi-key
+expectation wrong first and the test caught me, which is the same thing from the other side.)
+
+226 crate tests (1078 workspace), `test-qemu` green, `test-interactive` green at 17 steps —
+the new one takes the length of a String and sums a Range at a real prompt, both of which
+answered "expected a Table or a List" before. Non-vacuity: dropping the extra sort keys,
+removing the String arm from `rows`, and ignoring `format`'s operand each fail their tests.

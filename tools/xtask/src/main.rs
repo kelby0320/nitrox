@@ -721,7 +721,19 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 15. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
+    // 15. **Sequences and reduction** at a real prompt: a String is a sequence of its
+    //     characters (so `count` is its length), and a Range is a sequence of its values
+    //     (so it can be summed without first being written out as a list). Both were
+    //     "expected a Table or a List" before Part D.
+    s.send("format(\"len={}\", (\"hello\" | count))")?;
+    s.expect("len=5")?;
+    s.expect("/home>")?;
+    s.send("format(\"sum={}\", (1..=10 | sum))")?;
+    s.expect("sum=55")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 16. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
     //     observable rather than merely "the shell left". Before Part C the driver matched
     //     the literal line `exit`, so `exit 3` missed it entirely and came back as
     //     "`exit` is handled by the shell's driver".
@@ -734,7 +746,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 16. A bare `exit` still returns to the login prompt, and logging in again works. A
+    // 17. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;
