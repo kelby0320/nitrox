@@ -5,10 +5,14 @@
 //!
 //! ## Why this is small
 //!
-//! §10b only ever asks `~=` for a boolean — `ls | filter name ~= /\.rs$/`. There is no
-//! capture, no replace, no submatch extraction, and submatch extraction is the single
-//! largest source of complexity in a regex implementation. What remains is a parser, a
-//! compiler and a VM in a few hundred lines.
+//! §10b asks `~=` for a boolean — `ls | filter name ~= /\.rs$/` — and `capture` for the
+//! text a pattern matched. Everything else a regex library usually carries (replace, named
+//! groups, lookaround) is still out.
+//!
+//! **Submatch extraction is the single largest source of complexity in a regex engine**,
+//! and it is confined here to one function: [`Regex::captures`] runs a second, slot-
+//! carrying pass. [`Regex::is_match`] is untouched and allocates no slots — `~=` runs once
+//! per row inside `filter`, so it must not pay for a feature it never uses.
 //!
 //! That is also why the minimal version is the *architecturally correct* one rather than a
 //! stepping stone: adding counted repetition or character classes later extends the
@@ -37,6 +41,17 @@ use alloc::vec::Vec;
 /// A compiled pattern.
 pub struct Regex {
     prog: Vec<Inst>,
+    /// Where the program begins.
+    ///
+    /// **Not instruction zero.** Fragments are emitted as they are parsed and a combinator
+    /// emits its own instruction *after* its operands, so an alternation's `Split` lands
+    /// past both branches — `a|b` compiles to `Char(a); Char(b); Split(0, 1)`. Starting the
+    /// VM at zero therefore ran the *first branch only*, and `"b" ~= /a|b/` was false. It
+    /// went unnoticed because a concatenation does start at zero, and no test used a
+    /// top-level alternation whose second branch had to win.
+    start: usize,
+    /// `2 × (groups + 1)`: a start and an end for the whole match and for each group.
+    slots: usize,
 }
 
 /// One VM instruction.
@@ -53,6 +68,11 @@ enum Inst {
     Char(Class, usize),
     /// Fork: try both, in the same step.
     Split(usize, usize),
+    /// Record the current position in slot `.0`, consuming nothing, then go to `.1`.
+    ///
+    /// Slots are the *only* thing capture adds to the program: what matches is decided by
+    /// the same instructions as before, and these record where.
+    Save(usize, usize),
     /// Assert start-of-input, consuming nothing, then go to `.0`.
     AssertStart(usize),
     AssertEnd(usize),
@@ -85,7 +105,8 @@ impl Class {
 impl Regex {
     /// Compile a pattern, or say precisely what is not supported.
     pub fn new(pattern: &str) -> Result<Regex, String> {
-        let mut p = Parser { src: pattern.chars().collect(), pos: 0, prog: Vec::new() };
+        let mut p =
+            Parser { src: pattern.chars().collect(), pos: 0, prog: Vec::new(), groups: 0 };
         let frag = p.alternation()?;
         if p.pos < p.src.len() {
             return Err(alloc::format!(
@@ -98,7 +119,7 @@ impl Regex {
         let end = prog.len();
         prog.push(Inst::Match);
         patch(&mut prog, &frag.out, end);
-        Ok(Regex { prog })
+        Ok(Regex { prog, start: frag.start, slots: 2 * (p.groups + 1) })
     }
 
     /// Whether `text` contains a match (§10b's predicate).
@@ -117,7 +138,7 @@ impl Regex {
 
         for start in 0..=chars.len() {
             // Unanchored: a new thread may begin at every position.
-            self.add_thread(&mut current, &mut on_current, 0, start, &chars);
+            self.add_thread(&mut current, &mut on_current, self.start, start, &chars);
             if current.iter().any(|pc| matches!(self.prog[*pc], Inst::Match)) {
                 return true;
             }
@@ -142,6 +163,129 @@ impl Regex {
         current.iter().any(|pc| matches!(self.prog[*pc], Inst::Match))
     }
 
+    /// The leftmost match and its groups, as `(start, end)` character offsets.
+    ///
+    /// `None` when the pattern does not match; an element is `None` for a group that did
+    /// not participate (`(a)|(b)` leaves one of them unset by construction). Element 0 is
+    /// always the whole match.
+    ///
+    /// This is the Pike VM again, with two additions that give **leftmost-first**
+    /// semantics — the same rule Perl and RE2's default use:
+    ///
+    /// - Threads are processed in priority order, and a thread that reaches `Match`
+    ///   **cuts off every lower-priority thread in the same step**. That is what makes
+    ///   `(a|ab)` prefer `a`.
+    /// - Once a match exists, no new thread is seeded at a later start, so an earlier
+    ///   start always wins over a later one.
+    ///
+    /// Slots are cloned per thread. That is the cost of submatches and the reason `~=`
+    /// keeps its own slot-free pass.
+    pub fn captures(&self, text: &str) -> Option<Vec<Option<(usize, usize)>>> {
+        let chars: Vec<char> = text.chars().collect();
+        let mut current: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
+        let mut next: Vec<(usize, Vec<Option<usize>>)> = Vec::new();
+        let mut on_current = alloc::vec![false; self.prog.len()];
+        let mut on_next = alloc::vec![false; self.prog.len()];
+        let mut matched: Option<Vec<Option<usize>>> = None;
+
+        for at in 0..=chars.len() {
+            if matched.is_none() {
+                // Slot 0 is the match start, recorded when the thread is seeded rather
+                // than by an instruction — which is why the compiler emits `Save` only for
+                // groups, and why the program's entry point did not have to move.
+                let mut slots = alloc::vec![None; self.slots];
+                slots[0] = Some(at);
+                self.add_capturing(&mut current, &mut on_current, self.start, at, &chars, slots);
+            }
+            next.clear();
+            for slot in on_next.iter_mut() {
+                *slot = false;
+            }
+            let mut i = 0;
+            while i < current.len() {
+                let (pc, slots) = current[i].clone();
+                match &self.prog[pc] {
+                    Inst::Match => {
+                        let mut done = slots;
+                        done[1] = Some(at);
+                        matched = Some(done);
+                        break; // cut the lower-priority threads
+                    }
+                    Inst::Char(class, then) => {
+                        if at < chars.len() && class.matches(chars[at]) {
+                            self.add_capturing(
+                                &mut next,
+                                &mut on_next,
+                                *then,
+                                at + 1,
+                                &chars,
+                                slots,
+                            );
+                        }
+                    }
+                    _ => {}
+                }
+                i += 1;
+            }
+            core::mem::swap(&mut current, &mut next);
+            core::mem::swap(&mut on_current, &mut on_next);
+        }
+
+        matched.map(|slots| {
+            (0..self.slots / 2)
+                .map(|g| match (slots[2 * g], slots[2 * g + 1]) {
+                    (Some(a), Some(b)) => Some((a, b)),
+                    _ => None,
+                })
+                .collect()
+        })
+    }
+
+    /// [`Regex::add_thread`]'s twin, carrying slots. Kept separate rather than
+    /// generic because the whole point is that `is_match` allocates none.
+    fn add_capturing(
+        &self,
+        list: &mut Vec<(usize, Vec<Option<usize>>)>,
+        seen: &mut [bool],
+        pc: usize,
+        at: usize,
+        chars: &[char],
+        slots: Vec<Option<usize>>,
+    ) {
+        if pc >= self.prog.len() || seen[pc] {
+            return;
+        }
+        seen[pc] = true;
+        match &self.prog[pc] {
+            Inst::Split(a, b) => {
+                let (a, b) = (*a, *b);
+                // Priority order: `a` first. This is what makes the match leftmost-*first*
+                // rather than longest.
+                self.add_capturing(list, seen, a, at, chars, slots.clone());
+                self.add_capturing(list, seen, b, at, chars, slots);
+            }
+            Inst::Save(n, then) => {
+                let (n, then) = (*n, *then);
+                let mut slots = slots;
+                slots[n] = Some(at);
+                self.add_capturing(list, seen, then, at, chars, slots);
+            }
+            Inst::AssertStart(then) => {
+                let then = *then;
+                if at == 0 {
+                    self.add_capturing(list, seen, then, at, chars, slots);
+                }
+            }
+            Inst::AssertEnd(then) => {
+                let then = *then;
+                if at == chars.len() {
+                    self.add_capturing(list, seen, then, at, chars, slots);
+                }
+            }
+            _ => list.push((pc, slots)),
+        }
+    }
+
     /// Follow `Split`/`Jump`/assertions without consuming, adding reachable states.
     ///
     /// `seen` is what keeps this linear: a state already in the set this step is not added
@@ -156,6 +300,12 @@ impl Regex {
                 let (a, b) = (*a, *b);
                 self.add_thread(list, seen, a, at, chars);
                 self.add_thread(list, seen, b, at, chars);
+            }
+            // `is_match` does not care *where* anything matched, so a `Save` is a plain
+            // pass-through here — the slot-carrying twin in `captures` is where it records.
+            Inst::Save(_, then) => {
+                let then = *then;
+                self.add_thread(list, seen, then, at, chars);
             }
             Inst::AssertStart(then) => {
                 let then = *then;
@@ -193,7 +343,10 @@ fn patch(prog: &mut [Inst], holes: &[Hole], target: usize) {
         match *h {
             // Fill the instruction's successor *field*; never replace the instruction.
             Hole::Next(i) => match &mut prog[i] {
-                Inst::Char(_, then) | Inst::AssertStart(then) | Inst::AssertEnd(then) => {
+                Inst::Char(_, then)
+                | Inst::AssertStart(then)
+                | Inst::AssertEnd(then)
+                | Inst::Save(_, then) => {
                     *then = target;
                 }
                 _ => {}
@@ -216,6 +369,8 @@ struct Parser {
     src: Vec<char>,
     pos: usize,
     prog: Vec<Inst>,
+    /// How many capturing groups have been opened, which is also the last group's number.
+    groups: usize,
 }
 
 impl Parser {
@@ -320,12 +475,20 @@ impl Parser {
                          lookaround needs a different engine",
                     ));
                 }
+                // Groups are numbered in the order their `(` appears, which is the order
+                // a reader counts them in.
+                self.groups += 1;
+                let g = self.groups;
+                let open = self.emit(Inst::Save(2 * g, usize::MAX));
                 let inner = self.alternation()?;
                 if self.peek() != Some(')') {
                     return Err(String::from("unclosed `(` in a regex"));
                 }
                 self.pos += 1;
-                Ok(inner)
+                let close = self.emit(Inst::Save(2 * g + 1, usize::MAX));
+                patch(&mut self.prog, &[Hole::Next(open)], inner.start);
+                patch(&mut self.prog, &inner.out, close);
+                Ok(Frag { start: open, out: alloc::vec![Hole::Next(close)] })
             }
             '[' => {
                 self.pos += 1;
@@ -599,5 +762,102 @@ mod tests {
     fn matching_is_over_characters_not_bytes() {
         assert!(m("^.$", "é"));
         assert!(m("^é$", "é"));
+    }
+
+    // --- submatches (§10b, Part F) ------------------------------------------
+
+    fn caps(pattern: &str, text: &str) -> Option<Vec<Option<alloc::string::String>>> {
+        let re = Regex::new(pattern).expect("compiles");
+        let chars: Vec<char> = text.chars().collect();
+        re.captures(text).map(|groups| {
+            groups
+                .iter()
+                .map(|g| g.map(|(a, b)| chars[a..b].iter().collect()))
+                .collect()
+        })
+    }
+
+    fn text(pattern: &str, input: &str) -> Vec<alloc::string::String> {
+        caps(pattern, input)
+            .expect("a match")
+            .into_iter()
+            .map(|g| g.unwrap_or_else(|| alloc::string::String::from("<none>")))
+            .collect()
+    }
+
+    #[test]
+    fn element_zero_is_the_whole_match() {
+        assert_eq!(text("b.d", "abcde"), ["bcd"]);
+        assert!(caps("zzz", "abc").is_none());
+    }
+
+    #[test]
+    fn groups_come_back_in_the_order_they_open() {
+        assert_eq!(text(r"(\d+)-(\d+)", "call 12-345 now"), ["12-345", "12", "345"]);
+        // Nested groups are numbered by their `(`, which is how a reader counts them.
+        assert_eq!(text("((a)b)", "xaby"), ["ab", "ab", "a"]);
+    }
+
+    /// A group that did not participate is `None`, not an empty string — `(a)|(b)` leaves
+    /// one unset **by construction**, and "did not match" is not "matched nothing".
+    #[test]
+    fn a_group_that_did_not_participate_is_absent() {
+        let g = caps("(a)|(b)", "b").expect("a match");
+        assert_eq!(g[0].as_deref(), Some("b"));
+        assert_eq!(g[1], None);
+        assert_eq!(g[2].as_deref(), Some("b"));
+    }
+
+    /// **Leftmost-first**, the rule Perl and RE2's default use: an earlier start wins, and
+    /// within a start the higher-priority alternative wins.
+    #[test]
+    fn the_match_is_leftmost_then_first() {
+        assert_eq!(text("(a|ab)", "ab"), ["a", "a"]);
+        assert_eq!(text("a+", "baaa"), ["aaa"]);
+        // An earlier start beats a longer later one.
+        assert_eq!(text("(x|xy)", "zxy"), ["x", "x"]);
+    }
+
+    /// Anchors still mean what they meant; slots record *where*, they do not decide *what*.
+    #[test]
+    fn anchors_are_unaffected_by_slots() {
+        assert!(caps("^abc", "xabc").is_none());
+        assert_eq!(text("^(a)bc$", "abc"), ["abc", "a"]);
+    }
+
+    /// A repeated group keeps its **last** iteration, which is what every engine does and
+    /// the reason `(a)*` is a poor way to collect things.
+    #[test]
+    fn a_repeated_group_holds_its_last_iteration() {
+        assert_eq!(text("(ab)+", "ababab"), ["ababab", "ab"]);
+    }
+
+    /// The pathological case the engine exists to survive still terminates — now with
+    /// slots being cloned at every fork.
+    #[test]
+    fn the_pathological_pattern_still_terminates_with_slots() {
+        let g = caps("(a*)*b", "aaaaaaaaaaaaaaaaaaaaaaaaac");
+        assert!(g.is_none());
+    }
+
+    /// **A top-level alternation must try every branch**, which it did not.
+    ///
+    /// Instructions are emitted as fragments are parsed, and a combinator emits its own
+    /// after its operands — so `a|b` is `Char(a); Char(b); Split(0, 1)` and the `Split` is
+    /// the *last* instruction. Both VMs started at instruction zero, which is the first
+    /// branch, so `"b" ~= /a|b/` was false. A concatenation happens to start at zero, and
+    /// no test used an alternation whose second branch had to win — found by writing
+    /// `capture`'s tests, not by writing `capture`.
+    #[test]
+    fn an_alternation_tries_both_branches() {
+        let re = Regex::new("a|b").expect("compiles");
+        assert!(re.is_match("a"));
+        assert!(re.is_match("b"), "the second branch was unreachable");
+        assert!(!re.is_match("c"));
+        // …and the same for `capture`, which shares the entry point.
+        assert_eq!(text("(a)|(b)", "b")[0], "b");
+        // Nested inside a larger pattern, where the Split is not last either.
+        let re = Regex::new("x(a|b)y").expect("compiles");
+        assert!(re.is_match("xby"));
     }
 }

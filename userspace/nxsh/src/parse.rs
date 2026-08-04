@@ -55,7 +55,7 @@ const OPERATORS: &[&str] = &[
     // §10b's Part E families: strings, records, numbers.
     "split", "join", "trim", "replace", "upper", "lower",
     "keys", "values", "merge",
-    "round", "floor", "ceil", "trunc", "abs",
+    "round", "floor", "ceil", "trunc", "abs", "capture",
 ];
 
 /// Shell-state builtins (§3): they mutate the shell's own process state, which an

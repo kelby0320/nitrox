@@ -1086,7 +1086,7 @@ Parts, in order (tick as they land):
 - [x] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`** ✅ (2026-08-04)
 - [x] **Part D — sequences generalise, and reduction** ✅ (2026-08-04)
 - [x] **Part E — strings, records, numbers, `in`** ✅ (2026-08-04)
-- [ ] **Part F — `capture`: regex submatches**
+- [x] **Part F — `capture`: regex submatches** ✅ (2026-08-04)
 - [ ] **Part G — interrupt (`Ctrl-C`)** — also makes `strict` real
 
 **Expect each part to surface substrate gaps, and file them rather than paper over them** — the
@@ -1280,9 +1280,10 @@ and a record both open with `{`; `brace_expr` already tells them apart), and `in
 operand a tier lower than the other comparisons, because §8a puts ranges *below* comparison and
 `5 in 0..10` would otherwise be `(5 in 0) .. 10`.
 
-#### Part F — `capture`: regex submatches
+#### Part F — `capture`: regex submatches ✅ (2026-08-04)
 
-The only part with engine work behind it: submatch slots in the Pike VM — `(`/`)` compile to save
+**Landed — and writing its tests found that `a|b` never matched `"b"`.** The only part with engine
+work behind it: submatch slots in the Pike VM — `(`/`)` compile to save
 instructions, and each thread carries its slot vector.
 
 - **Do not change what matches.** Slots record *where*; the existing semantics (and the deliberate
@@ -1293,6 +1294,18 @@ instructions, and each thread carries its slot vector.
   and let only `capture` allocate.
 - Tests: groups; a non-participating group is `null`; no match is `null` overall; nested groups; and
   the existing pathological-pattern case still terminates.
+
+**The bug the tests found, which is not in the new code.** `Regex::new` discarded the compiled
+fragment's `start` and both VMs began at instruction zero. Instructions are emitted as fragments are
+parsed and a combinator emits its own *after* its operands, so `a|b` compiles to
+`Char(a); Char(b); Split(0,1)` — the entry point is the **last** instruction. Starting at zero ran
+the first branch only, so **`"b" ~= /a|b/` was false for the entire life of the engine**. A
+concatenation happens to start at zero, which is why every existing test passed; no test used a
+top-level alternation whose second branch had to win. `Regex` now records its entry point.
+
+Also: a regex literal only lexes where a pattern belongs (D3), so `capture` had to join `~=` as a
+trigger — otherwise `capture /(\d+)/` reads as a path. That keeps `list /` and `6 / 2` working,
+which is the pair D3 exists for.
 
 #### Part G — interrupt (`Ctrl-C`) — and `strict` becomes real
 
