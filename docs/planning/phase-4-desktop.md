@@ -541,7 +541,7 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).
 - Design docs: [`docs/history/nitrox-shell-design-v1.2.md`](../history/nitrox-shell-design-v1.2.md)
-  (language/grammar) and [`docs/history/nitrox-ui-composition-model-v1.md`](../history/nitrox-ui-composition-model-v1.md)
+  (language/grammar) and [`docs/history/nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md)
   (windows/widgets as resource servers).
 - The **rich interactive REPL** (reverse-search, Shift-Enter key events, schema-aware completion —
   design §11) is split out and **deferred**, gated on the console/tty server + compositor terminal
@@ -549,6 +549,11 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
   on the raw console.
 
 ### Display + input
+
+**Design: [`docs/history/nitrox-display-substrate-v1.md`](../history/nitrox-display-substrate-v1.md)**
+(framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
+[`nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md) (windows,
+ports, desktops, templates). Settled 2026-08-04; the build order is still to be written.
 
 - [x] **Per-interrupt-context lock-order tracking** ✅ (2026-07-29). Was scheduled here,
   ahead of the handlers it protects; pulled forward instead, because it turned out to be a

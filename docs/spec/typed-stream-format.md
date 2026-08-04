@@ -146,7 +146,7 @@ Used to embed a structured error in the middle of a data stream — e.g., `filte
 
 Generic operators handle error records by passing them through unmodified; the consuming end (typically `display`) renders them.
 
-Record tag `0x03` was reserved for a **widget record** (structured UI embedded in a stream). It has been dropped: TSM1 is a *data* format, and structured UI is a compositor concern, not a stream record type (see `docs/history/nitrox-ui-composition-model-v1.md` §1 "TSM1 stays data-only" and the decision log, 2026-07-23). A `0x03` record tag is now a decode error (`BadRecordTag`).
+Record tag `0x03` was reserved for a **widget record** (structured UI embedded in a stream). It has been dropped: TSM1 is a *data* format, and structured UI is a compositor concern, not a stream record type (see `docs/history/nitrox-ui-composition-model-v2.md` §1 "TSM1 stays data-only" and the decision log, 2026-07-23). A `0x03` record tag is now a decode error (`BadRecordTag`).
 
 ### Terminator (`0xFF`)
 
