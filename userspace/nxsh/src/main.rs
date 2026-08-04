@@ -518,6 +518,10 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
     interp.set_env(env);
     match interp.run(&script) {
         Ok(_) => EXIT_OK,
+        // §11f: `exit N` sets the *script's* status. It arrives on the error channel
+        // because that is the only path crossing every boundary — a `def`, a closure, a
+        // loop — but it is not a failure and must not be reported as one.
+        Err(e) if e.is_exit() => e.exit.unwrap_or(0) as i64,
         Err(e) => {
             let mut msg = String::from("nxsh: ");
             msg.push_str(&e.message);
@@ -624,18 +628,8 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
                             pending.push_str(&src);
                             let line = core::mem::take(&mut pending);
                             history.push(&line);
-                            if line.trim() == "exit" {
-                                return EXIT_OK;
-                            }
-                            match interp.run_line(&line) {
-                                Ok(Some(text)) => tty_write_crlf(tty, &text),
-                                Ok(None) => {}
-                                Err(e) => {
-                                    let mut msg = String::from("nxsh: ");
-                                    msg.push_str(&e.message);
-                                    msg.push('\n');
-                                    tty_write_crlf(tty, &msg);
-                                }
+                            if let Some(status) = run_and_render(&mut interp, tty, &line) {
+                                return status;
                             }
                         }
                         tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
@@ -693,26 +687,9 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
                         continue;
                     }
                     history.push(&src);
-                    // `exit` is a shell-state builtin (§3): it must change *this* process,
-                    // which an external program structurally cannot do — and it must end
-                    // *this loop*, which is the one thing `run_line` cannot do for it.
-                    //
-                    // **It is the only line this loop may intercept.** A `cd` guard sat
-                    // here too, left from before `cd` existed, and went on refusing a
-                    // builtin the interpreter had implemented. Every other line goes to
-                    // `run_line` unread.
-                    if src.trim() == "exit" {
-                        return EXIT_OK;
-                    }
-                    match interp.run_line(&src) {
-                        Ok(Some(text)) => tty_write_crlf(tty, &text),
-                        Ok(None) => {}
-                        Err(e) => {
-                            let mut msg = String::from("nxsh: ");
-                            msg.push_str(&e.message);
-                            msg.push('\n');
-                            tty_write_crlf(tty, &msg);
-                        }
+                    // **Every line goes to the interpreter unread.** See `run_and_render`.
+                    if let Some(status) = run_and_render(&mut interp, tty, &src) {
+                        return status;
                     }
                     tty_write(tty, nxsh::repl::prompt(interp.cwd().unwrap_or("/")).as_bytes());
                 }
@@ -722,6 +699,33 @@ fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
 }
 
 
+
+/// Run one line, render what it produced, and report whether the shell was asked to leave.
+///
+/// **The interactive loop now intercepts nothing.** It used to compare the typed line
+/// against the literal string `"exit"` — which is why `exit 1` missed the comparison,
+/// reached the interpreter, and came back as "`exit` is handled by the shell's driver".
+/// A special case in the driver is a second implementation of the language, and this one
+/// had already produced a bug of exactly that shape (a `cd` guard that outlived the
+/// builtin it was refusing). `exit` is a shell-state builtin (§3), so it is a control
+/// outcome of evaluation, and this function is the only thing that has to know it.
+fn run_and_render(interp: &mut Interp, tty: u64, src: &str) -> Option<i64> {
+    match interp.run_line(src) {
+        Ok(Some(text)) => {
+            tty_write_crlf(tty, &text);
+            None
+        }
+        Ok(None) => None,
+        Err(e) if e.is_exit() => Some(e.exit.unwrap_or(0) as i64),
+        Err(e) => {
+            let mut msg = String::from("nxsh: ");
+            msg.push_str(&e.message);
+            msg.push('\n');
+            tty_write_crlf(tty, &msg);
+            None
+        }
+    }
+}
 
 /// Reverse-search state: the query, the current match, and what is on screen.
 ///

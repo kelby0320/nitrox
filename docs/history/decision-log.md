@@ -10286,3 +10286,62 @@ new one converts text and does arithmetic with it at a real prompt, and checks t
 `"abc" | parse Int` fails loud there too. Non-vacuity: removing the keyword-stage branch
 fails 10 tests, removing the `_` fallback fails the two `assert` tests, and dropping the
 whitespace rule fails the fail-loud test.
+
+## 2026-08-04 — Milestone 4 Part C: the error path becomes a designed surface
+
+`fail`, a `kind` vocabulary, `e.stages`, `exit N`, `?` retired, and `try`/`catch` as an
+expression. Six items because they are one subject: what happens when something goes wrong,
+and what a script can do about it.
+
+**`try` needed one implementation with two entry points — "one node" was not enough.**
+Making it an expression would have silently broken `for x in xs { try { … } catch { continue } }`
+and a `return` inside a `try` body, because control flow cannot leave an expression (Part A's
+wall). So `exec_try` returns `Flow`: `exec` propagates it, and `eval` reduces it with
+`expression_value`, which is where a `break` in *value* position is refused. Both directions
+are tests. `TODO(control-flow-in-expression-position)` said to watch for exactly this bite
+here, and it bit — the entry is now Resolved, and the value of having filed it was knowing
+where to look rather than discovering it from a broken loop later.
+
+**`exit` travels the error channel, deliberately.** It is not a failure, but that channel is
+the only one that already crosses a `def`, a closure, a loop and a `match` arm — the
+alternative was a `pending_exit` field read at every boundary, which is ambient state in a
+codebase that keeps refusing it. `catch` re-raises it in one line, so leaving the shell is
+not something a script prevents by accident. Two smaller things fell out: `exit 3`'s argument
+arrives as a **bareword** (a builtin's argument is not an expression — `cd ..` is the reason),
+so it is read with `parse`'s scanner rather than a second one; and the interactive driver now
+intercepts **nothing**. It used to match the literal line `exit`, which is why `exit 1` missed
+the comparison and answered "`exit` is handled by the shell's driver". The standing warning in
+`nxsh/CLAUDE.md` about the driver being a second implementation of the language could finally
+be rewritten as "it intercepts nothing — do not add a case here."
+
+**A bug the tests found on the way: D4's fallback was burying failures.** A bare name that is
+not a binding is tried as a program, and any error was rewrapped as "`x` is not a binding, and
+running it as a program failed: …". That is right when the program is missing and wrong when
+it *ran and exited non-zero* — the search succeeded; the program failed. Worse, the rewrap
+flattened the error, discarding the `kind` and the per-stage report in the one case the report
+exists for. It now propagates a `PipelineFailed` unchanged. Found because the new `e.stages`
+test asked for a `kind` and got `Error`.
+
+**Where `PipelineStatus` arrives is now true rather than aspirational.** §2 claimed
+`let r = my_pipeline` put it in hand; it cannot, and the implementation had split the
+difference with an undocumented `__status` binding that the failure path dropped. The report
+rides on the error, `stage_rows` is one definition shared with `$last.status`, and `__status`
+is gone — the REPL's copy is a private field, which is what it always was in truth.
+
+`fail` takes a String or a Record; a Record must carry `message: String`, because an error
+without one is the vague failure §6 spends its schema diff on. The `kind` vocabulary is
+`Error` / `TypeError` / `ParseError` / `AssertionFailed` / `PipelineFailed`, each tested at
+the site that raises it, and §6's subset match is what keeps it extensible — a `catch` that
+reads only `message` is unaffected when a kind is added.
+
+217 crate tests (1069 workspace), `test-qemu` green, `test-interactive` green at **16 steps**:
+two new ones raise and catch an error at a real prompt, bind a fallback with `try` in value
+position, and check that `exit 3` really is the status — `session-mgr` logs "shell exit 3",
+so the argument form is observable rather than merely "the shell left". Non-vacuity: letting
+`catch` swallow `exit` fails that test, routing statement-position `try` through `eval` fails
+the control-flow test, and dropping the per-stage report fails both `e.stages` tests.
+
+One process note: moving the resolved deferral into the Resolved table, the first attempt
+sliced from the entry to the wrong anchor and silently deleted three unrelated deferrals with
+it. `check-deferrals` caught it immediately — `TODO(fs-server-restart)` no longer had an entry
+— which is precisely the leak that gate was built for after the 2026-07-24 audit.

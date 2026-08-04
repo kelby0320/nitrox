@@ -303,6 +303,10 @@ impl<'a> Parser<'a> {
                 let body = self.loop_body()?;
                 Ok(Stmt::While { cond, body })
             }
+            Tok::Fail => {
+                self.bump()?;
+                Ok(Stmt::Fail(self.expr()?))
+            }
             Tok::Break | Tok::Continue => {
                 let kw = self.bump()?;
                 if self.loop_depth == 0 {
@@ -318,20 +322,10 @@ impl<'a> Parser<'a> {
                 }
                 Ok(if kw == Tok::Break { Stmt::Break } else { Stmt::Continue })
             }
-            Tok::Try => {
-                self.bump()?;
-                let body = self.block()?;
-                self.expect(&Tok::Catch, "expected `catch` after a `try` block")?;
-                let catch_binding = if self.eat(&Tok::LParen)? {
-                    let n = self.ident("expected an error binding")?;
-                    self.expect(&Tok::RParen, "expected `)`")?;
-                    Some(n)
-                } else {
-                    None
-                };
-                let catch_body = self.block()?;
-                Ok(Stmt::Try { body, catch_binding, catch_body })
-            }
+            // `try` is an expression (§9c), so statement position is just an expression
+            // statement — one node and one evaluator path, rather than a statement form
+            // and an expression form that drift.
+            Tok::Try => Ok(Stmt::Expr(self.try_expr()?)),
             Tok::Strict => {
                 self.bump()?;
                 Ok(Stmt::Strict(self.block()?))
@@ -391,6 +385,24 @@ impl<'a> Parser<'a> {
         self.expect(&Tok::Eq, "expected `=` in a binding")?;
         let value = self.expr()?;
         Ok(Stmt::Bind { kind, name, ty, value, public })
+    }
+
+    /// `try { … } catch (e) { … }` (§9c). One production, reached from statement position
+    /// and from `primary` alike — which is what makes `let x = try { … } catch { … }` work
+    /// without a second implementation of the same construct.
+    fn try_expr(&mut self) -> Result<Expr> {
+        self.bump()?; // try
+        let body = self.block()?;
+        self.expect(&Tok::Catch, "expected `catch` after a `try` block")?;
+        let catch_binding = if self.eat(&Tok::LParen)? {
+            let n = self.ident("expected an error binding")?;
+            self.expect(&Tok::RParen, "expected `)`")?;
+            Some(n)
+        } else {
+            None
+        };
+        let catch_body = self.block()?;
+        Ok(Expr::Try { body, catch_binding, catch_body })
     }
 
     fn def_stmt(&mut self, public: bool) -> Result<Stmt> {
@@ -673,7 +685,11 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Question => {
                     self.bump()?;
-                    Expr::Try(Box::new(e))
+                    return self.fail(
+                        "`?` was retired in design v1.2 — an operation that fails already \
+                         propagates to its caller, so there was nothing for it to mark. \
+                         Use `try { … } catch { … }` to recover (§2)",
+                    );
                 }
                 _ => return Ok(e),
             };
@@ -753,6 +769,7 @@ impl<'a> Parser<'a> {
                 Ok(Expr::If { cond: Box::new(cond), then, otherwise })
             }
             Tok::Match => self.match_expr(),
+            Tok::Try => self.try_expr(),
             Tok::Expect => {
                 self.bump()?;
                 let t = self.type_expr()?;
@@ -1107,7 +1124,11 @@ impl<'a> Parser<'a> {
                 }
                 Tok::Question => {
                     self.bump()?;
-                    Expr::Try(Box::new(e))
+                    return self.fail(
+                        "`?` was retired in design v1.2 — an operation that fails already \
+                         propagates to its caller, so there was nothing for it to mark. \
+                         Use `try { … } catch { … }` to recover (§2)",
+                    );
                 }
                 _ => break,
             };
@@ -1711,14 +1732,38 @@ mod tests {
         assert!(ret.is_some());
     }
 
+    /// `try` is an **expression** as of v1.2, so statement position is an expression
+    /// statement — one node, reached from both places. `strict` remains a statement.
     #[test]
-    fn try_catch_and_strict_are_statements() {
+    fn try_catch_is_an_expression_and_strict_is_a_statement() {
         let s = script("try { open ./x } catch (err) { print }");
-        let Stmt::Try { catch_binding, .. } = &s.stmts[0] else { panic!() };
+        let Stmt::Expr(Expr::Try { catch_binding, .. }) = &s.stmts[0] else {
+            panic!("expected a try expression, got {:?}", s.stmts[0])
+        };
         assert_eq!(catch_binding.as_deref(), Some("err"));
+
+        // …and the same production in value position, which is the point of the change.
+        let s = script("let x = try { open ./x } catch { 0 }");
+        let Stmt::Bind { value: Expr::Try { .. }, .. } = &s.stmts[0] else {
+            panic!("expected a bound try expression, got {:?}", s.stmts[0])
+        };
 
         let s = script("strict { open ./in | save ./out }");
         assert!(matches!(s.stmts[0], Stmt::Strict(_)));
+    }
+
+    /// §2: `?` retired, and the message says why rather than "expected an expression".
+    #[test]
+    fn the_propagation_operator_is_retired_with_a_message() {
+        // In *word* mode a trailing `?` is part of the path (`./f?` is a filename), so the
+        // retired operator only exists where an expression does.
+        let e = parse_script("let x = a?").expect_err("`?` is gone");
+        assert!(e.message.contains("retired"), "{}", e.message);
+        assert!(e.message.contains("try"), "{}", e.message);
+        // The other three `?` spellings are untouched (§2's table).
+        script("let a: Int? = null");
+        script("let r: { size?: Int } = { size: 1 }");
+        script("let n = a?.size ?? 0");
     }
 
     /// §9h: no wildcard import — name what is imported, or bind the whole module.

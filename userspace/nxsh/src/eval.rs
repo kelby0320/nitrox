@@ -36,14 +36,80 @@ use crate::value::{Func, Val, render_i64};
 /// A runtime failure. The message is built for a person: it names the operation and the
 /// types involved, which is the §6 "schema diff, not a vague mismatch" posture applied to
 /// scalars.
+///
+/// `kind` is §2's vocabulary — small and closed at any moment, so matching on it is worth
+/// doing, and extensible because §6's subset match means a `catch` that reads only
+/// `message` keeps working when a kind is added.
 #[derive(Clone, PartialEq, Debug)]
 pub struct EvalError {
     pub message: String,
+    pub kind: String,
+    /// The §1 per-stage report, carried only by a [`PIPELINE_FAILED`].
+    ///
+    /// This is where `PipelineStatus` actually arrives (§2). A pipeline's *value* is its
+    /// data, and on failure it never reaches the binding at all — so the report rides on
+    /// the error, which is the one thing that does reach the `catch`.
+    pub stages: Option<Value>,
+    /// `exit N` (§11f) travelling out — **not a failure**, despite the channel.
+    ///
+    /// It uses the error path because that is the only one that already crosses every
+    /// boundary in this interpreter: a loop, a `def`, a closure, a `match` arm. The one
+    /// place that must not treat it as an error is `catch`, which re-raises rather than
+    /// handling it — leaving a shell is not something a script recovers from by accident.
+    pub exit: Option<i32>,
 }
+
+/// §2's `kind` vocabulary.
+pub const ERROR: &str = "Error";
+pub const TYPE_ERROR: &str = "TypeError";
+pub const PARSE_ERROR: &str = "ParseError";
+pub const ASSERTION_FAILED: &str = "AssertionFailed";
+pub const PIPELINE_FAILED: &str = "PipelineFailed";
 
 impl EvalError {
     fn new(message: impl Into<String>) -> EvalError {
-        EvalError { message: message.into() }
+        EvalError::of(ERROR, message)
+    }
+
+    fn of(kind: &str, message: impl Into<String>) -> EvalError {
+        EvalError {
+            message: message.into(),
+            kind: String::from(kind),
+            stages: None,
+            exit: None,
+        }
+    }
+
+    /// `exit N` — see the field.
+    fn exiting(status: i32) -> EvalError {
+        EvalError {
+            message: String::from("exit"),
+            kind: String::from(ERROR),
+            stages: None,
+            exit: Some(status),
+        }
+    }
+
+    pub fn is_exit(&self) -> bool {
+        self.exit.is_some()
+    }
+
+    /// The error as a `Record`, which is what `catch (e)` binds (§2).
+    ///
+    /// Deliberately an ordinary record so §9f's patterns take it apart with no new
+    /// grammar — and built here, once, so the vocabulary cannot drift between the sites
+    /// that raise it.
+    fn to_record(&self) -> Val {
+        let mut schema = Schema::new()
+            .field("kind", libstream::wire::TypeTag::String, TypeModifiers::NONE)
+            .field("message", libstream::wire::TypeTag::String, TypeModifiers::NONE);
+        let mut values =
+            alloc::vec![Value::Str(self.kind.clone()), Value::Str(self.message.clone())];
+        if let Some(stages) = &self.stages {
+            schema = schema.field("stages", libstream::wire::TypeTag::List, TypeModifiers::NONE);
+            values.push(stages.clone());
+        }
+        Val::Data(Value::Record(Arc::new(Record { schema, values })))
     }
 }
 
@@ -113,6 +179,13 @@ pub struct Interp {
     mode: Mode,
     /// Whether the statement currently executing is inside a `strict { }` block (§1).
     strict: bool,
+    /// The most recent pipeline's `PipelineStatus`, for `$last.status` (§11d).
+    ///
+    /// A private field rather than the `__status` *binding* it used to be: that binding
+    /// was a name a user could type for a feature the language does not have, and it was
+    /// dropped on the failure path — the one case the report exists for. The report now
+    /// rides on the error (§2); this is only the REPL's convenience copy.
+    last_status: Option<Val>,
     /// The runaway backstop, [`MAX_ITERATIONS`] in every build.
     ///
     /// A field rather than the constant read directly so the guard is **testable in
@@ -141,6 +214,7 @@ impl Interp {
             host,
             mode,
             strict: false,
+            last_status: None,
             iteration_limit: MAX_ITERATIONS,
         }
     }
@@ -252,10 +326,7 @@ impl Interp {
         if self.mode != Mode::Repl {
             return Ok(());
         }
-        let status = self
-            .lookup("__status")
-            .map(|s| s.val.clone())
-            .unwrap_or(Val::NULL);
+        let status = self.last_status.clone().unwrap_or(Val::NULL);
         let schema = Schema::new()
             .field("value", value.as_data().and_then(|v| v.type_tag()).unwrap_or(libstream::wire::TypeTag::Null), TypeModifiers::NONE)
             .field("status", libstream::wire::TypeTag::Record, TypeModifiers::NONE);
@@ -431,46 +502,56 @@ impl Interp {
                 };
                 Ok(Flow::Return(v))
             }
+            // §2's raising half. `try`/`catch` could catch an error and nothing in the
+            // language could produce one — so a `def` could validate its arguments and
+            // could not say what was wrong with them.
+            Stmt::Fail(e) => {
+                let v = self.eval(e)?;
+                Err(match v.as_data() {
+                    Some(Value::Str(m)) => EvalError::of(ERROR, m.clone()),
+                    // A record is raised as the error value itself, so a caller can match
+                    // on more than a message. It must carry one, though: an error whose
+                    // `message` is missing is the vague failure §6 spends its diff on.
+                    Some(Value::Record(r)) => {
+                        let field = |n: &str| {
+                            r.schema
+                                .fields
+                                .iter()
+                                .position(|f| f.name == n)
+                                .and_then(|i| r.values.get(i))
+                        };
+                        let Some(Value::Str(message)) = field("message") else {
+                            return Err(EvalError::new(
+                                "`fail` takes a message — a Record raised as an error must \
+                                 carry `message: String`",
+                            ));
+                        };
+                        let kind = match field("kind") {
+                            Some(Value::Str(k)) => k.clone(),
+                            _ => String::from(ERROR),
+                        };
+                        EvalError { message: message.clone(), kind, stages: None, exit: None }
+                    }
+                    _ => EvalError::new(alloc::format!(
+                        "`fail` takes a String message or a Record, got {}",
+                        v.type_name()
+                    )),
+                })
+            }
             // The parser has already established that these sit inside a loop body in
             // this function (§9c), so there is nothing left to check here.
             Stmt::Break => Ok(Flow::Break),
             Stmt::Continue => Ok(Flow::Continue),
+            // `try` is an expression, but in statement position its control flow must
+            // still reach the enclosing loop or function — so it is unwrapped here rather
+            // than going through `eval`, which can only return a value.
+            Stmt::Expr(Expr::Try { body, catch_binding, catch_body }) => {
+                self.exec_try(body, catch_binding, catch_body)
+            }
             Stmt::Expr(e) => Ok(Flow::Normal(self.eval(e)?)),
             // Already bound by `hoist_defs` at block entry (§5a), so the declaration
             // itself does nothing further.
             Stmt::Def { .. } => Ok(Flow::Normal(Val::NULL)),
-            // Statement position only — `let x = try { … }` does not parse. See
-            // `TODO(try-in-expression-position)` in deferred-decisions.md.
-            //
-            // §2: sugar over branching on a failure, **not** stack unwinding across
-            // unrelated frames — consistent with the system's rejection of hidden
-            // non-local control flow everywhere else (no signals).
-            Stmt::Try { body, catch_binding, catch_body } => {
-                match self.scoped_block(body) {
-                    Ok(flow) => Ok(flow),
-                    Err(e) => {
-                        self.push_scope();
-                        if let Some(n) = catch_binding {
-                            // The error is an ordinary `Record`, so `match err { … }`
-                            // needs no new grammar (§9f's payoff).
-                            let schema = Schema::new()
-                                .field("kind", libstream::wire::TypeTag::String, TypeModifiers::NONE)
-                                .field("message", libstream::wire::TypeTag::String, TypeModifiers::NONE);
-                            let rec = Value::Record(Arc::new(Record {
-                                schema,
-                                values: alloc::vec![
-                                    Value::Str(alloc::string::String::from("Error")),
-                                    Value::Str(e.message.clone()),
-                                ],
-                            }));
-                            let _ = self.bind(n, Val::Data(rec), false, false);
-                        }
-                        let r = self.exec_block(catch_body);
-                        self.pop_scope();
-                        r
-                    }
-                }
-            }
             // §1: deliberately a local, visible block rather than a bash-`pipefail`-style
             // ambient mode switch — the same no-ambient-state stance as the rejection of
             // a global `$?` and of implicit env inheritance.
@@ -486,6 +567,45 @@ impl Interp {
                 Ok(Flow::Normal(Val::NULL))
             }
         }
+    }
+
+    /// `try { … } catch (e) { … }` — one implementation, two entry points.
+    ///
+    /// §2: sugar over branching on a failure, **not** stack unwinding across unrelated
+    /// frames — consistent with the system's rejection of hidden non-local control flow
+    /// everywhere else (no signals).
+    ///
+    /// It returns `Flow` rather than a `Val` **so statement position keeps working**:
+    /// `for x in xs { try { … } catch { continue } }` has to reach the loop, and a `return`
+    /// inside a `try` has to leave the function. `exec` propagates that; `eval` reduces it
+    /// with `expression_value`, which is where a `break` in *value* position is refused
+    /// (`TODO(control-flow-in-expression-position)`). Making `try` an expression is
+    /// exactly the change that entry predicted would bite here.
+    fn exec_try(
+        &mut self,
+        body: &[Stmt],
+        catch_binding: &Option<String>,
+        catch_body: &[Stmt],
+    ) -> Result<Flow> {
+        let e = match self.scoped_block(body) {
+            Ok(flow) => return Ok(flow),
+            Err(e) => e,
+        };
+        // **`exit` is not a failure** (§11f): it travels the error path because that is
+        // the only channel crossing every boundary, and a `catch` that swallowed it would
+        // make leaving a shell something a script prevents by accident.
+        if e.is_exit() {
+            return Err(e);
+        }
+        self.push_scope();
+        if let Some(n) = catch_binding {
+            // An ordinary `Record`, built in one place (see `EvalError::to_record`), so
+            // `match err { … }` needs no new grammar — §9f's payoff.
+            let _ = self.bind(n, e.to_record(), false, false);
+        }
+        let r = self.exec_block(catch_body);
+        self.pop_scope();
+        r
     }
 
     /// A condition must be a `Bool`. See the module docs: no truthiness, deliberately.
@@ -622,6 +742,16 @@ impl Interp {
                         forced_external: false,
                     }));
                     self.pipeline(core::slice::from_ref(&call)).map_err(|e| {
+                        // **Only rewrap when the name was the problem.** D4's message
+                        // names both searches because "not found" leaves a reader guessing
+                        // which one they meant to satisfy — but if the program was found
+                        // and *ran*, the search succeeded and the failure is the
+                        // program's. Rewrapping that one buried its `kind` and threw away
+                        // the per-stage report (§2), which is the one case the report
+                        // exists for.
+                        if e.kind == PIPELINE_FAILED || e.is_exit() {
+                            return e;
+                        }
                         EvalError::new(alloc::format!(
                             "`{name}` is not a binding, and running it as a program \
                              failed: {}",
@@ -724,7 +854,9 @@ impl Interp {
             // **value** instead of raising, which is what makes `?` distinct in Rust. None
             // does yet. Recorded rather than pretended: writing `?` is accepted, means
             // what §2 says, and costs nothing.
-            Expr::Try(inner) => self.eval(inner),
+            Expr::Try { body, catch_binding, catch_body } => {
+                expression_value(self.exec_try(body, catch_binding, catch_body)?)
+            }
             // §6: `expect` is ascription in expression position, and `assert` its sibling
             // for a *content* predicate. Deliberately separate keywords rather than one
             // verb overloaded on argument type, so the message says "shape mismatch" or
@@ -742,7 +874,7 @@ impl Interp {
                 let v = self.eval(pred)?;
                 match v.as_bool() {
                     Some(true) => Ok(Val::NULL),
-                    Some(false) => Err(EvalError::new("assertion failed")),
+                    Some(false) => Err(EvalError::of(ASSERTION_FAILED, "assertion failed")),
                     None => Err(EvalError::new(alloc::format!(
                         "`assert` needs a Bool predicate, got {}",
                         v.type_name()
@@ -1262,7 +1394,47 @@ impl Interp {
                 Ok(Val::NULL)
             }
             // `exit` is handled by the driver, which owns the process.
-            "exit" => Err(EvalError::new("`exit` is handled by the shell's driver")),
+            // §11f. `exit` is a shell-state builtin, so it is a *control outcome of
+            // evaluation* rather than a string the REPL loop watches for — the driver used
+            // to compare the typed line against `"exit"`, which is why `exit 1` reached
+            // here at all and why a script could not set its own status.
+            //
+            // It travels the error channel deliberately: that is the only path already
+            // crossing a `def`, a closure and a loop. `catch` re-raises it (see
+            // `exec_try`), so leaving is not something a script prevents by accident.
+            "exit" => {
+                let status = match c.args.first() {
+                    None => 0,
+                    Some(Arg::Positional(e)) => {
+                        // A builtin's argument is a **bareword**, not an expression (`cd ..`
+                        // and `cd /system` both choke in expression mode), so `exit 3`
+                        // arrives as the text `"3"`. Reading it with the same scanner
+                        // `parse` uses keeps one definition of what a number looks like.
+                        let v = self.eval(e)?;
+                        match v.as_data() {
+                            Some(Value::Int(n)) => *n as i32,
+                            Some(Value::Str(t)) => match scan_number(t) {
+                                Some(Val::Data(Value::Int(n))) => n as i32,
+                                _ => {
+                                    return Err(EvalError::new(alloc::format!(
+                                        "`exit` takes a status Int, got {t:?}"
+                                    )));
+                                }
+                            },
+                            _ => {
+                                return Err(EvalError::new(alloc::format!(
+                                    "`exit` takes a status Int, got {}",
+                                    v.type_name()
+                                )));
+                            }
+                        }
+                    }
+                    Some(_) => {
+                        return Err(EvalError::new("`exit` takes a single status argument"));
+                    }
+                };
+                Err(EvalError::exiting(status))
+            }
             _ => Err(unavailable(c)),
         }
     }
@@ -1613,8 +1785,7 @@ impl Interp {
         // §1 and §2: the pipeline *is* an expression, so its data value is what a `let`
         // binds. `PipelineStatus` is orthogonal execution metadata, which is why there is
         // no global `$?` for it to live in — the two are kept apart deliberately (§11d).
-        let status = pipeline_status(&statuses);
-        self.bind("__status", status, true, false)?;
+        self.last_status = Some(pipeline_status(&statuses));
 
         // Fail loud, don't fail silent (§1): a non-zero or crashed stage anywhere makes
         // the pipeline report as failed. Downstream stages are *not* torn down — they
@@ -1632,7 +1803,12 @@ impl Interp {
                 msg.push_str(" exited ");
                 msg.push_str(&render_i64(bad.exit_status as i64));
             }
-            return Err(EvalError::new(msg));
+            // **Where `PipelineStatus` actually arrives** (§2). The pipeline's value is
+            // its data and the failure never reaches the binding, so the per-stage report
+            // travels on the error — the one thing that does reach the `catch`.
+            let mut e = EvalError::of(PIPELINE_FAILED, msg);
+            e.stages = Some(stage_rows(&statuses));
+            return Err(e);
         }
         Ok(carried.unwrap_or(Val::NULL))
     }
@@ -1798,7 +1974,11 @@ fn decode_output(run: &PipelineRun) -> Result<Option<Val>> {
 /// so, and §2 explains why there is no scalar `$?` to collapse it into — several stages
 /// do not have one status between them. `all_ok` is the derived boolean that covers the
 /// casual case without losing the per-stage detail a script may want.
-fn pipeline_status(stages: &[StageStatus]) -> Val {
+/// The §1 per-stage rows: `List<{command, exit_status, crashed, cancelled}>`.
+///
+/// One definition, used by `$last.status` and by the error a failed pipeline raises, so
+/// the two cannot describe the same run differently.
+fn stage_rows(stages: &[StageStatus]) -> Value {
     let mut rows: Vec<Value> = Vec::with_capacity(stages.len());
     for s in stages {
         let schema = Schema::new()
@@ -1816,13 +1996,17 @@ fn pipeline_status(stages: &[StageStatus]) -> Val {
             ],
         })));
     }
+    Value::List(Arc::from(rows))
+}
+
+fn pipeline_status(stages: &[StageStatus]) -> Val {
     let all_ok = stages.iter().all(|s| s.succeeded());
     let schema = Schema::new()
         .field("stages", libstream::wire::TypeTag::List, TypeModifiers::NONE)
         .field("all_ok", libstream::wire::TypeTag::Bool, TypeModifiers::NONE);
     Val::Data(Value::Record(Arc::new(Record {
         schema,
-        values: alloc::vec![Value::List(Arc::from(rows)), Value::Bool(all_ok)],
+        values: alloc::vec![stage_rows(stages), Value::Bool(all_ok)],
     })))
 }
 
@@ -2032,10 +2216,11 @@ fn expression_value(flow: Flow) -> Result<Val> {
 /// *as* a `T` and produces it. Fail-loud on anything it cannot read, because the whole
 /// reason §6 has no implicit coercion is that a silent one is unrecoverable.
 fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
+    let bad = |m: String| EvalError::of(PARSE_ERROR, m);
     let (name, nullable) = match t {
         TypeExpr::Named { name, nullable, .. } => (name.as_str(), *nullable),
         TypeExpr::Record { .. } => {
-            return Err(EvalError::new(
+            return Err(EvalError::of(PARSE_ERROR,
                 "`parse` converts to a scalar type — checking a record *shape* is what \
                  `expect` is for (§6)",
             ));
@@ -2045,7 +2230,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
         return if nullable {
             Ok(Val::NULL)
         } else {
-            Err(EvalError::new(alloc::format!(
+            Err(bad(alloc::format!(
                 "cannot parse Null as {name} — annotate `{name}?` if the value is \
                  genuinely optional"
             )))
@@ -2062,7 +2247,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
             // §6 is strict about surrounding whitespace *because* `trim` exists: quietly
             // accepting `" 42"` is the coercion this design spends its fail-loud rule on.
             if s.trim() != s.as_str() {
-                return Err(EvalError::new(alloc::format!(
+                return Err(bad(alloc::format!(
                     "cannot parse {s:?} as {name} — it has surrounding whitespace; \
                      `trim` it first"
                 )));
@@ -2074,11 +2259,11 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
                 // The distinction is the point: `Int` and `Float` are different types
                 // everywhere else in this language (§6), so `"3.5" | parse Int` truncating
                 // would be the one silent coercion left standing.
-                (Some(Val::Data(Value::Float(_))), "Int") => Err(EvalError::new(alloc::format!(
+                (Some(Val::Data(Value::Float(_))), "Int") => Err(bad(alloc::format!(
                     "cannot parse {s:?} as Int — it reads as a Float; `parse Float` it, or \
                      round it"
                 ))),
-                _ => Err(EvalError::new(alloc::format!(
+                _ => Err(bad(alloc::format!(
                     "cannot parse {s:?} as {name}"
                 ))),
             }
@@ -2088,13 +2273,13 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
         (Some(Value::Str(s)), "Bool") => match s.as_str() {
             "true" => Ok(Val::bool(true)),
             "false" => Ok(Val::bool(false)),
-            _ => Err(EvalError::new(alloc::format!(
+            _ => Err(bad(alloc::format!(
                 "cannot parse {s:?} as Bool — only \"true\" and \"false\""
             ))),
         },
         (Some(Value::Bytes(b)), "String") => match core::str::from_utf8(b) {
             Ok(s) => Ok(Val::str(s)),
-            Err(e) => Err(EvalError::new(alloc::format!(
+            Err(e) => Err(bad(alloc::format!(
                 "cannot parse these bytes as String — not UTF-8 at byte {}",
                 render_i64(e.valid_up_to() as i64)
             ))),
@@ -2104,7 +2289,7 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
             // Widening is lossless up to 2^53 and silently lossy past it, which is a
             // fabricated number by any other name (§8a).
             if f as i64 != *i {
-                return Err(EvalError::new(alloc::format!(
+                return Err(bad(alloc::format!(
                     "cannot parse {} as Float without losing precision",
                     render_i64(*i)
                 )));
@@ -2112,11 +2297,11 @@ fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
             Ok(Val::float(f))
         }
         // The other direction is `format`'s job, and saying so is more use than "cannot".
-        (_, "String") => Err(EvalError::new(alloc::format!(
+        (_, "String") => Err(bad(alloc::format!(
             "cannot parse {got} as String — rendering a value as text is `format(\"{{}}\", …)` \
              (§8d)"
         ))),
-        _ => Err(EvalError::new(alloc::format!(
+        _ => Err(bad(alloc::format!(
             "cannot parse {got} as {name}"
         ))),
     }
@@ -2362,7 +2547,7 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
             }
             return match v {
                 Val::Data(Value::Record(_)) => Ok(()),
-                other => Err(EvalError::new(alloc::format!(
+                other => Err(EvalError::of(TYPE_ERROR, alloc::format!(
                     "expected a record shape, got {}",
                     other.type_name()
                 ))),
@@ -2376,7 +2561,7 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
         return if nullable {
             Ok(())
         } else {
-            Err(EvalError::new(alloc::format!(
+            Err(EvalError::of(TYPE_ERROR, alloc::format!(
                 "expected {name}, got Null — annotate `{name}?` if the value is genuinely \
                  optional"
             )))
@@ -2388,7 +2573,7 @@ fn check_type(v: &Val, t: &TypeExpr) -> Result<()> {
     if actual == name {
         return Ok(());
     }
-    Err(EvalError::new(alloc::format!(
+    Err(EvalError::of(TYPE_ERROR, alloc::format!(
         "expected {name}, got {actual}"
     )))
 }
@@ -2770,6 +2955,40 @@ mod tests {
         let (r, _log) = run_with(host, "nope");
         let e = r.expect_err("should fail");
         assert!(e.message.contains("exited 3"), "{}", e.message);
+    }
+
+    /// **Where `PipelineStatus` actually arrives** (§2). v1.1 claimed `let r = my_pipeline`
+    /// put the status in hand; it cannot — the pipeline's value is its *data*, and on
+    /// failure it never reaches the binding. The report rides on the error instead, which
+    /// is the one thing that does reach the `catch`.
+    #[test]
+    fn a_failed_pipeline_carries_its_per_stage_report() {
+        let host = MockHost::new().with_failing("nope", 3);
+        let (r, _log) = run_with(host, "nope");
+        let e = r.expect_err("should fail");
+        std::println!("ERR = {:?}", e);
+        assert_eq!(e.kind, PIPELINE_FAILED);
+        let stages = e.stages.as_ref().expect("the per-stage report");
+        let Value::List(rows) = stages else { panic!("expected a list of stages") };
+        assert_eq!(rows.len(), 1);
+        let Value::Record(r0) = &rows[0] else { panic!("expected a stage record") };
+        // The §1 shape, unchanged, delivered where the question is asked.
+        let names: Vec<&str> = r0.schema.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names, ["command", "exit_status", "crashed", "cancelled"]);
+        assert_eq!(r0.values[0], Value::Str(alloc::string::String::from("nope")));
+        assert_eq!(r0.values[1], Value::Int(3));
+    }
+
+    /// …and a script can read it, which is the point: "which stage failed, and how" is one
+    /// field away rather than unanswerable.
+    #[test]
+    fn a_script_can_read_which_stage_failed() {
+        let host = MockHost::new().with_failing("nope", 3);
+        let (r, _log) = run_with(
+            host,
+            "try { nope } catch (e) { e.stages | filter exit_status != 0 | count }",
+        );
+        assert_eq!(r.expect("caught").render(), "1");
     }
 
     /// A crash and a non-zero exit are different things, and the report keeps them apart.
@@ -3567,5 +3786,128 @@ x"), "5");
     fn format_and_parse_round_trip() {
         assert_eq!(rendered("format(\"{}\", 42) | parse Int"), "42");
         assert_eq!(rendered("format(\"{}\", 2.5) | parse Float"), "2.5");
+    }
+
+    // --- errors: `fail`, kinds, `e.stages`, `exit` (§2, §11f, Part C) -------
+
+    /// **The half `try`/`catch` was missing.** A `def` could validate its arguments and
+    /// could not say what was wrong with them: the only in-language failure was `assert`,
+    /// whose message is permanently "assertion failed".
+    #[test]
+    fn fail_raises_a_catchable_error_with_a_message() {
+        assert_eq!(
+            rendered("try { fail \"bad path\" } catch (e) { e.message }"),
+            "bad path"
+        );
+        // …and it travels out of a `def`, which is the case that matters.
+        assert_eq!(
+            rendered("def check(n) {\n if n < 0 { fail \"negative\" }\n n\n}\ntry { check(-1) } catch (e) { e.message }"),
+            "negative"
+        );
+    }
+
+    /// A Record is raised as the error *value*, so a caller can match on more than a
+    /// message (§9f) — and must carry one, since an error without a message is the vague
+    /// failure §6 spends its schema diff on.
+    #[test]
+    fn fail_can_raise_a_record_and_demands_a_message() {
+        assert_eq!(
+            rendered("try { fail { kind: \"NotFound\", message: \"no such user\" } } catch (e) { e.kind }"),
+            "NotFound"
+        );
+        assert!(err("fail { code: 2 }").contains("must \\\n                                 carry") || err("fail { code: 2 }").contains("message"));
+        assert!(err("fail 42").contains("String message or a Record"));
+    }
+
+    /// §2's vocabulary, at each site that raises one. Matching on `kind` is only worth
+    /// doing if the kinds are actually distinct.
+    #[test]
+    fn each_kind_of_failure_names_itself() {
+        let kind = |src: &str| rendered(&alloc::format!("try {{ {src} }} catch (e) {{ e.kind }}"));
+        assert_eq!(kind("fail \"x\""), "Error");
+        assert_eq!(kind("assert (1 == 2)"), "AssertionFailed");
+        assert_eq!(kind("\"abc\" | parse Int"), "ParseError");
+        assert_eq!(kind("let x: Int = \"s\""), "TypeError");
+    }
+
+    /// §6's subset match is what makes the vocabulary extensible: a `catch` that reads
+    /// only `message` keeps working when a kind is added.
+    #[test]
+    fn a_catch_that_reads_only_the_message_is_unaffected_by_kinds() {
+        assert_eq!(rendered("try { assert (false) } catch (e) { e.message }"), "assertion failed");
+    }
+
+    /// **`exit` is a control outcome, not an error** (§11f) — and `catch` must not swallow
+    /// it, or leaving a shell becomes something a script prevents by accident.
+    #[test]
+    fn exit_is_not_catchable_and_carries_its_status() {
+        let mut i = Interp::new();
+        let e = i
+            .run(&crate::parse::parse_script("try { exit 3 } catch (e) { \"caught\" }").unwrap())
+            .expect_err("exit propagates");
+        assert!(e.is_exit(), "a catch swallowed `exit`");
+        assert_eq!(e.exit, Some(3));
+
+        // A bare `exit` is status 0…
+        let mut i = Interp::new();
+        let e = i.run(&crate::parse::parse_script("exit").unwrap()).expect_err("exit");
+        assert_eq!(e.exit, Some(0));
+        // …and it leaves a `def` too, rather than stopping at the boundary.
+        let mut i = Interp::new();
+        let e = i
+            .run(&crate::parse::parse_script("def quit() { exit 7 }\nquit()").unwrap())
+            .expect_err("exit");
+        assert_eq!(e.exit, Some(7));
+    }
+
+    #[test]
+    fn exit_wants_a_status_int() {
+        assert!(err("exit \"now\"").contains("status Int"));
+    }
+
+    // --- `try` is an expression (§9c) ---------------------------------------
+
+    /// The point of the change: a failure can produce a fallback **value**, chosen by the
+    /// catch branch — which is strictly more than a propagation operator could offer,
+    /// since the branch sees the error.
+    #[test]
+    fn try_catch_produces_a_value() {
+        assert_eq!(rendered("let n = try { \"x\" | parse Int } catch { 8080 }\nn"), "8080");
+        assert_eq!(rendered("let n = try { \"42\" | parse Int } catch { 8080 }\nn"), "42");
+        // The branch can vary the answer by what went wrong.
+        assert_eq!(
+            rendered("let n = try { fail \"nope\" } catch (e) { if e.kind == \"Error\" { 1 } else { 2 } }\nn"),
+            "1"
+        );
+    }
+
+    /// Statement position must keep working, and that is not automatic: `try` is now an
+    /// expression, and control flow cannot leave one. It is evaluated through a
+    /// `Flow`-returning path from `exec` for exactly this reason.
+    #[test]
+    fn control_flow_still_escapes_a_try_in_statement_position() {
+        // `continue` from a catch reaches the loop.
+        assert_eq!(
+            rendered("mut n = 0\nfor x in 0..4 {\n try { fail \"x\" } catch { continue }\n n = n + 1\n}\nn"),
+            "0"
+        );
+        // `return` from a try body leaves the function.
+        assert_eq!(
+            rendered("def f() {\n try { return 5 } catch { 0 }\n 9\n}\nf()"),
+            "5"
+        );
+        // `break` from a catch leaves the loop.
+        assert_eq!(
+            rendered("mut n = 0\nfor x in 0..4 {\n n = n + 1\n try { fail \"x\" } catch { break }\n}\nn"),
+            "1"
+        );
+    }
+
+    /// …and in *value* position it is refused rather than silently dropped, which is the
+    /// wall `TODO(control-flow-in-expression-position)` describes.
+    #[test]
+    fn control_flow_inside_a_try_used_as_a_value_is_refused() {
+        let e = err("for x in 0..3 {\n let y = try { fail \"x\" } catch { break }\n}");
+        assert!(e.contains("where a value is expected"), "{e}");
     }
 }

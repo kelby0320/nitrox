@@ -370,30 +370,6 @@ from. Not urgent — §10a dissolved every classic filter into an in-process gen
 the shipped programs a pipeline has at most one external stage — but it should be batched into the
 next ABI pass rather than rediscovered.
 
-**`try`/`catch` in expression position — `TODO(try-in-expression-position)`.**
-§9a makes blocks expressions and §9f shows `try`/`catch` composing with `match`, so
-`let msg = try { … } catch (e) { e.message }` reads as though it should work. It does not:
-`try` is parsed as a statement (§9c's `statement` production lists `try_stmt`), so it is
-only usable at statement level, and a caught value reaches the outside through a `mut`.
-
-The grammar as written is self-consistent — §9c really does put `try` among the statements
-— so this is a gap between what the grammar says and what §9a's "blocks are expressions"
-spirit implies, not a bug against the spec. A block *ending* in `try` already yields its
-value, which covers the function-return case §9a actually argues for.
-
-Trigger: the first script that wants to bind a caught value directly. The fix is small —
-add `try` to `primary` alongside `if` and `match`, which are already expressions there —
-but it is a grammar change and belongs with a considered pass over §9c rather than as a
-side effect of Part E.
-
-**Triggered 2026-08-04, and scheduled.** Milestone 4 *is* that considered pass over §9c
-(it adds `break`/`continue`/`fail` there), and the trigger arrived from the other
-direction as well: retiring the `?` propagation operator leaves no way to default on
-failure in expression position, so the recovery form has to land in the same part. Design
-written up in §9c of the shell design doc (v1.2); built in **Milestone 4 Part C**, where
-this entry moves to Resolved.
-
-
 **A profile's contents are fixed at server startup — `TODO(profile-generation-refresh)`.**
 `profile-server` reads its manifest once, at startup, from the initramfs, and never looks
 again. Installing a package therefore cannot become visible to a running session: the new
@@ -900,6 +876,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| `try`/`catch` in expression position (`try-in-expression-position`) | 2026-08-04 | Milestone 4 Part C. The fix was the one the entry predicted — `try` joins `primary` alongside `if` and `match` — and the trigger arrived from two directions at once: Milestone 4 *is* the considered pass over §9c the entry asked to wait for, and retiring the `?` propagation operator left no way to default on failure in expression position, so the recovery form had to land in the same part. It is strictly more than `?` offered: the catch branch sees the error, so the fallback can vary by `kind`, log first, or re-raise. **One node, two entry points** — `exec_try` returns `Flow`, so statement position keeps propagating `break`/`continue`/`return` out of a `try` body (a real regression risk, now a test) while expression position reduces it and refuses control flow. Writing it also turned up that §8c's `primary` production never listed `block`, `if` or `match` either, which is why `try`'s absence had looked deliberate. |
 | The shell's console loop has no automated cover (`nxsh-console-tests`) | 2026-08-03 | Resolved by testing the *whole* interactive path rather than extracting the loop. `cargo xtask test-interactive` boots the **release image** — which nothing else boots; `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a fixed script — and drives login, a wrong password, a shell prompt, a spawned program, a failing stage, cross-line interpreter state, and `exit` → log in again. Expect-driven, so the guest paces it. The rejected alternative was extracting the byte loop into the library half: the continuation *decision* is already host-tested, leaving only ~60 lines of stable byte handling, and a refactor of the critical interactive path is its own risk — while the two bugs it could never have caught (console-lookup rights, session wiring) are precisely the ones that hurt. Non-vacuity checked by reverting the login-echo fix: the run fails at `\npassword:`. |
 | The initramfs carries more than boot needs (`initramfs-minimisation`) | 2026-08-03 | The boot image now carries only what is required to reach a mounted root: `init` (the kernel boot-loads it), `fs-server-ext4` (it *is* the mount, and is the only possible restart image for root), `eshell` (the recovery path *for a failed mount*, so it must not live on the filesystem it recovers), and `profile-server` — the one the original rule missed, because `/bin` does not exist until it runs. Everything else moved into a `system` store package and is spawned through `/bin` like any other program: service-mgr, session-mgr, auth-service, logging-service, heartbeat. 1,506,596 → 206,360 bytes, an 86% cut in memory held for the machine's uptime. The recovery path was verified deliberately rather than assumed — a forced mount failure still reaches `eshell>`. |
 | Process teardown deferred wholesale (`exit-context-teardown`) | 2026-07-31 | `sys_process_exit` now closes the calling process's handle table in its own syscall context — Linux's `do_exit` → `exit_files` position: no locks held, free to allocate and drop. `exit_process` cannot, because it takes `SCHED` and never returns from `finish_exit`. Closing a handle is what other processes wait on (dropping an IPC endpoint's last reference nulls its peer and wakes whoever is blocked there), so this moves `PeerClosed` from "the reaper's next turn" to the moment of exit. The reaper still queues and closes the pid afterwards, finding an empty table: that path stays for processes killed externally, which never run the syscall. Measured rather than assumed — `exit_closed=` in `/proc/sched/stats`, 421 handles per self-test boot against 89 pids the reaper now finds already empty. |

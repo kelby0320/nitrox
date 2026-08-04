@@ -90,16 +90,21 @@ pub fn needs_continuation(src: &str) -> Continue {
 /// binding rather than a question.
 pub fn should_display(stmt: &Stmt) -> bool {
     // **The same predicate the language uses for a block's value.** `is_expression_shaped`
-    // counts `if` and `try` as value-producing (§9a), so a block ending in one evaluates to
-    // it — but this asked only for `Stmt::Expr`, and the REPL threw the rest away. Typing
+    // counts `if` as value-producing (§9a), so a block ending in one evaluates to it — but
+    // this asked only for `Stmt::Expr`, and the REPL threw the rest away. Typing
     // `if n > 3 { "big" } else { "small" }` at a prompt computed "big" and printed nothing.
+    //
+    // `try` is no longer named in either place: it became an *expression* in v1.2, so it
+    // arrives here as `Stmt::Expr` and is covered by the first arm. The two predicates
+    // still have to agree — that is the whole point of asking through
+    // `is_expression_shaped` rather than matching a second list.
     if !stmt.is_expression_shaped() {
         return false;
     }
     match stmt {
         Stmt::Expr(e) => !ends_in_terminal_operator(e),
-        // An `if`/`try` cannot itself *be* a terminal operator; its branches are blocks,
-        // and a branch ending in `save` yields null, which the caller already suppresses.
+        // An `if` cannot itself *be* a terminal operator; its branches are blocks, and a
+        // branch ending in `save` yields null, which the caller already suppresses.
         _ => true,
     }
 }

@@ -101,6 +101,8 @@ pub enum Tok {
     Continue,
     Def,
     Return,
+    /// `fail expr` — raising an error, the half `try`/`catch` was missing (§2).
+    Fail,
     Try,
     Catch,
     Strict,
@@ -811,6 +813,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "continue" => Tok::Continue,
         "def" => Tok::Def,
         "return" => Tok::Return,
+        "fail" => Tok::Fail,
         "try" => Tok::Try,
         "catch" => Tok::Catch,
         "strict" => Tok::Strict,
