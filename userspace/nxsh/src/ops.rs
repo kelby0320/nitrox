@@ -312,6 +312,213 @@ pub fn dedupe(v: &Val) -> OpResult<Val> {
     rebuild(v, seen)
 }
 
+// --- strings (§10b) -------------------------------------------------------
+//
+// These are *scalar* operators: they take a String and give something back, rather than
+// walking rows. v1.1 could **test** text with `~=` and never take it apart, and with `parse`
+// also missing, text that arrived as text stayed that way forever.
+
+/// `split SEP` — String → `List<String>`. The inverse of [`join`].
+pub fn split(v: &Val, sep: &str) -> OpResult<Val> {
+    let s = as_str(v, "split")?;
+    // An empty separator would give one element per character with no way to put them back,
+    // which is what `rows` already does properly (§10b) — so it is refused rather than
+    // quietly meaning something else.
+    if sep.is_empty() {
+        return Err(String::from(
+            "`split` needs a separator — to split into characters, the String is already a \
+             sequence of them",
+        ));
+    }
+    let parts: Vec<Value> =
+        s.split(sep).map(|p| Value::Str(String::from(p))).collect();
+    Ok(Val::Data(Value::List(Arc::from(parts))))
+}
+
+/// `join SEP` — a sequence → String.
+///
+/// Elements are rendered the way `++` renders them (§8a), so `[1, 2] | join ","` is
+/// `"1,2"`: one definition of "this value as text" rather than a second that disagrees.
+pub fn join(v: &Val, sep: &str) -> OpResult<Val> {
+    let mut out = String::new();
+    for (i, row) in rows(v)?.iter().enumerate() {
+        if i > 0 {
+            out.push_str(sep);
+        }
+        out.push_str(&row.render());
+    }
+    Ok(Val::str(out))
+}
+
+/// `trim` — leading and trailing whitespace.
+///
+/// This is what makes `parse`'s strictness workable (§6): the two exist as a pair, so text
+/// with stray spaces is trimmed deliberately rather than silently accepted.
+pub fn trim(v: &Val) -> OpResult<Val> {
+    Ok(Val::str(as_str(v, "trim")?.trim()))
+}
+
+/// `replace FROM TO` — **literal, not a pattern**. Pattern replacement is a different verb
+/// and waits on `capture`'s submatch work (§12).
+pub fn replace(v: &Val, from: &str, to: &str) -> OpResult<Val> {
+    if from.is_empty() {
+        return Err(String::from("`replace` needs something to replace"));
+    }
+    Ok(Val::str(as_str(v, "replace")?.replace(from, to)))
+}
+
+/// `upper` / `lower` — **ASCII only**, said where a user meets it rather than only in the
+/// design doc. Full case folding needs Unicode tables this system does not carry, and a
+/// `lower` that quietly mangles non-ASCII is worse than one that documents its range.
+pub fn upper(v: &Val) -> OpResult<Val> {
+    Ok(Val::str(as_str(v, "upper")?.to_ascii_uppercase()))
+}
+
+pub fn lower(v: &Val) -> OpResult<Val> {
+    Ok(Val::str(as_str(v, "lower")?.to_ascii_lowercase()))
+}
+
+fn as_str<'a>(v: &'a Val, op: &str) -> OpResult<&'a str> {
+    match v.as_data() {
+        Some(Value::Str(s)) => Ok(s.as_str()),
+        _ => Err(alloc::format!("`{op}` works on a String, got {}", v.type_name())),
+    }
+}
+
+// --- records (§10b) -------------------------------------------------------
+
+/// `keys` / `values` — in schema order, because the schema *is* the order.
+///
+/// A Record was constructible and readable by known field name only, so no script could
+/// walk one it did not itself write — which also blocked any generic handling of a schema
+/// that arrived at runtime.
+pub fn keys(v: &Val) -> OpResult<Val> {
+    let r = as_record(v, "keys")?;
+    let out: Vec<Value> =
+        r.schema.fields.iter().map(|f| Value::Str(f.name.clone())).collect();
+    Ok(Val::Data(Value::List(Arc::from(out))))
+}
+
+pub fn values(v: &Val) -> OpResult<Val> {
+    let r = as_record(v, "values")?;
+    Ok(Val::Data(Value::List(Arc::from(r.values.clone()))))
+}
+
+/// `merge OTHER` — the right operand wins a conflict, and the result schema is the union.
+pub fn merge(a: &Val, b: &Val) -> OpResult<Val> {
+    let left = as_record(a, "merge")?;
+    let right = as_record(b, "merge")?;
+    let mut schema = Schema::new();
+    let mut values: Vec<Value> = Vec::new();
+    for (i, f) in left.schema.fields.iter().enumerate() {
+        // A field the right operand also carries takes its value from there, and keeps the
+        // left's position — a merge should not reorder what it did not change.
+        let from_right = right
+            .schema
+            .fields
+            .iter()
+            .position(|g| g.name == f.name)
+            .and_then(|j| right.values.get(j));
+        let (tag, value) = match from_right {
+            Some(v) => (v.type_tag().unwrap_or(TypeTag::Null), v.clone()),
+            None => (f.ty, left.values.get(i).cloned().unwrap_or(Value::Null)),
+        };
+        schema = schema.field(&f.name, tag, TypeModifiers::NONE);
+        values.push(value);
+    }
+    for (j, g) in right.schema.fields.iter().enumerate() {
+        if left.schema.fields.iter().any(|f| f.name == g.name) {
+            continue;
+        }
+        let v = right.values.get(j).cloned().unwrap_or(Value::Null);
+        schema = schema.field(&g.name, v.type_tag().unwrap_or(TypeTag::Null), TypeModifiers::NONE);
+        values.push(v);
+    }
+    Ok(Val::Data(Value::Record(Arc::new(Record { schema, values }))))
+}
+
+fn as_record<'a>(v: &'a Val, op: &str) -> OpResult<&'a Record> {
+    match v.as_data() {
+        Some(Value::Record(r)) => Ok(r),
+        _ => Err(alloc::format!("`{op}` works on a Record, got {}", v.type_name())),
+    }
+}
+
+// --- numbers (§10b) -------------------------------------------------------
+
+/// `round` / `floor` / `ceil` / `trunc` — `Float` → `Int`, **named by which way they lose
+/// information** (§6). A cast that silently truncates is the fabricated value §8a refuses.
+///
+/// Hand-rolled because `f64::round` and friends live in `std`: this crate is `no_std`, so
+/// the arithmetic is done here rather than pulling in a libm.
+pub fn round(v: &Val) -> OpResult<Val> {
+    let x = as_f64(v, "round")?;
+    let t = trunc_f64(x, "round")?;
+    // Half **away from zero** — stated out loud because half-to-even is the other
+    // defensible answer, and silence would make it a coin flip settled by whoever wrote it.
+    let frac = x - (t as f64);
+    let away = if frac >= 0.5 {
+        1
+    } else if frac <= -0.5 {
+        -1
+    } else {
+        0
+    };
+    t.checked_add(away)
+        .map(Val::int)
+        .ok_or_else(|| String::from("`round` overflows an Int"))
+}
+
+pub fn floor(v: &Val) -> OpResult<Val> {
+    let x = as_f64(v, "floor")?;
+    let t = trunc_f64(x, "floor")?;
+    Ok(Val::int(if x < 0.0 && (t as f64) != x { t - 1 } else { t }))
+}
+
+pub fn ceil(v: &Val) -> OpResult<Val> {
+    let x = as_f64(v, "ceil")?;
+    let t = trunc_f64(x, "ceil")?;
+    Ok(Val::int(if x > 0.0 && (t as f64) != x { t + 1 } else { t }))
+}
+
+pub fn trunc(v: &Val) -> OpResult<Val> {
+    let x = as_f64(v, "trunc")?;
+    Ok(Val::int(trunc_f64(x, "trunc")?))
+}
+
+/// `abs` — the one that keeps its type, since it does not lose information.
+pub fn abs(v: &Val) -> OpResult<Val> {
+    match v.as_data() {
+        // `-i64::MIN` has no positive counterpart, so it is an error rather than itself
+        // (§8a: no wrapping, because a wrapped result is a fabricated number).
+        Some(Value::Int(i)) => i
+            .checked_abs()
+            .map(Val::int)
+            .ok_or_else(|| String::from("`abs` overflows an Int")),
+        Some(Value::Float(f)) => Ok(Val::float(if *f < 0.0 { -f } else { *f })),
+        _ => Err(alloc::format!("`abs` needs a number, got {}", v.type_name())),
+    }
+}
+
+fn as_f64(v: &Val, op: &str) -> OpResult<f64> {
+    match v.as_data() {
+        Some(Value::Float(f)) => Ok(*f),
+        Some(Value::Int(i)) => Ok(*i as f64),
+        _ => Err(alloc::format!("`{op}` needs a number, got {}", v.type_name())),
+    }
+}
+
+/// Toward zero, refusing anything an `Int` cannot hold.
+fn trunc_f64(x: f64, op: &str) -> OpResult<i64> {
+    if !(x.is_finite() && x > -9.3e18 && x < 9.3e18) {
+        return Err(alloc::format!(
+            "`{op}` cannot turn {} into an Int",
+            crate::value::render_f64(x)
+        ));
+    }
+    Ok(x as i64)
+}
+
 /// `select FIELD...` — projection. Missing fields are an error rather than silently
 /// absent columns: asking for a field that is not there is a mistake worth hearing about,
 /// and §6's subset-match rule is about *accepting extra* fields, not inventing missing

@@ -52,6 +52,10 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 const OPERATORS: &[&str] = &[
     "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last",
     "skip", "dedupe", "take", "count", "sum", "min", "max", "avg", "reduce",
+    // §10b's Part E families: strings, records, numbers.
+    "split", "join", "trim", "replace", "upper", "lower",
+    "keys", "values", "merge",
+    "round", "floor", "ceil", "trunc", "abs",
 ];
 
 /// Shell-state builtins (§3): they mutate the shell's own process state, which an
@@ -62,6 +66,13 @@ const BUILTINS: &[&str] = &["cd", "exit"];
 /// implicit `{ |it| … }` closure (§8b).
 const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map", "reduce"];
 
+/// Operators whose argument may open with `{`.
+///
+/// A predicate operator takes a **closure**; `merge` takes a **record**. `brace_expr` tells
+/// the two apart by looking for the `|` (§8c), so the only thing needed here is permission
+/// to read a `{` as an argument at all rather than as an enclosing block.
+const BRACE_ARG_OPERATORS: &[&str] = &["filter", "each", "map", "reduce", "merge"];
+
 /// Operators that take **no** arguments at all.
 ///
 /// `sum`/`min`/`max`/`avg` are deliberately *not* here: they take an optional column name,
@@ -70,7 +81,10 @@ const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map", "reduce"];
 /// Knowing this at parse time is what lets `(count > 0)` read as a comparison rather than
 /// as `count` applied to `> 0`. Without it a paren could not open a pipeline whose first
 /// stage is a command — `(list /system | …)` — because the fix for one broke the other.
-const NULLARY_OPERATORS: &[&str] = &["count", "dedupe"];
+const NULLARY_OPERATORS: &[&str] = &[
+    "count", "dedupe", "trim", "upper", "lower", "keys", "values", "round", "floor", "ceil",
+    "trunc", "abs",
+];
 
 /// Deepest nesting the parser will descend (D5). A recursive-descent parser recurses on
 /// user input on a fixed userspace stack, so a pathological expression must be an error
@@ -132,11 +146,12 @@ pub struct Parser<'a> {
     /// parse-time. The parser already knows the answer; making the user run the script to
     /// find out would be choosing the worse of two available errors.
     loop_depth: u32,
+    probe: u64,
 }
 
 impl<'a> Parser<'a> {
     pub fn new(src: &'a str) -> Parser<'a> {
-        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0, loop_depth: 0 }
+        Parser { lx: Lexer::new(src), depth: 0, head_ok: true, in_op_args: 0, loop_depth: 0, probe: 0 }
     }
 
     /// Parse a loop body: `break`/`continue` are legal inside it.
@@ -159,6 +174,8 @@ impl<'a> Parser<'a> {
     // --- plumbing -----------------------------------------------------------
 
     fn peek(&mut self) -> Result<Tok> {
+        self.probe += 1;
+        assert!(self.probe < 200_000, "parser spin");
         Ok(self.lx.peek(Mode::Expr)?.tok)
     }
 
@@ -597,10 +614,17 @@ impl<'a> Parser<'a> {
                 Tok::Le => BinOp::Le,
                 Tok::Gt => BinOp::Gt,
                 Tok::Ge => BinOp::Ge,
+                // `for x in xs` consumes its own `in` inside the `for` rule, before any
+                // expression is parsed — so the two never compete for the token (§8c).
+                Tok::In => BinOp::In,
                 _ => return Ok(lhs),
             };
             self.bump()?;
-            let rhs = self.add_expr()?;
+            // **`in` takes its right operand a tier lower than the others.** §8a puts
+            // ranges *below* comparison, so `5 in 0..10` would otherwise parse as
+            // `(5 in 0) .. 10` — the one spelling membership over a range obviously wants.
+            // Nothing else is affected: a range is not a meaningful operand of `<`.
+            let rhs = if op == BinOp::In { self.range_expr()? } else { self.add_expr()? };
             lhs = Expr::Binary(op, Box::new(lhs), Box::new(rhs));
         }
     }
@@ -1047,7 +1071,12 @@ impl<'a> Parser<'a> {
             // current directory, and `list [x]` is a path, not an index.
             Tok::Plus | Tok::PlusPlus | Tok::Star | Tok::Percent | Tok::Lt
             | Tok::Le | Tok::Gt | Tok::Ge | Tok::EqEq | Tok::Ne | Tok::Match_ | Tok::Eq
-            | Tok::QuestionQuestion | Tok::DotDot | Tok::DotDotEq => false,
+            | Tok::QuestionQuestion | Tok::DotDot | Tok::DotDotEq
+            // `in` joined this list when it became an infix comparison (§8a). Before that
+            // it could not follow a command head at all — `for x in xs` consumes its own
+            // — so `x in [1, 2]` read as the *program* `x` with word-mode arguments, and
+            // word mode on `[` was the lexer hang above.
+            | Tok::In => false,
             // `/` is division — except where division is impossible. `/system` already
             // lexes as one path word, so a *lone* `Slash` here means the next thing is
             // whitespace or a closer, and `list /` and `list / | count` have no right
@@ -1193,7 +1222,7 @@ impl<'a> Parser<'a> {
                 // or `if`. `for line in open ./log.txt { … }` is the case that needs
                 // this: without it the block is read as a record literal argument to
                 // `open`. Same disambiguation §8c uses for `{`, applied one level up.
-                Tok::LBrace if !PREDICATE_OPERATORS.contains(&name) => break,
+                Tok::LBrace if !BRACE_ARG_OPERATORS.contains(&name) => break,
                 // A flag in expression-mode argument position. Re-lex in word mode: it is
                 // `--reverse`, not minus-minus-reverse.
                 Tok::Minus => {
@@ -1994,5 +2023,20 @@ for line in open ./log.txt {
         script("for x in 0..3 { break }");
         let e = parse_script("for x in 0..3 { }\nbreak").expect_err("after the loop");
         assert!(e.message.contains("`for` or `while`"), "{}", e.message);
+    }
+
+    /// `in` is an infix comparison (§8a), so a bare name in front of it is an **operand**,
+    /// not a command head with arguments.
+    ///
+    /// It is the first operator that can follow a head at all — `for x in xs` consumes its
+    /// own `in` before any expression is parsed — and reading it as a command sent `[1, 2]`
+    /// into word mode, where the lexer hung. Both halves are fixed; this pins the parse.
+    #[test]
+    fn a_name_before_in_is_an_operand_not_a_command() {
+        let e = one_expr("x in [1, 2]");
+        assert!(matches!(e, Expr::Binary(BinOp::In, _, _)), "got {e:?}");
+        // …and the `for` form is untouched, which is the pair that matters.
+        let s = script("for x in [1, 2] {\n x\n}");
+        assert!(matches!(s.stmts[0], Stmt::For { .. }));
     }
 }

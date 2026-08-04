@@ -44,10 +44,17 @@ bin builds for `x86_64-unknown-nitrox`. No nightly features.
 
 ## Things that bit, and should not bite twice
 
-- **`is_ident_start` and `is_ident_char` are different sets.** `$` starts an identifier
-  (`$env`, `$last`) and does not continue one. `scan_ident` must begin *past* the first
-  byte, or a start-only character consumes nothing and the scanner spins — an infinite
-  loop, not a wrong token.
+- **Every scanner path must advance `pos` or return an error. A token that consumes
+  nothing is an infinite loop, not a wrong token.** This has now bitten twice, in two
+  modes. `is_ident_start` and `is_ident_char` are different sets — `$` starts an identifier
+  (`$env`, `$last`) and does not continue one — so `scan_ident` must begin *past* the first
+  byte. And in word mode, `]`/`)`/`}` are structural but their **openers** are not, so
+  `scan_bareword` at `[` scanned zero characters and left `pos` alone; the argument loop
+  then bumped the same empty `Word` forever, and `list [x]` locked the shell up. An empty
+  bareword is now an error, which makes the hang impossible for *any* character rather than
+  for the ones somebody thought of. The symptom is always a hung test run rather than a
+  failure, which is what makes it expensive — the second one was found only because a new
+  operator (`in`) could reach word mode for the first time.
 - **A bareword argument means different things per operator.** `sort size` names a column;
   `display files` names a binding. Arguments are kept unevaluated and each operator
   decides, because only the operator knows.

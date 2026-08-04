@@ -731,9 +731,26 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.send("format(\"sum={}\", (1..=10 | sum))")?;
     s.expect("sum=55")?;
     s.expect("/home>")?;
+    // …and Part E's breadth: text taken apart and put back, and membership.
+    s.send("\"a,b,c\" | split \",\" | join \"-\"")?;
+    s.expect("a-b-c")?;
+    s.expect("/home>")?;
+    s.send("format(\"hit={}\", (2 in [1, 2]))")?;
+    s.expect("hit=true")?;
+    s.expect("/home>")?;
     steps += 1;
 
-    // 16. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
+    // 16. **`list [x]` returns a prompt instead of locking the shell.** The word-mode
+    //     scanner produced an empty token at `[` without advancing, so the argument loop
+    //     bumped it forever — a user-reachable hang on a path that predates every part of
+    //     Milestone 4, and one with no escape until Ctrl-C exists (§11h). It is asserted
+    //     in guest because "the shell is still there" is the whole claim.
+    s.send("list [x]")?;
+    s.expect("cannot begin a bareword")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 17. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
     //     observable rather than merely "the shell left". Before Part C the driver matched
     //     the literal line `exit`, so `exit 3` missed it entirely and came back as
     //     "`exit` is handled by the shell's driver".
@@ -746,7 +763,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 17. A bare `exit` still returns to the login prompt, and logging in again works. A
+    // 18. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;

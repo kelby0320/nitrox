@@ -1531,6 +1531,51 @@ impl Interp {
 
         match name {
             "count" => wrap(ops::count(&need(operand)?)),
+            // §10b Part E. Argument-free scalar operators: the operand is the whole input.
+            "trim" | "upper" | "lower" | "keys" | "values" | "round" | "floor" | "ceil"
+            | "trunc" | "abs" => {
+                let v = need(operand)?;
+                wrap(match name {
+                    "trim" => ops::trim(&v),
+                    "upper" => ops::upper(&v),
+                    "lower" => ops::lower(&v),
+                    "keys" => ops::keys(&v),
+                    "values" => ops::values(&v),
+                    "round" => ops::round(&v),
+                    "floor" => ops::floor(&v),
+                    "ceil" => ops::ceil(&v),
+                    "trunc" => ops::trunc(&v),
+                    _ => ops::abs(&v),
+                })
+            }
+            "split" | "join" => {
+                let v = need(operand)?;
+                let Some(sep) = field_names.first() else {
+                    return Err(EvalError::new(alloc::format!("`{name}` needs a separator")));
+                };
+                wrap(if name == "split" {
+                    ops::split(&v, sep)
+                } else {
+                    ops::join(&v, sep)
+                })
+            }
+            "replace" => {
+                let v = need(operand)?;
+                let (Some(from), Some(to)) = (field_names.first(), field_names.get(1)) else {
+                    return Err(EvalError::new(
+                        "`replace` needs what to replace and what to replace it with",
+                    ));
+                };
+                wrap(ops::replace(&v, from, to))
+            }
+            "merge" => {
+                let v = need(operand)?;
+                let Some(e) = raw.first() else {
+                    return Err(EvalError::new("`merge` needs a record to merge in"));
+                };
+                let other = self.eval(e)?;
+                wrap(ops::merge(&v, &other))
+            }
             // §10b's reductions. A bareword is a *column* — the `sort size` reading — and
             // with none, the rows are the values.
             "sum" | "min" | "max" | "avg" => {
@@ -2416,6 +2461,52 @@ fn binary_values(op: BinOp, l: Val, r: Val) -> Result<Val> {
             s.push_str(&r.render());
             return Ok(Val::str(s));
         }
+        // §8a/§10b. Membership is an infix comparison because that is where the question
+        // is actually asked — inside an `if` — and a pipeline `contains` would be a second
+        // spelling of one idea.
+        In => {
+            return match r.as_data() {
+                // Substring, for the case that reads exactly like it: `"x" in name`.
+                Some(Value::Str(text)) => {
+                    let Some(Value::Str(needle)) = l.as_data() else {
+                        return Err(EvalError::new(alloc::format!(
+                            "`in` over a String needs a String on the left, got {}",
+                            l.type_name()
+                        )));
+                    };
+                    Ok(Val::bool(text.contains(needle.as_str())))
+                }
+                // A Record's membership is over its *field names*: `"size" in row`. Its
+                // values are reachable with `values` when that is the question (§10b).
+                Some(Value::Record(rec)) => {
+                    let Some(Value::Str(name)) = l.as_data() else {
+                        return Err(EvalError::new(alloc::format!(
+                            "`in` over a Record tests a field name, so it needs a String \
+                             on the left, got {}",
+                            l.type_name()
+                        )));
+                    };
+                    Ok(Val::bool(rec.schema.fields.iter().any(|f| &f.name == name)))
+                }
+                _ => match &r {
+                    // A Range answers without materialising: this is the one membership
+                    // test that would otherwise build ten million values to look at one.
+                    Val::Range { start, end, inclusive } => {
+                        let Some(Value::Int(n)) = l.as_data() else {
+                            return Err(EvalError::new(alloc::format!(
+                                "`in` over a Range needs an Int on the left, got {}",
+                                l.type_name()
+                            )));
+                        };
+                        Ok(Val::bool(*n >= *start && (*n < *end || (*inclusive && *n == *end))))
+                    }
+                    other => {
+                        let items = ops::rows(other).map_err(EvalError::new)?;
+                        Ok(Val::bool(items.iter().any(|i| values_equal(i, &l))))
+                    }
+                },
+            };
+        }
         // §10b: the gap `grep` left was a missing *operator*, not a missing program.
         Match => {
             let (Some(Value::Str(text)), Some(Value::Str(pattern))) = (l.as_data(), r.as_data())
@@ -2576,6 +2667,7 @@ fn op_name(op: BinOp) -> &'static str {
         BinOp::Eq => "`==`",
         BinOp::Ne => "`!=`",
         BinOp::Match => "`~=`",
+        BinOp::In => "`in`",
         BinOp::And => "`&&`",
         BinOp::Or => "`||`",
         BinOp::Coalesce => "`??`",
@@ -4075,5 +4167,113 @@ x"), "5");
         assert_eq!(rendered("[1, 2] | count | format(\"{} rows\")"), "2 rows");
         // The explicit form is unchanged.
         assert_eq!(rendered("format(\"{} {}\", 1, 2)"), "1 2");
+    }
+
+    // --- strings, records, numbers, `in` (§10b, Part E) ---------------------
+
+    /// v1.1 could *test* text with `~=` and never take it apart. `split`/`join` are the
+    /// inverse pair; `trim` is what makes `parse`'s strictness workable (§6).
+    #[test]
+    fn strings_can_be_taken_apart_and_put_back() {
+        assert_eq!(rendered("\"a,b,c\" | split \",\" | count"), "3");
+        assert_eq!(rendered("\"a,b,c\" | split \",\" | join \"-\""), "a-b-c");
+        assert_eq!(rendered("\"  x  \" | trim"), "x");
+        assert_eq!(rendered("\"a-b\" | replace \"-\" \"+\""), "a+b");
+        assert_eq!(rendered("\"Ab\" | upper"), "AB");
+        assert_eq!(rendered("\"Ab\" | lower"), "ab");
+        // The pair that closes Part B's loop: trim, then parse.
+        assert_eq!(rendered("\" 42 \" | trim | parse Int"), "42");
+    }
+
+    /// `join` renders its elements the way `++` does, so one definition of "this value as
+    /// text" serves both rather than two that disagree.
+    #[test]
+    fn join_renders_the_way_concatenation_does() {
+        assert_eq!(rendered("[1, 2] | join \",\""), "1,2");
+        assert_eq!(rendered("[1, 2] | join \",\""), rendered("1 ++ \",\" ++ 2"));
+    }
+
+    /// An empty separator is refused rather than quietly meaning "characters" — the String
+    /// is already a sequence of those (§10b).
+    #[test]
+    fn split_refuses_an_empty_separator() {
+        assert!(err("\"ab\" | split \"\"").contains("already a sequence"));
+        assert!(err("42 | trim").contains("works on a String"));
+    }
+
+    /// A Record was readable by known field name only, so nothing could walk one it did
+    /// not itself write.
+    #[test]
+    fn records_can_be_walked_and_merged() {
+        assert_eq!(rendered("{ a: 1, b: 2 } | keys"), "[\"a\", \"b\"]");
+        assert_eq!(rendered("{ a: 1, b: 2 } | values"), "[1, 2]");
+        // The right operand wins a conflict; the result schema is the union, and a merge
+        // does not reorder what it did not change.
+        assert_eq!(
+            rendered("{ a: 1, b: 2 } | merge { b: 9, c: 3 }"),
+            "{ a: 1, b: 9, c: 3 }"
+        );
+        // …and `keys` is what makes a record walkable at all, since `for` deliberately
+        // does not iterate one (§10b).
+        assert_eq!(rendered("{ a: 1, b: 2 } | keys | join \"+\""), "a+b");
+    }
+
+    /// Float → Int, named by **which way** it loses information (§6). A cast that silently
+    /// truncated would be the one fabricated value left standing.
+    #[test]
+    fn rounding_says_which_direction_it_loses() {
+        assert_eq!(rendered("2.4 | round"), "2");
+        assert_eq!(rendered("2.5 | round"), "3");
+        // Half **away from zero**, which is the half of this rule that needed saying.
+        assert_eq!(rendered("-2.5 | round"), "-3");
+        assert_eq!(rendered("2.9 | floor"), "2");
+        assert_eq!(rendered("-2.1 | floor"), "-3");
+        assert_eq!(rendered("2.1 | ceil"), "3");
+        assert_eq!(rendered("-2.9 | ceil"), "-2");
+        assert_eq!(rendered("-2.9 | trunc"), "-2");
+        assert_eq!(rendered("2.9 | trunc"), "2");
+    }
+
+    /// `abs` keeps its type, since it loses nothing — and refuses the one Int that has no
+    /// positive counterpart rather than wrapping to itself (§8a).
+    #[test]
+    fn abs_keeps_its_type_and_refuses_to_wrap() {
+        assert_eq!(rendered("-3 | abs"), "3");
+        assert_eq!(rendered("-2.5 | abs"), "2.5");
+        assert!(err("-9223372036854775808 | abs").contains("overflows"));
+        // A Float too large for an Int is refused rather than saturating.
+        assert!(err("1e30 | round").contains("cannot turn"));
+    }
+
+    /// **Membership is an infix comparison** (§8a), because that is where the question is
+    /// asked. The trap it has to survive is the other `in`.
+    #[test]
+    fn in_tests_membership_and_does_not_collide_with_for() {
+        assert_eq!(rendered("1 in [1, 2]"), "true");
+        assert_eq!(rendered("3 in [1, 2]"), "false");
+        assert_eq!(rendered("\"ell\" in \"hello\""), "true");
+        assert_eq!(rendered("\"a\" in { a: 1 }"), "true");
+        assert_eq!(rendered("\"z\" in { a: 1 }"), "false");
+        // A Range answers without materialising ten million values to look at one.
+        assert_eq!(rendered("5 in 0..10"), "true");
+        assert_eq!(rendered("10 in 0..10"), "false");
+        assert_eq!(rendered("10 in 0..=10"), "true");
+
+        // **The pair that matters**: both `in`s in one script. `for` consumes its own
+        // before any expression is parsed, which is true until someone reorders the parser.
+        assert_eq!(
+            rendered("mut hits = 0\nfor x in [1, 2, 3] {\n if x in [2, 3] { hits = hits + 1 }\n}\nhits"),
+            "2"
+        );
+    }
+
+    /// It composes with the reductions, which is the point of having both: a question about
+    /// a stream reads as one line rather than a loop.
+    #[test]
+    fn membership_composes_with_the_rest() {
+        assert_eq!(
+            rendered("[{ n: \"a\" }, { n: \"b\" }] | filter { |r| r.n in [\"b\"] } | count"),
+            "1"
+        );
     }
 }

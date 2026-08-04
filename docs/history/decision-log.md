@@ -10411,3 +10411,57 @@ rather than in a looser assertion. The pattern is not rare — ~33 `kprint_u64`/
 call sites across userspace build lines the same way, `service-mgr` included — so the general
 version is filed as `TODO(atomic-log-lines)` with the helper it wants (format into a stack
 buffer, one syscall) rather than swept now.
+
+## 2026-08-04 — Milestone 4 Part E: the breadth was mechanical, the hang it found was not
+
+`split`/`join`/`trim`/`replace`/`upper`/`lower`, `keys`/`values`/`merge`,
+`round`/`floor`/`ceil`/`trunc`/`abs`, and `in`. The operators are what the plan said they
+would be. The interesting part is what adding one infix operator exposed.
+
+**`in` is the first operator that can follow a command head.** `for x in xs` consumes its own
+`in` inside the `for` rule, before any expression is parsed — so until `in` became an infix
+comparison, the token could never appear after a bare name. `starts_an_argument` (D9's
+decision procedure) lists every infix operator that *continues an expression* and had no arm
+for it, so it fell to the `_ => true` catch-all: `x in [1, 2]` was read as the **program** `x`
+with word-mode arguments.
+
+**And word mode on `[` hung the lexer.** `]`, `)` and `}` are structural there so an argument
+list can end; their openers are not. `scan_bareword` at `[` therefore matched zero characters
+and left `pos` where it was, returning `Word("")` — and the argument loop bumped that empty
+token forever. Not a wrong parse: a spin.
+
+**This is a user-reachable hang that predates all of Milestone 4.** `list [x]` locks the shell
+up on `main` — and with no `Ctrl-C` until Part G, that is a reboot. It was found only because
+a new operator could reach word mode for the first time; nothing in the feature I was building
+was broken.
+
+Both halves are fixed, and the second is the one that matters:
+
+- `Tok::In` joins the operators that continue an expression, so `x in [1, 2]` parses as the
+  comparison it reads as.
+- **An empty bareword is a lexical error.** Every path out of `scan_word_mode` now advances
+  `pos` or returns an error, which makes the hang impossible for any character rather than for
+  the ones somebody thought of. The proof it is worth having: with the lexer fixed, reverting
+  the parser fix produces two test *failures* instead of a hung suite.
+
+This is the second time the same rule has been broken in this lexer, in two different modes —
+`scan_ident` documents the first (`$` starts an identifier and does not continue one, so
+scanning from `start` consumed nothing). `nxsh/CLAUDE.md` now carries it as a general rule
+rather than a note about `$`, because the symptom is always a hung run rather than a failure,
+which is what makes it expensive.
+
+Two smaller findings: `merge` needed the `{`-argument permission predicate operators have (a
+closure and a record both open with `{`, and `brace_expr` already tells them apart), and `in`
+takes its right operand a tier lower than the other comparisons — §8a puts ranges *below*
+comparison, so `5 in 0..10` would otherwise parse as `(5 in 0) .. 10`, which is the one
+spelling membership over a range obviously wants.
+
+The operators themselves: `join` renders elements the way `++` does, so "this value as text"
+has one definition; `split` refuses an empty separator because the String is already a
+sequence of characters (§10b); `round` is half **away from zero**, stated because half-to-even
+is the other defensible answer; the Float→Int family is hand-rolled since `f64::round` lives
+in `std` and this crate is `no_std`; and `abs` refuses `i64::MIN` rather than wrapping to
+itself.
+
+236 crate tests (1088 workspace), `test-qemu` green, `test-interactive` green at 18 steps —
+including `list [x]`, asserted in guest because "the shell is still there" is the whole claim.
