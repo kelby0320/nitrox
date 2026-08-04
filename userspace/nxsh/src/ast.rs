@@ -122,6 +122,9 @@ pub enum Expr {
     Match { scrutinee: Box<Expr>, arms: Vec<MatchArm> },
     /// `expect T` — ascription in expression position (§6).
     Expect(Box<Expr>, TypeExpr),
+    /// `parse T` — conversion, `expect`'s converting sibling (§6). Same grammar, same
+    /// fail-loud contract; `expect` asserts a value *is* a `T`, `parse` reads one as a `T`.
+    Parse(Box<Expr>, TypeExpr),
     /// `assert (predicate)` — a content check, deliberately not folded into `expect` (§6).
     Assert(Box<Expr>),
 }

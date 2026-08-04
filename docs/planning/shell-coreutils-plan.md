@@ -1082,7 +1082,7 @@ Two things hold for every part and are not repeated in each:
 Parts, in order (tick as they land):
 
 - [x] **Part A — `break` / `continue`** ✅ (2026-08-04)
-- [ ] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages**
+- [x] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages** ✅ (2026-08-04)
 - [ ] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`**
 - [ ] **Part D — sequences generalise, and reduction**
 - [ ] **Part E — strings, records, numbers, `in`**
@@ -1127,7 +1127,9 @@ Three things it turned up that the plan did not predict:
   `filter { |it| … }` is a parse error; `break` at top level is a parse error; and a `def`
   containing a loop containing a `break` still returns normally.
 
-#### Part B — `parse T`, and the keyword stages
+#### Part B — `parse T`, and the keyword stages ✅ (2026-08-04)
+
+**Landed, and the parser change turned out not to be the one the plan predicted.**
 
 One parser change carries both halves: `pipeline_stage` admits `stage_keyword` (§8c), which is what
 makes `expect`, `assert` **and** `parse` legal mid-pipeline. `expect`/`assert` were specified that
@@ -1143,6 +1145,29 @@ way in v1 and never worked; `parse` is new and would have had the same problem o
 - Tests: **§6's own examples, verbatim** — they are the thing that did not run, so they are the
   regression. Plus round-trips (`42 | format("{}") | parse Int`), and each refusal:
   `" 42 "`, `"abc"`, `"1.5" | parse Int`, `parse Bool` on `"yes"`.
+
+**What was actually wrong, and it was not the pipeline rule.** The parser had accepted `expect`
+in stage position since Milestone 3 — it even builds `Expr::Expect(Underscore, T)` there, which is
+the shape a stage needs. **The evaluator** was refusing it: any non-`Call` stage past the head got
+"a value cannot be a pipeline stage". So the fix landed in `pipeline()`, not in the grammar, and
+the `stage_keyword` production added to §8c documents what the parser already did.
+
+The mechanism is `_`: the operand is bound to it for the length of the stage, so
+`Expr::Underscore` picks it up with no separate operand channel. Two consequences worth keeping:
+
+- **`assert` had to stop clearing `head_ok`.** §6 writes `ls | assert (count > 0)`, and with a
+  command head refused inside the predicate, `count` parsed as a plain identifier and died as "not
+  a binding, and running it as a program failed". D4 still puts a local binding first for a bare
+  argument-free name, so `assert (n > 0)` over a `let n` is unaffected — which is its own test.
+- **`assert` passes its value through** in stage position. §6 puts it in the same slot as `expect`;
+  returning `Null` (what the expression form correctly does) would end every chain containing one.
+
+**`parse` reuses the lexer rather than sharing a factored-out scanner.** It runs `tokenize_expr`
+over the text and accepts a lone `Int`/`Float` token, so "what a number looks like to `parse` is
+what it looks like to the lexer" is literally true — radix prefixes, `_` separators, exponents and
+the no-octal rule all arrive without a second implementation, and cannot drift. The sign is handled
+in `parse` because a literal is unsigned in the grammar, which also means `parse Int` cannot read
+`i64::MIN` — exactly as no literal can write it.
 
 #### Part C — errors: `fail`, kinds, `e.stages`, `?` retired, `exit N`
 
