@@ -47,17 +47,22 @@ names it:
 |---|---|---|
 | **P1** | A QEMU **monitor/QMP channel** in `xtask`: `screendump` for the smoke gate, `input-send-event` for injection. Nothing uses a monitor today. | M1 Part D |
 | **P2** | The kernel exposes **Limine's framebuffer as a mappable resource**, bound into a namespace. `DeviceNode` models char and block; this is a third shape. | M1 Part B |
-| **P3** | A **PS/2 keyboard driver** in the kernel, emitting key events with modifiers. No input driver of any kind exists. | M3 |
+| **P3** | A **PS/2 keyboard and mouse driver** in the kernel, emitting key events with modifiers and pointer events. No input driver of any kind exists. | M3 |
 
 ## Milestone 1 — pixels, and the gate
 
 **Deliverable: the compositor composites a known scene, and the host test and the guest agree
 on the hash.** No window, no client, no font, no terminal.
 
-- [ ] **Part A — the `Framebuffer` trait and host compositing tests.** Base, width, height,
-      pitch, format; a real implementation and an in-memory one. Compositing becomes a pure
-      function over (surfaces, geometry, damage, stacking), asserted pixel-exactly on the host.
-      No kernel change, no QEMU. **This part is the gate**, and it lands first for that reason.
+- [ ] **Part A — `libdraw`: the `Framebuffer` trait and host compositing tests.** Base, width,
+      height, pitch, format; a real implementation and an in-memory one; rect fills, blits,
+      clipping. Compositing becomes a pure function over (surfaces, geometry, damage, stacking),
+      asserted pixel-exactly on the host. No kernel change, no QEMU. **This part is the gate**,
+      and it lands first for that reason.
+
+      It is a *shared* crate from the start: the compositor composites surfaces and a client
+      draws into one, and both do the same rect and glyph work. Building it as compositor-only
+      would mean writing it twice.
 - [ ] **Part B — P2: the framebuffer reaches userspace.** Kernel resource + namespace binding;
       a minimal program maps it and fills it. Proves the binding and the geometry hand-off.
 - [ ] **Part C — the self-hash.** The compositor composites a reference scene from *synthetic*
@@ -80,33 +85,72 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 - [ ] **Part B — `/dev/draw` served.** `new`, numbered windows, `info`. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
-- [ ] **Part C — a test client**, and the gate extends: the scene is now built from a real
-      client's committed buffer rather than a synthetic one.
-- [ ] **Part D — release semantics**, settled by the first client that double-buffers. A client
+- [ ] **Part C — `libui`: the client side of the protocol.** Connect, create a window, allocate
+      and commit surfaces, receive input, run an event loop. The same role `librsproto` plays for
+      the RS protocol — **the protocol gets a library, and clients use it.** If the first app
+      hand-rolls this instead, the surface protocol immediately has two implementations and the
+      second one lives in an application.
+- [ ] **Part D — a test client** built on `libui`, and the gate extends: the scene is now built
+      from a real client's committed buffer rather than a synthetic one.
+- [ ] **Part E — release semantics**, settled by the first client that double-buffers. A client
       that redraws into a buffer still being read produces tearing that is invisible in testing
       and obvious in use.
 
 ## Milestone 3 — input
 
-**Deliverable: a keystroke injected by the harness reaches a client and is reported back.**
+**Deliverable: a keystroke and a click injected by the harness reach a client and are reported
+back.**
 
-- [ ] **Part A — P3: the PS/2 driver.** Key events with modifiers from a char device;
-      scancode→keycode table host-tested.
+- [ ] **Part A — P3: the PS/2 driver.** Key events with modifiers, and pointer events, from a
+      char device; scancode→keycode table host-tested.
 - [ ] **Part B — focus and routing** in the compositor.
 - [ ] **Part C — QMP injection** in `test-interactive`, plus a client that echoes what it
       received. Keycode→character (the keymap) is userspace and host-tested.
 
-Pointer events are **not** in this milestone — nothing can move a window yet. They arrive in M5
-with window management.
+**Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
+with window management in a later milestone; buttons and menus need clicks, and the toolkit
+(M4) comes before any application, so the mouse is needed here.
 
-## Milestone 4 — the GUI terminal (the MVP flagship)
+## Milestone 4 — the widget toolkit
+
+**Design pass first**: the toolkit gets its own document before this milestone starts, the way
+the substrate and the shell did. The forks it has to settle are retained-versus-immediate mode,
+the layout model, event routing and focus-within-a-window, how a widget's invalidation becomes a
+damage rectangle, and how much of it the terminal actually uses.
+
+**Deliverable: enough toolkit to build the terminal, and no more.**
+
+**Why it comes before the first application rather than being extracted from two.** Extraction
+is the right instinct when application #1 is cheap to write — but the terminal is the flagship,
+and it needs a text area, menus, and a scrollbar. If it invents those inline we have built the
+toolkit anyway: coupled to a terminal, and with a second copy due the moment the file browser
+lands. So it ships first, and **the terminal decides how much of it exists**. Minimal is a
+requirement, not a compromise.
+
+- [ ] **Part A — the widget tree, layout, and invalidation.** Where a widget marking itself
+      dirty becomes a damage rectangle on a surface commit.
+- [ ] **Part B — event routing**: hit testing, pointer capture during a drag, and
+      **widget-level keyboard focus**, which is a *second* focus concept — the compositor
+      decides which window has focus, the toolkit decides which widget within it does.
+      Conflating them is the classic source of text arriving in the wrong field.
+- [ ] **Part C — the first widget set**, bounded by what the terminal needs: a text area, a
+      button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch.
+
+**No ABI question today.** With everything statically linked, the toolkit is an ordinary Rust
+crate that applications link. The seam matters when dynamic linking lands — the phase plan
+schedules the two together, and notes that two applications each embedding the toolkit share no
+pages, which is exactly when it starts to pay.
+
+## Milestone 5 — the GUI terminal (the MVP flagship)
 
 **Deliverable: the shell running in a window, drivable by the harness over QMP.**
 
-- [ ] **Part A — glyph rendering** with the bitmap font. Host-tested; the text/ANSI render path
-      is pure logic.
-- [ ] **Part B — the terminal client**: owns a window, renders the tty server's output, sends
-      key events back in.
+- [ ] **Part A — glyph rendering** with the bitmap font, in `libdraw`. Host-tested; the
+      text/ANSI render path is pure logic.
+- [ ] **Part B — the terminal client**, built on the toolkit: window chrome, menus and scrollbar
+      from M4's widget set, with **the grid as a custom-drawn widget of its own**. A terminal's
+      selection, wrapping and scrollback semantics are not a text editor's, and bending a
+      generic text area to serve both would distort the whole text stack.
 - [ ] **Part C — the tty server's second backend.** `backend_write` finally has the compositor
       surface it was built for, and a session chooses serial or GUI. **Both must keep working**
       (governing decision 3).
@@ -114,17 +158,17 @@ with window management.
 This is where `test-interactive` gains a GUI path alongside its serial one, and where the
 harness's QMP input channel stops being a test-only affordance.
 
-## Milestone 5 — windows, ports, desktops
+## Milestone 6 — windows, ports, desktops
 
-Sketched; detail when M4 lands.
+Sketched; detail when M5 lands.
 
-Multiple windows, stacking, move/resize (and with it pointer input). Ports under windows, with
+Multiple windows, stacking, move/resize. Ports under windows, with
 `list` answering discovery. The **desktop shell** as a second process: `/dev/desktop`, desktop
 membership as a filtered view of the compositor's window set, moving windows between desktops.
 Wiring by `sys_ns_bind` into an application's namespace, and the default-handler fallback.
 Templates: instantiate, extract, `open ./code.nxg | desktop`, `save`.
 
-## Milestone 6 — the composed desktop
+## Milestone 7 — the composed desktop
 
 Sketched. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via `QueryCaps`,
 Tier 2 durable wiring); and the question the composition doc leaves open — what happens to a
@@ -140,7 +184,7 @@ Filed shell items waiting on this arm:
 | Shift-Enter continuation | Key events with modifiers (M3) |
 | The prompt's live `PipelineStatus` glyph | A redraw-capable surface (M4) |
 | Completion's *candidate list* UI | M4 (the engine itself is schema work, not display) |
-| **`form`** (composition §3) | Designed since v1, **never built** — it is shell work, and this arm is what makes it meaningful. It wants an owner. |
+| **`form`** (composition §3) | Designed since v1, **never built**. It lands *late*, after the toolkit and the first applications — and it is more useful there: if `form` can be built from the existing widget set **without adding new widgets**, that is evidence the toolkit's abstractions were right. As the first consumer it would have shaped the toolkit around generated, spec-driven UI, which is the narrower case. |
 
 ## Risks worth naming now
 

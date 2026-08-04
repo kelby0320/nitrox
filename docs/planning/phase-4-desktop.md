@@ -554,8 +554,8 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 (framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
 [`nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md) (windows,
 ports, desktops, templates), both settled 2026-08-04. **Build order:
-[`display-arm-plan.md`](display-arm-plan.md)** — six milestones, three prerequisites, starting
-with the test gate.
+[`display-arm-plan.md`](display-arm-plan.md)** — seven milestones, three prerequisites, starting
+with the test gate and putting the widget toolkit before the first application.
 
 - [x] **Per-interrupt-context lock-order tracking** ✅ (2026-07-29). Was scheduled here,
   ahead of the handlers it protects; pulled forward instead, because it turned out to be a
