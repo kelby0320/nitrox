@@ -478,31 +478,6 @@ the helper is worth deciding once rather than per site. **Trigger:** the next to
 costs debugging time, or any test that needs to assert on a multi-part log line — the
 interactive suite now asserts on the one line that was fixed.
 
-**`Ctrl-C` does not reach a running pipeline stage — `TODO(interrupt-reaches-a-stage)`.**
-Every piece is built and none of it is proven to connect. `sys_process_terminate` works and
-is tested; `sleep` waits on its notification channel and exits when asked; the shell keeps
-its stage handles and asks. What does **not** happen is the tty server emitting the
-interrupt event at all when `Ctrl-C` follows a line that starts a pipeline: instrumenting
-the branch shows it never fires for `sleep 60\n\x03`, while the identical shape fires for
-`while true { }\n\x03`. So the shell never wakes, never asks, and the sleep runs its full
-minute.
-
-What is known, so the next attempt starts from data rather than from scratch:
-
-- The event **is** emitted, and the whole path works, when the interrupt follows a line the
-  shell evaluates *in-process* — that is what §11h's shipped tests cover.
-- The shell blocks in **two** places during a pipeline, and both now watch the tty: the
-  capture read of the tail's output (`ChannelReceiver::receive`, which is where a long
-  pipeline actually waits) and `reap`. Neither wakes, which is consistent with the event
-  never being sent rather than with the shell missing it.
-- A raw read stops at `0x03` so the byte cannot be handed over as input, and that change is
-  verified by the prompt-level test.
-
-**Trigger: the next attempt at this**, which should start by confirming whether the byte
-reaches `pending` at all in the pipeline case — a probe on the console read completion,
-not on the interrupt branch. Until then, `Ctrl-C` interrupts the *shell* and not the
-*program it is running*, and `strict` asks stages to stop that will not hear it.
-
 **Control flow inside an expression — `TODO(control-flow-in-expression-position)`.**
 `eval` returns a *value*, so a block whose value is being taken has no channel for control
 flow to travel back through. Two consequences, one new and one pre-existing:
@@ -921,6 +896,7 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| `Ctrl-C` does not reach a running pipeline stage (`interrupt-reaches-a-stage`) | 2026-08-04 | **Two bugs, and my first diagnosis was wrong about both.** I had reported that the tty server never emitted the interrupt event for a line that starts a pipeline; re-probing showed it emits it every time. The event was reaching the shell's channel *before* the shell began waiting on it — and a channel signals its waiters at the moment a message is enqueued, so a waiter that arrives afterwards never sees that edge. The shell slept on a message already sitting in its queue. Both blocking points (the capture read of the tail, and `reap`) now **poll before blocking**. The second bug was `run_line`: the interrupt checkpoint lived only in `exec_block`, so a line typed at a prompt was checked inside its loops and never between its statements — the third time that same rule has been learned in this file, after `hoist_defs` and the stale `cd` guard. |
 | `try`/`catch` in expression position (`try-in-expression-position`) | 2026-08-04 | Milestone 4 Part C. The fix was the one the entry predicted — `try` joins `primary` alongside `if` and `match` — and the trigger arrived from two directions at once: Milestone 4 *is* the considered pass over §9c the entry asked to wait for, and retiring the `?` propagation operator left no way to default on failure in expression position, so the recovery form had to land in the same part. It is strictly more than `?` offered: the catch branch sees the error, so the fallback can vary by `kind`, log first, or re-raise. **One node, two entry points** — `exec_try` returns `Flow`, so statement position keeps propagating `break`/`continue`/`return` out of a `try` body (a real regression risk, now a test) while expression position reduces it and refuses control flow. Writing it also turned up that §8c's `primary` production never listed `block`, `if` or `match` either, which is why `try`'s absence had looked deliberate. |
 | The shell's console loop has no automated cover (`nxsh-console-tests`) | 2026-08-03 | Resolved by testing the *whole* interactive path rather than extracting the loop. `cargo xtask test-interactive` boots the **release image** — which nothing else boots; `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a fixed script — and drives login, a wrong password, a shell prompt, a spawned program, a failing stage, cross-line interpreter state, and `exit` → log in again. Expect-driven, so the guest paces it. The rejected alternative was extracting the byte loop into the library half: the continuation *decision* is already host-tested, leaving only ~60 lines of stable byte handling, and a refactor of the critical interactive path is its own risk — while the two bugs it could never have caught (console-lookup rights, session wiring) are precisely the ones that hurt. Non-vacuity checked by reverting the login-echo fix: the run fails at `\npassword:`. |
 | The initramfs carries more than boot needs (`initramfs-minimisation`) | 2026-08-03 | The boot image now carries only what is required to reach a mounted root: `init` (the kernel boot-loads it), `fs-server-ext4` (it *is* the mount, and is the only possible restart image for root), `eshell` (the recovery path *for a failed mount*, so it must not live on the filesystem it recovers), and `profile-server` — the one the original rule missed, because `/bin` does not exist until it runs. Everything else moved into a `system` store package and is spawned through `/bin` like any other program: service-mgr, session-mgr, auth-service, logging-service, heartbeat. 1,506,596 → 206,360 bytes, an 86% cut in memory held for the machine's uptime. The recovery path was verified deliberately rather than assumed — a forced mount failure still reaches `eshell>`. |

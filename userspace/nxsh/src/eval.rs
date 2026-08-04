@@ -316,6 +316,12 @@ impl Interp {
         self.hoist_defs(&script.stmts)?;
         let mut out = None;
         for stmt in &script.stmts {
+            // **Anything `exec_block` does to a list of statements, `run_line` owes them
+            // too** (`nxsh/CLAUDE.md`) — and this is the third time that rule has been
+            // learned here, after `hoist_defs` and the stale `cd` guard. The interrupt
+            // checkpoint lived only in `exec_block`, so a line typed at a prompt was
+            // checked *inside* its loops and never *between* its statements.
+            self.check_interrupt()?;
             let value = boundary_value(self.exec(stmt)?)?;
             self.bind_last(&value)?;
             if crate::repl::should_display(stmt) && !value.is_null() {
