@@ -21,6 +21,7 @@ extern crate alloc;
 
 pub mod ast;
 pub mod eval;
+pub mod history;
 pub mod host;
 pub mod lex;
 pub mod ops;
