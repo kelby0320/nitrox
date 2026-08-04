@@ -1088,7 +1088,7 @@ Parts, in order (tick as they land):
 - [x] **Part E — strings, records, numbers, `in`** ✅ (2026-08-04)
 - [x] **Part F — `capture`: regex submatches** ✅ (2026-08-04)
 - [x] **Part G1 — interrupt (`Ctrl-C`) in the shell** ✅ (2026-08-04)
-- [x] **Part G2 — `sys_process_terminate`** ✅ (2026-08-04) — built; **not proven to reach a stage**, see `TODO(interrupt-reaches-a-stage)`
+- [x] **Part G2 — `sys_process_terminate`** ✅ (2026-08-04) — and `Ctrl-C` now reaches a running stage
 
 **Expect each part to surface substrate gaps, and file them rather than paper over them** — the
 rule Milestone 2 earned. Part G already has one before it starts (below).
@@ -1327,12 +1327,13 @@ target handles, the kernel never touches the target's execution, so there is no 
 and no second teardown path. `sys_process_terminate` enqueues `TerminateRequested` on the target's
 own notification channel and wakes it — that is the whole syscall.
 
-**It is not proven end to end.** The syscall, the stage-side listener (`sleep`) and the shell's
-asking all work in isolation; what does not happen is the tty emitting the interrupt event when
-`Ctrl-C` follows a line that starts a pipeline. Filed as `TODO(interrupt-reaches-a-stage)` with the
-evidence, and the in-guest step for it was **removed rather than left passing on a technicality** —
-at `sleep 30` it passed whether or not the request worked, because the sleep finished inside the
-timeout.
+**Proven end to end (2026-08-04, follow-up).** It did not connect at first, and the first diagnosis
+was wrong: the tty server emits the event every time. The shell was **sleeping on a message already
+in its queue** — a channel signals its waiters at enqueue time, so a waiter that arrives afterwards
+never sees the edge, and the interrupt is enqueued before the pipeline starts because the tty reads
+`Ctrl-C` in the same console read as the line. Both blocking points poll before blocking now. The
+second half was `run_line`, which had no interrupt checkpoint at all — `exec_block` had the only
+one, so a line typed at a prompt was checked inside its loops and never between its statements.
 
 Three pieces, in this order, because the first is a prerequisite for the other two *and* fixes a
 standing divergence on its own (§1: `strict` claims to terminate the remaining stages and today

@@ -226,6 +226,19 @@ impl Host for NitroxHost {
             // and then reading is what makes `Ctrl-C` reach a *stage* at all.
             if self.tty != 0 {
                 loop {
+                    // **Poll before blocking.** A channel signals its waiters at the moment
+                    // a message is enqueued, so a waiter that arrives *afterwards* never
+                    // sees that edge — and the interrupt is enqueued before this wait
+                    // begins, because the tty sees `Ctrl-C` in the same console read as the
+                    // line that started the pipeline. Waiting first meant sleeping on a
+                    // message that was already sitting in the queue.
+                    if drain_tty_interrupt(self.tty) {
+                        for &c in &children {
+                            // SAFETY: a Process handle this shell owns, SIGNAL from spawn.
+                            unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+                        }
+                        continue;
+                    }
                     // SAFETY: valid waiter buffers; two handles.
                     let waited = unsafe {
                         WAIT_HANDLES[0] = rx;
@@ -480,6 +493,14 @@ fn reap(
         };
         if waited < 1 {
             continue;
+        }
+        // Poll before blocking, for the same reason as the capture wait above.
+        if tty != 0 && !asked && drain_tty_interrupt(tty) {
+            asked = true;
+            for &c in children {
+                // SAFETY: a Process handle this shell owns, with SIGNAL from spawn.
+                unsafe { syscall1(SYS_PROCESS_TERMINATE, c) };
+            }
         }
         // An interrupt from the terminal: ask every stage to stop, once. Each is a
         // *request* — a stage that listens exits, one that does not keeps running and is

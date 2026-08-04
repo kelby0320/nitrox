@@ -790,6 +790,26 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 19. **`Ctrl-C` stops a running *stage*** (§11h, G2).
+    //
+    //     The ordering is made deterministic rather than assumed, and that took two goes.
+    //     Sending `sleep 60\n\x03` in one write does **not** test this: the interrupt is
+    //     already queued when the line is read, so the shell's statement checkpoint fires
+    //     before the pipeline ever starts and nothing is ever spawned — it passes without
+    //     a stage being involved. Sending the interrupt separately is a race the test can
+    //     only lose silently.
+    //
+    //     So the guest supplies the anchor. Two lines go in one write; `started=1` is
+    //     printed by the first, which proves the second is *now running*, and only then is
+    //     the interrupt sent. Sixty seconds is far past the 45s expect timeout, so this can
+    //     only pass by `sleep` actually being cut short.
+    s.send_raw("format(\"started={}\", 1)\nsleep 60\n")?;
+    s.expect("started=1")?;
+    s.send_raw("\x03")?;
+    s.expect("interrupted")?;
+    s.expect("/home>")?;
+    steps += 1;
+
     // 19. **`list [x]` returns a prompt instead of locking the shell.** The word-mode
     //     scanner produced an empty token at `[` without advancing, so the argument loop
     //     bumped it forever — a user-reachable hang on a path that predates every part of

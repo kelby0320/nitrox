@@ -10561,3 +10561,43 @@ this milestone, and the first one I *knew* was vacuous when I wrote it.
 
 1105 host tests, `test-qemu` green, `test-interactive` green at 21 steps, all five gates
 including `abi-sync-check` for the new syscall.
+
+## 2026-08-04 — The interrupt reaches a stage: a queued message, and a checkpoint `run_line` never had
+
+`TODO(interrupt-reaches-a-stage)` is closed, and **my first diagnosis of it was wrong in the
+way that matters**: I reported that the tty server never emitted the interrupt event when
+`Ctrl-C` follows a line that starts a pipeline, and that the `while true { }` case fired the
+same branch. Re-probing from one level upstream — the console read completion rather than the
+branch — showed the byte arriving with the line in a single 10-byte read, and the branch
+firing every time. The event was always sent. I had trusted a probe that did not run rather
+than checking that it had.
+
+**The real bug was readiness, not delivery.** A channel signals its waiters at the moment a
+message is enqueued. The tty sees `Ctrl-C` in the *same console read* as the line that starts
+the pipeline, so the event is queued on the shell's channel **before** the shell begins
+waiting on it — and a waiter that arrives after the edge never sees it. The shell slept on a
+message already sitting in its own queue. Both places the shell blocks during a pipeline (the
+capture read of the tail's output, which is where a long pipeline actually waits, and `reap`)
+now **poll before blocking**, which is the standard shape for edge-triggered readiness and
+should be the shape anywhere else this pattern appears.
+
+**The second bug was `run_line` again.** The interrupt checkpoint lived only in `exec_block`,
+so a line typed at a prompt was checked *inside* its loops and never *between* its statements.
+`nxsh/CLAUDE.md` already says "anything `exec_block` does to a list of statements, `run_line`
+owes them too" — this is the third time that rule has been learned the hard way, after
+`hoist_defs` and the stale `cd` guard. The note is now three examples long; the rule has not
+changed.
+
+**The test took two goes to be worth anything, and the first version was a trap I had already
+described.** Sending `sleep 60\n\x03` in one write does not test the stage path at all: the
+interrupt is already queued when the line is read, so the *statement* checkpoint fires before
+anything is spawned and the step passes with no stage involved. Sending the interrupt
+separately is a race the test can only lose silently. The version that means something makes
+the guest supply the anchor — two lines in one write, where the first prints `started=1` and
+therefore proves the second is running, and only then is the interrupt sent. Sixty seconds is
+far past the harness's 45-second timeout, so it can only pass by the sleep being cut short.
+
+Two negative controls, both failing as they should: `sleep` ignoring the request times out, and
+the shell not asking times out.
+
+1105 host tests, `test-qemu` green, `test-interactive` green at 22 steps, all five gates.
