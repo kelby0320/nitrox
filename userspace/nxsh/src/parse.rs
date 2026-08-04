@@ -51,7 +51,7 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 /// user-defined generic `def` is called with parens and is syntactically distinct.
 const OPERATORS: &[&str] = &[
     "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last",
-    "skip", "dedupe", "take", "count",
+    "skip", "dedupe", "take", "count", "sum", "min", "max", "avg", "reduce",
 ];
 
 /// Shell-state builtins (§3): they mutate the shell's own process state, which an
@@ -60,9 +60,12 @@ const BUILTINS: &[&str] = &["cd", "exit"];
 
 /// Operators whose bareword argument is a *predicate*, and therefore desugars to an
 /// implicit `{ |it| … }` closure (§8b).
-const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map"];
+const PREDICATE_OPERATORS: &[&str] = &["filter", "each", "map", "reduce"];
 
 /// Operators that take **no** arguments at all.
+///
+/// `sum`/`min`/`max`/`avg` are deliberately *not* here: they take an optional column name,
+/// so `sum size` has to keep reading `size` as an argument.
 ///
 /// Knowing this at parse time is what lets `(count > 0)` read as a comparison rather than
 /// as `count` applied to `> 0`. Without it a paren could not open a pipeline whose first

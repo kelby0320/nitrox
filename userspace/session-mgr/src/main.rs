@@ -710,14 +710,23 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // check that an interactive session never ran.
             #[cfg(not(feature = "test-harness"))]
             {
-                kprint(b"session-mgr: session ended (shell exit ");
+                // **One `kprint`, not four.** The console is shared, so a line assembled
+                // from several calls can be torn by any other process that logs between
+                // them — this one came back as `session ended (shell exit tty-server:
+                // terminal closed\n3)`, because the tty server logs the close while the
+                // status is being written. A log line that another writer can split down
+                // the middle is not a log line; assemble it, then emit it once.
+                let mut line = alloc::string::String::from(
+                    "session-mgr: session ended (shell exit ",
+                );
+                let mut buf = [0u8; 20];
                 if code < 0 {
-                    kprint(b"-");
-                    libkern::debug::kprint_u64((-(code as i64)) as u64);
-                } else {
-                    libkern::debug::kprint_u64(code as u64);
+                    line.push('-');
                 }
-                kprint(b")\n");
+                let digits = libkern::debug::fmt_u64(code.unsigned_abs() as u64, &mut buf);
+                line.push_str(core::str::from_utf8(digits).unwrap_or("?"));
+                line.push_str(")\n");
+                kprint(line.as_bytes());
             }
         }
         None => {

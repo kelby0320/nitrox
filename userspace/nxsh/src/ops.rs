@@ -15,8 +15,9 @@
 //!
 //! Everything here goes through [`rows`] and [`rebuild`]. A `Table` yields one `Record`
 //! per row and rebuilds as a `Table` with its schema preserved; a `List` yields its
-//! elements and rebuilds as a `List`. Operators therefore never mention which of the two
-//! they were handed, which is the whole point — and a scalar is an error rather than a
+//! elements and rebuilds as a `List`; a `String` yields its characters and rebuilds as a
+//! `String`; a `Range` yields its values. Operators therefore never mention which they
+//! were handed, which is the whole point — and a scalar is an error rather than a
 //! one-element sequence, because silently treating `5` as `[5]` is the kind of coercion
 //! §6 spends its fail-loud rule on.
 
@@ -31,10 +32,17 @@ use crate::value::{Val, render_i64};
 /// An operator failure. Plain strings: the evaluator wraps them.
 pub type OpResult<T> = Result<T, String>;
 
+/// How many values a `Range` will materialise into before an operator refuses it.
+///
+/// The same backstop `for` applies to a range it walks: a range is a *language* value with
+/// no storage behind it, so turning one into rows is where an absurd one has to be caught.
+pub const MAX_RANGE_ROWS: i64 = 10_000_000;
+
 /// Decompose a value into rows, generically.
 ///
 /// A `Table` gives one `Record` per row — which is what makes `filter name == "x"` work on
-/// a stream without the operator knowing the schema. A `List` gives its elements.
+/// a stream without the operator knowing the schema. A `List` gives its elements, a
+/// `String` its characters, and a `Range` its values (§10b).
 pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
     match v {
         Val::Data(Value::Table(t)) => Ok(t
@@ -50,9 +58,33 @@ pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
         Val::Data(Value::List(items)) => {
             Ok(items.iter().map(|i| Val::Data(i.clone())).collect())
         }
+        // **A String is a sequence of its characters** (§10b). This is where length,
+        // substring and slicing come from — `count`, `take`, `skip`, `last` over text —
+        // rather than from a second vocabulary of string-only verbs. Characters, not
+        // bytes: `"abc"[0]` already indexes characters, and two answers to "what is an
+        // element of a String" is one too many.
+        Val::Data(Value::Str(text)) => {
+            Ok(text.chars().map(|c| Val::str(alloc::string::String::from(c))).collect())
+        }
+        // A Range's elements are its values. It stays language-only (§8c) — materialising
+        // one here is exactly what it means to put it in front of an operator.
+        Val::Range { start, end, inclusive } => {
+            let last = if *inclusive { *end } else { *end - 1 };
+            let n = last.saturating_sub(*start).saturating_add(1);
+            if n > MAX_RANGE_ROWS {
+                return Err(String::from("range is too large to iterate"));
+            }
+            let mut out = Vec::new();
+            let mut i = *start;
+            while i <= last {
+                out.push(Val::int(i));
+                i += 1;
+            }
+            Ok(out)
+        }
         other => Err(alloc::format!(
-            "expected a Table or a List, got {} — an operator works over rows, and a \
-             scalar is not one",
+            "expected a sequence, got {} — an operator works over rows, and a scalar is \
+             not one. A Table, a List, a String (its characters) or a Range is one",
             other.type_name()
         )),
     }
@@ -64,6 +96,19 @@ pub fn rows(v: &Val) -> OpResult<Vec<Val>> {
 /// A row whose record no longer matches the schema forces a `List`, since a table with
 /// ragged rows is not a table.
 pub fn rebuild(original: &Val, out: Vec<Val>) -> OpResult<Val> {
+    // **The result comes back in the shape it went in.** Filtering a String yields a
+    // String; mapping one to something that is not text falls back to a List, which is the
+    // same rule a ragged Table already takes.
+    if let Val::Data(Value::Str(_)) = original {
+        let mut joined = String::new();
+        for r in &out {
+            match r.as_data() {
+                Some(Value::Str(s)) => joined.push_str(s),
+                _ => return as_list(out),
+            }
+        }
+        return Ok(Val::str(joined));
+    }
     if let Val::Data(Value::Table(t)) = original {
         let mut table_rows = Vec::with_capacity(out.len());
         for r in &out {
@@ -149,6 +194,110 @@ pub fn count(v: &Val) -> OpResult<Val> {
     Ok(Val::int(rows(v)?.len() as i64))
 }
 
+/// `sum` / `min` / `max` / `avg` (§10b) — the reductions `count` was alone in.
+///
+/// Without them "the total size of these files" needs a `mut` and a `for` loop, which is
+/// the shape a pipeline language exists to remove. A bareword names a *column*, the same
+/// reading `sort size` has; with no column the rows are the values.
+///
+/// **Empty input is where these differ, and each answer is forced.** The sum of nothing is
+/// zero; there is no minimum of an empty set and no average without a divisor, so those are
+/// errors — the same refusal to fabricate a value §8a makes for division by zero.
+pub fn sum(v: &Val, field: Option<&str>) -> OpResult<Val> {
+    let mut int_total: i64 = 0;
+    let mut float_total: f64 = 0.0;
+    let mut is_float = false;
+    for value in column(v, field, "sum")? {
+        match value {
+            Value::Int(i) => {
+                if is_float {
+                    float_total += i as f64;
+                } else {
+                    int_total = int_total.checked_add(i).ok_or_else(|| {
+                        String::from("`sum` overflows an Int — Nitrox does not wrap, \
+                                     because a wrapped total is a fabricated number")
+                    })?;
+                }
+            }
+            Value::Float(f) => {
+                if !is_float {
+                    is_float = true;
+                    float_total = int_total as f64;
+                }
+                float_total += f;
+            }
+            other => return Err(not_a_number("sum", &other)),
+        }
+    }
+    Ok(if is_float { Val::float(float_total) } else { Val::int(int_total) })
+}
+
+/// `avg` — always a `Float`, even over Ints. The alternative truncates silently.
+pub fn avg(v: &Val, field: Option<&str>) -> OpResult<Val> {
+    let values = column(v, field, "avg")?;
+    if values.is_empty() {
+        return Err(String::from(
+            "`avg` of nothing has no value — there is no divisor, and inventing one would \
+             be the fabricated number §8a refuses for division by zero",
+        ));
+    }
+    let n = values.len() as f64;
+    let mut total = 0.0;
+    for value in values {
+        match value {
+            Value::Int(i) => total += i as f64,
+            Value::Float(f) => total += f,
+            other => return Err(not_a_number("avg", &other)),
+        }
+    }
+    Ok(Val::float(total / n))
+}
+
+pub fn min(v: &Val, field: Option<&str>) -> OpResult<Val> {
+    extreme(v, field, "min", -1)
+}
+
+pub fn max(v: &Val, field: Option<&str>) -> OpResult<Val> {
+    extreme(v, field, "max", 1)
+}
+
+/// `min`/`max` share everything but which direction wins, and both order with the same
+/// `compare` as `sort` — so mixed types are an error rather than an ordering invented at
+/// the point of comparison.
+fn extreme(v: &Val, field: Option<&str>, op: &str, want: i32) -> OpResult<Val> {
+    let values = column(v, field, op)?;
+    let mut best: Option<Value> = None;
+    for value in values {
+        best = Some(match best {
+            None => value,
+            Some(b) => {
+                if compare(&value, &b)? == want {
+                    value
+                } else {
+                    b
+                }
+            }
+        });
+    }
+    best.map(Val::Data).ok_or_else(|| {
+        alloc::format!("`{op}` of nothing has no value — an empty sequence has no extreme")
+    })
+}
+
+fn not_a_number(op: &str, v: &Value) -> String {
+    alloc::format!("`{op}` needs numbers, got {}", Val::Data(v.clone()).type_name())
+}
+
+/// The values a reduction folds over: a named column, or the rows themselves.
+fn column(v: &Val, field: Option<&str>, op: &str) -> OpResult<Vec<Value>> {
+    let r = rows(v)?;
+    let mut out = Vec::with_capacity(r.len());
+    for row in &r {
+        out.push(key_of(row, field, op)?);
+    }
+    Ok(out)
+}
+
 /// `dedupe` (§10b) — row-equality deduplication, the same generic-row shape as
 /// `sort`/`filter`. Order-preserving: the first occurrence wins, because a shell that
 /// reordered while deduplicating would be doing two things under one name.
@@ -198,8 +347,12 @@ pub fn select(v: &Val, fields: &[String]) -> OpResult<Val> {
     table_from_records(out)
 }
 
-/// `sort FIELD [--reverse]`, or `sort` over bare values.
-pub fn sort(v: &Val, field: Option<&str>, reverse: bool) -> OpResult<Val> {
+/// `sort FIELD... [--reverse]`, or `sort` over bare values.
+///
+/// **Every key given is used**, in order: `sort dept name` sorts by department and then by
+/// name within it. Taking the first and silently discarding the rest is neither of the two
+/// acceptable behaviours (§10b).
+pub fn sort(v: &Val, fields: &[String], reverse: bool) -> OpResult<Val> {
     let mut r = rows(v)?;
     // A stable insertion sort: `Vec::sort_by` needs a total order, and comparing two
     // arbitrary `Value`s does not have one (a String and an Int are simply not ordered).
@@ -208,11 +361,11 @@ pub fn sort(v: &Val, field: Option<&str>, reverse: bool) -> OpResult<Val> {
     let mut err: Option<String> = None;
     let mut sorted: Vec<Val> = Vec::with_capacity(r.len());
     for item in r.drain(..) {
-        let key = sort_key(&item, field)?;
+        let key = sort_keys(&item, fields)?;
         let mut at = sorted.len();
         for i in 0..sorted.len() {
-            let other = sort_key(&sorted[i], field)?;
-            match compare(&key, &other) {
+            let other = sort_keys(&sorted[i], fields)?;
+            match compare_keys(&key, &other) {
                 Ok(ord) => {
                     let before = if reverse { ord > 0 } else { ord < 0 };
                     if before {
@@ -235,16 +388,49 @@ pub fn sort(v: &Val, field: Option<&str>, reverse: bool) -> OpResult<Val> {
     rebuild(v, sorted)
 }
 
+/// The ordering keys for one row, one per named field — or the row itself when no field
+/// was named.
+fn sort_keys(row: &Val, fields: &[String]) -> OpResult<Vec<Value>> {
+    if fields.is_empty() {
+        return Ok(alloc::vec![sort_key(row, None)?]);
+    }
+    let mut keys = Vec::with_capacity(fields.len());
+    for f in fields {
+        keys.push(sort_key(row, Some(f.as_str()))?);
+    }
+    Ok(keys)
+}
+
+/// Compare rows key by key: the first that differs decides, which is what makes the
+/// second key a tie-break rather than a second sort.
+fn compare_keys(a: &[Value], b: &[Value]) -> OpResult<i32> {
+    for (x, y) in a.iter().zip(b) {
+        let ord = compare(x, y)?;
+        if ord != 0 {
+            return Ok(ord);
+        }
+    }
+    Ok(0)
+}
+
 fn sort_key(row: &Val, field: Option<&str>) -> OpResult<Value> {
+    key_of(row, field, "sort")
+}
+
+/// One value out of a row: a named field, or the row itself.
+///
+/// Shared by `sort` and the reductions so that "which column?" is answered once — and so
+/// `sum size` and `sort size` fail the same way on a row that has no such field.
+fn key_of(row: &Val, field: Option<&str>, op: &str) -> OpResult<Value> {
     match field {
         None => row
             .as_data()
             .cloned()
-            .ok_or_else(|| String::from("cannot sort a value TSM1 cannot represent")),
+            .ok_or_else(|| alloc::format!("cannot `{op}` a value TSM1 cannot represent")),
         Some(f) => {
             let Val::Data(Value::Record(rec)) = row else {
                 return Err(alloc::format!(
-                    "`sort {f}` needs rows with fields, got {}",
+                    "`{op} {f}` needs rows with fields, got {}",
                     row.type_name()
                 ));
             };
@@ -537,11 +723,11 @@ mod tests {
     #[test]
     fn sort_orders_by_a_field_it_has_never_heard_of() {
         let t = table(&["c", "a", "b"], &[3, 1, 2]);
-        let s = sort(&t, Some("size"), false).unwrap();
+        let s = sort(&t, &[String::from("size")], false).unwrap();
         let r = rows(&s).unwrap();
         assert_eq!(r[0].render(), "{ name: \"a\", size: 1 }");
         assert_eq!(r[2].render(), "{ name: \"c\", size: 3 }");
-        let s = sort(&t, Some("size"), true).unwrap();
+        let s = sort(&t, &[String::from("size")], true).unwrap();
         assert_eq!(rows(&s).unwrap()[0].render(), "{ name: \"c\", size: 3 }");
     }
 
@@ -554,7 +740,7 @@ mod tests {
             schema,
             rows: vec![vec![Value::Str("a".into())], vec![Value::Int(1)]],
         })));
-        assert!(sort(&t, Some("v"), false).is_err());
+        assert!(sort(&t, &[String::from("v")], false).is_err());
     }
 
     #[test]

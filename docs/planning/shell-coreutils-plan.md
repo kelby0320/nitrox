@@ -1084,7 +1084,7 @@ Parts, in order (tick as they land):
 - [x] **Part A — `break` / `continue`** ✅ (2026-08-04)
 - [x] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages** ✅ (2026-08-04)
 - [x] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`** ✅ (2026-08-04)
-- [ ] **Part D — sequences generalise, and reduction**
+- [x] **Part D — sequences generalise, and reduction** ✅ (2026-08-04)
 - [ ] **Part E — strings, records, numbers, `in`**
 - [ ] **Part F — `capture`: regex submatches**
 - [ ] **Part G — interrupt (`Ctrl-C`)** — also makes `strict` real
@@ -1221,7 +1221,9 @@ to produce.
   it ran and exited non-zero, and it flattened the error, losing the `kind` and the per-stage report
   in the one case they exist for. It now propagates a `PipelineFailed` unchanged.
 
-#### Part D — sequences generalise, and reduction
+#### Part D — sequences generalise, and reduction ✅ (2026-08-04)
+
+**Landed.**
 
 - `rows()`/`rebuild()` accept a `String` (characters) and a `Range` (values), and rebuild in the
   shape they were handed (§10b). This is where length, substring and slicing come from.
@@ -1232,6 +1234,21 @@ to produce.
 - **Trap:** `"abc" | count` currently *errors*, and after this it is `3`. Check nothing leans on the
   refusal. Characters, not bytes — `"abc"[0]` already indexes characters, and two answers to "what
   is an element of a String" is one too many.
+
+**Notes from building it.** The trap was empty: the one test that pins the refusal uses `Val::int(5)`,
+which is still a scalar, so it kept passing unchanged and now documents the narrower rule. Three
+things worth recording:
+
+- **`sort` and the reductions share one key extractor.** `sum size` and `sort size` ask the same
+  question — "which column?" — so `key_of` answers it once, and a row with no such field fails the
+  same way for both. Renaming it out of `sort_key` was the whole change.
+- **The multi-key sort test only means something as a pair.** `sort d n` and `sort d` over the same
+  input give *different* answers (`["z","a","b"]` vs `["z","b","a"]`, the second because a stable
+  sort keeps input order within a tie) — and the single-key answer is exactly what the multi-key
+  case would produce if the second key were being dropped. Asserting one without the other would
+  have passed against the bug.
+- **`format`'s operand goes in as argument 0**, right after the template, because in stage position
+  the value flowing past *is* the subject: `… | format("{}")`.
 
 #### Part E — strings, records, numbers, `in`
 

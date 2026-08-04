@@ -458,6 +458,26 @@ missing — `History::search_back` already returns indices and can enumerate eve
 
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
 
+**A log line assembled from several `kprint`s can be torn — `TODO(atomic-log-lines)`.**
+The console is shared and `kprint` is a syscall per call, so a message built from several —
+`kprint(b"… exit "); kprint_u64(n); kprint(b")\n")` — can be split down the middle by any
+other process that logs in between. It is atomic *per call* and nothing more.
+
+**This is not hypothetical.** `session-mgr`'s session-ended line came back from CI as
+`session ended (shell exit tty-server: terminal closed` / `3)` — the tty server logged a
+close while the status was being written. It passed locally and failed under KVM on the
+runner, which is the timing signature of exactly this class. That one line now assembles
+into a `String` and emits once; **the pattern is everywhere else** — roughly 33 call sites
+across userspace use `kprint_u64`/`kprint_hex` mid-line, and `service-mgr` builds its
+service-declaration lines the same way.
+
+The fix is a small `kprintf`-style helper that formats into a stack buffer and issues one
+syscall, plus a sweep of the call sites. Deferred because it is a mechanical change across
+five services with no failure pressure behind it beyond diagnostics, and because the shape of
+the helper is worth deciding once rather than per site. **Trigger:** the next torn line that
+costs debugging time, or any test that needs to assert on a multi-part log line — the
+interactive suite now asserts on the one line that was fixed.
+
 **Control flow inside an expression — `TODO(control-flow-in-expression-position)`.**
 `eval` returns a *value*, so a block whose value is being taken has no channel for control
 flow to travel back through. Two consequences, one new and one pre-existing:
