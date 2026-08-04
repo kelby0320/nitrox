@@ -271,6 +271,11 @@ pub enum Stmt {
         cond: Expr,
         body: Vec<Stmt>,
     },
+    /// `break` / `continue` (§9c). **Legal only inside a `for`/`while` body in the same
+    /// function**, which the parser enforces — see `Parser::loop_depth`. Emitting them
+    /// here at all therefore means the check has already passed.
+    Break,
+    Continue,
     /// `try { … } catch (e) { … }` — sugar over branching on a Result-shaped value, not
     /// stack unwinding (§2).
     Try {
@@ -306,8 +311,8 @@ impl Expr {
 impl Stmt {
     /// Whether a block ending in this statement has that statement's value (§9a).
     ///
-    /// `let`, `return`, `for`, `while` and `def` produce no value, so a block ending in
-    /// one evaluates to `Null`. **`if` and `try` do** — §9a names only the first list as
+    /// `let`, `return`, `for`, `while`, `def`, `break` and `continue` produce no value, so
+    /// a block ending in one evaluates to `Null`. **`if` and `try` do** — §9a names only the first list as
     /// valueless, and §9f's own example uses `try`/`catch` in expression position. `if` is
     /// what
     /// makes the implicit-last-expression return rule work when a function ends in an

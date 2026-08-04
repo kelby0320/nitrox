@@ -96,6 +96,9 @@ pub enum Tok {
     For,
     In,
     While,
+    /// `break` / `continue` — loop-only, and the parser is what enforces that (§9c).
+    Break,
+    Continue,
     Def,
     Return,
     Try,
@@ -184,6 +187,8 @@ impl Tok {
                 | Tok::False
                 | Tok::Null
                 | Tok::Return
+                | Tok::Break
+                | Tok::Continue
                 | Tok::Underscore
                 | Tok::Question
                 | Tok::RParen
@@ -800,6 +805,8 @@ fn keyword_or_ident(w: &str) -> Tok {
         "for" => Tok::For,
         "in" => Tok::In,
         "while" => Tok::While,
+        "break" => Tok::Break,
+        "continue" => Tok::Continue,
         "def" => Tok::Def,
         "return" => Tok::Return,
         "try" => Tok::Try,

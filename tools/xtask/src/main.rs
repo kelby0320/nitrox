@@ -669,7 +669,32 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 12. `exit` returns to the login prompt, and logging in again works. A login that
+    // 12. **`break` at a real prompt** — and the multi-line path with it. The body holds
+    //     two statements, which are newline-separated (§9a), so the loop spans two lines
+    //     and the REPL's unclosed-brace continuation carries it (§11b). The `mut` survives
+    //     from the line before, which is what makes the count observable at all. Host
+    //     tests cover the semantics; this covers the path they cannot — every expensive
+    //     bug this shell has had was interactive-only.
+    //
+    //
+    //     Two things here were got wrong first and are worth keeping right. **The
+    //     assertion is `n=3`, not `3`**: `expect` scans forward until it matches, so a
+    //     bare digit finds the echo of the line that was just typed. And **the increment
+    //     comes before the test**, so that "the loop stopped" and "the rest of the body
+    //     was skipped" give different answers — with the increment last, a `break` that
+    //     merely abandoned the iteration would leave `n` at 3 as well, and the step would
+    //     pass against a broken implementation. Both were found by breaking `break` and
+    //     watching this step keep passing.
+    s.send("mut n = 0")?;
+    s.expect("/home>")?;
+    s.send("for x in 0..9 { n = n + 1\n if n == 3 { break } }")?;
+    s.expect("/home>")?;
+    s.send("format(\"n={}\", n)")?;
+    s.expect("n=3")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 13. `exit` returns to the login prompt, and logging in again works. A login that
     //     cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;

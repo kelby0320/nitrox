@@ -1081,7 +1081,7 @@ Two things hold for every part and are not repeated in each:
 
 Parts, in order (tick as they land):
 
-- [ ] **Part A — `break` / `continue`**
+- [x] **Part A — `break` / `continue`** ✅ (2026-08-04)
 - [ ] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages**
 - [ ] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`**
 - [ ] **Part D — sequences generalise, and reduction**
@@ -1092,11 +1092,29 @@ Parts, in order (tick as they land):
 **Expect each part to surface substrate gaps, and file them rather than paper over them** — the
 rule Milestone 2 earned. Part G already has one before it starts (below).
 
-#### Part A — `break` / `continue`
+#### Part A — `break` / `continue` ✅ (2026-08-04)
 
-New tokens, two statement forms (§9c), and a third and fourth variant beside `Normal`/`Return` in
-the evaluator's `Flow`. `for` and `while` consume them; every other construct propagates them the
-way it already propagates `Return`.
+**Landed.** New tokens, two statement forms (§9c), and a third and fourth variant beside
+`Normal`/`Return` in the evaluator's `Flow`. `for` and `while` consume them; every other construct
+propagates them the way it already propagates `Return`.
+
+Three things it turned up that the plan did not predict:
+
+- **A new statement-ending token must join `Tok::ends_statement`.** It is a whitelist of *enders*,
+  so anything new defaults to "continues": the lexer swallowed the newline after `break` and the
+  parser reported "expected a newline between statements" on the line *after*. The default is
+  right — a wrong "ends" splits one statement in two silently — but the symptom points one line
+  past the cause. Recorded in `nxsh/CLAUDE.md`.
+- **Control flow cannot leave an expression**, because `eval` returns a value and has no channel
+  to carry `Flow` back through. `break` in expression position is refused with the
+  statement-position form named in the message; the same wall makes `return` there *silently*
+  yield instead of leaving the function, which predates this part. Filed together as
+  `TODO(control-flow-in-expression-position)` — watch it at Part C, where `try` becomes an
+  expression.
+- **The runaway backstop had no test**, and proving it at ten million iterations costs more
+  wall-clock than the whole suite. The limit is now a field on `Interp` (still `MAX_ITERATIONS`
+  everywhere else), so `while`'s guard and the range guard both got their first coverage, in
+  microseconds.
 
 - **The loop-only and closure-boundary rules are one mechanism**: the parser tracks loop depth and
   **resets it on entering a `def` or closure body**. That reset *is* "`break` does not cross a

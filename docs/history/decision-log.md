@@ -10169,3 +10169,64 @@ list looked like a decision rather than an oversight. `primary` is corrected in 
 One implementation note carried into Part C: retiring `?` frees the `Expr::Try` variant, so
 `try` collapses to **one** node with statement position becoming an `expr` statement. Two
 forms of one construct is precisely how the `run_line`/`exec_block` divergence happened.
+
+## 2026-08-04 — Milestone 4 Part A: `break`/`continue`, and two tests that passed for the wrong reason
+
+The feature is small and went in as designed: `Tok::Break`/`Tok::Continue`, two statement
+forms, `Flow::Break`/`Flow::Continue` beside `Normal`/`Return`. §9c's two rules — loop-only,
+and does not cross a function boundary — are **one mechanism**: a loop counter in the parser
+that *resets* on entering a `def` or closure body. Both diagnostics are therefore parse-time,
+which is the better of the two available errors, and the reset is what makes `break` inside
+`filter { |it| … }` an error rather than a jump into an iteration that is not even written in
+this language.
+
+**`Flow` deliberately has no wildcard arm anywhere.** Every `match` on it is a place a
+`break` can be silently swallowed, so the compiler was made to ask at each of the eight
+sites. They split cleanly in two, which is worth more than the eight arms: a **function or
+script boundary** (`run`, `run_line`, `call_function`, `call_closure`), where the parser has
+already guaranteed a `break` cannot arrive and the arm states the invariant; and
+**expression position** (`Expr::Block`, `Expr::If`, a `match` arm), where a `break` is legal
+per §9c and still cannot work, because `eval` returns a value and has no channel to carry
+control flow back through. The second is refused with the statement-position form in the
+message. `return` hits the same wall and *silently* yields its operand instead of leaving the
+function — a pre-existing divergence from §5b, filed with it as
+`TODO(control-flow-in-expression-position)`.
+
+**What the lexer caught, exactly as its comment said it would.** `Tok::ends_statement` is a
+whitelist of *enders*, chosen so a new token defaults to "continues" — a wrong "ends" would
+split one statement into two silently, while a wrong "continues" produces a parse error. So
+`for x in xs { break }` parsed (a `}` follows) and `break` on its own line did not: the
+newline after it was suppressed and the error landed on the *next* line. The default was
+right and the design note was already there; it is now also in `nxsh/CLAUDE.md`, because the
+symptom points one line past the cause.
+
+**Two tests passed for the wrong reason, and both were found by breaking the feature.**
+
+The first was cost, not correctness: a `continue` that skips its increment loops forever, and
+proving the runaway backstop fires meant running ten million iterations — **41 seconds, on a
+suite whose entire value is finishing in one.** The limit is now a field on `Interp`
+(`MAX_ITERATIONS` in every real build), so the guard is provable in microseconds. It had no
+test at all before this; neither did the range guard beside it. Both do now.
+
+The second is the instructive one. The in-guest step types a loop at a real prompt — the path
+where every expensive bug this shell has had actually lived. Written first as
+`for x in 0..9 { if n == 3 { break }` / `n = n + 1 }` and asserting on `3`, it **passed with
+`break` deliberately broken**, twice, for two different reasons:
+
+- `expect` scans forward until it matches, so a bare `3` found the echo of `if n == 3`. Fixed
+  by asserting on `n=3` through `format`, a string that appears nowhere in what was typed.
+- Even then it passed — because **the mutation was masked by the program**. With `break`
+  ignored by the loop, `exec_block` still returns early, so the increment after it is skipped
+  on every iteration where the guard fires, and `n` sticks at 3 for the same final answer.
+  "The loop stopped" and "the rest of the body was skipped" were indistinguishable. Fixed by
+  putting the increment *before* the test, so a broken `break` runs to 9.
+
+The general lesson is not "assert on longer strings." It is that a negative control tests the
+mutation you chose, and a program can be written so that a broken implementation produces the
+right answer by a different route. Both the assertion and the *program under test* have to
+discriminate.
+
+195 host tests in the crate (1047 across the workspace), `test-qemu` and `test-interactive`
+green at 13 steps, all four `check-*` gates green. Non-vacuity checked three ways beyond the
+above: the loop ignoring `Break` fails two host tests, and removing the parser's loop-depth
+reset fails the closure-boundary test.

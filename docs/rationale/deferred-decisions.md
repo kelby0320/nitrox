@@ -482,6 +482,26 @@ missing — `History::search_back` already returns indices and can enumerate eve
 
 Trigger: the compositor terminal, or any terminal backend that can address the cursor.
 
+**Control flow inside an expression — `TODO(control-flow-in-expression-position)`.**
+`eval` returns a *value*, so a block whose value is being taken has no channel for control
+flow to travel back through. Two consequences, one new and one pre-existing:
+
+- **`break`/`continue` in expression position are refused** (Milestone 4 Part A) — `let y =
+  if c { break } else { 1 }` errors, with the statement-position form named in the message.
+  Legal per §9c (it may well be inside a loop), and still not expressible.
+- **`return` in expression position is silently wrong.** `let x = if c { return 1 } else { 2 }`
+  binds `1` to `x` and keeps going, instead of leaving the function as §5b says. That
+  predates Part A; it is the same missing mechanism, seen from the other side.
+
+Statement position is unaffected and is where these are actually written: `if done { break }`
+on its own line works, because `Stmt::If` propagates `Flow`.
+
+The fix for both is the same — a `Flow`-carrying result through expression evaluation —
+which is a change to every `eval` arm and wants its own slice. Trigger: **Milestone 4 Part C**
+is the one to watch, since `try`/`catch` becoming an expression puts a block in value
+position where a `break` is a plausible thing to write; if it does not bite there, wait for
+a real script.
+
 **Bitwise operators, and the `0o` literal — `TODO(shell-bitwise)`.**
 Shell design §8e admits hex and binary literals and justifies them by
 "permissions/flags/addresses" — and the language has no way to test a bit. The gap is real; the
