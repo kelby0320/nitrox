@@ -10389,3 +10389,25 @@ expectation wrong first and the test caught me, which is the same thing from the
 the new one takes the length of a String and sums a Range at a real prompt, both of which
 answered "expected a Table or a List" before. Non-vacuity: dropping the extra sort keys,
 removing the String arm from `rows`, and ignoring `format`'s operand each fail their tests.
+
+**Postscript (same day): the in-guest step was flaky, and the flake was a real defect.**
+CI's QEMU job failed on the `exit 3` assertion added in Part C while the same run passed
+locally. The transcript says why:
+
+```
+session-mgr: session ended (shell exit tty-server: terminal closed
+3)
+```
+
+`session-mgr` wrote that line in four `kprint` calls, and the tty server logged its close
+between two of them. `kprint` is atomic per *call*, so any line assembled from several is
+splittable by any other process — and the console is shared by every service. It passed
+locally and failed under KVM on the runner, which is the timing signature of this whole
+class. The line now assembles into a `String` and emits once.
+
+Worth being clear about what the test did: it was **right to fail**. The assertion was on a
+message the system genuinely does not emit reliably, and the fix belongs in the emitter
+rather than in a looser assertion. The pattern is not rare — ~33 `kprint_u64`/`kprint_hex`
+call sites across userspace build lines the same way, `service-mgr` included — so the general
+version is filed as `TODO(atomic-log-lines)` with the helper it wants (format into a stack
+buffer, one syscall) rather than swept now.
