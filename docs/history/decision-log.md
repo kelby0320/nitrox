@@ -10230,3 +10230,59 @@ discriminate.
 green at 13 steps, all four `check-*` gates green. Non-vacuity checked three ways beyond the
 above: the loop ignoring `Break` fails two host tests, and removing the parser's loop-depth
 reset fails the closure-boundary test.
+
+## 2026-08-04 — Milestone 4 Part B: the keyword stages were never a parser problem
+
+`parse T` lands, and with it §6's examples finally run. The part is worth recording for
+where the bug actually was, which is not where the plan (or the audit) said.
+
+**The parser had accepted `expect` in stage position since Milestone 3.** It even builds
+`Expr::Expect(Expr::Underscore, T)` there — precisely the shape a stage needs, with a
+placeholder for the value flowing past. **The evaluator** was the one refusing: `pipeline()`
+walks stages and, past the head, accepts only a `Call`, so everything else got "a value
+cannot be a pipeline stage". The audit reported the symptom correctly and inferred the wrong
+cause from it; the `stage_keyword` production now in §8c documents what the parser was
+already doing rather than changing it.
+
+**The mechanism is `_`, and it is a real binding rather than a side channel.** For the length
+of a keyword stage the operand is bound to `_`, so `Expr::Underscore` picks it up — no new
+operand plumbing, and `_` cannot leak, because the parser will not accept it as a binding
+name anywhere else. Two things fell out:
+
+- **`assert` had to stop clearing `head_ok`.** §6 writes `ls | assert (count > 0)`, and with
+  a command head refused inside the predicate, `count` parsed as a plain identifier and died
+  as "not a binding, and running it as a program failed". Allowing the head is safe because
+  D4 already resolves a bare, argument-free name to a *binding* first — so `assert (n > 0)`
+  over a `let n` still means the variable, and that is now its own test rather than an
+  assumption.
+- **`assert` passes its value through in stage position.** §6 puts it in the same slot as
+  `expect`; the expression form correctly yields `Null`, and a stage doing that would end
+  every chain it appeared in.
+
+**`parse` does not share a factored-out numeric scanner — it runs the lexer.**
+`Lexer::tokenize_expr` over the text, accepting a lone `Int`/`Float` token, which makes §6's
+"what a number looks like to `parse` is what it looks like to the lexer" true by construction
+instead of by discipline: `0xff`, `0b1010`, `1_000_000`, `1e3` and the no-leading-zero-octal
+rule all arrived without being written twice, and cannot drift apart later. The sign is
+handled in `parse` because a literal is unsigned in the grammar (`-5` is negation applied to
+one) — which also means `parse Int` cannot read `i64::MIN`, exactly as no literal can write
+it. Consistency there is the feature, not a gap.
+
+The refusals are the part that carries §6's weight, and each is a coercion another language
+performs silently: surrounding whitespace (`trim` exists, so accepting `" 42"` would be the
+one silent coercion left), `"3.5" | parse Int` (Int and Float are different types everywhere
+else in this language), `"yes" | parse Bool` (the list every configuration format got wrong),
+and `Int → Float` past 2^53, which is a fabricated number by another name. `42 | parse String`
+names `format` instead of just refusing.
+
+**A process note, because it cost a real minute.** The first negative control appeared to
+show the keyword-stage branch was doing nothing — `grep -cE '^test .* FAILED'` returned `0`.
+The pattern was wrong; the control had in fact failed ten tests. A verification step that
+answers "fine" because it is not looking properly is the same failure as the vacuous test in
+Part A, one layer up. Read the output, not the count.
+
+205 crate tests (1057 workspace), `test-qemu` and `test-interactive` green at 14 steps — the
+new one converts text and does arithmetic with it at a real prompt, and checks that
+`"abc" | parse Int` fails loud there too. Non-vacuity: removing the keyword-stage branch
+fails 10 tests, removing the `_` fallback fails the two `assert` tests, and dropping the
+whitespace rule fails the fail-loud test.

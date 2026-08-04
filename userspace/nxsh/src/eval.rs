@@ -597,9 +597,14 @@ impl Interp {
             Expr::Str(v) | Expr::Word(v) => Ok(Val::str(v.clone())),
             Expr::Bool(v) => Ok(Val::bool(*v)),
             Expr::Null => Ok(Val::NULL),
-            Expr::Underscore => Err(EvalError::new(
-                "`_` is a pipeline placeholder and has no value on its own",
-            )),
+            // Inside a keyword stage `_` *is* the value flowing past (§8c); anywhere else
+            // it is still the placeholder it has always been.
+            Expr::Underscore => match self.lookup_any(UNDERSCORE) {
+                Some(v) => Ok(v),
+                None => Err(EvalError::new(
+                    "`_` is a pipeline placeholder and has no value on its own",
+                )),
+            },
             // A `/pattern/` literal is its source text; `~=` compiles it. Keeping it a
             // String means a pattern can equally be built at run time, which a filter over
             // a user-supplied name needs.
@@ -728,6 +733,10 @@ impl Interp {
                 let v = self.eval(inner)?;
                 check_type(&v, t)?;
                 Ok(v)
+            }
+            Expr::Parse(inner, t) => {
+                let v = self.eval(inner)?;
+                parse_value(v, t)
             }
             Expr::Assert(pred) => {
                 let v = self.eval(pred)?;
@@ -1274,6 +1283,12 @@ impl Interp {
     /// one — `filter` with nothing to filter is a mistake, not an empty result — and the
     /// message says so rather than quietly answering for an empty stream.
     fn apply_operator(&mut self, c: &Call, operand: Option<Val>) -> Result<Val> {
+        // §6's `ls | assert (count > 0)`. Inside a keyword stage the value flowing past is
+        // bound to `_`, so an operator with nothing piped *into* it means that value —
+        // which is what lets a predicate be written the way §6 writes it. `_` is bound
+        // nowhere else (the parser will not accept it as a binding name), so this cannot
+        // reach past the stage it belongs to.
+        let operand = operand.or_else(|| self.lookup_any(UNDERSCORE));
         let name = c.name.as_str();
         // Positional arguments, evaluated once.
         let mut flags: Vec<&str> = Vec::new();
@@ -1551,6 +1566,35 @@ impl Interp {
                     continue;
                 }
             }
+            // **A keyword stage** — `expect T`, `parse T`, `assert (P)` (§8c).
+            //
+            // The parser has always accepted these after a `|`; the evaluator rejected
+            // them, which is why every example in §6 was written mid-pipeline and none of
+            // them ran. They read the value flowing past rather than taking an operand of
+            // their own, so the operand is bound to `_` for the length of the stage and
+            // `Expr::Underscore` picks it up — no separate operand channel, and
+            // `assert (count > 0)` works because a nullary operator finds `_` too.
+            if matches!(
+                &stages[i],
+                Expr::Expect(..) | Expr::Parse(..) | Expr::Assert(_)
+            ) {
+                let operand = carried.take().ok_or_else(|| {
+                    EvalError::new(
+                        "this stage checks the value arriving from the left of a pipe,                          and nothing is arriving",
+                    )
+                })?;
+                self.push_scope();
+                self.bind(UNDERSCORE, operand.clone(), false, false)?;
+                let r = self.eval(&stages[i]);
+                self.pop_scope();
+                let v = r?;
+                // `assert` is a check, not a transform: §6 puts it in the same pipeline
+                // slot as `expect`, so the value has to continue down the chain rather
+                // than the chain ending on a Null.
+                carried = Some(if matches!(&stages[i], Expr::Assert(_)) { operand } else { v });
+                i += 1;
+                continue;
+            }
             // The head stage may be an ordinary value supplying the pipeline's input.
             if i == 0 && !matches!(&stages[0], Expr::Call(_)) {
                 carried = Some(self.eval(&stages[0])?);
@@ -1791,6 +1835,12 @@ fn describe_expr(e: &Expr) -> &'static str {
     }
 }
 
+/// The name `_` is bound to inside a keyword stage (§8c). A real binding rather than a
+/// side channel: `expect`/`parse` reach it through `Expr::Underscore`, and a nullary
+/// operator reaches it when it has no piped operand, which is what makes §6's
+/// `ls | assert (count > 0)` mean what it reads like.
+const UNDERSCORE: &str = "_";
+
 /// Guard against a runaway `while` or an absurd range. Not a resource policy — a
 /// backstop, like the parser's depth bound.
 const MAX_ITERATIONS: u64 = 10_000_000;
@@ -1973,6 +2023,123 @@ fn expression_value(flow: Flow) -> Result<Val> {
              block's value is being taken, and they produce none. Put it in statement \
              position instead: `if done { break }` on a line of its own",
         )),
+    }
+}
+
+/// `parse T` (§6) — conversion, the direction v1.1 left out entirely.
+///
+/// `expect T` asserts a value already *is* a `T` and passes it through; this reads one
+/// *as* a `T` and produces it. Fail-loud on anything it cannot read, because the whole
+/// reason §6 has no implicit coercion is that a silent one is unrecoverable.
+fn parse_value(v: Val, t: &TypeExpr) -> Result<Val> {
+    let (name, nullable) = match t {
+        TypeExpr::Named { name, nullable, .. } => (name.as_str(), *nullable),
+        TypeExpr::Record { .. } => {
+            return Err(EvalError::new(
+                "`parse` converts to a scalar type — checking a record *shape* is what \
+                 `expect` is for (§6)",
+            ));
+        }
+    };
+    if v.is_null() {
+        return if nullable {
+            Ok(Val::NULL)
+        } else {
+            Err(EvalError::new(alloc::format!(
+                "cannot parse Null as {name} — annotate `{name}?` if the value is \
+                 genuinely optional"
+            )))
+        };
+    }
+    // Already a `T`. Not a special case so much as the identity one: `parse` asks whether
+    // the value can be read as a `T`, and a `T` trivially can.
+    if v.type_name() == name {
+        return Ok(v);
+    }
+    let got = v.type_name();
+    match (v.as_data(), name) {
+        (Some(Value::Str(s)), "Int" | "Float") => {
+            // §6 is strict about surrounding whitespace *because* `trim` exists: quietly
+            // accepting `" 42"` is the coercion this design spends its fail-loud rule on.
+            if s.trim() != s.as_str() {
+                return Err(EvalError::new(alloc::format!(
+                    "cannot parse {s:?} as {name} — it has surrounding whitespace; \
+                     `trim` it first"
+                )));
+            }
+            match (scan_number(s), name) {
+                (Some(Val::Data(Value::Int(i))), "Int") => Ok(Val::int(i)),
+                (Some(Val::Data(Value::Int(i))), "Float") => Ok(Val::float(i as f64)),
+                (Some(Val::Data(Value::Float(f))), "Float") => Ok(Val::float(f)),
+                // The distinction is the point: `Int` and `Float` are different types
+                // everywhere else in this language (§6), so `"3.5" | parse Int` truncating
+                // would be the one silent coercion left standing.
+                (Some(Val::Data(Value::Float(_))), "Int") => Err(EvalError::new(alloc::format!(
+                    "cannot parse {s:?} as Int — it reads as a Float; `parse Float` it, or \
+                     round it"
+                ))),
+                _ => Err(EvalError::new(alloc::format!(
+                    "cannot parse {s:?} as {name}"
+                ))),
+            }
+        }
+        // No `1`/`yes`/`on`. That list is where every configuration language has gone
+        // wrong, and this one has `==` for anything else a script means.
+        (Some(Value::Str(s)), "Bool") => match s.as_str() {
+            "true" => Ok(Val::bool(true)),
+            "false" => Ok(Val::bool(false)),
+            _ => Err(EvalError::new(alloc::format!(
+                "cannot parse {s:?} as Bool — only \"true\" and \"false\""
+            ))),
+        },
+        (Some(Value::Bytes(b)), "String") => match core::str::from_utf8(b) {
+            Ok(s) => Ok(Val::str(s)),
+            Err(e) => Err(EvalError::new(alloc::format!(
+                "cannot parse these bytes as String — not UTF-8 at byte {}",
+                render_i64(e.valid_up_to() as i64)
+            ))),
+        },
+        (Some(Value::Int(i)), "Float") => {
+            let f = *i as f64;
+            // Widening is lossless up to 2^53 and silently lossy past it, which is a
+            // fabricated number by any other name (§8a).
+            if f as i64 != *i {
+                return Err(EvalError::new(alloc::format!(
+                    "cannot parse {} as Float without losing precision",
+                    render_i64(*i)
+                )));
+            }
+            Ok(Val::float(f))
+        }
+        // The other direction is `format`'s job, and saying so is more use than "cannot".
+        (_, "String") => Err(EvalError::new(alloc::format!(
+            "cannot parse {got} as String — rendering a value as text is `format(\"{{}}\", …)` \
+             (§8d)"
+        ))),
+        _ => Err(EvalError::new(alloc::format!(
+            "cannot parse {got} as {name}"
+        ))),
+    }
+}
+
+/// Read a numeric literal — **by running the lexer over it**.
+///
+/// §6 says what a number looks like to `parse` is what it looks like to the lexer, and
+/// this is that sentence rather than a second scanner that agrees with the first until
+/// someone edits one: radix prefixes, `_` separators, exponents and the no-octal rule all
+/// arrive for free and stay in step (§8e).
+///
+/// The sign is handled here because a literal is unsigned in the grammar — `-5` is
+/// negation applied to one — which also means `parse Int` cannot read `i64::MIN`, exactly
+/// as no literal can write it.
+fn scan_number(text: &str) -> Option<Val> {
+    use crate::lex::{Lexer, Tok};
+    match Lexer::tokenize_expr(text).ok()?.as_slice() {
+        [Tok::Int(i), Tok::Eof] => Some(Val::int(*i)),
+        [Tok::Float(f), Tok::Eof] => Some(Val::float(*f)),
+        [Tok::Minus, Tok::Int(i), Tok::Eof] => Some(Val::int(-*i)),
+        [Tok::Minus, Tok::Float(f), Tok::Eof] => Some(Val::float(-*f)),
+        _ => None,
     }
 }
 
@@ -3286,5 +3453,119 @@ x"), "5");
             .run(&crate::parse::parse_script("for x in 0..100000 { }").unwrap())
             .expect_err("an absurd range");
         assert!(e.message.contains("too large to iterate"), "{}", e.message);
+    }
+
+    // --- keyword stages and `parse T` (§6, Part B) --------------------------
+
+    /// **§6's own examples, which is the point of this part.** Every one of them is
+    /// written mid-pipeline, and none of them ran: the parser accepted a keyword stage
+    /// and the evaluator answered "a value cannot be a pipeline stage", so ascription —
+    /// the type system's one real mechanism — was reachable only at a binding site.
+    #[test]
+    fn expect_and_assert_work_as_pipeline_stages() {
+        assert_eq!(rendered("[1, 2] | expect List | count"), "2");
+        assert_eq!(rendered("[1, 2] | assert (count > 0) | count"), "2");
+        // A mismatch still fails loud, mid-chain.
+        assert!(err("[1, 2] | expect Int").contains("expected Int, got List"));
+        assert!(err("[1, 2] | assert (count > 5)").contains("assertion failed"));
+    }
+
+    /// `assert` is a check, not a transform (§6): it occupies the same slot as `expect`,
+    /// so the value has to keep going. Returning `Null` would end every chain it appears
+    /// in — which is what the expression form does, correctly, since there is no chain.
+    #[test]
+    fn assert_passes_its_value_through() {
+        assert_eq!(rendered("[1, 2, 3] | assert (count == 3) | take 2 | count"), "2");
+    }
+
+    /// The mechanism under all of it: `_` is the value flowing past, for the length of
+    /// the stage and nowhere else.
+    #[test]
+    fn underscore_is_the_value_in_a_stage_and_nothing_outside_one() {
+        assert_eq!(rendered("[1, 2] | expect List | count"), "2");
+        assert!(err("_").contains("placeholder"));
+        // …and it does not leak out of the stage that bound it.
+        assert!(err("[1, 2] | expect List\n_").contains("placeholder"));
+    }
+
+    /// A keyword stage reads what arrives, so it has to have something arriving — and the
+    /// two ways of getting that wrong are different mistakes and get different messages.
+    #[test]
+    fn a_keyword_stage_needs_something_arriving() {
+        // At the head of a real pipeline: nothing has flowed in yet.
+        assert!(err("expect Int | count").contains("nothing is arriving"));
+        // With no pipeline at all it is not a stage, and `_` is what it always was.
+        assert!(err("expect Int").contains("placeholder"));
+    }
+
+    /// D4 still holds inside a predicate: a bare, argument-free name is a *binding* first
+    /// and a command second. Allowing a command head in there is what makes `count` mean
+    /// the operator; it must not make `n` stop meaning `n`.
+    #[test]
+    fn a_binding_still_wins_inside_an_assert_predicate() {
+        assert_eq!(rendered("let n = 5\n[1, 2] | assert (n > 0) | count"), "2");
+        assert!(err("let n = 0\n[1, 2] | assert (n > 0)").contains("assertion failed"));
+    }
+
+    /// **Conversion, the direction the language did not have.** Text read from a file, a
+    /// program, or a prompt could never become a number.
+    #[test]
+    fn parse_reads_text_as_a_number() {
+        assert_eq!(rendered("\"42\" | parse Int"), "42");
+        assert_eq!(rendered("\"-5\" | parse Int"), "-5");
+        assert_eq!(rendered("\"3.5\" | parse Float"), "3.5");
+        // An Int reads as a Float; the widening is the lossless direction.
+        assert_eq!(rendered("\"42\" | parse Float"), "42.0");
+        assert_eq!(rendered("42 | parse Float"), "42.0");
+    }
+
+    /// §6: what a number looks like to `parse` is what it looks like to the lexer — and
+    /// it is that sentence rather than a second scanner, so radix prefixes, separators
+    /// and exponents arrive without being reimplemented (§8e).
+    #[test]
+    fn parse_accepts_exactly_the_literals_the_lexer_does() {
+        assert_eq!(rendered("\"0xff\" | parse Int"), "255");
+        assert_eq!(rendered("\"0b1010\" | parse Int"), "10");
+        assert_eq!(rendered("\"1_000_000\" | parse Int"), "1000000");
+        assert_eq!(rendered("\"1e3\" | parse Float"), "1000.0");
+        // …including what it *refuses*: no leading-zero octal, so this is ten.
+        assert_eq!(rendered("\"010\" | parse Int"), "10");
+    }
+
+    /// Every refusal here is a coercion that another language would have performed
+    /// silently, which is the whole reason §6 has no implicit conversion.
+    #[test]
+    fn parse_fails_loud_on_everything_it_cannot_read() {
+        // Strict about whitespace *because* `trim` exists.
+        assert!(err("\" 42 \" | parse Int").contains("whitespace"));
+        // Int and Float are different types everywhere else in this language.
+        let e = err("\"3.5\" | parse Int");
+        assert!(e.contains("reads as a Float"), "{e}");
+        assert!(err("\"abc\" | parse Int").contains("cannot parse"));
+        // No `1`/`yes`/`on` — the list every config language got wrong.
+        assert_eq!(rendered("\"true\" | parse Bool"), "true");
+        assert!(err("\"yes\" | parse Bool").contains("only \"true\" and \"false\""));
+        // Precision loss is a fabricated number by another name (§8a).
+        assert!(err("9007199254740993 | parse Float").contains("losing precision"));
+        // And the other direction names the verb that does do it.
+        assert!(err("42 | parse String").contains("format"));
+    }
+
+    /// A value that is already a `T` reads as one — the identity case, not a special one.
+    #[test]
+    fn parse_of_the_type_it_already_is_passes_through() {
+        assert_eq!(rendered("42 | parse Int"), "42");
+        assert_eq!(rendered("\"x\" | parse String"), "x");
+        // Null needs the nullable form, exactly as an ascription does (§9e).
+        assert_eq!(rendered("null | parse Int?"), "null");
+        assert!(err("null | parse Int").contains("annotate `Int?`"));
+    }
+
+    /// The round trip that says the two halves meet: a value rendered to text and read
+    /// back is the value again.
+    #[test]
+    fn format_and_parse_round_trip() {
+        assert_eq!(rendered("format(\"{}\", 42) | parse Int"), "42");
+        assert_eq!(rendered("format(\"{}\", 2.5) | parse Float"), "2.5");
     }
 }

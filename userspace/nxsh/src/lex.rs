@@ -109,6 +109,8 @@ pub enum Tok {
     As,
     Expect,
     Assert,
+    /// `parse T` — §6's converting sibling of `expect T`.
+    Parse,
     True,
     False,
     Null,
@@ -817,6 +819,7 @@ fn keyword_or_ident(w: &str) -> Tok {
         "as" => Tok::As,
         "expect" => Tok::Expect,
         "assert" => Tok::Assert,
+        "parse" => Tok::Parse,
         "true" => Tok::True,
         "false" => Tok::False,
         "null" => Tok::Null,

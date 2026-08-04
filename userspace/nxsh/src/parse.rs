@@ -760,10 +760,22 @@ impl<'a> Parser<'a> {
                 // arrives, so it has no operand of its own here.
                 Ok(Expr::Expect(Box::new(Expr::Underscore), t))
             }
+            Tok::Parse => {
+                self.bump()?;
+                let t = self.type_expr()?;
+                // Like `expect`, `parse` reads the value flowing past it, so in stage
+                // position it has no operand of its own — `_` is bound to it (§8c).
+                Ok(Expr::Parse(Box::new(Expr::Underscore), t))
+            }
             Tok::Assert => {
                 self.bump()?;
                 self.expect(&Tok::LParen, "`assert` takes a parenthesised predicate")?;
-                self.head_ok = false;
+                // **A command head is legal inside the predicate**, which is what makes
+                // §6's `ls | assert (count > 0)` mean what it reads like: `count` there is
+                // the operator applied to the value flowing past, not an unbound variable.
+                // D4 still puts a local binding first for a bare, argument-free name, so
+                // `assert (n > 0)` over a `let n` is unaffected.
+                self.head_ok = true;
                 let e = self.expr()?;
                 self.expect(&Tok::RParen, "expected `)`")?;
                 Ok(Expr::Assert(Box::new(e)))

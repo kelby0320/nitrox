@@ -694,7 +694,20 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 13. `exit` returns to the login prompt, and logging in again works. A login that
+    // 13. **`parse` at a real prompt**, both directions of §6's contract: text becomes a
+    //     number and takes part in arithmetic, and text that is not a number fails loud
+    //     rather than becoming zero. `format` wraps the answer for the same reason as the
+    //     step above — `42` on its own would match the echo of what was typed, `sum=42`
+    //     cannot.
+    s.send("format(\"sum={}\", (\"40\" | parse Int) + 2)")?;
+    s.expect("sum=42")?;
+    s.expect("/home>")?;
+    s.send("\"abc\" | parse Int")?;
+    s.expect("cannot parse")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 14. `exit` returns to the login prompt, and logging in again works. A login that
     //     cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;
