@@ -1568,6 +1568,45 @@ impl Interp {
                 };
                 wrap(ops::replace(&v, from, to))
             }
+            // §10b: `~=` answers yes or no, so text that matched could not be taken
+            // apart. `capture` is the only operator with real engine work behind it —
+            // submatch slots in the Pike VM — and the only one that returns `null` for a
+            // failure rather than raising, because "did not match" is an ordinary answer
+            // that `??` and `== null` already handle (§9e).
+            "capture" => {
+                let v = need(operand)?;
+                let Some(Value::Str(text)) = v.as_data() else {
+                    return Err(EvalError::new(alloc::format!(
+                        "`capture` works on a String, got {}",
+                        v.type_name()
+                    )));
+                };
+                let Some(pattern) = raw.first() else {
+                    return Err(EvalError::new("`capture` needs a pattern"));
+                };
+                let pattern = self.eval(pattern)?;
+                let Some(Value::Str(pattern)) = pattern.as_data() else {
+                    return Err(EvalError::new("`capture` needs a pattern"));
+                };
+                let re = crate::regex::Regex::new(pattern).map_err(EvalError::new)?;
+                let chars: Vec<char> = text.chars().collect();
+                Ok(match re.captures(text) {
+                    None => Val::NULL,
+                    Some(groups) => Val::Data(Value::List(Arc::from(
+                        groups
+                            .iter()
+                            .map(|g| match g {
+                                // A group that did not participate is Null, not "" —
+                                // "did not match" is not "matched nothing".
+                                None => Value::Null,
+                                Some((a, b)) => {
+                                    Value::Str(chars[*a..*b].iter().collect())
+                                }
+                            })
+                            .collect::<Vec<_>>(),
+                    ))),
+                })
+            }
             "merge" => {
                 let v = need(operand)?;
                 let Some(e) = raw.first() else {
@@ -4275,5 +4314,51 @@ x"), "5");
             rendered("[{ n: \"a\" }, { n: \"b\" }] | filter { |r| r.n in [\"b\"] } | count"),
             "1"
         );
+    }
+
+    // --- `capture` (§10b, Part F) -------------------------------------------
+
+    /// `~=` answers yes or no, so text that matched could not be taken apart. This is the
+    /// half that could not be written without engine work.
+    #[test]
+    fn capture_returns_the_match_and_its_groups() {
+        assert_eq!(rendered("\"a12b\" | capture /(\\d+)/"), "[\"12\", \"12\"]");
+        assert_eq!(
+            rendered("\"12-345\" | capture /(\\d+)-(\\d+)/"),
+            "[\"12-345\", \"12\", \"345\"]"
+        );
+        // Element 0 is always the whole match, even with no groups at all.
+        assert_eq!(rendered("\"abc\" | capture /b./"), "[\"bc\"]");
+    }
+
+    /// **No match is `null`, not an error** — an ordinary answer that `??` and `== null`
+    /// already handle (§9e), and the reason `capture` composes with the rest.
+    #[test]
+    fn no_match_is_null_and_composes() {
+        assert_eq!(rendered("\"abc\" | capture /(\\d+)/"), "null");
+        assert_eq!(rendered("(\"abc\" | capture /(\\d+)/) ?? [\"none\"]"), "[\"none\"]");
+        // The shape §10b writes: capture, then read a group, then convert it.
+        assert_eq!(
+            rendered("let g = \"port 8080\" | capture /(\\d+)/\ng[1] | parse Int"),
+            "8080"
+        );
+    }
+
+    /// A group that did not participate is `null`. "Did not match" is not "matched
+    /// nothing", and a shell that conflated them would make the two indistinguishable.
+    #[test]
+    fn a_group_that_did_not_participate_is_null() {
+        assert_eq!(rendered("\"b\" | capture /(a)|(b)/"), "[\"b\", null, \"b\"]");
+    }
+
+    /// A pattern only lexes as one where a pattern can go (D3): after `~=`, and now after
+    /// `capture`. Everywhere else a leading `/` is still a path and an infix one division —
+    /// the property that made `list /` and `6 / 2` work as a pair.
+    #[test]
+    fn a_regex_literal_still_only_lexes_where_a_pattern_belongs() {
+        assert_eq!(rendered("6 / 2"), "3");
+        assert_eq!(rendered("\"x.rs\" ~= /\\.rs$/"), "true");
+        // …and `capture` refuses what it cannot work on rather than guessing.
+        assert!(err("42 | capture /x/").contains("works on a String"));
     }
 }

@@ -740,7 +740,21 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 16. **`list [x]` returns a prompt instead of locking the shell.** The word-mode
+    // 16. **`capture` at a real prompt**, the shape §10b writes: match, take a group,
+    //     convert it. Text that matched could only be tested before, never taken apart.
+    //     The second line pins the alternation fix — `~=` with a second branch that has to
+    //     win was false for the entire life of the engine.
+    s.send("let g = \"port 8080\" | capture /(\\d+)/")?;
+    s.expect("/home>")?;
+    s.send("format(\"port={}\", (g[1] | parse Int))")?;
+    s.expect("port=8080")?;
+    s.expect("/home>")?;
+    s.send("format(\"alt={}\", (\"b\" ~= /a|b/))")?;
+    s.expect("alt=true")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 17. **`list [x]` returns a prompt instead of locking the shell.** The word-mode
     //     scanner produced an empty token at `[` without advancing, so the argument loop
     //     bumped it forever — a user-reachable hang on a path that predates every part of
     //     Milestone 4, and one with no escape until Ctrl-C exists (§11h). It is asserted
@@ -750,7 +764,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 17. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
+    // 18. **`exit N` sets the status**, which `session-mgr` logs — so the argument form is
     //     observable rather than merely "the shell left". Before Part C the driver matched
     //     the literal line `exit`, so `exit 3` missed it entirely and came back as
     //     "`exit` is handled by the shell's driver".
@@ -763,7 +777,7 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
-    // 18. A bare `exit` still returns to the login prompt, and logging in again works. A
+    // 19. A bare `exit` still returns to the login prompt, and logging in again works. A
     //     login that cannot be repeated is not a login.
     s.send("exit")?;
     s.expect("nitrox login:")?;

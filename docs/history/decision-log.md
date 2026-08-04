@@ -10465,3 +10465,50 @@ itself.
 
 236 crate tests (1088 workspace), `test-qemu` green, `test-interactive` green at 18 steps —
 including `list [x]`, asserted in guest because "the shell is still there" is the whole claim.
+
+## 2026-08-04 — Milestone 4 Part F: `capture`, and the alternation that never matched
+
+Submatch slots in the Pike VM, and the operator on top of them. The engine work went as
+planned; the finding did not.
+
+**Writing `capture`'s tests found that `a|b` does not match `"b"`.** Not in the new code — in
+`is_match`, unchanged since Milestone 3 Part G. `Regex::new` discarded the compiled fragment's
+`start` and both VMs began at instruction zero. Instructions are emitted as fragments are
+parsed, and a combinator emits its own *after* its operands, so `a|b` compiles to
+`Char(a); Char(b); Split(0, 1)` — **the entry point is the last instruction**, and starting at
+zero ran the first branch only.
+
+Every existing test passed because a concatenation *does* start at zero, and no test used a
+top-level alternation whose second branch had to win. `/\.rs$/` is a concatenation; the
+pathological case `(a*)*b` expects *no* match, so it passes either way. The engine has shipped
+since Part G with alternation half-broken, and `~=` is the operator §10a leans on to dissolve
+`grep`. `Regex` now records its entry point, and the regression names the shape rather than
+the symptom.
+
+**What capture actually needed.** An `Inst::Save(slot, then)` that records a position and
+consumes nothing; groups numbered by their `(`; and a second VM pass carrying a slot vector
+per thread. Two rules give leftmost-first — the same semantics Perl and RE2's default use:
+a thread reaching `Match` cuts off every lower-priority thread in the same step, and once a
+match exists no new thread is seeded at a later start.
+
+**`~=` pays nothing for it**, which the plan asked for explicitly: `is_match` and `add_thread`
+are untouched and allocate no slots, and `captures`/`add_capturing` are their own pair. A
+`Save` is a plain pass-through in the non-capturing walker. `~=` runs once per row inside
+`filter`, so a feature it never uses must not cost it a clone per fork.
+
+**Slot 0 is set when a thread is seeded rather than by an instruction.** That is why the
+compiler emits `Save` only for groups and why the program's entry point did not have to move
+for the whole-match span — a small thing, but it is the reason the fix above is one field
+rather than a re-layout.
+
+Two language-level decisions: a group that did not participate is **`null`, not `""`**
+(`(a)|(b)` leaves one unset by construction, and "did not match" is not "matched nothing"),
+and no match at all is `null` rather than an error — an ordinary answer that `??` and
+`== null` already handle (§9e), which is what lets `capture` compose. And a regex literal only
+lexes where a pattern belongs (D3), so `capture` joined `~=` as a trigger; without that,
+`capture /(\d+)/` reads as a path, and with it `list /` and `6 / 2` still mean what they did.
+
+248 crate tests (1100 workspace), `test-qemu` green, `test-interactive` green at 19 steps —
+the new one captures a port number at a real prompt, converts it, and pins the alternation fix
+with `"b" ~= /a|b/`. Non-vacuity: starting the VM at zero again fails the alternation test,
+un-numbering the groups fails eight, and returning `""` for an absent group fails its own.

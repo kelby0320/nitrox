@@ -247,8 +247,11 @@ pub struct Lexer<'a> {
     /// Nesting depth of `(` and `[` only. `{` is excluded on purpose: blocks need their
     /// newlines (D2).
     depth: u32,
-    /// Whether the previous significant token was `~=`, which is what licenses a regex
-    /// literal (D3).
+    /// Whether the previous significant token licenses a **regex literal** (D3).
+    ///
+    /// Two tokens do: `~=`, and the `capture` operator. Both are places a pattern is the
+    /// only thing that can follow, which is what keeps `/` unambiguous everywhere else —
+    /// a leading `/` is a path, and an infix one is division.
     after_match_op: bool,
     /// The previous significant token, for the newline rule.
     prev: Option<Tok>,
@@ -295,7 +298,8 @@ impl<'a> Lexer<'a> {
         let t = self.peek(mode)?;
         self.pending = None;
         if t.tok != Tok::Eof {
-            self.after_match_op = t.tok == Tok::Match_;
+            self.after_match_op = t.tok == Tok::Match_
+                || matches!(&t.tok, Tok::Ident(n) if n == "capture");
             self.prev = Some(t.tok.clone());
         }
         Ok(t)
@@ -448,7 +452,7 @@ impl<'a> Lexer<'a> {
     fn scan_expr(&mut self, start: usize) -> Result<Tok> {
         let c = self.at(start);
 
-        // A regex literal, and only here (D3).
+        // A regex literal, and only after the two tokens that take one (D3).
         if c == b'/' && self.after_match_op {
             return self.scan_regex(start);
         }
