@@ -158,6 +158,10 @@ pub enum BinOp {
     Ne,
     /// `~=` — regex match (§10b).
     Match,
+    /// `in` — membership (§8a, §10b). An infix comparison rather than a pipeline operator,
+    /// because the pipeline form would be a second spelling of one idea and this is the
+    /// one that reads correctly inside an `if`.
+    In,
     And,
     Or,
     /// `??` — null coalescing (§9e).

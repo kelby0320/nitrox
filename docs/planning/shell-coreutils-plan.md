@@ -1085,7 +1085,7 @@ Parts, in order (tick as they land):
 - [x] **Part B — `parse T`, and `expect`/`assert`/`parse` as pipeline stages** ✅ (2026-08-04)
 - [x] **Part C — errors: `fail`, the `kind` vocabulary, `e.stages`, `?` retired, `exit N`** ✅ (2026-08-04)
 - [x] **Part D — sequences generalise, and reduction** ✅ (2026-08-04)
-- [ ] **Part E — strings, records, numbers, `in`**
+- [x] **Part E — strings, records, numbers, `in`** ✅ (2026-08-04)
 - [ ] **Part F — `capture`: regex submatches**
 - [ ] **Part G — interrupt (`Ctrl-C`)** — also makes `strict` real
 
@@ -1250,9 +1250,10 @@ things worth recording:
 - **`format`'s operand goes in as argument 0**, right after the template, because in stage position
   the value flowing past *is* the subject: `… | format("{}")`.
 
-#### Part E — strings, records, numbers, `in`
+#### Part E — strings, records, numbers, `in` ✅ (2026-08-04)
 
-Breadth on Part D's substrate: `split`/`join`/`trim`/`replace`/`upper`/`lower`,
+**Landed — and the "mostly mechanical" part found a user-reachable hang that predates all of
+Milestone 4.** Breadth on Part D's substrate: `split`/`join`/`trim`/`replace`/`upper`/`lower`,
 `keys`/`values`/`merge`, `round`/`floor`/`ceil`/`trunc`/`abs`, and `in` as an infix comparison
 (§8a). The lexer already has `Tok::In`.
 
@@ -1260,6 +1261,24 @@ Breadth on Part D's substrate: `split`/`join`/`trim`/`replace`/`upper`/`lower`,
   its own `in` before any expression is parsed (§8c), and that is exactly the kind of claim that is
   true until someone reorders a parser function.
 - `upper`/`lower` are ASCII-only and say so where a user meets it, not only in the design doc.
+
+**The trap was real, and it was worse than predicted.** The two `in`s do not collide — but `in`
+became the **first operator that can follow a command head**, because `for x in xs` consumes its own
+before any expression is parsed. `starts_an_argument` had no arm for it, so `x in [1, 2]` read as the
+*program* `x` with word-mode arguments — and word mode on `[` **hung the lexer**: `]`/`)`/`}` are
+structural, their openers are not, so `scan_bareword` scanned zero characters, left `pos` alone, and
+the argument loop bumped the same empty `Word` forever.
+
+That hang **predates Milestone 4 entirely**: `list [x]` locks the shell up on `main`, with no Ctrl-C
+to escape it (§11h). Both halves are fixed — `in` continues an expression, and an empty bareword is
+now a lexical error, which makes the hang impossible for *any* character rather than for the ones
+somebody thought of. With the lexer fixed, the parser bug would have been a test **failure** instead
+of a hung suite, which is the whole argument for the second fix.
+
+Two other notes: `merge` needed the `{`-argument permission that predicate operators have (a closure
+and a record both open with `{`; `brace_expr` already tells them apart), and `in` parses its right
+operand a tier lower than the other comparisons, because §8a puts ranges *below* comparison and
+`5 in 0..10` would otherwise be `(5 in 0) .. 10`.
 
 #### Part F — `capture`: regex submatches
 

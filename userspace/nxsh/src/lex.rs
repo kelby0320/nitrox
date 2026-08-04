@@ -572,7 +572,24 @@ impl<'a> Lexer<'a> {
             }
             return Ok(tok);
         }
-        Ok(Tok::Word(self.scan_bareword(start)))
+        let word = self.scan_bareword(start);
+        // **A zero-length token is an infinite loop, not a wrong answer.** `scan_bareword`
+        // stops at anything that is not a word character, and `]`/`)`/`}` are handled
+        // above as structure — but their *openers* are not, so `list [x]` scanned nothing,
+        // made no progress, and the argument loop bumped the same empty `Word` forever.
+        // It is the same failure `scan_ident` documents for `$`, one mode over.
+        //
+        // Refusing here makes the hang impossible for any character, rather than for the
+        // ones somebody thought of: every path out of this function now advances `pos` or
+        // returns an error.
+        if word.is_empty() {
+            return self.err(
+                "this character cannot begin a bareword argument — quote it if it is part \
+                 of a name",
+                start,
+            );
+        }
+        Ok(Tok::Word(word))
     }
 
     /// An unquoted run, ending at whitespace or at structure that could close the
@@ -1221,5 +1238,20 @@ mod tests {
         assert_eq!(toks("0.1"), vec![Tok::Float(0.1), Tok::Eof]);
         assert_eq!(toks("2.675"), vec![Tok::Float(2.675), Tok::Eof]);
         assert_eq!(toks("1_000.5"), vec![Tok::Float(1000.5), Tok::Eof]);
+    }
+
+    /// **A token that consumes nothing is a hang, not a wrong answer.**
+    ///
+    /// `]`, `)` and `}` are structural in word mode; their openers were not, so
+    /// `scan_bareword` at `[` scanned zero characters and left `pos` where it was — and
+    /// the caller bumped that empty `Word` forever. `list [x]` locked the shell up, on a
+    /// path that had nothing to do with the feature that finally surfaced it.
+    #[test]
+    fn a_bareword_that_scans_nothing_is_an_error_not_an_empty_token() {
+        let mut lx = Lexer::new("[x]");
+        assert!(lx.bump(Mode::Word).is_err(), "an empty word means no progress");
+        // The characters that *do* start a word still do.
+        let mut lx = Lexer::new("file[1].txt");
+        assert_eq!(lx.bump(Mode::Word).unwrap().tok, Tok::Word("file".into()));
     }
 }
