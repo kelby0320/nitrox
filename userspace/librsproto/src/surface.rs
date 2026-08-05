@@ -45,14 +45,67 @@ pub const ROLE_POPUP: u16 = 2;
 /// on the composition canvas.
 pub const ROLE_DIALOG: u16 = 3;
 
-/// Screen edge a panel docks to. Only meaningful for [`ROLE_PANEL`].
+/// Wire tag for the top edge.
 pub const EDGE_TOP: u16 = 0;
-/// Bottom edge.
+/// Wire tag for the bottom edge.
 pub const EDGE_BOTTOM: u16 = 1;
-/// Left edge.
+/// Wire tag for the left edge.
 pub const EDGE_LEFT: u16 = 2;
-/// Right edge.
+/// Wire tag for the right edge.
 pub const EDGE_RIGHT: u16 = 3;
+
+/// A screen edge a panel can dock to.
+///
+/// An enum rather than a raw `u16` so an edge that does not exist is **unrepresentable**
+/// rather than merely rejected by the parser. `Role`'s fields are public: with a raw tag,
+/// `Role::Panel { dock: 9, .. }` is constructible in Rust, and then a compositor's `match`
+/// needs a catch-all arm that silently reserves nothing while `strut()` still reports a
+/// reservation — two components disagreeing about the same window. `libdraw` pushed the
+/// depth check into `Geometry::with_pitch` for exactly this reason.
+#[derive(Copy, Clone, PartialEq, Eq, Debug)]
+pub enum Edge {
+    /// Top of the screen.
+    Top,
+    /// Bottom of the screen.
+    Bottom,
+    /// Left of the screen.
+    Left,
+    /// Right of the screen.
+    Right,
+}
+
+impl Edge {
+    /// The wire tag for this edge.
+    pub const fn tag(self) -> u16 {
+        match self {
+            Edge::Top => EDGE_TOP,
+            Edge::Bottom => EDGE_BOTTOM,
+            Edge::Left => EDGE_LEFT,
+            Edge::Right => EDGE_RIGHT,
+        }
+    }
+
+    /// The edge a wire tag names, or `None` if it names none.
+    pub const fn from_wire(tag: u16) -> Option<Edge> {
+        match tag {
+            EDGE_TOP => Some(Edge::Top),
+            EDGE_BOTTOM => Some(Edge::Bottom),
+            EDGE_LEFT => Some(Edge::Left),
+            EDGE_RIGHT => Some(Edge::Right),
+            _ => None,
+        }
+    }
+}
+
+/// Largest strut a panel may reserve, in pixels.
+///
+/// Bounded **at the protocol edge**, where an unbounded `u32` arrives straight off the
+/// wire from a client. Two panels each reserving `0x8000_0000` overflow a `u32`
+/// accumulator: in a debug build that is a client-triggered compositor panic, and in
+/// release (how `xtask` builds userspace) it wraps to zero and silently returns the *full*
+/// screen as the work area — defeating the clamp this protocol promises. The compositor
+/// also saturates, but a value no display could ever need has no business being accepted.
+pub const MAX_STRUT_RESERVE: u32 = 1 << 16;
 
 /// A window's role, and the extra facts a role carries.
 ///
@@ -71,7 +124,7 @@ pub enum Role {
     /// partial-width bar, or one that reserves less than it occupies, inexpressible.
     Panel {
         /// Which screen edge the panel docks to.
-        dock: u16,
+        dock: Edge,
         /// Pixels reserved along that edge, subtracted from the area offered to
         /// `normal` windows.
         reserve: u32,
@@ -108,7 +161,7 @@ impl Role {
     }
 
     /// The edge and size this role reserves, if any.
-    pub const fn strut(&self) -> Option<(u16, u32)> {
+    pub const fn strut(&self) -> Option<(Edge, u32)> {
         match self {
             Role::Panel { dock, reserve } => Some((*dock, *reserve)),
             _ => None,
@@ -146,7 +199,7 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     // body never carries whatever the caller's buffer happened to hold.
     let (aux16, aux32) = match req.role {
         Role::Normal => (0, 0),
-        Role::Panel { dock, reserve } => (dock, reserve),
+        Role::Panel { dock, reserve } => (dock.tag(), reserve),
         Role::Popup { parent } | Role::Dialog { parent } => (0, parent),
     };
     put_u16(out, 10, aux16);
@@ -166,10 +219,11 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
     let role = match get_u16(body, 8) {
         ROLE_NORMAL => Role::Normal,
         ROLE_PANEL => {
-            if aux16 > EDGE_RIGHT {
+            let Some(dock) = Edge::from_wire(aux16) else { return None };
+            if aux32 > MAX_STRUT_RESERVE {
                 return None;
             }
-            Role::Panel { dock: aux16, reserve: aux32 }
+            Role::Panel { dock, reserve: aux32 }
         }
         ROLE_POPUP => Role::Popup { parent: aux32 },
         ROLE_DIALOG => Role::Dialog { parent: aux32 },
@@ -365,8 +419,8 @@ mod tests {
     fn every_role_round_trips_with_its_extra_fields() {
         let roles = [
             Role::Normal,
-            Role::Panel { dock: EDGE_TOP, reserve: 32 },
-            Role::Panel { dock: EDGE_BOTTOM, reserve: 28 },
+            Role::Panel { dock: Edge::Top, reserve: 32 },
+            Role::Panel { dock: Edge::Bottom, reserve: 28 },
             Role::Popup { parent: 7 },
             Role::Dialog { parent: 12 },
         ];
@@ -384,8 +438,8 @@ mod tests {
 
     #[test]
     fn a_panel_reports_its_strut_and_refuses_focus() {
-        let p = Role::Panel { dock: EDGE_TOP, reserve: 32 };
-        assert_eq!(p.strut(), Some((EDGE_TOP, 32)));
+        let p = Role::Panel { dock: Edge::Top, reserve: 32 };
+        assert_eq!(p.strut(), Some((Edge::Top, 32)));
         assert!(!p.takes_focus(), "a panel must never take keyboard focus");
         // Everything else focuses and reserves nothing.
         for r in [Role::Normal, Role::Popup { parent: 1 }, Role::Dialog { parent: 1 }] {
@@ -412,6 +466,34 @@ mod tests {
         put_u16(&mut buf, 10, 9); // no such edge
         put_u32(&mut buf, 12, 32);
         assert!(parse_create_window_request(&buf).is_none());
+    }
+
+    #[test]
+    fn a_strut_larger_than_any_display_is_rejected() {
+        // Unbounded on the wire, this overflows the compositor's accumulator: a panic in
+        // debug, and in release a wrap to zero that returns the *full* screen as the work
+        // area — silently defeating the clamp the spec promises.
+        let mut buf = [0u8; CREATE_WINDOW_REQUEST_LEN];
+        put_u32(&mut buf, 0, 100);
+        put_u32(&mut buf, 4, 32);
+        put_u16(&mut buf, 8, ROLE_PANEL);
+        put_u16(&mut buf, 10, EDGE_TOP);
+        put_u32(&mut buf, 12, 0x8000_0000);
+        assert!(parse_create_window_request(&buf).is_none(), "an absurd reserve must be refused");
+
+        put_u32(&mut buf, 12, MAX_STRUT_RESERVE);
+        assert!(parse_create_window_request(&buf).is_some(), "the bound itself is allowed");
+        put_u32(&mut buf, 12, MAX_STRUT_RESERVE + 1);
+        assert!(parse_create_window_request(&buf).is_none());
+    }
+
+    #[test]
+    fn edge_tags_round_trip_and_unknown_tags_have_no_edge() {
+        for e in [Edge::Top, Edge::Bottom, Edge::Left, Edge::Right] {
+            assert_eq!(Edge::from_wire(e.tag()), Some(e));
+        }
+        assert_eq!(Edge::from_wire(4), None);
+        assert_eq!(Edge::from_wire(u16::MAX), None);
     }
 
     #[test]

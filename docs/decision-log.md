@@ -11061,3 +11061,51 @@ previous, panels taking focus, struts reserving nothing, and accepting a pitch t
 alias rows. Each was caught by the tests written for it; the tree restored byte-identical.
 
 1186 host tests (up from 1159), all six gates green.
+
+## 2026-08-05 — PR #173 review: three blocking, and a vacuous test the break-tests missed
+
+Reviewing Part A on its own — before Parts B and C build on the protocol — was the right
+call: two of the three blocking findings are in code that would have had consumers by then.
+
+**`destroy` orphaned grandchildren.** The `retain` removed only windows whose `parent`
+matched, so a submenu (a popup parented to a popup — the canonical nested case) survived
+its whole ancestry with a dead parent: still compositing, still eligible for focus, in the
+exact state `create` refuses to produce. It also made two spec sentences false. Now runs to
+a fixed point.
+
+**Strut accumulation could overflow on a client-supplied value.** The four accumulators used
+plain `+=` while the combining step twelve lines below already used `saturating_add`, and
+nothing bounded `reserve` on the wire. Two panels at `0x8000_0000` panic in debug — a
+client-triggered compositor death — and in **release**, which is how `xtask` builds
+userspace, wrap to zero and return the *full screen* as the work area, silently defeating
+the clamp the spec promises. Fixed at both ends: `saturating_add` in the loop, and a
+`MAX_STRUT_RESERVE` bound at the protocol edge, since this PR is where that edge freezes.
+
+**A vacuous test — and the break-tests had missed it.** Four behaviours were broken before
+submitting and all four were caught, but not this one:
+`a_window_with_no_committed_buffer_shows_background_not_garbage` passed with the `committed`
+guard removed, because the empty `MapSource` meant the *next* guard caught the window
+anyway. It was a duplicate of the test two below it, leaving the "created but never drawn
+into" path uncovered — the path that matters, since in the server an attached buffer is real
+mapped memory holding whatever the client last put there. One line (give the source pixels)
+makes it fail on the broken guard.
+
+**The fix for the strut finding needed three attempts, which is the more useful lesson.**
+The first replacement test used 128 panels at the protocol bound — 8.4M total, nowhere near
+a `u32` overflow, so `wrapping_add` and `saturating_add` were indistinguishable. The second
+used `u32::MAX - 1` twice, which *does* wrap but lands on a still-huge number the clamp
+handles anyway. Only `0x8000_0000` twice — summing to exactly 2³², wrapping to **zero** —
+distinguishes them. A test for an overflow guard has to make the wrapped value *small*, not
+merely wrong, and both wrong versions looked entirely plausible.
+
+Also fixed: `#[derive(Default)]` started `next_id` at 0 while `new()` started at 1, so the
+two constructors handed out different id spaces and a derived stack would accept
+`Popup { parent: 0 }` where `new()` returns `NoSuchParent`. `dock` became an `Edge` enum so
+a nonexistent edge is unrepresentable rather than merely parser-rejected — `Role`'s fields
+are public, and with a raw tag `work_area`'s catch-all arm would silently reserve nothing
+while `strut()` still reported a reservation, two components disagreeing about one window.
+The spec now states that **window ids are scoped to the connection that created them**
+(otherwise holding `/dev/draw` would be authority to destroy anyone else's windows), and
+that the zero-fill of unused role words is an encoder rule, not a format invariant.
+
+1192 host tests, all six gates green.

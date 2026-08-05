@@ -20,6 +20,19 @@ is in the loop (`docs/design/ui-composition-model.md` §2a).
 **Authority is the binding.** A process can create windows if and only if `/dev/draw` is
 in its namespace. There is no display capability bit and no registration call.
 
+**Window ids are scoped to the connection that created them.** A client may only name its
+own windows: `AttachBuffer`, `Commit` and `DestroyWindow` against an id belonging to
+another connection are `NotFound`, exactly as if the id did not exist. Nothing about the id
+space itself enforces this — ids are unique compositor-wide so that a desktop shell holding
+`/dev/draw` with broader rights can address any of them — so **the server keeps the
+per-connection set** and checks membership before dispatch.
+
+Without that rule, holding `/dev/draw` (which this spec makes the whole of the authority to
+create windows) would also be the authority to destroy anyone else's. The composition
+model already treats a cross-client *pixel read* as a leak worth capability-gating
+(`display-substrate.md` §4b); commit and destroy are the symmetric case and get the
+symmetric answer.
+
 **This category adds no kernel surface.** Everything it needs already exists:
 `sys_memory_create`, `sys_memory_map`, handle transfer on an IPC message, and
 notifications. That is the strongest argument for this shape over the alternatives
@@ -74,7 +87,7 @@ which is what a menu or a dialog already is.
 
 **A popup or dialog must name a parent that exists.** Otherwise the compositor holds a
 transient window with nothing to be transient to, and its stacking position is undefined.
-Destroying a parent destroys its popups and dialogs.
+Destroying a window destroys everything descended from it, transitively.
 
 ### Struts
 
@@ -88,8 +101,14 @@ covers a panel's pixels while the panel still reserves that space for *maximised
 Deriving from geometry would also make a partial-width bar, or one that reserves less than
 it occupies, inexpressible.
 
-Edges: `0` top, `1` bottom, `2` left, `3` right. Over-reservation clamps the work area to
-empty rather than inverting the rectangle.
+Edges: `0` top, `1` bottom, `2` left, `3` right.
+
+`reserve` is bounded at **65536** and a larger value is rejected. Unbounded, two panels can
+overflow the compositor's `u32` accumulator — a panic in a debug build, and in release a
+wrap to zero that returns the *full* screen as the work area, silently defeating the clamp
+below. The compositor also saturates when summing, so neither a single absurd value nor a
+large number of legitimate ones can wrap. Over-reservation clamps the work area to empty
+rather than inverting the rectangle.
 
 ## Operations
 
@@ -107,9 +126,14 @@ Request, 16 bytes:
 | 10 | 2 | role aux16 — a panel's `dock` edge; otherwise **zero** |
 | 12 | 4 | role aux32 — a panel's `reserve`, or a popup/dialog's `parent`; otherwise **zero** |
 
-Unused role words are written zero rather than left alone, so two otherwise-identical
-requests are identical on the wire. An unknown role tag, or a panel docked to an edge
-that does not exist, is **rejected** rather than defaulted.
+An unknown role tag, a panel docked to an edge that does not exist, and a `reserve` above
+the bound are all **rejected** rather than defaulted.
+
+**Encoders write unused role words zero**, so two otherwise-identical requests are
+identical on the wire. Decoders do **not** currently require it: for `normal` both words
+are ignored, and for `popup`/`dialog` the aux16 word is, so several encodings map to one
+role. That is deliberate room for a future field, not an invariant to rely on — do not
+treat a zeroed word as proof of anything.
 
 Reply, 4 bytes: the new `window` id.
 
@@ -142,8 +166,12 @@ Server → client, 8 bytes: `window`, `buffer`. Sent for the buffer that *left* 
 
 ### `DestroyWindow` (`0x0904`)
 
-Request, 4 bytes: `window`. Destroys the window, its attached buffers, and any popups or
-dialogs parented to it.
+Request, 4 bytes: `window`. Destroys the window, its attached buffers, and **every popup or
+dialog descended from it** — transitively, not just its direct children. A submenu is a
+popup parented to a popup; leaving it alive with a dead parent gives it no defined stacking
+position and still lets it take focus.
+
+`NotFound` if the id does not belong to this connection.
 
 ## See also
 

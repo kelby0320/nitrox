@@ -29,8 +29,7 @@ use libdraw::format::{PixelFormat, Rgb};
 use libdraw::framebuffer::{Framebuffer, Geometry};
 use libdraw::geom::{Point, Rect};
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, CreateWindowRequest, EDGE_BOTTOM, EDGE_LEFT, EDGE_RIGHT,
-    EDGE_TOP, Role,
+    AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role,
 };
 
 /// Where a window's pixels are, for a given (window, buffer) pair.
@@ -96,10 +95,21 @@ pub enum StackError {
 }
 
 /// The compositor's window stack: bottom-first order, plus the id allocator.
-#[derive(Default)]
 pub struct WindowStack {
     windows: Vec<Window>,
     next_id: u32,
+}
+
+impl Default for WindowStack {
+    /// Delegates to [`WindowStack::new`].
+    ///
+    /// **Not `#[derive(Default)]`.** That would start `next_id` at 0 while `new()` starts
+    /// at 1, so the two constructors would hand out different id spaces — and a client
+    /// using 0 as a "no parent" sentinel would get `Popup { parent: 0 }` *accepted* on a
+    /// derived stack where `new()` returns `NoSuchParent`.
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl WindowStack {
@@ -193,10 +203,24 @@ impl WindowStack {
     pub fn destroy(&mut self, id: u32) -> Result<(), StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         self.windows.remove(i);
-        // Children of a destroyed window cannot outlive it: a popup or dialog with no
-        // parent has no defined desktop or stacking position.
-        self.windows.retain(|w| !matches!(w.role,
-            Role::Popup { parent } | Role::Dialog { parent } if parent == id));
+        // Descendants cannot outlive an ancestor: a popup or dialog with no parent has no
+        // defined desktop or stacking position, and `create` refuses to produce one.
+        //
+        // **Transitively.** A single pass over direct children leaves a submenu — a popup
+        // parented to a popup, which is the canonical nested case — alive with a dead
+        // parent, still compositing and still eligible for focus after the menu chain it
+        // belonged to was closed. Repeat until nothing more is orphaned.
+        loop {
+            let live: Vec<u32> = self.windows.iter().map(|w| w.id).collect();
+            let before = self.windows.len();
+            self.windows.retain(|w| match w.role {
+                Role::Popup { parent } | Role::Dialog { parent } => live.contains(&parent),
+                _ => true,
+            });
+            if self.windows.len() == before {
+                break;
+            }
+        }
         Ok(())
     }
 
@@ -221,13 +245,18 @@ impl WindowStack {
         let (mut top, mut bottom, mut left, mut right) = (0u32, 0u32, 0u32, 0u32);
         for w in &self.windows {
             if let Some((edge, reserve)) = w.role.strut() {
-                match edge {
-                    EDGE_TOP => top += reserve,
-                    EDGE_BOTTOM => bottom += reserve,
-                    EDGE_LEFT => left += reserve,
-                    EDGE_RIGHT => right += reserve,
-                    _ => {}
-                }
+                // Saturating, not `+=`. `reserve` is bounded at the protocol edge, but the
+                // *sum* over many panels is not, and a wrap here is worse than a panic: in
+                // release it returns the full screen as the work area, silently defeating
+                // the clamp below. No catch-all arm — `Edge` is an enum, so a new edge is a
+                // compile error rather than a silently ignored reservation.
+                let slot = match edge {
+                    Edge::Top => &mut top,
+                    Edge::Bottom => &mut bottom,
+                    Edge::Left => &mut left,
+                    Edge::Right => &mut right,
+                };
+                *slot = slot.saturating_add(reserve);
             }
         }
         let horizontal = left.saturating_add(right);
@@ -345,12 +374,12 @@ mod tests {
             .create(&CreateWindowRequest {
                 width: 32,
                 height: 4,
-                role: Role::Panel { dock: EDGE_TOP, reserve: 4 },
+                role: Role::Panel { dock: Edge::Top, reserve: 4 },
             })
             .unwrap();
         assert_ne!(a, b, "ids must be unique");
         assert_eq!(s.window(a).unwrap().role, Role::Normal);
-        assert_eq!(s.window(b).unwrap().role, Role::Panel { dock: EDGE_TOP, reserve: 4 });
+        assert_eq!(s.window(b).unwrap().role, Role::Panel { dock: Edge::Top, reserve: 4 });
     }
 
     #[test]
@@ -437,13 +466,13 @@ mod tests {
         s.create(&CreateWindowRequest {
             width: 100,
             height: 8,
-            role: Role::Panel { dock: EDGE_TOP, reserve: 8 },
+            role: Role::Panel { dock: Edge::Top, reserve: 8 },
         })
         .unwrap();
         s.create(&CreateWindowRequest {
             width: 100,
             height: 6,
-            role: Role::Panel { dock: EDGE_BOTTOM, reserve: 6 },
+            role: Role::Panel { dock: Edge::Bottom, reserve: 6 },
         })
         .unwrap();
         s.create(&CreateWindowRequest { width: 40, height: 40, role: Role::Normal }).unwrap();
@@ -455,7 +484,7 @@ mod tests {
     fn every_edge_reserves_on_its_own_axis() {
         let mut s = WindowStack::new();
         for (edge, reserve) in
-            [(EDGE_LEFT, 3u32), (EDGE_RIGHT, 5), (EDGE_TOP, 2), (EDGE_BOTTOM, 4)]
+            [(Edge::Left, 3u32), (Edge::Right, 5), (Edge::Top, 2), (Edge::Bottom, 4)]
         {
             s.create(&CreateWindowRequest {
                 width: 1,
@@ -473,7 +502,7 @@ mod tests {
         s.create(&CreateWindowRequest {
             width: 1,
             height: 1,
-            role: Role::Panel { dock: EDGE_TOP, reserve: 90 },
+            role: Role::Panel { dock: Edge::Top, reserve: 90 },
         })
         .unwrap();
         let wa = s.work_area(Rect::new(0, 0, 100, 50));
@@ -489,7 +518,7 @@ mod tests {
         s.create(&CreateWindowRequest {
             width: 32,
             height: 4,
-            role: Role::Panel { dock: EDGE_TOP, reserve: 4 },
+            role: Role::Panel { dock: Edge::Top, reserve: 4 },
         })
         .unwrap();
         // The panel is topmost, but must not take focus.
@@ -504,7 +533,7 @@ mod tests {
         s.create(&CreateWindowRequest {
             width: 32,
             height: 4,
-            role: Role::Panel { dock: EDGE_TOP, reserve: 4 },
+            role: Role::Panel { dock: Edge::Top, reserve: 4 },
         })
         .unwrap();
         assert_eq!(s.focus_candidate(), None);
@@ -541,14 +570,100 @@ mod tests {
     #[test]
     fn a_window_with_no_committed_buffer_shows_background_not_garbage() {
         let mut s = WindowStack::new();
-        let src = MapSource::default();
+        let mut src = MapSource::default();
         let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
         s.attach(&attach(w, 0, 8, 8)).unwrap();
-        // Attached but never committed, and the source has no pixels for it.
+        // **The pixels must exist**, or the source-resolution guard catches the window and
+        // this test says nothing about the `committed` guard it is named for. In the server
+        // an attached buffer is real mapped memory holding whatever the client last put
+        // there; showing it before a commit is the bug.
+        src.put(w, 0, geom(8, 8), Rgb::new(0xC0, 0x10, 0x10));
         let mut fb = screen();
         let full = fb.geometry().bounds();
         s.compose_into(&mut fb, Rgb::new(1, 2, 3), &src, &[full]);
-        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(1, 2, 3)));
+        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(1, 2, 3)), "uncommitted pixels leaked");
+    }
+
+    #[test]
+    fn destroying_an_ancestor_reaches_grandchildren() {
+        // A submenu is a popup parented to a popup. One pass over direct children leaves it
+        // alive with a dead parent — still compositing, still eligible for focus.
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        let menu =
+            s.create(&CreateWindowRequest { width: 4, height: 4, role: Role::Popup { parent: w } })
+                .unwrap();
+        let sub = s
+            .create(&CreateWindowRequest { width: 2, height: 2, role: Role::Popup { parent: menu } })
+            .unwrap();
+        let dlg = s
+            .create(&CreateWindowRequest { width: 2, height: 2, role: Role::Dialog { parent: sub } })
+            .unwrap();
+        let other =
+            s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+
+        s.destroy(w).unwrap();
+        for gone in [menu, sub, dlg] {
+            assert!(s.window(gone).is_none(), "window {gone} outlived its ancestry");
+        }
+        assert!(s.window(other).is_some(), "unrelated windows are untouched");
+        assert_eq!(s.focus_candidate(), Some(other));
+    }
+
+    #[test]
+    fn strut_accumulation_saturates_rather_than_wrapping() {
+        // `reserve` is bounded at the protocol edge, but `Role`'s fields are **public**, so
+        // the library must not rely on that: anything constructing a `Role` in Rust bypasses
+        // the parser entirely. A wrap here is worse than a panic — in release it returns the
+        // *full* screen as the work area, silently defeating the clamp.
+        //
+        // Sized to actually overflow: two reserves near `u32::MAX` do, where a hundred
+        // legitimate ones do not. An earlier version of this test used 128 panels at the
+        // protocol bound (8.4M total) and could not tell `wrapping_add` from
+        // `saturating_add` at all.
+        let mut s = WindowStack::new();
+        for _ in 0..2 {
+            s.create(&CreateWindowRequest {
+                width: 1,
+                height: 1,
+                // Exactly 2^31 each: the sum is 2^32, which wraps to **zero** — the case
+                // that silently returns the full screen. `u32::MAX - 1` twice wraps to a
+                // still-huge number the clamp handles anyway, so it proves nothing; that
+                // was this test's second wrong version.
+                role: Role::Panel { dock: Edge::Top, reserve: 0x8000_0000 },
+            })
+            .unwrap();
+        }
+        let wa = s.work_area(Rect::new(0, 0, 100, 50));
+        assert_eq!(wa.size.h, 0, "the work area must clamp to empty, not wrap open");
+        assert!(wa.is_empty());
+    }
+
+    #[test]
+    fn a_realistic_pair_of_bars_still_leaves_a_work_area() {
+        // The saturation guard must not swallow ordinary values.
+        let mut s = WindowStack::new();
+        s.create(&CreateWindowRequest {
+            width: 100,
+            height: 32,
+            role: Role::Panel { dock: Edge::Top, reserve: 32 },
+        })
+        .unwrap();
+        s.create(&CreateWindowRequest {
+            width: 100,
+            height: 28,
+            role: Role::Panel { dock: Edge::Bottom, reserve: 28 },
+        })
+        .unwrap();
+        assert_eq!(s.work_area(Rect::new(0, 0, 200, 100)), Rect::new(0, 32, 200, 40));
+    }
+
+    #[test]
+    fn default_and_new_share_one_id_space() {
+        let mut d = WindowStack::default();
+        let mut n = WindowStack::new();
+        let req = CreateWindowRequest { width: 1, height: 1, role: Role::Normal };
+        assert_eq!(d.create(&req).unwrap(), n.create(&req).unwrap());
     }
 
     #[test]
