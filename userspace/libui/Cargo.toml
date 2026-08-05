@@ -1,0 +1,23 @@
+[package]
+name = "libui"
+version = "0.1.0"
+edition = "2024"
+
+# `libui` — the client side of the Surface protocol (plan M2 Part C). The role
+# `librsproto` plays for the RS protocol: the protocol gets a library, and clients use it.
+# If the first application hand-rolls this, the surface protocol immediately has two
+# implementations and the second one lives in an application.
+#
+# The **buffer lifecycle** — which buffer a client may draw into, and why single-buffering
+# cannot work — sits behind a `Transport` trait, so it host-tests against a mock instead of
+# needing a running compositor. The syscall-backed transport is the same crate; only the
+# logic above it is exercised on the host.
+[dependencies]
+libdraw = { path = "../libdraw" }
+librsproto = { path = "../librsproto" }
+libkern = { path = "../libkern" }
+libos = { path = "../libos" }
+
+[lib]
+name = "libui"
+path = "src/lib.rs"

@@ -126,6 +126,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "libui"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
+ "libkern",
+ "libos",
+ "librsproto",
+]
+
+[[package]]
 name = "logging-service"
 version = "0.1.0"
 dependencies = [

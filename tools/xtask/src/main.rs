@@ -267,6 +267,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
+    check_userspace_lib("libui")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -1433,6 +1434,16 @@ fn cmd_test() -> R<()> {
         .arg("-p")
         .arg("compositor")
         .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libui` host tests — the client-side buffer lifecycle behind a mock transport:
+    // which buffer may be drawn into, why single buffering cannot work, and that a release
+    // for another window frees nothing. The messages themselves are `librsproto`'s.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libui")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;

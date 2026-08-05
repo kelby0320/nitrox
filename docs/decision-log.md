@@ -11109,3 +11109,62 @@ The spec now states that **window ids are scoped to the connection that created 
 that the zero-fill of unused role words is an encoder rule, not a format invariant.
 
 1192 host tests, all six gates green.
+
+## 2026-08-05 — Display arm M2 Parts B–C: the compositor serves, and libui answers
+
+`/dev/draw` is bound and answered by a real resource server, and clients have a library
+to talk to it:
+
+```
+compositor: up
+compositor: serving /dev/draw
+init: compositor bound at /dev/draw
+```
+
+**The pattern already existed, three times over.** Surfaces needed no new syscalls;
+`/dev/draw` is the same subtree binding `/home` uses; and a connection is the same
+*directory-session* channel `profile-server` hands out for `/bin`. The compositor's whole
+transport story is a recombination of mechanisms already in the tree, which is a good sign
+about the substrate rather than a shortcut.
+
+**A connection is a channel**, and that is what makes Part A's ownership rule enforceable
+rather than merely stated: a request's identity is the endpoint it arrived on, so the
+server never asks who is calling. A client going away is `PeerClosed`, which is exactly
+when its windows should be destroyed.
+
+**Two bugs the guest caught, both invisible to the build.** The compositor spawned and
+failed with the ELF present and no "image not found" — it had **no `.cargo/config.toml`**,
+so it built as a PIE (`Type: DYN`) and the kernel's loader rejects `ET_DYN`. That trap is
+specific to how the crate came to exist: it began as a *library* in Part A and grew a bin
+in Part B, and a crate born as a library has nobody to tell it. `profile-server` was the
+right model precisely because it is also lib+bin — its `build.rs` uses
+`rustc-link-arg-bins` so the fixed-address linker script never reaches the host lib-test
+link. Then `cargo test -p compositor` failed on a duplicate `panic_impl`, since a `no_std`
+bin cannot build for the host; the xtask entry takes `--lib`, as `init` and `service-mgr`
+already do.
+
+**`libui`'s reason to exist is the buffer lifecycle, not the messages.** Encoding is
+`librsproto`'s job and already tested. What a client actually needs is the answer to
+"which buffer may I draw into now?", and getting it wrong produces tearing that is
+invisible in testing and obvious in use. That logic sits behind a `Transport` trait and
+host-tests against a mock.
+
+**Single buffering cannot work, and the library refuses it.** A buffer is busy from commit
+until release, and the compositor releases the buffer that *left* the screen — never the
+one on it. With one buffer there is never anything to release, so a client would stall
+forever or tear. `Window::new` rejects fewer than two rather than letting an application
+discover this at runtime. That is Part E's question answered at the client, though Part E
+still owes the proof against a real double-buffering client.
+
+**Nothing has yet exercised a client and the compositor together.** The server has no
+client, so its session, mapping and commit paths have not run even once; `libui` has only
+met a mock. Part D is what closes that, and it is the first point either half is tested at
+all.
+
+Also noted rather than fixed: the compositor repaints the **whole screen** on every applied
+request. Damage rectangles are carried by the protocol, parsed, and currently ignored. A
+full repaint is always correct and there is one client, but the damage plumbing is
+untested end to end and "the field exists and nothing reads it" is exactly the sort of
+thing that quietly stays true.
+
+1213 host tests, all six gates green, `test-qemu` green, display gate green.

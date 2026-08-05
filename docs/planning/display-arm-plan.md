@@ -2,8 +2,9 @@
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
-self-hash, and the `screendump` smoke gate. **Milestone 2 is in progress** — Part A (the
-surface protocol and the window model) landed 2026-08-05.
+self-hash, and the `screendump` smoke gate. **Milestone 2 is in progress** — Parts A (the surface
+protocol and window model), B (`/dev/draw` served) and C (`libui`) landed 2026-08-05.
+Parts D and E remain: nothing has yet exercised a client and the compositor together.
 
 ## What this is
 
@@ -86,14 +87,14 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 - [x] **Part A — the surface protocol.** ✅ (2026-08-05) Create, share the `MemoryObject`, `Commit { buffer,
       damage }`, release. Host-tested against the in-memory framebuffer. No new syscalls —
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
-- [ ] **Part B — `/dev/draw` served.** `new`, numbered windows, `info`. The same
+- [x] **Part B — `/dev/draw` served.** ✅ (2026-08-05) `new`, numbered windows, `info`. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
 
       **Window roles and panel struts land here**, not later: bars are `panel`, menus and the
       applications modal are `popup`, and retrofitting a role into a shipped protocol touches
       every client (substrate §4a).
-- [ ] **Part C — `libui`: the client side of the protocol.** Connect, create a window, allocate
+- [x] **Part C — `libui`: the client side of the protocol.** ✅ (2026-08-05) Connect, create a window, allocate
       and commit surfaces, receive input, run an event loop. The same role `librsproto` plays for
       the RS protocol — **the protocol gets a library, and clients use it.** If the first app
       hand-rolls this instead, the surface protocol immediately has two implementations and the
