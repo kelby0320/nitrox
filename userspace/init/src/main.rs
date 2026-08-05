@@ -27,7 +27,7 @@ use alloc::vec::Vec;
 use core::arch::asm;
 use init::manifest::{self, Mode, MountSpec};
 use libkern::*;
-use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
+use libos::{Handle, MapRead, MapReadWrite, Memory, Namespace, NsReadOnly, block_on};
 
 // The freeing userspace heap (slice 4). Replaces init's former fixed bump arena,
 // which never freed — fine for init's one-shot bootstrap, but init is now the first
@@ -1464,6 +1464,114 @@ fn run_test_harness(notif: u64, root_ns: u64) -> bool {
 /// not a deterministic catch of that specific timing bug, which only reproduced under
 /// sustained multi-second load.) session-mgr fires the `test-harness` verdict once login is
 /// proven; a crashed demo `parent` fails the run first (in `reap_loop`).
+/// Map `/dev/framebuffer` and fill it — the display arm's M1 Part B deliverable.
+///
+/// Proves the two things the plan asks of this part: that the **binding** reaches
+/// userspace at all, and that the **geometry hand-off** is usable. Both leaves are
+/// exercised: `/info` for the geometry a client cannot infer from the bytes, then the
+/// aperture itself.
+///
+/// The fill deliberately uses the *reported* `pitch` and channel shifts rather than
+/// assuming `width * 4` and `0x00RRGGBB`. Assuming either produces something that looks
+/// plausible under QEMU and is wrong on firmware that pads rows or reports BGR — and a
+/// compositor's self-hash cannot detect the second case, because the guest stays
+/// consistent with itself (`docs/design/display-substrate.md` §8c).
+#[cfg(feature = "selftest")]
+fn framebuffer_test(root_ns: u64) -> bool {
+    use libkern::abi::FramebufferInfo;
+
+    // SAFETY: `root_ns` is init's live root namespace, owned for its whole run; a
+    // borrowed Handle is a non-owning view and never closes it.
+    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+
+    // 1. Geometry, from the `/info` leaf.
+    // SAFETY: the path resolves to a read-mappable object holding one FramebufferInfo.
+    let info_obj = match block_on(unsafe {
+        ns.lookup::<Memory, MapRead>("/dev/framebuffer/info", Rights::MAP_READ)
+    }) {
+        Ok(m) => m,
+        Err(_) => {
+            kprint(b"init: /dev/framebuffer/info lookup FAIL (no display?)\n");
+            return false;
+        }
+    };
+    let info_addr = match info_obj.map(PAGE as usize) {
+        Ok(a) => a,
+        Err(_) => {
+            kprint(b"init: framebuffer info map FAIL\n");
+            return false;
+        }
+    };
+    // SAFETY: `info_addr` maps a page holding the struct followed by zero padding.
+    let info_bytes = unsafe { core::slice::from_raw_parts(info_addr as *const u8, PAGE as usize) };
+    let Some(info) = FramebufferInfo::from_bytes(info_bytes) else {
+        kprint(b"init: framebuffer info too short\n");
+        return false;
+    };
+
+    kprint(b"init: framebuffer ");
+    kprint_u64(info.width as u64);
+    kprint(b"x");
+    kprint_u64(info.height as u64);
+    kprint(b" pitch=");
+    kprint_u64(info.pitch);
+    kprint(b" bpp=");
+    kprint_u64(info.bits_per_pixel as u64);
+    kprint(b" rgb_shifts=");
+    kprint_u64(info.red_shift as u64);
+    kprint(b"/");
+    kprint_u64(info.green_shift as u64);
+    kprint(b"/");
+    kprint_u64(info.blue_shift as u64);
+    kprint(b"\n");
+
+    if info.bits_per_pixel != 32 || info.byte_len == 0 {
+        kprint(b"init: framebuffer geometry unusable\n");
+        return false;
+    }
+
+    // 2. The aperture itself.
+    // SAFETY: the path resolves to a read/write-mappable MemoryObject over the aperture.
+    let fb_obj = match block_on(unsafe {
+        ns.lookup::<Memory, MapReadWrite>(
+            "/dev/framebuffer",
+            Rights::MAP_READ | Rights::MAP_WRITE,
+        )
+    }) {
+        Ok(m) => m,
+        Err(_) => {
+            kprint(b"init: /dev/framebuffer lookup FAIL\n");
+            return false;
+        }
+    };
+    let fb_addr = match fb_obj.map(info.byte_len as usize) {
+        Ok(a) => a,
+        Err(_) => {
+            kprint(b"init: framebuffer map FAIL\n");
+            return false;
+        }
+    };
+
+    // 3. Fill a band, walking rows by `pitch` and packing by the reported shifts.
+    let band_h = core::cmp::min(info.height, 24) as u64;
+    let pixel = (0x33u32 << info.red_shift) | (0x88u32 << info.green_shift) | (0xCCu32 << info.blue_shift);
+    for y in 0..band_h {
+        // Row stride is `pitch`, never `width * 4`.
+        let row = fb_addr.wrapping_add((y * info.pitch) as usize);
+        for x in 0..info.width as usize {
+            // SAFETY: `y < height` and `x < width`, and the row base is computed with
+            // the reported `pitch`, so this lies inside the mapped `byte_len` bytes.
+            // `write_volatile` because the target is a device aperture.
+            unsafe { (row.add(x * 4) as *mut u32).write_volatile(pixel) };
+        }
+    }
+    kprint(b"init: framebuffer filled ");
+    kprint_u64(band_h);
+    kprint(b" row(s) OK\n");
+    true
+    // `fb_obj` / `info_obj` drop here → close the resolved handles.
+}
+
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {
@@ -1640,6 +1748,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // bind-mount from mount_one) and confirm it reaches the right file.
     #[cfg(feature = "selftest")]
     subtree_bind_test(root_ns);
+
+    #[cfg(feature = "selftest")]
+    {
+        // Advisory on a real machine — a system with no display must still boot — but
+        // **fatal under `test-harness`**, because the CI emulator always reports a
+        // framebuffer. Without this, a broken binding is indistinguishable from a
+        // headless host: the first run of this test printed "lookup FAIL" and the suite
+        // still reported PASSED.
+        let fb_ok = framebuffer_test(root_ns);
+        #[cfg(feature = "test-harness")]
+        if !fb_ok {
+            kprint(b"init: framebuffer test FAILED\n");
+            test_exit(false);
+        }
+        let _ = fb_ok;
+    }
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

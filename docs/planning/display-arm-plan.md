@@ -1,7 +1,8 @@
 # Nitrox Display Arm — Subproject Plan
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
-Milestone 1 Part A (`libdraw` + the gate) landed 2026-08-05.
+Milestone 1 Parts A (`libdraw` + the gate) and B (the framebuffer reaches
+userspace) landed 2026-08-05.
 
 ## What this is
 
@@ -65,7 +66,7 @@ on the hash.** No window, no client, no font, no terminal.
       It is a *shared* crate from the start: the compositor composites surfaces and a client
       draws into one, and both do the same rect and glyph work. Building it as compositor-only
       would mean writing it twice.
-- [ ] **Part B — P2: the framebuffer reaches userspace.** Kernel resource + namespace binding;
+- [x] **Part B — P2: the framebuffer reaches userspace.** ✅ (2026-08-05) Kernel resource + namespace binding;
       a minimal program maps it and fills it. Proves the binding and the geometry hand-off.
 - [ ] **Part C — the self-hash.** The compositor composites a reference scene from *synthetic*
       surfaces and hashes the result; `test-qemu` adjudicates via the existing `isa-debug-exit`

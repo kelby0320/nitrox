@@ -10797,3 +10797,57 @@ a `no_std` regression would sit undetected until Part B tried to build on it. Th
 is deleted once the compositor depends on the crate.
 
 1146 host tests (up from 1105), all six gates green, kernel builds.
+
+## 2026-08-05 — Display arm M1 Part B: the framebuffer reaches userspace
+
+`/dev/framebuffer` is bound into init's namespace and init maps it and writes pixels.
+Verified in the guest: `1280x800 pitch 5120 bpp 32`, geometry read back correctly,
+24 rows filled.
+
+**The aperture is a `MemoryObject` with borrowed frames.** `MemoryObject::Drop` hands
+every frame to the buddy allocator, which is right for anonymous memory and
+catastrophic for MMIO: closing the last framebuffer handle would put device physical
+addresses on the free list, to be handed out later as if they were RAM — silent at the
+mistake, corruption much later. `FrameOwnership::{Owned, Borrowed}` makes the
+distinction explicit and `Drop` skips borrowed frames. `MAX_SIZE` deliberately does not
+apply to the borrowed constructor: that cap bounds *eager allocation*, nothing is
+allocated here, and a 4K aperture (~33 MiB) legitimately exceeds it.
+
+**Geometry travels as a second leaf, not in `HandleInfo`.** `/dev/framebuffer` resolves
+to the aperture; `/dev/framebuffer/info` to a small read-only object holding a
+`#[repr(C)] FramebufferInfo` (width, height, pitch, byte_len, bpp, per-channel shift and
+size). `HandleInfo` is a frozen 24-byte struct shared by every object type and the wrong
+home for per-type fields — and a 16-versus-24-byte mismatch in it smashed a userspace
+stack once already. Two leaves reuse the suffix dispatch `/dev/blk` and `/proc/sched/*`
+already use, so **no new syscall appears**, which is what §3 means by geometry crossing
+"as an attribute of the resource rather than a second protocol".
+
+`FramebufferInfo` is mirrored in `userspace/libkern` with matching `offset_of!`/`size_of`
+asserts on both sides. `abi-sync-check` deliberately does not compare `#[repr(C)]`
+layouts — its own doc comment says the asserts are the stronger check and fail at build
+time.
+
+**Authority is the binding.** No display capability bit, no registration call: a process
+can drive the display if and only if `/dev/framebuffer` is in its namespace, the same
+rule the fs-server and profile-server live under.
+
+**Two bugs the guest caught that no host test could have.**
+
+1. **Ordering.** The aperture capture was folded into `draw_boot_screen`, which runs
+   *after* `run_first_userspace` — so every lookup resolved to "no aperture recorded".
+   It is now its own boot step before userspace exists, which is also the correct
+   separation: recording a system resource is not the same job as painting a banner.
+2. **Suffix convention.** `Namespace::resolve` strips the separator —
+   `/dev/entropy/x` yields `b"x"`, not `b"/x"`. The server matched `b"/info"`, so the
+   geometry leaf was unreachable.
+
+Neither was visible to the build or to 1150 host tests.
+
+**The first guest run was a vacuous pass, and that is now fixed.** `test-qemu` reported
+PASSED while the log read `lookup FAIL`, because the demo is non-fatal by design — a
+machine with no display must still boot. But under `test-harness` the emulator always
+reports a framebuffer, so a failure there is a real regression, and it now calls
+`test_exit(false)`. Verified by re-breaking the suffix: the same change that previously
+passed silently now fails the run (`qemu exit 35; expected 33`).
+
+1150 host tests, all six gates green, `test-qemu` green.

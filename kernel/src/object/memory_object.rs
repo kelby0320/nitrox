@@ -24,6 +24,23 @@ use crate::libkern::{AllocError, KBox, KVec};
 use crate::mm::{PAGE_SHIFT, PAGE_SIZE, PhysAddr, heap};
 use crate::object::header::KObjectHeader;
 
+/// Whether a [`MemoryObject`]'s frames belong to it.
+///
+/// The distinction is load-bearing rather than descriptive. [`Drop`] hands every
+/// frame back to the buddy allocator, which is correct for ordinary anonymous memory
+/// and **catastrophic** for a device aperture: closing the last handle to a framebuffer
+/// would put MMIO physical addresses on the free list, to be handed out later as if
+/// they were RAM. The failure is silent at the point of the mistake and appears much
+/// later as unrelated corruption.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum FrameOwnership {
+    /// Frames came from the buddy allocator and are freed on drop.
+    Owned,
+    /// Frames are a fixed physical range this object does not own — a device
+    /// aperture reported by firmware. Never freed.
+    Borrowed,
+}
+
 /// An anonymous memory kernel object.
 ///
 /// `#[repr(C)]` with [`KObjectHeader`] first so the type-erased object
@@ -36,9 +53,11 @@ pub struct MemoryObject {
     magic: u64,
     /// Page-rounded byte size of the object.
     size: usize,
-    /// One physical frame per page; `frames[i]` backs page `i`. Owned: freed
-    /// in [`Drop`] when the last reference releases.
+    /// One physical frame per page; `frames[i]` backs page `i`. Freed in [`Drop`]
+    /// only when [`MemoryObject::ownership`] is [`FrameOwnership::Owned`].
     frames: KVec<PhysAddr>,
+    /// Whether [`Drop`] frees `frames`.
+    ownership: FrameOwnership,
 }
 
 impl MemoryObject {
@@ -104,7 +123,62 @@ impl MemoryObject {
             magic: Self::MAGIC,
             size,
             frames,
+            ownership: FrameOwnership::Owned,
         })
+    }
+
+    /// Build a memory object over a **borrowed**, physically contiguous range that the
+    /// kernel does not own — a device aperture reported by firmware.
+    ///
+    /// No frames are allocated: `base` and `size` describe memory that already exists.
+    /// [`Drop`] therefore never frees them ([`FrameOwnership::Borrowed`]), which is the
+    /// entire point. The framebuffer is the first user: Limine hands the kernel a linear
+    /// aperture before userspace exists, and the compositor maps it through an ordinary
+    /// `MemoryObject` handle rather than through a bespoke protocol
+    /// (`docs/design/display-substrate.md` §3, "the kernel already has `MemoryObject`
+    /// for 'memory you map'").
+    ///
+    /// [`MemoryObject::MAX_SIZE`] deliberately does **not** apply. That cap is a
+    /// denial-of-service guard on *eager allocation* — it bounds how much RAM one
+    /// create can pin and zero. Nothing is allocated or zeroed here, and a 4K display's
+    /// aperture (≈33 MiB) legitimately exceeds it.
+    ///
+    /// `base` must be page-aligned; `size` is rounded up to whole pages. Returns
+    /// `AllocError` only if the frame vector itself cannot be allocated.
+    ///
+    /// # Safety
+    ///
+    /// `base..base + size` must be a physical range that is safe to map into a user
+    /// address space for the lifetime of every handle derived from this object, and
+    /// must not overlap any frame the buddy allocator manages. Passing ordinary RAM
+    /// here would create an object that aliases allocatable memory and never frees it.
+    pub unsafe fn try_new_borrowed(
+        base: PhysAddr,
+        size: usize,
+    ) -> Result<KBox<Self>, AllocError> {
+        let size = (size.max(1) + PAGE_SIZE - 1) & !(PAGE_SIZE - 1);
+        let npages = size >> PAGE_SHIFT;
+
+        let mut frames: KVec<PhysAddr> = KVec::new();
+        frames.try_reserve(npages)?;
+        for i in 0..npages {
+            frames
+                .try_push(PhysAddr::new(base.as_u64() + (i << PAGE_SHIFT) as u64))
+                .expect("within reserved capacity");
+        }
+
+        KBox::try_new(Self {
+            header: KObjectHeader::new(KObjectType::MemoryObject),
+            magic: Self::MAGIC,
+            size,
+            frames,
+            ownership: FrameOwnership::Borrowed,
+        })
+    }
+
+    /// Whether this object's frames are freed when it drops.
+    pub fn ownership(&self) -> FrameOwnership {
+        self.ownership
     }
 
     /// Allocate a memory object holding a copy of `bytes` (size rounded up to a
@@ -192,6 +266,11 @@ impl Drop for MemoryObject {
     /// owned `AddressSpace` carries its own `Drop` — a `MemoryObject` holds raw
     /// `PhysAddr`s with no owning wrapper, so it must free them itself.
     fn drop(&mut self) {
+        // Borrowed frames are a device aperture the kernel does not own. Freeing them
+        // would put MMIO addresses on the buddy free list — see [`FrameOwnership`].
+        if self.ownership == FrameOwnership::Borrowed {
+            return;
+        }
         for &f in self.frames.iter() {
             heap::buddy_free(f, 0);
         }
@@ -227,6 +306,72 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    fn a_borrowed_object_describes_the_range_without_allocating() {
+        init_global_heap();
+        // A plausible aperture base, page-aligned and well clear of anything the
+        // buddy hands out in tests.
+        let base = PhysAddr::new(0xF000_0000);
+        // SAFETY: test-only. Nothing maps or dereferences these frames — the test
+        // inspects the object's bookkeeping, never the memory itself.
+        let m = unsafe { MemoryObject::try_new_borrowed(base, 3 * PAGE_SIZE + 1).unwrap() };
+
+        assert_eq!(m.ownership(), FrameOwnership::Borrowed);
+        assert_eq!(m.size(), 4 * PAGE_SIZE, "size rounds up to whole pages");
+        assert_eq!(m.npages(), 4);
+        // Frames describe the aperture, contiguously, in order.
+        for (i, &f) in m.frames().iter().enumerate() {
+            assert_eq!(f.as_u64(), base.as_u64() + (i * PAGE_SIZE) as u64, "frame {i}");
+        }
+    }
+
+    #[test]
+    fn dropping_a_borrowed_object_never_frees_its_frames_into_the_buddy() {
+        // The property the whole `FrameOwnership` distinction exists for. If it
+        // regresses, closing the last framebuffer handle puts MMIO addresses on the
+        // buddy free list, and the damage surfaces much later, somewhere unrelated.
+        //
+        // Deterministic by construction: the fake aperture is a high physical range
+        // the test heap never contains, so a leaked frame is identifiable by address
+        // rather than by hoping the allocator hands the same one straight back. An
+        // earlier version of this test allocated a real frame and asserted the next
+        // allocation differed — which was flaky under the parallel test runner, and
+        // was caught only because two consecutive runs disagreed.
+        init_global_heap();
+        const APERTURE: u64 = 0xF000_0000;
+        const PAGES: usize = 64;
+
+        // SAFETY: test-only. Nothing maps or dereferences these frames; the object
+        // only records their addresses, and Borrowed drop must not touch them.
+        let m = unsafe {
+            MemoryObject::try_new_borrowed(PhysAddr::new(APERTURE), PAGES * PAGE_SIZE).unwrap()
+        };
+        drop(m);
+
+        // If Drop had freed them, those bogus addresses are now on the free list.
+        let mut taken = KVec::new();
+        taken.try_reserve(PAGES).unwrap();
+        for _ in 0..PAGES {
+            let f = heap::buddy_alloc(0).expect("a frame");
+            assert!(
+                f.as_u64() < APERTURE || f.as_u64() >= APERTURE + (PAGES * PAGE_SIZE) as u64,
+                "buddy returned {:#x}, inside the borrowed aperture — Drop freed frames \
+                 it does not own",
+                f.as_u64()
+            );
+            taken.try_push(f).unwrap();
+        }
+        for &f in taken.iter() {
+            heap::buddy_free(f, 0);
+        }
+    }
+
+    // The control for the test above lives in `drop_frees_frames_no_leak`: it builds
+    // and drops 64 eight-page *owned* objects against a 16 MiB heap, so if `Drop`
+    // ever stopped freeing anything at all, that test exhausts the heap and fails.
+    // Without it, "borrowed frames are not freed" would also pass on a `Drop` that
+    // had become a no-op.
 
     #[test]
     fn try_new_filled_copies_bytes_and_zeroes_tail() {
