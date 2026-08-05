@@ -2,7 +2,7 @@
 
 This document specifies the wire format of the resource server protocol — the binary protocol spoken by every userspace resource server over IPC. The protocol rides on top of the [IPC message format](ipc-message-format.md): each protocol message occupies the payload portion of an `IpcMsg`, with handles transferred via the message's handle list.
 
-**Status:** Pre-stabilization. The envelope and Meta operations are committed; per-category operations (Stream, Block, Control, etc.) will be specified as their resource server implementations land.
+**Status:** Pre-stabilization. The envelope and Meta operations are committed; per-category operations (Stream, Block, Control, etc.) will be specified as their resource server implementations land. `Auth` and `Surface` have specs.
 
 ## Envelope
 
@@ -67,7 +67,8 @@ The 16-bit `op` field decomposes:
 | `File` | `0x06xx` | Positioned, stateless file-content reads (page-cache fill) |
 | `Log` | `0x07xx` | Reserved for *reply-bearing* logging ops (read-back/query). The hot append path uses **no** op — see [Log records](#log-records). |
 | `Auth` | `0x08xx` | Credential validation (username/password → principal). See [Auth operations spec](rsproto-auth-ops.md). |
-| (reserved) | `0x09xx` – `0xFExx` | Future categories |
+| `Surface` | `0x09xx` | Windows, shared buffers, commit/release. See [Surface operations spec](rsproto-surface-ops.md). |
+| (reserved) | `0x0Axx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
 A resource server must implement at least the Meta category. Each server declares which other categories it supports via `Meta::QueryCaps`.

@@ -11014,3 +11014,98 @@ construction, since `PixelFormat`'s public fields made one constructible and the
 paths index a 4-byte word while striding by `bytes_per_pixel()`.
 
 1159 host tests, all six gates, `test-qemu` and the display gate green.
+
+## 2026-08-05 — Display arm M2 Part A: the surface protocol, and roles fixed at creation
+
+Windows, shared buffers, commit and release — as a new rsproto category rather than a
+bespoke protocol, because `/dev/draw` is a **userspace resource server with a subtree
+base**, the same binding kind `/home` uses, so window paths are already forwarded resolves
+(`ui-composition-model.md` §2a). `Surface` takes `0x09xx` from the reserved range and gets
+`docs/spec/rsproto-surface-ops.md` alongside the other per-category specs.
+
+**No kernel surface is added.** `sys_memory_create`/`_map`, handle transfer on an IPC
+message, and notifications already exist, which the substrate doc calls the strongest
+argument for this shape.
+
+**Two protocol decisions settled with the maintainer, both freezing here** because the
+plan puts roles in Milestone 2 and "retrofitting a role into a shipped protocol touches
+every client".
+
+*Role is immutable after creation.* A change would force the compositor to redo struts,
+focus policy and stacking mid-flight; a client wanting a different role creates a different
+window, which is what a menu or a dialog already is.
+
+*Struts are declared, not derived from geometry* — `dock: Edge` plus `reserve: u32`. The
+two genuinely differ: a **fullscreen** window covers a panel's pixels while the panel still
+reserves that space for *maximised* windows. Deriving would also make a partial-width bar,
+or one reserving less than it occupies, inexpressible.
+
+**The compositor is split like `fs-server-ext4` and `nxsh`**: the window model is a library
+with no syscalls — stack, roles, struts, commit application, compositing — and the server
+half (`/dev/draw`, IPC, mapped buffers) is the bin that lands with Part B. Pixels arrive
+through a `BufferSource` trait rather than being owned, because in the server they are
+mapped `MemoryObject`s and owning them would mean a copy per frame, defeating the
+shared-memory design.
+
+**`Release` names the buffer that *left* the screen**, not the one that arrived. Releasing
+the newly committed buffer would hand the client back memory the compositor is about to
+read — precisely the tearing this protocol exists to prevent — and re-committing the same
+buffer releases nothing, since the client already owns nothing else.
+
+Rejections recorded in the spec so nobody re-proposes them: pixels over IPC (copying a
+frame through messages), and server-allocated buffers (which makes the compositor the
+allocator for every client's rendering).
+
+Verified non-vacuous by breaking four behaviours: releasing the new buffer instead of the
+previous, panels taking focus, struts reserving nothing, and accepting a pitch that would
+alias rows. Each was caught by the tests written for it; the tree restored byte-identical.
+
+1186 host tests (up from 1159), all six gates green.
+
+## 2026-08-05 — PR #173 review: three blocking, and a vacuous test the break-tests missed
+
+Reviewing Part A on its own — before Parts B and C build on the protocol — was the right
+call: two of the three blocking findings are in code that would have had consumers by then.
+
+**`destroy` orphaned grandchildren.** The `retain` removed only windows whose `parent`
+matched, so a submenu (a popup parented to a popup — the canonical nested case) survived
+its whole ancestry with a dead parent: still compositing, still eligible for focus, in the
+exact state `create` refuses to produce. It also made two spec sentences false. Now runs to
+a fixed point.
+
+**Strut accumulation could overflow on a client-supplied value.** The four accumulators used
+plain `+=` while the combining step twelve lines below already used `saturating_add`, and
+nothing bounded `reserve` on the wire. Two panels at `0x8000_0000` panic in debug — a
+client-triggered compositor death — and in **release**, which is how `xtask` builds
+userspace, wrap to zero and return the *full screen* as the work area, silently defeating
+the clamp the spec promises. Fixed at both ends: `saturating_add` in the loop, and a
+`MAX_STRUT_RESERVE` bound at the protocol edge, since this PR is where that edge freezes.
+
+**A vacuous test — and the break-tests had missed it.** Four behaviours were broken before
+submitting and all four were caught, but not this one:
+`a_window_with_no_committed_buffer_shows_background_not_garbage` passed with the `committed`
+guard removed, because the empty `MapSource` meant the *next* guard caught the window
+anyway. It was a duplicate of the test two below it, leaving the "created but never drawn
+into" path uncovered — the path that matters, since in the server an attached buffer is real
+mapped memory holding whatever the client last put there. One line (give the source pixels)
+makes it fail on the broken guard.
+
+**The fix for the strut finding needed three attempts, which is the more useful lesson.**
+The first replacement test used 128 panels at the protocol bound — 8.4M total, nowhere near
+a `u32` overflow, so `wrapping_add` and `saturating_add` were indistinguishable. The second
+used `u32::MAX - 1` twice, which *does* wrap but lands on a still-huge number the clamp
+handles anyway. Only `0x8000_0000` twice — summing to exactly 2³², wrapping to **zero** —
+distinguishes them. A test for an overflow guard has to make the wrapped value *small*, not
+merely wrong, and both wrong versions looked entirely plausible.
+
+Also fixed: `#[derive(Default)]` started `next_id` at 0 while `new()` started at 1, so the
+two constructors handed out different id spaces and a derived stack would accept
+`Popup { parent: 0 }` where `new()` returns `NoSuchParent`. `dock` became an `Edge` enum so
+a nonexistent edge is unrepresentable rather than merely parser-rejected — `Role`'s fields
+are public, and with a raw tag `work_area`'s catch-all arm would silently reserve nothing
+while `strut()` still reported a reservation, two components disagreeing about one window.
+The spec now states that **window ids are scoped to the connection that created them**
+(otherwise holding `/dev/draw` would be authority to destroy anyone else's windows), and
+that the zero-fill of unused role words is an encoder rule, not a format invariant.
+
+1192 host tests, all six gates green.
