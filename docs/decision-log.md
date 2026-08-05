@@ -10962,3 +10962,55 @@ artifact on failure, since the image *is* the diagnostic.
 **Milestone 1 is complete**: the gate arrived with the first commit as governing decision 1
 required, and the framebuffer, the self-hash and the screendump gate all rest on it.
 1158 host tests, all six gates green, `test-qemu` green, display gate green.
+
+## 2026-08-05 — PR #172 review: a vacuous pass reintroduced mid-branch
+
+Seven findings on the M1 branch, all confirmed. Three are worth recording.
+
+**A regression introduced *inside* the branch.** At Part B, `framebuffer_test` returned
+`false` when `/dev/framebuffer/info` failed to resolve, and the call site made that fatal
+under `test-harness`. Part C's rewrite into `display-selftest` folded "the lookup failed"
+and "this machine has no display" into a single `AcquireError::NoBinding`, classified it
+as headless, and exited 0. Init only failed the run on a *non-zero* code — so **the entire
+display arm could be missing and `test-qemu` stayed green**. Demonstrated by making
+`record_aperture` return `false`: reference hash OK, "no /dev/framebuffer binding
+(headless)", PASSED, `qemu exit 33`.
+
+The Part B entry above says "the first guest run was a vacuous pass, and that is now
+fixed". True as of its date; two commits later it was not. That is precisely the class the
+separate review session exists to catch — the author's own model says "I fixed that", and
+only a reader rebuilding from the diff notices it came back.
+
+The fix puts the policy where the knowledge is. The program cannot judge whether a missing
+display matters, so it now reports **which** outcome occurred — `0` passed, `1` failed,
+`2` no binding — and init decides: `2` is tolerated on a real machine and fatal under
+`test-harness`, where the emulator always reports a framebuffer. Verified with the same
+break: `qemu exit 35; expected 33`.
+
+**The path filter omitted where the bug had actually lived.** `display.yml` did not list
+`kernel/src/main.rs` — which holds both `record_framebuffer()` and the
+`bind_kernel_server(b"/dev/framebuffer", ...)` call, and is exactly where the Part B
+ordering bug was. A commit touching only that file could have deleted the display without
+the one gate that catches it ever running. Also added: `init/src/main.rs`,
+`libkern/src/abi.rs`, `libos/**`.
+
+**Three current-behaviour docs the branch made false**, all of them lines written days
+earlier in the consistency pass: `architecture/overview.md`'s Status line ("the display arm
+is designed but has no code" — under a "Verified 2026-08-05" stamp), its layer diagram,
+`boot-flow.md`'s list of init's initial bindings, and `CLAUDE.md`'s claim that every
+`design/` document "describes a display system with no code behind it". The rule that
+`architecture/` describes what exists is only worth having if a PR that changes what exists
+updates it, and this one did not until the review said so.
+
+**A fourth doc-comment theft**, in the same session that recorded a memory about the
+hazard: `run_display_selftest` was inserted directly beneath `supervise`'s `///` block and
+wore it, leaving `supervise` undocumented. `#![deny(missing_docs)]` cannot see this,
+because the stolen comment satisfies the lint for the wrong item.
+
+Also fixed: `byte_len`'s doc claimed page-rounding it does not do; the boot screen clears
+the whole framebuffer with nothing synchronising it against the presentation, now
+documented as the margin it is; and `Geometry` now refuses a non-32-bpp format at
+construction, since `PixelFormat`'s public fields made one constructible and the write
+paths index a 4-byte word while striding by `bytes_per_pixel()`.
+
+1159 host tests, all six gates, `test-qemu` and the display gate green.

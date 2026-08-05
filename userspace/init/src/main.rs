@@ -1464,28 +1464,16 @@ fn run_test_harness(notif: u64, root_ns: u64) -> bool {
     }
 }
 
-/// The healthy supervise path. **Normally**, hand off to the service manager: spawn
-/// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
-/// reap_loop drops to the emergency console as the interim recovery, until a reboot
-/// path exists; see `docs/architecture/service-manager.md` § Recovery). **Under
-/// `selftest`**, bring up the login chain (service-mgr → auth-service + session-mgr) and
-/// the Phase-1/2 demo chain (`parent`) **concurrently**, then supervise via [`reap_loop`].
-/// Running them together is deliberate: `parent`'s direct `/dev/blk` reads overlap the
-/// login chain's fs-mediated block I/O (session-mgr/nxsh's forwarded `/home` reads), so
-/// the default test exercises concurrent direct + fs-mediated block I/O across all CPUs —
-/// the scenario that originally surfaced the cross-CPU-wake hang (now fixed by the
-/// reschedule IPI; see the 2026-07-20 decision log). The prior demo→login *sequencing* was
-/// a workaround for that hang and is no longer needed. (This is a concurrency *smoke test*,
-/// not a deterministic catch of that specific timing bug, which only reproduced under
-/// sustained multi-second load.) session-mgr fires the `test-harness` verdict once login is
-/// proven; a crashed demo `parent` fails the run first (in `reap_loop`).
 /// Spawn `display-selftest` and adjudicate it.
 ///
-/// Advisory on a real machine — a system with no display must still boot, and the program
-/// reports that case as a pass. **Fatal under `test-harness`**, because the CI emulator
-/// always reports a framebuffer, so a non-zero exit there is a real regression. Without
-/// that distinction a broken binding is indistinguishable from a headless host: the first
-/// run of the Part B demo printed a lookup failure and the suite still reported PASSED.
+/// The program reports three outcomes and this decides which of them matter: `0` passed,
+/// **`2` found no `/dev/framebuffer` binding**, anything else failed.
+///
+/// The `2` case is the one that needs a policy rather than a value judgement in the
+/// program. On a real machine with no display it is expected. Under `test-harness` the
+/// emulator always reports a framebuffer, so it means the binding is broken — and folding
+/// it into success is how the entire display arm could go missing with `test-qemu` still
+/// green, which is exactly what an earlier version of this code did.
 #[cfg(feature = "selftest")]
 fn run_display_selftest(notif: u64, root_ns: u64) {
     // SAFETY: SPAWN_DISPLAY is a valid writable arg block.
@@ -1525,16 +1513,42 @@ fn run_display_selftest(notif: u64, root_ns: u64) {
             let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
             // SAFETY: closing init's reference to the finished child.
             unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
-            if code != 0 {
-                kprint(b"init: display-selftest FAILED\n");
-                #[cfg(feature = "test-harness")]
-                test_exit(false);
+            match code {
+                0 => {}
+                2 => {
+                    kprint(b"init: display-selftest found no display\n");
+                    #[cfg(feature = "test-harness")]
+                    {
+                        kprint(b"init: ...but this build always has one -- FAILED\n");
+                        test_exit(false);
+                    }
+                }
+                _ => {
+                    kprint(b"init: display-selftest FAILED\n");
+                    #[cfg(feature = "test-harness")]
+                    test_exit(false);
+                }
             }
             return;
         }
     }
 }
 
+/// The healthy supervise path. **Normally**, hand off to the service manager: spawn
+/// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
+/// reap_loop drops to the emergency console as the interim recovery, until a reboot
+/// path exists; see `docs/architecture/service-manager.md` § Recovery). **Under
+/// `selftest`**, bring up the login chain (service-mgr → auth-service + session-mgr) and
+/// the Phase-1/2 demo chain (`parent`) **concurrently**, then supervise via [`reap_loop`].
+/// Running them together is deliberate: `parent`'s direct `/dev/blk` reads overlap the
+/// login chain's fs-mediated block I/O (session-mgr/nxsh's forwarded `/home` reads), so
+/// the default test exercises concurrent direct + fs-mediated block I/O across all CPUs —
+/// the scenario that originally surfaced the cross-CPU-wake hang (now fixed by the
+/// reschedule IPI; see the 2026-07-20 decision log). The prior demo→login *sequencing* was
+/// a workaround for that hang and is no longer needed. (This is a concurrency *smoke test*,
+/// not a deterministic catch of that specific timing bug, which only reproduced under
+/// sustained multi-second load.) session-mgr fires the `test-harness` verdict once login is
+/// proven; a crashed demo `parent` fails the run first (in `reap_loop`).
 fn supervise(notif: u64, root_ns: u64) -> ! {
     #[cfg(feature = "selftest")]
     {

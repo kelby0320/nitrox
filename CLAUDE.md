@@ -92,7 +92,7 @@ Documentation structure under `docs/`:
 ```
 docs/
   architecture/    subsystems that EXIST — what they do and how they relate
-  design/          subsystems DESIGNED BUT NOT BUILT (today: the display arm)
+  design/          subsystems DESIGNED BUT NOT BUILT (today: the display arm above M1)
   spec/            exact contracts (ABIs, wire formats, schemas, the shell language)
   reference/       catalogues (today: error codes only — see deferred-decisions.md)
   rationale/       why decisions were made (read here when puzzled)
@@ -111,8 +111,9 @@ wrong about how something works:
   same change.
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
-  is what a subsystem *will* be — every document in it today describes a display system
-  with no code behind it. `planning/` is what is intended, with checkboxes for what is
+  is what a subsystem *will* be. Today's documents describe the display system above
+  Milestone 1: `libdraw` and `/dev/framebuffer` exist, the compositor, windows and the
+  desktop shell do not. `planning/` is what is intended, with checkboxes for what is
   done. `archive/` is superseded. **Never conclude "the system does X" from any of them.**
 - **`decision-log.md` is a dated record and is append-only.** Entries are true as of their
   date; correcting one to match today's code destroys the evidence. Append a new entry.

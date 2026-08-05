@@ -36,7 +36,8 @@ pub struct FramebufferInfo {
     /// Bytes per row. **Not** `width * bytes_per_pixel` — firmware pads rows, and code
     /// that assumes otherwise writes every row after the first at a skewed offset.
     pub pitch: u64,
-    /// Total mappable bytes of the aperture (`pitch * height`, page-rounded).
+    /// Total mappable bytes of the aperture, exactly `pitch * height`. **Not** rounded
+    /// to a page; `MemoryObject` rounds up when it describes the frames.
     pub byte_len: u64,
     /// Bits per pixel. Only 32 is served; the server refuses anything else rather than
     /// letting a client render garbage.

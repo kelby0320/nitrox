@@ -24,6 +24,18 @@
 //! nothing about *what* differs — stride skew, swapped channels and wrong stacking order
 //! all present identically.
 //!
+//! **Exit codes distinguish the two ways this can end badly**, because the program cannot
+//! decide which of them matters — its environment can:
+//!
+//! - `0` — everything checked out.
+//! - `1` — a real failure: the hash disagreed, or the aperture resolved and then
+//!   misbehaved.
+//! - `2` — **no `/dev/framebuffer` binding at all.** On a machine with no display that is
+//!   expected; under `test-harness` the emulator always reports a framebuffer, so it means
+//!   the binding is broken. Folding this into `0` is exactly the regression this program
+//!   shipped with at first: the whole display arm could be gone and `test-qemu` stayed
+//!   green.
+//!
 //! This binary is disposable. The part worth keeping — `libdraw::acquire` — is in the
 //! library, so when the real compositor arrives at Milestone 2 this can simply go.
 
@@ -166,12 +178,14 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     let hash_ok = check_reference_hash();
 
+    let mut headless = false;
     let present_ok = match present_scene(root_ns) {
         Ok(()) => true,
         Err(AcquireError::NoBinding) => {
-            // No display bound into this namespace. Not a failure by itself — the
-            // caller's environment decides whether that is expected.
+            // No display bound into this namespace. Reported distinctly (exit 2) rather
+            // than as success: only the caller knows whether a display was expected here.
             kprint(b"display-selftest: no /dev/framebuffer binding (headless)\n");
+            headless = true;
             true
         }
         Err(e) => {
@@ -190,6 +204,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     };
 
     if hash_ok && present_ok {
+        if headless {
+            kprint(b"display-selftest: HEADLESS (no display to present to)\n");
+            exit(2);
+        }
         kprint(b"display-selftest: PASSED\n");
         exit(0);
     }

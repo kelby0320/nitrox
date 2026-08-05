@@ -317,6 +317,12 @@ fn kernel_main() {
 
     run_first_userspace();
 
+    // Best-effort boot screen. **It clears the whole framebuffer**, and nothing
+    // synchronises that against `display-selftest`'s presentation, which happens much
+    // later on another CPU — init does the manifest, the mounts and several selftests
+    // first, so the margin is large, but it is a margin rather than a guarantee. If
+    // `check-display` ever flakes with a blank or partially-cleared capture, this is why.
+    //
     // Best-effort boot screen, then retire the boot thread into the idle
     // thread. We must NOT fall through to `_start`'s `halt_loop` (it `cli`s,
     // which would freeze preemption): `exit` switches to the idle thread, which

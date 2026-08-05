@@ -16,10 +16,21 @@ on:
     paths: &display_paths
       - 'userspace/libdraw/**'
       - 'userspace/test-harness/src/display.rs'
+      # `kernel/src/main.rs` holds *both* halves of the binding — `record_framebuffer()`
+      # and its placement relative to `run_first_userspace()`, and the
+      # `bind_kernel_server(b"/dev/framebuffer", ...)` call. That is precisely where the
+      # ordering bug in Part B lived, and omitting it meant a commit touching only that
+      # file could remove the display entirely without this gate running.
+      - 'kernel/src/main.rs'
       - 'kernel/src/framebuffer.rs'
       - 'kernel/src/libkern/framebuffer.rs'
       - 'kernel/src/object/kernel_server.rs'
       - 'kernel/src/object/memory_object.rs'
+      # init spawns and adjudicates `display-selftest`; `abi.rs` is the userspace half of
+      # `FramebufferInfo`; `libos` is the lookup/map path `acquire` rides on.
+      - 'userspace/init/src/main.rs'
+      - 'userspace/libkern/src/abi.rs'
+      - 'userspace/libos/**'
       - 'tools/xtask/src/main.rs'
       - '.github/workflows/display.yml'
   pull_request:

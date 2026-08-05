@@ -32,20 +32,38 @@ pub struct Geometry {
 
 impl Geometry {
     /// Geometry with the tightest legal pitch for `width`.
-    pub const fn packed(width: u32, height: u32, format: PixelFormat) -> Self {
-        Self { width, height, pitch: width as usize * format.bytes_per_pixel(), format }
+    ///
+    /// # Panics
+    ///
+    /// If `format` is not 32 bits per pixel. See [`Geometry::with_pitch`] for why that is
+    /// checked here rather than at the write sites.
+    pub fn packed(width: u32, height: u32, format: PixelFormat) -> Self {
+        Self::with_pitch(width, height, width as usize * format.bytes_per_pixel(), format)
+            .expect("a packed pitch always holds a row; only the depth can fail")
     }
 
     /// Geometry with an explicit row stride.
     ///
-    /// Returns `None` if `pitch` cannot hold a row, which would otherwise alias rows
-    /// onto each other.
+    /// Returns `None` if `pitch` cannot hold a row (which would alias rows onto each
+    /// other), or if `format` is not 32 bits per pixel.
+    ///
+    /// **The depth check belongs here**, at the one point every framebuffer passes
+    /// through, rather than at each write. `PixelFormat`'s fields are public, so a 16-bpp
+    /// format is constructible; [`Framebuffer::put_pixel`] and
+    /// [`Framebuffer::fill_rect`] write a 4-byte word while striding by
+    /// `bytes_per_pixel()`, so such a format would index past the buffer's end and panic
+    /// on the last pixel of a row. Refusing the geometry makes that unreachable instead of
+    /// latent. (`from_limine` refuses non-32-bpp too, but nothing forces a `Geometry` to
+    /// come from firmware.)
     pub const fn with_pitch(
         width: u32,
         height: u32,
         pitch: usize,
         format: PixelFormat,
     ) -> Option<Self> {
+        if format.bits_per_pixel != 32 {
+            return None;
+        }
         if pitch < width as usize * format.bytes_per_pixel() {
             return None;
         }
@@ -240,6 +258,21 @@ mod tests {
         // 8 px × 4 bytes needs 32; 31 would alias row n+1 over row n.
         assert!(Geometry::with_pitch(8, 4, 31, PixelFormat::XRGB8888).is_none());
         assert!(Geometry::with_pitch(8, 4, 32, PixelFormat::XRGB8888).is_some());
+    }
+
+    #[test]
+    fn a_geometry_refuses_a_depth_the_write_paths_cannot_handle() {
+        // `put_pixel`/`fill_rect` write 4 bytes while striding by `bytes_per_pixel()`, so
+        // a 16-bpp geometry would index past the end of the last pixel in a row. Refused
+        // at construction rather than left to panic later.
+        let rgb565 = PixelFormat {
+            bits_per_pixel: 16,
+            red: crate::format::Channel::new(11, 5),
+            green: crate::format::Channel::new(5, 6),
+            blue: crate::format::Channel::new(0, 5),
+        };
+        assert!(Geometry::with_pitch(4, 2, 16, rgb565).is_none());
+        assert!(Geometry::with_pitch(4, 2, 16, PixelFormat::XRGB8888).is_some());
     }
 
     #[test]
