@@ -10851,3 +10851,57 @@ reports a framebuffer, so a failure there is a real regression, and it now calls
 passed silently now fails the run (`qemu exit 35; expected 33`).
 
 1150 host tests, all six gates green, `test-qemu` green.
+
+## 2026-08-05 — Display arm M1 Part C: the self-hash, and where the durable code lives
+
+The guest composites `libdraw`'s reference scene and reports its hash; it matches
+`REFERENCE_HASH`, the constant the host test asserts against its own composite:
+
+```
+display-selftest: reference hash 0x5720b2b9f85bc715 OK
+display-selftest: framebuffer 1280x800 pitch=5120
+display-selftest: presented scene at (0,0)
+```
+
+**Throwaway program versus compositor server — the question dissolved by splitting it.**
+The plan's Part C says "the compositor composites a reference scene", but the real
+compositor (M2 Part B: `/dev/draw` served, the RS protocol, window management) is three
+parts away, and growing init's demo chain was the wrong answer too: compositing is not
+init's job and `userspace/init/CLAUDE.md` calls it critical-path.
+
+So the durable part went to the library and the disposable part stayed disposable.
+`libdraw::acquire` — read `/dev/framebuffer/info`, turn a firmware geometry report into
+a `Geometry`, map the aperture — is the compositor's forever and was *already* duplicated
+inline in init's Part B demo. It sits behind an optional `io` feature, exactly the split
+`libstream` uses for its syscall transport, so the crate's core stays dependency-free and
+host-testable. `display-selftest` is then thin enough that deleting it at M2 costs
+nothing.
+
+`geometry_from` being pure arithmetic matters more than it sounds: it is where a
+channel-order or stride mistake would live, and it now has host tests for a swapped-BGR
+report, a padded stride, an unsupported depth and a pitch too narrow for a row — none of
+which need a display.
+
+**Init's inline framebuffer demo is gone**, superseded by the spawned program. Leaving it
+would have been exactly the "for now" accretion the forbidden-patterns list warns about.
+
+**The two checks are deliberately separate**, because they fail for different reasons and
+only one needs hardware. The self-hash renders into the scene's own 64×32 buffer, so it
+needs **no framebuffer at all** — what it proves is that compositing behaves identically
+compiled for `x86_64-unknown-nitrox` as on the host. Presentation is the half that needs
+the binding, and it is what §8c's `screendump` will check: a compositor can hash its own
+buffer correctly while writing to the wrong base address. Splitting them means a
+framebuffer problem cannot break the hash check, and a compositing bug cannot hide behind
+a display problem.
+
+**The PPM dump is emitted, not merely encoded.** A hash answers *whether* something
+changed and nothing about *what* — stride skew, swapped channels and wrong stacking order
+all present as two hex numbers. On mismatch the scene is now hex-dumped over serial
+between `---PPM-BEGIN---`/`---PPM-END---` markers. Verified end to end by perturbing
+`REFERENCE_HASH` by one bit: the host test failed, the guest failed the run
+(`qemu exit 35; expected 33`), and the log extracted to a valid 6157-byte P6 image —
+64×32, 6144 body bytes, 661 distinct colours, pixel (0,0) exactly `BACKGROUND`. Writing
+the encoder without a way to get the bytes out would have left the original problem
+untouched.
+
+1158 host tests (up from 1150), all six gates green, `test-qemu` green.

@@ -1,8 +1,8 @@
 # Nitrox Display Arm — Subproject Plan
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
-Milestone 1 Parts A (`libdraw` + the gate) and B (the framebuffer reaches
-userspace) landed 2026-08-05.
+Milestone 1 Parts A (`libdraw` + the gate), B (the framebuffer reaches userspace)
+and C (the self-hash) landed 2026-08-05. Part D (`screendump`) is the remainder.
 
 ## What this is
 
@@ -68,7 +68,7 @@ on the hash.** No window, no client, no font, no terminal.
       would mean writing it twice.
 - [x] **Part B — P2: the framebuffer reaches userspace.** ✅ (2026-08-05) Kernel resource + namespace binding;
       a minimal program maps it and fills it. Proves the binding and the geometry hand-off.
-- [ ] **Part C — the self-hash.** The compositor composites a reference scene from *synthetic*
+- [x] **Part C — the self-hash.** ✅ (2026-08-05) The compositor composites a reference scene from *synthetic*
       surfaces and hashes the result; `test-qemu` adjudicates via the existing `isa-debug-exit`
       verdict; Part A's host test asserts the same constant.
 - [ ] **Part D — P1: `screendump`.** QMP channel in `xtask`, reference image compared once per

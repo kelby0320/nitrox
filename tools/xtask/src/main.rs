@@ -236,10 +236,11 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
     // time. Only `init` (and the kernel) carry the selftest / test-harness feature.
     cmd_build_hello()?;
-    // The integration smoke-test harness (bins `test-harness` + `test-stage`) is built
+    // The integration smoke-test harness (bins `test-harness`, `test-stage` and
+    // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.features().is_some() {
-        build_userspace_bin("test-harness", None)?;
+        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest"], None)?;
     }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
@@ -1156,10 +1157,16 @@ fn cmd_test() -> R<()> {
     // governing decision 1: "No compositing code merges without the `Framebuffer` trait
     // and host tests behind it"). Pure `core + alloc`, no deps, so compositing is
     // asserted pixel-exactly in milliseconds rather than through a boot.
+    // `--features io` so the framebuffer-acquisition arithmetic is covered too:
+    // `geometry_from` is where a channel-order or stride mistake would live, and it is
+    // pure logic that needs no display. The feature is off by default so the crate's
+    // core stays dependency-free.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
         .arg("libdraw")
+        .arg("--features")
+        .arg("io")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
@@ -2542,6 +2549,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     if mode.features().is_some() {
         programs.push("test-harness");
         programs.push("test-stage");
+        programs.push("display-selftest");
     }
     let mut ino = 3u32;
     for name in programs {

@@ -38,11 +38,14 @@
 
 extern crate alloc;
 
+#[cfg(feature = "io")]
+pub mod acquire;
 pub mod compose;
 pub mod format;
 pub mod framebuffer;
 pub mod geom;
 pub mod hash;
+pub mod ppm;
 pub mod scene;
 
 pub use compose::{SurfaceRef, compose, compose_full};

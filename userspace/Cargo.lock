@@ -69,6 +69,10 @@ version = "0.1.0"
 [[package]]
 name = "libdraw"
 version = "0.1.0"
+dependencies = [
+ "libkern",
+ "libos",
+]
 
 [[package]]
 name = "libheap"
@@ -162,6 +166,7 @@ dependencies = [
 name = "test-harness"
 version = "0.1.0"
 dependencies = [
+ "libdraw",
  "libheap",
  "libkern",
  "libos",

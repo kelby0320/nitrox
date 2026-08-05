@@ -16,6 +16,16 @@ edition = "2024"
 # of through a 90-second boot. That is the whole point of the `Framebuffer` seam:
 # the piece that *looks* like it needs a screen does not.
 [dependencies]
+# Acquiring the framebuffer is the one part of this crate that touches syscalls, so it
+# sits behind the optional `io` feature — the same split `libstream` uses to keep its
+# wire core dependency-free. Off by default, so `cargo test -p libdraw` on the host
+# builds pure `core + alloc` with no dependency at all.
+libos = { path = "../libos", optional = true }
+libkern = { path = "../libkern", optional = true }
+
+[features]
+# `acquire::*`: read `/dev/framebuffer/info` and map `/dev/framebuffer`.
+io = ["dep:libos", "dep:libkern"]
 
 [lib]
 name = "libdraw"
