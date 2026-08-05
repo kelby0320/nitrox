@@ -269,8 +269,8 @@ If you're new to the project and want depth on a specific area:
 - **Understanding how a subsystem works:** start in `docs/architecture/`. Each major subsystem has its own document.
 - **Understanding why a decision was made:** `docs/rationale/`. These capture the design discussions that produced v5.1 of the design document, plus subsequent refinements.
 - **Looking up exact contracts (ABIs, formats, layouts):** `docs/spec/`. These are normative — when implementing or consuming a contract, the spec is the source of truth.
-- **Working day-to-day in the repo:** `docs/conventions/` for code style, `unsafe` policy, testing conventions, debugging.
-- **Specific lookup questions:** `docs/reference/` for catalogues — every kernel object, every syscall, every error code, every system capability.
+- **Working day-to-day in the repo:** `docs/conventions/` — today the architecture boundary, the QEMU integration tests, and the userspace build. Code style and the `unsafe` policy live in the root and `kernel/` `CLAUDE.md` files, not in a conventions doc.
+- **Specific lookup questions:** `docs/reference/` — today the **error-code catalogue only**. The syscall set is `docs/spec/syscall-abi.md` (gated against the kernel by `cargo xtask check-docs`); per-object rights are `handle-system.md` § "Rights model"; syscaps are `syscaps.md`. Further catalogues are a recorded deferral (`docs-reference-catalogues`).
 
 The full design document that produced this architecture lives in `docs/archive/os-design-v5.1.md`. It's a comprehensive single artifact rather than a working set, preserved for context and reference.
 

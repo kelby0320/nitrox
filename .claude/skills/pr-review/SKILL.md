@@ -58,9 +58,11 @@ Before judging anything, understand it independently.
 2. **Read the surrounding code, not just the diff.** A diff shows what changed, never what
    it broke. Read whole functions, the callers, and the type definitions involved.
 3. **Read the doc that governs the change.** `docs/spec/` for contracts, `docs/architecture/`
-   for subsystem behaviour, `docs/reference/` for catalogues. Note: **`docs/history/` is a
-   record and `docs/planning/` contains designs for unbuilt things** — neither describes
-   current behaviour, so do not judge code against them.
+   for subsystem behaviour, `docs/reference/` for the error-code catalogue. Note:
+   **`docs/design/` (subsystems with no code yet), `docs/archive/` (superseded) and
+   `docs/planning/` (intent, with checkboxes) do not describe current behaviour**, so never
+   judge code against them. `docs/decision-log.md` is a dated, append-only record: entries
+   are true as of their date and must not be "corrected" to match today's code.
 
 When source and a spec disagree, the source wins and **the spec is a finding** (project
 rule, root `CLAUDE.md`).
@@ -121,7 +123,8 @@ The reason this review exists in part. Ask whether the change makes any statemen
 and the PR does not update it, that is a finding — a stale contract costs more than the bug.
 
 New convention discovered → `docs/conventions/`. New design decision →
-`docs/history/decision-log.md`. Deferred item implemented → `docs/rationale/deferred-decisions.md`.
+`docs/decision-log.md` (append a new entry; never edit an old one). Deferred item
+implemented → `docs/rationale/deferred-decisions.md`.
 
 ## Phase 4 — verify before you report
 
@@ -171,7 +174,7 @@ costs more than the issues it invents.
   diff, you reviewed the wrong artifact.
 - **Re-running CI.** It is green; that is what green means. Spend the time on what gates
   cannot see.
-- **Judging code against `docs/history/` or `docs/planning/`.** Those describe the past and
-  the unbuilt. Neither is a contract.
+- **Judging code against `docs/design/`, `docs/archive/` or `docs/planning/`.** Those
+  describe the unbuilt, the superseded, and the intended. None is a contract.
 - **Scope creep.** Pre-existing problems the diff merely touches are worth *naming* as
   optional, never blocking. The author is not obliged to fix the neighbourhood.

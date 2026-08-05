@@ -72,8 +72,8 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     truncate — all ✅ (2026-07-24). See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
     gaps surfaced by the coreutils subproject".
   - **The display arm** — 📋 planned 2026-08-04, not started. Design in
-    [nitrox-display-substrate-v1.md](../design/display-substrate.md) +
-    [nitrox-ui-composition-model-v2.md](../design/ui-composition-model.md);
+    [docs/design/display-substrate.md](../design/display-substrate.md) +
+    [docs/design/ui-composition-model.md](../design/ui-composition-model.md);
     build order in [display-arm-plan.md](display-arm-plan.md). Milestone 1 is the test
     gate: the compositor composites a known scene and host and guest agree on the hash.
   - **Now: pre-CLI substrate hardening** (the deferral audit, 2026-07-24) — four slices
@@ -115,4 +115,4 @@ Things that need ongoing attention across all phases, not phase-specific:
 
 ## Where this document lives
 
-Recommended location: `docs/planning/implementation-plan.md` or `IMPLEMENTATION.md` at the repo root. The repo root has the advantage of being easy to find; `docs/planning/` keeps the docs tree tidy. Either is fine — pick one and stick with it.
+Recommended location: `docs/planning/implementation-plan.md` or `IMPLEMENTATION.md` at the repo root. <!-- check-docs: allow-missing --> The repo root has the advantage of being easy to find; `docs/planning/` keeps the docs tree tidy. Either is fine — pick one and stick with it.

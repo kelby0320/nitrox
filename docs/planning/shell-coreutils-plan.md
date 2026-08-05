@@ -511,7 +511,7 @@ settled answer.
 expression. §5b says `list --long /some/path` passes barewords to an external program, so
 `/some/path` is a string. These cannot both be parsed by one rule:
 
-- `README.md` as an external argument is a filename; as an expression it is field access on
+- `README.md` as an external argument is a filename; as an expression it is field access on <!-- check-docs: allow-missing -->
   `README`.
 - `/system` as an external argument is a path; as an expression it is a division operator with no
   left operand.
@@ -1055,7 +1055,7 @@ the session was built with, and nothing else.*
 **Where this came from.** Not a feature wish-list: an audit of the *built* language against the
 design doc, run by driving the interpreter rather than reading the grammar — which is how items
 like "§6's own examples do not parse" surfaced at all. The design decisions it produced are
-recorded in `nitrox-shell-design-v1.2.md` (§2, §6, §8c/§8e, §9c, §10b, §11f, §11h); **this section
+recorded in `docs/spec/shell-language.md` (§2, §6, §8c/§8e, §9c, §10b, §11f, §11h); **this section
 is the build order, not the design.** Read the design first; the parts below assume it.
 
 **The through-line is two sentences.** The language could *test* values but not *transform* them —
@@ -1447,7 +1447,7 @@ with baked-in arguments, package system beyond single-file `use`, circular-impor
 Phase 4 *before* this subproject — check them off in [`phase-4-desktop.md`](phase-4-desktop.md).
 If they are not done, that is the work to do first, not this plan.
 
-With the prereqs in, read, in order: this plan → `nitrox-shell-design-v1.2.md` →
-`nitrox-ui-composition-model-v2.md` (for `form`/stdout only) → `docs/spec/typed-stream-format.md`
+With the prereqs in, read, in order: this plan → `docs/spec/shell-language.md` →
+`docs/design/ui-composition-model.md` (for `form`/stdout only) → `docs/spec/typed-stream-format.md`
 (TSM1 wire) → `docs/spec/rsproto-*.md` (the protocol the fs-server speaks). Then start at
 **Milestone 1 (`list` + `copy`)** — the first integrated proof that the substrate composes.

@@ -552,9 +552,9 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 **Design: [`docs/design/display-substrate.md`](../design/display-substrate.md)**
 (framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
-[`nitrox-ui-composition-model-v2.md`](../design/ui-composition-model.md) (windows,
+[`docs/design/ui-composition-model.md`](../design/ui-composition-model.md) (windows,
 ports, desktops, templates) and
-[`nitrox-desktop-shell-v1.md`](../design/desktop-shell.md) (bars, applications modal,
+[`docs/design/desktop-shell.md`](../design/desktop-shell.md) (bars, applications modal,
 overview), all settled 2026-08-04. **Build order:
 [`display-arm-plan.md`](display-arm-plan.md)** — seven milestones, three prerequisites, starting
 with the test gate and putting the widget toolkit before the first application.

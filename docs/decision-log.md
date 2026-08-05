@@ -10681,3 +10681,55 @@ record to match today's layout destroys the evidence it exists to preserve.
 
 1105 host tests, all six gates green (check-arch, check-nightly, check-deferrals,
 check-docs, check-irq-scope, abi-sync-check), kernel builds.
+
+## 2026-08-05 — First `/pr-review` round: what a fresh session caught that the author did not
+
+PR #171 (the docs consistency pass) was the review skill's first subject. Seven findings,
+**zero false positives**, all confirmed against source. Three are worth recording because
+they are lessons about the gate rather than about the PR.
+
+**1. The rename swept only the prefixed form.** Dissolving `docs/history/` rewrote every
+`docs/history/x.md` and `../history/x.md` reference — and left 11 **bare backticked
+filenames** (`` `nitrox-display-substrate-v1.md` ``) naming files that no longer exist.
+`shell-coreutils-plan.md` had an ordered reading list in which two of three entries were
+unfindable. The clearest evidence it was an oversight: `spec/shell-language.md:15` was
+edited by that PR to say the companion is "present in `docs/design/`" while leaving the
+filename at its pre-rename form.
+
+`check-docs` structurally could not see it — check 2a only fired on pieces starting with
+`docs/`. It now also resolves **bare basenames** against every `*.md` in the repo, which is
+the check that would have caught this. Append-only records (`decision-log.md`, `archive/`)
+are exempt from that one: their filename mentions describe the world as it was.
+
+**2. The gate did not scan its own tooling.** `roots` was `docs/` + `kernel/docs/`, so the
+~12 `CLAUDE.md` files and `.claude/skills/` were invisible. Dissolving `docs/history/` left
+`SKILL.md` instructing reviewers to file decisions in `docs/history/decision-log.md` and to
+treat `docs/history/` as the class not to judge code against — a document that would have
+sent the *next* review chasing a directory this pass deleted. Adding `.claude/`, `kernel/`,
+`userspace/` and `tools/` to the walk immediately surfaced a further real one:
+`userspace/init/CLAUDE.md` cited `bootstrap-mount-topology.md`, a doc that has never
+existed and that the same pass had already rerouted in `init-toml-schema.md`.
+
+**3. The syscall check was silently incomplete, and the empty-parse guard did not help.**
+`parse::<i64>()` cannot read `0xFFFF_0000`, so `SYS_DEBUG_KPRINT` and `SYS_TEST_EXIT` never
+entered the comparison; `syscall-abi.md` documents them as prose bullets rather than table
+rows, so they never entered the other side either. **The two omissions cancelled** and the
+gate printed "37 syscalls … all agree ✓" against a kernel holding 39.
+
+The guard added the day before was written against exactly this class and missed it,
+because it only fires when a side parses *entirely* empty. Partial silent drops are the
+common case and the dangerous one. Fixed three ways: parse hex on both sides, read the
+prose-bullet form, and — the structural fix — **assert the parsed count equals the number
+of `pub const SYS_` declarations**, so any future format the parser cannot read fails loudly
+instead of shrinking the comparison.
+
+**A note on the review itself.** It also reintroduced-defect-spotted: `visit_md_files_skipping`
+had been inserted between `visit_rs_files_skipping`'s doc comment and its signature, leaving
+the new function wearing the old one's documentation and the old function with none — the
+same stacked-comment shape as the `IMAGE_SIZE_MIB` "64 is enough…" defect that the very same
+PR had fixed two commits earlier. Reading a diff without the author's context is what makes
+that visible.
+
+The value was not in any single finding but in the class: every one was a **pocket the sweep
+missed**, and two of them were pockets the new checker was structurally blind to. A reviewer
+that shares the author's model of "where the problem is" checks the same places.

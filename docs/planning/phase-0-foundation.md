@@ -15,7 +15,8 @@ complete; Phase 4 is active.
 ### Tasks
 
 - [x] Monorepo set up with three workspaces (`kernel/`, `userspace/`, `tools/`) per the structure in [docs/architecture/overview.md]
-- [x] Top-level repo structure (`docs/`, `.cargo/`, `.gitignore`, `README.md`, `LICENSE`)
+- [x] Top-level repo structure (`docs/`, `.cargo/`, `.gitignore`) — **`README.md` and <!-- check-docs: allow-missing -->
+      `LICENSE` were never actually created** (noted 2026-08-05)
 - [x] `CLAUDE.md` files in place (root, `kernel/`, `userspace/`, `userspace/libkern/`, `userspace/init/`)
 - [x] `.claude/settings.json` configured
 - [x] Custom target JSON for `x86_64-unknown-none` in `kernel/.cargo/config.toml`
