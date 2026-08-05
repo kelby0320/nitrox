@@ -61,6 +61,15 @@ wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
 Don't run kernel code on the host. Don't run `cargo build` directly in the kernel workspace without the custom target — it will fail.
 
+## Review workflow
+
+Every PR gets reviewed by a **separate, fresh Claude Code session** — `/pr-review <N>`,
+defined in `.claude/skills/pr-review/SKILL.md`. The point of the split is that the
+reviewer does not inherit the author's context, so it cannot inherit the author's blind
+spots. The reviewer reports and does not edit; findings come back to the working session.
+
+If you are the working session, do not run it on your own work — you are the author.
+
 ## Repository layout
 
 ```
