@@ -1,5 +1,11 @@
 # Scheduler
 
+**Status:** Implemented — per-CPU runqueues, the three scheduling classes, virtual-runtime
+fairness, work-stealing migration and reschedule IPIs are all live, and the `REAL_TIME`
+syscap gate landed with the capability system (Phase 3 slice 6, 2026-07-14). Remaining
+deferrals are marked inline. See [smp.md](smp.md) for the multi-core substrate.
+Verified 2026-08-05.
+
 The kernel scheduler: how runnable threads are chosen, how that scales from one
 CPU to many, and the per-CPU substrate SMP stands on. This document is the design
 contract for the Phase 3 kernel-first slices (0–3); it supersedes the high-level
@@ -74,12 +80,13 @@ The per-CPU pick is therefore: *if any RealTime runnable → highest-priority FI
 else if any TimeShared runnable → min-vruntime; else the idle thread.* This collapses
 to today's behavior when every thread is TimeShared with equal weight.
 
-> **Status (slice 2):** the dispatch above is implemented; the **`REAL_TIME` gate is
-> not yet** — it needs the `SysCaps` capability system, which doesn't exist. Until that
-> lands, *user* threads are always TimeShared and only trusted *kernel* threads enter
-> RealTime (via `sched::spawn_with_class`). The gate and the user-facing `ThreadArgs`
-> class/nice/affinity ABI land with the capability system. See the decision log
-> (2026-06-29).
+> **Status:** implemented, including the `REAL_TIME` gate. The gate was blocked on the
+> `SysCaps` capability system, which landed in Phase 3 slice 6 (2026-07-14); a user thread
+> requesting `RealTime` now goes through `require_syscap(SysCaps::REAL_TIME)` in
+> `kernel/src/syscall/table.rs`, and the user-facing `ThreadArgs` class/nice/affinity ABI
+> is specified in [thread-args](../spec/thread-args.md). Kernel threads still enter
+> RealTime directly via `sched::spawn_with_class`. See the decision log (2026-06-29) for
+> the original sequencing.
 
 ### TimeShared: virtual-runtime fairness
 

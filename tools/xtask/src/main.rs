@@ -8,6 +8,7 @@
 //!   test            host-side unit tests (kernel lib + tools workspace)
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
 //!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
+//!   check-docs      fail if a doc links to, or cites, a path that does not exist
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -114,6 +115,7 @@ fn main() -> ExitCode {
         Some("check-arch") => cmd_check_arch(),
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
+        Some("check-docs") => cmd_check_docs(),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -150,6 +152,7 @@ fn print_help() {
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry\n  \
+           check-docs      fail if a doc links to, or cites, a path that does not exist\n  \
            check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
            abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
            fetch-limine  download the pinned Limine binary tarball\n  \
@@ -1688,6 +1691,146 @@ fn cmd_check_deferrals() -> R<()> {
     }
 }
 
+/// `cargo xtask check-docs` — the documentation cannot point at things that do not exist.
+///
+/// Three cheap, mechanical checks. None of them can tell whether a doc's *prose* is true;
+/// they exist because the 2026-08-05 consistency pass found that a large share of the
+/// drift was not subtle at all. `docs/architecture/overview.md` — the file the root
+/// `CLAUDE.md` tells you to read first — linked to five documents that had never been
+/// written, and a spec cited a `librsproto` source file that does not exist. A reader who
+/// follows a dead reference goes to the source and builds a private model, which is one of
+/// the ways the docs and the code came apart in the first place.
+///
+/// 1. **Link integrity.** Every relative `[text](path.md)` link resolves.
+/// 2. **Cited source paths.** A backticked `kernel/…`, `userspace/…` or `tools/…` path in a
+///    doc that describes *current behaviour* must exist.
+/// 3. **Status lines.** Every `docs/architecture/*.md` carries one, because `CLAUDE.md`
+///    promises it and tells readers to trust it over the body's tense.
+///
+/// **Check 2 is deliberately scoped, and the escape hatch is deliberate too.** It skips
+/// `docs/history/` and `docs/planning/`, which are records rather than descriptions: a
+/// ticked box reading "Retire `kernel/src/embedded_images.rs` entirely" cites a path that
+/// is absent *because the work succeeded*, and rewriting it would corrupt the record. The
+/// remaining false positive is the honest forward reference — `user-memory-access.md` says
+/// "*When* aarch64 is implemented its primitives live in …" — so a line carrying
+/// `<!-- check-docs: allow-missing -->` is exempt. Both shapes were real findings from that
+/// pass, not hypotheticals.
+fn cmd_check_docs() -> R<()> {
+    const ALLOW: &str = "<!-- check-docs: allow-missing -->";
+    let root = repo_root();
+
+    // Docs that describe how the system behaves today. `history/` (a record, including
+    // living design docs for unbuilt work) and `planning/` (intent, with checkboxes) are
+    // excluded from the source-path check for the reason in the doc comment above.
+    let describes_current = |p: &Path| {
+        let s = p.to_string_lossy().replace('\\', "/");
+        ["/docs/spec/", "/docs/reference/", "/docs/architecture/", "/docs/conventions/"]
+            .iter()
+            .any(|d| s.contains(d))
+    };
+
+    let mut violations: Vec<String> = Vec::new();
+    let (mut links, mut paths) = (0usize, 0usize);
+
+    let mut roots: Vec<PathBuf> = vec![root.join("docs"), root.join("kernel").join("docs")];
+    roots.retain(|p| p.exists());
+
+    let mut check = |path: &Path| -> R<()> {
+        let text = fs::read_to_string(path)?;
+        let dir = path.parent().unwrap_or(&root).to_path_buf();
+        for (i, line) in text.lines().enumerate() {
+            let at = |m: &str| format!("{}:{}: {m}", path.display(), i + 1);
+
+            // 1. Relative markdown links to .md files.
+            let mut rest = line;
+            while let Some(open) = rest.find("](") {
+                let after = &rest[open + 2..];
+                let Some(close) = after.find(')') else { break };
+                let target = &after[..close];
+                rest = &after[close..];
+                let file = target.split('#').next().unwrap_or("");
+                if file.is_empty() || !file.ends_with(".md") || file.contains("://") {
+                    continue;
+                }
+                links += 1;
+                if !dir.join(file).exists() {
+                    violations.push(at(&format!("link target does not exist: {file}")));
+                }
+            }
+
+            // 2. Backticked repo-relative source paths, in current-behaviour docs only.
+            if describes_current(path) && !line.contains(ALLOW) {
+                for piece in line.split('`').skip(1).step_by(2) {
+                    let ok_prefix = ["kernel/", "userspace/", "tools/"]
+                        .iter()
+                        .any(|p| piece.starts_with(p));
+                    let ok_suffix = piece.ends_with(".rs") || piece.ends_with(".toml");
+                    // `kernel/src/arch/<arch>/registers.rs` is a template, not a path.
+                    let placeholder = piece.contains('<') || piece.contains('>');
+                    if !ok_prefix || !ok_suffix || piece.contains(' ') || placeholder {
+                        continue;
+                    }
+                    paths += 1;
+                    if !root.join(piece).exists() {
+                        violations.push(at(&format!(
+                            "cited source path does not exist: {piece} \
+                             (if the reference is deliberate, mark the line `{ALLOW}`)"
+                        )));
+                    }
+                }
+            }
+        }
+        Ok(())
+    };
+
+    for r in &roots {
+        visit_md_files_skipping(r, &["target"], &mut check)?;
+    }
+
+    // 3. Every architecture doc states what is actually built.
+    let arch_dir = root.join("docs").join("architecture");
+    let mut arch_docs = 0usize;
+    if arch_dir.exists() {
+        for entry in fs::read_dir(&arch_dir)? {
+            let path = entry?.path();
+            if path.extension().map_or(false, |e| e == "md") {
+                arch_docs += 1;
+                let text = fs::read_to_string(&path)?;
+                let has_status = text.lines().take(20).any(|l| {
+                    let t = l.trim_start_matches("> ").trim_start_matches('*').to_lowercase();
+                    t.starts_with("status")
+                });
+                if !has_status {
+                    violations.push(format!(
+                        "{}: no Status line in the first 20 lines — every architecture doc \
+                         must state what is actually built (root CLAUDE.md promises this)",
+                        path.display()
+                    ));
+                }
+            }
+        }
+    }
+
+    if violations.is_empty() {
+        println!(
+            "check-docs: {links} link(s), {paths} cited source path(s), \
+             {arch_docs} architecture doc(s) with a Status line — all resolve ✓"
+        );
+        Ok(())
+    } else {
+        let mut msg = String::from(
+            "documentation must not point at things that do not exist \
+             (see cmd_check_docs in tools/xtask/src/main.rs for why each check exists):\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        Err(msg.into())
+    }
+}
+
 /// `cargo xtask check-irq-scope` — every interrupt entry opens a lock-ordering scope.
 ///
 /// The kernel's lock-rank tracker (`kernel/src/libkern/lockrank.rs`) models interrupt
@@ -1885,6 +2028,30 @@ fn cmd_check_arch() -> R<()> {
 /// Recursively visit every `.rs` file under `dir`, calling `f` on each.
 /// [`visit_rs_files`], but pruning any directory whose name is in `skip` (e.g. build
 /// output trees, which can be enormous and are not project source).
+/// Walk every `*.md` under `dir`, skipping directory names in `skip`.
+fn visit_md_files_skipping(
+    dir: &Path,
+    skip: &[&str],
+    f: &mut dyn FnMut(&Path) -> R<()>,
+) -> R<()> {
+    if !dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+            if skip.contains(&name) {
+                continue;
+            }
+            visit_md_files_skipping(&path, skip, f)?;
+        } else if path.extension().map_or(false, |e| e == "md") {
+            f(&path)?;
+        }
+    }
+    Ok(())
+}
+
 fn visit_rs_files_skipping(
     dir: &Path,
     skip: &[&str],

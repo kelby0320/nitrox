@@ -109,6 +109,13 @@ Every doc under `architecture/` carries a **Status** line naming what is actuall
 when it was last checked. Trust it over the body's tense, and correct it when you find it
 wrong.
 
+`cargo xtask check-docs` (in CI) enforces the mechanical part: every relative doc link
+resolves, every backticked `kernel/…`/`userspace/…`/`tools/…` path cited by a
+current-behaviour doc exists, and every `architecture/` doc has a Status line. It cannot
+tell whether prose is *true* — that part is on review. A deliberate reference to a path
+that does not exist (an honest forward reference, or a record of a deletion) is exempted by
+marking the line `<!-- check-docs: allow-missing -->`.
+
 When uncertain why something is the way it is, check `docs/rationale/rejected-approaches.md` first — many "obvious" alternatives were considered and rejected for specific reasons.
 
 ## Subdirectory rules
