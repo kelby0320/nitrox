@@ -51,6 +51,7 @@ cargo xtask qemu --selftest # …with the boot self-tests / demos compiled in
 cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
 cargo xtask test           # host-side unit tests
 cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
+cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
 ```
 
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
@@ -58,6 +59,13 @@ headless and adjudicates the whole boot (kernel → init → mount → userspace
 from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
+
+`cargo xtask check-display` is the display arm's **smoke gate**, not a per-commit one:
+it boots an image and compares the guest's screen against a `libdraw` render over QMP
+`screendump`. It catches what a self-hash structurally cannot — a wrong base address,
+a wrong stride, or swapped channels — because the guest stays consistent with itself.
+CI runs it automatically via `.github/workflows/display.yml`, path-filtered to the
+files that could break it.
 
 Don't run kernel code on the host. Don't run `cargo build` directly in the kernel workspace without the custom target — it will fail.
 

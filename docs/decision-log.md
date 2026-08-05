@@ -10905,3 +10905,60 @@ the encoder without a way to get the bytes out would have left the original prob
 untouched.
 
 1158 host tests (up from 1150), all six gates green, `test-qemu` green.
+
+## 2026-08-05 — Display arm M1 Part D: `screendump`, and Milestone 1 closes
+
+`cargo xtask check-display` boots the image, waits for the guest to say the scene is on
+screen, captures the display over QMP, and compares it to a `libdraw` render:
+
+```
+  ok: saw "display-selftest: presented scene at (0,0)"
+  captured 1280x800 from the guest's display
+xtask: display gate PASSED — the 64x32 scene on screen matches libdraw pixel for pixel ✓
+```
+
+**No golden image, and that is not a shortcut.** The expected picture is rendered by the
+same `libdraw` the guest uses — `tools/xtask` already depends on a userspace crate
+(`libcrypto`), so the same trick works here. There is no binary artefact to regenerate and
+no brittle-image maintenance, and it is *sound* precisely because what §8c tests is the
+**binding** — base address, stride, channel order — not the compositing, which §8b already
+covers. Using libdraw as the oracle for its own compositing would be circular; using it as
+the oracle for the framebuffer plumbing is exactly right.
+
+**QMP, not the human monitor**, even though HMP's `screendump` would have been simpler.
+QMP is the supported interface, and Milestone 3 needs `input-send-event` from the same
+channel; HMP now would mean replacing it then. The client is about eighty lines with no
+JSON library: the commands sent are fixed strings and the only thing parsed is whether a
+reply carries `"return"` or `"error"`. It skips asynchronous `"event"` messages, because a
+reader that took the next line as its answer would eventually read an event and misreport
+success.
+
+**The guest paces the capture.** Screendumping on a timer would race the boot and produce
+a blank or half-drawn frame indistinguishable from a real mismatch, so the harness waits
+for `display-selftest: presented scene at (0,0)` on the serial console first.
+
+**The §8c claim, demonstrated rather than asserted.** Swapping red and blue in the
+firmware-report interpretation produces:
+
+| Gate | Result |
+|---|---|
+| `test-qemu` (self-hash) | **PASSED** — the guest hashes its own buffer, unaffected |
+| `check-display` (screendump) | **FAILED** — 2041 of 2048 pixels differ |
+
+with the diagnostic naming the bug: `screen (27, 20, 14), expected (14, 20, 27)`, red and
+blue transposed and green untouched. (2041 rather than 2048 because seven pixels happened
+to have `r == b`.) A stride error off by one pixel is caught too, reporting `first at
+(0,1)` — row 0 correct, the skew starting at row 1, which is what a stride bug looks like.
+
+That is the design doc's division shown working: **`test-qemu` tests the compositor,
+`check-display` tests the framebuffer binding**, and neither substitutes for the other.
+
+**It runs on a path filter, not per commit and not by hand.** The plan calls it a smoke
+gate — slow, image comparison is brittle, narrow class of bug. But a gate that runs only
+when somebody remembers is not a gate, so `.github/workflows/display.yml` triggers on the
+files that could actually break it and nowhere else, and uploads the capture as an
+artifact on failure, since the image *is* the diagnostic.
+
+**Milestone 1 is complete**: the gate arrived with the first commit as governing decision 1
+required, and the framebuffer, the self-hash and the screendump gate all rest on it.
+1158 host tests, all six gates green, `test-qemu` green, display gate green.

@@ -1,8 +1,8 @@
 # Nitrox Display Arm — Subproject Plan
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
-Milestone 1 Parts A (`libdraw` + the gate), B (the framebuffer reaches userspace)
-and C (the self-hash) landed 2026-08-05. Part D (`screendump`) is the remainder.
+**Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
+self-hash, and the `screendump` smoke gate. Milestone 2 (a client with a surface) is next.
 
 ## What this is
 
@@ -52,7 +52,7 @@ names it:
 | **P2** | The kernel exposes **Limine's framebuffer as a mappable resource**, bound into a namespace. `DeviceNode` models char and block; this is a third shape. | M1 Part B |
 | **P3** | A **PS/2 keyboard and mouse driver** in the kernel, emitting key events with modifiers and pointer events. No input driver of any kind exists. | M3 |
 
-## Milestone 1 — pixels, and the gate
+## Milestone 1 — pixels, and the gate ✅ complete (2026-08-05)
 
 **Deliverable: the compositor composites a known scene, and the host test and the guest agree
 on the hash.** No window, no client, no font, no terminal.
@@ -71,7 +71,7 @@ on the hash.** No window, no client, no font, no terminal.
 - [x] **Part C — the self-hash.** ✅ (2026-08-05) The compositor composites a reference scene from *synthetic*
       surfaces and hashes the result; `test-qemu` adjudicates via the existing `isa-debug-exit`
       verdict; Part A's host test asserts the same constant.
-- [ ] **Part D — P1: `screendump`.** QMP channel in `xtask`, reference image compared once per
+- [x] **Part D — P1: `screendump`.** ✅ (2026-08-05) QMP channel in `xtask`, reference image compared once per
       display change. Catches what a self-hash structurally cannot: wrong base address, wrong
       stride, swapped channels.
 
