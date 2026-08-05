@@ -12,9 +12,18 @@ edition = "2024"
 # they are mapped `MemoryObject`s the client drew into, and copying every frame to satisfy
 # the type would defeat the whole shared-memory design.
 [dependencies]
-libdraw = { path = "../libdraw" }
+# The bin needs the syscall-touching half of libdraw (`acquire`); the library half of
+# this crate does not, and its host tests build without it.
+libdraw = { path = "../libdraw", features = ["io"] }
 librsproto = { path = "../librsproto" }
+libkern = { path = "../libkern" }
+libos = { path = "../libos" }
+libheap = { path = "../libheap" }
 
 [lib]
 name = "compositor"
 path = "src/lib.rs"
+
+[[bin]]
+name = "compositor"
+path = "src/main.rs"

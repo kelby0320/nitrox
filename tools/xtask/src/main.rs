@@ -263,9 +263,10 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // session-mgr fires the self-test verdict, so it takes the build-mode feature
     // (`selftest`/`test-harness`) like init.
     build_userspace_bin("session-mgr", mode.features())?;
-    // A library with no consumer yet — see `check_userspace_lib`.
+    build_userspace_bin("compositor", None)?;
+    // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
+    // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
-    check_userspace_lib("compositor")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -1423,13 +1424,15 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
-    // `compositor` host tests — the window model: roles, struts, the buffer lifecycle,
-    // stacking, and compositing. No syscalls in the library half (the server bin lands
-    // with M2 Part B), so it host-tests like `nxsh`'s language half.
+    // `compositor` host tests — the window model and request dispatch: roles, struts, the
+    // buffer lifecycle, stacking, compositing, and the per-connection ownership boundary.
+    // `--lib` skips the `#![no_main]` server bin, which cannot build for the host, exactly
+    // as for `init` and `service-mgr`.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
         .arg("compositor")
+        .arg("--lib")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
@@ -2806,7 +2809,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     //
     // Everything else is read from the real filesystem through the store and a profile,
     // like any other program.
-    let mut programs = vec!["init", "fs-server-ext4", "eshell", "profile-server"];
+    let mut programs = vec!["init", "fs-server-ext4", "eshell", "profile-server", "compositor"];
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.
     if mode.features().is_some() {
