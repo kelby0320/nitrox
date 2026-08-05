@@ -1811,10 +1811,116 @@ fn cmd_check_docs() -> R<()> {
         }
     }
 
+    // 4. The two hand-maintained numeric tables must agree with the kernel.
+    //
+    // `abi-sync-check` ties the kernel to `libkern`; nothing tied either to the docs, so
+    // `syscall-abi.md` and `error-codes.md` could drift from both and no gate would notice.
+    // They happen to agree today (37 syscalls, 16 error codes, checked 2026-08-05) — this
+    // keeps it that way, for the same reason `abi-sync-check` exists.
+    let mut table_stats: Vec<String> = Vec::new();
+    for (what, src_rel, doc_rel) in [
+        ("syscall", "kernel/src/syscall/table.rs", "docs/spec/syscall-abi.md"),
+        ("error code", "kernel/src/syscall/error.rs", "docs/reference/error-codes.md"),
+    ] {
+        let src_text = fs::read_to_string(root.join(src_rel))?;
+        let doc_text = fs::read_to_string(root.join(doc_rel))?;
+
+        let mut from_src: Vec<(i64, String)> = Vec::new();
+        if what == "syscall" {
+            // `pub const SYS_FOO_BAR: u64 = 12;` → (12, "sys_foo_bar")
+            for line in src_text.lines() {
+                let Some(rest) = line.trim().strip_prefix("pub const SYS_") else { continue };
+                let Some((name, tail)) = rest.split_once(": u64 = ") else { continue };
+                let Some(num) = tail.trim_end_matches(';').trim().parse::<i64>().ok() else {
+                    continue;
+                };
+                from_src.push((num, format!("sys_{}", name.to_ascii_lowercase())));
+            }
+        } else {
+            // The `KError` enum body only — a stray `= -1` elsewhere must not match.
+            let body = match src_text.find("enum KError") {
+                Some(a) => {
+                    let tail = &src_text[a..];
+                    &tail[..tail.find("\n}").unwrap_or(tail.len())]
+                }
+                None => "",
+            };
+            for line in body.lines() {
+                let Some((name, tail)) = line.trim().split_once(" = ") else { continue };
+                if !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') || name.is_empty() {
+                    continue;
+                }
+                let Some(num) = tail.trim_end_matches(',').trim().parse::<i64>().ok() else {
+                    continue;
+                };
+                from_src.push((num, name.to_string()));
+            }
+        }
+
+        // Markdown rows: `| `<number>` | `<name>` | …`
+        let mut from_doc: Vec<(i64, String)> = Vec::new();
+        for line in doc_text.lines() {
+            let line = line.trim();
+            if !line.starts_with('|') {
+                continue;
+            }
+            let cells: Vec<&str> = line.split('|').map(str::trim).collect();
+            let unquote = |c: &str| c.trim_matches('`').trim().to_string();
+            if cells.len() < 3 {
+                continue;
+            }
+            let (a, b) = (unquote(cells[1]), unquote(cells[2]));
+            let Ok(num) = a.parse::<i64>() else { continue };
+            if b.is_empty() || !b.chars().all(|c| c.is_ascii_alphanumeric() || c == '_') {
+                continue;
+            }
+            from_doc.push((num, b));
+        }
+
+        from_src.sort();
+        from_doc.sort();
+
+        // A checker that parses nothing passes silently. That is a vacuous check, and this
+        // project has shipped four vacuous tests; refuse to be the fifth.
+        if from_src.is_empty() || from_doc.is_empty() {
+            violations.push(format!(
+                "{what} table: parsed {} entries from {src_rel} and {} from {doc_rel} — \
+                 one side parsed empty, so the comparison proves nothing. The format \
+                 changed; update cmd_check_docs.",
+                from_src.len(),
+                from_doc.len()
+            ));
+            continue;
+        }
+
+        for (n, name) in &from_src {
+            match from_doc.iter().find(|(dn, _)| dn == n) {
+                None => violations.push(format!(
+                    "{doc_rel}: {what} {n} (`{name}`) is defined in {src_rel} but missing \
+                     from the table"
+                )),
+                Some((_, dname)) if dname != name => violations.push(format!(
+                    "{doc_rel}: {what} {n} is `{name}` in {src_rel} but `{dname}` in the table"
+                )),
+                Some(_) => {}
+            }
+        }
+        for (n, name) in &from_doc {
+            if !from_src.iter().any(|(sn, _)| sn == n) {
+                violations.push(format!(
+                    "{doc_rel}: {what} {n} (`{name}`) is in the table but not defined in \
+                     {src_rel}"
+                ));
+            }
+        }
+        table_stats.push(format!("{} {what}s", from_src.len()));
+    }
+
     if violations.is_empty() {
         println!(
             "check-docs: {links} link(s), {paths} cited source path(s), \
-             {arch_docs} architecture doc(s) with a Status line — all resolve ✓"
+             {arch_docs} architecture doc(s) with a Status line, {} — all agree ✓",
+            table_stats.join(" + ")
         );
         Ok(())
     } else {
