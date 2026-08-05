@@ -67,6 +67,10 @@ name = "libcrypto"
 version = "0.1.0"
 
 [[package]]
+name = "libdraw"
+version = "0.1.0"
+
+[[package]]
 name = "libheap"
 version = "0.1.0"
 dependencies = [

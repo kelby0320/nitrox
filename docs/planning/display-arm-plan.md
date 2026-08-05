@@ -1,7 +1,7 @@
 # Nitrox Display Arm — Subproject Plan
 
-**Status:** 📋 planned (2026-08-04), not started. The design is settled; this is the order it
-gets built in.
+**Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
+Milestone 1 Part A (`libdraw` + the gate) landed 2026-08-05.
 
 ## What this is
 
@@ -56,7 +56,7 @@ names it:
 **Deliverable: the compositor composites a known scene, and the host test and the guest agree
 on the hash.** No window, no client, no font, no terminal.
 
-- [ ] **Part A — `libdraw`: the `Framebuffer` trait and host compositing tests.** Base, width,
+- [x] **Part A — `libdraw`: the `Framebuffer` trait and host compositing tests.** ✅ (2026-08-05) Base, width,
       height, pitch, format; a real implementation and an in-memory one; rect fills, blits,
       clipping. Compositing becomes a pure function over (surfaces, geometry, damage, stacking),
       asserted pixel-exactly on the host. No kernel change, no QEMU. **This part is the gate**,

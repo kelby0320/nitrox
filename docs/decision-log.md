@@ -10733,3 +10733,67 @@ that visible.
 The value was not in any single finding but in the class: every one was a **pocket the sweep
 missed**, and two of them were pockets the new checker was structurally blind to. A reviewer
 that shares the author's model of "where the problem is" checks the same places.
+
+## 2026-08-05 — Display arm M1 Part A: `libdraw`, and the gate arrives with it
+
+The display arm's first commit is its test gate, per the plan's governing decision 1:
+"No compositing code merges without the `Framebuffer` trait and host tests behind it.
+Everything else in this system has a gate; pixels are the one place where 'we'll add
+tests once it works' would actually happen."
+
+`userspace/libdraw` — pure `core + alloc`, no dependencies, like `libstream` and
+`libcrypto` — carries geometry, pixel formats, the `Framebuffer` seam, compositing,
+the visible-pixel hash, and the reference scene. 41 host tests, all running in well
+under a second.
+
+**Three decisions worth recording.**
+
+**1. The reference scene composites into its own buffer, not the real screen.** This
+was not obvious. §8b has the guest composite a known scene and report a hash the host
+asserts as a constant — but the guest's framebuffer is whatever Limine reports, so
+compositing into it would make the hash depend on the emulator's resolution and there
+would be no constant to assert. The scene therefore fixes its own geometry (64×32 at a
+268-byte pitch). What §8b then catches is *the compositor behaving differently compiled
+for the target than on the host* — integer width, endianness, optimisation. The
+different question, "did the pixels reach the screen at all", is §8c's `screendump`,
+and it is a different mechanism because a self-hash structurally cannot answer it.
+
+**2. Every element of the scene earns its place by the bug it makes visible.** Two
+overlapping surfaces (stacking applied backwards), one off the left edge (clipping that
+wraps or underflows), one off the bottom-right (clipping that overruns), one entirely
+off-screen (culling that draws it anyway), a screen stride that is deliberately not
+`width × 4` (rows written at `width × bpp` instead of `pitch`), surface strides that
+differ from the screen's (the same bug on the read side), and one surface in the
+**opposite channel order** (a blit that copies words instead of translating).
+
+The subtle one is that surface content varies along **both** axes. A solid fill — or a
+pattern varying in only one axis — hashes *identically* when rows are transposed, so
+the scene would look thorough and catch nothing. §8e warns that a solid fill "would
+hash fine and prove nearly nothing"; the same trap has a second floor.
+
+**3. The hash covers visible pixels only, never row padding.** Folding in
+`pitch - width × bpp` bytes of never-written memory would make the same picture hash
+differently run to run, which §7 forbids outright. It also means a host buffer and a
+guest framebuffer with *different* strides hash identically for the same image — which
+is what lets the two sides of the gate be compared at all.
+
+**Pixel format is data-driven from Limine's report**, not assumed. `PixelFormat`
+carries a shift and size per channel; `from_limine` builds one and refuses any depth
+but 32 rather than rendering garbage. The plan names channel order as a risk, and it is
+precisely the bug a self-hash cannot see.
+
+**The break-tests found a real defect in the code under test.** Breaking `offset_of` to
+confirm the tests were not vacuous produced only *one* failure — the scene hash — when
+it should have tripped the padding test too. The cause was `fill_rect` open-coding
+`y * pitch + x * bpp` instead of calling `offset_of`: two copies of the same
+arithmetic, only one covered. Routing it through `offset_of` takes the same break from
+1 failing test to 3. Five deliberate breaks were run in total (stride, clipping,
+stacking order, format translation, hash padding); every one was caught, and the
+reference scene caught four of the five on its own.
+
+`libdraw` also gets an explicit `cargo xtask build` step, because it is a library with
+**no consumer yet** — nothing would compile it for `x86_64-unknown-nitrox` at all, and
+a `no_std` regression would sit undetected until Part B tried to build on it. The entry
+is deleted once the compositor depends on the crate.
+
+1146 host tests (up from 1105), all six gates green, kernel builds.

@@ -260,6 +260,8 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // session-mgr fires the self-test verdict, so it takes the build-mode feature
     // (`selftest`/`test-harness`) like init.
     build_userspace_bin("session-mgr", mode.features())?;
+    // A library with no consumer yet — see `check_userspace_lib`.
+    check_userspace_lib("libdraw")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -356,6 +358,27 @@ fn cmd_build_hello() -> R<()> {
 /// for the spawn-demo binaries (`parent`, `child`).
 fn build_userspace_bin(name: &str, features: Option<&str>) -> R<()> {
     build_userspace_crate(name, &[name], features)
+}
+
+/// Build a userspace **library** crate for the bare target, purely to prove it still
+/// compiles there.
+///
+/// Libraries are normally built as a side effect of the bins that depend on them, so they
+/// need no entry here. `libdraw` is the exception: it lands (plan M1 Part A) before the
+/// compositor that will consume it, so nothing would compile it for
+/// `x86_64-unknown-nitrox` at all, and a `no_std` regression — an accidental `std` path,
+/// an `alloc` item behind the wrong cfg — would sit undetected until Part B went to build
+/// on it. Its host tests pass on the host target and prove nothing about that.
+///
+/// Delete the entry once a bin depends on the crate; the bin's build covers it then.
+fn check_userspace_lib(dir: &str) -> R<()> {
+    let crate_dir = repo_root().join("userspace").join(dir);
+    let mut c = userspace_cargo();
+    c.arg("build").arg("--release").arg("-p").arg(dir);
+    arg_userspace_target(&mut c);
+    run(c.current_dir(&crate_dir))?;
+    println!("xtask: {dir} compiles for {USERSPACE_TARGET} ✓");
+    Ok(())
 }
 
 /// Build the userspace crate in `userspace/<dir>` for the bare target, then verify each of
@@ -1125,6 +1148,18 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("librsproto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libdraw` host tests — geometry, pixel formats, framebuffers, compositing, and
+    // the reference scene's hash. This is the display arm's gate (plan M1 Part A,
+    // governing decision 1: "No compositing code merges without the `Framebuffer` trait
+    // and host tests behind it"). Pure `core + alloc`, no deps, so compositing is
+    // asserted pixel-exactly in milliseconds rather than through a boot.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libdraw")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
