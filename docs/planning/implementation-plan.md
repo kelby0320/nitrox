@@ -71,6 +71,11 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **Substrate gaps it surfaced** — exit-time handle reclamation, the wall clock, and file
     truncate — all ✅ (2026-07-24). See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
     gaps surfaced by the coreutils subproject".
+  - **The display arm** — 📋 planned 2026-08-04, not started. Design in
+    [nitrox-display-substrate-v1.md](../history/nitrox-display-substrate-v1.md) +
+    [nitrox-ui-composition-model-v2.md](../history/nitrox-ui-composition-model-v2.md);
+    build order in [display-arm-plan.md](display-arm-plan.md). Milestone 1 is the test
+    gate: the compositor composites a known scene and host and guest agree on the hash.
   - **Now: pre-CLI substrate hardening** (the deferral audit, 2026-07-24) — four slices
     landing before coreutils Milestone 2: trustworthy deferral docs + CI running the QEMU
     gate; the demand-fault path (fill cookie, read-ahead, blocking second faulter, shared

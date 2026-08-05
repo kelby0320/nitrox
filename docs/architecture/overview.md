@@ -214,7 +214,7 @@ The Unix shell pipeline is a high point of system design — programs as composa
 
 Programs that produce raw text are not left out. Their output is automatically wrapped as a single-column `Table<String>` with column name `line`, and all generic operators work on it. The floor is Unix; everything above it is opt-in.
 
-The same model extends to GUIs, but **not** by embedding UI in the data stream: an early `WidgetRecord` stream type was dropped because a widget isn't data — it has identity, mutable state, an event stream, and a lifecycle. Instead, widgets and windows are **resource servers** a program talks to, and TSM1 stays data-only. A program still doesn't choose its own rendering — the display layer does — it just does so by composing live UI resources rather than by emitting a widget record. See [UI composition model](../history/nitrox-ui-composition-model-v1.md).
+The same model extends to GUIs, but **not** by embedding UI in the data stream: an early `WidgetRecord` stream type was dropped because a widget isn't data — it has identity, mutable state, an event stream, and a lifecycle. Instead, widgets and windows are **resource servers** a program talks to, and TSM1 stays data-only. A program still doesn't choose its own rendering — the display layer does — it just does so by composing live UI resources rather than by emitting a widget record. See [UI composition model](../history/nitrox-ui-composition-model-v2.md) for what a window *is*, and [display substrate](../history/nitrox-display-substrate-v1.md) for how pixels, surfaces and input actually work.
 
 See: [shell and typed streams architecture](shell-and-streams.md), [typed stream wire format](../spec/typed-stream-format.md).
 
