@@ -1,6 +1,6 @@
 //! `Handle<T, M>` — the typed capability handle.
 //!
-//! Implements the typestate design from `docs/history/os-design-v5.1.md`: `T` is the
+//! Implements the typestate design from `docs/archive/os-design-v5.1.md`: `T` is the
 //! object-type marker, `M` the mode marker encoding **principal** rights as a type
 //! (so the wrong operation is a compile error), and `extra` carries the generic +
 //! modifier rights checked at runtime. A `Handle` **owns** its capability and closes

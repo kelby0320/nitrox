@@ -1,5 +1,9 @@
 # fs-server-ext4 read-write
 
+**Status:** Implemented — `userspace/fs-server-ext4`, read **and** write, with host tests
+that build an image with `mke2fs` and require `e2fsck -fn` to find it clean. Individual
+deferrals are marked inline. Verified 2026-08-05.
+
 How `fs-server-ext4` becomes writable — its **ext4-specific realization** of the generic
 Model A data-path contract. Read the contract first: **`docs/architecture/filesystem-data-path.md`**
 defines the fs-neutral protocol (`MapRange`/`AllocRange`/`BlockRun`), the kernel interface
@@ -133,4 +137,4 @@ map today); the fs-server open-file cookie.
 - `docs/architecture/filesystem-data-path.md` — the generic contract this realizes
 - `docs/spec/rsproto-block-ops.md` — the Model A wire ops (`MapRange`/`AllocRange`)
 - `userspace/fs-server-ext4/` + its `CLAUDE.md` — the reader RW extends
-- `docs/history/decision-log.md` 2026-06-25 — Model A vs Model B
+- `docs/decision-log.md` 2026-06-25 — Model A vs Model B

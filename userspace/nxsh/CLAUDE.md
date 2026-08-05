@@ -10,7 +10,7 @@ the interactive loop. Scripts are `.nx`.
 **It is the login leaf** as of 2026-07-31 — `session-mgr` spawns it into the constructed
 session namespace with empty syscaps. It replaced the throwaway `usersh`, which is gone.
 
-- Design (semantics/grammar): `docs/history/nitrox-shell-design-v1.2.md`
+- Design (semantics/grammar): `docs/spec/shell-language.md`
 - Build plan and the decisions it resolved: `docs/planning/shell-coreutils-plan.md`
 
 ## Structure — and the reason for it

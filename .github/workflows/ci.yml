@@ -66,6 +66,15 @@ jobs:
       - name: cargo xtask check-deferrals
         run: cargo xtask check-deferrals
 
+      # Documentation must not point at things that do not exist. The 2026-08-05
+      # consistency pass found `docs/architecture/overview.md` — the file the root
+      # CLAUDE.md tells you to read first — linking to five documents that had never
+      # been written, plus a spec citing a `librsproto` source file that does not
+      # exist. A reader who follows a dead reference goes to the source and builds a
+      # private model, which is one of the ways the docs and the code came apart.
+      - name: cargo xtask check-docs
+        run: cargo xtask check-docs
+
       # The lock-order tracker gives every interrupt handler a fresh scope, because the
       # acquisition order genuinely restarts at an interrupt boundary. A dispatcher that
       # skips the scope does not fail loudly — it reports phantom inversions from its own

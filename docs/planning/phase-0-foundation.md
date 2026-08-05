@@ -15,7 +15,8 @@ complete; Phase 4 is active.
 ### Tasks
 
 - [x] Monorepo set up with three workspaces (`kernel/`, `userspace/`, `tools/`) per the structure in [docs/architecture/overview.md]
-- [x] Top-level repo structure (`docs/`, `.cargo/`, `.gitignore`, `README.md`, `LICENSE`)
+- [x] Top-level repo structure (`docs/`, `.cargo/`, `.gitignore`) — **`README.md` and <!-- check-docs: allow-missing -->
+      `LICENSE` were never actually created** (noted 2026-08-05)
 - [x] `CLAUDE.md` files in place (root, `kernel/`, `userspace/`, `userspace/libkern/`, `userspace/init/`)
 - [x] `.claude/settings.json` configured
 - [x] Custom target JSON for `x86_64-unknown-none` in `kernel/.cargo/config.toml`
@@ -32,8 +33,8 @@ complete; Phase 4 is active.
 - [ ] `xtask test-qemu` — QEMU integration tests via `isa-debug-exit` (not built in Phase 0 — see deviation note)
 - [x] GitHub Actions CI running `cargo build` and `xtask test` on every push
 - [x] `docs/` populated with the foundational documents (overview, rationale, spec)
-- [x] v5.1 design doc archived at `docs/history/design-doc-v5.1.md`
-- [x] Decision log started at `docs/history/decision-log.md`
+- [x] v5.1 design doc archived at `docs/archive/os-design-v5.1.md`
+- [x] Decision log started at `docs/decision-log.md`
 
 ### Milestone
 

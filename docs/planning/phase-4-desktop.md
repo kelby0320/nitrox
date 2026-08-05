@@ -540,8 +540,8 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 - **See [`docs/planning/shell-coreutils-plan.md`](shell-coreutils-plan.md)** for the full breakdown
   (milestones, the `~=` regex / `save`-`open` format / env-var gaps, and the deferred rich REPL).
-- Design docs: [`docs/history/nitrox-shell-design-v1.2.md`](../history/nitrox-shell-design-v1.2.md)
-  (language/grammar) and [`docs/history/nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md)
+- Design docs: [`docs/spec/shell-language.md`](../spec/shell-language.md)
+  (language/grammar) and [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
   (windows/widgets as resource servers).
 - The **rich interactive REPL** (reverse-search, Shift-Enter key events, schema-aware completion —
   design §11) is split out and **deferred**, gated on the console/tty server + compositor terminal
@@ -550,11 +550,11 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 
 ### Display + input
 
-**Design: [`docs/history/nitrox-display-substrate-v1.md`](../history/nitrox-display-substrate-v1.md)**
+**Design: [`docs/design/display-substrate.md`](../design/display-substrate.md)**
 (framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
-[`nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md) (windows,
+[`docs/design/ui-composition-model.md`](../design/ui-composition-model.md) (windows,
 ports, desktops, templates) and
-[`nitrox-desktop-shell-v1.md`](../history/nitrox-desktop-shell-v1.md) (bars, applications modal,
+[`docs/design/desktop-shell.md`](../design/desktop-shell.md) (bars, applications modal,
 overview), all settled 2026-08-04. **Build order:
 [`display-arm-plan.md`](display-arm-plan.md)** — seven milestones, three prerequisites, starting
 with the test gate and putting the widget toolkit before the first application.

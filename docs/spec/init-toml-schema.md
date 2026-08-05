@@ -220,6 +220,6 @@ Adding any of these requires the corresponding kernel module or userspace tool t
 
 ## Where to read more
 
-- [Bootstrap mount topology](../architecture/bootstrap-mount-topology.md)
+- [Boot flow architecture](../architecture/boot-flow.md) — the mount topology init brings up
 - [Boot flow](../architecture/boot-flow.md)
 - [Why supervisor-mediated registration](../rationale/why-supervisor-registration.md)

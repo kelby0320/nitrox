@@ -1,5 +1,8 @@
 # Logging service
 
+**Status:** Implemented — the in-kernel log (`kernel/src/klog.rs`) and the userspace
+`logging-service`. Verified 2026-08-05.
+
 The userspace **logging service** collects structured log records from any process
 that holds a logging capability, stamps each with trusted provenance, and fans them
 out to sinks. It is the concrete implementation of the `log` handle seam that
@@ -12,7 +15,7 @@ It is **not** the kernel log. `kernel/src/klog.rs` + `/dev/log` capture *kernel*
 records. The two are distinct streams a future unification may merge (see
 [Relationship to the kernel log](#relationship-to-the-kernel-log)).
 
-For the record shape's origin see `docs/history/os-design-v5.1.md` § Logging. This doc
+For the record shape's origin see `docs/archive/os-design-v5.1.md` § Logging. This doc
 supersedes that sketch's wiring: there is **no** per-service broker/relay through
 service-mgr — see [Identity is capability-derived](#identity-is-capability-derived) — and
 **no bespoke logging protocol**: connecting reuses namespace resolve, appending is a
@@ -244,6 +247,6 @@ where a real logging op namespace would be introduced); and any kernel-log unifi
 - `docs/architecture/service-manager.md` — the `log` handle seam this replaces
 - `docs/spec/service-toml-schema.md` — `[service.<name>.handles.log]`, stdio routing
 - `docs/spec/rsproto-wire-format.md` — the `LogRecord` body codec (append is a raw channel send, no op)
-- `docs/history/os-design-v5.1.md` § Logging — the original record sketch
+- `docs/archive/os-design-v5.1.md` § Logging — the original record sketch
 - `kernel/src/klog.rs`, `/dev/log` — the distinct kernel log
 - The audit subsystem (`SysCaps::AUDIT_CONTROL`) — the Security-tier analog, its own slice

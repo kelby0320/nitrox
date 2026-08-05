@@ -33,9 +33,9 @@ These shape every decision; deviation requires explicit discussion:
   hard-float ABI and stable rustc ships no freestanding x86_64 target that has one. A
   custom spec has no precompiled sysroot, so `core`/`alloc` are rebuilt with
   `-Z build-std`, which is nightly-only. The pin is exact, not floating. This buys a
-  *target*, not a licence — see `docs/history/decision-log.md` (2026-07-21
+  *target*, not a licence — see `docs/decision-log.md` (2026-07-21
   floating-point).
-- **Assembly is emitted from Rust**, not NASM: `core::arch::asm!`, `global_asm!`, and `#[unsafe(naked)]` + `naked_asm!` (all stable since Rust 1.88). The exception entry stubs, the GDT/TSS load, the user-memory copy routines, and the thread context switch are all in-tree Rust asm. There is no assembler in the build — `build.rs` only passes the linker script. (Earlier drafts reserved NASM for the entry stub and context switch; both turned out cleaner as Rust-emitted asm — see `docs/history/decision-log.md` 2026-05-13 and 2026-05-29 — so NASM is not used. Re-evaluate only if a routine genuinely cannot be expressed via `asm!`/`naked_asm!`.)
+- **Assembly is emitted from Rust**, not NASM: `core::arch::asm!`, `global_asm!`, and `#[unsafe(naked)]` + `naked_asm!` (all stable since Rust 1.88). The exception entry stubs, the GDT/TSS load, the user-memory copy routines, and the thread context switch are all in-tree Rust asm. There is no assembler in the build — `build.rs` only passes the linker script. (Earlier drafts reserved NASM for the entry stub and context switch; both turned out cleaner as Rust-emitted asm — see `docs/decision-log.md` 2026-05-13 and 2026-05-29 — so NASM is not used. Re-evaluate only if a routine genuinely cannot be expressed via `asm!`/`naked_asm!`.)
 - **Cargo + cargo xtask** for builds. The `xtask` workspace provides higher-level commands (`xtask qemu`, `xtask image`, etc.).
 - **Limine** as the bootloader.
 
@@ -83,13 +83,52 @@ Documentation structure under `docs/`:
 
 ```
 docs/
-  architecture/  what the subsystems do and how they relate
-  rationale/     why decisions were made (read here when puzzled)
-  spec/          exact contracts (ABIs, wire formats, schemas)
-  reference/     catalogues (kernel objects, syscalls, errors, syscaps)
-  conventions/   how to write code in this project
-  history/       v5.1 design doc, decision log
+  architecture/    subsystems that EXIST — what they do and how they relate
+  design/          subsystems DESIGNED BUT NOT BUILT (today: the display arm)
+  spec/            exact contracts (ABIs, wire formats, schemas, the shell language)
+  reference/       catalogues (today: error codes only — see deferred-decisions.md)
+  rationale/       why decisions were made (read here when puzzled)
+  conventions/     how to write code in this project
+  planning/        phase and subproject plans, with checkboxes
+  archive/         superseded artifacts, kept for the record (the v5.1 design doc)
+  decision-log.md  the running record of decisions and their reasoning
 ```
+
+**Which of these describe the system as it is today**, and which do not — this matters more
+than it looks, because reading the wrong class as current is how you end up confidently
+wrong about how something works:
+
+- **`spec/`, `reference/`, `architecture/`, `conventions/` describe current behaviour.**
+  If one disagrees with the source, the source wins and the doc is a bug — fix it in the
+  same change.
+- **`rationale/` explains why**, and is largely timeless.
+- **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
+  is what a subsystem *will* be — every document in it today describes a display system
+  with no code behind it. `planning/` is what is intended, with checkboxes for what is
+  done. `archive/` is superseded. **Never conclude "the system does X" from any of them.**
+- **`decision-log.md` is a dated record and is append-only.** Entries are true as of their
+  date; correcting one to match today's code destroys the evidence. Append a new entry.
+
+**A `design/` doc graduates to `architecture/` when the code lands** — the milestone that
+builds it should carry that move as a checkbox, because the doc is otherwise the thing
+nobody remembers to update.
+
+**Filenames carry no version number.** `foo-design-v1.2.md` guarantees link rot on every
+revision — renaming it breaks every inbound reference, which is a self-inflicted source of
+exactly the drift these rules exist to prevent. The version belongs in the doc's Status
+line; git carries the history. (`archive/os-design-v5.1.md` is the exception: there the
+version is the artifact's identity and the file is frozen.)
+
+Every doc under `architecture/` carries a **Status** line naming what is actually built and
+when it was last checked. Trust it over the body's tense, and correct it when you find it
+wrong.
+
+`cargo xtask check-docs` (in CI) enforces the mechanical part: every relative doc link
+resolves, every backticked `kernel/…`/`userspace/…`/`tools/…` path cited by a
+current-behaviour doc exists, and every `architecture/` doc has a Status line. It cannot
+tell whether prose is *true* — that part is on review. A deliberate reference to a path
+that does not exist (an honest forward reference, or a record of a deletion) is exempted by
+marking the line `<!-- check-docs: allow-missing -->`.
 
 When uncertain why something is the way it is, check `docs/rationale/rejected-approaches.md` first — many "obvious" alternatives were considered and rejected for specific reasons.
 
@@ -135,7 +174,7 @@ If you find yourself writing one of these, stop and ask.
 
 - **Implementation produces new conventions** → `docs/conventions/`
 - **Implementation reveals a subtlety in an architecture doc** → update the architecture doc; the docs are living
-- **A new design decision is made** → append to `docs/history/decision-log.md` with date and reasoning
+- **A new design decision is made** → append to `docs/decision-log.md` with date and reasoning
 - **A deferred item is being implemented** → update `docs/rationale/deferred-decisions.md`
 - **A spec contract changes** → update the spec doc; bump version markers as needed
 
@@ -143,4 +182,4 @@ If you find yourself writing one of these, stop and ask.
 
 The project is pre-v0.1. The syscall ABI, wire formats, and kernel internals are pre-stabilization. The `docs/spec/` documents are the canonical contracts within this pre-stabilization period; if a spec doc and the source disagree, the source wins and the spec is updated to match (filed against the decision log).
 
-Phases 0–3 (foundation, kernel substrate, boot-to-userspace, service ecosystem) are **complete** (Phase 3 closed 2026-07-21). Phase 4 (toward a usable windowed desktop) is next. See `docs/history/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.
+Phases 0–3 (foundation, kernel substrate, boot-to-userspace, service ecosystem) are **complete** (Phase 3 closed 2026-07-21). Phase 4 (toward a usable windowed desktop) is next. See `docs/decision-log.md` for the current implementation phase and `docs/planning/implementation-plan.md` for the slice-by-slice breakdown.

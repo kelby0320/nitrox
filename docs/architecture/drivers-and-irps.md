@@ -14,14 +14,16 @@ the implementing slices; this doc cross-links forward to them. Background:
 `docs/architecture/overview.md` (§ "Drivers and IRPs"),
 `docs/architecture/notifications.md` (async event delivery),
 `docs/architecture/handle-system.md` (kernel objects and handles), and the
-original design in `docs/history/os-design-v5.1.md` § "Driver Subsystem".
+original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 
-> **Status.** This is a Phase 2 design doc. Almost nothing here is built yet:
-> Phase 1 shipped the LAPIC timer and the `sys_wait` wait machinery, but the
-> IOAPIC, the DPC queue, `PendingOperation`, `InterruptObject`, `DeviceNode`,
-> and the IRP framework are all Phase 2 work (the latter four are currently
-> `KObjectType` tags with no implementation). Each section names the prereq item
-> or slice that implements it. See the § "Phase 2 scope" table at the end.
+> **Status.** Implemented (Phase 2, complete). Every component this document once
+> listed as unbuilt now exists: the IOAPIC (`kernel/src/arch/x86_64/ioapic.rs`), the
+> DPC queue (`kernel/src/dpc.rs`), `PendingOperation`, `InterruptObject` and
+> `DeviceNode` (`kernel/src/object/`), and the IRP framework (`kernel/src/io/irp.rs`),
+> which carries real block I/O for `fs-server-ext4`. Individual deferrals — IRP
+> cancellation, the module loader, driver-process `Handle<DeviceNode>` — are marked
+> inline and in `deferred-decisions.md`. The § "Phase 2 scope" table at the end is a
+> record of the original plan. Verified 2026-08-05.
 
 ## Three concepts, kept distinct
 
@@ -287,6 +289,6 @@ All deferrals are tracked in `docs/rationale/deferred-decisions.md`.
 - The **storage slice** — implements § "The IRP model", § "Device discovery",
   and § "Block-device drivers as resource servers" (PCI, AHCI, GPT, `DeviceNode`,
   the block resource server).
-- `docs/history/decision-log.md` (2026-06-11) — the decisions recorded here.
+- `docs/decision-log.md` (2026-06-11) — the decisions recorded here.
 - `docs/planning/implementation-plan.md` (Phase 2) — slice ordering and the
   prerequisite band.

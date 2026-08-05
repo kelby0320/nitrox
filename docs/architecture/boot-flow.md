@@ -1,181 +1,204 @@
 # Boot Flow
 
-This document describes how a Nitrox machine progresses from power-on to a
-running system. The flow is split into phases that map onto the project's
-implementation roadmap; in pre-v0.1, only Phase 0 (foundation boot) is
-implemented — later phases are described aspirationally and will be filled
-in as they are built.
-
-For exact contracts (Limine protocol layout, syscall ABI, etc.), see the
-corresponding `docs/spec/` document. For the rationale behind specific
-choices, see `docs/rationale/`.
-
----
+**Status:** Current. Describes the boot as it runs today — UEFI → Limine → kernel → `init`
+→ fs-server → `service-mgr` → `auth-service` → `session-mgr` → login → `nxsh` (Phases 0–3
+complete, 2026-07-21). Every stage below is exercised on each CI run by
+`cargo xtask test-qemu` (headless, adjudicated by `isa-debug-exit`) and
+`cargo xtask test-interactive` (expect-driven over the serial console).
+Verified against source 2026-08-05.
 
 ## Overview
 
 ```
-UEFI firmware
-  └─► Limine (BOOTX64.EFI)              ◄── Phase 0 implemented
-        └─► Nitrox kernel _start
-              └─► kernel_main
-                    └─► framebuffer text + halt loop
-
-  ── Phase 1+ (deferred) ──
-        ├─► IDT, exception model
-        ├─► Physical/virtual memory management
-        ├─► Handle table, IPC, scheduler
-        ├─► In-kernel resource servers (/proc, /dev, /initramfs)
-        └─► PID 1 (init) spawned from initramfs
-              └─► fs-servers, service-mgr, session-mgr
-                    └─► login, user shell
+UEFI firmware (OVMF under QEMU)
+  └─► Limine (BOOTX64.EFI) — reads limine.conf, loads kernel + initramfs module
+        └─► kernel _start → kernel_main
+              ├─ serial console, GDT/TSS/IDT
+              ├─ buddy + slab allocators, paging, HHDM
+              ├─ initramfs module registered
+              ├─ platform discovery (ACPI: PCIe ECAM, interrupt routing)
+              ├─ local APIC (x2APIC), TSC + LAPIC timer calibration
+              ├─ DPC queue, interrupt router (IOAPIC)
+              ├─ global handle table
+              ├─ scheduler, then AP bring-up (SMP)
+              └─► first userspace process
+                    └─► init (pid 1)
+                          ├─ read /initramfs/etc/init.toml
+                          ├─ mount critical path (spawn fs-server per mount)
+                          ├─ bind profile-server at /bin
+                          ├─ bind logging-service at /log
+                          ├─ bind tty-server at /dev/tty
+                          └─► service-mgr
+                                ├─► auth-service
+                                └─► session-mgr ─► login ─► nxsh
 ```
+
+Failure on the critical path drops to `eshell`, the emergency shell (see § "The
+emergency path").
 
 ---
 
-## Phase 0 — Foundation boot (implemented)
+## 1. Firmware: UEFI loads Limine
 
-Goal: get a recognisable boot indicator on the framebuffer, prove the
-toolchain, prove the Limine integration, prove the higher-half load.
+QEMU is launched with OVMF as `pflash`. UEFI scans removable media, finds the EFI System
+Partition (GPT type `EF00`) on the virtual disk, and loads `EFI/BOOT/BOOTX64.EFI` from the
+FAT32 inside. That binary is Limine's UEFI loader, vendored under
+`tools/build-cache/limine/` by `tools/xtask`.
 
-### 1. Firmware: UEFI loads Limine
-
-QEMU is launched with OVMF as `pflash`. UEFI scans removable media,
-finds an EFI System Partition (GPT type `EF00`) on the virtual disk,
-and loads `EFI/BOOT/BOOTX64.EFI` from the FAT32 inside. That binary is
-Limine's UEFI loader, vendored under `tools/build-cache/limine/` by
-`tools/xtask`.
-
-Disk image layout (built by `cargo xtask image`):
+Disk image layout (built by `cargo xtask image`; sizes are `IMAGE_SIZE_MIB` and
+`ESP_SIZE_MIB` in `tools/xtask/src/main.rs`):
 
 ```
-nitrox.hdd (64 MiB raw, GPT)
-└── partition 1 (EFI System, FAT32, "NITROX_ESP")
-    ├── /EFI/BOOT/BOOTX64.EFI         ← Limine v12.2.0
-    ├── /boot/limine/limine.conf      ← vendored from boot/limine.conf
-    └── /boot/kernel                  ← our ELF
+nitrox.hdd (128 MiB raw, GPT — two partitions)
+├── partition 1 (EFI System, FAT32, 48 MiB, "NITROX_ESP", type ef00)
+│   ├── /EFI/BOOT/BOOTX64.EFI         ← Limine v12.2.0
+│   ├── /boot/limine/limine.conf      ← vendored from boot/limine.conf
+│   ├── /boot/kernel                  ← our ELF
+│   └── /boot/initramfs               ← cpio; the boot-critical closure
+└── partition 2 (ext4, "nitrox-root", type 8300, rest of disk)
+    └── the root filesystem: /system, /home, /store
 ```
 
-### 2. Limine reads `limine.conf` and finds the kernel
+The second partition rides the same boot disk on purpose: the GPT driver enumerates every
+non-empty entry and binds `/dev/disk/by-partlabel/nitrox-root`, so no separate QEMU drive
+is needed.
 
-The config — `boot/limine.conf` — names one entry pointing at
-`boot():/boot/kernel`. Timeout is 0 so the entry boots immediately.
+## 2. Limine reads `limine.conf` and finds the kernel
 
-Limine then loads the kernel ELF, scans the binary for our request
-statics (the `.limine_requests` bracketed region — see
-`kernel/linker.ld` and `kernel/src/main.rs`), sets up:
+`boot/limine.conf` names one entry pointing at `boot():/boot/kernel`, with
+`module_path: boot():/boot/initramfs`. Timeout is 0 so the entry boots immediately.
+
+Limine loads the kernel ELF, scans it for our request statics (the `.limine_requests`
+bracketed region — see `kernel/linker.ld` and `kernel/src/main.rs`), and sets up:
 
 - 64-bit long mode, with 4-level paging
 - A higher-half kernel mapping anchored at `0xffffffff80000000`
-- A higher-half direct map of physical memory (HHDM — declared but not
-  yet consumed by Phase 0)
+- A higher-half direct map of physical memory (HHDM)
 - The framebuffer (linear, 32 bpp, driven by Limine's response struct)
 - A 64 KiB stack in bootloader-reclaimable memory
 - A bootloader GDT with `CS=0x28`, `DS=0x30`
 - `RFLAGS.IF = 0` (interrupts disabled)
 
-…and jumps to our ELF entry, `_start`. Per the Limine protocol the
-return address pushed onto the stack is zero; the kernel must not
-return.
+…and jumps to our ELF entry, `_start`. Per the Limine protocol the return address pushed
+onto the stack is zero; the kernel must not return.
 
-### 3. Kernel `_start` → `kernel_main`
+**The Limine bindings are hand-rolled** `#[repr(C)]` types in `kernel/src/limine.rs`, not
+the `limine` crate — the kernel takes no external crates. Bump `LIMINE_VERSION` in `xtask`
+and the bindings together.
 
-`kernel/src/main.rs` declares four statics in the `.limine_requests*`
-sections (linked in by `kernel/linker.ld`):
+## 3. Kernel `_start` → `kernel_main`
 
-- `BASE_REVISION` — `BaseRevision::new(6)`, the protocol revision we
-  require. Limine zeroes its inner `revision` field if it supports the
-  requested revision; we check this before trusting anything else.
-- `FRAMEBUFFER_REQUEST` — `FramebufferRequest::new()`; the response
-  pointer is populated by Limine before jump.
-- `REQUESTS_START` / `REQUESTS_END` — markers that bracket the request
-  region for fast scanning, mandatory under base revision 6.
+`kernel/src/main.rs` declares six request statics plus the two bracketing markers, linked
+into `.limine_requests*` by `kernel/linker.ld`:
 
-`kernel_main`:
+- `BASE_REVISION` — `BaseRevision::new(6)`, the protocol revision we require. Checked
+  before anything else is trusted.
+- `FRAMEBUFFER_REQUEST`, `MEMMAP_REQUEST`, `HHDM_REQUEST`, `MODULE_REQUEST`, `SMP_REQUEST`
+- `REQUESTS_START` / `REQUESTS_END` — mandatory under base revision 6.
 
-1. Verifies `BASE_REVISION.supported()`. If false, halt.
-2. Reads `FRAMEBUFFER_REQUEST.response`; bails if null.
-3. Dereferences the first `Framebuffer` in the response array.
-4. Builds an `FbWriter` over its linear mapping (Phase 0 only handles
-   32 bpp framebuffers — anything else means halt).
-5. Clears the framebuffer to a dark slate (`Rgb::BG`).
-6. Writes `NITROX KERNEL` in cyan, then `PHASE 0: BOOT OK` in white,
-   using the hand-coded 8x16 font in `kernel/src/font.rs`.
+All but `BASE_REVISION` are `static mut`: Limine writes their `response` field after the
+binary is loaded, and a plain `static` would let rustc constant-fold the read.
 
-Then control returns to `_start`, which calls `arch::halt_loop` — a
-`cli; hlt` loop. The kernel halts cleanly with output visible.
+`kernel_main` then brings the system up in this order — the ordering is load-bearing, and
+each step's rationale is in the source comments:
 
-### 4. End of Phase 0
+1. **Serial first.** It touches only fixed I/O ports, so every later step can report
+   progress *and failure* to the console before anything else exists.
+2. **CPU tables** — GDT + TSS, then IDT (`arch::Cpu::init_tables`).
+3. **Memory** — walk Limine's memory map, bring up the buddy allocator and the slab over
+   it. This is the first code to walk firmware structures and the first place a fault can
+   happen, which is why the IDT is already live.
+4. **Paging** — `paging_init` enables NX and captures the kernel-half PML4 template every
+   future `AddressSpace::new` inherits. Must precede any address-space construction.
+5. **initramfs** — register the Limine-loaded module so the `/initramfs` resource server
+   can serve it. Needs the HHDM.
+6. **Platform discovery** — ACPI on x86_64: the PCIe ECAM window and the interrupt-routing
+   topology. Missing or malformed tables are logged, not fatal.
+7. **Local APIC** (x2APIC), then **TSC + LAPIC timer calibration** against the legacy PIT.
+8. **DPC queue**, then the **interrupt router** (IOAPIC).
+9. **Global handle table.**
+10. **Scheduler** (`sched_bringup`), then **AP bring-up** (`bring_up_aps`) via Limine's SMP
+    response — capped at `MAX_CPUS`, extras left parked. Absent an SMP response the system
+    stays single-CPU.
+11. **Boot screen**, then the first userspace process.
 
-No interrupts have been enabled. No IDT exists. No allocator has been
-brought up. The kernel is intentionally a brick that *displays a sign*.
+## 4. The first userspace process
 
----
+`run_first_userspace` arms the syscall fast path, then builds pid 1 by hand — this is the
+one process nothing else can construct:
 
-## Phase 1 — kernel core (deferred)
+- Allocate an address space; load `/sbin/init` from the initramfs (halt if absent).
+- Allocate the process and a notification channel, and a handle to it.
+- Allocate a namespace and bind the initial set: `/dev/entropy`, `/dev/console`,
+  `/dev/log`, `/proc/self/*`, `/proc/sched/stats`, `/initramfs`, `/dev/blk`.
+- Spawn with exactly two handles — the notification channel and the namespace root.
 
-Brings up the structures that turn the brick into a kernel.
+**init receives two handles and no more.** Everything else it obtains, it obtains by
+lookup in the namespace it was given, which is the capability model's opening move rather
+than an implementation detail.
 
-1. **CPU plumbing.** Replace Limine's GDT with our own. Install an IDT,
-   route hardware exceptions to handlers, set up the IST stacks for
-   double-fault and NMI.
-2. **Physical memory.** Walk Limine's memory-map response, mark
-   `bootloader-reclaimable` regions for later release, hand `usable`
-   regions to the buddy allocator.
-3. **Virtual memory.** Build the kernel-half page tables we own (rather
-   than relying on Limine's transient ones), set up the slab allocator
-   over the buddy, define the VMA tree shape for processes (even though
-   no process exists yet).
-4. **Interrupts.** Set up the LAPIC, the I/O APIC, a timer source. Allow
-   the `cli; hlt` to be replaced with `sti; hlt` once the IDT is sound.
-5. **Logging.** Promote the framebuffer console to a real kernel log
-   sink. Add a serial backend (writes also go to QEMU's `-serial` for
-   automated tests).
+## 5. init (pid 1)
 
-After Phase 1, the kernel can execute code in response to interrupts
-and own its own memory.
+`_start(notif, root_ns, …)` in `userspace/init/src/main.rs`:
 
----
+1. **Read the manifest** — `/initramfs/etc/init.toml`, parsed into an ordered list of
+   mounts (shallowest first). Unreadable, unparseable or non-UTF-8 → the emergency path.
+2. **Mount the critical path.** Per entry: resolve the device, spawn the fs-server, hand
+   over the device handle, wait for its `Ready` message carrying the server's endpoint,
+   and bind that endpoint at the mount point. Any failure → the emergency path.
+3. **Bind the system servers**, each by the same spawn → `Ready` → bind handshake:
+   `profile-server` at `/bin` (projecting the store), `logging-service` at `/log`, and
+   `tty-server` at `/dev/tty`.
 
-## Phase 2 — capabilities, IPC, the first process (deferred)
+   The tty server is the one **non-fatal** binding: if it fails, init logs "no terminal
+   server; sessions will have no `/dev/tty`" and continues.
+4. **Hand off** to `service-mgr` and stay resident as supervisor.
 
-1. Handle table (segmented), kernel object framework, `Rights` checks.
-2. Namespace engine and in-kernel resource servers:
-   `/proc`, `/dev`, `/initramfs`, `/dev/framebuffer`.
-3. IPC channels and notification queues.
-4. Scheduler (per-CPU runqueues, three classes — RealTime/TimeShared/Idle).
-5. Spawn `init` (PID 1) from the initramfs with the initial handle set
-   and full system capabilities.
+Under the `selftest` / `test-harness` builds init additionally runs the filesystem demo
+chain (large-file read, overwrite, grow, create, subtree bind) between steps 2 and 3, and
+the harness verdict gates the handoff to the login chain.
 
-After Phase 2 the kernel has a userspace process running.
+## 6. service-mgr → session-mgr → login
 
----
+`service-mgr` reads service declarations, constructs each service's namespace and handle
+set, spawns it and supervises it. On the login path specifically:
 
-## Phase 3 — userspace boot (deferred)
+1. **`auth-service`** — spawn + `Ready` handshake, yielding the client channel.
+2. **`session-mgr`** — spawned with re-delegated `BIND_NAMESPACE`, then handed the
+   fs-server endpoint and the auth channel.
 
-Init reads `/etc/init.toml` from the initramfs and processes critical-path
-mounts in dependency order, spawning fs-server instances and binding their
-endpoints. From there it spawns the service manager, which brings up
-logging, audit, device manager, package manager, session manager, and
-eventually the session manager presents login.
+`session-mgr` presents login, authenticates against `auth-service`, constructs the session
+namespace, and spawns `nxsh` into it with empty syscaps. **`nxsh` is the login leaf** as of
+2026-07-31; the throwaway `usersh` is gone.
 
-Failure at any critical-path stage drops into `eshell`, the emergency
-shell. See the (yet-to-be-written) `emergency-recovery.md`.
+**Servers never register themselves.** In every handshake above, a supervisor holding
+`BIND_NAMESPACE` does the binding — see
+[why supervisor registration](../rationale/why-supervisor-registration.md).
 
----
+## The emergency path
 
-## State at each phase boundary
+Failure on the critical path — no usable manifest, a mount that will not come up, a
+required system server that will not bind — drops to `eshell`, a minimal interactive shell
+bundled in the initramfs with enough capability to inspect block devices, edit `init.toml`
+and reboot. Recovery from a misconfigured boot does not need a rescue USB.
 
-| State                            | Phase 0 | Phase 1 | Phase 2 | Phase 3 |
-|----------------------------------|:-------:|:-------:|:-------:|:-------:|
-| Long mode + paging               |   ✓     |   ✓     |   ✓     |   ✓     |
-| IDT, exception handling          |         |   ✓     |   ✓     |   ✓     |
-| Physical-memory bookkeeping      |         |   ✓     |   ✓     |   ✓     |
-| Allocator (buddy + slab)         |         |   ✓     |   ✓     |   ✓     |
-| Interrupts enabled, timer        |         |   ✓     |   ✓     |   ✓     |
-| Handle table, kernel objects     |         |         |   ✓     |   ✓     |
-| Namespace + in-kernel RS         |         |         |   ✓     |   ✓     |
-| IPC, notifications, scheduler    |         |         |   ✓     |   ✓     |
-| PID 1 (init) running             |         |         |   ✓     |   ✓     |
-| fs-servers, service-mgr          |         |         |         |   ✓     |
-| Session manager, user shell      |         |         |         |   ✓     |
+`eshell` deliberately keeps `kprint` and talks to the raw console device rather than the
+tty server: its whole precondition is that the normal path failed. See
+[console and tty](console-and-tty.md) § "`eshell` is separate, and has to be".
+
+## Where this is verified
+
+| | What it proves |
+|---|---|
+| `cargo xtask test-qemu` | The whole boot to userspace, headless; the guest writes a verdict to `isa-debug-exit` and a hang is caught by a wall-clock timeout. Runs under **KVM** — the kernel is x2APIC-only and QEMU 8.2's TCG does not emulate x2APIC. |
+| `cargo xtask test-interactive` | The login chain end to end over the serial console, expect-driven: the login prompt, a rejected password, a successful login, and shell behaviour after it. |
+
+See [qemu integration tests](../conventions/qemu-integration-tests.md).
+
+## History
+
+This document previously described the boot as a four-phase plan with Phases 1–3 unbuilt.
+Those phases are complete; the plan itself is preserved in
+[`docs/planning/`](../planning/implementation-plan.md) (`phase-0-foundation.md` through
+`phase-3-service-ecosystem.md`), which is where the historical sequencing belongs. The
+decision log records the reasoning behind individual steps.

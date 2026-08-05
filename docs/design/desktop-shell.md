@@ -2,14 +2,18 @@
 
 ## Status
 
+**Not built.** This describes a subsystem with no code behind it; the build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when the desktop shell lands (Milestone 7).
+
 What a user actually sees and touches: the bars, the applications modal, the overview, and
 the desktop indicator. Settled with the maintainer 2026-08-04, with two items deliberately
 shelved (§9).
 
 Three documents divide this space:
 
-- **`nitrox-display-substrate-v1.md`** — mechanism. Framebuffer, surfaces, input, the test gate.
-- **`nitrox-ui-composition-model-v2.md`** — semantics. What a window *is*, ports, desktops,
+- **`display-substrate.md`** — mechanism. Framebuffer, surfaces, input, the test gate.
+- **`ui-composition-model.md`** — semantics. What a window *is*, ports, desktops,
   templates.
 - **This document** — the shell built on both, and the demands it places back on the compositor
   (§8). It is also what settled the widget toolkit's central question (§5).
@@ -151,7 +155,7 @@ list widget to something that may be removed.
 ## 8. What the shell needs from the compositor
 
 The actionable output of this document — every one of these is a demand on the substrate, and
-several are not in `nitrox-display-substrate-v1.md` yet:
+several are not in `display-substrate.md` yet:
 
 | Requirement | Why | Status |
 |---|---|---|

@@ -224,6 +224,7 @@ conflict notes in `overview.md`.
   std-port seam.
 - `docs/planning/implementation-plan.md` — Phase 3 slice 4 (this crate) and the
   userspace-runtime band.
-- `docs/history/decision-log.md` (2026-07-13) — userspace-runtime sequencing + std
+- `docs/decision-log.md` (2026-07-13) — userspace-runtime sequencing + std
   deferral rationale.
-- `userspace/init/src/heap.rs` — the bump allocator this replaces.
+- The bump allocator this replaced lived at `userspace/init/src/heap.rs` <!-- check-docs: allow-missing -->
+  — it was removed when libheap landed.

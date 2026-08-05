@@ -1,21 +1,25 @@
 # libos — the typed, async userspace runtime
 
-**Status:** Design (pre-implementation). Target: Phase 3 slice 5. Living document —
-update as implementation reveals subtleties.
+**Status:** Implemented (Phase 3 slice 5). `userspace/libos` provides `Handle<T, M>`, the
+`Op` future over `sys_wait`, and `block_on`; `init` and the test harness build on it.
+Slice 7 landed too: `Handle<Process>`, `Handle<Thread>` and the authority-gated `ns_bind`
+are all present. Living document — update as implementation reveals subtleties. Sections
+still marked *deferred* (chiefly the multi-task executor) are genuinely unbuilt.
+Verified 2026-08-05.
 
-`libos` is the **typed, async face of the syscall surface**. Today every userspace
-binary calls the raw `libkern` surface directly: bare `u64` handles, `IoResult`
-decoded by byte offset, and a `po_wait` helper (submit → `sys_wait` → decode → close)
-**copy-pasted verbatim into init, eshell, parent, and fs-server**. libos replaces that
-with (a) `Handle<T, M>` typestate wrappers that make rights errors compile failures,
-and (b) an `Op` future + `block_on` so an async I/O reads as `handle.read(buf).block_on()?`.
+`libos` is the **typed, async face of the syscall surface**. Before it, every userspace
+binary called the raw `libkern` surface directly: bare `u64` handles, `IoResult` decoded
+by byte offset, and a `po_wait` helper (submit → `sys_wait` → decode → close)
+**copy-pasted verbatim into init, eshell, parent, and fs-server**. libos replaced that
+with (a) `Handle<T, M>` typestate wrappers that make rights errors compile failures, and
+(b) an `Op` future + `block_on` so an async I/O reads as `handle.read(buf).block_on()?`.
 
 ## Position in the stack
 
 ```
 Application / services
   ↓
-libstream   librsproto                 ← typed streams (deferred), RS protocol
+libstream   librsproto                 ← typed streams (TSM1), RS protocol
   ↓
 libos                                  ← THIS: Handle<T,M>, Op future, block_on
   ↓
@@ -46,12 +50,12 @@ Namespace, NotificationChannel, Entropy, PendingOperation); the `Op` future over
   era; wants its own wire-protocol/streaming design pass.
 
 `Handle<Process>` / `Handle<Thread>` and the authority-gated `ns_bind` were deferred
-here in slice 5 (their ABIs finalized in slice 6, SysCaps) and land in **slice 7**
-below.
+here in slice 5 (their ABIs finalized in slice 6, SysCaps) and **landed in slice 7** —
+see the slice 7 section below; all three are in `userspace/libos/src/objects.rs` today.
 
 ## The `Handle<T, M>` typestate model
 
-The design is the one already committed on paper (`docs/history/os-design-v5.1.md`
+The design is the one already committed on paper (`docs/archive/os-design-v5.1.md`
 § "Handle typestate"); libos implements it. A handle is:
 
 ```rust
@@ -225,10 +229,10 @@ must preserve.)
 - **eshell**'s console read loop moves onto libos byte I/O + `block_on`, staying
   alloc-free.
 
-## Process, thread, and authority spawning (slice 7)
+## Process, thread, and authority spawning (slice 7 — landed)
 
-The pieces held back from slice 5, now that `SpawnArgs`/`ThreadArgs` + SysCaps are
-settled (slice 6). Two new object markers — **`Process`**, **`Thread`** — each with the
+The pieces held back from slice 5, unblocked once `SpawnArgs`/`ThreadArgs` + SysCaps were
+settled (slice 6). All of this is implemented. Two new object markers — **`Process`**, **`Thread`** — each with the
 `Only` mode (their granted rights live in `extra`; the v5.1 `ProcObserve`/`Control`/
 `Terminate` mode lattice is a later refinement, no consumer distinguishes them yet).
 
@@ -288,7 +292,7 @@ where the change stays surgical.
 
 ## References
 
-- `docs/history/os-design-v5.1.md` § Handle typestate — the authoritative `Handle<T,M>`
+- `docs/archive/os-design-v5.1.md` § Handle typestate — the authoritative `Handle<T,M>`
   design libos implements.
 - `docs/architecture/handle-system.md`, `docs/spec/handle-encoding.md` — the kernel
   handle table + `Rights` this wraps.

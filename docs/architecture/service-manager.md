@@ -1,5 +1,8 @@
 # Service Manager (`service-mgr`)
 
+**Status:** Implemented (Phase 3) — `userspace/service-mgr`, spawned by `init`, supervising
+the service set and performing supervisor-side namespace binding. Verified 2026-08-05.
+
 Design doc for `service-mgr`, the userspace process supervisor. Status:
 **pre-implementation** — this is the design; the crate does not exist yet. It is
 the first entry in the Phase 3 service backlog.

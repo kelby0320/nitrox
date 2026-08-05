@@ -122,7 +122,7 @@ Don't add complex testing scaffolding to init itself. Keep it minimal.
 ## Useful pointers
 
 - Boot flow: `docs/architecture/boot-flow.md`
-- Bootstrap mount topology: `docs/architecture/bootstrap-mount-topology.md`
+- Bootstrap mount topology: `docs/architecture/boot-flow.md` § "init (pid 1)"
 - init.toml schema: `docs/spec/init-toml-schema.md`
 - Resource server startup protocol: `docs/architecture/namespace-and-resource-servers.md` § Resource Server Startup Protocol
 - Why supervisor-mediated registration: `docs/rationale/why-supervisor-registration.md`

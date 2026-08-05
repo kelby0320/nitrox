@@ -181,7 +181,7 @@ Encoding rules:
 Each operation's body is documented per category. See:
 - [Namespace operations spec](rsproto-namespace-ops.md)
 - [File operations spec](rsproto-file-ops.md)
-- [Stream operations spec](rsproto-stream-ops.md) (TBD when implemented)
+- Stream operations spec — **not written.** Lands with the implementing slice.
 - [Block operations spec](rsproto-block-ops.md) (`MapRange`/`AllocRange` — Model A)
 - [Auth operations spec](rsproto-auth-ops.md) (`Authenticate` — credential validation)
 

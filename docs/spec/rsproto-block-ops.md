@@ -9,8 +9,10 @@ contract and [ext4-fs-server-rw.md](../architecture/ext4-fs-server-rw.md) for th
 implementer.
 
 **Status:** Pre-stabilization. Introduced with the fs-server-ext4 read-write slice. A
-**kernel↔server ABI** — the kernel hand-codes the request/reply (`kernel/src/rsproto.rs`);
-`librsproto` (`userspace/librsproto/src/block.rs`) carries the userspace mirror.
+**kernel↔server ABI** — the kernel hand-codes the request/reply (`kernel/src/rsproto.rs`).
+There is no `librsproto` mirror for these ops: the server side is implemented directly by
+the consumer, today `fs-server-ext4`'s `BlockReader`/`BlockWriter` traits over
+`sys_io_submit` (`userspace/fs-server-ext4/src/lib.rs`).
 
 **Filesystem-neutral.** These ops speak only in **device block runs** — never in any
 filesystem's internal structures. ext4 produces runs by walking/inserting its extent tree;

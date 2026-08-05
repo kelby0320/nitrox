@@ -2,6 +2,10 @@
 
 ## Status
 
+**Not built.** This describes a subsystem with no code behind it; the build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when windows, ports and desktops land (Milestone 6).
+
 This document revises the "User Interface and Shell" section of `os-design-v5.1.md`. That
 section was written early, before kernel/system design matured, and its central mechanism —
 `WidgetRecord` as a TSM1 stream variant — doesn't hold up under scrutiny. This document
@@ -15,7 +19,7 @@ builtin/external boundary — are still open and are the next topic of discussio
 ### Changes in v2 (2026-08-04)
 
 The mechanism beneath this document is now specified separately:
-**`nitrox-display-substrate-v1.md`** — framebuffer ownership, the surface protocol, input,
+**`display-substrate.md`** — framebuffer ownership, the surface protocol, input,
 text rendering, and the test gate. This document keeps the semantics; that one has the
 pixels. Where they touch, the namespace shape below is authoritative.
 
@@ -34,7 +38,7 @@ What is new or revised here:
   that matters: a template is a *file* and a desktop is a *namespace*; extraction
   translates between them rather than snapshotting.
 - **§8 — five of v1's six carried-forward shell questions are answered** by the shell
-  subproject (Milestone 4, design `nitrox-shell-design-v1.2.md`), and the namespace-overload
+  subproject (Milestone 4, design `docs/spec/shell-language.md`), and the namespace-overload
   question is largely resolved by §2a.
 
 ## 1. TSM1 stays data-only
@@ -332,7 +336,7 @@ serving ports through the compositor makes it a **discovery bottleneck** on a ca
 windows.
 
 **The shell questions v1 carried are now answered** by the shell subproject (Milestone 4;
-design `nitrox-shell-design-v1.2.md`):
+design `docs/spec/shell-language.md`):
 
 | v1 question | Where it landed |
 |---|---|

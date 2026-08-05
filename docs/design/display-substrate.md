@@ -2,14 +2,18 @@
 
 ## Status
 
+**Not built.** This describes a subsystem with no code behind it; the build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when the compositor lands.
+
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
 maintainer 2026-08-04.
 
-**Companion documents.** `nitrox-ui-composition-model-v2.md` owns the layer above — what a
+**Companion documents.** `ui-composition-model.md` owns the layer above — what a
 window *means*, how windows compose, desktops, templates. It was written first and settles the
 semantics; this one exists because it specifies none of the mechanism, and where they touch (the
-namespace shape for `/dev/draw`) v2 is authoritative. `nitrox-desktop-shell-v1.md` owns what a
+namespace shape for `/dev/draw`) v2 is authoritative. `desktop-shell.md` owns what a
 user actually sees, and §4a, §4b and §5a below exist **because that document demanded them** —
 roles, struts, capture and global hotkeys were all absent from the first draft of this one.
 
@@ -123,7 +127,7 @@ Retrofitting a role into a shipped protocol touches every client.
 ### 4b. Thumbnail capture
 
 The compositor can hand a client a **scaled snapshot** of another window's surface. The desktop
-shell's overview is built on it (`nitrox-desktop-shell-v1.md` §6), and it is what lets the
+shell's overview is built on it (`desktop-shell.md` §6), and it is what lets the
 overview be an image grid the shell draws rather than a transform pipeline inside the
 compositor.
 

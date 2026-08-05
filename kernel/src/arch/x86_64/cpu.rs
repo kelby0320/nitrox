@@ -146,13 +146,13 @@ fn ensure_smap_smep() {
     assert!(
         ebx & CPUID_7_0_EBX_SMEP != 0,
         "SMEP not supported by this CPU — Phase 1 requires SMEP/SMAP \
-         (see docs/history/decision-log.md). Under QEMU use \
+         (see docs/decision-log.md). Under QEMU use \
          `-cpu qemu64,+smap,+smep`."
     );
     assert!(
         ebx & CPUID_7_0_EBX_SMAP != 0,
         "SMAP not supported by this CPU — Phase 1 requires SMEP/SMAP \
-         (see docs/history/decision-log.md). Under QEMU use \
+         (see docs/decision-log.md). Under QEMU use \
          `-cpu qemu64,+smap,+smep`."
     );
     // SAFETY: both feature bits are present per the assertions above, so

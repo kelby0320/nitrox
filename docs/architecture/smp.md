@@ -14,10 +14,11 @@ scheduler.md first for the policy; read this for the SMP machinery and the war
 stories. Anchors are `file:function` (line numbers drift; symbol names are
 stable).
 
-Status: as of 2026-07-01 the system boots to a userspace `eshell` on `-smp 4`
-with **user threads distributing across all cores and migrating via
-work-stealing**, verified 0 failures over 150 KVM boot-loops plus a scripted
-`eshell` interaction stress. Cross-CPU **wake** delivery is now explicit: a
+Status: implemented. The SMP bring-up verification below dates from 2026-07-01, when the
+boot leaf was still `eshell`; the system now boots through the login chain to `nxsh` on
+`-smp 4` with **user threads distributing across all cores and migrating via
+work-stealing**, verified at the time as 0 failures over 150 KVM boot-loops plus a
+scripted `eshell` interaction stress. Cross-CPU **wake** delivery is now explicit: a
 **reschedule IPI** (§6) pokes a core when a thread is placed on it from another
 core, so a woken thread on an idle core runs immediately instead of waiting for
 that core's next tick (added 2026-07-20 to fix a concurrent-block-I/O hang — see
@@ -460,7 +461,7 @@ syscalls while migratable.
 - [memory-management.md](memory-management.md) — address spaces, the kernel vmap,
   TLB.
 - [boot-flow.md](boot-flow.md) — the boot sequence this doc's §3 slots into.
-- Decision log ([../history/decision-log.md](../history/decision-log.md)),
+- Decision log ([../decision-log.md](../decision-log.md)),
   2026-07-01 entries — the SCE / APIC-id fixes, the switch-out race + dense-index
   collision fixes, and user-thread migration.
 - Deferred decisions

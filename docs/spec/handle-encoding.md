@@ -234,4 +234,5 @@ All multi-byte integers in handle table entries and the `RawHandle` value are li
 
 - [Handle system architecture](../architecture/handle-system.md) — implementation details, lookup path, allocation, close
 - [Why capabilities](../rationale/why-capabilities.md) — design rationale
-- [Kernel objects reference](../reference/kernel-objects-catalogue.md) — per-type rights and operations
+- [Handle system architecture](../architecture/handle-system.md) § "Rights model" — per-type rights
+  and operations. (No standalone `reference/` catalogue is written.)
