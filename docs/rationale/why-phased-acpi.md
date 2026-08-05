@@ -123,6 +123,7 @@ Both paths are wrapped behind `ArchPower::shutdown()` and `ArchPower::reboot()`,
 
 ## Where to read more
 
-- [Power management architecture](../architecture/power-management.md) — full power management subsystem, both phases
+- Power management architecture — **not written.** ACPI is Phase 2 and not yet active
+  (see the root `CLAUDE.md`, "Forbidden patterns", on the planned ACPICA exception).
 - [Boot flow architecture](../architecture/boot-flow.md) — where ACPI initialization happens during boot
 - [ACPICA project documentation](https://www.intel.com/content/www/us/en/developer/articles/tool/acpi-component-architecture-downloads.html) — for when Phase 2 happens

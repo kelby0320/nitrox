@@ -226,4 +226,5 @@ conflict notes in `overview.md`.
   userspace-runtime band.
 - `docs/history/decision-log.md` (2026-07-13) — userspace-runtime sequencing + std
   deferral rationale.
-- `userspace/init/src/heap.rs` — the bump allocator this replaces.
+- The bump allocator this replaced lived at `userspace/init/src/heap.rs`; it was removed
+  when libheap landed.

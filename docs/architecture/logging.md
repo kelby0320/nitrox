@@ -1,5 +1,8 @@
 # Logging service
 
+**Status:** Implemented — the in-kernel log (`kernel/src/klog.rs`) and the userspace
+`logging-service`. Verified 2026-08-05.
+
 The userspace **logging service** collects structured log records from any process
 that holds a logging capability, stamps each with trusted provenance, and fans them
 out to sinks. It is the concrete implementation of the `log` handle seam that

@@ -1,5 +1,8 @@
 # Memory management
 
+**Status:** Implemented — buddy + slab allocators, VMA/address-space management and user
+access primitives under `kernel/src/mm/`. Verified 2026-08-05.
+
 Three layers, each owning a single concern:
 
 | Layer  | Code                                  | Owns                                   |

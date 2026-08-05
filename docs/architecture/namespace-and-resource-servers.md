@@ -1,5 +1,9 @@
 # Namespaces and Resource Servers
 
+**Status:** Implemented — `kernel/src/object/namespace.rs`, with userspace resource servers
+(fs-server, profile-server, auth, tty) bound by supervisors. Deferrals are marked inline.
+Verified 2026-08-05.
+
 Nitrox has **no global filesystem tree, no mount table, no VFS**. What it has
 instead is the **per-process namespace**: a private map from paths to resources.
 Looking up `/store/config` is meaningful only relative to *your* namespace; there

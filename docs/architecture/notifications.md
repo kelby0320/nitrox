@@ -1,5 +1,9 @@
 # Notifications
 
+**Status:** Implemented — `NotificationChannel`
+(`kernel/src/object/notification_channel.rs`). See `docs/spec/notification-format.md` for
+the wire contract. Verified 2026-08-05.
+
 Nitrox has no Unix signals (see `docs/rationale/why-no-signals.md`). Async
 events — hardware faults, child exits, IPC peer-close, resource changes — are
 delivered as structured **`Notification`** values into a per-process **bounded

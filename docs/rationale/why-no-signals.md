@@ -127,5 +127,6 @@ Programs that relied on `SIGALRM` for timeouts use `Timer` kernel objects direct
 
 - [Notification format spec](../spec/notification-format.md) — exact wire format of every notification variant
 - [IPC architecture](../architecture/ipc.md) — IPC channels (distinct from notifications; covers the peer-to-peer case)
-- [Process model architecture](../architecture/process-model.md) — termination, exit status, reaping
+- [Notifications architecture](../architecture/notifications.md) and
+  [notification format spec](../spec/notification-format.md) — termination, exit status, reaping
 - [Why async-first syscalls](why-async-syscalls.md) — relates to the EINTR/syscall-restart story

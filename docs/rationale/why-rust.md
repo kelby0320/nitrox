@@ -80,6 +80,9 @@ The `unsafe` boundary is documented per-subdirectory. `kernel/src/arch/` is most
 
 ## Where to read more
 
-- [`unsafe` policy](../conventions/unsafe-policy.md) — when unsafe is allowed and how it must be documented
-- [Code style](../conventions/code-style.md) — Rust conventions for the project
-- [Toolchain reference](../reference/toolchain.md) — specific versions and required tooling
+- `unsafe` policy — the root `CLAUDE.md` ("Document `unsafe` blocks") and `kernel/CLAUDE.md`.
+  No standalone conventions doc is written.
+- Code style — the root `CLAUDE.md` ("Cross-cutting conventions", "Forbidden patterns").
+  No standalone conventions doc is written.
+- [Userspace build](../conventions/userspace-build.md) and the root `CLAUDE.md`
+  ("Language and toolchain rules") — versions and required tooling.

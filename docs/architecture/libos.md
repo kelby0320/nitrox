@@ -1,7 +1,10 @@
 # libos — the typed, async userspace runtime
 
-**Status:** Design (pre-implementation). Target: Phase 3 slice 5. Living document —
-update as implementation reveals subtleties.
+**Status:** Implemented (Phase 3 slice 5). `userspace/libos` provides `Handle<T, M>`, the
+`Op` future over `sys_wait`, and `block_on`; `init` and the test harness build on it.
+Living document — update as implementation reveals subtleties. **Parts of the body below
+are still written in the future tense of the original design; treat the Status line as
+authoritative where they disagree.** Verified 2026-08-05.
 
 `libos` is the **typed, async face of the syscall surface**. Today every userspace
 binary calls the raw `libkern` surface directly: bare `u64` handles, `IoResult`
@@ -15,7 +18,7 @@ and (b) an `Op` future + `block_on` so an async I/O reads as `handle.read(buf).b
 ```
 Application / services
   ↓
-libstream   librsproto                 ← typed streams (deferred), RS protocol
+libstream   librsproto                 ← typed streams (TSM1), RS protocol
   ↓
 libos                                  ← THIS: Handle<T,M>, Op future, block_on
   ↓

@@ -222,5 +222,5 @@ The wire format is deliberately not exposed in the typical application API; prog
 
 ## Where to read more
 
-- [Shell and typed streams architecture](../architecture/shell-and-streams.md)
-- [TypedRecord usage in libstream](../reference/libstream-reference.md) (TBD)
+- [Shell language design](../history/nitrox-shell-design-v1.2.md) — the language over these streams
+- `TypedRecord` usage in libstream — **not written.** The crate is `userspace/libstream`.

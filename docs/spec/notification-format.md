@@ -266,4 +266,4 @@ The `_pad` fields ensure each variant is exactly 64 bytes total. Specifying expl
 
 - [Notification queue architecture](../architecture/notifications.md) — implementation, delivery, exception priority chain
 - [Why no signals](../rationale/why-no-signals.md) — design rationale
-- [Process model architecture](../architecture/process-model.md) — `ChildExited` semantics, reaping
+- [Notifications architecture](../architecture/notifications.md) — `ChildExited` semantics, reaping

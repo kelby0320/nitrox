@@ -10,10 +10,10 @@ Nitrox's distinctive choice: projection is done by a **resource server** resolvi
 lookups, **not** by symlink farms (as Nix does). This is the capability-native form —
 it composes with per-process namespaces and rights.
 
-Status: **pre-implementation** (Phase 3 backlog item 2). Slice 1 ships the **system
-profile** projected at `/bin`, read from a manifest, over a read-only store. Per-user
-profile overlays, runtime generation switching, and rollback are designed here but
-land later (they need session-mgr / persisted state).
+Status: **implemented, slice 1** (Phase 3). The **system profile** is projected at `/bin`
+from a manifest over the read-only store by `userspace/profile-server`, which `init`
+spawns and whose endpoint it hands to `service-mgr`. Per-user profile overlays, runtime
+generation switching, and rollback are designed here but **not built**. Verified 2026-08-05.
 
 ## What a profile is
 

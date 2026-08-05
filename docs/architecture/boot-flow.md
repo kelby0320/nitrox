@@ -1,5 +1,12 @@
 # Boot Flow
 
+**Status:** The boot described here runs end to end today — UEFI → Limine → kernel → `init`
+→ fs-server → `service-mgr` → `session-mgr` → login → `nxsh` (Phases 0–3 complete, 2026-07-21),
+exercised on every CI run by `cargo xtask test-qemu` and `test-interactive`.
+**⚠️ The phase narrative below is stale**: it is frozen at Phase 0 and still describes the
+IDT, memory management, IPC, the scheduler, init and login as deferred future work. Read it
+as a record of the original plan, not as how the system boots. Rewrite pending (2026-08-05).
+
 This document describes how a Nitrox machine progresses from power-on to a
 running system. The flow is split into phases that map onto the project's
 implementation roadmap; in pre-v0.1, only Phase 0 (foundation boot) is

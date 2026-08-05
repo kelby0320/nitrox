@@ -888,6 +888,10 @@ expressed as "the boot completes and the harness agrees". See
 
 **Comprehensive systemwide tracing infrastructure (DTrace/eBPF equivalent).** Per-CPU ring buffers for kernel tracing exist in concept. A full programmable tracing facility (DTrace probes, eBPF-style filters, etc.) is out of scope initially. Trigger: deep performance analysis needs that exceed what `kprintln!` and basic tracing handles.
 
+### Documentation
+
+**`docs/reference/` catalogues (`docs-reference-catalogues`).** The root `CLAUDE.md` once described `reference/` as holding catalogues for kernel objects, syscalls, errors and syscaps; only `error-codes.md` was ever written, and three documents linked to a `kernel-objects-catalogue.md` that did not exist. Those links now point at the architecture docs that actually carry the material (`handle-system.md` § "Rights model" for per-type rights, `syscall-abi.md` for the syscall set), and `CLAUDE.md` describes what is really there. A genuine per-object catalogue is still worth having — and unlike the prose docs it could be **generated from source and gated**, which is the one form of reference material that cannot drift. Trigger: the syscall or object set becoming large enough that reading `kernel/src/syscall/table.rs` stops being the faster answer, or the v1.0 ABI freeze, whichever comes first.
+
 ## Resolved (kept for the record)
 
 Entries that have been **done**, listed here rather than left in the open sections above —

@@ -7,10 +7,11 @@ this model at all, read [why-content-addressed-store](../rationale/why-content-a
 first. The user-facing projection layer that makes the store usable is
 [profiles-and-namespace-projection](profiles-and-namespace-projection.md).
 
-Status: **pre-implementation** (Phase 3 backlog item 2). The first slice ships a
-**read-only** store, pre-built into the ext4 image; the package manager (the store's
-writer), runtime generation switching, and GC are designed here but land later (they
-need fs-server RW).
+Status: **implemented, first slice** (Phase 3). The **read-only** store is built into the
+ext4 image by `xtask` (hash-keyed packages under `/store`) and projected by
+`profile-server`. The package manager (the store's writer), runtime generation switching,
+and GC are designed here but **not built** — see § "The package manager (deferred)".
+Verified 2026-08-05.
 
 ## What it is
 

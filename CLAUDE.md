@@ -86,10 +86,28 @@ docs/
   architecture/  what the subsystems do and how they relate
   rationale/     why decisions were made (read here when puzzled)
   spec/          exact contracts (ABIs, wire formats, schemas)
-  reference/     catalogues (kernel objects, syscalls, errors, syscaps)
+  reference/     catalogues (today: error codes only — see deferred-decisions.md)
   conventions/   how to write code in this project
-  history/       v5.1 design doc, decision log
+  history/       v5.1 design doc, decision log, and living design docs (shell, display)
 ```
+
+**Which of these describe the system as it is today**, and which do not — this matters more
+than it looks, because reading the wrong class as current is how you end up confidently
+wrong about how something works:
+
+- **`spec/`, `reference/`, `architecture/`, `conventions/` describe current behaviour.**
+  If one disagrees with the source, the source wins and the doc is a bug — fix it in the
+  same change.
+- **`rationale/` explains why**, and is largely timeless.
+- **`history/` and `planning/` do not describe current behaviour.** `history/` holds a
+  record (the decision log, the v5.1 design doc) *and* living design docs for work that may
+  be partly or wholly unbuilt — every display document there describes a system with no
+  code behind it. `planning/` is what is intended, with checkboxes for what is done.
+  **Never conclude "the system does X" from either.**
+
+Every doc under `architecture/` carries a **Status** line naming what is actually built and
+when it was last checked. Trust it over the body's tense, and correct it when you find it
+wrong.
 
 When uncertain why something is the way it is, check `docs/rationale/rejected-approaches.md` first — many "obvious" alternatives were considered and rejected for specific reasons.
 

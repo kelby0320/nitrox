@@ -1,5 +1,9 @@
 # Filesystem data path (kernel ↔ fs-server contract)
 
+**Status:** Implemented — the kernel page-cache/mapping path between fs-server and client,
+with deferrals (periodic writeback daemon, per-page dirty tracking) marked inline.
+Verified 2026-08-05.
+
 How file **data** moves between a userspace filesystem server, the kernel page cache, and
 the block device. This contract is **filesystem-agnostic**: `fs-server-ext4` is the first
 implementer, but FAT32, or any future block filesystem, speaks the same protocol and uses

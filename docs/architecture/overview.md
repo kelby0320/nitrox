@@ -1,5 +1,11 @@
 # Nitrox — Architecture Overview
 
+**Status:** Phases 0–3 complete (2026-07-21) — the kernel, capability substrate, boot to
+userspace and the service ecosystem are all built and running. Phase 4 (a windowed desktop)
+is in progress: the typed shell is built through Milestone 4; **the display arm is designed
+but has no code** (see `docs/planning/display-arm-plan.md`). Sections below describing the
+display server, compositor and windowing are forward-looking. Verified 2026-08-05.
+
 Nitrox is a hobby operating system written in Rust. This document is the entry point to the project's architecture documentation. It's intended to be read in one sitting and to give you a working mental model of the system. It is not a specification — it is orientation.
 
 For specific details: where this document says "the handle table is segmented," the [handle system architecture document](handle-system.md) describes the segmented structure in depth, and [the handle encoding spec](../spec/handle-encoding.md) gives the bit-level layout. The pattern is consistent throughout — every overview claim has a corresponding architecture document with depth, and where contracts matter, a spec document with precision.
@@ -35,7 +41,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │ Userspace                                                       │
 │                                                                 │
 │   User applications                                             │
-│   Shell, display server, compositor (deferred)                  │
+│   Shell (nxsh); display server, compositor (designed, not built)│
 │   Service manager, session manager, profile servers             │
 │   Resource servers (fs-servers, netstack, etc.)                 │
 │   Init (PID 1)                                                  │
@@ -87,7 +93,9 @@ A kernel object is anything that can be referenced by a handle. The complete lis
 
 Internal kernel data structures (page table entries, VMA trees, IRPs, scheduler runqueues) are not kernel objects — they're not handle-accessible.
 
-See: [kernel objects reference](../reference/kernel-objects-catalogue.md).
+See: [handle system architecture](handle-system.md) § "Rights model" for per-type rights.
+(A standalone per-object catalogue under `reference/` is not written; see
+`docs/rationale/deferred-decisions.md`, `docs-reference-catalogues`.)
 
 ### Namespaces and resource servers
 
@@ -121,7 +129,8 @@ There are no UIDs, no GIDs, no process groups, no session IDs. Children are trac
 
 Process spawn takes an explicit list of handle grants. Children do not inherit handles automatically. Argv and environment are typed structural values (a list of strings, a map of strings to typed values) rather than null-terminated C strings.
 
-See: [process model architecture](process-model.md), [why no signals](../rationale/why-no-signals.md).
+See: [why no signals](../rationale/why-no-signals.md), [process spawn args](../spec/process-spawn-args.md),
+[notification format](../spec/notification-format.md) (`ChildExited`, reaping).
 
 ### IPC and notifications
 
@@ -181,7 +190,8 @@ If a critical-path mount fails, init drops into the emergency shell (`eshell`), 
 
 The initramfs must contain the closure of software needed for critical-path mounting — all required fs-server binaries, any kernel modules for unusual storage controllers, plus eshell. The system image builder computes this closure at build time based on the target system's mount topology.
 
-See: [boot flow architecture](boot-flow.md), [init.toml schema](../spec/init-toml-schema.md), [emergency recovery](../architecture/emergency-recovery.md).
+See: [boot flow architecture](boot-flow.md), [init.toml schema](../spec/init-toml-schema.md),
+[console and tty](console-and-tty.md) § "`eshell` is separate, and has to be".
 
 ### Service management
 
@@ -189,7 +199,8 @@ The service manager is a supervised process started by init. It reads service de
 
 Resource servers (filesystem drivers, network stack, profile servers, etc.) are spawned through a standard protocol: the service manager creates a control IPC channel, spawns the resource server with the channel and the resources it needs, waits for a "Ready" message containing the resource server's endpoint handle, and then binds the endpoint into the appropriate namespace.
 
-See: [init and service management architecture](init-and-services.md), [service.toml schema](../spec/service-toml-schema.md).
+See: [service manager architecture](service-manager.md), [boot flow architecture](boot-flow.md),
+[service.toml schema](../spec/service-toml-schema.md).
 
 ### Runtime libraries
 
@@ -206,7 +217,8 @@ There is deliberately **no `librt` / green-thread crate.** A Go-style fiber sche
 
 A future `std` port will eventually provide `std::fs`, `std::thread`, `std::net` over the native handle-based interface, enabling the broader Rust ecosystem — deferred until the syscall ABI is stabilizing (see the implementation plan's Phase 4+ std-port note). It is built **on top of** these libraries, not as a separate reimplementation: only std's per-OS platform layer (`std::sys`) is written for Nitrox, and it forwards to the native stack. The libraries sort by how they relate to that port — some **feed the pal** (survive *below* std: libkern's syscall floor, libheap's allocator engine, libos's wait/notification plumbing), and some **provide what std never will** (survive *beside* std: libos's async runtime, libstream's typed I/O, librsproto). A crate that does neither — that std simply supersedes — is a stopgap and is not built as a durable library (this is why there is no standalone sync-wrapper crate: that role is `std::io`). Beyond the POSIX-semantics mismatch (ambient authority, synchronous I/O, signals), the port's main structural task is that `std` wants to *own* the process singletons — the global allocator, the entry point, the panic runtime, and TLS — which the native libraries also provide; the libraries are therefore built so those singletons are **swappable engines `std::sys` can adopt** rather than hard-wired statics (e.g. libheap's engine/registration split). The panic strategy stays `panic = "abort"` across the port.
 
-See: [userspace runtime architecture](userspace-runtime.md).
+See: [libos](libos.md), [libheap](libheap.md). (`libstream` and `librsproto` do not yet have
+their own architecture docs; `librsproto`'s contracts are the `rsproto-*` specs.)
 
 ### Shell and typed streams
 
@@ -216,7 +228,9 @@ Programs that produce raw text are not left out. Their output is automatically w
 
 The same model extends to GUIs, but **not** by embedding UI in the data stream: an early `WidgetRecord` stream type was dropped because a widget isn't data — it has identity, mutable state, an event stream, and a lifecycle. Instead, widgets and windows are **resource servers** a program talks to, and TSM1 stays data-only. A program still doesn't choose its own rendering — the display layer does — it just does so by composing live UI resources rather than by emitting a widget record. See [UI composition model](../history/nitrox-ui-composition-model-v2.md) for what a window *is*, and [display substrate](../history/nitrox-display-substrate-v1.md) for how pixels, surfaces and input actually work.
 
-See: [shell and typed streams architecture](shell-and-streams.md), [typed stream wire format](../spec/typed-stream-format.md).
+See: [shell language design](../history/nitrox-shell-design-v1.2.md),
+[shell + coreutils plan](../planning/shell-coreutils-plan.md),
+[typed stream wire format](../spec/typed-stream-format.md).
 
 ## Boot flow at a glance
 

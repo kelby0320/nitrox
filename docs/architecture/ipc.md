@@ -1,5 +1,9 @@
 # IPC
 
+**Status:** Implemented — `IpcChannel` (`kernel/src/object/ipc_channel.rs`) with
+`sys_channel_create`/`send`/`recv`. See `docs/spec/ipc-message-format.md` for the wire
+contract and its documented deferrals. Verified 2026-08-05.
+
 Inter-process communication in Nitrox is **message passing over capability
 endpoints**, not shared memory and not Unix pipes. A channel is a pair of
 **endpoints**; a send on one endpoint enqueues a fixed-size message into the

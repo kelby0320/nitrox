@@ -1,5 +1,8 @@
 # Entropy
 
+**Status:** Implemented — `kernel/src/entropy.rs`, `kernel/src/arch/entropy.rs` and the
+`EntropyObject` kernel object. Verified 2026-08-05.
+
 Nitrox keeps a single in-kernel **CSPRNG**: a cryptographically-strong random
 generator seeded from hardware (`RDSEED`/`RDRAND`) and software (interrupt-timing
 jitter) sources, drawn through a ChaCha20 stream. Userspace reaches it through an
