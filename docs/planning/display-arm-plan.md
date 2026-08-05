@@ -13,6 +13,8 @@ the source of truth for *the order*.
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
 - **Semantics:** [`docs/history/nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md)
   — windows, ports, desktops, templates.
+- **The shell itself:** [`docs/history/nitrox-desktop-shell-v1.md`](../history/nitrox-desktop-shell-v1.md)
+  — bars, applications modal, overview, and the operations it demands of the compositor.
 
 The typed shell + coreutils subproject ([`shell-coreutils-plan.md`](shell-coreutils-plan.md)) is
 the CLI arm of the same phase and is complete through Milestone 4. Several of its deferred
@@ -85,6 +87,10 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 - [ ] **Part B — `/dev/draw` served.** `new`, numbered windows, `info`. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
+
+      **Window roles and panel struts land here**, not later: bars are `panel`, menus and the
+      applications modal are `popup`, and retrofitting a role into a shipped protocol touches
+      every client (substrate §4a).
 - [ ] **Part C — `libui`: the client side of the protocol.** Connect, create a window, allocate
       and commit surfaces, receive input, run an event loop. The same role `librsproto` plays for
       the RS protocol — **the protocol gets a library, and clients use it.** If the first app
@@ -162,7 +168,8 @@ harness's QMP input channel stops being a test-only affordance.
 
 Sketched; detail when M5 lands.
 
-Multiple windows, stacking, move/resize. Ports under windows, with
+Multiple windows, stacking, move/resize, and **the overview** — thumbnail capture, the frozen
+image grid, and the desktop sidebar (desktop shell §6). Ports under windows, with
 `list` answering discovery. The **desktop shell** as a second process: `/dev/desktop`, desktop
 membership as a filtered view of the compositor's window set, moving windows between desktops.
 Wiring by `sys_ns_bind` into an application's namespace, and the default-handler fallback.

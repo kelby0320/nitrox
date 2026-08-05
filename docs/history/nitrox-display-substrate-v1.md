@@ -6,11 +6,12 @@ The mechanism beneath the display: who owns the framebuffer, how a client's pixe
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
 maintainer 2026-08-04.
 
-**Companion document: `nitrox-ui-composition-model-v2.md`**, which owns the layer above —
-what a window *means*, how windows compose, desktops, templates. That document was written
-first and settles the semantics; this one exists because it specifies none of the mechanism.
-Where they touch (the namespace shape for `/dev/draw`), v2 is authoritative and this document
-defers to it.
+**Companion documents.** `nitrox-ui-composition-model-v2.md` owns the layer above — what a
+window *means*, how windows compose, desktops, templates. It was written first and settles the
+semantics; this one exists because it specifies none of the mechanism, and where they touch (the
+namespace shape for `/dev/draw`) v2 is authoritative. `nitrox-desktop-shell-v1.md` owns what a
+user actually sees, and §4a, §4b and §5a below exist **because that document demanded them** —
+roles, struts, capture and global hotkeys were all absent from the first draft of this one.
 
 Nothing here is built. The build order is `docs/planning/display-arm-plan.md`.
 
@@ -99,6 +100,41 @@ nothing here. Client-allocated is also the Wayland shape the Phase 4 plan alread
 is still reading produces tearing that is invisible in testing and obvious in use. Double
 buffering is the client's business; *knowing when it is safe* is the protocol's.
 
+### 4a. Window roles, and reserved space
+
+A window carries a **role**: `normal`, `panel`, `popup`, or `dialog`. It is not decoration —
+each changes what the compositor does:
+
+- **`panel`** — a bar. Occupies a screen edge, is always visible regardless of which desktop is
+  current, and **never takes keyboard focus**, so clicking the clock does not steal input from
+  the terminal.
+- **`popup`** — a menu or a modal. Transient, parented to another window, and may extend beyond
+  its parent's bounds. Menus force this: a menu clipped to its window is not a menu.
+- **`dialog`** — parented, on its parent's desktop, listed but **not offered as a wirable node**
+  on the composition canvas (v2 §6).
+- **`normal`** — everything else.
+
+**A panel reserves space.** A maximised window must not cover the bars, which X calls struts.
+The compositor subtracts reserved edges from the area it offers to `normal` windows.
+
+**Roles and struts must be settled before the window protocol is frozen** (plan Milestone 2).
+Retrofitting a role into a shipped protocol touches every client.
+
+### 4b. Thumbnail capture
+
+The compositor can hand a client a **scaled snapshot** of another window's surface. The desktop
+shell's overview is built on it (`nitrox-desktop-shell-v1.md` §6), and it is what lets the
+overview be an image grid the shell draws rather than a transform pipeline inside the
+compositor.
+
+**Capability-gated, necessarily.** Giving a client another window's pixels is the leak the
+composition model's namespace rule exists to prevent — the shell may do it because it holds
+`/dev/draw` with rights an application does not.
+
+**Captured at thumbnail size**, scaled once at capture. Snapshotting eight full-resolution
+surfaces is tens of megabytes; scaling on the way out is a few, and it is the difference between
+affordable and not on a software renderer.
+
 ## 5. Input
 
 A PS/2 keyboard and mouse driver in the kernel — that is where AHCI lives, so it is the
@@ -122,6 +158,16 @@ at key events rather than characters.
 
 **The compositor owns focus and routes.** It knows which window is focused because it owns
 stacking and input; routing anywhere else would need a second copy of that state.
+
+### 5a. Global hotkeys
+
+A client may register a key combination that reaches it **regardless of focus** — the desktop
+shell's Super key is the motivating case.
+
+**This is a capability, not an ambient grab.** If any process could claim Super, any process
+could impersonate the launcher; if any process could claim a printable key, any process could
+keylog. Registration is gated the same way capture is: by holding a binding an ordinary
+application was never given.
 
 ## 6. Text
 
@@ -227,4 +273,8 @@ nothing.
 - **A font rasterizer, and with it the first external crate in userspace** (§6). Trigger:
   text at more than one size.
 - **Multiple outputs** (§2) — the module seam exists for it; nothing is designed.
+- **Live thumbnails** (§4b) — frozen is the v1 answer. Trigger: the frozen ones being visibly
+  wrong in use.
+- **What a `panel` does on a multi-desktop system** (§4a) — bars are always visible, which is
+  simple; a panel that belonged to one desktop would need a rule nothing has yet.
 - **Reference-scene contents** (§8e).
