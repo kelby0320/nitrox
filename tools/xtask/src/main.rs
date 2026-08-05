@@ -29,9 +29,7 @@ use std::process::{Command, ExitCode};
 /// to `kernel/src/limine.rs`.
 const LIMINE_VERSION: &str = "v12.2.0";
 
-/// Disk image size in MiB. 64 is enough for the kernel + Limine UEFI
-/// loader several times over.
-/// Total boot-disk size. Holds two GPT partitions: the EFI System Partition
+/// Total boot-disk size, in MiB. Holds two GPT partitions: the EFI System Partition
 /// (FAT32, [`ESP_SIZE_MIB`]) and the ext4 `nitrox-root` filesystem (the rest).
 const IMAGE_SIZE_MIB: u64 = 128;
 /// The EFI System Partition size. Comfortably above the FAT32 minimum so
