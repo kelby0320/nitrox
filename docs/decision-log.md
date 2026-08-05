@@ -11168,3 +11168,64 @@ untested end to end and "the field exists and nothing reads it" is exactly the s
 thing that quietly stays true.
 
 1213 host tests, all six gates green, `test-qemu` green, display gate green.
+
+## 2026-08-05 — PR #174 review: the server could not answer, and I said it did
+
+Thirteen findings. Three blocking, and the first is the most serious mistake in this arm.
+
+**The compositor never sent anything on a session channel.** `dispatch` produced replies
+and `Outcome::Applied { release }` values, and `serve_session` dropped both — the match arm
+discarded the payload and `let _ = request_id;` threw away the id a reply must echo. Three
+`SYS_CHANNEL_SEND` call sites existed, all on the control or forwarding endpoint;
+`build_release_event` appeared nowhere outside a test mock. The Surface protocol was
+one-way as implemented: a client could not learn its window id, and a double-buffered
+client would stall from its third frame forever.
+
+**And I ticked the box.** `docs/planning/display-arm-plan.md` said `[x] Part B — /dev/draw
+served ✅`, and the entry above says `/dev/draw` is "bound and answered by a real resource
+server". It was bound. It did not answer. The reviewer's phrasing is the one to keep: *this
+is not the same as "untested" — the reply path is not written.*
+
+That is exactly the failure the docs consistency pass existed to prevent, committed by the
+same person who ran it, three weeks later, in a plan checkbox. The lesson is narrow and
+worth stating: **"I wrote the code that produces X" is not evidence that X reaches anyone.**
+Both halves of a protocol need a consumer before either can be called done, which is what
+Part D is for and why nothing before it should have been ticked.
+
+Part B and Part C are now marked *partial*, with what is missing spelled out. Part C's tick
+was wrong on a second count: it claimed "receive input, run an event loop", which is M3.
+
+**The ownership boundary was enforced for the stack and bypassed for the pixels.**
+`AttachBuffer` mapped and recorded the client's memory *before* dispatch checked
+ownership, and `Server::pixels` resolves by first match — so a second client could attach
+under a predictable window id (`next_id` from 1), be told `NotFound`, and still have its
+pixels painted into the rightful owner's window. The map now happens only after dispatch
+accepts, and a rejected attach closes the handle instead of leaking it.
+
+**`libui` could not receive a reply at all.** `sys_channel_recv` is non-blocking — an empty
+queue is `WouldBlock` — and the transport sent then recv'd with no `sys_wait` between, so
+it failed unless the server happened to be scheduled in the gap. The idiom
+`librsproto::session` already documents is send → `sys_wait` → recv. Fixed, and messages
+that are not the awaited reply are now **parked rather than dropped**: a `Release` arriving
+first would otherwise be lost, leaving the client's buffer busy forever. Replies are matched
+by request id, not merely by op.
+
+Also fixed: `commit` marked a buffer busy *before* the send, stranding it if the send
+failed; `bind_compositor` leaked `ctrl_init` and `endpoint` on every path but spawn failure,
+so the compositor never saw the `PeerClosed` every other server gets; a fifth doc-comment
+theft (`read_current_generation`'s block, now returned); the display gate's path filter
+omitted `userspace/compositor/**`, which the gate boots; and three docs the change made
+false, including root `CLAUDE.md`.
+
+**The clear/render race is closed rather than narrowed.** The compositor announced `Ready`
+*before* clearing the screen, so `bind_compositor` returned with the clear still pending and
+two processes held the aperture mapped read-write. Clearing before the handshake makes
+`Ready` mean "I have taken the screen"; the reviewer's suggestions (pace it, or capture
+twice) would have narrowed the window rather than removed it.
+
+The reviewer also noted `double_buffering_can_draw_forever_…` survives removing
+`b.busy = true` alone, because with `busy` never set `next_free` always returns buffer 0 and
+every assertion still holds. It catches the two breaks that matter, and another test covers
+the flag — but the name promises more than the body checks.
+
+1214 host tests, all six gates green, `test-qemu` green, display gate green.

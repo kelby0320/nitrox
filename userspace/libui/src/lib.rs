@@ -185,12 +185,9 @@ impl<T: Transport> Window<T> {
         buffer_id: u32,
         damage: (u32, u32, u32, u32),
     ) -> Result<(), UiError> {
-        let b = self
-            .buffers
-            .iter_mut()
-            .find(|b| b.id == buffer_id)
-            .ok_or(UiError::NoSuchBuffer)?;
-        b.busy = true;
+        if !self.buffers.iter().any(|b| b.id == buffer_id) {
+            return Err(UiError::NoSuchBuffer);
+        }
         let mut body = [0u8; 32];
         let n = build_commit_request(
             &mut body,
@@ -204,7 +201,13 @@ impl<T: Transport> Window<T> {
             },
         )
         .ok_or(UiError::Malformed)?;
+        // **Marked busy only after the send succeeds.** Setting it first strands the buffer
+        // if the send fails — the compositor never saw the commit and will never release
+        // it, so a double-buffered client stalls forever after two such failures.
         self.transport.request(OP_COMMIT, &body[..n], None, &mut [])?;
+        if let Some(b) = self.buffers.iter_mut().find(|b| b.id == buffer_id) {
+            b.busy = true;
+        }
         Ok(())
     }
 
@@ -405,6 +408,23 @@ mod tests {
     fn a_pitch_too_small_for_a_row_is_refused_at_attach() {
         let mut w = window(2);
         assert_eq!(w.attach(9, 64, 32, 64 * 4 - 1, 1), Err(UiError::Malformed));
+    }
+
+    #[test]
+    fn a_failed_commit_leaves_the_buffer_drawable() {
+        // If `busy` were set before the send, a failed commit would strand the buffer: the
+        // compositor never saw it and will never release it. Two such failures on a
+        // double-buffered window stall the client forever.
+        let mut w = window(2);
+        w.transport.fail = true;
+        assert_eq!(w.commit(0, (0, 0, 1, 1)), Err(UiError::Transport));
+        assert_eq!(w.next_free(), Some(0), "buffer 0 must still be drawable");
+        assert!(!w.buffers().iter().find(|b| b.id == 0).unwrap().busy);
+
+        // And a subsequent successful commit does mark it.
+        w.transport.fail = false;
+        w.commit(0, (0, 0, 1, 1)).unwrap();
+        assert!(w.buffers().iter().find(|b| b.id == 0).unwrap().busy);
     }
 
     #[test]

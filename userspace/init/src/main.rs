@@ -845,10 +845,6 @@ fn bind_tty_server(root_ns: u64) -> bool {
     true
 }
 
-/// The slice-7 milestone: look up `/system/current-generation` through the just-
-/// mounted root fs-server (the kernel forwards the lookup, the server reads the
-/// file and replies a `MemoryObject`), map it, and log its content — proving the
-/// whole stack end to end.
 /// Spawn the compositor and bind its endpoint at `/dev/draw`.
 ///
 /// **Non-fatal.** A machine with no usable framebuffer still boots to a serial console,
@@ -888,11 +884,21 @@ fn bind_compositor(root_ns: u64) -> bool {
         Some(e) => e,
         None => {
             kprint(b"init: compositor Ready timeout/invalid\n");
+            // SAFETY: done with the control channel either way.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
             return false;
         }
     };
+    // The control channel has served its purpose. Closing it is not tidiness: it is the
+    // `PeerClosed` every other server observes when init is finished with it.
+    // SAFETY: closing init's own control endpoint.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
     // SAFETY: binding the compositor's forwarding endpoint as a subtree at /dev/draw.
     let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/draw".as_ptr() as u64, 9, endpoint) };
+    // The binding takes its own reference, so init's handle goes either way.
+    // SAFETY: closing init's reference to the endpoint.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     if br != 0 {
         kprint(b"init: compositor bind FAIL at /dev/draw\n");
         return false;
@@ -901,6 +907,10 @@ fn bind_compositor(root_ns: u64) -> bool {
     true
 }
 
+/// The slice-7 milestone: look up `/system/current-generation` through the just-
+/// mounted root fs-server (the kernel forwards the lookup, the server reads the
+/// file and replies a `MemoryObject`), map it, and log its content — proving the
+/// whole stack end to end.
 fn read_current_generation(root_ns: u64) {
     // libos path (the init dogfood for slice 5): borrow the process-owned root
     // namespace, then `lookup(...).block_on()` + `map()` — replacing the hand-rolled

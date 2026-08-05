@@ -1,4 +1,4 @@
-/* Linker script for the `hello` userspace program.
+/* Linker script for the `compositor` userspace program.
  *
  * Produces a static, non-PIE ET_EXEC at a fixed low user virtual address,
  * with page-aligned PT_LOAD segments so the kernel ELF loader's

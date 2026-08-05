@@ -42,7 +42,7 @@ use libkern::{
 };
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
-use librsproto::surface::OP_ATTACH_BUFFER;
+use librsproto::surface::{OP_ATTACH_BUFFER, OP_RELEASE};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// `alloc` backing — the window stack and its buffer lists allocate.
@@ -204,6 +204,44 @@ fn reply_resolve_error(serve_end: u64, request_id: u64, err: KError) -> bool {
     }
 }
 
+/// Send a reply body on a **session** channel.
+///
+/// The half of the protocol that was missing: `dispatch` produced replies and this never
+/// sent them, so a client could not learn its window id and never saw a `Release`. The
+/// spec has said "Reply, 4 bytes: the new `window` id" since Part A.
+fn reply_on_session(session: u64, op: u16, request_id: u64, body: &[u8]) -> bool {
+    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
+    unsafe {
+        let Some(rs_len) =
+            encode(&mut REPLY_MSG[PAYLOAD_OFF..], op, request_id, RS_FLAG_REPLY, body, 0)
+        else {
+            return false;
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            session,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    }
+}
+
+/// Tell a client a buffer has left the screen and may be drawn into again.
+///
+/// Server-initiated, so it carries no request id. Without it a double-buffered client
+/// stalls after its second commit, forever.
+fn send_release(session: u64, window: u32, buffer: u32) -> bool {
+    let mut body = [0u8; librsproto::surface::RELEASE_EVENT_LEN];
+    let Some(n) = librsproto::surface::build_release_event(&mut body, window, buffer) else {
+        return false;
+    };
+    reply_on_session(session, OP_RELEASE, 0, &body[..n])
+}
+
 /// Open a session: mint a channel, keep the server end, hand the client end back.
 fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
     // SAFETY: single-threaded server scanning its own slot table.
@@ -255,6 +293,9 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
     // with the size its own geometry declares.
     let addr = unsafe { syscall4(SYS_MEMORY_MAP, handle, 0, len as u64, libkern::RIGHT_MAP_READ) };
     if addr <= 0 {
+        // SAFETY: the map failed, so nothing references the object; drop our handle rather
+        // than leaking it for the compositor's life.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
         return false;
     }
     srv.buffers.push(MappedBuffer {
@@ -267,6 +308,56 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
     // SAFETY: closing our reference; the mapping outlives it.
     unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
     true
+}
+
+/// Recomposite the whole screen.
+///
+/// Damage-bounded repaint is an optimisation the protocol already carries and this does not
+/// yet exploit — a full repaint is always correct, and this milestone has one client.
+fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
+    let bounds = fb.geometry().bounds();
+    srv.stack.compose_into(fb, BACKGROUND, srv, &[bounds]);
+}
+
+/// The wire error a rejected request reports.
+fn surface_errno(e: SurfaceError) -> KError {
+    match e {
+        SurfaceError::Malformed => KError::InvalidArgument,
+        SurfaceError::Unsupported => KError::Unsupported,
+        // A window belonging to another connection reports exactly what a nonexistent one
+        // does, so the reply cannot be used to probe which ids exist.
+        SurfaceError::NotFound => KError::NotFound,
+        SurfaceError::Rejected(_) => KError::InvalidArgument,
+    }
+}
+
+/// Send an error reply on a session channel.
+fn reply_error_on_session(session: u64, op: u16, request_id: u64, err: KError) -> bool {
+    let mut ebody = [0u8; librsproto::error::ERROR_BODY_LEN];
+    let elen = librsproto::error::error_body(&mut ebody, err.as_i32(), 0, b"").unwrap_or(0);
+    // SAFETY: REPLY_MSG is a valid buffer; no handles transferred.
+    unsafe {
+        let Some(rs_len) = encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            op,
+            request_id,
+            RS_FLAG_REPLY | RS_FLAG_ERROR,
+            &ebody[..elen],
+            0,
+        ) else {
+            return false;
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 0;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            session,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            0,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    }
 }
 
 /// Serve one request on session `slot`. Returns `false` if the session should close.
@@ -306,12 +397,6 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
     };
     let body = &body_buf[..body_len];
 
-    // An `AttachBuffer` must map its transferred handle *before* dispatch records the
-    // buffer, so a later commit can resolve pixels for it.
-    if op == OP_ATTACH_BUFFER && handle != 0 && !map_attached_buffer(srv, body, handle) {
-        return true;
-    }
-
     // SAFETY: a bounded mutable slice over the reply buffer; `body` is a local copy.
     let outcome = unsafe {
         dispatch(
@@ -323,13 +408,44 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
         )
     };
 
+    // **Map only after `dispatch` accepted the attach.** Mapping first would record the
+    // client's memory under ids it does not own: `dispatch` would answer `NotFound`, the
+    // entry would stay, and `Server::pixels` resolves by first match — so another client's
+    // pixels would be painted into the rightful owner's window. Doing it in this order
+    // makes the ownership boundary cover the pixels, not just the stack.
+    if op == OP_ATTACH_BUFFER && handle != 0 {
+        if matches!(outcome, Outcome::Applied { .. }) {
+            if !map_attached_buffer(srv, body, handle) {
+                return true;
+            }
+        } else {
+            // Rejected: drop the handle rather than leaking it for the compositor's life.
+            // SAFETY: closing a handle this process owns and will not use.
+            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        }
+    }
+
     match outcome {
-        Outcome::Reply(_) | Outcome::Applied { .. } => {
-            // Recomposite the whole screen. Damage-bounded repaint is an optimisation the
-            // protocol already carries and the compositor does not yet exploit; a full
-            // repaint is always correct and this milestone has one client.
-            let bounds = fb.geometry().bounds();
-            srv.stack.compose_into(fb, BACKGROUND, srv, &[bounds]);
+        Outcome::Reply(len) => {
+            // SAFETY: `dispatch` wrote `len` bytes at this offset in REPLY_MSG. Copy them
+            // out before `reply_on_session` re-encodes into the same buffer.
+            let mut body = [0u8; MAX_BODY];
+            let n = len.min(MAX_BODY);
+            unsafe {
+                body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
+            }
+            reply_on_session(ch, op, request_id, &body[..n]);
+            repaint(srv, fb);
+        }
+        Outcome::Applied { release } => {
+            if let Some((window, buffer)) = release {
+                send_release(ch, window, buffer);
+            }
+            // A destroy is transitive, so drop every mapping whose window is gone.
+            // Otherwise a client looping create/attach/destroy grows the compositor's
+            // address space without bound.
+            srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
+            repaint(srv, fb);
         }
         Outcome::Failed(e) => {
             kprint(match e {
@@ -338,9 +454,9 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                 SurfaceError::NotFound => b"compositor: no such window for this connection\n",
                 SurfaceError::Rejected(_) => b"compositor: request rejected\n",
             });
+            reply_error_on_session(ch, op, request_id, surface_errno(e));
         }
     }
-    let _ = request_id;
     true
 }
 
@@ -472,19 +588,27 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         kprint(b"compositor: channel create FAIL\n");
         exit(1);
     };
-    if !send_ready(ctrl, kernel_end) {
-        kprint(b"compositor: Ready send FAIL\n");
-        exit(1);
-    }
-
     let mut srv = Server {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
         buffers: alloc::vec::Vec::new(),
     };
-    // Clear once so the screen is background rather than whatever the boot left.
+
+    // Clear **before** announcing readiness, so `Meta::Ready` means "I have taken the
+    // screen" rather than "I am about to".
+    //
+    // Announcing first left the clear racing whatever init spawned next: `bind_compositor`
+    // would return while the clear was still pending, and on `-smp 4` two processes then
+    // held `/dev/framebuffer` mapped read-write with nothing arbitrating. Ordering it here
+    // costs nothing and removes the window entirely, where pacing it against a later signal
+    // would only narrow it.
     let bounds = fb.geometry().bounds();
     srv.stack.compose_into(&mut fb, BACKGROUND, &srv, &[bounds]);
+
+    if !send_ready(ctrl, kernel_end) {
+        kprint(b"compositor: Ready send FAIL\n");
+        exit(1);
+    }
 
     serve_loop(serve_end, fb, &mut srv);
 }

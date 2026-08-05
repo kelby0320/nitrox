@@ -2,9 +2,9 @@
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
-self-hash, and the `screendump` smoke gate. **Milestone 2 is in progress** — Parts A (the surface
-protocol and window model), B (`/dev/draw` served) and C (`libui`) landed 2026-08-05.
-Parts D and E remain: nothing has yet exercised a client and the compositor together.
+self-hash, and the `screendump` smoke gate. **Milestone 2 is in progress.** Part A (the surface protocol and window model) landed
+2026-08-05. Parts B and C are **partial** — see their boxes. Nothing has yet exercised a
+client and the compositor together, which is how the gaps went unnoticed.
 
 ## What this is
 
@@ -87,20 +87,28 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 - [x] **Part A — the surface protocol.** ✅ (2026-08-05) Create, share the `MemoryObject`, `Commit { buffer,
       damage }`, release. Host-tested against the in-memory framebuffer. No new syscalls —
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
-- [x] **Part B — `/dev/draw` served.** ✅ (2026-08-05) `new`, numbered windows, `info`. The same
+- [ ] **Part B — `/dev/draw` served.** ⚠️ *partial* — the server is bound and dispatches,
+      but **does not yet reply on a session channel**, and only `new` resolves; numbered
+      window paths and `info` are outstanding. `new`, numbered windows, `info`. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
 
       **Window roles and panel struts land here**, not later: bars are `panel`, menus and the
       applications modal are `popup`, and retrofitting a role into a shipped protocol touches
       every client (substrate §4a).
-- [x] **Part C — `libui`: the client side of the protocol.** ✅ (2026-08-05) Connect, create a window, allocate
+- [ ] **Part C — `libui`: the client side of the protocol.** ⚠️ *partial* — the buffer
+      lifecycle is done and host-tested; the transport cannot receive a reply (no
+      `sys_wait`), and input/event-loop is M3 work that should not have been ticked. Connect, create a window, allocate
       and commit surfaces, receive input, run an event loop. The same role `librsproto` plays for
       the RS protocol — **the protocol gets a library, and clients use it.** If the first app
       hand-rolls this instead, the surface protocol immediately has two implementations and the
       second one lives in an application.
 - [ ] **Part D — a test client** built on `libui`, and the gate extends: the scene is now built
       from a real client's committed buffer rather than a synthetic one.
+- [ ] **Graduate the design docs.** When this milestone closes, `docs/design/` moves to
+      `docs/architecture/` for the parts with code behind them — root `CLAUDE.md` requires
+      "the milestone that builds it should carry that move as a checkbox", and until this
+      PR nothing did.
 - [ ] **Part E — release semantics**, settled by the first client that double-buffers. A client
       that redraws into a buffer still being read produces tearing that is invisible in testing
       and obvious in use.
