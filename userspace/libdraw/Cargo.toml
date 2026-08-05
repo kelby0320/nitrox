@@ -1,0 +1,32 @@
+[package]
+name = "libdraw"
+version = "0.1.0"
+edition = "2024"
+
+# `libdraw` — the pixel layer: geometry, pixel formats, framebuffers, and
+# compositing. See `docs/design/display-substrate.md` §3, §7, §8a and
+# `docs/planning/display-arm-plan.md` Milestone 1 Part A.
+#
+# **Shared from the start, deliberately.** The compositor composites surfaces and a
+# client draws into one; both do the same rect and blit work, so building this as
+# compositor-only would mean writing it twice (plan M1 Part A).
+#
+# Pure `core + alloc` with **no dependencies**, like `libstream` and `libcrypto`, so
+# compositing host-tests unchanged (`cargo test -p libdraw --target <host>`) instead
+# of through a 90-second boot. That is the whole point of the `Framebuffer` seam:
+# the piece that *looks* like it needs a screen does not.
+[dependencies]
+# Acquiring the framebuffer is the one part of this crate that touches syscalls, so it
+# sits behind the optional `io` feature — the same split `libstream` uses to keep its
+# wire core dependency-free. Off by default, so `cargo test -p libdraw` on the host
+# builds pure `core + alloc` with no dependency at all.
+libos = { path = "../libos", optional = true }
+libkern = { path = "../libkern", optional = true }
+
+[features]
+# `acquire::*`: read `/dev/framebuffer/info` and map `/dev/framebuffer`.
+io = ["dep:libos", "dep:libkern"]
+
+[lib]
+name = "libdraw"
+path = "src/lib.rs"

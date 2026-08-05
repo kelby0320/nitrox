@@ -2,9 +2,12 @@
 
 **Status:** Phases 0–3 complete (2026-07-21) — the kernel, capability substrate, boot to
 userspace and the service ecosystem are all built and running. Phase 4 (a windowed desktop)
-is in progress: the typed shell is built through Milestone 4; **the display arm is designed
-but has no code** (see `docs/planning/display-arm-plan.md`). Sections below describing the
-display server, compositor and windowing are forward-looking. Verified 2026-08-05.
+is in progress: the typed shell is built through Milestone 4, and the display arm has
+started — **Milestone 1 is complete** (`libdraw` compositing, `/dev/framebuffer` bound, and
+both halves of the test gate). Sections below describing the **display server, compositor
+and windowing are still forward-looking**; see
+[`display-arm-plan.md`](../planning/display-arm-plan.md) for what exists versus what does
+not. Verified 2026-08-05.
 
 Nitrox is a hobby operating system written in Rust. This document is the entry point to the project's architecture documentation. It's intended to be read in one sitting and to give you a working mental model of the system. It is not a specification — it is orientation.
 
@@ -41,7 +44,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │ Userspace                                                       │
 │                                                                 │
 │   User applications                                             │
-│   Shell (nxsh); display server, compositor (designed, not built)│
+│   Shell (nxsh); libdraw + /dev/framebuffer (M1); compositor TBD │
 │   Service manager, session manager, profile servers             │
 │   Resource servers (fs-servers, netstack, etc.)                 │
 │   Init (PID 1)                                                  │

@@ -120,7 +120,10 @@ each step's rationale is in the source comments:
 10. **Scheduler** (`sched_bringup`), then **AP bring-up** (`bring_up_aps`) via Limine's SMP
     response — capped at `MAX_CPUS`, extras left parked. Absent an SMP response the system
     stays single-CPU.
-11. **Boot screen**, then the first userspace process.
+11. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
+    layout) so `/dev/framebuffer` can serve it. Must precede the next step, which binds
+    that path into init's namespace.
+12. **Boot screen**, then the first userspace process.
 
 ## 4. The first userspace process
 
@@ -130,7 +133,9 @@ one process nothing else can construct:
 - Allocate an address space; load `/sbin/init` from the initramfs (halt if absent).
 - Allocate the process and a notification channel, and a handle to it.
 - Allocate a namespace and bind the initial set: `/dev/entropy`, `/dev/console`,
-  `/dev/log`, `/proc/self/*`, `/proc/sched/stats`, `/initramfs`, `/dev/blk`.
+  `/dev/log`, `/proc/self/*`, `/proc/sched/stats`, `/initramfs`, `/dev/blk`, and
+  `/dev/framebuffer` (the display aperture, plus its `info` leaf — recorded at step 11 of
+  § 3).
 - Spawn with exactly two handles — the notification channel and the namespace root.
 
 **init receives two handles and no more.** Everything else it obtains, it obtains by

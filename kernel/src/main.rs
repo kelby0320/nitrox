@@ -32,7 +32,7 @@ use nitrox_kernel::arch::platform::ArchPlatform;
 use nitrox_kernel::arch::smp::ArchSmp;
 use nitrox_kernel::arch::timer::ArchTimer;
 use nitrox_kernel::dpc;
-use nitrox_kernel::framebuffer::{FbWriter, Rgb};
+use nitrox_kernel::framebuffer::{self, FbWriter, Rgb};
 use nitrox_kernel::kprintln;
 use nitrox_kernel::limine::{
     BaseRevision, FramebufferRequest, HhdmRequest, MemoryMapRequest, ModuleRequest,
@@ -307,8 +307,22 @@ fn kernel_main() {
     // Arm the syscall fast path and prove it end-to-end by dropping to
     // ring 3 and running a tiny hand-assembled blob that calls sys_kprint.
     // (Throwaway harness — replaced next slice by an ELF-loaded process.)
+    // Record the display aperture **before** userspace exists, because
+    // `run_first_userspace` binds `/dev/framebuffer` into init's namespace and init may
+    // look it up as soon as it is scheduled. An earlier version folded this into
+    // `draw_boot_screen`, which runs *after* this line — the binding resolved to
+    // "no aperture recorded" every time, and the boot still passed because the demo is
+    // non-fatal.
+    record_framebuffer();
+
     run_first_userspace();
 
+    // Best-effort boot screen. **It clears the whole framebuffer**, and nothing
+    // synchronises that against `display-selftest`'s presentation, which happens much
+    // later on another CPU — init does the manifest, the mounts and several selftests
+    // first, so the margin is large, but it is a margin rather than a guarantee. If
+    // `check-display` ever flakes with a blank or partially-cleared capture, this is why.
+    //
     // Best-effort boot screen, then retire the boot thread into the idle
     // thread. We must NOT fall through to `_start`'s `halt_loop` (it `cli`s,
     // which would freeze preemption): `exit` switches to the idle thread, which
@@ -454,6 +468,52 @@ fn bring_up_aps() {
         }
     }
     kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);
+}
+
+/// Capture Limine's framebuffer as a userspace-mappable aperture.
+///
+/// Separate from [`draw_boot_screen`] on purpose: recording a system resource is not the
+/// same job as painting a banner, and the two have different deadlines. This must run
+/// before `run_first_userspace` binds `/dev/framebuffer`; the banner is best-effort and
+/// runs last.
+///
+/// Requires the HHDM, since Limine reports the framebuffer at a higher-half virtual
+/// address and a `MemoryObject` needs the physical base.
+fn record_framebuffer() {
+    // SAFETY: `FRAMEBUFFER_REQUEST.response` is written by Limine before jumping to
+    // `_start`; we are the sole reader.
+    let response = unsafe { (&raw const FRAMEBUFFER_REQUEST).read().response };
+    if response.is_null() {
+        kprintln!("framebuffer: no Limine response — /dev/framebuffer will be unavailable");
+        return;
+    }
+    // SAFETY: a non-null response pointer guarantees a valid `FramebufferResponse`.
+    let response = unsafe { &*response };
+    if response.framebuffer_count == 0 || response.framebuffers.is_null() {
+        kprintln!("framebuffer: none reported — /dev/framebuffer will be unavailable");
+        return;
+    }
+    // SAFETY: the array is dense; slot 0 is present when `framebuffer_count > 0`.
+    let fb_ptr = unsafe { *response.framebuffers };
+    if fb_ptr.is_null() {
+        return;
+    }
+    // SAFETY: Limine guarantees the descriptor outlives the kernel's use of it here.
+    let fb = unsafe { &*fb_ptr };
+
+    // SAFETY: `fb` is Limine's live descriptor and `hhdm_offset()` is the offset Limine
+    // reported for this boot, so `address - offset` is the aperture's physical base.
+    if unsafe { framebuffer::record_aperture(fb, nitrox_kernel::mm::heap::hhdm_offset()) } {
+        kprintln!(
+            "framebuffer: {}x{} pitch {} bpp {} — /dev/framebuffer available",
+            fb.width,
+            fb.height,
+            fb.pitch,
+            fb.bpp
+        );
+    } else {
+        kprintln!("framebuffer: unsupported depth ({} bpp) — /dev/framebuffer unavailable", fb.bpp);
+    }
 }
 
 /// Draw the boot screen to Limine's framebuffer, if one is present. Best-effort:
@@ -647,6 +707,35 @@ fn run_first_userspace() {
     {
         kprintln!("init: binding /dev/log failed");
         return;
+    }
+
+    // `/dev/framebuffer` — the display aperture, and its `/info` leaf. **Whoever holds
+    // this binding is the compositor**: authority here is the namespace grant, not a
+    // capability bit and not a registration call, exactly as for the fs-server and
+    // profile-server (`docs/design/display-substrate.md` §3).
+    //
+    // `MAP_READ | MAP_WRITE` because a compositor writes pixels; `INSPECT` so it can
+    // `stat` the object's size; `TRANSFER` so init can hand the binding onward to the
+    // process that will actually drive the display. No `READ`/`WRITE` — only the `MAP_*`
+    // band is valid on a `MemoryObject`, and including them would be rejected as
+    // `BadRights`.
+    let framebuffer_binding_rights = Rights::MAP_READ
+        | Rights::MAP_WRITE
+        | Rights::DUPLICATE
+        | Rights::INSPECT
+        | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(
+            b"/dev/framebuffer",
+            KernelServerId::Framebuffer,
+            framebuffer_binding_rights,
+        )
+        .is_err()
+    {
+        // Non-fatal: a system with no usable framebuffer still boots to a serial
+        // console, and every existing test path is serial. The display arm is the only
+        // consumer.
+        kprintln!("init: binding /dev/framebuffer failed — display unavailable");
     }
 
     // `/proc/self/*` — self-reference servers. Each binding is just a dispatch id;

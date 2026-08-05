@@ -16,6 +16,8 @@ libos = { path = "../libos" }
 librsproto = { path = "../librsproto", features = ["io"] }
 libheap = { path = "../libheap" }
 libstream = { path = "../libstream", features = ["io"] }
+# `io` for `acquire`: the selftest maps the real framebuffer.
+libdraw = { path = "../libdraw", features = ["io"] }
 
 [[bin]]
 name = "test-harness"
@@ -24,3 +26,10 @@ path = "src/harness.rs"
 [[bin]]
 name = "test-stage"
 path = "src/stage.rs"
+
+# The display arm's guest-side gate (plan M1 Part C). Disposable: the durable part
+# (`libdraw::acquire`) lives in the library, so this goes when the real compositor
+# arrives at Milestone 2.
+[[bin]]
+name = "display-selftest"
+path = "src/display.rs"

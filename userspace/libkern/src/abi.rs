@@ -411,3 +411,91 @@ impl NsEntry {
 const _: () = assert!(offset_of!(HandleInfo, rights) == 0);
 const _: () = assert!(offset_of!(HandleInfo, object_type) == 8);
 const _: () = assert!(offset_of!(HandleInfo, generation) == 12);
+
+// --- Framebuffer geometry -----------------------------------------------
+
+/// Geometry and pixel layout of the system framebuffer.
+///
+/// The userspace mirror of `kernel/src/libkern/framebuffer.rs`. Obtained by mapping
+/// `/dev/framebuffer/info`, which resolves to a read-only `MemoryObject` holding exactly
+/// one of these; the aperture itself is `/dev/framebuffer`.
+///
+/// Both sides carry the layout asserts below. `cargo xtask abi-sync-check` deliberately
+/// does not compare `#[repr(C)]` layouts — the asserts are the stronger check, and they
+/// fail at build time rather than in a separate pass.
+///
+/// **Channel layout is reported, not assumed.** Firmware does not always choose
+/// `0x00RRGGBB`; a client that hardcodes it renders channel-swapped output on hardware
+/// that reports BGR.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FramebufferInfo {
+    /// Visible width in pixels.
+    pub width: u32,
+    /// Visible height in pixels.
+    pub height: u32,
+    /// Bytes per row. **Not** `width * bytes_per_pixel` — firmware pads rows.
+    pub pitch: u64,
+    /// Total mappable bytes of the aperture.
+    pub byte_len: u64,
+    /// Bits per pixel. Only 32 is served.
+    pub bits_per_pixel: u16,
+    /// Bit offset of the red channel's least significant bit.
+    pub red_shift: u8,
+    /// Red channel width in bits.
+    pub red_size: u8,
+    /// Bit offset of the green channel's least significant bit.
+    pub green_shift: u8,
+    /// Green channel width in bits.
+    pub green_size: u8,
+    /// Bit offset of the blue channel's least significant bit.
+    pub blue_shift: u8,
+    /// Blue channel width in bits.
+    pub blue_size: u8,
+}
+
+const _: () = assert!(core::mem::size_of::<FramebufferInfo>() == 32);
+const _: () = assert!(core::mem::align_of::<FramebufferInfo>() == 8);
+const _: () = assert!(offset_of!(FramebufferInfo, width) == 0);
+const _: () = assert!(offset_of!(FramebufferInfo, height) == 4);
+const _: () = assert!(offset_of!(FramebufferInfo, pitch) == 8);
+const _: () = assert!(offset_of!(FramebufferInfo, byte_len) == 16);
+const _: () = assert!(offset_of!(FramebufferInfo, bits_per_pixel) == 24);
+const _: () = assert!(offset_of!(FramebufferInfo, red_shift) == 26);
+const _: () = assert!(offset_of!(FramebufferInfo, red_size) == 27);
+const _: () = assert!(offset_of!(FramebufferInfo, green_shift) == 28);
+const _: () = assert!(offset_of!(FramebufferInfo, green_size) == 29);
+const _: () = assert!(offset_of!(FramebufferInfo, blue_shift) == 30);
+const _: () = assert!(offset_of!(FramebufferInfo, blue_size) == 31);
+
+impl FramebufferInfo {
+    /// Read one from the first 32 bytes of a mapped `/dev/framebuffer/info` object.
+    ///
+    /// Returns `None` if the slice is short — a truncated read would otherwise produce
+    /// a plausible-looking geometry with zeroed tail fields, and a client would map an
+    /// aperture of the wrong size.
+    pub fn from_bytes(b: &[u8]) -> Option<Self> {
+        if b.len() < core::mem::size_of::<Self>() {
+            return None;
+        }
+        let u32_at = |o: usize| u32::from_le_bytes([b[o], b[o + 1], b[o + 2], b[o + 3]]);
+        let u64_at = |o: usize| {
+            u64::from_le_bytes([
+                b[o], b[o + 1], b[o + 2], b[o + 3], b[o + 4], b[o + 5], b[o + 6], b[o + 7],
+            ])
+        };
+        Some(Self {
+            width: u32_at(0),
+            height: u32_at(4),
+            pitch: u64_at(8),
+            byte_len: u64_at(16),
+            bits_per_pixel: u16::from_le_bytes([b[24], b[25]]),
+            red_shift: b[26],
+            red_size: b[27],
+            green_shift: b[28],
+            green_size: b[29],
+            blue_shift: b[30],
+            blue_size: b[31],
+        })
+    }
+}

@@ -67,6 +67,14 @@ name = "libcrypto"
 version = "0.1.0"
 
 [[package]]
+name = "libdraw"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "libos",
+]
+
+[[package]]
 name = "libheap"
 version = "0.1.0"
 dependencies = [
@@ -158,6 +166,7 @@ dependencies = [
 name = "test-harness"
 version = "0.1.0"
 dependencies = [
+ "libdraw",
  "libheap",
  "libkern",
  "libos",

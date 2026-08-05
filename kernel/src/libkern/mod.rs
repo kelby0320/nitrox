@@ -19,6 +19,7 @@
 
 pub mod chacha;
 pub mod clock;
+pub mod framebuffer;
 pub mod handle;
 pub mod io_op;
 pub mod io_result;

@@ -155,6 +155,21 @@ static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
+/// Spawn args for `display-selftest` (display arm M1 Part C): no handles, and it
+/// inherits a LOOKUP-only handle to init's root namespace so it resolves
+/// `/dev/framebuffer` and `/dev/framebuffer/info`. **No syscaps** — it binds nothing;
+/// authority over the display is the namespace binding itself. Selftest builds only.
+#[cfg(feature = "selftest")]
+static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/display-selftest
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+    syscaps: 0,
+};
 /// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
 /// inherit a LOOKUP-only handle to init's root namespace (so it resolves
 /// `/dev/console` for input and `/dev/blk/*` for `lsblk`). It runs as the
@@ -1449,6 +1464,76 @@ fn run_test_harness(notif: u64, root_ns: u64) -> bool {
     }
 }
 
+/// Spawn `display-selftest` and adjudicate it.
+///
+/// The program reports three outcomes and this decides which of them matter: `0` passed,
+/// **`2` found no `/dev/framebuffer` binding**, anything else failed.
+///
+/// The `2` case is the one that needs a policy rather than a value judgement in the
+/// program. On a real machine with no display it is expected. Under `test-harness` the
+/// emulator always reports a framebuffer, so it means the binding is broken — and folding
+/// it into success is how the entire display arm could go missing with `test-qemu` still
+/// green, which is exactly what an earlier version of this code did.
+#[cfg(feature = "selftest")]
+fn run_display_selftest(notif: u64, root_ns: u64) {
+    // SAFETY: SPAWN_DISPLAY is a valid writable arg block.
+    let h = unsafe {
+        spawn_program(root_ns, b"/initramfs/sbin/display-selftest", &raw mut SPAWN_DISPLAY)
+    };
+    if h < 0 {
+        kprint(b"init: display-selftest spawn FAIL\n");
+        #[cfg(feature = "test-harness")]
+        test_exit(false);
+        return;
+    }
+    loop {
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = notif;
+            syscall4(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                u64::MAX,
+            )
+        };
+        if waited < 1 {
+            continue;
+        }
+        // SAFETY: NOTIF is a valid 64-byte writable out-param.
+        let r = unsafe { syscall4(SYS_NOTIF_RECV, notif, (&raw mut NOTIF) as u64, 0, 0) };
+        if r != 0 {
+            continue; // WouldBlock: drained
+        }
+        // SAFETY: the kernel wrote a 64-byte Notification into NOTIF.
+        let (kind, body) =
+            unsafe { ((&raw const NOTIF.kind).read(), (&raw const NOTIF.body).read()) };
+        if kind == KIND_CHILD_EXITED {
+            let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
+            // SAFETY: closing init's reference to the finished child.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+            match code {
+                0 => {}
+                2 => {
+                    kprint(b"init: display-selftest found no display\n");
+                    #[cfg(feature = "test-harness")]
+                    {
+                        kprint(b"init: ...but this build always has one -- FAILED\n");
+                        test_exit(false);
+                    }
+                }
+                _ => {
+                    kprint(b"init: display-selftest FAILED\n");
+                    #[cfg(feature = "test-harness")]
+                    test_exit(false);
+                }
+            }
+            return;
+        }
+    }
+}
+
 /// The healthy supervise path. **Normally**, hand off to the service manager: spawn
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
 /// reap_loop drops to the emergency console as the interim recovery, until a reboot
@@ -1640,6 +1725,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // bind-mount from mount_one) and confirm it reaches the right file.
     #[cfg(feature = "selftest")]
     subtree_bind_test(root_ns);
+
+    // The display arm's guest-side gate runs as its own program
+    // (`display-selftest`), not inline here: compositing is not init's job, and
+    // `userspace/init/CLAUDE.md` calls this critical-path code. It supersedes the
+    // inline framebuffer demo that proved M1 Part B.
+    #[cfg(feature = "selftest")]
+    run_display_selftest(notif, root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

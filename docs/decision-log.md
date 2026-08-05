@@ -10733,3 +10733,284 @@ that visible.
 The value was not in any single finding but in the class: every one was a **pocket the sweep
 missed**, and two of them were pockets the new checker was structurally blind to. A reviewer
 that shares the author's model of "where the problem is" checks the same places.
+
+## 2026-08-05 — Display arm M1 Part A: `libdraw`, and the gate arrives with it
+
+The display arm's first commit is its test gate, per the plan's governing decision 1:
+"No compositing code merges without the `Framebuffer` trait and host tests behind it.
+Everything else in this system has a gate; pixels are the one place where 'we'll add
+tests once it works' would actually happen."
+
+`userspace/libdraw` — pure `core + alloc`, no dependencies, like `libstream` and
+`libcrypto` — carries geometry, pixel formats, the `Framebuffer` seam, compositing,
+the visible-pixel hash, and the reference scene. 41 host tests, all running in well
+under a second.
+
+**Three decisions worth recording.**
+
+**1. The reference scene composites into its own buffer, not the real screen.** This
+was not obvious. §8b has the guest composite a known scene and report a hash the host
+asserts as a constant — but the guest's framebuffer is whatever Limine reports, so
+compositing into it would make the hash depend on the emulator's resolution and there
+would be no constant to assert. The scene therefore fixes its own geometry (64×32 at a
+268-byte pitch). What §8b then catches is *the compositor behaving differently compiled
+for the target than on the host* — integer width, endianness, optimisation. The
+different question, "did the pixels reach the screen at all", is §8c's `screendump`,
+and it is a different mechanism because a self-hash structurally cannot answer it.
+
+**2. Every element of the scene earns its place by the bug it makes visible.** Two
+overlapping surfaces (stacking applied backwards), one off the left edge (clipping that
+wraps or underflows), one off the bottom-right (clipping that overruns), one entirely
+off-screen (culling that draws it anyway), a screen stride that is deliberately not
+`width × 4` (rows written at `width × bpp` instead of `pitch`), surface strides that
+differ from the screen's (the same bug on the read side), and one surface in the
+**opposite channel order** (a blit that copies words instead of translating).
+
+The subtle one is that surface content varies along **both** axes. A solid fill — or a
+pattern varying in only one axis — hashes *identically* when rows are transposed, so
+the scene would look thorough and catch nothing. §8e warns that a solid fill "would
+hash fine and prove nearly nothing"; the same trap has a second floor.
+
+**3. The hash covers visible pixels only, never row padding.** Folding in
+`pitch - width × bpp` bytes of never-written memory would make the same picture hash
+differently run to run, which §7 forbids outright. It also means a host buffer and a
+guest framebuffer with *different* strides hash identically for the same image — which
+is what lets the two sides of the gate be compared at all.
+
+**Pixel format is data-driven from Limine's report**, not assumed. `PixelFormat`
+carries a shift and size per channel; `from_limine` builds one and refuses any depth
+but 32 rather than rendering garbage. The plan names channel order as a risk, and it is
+precisely the bug a self-hash cannot see.
+
+**The break-tests found a real defect in the code under test.** Breaking `offset_of` to
+confirm the tests were not vacuous produced only *one* failure — the scene hash — when
+it should have tripped the padding test too. The cause was `fill_rect` open-coding
+`y * pitch + x * bpp` instead of calling `offset_of`: two copies of the same
+arithmetic, only one covered. Routing it through `offset_of` takes the same break from
+1 failing test to 3. Five deliberate breaks were run in total (stride, clipping,
+stacking order, format translation, hash padding); every one was caught, and the
+reference scene caught four of the five on its own.
+
+`libdraw` also gets an explicit `cargo xtask build` step, because it is a library with
+**no consumer yet** — nothing would compile it for `x86_64-unknown-nitrox` at all, and
+a `no_std` regression would sit undetected until Part B tried to build on it. The entry
+is deleted once the compositor depends on the crate.
+
+1146 host tests (up from 1105), all six gates green, kernel builds.
+
+## 2026-08-05 — Display arm M1 Part B: the framebuffer reaches userspace
+
+`/dev/framebuffer` is bound into init's namespace and init maps it and writes pixels.
+Verified in the guest: `1280x800 pitch 5120 bpp 32`, geometry read back correctly,
+24 rows filled.
+
+**The aperture is a `MemoryObject` with borrowed frames.** `MemoryObject::Drop` hands
+every frame to the buddy allocator, which is right for anonymous memory and
+catastrophic for MMIO: closing the last framebuffer handle would put device physical
+addresses on the free list, to be handed out later as if they were RAM — silent at the
+mistake, corruption much later. `FrameOwnership::{Owned, Borrowed}` makes the
+distinction explicit and `Drop` skips borrowed frames. `MAX_SIZE` deliberately does not
+apply to the borrowed constructor: that cap bounds *eager allocation*, nothing is
+allocated here, and a 4K aperture (~33 MiB) legitimately exceeds it.
+
+**Geometry travels as a second leaf, not in `HandleInfo`.** `/dev/framebuffer` resolves
+to the aperture; `/dev/framebuffer/info` to a small read-only object holding a
+`#[repr(C)] FramebufferInfo` (width, height, pitch, byte_len, bpp, per-channel shift and
+size). `HandleInfo` is a frozen 24-byte struct shared by every object type and the wrong
+home for per-type fields — and a 16-versus-24-byte mismatch in it smashed a userspace
+stack once already. Two leaves reuse the suffix dispatch `/dev/blk` and `/proc/sched/*`
+already use, so **no new syscall appears**, which is what §3 means by geometry crossing
+"as an attribute of the resource rather than a second protocol".
+
+`FramebufferInfo` is mirrored in `userspace/libkern` with matching `offset_of!`/`size_of`
+asserts on both sides. `abi-sync-check` deliberately does not compare `#[repr(C)]`
+layouts — its own doc comment says the asserts are the stronger check and fail at build
+time.
+
+**Authority is the binding.** No display capability bit, no registration call: a process
+can drive the display if and only if `/dev/framebuffer` is in its namespace, the same
+rule the fs-server and profile-server live under.
+
+**Two bugs the guest caught that no host test could have.**
+
+1. **Ordering.** The aperture capture was folded into `draw_boot_screen`, which runs
+   *after* `run_first_userspace` — so every lookup resolved to "no aperture recorded".
+   It is now its own boot step before userspace exists, which is also the correct
+   separation: recording a system resource is not the same job as painting a banner.
+2. **Suffix convention.** `Namespace::resolve` strips the separator —
+   `/dev/entropy/x` yields `b"x"`, not `b"/x"`. The server matched `b"/info"`, so the
+   geometry leaf was unreachable.
+
+Neither was visible to the build or to 1150 host tests.
+
+**The first guest run was a vacuous pass, and that is now fixed.** `test-qemu` reported
+PASSED while the log read `lookup FAIL`, because the demo is non-fatal by design — a
+machine with no display must still boot. But under `test-harness` the emulator always
+reports a framebuffer, so a failure there is a real regression, and it now calls
+`test_exit(false)`. Verified by re-breaking the suffix: the same change that previously
+passed silently now fails the run (`qemu exit 35; expected 33`).
+
+1150 host tests, all six gates green, `test-qemu` green.
+
+## 2026-08-05 — Display arm M1 Part C: the self-hash, and where the durable code lives
+
+The guest composites `libdraw`'s reference scene and reports its hash; it matches
+`REFERENCE_HASH`, the constant the host test asserts against its own composite:
+
+```
+display-selftest: reference hash 0x5720b2b9f85bc715 OK
+display-selftest: framebuffer 1280x800 pitch=5120
+display-selftest: presented scene at (0,0)
+```
+
+**Throwaway program versus compositor server — the question dissolved by splitting it.**
+The plan's Part C says "the compositor composites a reference scene", but the real
+compositor (M2 Part B: `/dev/draw` served, the RS protocol, window management) is three
+parts away, and growing init's demo chain was the wrong answer too: compositing is not
+init's job and `userspace/init/CLAUDE.md` calls it critical-path.
+
+So the durable part went to the library and the disposable part stayed disposable.
+`libdraw::acquire` — read `/dev/framebuffer/info`, turn a firmware geometry report into
+a `Geometry`, map the aperture — is the compositor's forever and was *already* duplicated
+inline in init's Part B demo. It sits behind an optional `io` feature, exactly the split
+`libstream` uses for its syscall transport, so the crate's core stays dependency-free and
+host-testable. `display-selftest` is then thin enough that deleting it at M2 costs
+nothing.
+
+`geometry_from` being pure arithmetic matters more than it sounds: it is where a
+channel-order or stride mistake would live, and it now has host tests for a swapped-BGR
+report, a padded stride, an unsupported depth and a pitch too narrow for a row — none of
+which need a display.
+
+**Init's inline framebuffer demo is gone**, superseded by the spawned program. Leaving it
+would have been exactly the "for now" accretion the forbidden-patterns list warns about.
+
+**The two checks are deliberately separate**, because they fail for different reasons and
+only one needs hardware. The self-hash renders into the scene's own 64×32 buffer, so it
+needs **no framebuffer at all** — what it proves is that compositing behaves identically
+compiled for `x86_64-unknown-nitrox` as on the host. Presentation is the half that needs
+the binding, and it is what §8c's `screendump` will check: a compositor can hash its own
+buffer correctly while writing to the wrong base address. Splitting them means a
+framebuffer problem cannot break the hash check, and a compositing bug cannot hide behind
+a display problem.
+
+**The PPM dump is emitted, not merely encoded.** A hash answers *whether* something
+changed and nothing about *what* — stride skew, swapped channels and wrong stacking order
+all present as two hex numbers. On mismatch the scene is now hex-dumped over serial
+between `---PPM-BEGIN---`/`---PPM-END---` markers. Verified end to end by perturbing
+`REFERENCE_HASH` by one bit: the host test failed, the guest failed the run
+(`qemu exit 35; expected 33`), and the log extracted to a valid 6157-byte P6 image —
+64×32, 6144 body bytes, 661 distinct colours, pixel (0,0) exactly `BACKGROUND`. Writing
+the encoder without a way to get the bytes out would have left the original problem
+untouched.
+
+1158 host tests (up from 1150), all six gates green, `test-qemu` green.
+
+## 2026-08-05 — Display arm M1 Part D: `screendump`, and Milestone 1 closes
+
+`cargo xtask check-display` boots the image, waits for the guest to say the scene is on
+screen, captures the display over QMP, and compares it to a `libdraw` render:
+
+```
+  ok: saw "display-selftest: presented scene at (0,0)"
+  captured 1280x800 from the guest's display
+xtask: display gate PASSED — the 64x32 scene on screen matches libdraw pixel for pixel ✓
+```
+
+**No golden image, and that is not a shortcut.** The expected picture is rendered by the
+same `libdraw` the guest uses — `tools/xtask` already depends on a userspace crate
+(`libcrypto`), so the same trick works here. There is no binary artefact to regenerate and
+no brittle-image maintenance, and it is *sound* precisely because what §8c tests is the
+**binding** — base address, stride, channel order — not the compositing, which §8b already
+covers. Using libdraw as the oracle for its own compositing would be circular; using it as
+the oracle for the framebuffer plumbing is exactly right.
+
+**QMP, not the human monitor**, even though HMP's `screendump` would have been simpler.
+QMP is the supported interface, and Milestone 3 needs `input-send-event` from the same
+channel; HMP now would mean replacing it then. The client is about eighty lines with no
+JSON library: the commands sent are fixed strings and the only thing parsed is whether a
+reply carries `"return"` or `"error"`. It skips asynchronous `"event"` messages, because a
+reader that took the next line as its answer would eventually read an event and misreport
+success.
+
+**The guest paces the capture.** Screendumping on a timer would race the boot and produce
+a blank or half-drawn frame indistinguishable from a real mismatch, so the harness waits
+for `display-selftest: presented scene at (0,0)` on the serial console first.
+
+**The §8c claim, demonstrated rather than asserted.** Swapping red and blue in the
+firmware-report interpretation produces:
+
+| Gate | Result |
+|---|---|
+| `test-qemu` (self-hash) | **PASSED** — the guest hashes its own buffer, unaffected |
+| `check-display` (screendump) | **FAILED** — 2041 of 2048 pixels differ |
+
+with the diagnostic naming the bug: `screen (27, 20, 14), expected (14, 20, 27)`, red and
+blue transposed and green untouched. (2041 rather than 2048 because seven pixels happened
+to have `r == b`.) A stride error off by one pixel is caught too, reporting `first at
+(0,1)` — row 0 correct, the skew starting at row 1, which is what a stride bug looks like.
+
+That is the design doc's division shown working: **`test-qemu` tests the compositor,
+`check-display` tests the framebuffer binding**, and neither substitutes for the other.
+
+**It runs on a path filter, not per commit and not by hand.** The plan calls it a smoke
+gate — slow, image comparison is brittle, narrow class of bug. But a gate that runs only
+when somebody remembers is not a gate, so `.github/workflows/display.yml` triggers on the
+files that could actually break it and nowhere else, and uploads the capture as an
+artifact on failure, since the image *is* the diagnostic.
+
+**Milestone 1 is complete**: the gate arrived with the first commit as governing decision 1
+required, and the framebuffer, the self-hash and the screendump gate all rest on it.
+1158 host tests, all six gates green, `test-qemu` green, display gate green.
+
+## 2026-08-05 — PR #172 review: a vacuous pass reintroduced mid-branch
+
+Seven findings on the M1 branch, all confirmed. Three are worth recording.
+
+**A regression introduced *inside* the branch.** At Part B, `framebuffer_test` returned
+`false` when `/dev/framebuffer/info` failed to resolve, and the call site made that fatal
+under `test-harness`. Part C's rewrite into `display-selftest` folded "the lookup failed"
+and "this machine has no display" into a single `AcquireError::NoBinding`, classified it
+as headless, and exited 0. Init only failed the run on a *non-zero* code — so **the entire
+display arm could be missing and `test-qemu` stayed green**. Demonstrated by making
+`record_aperture` return `false`: reference hash OK, "no /dev/framebuffer binding
+(headless)", PASSED, `qemu exit 33`.
+
+The Part B entry above says "the first guest run was a vacuous pass, and that is now
+fixed". True as of its date; two commits later it was not. That is precisely the class the
+separate review session exists to catch — the author's own model says "I fixed that", and
+only a reader rebuilding from the diff notices it came back.
+
+The fix puts the policy where the knowledge is. The program cannot judge whether a missing
+display matters, so it now reports **which** outcome occurred — `0` passed, `1` failed,
+`2` no binding — and init decides: `2` is tolerated on a real machine and fatal under
+`test-harness`, where the emulator always reports a framebuffer. Verified with the same
+break: `qemu exit 35; expected 33`.
+
+**The path filter omitted where the bug had actually lived.** `display.yml` did not list
+`kernel/src/main.rs` — which holds both `record_framebuffer()` and the
+`bind_kernel_server(b"/dev/framebuffer", ...)` call, and is exactly where the Part B
+ordering bug was. A commit touching only that file could have deleted the display without
+the one gate that catches it ever running. Also added: `init/src/main.rs`,
+`libkern/src/abi.rs`, `libos/**`.
+
+**Three current-behaviour docs the branch made false**, all of them lines written days
+earlier in the consistency pass: `architecture/overview.md`'s Status line ("the display arm
+is designed but has no code" — under a "Verified 2026-08-05" stamp), its layer diagram,
+`boot-flow.md`'s list of init's initial bindings, and `CLAUDE.md`'s claim that every
+`design/` document "describes a display system with no code behind it". The rule that
+`architecture/` describes what exists is only worth having if a PR that changes what exists
+updates it, and this one did not until the review said so.
+
+**A fourth doc-comment theft**, in the same session that recorded a memory about the
+hazard: `run_display_selftest` was inserted directly beneath `supervise`'s `///` block and
+wore it, leaving `supervise` undocumented. `#![deny(missing_docs)]` cannot see this,
+because the stolen comment satisfies the lint for the wrong item.
+
+Also fixed: `byte_len`'s doc claimed page-rounding it does not do; the boot screen clears
+the whole framebuffer with nothing synchronising it against the presentation, now
+documented as the margin it is; and `Geometry` now refuses a non-32-bpp format at
+construction, since `PixelFormat`'s public fields made one constructible and the write
+paths index a 4-byte word while striding by `bytes_per_pixel()`.
+
+1159 host tests, all six gates, `test-qemu` and the display gate green.

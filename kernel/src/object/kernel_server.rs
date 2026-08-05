@@ -64,6 +64,10 @@ pub enum KernelServerId {
     /// `/proc/sched/stats` — per-CPU scheduler statistics, served as a read-only
     /// [`MemoryObject`] text snapshot (see [`sched_stats_server`]).
     SchedStats,
+    /// `/dev/framebuffer` — the display aperture (see [`framebuffer_server`]). The one
+    /// server with **two leaves**: the bound path itself resolves to the mappable
+    /// aperture, and the `info` suffix to its geometry.
+    Framebuffer,
     // The `/dev` directory listing is deferred — see
     // `docs/rationale/deferred-decisions.md`.
 }
@@ -111,6 +115,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
         KernelServerId::Console => console_server(suffix, requested),
         KernelServerId::Log => log_server(suffix, requested),
+        KernelServerId::Framebuffer => framebuffer_server(suffix, requested),
         KernelServerId::SchedStats => sched_stats_server(suffix, requested),
     }
 }
@@ -292,6 +297,56 @@ fn log_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     // creation reference before adopting it).
     crate::klog::copy_into_frames(memobj.frames());
     complete_with_memobj(memobj)
+}
+
+/// `/dev/framebuffer` — the display aperture, and the one server with **two leaves**.
+///
+/// - `""` (the bound path itself) → a **borrowed** [`MemoryObject`] over the firmware
+///   aperture. Borrowed is load-bearing: the frames are MMIO the kernel does not own, and
+///   an owned object would hand those physical addresses to the buddy allocator when the
+///   last handle closed (see [`FrameOwnership`](crate::object::memory_object::FrameOwnership)).
+/// - `"info"` → a read-only [`MemoryObject`] holding one
+///   [`FramebufferInfo`](crate::libkern::framebuffer::FramebufferInfo): width, height,
+///   pitch and channel layout, none of which a client can infer from the bytes.
+///
+/// Two leaves rather than a richer `HandleInfo`, because that struct is a frozen 24-byte
+/// layout shared by every object type and the wrong home for per-type fields — and it is
+/// the same namespace lookup every other server uses, so no new syscall appears
+/// (`docs/design/display-substrate.md` §3, geometry "as an attribute of the resource
+/// rather than a second protocol").
+///
+/// **Authority is the binding.** There is no display capability bit: a process can drive
+/// the display if and only if its namespace contains this path (§3, and the same rule the
+/// fs-server and profile-server live under). `requested` is ignored here — the binding's
+/// rights cap what the caller obtains, applied by the lookup syscall.
+///
+/// Returns `Unsupported` when no aperture was recorded at boot (no framebuffer, or a
+/// depth other than 32 bits), rather than a zero-sized object a client would map and then
+/// scribble past.
+fn framebuffer_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    let Some((phys_base, info)) = crate::framebuffer::aperture() else {
+        return OpStatus::Rejected(KError::Unsupported);
+    };
+
+    match suffix {
+        b"" => {
+            // SAFETY: `phys_base .. + byte_len` is the firmware-reported display
+            // aperture, recorded once at boot. It is device memory outside every region
+            // the buddy allocator manages (Limine reports it as framebuffer, not usable
+            // RAM), and it stays mapped for the life of the system.
+            match unsafe {
+                MemoryObject::try_new_borrowed(phys_base, info.byte_len as usize)
+            } {
+                Ok(obj) => complete_with_memobj(obj),
+                Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+            }
+        }
+        b"info" => match MemoryObject::try_new_filled(info.as_bytes()) {
+            Ok(obj) => complete_with_memobj(obj),
+            Err(_) => OpStatus::Rejected(KError::OutOfMemory),
+        },
+        _ => OpStatus::Rejected(KError::NotFound),
+    }
 }
 
 /// `/proc/sched/stats` — a **leaf** server returning the per-CPU scheduler

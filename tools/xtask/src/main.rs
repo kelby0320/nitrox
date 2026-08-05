@@ -9,6 +9,7 @@
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
 //!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
 //!   check-docs      fail if a doc links to, or cites, a path that does not exist
+//!   check-display   boot + screendump; compare the screen against a libdraw render
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -116,6 +117,7 @@ fn main() -> ExitCode {
         Some("check-nightly") => cmd_check_nightly(),
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
+        Some("check-display") => cmd_check_display(accel),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -236,10 +238,11 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // ELFs via `include_bytes!`, so the artifacts must exist at kernel compile
     // time. Only `init` (and the kernel) carry the selftest / test-harness feature.
     cmd_build_hello()?;
-    // The integration smoke-test harness (bins `test-harness` + `test-stage`) is built
+    // The integration smoke-test harness (bins `test-harness`, `test-stage` and
+    // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.features().is_some() {
-        build_userspace_bin("test-harness", None)?;
+        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest"], None)?;
     }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
@@ -260,6 +263,8 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // session-mgr fires the self-test verdict, so it takes the build-mode feature
     // (`selftest`/`test-harness`) like init.
     build_userspace_bin("session-mgr", mode.features())?;
+    // A library with no consumer yet — see `check_userspace_lib`.
+    check_userspace_lib("libdraw")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -356,6 +361,27 @@ fn cmd_build_hello() -> R<()> {
 /// for the spawn-demo binaries (`parent`, `child`).
 fn build_userspace_bin(name: &str, features: Option<&str>) -> R<()> {
     build_userspace_crate(name, &[name], features)
+}
+
+/// Build a userspace **library** crate for the bare target, purely to prove it still
+/// compiles there.
+///
+/// Libraries are normally built as a side effect of the bins that depend on them, so they
+/// need no entry here. `libdraw` is the exception: it lands (plan M1 Part A) before the
+/// compositor that will consume it, so nothing would compile it for
+/// `x86_64-unknown-nitrox` at all, and a `no_std` regression — an accidental `std` path,
+/// an `alloc` item behind the wrong cfg — would sit undetected until Part B went to build
+/// on it. Its host tests pass on the host target and prove nothing about that.
+///
+/// Delete the entry once a bin depends on the crate; the bin's build covers it then.
+fn check_userspace_lib(dir: &str) -> R<()> {
+    let crate_dir = repo_root().join("userspace").join(dir);
+    let mut c = userspace_cargo();
+    c.arg("build").arg("--release").arg("-p").arg(dir);
+    arg_userspace_target(&mut c);
+    run(c.current_dir(&crate_dir))?;
+    println!("xtask: {dir} compiles for {USERSPACE_TARGET} ✓");
+    Ok(())
 }
 
 /// Build the userspace crate in `userspace/<dir>` for the bare target, then verify each of
@@ -847,6 +873,256 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     Ok(steps)
 }
 
+/// `cargo xtask check-display` — prove the pixels actually reach the screen.
+///
+/// **What a self-hash structurally cannot answer** (`docs/design/display-substrate.md`
+/// §8c): a compositor can hash its own buffer correctly while writing to the wrong base
+/// address, the wrong stride, or with the channels swapped. Nothing inside the guest can
+/// detect that, because the guest stays perfectly consistent with itself. So the picture
+/// has to be read from outside, which is what QEMU's `screendump` is for.
+///
+/// The division worth remembering: **`test-qemu` tests the compositor, this tests the
+/// framebuffer binding.**
+///
+/// **No golden image.** The expected picture is rendered here by the same `libdraw` the
+/// guest uses, so there is no binary artefact in the repo to regenerate, and no
+/// brittle-image maintenance problem. That is sound precisely because what is under test
+/// is the *binding* — base address, stride, channel order — not the compositing, which
+/// §8b already covers.
+///
+/// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
+/// so the plan runs it once per display-arm change.
+fn cmd_check_display(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::TestHarness)?;
+    let ovmf = locate_ovmf()?;
+
+    let work = repo_root().join("tools/build-cache");
+    fs::create_dir_all(&work).ok();
+    let qmp_sock = work.join("qmp.sock");
+    let shot = work.join("screendump.ppm");
+    let _ = fs::remove_file(&qmp_sock);
+    let _ = fs::remove_file(&shot);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        // The machine protocol channel: `screendump` here, `input-send-event` in M3.
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    println!("xtask: display gate — booting and capturing the screen…\n");
+    let mut session = Session::spawn(cmd)?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+
+    // The guest paces this: capture only once it says the scene is on the screen.
+    // Screendumping on a timer would race the boot and produce a blank or half-drawn
+    // frame that looks like a real mismatch.
+    session.expect("display-selftest: presented scene at (0,0)")?;
+    qmp.screendump(&shot)?;
+
+    let captured = fs::read(&shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
+    let (w, h, pixels) = parse_ppm(&captured)?;
+    println!("  captured {w}x{h} from the guest's display");
+
+    // The expected image, rendered here rather than stored.
+    use libdraw::framebuffer::Framebuffer;
+    let expected = libdraw::scene::render_reference();
+    let (sw, sh) = (libdraw::scene::SCREEN_WIDTH, libdraw::scene::SCREEN_HEIGHT);
+    if w < sw || h < sh {
+        let _ = session.child.kill();
+        return Err(format!("guest display is {w}x{h}, smaller than the {sw}x{sh} scene").into());
+    }
+
+    let mut mismatches = 0usize;
+    let mut first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
+    for y in 0..sh {
+        for x in 0..sw {
+            let want = Framebuffer::get_pixel(&expected, x, y).unwrap_or_default();
+            let i = (y as usize * w as usize + x as usize) * 3;
+            let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
+            if got != (want.r, want.g, want.b) {
+                mismatches += 1;
+                if first.is_none() {
+                    first = Some((x, y, got, (want.r, want.g, want.b)));
+                }
+            }
+        }
+    }
+
+    let _ = session.child.kill();
+    let _ = fs::remove_file(&qmp_sock);
+
+    if mismatches == 0 {
+        println!(
+            "\nxtask: display gate PASSED — the {sw}x{sh} scene on screen matches libdraw \
+             pixel for pixel ✓"
+        );
+        return Ok(());
+    }
+    let (x, y, got, want) = first.expect("a mismatch was counted");
+    Err(format!(
+        "display gate FAILED: {mismatches} of {} pixels differ.\n  \
+         first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
+         the capture is at {} — a whole-image shift suggests a base-address or stride \
+         error, and swapped components suggest a channel-order one",
+        sw as usize * sh as usize,
+        shot.display()
+    )
+    .into())
+}
+
+/// Parse a binary PPM (P6) into `(width, height, rgb_bytes)`.
+///
+/// QEMU writes exactly this format, and it is what `libdraw::ppm` emits, so the two ends
+/// of the gate speak the same thing. Hand-rolled because it is a header and raw bytes.
+fn parse_ppm(data: &[u8]) -> R<(u32, u32, Vec<u8>)> {
+    // Header fields are whitespace-separated ASCII: "P6", width, height, maxval, then a
+    // single whitespace byte and the body.
+    let mut fields: Vec<String> = Vec::new();
+    let mut i = 0usize;
+    while fields.len() < 4 && i < data.len() {
+        while i < data.len() && data[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        if i < data.len() && data[i] == b'#' {
+            while i < data.len() && data[i] != b'\n' {
+                i += 1;
+            }
+            continue;
+        }
+        let start = i;
+        while i < data.len() && !data[i].is_ascii_whitespace() {
+            i += 1;
+        }
+        fields.push(String::from_utf8_lossy(&data[start..i]).into_owned());
+    }
+    if fields.len() != 4 || fields[0] != "P6" {
+        return Err(format!("not a binary PPM (fields: {fields:?})").into());
+    }
+    let w: u32 = fields[1].parse().map_err(|_| "bad PPM width")?;
+    let h: u32 = fields[2].parse().map_err(|_| "bad PPM height")?;
+    if fields[3] != "255" {
+        return Err(format!("unsupported PPM maxval {}", fields[3]).into());
+    }
+    i += 1; // the single whitespace byte after maxval
+    let need = w as usize * h as usize * 3;
+    if data.len() < i + need {
+        return Err(format!("PPM body short: {} < {need}", data.len() - i).into());
+    }
+    Ok((w, h, data[i..i + need].to_vec()))
+}
+
+/// A minimal QMP client over a Unix socket.
+///
+/// QEMU's machine protocol is line-delimited JSON. This speaks just enough of it for the
+/// display gate — a handshake and one command — without a JSON library: the messages
+/// sent are fixed strings, and the only thing read back is whether a reply line carries
+/// `"return"` or `"error"`.
+///
+/// QMP rather than the human monitor because it is the supported interface and because
+/// Milestone 3 needs `input-send-event` from the same channel; adding HMP now would mean
+/// replacing it then.
+struct Qmp {
+    stream: std::os::unix::net::UnixStream,
+    buf: Vec<u8>,
+}
+
+impl Qmp {
+    /// Connect and complete the capabilities handshake.
+    ///
+    /// QEMU creates the socket as it starts, so this retries briefly rather than
+    /// requiring the caller to guess how long that takes.
+    fn connect(path: &Path) -> R<Qmp> {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let stream = loop {
+            match std::os::unix::net::UnixStream::connect(path) {
+                Ok(s) => break s,
+                Err(_) if std::time::Instant::now() < deadline => {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Err(e) => return Err(format!("connect QMP socket {}: {e}", path.display()).into()),
+            }
+        };
+        stream
+            .set_read_timeout(Some(std::time::Duration::from_secs(30)))
+            .map_err(|e| format!("qmp read timeout: {e}"))?;
+        let mut q = Qmp { stream, buf: Vec::new() };
+        // The greeting arrives unsolicited; then capabilities must be negotiated before
+        // any other command is accepted.
+        let greeting = q.read_line()?;
+        if !greeting.contains("QMP") {
+            return Err(format!("unexpected QMP greeting: {greeting}").into());
+        }
+        q.execute(r#"{"execute":"qmp_capabilities"}"#)?;
+        Ok(q)
+    }
+
+    /// Read one newline-delimited message.
+    fn read_line(&mut self) -> R<String> {
+        use std::io::Read as _;
+        loop {
+            if let Some(i) = self.buf.iter().position(|&b| b == b'\n') {
+                let line = String::from_utf8_lossy(&self.buf[..i]).into_owned();
+                self.buf.drain(..=i);
+                return Ok(line);
+            }
+            let mut chunk = [0u8; 4096];
+            let n = self.stream.read(&mut chunk).map_err(|e| format!("qmp read: {e}"))?;
+            if n == 0 {
+                return Err("qmp socket closed".into());
+            }
+            self.buf.extend_from_slice(&chunk[..n]);
+        }
+    }
+
+    /// Send one command and wait for its reply, skipping asynchronous events.
+    ///
+    /// QEMU interleaves `{"event": ...}` messages with replies, so a reader that took the
+    /// next line as the answer would eventually read an event and misreport success.
+    fn execute(&mut self, json: &str) -> R<String> {
+        use std::io::Write as _;
+        self.stream
+            .write_all(format!("{json}\n").as_bytes())
+            .map_err(|e| format!("qmp write: {e}"))?;
+        self.stream.flush().map_err(|e| format!("qmp flush: {e}"))?;
+        loop {
+            let line = self.read_line()?;
+            if line.contains("\"event\"") {
+                continue; // asynchronous event, not our reply
+            }
+            if line.contains("\"error\"") {
+                return Err(format!("qmp command failed: {json} -> {line}").into());
+            }
+            if line.contains("\"return\"") {
+                return Ok(line);
+            }
+            // Anything else is unexpected; surface it rather than looping forever.
+            return Err(format!("unexpected qmp reply: {line}").into());
+        }
+    }
+
+    /// Capture the guest's display to `path` as a binary PPM.
+    fn screendump(&mut self, path: &Path) -> R<()> {
+        let p = path.to_str().ok_or("screendump path is not UTF-8")?;
+        self.execute(&format!(r#"{{"execute":"screendump","arguments":{{"filename":"{p}"}}}}"#))?;
+        Ok(())
+    }
+}
+
 /// A driven QEMU serial session: write lines, wait for text.
 struct Session {
     child: std::process::Child,
@@ -1125,6 +1401,24 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("librsproto")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libdraw` host tests — geometry, pixel formats, framebuffers, compositing, and
+    // the reference scene's hash. This is the display arm's gate (plan M1 Part A,
+    // governing decision 1: "No compositing code merges without the `Framebuffer` trait
+    // and host tests behind it"). Pure `core + alloc`, no deps, so compositing is
+    // asserted pixel-exactly in milliseconds rather than through a boot.
+    // `--features io` so the framebuffer-acquisition arithmetic is covered too:
+    // `geometry_from` is where a channel-order or stride mistake would live, and it is
+    // pure logic that needs no display. The feature is off by default so the crate's
+    // core stays dependency-free.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libdraw")
+        .arg("--features")
+        .arg("io")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
@@ -2507,6 +2801,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     if mode.features().is_some() {
         programs.push("test-harness");
         programs.push("test-stage");
+        programs.push("display-selftest");
     }
     let mut ino = 3u32;
     for name in programs {

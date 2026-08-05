@@ -1,0 +1,98 @@
+name: Display gate
+
+# `cargo xtask check-display` boots a full image and compares the guest's screen against
+# a `libdraw` render, which is the only way to catch a wrong base address, a wrong stride,
+# or swapped channels: the guest stays perfectly consistent with itself, so no self-hash
+# can see them (docs/design/display-substrate.md §8c).
+#
+# It is deliberately **not** part of the per-commit CI. The display-arm plan calls it a
+# smoke gate — "it is slow, image comparison is brittle, and it covers a narrow class of
+# bug that changes rarely". But a gate that only runs when somebody remembers is not a
+# gate, so it runs automatically on the paths that could actually break it, and nowhere
+# else.
+on:
+  push:
+    branches: [main]
+    paths: &display_paths
+      - 'userspace/libdraw/**'
+      - 'userspace/test-harness/src/display.rs'
+      # `kernel/src/main.rs` holds *both* halves of the binding — `record_framebuffer()`
+      # and its placement relative to `run_first_userspace()`, and the
+      # `bind_kernel_server(b"/dev/framebuffer", ...)` call. That is precisely where the
+      # ordering bug in Part B lived, and omitting it meant a commit touching only that
+      # file could remove the display entirely without this gate running.
+      - 'kernel/src/main.rs'
+      - 'kernel/src/framebuffer.rs'
+      - 'kernel/src/libkern/framebuffer.rs'
+      - 'kernel/src/object/kernel_server.rs'
+      - 'kernel/src/object/memory_object.rs'
+      # init spawns and adjudicates `display-selftest`; `abi.rs` is the userspace half of
+      # `FramebufferInfo`; `libos` is the lookup/map path `acquire` rides on.
+      - 'userspace/init/src/main.rs'
+      - 'userspace/libkern/src/abi.rs'
+      - 'userspace/libos/**'
+      - 'tools/xtask/src/main.rs'
+      - '.github/workflows/display.yml'
+  pull_request:
+    branches: [main]
+    paths: *display_paths
+
+concurrency:
+  group: display-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  screendump:
+    name: Screendump vs libdraw render
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable for kernel/tools, pinned nightly for userspace)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-none
+          rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' userspace/rust-toolchain.toml)" \
+            --profile minimal --component rust-src --no-self-update
+
+      - name: Cache cargo registry and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+            tools/target
+            userspace/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml', 'kernel/.cargo/config.toml', 'userspace/rust-toolchain.toml', 'userspace/x86_64-unknown-nitrox.json') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      # Same tooling the integration job needs: GPT/FAT for the image, OVMF for firmware,
+      # e2fsprogs for the ext4 partition. KVM for the same x2APIC reason.
+      - name: Install QEMU, OVMF and image tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf gdisk mtools dosfstools e2fsprogs
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: cargo xtask check-display
+        run: cargo xtask check-display --kvm
+
+      # The capture is the whole diagnostic when this fails: a whole-image shift means a
+      # base-address or stride error, transposed components mean a channel-order one.
+      - name: Upload the capture on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: screendump
+          path: tools/build-cache/screendump.ppm
+          if-no-files-found: ignore
