@@ -10,7 +10,7 @@
 //! Hand-rolled bitflags in the [`Rights`](super::handle::Rights) style (the kernel
 //! forbids the `bitflags` crate). The bit positions are normative and mirrored in
 //! `userspace/libkern/src/syscaps.rs`; the set is the v5.1-committed six
-//! (`docs/history/os-design-v5.1.md` § "System Capability Bitmask").
+//! (`docs/archive/os-design-v5.1.md` § "System Capability Bitmask").
 
 use core::ops::{BitAnd, BitOr, BitOrAssign};
 

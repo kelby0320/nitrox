@@ -146,7 +146,7 @@ Used to embed a structured error in the middle of a data stream — e.g., `filte
 
 Generic operators handle error records by passing them through unmodified; the consuming end (typically `display`) renders them.
 
-Record tag `0x03` was reserved for a **widget record** (structured UI embedded in a stream). It has been dropped: TSM1 is a *data* format, and structured UI is a compositor concern, not a stream record type (see `docs/history/nitrox-ui-composition-model-v2.md` §1 "TSM1 stays data-only" and the decision log, 2026-07-23). A `0x03` record tag is now a decode error (`BadRecordTag`).
+Record tag `0x03` was reserved for a **widget record** (structured UI embedded in a stream). It has been dropped: TSM1 is a *data* format, and structured UI is a compositor concern, not a stream record type (see `docs/design/ui-composition-model.md` §1 "TSM1 stays data-only" and the decision log, 2026-07-23). A `0x03` record tag is now a decode error (`BadRecordTag`).
 
 ### Terminator (`0xFF`)
 
@@ -222,5 +222,5 @@ The wire format is deliberately not exposed in the typical application API; prog
 
 ## Where to read more
 
-- [Shell language design](../history/nitrox-shell-design-v1.2.md) — the language over these streams
+- [Shell language design](shell-language.md) — the language over these streams
 - `TypedRecord` usage in libstream — **not written.** The crate is `userspace/libstream`.

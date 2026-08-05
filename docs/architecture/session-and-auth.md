@@ -20,7 +20,7 @@ filesystem root) is even *nameable*.
 ## No user model in the kernel
 
 The kernel knows nothing of users, sessions, passwords, or login
-(`docs/history/os-design-v5.1.md`: "no UIDs, no GIDs, … no session IDs"). It provides
+(`docs/archive/os-design-v5.1.md`: "no UIDs, no GIDs, … no session IDs"). It provides
 only mechanisms — handles ([`Rights`](handle-system.md)), ambient
 [`SysCaps`](syscaps.md), and [namespaces](namespace-and-resource-servers.md). The
 entire human-facing model is **policy in userspace**: who a principal is, what its
@@ -201,7 +201,7 @@ supervisor drops to on a critical-path failure — no longer the normal console.
 
 ## References
 
-- `docs/history/os-design-v5.1.md` §§ Session Manager / Authentication Service,
+- `docs/archive/os-design-v5.1.md` §§ Session Manager / Authentication Service,
   "Capability Bootstrap", "Policy vs. Mechanism," boot step 14.
 - [rsproto-auth-ops](../spec/rsproto-auth-ops.md) — the `Authenticate` wire contract.
 - [syscaps](syscaps.md) — `BIND_NAMESPACE` delegation, `child = parent & args`.

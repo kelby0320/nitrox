@@ -7,7 +7,7 @@
 //! boundary (sign-extended into the `isize` return register).
 //!
 //! Only the variants the current slices use are listed; the rest of the
-//! v5.1 error space (`docs/history/os-design-v5.1.md`) is filled in as
+//! v5.1 error space (`docs/archive/os-design-v5.1.md`) is filled in as
 //! syscalls that need them land. The numeric values are the contract and
 //! must not change once userspace mirrors them.
 //!

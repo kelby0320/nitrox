@@ -12,7 +12,7 @@ layout randomization (ASLR) and the handle-table slot shuffle.
 This document is the design for the entropy subsystem. Exact ABIs (the
 `sys_entropy_*` signatures) live in [`docs/spec/syscall-abi.md`](../spec/syscall-abi.md);
 this is the *why* and the *shape*. The original sketch is
-[`docs/history/os-design-v5.1.md`](../history/os-design-v5.1.md) § Entropy.
+[`docs/archive/os-design-v5.1.md`](../archive/os-design-v5.1.md) § Entropy.
 
 > **Implementation phasing.** This doc designs the whole subsystem, but it lands
 > across **Phase 2 slice 2** (this slice) plus one consumer in slice 3:

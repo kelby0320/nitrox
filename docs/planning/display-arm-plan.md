@@ -9,11 +9,11 @@ The build sequence for Phase 4's display arm: framebuffer to compositor to GUI t
 the composition layer above it. The design docs are the source of truth for *what*; this plan is
 the source of truth for *the order*.
 
-- **Mechanism:** [`docs/history/nitrox-display-substrate-v1.md`](../history/nitrox-display-substrate-v1.md)
+- **Mechanism:** [`docs/design/display-substrate.md`](../design/display-substrate.md)
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
-- **Semantics:** [`docs/history/nitrox-ui-composition-model-v2.md`](../history/nitrox-ui-composition-model-v2.md)
+- **Semantics:** [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
   — windows, ports, desktops, templates.
-- **The shell itself:** [`docs/history/nitrox-desktop-shell-v1.md`](../history/nitrox-desktop-shell-v1.md)
+- **The shell itself:** [`docs/design/desktop-shell.md`](../design/desktop-shell.md)
   — bars, applications modal, overview, and the operations it demands of the compositor.
 
 The typed shell + coreutils subproject ([`shell-coreutils-plan.md`](shell-coreutils-plan.md)) is

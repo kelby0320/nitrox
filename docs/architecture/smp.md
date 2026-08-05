@@ -461,7 +461,7 @@ syscalls while migratable.
 - [memory-management.md](memory-management.md) — address spaces, the kernel vmap,
   TLB.
 - [boot-flow.md](boot-flow.md) — the boot sequence this doc's §3 slots into.
-- Decision log ([../history/decision-log.md](../history/decision-log.md)),
+- Decision log ([../decision-log.md](../decision-log.md)),
   2026-07-01 entries — the SCE / APIC-id fixes, the switch-out race + dense-index
   collision fixes, and user-thread migration.
 - Deferred decisions

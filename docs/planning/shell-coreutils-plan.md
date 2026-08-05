@@ -11,8 +11,8 @@ A build plan and gap analysis for the Nitrox shell + coreutils **language subpro
 interpreter, the coreutils, and the (minimal) REPL. Derived from the design docs and cross-checked
 against the implemented system:
 
-- **Design (semantics/grammar):** `docs/history/nitrox-shell-design-v1.2.md`
-- **Design (UI composition, upstream where they touch):** `docs/history/nitrox-ui-composition-model-v2.md`
+- **Design (semantics/grammar):** `docs/spec/shell-language.md`
+- **Design (UI composition, upstream where they touch):** `docs/design/ui-composition-model.md`
 - **This plan** sequences the subproject's own work (language → coreutils → minimal REPL) and
   records the design gaps it must resolve as it goes.
 
@@ -67,7 +67,7 @@ the **design gaps (1B)** are decisions still owed but can mostly be made as thei
 - §9d presented `Value` as already having `Table`/`List`/`Record` variants "unchanged." It does
   not; reworded to "planned representation," with the implementation reality called out.
 - Section numbering made contiguous (old §12→§11, §13→§12).
-- Companion UI doc confirmed present in `docs/history/`.
+- Companion UI doc confirmed present in `docs/design/`.
 
 ### 1B. Design gaps — decisions still owed
 

@@ -944,4 +944,4 @@ so none was ever reviewed. If you write a stub, a `TODO`, or prose that promises
 work, mirror it here. `cargo xtask check-deferrals` enforces the `TODO(tag)` half of that
 mechanically.
 
-The decision log (`history/decision-log.md`) is the place to record the actual decision when a deferred item moves into active work — what triggered it, what the implementation approach is, when the decision was made.
+The decision log (`docs/decision-log.md`) is the place to record the actual decision when a deferred item moves into active work — what triggered it, what the implementation approach is, when the decision was made.

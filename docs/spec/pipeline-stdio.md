@@ -163,4 +163,4 @@ channel's:
 - `docs/spec/process-spawn-args.md` — the register bootstrap this layers on.
 - `docs/spec/typed-stream-format.md` — TSM1 (`argv` is a `List<String>`).
 - `docs/spec/ipc-message-format.md` — the IPC message envelope + handle transfer.
-- `docs/history/nitrox-shell-design-v1.2.md` §1 — the pipeline execution model.
+- `docs/spec/shell-language.md` §1 — the pipeline execution model.

@@ -14,7 +14,7 @@ the implementing slices; this doc cross-links forward to them. Background:
 `docs/architecture/overview.md` (§ "Drivers and IRPs"),
 `docs/architecture/notifications.md` (async event delivery),
 `docs/architecture/handle-system.md` (kernel objects and handles), and the
-original design in `docs/history/os-design-v5.1.md` § "Driver Subsystem".
+original design in `docs/archive/os-design-v5.1.md` § "Driver Subsystem".
 
 > **Status.** Implemented (Phase 2, complete). Every component this document once
 > listed as unbuilt now exists: the IOAPIC (`kernel/src/arch/x86_64/ioapic.rs`), the
@@ -289,6 +289,6 @@ All deferrals are tracked in `docs/rationale/deferred-decisions.md`.
 - The **storage slice** — implements § "The IRP model", § "Device discovery",
   and § "Block-device drivers as resource servers" (PCI, AHCI, GPT, `DeviceNode`,
   the block resource server).
-- `docs/history/decision-log.md` (2026-06-11) — the decisions recorded here.
+- `docs/decision-log.md` (2026-06-11) — the decisions recorded here.
 - `docs/planning/implementation-plan.md` (Phase 2) — slice ordering and the
   prerequisite band.

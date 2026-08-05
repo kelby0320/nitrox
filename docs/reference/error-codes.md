@@ -14,7 +14,7 @@ it and the source disagree, the source wins and this page is wrong.
 ## Read this before assigning a new value
 
 **The v5.1 design document's numbering is not the implemented numbering, and the two
-disagree in the range most likely to be reached for.** `docs/history/os-design-v5.1.md`
+disagree in the range most likely to be reached for.** `docs/archive/os-design-v5.1.md`
 reserved `-11` for `AlreadyExists` and placed the blocking errors at `-20..-23`. The
 implementation instead put `WouldBlock`/`TimedOut`/`PeerClosed` at `-11..-13`, so when
 `AlreadyExists` was finally needed (2026-07-30) its documented slot was long since

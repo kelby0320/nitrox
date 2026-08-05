@@ -55,7 +55,7 @@ see the slice 7 section below; all three are in `userspace/libos/src/objects.rs`
 
 ## The `Handle<T, M>` typestate model
 
-The design is the one already committed on paper (`docs/history/os-design-v5.1.md`
+The design is the one already committed on paper (`docs/archive/os-design-v5.1.md`
 § "Handle typestate"); libos implements it. A handle is:
 
 ```rust
@@ -292,7 +292,7 @@ where the change stays surgical.
 
 ## References
 
-- `docs/history/os-design-v5.1.md` § Handle typestate — the authoritative `Handle<T,M>`
+- `docs/archive/os-design-v5.1.md` § Handle typestate — the authoritative `Handle<T,M>`
   design libos implements.
 - `docs/architecture/handle-system.md`, `docs/spec/handle-encoding.md` — the kernel
   handle table + `Rights` this wraps.

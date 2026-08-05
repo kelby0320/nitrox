@@ -2,6 +2,10 @@
 
 ## Status
 
+**Not built.** This describes a subsystem with no code behind it; the build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when the compositor lands.
+
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
 maintainer 2026-08-04.

@@ -5,7 +5,7 @@
 //! **first field**, so a type-erased `*mut ()` from the handle table can
 //! be read as `*const KObjectHeader` at offset 0 without knowing the
 //! concrete type (see `docs/architecture/overview.md` § "Kernel objects"
-//! and `docs/history/os-design-v5.1.md` § "Object Header and Dispatch").
+//! and `docs/archive/os-design-v5.1.md` § "Object Header and Dispatch").
 //! The concrete type is needed only to run the right destructor when the
 //! last reference goes away — dispatched via `match` on
 //! [`KObjectType`](crate::libkern::handle::KObjectType), never `dyn`

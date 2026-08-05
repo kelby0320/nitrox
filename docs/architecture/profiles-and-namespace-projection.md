@@ -135,7 +135,7 @@ path    = "/store/9f3a2c1b-heartbeat-0.1.0"
 - Unknown keys/tables are ignored (forward-compat), like the service schema.
 
 (This starts inline in this architecture doc; if it grows it splits into a
-`docs/spec/profile-manifest-schema.md`, as `service.toml` did.)
+`docs/spec/profile-manifest-schema.md`, as `service.toml` did.) <!-- check-docs: allow-missing -->
 
 ## Generations, switching, rollback
 

@@ -137,4 +137,4 @@ map today); the fs-server open-file cookie.
 - `docs/architecture/filesystem-data-path.md` — the generic contract this realizes
 - `docs/spec/rsproto-block-ops.md` — the Model A wire ops (`MapRange`/`AllocRange`)
 - `userspace/fs-server-ext4/` + its `CLAUDE.md` — the reader RW extends
-- `docs/history/decision-log.md` 2026-06-25 — Model A vs Model B
+- `docs/decision-log.md` 2026-06-25 — Model A vs Model B

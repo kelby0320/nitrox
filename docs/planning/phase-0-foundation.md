@@ -32,8 +32,8 @@ complete; Phase 4 is active.
 - [ ] `xtask test-qemu` — QEMU integration tests via `isa-debug-exit` (not built in Phase 0 — see deviation note)
 - [x] GitHub Actions CI running `cargo build` and `xtask test` on every push
 - [x] `docs/` populated with the foundational documents (overview, rationale, spec)
-- [x] v5.1 design doc archived at `docs/history/design-doc-v5.1.md`
-- [x] Decision log started at `docs/history/decision-log.md`
+- [x] v5.1 design doc archived at `docs/archive/os-design-v5.1.md`
+- [x] Decision log started at `docs/decision-log.md`
 
 ### Milestone
 

@@ -2,6 +2,10 @@
 
 ## Status
 
+**Not built.** This describes a subsystem with no code behind it; the build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when windows, ports and desktops land (Milestone 6).
+
 This document revises the "User Interface and Shell" section of `os-design-v5.1.md`. That
 section was written early, before kernel/system design matured, and its central mechanism —
 `WidgetRecord` as a TSM1 stream variant — doesn't hold up under scrutiny. This document

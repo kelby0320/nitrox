@@ -121,6 +121,6 @@ and would write its own bytes, because it has no blocks for the kernel to addres
 - `docs/architecture/ext4-fs-server-rw.md` — the first implementer (ext4's realization)
 - `docs/spec/rsproto-block-ops.md` — the Model A wire ops (`MapRange`/`AllocRange`, `BlockRun`)
 - `docs/spec/rsproto-file-ops.md` — the Model B wire op (`ReadRange`)
-- `docs/history/decision-log.md` 2026-06-25 — Model A vs Model B
+- `docs/decision-log.md` 2026-06-25 — Model A vs Model B
 - `kernel/src/object/file_object.rs` — the `FileObject` producer seam
 - `docs/architecture/drivers-and-irps.md` — the IRP / block path

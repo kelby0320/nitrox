@@ -226,9 +226,9 @@ The Unix shell pipeline is a high point of system design — programs as composa
 
 Programs that produce raw text are not left out. Their output is automatically wrapped as a single-column `Table<String>` with column name `line`, and all generic operators work on it. The floor is Unix; everything above it is opt-in.
 
-The same model extends to GUIs, but **not** by embedding UI in the data stream: an early `WidgetRecord` stream type was dropped because a widget isn't data — it has identity, mutable state, an event stream, and a lifecycle. Instead, widgets and windows are **resource servers** a program talks to, and TSM1 stays data-only. A program still doesn't choose its own rendering — the display layer does — it just does so by composing live UI resources rather than by emitting a widget record. See [UI composition model](../history/nitrox-ui-composition-model-v2.md) for what a window *is*, and [display substrate](../history/nitrox-display-substrate-v1.md) for how pixels, surfaces and input actually work.
+The same model extends to GUIs, but **not** by embedding UI in the data stream: an early `WidgetRecord` stream type was dropped because a widget isn't data — it has identity, mutable state, an event stream, and a lifecycle. Instead, widgets and windows are **resource servers** a program talks to, and TSM1 stays data-only. A program still doesn't choose its own rendering — the display layer does — it just does so by composing live UI resources rather than by emitting a widget record. See [UI composition model](../design/ui-composition-model.md) for what a window *is*, and [display substrate](../design/display-substrate.md) for how pixels, surfaces and input actually work.
 
-See: [shell language design](../history/nitrox-shell-design-v1.2.md),
+See: [shell language design](../spec/shell-language.md),
 [shell + coreutils plan](../planning/shell-coreutils-plan.md),
 [typed stream wire format](../spec/typed-stream-format.md).
 
@@ -272,6 +272,6 @@ If you're new to the project and want depth on a specific area:
 - **Working day-to-day in the repo:** `docs/conventions/` for code style, `unsafe` policy, testing conventions, debugging.
 - **Specific lookup questions:** `docs/reference/` for catalogues — every kernel object, every syscall, every error code, every system capability.
 
-The full design document that produced this architecture lives in `docs/history/design-doc-v5.1.md`. It's a comprehensive single artifact rather than a working set, preserved for context and reference.
+The full design document that produced this architecture lives in `docs/archive/os-design-v5.1.md`. It's a comprehensive single artifact rather than a working set, preserved for context and reference.
 
 If you're a future Claude Code session, start with the per-subdirectory `CLAUDE.md` files for environment-specific guidance, then this overview, then whichever architecture/spec/reference document is closest to the task at hand.

@@ -32,7 +32,7 @@ privileged *classes of operation* in the few processes that need them.
 
 ## The capability set
 
-Six capabilities (the v5.1-committed set; `docs/history/os-design-v5.1.md` §"System
+Six capabilities (the v5.1-committed set; `docs/archive/os-design-v5.1.md` §"System
 Capability Bitmask"). Each is one bit of a `u64`:
 
 | Bit | Capability | Gates | Wired |
@@ -248,7 +248,7 @@ under QEMU.
 
 ## References
 
-- `docs/history/os-design-v5.1.md` §"System Capability Bitmask", §"Capability
+- `docs/archive/os-design-v5.1.md` §"System Capability Bitmask", §"Capability
   Bootstrap", §"Policy vs. Mechanism" — the committed model.
 - `docs/rationale/why-capabilities.md`; `docs/rationale/why-supervisor-registration.md`.
 - `docs/architecture/handle-system.md` — the `Rights` axis SysCaps complements.

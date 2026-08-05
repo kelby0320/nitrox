@@ -1708,7 +1708,8 @@ fn cmd_check_deferrals() -> R<()> {
 ///    promises it and tells readers to trust it over the body's tense.
 ///
 /// **Check 2 is deliberately scoped, and the escape hatch is deliberate too.** It skips
-/// `docs/history/` and `docs/planning/`, which are records rather than descriptions: a
+/// `docs/design/`, `docs/archive/` and `docs/planning/`, which are not descriptions of
+/// current behaviour: a
 /// ticked box reading "Retire `kernel/src/embedded_images.rs` entirely" cites a path that
 /// is absent *because the work succeeded*, and rewriting it would corrupt the record. The
 /// remaining false positive is the honest forward reference — `user-memory-access.md` says
@@ -1719,9 +1720,9 @@ fn cmd_check_docs() -> R<()> {
     const ALLOW: &str = "<!-- check-docs: allow-missing -->";
     let root = repo_root();
 
-    // Docs that describe how the system behaves today. `history/` (a record, including
-    // living design docs for unbuilt work) and `planning/` (intent, with checkboxes) are
-    // excluded from the source-path check for the reason in the doc comment above.
+    // Docs that describe how the system behaves today. `design/` (subsystems not yet
+    // built), `archive/` (superseded artifacts) and `planning/` (intent, with checkboxes)
+    // are excluded from the source-path check for the reason in the doc comment above.
     let describes_current = |p: &Path| {
         let s = p.to_string_lossy().replace('\\', "/");
         ["/docs/spec/", "/docs/reference/", "/docs/architecture/", "/docs/conventions/"]
@@ -1758,6 +1759,24 @@ fn cmd_check_docs() -> R<()> {
                 }
             }
 
+            // 2a. Backticked `docs/…​.md` references, in every doc. These are prose, not
+            // markdown links, so check 1 never sees them — which is exactly how
+            // `docs/history/design-doc-v5.1.md` survived in `overview.md` for months
+            // while the file was really named `os-design-v5.1.md`.
+            if !line.contains(ALLOW) {
+                for piece in line.split('`').skip(1).step_by(2) {
+                    // `docs/spec/rsproto-*.md` names a family, not a file.
+                    if !piece.starts_with("docs/") || !piece.ends_with(".md") || piece.contains('*')
+                    {
+                        continue;
+                    }
+                    paths += 1;
+                    if !root.join(piece).exists() {
+                        violations.push(at(&format!("cited doc does not exist: {piece}")));
+                    }
+                }
+            }
+
             // 2. Backticked repo-relative source paths, in current-behaviour docs only.
             if describes_current(path) && !line.contains(ALLOW) {
                 for piece in line.split('`').skip(1).step_by(2) {
@@ -1787,23 +1806,33 @@ fn cmd_check_docs() -> R<()> {
         visit_md_files_skipping(r, &["target"], &mut check)?;
     }
 
-    // 3. Every architecture doc states what is actually built.
-    let arch_dir = root.join("docs").join("architecture");
+    // 3. Every architecture and design doc states what is actually built. `design/` needs
+    //    it most: those documents describe subsystems with no code behind them.
     let mut arch_docs = 0usize;
-    if arch_dir.exists() {
-        for entry in fs::read_dir(&arch_dir)? {
+    for sub in ["architecture", "design"] {
+        let dir = root.join("docs").join(sub);
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(&dir)? {
             let path = entry?.path();
             if path.extension().map_or(false, |e| e == "md") {
                 arch_docs += 1;
                 let text = fs::read_to_string(&path)?;
                 let has_status = text.lines().take(20).any(|l| {
-                    let t = l.trim_start_matches("> ").trim_start_matches('*').to_lowercase();
+                    let t = l
+                        .trim_start_matches('#')
+                        .trim_start_matches("> ")
+                        .trim_start_matches('*')
+                        .trim_start()
+                        .to_lowercase();
                     t.starts_with("status")
                 });
                 if !has_status {
                     violations.push(format!(
-                        "{}: no Status line in the first 20 lines — every architecture doc \
-                         must state what is actually built (root CLAUDE.md promises this)",
+                        "{}: no Status line in the first 20 lines — every architecture and \
+                         design doc must state what is actually built (root CLAUDE.md \
+                         promises this)",
                         path.display()
                     ));
                 }

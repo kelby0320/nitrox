@@ -4209,9 +4209,9 @@ drivers) toward the milestone where init actually mounts a root fs.
 
 The paper layer for the storage slice — the ABI and object contracts settled
 before any of it gets baked into the kernel ABI hash. New specs:
-[`docs/spec/io-operation.md`](../spec/io-operation.md) (`IoOp`/`IoOpcode`),
-[`docs/spec/irp-layout.md`](../spec/irp-layout.md) (`Irp` + sub-types), and
-[`docs/spec/device-node.md`](../spec/device-node.md) (the `DeviceNode` object,
+[`docs/spec/io-operation.md`](spec/io-operation.md) (`IoOp`/`IoOpcode`),
+[`docs/spec/irp-layout.md`](spec/irp-layout.md) (`Irp` + sub-types), and
+[`docs/spec/device-node.md`](spec/device-node.md) (the `DeviceNode` object,
 resource descriptor, and block-device naming). `syscall-abi.md`,
 `abi-version-hash.md`, and `deferred-decisions.md` updated to match. The
 consequential decisions:
@@ -9656,7 +9656,7 @@ with, which is precisely the ambient authority per-process namespaces exist to r
 "absence is the sandbox" means nothing if absence is never arranged. A profile is a *choice*
 about what a user may run; the initramfs is an accident of what booting needed. So: the
 profile server's `/bin`, which
-[`profiles-and-namespace-projection.md`](../architecture/profiles-and-namespace-projection.md)
+[`profiles-and-namespace-projection.md`](architecture/profiles-and-namespace-projection.md)
 already named as the answer. System profile only; per-user overlays stay deferred, since
 nothing yet needs two users to see different programs.
 
@@ -10601,3 +10601,83 @@ Two negative controls, both failing as they should: `sleep` ignoring the request
 the shell not asking times out.
 
 1105 host tests, `test-qemu` green, `test-interactive` green at 22 steps, all five gates.
+
+## 2026-08-05 — The docs consistency pass: `docs/history/` dissolved, and a gate
+
+Two problems reported together: docs that describe a system the code has moved past, and
+changes that turn out to be wrong some commits later. The second produced a PR review skill
+run from a separate session (`.claude/skills/pr-review/`). This entry covers the first.
+
+**What the audit found.** The drift was not where either of us expected. The numeric
+contracts were *perfect* — all 37 syscalls and 16 error codes in `spec/syscall-abi.md` and
+`reference/error-codes.md` match the kernel exactly. ABI discipline held. Everything wrong
+was prose and status:
+
+- **17 dangling links**, every one in a "See also" block, and none of them stale — the
+  targets were never written. `architecture/overview.md`, the file `CLAUDE.md` tells you to
+  read *first*, pointed at five nonexistent documents.
+- **`boot-flow.md` was frozen about a year back**, calling the kernel "intentionally a
+  brick that *displays a sign*" and placing the IDT, memory management, IPC, the scheduler,
+  init and login under headings marked "(deferred)". Rewritten from source.
+- **11 of 22 architecture docs had no Status line**, and four more were wrong.
+  `drivers-and-irps.md` named six components as unimplemented `KObjectType` tags; all six
+  exist. `scheduler.md` said the `REAL_TIME` gate "needs the `SysCaps` capability system,
+  which doesn't exist" — SysCaps shipped in slice 6 and the gate came with it.
+- **One stale comment in code**: `tools/xtask` had two stacked doc comments on
+  `IMAGE_SIZE_MIB`, the first reading "64 is enough…" above `= 128`. `boot-flow.md` had
+  inherited the 64.
+
+**`docs/history/` was misnamed from the start** — it began as the place the original design
+document went, and then accreted three incompatible things: an actively-appended reasoning
+record, a frozen artifact, and four *living* design docs for work that is mostly unbuilt.
+That is the structural cause of "read the docs, believe the wrong thing". Dissolved:
+
+| Was | Now |
+|---|---|
+| `history/decision-log.md` | `docs/decision-log.md` — an active record, not history |
+| `history/os-design-v5.1.md` | `docs/archive/os-design-v5.1.md` — superseded, frozen |
+| `history/nitrox-{display-substrate,ui-composition-model,desktop-shell}-v*.md` | `docs/design/` — designed, no code |
+| `history/nitrox-shell-design-v1.2.md` | `docs/spec/shell-language.md` — a language contract, and built |
+
+A `design/` doc **graduates to `architecture/` when the code lands**; the milestone that
+builds it carries that move as a checkbox, because the doc is otherwise what nobody
+remembers to update.
+
+**Filenames no longer carry version numbers.** `nitrox-shell-design-v1.1.md` → `v1.2.md`
+forced updating 7 references the week before; `ui-composition-model-v1` → `v2` did the same.
+A version in a filename guarantees link rot on every revision — a self-inflicted source of
+exactly the drift being cleaned up. The version lives in the doc's Status line and git
+carries the history. `archive/os-design-v5.1.md` keeps its version: there it is the
+artifact's identity, and the file is frozen.
+
+**`cargo xtask check-docs`** now gates the mechanical half in CI, on the `abi-sync-check`
+precedent — that gate exists because `libkern` mirrors the kernel ABI with nothing tying
+them together, and this is the same shape. It checks link integrity, cited source paths,
+cited `docs/*.md` paths, Status-line presence in `architecture/` and `design/`, and the
+syscall and error tables against the kernel. That last closes a real gap: `abi-sync-check`
+ties kernel↔libkern, but nothing tied either to the documentation.
+
+**Three things the gate taught, all from running it rather than designing it:**
+
+1. **A naive "cited path must exist" check is wrong.** A ticked box reading "Retire
+   `kernel/src/embedded_images.rs` entirely" cites a path absent *because the work
+   succeeded*; `user-memory-access.md` says "*When* aarch64 is implemented its primitives
+   live in …". Both are correct as written. Hence the scoping to current-behaviour docs
+   plus a `<!-- check-docs: allow-missing -->` escape.
+2. **The gate caught breakage introduced during the pass itself** — moving
+   `decision-log.md` up a directory invalidated four of its own relative links, which the
+   rewrite script had not accounted for.
+3. **The empty-parse guard matters more than the comparison.** A checker that parses zero
+   entries and reports success is vacuous, and would stay green forever after any format
+   change. It now fails loudly if either side parses empty. **The first negative control
+   for that guard was invalid**: renaming `KError` to `KErrorRenamed` did not fire it,
+   because `find("enum KError")` still matches as a prefix — the test looked like proof the
+   guard was broken when it only proved the control was. A negative control that fails to
+   fail is indistinguishable from a check that does not work.
+
+`decision-log.md` entries are **append-only**. Two entries here reference `docs/history/`;
+they are true as of their dates and were deliberately left, because correcting a dated
+record to match today's layout destroys the evidence it exists to preserve.
+
+1105 host tests, all six gates green (check-arch, check-nightly, check-deferrals,
+check-docs, check-irq-scope, abi-sync-check), kernel builds.

@@ -2,6 +2,10 @@
 
 ## Status
 
+**Not built.** This describes a subsystem with no code behind it; the build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when the desktop shell lands (Milestone 7).
+
 What a user actually sees and touches: the bars, the applications modal, the overview, and
 the desktop indicator. Settled with the maintainer 2026-08-04, with two items deliberately
 shelved (§9).
