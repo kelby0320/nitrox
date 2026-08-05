@@ -1,0 +1,20 @@
+[package]
+name = "compositor"
+version = "0.1.0"
+edition = "2024"
+
+# The compositor. Split the way `fs-server-ext4` and `nxsh` are: the **window model** is a
+# library — the stack, roles and struts, commit application, and compositing — with no
+# syscalls in it, so it host-tests in milliseconds instead of through a boot. The server
+# half (`/dev/draw`, IPC, mapped buffers) is the bin, and lands with plan M2 Part B.
+#
+# Pixels arrive as borrowed slices via `BufferSource`, not owned buffers: in the server
+# they are mapped `MemoryObject`s the client drew into, and copying every frame to satisfy
+# the type would defeat the whole shared-memory design.
+[dependencies]
+libdraw = { path = "../libdraw" }
+librsproto = { path = "../librsproto" }
+
+[lib]
+name = "compositor"
+path = "src/lib.rs"

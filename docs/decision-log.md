@@ -11014,3 +11014,50 @@ construction, since `PixelFormat`'s public fields made one constructible and the
 paths index a 4-byte word while striding by `bytes_per_pixel()`.
 
 1159 host tests, all six gates, `test-qemu` and the display gate green.
+
+## 2026-08-05 — Display arm M2 Part A: the surface protocol, and roles fixed at creation
+
+Windows, shared buffers, commit and release — as a new rsproto category rather than a
+bespoke protocol, because `/dev/draw` is a **userspace resource server with a subtree
+base**, the same binding kind `/home` uses, so window paths are already forwarded resolves
+(`ui-composition-model.md` §2a). `Surface` takes `0x09xx` from the reserved range and gets
+`docs/spec/rsproto-surface-ops.md` alongside the other per-category specs.
+
+**No kernel surface is added.** `sys_memory_create`/`_map`, handle transfer on an IPC
+message, and notifications already exist, which the substrate doc calls the strongest
+argument for this shape.
+
+**Two protocol decisions settled with the maintainer, both freezing here** because the
+plan puts roles in Milestone 2 and "retrofitting a role into a shipped protocol touches
+every client".
+
+*Role is immutable after creation.* A change would force the compositor to redo struts,
+focus policy and stacking mid-flight; a client wanting a different role creates a different
+window, which is what a menu or a dialog already is.
+
+*Struts are declared, not derived from geometry* — `dock: Edge` plus `reserve: u32`. The
+two genuinely differ: a **fullscreen** window covers a panel's pixels while the panel still
+reserves that space for *maximised* windows. Deriving would also make a partial-width bar,
+or one reserving less than it occupies, inexpressible.
+
+**The compositor is split like `fs-server-ext4` and `nxsh`**: the window model is a library
+with no syscalls — stack, roles, struts, commit application, compositing — and the server
+half (`/dev/draw`, IPC, mapped buffers) is the bin that lands with Part B. Pixels arrive
+through a `BufferSource` trait rather than being owned, because in the server they are
+mapped `MemoryObject`s and owning them would mean a copy per frame, defeating the
+shared-memory design.
+
+**`Release` names the buffer that *left* the screen**, not the one that arrived. Releasing
+the newly committed buffer would hand the client back memory the compositor is about to
+read — precisely the tearing this protocol exists to prevent — and re-committing the same
+buffer releases nothing, since the client already owns nothing else.
+
+Rejections recorded in the spec so nobody re-proposes them: pixels over IPC (copying a
+frame through messages), and server-allocated buffers (which makes the compositor the
+allocator for every client's rendering).
+
+Verified non-vacuous by breaking four behaviours: releasing the new buffer instead of the
+previous, panels taking focus, struts reserving nothing, and accepting a pitch that would
+alias rows. Each was caught by the tests written for it; the tree restored byte-identical.
+
+1186 host tests (up from 1159), all six gates green.

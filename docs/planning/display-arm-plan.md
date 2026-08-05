@@ -2,7 +2,8 @@
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
-self-hash, and the `screendump` smoke gate. Milestone 2 (a client with a surface) is next.
+self-hash, and the `screendump` smoke gate. **Milestone 2 is in progress** — Part A (the
+surface protocol and the window model) landed 2026-08-05.
 
 ## What this is
 
@@ -82,7 +83,7 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 
 **Deliverable: a program's pixels appear in a window, verified by hash.**
 
-- [ ] **Part A — the surface protocol.** Create, share the `MemoryObject`, `Commit { buffer,
+- [x] **Part A — the surface protocol.** ✅ (2026-08-05) Create, share the `MemoryObject`, `Commit { buffer,
       damage }`, release. Host-tested against the in-memory framebuffer. No new syscalls —
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
 - [ ] **Part B — `/dev/draw` served.** `new`, numbered windows, `info`. The same

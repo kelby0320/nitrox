@@ -265,6 +265,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("session-mgr", mode.features())?;
     // A library with no consumer yet — see `check_userspace_lib`.
     check_userspace_lib("libdraw")?;
+    check_userspace_lib("compositor")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -1419,6 +1420,16 @@ fn cmd_test() -> R<()> {
         .arg("libdraw")
         .arg("--features")
         .arg("io")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `compositor` host tests — the window model: roles, struts, the buffer lifecycle,
+    // stacking, and compositing. No syscalls in the library half (the server bin lands
+    // with M2 Part B), so it host-tests like `nxsh`'s language half.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("compositor")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
