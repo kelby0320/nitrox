@@ -194,6 +194,32 @@ impl Transport for ChannelTransport {
         }
     }
 
+    fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
+        loop {
+            // A parked message counts: it is already here and older than anything on the
+            // wire, so blocking first would be wrong.
+            if let Some(ev) = self.poll_event(buf)? {
+                return Ok(ev);
+            }
+            let handles = [self.channel];
+            let mut results = [0u8; 24];
+            // SAFETY: a valid handle array and result buffer for one waiter. `sys_wait` is
+            // where the thread blocks — never inside the recv.
+            let waited = unsafe {
+                syscall4(
+                    SYS_WAIT,
+                    handles.as_ptr() as u64,
+                    1,
+                    results.as_mut_ptr() as u64,
+                    u64::MAX,
+                )
+            };
+            if waited != 1 {
+                return Err(UiError::Transport);
+            }
+        }
+    }
+
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
         // Parked messages first: a `Release` that arrived while we were waiting for a reply
         // is still an event the client needs, and it is older than anything on the wire.

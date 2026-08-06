@@ -11229,3 +11229,58 @@ every assertion still holds. It catches the two breaks that matter, and another 
 the flag — but the name promises more than the body checks.
 
 1214 host tests, all six gates green, `test-qemu` green, display gate green.
+
+## 2026-08-06 — Display arm M2 Part D: the first real client, and what it caught
+
+A second process now connects over `/dev/draw`, shares memory with the compositor, and
+requires it to talk back:
+
+```
+ui-testclient: committed 6 frames over 2 buffers
+ui-testclient: scene presented via /dev/draw
+xtask: display gate PASSED — the 64x32 scene on screen matches libdraw pixel for pixel ✓
+```
+
+The scene reaching the screen now travels the whole protocol rather than being written
+straight to the aperture, so §8c compares what a client actually produced.
+
+**Six frames over two buffers is the load-bearing detail.** Frames 3–6 are only reachable
+if the compositor released each buffer as it left the screen. This is the test that could
+not have passed against the one-way protocol PR #174 shipped, and it failed on its first
+run for a different reason, which is the point of writing it.
+
+**Three bugs it found, none visible to 1213 host tests or three green CI jobs.**
+
+*`libui` had no way to wait.* `poll_event` is non-blocking, so the client asked once,
+found nothing free, and stalled at frame 2 — a release that has not arrived *yet* is not
+one that will never arrive. The library now has `Transport::wait_event` and
+`Window::acquire`, which drains pending events and blocks only if every buffer is still
+held. That is the call a render loop actually wants; `next_free` alone was never enough.
+
+*The compositor acknowledged before it painted.* `send_release` ran before `repaint`, so a
+client learned its buffer was free while the frame was still unpainted, and anything pacing
+off that — the display gate, or a second client — observed a screen that had not caught up.
+Same shape as announcing `Ready` before clearing, fixed the same way: do the work, then
+report it.
+
+*The test itself was wrong, and the compositor was right.* After presenting, the client
+exited; the compositor saw `PeerClosed`, destroyed its windows — correctly — and repainted
+to background, so the gate captured an empty screen that looked exactly like a compositing
+failure. Diagnosing it took reading the framebuffer back after `compose` (`33,33,33`,
+correct) and reproducing the exact guest geometry in a host test (passes). Only then was it
+clear the composite was fine and the *window* was gone. A real client does not exit while
+its window is on screen, so this one parks and reports failures through `SYS_TEST_EXIT`
+instead of an exit code.
+
+That last one is worth keeping: **when the picture is wrong, the compositor is not the only
+suspect** — the window may simply no longer exist. The host test written to isolate it
+(`the_guest_configuration_composites_a_client_surface`) stays, because it pins the exact
+1280×800/5120 + 64×32/256 shape the guest produces.
+
+**Part C is now genuinely complete and Part B genuinely is not.** B replies on session
+channels — proven by a client that cannot proceed without it — but only `new` resolves;
+numbered window paths and `info` remain. Part C's earlier tick also claimed input and an
+event loop, which are M3.
+
+1218 host tests, all six gates green, `test-qemu` green, display gate green through the
+full client path.

@@ -193,6 +193,7 @@ dependencies = [
  "libos",
  "librsproto",
  "libstream",
+ "libui",
 ]
 
 [[package]]

@@ -242,7 +242,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.features().is_some() {
-        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest"], None)?;
+        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest", "ui-testclient"], None)?;
     }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
@@ -934,7 +934,12 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The guest paces this: capture only once it says the scene is on the screen.
     // Screendumping on a timer would race the boot and produce a blank or half-drawn
     // frame that looks like a real mismatch.
-    session.expect("display-selftest: presented scene at (0,0)")?;
+    //
+    // Since M2 Part D the scene arrives through the **whole Surface protocol** — a real
+    // client sharing memory with the compositor — rather than being written straight to
+    // the aperture. The client emits this only after a `Release` acknowledges its final
+    // commit, so the frame is composited by the time we capture.
+    session.expect("ui-testclient: scene presented via /dev/draw")?;
     qmp.screendump(&shot)?;
 
     let captured = fs::read(&shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
@@ -2827,6 +2832,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         programs.push("test-harness");
         programs.push("test-stage");
         programs.push("display-selftest");
+        programs.push("ui-testclient");
     }
     let mut ino = 3u32;
     for name in programs {

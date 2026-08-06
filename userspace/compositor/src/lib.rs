@@ -731,6 +731,44 @@ mod tests {
     }
 
     #[test]
+    fn the_guest_configuration_composites_a_client_surface() {
+        // The exact shape `ui-testclient` produces in the guest: a 1280x800 screen at
+        // pitch 5120, a 64x32 client surface at pitch 256, window origin (0,0). Written
+        // after the guest showed pure background in the window region with every guard in
+        // `compose_into` passing and the client's pixels verified correct.
+        let mut fb = MemFramebuffer::new(
+            Geometry::with_pitch(1280, 800, 5120, PixelFormat::XRGB8888).unwrap(),
+        );
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 64, height: 32, role: Role::Normal }).unwrap();
+        s.attach(&AttachBufferRequest {
+            window: w,
+            buffer: 0,
+            width: 64,
+            height: 32,
+            pitch: 256,
+            format: SURFACE_FORMAT_XRGB8888,
+        })
+        .unwrap();
+        let g = Geometry::with_pitch(64, 32, 256, PixelFormat::XRGB8888).unwrap();
+        let marker = Rgb::new(33, 33, 33);
+        src.put(w, 0, g, marker);
+        s.commit(&commit(w, 0)).unwrap();
+
+        let bounds = fb.geometry().bounds();
+        s.compose_into(&mut fb, Rgb::new(0x0E, 0x14, 0x1B), &src, &[bounds]);
+
+        assert_eq!(fb.get_pixel(6, 5), Some(marker), "the client's surface must reach the screen");
+        assert_eq!(fb.get_pixel(63, 31), Some(marker), "including its last pixel");
+        assert_eq!(
+            fb.get_pixel(64, 0),
+            Some(Rgb::new(0x0E, 0x14, 0x1B)),
+            "and stop at its edge"
+        );
+    }
+
+    #[test]
     fn a_bad_pitch_is_refused_at_attach() {
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();

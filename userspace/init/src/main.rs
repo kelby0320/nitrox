@@ -155,6 +155,20 @@ static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
+/// Spawn args for `ui-testclient` (display arm M2 Part D): no handles, inheriting a
+/// LOOKUP-only handle to init's root namespace so it resolves `/dev/draw/new`. **No
+/// syscaps** — authority over the display is the namespace binding, nothing more.
+#[cfg(feature = "selftest")]
+static mut SPAWN_UICLIENT: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/ui-testclient
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+    syscaps: 0,
+};
 /// Spawn args for `display-selftest` (display arm M1 Part C): no handles, and it
 /// inherits a LOOKUP-only handle to init's root namespace so it resolves
 /// `/dev/framebuffer` and `/dev/framebuffer/info`. **No syscaps** — it binds nothing;
@@ -1610,6 +1624,34 @@ fn run_display_selftest(notif: u64, root_ns: u64) {
     }
 }
 
+/// Spawn `ui-testclient` — the display arm's first real client.
+///
+/// **Spawned, not awaited.** On success the client *parks*: exiting would close its
+/// channel, and the compositor would correctly destroy its windows and repaint, leaving
+/// the display gate to capture an empty screen. So it reports its own failures through
+/// `SYS_TEST_EXIT` — the same verdict path init uses — and a successful run simply leaves
+/// its window on screen for the rest of the boot.
+///
+/// This is the first test that exercises a client and the compositor together. Everything
+/// before it tested one half: `libui` against a mock, the compositor against nothing. That
+/// is how a one-way protocol shipped with green CI.
+#[cfg(feature = "selftest")]
+fn run_ui_testclient(root_ns: u64) {
+    // SAFETY: SPAWN_UICLIENT is a valid writable arg block.
+    let h = unsafe {
+        spawn_program(root_ns, b"/initramfs/sbin/ui-testclient", &raw mut SPAWN_UICLIENT)
+    };
+    if h < 0 {
+        kprint(b"init: ui-testclient spawn FAIL\n");
+        #[cfg(feature = "test-harness")]
+        test_exit(false);
+        return;
+    }
+    // SAFETY: closing init's reference; the client runs on and is reaped by `reap_loop`
+    // if it ever does exit.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+}
+
 /// The healthy supervise path. **Normally**, hand off to the service manager: spawn
 /// it and supervise it via [`reap_loop`] (if service-mgr exits — a critical fault —
 /// reap_loop drops to the emergency console as the interim recovery, until a reboot
@@ -1812,6 +1854,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
 
     #[cfg(feature = "selftest")]
     run_display_selftest(notif, root_ns);
+
+    // After the compositor is serving: the first client. Its committed buffer is what
+    // `check-display` compares, so it runs last and leaves the scene on screen.
+    #[cfg(feature = "selftest")]
+    run_ui_testclient(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

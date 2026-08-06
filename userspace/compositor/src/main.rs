@@ -438,14 +438,21 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             repaint(srv, fb);
         }
         Outcome::Applied { release } => {
-            if let Some((window, buffer)) = release {
-                send_release(ch, window, buffer);
-            }
             // A destroy is transitive, so drop every mapping whose window is gone.
             // Otherwise a client looping create/attach/destroy grows the compositor's
             // address space without bound.
             srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
+
+            // **Paint before releasing.** A `Release` is the client's evidence that the
+            // commit it displaced has been dealt with; sending it first tells the client
+            // the frame is done while the pixels are still unpainted. The client then
+            // reports progress, and anything pacing off that — the display gate, or a
+            // second client — observes a screen that has not caught up. Same shape as
+            // announcing `Ready` before clearing the screen.
             repaint(srv, fb);
+            if let Some((window, buffer)) = release {
+                send_release(ch, window, buffer);
+            }
         }
         Outcome::Failed(e) => {
             kprint(match e {
