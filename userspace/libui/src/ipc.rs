@@ -27,9 +27,14 @@ const MAX_BODY: usize = 64;
 /// point arbitrarily far from the discard that caused it. Reporting it turns a silent hang
 /// into a loud failure (PR #175 review, finding 9).
 ///
-/// Nothing reaches this today — only `Window::new` waits for a reply, so at most a couple
-/// of messages can park — which is exactly why it is worth making the unreachable case
-/// noisy while it is still unreachable.
+/// **It is reachable, and `parked_len` never resets between requests.** It accumulates for
+/// the life of the connection for any client that does not drain events, and the ops that
+/// fill it are the ones the protocol calls silent: `AttachBuffer`, `Commit` and
+/// `DestroyWindow` send nothing on success and an error reply on failure. A client that
+/// ignores those replies — which the spec, until this was written down, gave it no reason
+/// not to — dies at the ninth rejection, and it surfaces on an unrelated later request as
+/// `Transport` with nothing pointing at the cause. Drain with `Window::pump` or
+/// `poll_event` (PR #175 review, finding 3).
 const MAX_PARKED: usize = 8;
 
 /// A connection to the compositor over an IPC channel.
@@ -90,6 +95,24 @@ impl ChannelTransport {
         .map_err(|_| UiError::Transport)?;
         // SAFETY: a live endpoint this process now owns.
         Ok(unsafe { Self::new(ch.into_raw().0) })
+    }
+}
+
+impl Drop for ChannelTransport {
+    /// Close the endpoint — **a dropped transport must not strand a compositor session**.
+    ///
+    /// `connect` takes ownership via `Handle::into_raw`, which suppresses the close, and
+    /// nothing closed it afterwards. The compositor frees a session slot only on
+    /// `PeerClosed`, which never arrives while the endpoint is open, so every dropped
+    /// transport cost a slot for the compositor's life. There are `MAX_WAIT_HANDLES - 1` =
+    /// 31 of them, shared by the whole machine: one client opening and dropping 31
+    /// connections makes `/dev/draw/new` fail for **every** process, permanently, while the
+    /// offending client keeps running and looks healthy (PR #175 review, finding 4).
+    fn drop(&mut self) {
+        if self.channel != 0 {
+            // SAFETY: closing an endpoint this transport owns and no longer uses.
+            unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, self.channel, 0, 0, 0) };
+        }
     }
 }
 

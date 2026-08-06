@@ -634,6 +634,36 @@ mod tests {
     }
 
     #[test]
+    fn window_info_sits_at_the_offsets_the_spec_publishes() {
+        // A round trip cannot see a swapped pair — `write` and `read` agree with each other
+        // whatever they agree on. `docs/spec/rsproto-surface-ops.md` publishes an exact
+        // byte table as a contract for other implementations, so the bytes are pinned here
+        // rather than only their symmetry (PR #175 review, finding 7).
+        let info = WindowInfo {
+            id: 0x1112_1314,
+            width: 0x2122_2324,
+            height: 0x3132_3334,
+            x: -2,
+            y: -3,
+            role: 0x5152,
+            dock: 0x6162,
+            reserve: 0x7172_7374,
+            parent: 0x8182_8384,
+        };
+        let mut b = [0u8; 32];
+        info.write(&mut b).unwrap();
+        assert_eq!(&b[0..4], &0x1112_1314u32.to_le_bytes(), "id @0");
+        assert_eq!(&b[4..8], &0x2122_2324u32.to_le_bytes(), "width @4");
+        assert_eq!(&b[8..12], &0x3132_3334u32.to_le_bytes(), "height @8");
+        assert_eq!(&b[12..16], &(-2i32).to_le_bytes(), "x @12, signed");
+        assert_eq!(&b[16..20], &(-3i32).to_le_bytes(), "y @16, signed");
+        assert_eq!(&b[20..22], &0x5152u16.to_le_bytes(), "role @20");
+        assert_eq!(&b[22..24], &0x6162u16.to_le_bytes(), "dock @22");
+        assert_eq!(&b[24..28], &0x7172_7374u32.to_le_bytes(), "reserve @24");
+        assert_eq!(&b[28..32], &0x8182_8384u32.to_le_bytes(), "parent @28");
+    }
+
+    #[test]
     fn window_info_round_trips_every_role() {
         let cases = [
             (Role::Normal, 0u16, 0u32, 0u32),

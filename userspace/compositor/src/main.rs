@@ -62,6 +62,11 @@ const MAX_BODY: usize = 64;
 /// One less than the wait limit: the forwarding endpoint takes the first slot.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
 
+/// How many client-driven rejections get logged before the tap closes.
+const MAX_LOGGED_REJECTIONS: u32 = 8;
+
+static mut REJECTIONS_LOGGED: u32 = 0;
+
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -484,7 +489,15 @@ fn surface_errno(e: SurfaceError) -> KError {
         SurfaceError::Malformed => KError::InvalidArgument,
         SurfaceError::Unsupported => KError::Unsupported,
         // A window belonging to another connection reports exactly what a nonexistent one
-        // does, so the reply cannot be used to probe which ids exist.
+        // does. **This is ownership enforcement, not secrecy** — a distinction worth being
+        // exact about, because this comment used to claim the reply "cannot be used to probe
+        // which ids exist" and that has not been true since `/dev/draw/<N>/info` landed:
+        // a namespace resolve answers the same question for any holder of `/dev/draw`
+        // (PR #175 review, finding 2). What collapsing the two cases still buys is that a
+        // client learns nothing *from acting* — it cannot tell "not yours" from "not there",
+        // so there is no oracle to walk by attempting operations, and the session channel
+        // remains the only place anything can be changed. Enumeration lives at the
+        // namespace, deliberately; see `docs/spec/rsproto-surface-ops.md`.
         SurfaceError::NotFound => KError::NotFound,
         SurfaceError::Rejected(_) => KError::InvalidArgument,
     }
@@ -630,12 +643,28 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             }
         }
         Outcome::Failed(e) => {
-            kprint(match e {
-                SurfaceError::Malformed => b"compositor: malformed request\n" as &[u8],
-                SurfaceError::Unsupported => b"compositor: unsupported op\n",
-                SurfaceError::NotFound => b"compositor: no such window for this connection\n",
-                SurfaceError::Rejected(_) => b"compositor: request rejected\n",
-            });
+            // **Logged a bounded number of times.** A rejection is client-driven, so this
+            // is an unbounded write to a shared console: one misbehaving client can bury
+            // every other service's output, and the churn probe alone produced 80 identical
+            // lines per boot (PR #175 review, finding 6). The first few are the diagnostic;
+            // the rest are noise, and the error still goes back to the client that caused
+            // it either way.
+            // SAFETY: single-threaded server incrementing its own counter.
+            let n = unsafe {
+                REJECTIONS_LOGGED += 1;
+                REJECTIONS_LOGGED
+            };
+            if n <= MAX_LOGGED_REJECTIONS {
+                kprint(match e {
+                    SurfaceError::Malformed => b"compositor: malformed request\n" as &[u8],
+                    SurfaceError::Unsupported => b"compositor: unsupported op\n",
+                    SurfaceError::NotFound => b"compositor: no such window for this connection\n",
+                    SurfaceError::Rejected(_) => b"compositor: request rejected\n",
+                });
+                if n == MAX_LOGGED_REJECTIONS {
+                    kprint(b"compositor: (further rejections not logged)\n");
+                }
+            }
             reply_error_on_session(ch, op, request_id, surface_errno(e));
         }
     }

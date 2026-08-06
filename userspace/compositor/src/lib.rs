@@ -347,6 +347,30 @@ mod tests {
         }
     }
 
+    /// A distinct colour per source row. A uniform fill cannot detect a row-stride error —
+    /// a skew just moves one shade onto an identical one — which is exactly how
+    /// `the_guest_configuration_composites_a_client_surface` passed against a compositor
+    /// reading the source at `width * 4` (PR #175 review, finding 1).
+    fn row_colour(y: u32) -> Rgb {
+        Rgb::new(0x20 + y as u8, 0x40, 0x80)
+    }
+
+    impl MapSource {
+        /// Fill with [`row_colour`], so which source row reached the screen is *readable
+        /// from the screen*.
+        fn put_striped(&mut self, window: u32, buffer: u32, g: Geometry) {
+            let mut px = vec![0u8; g.byte_len()];
+            for y in 0..g.height {
+                let word = g.format.encode(row_colour(y)).to_le_bytes();
+                for x in 0..g.width {
+                    let off = g.offset_of(x, y).unwrap();
+                    px[off..off + 4].copy_from_slice(&word);
+                }
+            }
+            self.0.insert((window, buffer), px);
+        }
+    }
+
     impl BufferSource for MapSource {
         fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
             self.0.get(&(window, buffer)).map(|v| v.as_slice())
@@ -773,15 +797,26 @@ mod tests {
         })
         .unwrap();
         let g = Geometry::with_pitch(64, 32, 268, PixelFormat::XRGB8888).unwrap();
-        let marker = Rgb::new(33, 33, 33);
-        src.put(w, 0, g, marker);
+        // Striped, not uniform. With a single colour every assertion below holds just as
+        // well against a compositor that reads the source at `width * 4` — which is the
+        // bug the 268 pitch exists to expose, so the test would have been asserting
+        // nothing about the thing it was written for.
+        src.put_striped(w, 0, g);
         s.commit(&commit(w, 0)).unwrap();
 
         let bounds = fb.geometry().bounds();
         s.compose_into(&mut fb, Rgb::new(0x0E, 0x14, 0x1B), &src, &[bounds]);
 
-        assert_eq!(fb.get_pixel(6, 5), Some(marker), "the client's surface must reach the screen");
-        assert_eq!(fb.get_pixel(63, 31), Some(marker), "including its last pixel");
+        // Each of these names the source row it must have come from. Read at pitch 256,
+        // screen row 5 lands in source row 4 and row 31 in source row 29 — different
+        // colours, so the skew is a failure rather than a coincidence.
+        assert_eq!(
+            fb.get_pixel(6, 5),
+            Some(row_colour(5)),
+            "the client's surface must reach the screen, row for row"
+        );
+        assert_eq!(fb.get_pixel(63, 31), Some(row_colour(31)), "including its last pixel");
+        assert_eq!(fb.get_pixel(0, 0), Some(row_colour(0)), "and its first");
         assert_eq!(
             fb.get_pixel(64, 0),
             Some(Rgb::new(0x0E, 0x14, 0x1B)),

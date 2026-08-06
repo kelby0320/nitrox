@@ -11526,3 +11526,68 @@ easily.
 (`DEFAULT_USER_STACK_SIZE`, `kernel/src/arch/x86_64/abi.rs`). Deliberately not done here —
 it is a kernel-wide change and this is a display PR. Boxing the transport is the right fix
 regardless: a 9 KiB struct does not belong in a stack frame at any stack size.
+
+### Review round 2 of PR #175 — a test that asserted nothing about its own subject
+
+The blocking finding is the one worth keeping, because the test in question was written
+*specifically* to close a gap and did not.
+
+`the_guest_configuration_composites_a_client_surface` pins the guest's shape at a source
+pitch of 268, and carries a comment saying the padding is the point — that a stride computed
+from the width instead of the pitch skews every row, and equal numbers would hide it. The
+test filled the surface with **one colour**, so a row skew moved that colour onto itself.
+With the compositor reading the source at `width * 4`, the whole compositor suite passed and
+`check-display` failed at 1151 of 2048 pixels. The assertion held for both the correct and
+the broken implementation.
+
+Fixed by filling with a **distinct colour per row**, so which source row reached the screen
+is readable from the screen: at pitch 256, screen row 5 lands in source row 4, and the
+assertion names the row it must have come from. Verified against the same break — `left: 36,
+right: 37`, the two adjacent row colours.
+
+Two lessons, and the second is the general one. First: **a uniform fixture cannot detect a
+geometry bug**, because every wrong answer is the right colour. Second: the behaviour *was*
+covered, by `check-display` — so the code was never wrong, only the claim about what
+guarded it. That is worse than an untested behaviour, because the comment invited the next
+person to trim the display gate's path filter believing the host test carried this.
+
+**Enumeration: the compositor answered the same question two ways.** `surface_errno`
+collapsed "not yours" into "not there" with a comment saying the reply "cannot be used to
+probe which ids exist" — which stopped being true the moment `/dev/draw/<N>/info` landed,
+since a namespace resolve answers it for any holder of `/dev/draw`, and ids run sequentially
+from 1. Resolved by choosing, not by patching: **the namespace is where you ask, the session
+channel is where you act.** Enumerable metadata is deliberate — a window manager needs
+exactly that, and holding `/dev/draw` is how it is authorised — while the session rule's real
+job is ownership enforcement: a client learns nothing *from acting*, so there is no oracle to
+walk by attempting operations, and it can never reach another client's pixels. Both halves
+are now in the spec, with the note that hiding a window in future means changing **both**
+doors, since scoping one alone achieves nothing.
+
+**A spec gap explained a bug that looked like a client bug.** `AttachBuffer`, `Commit` and
+`DestroyWindow` are silent on success and reply with an error on failure — an asymmetry the
+per-op sections never stated. A client reading only the spec never learns it must drain those
+replies, and dies at the ninth rejection when `MAX_PARKED` fills, at a point arbitrarily far
+from the cause. Now a table in the spec, and the `MAX_PARKED` doc no longer claims the case
+is unreachable: it is reachable, `parked_len` never resets, and the reviewer reached it by
+reverting the probe to fire-and-forget.
+
+**`ChannelTransport` had no `Drop`**, so a dropped transport stranded a compositor session
+slot forever — 31 of them machine-wide, shared, and one client opening and dropping that many
+makes `/dev/draw/new` fail for **every** process while the offender looks healthy. The same
+class as the three leaks fixed the round before, on the client side of the same protocol.
+
+**A rejection log line was an unbounded client-driven write to a shared console** — the churn
+probe alone produced 80 identical lines a boot. Capped at 8 with a closing notice.
+
+**Sizing a probe against the sparsest leak it must catch.** Adding a second disposal path to
+the churn cycle (a handle riding `Commit`, which is what distinguishes the new exhaustive
+disposal from the old attach-only shape) made each break leak on only *half* the cycles. At
+80 cycles that is 120 MiB, the guest absorbed it, and the probe passed against the narrowed
+code — vacuous, in the exact way the blocking finding was. Raised to 128 so the alternating
+half alone is 192 MiB; the break now fails at cycle 124. **A probe sized against its
+densest leak is not sized at all.**
+
+And `WindowInfo`'s byte offsets are now asserted directly, not merely round-tripped: a
+symmetric swap of `x` and `y` in both `write` and `read` left the whole librsproto suite
+green while the new test fails. The PR publishes that table as a contract for other
+implementations, and a table nothing checks is a table that drifts.

@@ -89,14 +89,30 @@ compositor unmaps its own copy before replying and never writes to it again. Val
 current as of the resolve and never change afterwards. Poll by resolving again.
 
 **Any holder of `/dev/draw` may read any window's `info`, including windows it does not
-own.** This is deliberate. A forwarded resolve carries no connection identity — the
-namespace hands the compositor a path, not a caller — so `info` cannot be scoped to the
-owning client without inventing an identity the protocol does not have. What the protocol
-gates is **pixels**: buffers are reachable only through connection-scoped window ids, and
-the ownership check precedes every mapping. Window *geometry* is not treated as secret
-between processes that already share a screen. If a future role holds content whose
-existence or placement must be hidden from a peer that already has draw access, that is a
-change to this rule and needs its own decision.
+own, and may enumerate windows by walking ids.** This is deliberate, and it is the
+system's answer to a question the session channel answers differently — so the split is
+worth stating exactly, because the two doors are easy to mistake for one.
+
+- **The namespace is where you ask.** `<N>/info` is the enumeration surface. Ids come from a
+  counter starting at 1, so walking them reveals which windows exist, their geometry, and
+  their roles. A window manager or desktop shell needs precisely this, and holding
+  `/dev/draw` is how it is authorised to have it.
+- **The session channel is where you act, and it is scoped.** Every operation names a window
+  through a connection, and a window belonging to another connection reports exactly what a
+  nonexistent one does. That is **ownership enforcement, not secrecy**: a client learns
+  nothing *from acting*, so there is no oracle to walk by attempting operations, and it can
+  never reach another client's pixels.
+
+A forwarded resolve carries no connection identity — the namespace hands the compositor a
+path, not a caller — so `info` **cannot** be scoped to the owning client without inventing
+an identity the protocol does not have. Given that, enumerable metadata is a choice, not an
+accident: window geometry is not treated as secret between processes that already share a
+screen, while **pixels** are, and stay behind connection-scoped ids and the ownership check
+that precedes every mapping.
+
+If a future role holds content whose existence or placement must be hidden from a peer that
+already has draw access, **both doors have to change together** — scoping the session
+channel alone would achieve nothing while this path answers freely.
 
 ## The buffer lifecycle
 
@@ -129,6 +145,30 @@ same buffer gets no release, because it already owns nothing else.
 non-starter, named here so nobody proposes it as a simplification. **Rejected:
 server-allocated buffers** — that makes the compositor the allocator for every client's
 rendering and couples buffer lifetime to compositor policy.
+
+## Which requests reply, and why a client must drain
+
+This is the asymmetry a second implementation gets wrong if it reads only the per-op
+sections, so it is stated once, normatively:
+
+| Op | On success | On failure |
+|---|---|---|
+| `CreateWindow` | reply carrying the window id | error reply |
+| `AttachBuffer` | **silent** | error reply |
+| `Commit` | **silent** | error reply |
+| `DestroyWindow` | **silent** | error reply |
+| `Release` | server-initiated; never a reply | — |
+
+An error reply carries `RS_FLAG_REPLY | RS_FLAG_ERROR` with the **same op and request id** as
+the request it refuses. Two consequences a client must handle:
+
+1. **A refusal is not a success.** Matching on `RS_FLAG_REPLY` and the request id alone
+   accepts an error body as a result — a client doing that will read a window id out of an
+   error code.
+2. **Refusals of otherwise-silent ops must be consumed.** They arrive unsolicited from the
+   client's point of view, since it was not waiting for anything. A client that never drains
+   them accumulates them until its receive path gives out, and the failure then appears at an
+   unrelated later request with nothing pointing at the cause.
 
 ## Window roles
 

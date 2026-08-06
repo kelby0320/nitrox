@@ -48,8 +48,8 @@ use libkern::{
     syscall4,
 };
 use librsproto::surface::{
-    AttachBufferRequest, OP_ATTACH_BUFFER, Role, SURFACE_FORMAT_XRGB8888,
-    build_attach_buffer_request,
+    AttachBufferRequest, CommitRequest, OP_ATTACH_BUFFER, OP_COMMIT, Role,
+    SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
 };
 use libui::Transport;
 use libui::{Window, ipc::ChannelTransport};
@@ -66,11 +66,14 @@ const BUFFERS: usize = 2;
 
 /// Window-churn cycles, and the buffer size each one shares with the compositor.
 ///
-/// Sized so the run **fails on a leak rather than merely leaking**: 80 × 3 MiB is 240 MiB
-/// against a 256 MiB guest, so if the compositor keeps a mapping for a window that no
-/// longer exists, `sys_memory_create` runs out and this reports it. A smaller buffer or
-/// fewer cycles would leak just as truly and pass just as green.
-const CHURN_CYCLES: usize = 80;
+/// Sized so the run **fails on a leak rather than merely leaking**, and sized against the
+/// *sparsest* leak it has to catch. The cycle alternates two disposal paths, so a break in
+/// either one leaks on only half the cycles: 128 cycles is 64 leaking ones at 3 MiB, which
+/// is 192 MiB against a 256 MiB guest. At 80 cycles a break in the alternating half leaked
+/// 120 MiB, the guest absorbed it, and the probe passed — vacuous coverage of exactly the
+/// kind this milestone keeps producing. A smaller buffer or fewer cycles would leak just as
+/// truly and pass just as green.
+const CHURN_CYCLES: usize = 128;
 /// Churn window width — the buffer is `CHURN_W * 4 * CHURN_H` = 3 MiB.
 const CHURN_W: u32 = 1024;
 /// Churn window height.
@@ -245,18 +248,40 @@ fn churn(root_ns: u64) -> bool {
             kprint(b"\n");
             return false;
         };
+        //
+        // Alternates between two *different* disposal paths, because they are distinguished
+        // by different code. An attach that is rejected exercises the outcome branch; a
+        // handle riding `Commit` exercises the op branch — and only the second one fails if
+        // the close is ever narrowed back to `if op == OP_ATTACH_BUFFER` with an else.
         let mut req = [0u8; 32];
-        let Some(rn) = build_attach_buffer_request(
-            &mut req,
-            &AttachBufferRequest {
-                window: 0xDEAD_BEEF,
-                buffer: 0,
-                width: CHURN_W,
-                height: CHURN_H,
-                pitch: pitch as u32,
-                format: SURFACE_FORMAT_XRGB8888,
-            },
-        ) else {
+        let built = if cycle % 2 == 0 {
+            build_attach_buffer_request(
+                &mut req,
+                &AttachBufferRequest {
+                    window: 0xDEAD_BEEF,
+                    buffer: 0,
+                    width: CHURN_W,
+                    height: CHURN_H,
+                    pitch: pitch as u32,
+                    format: SURFACE_FORMAT_XRGB8888,
+                },
+            )
+            .map(|n| (n, OP_ATTACH_BUFFER))
+        } else {
+            build_commit_request(
+                &mut req,
+                &CommitRequest {
+                    window: 0xDEAD_BEEF,
+                    buffer: 0,
+                    damage_x: 0,
+                    damage_y: 0,
+                    damage_w: CHURN_W,
+                    damage_h: CHURN_H,
+                },
+            )
+            .map(|n| (n, OP_COMMIT))
+        };
+        let Some((rn, bogus_op)) = built else {
             return false;
         };
         // **Waits for the refusal rather than firing and forgetting.** Two reasons: it
@@ -265,10 +290,10 @@ fn churn(root_ns: u64) -> bool {
         // an unrelated-looking reason. `Err(Server)` is the expected answer here; anything
         // else means the compositor accepted an attach to a window that does not exist.
         let mut reply = [0u8; 32];
-        match t.request(OP_ATTACH_BUFFER, &req[..rn], Some(bogus_handle), &mut reply) {
+        match t.request(bogus_op, &req[..rn], Some(bogus_handle), &mut reply) {
             Err(libui::UiError::Server) => {}
             _ => {
-                kprint(b"churn: bogus attach was not refused at cycle ");
+                kprint(b"churn: bogus request was not refused at cycle ");
                 kprint_u64(cycle as u64);
                 kprint(b"\n");
                 return false;
@@ -341,7 +366,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //     kept a single one of their buffers mapped. Before the presented window exists in
     //     its final form, so a churn window can never be what `check-display` captures.
     if !churn(root_ns) {
-        fail(b"ui-testclient: window churn FAILED -- compositor leaking buffer mappings?\n");
+        // Deliberately names **no** suspect. This line used to blame the compositor for
+        // leaking, and during review it misattributed two client-side failures in a row —
+        // the parked-queue overflow and a missing `RS_FLAG_ERROR` check. This PR's own
+        // lesson applies to its own diagnostics: when the picture is wrong, the compositor
+        // is not the only suspect. The `churn:` line above says which step failed.
+        fail(b"ui-testclient: window churn FAILED (see the churn: line above)\n");
     }
     kprint(b"ui-testclient: churned ");
     kprint_u64(CHURN_CYCLES as u64);
