@@ -6,9 +6,12 @@ obtains a window and gets its pixels onto the screen: create a window, attach a 
 buffer, commit it with a damage rectangle, and receive it back when the compositor is done.
 
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 2 Part A
-(`docs/planning/display-arm-plan.md`). `CreateWindow`, `AttachBuffer`, `Commit`, `Release`
-and `DestroyWindow` are defined. Input events, thumbnail capture, window movement and
-port wiring are later milestones and will extend this category.
+(`docs/planning/display-arm-plan.md`); the namespace surface completed in Part B.
+`CreateWindow`, `AttachBuffer`, `Commit`, `Release` and `DestroyWindow` are defined, and
+two paths resolve: `/dev/draw/new` for a session and `/dev/draw/<N>/info` for a window's
+metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Input
+events, thumbnail capture, window movement and port wiring are later milestones and will
+extend this category.
 
 ## Where it sits
 
@@ -55,6 +58,62 @@ so the compositor never has to ask *who is calling* — it already knows. It als
 lifetime question, since a client going away is a channel closing, which is exactly when
 its windows should be destroyed.
 
+## Reading a window's metadata — `/dev/draw/<N>/info`
+
+Resolving **`/dev/draw/<N>/info`**, where `<N>` is a decimal window id, answers with a
+**`MemoryObject` of exactly 32 bytes** (`OBJECT_KIND_MEMOBJ`) holding one `WindowInfo`. The
+same shape `/dev/framebuffer/info` uses: a resolve answers with an object the caller maps,
+not with a message.
+
+| Offset | Size | Type | Field |
+|---|---|---|---|
+| 0 | 4 | `u32` | `id` |
+| 4 | 4 | `u32` | `width` |
+| 8 | 4 | `u32` | `height` |
+| 12 | 4 | **`i32`** | `x` — screen coordinate, **signed**; a window may sit at a negative origin |
+| 16 | 4 | **`i32`** | `y` — likewise |
+| 20 | 2 | `u16` | `role` tag, as in `CreateWindow` |
+| 22 | 2 | `u16` | `dock` edge for a panel; otherwise zero |
+| 24 | 4 | `u32` | `reserve` for a panel; otherwise zero |
+| 28 | 4 | `u32` | `parent` for a popup/dialog; otherwise zero |
+
+All fields are little-endian. A read of fewer than 32 bytes is **refused, not read short**.
+
+**`width`/`height` report the committed buffer's geometry**, not the size requested at
+`CreateWindow` — the request is an aspiration and the commit is a fact, and they may
+differ. Before the window's first `Commit` there is no committed buffer, and the
+**requested** size is reported instead.
+
+**The object is a snapshot, not a live mapping.** Each resolve mints a fresh object; the
+compositor unmaps its own copy before replying and never writes to it again. Values are
+current as of the resolve and never change afterwards. Poll by resolving again.
+
+**Any holder of `/dev/draw` may read any window's `info`, including windows it does not
+own, and may enumerate windows by walking ids.** This is deliberate, and it is the
+system's answer to a question the session channel answers differently — so the split is
+worth stating exactly, because the two doors are easy to mistake for one.
+
+- **The namespace is where you ask.** `<N>/info` is the enumeration surface. Ids come from a
+  counter starting at 1, so walking them reveals which windows exist, their geometry, and
+  their roles. A window manager or desktop shell needs precisely this, and holding
+  `/dev/draw` is how it is authorised to have it.
+- **The session channel is where you act, and it is scoped.** Every operation names a window
+  through a connection, and a window belonging to another connection reports exactly what a
+  nonexistent one does. That is **ownership enforcement, not secrecy**: a client learns
+  nothing *from acting*, so there is no oracle to walk by attempting operations, and it can
+  never reach another client's pixels.
+
+A forwarded resolve carries no connection identity — the namespace hands the compositor a
+path, not a caller — so `info` **cannot** be scoped to the owning client without inventing
+an identity the protocol does not have. Given that, enumerable metadata is a choice, not an
+accident: window geometry is not treated as secret between processes that already share a
+screen, while **pixels** are, and stay behind connection-scoped ids and the ownership check
+that precedes every mapping.
+
+If a future role holds content whose existence or placement must be hidden from a peer that
+already has draw access, **both doors have to change together** — scoping the session
+channel alone would achieve nothing while this path answers freely.
+
 ## The buffer lifecycle
 
 ```
@@ -86,6 +145,30 @@ same buffer gets no release, because it already owns nothing else.
 non-starter, named here so nobody proposes it as a simplification. **Rejected:
 server-allocated buffers** — that makes the compositor the allocator for every client's
 rendering and couples buffer lifetime to compositor policy.
+
+## Which requests reply, and why a client must drain
+
+This is the asymmetry a second implementation gets wrong if it reads only the per-op
+sections, so it is stated once, normatively:
+
+| Op | On success | On failure |
+|---|---|---|
+| `CreateWindow` | reply carrying the window id | error reply |
+| `AttachBuffer` | **silent** | error reply |
+| `Commit` | **silent** | error reply |
+| `DestroyWindow` | **silent** | error reply |
+| `Release` | server-initiated; never a reply | — |
+
+An error reply carries `RS_FLAG_REPLY | RS_FLAG_ERROR` with the **same op and request id** as
+the request it refuses. Two consequences a client must handle:
+
+1. **A refusal is not a success.** Matching on `RS_FLAG_REPLY` and the request id alone
+   accepts an error body as a result — a client doing that will read a window id out of an
+   error code.
+2. **Refusals of otherwise-silent ops must be consumed.** They arrive unsolicited from the
+   client's point of view, since it was not waiting for anything. A client that never drains
+   them accumulates them until its receive path gives out, and the failure then appears at an
+   unrelated later request with nothing pointing at the cause.
 
 ## Window roles
 

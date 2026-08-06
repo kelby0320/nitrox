@@ -8,7 +8,7 @@ use libkern::error::KError;
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_WAIT, syscall4, syscall5,
 };
-use librsproto::{RS_FLAG_REPLY, decode, encode};
+use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 use crate::{Transport, UiError};
 
@@ -18,7 +18,23 @@ const MSG_LEN: usize = 4096;
 const PAYLOAD_OFF: usize = 24;
 /// Largest event body parked while waiting for a reply.
 const MAX_BODY: usize = 64;
-/// How many out-of-order messages can be parked before the oldest are dropped.
+/// How many out-of-order messages can be parked while waiting for a reply.
+///
+/// Overflow is an **error, not a drop**. The obvious cheap behaviour — discard one and
+/// carry on — is wrong here because the messages that park are mostly `Release`, and a lost
+/// `Release` leaves a buffer marked busy that will never be freed. Since `Window::acquire`
+/// blocks with no timeout, that is not a recoverable `None`: it is a permanent hang, at a
+/// point arbitrarily far from the discard that caused it. Reporting it turns a silent hang
+/// into a loud failure (PR #175 review, finding 9).
+///
+/// **It is reachable, and `parked_len` never resets between requests.** It accumulates for
+/// the life of the connection for any client that does not drain events, and the ops that
+/// fill it are the ones the protocol calls silent: `AttachBuffer`, `Commit` and
+/// `DestroyWindow` send nothing on success and an error reply on failure. A client that
+/// ignores those replies — which the spec, until this was written down, gave it no reason
+/// not to — dies at the ninth rejection, and it surfaces on an unrelated later request as
+/// `Transport` with nothing pointing at the cause. Drain with `Window::pump` or
+/// `poll_event` (PR #175 review, finding 3).
 const MAX_PARKED: usize = 8;
 
 /// A connection to the compositor over an IPC channel.
@@ -28,7 +44,10 @@ pub struct ChannelTransport {
     msg: [u8; MSG_LEN],
     handles: [u64; 4],
     recv_msg: [u8; MSG_LEN],
-    recv_handles: [u64; 4],
+    /// Sized by the kernel's `IPC_HANDLE_MAX`, not by what a compositor is expected to
+    /// send: `sys_channel_recv` takes no capacity argument and copies the *sender's*
+    /// handle count here (PR #175 review, finding 1).
+    recv_handles: [u64; libkern::abi::IPC_HANDLE_MAX],
     recv_count: u64,
     /// Messages that arrived while waiting for a reply — drained by `poll_event`.
     parked: [(u16, [u8; MAX_BODY], usize); MAX_PARKED],
@@ -40,8 +59,10 @@ impl ChannelTransport {
     ///
     /// # Safety
     ///
-    /// `channel` must be a live IPC endpoint owned by this process for the transport's
-    /// lifetime, connected to a compositor.
+    /// `channel` must be a live IPC endpoint connected to a compositor, and the caller must
+    /// be **giving it away**: the transport takes ownership and its `Drop` closes it.
+    /// Passing a borrowed handle is a double close, and passing one the caller closes
+    /// separately is worse — the id can be reused by then.
     pub const unsafe fn new(channel: u64) -> Self {
         Self {
             channel,
@@ -49,7 +70,7 @@ impl ChannelTransport {
             msg: [0; MSG_LEN],
             handles: [0; 4],
             recv_msg: [0; MSG_LEN],
-            recv_handles: [0; 4],
+            recv_handles: [0; libkern::abi::IPC_HANDLE_MAX],
             recv_count: 0,
             parked: [(0, [0; MAX_BODY], 0); MAX_PARKED],
             parked_len: 0,
@@ -79,6 +100,24 @@ impl ChannelTransport {
         .map_err(|_| UiError::Transport)?;
         // SAFETY: a live endpoint this process now owns.
         Ok(unsafe { Self::new(ch.into_raw().0) })
+    }
+}
+
+impl Drop for ChannelTransport {
+    /// Close the endpoint — **a dropped transport must not strand a compositor session**.
+    ///
+    /// `connect` takes ownership via `Handle::into_raw`, which suppresses the close, and
+    /// nothing closed it afterwards. The compositor frees a session slot only on
+    /// `PeerClosed`, which never arrives while the endpoint is open, so every dropped
+    /// transport cost a slot for the compositor's life. There are `MAX_WAIT_HANDLES - 1` =
+    /// 31 of them, shared by the whole machine: one client opening and dropping 31
+    /// connections makes `/dev/draw/new` fail for **every** process, permanently, while the
+    /// offending client keeps running and looks healthy (PR #175 review, finding 4).
+    fn drop(&mut self) {
+        if self.channel != 0 {
+            // SAFETY: closing an endpoint this transport owns and no longer uses.
+            unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, self.channel, 0, 0, 0) };
+        }
     }
 }
 
@@ -177,6 +216,11 @@ impl Transport for ChannelTransport {
                 if m.op != op {
                     return Err(UiError::BadReply);
                 }
+                // A refusal is still this request's reply — consumed here, not parked, or
+                // it would sit in the queue and eventually overflow it.
+                if m.flags & RS_FLAG_ERROR != 0 {
+                    return Err(UiError::Server);
+                }
                 let n = m.body.len().min(reply.len());
                 reply[..n].copy_from_slice(&m.body[..n]);
                 return Ok(Some(n));
@@ -187,9 +231,36 @@ impl Transport for ChannelTransport {
             let n = m.body.len().min(MAX_BODY);
             let mut body = [0u8; MAX_BODY];
             body[..n].copy_from_slice(&m.body[..n]);
-            if self.parked_len < self.parked.len() {
-                self.parked[self.parked_len] = (m.op, body, n);
-                self.parked_len += 1;
+            if self.parked_len >= self.parked.len() {
+                return Err(UiError::Transport);
+            }
+            self.parked[self.parked_len] = (m.op, body, n);
+            self.parked_len += 1;
+        }
+    }
+
+    fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
+        loop {
+            // A parked message counts: it is already here and older than anything on the
+            // wire, so blocking first would be wrong.
+            if let Some(ev) = self.poll_event(buf)? {
+                return Ok(ev);
+            }
+            let handles = [self.channel];
+            let mut results = [0u8; 24];
+            // SAFETY: a valid handle array and result buffer for one waiter. `sys_wait` is
+            // where the thread blocks — never inside the recv.
+            let waited = unsafe {
+                syscall4(
+                    SYS_WAIT,
+                    handles.as_ptr() as u64,
+                    1,
+                    results.as_mut_ptr() as u64,
+                    u64::MAX,
+                )
+            };
+            if waited != 1 {
+                return Err(UiError::Transport);
             }
         }
     }

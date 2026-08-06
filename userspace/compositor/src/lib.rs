@@ -273,6 +273,23 @@ impl WindowStack {
         )
     }
 
+    /// The `info` a window reports at `/dev/draw/<id>/info`.
+    ///
+    /// Reports the **committed** buffer's size when there is one, because that is what is
+    /// actually on screen; the requested size is only a hint until a client commits.
+    pub fn info(&self, id: u32) -> Option<librsproto::surface::WindowInfo> {
+        let w = self.window(id)?;
+        let bounds = w.bounds();
+        Some(librsproto::surface::WindowInfo::new(
+            w.id,
+            w.role,
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.w,
+            bounds.size.h,
+        ))
+    }
+
     /// The topmost window that may take keyboard focus, if any.
     ///
     /// Panels are skipped: clicking the clock must not steal input from the terminal.
@@ -321,6 +338,30 @@ mod tests {
             let mut px = vec![0u8; g.byte_len()];
             let word = g.format.encode(colour).to_le_bytes();
             for y in 0..g.height {
+                for x in 0..g.width {
+                    let off = g.offset_of(x, y).unwrap();
+                    px[off..off + 4].copy_from_slice(&word);
+                }
+            }
+            self.0.insert((window, buffer), px);
+        }
+    }
+
+    /// A distinct colour per source row. A uniform fill cannot detect a row-stride error —
+    /// a skew just moves one shade onto an identical one — which is exactly how
+    /// `the_guest_configuration_composites_a_client_surface` passed against a compositor
+    /// reading the source at `width * 4` (PR #175 review, finding 1).
+    fn row_colour(y: u32) -> Rgb {
+        Rgb::new(0x20 + y as u8, 0x40, 0x80)
+    }
+
+    impl MapSource {
+        /// Fill with [`row_colour`], so which source row reached the screen is *readable
+        /// from the screen*.
+        fn put_striped(&mut self, window: u32, buffer: u32, g: Geometry) {
+            let mut px = vec![0u8; g.byte_len()];
+            for y in 0..g.height {
+                let word = g.format.encode(row_colour(y)).to_le_bytes();
                 for x in 0..g.width {
                     let off = g.offset_of(x, y).unwrap();
                     px[off..off + 4].copy_from_slice(&word);
@@ -728,6 +769,101 @@ mod tests {
         let mut fb = screen();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
         assert_eq!(fb.get_pixel(0, 0), Some(red), "window 1 now is");
+    }
+
+    #[test]
+    fn the_guest_configuration_composites_a_client_surface() {
+        // The exact shape `ui-testclient` produces in the guest: a 1280x800 screen at
+        // pitch 5120, a 64x32 client surface at **pitch 268**, window origin (0,0). Written
+        // after the guest showed pure background in the window region with every guard in
+        // `compose_into` passing and the client's pixels verified correct.
+        //
+        // 268 is not 64*4. The padding is the point: a source stride computed from the
+        // width instead of the pitch skews every row after the first, and the two numbers
+        // agreeing would hide it. Keep this in step with `libdraw::scene::SCREEN_PITCH`.
+        let mut fb = MemFramebuffer::new(
+            Geometry::with_pitch(1280, 800, 5120, PixelFormat::XRGB8888).unwrap(),
+        );
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 64, height: 32, role: Role::Normal }).unwrap();
+        s.attach(&AttachBufferRequest {
+            window: w,
+            buffer: 0,
+            width: 64,
+            height: 32,
+            pitch: 268,
+            format: SURFACE_FORMAT_XRGB8888,
+        })
+        .unwrap();
+        let g = Geometry::with_pitch(64, 32, 268, PixelFormat::XRGB8888).unwrap();
+        // Striped, not uniform. With a single colour every assertion below holds just as
+        // well against a compositor that reads the source at `width * 4` — which is the
+        // bug the 268 pitch exists to expose, so the test would have been asserting
+        // nothing about the thing it was written for.
+        src.put_striped(w, 0, g);
+        s.commit(&commit(w, 0)).unwrap();
+
+        let bounds = fb.geometry().bounds();
+        s.compose_into(&mut fb, Rgb::new(0x0E, 0x14, 0x1B), &src, &[bounds]);
+
+        // Each of these names the source row it must have come from. Read at pitch 256,
+        // screen row 5 lands in source row 4 and row 31 in source row 29 — different
+        // colours, so the skew is a failure rather than a coincidence.
+        assert_eq!(
+            fb.get_pixel(6, 5),
+            Some(row_colour(5)),
+            "the client's surface must reach the screen, row for row"
+        );
+        assert_eq!(fb.get_pixel(63, 31), Some(row_colour(31)), "including its last pixel");
+        assert_eq!(fb.get_pixel(0, 0), Some(row_colour(0)), "and its first");
+        assert_eq!(
+            fb.get_pixel(64, 0),
+            Some(Rgb::new(0x0E, 0x14, 0x1B)),
+            "and stop at its edge"
+        );
+    }
+
+    #[test]
+    fn info_reports_the_committed_size_not_the_requested_one() {
+        // A client may create a window at one size and commit a buffer of another; what is
+        // on screen is the buffer, so that is what `info` must report.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 100, height: 50, role: Role::Normal }).unwrap();
+        let info = s.info(w).unwrap();
+        assert_eq!((info.width, info.height), (100, 50), "requested size before any commit");
+
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::BLACK);
+        s.commit(&commit(w, 0)).unwrap();
+        s.set_origin(w, Point::new(-3, 12)).unwrap();
+
+        let info = s.info(w).unwrap();
+        assert_eq!((info.width, info.height), (8, 8), "committed size once there is one");
+        assert_eq!((info.x, info.y), (-3, 12));
+        assert_eq!(info.id, w);
+    }
+
+    #[test]
+    fn info_carries_the_role_and_its_extra_fields() {
+        let mut s = WindowStack::new();
+        let p = s
+            .create(&CreateWindowRequest {
+                width: 100,
+                height: 24,
+                role: Role::Panel { dock: Edge::Bottom, reserve: 24 },
+            })
+            .unwrap();
+        let info = s.info(p).unwrap();
+        assert_eq!(info.role, librsproto::surface::ROLE_PANEL);
+        assert_eq!(info.reserve, 24);
+
+        let child = s
+            .create(&CreateWindowRequest { width: 4, height: 4, role: Role::Popup { parent: p } })
+            .unwrap();
+        assert_eq!(s.info(child).unwrap().parent, p);
+        assert!(s.info(9999).is_none(), "a window that does not exist has no info");
     }
 
     #[test]

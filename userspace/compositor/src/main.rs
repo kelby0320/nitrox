@@ -38,7 +38,7 @@ use libdraw::format::Rgb;
 use libdraw::framebuffer::{Framebuffer, RawFramebuffer};
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE,
-    SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall4, syscall5,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
@@ -62,13 +62,31 @@ const MAX_BODY: usize = 64;
 /// One less than the wait limit: the forwarding endpoint takes the first slot.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
 
+/// How many client-driven rejections get logged **per session** before the tap closes.
+///
+/// Per session, not per process. A single global budget is spent by whichever client
+/// misbehaves first and never refills — on a selftest image the churn probe burns all of it
+/// in the first second, so on exactly the builds where a rejection would be diagnostic,
+/// no later one is ever logged (PR #175 review, finding 6). A session's counter resets when
+/// the slot is reused, which is also when the client behind it is a different program.
+const MAX_LOGGED_REJECTIONS: u32 = 8;
+
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 4] = [0; 4];
+/// Sized by the **kernel's** limit, not by what this server expects.
+///
+/// `sys_channel_recv` takes no capacity argument: it copies `handle_count * 8` bytes here,
+/// where the count is the sender's and is bounded only by `IPC_HANDLE_MAX`. A `[u64; 4]`
+/// therefore let any client with a session overrun this static by 32 bytes into whatever
+/// the linker placed next, by sending eight transfers (PR #175 review, finding 1). Every
+/// other resource server in the tree already sizes it this way.
+static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
+    [0; libkern::abi::IPC_HANDLE_MAX];
 static mut RECV_COUNT: u64 = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 4] = [0; 4];
+static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
+    [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
     [0; libkern::abi::MAX_WAIT_HANDLES];
@@ -81,6 +99,27 @@ struct MappedBuffer {
     buffer: u32,
     addr: *mut u8,
     len: usize,
+}
+
+impl Drop for MappedBuffer {
+    /// Unmap when the record goes away — **the record is not the mapping**.
+    ///
+    /// Both places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
+    /// removed records and nothing else. Dropping a `MappedBuffer` used to leave the VMA
+    /// behind, so the comment at the destroy site — "otherwise a client looping
+    /// create/attach/destroy grows the compositor's address space without bound" — described
+    /// an intent the code did not carry out. It leaked on the ordinary application
+    /// lifecycle: every window closed, every client that exits.
+    ///
+    /// Worse than the address space, it pinned the **client's** memory. `map_attached_buffer`
+    /// closes its handle immediately and relies on the mapping to hold the object alive, so
+    /// a stale mapping meant a client's framebuffer was never freed after that client was
+    /// gone — at a real window size, megabytes per window.
+    fn drop(&mut self) {
+        // SAFETY: `addr`/`len` came from a successful `sys_memory_map` in
+        // `map_attached_buffer`; a record is dropped once, so this unmaps once.
+        unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, self.addr as u64, self.len as u64) };
+    }
 }
 
 /// Everything the serve loop owns.
@@ -96,8 +135,9 @@ impl BufferSource for Server {
     fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
         let b = self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?;
         // SAFETY: `addr`/`len` come from a successful `sys_memory_map` of the client's
-        // `MemoryObject`, which stays mapped for this process's life (nothing unmaps it),
-        // and the slice is read-only and borrowed no longer than `&self`.
+        // `MemoryObject`. The mapping lives exactly as long as its `MappedBuffer` record —
+        // `Drop` unmaps — and this slice borrows `&self`, so no `&mut` path that could drop
+        // the record can run while it is alive.
         Some(unsafe { core::slice::from_raw_parts(b.addr, b.len) })
     }
 }
@@ -242,6 +282,136 @@ fn send_release(session: u64, window: u32, buffer: u32) -> bool {
     reply_on_session(session, OP_RELEASE, 0, &body[..n])
 }
 
+/// What a forwarded resolve under `/dev/draw` is asking for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resolved {
+    /// `new` — mint a session.
+    New,
+    /// `<N>/info` — that window's metadata.
+    Info(u32),
+    /// Anything else.
+    Unknown,
+}
+
+/// Classify a resolve suffix.
+///
+/// Suffixes arrive without a leading separator (`/dev/draw/1/info` -> `1/info`), the
+/// convention `Namespace::resolve` uses and one that cost a boot to rediscover in M1.
+fn classify(suffix: &[u8]) -> Resolved {
+    if suffix == b"new" {
+        return Resolved::New;
+    }
+    if let Some(slash) = suffix.iter().position(|&c| c == b'/')
+        && &suffix[slash + 1..] == b"info"
+        && let Some(id) = parse_u32(&suffix[..slash])
+    {
+        return Resolved::Info(id);
+    }
+    Resolved::Unknown
+}
+
+/// Parse a decimal window id. Rejects empty input, non-digits and overflow — a resolve
+/// suffix is client-supplied text.
+fn parse_u32(b: &[u8]) -> Option<u32> {
+    if b.is_empty() || b.len() > 10 {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+    }
+    Some(n)
+}
+
+/// Answer `<N>/info` with a read-only object holding the window's `WindowInfo`.
+///
+/// The same shape `/dev/framebuffer/info` uses: a resolve answers with an object the caller
+/// maps, not with a message. A fresh object per resolve, holding a snapshot — handing out a
+/// live shared mapping would let readers observe mid-update state.
+fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> bool {
+    let Some(info) = srv.stack.info(id) else {
+        return reply_resolve_error(serve_end, request_id, KError::NotFound);
+    };
+    let mut bytes = [0u8; 32];
+    if info.write(&mut bytes).is_none() {
+        return reply_resolve_error(serve_end, request_id, KError::KernelError);
+    }
+    // SAFETY: a plain anonymous object of `bytes.len()`.
+    let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
+    if obj <= 0 {
+        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
+    }
+    // SAFETY: mapping an object this process just created, to fill it.
+    let addr = unsafe {
+        syscall4(
+            SYS_MEMORY_MAP,
+            obj as u64,
+            0,
+            bytes.len() as u64,
+            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
+        )
+    };
+    if addr <= 0 {
+        // SAFETY: closing the object we just made and cannot use.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
+        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
+    }
+    // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+    // **Unmap before replying.** The mapping was only ever a way to fill the object, and it
+    // holds its own reference to it — so leaving it behind would pin the frames for the
+    // compositor's life even after the handle is transferred away, and nothing records
+    // `addr` to reclaim them later. Any holder of `/dev/draw` can resolve `info` in a loop,
+    // which made this an unbounded leak drivable by any client (PR #175 review, finding 1).
+    // SAFETY: unmapping a range this process mapped moments ago and never reads again.
+    unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
+
+    let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
+    if resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32)
+        .is_none()
+    {
+        // SAFETY: nothing was sent, so the object is still ours to drop.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
+        return reply_resolve_error(serve_end, request_id, KError::KernelError);
+    }
+    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; the object rides the reply.
+    let sent = unsafe {
+        let Some(rs_len) = encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            OP_NS_RESOLVE,
+            request_id,
+            RS_FLAG_REPLY,
+            &body,
+            1,
+        ) else {
+            // SAFETY: nothing was sent, so the object is still ours to drop.
+            syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0);
+            return false;
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 1;
+        REPLY_HANDLES[0] = obj as u64;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            serve_end,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    };
+    if !sent {
+        // A failed send leaves the transfers untaken, so the object is still ours — the
+        // same rule `open_session` follows for the endpoint it failed to hand over.
+        // SAFETY: closing a handle this process still owns.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
+    }
+    sent
+}
+
 /// Open a session: mint a channel, keep the server end, hand the client end back.
 fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
     // SAFETY: single-threaded server scanning its own slot table.
@@ -286,8 +456,15 @@ fn close_session(slot: usize, srv: &mut Server) {
 ///
 /// Mapped **once, at attach**, and kept for the buffer's life — the handle crosses the
 /// channel a single time, not per frame.
+///
+/// **Always consumes `handle`**, on every path. A transferred handle nobody closes keeps
+/// its object — and so the client's frames — alive for the compositor's life.
 fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
-    let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else { return false };
+    let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else {
+        // SAFETY: we are not mapping it, so drop it rather than leaking the object.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        return false;
+    };
     let len = req.pitch as usize * req.height as usize;
     // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
     // with the size its own geometry declares.
@@ -325,7 +502,15 @@ fn surface_errno(e: SurfaceError) -> KError {
         SurfaceError::Malformed => KError::InvalidArgument,
         SurfaceError::Unsupported => KError::Unsupported,
         // A window belonging to another connection reports exactly what a nonexistent one
-        // does, so the reply cannot be used to probe which ids exist.
+        // does. **This is ownership enforcement, not secrecy** — a distinction worth being
+        // exact about, because this comment used to claim the reply "cannot be used to probe
+        // which ids exist" and that has not been true since `/dev/draw/<N>/info` landed:
+        // a namespace resolve answers the same question for any holder of `/dev/draw`
+        // (PR #175 review, finding 2). What collapsing the two cases still buys is that a
+        // client learns nothing *from acting* — it cannot tell "not yours" from "not there",
+        // so there is no oracle to walk by attempting operations, and the session channel
+        // remains the only place anything can be changed. Enumeration lives at the
+        // namespace, deliberately; see `docs/spec/rsproto-surface-ops.md`.
         SurfaceError::NotFound => KError::NotFound,
         SurfaceError::Rejected(_) => KError::InvalidArgument,
     }
@@ -389,10 +574,33 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
-        let Ok(m) = decode(req) else { return true };
+        // Take the handles out **before** anything can fail. A message that does not decode
+        // can still have carried one, and returning early without closing it pins the
+        // client's object for the compositor's life — a leak a client drives by sending one
+        // malformed message.
+        //
+        // **Every** transfer, not just the first. No Surface op takes more than one handle,
+        // but a client is free to send up to `IPC_HANDLE_MAX`, and the kernel installs all
+        // of them in this process's table whether or not anything here looks at them. The
+        // surplus is closed immediately: it can never be wanted, and leaving it was the
+        // same unbounded leak as the three fixed above, differing only in how it arrived
+        // (PR #175 review, finding 2).
+        let hcount =
+            ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+        for i in 1..hcount {
+            // SAFETY: closing a handle this process owns and no op can name.
+            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
+        }
+        let h = if hcount > 0 { RECV_HANDLES[0] } else { 0 };
+        let Ok(m) = decode(req) else {
+            if h != 0 {
+                // SAFETY: closing a handle this process owns and will never interpret.
+                syscall4(SYS_HANDLE_CLOSE, h, 0, 0, 0);
+            }
+            return true;
+        };
         let n = m.body.len().min(MAX_BODY);
         body_buf[..n].copy_from_slice(&m.body[..n]);
-        let h = if (&raw const RECV_COUNT).read() > 0 { RECV_HANDLES[0] } else { 0 };
         (m.op, m.request_id, n, h)
     };
     let body = &body_buf[..body_len];
@@ -413,16 +621,22 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
     // entry would stay, and `Server::pixels` resolves by first match — so another client's
     // pixels would be painted into the rightful owner's window. Doing it in this order
     // makes the ownership boundary cover the pixels, not just the stack.
-    if op == OP_ATTACH_BUFFER && handle != 0 {
-        if matches!(outcome, Outcome::Applied { .. }) {
-            if !map_attached_buffer(srv, body, handle) {
-                return true;
-            }
-        } else {
-            // Rejected: drop the handle rather than leaking it for the compositor's life.
-            // SAFETY: closing a handle this process owns and will not use.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+    //
+    // Whatever happens, the handle is **disposed of exactly once**. It is only ever consumed
+    // by `map_attached_buffer`, which closes it on all of its own paths; everything else —
+    // a rejected attach, or a handle riding an op that has no business carrying one, which a
+    // client is free to send — closes it here. Anything left unclosed keeps the client's
+    // object, and therefore its frames, alive for the compositor's life.
+    let mut consumed = false;
+    if op == OP_ATTACH_BUFFER && handle != 0 && matches!(outcome, Outcome::Applied { .. }) {
+        consumed = true;
+        if !map_attached_buffer(srv, body, handle) {
+            return true;
         }
+    }
+    if handle != 0 && !consumed {
+        // SAFETY: closing a handle this process owns and will not use.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
     }
 
     match outcome {
@@ -434,26 +648,59 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             unsafe {
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
             }
-            reply_on_session(ch, op, request_id, &body[..n]);
+            if !reply_on_session(ch, op, request_id, &body[..n]) {
+                // The client is blocked in `request` waiting for exactly this. A silent
+                // failure parks it forever, so say so — see `send_release` below.
+                kprint(b"compositor: DROPPED a reply (client receive ring full)\n");
+            }
             repaint(srv, fb);
         }
         Outcome::Applied { release } => {
-            if let Some((window, buffer)) = release {
-                send_release(ch, window, buffer);
-            }
             // A destroy is transitive, so drop every mapping whose window is gone.
             // Otherwise a client looping create/attach/destroy grows the compositor's
             // address space without bound.
             srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
+
+            // **Paint before releasing.** A `Release` is the client's evidence that the
+            // commit it displaced has been dealt with; sending it first tells the client
+            // the frame is done while the pixels are still unpainted. The client then
+            // reports progress, and anything pacing off that — the display gate, or a
+            // second client — observes a screen that has not caught up. Same shape as
+            // announcing `Ready` before clearing the screen.
             repaint(srv, fb);
+            if let Some((window, buffer)) = release
+                && !send_release(ch, window, buffer)
+            {
+                // **A dropped `Release` is now a permanent client hang, not a slow frame.**
+                // These go out `NOBLOCK` on a channel four messages deep, so a client that
+                // commits several frames before draining makes the send simply fail — and
+                // since `Window::acquire` blocks with no timeout, the buffer stays `busy`
+                // and the client never wakes. Unlike a rejection this is **not**
+                // client-driven noise: it is the compositor losing a message it owed, so it
+                // is not subject to `MAX_LOGGED_REJECTIONS` (PR #175 review, finding 3).
+                kprint(b"compositor: DROPPED a Release (client receive ring full)\n");
+            }
         }
         Outcome::Failed(e) => {
-            kprint(match e {
-                SurfaceError::Malformed => b"compositor: malformed request\n" as &[u8],
-                SurfaceError::Unsupported => b"compositor: unsupported op\n",
-                SurfaceError::NotFound => b"compositor: no such window for this connection\n",
-                SurfaceError::Rejected(_) => b"compositor: request rejected\n",
-            });
+            // **Logged a bounded number of times.** A rejection is client-driven, so this
+            // is an unbounded write to a shared console: one misbehaving client can bury
+            // every other service's output, and the churn probe alone produced 80 identical
+            // lines per boot (PR #175 review, finding 6). The first few are the diagnostic;
+            // the rest are noise, and the error still goes back to the client that caused
+            // it either way.
+            srv.conns[slot].rejections_logged += 1;
+            let n = srv.conns[slot].rejections_logged;
+            if n <= MAX_LOGGED_REJECTIONS {
+                kprint(match e {
+                    SurfaceError::Malformed => b"compositor: malformed request\n" as &[u8],
+                    SurfaceError::Unsupported => b"compositor: unsupported op\n",
+                    SurfaceError::NotFound => b"compositor: no such window for this connection\n",
+                    SurfaceError::Rejected(_) => b"compositor: request rejected\n",
+                });
+                if n == MAX_LOGGED_REJECTIONS {
+                    kprint(b"compositor: (further rejections not logged)\n");
+                }
+            }
             reply_error_on_session(ch, op, request_id, surface_errno(e));
         }
     }
@@ -520,8 +767,8 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             continue;
         }
 
-        // A forwarded resolve. Only `new` is answerable today: numbered window paths and
-        // `info` are the rest of Part B.
+        // A forwarded resolve: `new` mints a session, `<N>/info` answers with window
+        // metadata. A bare `<N>` and `<N>/ports/...` are later milestones.
         // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
         let rr = unsafe {
             syscall4(
@@ -536,7 +783,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             continue;
         }
         // SAFETY: bounded read of the payload, then of the resolve's suffix.
-        let (request_id, is_new, ok) = unsafe {
+        let (request_id, resolved, ok) = unsafe {
             let payload_len =
                 u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
@@ -548,19 +795,25 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                     let suffix = librsproto::namespace::parse_resolve_request(m.body)
                         .map(|r| r.suffix)
                         .unwrap_or(b"");
-                    (m.request_id, suffix == b"new", true)
+                    (m.request_id, classify(suffix), true)
                 }
-                Ok(m) => (m.request_id, false, true),
-                Err(_) => (0, false, false),
+                Ok(m) => (m.request_id, Resolved::Unknown, true),
+                Err(_) => (0, Resolved::Unknown, false),
             }
         };
         if !ok {
             continue;
         }
-        if is_new {
-            open_session(serve_end, request_id, srv);
-        } else {
-            reply_resolve_error(serve_end, request_id, KError::NotFound);
+        match resolved {
+            Resolved::New => {
+                open_session(serve_end, request_id, srv);
+            }
+            Resolved::Info(id) => {
+                reply_window_info(serve_end, request_id, srv, id);
+            }
+            Resolved::Unknown => {
+                reply_resolve_error(serve_end, request_id, KError::NotFound);
+            }
         }
     }
 }

@@ -10,11 +10,13 @@
 //!    compiled for `x86_64-unknown-nitrox` as it does on the host: integer width,
 //!    endianness, optimisation. "The same hash asserted in two places is what makes this
 //!    worth running" (`docs/design/display-substrate.md` §8b).
-//! 2. **Presentation.** Acquire the real framebuffer and blit the scene into a known
-//!    corner, so Part D's `screendump` has something to compare. This is the half that
-//!    needs the binding, and it is what §8c checks: a compositor can hash its own buffer
-//!    correctly while writing to the wrong base address or with the channels swapped, and
-//!    **nothing inside the guest can detect that**.
+//! 2. **The framebuffer is reachable.** Acquire it and report its geometry, proving the
+//!    binding and the geometry hand-off still work.
+//!
+//! It no longer *presents* the scene: since M2 Part D that is `ui-testclient`'s job, and
+//! the picture `check-display` compares now arrives through the whole Surface protocol
+//! rather than being written straight to the aperture. Writing it here as well would race
+//! the compositor for the same pixels.
 //!
 //! Splitting them means a framebuffer problem cannot break the hash check and a
 //! compositing bug cannot hide behind a display problem.
@@ -45,9 +47,6 @@
 extern crate alloc;
 
 use libdraw::acquire::{self, AcquireError};
-use libdraw::compose::{SurfaceRef, compose_full};
-use libdraw::framebuffer::Framebuffer;
-use libdraw::geom::Point;
 use libdraw::hash::hash_visible;
 use libdraw::scene::{self, REFERENCE_HASH};
 use libkern::{exit, kprint};
@@ -138,14 +137,19 @@ fn check_reference_hash() -> bool {
     false
 }
 
-/// Check 2: acquire the real framebuffer and present the scene into a known corner.
+/// Check 2: the real framebuffer can still be acquired and describes itself sanely.
 ///
-/// Returns `false` only for failures that indicate a *broken binding*. A machine with no
+/// It **acquires and does not draw.** Since M2 Part D the scene reaches the screen through
+/// the compositor, and a second writer to the same aperture would race it — so what is left
+/// to check here is the binding itself, which is still worth checking: `NoBinding` is how a
+/// removed or misordered `/dev/framebuffer` registration shows up.
+///
+/// Returns `Err` only for failures that indicate a *broken binding*. A machine with no
 /// display at all reports `NoBinding` and is not a failure here — the caller decides,
 /// because only it knows whether a display was expected.
-fn present_scene(root_ns: u64) -> Result<(), AcquireError> {
+fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (mut fb, info) = unsafe { acquire::acquire(root_ns) }?;
+    let (_fb, info) = unsafe { acquire::acquire(root_ns) }?;
 
     kprint(b"display-selftest: framebuffer ");
     kprint_u64(info.width as u64);
@@ -155,17 +159,7 @@ fn present_scene(root_ns: u64) -> Result<(), AcquireError> {
     kprint_u64(info.pitch);
     kprint(b"\n");
 
-    // Render the scene once, then blit it into the top-left corner as an ordinary
-    // surface. Deliberately reusing the compositing path rather than a bespoke copy:
-    // if `compose` is wrong, this is wrong the same way, and §8c's screendump is what
-    // notices.
-    let src = scene::render_reference();
-    let src_geometry = src.geometry();
-    let pixels = src.into_bytes();
-    let surface = SurfaceRef::new(src_geometry, Point::new(0, 0), &pixels);
-    compose_full(&mut fb, scene::BACKGROUND, &[surface]);
-
-    kprint(b"display-selftest: presented scene at (0,0)\n");
+    kprint(b"display-selftest: framebuffer reachable\n");
     Ok(())
 }
 
@@ -179,7 +173,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let hash_ok = check_reference_hash();
 
     let mut headless = false;
-    let present_ok = match present_scene(root_ns) {
+    let present_ok = match check_framebuffer_binding(root_ns) {
         Ok(()) => true,
         Err(AcquireError::NoBinding) => {
             // No display bound into this namespace. Reported distinctly (exit 2) rather

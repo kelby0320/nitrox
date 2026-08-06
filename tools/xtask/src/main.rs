@@ -242,7 +242,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.features().is_some() {
-        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest"], None)?;
+        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest", "ui-testclient"], None)?;
     }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
@@ -934,7 +934,12 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The guest paces this: capture only once it says the scene is on the screen.
     // Screendumping on a timer would race the boot and produce a blank or half-drawn
     // frame that looks like a real mismatch.
-    session.expect("display-selftest: presented scene at (0,0)")?;
+    //
+    // Since M2 Part D the scene arrives through the **whole Surface protocol** — a real
+    // client sharing memory with the compositor — rather than being written straight to
+    // the aperture. The client emits this only after a `Release` acknowledges its final
+    // commit, so the frame is composited by the time we capture.
+    session.expect("ui-testclient: scene presented via /dev/draw")?;
     qmp.screendump(&shot)?;
 
     let captured = fs::read(&shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
@@ -1136,6 +1141,21 @@ struct Session {
     cursor: usize,
 }
 
+impl Drop for Session {
+    /// Kill the guest when the session goes out of scope.
+    ///
+    /// Every `?` between `spawn` and an explicit `kill` used to leak a QEMU, and a leaked
+    /// QEMU holds the write lock on `tools/build-cache/nitrox.hdd` — so the *next* run boots
+    /// a guest that cannot open its disk and fails with a bare timeout and no serial output,
+    /// which looks nothing like the original error. A reviewer lost a pass to a 20-hour-old
+    /// orphan this way (PR #175 review). Killing an already-dead child is harmless, so the
+    /// explicit kills elsewhere stay valid.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Session {
     fn spawn(mut cmd: Command) -> R<Session> {
         let mut child = cmd.spawn().map_err(|e| format!("spawn qemu: {e}"))?;
@@ -1172,7 +1192,27 @@ impl Session {
                 }
             }
             if std::time::Instant::now() > deadline {
-                return Err(format!("timed out after {TIMEOUT:?} waiting for {pat:?}").into());
+                // **Distinguish "the guest said nothing" from "the guest stopped early".**
+                // They are the same line in the log and completely different faults: no
+                // output at all usually means QEMU never got as far as the guest — a disk
+                // held open by an orphaned instance, a missing image, bad firmware — while
+                // partial output is a real hang, and the tail says where.
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                if g.trim().is_empty() {
+                    return Err(format!(
+                        "timed out after {TIMEOUT:?} waiting for {pat:?}, and the guest \
+                         produced NO output at all — this is usually QEMU failing to start \
+                         rather than a hang (a stale qemu-system-x86_64 holding \
+                         build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
+                    )
+                    .into());
+                }
+                let tail: String = g.chars().rev().take(400).collect::<Vec<_>>()
+                    .into_iter().rev().collect();
+                return Err(format!(
+                    "timed out after {TIMEOUT:?} waiting for {pat:?}; last output was:\n{tail}"
+                )
+                .into());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
@@ -2827,6 +2867,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         programs.push("test-harness");
         programs.push("test-stage");
         programs.push("display-selftest");
+        programs.push("ui-testclient");
     }
     let mut ino = 3u32;
     for name in programs {

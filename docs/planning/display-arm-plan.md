@@ -2,9 +2,10 @@
 
 **Status:** 🚧 in progress. The design is settled; this is the order it gets built in.
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
-self-hash, and the `screendump` smoke gate. **Milestone 2 is in progress.** Part A (the surface protocol and window model) landed
-2026-08-05. Parts B and C are **partial** — see their boxes. Nothing has yet exercised a
-client and the compositor together, which is how the gaps went unnoticed.
+self-hash, and the `screendump` smoke gate. **Milestones 1–2 are complete** (2026-08-06). A real client drives the compositor on every
+`test-qemu` run, and the display gate compares a picture that arrived through the whole
+Surface protocol. Milestone 3 (input) is next, and needs P3 — a PS/2 driver, the first
+input device of any kind.
 
 ## What this is
 
@@ -80,38 +81,48 @@ on the hash.** No window, no client, no font, no terminal.
 **The reference scene needs choosing deliberately** (substrate §8e): overlap, clipping at a
 screen edge, and a non-trivial stride. A solid fill would hash fine and prove nearly nothing.
 
-## Milestone 2 — a client with a surface
+## Milestone 2 — a client with a surface ✅ complete (2026-08-06)
 
 **Deliverable: a program's pixels appear in a window, verified by hash.**
 
 - [x] **Part A — the surface protocol.** ✅ (2026-08-05) Create, share the `MemoryObject`, `Commit { buffer,
       damage }`, release. Host-tested against the in-memory framebuffer. No new syscalls —
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
-- [ ] **Part B — `/dev/draw` served.** ⚠️ *partial* — the server is bound and dispatches,
-      but **does not yet reply on a session channel**, and only `new` resolves; numbered
-      window paths and `info` are outstanding. `new`, numbered windows, `info`. The same
+- [x] **Part B — `/dev/draw` served.** ✅ (2026-08-06) `new` mints a session; `<N>/info`
+      answers with a mapped `WindowInfo` snapshot; replies and `Release` events go out on
+      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 6. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
 
       **Window roles and panel struts land here**, not later: bars are `panel`, menus and the
       applications modal are `popup`, and retrofitting a role into a shipped protocol touches
       every client (substrate §4a).
-- [ ] **Part C — `libui`: the client side of the protocol.** ⚠️ *partial* — the buffer
-      lifecycle is done and host-tested; the transport cannot receive a reply (no
-      `sys_wait`), and input/event-loop is M3 work that should not have been ticked. Connect, create a window, allocate
-      and commit surfaces, receive input, run an event loop. The same role `librsproto` plays for
+- [x] **Part C — `libui`: the client side of the protocol.** ✅ (2026-08-06) Connect,
+      create a window, allocate and commit surfaces, and `acquire` a buffer — blocking when
+      the compositor holds them all. *Receiving input and the event loop are M3*, and were
+      wrongly claimed here before. The same role `librsproto` plays for
       the RS protocol — **the protocol gets a library, and clients use it.** If the first app
       hand-rolls this instead, the surface protocol immediately has two implementations and the
       second one lives in an application.
-- [ ] **Part D — a test client** built on `libui`, and the gate extends: the scene is now built
+- [x] **Part D — a test client** ✅ (2026-08-06) built on `libui`, and the gate extends: the scene is now built
       from a real client's committed buffer rather than a synthetic one.
-- [ ] **Graduate the design docs.** When this milestone closes, `docs/design/` moves to
-      `docs/architecture/` for the parts with code behind them — root `CLAUDE.md` requires
-      "the milestone that builds it should carry that move as a checkbox", and until this
-      PR nothing did.
-- [ ] **Part E — release semantics**, settled by the first client that double-buffers. A client
-      that redraws into a buffer still being read produces tearing that is invisible in testing
-      and obvious in use.
+**On graduating the design docs.** Root `CLAUDE.md` requires the milestone that builds a
+`design/` doc to carry its move to `architecture/` as a checkbox. That move is **not** M2's:
+the three documents describe subsystems that are only partly built — `display-substrate.md`
+still specifies input, text, capture and hotkeys with no code; `ui-composition-model.md`
+specifies ports and desktops (M6); `desktop-shell.md` has nothing built at all. Moving a
+document to `architecture/` while most of it describes the future is precisely the confusion
+that directory split exists to prevent. Each carries an accurate Status line meanwhile, and
+graduates with the milestone that finishes its subsystem — the checkboxes live in M6 and M7
+below.
+- [x] **Part E — release semantics** ✅ (2026-08-06), settled by the first client that
+      double-buffers, exactly as this box anticipated. Three rules came out of it, each
+      found by something breaking rather than by design: `Release` names the buffer that
+      **left** the screen, never the one on it; the compositor **paints before it
+      acknowledges**, or a client pacing off the release observes a screen that has not
+      caught up; and a client **blocks** for a release rather than polling once, because a
+      release that has not arrived yet is not one that never will. Single buffering is
+      refused at construction — with one buffer there is never anything to release.
 
 ## Milestone 3 — input
 
@@ -179,6 +190,9 @@ harness's QMP input channel stops being a test-only affordance.
 
 Sketched; detail when M5 lands.
 
+- [ ] **Graduate `ui-composition-model.md`** to `docs/architecture/` — this milestone builds
+      the ports and desktops it specifies, which is the rest of that document.
+
 Multiple windows, stacking, move/resize, and **the overview** — thumbnail capture, the frozen
 image grid, and the desktop sidebar (desktop shell §6). Ports under windows, with
 `list` answering discovery. The **desktop shell** as a second process: `/dev/desktop`, desktop
@@ -188,9 +202,13 @@ Templates: instantiate, extract, `open ./code.nxg | desktop`, `save`.
 
 ## Milestone 7 — the composed desktop
 
-Sketched. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via `QueryCaps`,
-Tier 2 durable wiring); and the question the composition doc leaves open — what happens to a
-wired graph when an application crashes, and whether the desktop shell respawns and rewires it.
+Sketched. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via
+`QueryCaps`, Tier 2 durable wiring); and the question the composition doc leaves open — what
+happens to a wired graph when an application crashes, and whether the desktop shell respawns
+and rewires it.
+
+- [ ] **Graduate `display-substrate.md` and `desktop-shell.md`** to `docs/architecture/` —
+      by the end of this milestone the substrate is fully built and the shell exists.
 
 ## What this unblocks
 

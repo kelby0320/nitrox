@@ -11229,3 +11229,421 @@ every assertion still holds. It catches the two breaks that matter, and another 
 the flag — but the name promises more than the body checks.
 
 1214 host tests, all six gates green, `test-qemu` green, display gate green.
+
+## 2026-08-06 — Display arm M2 Part D: the first real client, and what it caught
+
+A second process now connects over `/dev/draw`, shares memory with the compositor, and
+requires it to talk back:
+
+```
+ui-testclient: committed 6 frames over 2 buffers
+ui-testclient: scene presented via /dev/draw
+xtask: display gate PASSED — the 64x32 scene on screen matches libdraw pixel for pixel ✓
+```
+
+The scene reaching the screen now travels the whole protocol rather than being written
+straight to the aperture, so §8c compares what a client actually produced.
+
+**Six frames over two buffers is the load-bearing detail.** Frames 3–6 are only reachable
+if the compositor released each buffer as it left the screen. This is the test that could
+not have passed against the one-way protocol PR #174 shipped, and it failed on its first
+run for a different reason, which is the point of writing it.
+
+**Three bugs it found, none visible to 1213 host tests or three green CI jobs.**
+
+*`libui` had no way to wait.* `poll_event` is non-blocking, so the client asked once,
+found nothing free, and stalled at frame 2 — a release that has not arrived *yet* is not
+one that will never arrive. The library now has `Transport::wait_event` and
+`Window::acquire`, which drains pending events and blocks only if every buffer is still
+held. That is the call a render loop actually wants; `next_free` alone was never enough.
+
+*The compositor acknowledged before it painted.* `send_release` ran before `repaint`, so a
+client learned its buffer was free while the frame was still unpainted, and anything pacing
+off that — the display gate, or a second client — observed a screen that had not caught up.
+Same shape as announcing `Ready` before clearing, fixed the same way: do the work, then
+report it.
+
+*The test itself was wrong, and the compositor was right.* After presenting, the client
+exited; the compositor saw `PeerClosed`, destroyed its windows — correctly — and repainted
+to background, so the gate captured an empty screen that looked exactly like a compositing
+failure. Diagnosing it took reading the framebuffer back after `compose` (`33,33,33`,
+correct) and reproducing the exact guest geometry in a host test (passes). Only then was it
+clear the composite was fine and the *window* was gone. A real client does not exit while
+its window is on screen, so this one parks and reports failures through `SYS_TEST_EXIT`
+instead of an exit code.
+
+That last one is worth keeping: **when the picture is wrong, the compositor is not the only
+suspect** — the window may simply no longer exist. The host test written to isolate it
+(`the_guest_configuration_composites_a_client_surface`) stays, because it pins the exact
+1280×800/5120 + 64×32/256 shape the guest produces.
+
+**Part C is now genuinely complete and Part B genuinely is not.** B replies on session
+channels — proven by a client that cannot proceed without it — but only `new` resolves;
+numbered window paths and `info` remain. Part C's earlier tick also claimed input and an
+event loop, which are M3.
+
+1218 host tests, all six gates green, `test-qemu` green, display gate green through the
+full client path.
+
+---
+
+## 2026-08-06 — Display arm M2 Part B, Part E, and the milestone closed
+
+**`/dev/draw/<N>/info` answers, so Part B is done for real.** The tick before this one was
+premature twice over, and the second time it was recorded in this log as "answered by a
+real resource server" while the server had never sent a byte on a session channel. What was
+actually missing after that fix was the rest of the namespace: `new` minted a session,
+nothing else resolved.
+
+A resolve of `/dev/draw/<N>/info` now returns a `MemoryObject` holding a 32-byte
+`WindowInfo` — id, committed size, position, role, dock edge, reserve, parent. Three
+details are deliberate:
+
+*Once something is committed, the size reported is the **committed** buffer's, not the
+requested one.* A client asks for 64×32 and attaches and commits a 32×16 buffer; `info`
+says 32×16, because the request is an aspiration and the commit is a fact. **Before any
+commit it reports the requested size**, which is what `Window::bounds` falls back to — a
+created window has no pixels yet, but its requested size is the only information that
+exists about it, and inventing a second notion of size inside one struct to say "nothing
+yet" would buy a distinction no caller has asked for. The two host tests pin exactly this
+pair: committed size after a commit, requested size before one.
+
+*It is a snapshot, not a mapping of live state.* Each resolve mints a fresh object. A
+shared page would be faster and would also hand every reader a window into the
+compositor's bookkeeping; a 32-byte copy costs nothing at this scale and can be revisited
+when something actually polls it.
+
+*It is readable by anyone holding `/dev/draw`, and that is the intended boundary.* A
+resolve carries no connection identity — the namespace hands the compositor a path, not a
+caller — so `info` cannot be scoped to the owning client without inventing one. The
+protocol gates **pixels**, which stay behind connection-scoped ids and the ownership check
+that precedes every mapping; geometry is not secret in a system where the compositor draws
+every window on one screen anyway. If windows ever hold content worth hiding from a peer
+that already has draw access, this becomes a real decision. Recorded here so it is a
+decision and not an oversight.
+
+**Part E — release semantics — is closed by the client, as its own box predicted.** It was
+written as "settled by the first client that double-buffers," and it was, though not by
+agreeing with anything written in advance. Three rules came out of it, each found by
+something breaking:
+
+- `Release` names the buffer that **left** the screen, never the one on it.
+- The compositor **paints before it acknowledges**. Acknowledging first is a lie a
+  single-threaded test cannot see and a real client trips over immediately.
+- A client **blocks** for a release rather than polling once.
+
+Single buffering is refused at construction: with one buffer there is never anything to
+release, so the semantics have nothing to say and a client would deadlock waiting for a
+statement the protocol cannot make.
+
+**Milestone 2 is complete**, and the boxes are ticked with more care than the last two
+times. What M2 built: the Surface protocol, a compositor process bound at `/dev/draw` that
+answers on session channels, `libui`, and a real second process that drives the whole path
+on every `test-qemu` run. What it did not build, and is no longer claimed: input, ports,
+desktops, a shell.
+
+**The design docs do not graduate yet.** Root `CLAUDE.md` requires the milestone that
+builds a `design/` document to carry its move to `architecture/`, and nothing did — so the
+checkbox went into M2 by default. That was wrong: `display-substrate.md` still specifies
+input, text, capture and hotkeys with no code behind them, and `ui-composition-model.md`
+specifies ports and desktops. Moving a document to `architecture/` while most of it
+describes the future is the exact confusion the split exists to prevent. The checkboxes now
+sit in M6 and M7, with the milestones that finish those subsystems. The rule is: a document
+graduates when its **subsystem** is built, not when the first milestone to touch it lands.
+
+1222 host tests, all six gates green, `test-qemu` green, display gate green through the
+full client path.
+
+### Review of PR #175 — an unbounded leak, and a gate that stopped watching its own subject
+
+Twelve findings; the three blocking ones are worth keeping.
+
+**Every `/dev/draw/<N>/info` resolve leaked a page and a VMA in the compositor.**
+`reply_window_info` created a `MemoryObject`, mapped it to fill it, transferred the handle
+on the reply — and never unmapped. The mapping holds its own reference to the object (this
+file's own `map_attached_buffer` says so), so the frames survived the handle going away, and
+nothing recorded the address, so they could never be reclaimed. Any process with `/dev/draw`
+in its namespace — which *is* the whole authority to open a window — could loop the resolve
+and consume the compositor's address space and physical memory without limit. The fix is one
+unmap after the copy, plus closing the object on the two failure paths that dropped it
+(`open_session` and `map_attached_buffer` both already did this; this was the odd one out).
+The same defect existed on the client side of the exchange, in the harness's `check_info`,
+and is fixed the same way.
+
+**Worth recording: I could not build a repro that fails, and the fix is not gated.**
+4000 resolves in a boot leaks 16 MiB of a 256 MiB guest, which nothing notices; 20000 does
+not complete before `session-mgr` fires the verdict; and shrinking the guest to 48 MiB or
+96 MiB hangs the *baseline*, so it is not a control. The wall-clock difference between the
+leaking and fixed builds at 4000 resolves was 140 ms out of 16 s, i.e. build noise. So this
+one rests on reading the code and the codebase's documented mapping-reference semantics,
+not on a red-to-green demonstration — which is worth stating plainly, because every other
+fix this milestone had one.
+
+**The display gate had stopped watching the file that produces its picture.** The path
+filter named `userspace/test-harness/src/display.rs` specifically, from when
+`display-selftest` drew the scene. Since Part D `ui-testclient` renders and commits it and
+prints the line the gate blocks on, and neither `uiclient.rs` nor the `Cargo.toml` that
+registers the bin matched any entry — so a commit touching only the client could break the
+display with the gate never running. Widened to `userspace/test-harness/**` and
+`userspace/librsproto/**`.
+
+The same finding answers a question the PR asked: *init cannot wait on a process that never
+exits — check that interaction.* Spawn-and-forget is right for the success path, and a
+`fail()` is caught only because it comfortably wins a race against the whole login chain
+that produces the PASS verdict — nothing orders the two. A **hang** is worse: the client
+parks, `session-mgr` fires PASS anyway, QEMU exits 33. `check-display`'s expect timeout is
+the only thing that sees it, which is the sharper reason its filter had to cover the client.
+
+**A decision-log entry stated the opposite of what the code does.** The entry above claimed
+`info` reports 0×0 before the first commit. It reports the *requested* size — `bounds()`
+falls back to it — which is what this branch's own test asserts and what the guest depends
+on. Corrected in place rather than by a contradicting entry, on the grounds that the
+append-only rule protects the record from retroactive revision and this had not yet merged.
+The rule stands; an error caught before merge is not yet part of the record.
+
+**The guest had quietly lost its padded-stride coverage.** `scene::SCREEN_PITCH` is 268
+rather than 256 so that any code computing a row offset from the width instead of the pitch
+skews every row after the first. `display-selftest` used to compose at that pitch; when
+`ui-testclient` took over producing the picture it re-copied into a `w * 4` = 256 buffer, so
+the two numbers agreed again and the bug the padding exists to catch could not appear. The
+client now attaches at 268, and the host test that pins the guest shape with it. Verified
+by breaking it: with the compositor's source geometry taking `req.width * 4` instead of
+`req.pitch`, the gate fails at 1151 of 2048 pixels, first at **(0,1)** — the second row,
+which is the signature of a stride skew. At pitch 256 that break produced a perfect screen.
+
+Also from the review: the parked-message queue in `libui` documented dropping the oldest
+and dropped the newest; since `acquire` blocks with no timeout, a dropped `Release` is a
+permanent hang rather than a recoverable `None`, so overflow is now an error — noisy while
+it is still unreachable. The `WindowInfo` layout, the `/dev/draw/<N>/info` path and the
+access boundary moved into `docs/spec/rsproto-surface-ops.md`, where wire contracts belong;
+a `librsproto` doc comment is not that place, and `x`/`y` being signed is exactly the kind
+of thing a later reader gets wrong from a Rust type alone.
+
+One pleasing correction in the other direction: **the release-ordering rule Part E arrived
+at was already in the spec.** The lifecycle diagram has shown `composite` before `Release`
+since Part A. The code was wrong and the document was right — the reverse of the failure
+mode most of this project's doc rules are built to prevent.
+
+### The second leak — the one the review found by implication
+
+Asked whether the `info` leak meant "a leak somewhere", the honest answer turned out to be
+yes, and a worse one, one file over.
+
+`MappedBuffer` — the compositor's record of a client buffer it has mapped — had **no
+`Drop`**. Both places that shrink `Server::buffers` do it with `Vec::retain`, which drops
+the removed records and nothing else, so the VMA stayed. The destroy site even carries the
+comment *"otherwise a client looping create/attach/destroy grows the compositor's address
+space without bound"* — describing an intent the code did not carry out. Reading that
+comment is presumably why nobody looked underneath it, this author included.
+
+It is worse than the `info` leak on three counts. It leaks a **whole framebuffer** rather
+than a page — megabytes per window at any real size. It fires on the **ordinary application
+lifecycle**: every window closed, every client that exits, no adversary required. And
+because `map_attached_buffer` closes its handle immediately and relies on the mapping to
+hold the object alive, the stale mapping pinned the **client's** frames — so a program that
+exited never got its memory back.
+
+**Why nothing caught it.** `ui-testclient` parks with its window open, by design, because
+exiting made the display gate capture an empty screen. So in the entire guest suite no
+buffer mapping was ever torn down. The one code path that frees a client's pixels had no
+coverage at all, and the shape of the fix for an earlier bug is what removed the chance of
+getting any.
+
+**This one is proven both ways.** `ui-testclient` now churns 80 windows on a second
+connection, each sharing a 3 MiB buffer, before presenting. 80 × 3 MiB is 240 MiB against a
+256 MiB guest, so a compositor that keeps one mapping per destroyed window runs the guest
+out of memory and the client says so. With the `Drop` in place the run is green; with its
+body removed the boot fails at `window churn FAILED` with exit 35. Sizing that deliberately:
+a smaller buffer or fewer cycles would leak just as truly and pass just as green, which is
+the trap the `info` probe fell into.
+
+**Two smaller things fell out of writing it.**
+
+*A client cannot hold its transport on the stack.* `ChannelTransport` is ~9 KiB — two 4 KiB
+message buffers plus the parked queue — against a **32 KiB** user stack. Moving one in and
+out of a `Window` each cycle overflowed it, and the symptom is worth remembering: the
+process died in its *prologue*, printing nothing at all, not even its own first line, while
+everything around it looked healthy. The fault address (`0x7fff_fffe_7fc8`) sat one byte
+below the stack's low end, which is the only thing that identified it. `libui` now
+implements `Transport for Box<T>` so a window can hold a pointer, and the reason is written
+at the impl rather than in a commit message.
+
+*`Window::into_transport`.* Closing a window and opening another is ordinary behaviour and
+must not require reconnecting — that would cost a compositor session slot per window.
+
+The doc-comment orphaning pattern struck for the **seventh** time this milestone, inserting
+the `Box` impl above `Window` and stealing its `/// A window and its buffers.`. First time
+it was caught mechanically: `Window` is public, so `#![deny(missing_docs)]` fired. That is
+the fix for the public case and nothing for the private one — `fail`, in the same review
+round, was private and silent.
+
+### A third class, found by auditing instead of asserting
+
+Asked whether the leaks were fixed, the useful move was to enumerate every
+map/create/close site in the compositor rather than answer from memory. That turned up a
+third class, distinct from the first two: **a transferred handle nobody consumes**.
+
+`AttachBuffer` carries a `MemoryObject` in the message's transfer slot. Three paths took
+delivery and never closed it:
+
+- **A message that fails to decode.** The handle was read *after* `decode`, so a malformed
+  message returned early with the handle still in the table. One bad message, one pinned
+  object, and a client can send as many as it likes.
+- **A handle riding an op that has no business carrying one.** The disposal was written as
+  `if op == OP_ATTACH_BUFFER && handle != 0 { … }`, so a handle attached to `Commit`, or to
+  anything else, fell through every branch.
+- **`map_attached_buffer`'s parse-failure path**, the one early return in that function
+  that did not close.
+
+Rewritten so disposal is structural rather than per-case: the handle is taken out of the
+message **before anything can fail**, `map_attached_buffer` is documented and implemented to
+consume it on every path, and a single `if handle != 0 && !consumed` closes everything else.
+The old shape enumerated the cases it knew about; this one is exhaustive by construction.
+
+**Proven, at cycle 63.** `ui-testclient`'s churn loop now also sends, each cycle, an
+`AttachBuffer` naming a window that does not exist, carrying a real 3 MiB object — one
+malformed message, the thing any client can do. With the close removed the guest runs out of
+memory and says so; with it, green.
+
+**Writing that test found a `libui` bug worth more than the test.** `request` matched
+replies on `RS_FLAG_REPLY` and the request id alone. The compositor sends refusals as
+`RS_FLAG_REPLY | RS_FLAG_ERROR` with the same op and id — so **an error came back to the
+caller as a success**, and the caller parsed the error body as a result. `Window::new` would
+have read a window id out of an error code. `UiError::Server` now exists and `request`
+returns it. Verified the guest test actually guards this by removing the flag check: the run
+fails at cycle 0 with `bogus attach was not refused`.
+
+Two smaller notes from the same session. The rejected-attach probe first failed at cycle
+**9**, which looked like a leak and was not: it was `MAX_PARKED` = 8, the queue-overflow
+error introduced earlier in this same review round, doing exactly its job — eight unconsumed
+error replies had piled up because the probe fired and forgot. The change made a silent
+condition loud, and the first thing it caught was the test. And **a failed `NOBLOCK` send
+leaves its transfer untaken**, so the sender still owns the handle and must close it; the
+channel holds four messages, so a client that does not wait for replies reaches that case
+easily.
+
+**32 KiB of user stack is small** for a client holding protocol buffers, and worth raising
+(`DEFAULT_USER_STACK_SIZE`, `kernel/src/arch/x86_64/abi.rs`). Deliberately not done here —
+it is a kernel-wide change and this is a display PR. Boxing the transport is the right fix
+regardless: a 9 KiB struct does not belong in a stack frame at any stack size.
+
+### Review round 2 of PR #175 — a test that asserted nothing about its own subject
+
+The blocking finding is the one worth keeping, because the test in question was written
+*specifically* to close a gap and did not.
+
+`the_guest_configuration_composites_a_client_surface` pins the guest's shape at a source
+pitch of 268, and carries a comment saying the padding is the point — that a stride computed
+from the width instead of the pitch skews every row, and equal numbers would hide it. The
+test filled the surface with **one colour**, so a row skew moved that colour onto itself.
+With the compositor reading the source at `width * 4`, the whole compositor suite passed and
+`check-display` failed at 1151 of 2048 pixels. The assertion held for both the correct and
+the broken implementation.
+
+Fixed by filling with a **distinct colour per row**, so which source row reached the screen
+is readable from the screen: at pitch 256, screen row 5 lands in source row 4, and the
+assertion names the row it must have come from. Verified against the same break — `left: 36,
+right: 37`, the two adjacent row colours.
+
+Two lessons, and the second is the general one. First: **a uniform fixture cannot detect a
+geometry bug**, because every wrong answer is the right colour. Second: the behaviour *was*
+covered, by `check-display` — so the code was never wrong, only the claim about what
+guarded it. That is worse than an untested behaviour, because the comment invited the next
+person to trim the display gate's path filter believing the host test carried this.
+
+**Enumeration: the compositor answered the same question two ways.** `surface_errno`
+collapsed "not yours" into "not there" with a comment saying the reply "cannot be used to
+probe which ids exist" — which stopped being true the moment `/dev/draw/<N>/info` landed,
+since a namespace resolve answers it for any holder of `/dev/draw`, and ids run sequentially
+from 1. Resolved by choosing, not by patching: **the namespace is where you ask, the session
+channel is where you act.** Enumerable metadata is deliberate — a window manager needs
+exactly that, and holding `/dev/draw` is how it is authorised — while the session rule's real
+job is ownership enforcement: a client learns nothing *from acting*, so there is no oracle to
+walk by attempting operations, and it can never reach another client's pixels. Both halves
+are now in the spec, with the note that hiding a window in future means changing **both**
+doors, since scoping one alone achieves nothing.
+
+**A spec gap explained a bug that looked like a client bug.** `AttachBuffer`, `Commit` and
+`DestroyWindow` are silent on success and reply with an error on failure — an asymmetry the
+per-op sections never stated. A client reading only the spec never learns it must drain those
+replies, and dies at the ninth rejection when `MAX_PARKED` fills, at a point arbitrarily far
+from the cause. Now a table in the spec, and the `MAX_PARKED` doc no longer claims the case
+is unreachable: it is reachable, `parked_len` never resets, and the reviewer reached it by
+reverting the probe to fire-and-forget.
+
+**`ChannelTransport` had no `Drop`**, so a dropped transport stranded a compositor session
+slot forever — 31 of them machine-wide, shared, and one client opening and dropping that many
+makes `/dev/draw/new` fail for **every** process while the offender looks healthy. The same
+class as the three leaks fixed the round before, on the client side of the same protocol.
+
+**A rejection log line was an unbounded client-driven write to a shared console** — the churn
+probe alone produced 80 identical lines a boot. Capped at 8 with a closing notice.
+
+**Sizing a probe against the sparsest leak it must catch.** Adding a second disposal path to
+the churn cycle (a handle riding `Commit`, which is what distinguishes the new exhaustive
+disposal from the old attach-only shape) made each break leak on only *half* the cycles. At
+80 cycles that is 120 MiB, the guest absorbed it, and the probe passed against the narrowed
+code — vacuous, in the exact way the blocking finding was. Raised to 128 so the alternating
+half alone is 192 MiB; the break now fails at cycle 124. **A probe sized against its
+densest leak is not sized at all.**
+
+And `WindowInfo`'s byte offsets are now asserted directly, not merely round-tripped: a
+symmetric swap of `x` and `y` in both `write` and `read` left the whole librsproto suite
+green while the new test fails. The PR publishes that table as a contract for other
+implementations, and a table nothing checks is a table that drifts.
+
+### Review round 3 of PR #175 — the kernel's limit, not the server's expectation
+
+Three findings, all pre-existing, all in code this PR had just claimed to make exhaustive.
+That is the pattern worth noting: the review found them *because* the new comments made a
+completeness claim, and a claim is a thing that can be checked.
+
+**`RECV_HANDLES` was half the size the kernel may write.** `sys_channel_recv` takes no
+capacity argument — it copies `handle_count * 8` bytes, where the count is the *sender's*,
+bounded only by `IPC_HANDLE_MAX` = 8. The compositor declared `[u64; 4]`, so any client
+holding a session could overrun a 32-byte static by 32 bytes into whatever the linker placed
+next, by sending eight transfers. Every other resource server in the tree already sized it
+correctly; the compositor and `libui` were the two that did not. Both now use
+`libkern::abi::IPC_HANDLE_MAX`, which existed the whole time.
+
+The general form: **an array the kernel writes into is sized by the kernel's limit, not by
+what this server expects to receive.** The compositor's expectation was right — no Surface op
+takes more than one handle — and irrelevant, because nothing enforces an expectation.
+
+**"Disposed of exactly once" was true only of handle zero.** The disposal block rewritten
+last round reads `RECV_HANDLES[0]` and closes one handle, so a message carrying *n* transfers
+leaked *n − 1* objects for the compositor's life — the same unbounded, client-driven leak as
+the three fixed before it, differing only in how it arrived. Now every surplus handle is
+closed at extraction, before anything can fail.
+
+Both of these were reachable only because the code assumed the shape of a well-behaved
+message. The lesson is not "check the count"; it is that **the completeness claim in a
+comment is a hypothesis**, and this one had been written the round before with enough
+confidence to stop anyone looking.
+
+**A dropped `Release` is now a permanent hang, and that is a genuine gap, not a fixed bug.**
+Session channels are four deep and the compositor sends `NOBLOCK`, so a client that lets its
+ring fill loses the message — and since `acquire` blocks with no timeout, the buffer stays
+busy forever. This round only adds the log line (`compositor: DROPPED a Release`), which
+makes it diagnosable and does not fix it. Every real fix costs something — blocking lets one
+slow client stall every window, an outbound queue needs its own bound, disconnecting kills a
+client whose ring was transiently full — and with exactly one well-behaved client to test
+against, all three are untested theory. Filed in `deferred-decisions.md` rather than guessed
+at, with M3 input as the trigger.
+
+**Two bugs in the harness, one of which cost the reviewer a pass.** `Session` killed its QEMU
+only on the paths that reached an explicit `kill`, so every `?` between spawn and the end
+leaked one — and a leaked QEMU holds the write lock on `build-cache/nitrox.hdd`, so the
+*next* run boots a guest that cannot open its disk and fails with a bare 45-second timeout
+and no serial output. The reviewer lost a pass to a 20-hour-old orphan of mine; there was
+still a 4½-hour-old one on this machine when I went looking. `Session` now kills on `Drop`.
+And `expect`'s timeout message now distinguishes **no output at all** — which usually means
+QEMU never started — from a partial boot, and prints the tail in the second case. Two
+failures that were one indistinguishable line.
+
+Also fixed: the rejection-log budget was global and never reset, so the churn probe spent all
+eight in the first second of every selftest boot and no later rejection could ever be
+logged — it is per-session now; `shared_buffer` leaked its object when the map failed, in the
+one file whose purpose is proving leaks absent; and `ChannelTransport::new`'s `# Safety`
+block now says the caller is giving the handle away, which became true when `Drop` landed and
+the doc did not follow.

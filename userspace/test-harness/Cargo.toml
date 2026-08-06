@@ -18,6 +18,7 @@ libheap = { path = "../libheap" }
 libstream = { path = "../libstream", features = ["io"] }
 # `io` for `acquire`: the selftest maps the real framebuffer.
 libdraw = { path = "../libdraw", features = ["io"] }
+libui = { path = "../libui" }
 
 [[bin]]
 name = "test-harness"
@@ -33,3 +34,9 @@ path = "src/stage.rs"
 [[bin]]
 name = "display-selftest"
 path = "src/display.rs"
+
+# The display arm's first real client (plan M2 Part D): a second process that shares
+# memory with the compositor and requires it to talk back.
+[[bin]]
+name = "ui-testclient"
+path = "src/uiclient.rs"

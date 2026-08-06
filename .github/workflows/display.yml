@@ -20,7 +20,17 @@ on:
       # display without touching anything else on this list.
       - 'userspace/compositor/**'
       - 'userspace/libui/**'
-      - 'userspace/test-harness/src/display.rs'
+      # The **whole** test-harness crate, not `display.rs` alone. Since M2 Part D the
+      # picture this gate compares is rendered and committed by `ui-testclient`, and the
+      # line the gate blocks on is printed there — so a commit touching only `uiclient.rs`
+      # could break the display with this workflow never running. `test-qemu` would not
+      # catch it either: the client parks on success, so a *hang* leaves session-mgr free
+      # to fire PASS and QEMU still exits 33. This gate's expect timeout is the only thing
+      # that sees it (PR #175 review, finding 3).
+      - 'userspace/test-harness/**'
+      # `librsproto` carries the Surface encoders and `WindowInfo`; every message on the
+      # path from client to screen rides them.
+      - 'userspace/librsproto/**'
       # `kernel/src/main.rs` holds *both* halves of the binding — `record_framebuffer()`
       # and its placement relative to `run_first_userspace()`, and the
       # `bind_kernel_server(b"/dev/framebuffer", ...)` call. That is precisely where the
