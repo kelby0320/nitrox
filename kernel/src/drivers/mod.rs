@@ -7,6 +7,7 @@
 pub mod ahci;
 pub mod console;
 pub mod gpt;
+pub mod ps2;
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::timer::ArchTimer;
