@@ -169,6 +169,95 @@ impl Role {
     }
 }
 
+// --- Window info ------------------------------------------------------------
+
+/// What `/dev/draw/<N>/info` reports about a window.
+///
+/// Served as the bytes of a small read-only `MemoryObject`, the same shape
+/// `/dev/framebuffer/info` uses — a resolve answers with an object the caller maps, not
+/// with a message.
+///
+/// **Readable by anyone holding `/dev/draw`, deliberately.** A resolve arrives on the
+/// forwarding endpoint with no connection identity attached, so the compositor could not
+/// scope this per client even if it wanted to. That is the right answer rather than a
+/// concession: the composition model expects a canvas or desktop shell to enumerate windows
+/// and read their metadata, and `display-substrate.md` §4b gates *pixels* — not titles,
+/// roles or geometry — as the thing that actually leaks.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct WindowInfo {
+    /// Compositor-assigned window id.
+    pub id: u32,
+    /// Committed width, or the requested width if nothing is committed yet.
+    pub width: u32,
+    /// Committed height, or the requested height.
+    pub height: u32,
+    /// Top-left corner in screen coordinates. Signed: a window may sit off an edge.
+    pub x: i32,
+    /// Top-left corner, y.
+    pub y: i32,
+    /// Role tag — see [`ROLE_NORMAL`] and friends.
+    pub role: u16,
+    /// A panel's dock edge; zero otherwise.
+    pub dock: u16,
+    /// A panel's reservation; zero otherwise.
+    pub reserve: u32,
+    /// A popup or dialog's parent window; zero otherwise.
+    pub parent: u32,
+}
+
+const _: () = assert!(core::mem::size_of::<WindowInfo>() == 32);
+
+impl WindowInfo {
+    /// Build the info for a window with `role` at `(x, y)`, sized `width × height`.
+    pub fn new(id: u32, role: Role, x: i32, y: i32, width: u32, height: u32) -> Self {
+        let (dock, reserve, parent) = match role {
+            Role::Normal => (0, 0, 0),
+            Role::Panel { dock, reserve } => (dock.tag(), reserve, 0),
+            Role::Popup { parent } | Role::Dialog { parent } => (0, 0, parent),
+        };
+        Self { id, width, height, x, y, role: role.tag(), dock, reserve, parent }
+    }
+
+    /// Serialise into `out`; returns the length written.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 32 {
+            return None;
+        }
+        put_u32(out, 0, self.id);
+        put_u32(out, 4, self.width);
+        put_u32(out, 8, self.height);
+        put_u32(out, 12, self.x as u32);
+        put_u32(out, 16, self.y as u32);
+        put_u16(out, 20, self.role);
+        put_u16(out, 22, self.dock);
+        put_u32(out, 24, self.reserve);
+        put_u32(out, 28, self.parent);
+        Some(32)
+    }
+
+    /// Parse from the first 32 bytes of a mapped `info` object.
+    ///
+    /// Returns `None` if the slice is short: a truncated read would otherwise produce a
+    /// plausible window with zeroed geometry.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 32 {
+            return None;
+        }
+        Some(Self {
+            id: get_u32(b, 0),
+            width: get_u32(b, 4),
+            height: get_u32(b, 8),
+            x: get_u32(b, 12) as i32,
+            y: get_u32(b, 16) as i32,
+            role: get_u16(b, 20),
+            dock: get_u16(b, 22),
+            reserve: get_u32(b, 24),
+            parent: get_u32(b, 28),
+        })
+    }
+}
+
 // --- CreateWindow -----------------------------------------------------------
 
 /// Body length of a `CreateWindowRequest`.
@@ -542,6 +631,39 @@ mod tests {
         };
         build_attach_buffer_request(&mut buf, &req).unwrap();
         assert!(parse_attach_buffer_request(&buf).is_none());
+    }
+
+    #[test]
+    fn window_info_round_trips_every_role() {
+        let cases = [
+            (Role::Normal, 0u16, 0u32, 0u32),
+            (Role::Panel { dock: Edge::Bottom, reserve: 28 }, EDGE_BOTTOM, 28, 0),
+            (Role::Popup { parent: 4 }, 0, 0, 4),
+            (Role::Dialog { parent: 9 }, 0, 0, 9),
+        ];
+        let mut buf = [0u8; 48];
+        for (role, dock, reserve, parent) in cases {
+            let info = WindowInfo::new(7, role, -3, 12, 640, 480);
+            let n = info.write(&mut buf).unwrap();
+            assert_eq!(n, 32);
+            let got = WindowInfo::read(&buf[..n]).unwrap();
+            assert_eq!(got, info);
+            assert_eq!(got.id, 7);
+            assert_eq!((got.x, got.y), (-3, 12), "a negative origin must survive");
+            assert_eq!((got.width, got.height), (640, 480));
+            assert_eq!(got.role, role.tag());
+            assert_eq!((got.dock, got.reserve, got.parent), (dock, reserve, parent));
+        }
+    }
+
+    #[test]
+    fn a_truncated_info_is_refused_rather_than_read_short() {
+        let mut buf = [0u8; 32];
+        WindowInfo::new(1, Role::Normal, 0, 0, 8, 8).write(&mut buf).unwrap();
+        for short in 0..32 {
+            assert!(WindowInfo::read(&buf[..short]).is_none(), "len {short}");
+        }
+        assert!(WindowInfo::read(&buf).is_some());
     }
 
     #[test]

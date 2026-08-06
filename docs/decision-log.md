@@ -11284,3 +11284,68 @@ event loop, which are M3.
 
 1218 host tests, all six gates green, `test-qemu` green, display gate green through the
 full client path.
+
+---
+
+## 2026-08-06 — Display arm M2 Part B, Part E, and the milestone closed
+
+**`/dev/draw/<N>/info` answers, so Part B is done for real.** The tick before this one was
+premature twice over, and the second time it was recorded in this log as "answered by a
+real resource server" while the server had never sent a byte on a session channel. What was
+actually missing after that fix was the rest of the namespace: `new` minted a session,
+nothing else resolved.
+
+A resolve of `/dev/draw/<N>/info` now returns a `MemoryObject` holding a 32-byte
+`WindowInfo` — id, committed size, position, role, dock edge, reserve, parent. Three
+details are deliberate:
+
+*The size reported is the **committed** buffer's, not the requested one.* A client asks for
+64×32 and attaches a 32×16 buffer; until it commits, the window has no pixels, and
+answering with the request would describe a window that does not exist yet. `info` before
+the first commit reports 0×0. The two host tests are exactly this pair.
+
+*It is a snapshot, not a mapping of live state.* Each resolve mints a fresh object. A
+shared page would be faster and would also hand every reader a window into the
+compositor's bookkeeping; a 32-byte copy costs nothing at this scale and can be revisited
+when something actually polls it.
+
+*It is readable by anyone holding `/dev/draw`, and that is the intended boundary.* A
+resolve carries no connection identity — the namespace hands the compositor a path, not a
+caller — so `info` cannot be scoped to the owning client without inventing one. The
+protocol gates **pixels**, which stay behind connection-scoped ids and the ownership check
+that precedes every mapping; geometry is not secret in a system where the compositor draws
+every window on one screen anyway. If windows ever hold content worth hiding from a peer
+that already has draw access, this becomes a real decision. Recorded here so it is a
+decision and not an oversight.
+
+**Part E — release semantics — is closed by the client, as its own box predicted.** It was
+written as "settled by the first client that double-buffers," and it was, though not by
+agreeing with anything written in advance. Three rules came out of it, each found by
+something breaking:
+
+- `Release` names the buffer that **left** the screen, never the one on it.
+- The compositor **paints before it acknowledges**. Acknowledging first is a lie a
+  single-threaded test cannot see and a real client trips over immediately.
+- A client **blocks** for a release rather than polling once.
+
+Single buffering is refused at construction: with one buffer there is never anything to
+release, so the semantics have nothing to say and a client would deadlock waiting for a
+statement the protocol cannot make.
+
+**Milestone 2 is complete**, and the boxes are ticked with more care than the last two
+times. What M2 built: the Surface protocol, a compositor process bound at `/dev/draw` that
+answers on session channels, `libui`, and a real second process that drives the whole path
+on every `test-qemu` run. What it did not build, and is no longer claimed: input, ports,
+desktops, a shell.
+
+**The design docs do not graduate yet.** Root `CLAUDE.md` requires the milestone that
+builds a `design/` document to carry its move to `architecture/`, and nothing did — so the
+checkbox went into M2 by default. That was wrong: `display-substrate.md` still specifies
+input, text, capture and hotkeys with no code behind them, and `ui-composition-model.md`
+specifies ports and desktops. Moving a document to `architecture/` while most of it
+describes the future is the exact confusion the split exists to prevent. The checkboxes now
+sit in M6 and M7, with the milestones that finish those subsystems. The rule is: a document
+graduates when its **subsystem** is built, not when the first milestone to touch it lands.
+
+1222 host tests, all six gates green, `test-qemu` green, display gate green through the
+full client path.

@@ -38,7 +38,7 @@ use libdraw::format::Rgb;
 use libdraw::framebuffer::{Framebuffer, RawFramebuffer};
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE,
-    SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall4, syscall5,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall4, syscall5,
 };
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
@@ -240,6 +240,115 @@ fn send_release(session: u64, window: u32, buffer: u32) -> bool {
         return false;
     };
     reply_on_session(session, OP_RELEASE, 0, &body[..n])
+}
+
+/// What a forwarded resolve under `/dev/draw` is asking for.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Resolved {
+    /// `new` — mint a session.
+    New,
+    /// `<N>/info` — that window's metadata.
+    Info(u32),
+    /// Anything else.
+    Unknown,
+}
+
+/// Classify a resolve suffix.
+///
+/// Suffixes arrive without a leading separator (`/dev/draw/1/info` -> `1/info`), the
+/// convention `Namespace::resolve` uses and one that cost a boot to rediscover in M1.
+fn classify(suffix: &[u8]) -> Resolved {
+    if suffix == b"new" {
+        return Resolved::New;
+    }
+    if let Some(slash) = suffix.iter().position(|&c| c == b'/')
+        && &suffix[slash + 1..] == b"info"
+        && let Some(id) = parse_u32(&suffix[..slash])
+    {
+        return Resolved::Info(id);
+    }
+    Resolved::Unknown
+}
+
+/// Parse a decimal window id. Rejects empty input, non-digits and overflow — a resolve
+/// suffix is client-supplied text.
+fn parse_u32(b: &[u8]) -> Option<u32> {
+    if b.is_empty() || b.len() > 10 {
+        return None;
+    }
+    let mut n: u32 = 0;
+    for &c in b {
+        if !c.is_ascii_digit() {
+            return None;
+        }
+        n = n.checked_mul(10)?.checked_add((c - b'0') as u32)?;
+    }
+    Some(n)
+}
+
+/// Answer `<N>/info` with a read-only object holding the window's `WindowInfo`.
+///
+/// The same shape `/dev/framebuffer/info` uses: a resolve answers with an object the caller
+/// maps, not with a message. A fresh object per resolve, holding a snapshot — handing out a
+/// live shared mapping would let readers observe mid-update state.
+fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> bool {
+    let Some(info) = srv.stack.info(id) else {
+        return reply_resolve_error(serve_end, request_id, KError::NotFound);
+    };
+    let mut bytes = [0u8; 32];
+    if info.write(&mut bytes).is_none() {
+        return reply_resolve_error(serve_end, request_id, KError::KernelError);
+    }
+    // SAFETY: a plain anonymous object of `bytes.len()`.
+    let obj = unsafe { syscall4(SYS_MEMORY_CREATE, bytes.len() as u64, 0, 0, 0) };
+    if obj <= 0 {
+        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
+    }
+    // SAFETY: mapping an object this process just created, to fill it.
+    let addr = unsafe {
+        syscall4(
+            SYS_MEMORY_MAP,
+            obj as u64,
+            0,
+            bytes.len() as u64,
+            libkern::RIGHT_MAP_READ | libkern::RIGHT_MAP_WRITE,
+        )
+    };
+    if addr <= 0 {
+        // SAFETY: closing the object we just made and cannot use.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
+        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
+    }
+    // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
+    unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+
+    let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
+    let _ =
+        resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32);
+    // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; the object rides the reply.
+    unsafe {
+        let Some(rs_len) = encode(
+            &mut REPLY_MSG[PAYLOAD_OFF..],
+            OP_NS_RESOLVE,
+            request_id,
+            RS_FLAG_REPLY,
+            &body,
+            1,
+        ) else {
+            return false;
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 1;
+        REPLY_HANDLES[0] = obj as u64;
+        syscall5(
+            SYS_CHANNEL_SEND,
+            serve_end,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            1,
+            SENDMODE_NOBLOCK,
+        ) == 0
+    }
 }
 
 /// Open a session: mint a channel, keep the server end, hand the client end back.
@@ -527,8 +636,8 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             continue;
         }
 
-        // A forwarded resolve. Only `new` is answerable today: numbered window paths and
-        // `info` are the rest of Part B.
+        // A forwarded resolve: `new` mints a session, `<N>/info` answers with window
+        // metadata. A bare `<N>` and `<N>/ports/...` are later milestones.
         // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
         let rr = unsafe {
             syscall4(
@@ -543,7 +652,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             continue;
         }
         // SAFETY: bounded read of the payload, then of the resolve's suffix.
-        let (request_id, is_new, ok) = unsafe {
+        let (request_id, resolved, ok) = unsafe {
             let payload_len =
                 u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
             let req = core::slice::from_raw_parts(
@@ -555,19 +664,25 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                     let suffix = librsproto::namespace::parse_resolve_request(m.body)
                         .map(|r| r.suffix)
                         .unwrap_or(b"");
-                    (m.request_id, suffix == b"new", true)
+                    (m.request_id, classify(suffix), true)
                 }
-                Ok(m) => (m.request_id, false, true),
-                Err(_) => (0, false, false),
+                Ok(m) => (m.request_id, Resolved::Unknown, true),
+                Err(_) => (0, Resolved::Unknown, false),
             }
         };
         if !ok {
             continue;
         }
-        if is_new {
-            open_session(serve_end, request_id, srv);
-        } else {
-            reply_resolve_error(serve_end, request_id, KError::NotFound);
+        match resolved {
+            Resolved::New => {
+                open_session(serve_end, request_id, srv);
+            }
+            Resolved::Info(id) => {
+                reply_window_info(serve_end, request_id, srv, id);
+            }
+            Resolved::Unknown => {
+                reply_resolve_error(serve_end, request_id, KError::NotFound);
+            }
         }
     }
 }

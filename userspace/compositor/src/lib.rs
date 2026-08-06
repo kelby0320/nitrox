@@ -273,6 +273,23 @@ impl WindowStack {
         )
     }
 
+    /// The `info` a window reports at `/dev/draw/<id>/info`.
+    ///
+    /// Reports the **committed** buffer's size when there is one, because that is what is
+    /// actually on screen; the requested size is only a hint until a client commits.
+    pub fn info(&self, id: u32) -> Option<librsproto::surface::WindowInfo> {
+        let w = self.window(id)?;
+        let bounds = w.bounds();
+        Some(librsproto::surface::WindowInfo::new(
+            w.id,
+            w.role,
+            bounds.origin.x,
+            bounds.origin.y,
+            bounds.size.w,
+            bounds.size.h,
+        ))
+    }
+
     /// The topmost window that may take keyboard focus, if any.
     ///
     /// Panels are skipped: clicking the clock must not steal input from the terminal.
@@ -766,6 +783,48 @@ mod tests {
             Some(Rgb::new(0x0E, 0x14, 0x1B)),
             "and stop at its edge"
         );
+    }
+
+    #[test]
+    fn info_reports_the_committed_size_not_the_requested_one() {
+        // A client may create a window at one size and commit a buffer of another; what is
+        // on screen is the buffer, so that is what `info` must report.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 100, height: 50, role: Role::Normal }).unwrap();
+        let info = s.info(w).unwrap();
+        assert_eq!((info.width, info.height), (100, 50), "requested size before any commit");
+
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::BLACK);
+        s.commit(&commit(w, 0)).unwrap();
+        s.set_origin(w, Point::new(-3, 12)).unwrap();
+
+        let info = s.info(w).unwrap();
+        assert_eq!((info.width, info.height), (8, 8), "committed size once there is one");
+        assert_eq!((info.x, info.y), (-3, 12));
+        assert_eq!(info.id, w);
+    }
+
+    #[test]
+    fn info_carries_the_role_and_its_extra_fields() {
+        let mut s = WindowStack::new();
+        let p = s
+            .create(&CreateWindowRequest {
+                width: 100,
+                height: 24,
+                role: Role::Panel { dock: Edge::Bottom, reserve: 24 },
+            })
+            .unwrap();
+        let info = s.info(p).unwrap();
+        assert_eq!(info.role, librsproto::surface::ROLE_PANEL);
+        assert_eq!(info.reserve, 24);
+
+        let child = s
+            .create(&CreateWindowRequest { width: 4, height: 4, role: Role::Popup { parent: p } })
+            .unwrap();
+        assert_eq!(s.info(child).unwrap().parent, p);
+        assert!(s.info(9999).is_none(), "a window that does not exist has no info");
     }
 
     #[test]

@@ -102,6 +102,63 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, addr as *mut u8))
 }
 
+/// Resolve `/dev/draw/<id>/info`, map it, and check it describes the window we created.
+fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
+    use libkern::handle::{RawHandle, Rights};
+    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
+
+    let mut path = [0u8; 32];
+    let prefix = b"/dev/draw/";
+    path[..prefix.len()].copy_from_slice(prefix);
+    let mut n = prefix.len();
+    // The id, in decimal.
+    let mut digits = [0u8; 10];
+    let (mut d, mut v) = (0usize, id);
+    if v == 0 {
+        digits[0] = b'0';
+        d = 1;
+    }
+    while v > 0 {
+        digits[d] = b'0' + (v % 10) as u8;
+        v /= 10;
+        d += 1;
+    }
+    for j in 0..d {
+        path[n] = digits[d - 1 - j];
+        n += 1;
+    }
+    path[n..n + 5].copy_from_slice(b"/info");
+    n += 5;
+    let Ok(path) = core::str::from_utf8(&path[..n]) else { return false };
+
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let ns =
+        unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+    // SAFETY: the path resolves to a read-mappable object holding one `WindowInfo`.
+    let Ok(obj) = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }) else {
+        return false;
+    };
+    let Ok(addr) = obj.map(32) else { return false };
+    // SAFETY: the compositor serves exactly 32 bytes of `WindowInfo` here.
+    let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 32) };
+    let Some(info) = librsproto::surface::WindowInfo::read(bytes) else { return false };
+
+    kprint(b"ui-testclient: info id=");
+    kprint_u64(info.id as u64);
+    kprint(b" ");
+    kprint_u64(info.width as u64);
+    kprint(b"x");
+    kprint_u64(info.height as u64);
+    kprint(b" role=");
+    kprint_u64(info.role as u64);
+    kprint(b"\n");
+
+    info.id == id
+        && info.width == want_w
+        && info.height == want_h
+        && info.role == librsproto::surface::ROLE_NORMAL
+}
+
 /// # Safety
 ///
 /// Called by the kernel's ELF entry with the standard bootstrap arguments.
@@ -145,6 +202,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"ui-testclient: window ");
     kprint_u64(win.id() as u64);
     kprint(b"\n");
+
+    // 2b. Read the window's own metadata back through the *numbered* path. This is the
+    //     other half of Part B: `/dev/draw/new` mints a session, `/dev/draw/<N>/info`
+    //     answers with a mapped snapshot. Checking it here rather than in a host test is
+    //     what proves the resolve suffix, the id parsing and the object hand-off agree.
+    if !check_info(root_ns, win.id(), w, h) {
+        fail(b"ui-testclient: /dev/draw/<N>/info FAILED\n");
+    }
 
     // 3. Shared memory. Rendered once; both buffers get the same picture, so whichever is
     //    on screen at the end is the one `check-display` expects.
