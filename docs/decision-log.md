@@ -11891,3 +11891,33 @@ The general lesson: when a bug is rare, buy observation rather than samples. Soa
 like progress and tooling feels like a detour, and the arithmetic says otherwise — at a 6%
 rate, telling "fixed" from "lucky" costs 60 boots per experiment, while the instrument that
 answered it took about an hour and is now permanent.
+
+### M3 Part A, step 2 — the i8042 wired up, and a flake that was not mine
+
+The driver boots: `ps2: keyboard mouse armed (kbd vec0x33, aux vec0x34)`, with
+`/dev/input/raw/0` and `/dev/input/raw/1` bound in the root namespace.
+
+**Bring-up is polled, and the ordering is load-bearing rather than stylistic.**
+`arch::ps2::init` disables both ports, programs the config byte once, resets each device and
+consumes every response — all with interrupts masked — before `arm` routes anything. The
+reason is the `0xAA` collision: the byte a device sends to report a passed self-test is
+byte-identical to `0x2A | 0x80`, an ordinary **Left Shift release**. Nothing in the stream
+distinguishes them; only time does. Arming first would deliver a phantom Shift release on
+every boot, and the "fix" would be to special-case `0xAA` in the decoder — which swallows
+every real Left Shift release instead. Consuming the responses before a byte can reach the
+decoder is the only version that is not wrong somewhere.
+
+**One config byte, written once**, for the reason the #176 review gave: enabling the mouse is
+a read-modify-write of the byte carrying the keyboard's IRQ-1 enable.
+
+**The drain loop is bounded, unlike the console's.** `IrqSpinLock` masks interrupts, so an
+unbounded drain is an unbounded interrupts-off window — a device that streams without pause
+(a mouse left reporting after a bad reset, a stuck repeating key) would hold the CPU
+forever. `drivers/console.rs` has the same shape and gets away with it because a UART with
+nothing arriving stops immediately; a controller with two attached devices is not that.
+64 bytes per interrupt, and whatever remains raises the line again.
+
+**A hang appeared while wiring this up, and it was not mine** — 2 timeouts in 20 runs
+with the driver and 2 in 20 without it. It is the `SlabCache` deadlock fixed earlier on
+this branch; the control that established it was innocent is recorded there.
+

@@ -42,7 +42,7 @@ mod x86_64;
 // init/protections/kernel-stack/halt — now lives on the `Cpu` trait below;
 // paging companions on `Paging`.)
 #[cfg(target_arch = "x86_64")]
-pub use x86_64::{abi, serial};
+pub use x86_64::{abi, ps2, serial};
 
 /// Terminate the emulator with a harness verdict (QEMU `isa-debug-exit`). Only
 /// under the `test-harness` feature — the integration-test build (`cargo xtask

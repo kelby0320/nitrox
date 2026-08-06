@@ -268,6 +268,13 @@ fn kernel_main() {
     // publishes the console char `DeviceNode` for `/dev/console`.
     nitrox_kernel::drivers::console::init();
 
+    // Milestone 3 Part A: the i8042. Same constraints as the console above and for a
+    // sharper reason — bring-up is polled precisely so every controller response is
+    // consumed here, with interrupts masked, before a byte can reach the scancode decoder.
+    // `0xAA` (self-test passed) is byte-identical to a Left Shift release, so arming first
+    // would deliver a phantom Shift on every boot.
+    nitrox_kernel::drivers::ps2::init();
+
     // Establish the BSP's per-CPU identity (dense logical index 0) **before**
     // the scheduler starts using `current_cpu()` and — critically — before any
     // AP is online (`bring_up_aps`), so this runs while the boot thread is still
@@ -833,6 +840,24 @@ fn run_first_userspace() {
         .is_err()
     {
         kprintln!("init: binding /dev/blk failed");
+        return;
+    }
+
+    // `/dev/input/raw/<n>` — the i8042's keyboard and mouse nodes. Read-only (input),
+    // plus the generic management band so a supervisor can `stat` one and hand it to the
+    // input-server at spawn. A lookup is `NotFound` when no such device answered, which is
+    // the normal case on a machine with no i8042.
+    //
+    // **Bound into the root namespace only.** This is the authority to read one input
+    // device unfiltered — a keylogger, if it reaches the wrong process — so no session
+    // namespace should ever project it (`docs/design/input-subsystem.md` §5).
+    let raw_input_binding_rights =
+        Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
+    if ns
+        .bind_kernel_server(b"/dev/input/raw", KernelServerId::RawInput, raw_input_binding_rights)
+        .is_err()
+    {
+        kprintln!("init: binding /dev/input/raw failed");
         return;
     }
 
