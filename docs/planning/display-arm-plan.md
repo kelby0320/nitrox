@@ -136,15 +136,35 @@ raw event records and a userspace **`input-server`** takes the merge-and-policy 
 is the arrangement `tty-server` already uses over `/dev/console`. The extra part is the cost;
 what it buys is not relitigating the kernel boundary for USB HID, touchpads and touchscreens.
 
-- [ ] **Part A — P3: the PS/2 drivers.** Keyboard (ISA IRQ 1) and mouse (IRQ 12) as Tier 1
-      drivers, each a char `DeviceNode` at `/dev/input/raw/<n>` emitting `InputEvent`
-      records. Scancode→keycode table and mouse packet framing host-tested. Needs
-      `install_isa_irq` exposed through the neutral `crate::arch` interface — it is
-      `pub(crate)` in `arch::x86_64::ioapic` today, and `check-arch` rejects reaching past it.
+- [ ] **Part A — P3: the i8042 driver.** **One** Tier 1 driver for the controller,
+      publishing **two** char `DeviceNode`s — `/dev/input/raw/0` (keyboard) and
+      `/dev/input/raw/1` (mouse) — each emitting `InputEvent` records. Keyboard and mouse are
+      two devices behind one i8042: they share data port `0x60`, are configured through
+      command port `0x64`, and enabling the mouse is a read-modify-write of the *same* config
+      byte that carries the keyboard's IRQ-1 enable. Two independently-initialising drivers
+      race on that byte and produce a machine that intermittently boots with a dead keyboard.
+      Scancode→keycode table and mouse packet framing host-tested.
+
+      **The interrupt is wired inside the arch layer, not through a neutral verb.**
+      `arch/mod.rs` refuses to re-export `install_isa_irq` in as many words — "ISA" is
+      x86-only jargon, and "a fixed legacy platform device wires its own interrupt inside the
+      arch layer". The i8042 is exactly that class of device (ports `0x60`/`0x64` are as
+      x86-only as IRQ 1), so it follows the serial console: an `arch::ps2` module owning port
+      I/O and IRQ arming behind neutral verbs, with `drivers/ps2.rs` owning the ring, the
+      framing and the portable scancode table — mirroring `drivers/console.rs` over
+      `arch::serial::console_arm_rx`. Note that `check-arch` **cannot** catch this: it greps
+      for literal `arch::x86_64` in non-arch code, and a neutral re-export is precisely how a
+      violation would satisfy it.
 - [ ] **Part B — `input-server`.** A userspace resource server holding every raw node
       exclusively; merges the device streams into one ordered stream and serves
       `/dev/input/new`, minting a per-consumer channel the way `/dev/draw/new` does. A new
       rsproto `Input` category.
+- [ ] **Part B — `docs/spec/rsproto-input-ops.md`.** <!-- check-docs: allow-missing --> Every rsproto category in the tree has a
+      spec doc; this one also has to pin the `InputEvent` layout and the `EV_*`/`KEY_*`
+      numbering, because they are a kernel↔userspace ABI living in at least two crates.
+- [ ] **Part B — the `EV_*`/`KEY_*` constants under `abi-sync-check`.** It already compares
+      exactly this kind of constant family across the kernel/userspace boundary; a numbering
+      that drifts between the driver and the server is a silent misrouting, not a build error.
 - [ ] **Part C — `libinput`, focus and routing.** `libinput` turns triples into logical
       events and tracks modifier state; the compositor uses it to route to the focused
       window and to stamp the Surface-layer `KeyEvent`. Keycode→character lives here too,

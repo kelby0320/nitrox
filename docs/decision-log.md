@@ -11732,3 +11732,63 @@ a sandboxed compositor is a construction rather than a feature.
 M3 is now four parts. Also corrected while here: `display-substrate.md`'s Status still
 claimed it graduates to `architecture/` when Milestone 2 closes — that checkbox moved to M7
 during the PR #175 review, and the doc had not followed.
+
+### Review of PR #176 — proposing the exact thing this log had already decided against
+
+The blocking finding is the one worth keeping, and it is embarrassing in a useful way.
+
+**The revised Milestone 3 told an implementer to expose `install_isa_irq` through the
+neutral `crate::arch` interface.** There is a comment at that precise re-export site refusing
+it — *"ISA is an x86-only concept … a fixed legacy platform device wires its own interrupt
+inside the arch layer"* — and above that, an entry in **this document** (the 2026-07 console
+work) deciding it in as many words: `install_isa_irq` is arch-internal, the console arms its
+RX interrupt through a console-*named* neutral verb, and that is *more* neutral than a
+generic installer because the driver need not know its own IRQ number.
+
+I grepped past that comment while researching this design — it was in the output I read — and
+proposed its opposite an hour later. The i8042 is the same class of device as COM1: a fixed
+legacy platform device on a port-I/O-only bus, where `0x60`/`0x64` are as x86-only as IRQ 1.
+Part A now follows the console exactly: an `arch::ps2` module owning port I/O and IRQ arming
+behind neutral verbs, with `drivers/ps2.rs` owning the ring, framing and the portable
+scancode table.
+
+**The gate I cited as the reason for the change could not have caught the change.**
+`check-arch` greps for literal `arch::x86_64` in non-arch code — so a neutral re-export is
+precisely how a violation satisfies it. This is the same shape as the display gate's path
+filter in PR #175: a gate consulted for reassurance about the one case it structurally cannot
+see. Recorded in the plan next to the checkbox, because the next person will reach for the
+same reassurance.
+
+**The evdev borrow was half a mechanism.** `InputEvent` is fixed-size; the char device it
+rides is byte-granular, and the console's ring drops **one byte** when full. A single byte
+lost at a non-record boundary misaligns the stream permanently — `kind` starts reading the
+high half of the previous `time_ns` — and nothing recovers, because the record has no sync
+word and `EV_SYN` is a value *inside* a record rather than a framing marker. Splitting is
+harmless; dropping is fatal. evdev has the missing half and I took only the ergonomic one.
+§3a now specifies both: the raw ring drops **whole records**, and a drop is announced with
+`SYN_DROPPED` so the consumer discards stale modifier and pointer state instead of carrying a
+phantom held key for the rest of the session. This is the design's one departure from
+reusing the console mechanism unchanged, and §2 no longer claims otherwise.
+
+**"Holds it exclusively" was resting on a precedent that does not hold.** The keylogging
+argument is that only the input-server holds the raw nodes — cited to `tty-server`. But
+exclusivity there is *convention*: `session-mgr` still binds `/dev/console` into every
+session namespace unconditionally, a bind left vestigial when the shell moved to `/dev/tty`.
+So the property is a constraint on the supervisor, not a consequence of the design, and §5
+now says so and binds Part B to it. Worth generalising: **"X holds it exclusively" is never
+a property of a capability system, only of the code that hands out capabilities.**
+
+**`time_ns` is load-bearing at Part B, not M4.** I defended it as future-proofing for
+double-click and invited challenge on it. The reviewer supplied a better argument than mine:
+§1 says merging is an ordering problem, and the server reads two nodes over *independent*
+`sys_io_submit` round trips — so without an interrupt-time stamp the only order available is
+the order its reads completed in, which is scheduling noise. The field is not speculative;
+the merge is wrong without it.
+
+Also: the i8042 is **one** controller and the plan described two independent drivers, which
+would race on the shared config byte at init and produce intermittent dead keyboards; Part B
+now carries its spec doc and an `abi-sync-check` entry for the `EV_*`/`KEY_*` numbering, as
+every other rsproto category does; the input deferrals (key repeat, USB HID, hotplug,
+multitouch, `EV_ABS` mapping, pointer-position ownership) are in `deferred-decisions.md`,
+which is the only place a deferral exists; and the new document is now reachable from both
+places that enumerate the arm's design docs.

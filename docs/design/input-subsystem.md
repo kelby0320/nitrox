@@ -47,10 +47,11 @@ this system already does with the console.
 ## 2. The layers
 
 ```
-   PS/2 kbd   PS/2 mouse        (later: USB HID, i2c touchpad, …)
-      │            │
-      │  IRQ 1     │  IRQ 12                       kernel: Tier 1 drivers
-      ▼            ▼                               one char DeviceNode per device
+        i8042 controller             (later: USB HID, i2c touchpad, …)
+       ┌──────┴──────┐
+   kbd port      aux port                          kernel: ONE Tier 1 driver
+      │ IRQ 1       │ IRQ 12                       ports 0x60/0x64 are shared, so
+      ▼             ▼                              this is one driver, two nodes
   /dev/input/raw/0   /dev/input/raw/1              emitting InputEvent records
       │            │
       └──────┬─────┘
@@ -73,8 +74,10 @@ this system already does with the console.
 fed by COM1's receive interrupt — and a userspace resource server holds it *exclusively*
 and serves `/dev/tty`. Input is the same arrangement with more devices below it. That
 pattern is built, in use, and documented in
-[`console-and-tty.md`](../architecture/console-and-tty.md); this design deliberately adds no
-new mechanism to it.
+[`console-and-tty.md`](../architecture/console-and-tty.md). This design reuses it almost
+unchanged — with **one** deliberate departure, in §3a: the raw node's ring is event-granular
+rather than byte-granular, because a fixed-size record over a ring that drops single bytes
+desynchronises permanently.
 
 ## 3. One record format, everywhere
 
@@ -91,7 +94,8 @@ pub struct InputEvent {
     /// `0`/`1`/`2` (release/press/repeat) for `EV_KEY`; a signed delta for
     /// `EV_REL`; an absolute position for `EV_ABS`.
     pub value: i32,
-    /// Kernel monotonic time **at the interrupt**, not at delivery.
+    /// Kernel monotonic time **at the interrupt**, not at delivery. Load-bearing from
+    /// Part B onward — see below.
     pub time_ns: u64,
 }
 // 16 bytes, naturally aligned, no padding.
@@ -104,6 +108,15 @@ changes, so no future device breaks the wire — which is precisely the corner a
 with named `x`/`y`/`modifiers` fields paints you into, because the second device class
 either wastes fields or forces a layout change.
 
+**`time_ns` is what makes merging possible, not a convenience for double-click.** §1 calls
+merging an ordering problem that exactly one component should decide. The `input-server`
+reads two device nodes over *independent* `sys_io_submit` round trips, so without an
+interrupt-time stamp the only order available to it is the order its own reads happened to
+complete in — which is scheduling noise, and would make a keystroke land before or after a
+click depending on how the server was descheduled. Stamping at the interrupt is the only
+place the true order still exists. Double-click and key-repeat timing are a second use, and
+the reason the field is 8 bytes rather than a counter: they need real time, not sequence.
+
 The shape is deliberately Linux's `evdev`, numbering included. Twenty-five years across
 mice, tablets, touchscreens, accelerometers and game controllers without a layout break is
 the strongest available evidence, and matching the numbering means existing knowledge about
@@ -112,6 +125,37 @@ keycodes transfers.
 **A logical event is a group terminated by `EV_SYN`/`SYN_REPORT`.** A diagonal mouse move
 is `REL_X`, `REL_Y`, `SYN`. Consumers must accumulate until the `SYN` rather than acting on
 each record, and a batch delivered to a consumer never splits a group.
+
+### 3a. Loss, and why a fixed-size record needs `SYN_DROPPED`
+
+The record is fixed-size and the raw node is a **byte**-granular char device. Those two facts
+do not compose safely by default, and getting it wrong is unrecoverable rather than merely
+lossy:
+
+- The console's ring drops **one byte** when full (`drivers/console.rs`, `RING_CAP = 256` —
+  sixteen `InputEvent`s at this size). A single byte dropped at a non-record boundary
+  permanently misaligns the stream: `kind` starts reading the high half of the previous
+  `time_ns`, and nothing recovers, because `InputEvent` has no sync word and `EV_SYN` is a
+  *value inside* a record rather than a framing marker you can scan for.
+- A short read that ends mid-record is ordinary for that mechanism. **Splitting is fine** —
+  the reader buffers the remainder — but **dropping is not**.
+
+So the borrow from evdev has to include the half that makes it survivable, and this design
+takes both:
+
+1. **The raw node's ring drops whole records, never bytes.** The ring is event-granular; when
+   it is full the *oldest* whole record is discarded. This is a departure from
+   `drivers/console.rs` and is the one place this subsystem does not reuse the console's
+   mechanism unchanged.
+2. **A drop is announced.** The driver sets a flag and the next group the consumer receives
+   is preceded by `EV_SYN`/`SYN_DROPPED`, evdev's marker meaning *discard your accumulated
+   state and resynchronise from the next `SYN_REPORT`* — because after a loss the consumer's
+   idea of which keys are held and where the pointer is are both stale, and silently carrying
+   on is how a phantom held modifier survives for the rest of a session.
+
+§7's overflow question covers the server→consumer channel. This is the harder half —
+driver→server — and it is settled here rather than deferred, because it is a property of the
+record format rather than of a policy.
 
 **Costs, stated plainly.** One logical event is several records, so every consumer needs a
 small state machine — that is what `libinput` exists to be. Multitouch will need slot
@@ -123,7 +167,7 @@ wire break.
 
 | Concern | Where | Why there |
 |---|---|---|
-| Port I/O, IRQ, controller state machine | kernel driver | Port I/O is ring 0; PS/2's one-byte output buffer needs a prompt ISR |
+| Port I/O, IRQ, controller state machine | kernel driver | Port I/O is ring 0; the i8042's one-byte output buffer needs a prompt ISR |
 | Scancode → keycode | kernel driver | One small table every consumer would otherwise duplicate; getting it wrong is a bug, not a preference (`display-substrate.md` §5) |
 | Merging device streams; hotplug; device policy (acceleration, tap-to-click) | `input-server` | Policy, and it needs to see every device at once |
 | Triples → logical events; modifier state; click/drag synthesis | `libinput` | Consumer-side interpretation, shared by the compositor and any future privileged consumer |
@@ -168,13 +212,24 @@ layers away.
 
 - Holding a raw node is the authority to read one device unfiltered — the input-server's
   alone, granted by init at spawn.
+
+  **This is a constraint on the supervisor, not a consequence of the design**, and it is
+  worth stating because the precedent this document leans on does not currently honour it.
+  `tty-server` holds `/dev/console` exclusively by convention: `session-mgr` still binds the
+  raw device into *every* session namespace unconditionally, a bind left vestigial when the
+  shell moved to `/dev/tty`. Nothing in the mechanism prevented it. The keylogging argument
+  below is only as true as the binding discipline, so Part B must **not** bind
+  `/dev/input/raw/*` anywhere but the input-server's namespace, and a session's `/dev`
+  projection must not carry it.
 - Holding `/dev/input/new` is the authority to receive merged input for the whole machine.
   The compositor has it. Nothing else does, which is what makes keylogging a namespace
   question rather than a permission check.
 - A client has neither, and receives only what the compositor routes to its own windows.
 
 Resolving `/dev/input/new` mints a per-consumer channel, exactly as `/dev/draw/new` does —
-the directory-session pattern, a third instance of it. That the server can serve *different*
+the directory-session pattern, which by now is the house style rather than a novelty
+(`/log/<principal>`, `/dev/tty` and `/dev/draw/new` all mint on resolve, and `profile-server`
+and `fs-server` use the directory-session form for `/bin` and `/home`). That the server can serve *different*
 consumers *different* streams is what makes a filtered or blocked input stream for a
 sandboxed compositor a construction rather than a feature.
 
