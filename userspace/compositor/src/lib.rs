@@ -750,9 +750,13 @@ mod tests {
     #[test]
     fn the_guest_configuration_composites_a_client_surface() {
         // The exact shape `ui-testclient` produces in the guest: a 1280x800 screen at
-        // pitch 5120, a 64x32 client surface at pitch 256, window origin (0,0). Written
+        // pitch 5120, a 64x32 client surface at **pitch 268**, window origin (0,0). Written
         // after the guest showed pure background in the window region with every guard in
         // `compose_into` passing and the client's pixels verified correct.
+        //
+        // 268 is not 64*4. The padding is the point: a source stride computed from the
+        // width instead of the pitch skews every row after the first, and the two numbers
+        // agreeing would hide it. Keep this in step with `libdraw::scene::SCREEN_PITCH`.
         let mut fb = MemFramebuffer::new(
             Geometry::with_pitch(1280, 800, 5120, PixelFormat::XRGB8888).unwrap(),
         );
@@ -764,11 +768,11 @@ mod tests {
             buffer: 0,
             width: 64,
             height: 32,
-            pitch: 256,
+            pitch: 268,
             format: SURFACE_FORMAT_XRGB8888,
         })
         .unwrap();
-        let g = Geometry::with_pitch(64, 32, 256, PixelFormat::XRGB8888).unwrap();
+        let g = Geometry::with_pitch(64, 32, 268, PixelFormat::XRGB8888).unwrap();
         let marker = Rgb::new(33, 33, 33);
         src.put(w, 0, g, marker);
         s.commit(&commit(w, 0)).unwrap();

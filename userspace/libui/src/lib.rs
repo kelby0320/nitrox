@@ -53,8 +53,6 @@ pub enum UiError {
     Malformed,
     /// Fewer than two buffers were requested — see the module docs.
     TooFewBuffers,
-    /// Every buffer is still held by the compositor.
-    NoFreeBuffer,
     /// No buffer with that id.
     NoSuchBuffer,
 }

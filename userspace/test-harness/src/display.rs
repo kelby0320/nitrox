@@ -137,14 +137,19 @@ fn check_reference_hash() -> bool {
     false
 }
 
-/// Check 2: acquire the real framebuffer and present the scene into a known corner.
+/// Check 2: the real framebuffer can still be acquired and describes itself sanely.
 ///
-/// Returns `false` only for failures that indicate a *broken binding*. A machine with no
+/// It **acquires and does not draw.** Since M2 Part D the scene reaches the screen through
+/// the compositor, and a second writer to the same aperture would race it — so what is left
+/// to check here is the binding itself, which is still worth checking: `NoBinding` is how a
+/// removed or misordered `/dev/framebuffer` registration shows up.
+///
+/// Returns `Err` only for failures that indicate a *broken binding*. A machine with no
 /// display at all reports `NoBinding` and is not a failure here — the caller decides,
 /// because only it knows whether a display was expected.
-fn present_scene(root_ns: u64) -> Result<(), AcquireError> {
+fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let (mut fb, info) = unsafe { acquire::acquire(root_ns) }?;
+    let (_fb, info) = unsafe { acquire::acquire(root_ns) }?;
 
     kprint(b"display-selftest: framebuffer ");
     kprint_u64(info.width as u64);
@@ -154,9 +159,6 @@ fn present_scene(root_ns: u64) -> Result<(), AcquireError> {
     kprint_u64(info.pitch);
     kprint(b"\n");
 
-    // Deliberately does **not** draw. `ui-testclient` puts the scene on screen through the
-    // compositor, and a second writer to the same aperture would race it.
-    let _ = &mut fb;
     kprint(b"display-selftest: framebuffer reachable\n");
     Ok(())
 }
@@ -171,7 +173,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let hash_ok = check_reference_hash();
 
     let mut headless = false;
-    let present_ok = match present_scene(root_ns) {
+    let present_ok = match check_framebuffer_binding(root_ns) {
         Ok(()) => true,
         Err(AcquireError::NoBinding) => {
             // No display bound into this namespace. Reported distinctly (exit 2) rather

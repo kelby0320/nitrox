@@ -38,7 +38,7 @@ use libdraw::format::Rgb;
 use libdraw::framebuffer::{Framebuffer, RawFramebuffer};
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall4, syscall5,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
@@ -321,12 +321,24 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
     }
     // SAFETY: `addr` maps at least `bytes.len()` writable bytes.
     unsafe { core::ptr::copy_nonoverlapping(bytes.as_ptr(), addr as *mut u8, bytes.len()) };
+    // **Unmap before replying.** The mapping was only ever a way to fill the object, and it
+    // holds its own reference to it — so leaving it behind would pin the frames for the
+    // compositor's life even after the handle is transferred away, and nothing records
+    // `addr` to reclaim them later. Any holder of `/dev/draw` can resolve `info` in a loop,
+    // which made this an unbounded leak drivable by any client (PR #175 review, finding 1).
+    // SAFETY: unmapping a range this process mapped moments ago and never reads again.
+    unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, addr as u64, bytes.len() as u64) };
 
     let mut body = [0u8; librsproto::namespace::RESOLVE_REPLY_LEN];
-    let _ =
-        resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32);
+    if resolve_reply(&mut body, librsproto::namespace::OBJECT_KIND_MEMOBJ, bytes.len() as u32)
+        .is_none()
+    {
+        // SAFETY: nothing was sent, so the object is still ours to drop.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
+        return reply_resolve_error(serve_end, request_id, KError::KernelError);
+    }
     // SAFETY: REPLY_MSG/REPLY_HANDLES are valid; the object rides the reply.
-    unsafe {
+    let sent = unsafe {
         let Some(rs_len) = encode(
             &mut REPLY_MSG[PAYLOAD_OFF..],
             OP_NS_RESOLVE,
@@ -335,6 +347,8 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
             &body,
             1,
         ) else {
+            // SAFETY: nothing was sent, so the object is still ours to drop.
+            syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0);
             return false;
         };
         REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
@@ -348,7 +362,14 @@ fn reply_window_info(serve_end: u64, request_id: u64, srv: &Server, id: u32) -> 
             1,
             SENDMODE_NOBLOCK,
         ) == 0
+    };
+    if !sent {
+        // A failed send leaves the transfers untaken, so the object is still ours — the
+        // same rule `open_session` follows for the endpoint it failed to hand over.
+        // SAFETY: closing a handle this process still owns.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, obj as u64, 0, 0, 0) };
     }
+    sent
 }
 
 /// Open a session: mint a channel, keep the server end, hand the client end back.

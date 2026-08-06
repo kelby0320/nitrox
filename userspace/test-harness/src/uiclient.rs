@@ -142,6 +142,10 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
     // SAFETY: the compositor serves exactly 32 bytes of `WindowInfo` here.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 32) };
     let Some(info) = librsproto::surface::WindowInfo::read(bytes) else { return false };
+    // Unmap once the snapshot is read. `info` mints a fresh object per resolve, so a client
+    // that polls it and never unmaps leaks a page each time — the same defect the compositor
+    // had on its side of this exchange (PR #175 review, finding 1).
+    let _ = obj.unmap(addr as *mut u8, 32);
 
     kprint(b"ui-testclient: info id=");
     kprint_u64(info.id as u64);
@@ -159,9 +163,6 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
         && info.role == librsproto::surface::ROLE_NORMAL
 }
 
-/// # Safety
-///
-/// Called by the kernel's ELF entry with the standard bootstrap arguments.
 /// Report failure and end the run.
 ///
 /// Called instead of exiting with a code, because init cannot wait for this program: on
@@ -178,6 +179,12 @@ fn fail(msg: &[u8]) -> ! {
     exit(1);
 }
 
+/// Entry point: connect, create a window, share buffers, present, then park.
+///
+/// # Safety
+///
+/// Called by the kernel's ELF entry with the standard bootstrap arguments — `notif` is this
+/// process's notification handle and `root_ns` its root namespace.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"ui-testclient: up\n");
@@ -213,7 +220,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 3. Shared memory. Rendered once; both buffers get the same picture, so whichever is
     //    on screen at the end is the one `check-display` expects.
-    let pitch = w as usize * 4;
+    // **Attached at `SCREEN_PITCH` (268), not `w * 4` (256).** The extra 12 bytes are three
+    // pixels of row padding that exist for exactly one reason: any code computing a row
+    // offset from the width rather than the pitch skews every row after the first, and a
+    // 256-byte buffer hides that bug because the two numbers agree. `display-selftest` used
+    // to carry this coverage in the guest; when the client took over producing the picture
+    // it briefly did not (PR #175 review, finding 7).
+    let pitch = scene::SCREEN_PITCH;
     let len = pitch * h as usize;
     let rendered = scene::render_reference();
     let mut maps: [*mut u8; BUFFERS] = [core::ptr::null_mut(); BUFFERS];

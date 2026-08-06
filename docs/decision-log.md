@@ -11299,10 +11299,14 @@ A resolve of `/dev/draw/<N>/info` now returns a `MemoryObject` holding a 32-byte
 `WindowInfo` — id, committed size, position, role, dock edge, reserve, parent. Three
 details are deliberate:
 
-*The size reported is the **committed** buffer's, not the requested one.* A client asks for
-64×32 and attaches a 32×16 buffer; until it commits, the window has no pixels, and
-answering with the request would describe a window that does not exist yet. `info` before
-the first commit reports 0×0. The two host tests are exactly this pair.
+*Once something is committed, the size reported is the **committed** buffer's, not the
+requested one.* A client asks for 64×32 and attaches and commits a 32×16 buffer; `info`
+says 32×16, because the request is an aspiration and the commit is a fact. **Before any
+commit it reports the requested size**, which is what `Window::bounds` falls back to — a
+created window has no pixels yet, but its requested size is the only information that
+exists about it, and inventing a second notion of size inside one struct to say "nothing
+yet" would buy a distinction no caller has asked for. The two host tests pin exactly this
+pair: committed size after a commit, requested size before one.
 
 *It is a snapshot, not a mapping of live state.* Each resolve mints a fresh object. A
 shared page would be faster and would also hand every reader a window into the
@@ -11349,3 +11353,73 @@ graduates when its **subsystem** is built, not when the first milestone to touch
 
 1222 host tests, all six gates green, `test-qemu` green, display gate green through the
 full client path.
+
+### Review of PR #175 — an unbounded leak, and a gate that stopped watching its own subject
+
+Twelve findings; the three blocking ones are worth keeping.
+
+**Every `/dev/draw/<N>/info` resolve leaked a page and a VMA in the compositor.**
+`reply_window_info` created a `MemoryObject`, mapped it to fill it, transferred the handle
+on the reply — and never unmapped. The mapping holds its own reference to the object (this
+file's own `map_attached_buffer` says so), so the frames survived the handle going away, and
+nothing recorded the address, so they could never be reclaimed. Any process with `/dev/draw`
+in its namespace — which *is* the whole authority to open a window — could loop the resolve
+and consume the compositor's address space and physical memory without limit. The fix is one
+unmap after the copy, plus closing the object on the two failure paths that dropped it
+(`open_session` and `map_attached_buffer` both already did this; this was the odd one out).
+The same defect existed on the client side of the exchange, in the harness's `check_info`,
+and is fixed the same way.
+
+**Worth recording: I could not build a repro that fails, and the fix is not gated.**
+4000 resolves in a boot leaks 16 MiB of a 256 MiB guest, which nothing notices; 20000 does
+not complete before `session-mgr` fires the verdict; and shrinking the guest to 48 MiB or
+96 MiB hangs the *baseline*, so it is not a control. The wall-clock difference between the
+leaking and fixed builds at 4000 resolves was 140 ms out of 16 s, i.e. build noise. So this
+one rests on reading the code and the codebase's documented mapping-reference semantics,
+not on a red-to-green demonstration — which is worth stating plainly, because every other
+fix this milestone had one.
+
+**The display gate had stopped watching the file that produces its picture.** The path
+filter named `userspace/test-harness/src/display.rs` specifically, from when
+`display-selftest` drew the scene. Since Part D `ui-testclient` renders and commits it and
+prints the line the gate blocks on, and neither `uiclient.rs` nor the `Cargo.toml` that
+registers the bin matched any entry — so a commit touching only the client could break the
+display with the gate never running. Widened to `userspace/test-harness/**` and
+`userspace/librsproto/**`.
+
+The same finding answers a question the PR asked: *init cannot wait on a process that never
+exits — check that interaction.* Spawn-and-forget is right for the success path, and a
+`fail()` is caught only because it comfortably wins a race against the whole login chain
+that produces the PASS verdict — nothing orders the two. A **hang** is worse: the client
+parks, `session-mgr` fires PASS anyway, QEMU exits 33. `check-display`'s expect timeout is
+the only thing that sees it, which is the sharper reason its filter had to cover the client.
+
+**A decision-log entry stated the opposite of what the code does.** The entry above claimed
+`info` reports 0×0 before the first commit. It reports the *requested* size — `bounds()`
+falls back to it — which is what this branch's own test asserts and what the guest depends
+on. Corrected in place rather than by a contradicting entry, on the grounds that the
+append-only rule protects the record from retroactive revision and this had not yet merged.
+The rule stands; an error caught before merge is not yet part of the record.
+
+**The guest had quietly lost its padded-stride coverage.** `scene::SCREEN_PITCH` is 268
+rather than 256 so that any code computing a row offset from the width instead of the pitch
+skews every row after the first. `display-selftest` used to compose at that pitch; when
+`ui-testclient` took over producing the picture it re-copied into a `w * 4` = 256 buffer, so
+the two numbers agreed again and the bug the padding exists to catch could not appear. The
+client now attaches at 268, and the host test that pins the guest shape with it. Verified
+by breaking it: with the compositor's source geometry taking `req.width * 4` instead of
+`req.pitch`, the gate fails at 1151 of 2048 pixels, first at **(0,1)** — the second row,
+which is the signature of a stride skew. At pitch 256 that break produced a perfect screen.
+
+Also from the review: the parked-message queue in `libui` documented dropping the oldest
+and dropped the newest; since `acquire` blocks with no timeout, a dropped `Release` is a
+permanent hang rather than a recoverable `None`, so overflow is now an error — noisy while
+it is still unreachable. The `WindowInfo` layout, the `/dev/draw/<N>/info` path and the
+access boundary moved into `docs/spec/rsproto-surface-ops.md`, where wire contracts belong;
+a `librsproto` doc comment is not that place, and `x`/`y` being signed is exactly the kind
+of thing a later reader gets wrong from a Rust type alone.
+
+One pleasing correction in the other direction: **the release-ordering rule Part E arrived
+at was already in the spec.** The lifecycle diagram has shown `composite` before `Release`
+since Part A. The code was wrong and the document was right — the reverse of the failure
+mode most of this project's doc rules are built to prevent.

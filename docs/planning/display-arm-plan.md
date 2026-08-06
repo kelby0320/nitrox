@@ -90,7 +90,7 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
 - [x] **Part B — `/dev/draw` served.** ✅ (2026-08-06) `new` mints a session; `<N>/info`
       answers with a mapped `WindowInfo` snapshot; replies and `Release` events go out on
-      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 6. `new`, numbered windows, `info`. The same
+      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 6. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
 
@@ -100,8 +100,7 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
 - [x] **Part C — `libui`: the client side of the protocol.** ✅ (2026-08-06) Connect,
       create a window, allocate and commit surfaces, and `acquire` a buffer — blocking when
       the compositor holds them all. *Receiving input and the event loop are M3*, and were
-      wrongly claimed here before. Connect, create a window, allocate
-      and commit surfaces, receive input, run an event loop. The same role `librsproto` plays for
+      wrongly claimed here before. The same role `librsproto` plays for
       the RS protocol — **the protocol gets a library, and clients use it.** If the first app
       hand-rolls this instead, the surface protocol immediately has two implementations and the
       second one lives in an application.
@@ -203,12 +202,13 @@ Templates: instantiate, extract, `open ./code.nxg | desktop`, `save`.
 
 ## Milestone 7 — the composed desktop
 
-Sketched.
+Sketched. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via
+`QueryCaps`, Tier 2 durable wiring); and the question the composition doc leaves open — what
+happens to a wired graph when an application crashes, and whether the desktop shell respawns
+and rewires it.
 
 - [ ] **Graduate `display-substrate.md` and `desktop-shell.md`** to `docs/architecture/` —
-      by the end of this milestone the substrate is fully built and the shell exists. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via `QueryCaps`,
-Tier 2 durable wiring); and the question the composition doc leaves open — what happens to a
-wired graph when an application crashes, and whether the desktop shell respawns and rewires it.
+      by the end of this milestone the substrate is fully built and the shell exists.
 
 ## What this unblocks
 

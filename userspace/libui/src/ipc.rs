@@ -18,7 +18,18 @@ const MSG_LEN: usize = 4096;
 const PAYLOAD_OFF: usize = 24;
 /// Largest event body parked while waiting for a reply.
 const MAX_BODY: usize = 64;
-/// How many out-of-order messages can be parked before the oldest are dropped.
+/// How many out-of-order messages can be parked while waiting for a reply.
+///
+/// Overflow is an **error, not a drop**. The obvious cheap behaviour — discard one and
+/// carry on — is wrong here because the messages that park are mostly `Release`, and a lost
+/// `Release` leaves a buffer marked busy that will never be freed. Since `Window::acquire`
+/// blocks with no timeout, that is not a recoverable `None`: it is a permanent hang, at a
+/// point arbitrarily far from the discard that caused it. Reporting it turns a silent hang
+/// into a loud failure (PR #175 review, finding 9).
+///
+/// Nothing reaches this today — only `Window::new` waits for a reply, so at most a couple
+/// of messages can park — which is exactly why it is worth making the unreachable case
+/// noisy while it is still unreachable.
 const MAX_PARKED: usize = 8;
 
 /// A connection to the compositor over an IPC channel.
@@ -187,10 +198,11 @@ impl Transport for ChannelTransport {
             let n = m.body.len().min(MAX_BODY);
             let mut body = [0u8; MAX_BODY];
             body[..n].copy_from_slice(&m.body[..n]);
-            if self.parked_len < self.parked.len() {
-                self.parked[self.parked_len] = (m.op, body, n);
-                self.parked_len += 1;
+            if self.parked_len >= self.parked.len() {
+                return Err(UiError::Transport);
             }
+            self.parked[self.parked_len] = (m.op, body, n);
+            self.parked_len += 1;
         }
     }
 
