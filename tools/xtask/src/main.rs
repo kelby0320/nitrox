@@ -1141,6 +1141,21 @@ struct Session {
     cursor: usize,
 }
 
+impl Drop for Session {
+    /// Kill the guest when the session goes out of scope.
+    ///
+    /// Every `?` between `spawn` and an explicit `kill` used to leak a QEMU, and a leaked
+    /// QEMU holds the write lock on `tools/build-cache/nitrox.hdd` — so the *next* run boots
+    /// a guest that cannot open its disk and fails with a bare timeout and no serial output,
+    /// which looks nothing like the original error. A reviewer lost a pass to a 20-hour-old
+    /// orphan this way (PR #175 review). Killing an already-dead child is harmless, so the
+    /// explicit kills elsewhere stay valid.
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
 impl Session {
     fn spawn(mut cmd: Command) -> R<Session> {
         let mut child = cmd.spawn().map_err(|e| format!("spawn qemu: {e}"))?;
@@ -1177,7 +1192,27 @@ impl Session {
                 }
             }
             if std::time::Instant::now() > deadline {
-                return Err(format!("timed out after {TIMEOUT:?} waiting for {pat:?}").into());
+                // **Distinguish "the guest said nothing" from "the guest stopped early".**
+                // They are the same line in the log and completely different faults: no
+                // output at all usually means QEMU never got as far as the guest — a disk
+                // held open by an orphaned instance, a missing image, bad firmware — while
+                // partial output is a real hang, and the tail says where.
+                let g = self.out.lock().map_err(|_| "transcript lock")?;
+                if g.trim().is_empty() {
+                    return Err(format!(
+                        "timed out after {TIMEOUT:?} waiting for {pat:?}, and the guest \
+                         produced NO output at all — this is usually QEMU failing to start \
+                         rather than a hang (a stale qemu-system-x86_64 holding \
+                         build-cache/nitrox.hdd will do it; check with `pgrep -a qemu`)"
+                    )
+                    .into());
+                }
+                let tail: String = g.chars().rev().take(400).collect::<Vec<_>>()
+                    .into_iter().rev().collect();
+                return Err(format!(
+                    "timed out after {TIMEOUT:?} waiting for {pat:?}; last output was:\n{tail}"
+                )
+                .into());
             }
             std::thread::sleep(std::time::Duration::from_millis(50));
         }

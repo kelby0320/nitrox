@@ -11591,3 +11591,59 @@ And `WindowInfo`'s byte offsets are now asserted directly, not merely round-trip
 symmetric swap of `x` and `y` in both `write` and `read` left the whole librsproto suite
 green while the new test fails. The PR publishes that table as a contract for other
 implementations, and a table nothing checks is a table that drifts.
+
+### Review round 3 of PR #175 — the kernel's limit, not the server's expectation
+
+Three findings, all pre-existing, all in code this PR had just claimed to make exhaustive.
+That is the pattern worth noting: the review found them *because* the new comments made a
+completeness claim, and a claim is a thing that can be checked.
+
+**`RECV_HANDLES` was half the size the kernel may write.** `sys_channel_recv` takes no
+capacity argument — it copies `handle_count * 8` bytes, where the count is the *sender's*,
+bounded only by `IPC_HANDLE_MAX` = 8. The compositor declared `[u64; 4]`, so any client
+holding a session could overrun a 32-byte static by 32 bytes into whatever the linker placed
+next, by sending eight transfers. Every other resource server in the tree already sized it
+correctly; the compositor and `libui` were the two that did not. Both now use
+`libkern::abi::IPC_HANDLE_MAX`, which existed the whole time.
+
+The general form: **an array the kernel writes into is sized by the kernel's limit, not by
+what this server expects to receive.** The compositor's expectation was right — no Surface op
+takes more than one handle — and irrelevant, because nothing enforces an expectation.
+
+**"Disposed of exactly once" was true only of handle zero.** The disposal block rewritten
+last round reads `RECV_HANDLES[0]` and closes one handle, so a message carrying *n* transfers
+leaked *n − 1* objects for the compositor's life — the same unbounded, client-driven leak as
+the three fixed before it, differing only in how it arrived. Now every surplus handle is
+closed at extraction, before anything can fail.
+
+Both of these were reachable only because the code assumed the shape of a well-behaved
+message. The lesson is not "check the count"; it is that **the completeness claim in a
+comment is a hypothesis**, and this one had been written the round before with enough
+confidence to stop anyone looking.
+
+**A dropped `Release` is now a permanent hang, and that is a genuine gap, not a fixed bug.**
+Session channels are four deep and the compositor sends `NOBLOCK`, so a client that lets its
+ring fill loses the message — and since `acquire` blocks with no timeout, the buffer stays
+busy forever. This round only adds the log line (`compositor: DROPPED a Release`), which
+makes it diagnosable and does not fix it. Every real fix costs something — blocking lets one
+slow client stall every window, an outbound queue needs its own bound, disconnecting kills a
+client whose ring was transiently full — and with exactly one well-behaved client to test
+against, all three are untested theory. Filed in `deferred-decisions.md` rather than guessed
+at, with M3 input as the trigger.
+
+**Two bugs in the harness, one of which cost the reviewer a pass.** `Session` killed its QEMU
+only on the paths that reached an explicit `kill`, so every `?` between spawn and the end
+leaked one — and a leaked QEMU holds the write lock on `build-cache/nitrox.hdd`, so the
+*next* run boots a guest that cannot open its disk and fails with a bare 45-second timeout
+and no serial output. The reviewer lost a pass to a 20-hour-old orphan of mine; there was
+still a 4½-hour-old one on this machine when I went looking. `Session` now kills on `Drop`.
+And `expect`'s timeout message now distinguishes **no output at all** — which usually means
+QEMU never started — from a partial boot, and prints the tail in the second case. Two
+failures that were one indistinguishable line.
+
+Also fixed: the rejection-log budget was global and never reset, so the churn probe spent all
+eight in the first second of every selftest boot and no later rejection could ever be
+logged — it is per-session now; `shared_buffer` leaked its object when the map failed, in the
+one file whose purpose is proving leaks absent; and `ChannelTransport::new`'s `# Safety`
+block now says the caller is giving the handle away, which became true when `Drop` landed and
+the doc did not follow.

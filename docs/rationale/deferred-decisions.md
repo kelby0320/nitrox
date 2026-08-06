@@ -259,6 +259,20 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
+**Back-pressure for compositor→client messages.** A session channel holds four messages and
+the compositor sends `NOBLOCK`, so a client that lets its receive ring fill makes the send
+fail and the message is simply gone. For a `Release` that is now unrecoverable: `libui`'s
+`Window::acquire` blocks in `sys_wait` with no timeout, so the buffer stays busy and the
+client never wakes. **Today the compositor only logs the drop** (`compositor: DROPPED a
+Release`) — enough to diagnose, not a fix. The three candidate answers each cost something:
+blocking the compositor lets one slow client stall every other window; a per-session outbound
+queue needs a bound and a policy for overrunning *that*; disconnecting the client turns an
+infinite hang into a definite error but kills a client whose ring was only transiently full.
+Deferred until there is a second real client to characterise against — with one well-behaved
+client that drains through `acquire`, every option is untested theory. Trigger: M3 input (a
+second event stream to the same channel) or the first client that is not `ui-testclient`.
+Raised by the PR #175 review, 2026-08-06.
+
 ### Filesystems
 
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack

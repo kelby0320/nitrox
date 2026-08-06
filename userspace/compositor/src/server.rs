@@ -33,12 +33,18 @@ use crate::{StackError, WindowStack};
 pub struct Connection {
     /// Windows created over this connection, in creation order.
     owned: Vec<u32>,
+    /// Rejections logged for this connection so far.
+    ///
+    /// Per connection rather than per process so that one noisy client cannot spend the
+    /// whole machine's diagnostic budget — `Connection::new` resets it, and a session slot
+    /// is reused only by a different client.
+    pub rejections_logged: u32,
 }
 
 impl Connection {
     /// A connection owning nothing.
     pub fn new() -> Self {
-        Self { owned: Vec::new() }
+        Self { owned: Vec::new(), rejections_logged: 0 }
     }
 
     /// Whether this connection may name `window`.

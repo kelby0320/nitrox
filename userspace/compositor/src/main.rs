@@ -62,18 +62,31 @@ const MAX_BODY: usize = 64;
 /// One less than the wait limit: the forwarding endpoint takes the first slot.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
 
-/// How many client-driven rejections get logged before the tap closes.
+/// How many client-driven rejections get logged **per session** before the tap closes.
+///
+/// Per session, not per process. A single global budget is spent by whichever client
+/// misbehaves first and never refills — on a selftest image the churn probe burns all of it
+/// in the first second, so on exactly the builds where a rejection would be diagnostic,
+/// no later one is ever logged (PR #175 review, finding 6). A session's counter resets when
+/// the slot is reused, which is also when the client behind it is a different program.
 const MAX_LOGGED_REJECTIONS: u32 = 8;
-
-static mut REJECTIONS_LOGGED: u32 = 0;
 
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut RECV_HANDLES: [u64; 4] = [0; 4];
+/// Sized by the **kernel's** limit, not by what this server expects.
+///
+/// `sys_channel_recv` takes no capacity argument: it copies `handle_count * 8` bytes here,
+/// where the count is the sender's and is bounded only by `IPC_HANDLE_MAX`. A `[u64; 4]`
+/// therefore let any client with a session overrun this static by 32 bytes into whatever
+/// the linker placed next, by sending eight transfers (PR #175 review, finding 1). Every
+/// other resource server in the tree already sizes it this way.
+static mut RECV_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
+    [0; libkern::abi::IPC_HANDLE_MAX];
 static mut RECV_COUNT: u64 = 0;
 static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
-static mut REPLY_HANDLES: [u64; 4] = [0; 4];
+static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
+    [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
     [0; libkern::abi::MAX_WAIT_HANDLES];
@@ -561,11 +574,24 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
-        // Take the handle out **before** anything can fail. A message that does not decode
+        // Take the handles out **before** anything can fail. A message that does not decode
         // can still have carried one, and returning early without closing it pins the
         // client's object for the compositor's life — a leak a client drives by sending one
         // malformed message.
-        let h = if (&raw const RECV_COUNT).read() > 0 { RECV_HANDLES[0] } else { 0 };
+        //
+        // **Every** transfer, not just the first. No Surface op takes more than one handle,
+        // but a client is free to send up to `IPC_HANDLE_MAX`, and the kernel installs all
+        // of them in this process's table whether or not anything here looks at them. The
+        // surplus is closed immediately: it can never be wanted, and leaving it was the
+        // same unbounded leak as the three fixed above, differing only in how it arrived
+        // (PR #175 review, finding 2).
+        let hcount =
+            ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+        for i in 1..hcount {
+            // SAFETY: closing a handle this process owns and no op can name.
+            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
+        }
+        let h = if hcount > 0 { RECV_HANDLES[0] } else { 0 };
         let Ok(m) = decode(req) else {
             if h != 0 {
                 // SAFETY: closing a handle this process owns and will never interpret.
@@ -622,7 +648,11 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             unsafe {
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
             }
-            reply_on_session(ch, op, request_id, &body[..n]);
+            if !reply_on_session(ch, op, request_id, &body[..n]) {
+                // The client is blocked in `request` waiting for exactly this. A silent
+                // failure parks it forever, so say so — see `send_release` below.
+                kprint(b"compositor: DROPPED a reply (client receive ring full)\n");
+            }
             repaint(srv, fb);
         }
         Outcome::Applied { release } => {
@@ -638,8 +668,17 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // second client — observes a screen that has not caught up. Same shape as
             // announcing `Ready` before clearing the screen.
             repaint(srv, fb);
-            if let Some((window, buffer)) = release {
-                send_release(ch, window, buffer);
+            if let Some((window, buffer)) = release
+                && !send_release(ch, window, buffer)
+            {
+                // **A dropped `Release` is now a permanent client hang, not a slow frame.**
+                // These go out `NOBLOCK` on a channel four messages deep, so a client that
+                // commits several frames before draining makes the send simply fail — and
+                // since `Window::acquire` blocks with no timeout, the buffer stays `busy`
+                // and the client never wakes. Unlike a rejection this is **not**
+                // client-driven noise: it is the compositor losing a message it owed, so it
+                // is not subject to `MAX_LOGGED_REJECTIONS` (PR #175 review, finding 3).
+                kprint(b"compositor: DROPPED a Release (client receive ring full)\n");
             }
         }
         Outcome::Failed(e) => {
@@ -649,11 +688,8 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // lines per boot (PR #175 review, finding 6). The first few are the diagnostic;
             // the rest are noise, and the error still goes back to the client that caused
             // it either way.
-            // SAFETY: single-threaded server incrementing its own counter.
-            let n = unsafe {
-                REJECTIONS_LOGGED += 1;
-                REJECTIONS_LOGGED
-            };
+            srv.conns[slot].rejections_logged += 1;
+            let n = srv.conns[slot].rejections_logged;
             if n <= MAX_LOGGED_REJECTIONS {
                 kprint(match e {
                     SurfaceError::Malformed => b"compositor: malformed request\n" as &[u8],

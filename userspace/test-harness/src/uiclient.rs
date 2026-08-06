@@ -119,6 +119,10 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
         )
     };
     if addr <= 0 {
+        // SAFETY: the map failed, so nothing references the object; closing our only
+        // handle to it. Only reachable when allocation is already failing — but this file
+        // exists to prove leaks absent, so it should not contain one.
+        unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, h as u64, 0, 0, 0) };
         return None;
     }
     Some((h as u64, addr as *mut u8))

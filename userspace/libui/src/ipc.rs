@@ -44,7 +44,10 @@ pub struct ChannelTransport {
     msg: [u8; MSG_LEN],
     handles: [u64; 4],
     recv_msg: [u8; MSG_LEN],
-    recv_handles: [u64; 4],
+    /// Sized by the kernel's `IPC_HANDLE_MAX`, not by what a compositor is expected to
+    /// send: `sys_channel_recv` takes no capacity argument and copies the *sender's*
+    /// handle count here (PR #175 review, finding 1).
+    recv_handles: [u64; libkern::abi::IPC_HANDLE_MAX],
     recv_count: u64,
     /// Messages that arrived while waiting for a reply — drained by `poll_event`.
     parked: [(u16, [u8; MAX_BODY], usize); MAX_PARKED],
@@ -56,8 +59,10 @@ impl ChannelTransport {
     ///
     /// # Safety
     ///
-    /// `channel` must be a live IPC endpoint owned by this process for the transport's
-    /// lifetime, connected to a compositor.
+    /// `channel` must be a live IPC endpoint connected to a compositor, and the caller must
+    /// be **giving it away**: the transport takes ownership and its `Drop` closes it.
+    /// Passing a borrowed handle is a double close, and passing one the caller closes
+    /// separately is worse — the id can be reused by then.
     pub const unsafe fn new(channel: u64) -> Self {
         Self {
             channel,
@@ -65,7 +70,7 @@ impl ChannelTransport {
             msg: [0; MSG_LEN],
             handles: [0; 4],
             recv_msg: [0; MSG_LEN],
-            recv_handles: [0; 4],
+            recv_handles: [0; libkern::abi::IPC_HANDLE_MAX],
             recv_count: 0,
             parked: [(0, [0; MAX_BODY], 0); MAX_PARKED],
             parked_len: 0,
