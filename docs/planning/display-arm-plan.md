@@ -53,7 +53,7 @@ names it:
 |---|---|---|
 | **P1** | A QEMU **monitor/QMP channel** in `xtask`: `screendump` for the smoke gate, `input-send-event` for injection. Nothing uses a monitor today. | M1 Part D |
 | **P2** | The kernel exposes **Limine's framebuffer as a mappable resource**, bound into a namespace. `DeviceNode` models char and block; this is a third shape. | M1 Part B |
-| **P3** | A **PS/2 keyboard and mouse driver** in the kernel, emitting key events with modifiers and pointer events. No input driver of any kind exists. | M3 |
+| **P3** | A **PS/2 keyboard and mouse driver** in the kernel, emitting `InputEvent` records from char device nodes. No input driver of any kind exists — the serial console's COM1 receive is the only path from a human to this system. | M3 |
 
 ## Milestone 1 — pixels, and the gate ✅ complete (2026-08-05)
 
@@ -129,11 +129,28 @@ below.
 **Deliverable: a keystroke and a click injected by the harness reach a client and are reported
 back.**
 
-- [ ] **Part A — P3: the PS/2 driver.** Key events with modifiers, and pointer events, from a
-      char device; scancode→keycode table host-tested.
-- [ ] **Part B — focus and routing** in the compositor.
-- [ ] **Part C — QMP injection** in `test-interactive`, plus a client that echoes what it
-      received. Keycode→character (the keymap) is userspace and host-tested.
+**Four parts, not three** (revised 2026-08-06). The original three assumed a PS/2 driver
+that emitted finished key events straight to the compositor. That is one device away from
+wrong — see [`input-subsystem.md`](../design/input-subsystem.md) — so the driver shrinks to
+raw event records and a userspace **`input-server`** takes the merge-and-policy role, which
+is the arrangement `tty-server` already uses over `/dev/console`. The extra part is the cost;
+what it buys is not relitigating the kernel boundary for USB HID, touchpads and touchscreens.
+
+- [ ] **Part A — P3: the PS/2 drivers.** Keyboard (ISA IRQ 1) and mouse (IRQ 12) as Tier 1
+      drivers, each a char `DeviceNode` at `/dev/input/raw/<n>` emitting `InputEvent`
+      records. Scancode→keycode table and mouse packet framing host-tested. Needs
+      `install_isa_irq` exposed through the neutral `crate::arch` interface — it is
+      `pub(crate)` in `arch::x86_64::ioapic` today, and `check-arch` rejects reaching past it.
+- [ ] **Part B — `input-server`.** A userspace resource server holding every raw node
+      exclusively; merges the device streams into one ordered stream and serves
+      `/dev/input/new`, minting a per-consumer channel the way `/dev/draw/new` does. A new
+      rsproto `Input` category.
+- [ ] **Part C — `libinput`, focus and routing.** `libinput` turns triples into logical
+      events and tracks modifier state; the compositor uses it to route to the focused
+      window and to stamp the Surface-layer `KeyEvent`. Keycode→character lives here too,
+      host-tested, and is what a client uses.
+- [ ] **Part D — QMP injection** in `test-interactive`, plus a client that echoes what it
+      received: a keystroke and a click injected by the harness reach a window and come back.
 
 **Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
 with window management in a later milestone; buttons and menus need clicks, and the toolkit
