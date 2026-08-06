@@ -11109,3 +11109,123 @@ The spec now states that **window ids are scoped to the connection that created 
 that the zero-fill of unused role words is an encoder rule, not a format invariant.
 
 1192 host tests, all six gates green.
+
+## 2026-08-05 — Display arm M2 Parts B–C: the compositor serves, and libui answers
+
+`/dev/draw` is bound and answered by a real resource server, and clients have a library
+to talk to it:
+
+```
+compositor: up
+compositor: serving /dev/draw
+init: compositor bound at /dev/draw
+```
+
+**The pattern already existed, three times over.** Surfaces needed no new syscalls;
+`/dev/draw` is the same subtree binding `/home` uses; and a connection is the same
+*directory-session* channel `profile-server` hands out for `/bin`. The compositor's whole
+transport story is a recombination of mechanisms already in the tree, which is a good sign
+about the substrate rather than a shortcut.
+
+**A connection is a channel**, and that is what makes Part A's ownership rule enforceable
+rather than merely stated: a request's identity is the endpoint it arrived on, so the
+server never asks who is calling. A client going away is `PeerClosed`, which is exactly
+when its windows should be destroyed.
+
+**Two bugs the guest caught, both invisible to the build.** The compositor spawned and
+failed with the ELF present and no "image not found" — it had **no `.cargo/config.toml`**,
+so it built as a PIE (`Type: DYN`) and the kernel's loader rejects `ET_DYN`. That trap is
+specific to how the crate came to exist: it began as a *library* in Part A and grew a bin
+in Part B, and a crate born as a library has nobody to tell it. `profile-server` was the
+right model precisely because it is also lib+bin — its `build.rs` uses
+`rustc-link-arg-bins` so the fixed-address linker script never reaches the host lib-test
+link. Then `cargo test -p compositor` failed on a duplicate `panic_impl`, since a `no_std`
+bin cannot build for the host; the xtask entry takes `--lib`, as `init` and `service-mgr`
+already do.
+
+**`libui`'s reason to exist is the buffer lifecycle, not the messages.** Encoding is
+`librsproto`'s job and already tested. What a client actually needs is the answer to
+"which buffer may I draw into now?", and getting it wrong produces tearing that is
+invisible in testing and obvious in use. That logic sits behind a `Transport` trait and
+host-tests against a mock.
+
+**Single buffering cannot work, and the library refuses it.** A buffer is busy from commit
+until release, and the compositor releases the buffer that *left* the screen — never the
+one on it. With one buffer there is never anything to release, so a client would stall
+forever or tear. `Window::new` rejects fewer than two rather than letting an application
+discover this at runtime. That is Part E's question answered at the client, though Part E
+still owes the proof against a real double-buffering client.
+
+**Nothing has yet exercised a client and the compositor together.** The server has no
+client, so its session, mapping and commit paths have not run even once; `libui` has only
+met a mock. Part D is what closes that, and it is the first point either half is tested at
+all.
+
+Also noted rather than fixed: the compositor repaints the **whole screen** on every applied
+request. Damage rectangles are carried by the protocol, parsed, and currently ignored. A
+full repaint is always correct and there is one client, but the damage plumbing is
+untested end to end and "the field exists and nothing reads it" is exactly the sort of
+thing that quietly stays true.
+
+1213 host tests, all six gates green, `test-qemu` green, display gate green.
+
+## 2026-08-05 — PR #174 review: the server could not answer, and I said it did
+
+Thirteen findings. Three blocking, and the first is the most serious mistake in this arm.
+
+**The compositor never sent anything on a session channel.** `dispatch` produced replies
+and `Outcome::Applied { release }` values, and `serve_session` dropped both — the match arm
+discarded the payload and `let _ = request_id;` threw away the id a reply must echo. Three
+`SYS_CHANNEL_SEND` call sites existed, all on the control or forwarding endpoint;
+`build_release_event` appeared nowhere outside a test mock. The Surface protocol was
+one-way as implemented: a client could not learn its window id, and a double-buffered
+client would stall from its third frame forever.
+
+**And I ticked the box.** `docs/planning/display-arm-plan.md` said `[x] Part B — /dev/draw
+served ✅`, and the entry above says `/dev/draw` is "bound and answered by a real resource
+server". It was bound. It did not answer. The reviewer's phrasing is the one to keep: *this
+is not the same as "untested" — the reply path is not written.*
+
+That is exactly the failure the docs consistency pass existed to prevent, committed by the
+same person who ran it, three weeks later, in a plan checkbox. The lesson is narrow and
+worth stating: **"I wrote the code that produces X" is not evidence that X reaches anyone.**
+Both halves of a protocol need a consumer before either can be called done, which is what
+Part D is for and why nothing before it should have been ticked.
+
+Part B and Part C are now marked *partial*, with what is missing spelled out. Part C's tick
+was wrong on a second count: it claimed "receive input, run an event loop", which is M3.
+
+**The ownership boundary was enforced for the stack and bypassed for the pixels.**
+`AttachBuffer` mapped and recorded the client's memory *before* dispatch checked
+ownership, and `Server::pixels` resolves by first match — so a second client could attach
+under a predictable window id (`next_id` from 1), be told `NotFound`, and still have its
+pixels painted into the rightful owner's window. The map now happens only after dispatch
+accepts, and a rejected attach closes the handle instead of leaking it.
+
+**`libui` could not receive a reply at all.** `sys_channel_recv` is non-blocking — an empty
+queue is `WouldBlock` — and the transport sent then recv'd with no `sys_wait` between, so
+it failed unless the server happened to be scheduled in the gap. The idiom
+`librsproto::session` already documents is send → `sys_wait` → recv. Fixed, and messages
+that are not the awaited reply are now **parked rather than dropped**: a `Release` arriving
+first would otherwise be lost, leaving the client's buffer busy forever. Replies are matched
+by request id, not merely by op.
+
+Also fixed: `commit` marked a buffer busy *before* the send, stranding it if the send
+failed; `bind_compositor` leaked `ctrl_init` and `endpoint` on every path but spawn failure,
+so the compositor never saw the `PeerClosed` every other server gets; a fifth doc-comment
+theft (`read_current_generation`'s block, now returned); the display gate's path filter
+omitted `userspace/compositor/**`, which the gate boots; and three docs the change made
+false, including root `CLAUDE.md`.
+
+**The clear/render race is closed rather than narrowed.** The compositor announced `Ready`
+*before* clearing the screen, so `bind_compositor` returned with the clear still pending and
+two processes held the aperture mapped read-write. Clearing before the handshake makes
+`Ready` mean "I have taken the screen"; the reviewer's suggestions (pace it, or capture
+twice) would have narrowed the window rather than removed it.
+
+The reviewer also noted `double_buffering_can_draw_forever_…` survives removing
+`b.busy = true` alone, because with `busy` never set `next_free` always returns buffer 0 and
+every assertion still holds. It catches the two breaks that matter, and another test covers
+the flag — but the name promises more than the body checks.
+
+1214 host tests, all six gates green, `test-qemu` green, display gate green.

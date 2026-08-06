@@ -22,6 +22,8 @@
 
 extern crate alloc;
 
+pub mod server;
+
 use alloc::vec::Vec;
 
 use libdraw::compose::{SurfaceRef, compose};

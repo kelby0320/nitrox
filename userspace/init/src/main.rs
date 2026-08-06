@@ -170,6 +170,20 @@ static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0,
 };
+/// Spawn args for the `compositor` (display arm M2 Part B): no handles, and it inherits a
+/// LOOKUP-only handle to init's root namespace so it resolves `/dev/framebuffer`.
+/// **No syscaps** — it binds nothing; init does the binding, as for every other resource
+/// server (`docs/rationale/why-supervisor-registration.md`).
+static mut SPAWN_COMPOSITOR: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/compositor
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
 /// Spawn args for the interactive emergency shell `eshell` (slice 9): no handles,
 /// inherit a LOOKUP-only handle to init's root namespace (so it resolves
 /// `/dev/console` for input and `/dev/blk/*` for `lsblk`). It runs as the
@@ -828,6 +842,68 @@ fn bind_tty_server(root_ns: u64) -> bool {
     kprint(b"init: tty server bound at /dev/tty\n");
     // init keeps `ls_h` (the long-lived server's process handle).
     let _ = ls_h;
+    true
+}
+
+/// Spawn the compositor and bind its endpoint at `/dev/draw`.
+///
+/// **Non-fatal.** A machine with no usable framebuffer still boots to a serial console,
+/// and every existing test path is serial; the display arm is the only consumer. Returns
+/// `false` if the display is unavailable, which the caller reports but does not treat as a
+/// boot failure.
+///
+/// The binding is a **subtree** — the compositor answers resolves for everything beneath
+/// `/dev/draw`, the same shape `/home` uses — so `/dev/draw/new` forwards `new` to it and
+/// nobody calls `sys_ns_bind` when a window opens.
+fn bind_compositor(root_ns: u64) -> bool {
+    // 1. Control channel: init keeps end 0, the server gets end 1.
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params; earlier binds have completed.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // 2. Spawn, moving the control endpoint in.
+    // SAFETY: SPAWN_COMPOSITOR is a valid writable arg block.
+    let h = unsafe {
+        SPAWN_COMPOSITOR.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/initramfs/sbin/compositor", &raw mut SPAWN_COMPOSITOR)
+    };
+    if h < 0 {
+        kprint(b"init: compositor spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    // 3. Await Meta::Ready and take the forwarding endpoint it carries.
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: compositor Ready timeout/invalid\n");
+            // SAFETY: done with the control channel either way.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // The control channel has served its purpose. Closing it is not tidiness: it is the
+    // `PeerClosed` every other server observes when init is finished with it.
+    // SAFETY: closing init's own control endpoint.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // SAFETY: binding the compositor's forwarding endpoint as a subtree at /dev/draw.
+    let br = unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/draw".as_ptr() as u64, 9, endpoint) };
+    // The binding takes its own reference, so init's handle goes either way.
+    // SAFETY: closing init's reference to the endpoint.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: compositor bind FAIL at /dev/draw\n");
+        return false;
+    }
+    kprint(b"init: compositor bound at /dev/draw\n");
     true
 }
 
@@ -1730,6 +1806,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // (`display-selftest`), not inline here: compositing is not init's job, and
     // `userspace/init/CLAUDE.md` calls this critical-path code. It supersedes the
     // inline framebuffer demo that proved M1 Part B.
+    if !bind_compositor(root_ns) {
+        kprint(b"init: no compositor; /dev/draw unavailable\n");
+    }
+
     #[cfg(feature = "selftest")]
     run_display_selftest(notif, root_ns);
 

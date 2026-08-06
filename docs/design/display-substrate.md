@@ -2,9 +2,11 @@
 
 ## Status
 
-**Not built.** This describes a subsystem with no code behind it; the build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
-when the compositor lands.
+**Partly built.** Milestones 1–2 have landed: `libdraw`, the `/dev/framebuffer` binding,
+the compositor serving `/dev/draw`, and `libui`. Input (§5), text (§6), thumbnail capture
+(§4b) and global hotkeys (§5a) have **no code**. The build order is
+[`display-arm-plan.md`](../planning/display-arm-plan.md); this graduates to `architecture/`
+when Milestone 2 closes, which the plan carries as a checkbox.
 
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
@@ -17,7 +19,8 @@ namespace shape for `/dev/draw`) v2 is authoritative. `desktop-shell.md` owns wh
 user actually sees, and §4a, §4b and §5a below exist **because that document demanded them** —
 roles, struts, capture and global hotkeys were all absent from the first draft of this one.
 
-Nothing here is built. The build order is `docs/planning/display-arm-plan.md`.
+Milestones 1–2 of this are built (see the Status above); everything from input onward is
+not. The build order is `docs/planning/display-arm-plan.md`.
 
 ## 1. What exists today
 

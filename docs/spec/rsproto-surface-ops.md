@@ -38,6 +38,23 @@ symmetric answer.
 notifications. That is the strongest argument for this shape over the alternatives
 (`docs/design/display-substrate.md` §4).
 
+## How a client obtains a connection
+
+Resolving **`/dev/draw/new`** mints a channel pair: the compositor keeps the server end and
+hands the client end back as the resolve's answer (`OBJECT_KIND_CHANNEL`). The client then
+speaks Surface ops over that channel.
+
+This is not a new mechanism — it is the **directory-session** pattern `profile-server`
+already uses for `/bin`, where "there is no distinct directory reply kind: a directory
+handle *is* a live channel to the server". The forwarded resolve is the introduction; the
+channel is the conversation.
+
+**The connection is the channel**, and that is what makes the ownership rule above
+enforceable rather than merely stated: a request's identity is the endpoint it arrived on,
+so the compositor never has to ask *who is calling* — it already knows. It also fixes the
+lifetime question, since a client going away is a channel closing, which is exactly when
+its windows should be destroyed.
+
 ## The buffer lifecycle
 
 ```

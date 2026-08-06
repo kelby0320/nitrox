@@ -15,6 +15,11 @@ on:
     branches: [main]
     paths: &display_paths
       - 'userspace/libdraw/**'
+      # The gate boots a `test-harness` image, in which init spawns the compositor and it
+      # maps the framebuffer read-write and clears the screen. A change here can blank the
+      # display without touching anything else on this list.
+      - 'userspace/compositor/**'
+      - 'userspace/libui/**'
       - 'userspace/test-harness/src/display.rs'
       # `kernel/src/main.rs` holds *both* halves of the binding — `record_framebuffer()`
       # and its placement relative to `run_first_userspace()`, and the
