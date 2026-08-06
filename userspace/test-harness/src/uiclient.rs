@@ -47,7 +47,11 @@ use libkern::{
     SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2,
     syscall4,
 };
-use librsproto::surface::Role;
+use librsproto::surface::{
+    AttachBufferRequest, OP_ATTACH_BUFFER, Role, SURFACE_FORMAT_XRGB8888,
+    build_attach_buffer_request,
+};
+use libui::Transport;
 use libui::{Window, ipc::ChannelTransport};
 
 /// `alloc` backing — rendering the reference scene allocates.
@@ -201,13 +205,23 @@ fn churn(root_ns: u64) -> bool {
     };
     let pitch = CHURN_W as usize * 4;
     let len = pitch * CHURN_H as usize;
-    for _ in 0..CHURN_CYCLES {
+    for cycle in 0..CHURN_CYCLES {
         let mut w = match Window::new(t, CHURN_W, CHURN_H, Role::Normal, BUFFERS) {
             Ok(w) => w,
-            Err(_) => return false,
+            Err(_) => {
+                kprint(b"churn: Window::new failed at cycle ");
+                kprint_u64(cycle as u64);
+                kprint(b"\n");
+                return false;
+            }
         };
         // The allocation that fails first when the compositor is hoarding.
-        let Some((handle, addr)) = shared_buffer(len) else { return false };
+        let Some((handle, addr)) = shared_buffer(len) else {
+            kprint(b"churn: real buffer alloc failed at cycle ");
+            kprint_u64(cycle as u64);
+            kprint(b"\n");
+            return false;
+        };
         if w.attach(0, CHURN_W, CHURN_H, pitch as u32, handle).is_err() {
             return false;
         }
@@ -219,6 +233,49 @@ fn churn(root_ns: u64) -> bool {
         // all that is left holding the object on this side.
         // SAFETY: unmapping a range this process mapped in `shared_buffer`.
         unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
+
+        // **A rejected attach must also give the memory back.** The handle rides the
+        // message whether or not the compositor accepts it, so an attach naming a window
+        // that does not exist — one malformed message, which any client can send — used to
+        // hand over an object nobody ever closed. Sent through the raw transport because
+        // `libui` deliberately cannot express it.
+        let Some((bogus_handle, bogus_addr)) = shared_buffer(len) else {
+            kprint(b"churn: bogus buffer alloc failed at cycle ");
+            kprint_u64(cycle as u64);
+            kprint(b"\n");
+            return false;
+        };
+        let mut req = [0u8; 32];
+        let Some(rn) = build_attach_buffer_request(
+            &mut req,
+            &AttachBufferRequest {
+                window: 0xDEAD_BEEF,
+                buffer: 0,
+                width: CHURN_W,
+                height: CHURN_H,
+                pitch: pitch as u32,
+                format: SURFACE_FORMAT_XRGB8888,
+            },
+        ) else {
+            return false;
+        };
+        // **Waits for the refusal rather than firing and forgetting.** Two reasons: it
+        // paces the loop against the compositor, and an unconsumed error reply is a message
+        // that parks — eight of those overflow the queue and the *next* request fails for
+        // an unrelated-looking reason. `Err(Server)` is the expected answer here; anything
+        // else means the compositor accepted an attach to a window that does not exist.
+        let mut reply = [0u8; 32];
+        match t.request(OP_ATTACH_BUFFER, &req[..rn], Some(bogus_handle), &mut reply) {
+            Err(libui::UiError::Server) => {}
+            _ => {
+                kprint(b"churn: bogus attach was not refused at cycle ");
+                kprint_u64(cycle as u64);
+                kprint(b"\n");
+                return false;
+            }
+        }
+        // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, bogus_addr as u64, len as u64) };
     }
     true
 }

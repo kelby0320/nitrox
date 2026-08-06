@@ -11476,3 +11476,53 @@ the `Box` impl above `Window` and stealing its `/// A window and its buffers.`. 
 it was caught mechanically: `Window` is public, so `#![deny(missing_docs)]` fired. That is
 the fix for the public case and nothing for the private one — `fail`, in the same review
 round, was private and silent.
+
+### A third class, found by auditing instead of asserting
+
+Asked whether the leaks were fixed, the useful move was to enumerate every
+map/create/close site in the compositor rather than answer from memory. That turned up a
+third class, distinct from the first two: **a transferred handle nobody consumes**.
+
+`AttachBuffer` carries a `MemoryObject` in the message's transfer slot. Three paths took
+delivery and never closed it:
+
+- **A message that fails to decode.** The handle was read *after* `decode`, so a malformed
+  message returned early with the handle still in the table. One bad message, one pinned
+  object, and a client can send as many as it likes.
+- **A handle riding an op that has no business carrying one.** The disposal was written as
+  `if op == OP_ATTACH_BUFFER && handle != 0 { … }`, so a handle attached to `Commit`, or to
+  anything else, fell through every branch.
+- **`map_attached_buffer`'s parse-failure path**, the one early return in that function
+  that did not close.
+
+Rewritten so disposal is structural rather than per-case: the handle is taken out of the
+message **before anything can fail**, `map_attached_buffer` is documented and implemented to
+consume it on every path, and a single `if handle != 0 && !consumed` closes everything else.
+The old shape enumerated the cases it knew about; this one is exhaustive by construction.
+
+**Proven, at cycle 63.** `ui-testclient`'s churn loop now also sends, each cycle, an
+`AttachBuffer` naming a window that does not exist, carrying a real 3 MiB object — one
+malformed message, the thing any client can do. With the close removed the guest runs out of
+memory and says so; with it, green.
+
+**Writing that test found a `libui` bug worth more than the test.** `request` matched
+replies on `RS_FLAG_REPLY` and the request id alone. The compositor sends refusals as
+`RS_FLAG_REPLY | RS_FLAG_ERROR` with the same op and id — so **an error came back to the
+caller as a success**, and the caller parsed the error body as a result. `Window::new` would
+have read a window id out of an error code. `UiError::Server` now exists and `request`
+returns it. Verified the guest test actually guards this by removing the flag check: the run
+fails at cycle 0 with `bogus attach was not refused`.
+
+Two smaller notes from the same session. The rejected-attach probe first failed at cycle
+**9**, which looked like a leak and was not: it was `MAX_PARKED` = 8, the queue-overflow
+error introduced earlier in this same review round, doing exactly its job — eight unconsumed
+error replies had piled up because the probe fired and forgot. The change made a silent
+condition loud, and the first thing it caught was the test. And **a failed `NOBLOCK` send
+leaves its transfer untaken**, so the sender still owns the handle and must close it; the
+channel holds four messages, so a client that does not wait for replies reaches that case
+easily.
+
+**32 KiB of user stack is small** for a client holding protocol buffers, and worth raising
+(`DEFAULT_USER_STACK_SIZE`, `kernel/src/arch/x86_64/abi.rs`). Deliberately not done here —
+it is a kernel-wide change and this is a display PR. Boxing the transport is the right fix
+regardless: a 9 KiB struct does not belong in a stack frame at any stack size.

@@ -438,8 +438,15 @@ fn close_session(slot: usize, srv: &mut Server) {
 ///
 /// Mapped **once, at attach**, and kept for the buffer's life — the handle crosses the
 /// channel a single time, not per frame.
+///
+/// **Always consumes `handle`**, on every path. A transferred handle nobody closes keeps
+/// its object — and so the client's frames — alive for the compositor's life.
 fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
-    let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else { return false };
+    let Some(req) = librsproto::surface::parse_attach_buffer_request(body) else {
+        // SAFETY: we are not mapping it, so drop it rather than leaking the object.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+        return false;
+    };
     let len = req.pitch as usize * req.height as usize;
     // SAFETY: `handle` is a `MemoryObject` the client transferred; mapping it read-only
     // with the size its own geometry declares.
@@ -541,10 +548,20 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
             payload_len.min(MSG_LEN - PAYLOAD_OFF),
         );
-        let Ok(m) = decode(req) else { return true };
+        // Take the handle out **before** anything can fail. A message that does not decode
+        // can still have carried one, and returning early without closing it pins the
+        // client's object for the compositor's life — a leak a client drives by sending one
+        // malformed message.
+        let h = if (&raw const RECV_COUNT).read() > 0 { RECV_HANDLES[0] } else { 0 };
+        let Ok(m) = decode(req) else {
+            if h != 0 {
+                // SAFETY: closing a handle this process owns and will never interpret.
+                syscall4(SYS_HANDLE_CLOSE, h, 0, 0, 0);
+            }
+            return true;
+        };
         let n = m.body.len().min(MAX_BODY);
         body_buf[..n].copy_from_slice(&m.body[..n]);
-        let h = if (&raw const RECV_COUNT).read() > 0 { RECV_HANDLES[0] } else { 0 };
         (m.op, m.request_id, n, h)
     };
     let body = &body_buf[..body_len];
@@ -565,16 +582,22 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
     // entry would stay, and `Server::pixels` resolves by first match — so another client's
     // pixels would be painted into the rightful owner's window. Doing it in this order
     // makes the ownership boundary cover the pixels, not just the stack.
-    if op == OP_ATTACH_BUFFER && handle != 0 {
-        if matches!(outcome, Outcome::Applied { .. }) {
-            if !map_attached_buffer(srv, body, handle) {
-                return true;
-            }
-        } else {
-            // Rejected: drop the handle rather than leaking it for the compositor's life.
-            // SAFETY: closing a handle this process owns and will not use.
-            unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
+    //
+    // Whatever happens, the handle is **disposed of exactly once**. It is only ever consumed
+    // by `map_attached_buffer`, which closes it on all of its own paths; everything else —
+    // a rejected attach, or a handle riding an op that has no business carrying one, which a
+    // client is free to send — closes it here. Anything left unclosed keeps the client's
+    // object, and therefore its frames, alive for the compositor's life.
+    let mut consumed = false;
+    if op == OP_ATTACH_BUFFER && handle != 0 && matches!(outcome, Outcome::Applied { .. }) {
+        consumed = true;
+        if !map_attached_buffer(srv, body, handle) {
+            return true;
         }
+    }
+    if handle != 0 && !consumed {
+        // SAFETY: closing a handle this process owns and will not use.
+        unsafe { syscall4(SYS_HANDLE_CLOSE, handle, 0, 0, 0) };
     }
 
     match outcome {

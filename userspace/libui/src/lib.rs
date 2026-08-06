@@ -55,6 +55,14 @@ pub enum UiError {
     TooFewBuffers,
     /// No buffer with that id.
     NoSuchBuffer,
+    /// The compositor answered this request with an error.
+    ///
+    /// Distinct from [`UiError::BadReply`]: the reply is well-formed and *is* for this
+    /// request — it just says no. Before this existed, `request` matched on
+    /// `RS_FLAG_REPLY` alone, so an error reply came back as a **successful** one and the
+    /// caller parsed the error body as a result. `Window::new` would have read a window id
+    /// out of an error code.
+    Server,
 }
 
 /// How a client talks to the compositor.
@@ -99,7 +107,6 @@ pub struct ClientBuffer {
     pub busy: bool,
 }
 
-/// A window and its buffers.
 /// A boxed transport is a transport.
 ///
 /// Not a convenience: [`ipc::ChannelTransport`] carries two 4 KiB message buffers plus the

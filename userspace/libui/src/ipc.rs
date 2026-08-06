@@ -8,7 +8,7 @@ use libkern::error::KError;
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_WAIT, syscall4, syscall5,
 };
-use librsproto::{RS_FLAG_REPLY, decode, encode};
+use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 use crate::{Transport, UiError};
 
@@ -187,6 +187,11 @@ impl Transport for ChannelTransport {
             if m.flags & RS_FLAG_REPLY != 0 && m.request_id == id {
                 if m.op != op {
                     return Err(UiError::BadReply);
+                }
+                // A refusal is still this request's reply — consumed here, not parked, or
+                // it would sit in the queue and eventually overflow it.
+                if m.flags & RS_FLAG_ERROR != 0 {
+                    return Err(UiError::Server);
                 }
                 let n = m.body.len().min(reply.len());
                 reply[..n].copy_from_slice(&m.body[..n]);
