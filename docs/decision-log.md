@@ -11423,3 +11423,56 @@ One pleasing correction in the other direction: **the release-ordering rule Part
 at was already in the spec.** The lifecycle diagram has shown `composite` before `Release`
 since Part A. The code was wrong and the document was right — the reverse of the failure
 mode most of this project's doc rules are built to prevent.
+
+### The second leak — the one the review found by implication
+
+Asked whether the `info` leak meant "a leak somewhere", the honest answer turned out to be
+yes, and a worse one, one file over.
+
+`MappedBuffer` — the compositor's record of a client buffer it has mapped — had **no
+`Drop`**. Both places that shrink `Server::buffers` do it with `Vec::retain`, which drops
+the removed records and nothing else, so the VMA stayed. The destroy site even carries the
+comment *"otherwise a client looping create/attach/destroy grows the compositor's address
+space without bound"* — describing an intent the code did not carry out. Reading that
+comment is presumably why nobody looked underneath it, this author included.
+
+It is worse than the `info` leak on three counts. It leaks a **whole framebuffer** rather
+than a page — megabytes per window at any real size. It fires on the **ordinary application
+lifecycle**: every window closed, every client that exits, no adversary required. And
+because `map_attached_buffer` closes its handle immediately and relies on the mapping to
+hold the object alive, the stale mapping pinned the **client's** frames — so a program that
+exited never got its memory back.
+
+**Why nothing caught it.** `ui-testclient` parks with its window open, by design, because
+exiting made the display gate capture an empty screen. So in the entire guest suite no
+buffer mapping was ever torn down. The one code path that frees a client's pixels had no
+coverage at all, and the shape of the fix for an earlier bug is what removed the chance of
+getting any.
+
+**This one is proven both ways.** `ui-testclient` now churns 80 windows on a second
+connection, each sharing a 3 MiB buffer, before presenting. 80 × 3 MiB is 240 MiB against a
+256 MiB guest, so a compositor that keeps one mapping per destroyed window runs the guest
+out of memory and the client says so. With the `Drop` in place the run is green; with its
+body removed the boot fails at `window churn FAILED` with exit 35. Sizing that deliberately:
+a smaller buffer or fewer cycles would leak just as truly and pass just as green, which is
+the trap the `info` probe fell into.
+
+**Two smaller things fell out of writing it.**
+
+*A client cannot hold its transport on the stack.* `ChannelTransport` is ~9 KiB — two 4 KiB
+message buffers plus the parked queue — against a **32 KiB** user stack. Moving one in and
+out of a `Window` each cycle overflowed it, and the symptom is worth remembering: the
+process died in its *prologue*, printing nothing at all, not even its own first line, while
+everything around it looked healthy. The fault address (`0x7fff_fffe_7fc8`) sat one byte
+below the stack's low end, which is the only thing that identified it. `libui` now
+implements `Transport for Box<T>` so a window can hold a pointer, and the reason is written
+at the impl rather than in a commit message.
+
+*`Window::into_transport`.* Closing a window and opening another is ordinary behaviour and
+must not require reconnecting — that would cost a compositor session slot per window.
+
+The doc-comment orphaning pattern struck for the **seventh** time this milestone, inserting
+the `Box` impl above `Window` and stealing its `/// A window and its buffers.`. First time
+it was caught mechanically: `Window` is public, so `#![deny(missing_docs)]` fired. That is
+the fix for the public case and nothing for the private one — `fail`, in the same review
+round, was private and silent.

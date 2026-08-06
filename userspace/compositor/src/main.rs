@@ -83,6 +83,27 @@ struct MappedBuffer {
     len: usize,
 }
 
+impl Drop for MappedBuffer {
+    /// Unmap when the record goes away — **the record is not the mapping**.
+    ///
+    /// Both places that shrink `Server::buffers` do it with `Vec::retain`, which drops the
+    /// removed records and nothing else. Dropping a `MappedBuffer` used to leave the VMA
+    /// behind, so the comment at the destroy site — "otherwise a client looping
+    /// create/attach/destroy grows the compositor's address space without bound" — described
+    /// an intent the code did not carry out. It leaked on the ordinary application
+    /// lifecycle: every window closed, every client that exits.
+    ///
+    /// Worse than the address space, it pinned the **client's** memory. `map_attached_buffer`
+    /// closes its handle immediately and relies on the mapping to hold the object alive, so
+    /// a stale mapping meant a client's framebuffer was never freed after that client was
+    /// gone — at a real window size, megabytes per window.
+    fn drop(&mut self) {
+        // SAFETY: `addr`/`len` came from a successful `sys_memory_map` in
+        // `map_attached_buffer`; a record is dropped once, so this unmaps once.
+        unsafe { syscall2(libkern::SYS_MEMORY_UNMAP, self.addr as u64, self.len as u64) };
+    }
+}
+
 /// Everything the serve loop owns.
 struct Server {
     stack: WindowStack,
@@ -96,8 +117,9 @@ impl BufferSource for Server {
     fn pixels(&self, window: u32, buffer: u32) -> Option<&[u8]> {
         let b = self.buffers.iter().find(|b| b.window == window && b.buffer == buffer)?;
         // SAFETY: `addr`/`len` come from a successful `sys_memory_map` of the client's
-        // `MemoryObject`, which stays mapped for this process's life (nothing unmaps it),
-        // and the slice is read-only and borrowed no longer than `&self`.
+        // `MemoryObject`. The mapping lives exactly as long as its `MappedBuffer` record —
+        // `Drop` unmaps — and this slice borrows `&self`, so no `&mut` path that could drop
+        // the record can run while it is alive.
         Some(unsafe { core::slice::from_raw_parts(b.addr, b.len) })
     }
 }

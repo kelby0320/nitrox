@@ -100,6 +100,35 @@ pub struct ClientBuffer {
 }
 
 /// A window and its buffers.
+/// A boxed transport is a transport.
+///
+/// Not a convenience: [`ipc::ChannelTransport`] carries two 4 KiB message buffers plus the
+/// parked-event queue, so it is ~9 KiB, and a userspace thread starts with a **32 KiB**
+/// stack. Holding one by value — and moving it in and out of a `Window` — is enough to run
+/// a client off the end of its stack, which presents as a process that dies in its
+/// prologue and prints nothing at all, before its own first line. Box it and the `Window`
+/// holds a pointer.
+impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
+    fn request(
+        &mut self,
+        op: u16,
+        body: &[u8],
+        handle: Option<u64>,
+        reply: &mut [u8],
+    ) -> Result<Option<usize>, UiError> {
+        (**self).request(op, body, handle, reply)
+    }
+
+    fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
+        (**self).wait_event(buf)
+    }
+
+    fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
+        (**self).poll_event(buf)
+    }
+}
+
+/// A window and its buffers.
 pub struct Window<T: Transport> {
     transport: T,
     id: u32,
@@ -134,6 +163,16 @@ impl<T: Transport> Window<T> {
             .ok_or(UiError::BadReply)?;
         let id = parse_create_window_reply(&reply[..len]).ok_or(UiError::BadReply)?;
         Ok(Self { transport, id, buffers: Vec::new() })
+    }
+
+    /// Consume the window and hand back its connection.
+    ///
+    /// A connection outlives any one window — closing a window and opening another is
+    /// ordinary application behaviour and must not require reconnecting, which would cost a
+    /// compositor session slot each time. Pair with [`Window::destroy`]: destroy the window,
+    /// then take the transport back for the next one.
+    pub fn into_transport(self) -> T {
+        self.transport
     }
 
     /// This window's id.

@@ -43,7 +43,10 @@ extern crate alloc;
 
 use libdraw::framebuffer::Framebuffer;
 use libdraw::scene;
-use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall4};
+use libkern::{
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2,
+    syscall4,
+};
 use librsproto::surface::Role;
 use libui::{Window, ipc::ChannelTransport};
 
@@ -56,6 +59,18 @@ static ALLOC: libheap::Heap = libheap::Heap;
 const FRAMES: usize = 6;
 /// Buffers the client allocates. Two is the minimum the protocol permits.
 const BUFFERS: usize = 2;
+
+/// Window-churn cycles, and the buffer size each one shares with the compositor.
+///
+/// Sized so the run **fails on a leak rather than merely leaking**: 80 × 3 MiB is 240 MiB
+/// against a 256 MiB guest, so if the compositor keeps a mapping for a window that no
+/// longer exists, `sys_memory_create` runs out and this reports it. A smaller buffer or
+/// fewer cycles would leak just as truly and pass just as green.
+const CHURN_CYCLES: usize = 80;
+/// Churn window width — the buffer is `CHURN_W * 4 * CHURN_H` = 3 MiB.
+const CHURN_W: u32 = 1024;
+/// Churn window height.
+const CHURN_H: u32 = 768;
 
 fn kprint_u64(n: u64) {
     if n == 0 {
@@ -163,6 +178,51 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
         && info.role == librsproto::surface::ROLE_NORMAL
 }
 
+/// Open and close windows in a loop, proving the compositor gives the memory back.
+///
+/// This is the ordinary application lifecycle — a window closes, a client exits — and until
+/// the review of PR #175 nothing exercised it: `ui-testclient` parked with its window open,
+/// so no buffer mapping was ever torn down in the guest. The compositor dropped its
+/// bookkeeping record on destroy and left the mapping behind, which pinned the *client's*
+/// frames, because `map_attached_buffer` closes its handle and relies on the mapping to
+/// hold the object alive.
+///
+/// Runs on its own connection so the presented window is untouched, and commits nothing —
+/// a churn window never reaches the screen.
+#[inline(never)]
+fn churn(root_ns: u64) -> bool {
+    // **Boxed.** A `ChannelTransport` is ~9 KiB against a 32 KiB stack, and moving one in
+    // and out of a `Window` each cycle overflows it — which presents as a process that dies
+    // in its prologue and never prints its own first line.
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => alloc::boxed::Box::new(t),
+        Err(_) => return false,
+    };
+    let pitch = CHURN_W as usize * 4;
+    let len = pitch * CHURN_H as usize;
+    for _ in 0..CHURN_CYCLES {
+        let mut w = match Window::new(t, CHURN_W, CHURN_H, Role::Normal, BUFFERS) {
+            Ok(w) => w,
+            Err(_) => return false,
+        };
+        // The allocation that fails first when the compositor is hoarding.
+        let Some((handle, addr)) = shared_buffer(len) else { return false };
+        if w.attach(0, CHURN_W, CHURN_H, pitch as u32, handle).is_err() {
+            return false;
+        }
+        if w.destroy().is_err() {
+            return false;
+        }
+        t = w.into_transport();
+        // The client's own half. `attach` transferred the handle away, so this mapping is
+        // all that is left holding the object on this side.
+        // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+        unsafe { syscall2(SYS_MEMORY_UNMAP, addr as u64, len as u64) };
+    }
+    true
+}
+
 /// Report failure and end the run.
 ///
 /// Called instead of exiting with a code, because init cannot wait for this program: on
@@ -192,7 +252,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // 1. A session. The compositor mints a channel per resolve of `/dev/draw/new`.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
-        Ok(t) => t,
+        // Boxed for the same reason `churn` boxes its own: ~9 KiB of message buffers has no
+        // business sitting in a 32 KiB stack frame alongside everything else here.
+        Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => {
             fail(b"ui-testclient: connect to /dev/draw FAILED\n");
         }
@@ -217,6 +279,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     if !check_info(root_ns, win.id(), w, h) {
         fail(b"ui-testclient: /dev/draw/<N>/info FAILED\n");
     }
+
+    // 2c. Open and close windows until the guest would run out of memory if the compositor
+    //     kept a single one of their buffers mapped. Before the presented window exists in
+    //     its final form, so a churn window can never be what `check-display` captures.
+    if !churn(root_ns) {
+        fail(b"ui-testclient: window churn FAILED -- compositor leaking buffer mappings?\n");
+    }
+    kprint(b"ui-testclient: churned ");
+    kprint_u64(CHURN_CYCLES as u64);
+    kprint(b" windows\n");
 
     // 3. Shared memory. Rendered once; both buffers get the same picture, so whichever is
     //    on screen at the end is the one `check-display` expects.
