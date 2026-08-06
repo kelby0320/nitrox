@@ -554,6 +554,8 @@ coreutils breadth, and a minimal (non-rich) REPL are its scope:
 (framebuffer ownership, the surface protocol, input, text, determinism, and the test gate) and
 [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md) (windows,
 ports, desktops, templates) and
+[`docs/design/input-subsystem.md`](../design/input-subsystem.md) (the path from an
+interrupt to a keystroke in a window: kernel drivers, the `input-server`, `libinput`) and
 [`docs/design/desktop-shell.md`](../design/desktop-shell.md) (bars, applications modal,
 overview), all settled 2026-08-04. **Build order:
 [`display-arm-plan.md`](display-arm-plan.md)** — seven milestones, three prerequisites, starting

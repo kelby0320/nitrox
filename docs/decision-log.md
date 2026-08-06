@@ -11647,3 +11647,148 @@ logged — it is per-session now; `shared_buffer` leaked its object when the map
 one file whose purpose is proving leaks absent; and `ChannelTransport::new`'s `# Safety`
 block now says the caller is giving the handle away, which became true when `Drop` landed and
 the doc did not follow.
+
+## 2026-08-06 — Input is a subsystem, not a driver: kernel drivers + a userspace server
+
+Milestone 3 was three parts and assumed the obvious shape: a PS/2 driver in the kernel
+emitting finished key events, read by the compositor. The maintainer pushed on it before any
+code — *this will grow to touchpads, touchscreens, keypads, other buses; where does the
+subsystem live?* — and the obvious shape does not survive the second device.
+
+**Decision: Tier 1 drivers in the kernel, a userspace `input-server` above them, one record
+format throughout.** Full design in `docs/design/input-subsystem.md`; the reasoning worth
+keeping here is why the alternatives lost.
+
+**All-in-kernel** loses on the project's own argument. `display-substrate.md` §5 already
+puts keycode→character in userspace because "a keyboard layout should not be a kernel
+rebuild". Pointer acceleration, tap-to-click and palm rejection are more policy-laden than a
+keymap, not less, and USB HID report-descriptor parsing is close to running a bytecode in
+ring 0 to find out where the X axis is. Keeping it all in the kernel means relitigating that
+boundary at every device class.
+
+**Fully-userspace drivers (Tier 2)** lose on availability, not merit. `InterruptObject` was
+built for exactly this — its doc says so — but there is **no userspace-facing interrupt
+syscall and no port-I/O capability at all**: no IOPL, no TSS I/O bitmap, and granting port
+I/O per process is its own capability-model question. It is the right destination; the
+chosen design is what will host it later without the compositor noticing.
+
+**The middle option is not a compromise, it is the shape already in the tree.** `tty-server`
+holds `/dev/console` — a kernel char `DeviceNode` fed by COM1's receive IRQ — exclusively,
+and serves `/dev/tty`. Input is that arrangement with more devices under it, and adds no new
+mechanism.
+
+**The latency objection expired in July.** The strongest argument for keeping everything in
+the kernel was the extra hop, and it would have been decisive while an IRQ-tail wake could
+wait for the 10 ms tick. That was root-caused and fixed on 2026-07-23. Worth noting because
+it is a case of an old fix silently changing which architecture is affordable — nobody would
+have connected the two.
+
+**One record format, `evdev`'s triple, numbering included.**
+
+```rust
+#[repr(C)]
+struct InputEvent { kind: u16, code: u16, value: i32, time_ns: u64 }  // 16 bytes
+```
+
+Extensibility lives in the `kind`/`code` enums, never in the layout, so a touchscreen is new
+`EV_ABS` codes and a dial is a new `EV_REL` code and neither breaks the wire. That is the
+whole reason for choosing it over a "fat" record with named `x`/`y`/`modifiers` fields: the
+fat record is more ergonomic for exactly one device class and forces a layout change at the
+second. Twenty-five years of evdev across mice, tablets, touchscreens and accelerometers
+without a layout break is the strongest evidence available. The costs are real and recorded
+in the design: a logical event is several records terminated by `SYN`, so every consumer
+needs a state machine, and multitouch will need slots bolted on as it did for evdev.
+
+**Two things fell out of writing it up, both corrections to what I had proposed an hour
+earlier.**
+
+*The kernel drivers emit the same triples, not a per-device raw format.* I had the kernel
+emitting device-specific records and the server translating, which meant two ABIs — the main
+cost I had listed against this design. If the driver emits `{EV_KEY, KEY_A, 1}` directly
+there is one format in the entire system, the scancode table stays in the kernel where §5
+wants it, and the server is pure merge and policy. The cost I was weighing did not exist.
+
+*Modifier state is tracked by the consumer, not stamped by the server.* I had said the
+server should stamp it. With a triple stream shift and control are ordinary key events, so
+`libinput` accumulates state on the compositor's side and the compositor stamps the
+Surface-layer `KeyEvent` — which puts modifier policy next to keymap policy instead of two
+layers away.
+
+**`libinput` is a separate crate from `libui`, and not for the reason it first appears.**
+The maintainer proposed the split on separation of concerns and was right, but the framing
+that input is "the client's other library" is wrong: **a client never reads the input
+stream.** Input reaches a window over its Surface session channel, routed by the compositor.
+So `libinput` owns *interpreting* input — triples→events on the compositor side, and
+keycode+modifiers→text on the client side — while `libui` owns *transporting* it to a
+window, which is Surface protocol and already its job. Sibling crates, and `libui` may depend
+on `libinput`; the tree already has that shape with `libui` → `libdraw`.
+
+**Authority falls out of the namespace, three tiers, no new mechanism.** The input-server
+alone holds `/dev/input/raw/<n>`; the compositor alone holds `/dev/input/new`; a client holds
+neither and gets only what is routed to its own windows. Keylogging is therefore a question
+about namespace construction rather than a permission check, and a filtered input stream for
+a sandboxed compositor is a construction rather than a feature.
+
+M3 is now four parts. Also corrected while here: `display-substrate.md`'s Status still
+claimed it graduates to `architecture/` when Milestone 2 closes — that checkbox moved to M7
+during the PR #175 review, and the doc had not followed.
+
+### Review of PR #176 — proposing the exact thing this log had already decided against
+
+The blocking finding is the one worth keeping, and it is embarrassing in a useful way.
+
+**The revised Milestone 3 told an implementer to expose `install_isa_irq` through the
+neutral `crate::arch` interface.** There is a comment at that precise re-export site refusing
+it — *"ISA is an x86-only concept … a fixed legacy platform device wires its own interrupt
+inside the arch layer"* — and above that, an entry in **this document** (the 2026-07 console
+work) deciding it in as many words: `install_isa_irq` is arch-internal, the console arms its
+RX interrupt through a console-*named* neutral verb, and that is *more* neutral than a
+generic installer because the driver need not know its own IRQ number.
+
+I grepped past that comment while researching this design — it was in the output I read — and
+proposed its opposite an hour later. The i8042 is the same class of device as COM1: a fixed
+legacy platform device on a port-I/O-only bus, where `0x60`/`0x64` are as x86-only as IRQ 1.
+Part A now follows the console exactly: an `arch::ps2` module owning port I/O and IRQ arming
+behind neutral verbs, with `drivers/ps2.rs` owning the ring, framing and the portable
+scancode table.
+
+**The gate I cited as the reason for the change could not have caught the change.**
+`check-arch` greps for literal `arch::x86_64` in non-arch code — so a neutral re-export is
+precisely how a violation satisfies it. This is the same shape as the display gate's path
+filter in PR #175: a gate consulted for reassurance about the one case it structurally cannot
+see. Recorded in the plan next to the checkbox, because the next person will reach for the
+same reassurance.
+
+**The evdev borrow was half a mechanism.** `InputEvent` is fixed-size; the char device it
+rides is byte-granular, and the console's ring drops **one byte** when full. A single byte
+lost at a non-record boundary misaligns the stream permanently — `kind` starts reading the
+high half of the previous `time_ns` — and nothing recovers, because the record has no sync
+word and `EV_SYN` is a value *inside* a record rather than a framing marker. Splitting is
+harmless; dropping is fatal. evdev has the missing half and I took only the ergonomic one.
+§3a now specifies both: the raw ring drops **whole records**, and a drop is announced with
+`SYN_DROPPED` so the consumer discards stale modifier and pointer state instead of carrying a
+phantom held key for the rest of the session. This is the design's one departure from
+reusing the console mechanism unchanged, and §2 no longer claims otherwise.
+
+**"Holds it exclusively" was resting on a precedent that does not hold.** The keylogging
+argument is that only the input-server holds the raw nodes — cited to `tty-server`. But
+exclusivity there is *convention*: `session-mgr` still binds `/dev/console` into every
+session namespace unconditionally, a bind left vestigial when the shell moved to `/dev/tty`.
+So the property is a constraint on the supervisor, not a consequence of the design, and §5
+now says so and binds Part B to it. Worth generalising: **"X holds it exclusively" is never
+a property of a capability system, only of the code that hands out capabilities.**
+
+**`time_ns` is load-bearing at Part B, not M4.** I defended it as future-proofing for
+double-click and invited challenge on it. The reviewer supplied a better argument than mine:
+§1 says merging is an ordering problem, and the server reads two nodes over *independent*
+`sys_io_submit` round trips — so without an interrupt-time stamp the only order available is
+the order its reads completed in, which is scheduling noise. The field is not speculative;
+the merge is wrong without it.
+
+Also: the i8042 is **one** controller and the plan described two independent drivers, which
+would race on the shared config byte at init and produce intermittent dead keyboards; Part B
+now carries its spec doc and an `abi-sync-check` entry for the `EV_*`/`KEY_*` numbering, as
+every other rsproto category does; the input deferrals (key repeat, USB HID, hotplug,
+multitouch, `EV_ABS` mapping, pointer-position ownership) are in `deferred-decisions.md`,
+which is the only place a deferral exists; and the new document is now reachable from both
+places that enumerate the arm's design docs.

@@ -259,6 +259,26 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
+**Input: key repeat.** Held keys do not repeat. The record format reserves `value == 2` for
+it (`docs/design/input-subsystem.md` §3), so no wire change is needed, but it wants a timer
+in `libinput` and a policy for delay/rate. Trigger: the first text field — M4's toolkit.
+Raised 2026-08-06.
+
+**Input: USB HID, hotplug, multitouch slots, gesture recognition.** None exists; M3 builds
+PS/2 only. All of them land in the `input-server` or `libinput` rather than the kernel, which
+is the point of the arrangement (`docs/design/input-subsystem.md` §1) — so none requires a
+kernel change when it arrives. Trigger: hardware, or a laptop touchpad. Multitouch
+additionally needs slot semantics on top of `SYN` grouping, as evdev did. Raised 2026-08-06.
+
+**Input: `EV_ABS` device-space → screen-space mapping.** Absolute coordinates are meaningless
+without knowing the device's resolution and the screen's, and nothing decides who maps them.
+Not needed until a touchscreen or a tablet. Raised 2026-08-06.
+
+**Input: who owns accumulated pointer position.** The `input-server` sees every device; the
+compositor owns the screen and draws the cursor. Deltas are unambiguous and accumulation is
+not, so one of them has to own the position and neither obviously should. Deferred until
+there is a second pointing device to disagree about it. Raised 2026-08-06.
+
 **Back-pressure for compositor→client messages.** A session channel holds four messages and
 the compositor sends `NOBLOCK`, so a client that lets its receive ring fill makes the send
 fail and the message is simply gone. For a `Release` that is now unrecoverable: `libui`'s

@@ -5,8 +5,9 @@
 **Partly built.** Milestones 1–2 have landed: `libdraw`, the `/dev/framebuffer` binding,
 the compositor serving `/dev/draw`, and `libui`. Input (§5), text (§6), thumbnail capture
 (§4b) and global hotkeys (§5a) have **no code**. The build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md); this graduates to `architecture/`
-when Milestone 2 closes, which the plan carries as a checkbox.
+[`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
+when its **subsystem** is built, not when the first milestone touching it lands — the plan
+carries that checkbox at Milestone 7, where input, text and capture are finished.
 
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
@@ -143,6 +144,15 @@ surfaces is tens of megabytes; scaling on the way out is a few, and it is the di
 affordable and not on a software renderer.
 
 ## 5. Input
+
+> **Elaborated, and one thing relocated.** [`input-subsystem.md`](input-subsystem.md) now
+> owns the mechanism, and every principle below survives it. The one correction: the
+> `KeyEvent` here is the **Surface-layer** event, compositor→client. The *device* layer
+> beneath it carries `InputEvent` triples, which have no modifiers field because shift and
+> control are ordinary key events there — the compositor accumulates modifier state and
+> stamps it onto the event below. The driver also shrinks: it emits raw records, and a
+> userspace `input-server` merges and applies policy, the way `tty-server` already sits over
+> `/dev/console`.
 
 A PS/2 keyboard and mouse driver in the kernel — that is where AHCI lives, so it is the
 existing rule rather than a new one — delivering **key events**, not bytes:
