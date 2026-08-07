@@ -2967,6 +2967,11 @@ fn drain_pending_drops(g: &mut SchedState, buf: &mut [Option<ObjectRef>]) -> usi
 /// fixed local buffer under a brief hold ([`drain_pending_drops`] — preserving
 /// the lists' reserved capacity), then drops them with the lock released.
 pub fn reap_pending() {
+    // Completed block IRPs, whose boxes their DPC deliberately did not free. Same rule as
+    // the `deferred_drops` below and the same reason: a free reaches the plain-spinlock
+    // allocator, which must not happen in IRQ or DPC context. Done first so the frees
+    // happen even if there is nothing else to reap.
+    crate::io::block::reclaim_completed();
     loop {
         let mut buf: [Option<ObjectRef>; REAP_RESERVE + DEFERRED_DROP_RESERVE] =
             [const { None }; REAP_RESERVE + DEFERRED_DROP_RESERVE];

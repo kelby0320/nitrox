@@ -11792,3 +11792,92 @@ every other rsproto category does; the input deferrals (key repeat, USB HID, hot
 multitouch, `EV_ABS` mapping, pointer-position ownership) are in `deferred-decisions.md`,
 which is the only place a deferral exists; and the new document is now reachable from both
 places that enumerate the arm's design docs.
+
+## 2026-08-06 — `test-qemu`'s intermittent hang: a same-CPU allocator deadlock
+
+`cargo xtask test-qemu` failed roughly one boot in twenty, hanging with no verdict. It had
+been treated as environmental. It is a real kernel deadlock, it is years' worth of latent —
+older than any recent change — and it made every "test-qemu green" claim in the display
+milestone weaker evidence than it was presented as.
+
+### The instrument, because there was none
+
+The first problem was that a hang produced **one line of evidence**: `timeout(1)` wrapped
+QEMU, so by the time xtask learned the run had timed out the guest was already dead.
+`cmd_test_qemu` now owns its own deadline, drains serial output on a thread, and — when the
+deadline passes — **stops the guest, dumps state over QMP, and only then kills it**:
+
+- per-vCPU `RIP`, resolved against the kernel's symbols;
+- a stack walk per CPU (raw words off `RSP` filtered to things that resolve — an
+  approximation, but enough to answer "is this CPU inside this function twice?");
+- `RBX`, which for a spin inside a lock acquire carries the receiver — the only way to tell
+  *one CPU waiting on another* from *two CPUs waiting on nothing*;
+- the full register block.
+
+Symbol resolution is a hand-rolled ELF64 `symtab` walk plus a small legacy `_ZN` demangler,
+rather than adding an `nm`/`addr2line` requirement to every machine that runs the tests.
+
+**Pausing the guest first is load-bearing, and was missing at first.** Without it the vCPUs
+keep running between queries, so the RIP summary, the stack walk and the register block are
+three snapshots of three different moments — they visibly disagreed, which is how it was
+caught.
+
+### What it found, on the sixteenth boot
+
+```
+CPU#0  SlabCache::free+0x52    RBX=0xffffffff80058078
+    ↳ drop_in_place<io::block::IrpBox>  ↳ io::block::irp_complete_dpc  ↳ dpc::run_pending
+CPU#3  SlabCache::alloc+0x42   RBX=0xffffffff80058078
+    ↳ PendingOperation::try_new  ↳ sys_io_submit  ↳ syscall::dispatch
+CPU#1, CPU#2  sched::idle_body
+```
+
+Same `RBX` — the same cache. `irp_complete_dpc` ended with `drop(KBox::from_raw(bx_ptr))`,
+reclaiming the `IrpBox`, its three `ObjectRef`s and the `frags` backing, all of which reach
+`SlabCache::free`. DPCs run at the interrupt-dispatch tail, on top of whatever the CPU was
+doing, and `SlabCache` is guarded by a plain `SpinLock` — preemption off, **interrupts on**.
+So a completion interrupt landing on a CPU whose current thread already held that lock spun
+forever on a lock the frame beneath it could never release, and every other CPU wanting that
+cache queued behind it.
+
+That accounts for the whole profile: rare (the interrupt must land inside a short critical
+section on the same CPU), not reproducible under load, unrelated to any recent change, and
+with a *varying* last-printed line, because the victim is whoever happens to be allocating.
+
+### The fix
+
+The DPC signals the `PendingOperation` as before — allocation-free — then pushes the box onto
+an **intrusive list threaded through the box itself**, and `sched::reap_pending` drops the
+list outside any lock. This is the remedy `kernel/CLAUDE.md` already names ("freeing counts
+as allocating … park refs in `sched`'s `deferred_drops`") and that `wake_entropy_seed_waiters`
+already applies to the entropy path; the IRP completion was the instance that was missed.
+
+Intrusive rather than a fixed-capacity array on purpose: an array needs an overflow policy,
+and the only action available in DPC context is to drop in place — which is the bug. A link
+field makes the hand-off allocation-free *and* unbounded, so there is no overflow case to get
+wrong. The drain runs from `reap_pending`, which `idle_body` calls, so any CPU going idle
+reclaims.
+
+**Confirmed, not proven: 64 consecutive clean boots.** Against the ~6% rate measured over
+roughly 160 boots, that would happen by chance under 2% of the time. Recorded as a number
+rather than a verdict — this is precisely the bug whose character was that one green run
+means nothing.
+
+### What it cost, which is the part worth keeping
+
+Three hypotheses, in order: *the new PS/2 driver* (killed by a stashed-branch soak), *a lost
+wake in spawn → exit → reap* (inferred from four failures that all stopped just after a demo
+banner — confident, detailed, and about the wrong subsystem), and *re-entrant `alloc` via
+`grow_locked`* (from the first dump, before there were stacks). Ninety boots produced the
+wrong answer twice; the stack walk produced the right one on the next catch.
+
+There is also a near-miss worth recording: `-smp 1` failed **eight times out of eight**,
+which looked like the deterministic reproduction the investigation needed. It was a different
+failure — the harness has an explicit `>=2 CPUs with switches>0` gate, so a single-CPU boot
+fails cleanly with exit 35 rather than hanging. **A reproduction that suddenly goes perfect
+deserves more suspicion than a flaky one, not less.**
+
+The general lesson: when a bug is rare, buy observation rather than samples. Soaking feels
+like progress and tooling feels like a detour, and the arithmetic says otherwise — at a 6%
+rate, telling "fixed" from "lucky" costs 60 boots per experiment, while the instrument that
+answered it took about an hour and is now permanent.

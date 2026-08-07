@@ -12,7 +12,8 @@
 use crate::dpc::Dpc;
 use crate::io::irp::{IRP_BUF_FRAGS, Irp, IrpBuffer, IrpOp, PhysFrag};
 use crate::libkern::io_op::IoOpcode;
-use crate::libkern::{KBox, KVec};
+use crate::libkern::lockrank::LockRank;
+use crate::libkern::{IrqSpinLock, KBox, KVec};
 use crate::mm::{PAGE_SIZE, PhysAddr};
 use crate::object::{DeviceNode, MemoryObject, ObjectRef};
 use crate::syscall::error::KError;
@@ -56,6 +57,13 @@ pub(crate) struct IrpBox {
     _po: ObjectRef,
     _buffer: ObjectRef,
     _device: ObjectRef,
+    /// Intrusive link for [`RECLAIM`], used only between completion and reclamation.
+    ///
+    /// Threading the list through the box itself is what makes the hand-off in
+    /// [`irp_complete_dpc`] allocation-free *and* unbounded: a fixed-capacity parking
+    /// array would have to do something on overflow, and the only thing available would be
+    /// to drop in place — which is the bug this exists to prevent.
+    reclaim_next: *mut IrpBox,
 }
 
 /// Build the fragment list covering the buffer byte range `[buf_offset,
@@ -133,6 +141,7 @@ pub fn dispatch_block_irp(
         _po: po.clone(),
         _buffer: buffer.clone(),
         _device: device.clone(),
+        reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
     let bx_ptr = KBox::into_raw(bx).as_ptr();
@@ -201,6 +210,7 @@ pub fn dispatch_block_irp_into_frame(
         _po: po.clone(),
         _buffer: pin, // pins the frame owner (the FileObject), not a MemoryObject
         _device: device.clone(),
+        reclaim_next: core::ptr::null_mut(),
     })
     .map_err(|_| KError::OutOfMemory)?;
     let bx_ptr = KBox::into_raw(bx).as_ptr();
@@ -224,6 +234,47 @@ pub fn dispatch_block_irp_into_frame(
 /// The IRP completion DPC: signal the request's `PendingOperation` with the
 /// IRP's terminal status (and bytes transferred), then reclaim the `IrpBox`
 /// (dropping its owning references). `ctx` is the `*mut IrpBox` (== `*mut Irp`).
+/// Boxes whose IRP has completed, waiting to be reclaimed in **thread** context.
+///
+/// An `IrqSpinLock` because [`irp_complete_dpc`] pushes from the interrupt-dispatch tail:
+/// masking interrupts is allocation-free, which is the whole constraint here.
+static RECLAIM: IrqSpinLock<ReclaimHead> =
+    IrqSpinLock::new(LockRank::Leaf, ReclaimHead(core::ptr::null_mut()));
+
+/// Head of the intrusive reclaim list.
+struct ReclaimHead(*mut IrpBox);
+
+// SAFETY: the pointer is an `IrpBox` this module allocated and owns exclusively from the
+// moment its IRP completes; it is reachable only under `RECLAIM`, and the thread-context
+// drain takes the whole list before touching any of it. Same reasoning as `BlockBackend`
+// above — a raw pointer into memory this module owns for a well-defined interval.
+unsafe impl Send for ReclaimHead {}
+
+/// Drop every completed IRP box. **Thread context only** — this is where the frees that
+/// [`irp_complete_dpc`] must not do actually happen.
+///
+/// Called from `sched::reap_pending`, which is already the home for deferred drops: thread
+/// context, no `SCHED` held, not IRQ context.
+pub fn reclaim_completed() {
+    // Take the whole list in one swap, then drop outside the lock — a drop reaches the
+    // allocator, and holding an IRQ-masking lock across it would reintroduce a smaller
+    // version of the same hazard.
+    let mut head = {
+        let mut g = RECLAIM.lock();
+        core::mem::replace(&mut g.0, core::ptr::null_mut())
+    };
+    while !head.is_null() {
+        // SAFETY: `head` came off the reclaim list, where `irp_complete_dpc` put a box it
+        // had finished with and nothing else references. `reclaim_next` was written before
+        // the push.
+        let next = unsafe { (*head).reclaim_next };
+        // SAFETY: the box was `KBox::into_raw`'d in `dispatch_block_irp` and is reclaimed
+        // exactly once — the completion path pushes it here exactly once.
+        drop(unsafe { KBox::from_raw(core::ptr::NonNull::new_unchecked(head)) });
+        head = next;
+    }
+}
+
 fn irp_complete_dpc(ctx: *mut ()) {
     let bx_ptr = ctx as *mut IrpBox;
     // SAFETY: `ctx` is the box pointer armed in `dispatch_block_irp`; the box is
@@ -234,10 +285,24 @@ fn irp_complete_dpc(ctx: *mut ()) {
     };
     // Deliver the outcome through the PO (result payload = bytes transferred).
     crate::sched::complete_pending_op(po, status, transferred);
-    // Reclaim the box: drops `_po`/`_buffer`/`_device` and the `frags` backing.
-    // SAFETY: the box was `KBox::into_raw`'d in `dispatch_block_irp` and is
-    // reclaimed exactly once here.
-    drop(unsafe { KBox::from_raw(core::ptr::NonNull::new_unchecked(bx_ptr)) });
+    // **Hand the box to thread context; do not drop it here.** Dropping releases
+    // `_po`/`_buffer`/`_device` and the `frags` backing, and every one of those reaches
+    // `SlabCache::free`, whose lock is a plain `SpinLock` — preemption off, interrupts on.
+    // This DPC runs at the interrupt-dispatch tail, on top of whatever the CPU was doing,
+    // so if it interrupted a thread that already held that lock the free spins forever on
+    // a lock the frame beneath it can never release, and every other CPU wanting that cache
+    // queues behind it. That is the `test-qemu` hang, confirmed by a stack dump showing
+    // exactly this DPC in `SlabCache::free` while another CPU sat in `SlabCache::alloc` on
+    // the same cache. `kernel/CLAUDE.md` states the rule — "freeing counts as allocating"
+    // — and `wake_entropy_seed_waiters` is the same fix for the entropy path.
+    //
+    // SAFETY: the box is live and owned by this completion; nothing else references it
+    // once the IRP has completed, so writing its link and publishing it is sound.
+    unsafe {
+        let mut g = RECLAIM.lock();
+        (*bx_ptr).reclaim_next = g.0;
+        g.0 = bx_ptr;
+    }
 }
 
 /// Read `count` 512-byte sectors starting at `lba` from the block `device`
