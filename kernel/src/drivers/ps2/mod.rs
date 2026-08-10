@@ -60,11 +60,20 @@ struct ParkedRead {
 struct Device {
     ring: EventRing,
     parked: Option<ParkedRead>,
+    /// Set when the DPC has satisfied `parked` and thread context still owes it a drop.
+    ///
+    /// The `ParkedRead` deliberately stays in place once spent. Taking it out of the DPC
+    /// would drop its two `ObjectRef`s there, and a last-reference drop runs
+    /// `dispatch_destroy` → `SlabCache::free`, whose lock is a plain `SpinLock` — the
+    /// same-CPU deadlock fixed for `io::block` (decision log, 2026-08-06). Leaving it owned
+    /// here keeps the objects alive for free until [`reclaim_completed`] can drop them in
+    /// thread context.
+    spent: bool,
 }
 
 impl Device {
     const fn new() -> Self {
-        Self { ring: EventRing::new(), parked: None }
+        Self { ring: EventRing::new(), parked: None, spent: false }
     }
 }
 
@@ -112,9 +121,15 @@ pub fn device_ref(index: usize) -> Option<ObjectRef> {
 
 /// Copy `src` into `buffer`'s frames starting at byte `buf_offset`, via the HHDM. The
 /// caller has bounds-checked the range (`sys_io_submit` does). Runs outside the lock.
-fn copy_into_memobj(buffer: &ObjectRef, buf_offset: u64, src: &[u8]) {
-    // SAFETY: `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
+///
+/// # Safety
+///
+/// `buffer` must point at a live `MemoryObject` — held alive by an `ObjectRef` the caller
+/// keeps for the duration. The DPC passes a *borrowed* pointer precisely so it never owns a
+/// reference it would then have to drop.
+unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
+    // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
+    let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
     let frames = mo.frames();
     let hhdm = heap::hhdm_offset();
     let mut pos = buf_offset as usize;
@@ -163,6 +178,8 @@ fn submit_read(
         // to a reader that simply passed a short buffer.
         return Err(KError::InvalidArgument);
     }
+    // Thread context: release anything a previous completion left owed before parking.
+    reclaim_completed();
     let now = crate::arch::Timer::read_ns();
     let mut tmp = [0u8; DRAIN_MAX];
     let drained = {
@@ -183,7 +200,8 @@ fn submit_read(
         }
     };
     if let Some(n) = drained {
-        copy_into_memobj(buffer, buf_offset, &tmp[..n]);
+        // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
+        unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
         crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
     }
     Ok(())
@@ -194,21 +212,50 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
     let now = crate::arch::Timer::read_ns();
     for index in 0..DEV_COUNT {
         let mut tmp = [0u8; DRAIN_MAX];
+        // **Borrow, never take.** The `ParkedRead` stays owned by `Device` and only its raw
+        // pointers come out, so this DPC drops nothing — see `Device::spent`.
         let completed = {
             let mut g = PS2.lock();
             let dev = &mut g.devices[index];
-            if dev.parked.is_some() && !dev.ring.is_empty() {
-                let pr = dev.parked.take().expect("checked is_some");
-                let n = dev.ring.drain_into(&mut tmp[..pr.max_len.min(DRAIN_MAX)], now);
-                Some((pr.po, pr.buffer, pr.buf_offset, n))
+            match dev.parked.as_ref() {
+                Some(pr) if !dev.spent && !dev.ring.is_empty() => {
+                    let (po, buffer, off, max) =
+                        (pr.po.as_ptr(), pr.buffer.as_ptr(), pr.buf_offset, pr.max_len);
+                    let n = dev.ring.drain_into(&mut tmp[..max.min(DRAIN_MAX)], now);
+                    dev.spent = true;
+                    Some((po, buffer, off, n))
+                }
+                _ => None,
+            }
+        };
+        if let Some((po, buffer, buf_offset, n)) = completed {
+            // SAFETY: `buffer` is still pinned by the `ObjectRef` left in `dev.parked`,
+            // which only thread context removes.
+            unsafe { copy_into_memobj(buffer, buf_offset, &tmp[..n]) };
+            crate::sched::complete_pending_op(po, 0, n as u64);
+        }
+    }
+}
+
+/// Drop any `ParkedRead` the DPC has finished with. **Thread context only.**
+///
+/// This is where the two `ObjectRef`s a completed read pinned are actually released — the
+/// frees that `ps2_intr_dpc` must not do. Called from `sched::reap_pending` (so any CPU
+/// going idle reclaims) and from [`submit_read`] before parking a new read.
+pub fn reclaim_completed() {
+    for index in 0..DEV_COUNT {
+        // Take under the lock, drop outside it: a drop reaches the allocator.
+        let spent = {
+            let mut g = PS2.lock();
+            let dev = &mut g.devices[index];
+            if dev.spent {
+                dev.spent = false;
+                dev.parked.take()
             } else {
                 None
             }
         };
-        if let Some((po, buffer, buf_offset, n)) = completed {
-            copy_into_memobj(&buffer, buf_offset, &tmp[..n]);
-            crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
-        }
+        drop(spent);
     }
 }
 

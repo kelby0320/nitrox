@@ -59,11 +59,14 @@ struct Inner {
     len: usize,
     /// The single outstanding parked read, or `None`.
     parked: Option<ParkedRead>,
+    /// Set when [`console_intr_dpc`] has satisfied `parked` and thread context still owes it
+    /// a drop. The entry stays in place until then — see [`reclaim_completed`].
+    spent: bool,
 }
 
 impl Inner {
     const fn new() -> Self {
-        Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None }
+        Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None, spent: false }
     }
 
     /// Push one received byte; drops it if the ring is full.
@@ -100,9 +103,15 @@ static CONSOLE_NODE: AtomicPtr<()> = AtomicPtr::new(core::ptr::null_mut());
 /// The caller has bounds-checked `buf_offset + src.len() <= buffer.size()`
 /// (`sys_io_submit` does). Runs outside the console lock; the `MemoryObject` frames
 /// are kernel memory (not user memory), so this is sound from a DPC too.
-fn copy_into_memobj(buffer: &ObjectRef, buf_offset: u64, src: &[u8]) {
-    // SAFETY: `buffer` pins a live `MemoryObject`.
-    let mo: &MemoryObject = unsafe { &*(buffer.as_ptr() as *const MemoryObject) };
+///
+/// # Safety
+///
+/// `buffer` must point at a live `MemoryObject`, kept alive by an `ObjectRef` the caller
+/// holds for the duration. The DPC passes a *borrowed* pointer so it never owns a reference
+/// it would then have to drop.
+unsafe fn copy_into_memobj(buffer: *const (), buf_offset: u64, src: &[u8]) {
+    // SAFETY: the caller guarantees `buffer` pins a live `MemoryObject`.
+    let mo: &MemoryObject = unsafe { &*(buffer as *const MemoryObject) };
     let frames = mo.frames();
     let hhdm = heap::hhdm_offset();
     let mut pos = buf_offset as usize;
@@ -131,6 +140,8 @@ fn submit_read(
     max_len: u64,
     _ctx: *mut (),
 ) -> Result<(), KError> {
+    // Thread context: release anything a previous completion left owed before parking.
+    reclaim_completed();
     let max_len = (max_len as usize).min(RING_CAP);
     let mut tmp = [0u8; RING_CAP];
     // Decide under the lock; do the copy + PO completion after releasing it.
@@ -151,7 +162,8 @@ fn submit_read(
         }
     };
     if let Some(n) = drained {
-        copy_into_memobj(buffer, buf_offset, &tmp[..n]);
+        // SAFETY: `buffer` is the caller's live `MemoryObject` reference, held across this.
+        unsafe { copy_into_memobj(buffer.as_ptr(), buf_offset, &tmp[..n]) };
         crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
     }
     Ok(())
@@ -161,37 +173,52 @@ fn submit_read(
 /// buffer and complete its PO (waking the reader). Queued by [`console_isr`].
 fn console_intr_dpc(_ctx: *mut ()) {
     let mut tmp = [0u8; RING_CAP];
+    // **Borrow, never take** — see `Inner::spent` and `reclaim_completed`.
     let completed = {
         let mut g = CONSOLE.lock();
-        if g.parked.is_some() && g.len > 0 {
-            let pr = g.parked.take().expect("checked is_some");
-            let take = pr.max_len.min(RING_CAP);
-            let n = g.pop_into(&mut tmp[..take]);
-            Some((pr.po, pr.buffer, pr.buf_offset, n))
+        match g.parked.as_ref() {
+            Some(pr) if !g.spent && g.len > 0 => {
+                let (po, buffer, off, take) =
+                    (pr.po.as_ptr(), pr.buffer.as_ptr(), pr.buf_offset, pr.max_len.min(RING_CAP));
+                let n = g.pop_into(&mut tmp[..take]);
+                g.spent = true;
+                Some((po, buffer, off, n))
+            }
+            _ => None,
+        }
+    };
+    if let Some((po, buffer, buf_offset, n)) = completed {
+        // SAFETY: `buffer` is still pinned by the `ObjectRef` left in `g.parked`, which only
+        // thread context removes.
+        unsafe { copy_into_memobj(buffer, buf_offset, &tmp[..n]) };
+        crate::sched::complete_pending_op(po, 0, n as u64);
+        // **Nothing is dropped here, deliberately.** This DPC used to take the `ParkedRead`
+        // and release its `po`/`buffer` refs, justified by "refcount decrements only — the
+        // caller's handles keep the objects alive". That is false: nothing cancels a parked
+        // read, so a process that submits one and exits leaves the *last* references here,
+        // and `ObjectRef::drop` then runs `dispatch_destroy` → `SlabCache::free` in DPC
+        // context — the same-CPU allocator deadlock fixed for `io::block` (decision log,
+        // 2026-08-06). `reclaim_completed` does the drop in thread context instead.
+    }
+}
+
+/// Drop a `ParkedRead` the DPC has finished with. **Thread context only** — this is where
+/// the refs a completed console read pinned are actually released.
+///
+/// Called from `sched::reap_pending` (so any CPU going idle reclaims) and from
+/// [`submit_read`] before parking a new read.
+pub fn reclaim_completed() {
+    // Take under the lock, drop outside it: a drop reaches the allocator.
+    let spent = {
+        let mut g = CONSOLE.lock();
+        if g.spent {
+            g.spent = false;
+            g.parked.take()
         } else {
             None
         }
     };
-    if let Some((po, buffer, buf_offset, n)) = completed {
-        copy_into_memobj(&buffer, buf_offset, &tmp[..n]);
-        crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
-        // `po` / `buffer` drop here, outside the lock.
-        //
-        // **This is a known hazard, not a safe pattern.** The justification that used to sit
-        // here — "refcount decrements only, the caller's handles keep the objects alive" —
-        // is an assumption that fails: nothing cancels a parked read, so a process that
-        // submits one and exits before a keystroke arrives leaves the *last* references
-        // here, and `ObjectRef::drop` then runs `dispatch_destroy` → `SlabCache::free` in
-        // DPC context. That is exactly the deadlock fixed in `io::block` (decision log,
-        // 2026-08-06): the slab lock is a plain `SpinLock`, so a DPC that frees can spin
-        // forever against an allocator holder it interrupted on the same CPU.
-        //
-        // Left as-is deliberately rather than half-fixed: the remedy is to park the refs for
-        // thread-context reclamation, and unlike the IRP box (which owns an intrusive link)
-        // that needs a bounded home and a policy for overflowing it. Filed in
-        // `docs/rationale/deferred-decisions.md`. It does not fire in CI — headless boots
-        // send no serial input — which is why it has survived (PR #177 review, finding 4).
-    }
+    drop(spent);
 }
 
 /// COM1 RX interrupt handler: drain every available byte into the ring, then — if a

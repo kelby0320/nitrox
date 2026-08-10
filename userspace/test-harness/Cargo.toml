@@ -40,3 +40,7 @@ path = "src/display.rs"
 [[bin]]
 name = "ui-testclient"
 path = "src/uiclient.rs"
+
+[[bin]]
+name = "input-testclient"
+path = "src/inputclient.rs"

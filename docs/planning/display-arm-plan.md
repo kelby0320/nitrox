@@ -4,8 +4,8 @@
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
 self-hash, and the `screendump` smoke gate. **Milestones 1–2 are complete** (2026-08-06). A real client drives the compositor on every
 `test-qemu` run, and the display gate compares a picture that arrived through the whole
-Surface protocol. Milestone 3 (input) is next, and needs P3 — a PS/2 driver, the first
-input device of any kind.
+Surface protocol. **Milestone 3 Part A is complete** (2026-08-06): P3 — the i8042 driver — is built and
+proven by `cargo xtask check-input`, which injects a keystroke and a click over QMP.
 
 ## What this is
 
@@ -136,7 +136,11 @@ raw event records and a userspace **`input-server`** takes the merge-and-policy 
 is the arrangement `tty-server` already uses over `/dev/console`. The extra part is the cost;
 what it buys is not relitigating the kernel boundary for USB HID, touchpads and touchscreens.
 
-- [ ] **Part A — P3: the i8042 driver.** **One** Tier 1 driver for the controller,
+- [x] **Part A — P3: the i8042 driver.** ✅ (2026-08-06) Proven end to end by
+      `cargo xtask check-input`, which injects a keystroke and a click over QMP and checks
+      the decoded `InputEvent`s reach userspace — the driver was "armed" for two commits
+      before anything had pressed a key, which is the same shape as the compositor that was
+      bound and never answered (PR #174). **One** Tier 1 driver for the controller,
       publishing **two** char `DeviceNode`s — `/dev/input/raw/0` (keyboard) and
       `/dev/input/raw/1` (mouse) — each emitting `InputEvent` records. Keyboard and mouse are
       two devices behind one i8042: they share data port `0x60`, are configured through

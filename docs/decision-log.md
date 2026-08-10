@@ -11921,3 +11921,52 @@ nothing arriving stops immediately; a controller with two attached devices is no
 with the driver and 2 in 20 without it. It is the `SlabCache` deadlock fixed earlier on
 this branch; the control that established it was innocent is recorded there.
 
+
+### M3 Part A complete — and the hazard I had just fixed, introduced again
+
+**`cargo xtask check-input` injects a keystroke and a click over QMP and checks the decoded
+events reach userspace.** It is the input equivalent of the display gate and exists for the
+same reason: every self-contained check can pass while the thing does not work. `ps2:
+keyboard mouse armed` proves bring-up ran and nothing more — a headless boot generates no
+input interrupt, so the ISR, the event ring and the parked read had never executed. Part A
+was "armed" for two commits, which is exactly the shape of the compositor that was bound and
+never answered through three green CI jobs (PR #174).
+
+It passed first try, which is worth noting only because the interesting part is what it can
+catch. Verified by breaking three things no host test can see:
+
+| break | result |
+|---|---|
+| the mouse's `dy` negation removed | gate fails — `REL_Y` comes back inverted |
+| the scancode identity off by one | gate fails — `a` decodes as keycode 31 |
+| the ISR stops queueing its DPC | gate fails — the reader parks forever |
+
+The `REL_Y` assertion is the one that justifies the whole gate. The PS/2 wire reports
+positive-Y as *up* and `REL_Y` is positive-*down*, so the driver negates — and a missing
+negation is a one-line error that **no host test can catch**, because the host has no PS/2
+wire to be wrong about. An injected downward motion coming back as `+3` is the only evidence
+that inversion works end to end.
+
+### The fix I had just shipped, broken again in the same milestone
+
+Answering "when should we take the `console_intr_dpc` hazard?", the honest answer turned out
+to be "immediately, because Part A is a third instance". `ps2_intr_dpc` moved the parked
+read's `po`/`buffer` out and dropped them **in DPC context** — the same same-CPU allocator
+deadlock fixed for `io::block` one PR earlier, written by the person who had just fixed it,
+in a driver modelled on the console driver that still had it.
+
+That is the useful data point: the pattern reproduces because it is what the surrounding code
+does. Copying a working driver copies its bugs, and a rule in `CLAUDE.md` does not stop that —
+the console's own comment *argued* the pattern was safe ("refcount decrements only"), which is
+worse than silence.
+
+**The fix generalises better than the one before it: the DPC never takes ownership.** It
+signals through a borrowed `*const ()` and marks the entry `spent`; the `ParkedRead` stays
+owned by the driver until thread context removes it. No new global machinery, no capacity to
+size, no overflow policy — the refs keep the objects alive for free while they wait. Applied
+to both `ps2` and `console`, drained from `sched::reap_pending` (which `idle_body` calls) and
+from `submit_read` before parking a new read.
+
+That closes the `console_intr_dpc` deferral raised by the PR #177 review, and it retires the
+"needs a bounded parking home and an overflow policy" objection that made me file it rather
+than fix it — that objection was an artifact of assuming the DPC had to *own* the refs.

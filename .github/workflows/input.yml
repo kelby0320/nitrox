@@ -1,0 +1,84 @@
+name: Input gate
+
+# `cargo xtask check-input` injects a keystroke and a click over QMP and checks the decoded
+# events reach userspace. It exists for the same reason the display gate does: every
+# self-contained check can pass while the thing does not work. A driver that prints
+# `ps2: keyboard mouse armed` proves its bring-up ran, and nothing more — the ISR, the event
+# ring and the parked read are only exercised by an interrupt that a headless boot never
+# generates. This is the only thing that presses a key.
+#
+# Path-filtered like the display gate, and for the same reason: it boots a full image, so it
+# is a smoke gate rather than a per-commit one.
+on:
+  push:
+    branches: [main]
+    paths: &input_paths
+      - 'kernel/src/drivers/ps2/**'
+      - 'kernel/src/arch/x86_64/ps2.rs'
+      - 'kernel/src/libkern/input.rs'
+      # The device nodes are published by the driver but *served* here, and bound in
+      # `main.rs`; either can make the raw nodes unresolvable without touching the driver.
+      - 'kernel/src/object/kernel_server.rs'
+      - 'kernel/src/main.rs'
+      # The DPC hands its parked read to thread context through `reap_pending`; a change to
+      # either side can leave a reader blocked forever with the driver still reporting armed.
+      - 'kernel/src/sched.rs'
+      - 'kernel/src/dpc.rs'
+      # The whole harness crate: `inputclient.rs` is what reads the nodes and prints the
+      # lines this gate matches on, and `Cargo.toml` registers it.
+      - 'userspace/test-harness/**'
+      - 'userspace/init/src/main.rs'
+      - 'userspace/libkern/src/abi.rs'
+      - 'tools/xtask/src/main.rs'
+      - '.github/workflows/input.yml'
+  pull_request:
+    branches: [main]
+    paths: *input_paths
+
+concurrency:
+  group: input-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  inject:
+    name: Injected key + click reach userspace
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable for kernel/tools, pinned nightly for userspace)
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup default stable
+          rustup target add x86_64-unknown-none
+          rustup toolchain install "$(grep -oP 'channel\s*=\s*"\K[^"]+' userspace/rust-toolchain.toml)" \
+            --profile minimal --component rust-src --no-self-update
+
+      - name: Cache cargo registry and build outputs
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            kernel/target
+            tools/target
+            userspace/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml', '.cargo/config.toml', 'kernel/.cargo/config.toml', 'userspace/rust-toolchain.toml', 'userspace/x86_64-unknown-nitrox.json') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: Install QEMU, OVMF and image tooling
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y qemu-system-x86 ovmf gdisk mtools dosfstools e2fsprogs
+
+      - name: Enable KVM
+        run: |
+          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' \
+            | sudo tee /etc/udev/rules.d/99-kvm4all.rules
+          sudo udevadm control --reload-rules
+          sudo udevadm trigger --name-match=kvm
+
+      - name: cargo xtask check-input
+        run: cargo xtask check-input --kvm
