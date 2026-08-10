@@ -159,14 +159,22 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
       `arch::serial::console_arm_rx`. Note that `check-arch` **cannot** catch this: it greps
       for literal `arch::x86_64` in non-arch code, and a neutral re-export is precisely how a
       violation would satisfy it.
-- [ ] **Part B — `input-server`.** A userspace resource server holding every raw node
+- [x] **Part B — `input-server`.** ✅ (2026-08-06) Proven end to end by `check-input`, which
+      now asserts **through** the server rather than off the driver — the client cannot open
+      the raw nodes any more, which is the exclusivity the keylogging boundary rests on,
+      demonstrated rather than asserted. A userspace resource server holding every raw node
       exclusively; merges the device streams into one ordered stream and serves
       `/dev/input/new`, minting a per-consumer channel the way `/dev/draw/new` does. A new
       rsproto `Input` category.
-- [ ] **Part B — `docs/spec/rsproto-input-ops.md`.** <!-- check-docs: allow-missing --> Every rsproto category in the tree has a
+- [x] **Part B — `docs/spec/rsproto-input-ops.md`.** ✅ (2026-08-06) Written before the
+      server, and allocating its category uncovered the `Tty`/`Surface` collision. Every
+      rsproto category in the tree has a
       spec doc; this one also has to pin the `InputEvent` layout and the `EV_*`/`KEY_*`
       numbering, because they are a kernel↔userspace ABI living in at least two crates.
-- [ ] **Part B — the `EV_*`/`KEY_*` constants under `abi-sync-check`.** It already compares
+- [x] **Part B — the `EV_*`/`KEY_*` constants under `abi-sync-check`.** ✅ (2026-08-06) Done
+      early, in the PR #178 review: the kernel doc claimed a `userspace/libkern` mirror that
+      did not exist, so the mirror, a `U16Const` shape and 156 compared values landed
+      together. It already compares
       exactly this kind of constant family across the kernel/userspace boundary; a numbering
       that drifts between the driver and the server is a silent misrouting, not a build error.
 - [ ] **Part C — `libinput`, focus and routing.** `libinput` turns triples into logical

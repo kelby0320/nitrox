@@ -12095,3 +12095,174 @@ Four contract docs were updated for the new binding and the driver's existence
 "input … do not [exist]" sentence, and `console-and-tty.md`'s four "waits on a real keyboard
 driver" claims), plus `device-node.md`, whose "when they arrive" prediction about an indexed
 char registry has now arrived.
+
+## 2026-08-06 — M3 Part B: the input contract, and a category collision found while writing it
+
+**Batch ordering, not global.** `input-subsystem.md` said `time_ns` lets the `input-server`
+order events correctly. It cannot, fully: to know no *older* mouse event is still coming, the
+server would have to hold every keystroke until the mouse had spoken. Settled with the
+maintainer: the server drains both nodes on each wakeup, sorts **that set** by `time_ns`, and
+forwards it; already-forwarded events are never reordered.
+
+That is exactly right for the case merging exists for — a click and a keystroke that happen
+together are both buffered by the time the server wakes, so shift-click sorts correctly — and
+honestly weaker than the design doc implied. The alternative, holding events for a 2–5 ms
+window to buy a global guarantee, adds latency to every keystroke to fix an ordering nobody
+observes, and adds a tunable that will be wrong on some machine. The design doc is corrected
+and `rsproto-input-ops.md` states it normatively.
+
+**Loss needs no back-pressure design, because the record format already has one.** A consumer
+that stops reading eventually has nowhere to put the next batch. Rather than invent flow
+control, the server discards the batch and precedes the next successful one with
+`EV_SYN`/`SYN_DROPPED` — the same contract the kernel's per-device ring uses. A slow consumer
+degrades to a resynchronising one.
+
+Worth distinguishing from the Surface protocol's open back-pressure question: there, a dropped
+`Release` is unrecoverable, because nothing tells the client its buffer is free again. Input is
+recoverable because `SYN_DROPPED` tells the consumer exactly what to do. Same-shaped problem,
+different answer, and the difference is whether the protocol can express "you missed
+something".
+
+**`Input` is `0x0Axx` — and allocating it uncovered a collision that had already shipped.**
+`librsproto`'s `OP_TTY_*` constants occupy `0x0900`–`0x0905`, one-for-one with `Surface`'s
+`0x0900`–`0x0904`: `OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` are both `0x0900`. The tty server
+took the range on 2026-08-03 without registering it in the wire-format table; `Surface` was
+assigned the same range on 2026-08-05, by a registry that had no idea.
+
+It is harmless on the wire — a channel carries one category's ops, so the channel
+disambiguates — which is exactly why nobody noticed and why it would have kept not being
+noticed. The registry is the contract; the code contradicts it; and a tool decoding a message
+without knowing its sender cannot tell a `Commit` from a `SetMode`. Filed rather than fixed
+here, because it is off this slice's path, and flagged in the wire spec so the next person
+allocating a category sees it before repeating it.
+
+The general lesson is about the registry, not the tty: **a table that nothing enforces
+records intentions, not facts.** Two servers picked ranges three days apart and the document
+recorded only one of them. `abi-sync-check` exists for exactly this class of drift on
+constants that cross the kernel boundary; nothing plays that role for category allocation.
+
+### Fixing the category collision: `Tty` moves to `0x0Bxx`
+
+Filed for about an hour, then fixed on the maintainer's instruction — the right call, since
+carrying a known-wrong registry is how the next allocation goes wrong too.
+
+**The state, exactly.** The registry allocates thirteen categories; the code uses five of
+them (`Meta`, `Namespace`, `File`, `Auth`, and `0x09xx`). `Stream`, `Block`, `Control`,
+`Power` and `Log` are registered names with no constants behind them. The clash was total
+rather than partial: `Surface`'s five ops and `Tty`'s first five landed on the same five
+numbers, `0x0900`–`0x0904`.
+
+**`Tty` moved, not `Surface`.** The maintainer's only requirement was separation, so the
+choice went to churn and to who owed a document: `Tty` was the one with neither a registry row
+nor a spec, its six constants are referenced by name in all five consumers (nothing hardcodes
+a number, which the change verified before touching anything), and moving it leaves the
+display stack — reviewed twice this week — untouched. It now has a row and a note in
+`console-and-tty.md` recording its number.
+
+**Nothing on the wire changed shape, which is the whole reason this was invisible.** A tty
+channel only ever carries tty ops and a Surface session only Surface ops, so the *channel*
+disambiguates and no message was ever misread. Verified after the renumber: `test-qemu`
+green, `test-interactive` green through all 22 steps including the full login (`nitrox
+login:` → `password:` → a shell prompt), which is the path that actually exercises
+`ReadLine`, `Write` and `Close`.
+
+**The lesson is about the registry, not the tty.** A table nothing enforces records
+intentions, not facts — two servers picked ranges three days apart and the document knew
+about one. `abi-sync-check` plays this role for constants crossing the kernel boundary and
+would have caught it instantly; nothing plays it for category allocation. The wire spec now
+says the rule out loud ("add the row in the same change that picks the number") rather than
+leaving it implied by a table, because the failure was not a disagreement about ownership —
+it was one server never writing itself down.
+
+### M3 Part B complete — the merged stream reaches a consumer
+
+`cargo xtask check-input` now asserts **through the server**: i8042 → driver ring → raw node
+→ `input-server` → merge → consumer channel → guest. Every event the harness injects comes
+back decoded, including `REL_Y` still negated after two more hops.
+
+**The old test client stopped working, and that was the design.** It read `/dev/input/raw/0`
+directly; once the server holds both nodes, a second reader gets `WouldBlock` — the driver is
+single-reader per device. So the exclusivity the keylogging boundary rests on is now
+*demonstrated* rather than asserted: the client was rewritten to consume `/dev/input/new`,
+which is the only way anything but the server can see input.
+
+**Four bugs, each found by running rather than reading.**
+
+*The control endpoint went across with no rights.* `SPAWN_INPUT_SERVER` had `rights: [0; 4]`,
+so `Meta::Ready` could not transfer the forwarding endpoint. The failure is late and quiet —
+the server comes up, opens both devices, prints nothing wrong, and only then cannot announce
+itself. `TRANSFER` is the right that matters and the easiest to leave out, because the send
+that needs it is the last thing a server does.
+
+*The server matched the wrong resolve suffix.* It checked `suffix == b"new"`, copied from the
+compositor — but the compositor is bound at the **subtree** `/dev/draw`, so `/dev/draw/new`
+leaves `new` behind, while this server is bound at the **leaf** `/dev/input/new` and gets an
+empty suffix. The two lines look identical and mean different things. Binding a subtree at
+`/dev/input` instead would collide with the kernel's `/dev/input/raw`.
+
+*The client waited for a record count.* `EXPECTED_EVENTS = 10` was wrong (nine: the motion is
+`REL_X`, `REL_Y`, `SYN`) and wrong in kind — how many records an injection produces is the
+driver's business, so a count needs updating whenever packet framing changes. It waits for the
+button press now, the last thing injected: the event that *means* the sequence finished.
+
+*And the crate was not in the test suite.* Eleven library tests sat in the tree while
+`cargo xtask test` reported the old number, and the first draft of that commit message quoted
+the number the gate did not yet produce. Wired in and the message corrected.
+
+**The gate catches the server, not just the driver.** Verified by breaking it two ways —
+never forwarding a batch, and never harvesting the mouse's completions — each of which fails
+`check-input` while every host test stays green. That is the property Part A's gate had for
+the driver and Part B needed for the server.
+
+### Review of PR #179 — one record type, two producers, two units
+
+The blocking finding is a units mismatch that no compile-time check could see and that both
+sides documented differently.
+
+**`SYN_DROPPED.value` meant records in the kernel and batches in the server.** The kernel's
+per-device ring increments its loss counter once per discarded *record*; the server
+incremented once per discarded *batch*. The spec said records and claimed the two were "the
+same contract". A consumer stalling through three 20-record batches would have been told it
+missed **3**.
+
+Fixed by changing the code, not the wording. Rewording would have been quicker and would have
+left the field meaning two things depending on who sent it — and a consumer cannot tell: a
+`SYN_DROPPED` arriving on `/dev/input/new` may have originated in the kernel's ring and been
+forwarded, or been minted by the server. `record_loss` now takes the batch's record count.
+The spec says the unit is load-bearing and why.
+
+Worth noting what did *not* catch this. Both sides are `#[repr(C)]` with layout asserts, the
+constants are compared by `abi-sync-check`, and the record round-trips through
+`InputEvent::read`. Every mechanism the project has for ABI drift was in place and none of
+them is about *meaning* — the field was the right width, at the right offset, with the right
+name, carrying a different quantity.
+
+**A consumer that sent anything was silently unsubscribed.** The kernel signals an IPC
+endpoint when its receive queue is non-empty *or* its peer is gone; the reap branch treated
+both as gone. Nothing sends on a consumer channel today, which is precisely why the bug would
+have waited for the first thing that did — a Part C hotkey registration, a `QueryCaps`, a
+stray reply from a client library — and cut its input stream with no error to either side.
+Now it recvs: `PeerClosed` reaps, a message is drained and logged.
+
+**Two silent error paths now speak.** A failed `sys_io_submit` drops a device out of the wait
+set, and on a quiet machine nothing wakes the loop to re-arm it — a device that stops
+delivering, permanently, with no output. A failed `sys_wait` spins the loop at 100% in
+silence. Neither is reachable today as far as anyone can show; both are one `kprint` from
+diagnosable, which is the difference between an hour and a day when they do happen.
+
+**And `CLAUDE.md` still said the `input-server` does not exist.** That sentence is the one
+telling a fresh session not to read `design/` as reality, so leaving it stale is the specific
+failure it was written to prevent — and the previous slice updated the same sentence for the
+driver. Five docs were updated in this PR and that one was missed; it is a fair sign that
+"update the docs" is not a step but a checklist.
+
+The doc-comment orphaning pattern struck for the **eleventh** time: the new
+`OP_INPUT_EVENTS` inherited `OP_AUTHENTICATE`'s doc line (pre-existing in `main`, where it sat
+on `OP_TTY_READ_LINE`), so `cargo doc` rendered the wrong first sentence for a newly public
+constant. Both now have their own.
+
+Finally, the reviewer verified `po_completion`'s zero-deadline re-wait and noted the thing
+nothing had written down: it clobbers `WAIT_RESULTS[0..24]` while `serve_loop` is iterating
+that buffer, and is safe only because the inner wait passes `count = 1` and the outer loop has
+already consumed the record it is on. Correct, load-bearing, and now stated at the function —
+widening that call would corrupt the loop silently.

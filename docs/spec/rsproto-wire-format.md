@@ -68,8 +68,23 @@ The 16-bit `op` field decomposes:
 | `Log` | `0x07xx` | Reserved for *reply-bearing* logging ops (read-back/query). The hot append path uses **no** op — see [Log records](#log-records). |
 | `Auth` | `0x08xx` | Credential validation (username/password → principal). See [Auth operations spec](rsproto-auth-ops.md). |
 | `Surface` | `0x09xx` | Windows, shared buffers, commit/release. See [Surface operations spec](rsproto-surface-ops.md). |
-| (reserved) | `0x0Axx` – `0xFExx` | Future categories |
+| `Input` | `0x0Axx` | Merged input events from the `input-server`. See [Input operations spec](rsproto-input-ops.md). |
+| `Tty` | `0x0Bxx` | Terminal read/write/mode, served by `tty-server` at `/dev/tty`. See [`console-and-tty.md`](../architecture/console-and-tty.md). |
+| (reserved) | `0x0Cxx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
+
+**This table is the allocation, and every category in it must be distinct.** That sounds
+obvious and was not enforced: `Tty` took `0x09xx` on 2026-08-03 without adding a row, and
+`Surface` was assigned the same range on 2026-08-05 by a registry that had no way to know.
+Five ops collided exactly — `OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` were both `0x0900` —
+for three days, invisibly, because a channel only ever carries one category's ops and so
+disambiguates them on the wire. `Tty` moved to `0x0Bxx` on 2026-08-06, when allocating
+`Input` surfaced the clash.
+
+**Add the row in the same change that picks the number.** The collision was not a
+disagreement about who should own `0x09xx`; it was one server never writing itself down. A
+new category costs a table row, and skipping it makes the next allocation wrong rather than
+this one.
 
 A resource server must implement at least the Meta category. Each server declares which other categories it supports via `Meta::QueryCaps`.
 
