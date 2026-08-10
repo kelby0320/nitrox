@@ -69,19 +69,22 @@ The 16-bit `op` field decomposes:
 | `Auth` | `0x08xx` | Credential validation (username/password → principal). See [Auth operations spec](rsproto-auth-ops.md). |
 | `Surface` | `0x09xx` | Windows, shared buffers, commit/release. See [Surface operations spec](rsproto-surface-ops.md). |
 | `Input` | `0x0Axx` | Merged input events from the `input-server`. See [Input operations spec](rsproto-input-ops.md). |
-| (reserved) | `0x0Bxx` – `0xFExx` | Future categories |
+| `Tty` | `0x0Bxx` | Terminal read/write/mode, served by `tty-server` at `/dev/tty`. See [`console-and-tty.md`](../architecture/console-and-tty.md). |
+| (reserved) | `0x0Cxx` – `0xFExx` | Future categories |
 | `Vendor` | `0xFFxx` | Server-specific or experimental |
 
-> ⚠️ **`Tty` is unregistered and collides with `Surface`.** `librsproto`'s `OP_TTY_*`
-> constants occupy `0x0900`–`0x0905`, one-for-one with `Surface`'s `0x0900`–`0x0904`:
-> `OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` are both `0x0900`. The tty server took the range
-> on 2026-08-03 without adding a row here, and `Surface` was assigned it on 2026-08-05.
->
-> It is harmless on the wire today — a tty channel only ever carries tty ops and a Surface
-> session only Surface ops, so the *channel* disambiguates — but the registry is the contract
-> and the code contradicts it, and any tool that decodes a message without knowing which
-> server sent it cannot tell a `Commit` from a `SetMode`. Recorded rather than silently
-> worked around; see `deferred-decisions.md`.
+**This table is the allocation, and every category in it must be distinct.** That sounds
+obvious and was not enforced: `Tty` took `0x09xx` on 2026-08-03 without adding a row, and
+`Surface` was assigned the same range on 2026-08-05 by a registry that had no way to know.
+Five ops collided exactly — `OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` were both `0x0900` —
+for three days, invisibly, because a channel only ever carries one category's ops and so
+disambiguates them on the wire. `Tty` moved to `0x0Bxx` on 2026-08-06, when allocating
+`Input` surfaced the clash.
+
+**Add the row in the same change that picks the number.** The collision was not a
+disagreement about who should own `0x09xx`; it was one server never writing itself down. A
+new category costs a table row, and skipping it makes the next allocation wrong rather than
+this one.
 
 A resource server must implement at least the Meta category. Each server declares which other categories it supports via `Meta::QueryCaps`.
 

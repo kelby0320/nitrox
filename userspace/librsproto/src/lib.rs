@@ -84,10 +84,18 @@ pub const OP_FILE_RENAME: u16 = 0x0605;
 /// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
 /// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
+// The `Tty` category is `0x0Bxx`. It occupied `0x09xx` from 2026-08-03 without registering
+// itself in `rsproto-wire-format.md`, and `Surface` was assigned that range on 2026-08-05 —
+// so five ops collided exactly (`OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` were both
+// `0x0900`). Harmless on the wire, because a channel only ever carries one category's ops
+// and therefore disambiguates them, which is why it went unnoticed for three days. Moved on
+// 2026-08-06 when allocating `Input`; `Tty` moved rather than `Surface` because it was the
+// one with neither a registry row nor a spec, and it now has both.
+
 /// `Tty::ReadLine` — ask the tty for one edited line. The reply body is the line's bytes
 /// (no terminator). Completes only when the user finishes a line, so a client may have at
 /// most one outstanding.
-pub const OP_TTY_READ_LINE: u16 = 0x0900;
+pub const OP_TTY_READ_LINE: u16 = 0x0B00;
 /// `Tty::Read` — take whatever input is available, **unedited**.
 ///
 /// The raw counterpart to [`OP_TTY_READ_LINE`]: it completes as soon as any byte arrives
@@ -99,23 +107,23 @@ pub const OP_TTY_READ_LINE: u16 = 0x0900;
 /// **There is deliberately no `TTY_MODE_RAW`.** Two read ops say the same thing with less
 /// state: a client asks for what it wants, when it wants it, and cannot leave a terminal in
 /// a mode some later reader did not expect.
-pub const OP_TTY_READ: u16 = 0x0904;
+pub const OP_TTY_READ: u16 = 0x0B04;
 /// `Tty::Write` — write the body's bytes to the terminal. This is what makes terminal
 /// output a **capability**: a process writes because it holds a tty channel, not because
 /// it can reach an ambient debug syscall.
-pub const OP_TTY_WRITE: u16 = 0x0901;
+pub const OP_TTY_WRITE: u16 = 0x0B01;
 /// `Tty::SetMode` — one body byte of flags; bit 0 is echo.
 ///
 /// Echo belongs to the server, not the caller. It was a `bool` each client passed to its
 /// own `read_line`, so reading a password safely depended on every caller remembering to
 /// pass `false`.
-pub const OP_TTY_SET_MODE: u16 = 0x0902;
+pub const OP_TTY_SET_MODE: u16 = 0x0B02;
 /// `Tty::Close` — the supervisor declaring this tty finished.
 ///
 /// **Revocation, not release.** Handles are refcounted and this kernel has none, so
 /// closing a handle cannot take a capability back from a process that outlived its
 /// session. The server declining to serve the channel is what makes teardown a guarantee.
-pub const OP_TTY_CLOSE: u16 = 0x0903;
+pub const OP_TTY_CLOSE: u16 = 0x0B03;
 
 /// **Interrupt** — the one message a terminal sends *unsolicited* (§11h).
 ///
@@ -126,7 +134,7 @@ pub const OP_TTY_CLOSE: u16 = 0x0903;
 ///
 /// A client that never looks for it is unaffected: it queues like any other message, and
 /// the shell drains it with a non-blocking receive at its own checkpoints.
-pub const OP_TTY_INTERRUPT: u16 = 0x0905;
+pub const OP_TTY_INTERRUPT: u16 = 0x0B05;
 
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;

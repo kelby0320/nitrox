@@ -12140,3 +12140,36 @@ The general lesson is about the registry, not the tty: **a table that nothing en
 records intentions, not facts.** Two servers picked ranges three days apart and the document
 recorded only one of them. `abi-sync-check` exists for exactly this class of drift on
 constants that cross the kernel boundary; nothing plays that role for category allocation.
+
+### Fixing the category collision: `Tty` moves to `0x0Bxx`
+
+Filed for about an hour, then fixed on the maintainer's instruction — the right call, since
+carrying a known-wrong registry is how the next allocation goes wrong too.
+
+**The state, exactly.** The registry allocates thirteen categories; the code uses five of
+them (`Meta`, `Namespace`, `File`, `Auth`, and `0x09xx`). `Stream`, `Block`, `Control`,
+`Power` and `Log` are registered names with no constants behind them. The clash was total
+rather than partial: `Surface`'s five ops and `Tty`'s first five landed on the same five
+numbers, `0x0900`–`0x0904`.
+
+**`Tty` moved, not `Surface`.** The maintainer's only requirement was separation, so the
+choice went to churn and to who owed a document: `Tty` was the one with neither a registry row
+nor a spec, its six constants are referenced by name in all five consumers (nothing hardcodes
+a number, which the change verified before touching anything), and moving it leaves the
+display stack — reviewed twice this week — untouched. It now has a row and a note in
+`console-and-tty.md` recording its number.
+
+**Nothing on the wire changed shape, which is the whole reason this was invisible.** A tty
+channel only ever carries tty ops and a Surface session only Surface ops, so the *channel*
+disambiguates and no message was ever misread. Verified after the renumber: `test-qemu`
+green, `test-interactive` green through all 22 steps including the full login (`nitrox
+login:` → `password:` → a shell prompt), which is the path that actually exercises
+`ReadLine`, `Write` and `Close`.
+
+**The lesson is about the registry, not the tty.** A table nothing enforces records
+intentions, not facts — two servers picked ranges three days apart and the document knew
+about one. `abi-sync-check` plays this role for constants crossing the kernel boundary and
+would have caught it instantly; nothing plays it for category allocation. The wire spec now
+says the rule out loud ("add the row in the same change that picks the number") rather than
+leaving it implied by a table, because the failure was not a disagreement about ownership —
+it was one server never writing itself down.

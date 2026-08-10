@@ -69,6 +69,13 @@ otherwise absorb by accident.
 
 ## Shape — the decisions
 
+**The `Tty` rsproto category is `0x0Bxx`** (`../spec/rsproto-wire-format.md`). It sat on
+`0x09xx` from this server's first commit until 2026-08-06 without a registry row, colliding
+op-for-op with `Surface`, which the registry had assigned that range. It moved when
+allocating `Input` surfaced the clash. No message changed shape — a channel only ever carries
+one category's ops, which is why nothing broke and why nothing noticed — only the numbers.
+
+
 ### It is a userspace resource server
 
 Like the fs-server, the profile server and the logging service: spawned by a supervisor, bound

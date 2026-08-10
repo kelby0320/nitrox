@@ -259,17 +259,6 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
-**The `Tty` rsproto category is unregistered and collides with `Surface`.** `OP_TTY_*`
-occupies `0x0900`–`0x0905`, one-for-one with `Surface`'s `0x0900`–`0x0904` — `OP_TTY_READ_LINE`
-and `OP_CREATE_WINDOW` are both `0x0900`. The tty server took the range on 2026-08-03 without
-registering it in `rsproto-wire-format.md`; `Surface` was assigned the same range on
-2026-08-05. Harmless on the wire (a channel only ever carries one category's ops, so the
-channel disambiguates) and therefore not urgent, but the registry is the contract and the code
-contradicts it. The fix is to move `Tty` to a free category and add its row — everything is
-pre-v0.1 and rebuilt together, so it costs a recompile, not a migration. Deferred only because
-it is off the path of the slice that found it (M3 Part B, allocating `Input` at `0x0Axx`).
-Raised 2026-08-06.
-
 **Input: key repeat.** Held keys do not repeat. The record format reserves `value == 2` for
 it (`docs/design/input-subsystem.md` §3), so no wire change is needed, but it wants a timer
 in `libinput` and a policy for delay/rate. Trigger: the first text field — M4's toolkit.
@@ -973,6 +962,7 @@ decision log entry for the date shown.
 | fs-server block I/O in 4 KiB blocks | 2026-07-23 | `DiskReader`'s transfer unit is the 4 KiB block — ~8× fewer device round trips. |
 | Image assembly + QEMU smoke in CI | 2026-07-24 | A second CI job runs `xtask test-qemu` (which builds the image), with OVMF/gdisk/mtools/e2fsprogs installed. It had been deferred "until there is meaningful regression surface"; every Milestone 1 regression was caught by this gate and none would have failed the other jobs. |
 | Per-interrupt-context lock-order tracking | 2026-07-29 | `lockrank::enter_interrupt` gives every interrupt handler a fresh view of the held-rank stack, so the order restarts at an interrupt boundary as it actually does. This was a *prerequisite* for the tracker, not a refinement — flat ranking panicked about one boot in three. `tlb::LOCK` is now ranked normally and needs no exemption; `cargo xtask check-irq-scope` keeps every entry stub scoped. |
+| `Tty`/`Surface` rsproto category collision | 2026-08-06 | Fixed in the same slice that found it: `Tty` moved from `0x09xx` to `0x0Bxx` and gained a registry row, `Surface` kept `0x09xx`, `Input` took `0x0Axx`. It was filed for about an hour before the maintainer said to fix it rather than carry it. |
 | Console DPC freeing in DPC context | 2026-08-06 | Fixed with the PS/2 driver, which turned out to have the same hazard: the DPC now signals through a *borrowed* pointer and marks the parked read `spent`, leaving its `ObjectRef`s owned by the driver until `reap_pending` drops them in thread context. The "needs a bounded parking home and an overflow policy" objection that deferred it was an artifact of assuming the DPC had to own the refs. |
 | `test-qemu`'s intermittent hang | 2026-08-06 | Root-caused and fixed: `irp_complete_dpc` freed its `IrpBox` in DPC context, so a completion interrupt landing on a CPU that already held the `SlabCache` lock self-deadlocked against the frame beneath it. The box is now handed to thread context through an intrusive list drained by `reap_pending`. 64 consecutive clean boots against a ~6% base rate. Found by the QMP state dump `cmd_test_qemu` now takes on timeout. |
 | `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
