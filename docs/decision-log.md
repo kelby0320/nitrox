@@ -12266,3 +12266,36 @@ nothing had written down: it clobbers `WAIT_RESULTS[0..24]` while `serve_loop` i
 that buffer, and is safe only because the inner wait passes `count = 1` and the outer loop has
 already consumed the record it is on. Correct, load-bearing, and now stated at the function —
 widening that call would corrupt the loop silently.
+
+### The plan drifted, and the maintainer caught it before the code did
+
+Part C was about to be built to a shape the plan did not describe. Worth recording because
+the failure is quiet and the correction is cheap only while it is early.
+
+**Two different drifts, and they pull opposite ways.**
+
+*Scope the plan did not name.* `PointerEvent` is a record type and a spec section; the plan's
+Part C mentioned only `KeyEvent`. That is not scope creep in the bad sense — a client
+receiving a click is Part C's own deliverable, and it turned out to be the trigger that
+`display-substrate.md` §9 had parked pointer events behind, earlier than the trigger that
+document guessed ("the compositor needing to move a window"). But the plan is the agreement
+about what is being built, and acquiring a wire contract without writing it down is exactly
+how the next person inherits a document that describes a different system.
+
+*Scope belonging to the next part.* The remaining-work list had `libui` delivery and the gate
+assertion inside Part C. Re-reading Part D — "plus a client that echoes what it received" —
+they are D's, and folding them forward would have left D as a checkbox with nothing behind
+it. That is worse than it sounds: the parts exist so each one lands with its own proof, and a
+part with no work has no proof either.
+
+**The boundary is now stated rather than implied: the channel.** Part C ends when the
+compositor sends a `KeyEvent`; Part D begins when a client receives one. Part C is
+sub-divided into C1 (records, done), C2 (`libinput`), C3 (the compositor consuming
+`/dev/input/new`) so each has a checkbox and C3 carries the correction of the Surface spec's
+"specified but not yet sent" Status line.
+
+The general lesson is one this project keeps relearning in different costumes: **a plan
+consulted only at the start of a slice is a sketch.** The same failure produced the M2 Part B
+box ticked while the server never answered, and the `Tty` category that took a range without
+a registry row. Checking the plan when the work *changes* — not only when it starts — is what
+would have caught all three.

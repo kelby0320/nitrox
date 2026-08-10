@@ -177,12 +177,32 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
       together. It already compares
       exactly this kind of constant family across the kernel/userspace boundary; a numbering
       that drifts between the driver and the server is a silent misrouting, not a build error.
-- [ ] **Part C — `libinput`, focus and routing.** `libinput` turns triples into logical
-      events and tracks modifier state; the compositor uses it to route to the focused
-      window and to stamp the Surface-layer `KeyEvent`. Keycode→character lives here too,
-      host-tested, and is what a client uses.
-- [ ] **Part D — QMP injection** in `test-interactive`, plus a client that echoes what it
-      received: a keystroke and a click injected by the harness reach a window and come back.
+- [ ] **Part C — the Surface-layer events, `libinput`, focus and routing.** Everything up to
+      and including *the compositor sending an event*. The boundary with Part D is the
+      channel: C ends when a `KeyEvent` goes out; D begins when a client receives one.
+
+      - [x] **C1 — the Surface-layer records.** ✅ (2026-08-06) `KeyEvent` and `PointerEvent`
+            in `librsproto` and `rsproto-surface-ops.md`. **`PointerEvent` was not in this
+            plan** and is scope this milestone acquired honestly: the plan named only
+            `KeyEvent`, because `display-substrate.md` §9 had parked pointer events with the
+            trigger "the compositor needing to move a window". Part C's own deliverable — a
+            click reaching a client — turned out to be the earlier trigger.
+      - [ ] **C2 — `libinput`.** The `SYN` state machine, modifier tracking, and
+            keycode→character. Pure and host-tested; it is what turns device triples into
+            something a window can use, on both sides of the protocol.
+      - [ ] **C3 — the compositor consumes `/dev/input/new`.** Focus (topmost window whose
+            role takes it), pointer hit-testing, and sending. This is the checkbox that also
+            corrects `rsproto-surface-ops.md`'s Status line, which currently says the records
+            are "specified but not yet sent".
+
+- [ ] **Part D — a client receives it.** `libui` delivers input into a window's event queue,
+      and a test client echoes what arrived: a keystroke and a click injected by the harness
+      reach a **window** and come back, which is the milestone's deliverable.
+
+      **QMP injection is already done**, pulled forward to Part A (`cargo xtask check-input`)
+      because a driver that is merely "armed" proves nothing — the same reason M2 Part D
+      existed. What remains here is the client half and extending that gate to assert through
+      `libui` rather than off the input server.
 
 **Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
 with window management in a later milestone; buttons and menus need clicks, and the toolkit
