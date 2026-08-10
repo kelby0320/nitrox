@@ -167,8 +167,11 @@ enumeration — but the in-kernel resource-server registry
   order-independent and are what `init.toml` mount specs reference. The raw
   `/dev/blk/N` whole-disk nodes are not what a manifest should name.
 
-`Char`/other device families get their own prefix and registry when they arrive;
-the `/dev/blk` registry is block-only.
+`Char` devices now have both shapes: `/dev/console` is a **leaf** binding to the single
+serial console, and `/dev/input/raw/<n>` is the first **indexed char registry** — a subtree
+binding whose suffix indexes the nodes a driver published, served exactly as `/dev/blk/<n>`
+serves block devices. Other device families get their own prefix and registry when they
+arrive; the `/dev/blk` registry remains block-only.
 
 ### Rights at the binding
 

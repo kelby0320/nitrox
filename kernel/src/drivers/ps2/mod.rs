@@ -60,20 +60,24 @@ struct ParkedRead {
 struct Device {
     ring: EventRing,
     parked: Option<ParkedRead>,
-    /// Set when the DPC has satisfied `parked` and thread context still owes it a drop.
+    /// A satisfied `ParkedRead` the DPC has finished with, awaiting a thread-context drop.
     ///
-    /// The `ParkedRead` deliberately stays in place once spent. Taking it out of the DPC
-    /// would drop its two `ObjectRef`s there, and a last-reference drop runs
-    /// `dispatch_destroy` → `SlabCache::free`, whose lock is a plain `SpinLock` — the
-    /// same-CPU deadlock fixed for `io::block` (decision log, 2026-08-06). Leaving it owned
-    /// here keeps the objects alive for free until [`reclaim_completed`] can drop them in
-    /// thread context.
-    spent: bool,
+    /// **The DPC takes the entry out of `parked` and owns it for the whole time it uses its
+    /// pointers**, then publishes it here at the end. That exclusive ownership is what makes
+    /// the hand-off sound, and the obvious alternative is not: an earlier version left the
+    /// entry in `parked` and merely flagged it reclaimable *before* the copy, so another
+    /// CPU running `reap_pending` could take it and drop the last reference while this DPC
+    /// was still dereferencing the `MemoryObject` — a use-after-free rather than the
+    /// deadlock it was avoiding (PR #178 review, blocking 1).
+    ///
+    /// The DPC still never *drops* it: a last-reference drop reaches `SlabCache::free`,
+    /// whose plain `SpinLock` is the same-CPU deadlock fixed for `io::block`.
+    to_drop: Option<ParkedRead>,
 }
 
 impl Device {
     const fn new() -> Self {
-        Self { ring: EventRing::new(), parked: None, spent: false }
+        Self { ring: EventRing::new(), parked: None, to_drop: None }
     }
 }
 
@@ -212,27 +216,35 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
     let now = crate::arch::Timer::read_ns();
     for index in 0..DEV_COUNT {
         let mut tmp = [0u8; DRAIN_MAX];
-        // **Borrow, never take.** The `ParkedRead` stays owned by `Device` and only its raw
-        // pointers come out, so this DPC drops nothing — see `Device::spent`.
+        // **Take exclusive ownership for the duration.** Once the entry is out of
+        // `dev.parked` no other CPU can see it, so nothing can drop the objects while this
+        // DPC is using them — and because the DPC hands the entry on rather than dropping
+        // it, it still never calls the allocator.
         let completed = {
             let mut g = PS2.lock();
             let dev = &mut g.devices[index];
-            match dev.parked.as_ref() {
-                Some(pr) if !dev.spent && !dev.ring.is_empty() => {
-                    let (po, buffer, off, max) =
-                        (pr.po.as_ptr(), pr.buffer.as_ptr(), pr.buf_offset, pr.max_len);
-                    let n = dev.ring.drain_into(&mut tmp[..max.min(DRAIN_MAX)], now);
-                    dev.spent = true;
-                    Some((po, buffer, off, n))
-                }
-                _ => None,
+            if dev.parked.is_some() && !dev.ring.is_empty() {
+                let pr = dev.parked.take().expect("checked is_some");
+                let n = dev.ring.drain_into(&mut tmp[..pr.max_len.min(DRAIN_MAX)], now);
+                Some((pr, n))
+            } else {
+                None
             }
         };
-        if let Some((po, buffer, buf_offset, n)) = completed {
-            // SAFETY: `buffer` is still pinned by the `ObjectRef` left in `dev.parked`,
-            // which only thread context removes.
-            unsafe { copy_into_memobj(buffer, buf_offset, &tmp[..n]) };
-            crate::sched::complete_pending_op(po, 0, n as u64);
+        if let Some((pr, n)) = completed {
+            // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a
+            // local — unreachable from any other CPU until it is published below.
+            unsafe { copy_into_memobj(pr.buffer.as_ptr(), pr.buf_offset, &tmp[..n]) };
+            crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64);
+            // Publish for thread-context reclamation. Last, so the entry is never reachable
+            // while its pointers are still in use.
+            let mut g = PS2.lock();
+            debug_assert!(
+                g.devices[index].to_drop.is_none(),
+                "a second completion before a reclaim: submit_read drains first, so a new \
+                 read cannot be parked while one is owed"
+            );
+            g.devices[index].to_drop = Some(pr);
         }
     }
 }
@@ -242,20 +254,17 @@ fn ps2_intr_dpc(_ctx: *mut ()) {
 /// This is where the two `ObjectRef`s a completed read pinned are actually released — the
 /// frees that `ps2_intr_dpc` must not do. Called from `sched::reap_pending` (so any CPU
 /// going idle reclaims) and from [`submit_read`] before parking a new read.
+///
+/// Safe to run concurrently with a DPC on another CPU: the DPC owns its entry outright until
+/// it publishes it in `to_drop`, so there is nothing here to race with.
 pub fn reclaim_completed() {
     for index in 0..DEV_COUNT {
         // Take under the lock, drop outside it: a drop reaches the allocator.
-        let spent = {
+        let owed = {
             let mut g = PS2.lock();
-            let dev = &mut g.devices[index];
-            if dev.spent {
-                dev.spent = false;
-                dev.parked.take()
-            } else {
-                None
-            }
+            g.devices[index].to_drop.take()
         };
-        drop(spent);
+        drop(owed);
     }
 }
 

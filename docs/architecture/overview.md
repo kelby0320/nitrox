@@ -61,7 +61,7 @@ The [namespace and capabilities rationale](../rationale/why-capabilities.md) goe
 │   IPC channels, notification queues                             │
 │   Scheduler (per-CPU runqueues, three classes)                  │
 │   IRP-based driver framework                                    │
-│   Tier 1 drivers: PCI, AHCI/NVMe, GPT, console                  │
+│   Tier 1 drivers: PCI, AHCI/NVMe, GPT, console, i8042                  │
 │   In-kernel resource servers: /proc, /dev, /initramfs, ...      │
 │                                                                 │
 │   Architecture abstraction layer: x86_64 (initial), aarch64     │

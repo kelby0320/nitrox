@@ -58,10 +58,22 @@ impl EventRing {
         self.len
     }
 
-    /// True when nothing is buffered **and** no loss is owed. A ring owing a `SYN_DROPPED`
-    /// is not empty, because it still has something to tell the consumer.
+    /// True when the ring holds nothing to deliver.
+    ///
+    /// **Deliberately just `len == 0`.** An earlier version also tested `lost == 0`, on the
+    /// reasoning that a ring owing a `SYN_DROPPED` still has something to tell the consumer.
+    /// That state cannot arise: `lost` is only incremented by [`push`](Self::push) when the
+    /// ring is *full*, and that same push immediately refills the slot it freed, so
+    /// `lost > 0` implies `len == RING_EVENTS`. `len` falls only through
+    /// [`drain_into`](Self::drain_into), which emits the announcement and clears `lost`
+    /// before it removes anything. So `len == 0` already implies nothing is owed.
+    ///
+    /// It is gone rather than kept as defence because it could not be tested: the PR #178
+    /// review showed the original assertion held for the broken implementation too, and two
+    /// further attempts to construct the state were equally vacuous — which is the argument
+    /// for deleting dead code rather than for writing a third contrivance around it.
     pub fn is_empty(&self) -> bool {
-        self.len == 0 && self.lost == 0
+        self.len == 0
     }
 
     /// Push one event, discarding the oldest whole record if the ring is full.
@@ -74,6 +86,10 @@ impl EventRing {
         let tail = (self.head + self.len) % RING_EVENTS;
         self.buf[tail] = e;
         self.len += 1;
+        // Why `is_empty` need not consider `lost`: a loss is only recorded by dropping from
+        // a full ring, and this push refills the slot, so an owed announcement always has
+        // records travelling with it.
+        debug_assert!(self.lost == 0 || self.len == RING_EVENTS, "a loss implies a full ring");
     }
 
     /// Push a group, all-or-nothing.
@@ -232,19 +248,40 @@ mod tests {
     }
 
     #[test]
-    fn a_ring_owing_a_loss_is_not_empty() {
-        // Otherwise a driver with nothing buffered would never wake a reader to tell it the
-        // stream broke, and the consumer would sit on stale state indefinitely.
+    fn a_loss_is_only_ever_recorded_by_a_full_ring() {
+        // The invariant that makes `is_empty` safe as `len == 0`: overflow is the only
+        // source of `lost`, and the overflowing push refills the ring, so a loss never
+        // outlives the records it arrived with. Asserted on the *strong* form
+        // (`len == RING_EVENTS`), not the weak `len > 0` — a first attempt used the weak
+        // form and still passed against a `push` that dropped without refilling.
         let mut r = EventRing::new();
-        for i in 0..RING_EVENTS as u16 + 1 {
+        for i in 0..RING_EVENTS as u16 * 3 {
+            r.push(ev(i));
+            assert!(
+                r.lost == 0 || r.len() == RING_EVENTS,
+                "after {i} pushes: lost={} with len={}",
+                r.lost,
+                r.len()
+            );
+        }
+        assert!(r.lost > 0, "the run overflowed, so the invariant was actually exercised");
+    }
+
+    #[test]
+    fn a_drained_ring_is_empty_and_owes_nothing() {
+        // The consumer-visible half: once everything has been taken, including any
+        // announcement, the ring reports empty and a reader parks rather than spinning.
+        let mut r = EventRing::new();
+        for i in 0..RING_EVENTS as u16 + 5 {
             r.push(ev(i));
         }
-        assert!(!r.is_empty());
+        assert!(!r.is_empty(), "records buffered");
         let mut out = [InputEvent::default(); RING_EVENTS + 4];
-        while !r.is_empty() {
-            assert!(drain(&mut r, RING_EVENTS + 4, &mut out) > 0, "draining must make progress");
-        }
-        assert!(r.is_empty());
+        let n = drain(&mut r, RING_EVENTS + 4, &mut out);
+        assert_eq!(out[0].code, SYN_DROPPED, "the announcement leads");
+        assert_eq!(n, RING_EVENTS + 1, "announcement plus every survivor");
+        assert_eq!(r.len(), 0);
+        assert!(r.is_empty(), "and nothing is owed afterwards");
     }
 
     #[test]

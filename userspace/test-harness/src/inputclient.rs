@@ -22,6 +22,7 @@
 #![no_std]
 #![no_main]
 
+use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::{
     IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, SYS_IO_SUBMIT,
     SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
@@ -29,8 +30,10 @@ use libkern::{
 
 /// One page for the read buffer.
 const PAGE: u64 = 4096;
-/// Bytes per `InputEvent` — mirrors `kernel/src/libkern/input.rs`.
-const EVENT_LEN: usize = 16;
+/// Bytes per record, from the shared ABI rather than a local literal — an earlier version
+/// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
+/// have gone unnoticed until this gate happened to run (PR #178 review).
+const EVENT_LEN: usize = INPUT_EVENT_LEN;
 /// Events to request per read.
 const READ_EVENTS: u64 = 16;
 
@@ -195,14 +198,11 @@ impl Reader {
     /// Print event `i` from the buffer in the form the harness matches on.
     fn print_event(&self, tag: &[u8], i: usize) {
         let base = self.buf_addr + (i * EVENT_LEN) as u64;
-        // SAFETY: `base + 16` is within the mapped page (`i < READ_EVENTS`).
-        let (kind, code, value) = unsafe {
-            (
-                (base as *const u16).read_volatile(),
-                ((base + 2) as *const u16).read_volatile(),
-                ((base + 4) as *const i32).read_volatile(),
-            )
-        };
+        // SAFETY: `base + EVENT_LEN` is within the mapped page (`i < READ_EVENTS`), and the
+        // driver writes whole records only.
+        let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, EVENT_LEN) };
+        let Some(ev) = InputEvent::read(bytes) else { return };
+        let (kind, code, value) = (ev.kind, ev.code, ev.value);
         Line::new()
             .str(tag)
             .str(b" kind=")

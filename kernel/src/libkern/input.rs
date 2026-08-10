@@ -32,7 +32,8 @@ use core::mem::{align_of, offset_of, size_of};
 /// One input event: what happened, on what, when.
 ///
 /// `#[repr(C)]`, 16 bytes, and mirrored byte-for-byte in `userspace/libkern/src/abi.rs`.
-/// Both sides carry the layout asserts below.
+/// Both sides carry the layout asserts below, and `cargo xtask abi-sync-check` compares the
+/// `EV_*`/`KEY_*`/`REL_*`/`BTN_*` constants across the boundary.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct InputEvent {

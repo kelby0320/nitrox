@@ -12033,3 +12033,65 @@ predicted this failure.
 `ui-testclient` prints its `info id=… WxH role=…` line the same multi-call way. Nothing
 `expect`s on it, so it costs only occasionally-garbled log output rather than a flaky gate —
 left as-is, and named here so this does not read as a completed sweep.
+
+### Review of PR #178 — a use-after-free introduced while fixing a deadlock
+
+The blocking finding is the one the PR explicitly asked a reviewer to check, and the answer
+was that it was wrong.
+
+**The DPC published the `ParkedRead` as reclaimable before it stopped using it.** Both
+drivers set `spent = true` under the lock, released the lock, and *then* used the borrowed
+`po`/`buffer` pointers for the copy and the completion. `spent` is exactly what authorises
+`reclaim_completed` to take the entry and drop the last references — so for the whole
+duration of the copy, another CPU running `reap_pending` could free the `MemoryObject` and
+the `PendingOperation` out from under the DPC.
+
+The SAFETY comment is where the reasoning failed, and it is worth quoting because it reads
+as sound: *"`buffer` is still pinned by the `ObjectRef` left in `dev.parked`, which only
+thread context removes."* True, and **insufficient**: a DPC runs with interrupts masked,
+which excludes thread context *on its own CPU*. The other three run concurrently, and both
+gates boot `-smp 4`. I reasoned about the CPU I was on and wrote a guarantee about the
+machine.
+
+**The fix removes the borrow rather than reordering it.** The DPC now `take()`s the entry —
+owning it outright, unreachable from any other CPU — does the copy and the completion, and
+publishes it into a separate `to_drop` slot as its *last* action. Exclusive ownership is a
+much easier thing to be right about than a window, and it still never drops.
+
+Reordering was tempting and does not work: whatever is done last is done while the entry is
+either still reclaimable (freeing the `PendingOperation` before `complete_pending_op`) or not
+yet reclaimable (leaving the woken client's `submit_read` to find it and fail). Ownership
+sidesteps the ordering question entirely.
+
+**A dead clause, and two vacuous attempts to test it.** The review showed
+`a_ring_owing_a_loss_is_not_empty` passing against an `is_empty` with its `lost` check
+deleted — the assertion held with 128 records still buffered, so it was true for correct and
+broken alike. Trying to fix it produced a *second* vacuous test, and then a third that also
+passed against a broken `push`. That was the signal: the state `len == 0 && lost > 0` is
+**unreachable** — `lost` only rises when the ring is full, and the same push refills it, so a
+drain always announces before it can empty. The clause was dead code, and three failed
+attempts to cover it are a better argument for deleting it than for writing a fourth. Now
+`is_empty` is `len == 0`, with a `debug_assert` and a test pinning the invariant that makes
+it safe — verified by a break that the earlier versions survived.
+
+**The kernel claimed a userspace ABI mirror that did not exist.** `input.rs` said
+`InputEvent` was "mirrored byte-for-byte in `userspace/libkern/src/abi.rs`"; there was no
+such type, `abi-sync-check` did not cover the file, and the only consumer hardcoded `16` and
+read fields at literal offsets. A swap of `code` and `value` would have passed every
+compile-time check on both sides. The mirror now exists, the 31 keycodes and the `EV_*`/
+`REL_*`/`BTN_*` constants are compared by `abi-sync-check` (a new `U16Const` shape), and the
+client reads through `InputEvent::read` instead of by offset. The checker earned its keep
+immediately by failing until every keycode was mirrored.
+
+**And a spec the change made false.** `io-operation.md` defines char reads as byte streams:
+`length` is a maximum, `result` is ≥ 1, alignment rules explicitly do not apply. The raw
+input nodes floor `length` to a whole record and reject anything smaller *synchronously* —
+so the spec now distinguishes **byte-stream** from **record-stream** char devices, and says
+why the latter truncates: not because the medium is addressed in records, but because a
+partial record is unrecoverable when the record carries no sync word.
+
+Four contract docs were updated for the new binding and the driver's existence
+(`boot-flow.md`'s closed list of nine, `overview.md`'s Tier 1 line, root `CLAUDE.md`'s
+"input … do not [exist]" sentence, and `console-and-tty.md`'s four "waits on a real keyboard
+driver" claims), plus `device-node.md`, whose "when they arrive" prediction about an indexed
+char registry has now arrived.

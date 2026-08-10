@@ -2170,6 +2170,8 @@ enum AbiShape {
     EnumVariant,
     /// `pub const NAME: Rights = Rights(1 << k);`
     RightsBit,
+    /// `pub const NAME: u16 = <int>;` — the input event classes and codes.
+    U16Const,
 }
 
 /// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
@@ -2198,6 +2200,13 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         kernel_file: "kernel/src/libkern/handle.rs",
         user_file: "userspace/libkern/src/handle.rs",
         shape: AbiShape::RightsBit,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "input event classes and codes",
+        kernel_file: "kernel/src/libkern/input.rs",
+        user_file: "userspace/libkern/src/abi.rs",
+        shape: AbiShape::U16Const,
         one_sided: &[],
     },
     AbiFamily {
@@ -2249,6 +2258,33 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
                 if let Some(v) = parse_int(val) {
                     out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::U16Const => {
+                // pub const NAME: u16 = <int>;  (and the i32 `KEY_*` values alongside them)
+                let Some(rest) = t.strip_prefix("pub const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                let Some((ty, val)) = tail.split_once('=') else { continue };
+                if ty.trim() != "u16" && ty.trim() != "i32" {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::EnumVariant => {
+                // Name = <int>,
+                let Some(body) = t.strip_suffix(',') else { continue };
+                let Some((name, val)) = body.split_once('=') else { continue };
+                let name = name.trim();
+                if name.is_empty()
+                    || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.to_string(), v);
                 }
             }
             AbiShape::EnumVariant => {

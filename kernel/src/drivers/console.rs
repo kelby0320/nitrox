@@ -59,14 +59,15 @@ struct Inner {
     len: usize,
     /// The single outstanding parked read, or `None`.
     parked: Option<ParkedRead>,
-    /// Set when [`console_intr_dpc`] has satisfied `parked` and thread context still owes it
-    /// a drop. The entry stays in place until then — see [`reclaim_completed`].
-    spent: bool,
+    /// A satisfied `ParkedRead` the DPC has finished with, awaiting a thread-context drop.
+    /// The DPC **owns** the entry while it uses its pointers and publishes it here last —
+    /// see [`console_intr_dpc`] and [`reclaim_completed`].
+    to_drop: Option<ParkedRead>,
 }
 
 impl Inner {
     const fn new() -> Self {
-        Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None, spent: false }
+        Inner { ring: [0; RING_CAP], head: 0, len: 0, parked: None, to_drop: None }
     }
 
     /// Push one received byte; drops it if the ring is full.
@@ -173,32 +174,36 @@ fn submit_read(
 /// buffer and complete its PO (waking the reader). Queued by [`console_isr`].
 fn console_intr_dpc(_ctx: *mut ()) {
     let mut tmp = [0u8; RING_CAP];
-    // **Borrow, never take** — see `Inner::spent` and `reclaim_completed`.
+    // **Take exclusive ownership for the duration** — see `Inner::to_drop`. Leaving the
+    // entry visible and merely flagging it reclaimable lets another CPU's `reap_pending`
+    // drop the last reference mid-copy (PR #178 review, blocking 1).
     let completed = {
         let mut g = CONSOLE.lock();
-        match g.parked.as_ref() {
-            Some(pr) if !g.spent && g.len > 0 => {
-                let (po, buffer, off, take) =
-                    (pr.po.as_ptr(), pr.buffer.as_ptr(), pr.buf_offset, pr.max_len.min(RING_CAP));
-                let n = g.pop_into(&mut tmp[..take]);
-                g.spent = true;
-                Some((po, buffer, off, n))
-            }
-            _ => None,
+        if g.parked.is_some() && g.len > 0 {
+            let pr = g.parked.take().expect("checked is_some");
+            let take = pr.max_len.min(RING_CAP);
+            let n = g.pop_into(&mut tmp[..take]);
+            Some((pr, n))
+        } else {
+            None
         }
     };
-    if let Some((po, buffer, buf_offset, n)) = completed {
-        // SAFETY: `buffer` is still pinned by the `ObjectRef` left in `g.parked`, which only
-        // thread context removes.
-        unsafe { copy_into_memobj(buffer, buf_offset, &tmp[..n]) };
-        crate::sched::complete_pending_op(po, 0, n as u64);
-        // **Nothing is dropped here, deliberately.** This DPC used to take the `ParkedRead`
-        // and release its `po`/`buffer` refs, justified by "refcount decrements only — the
-        // caller's handles keep the objects alive". That is false: nothing cancels a parked
-        // read, so a process that submits one and exits leaves the *last* references here,
-        // and `ObjectRef::drop` then runs `dispatch_destroy` → `SlabCache::free` in DPC
-        // context — the same-CPU allocator deadlock fixed for `io::block` (decision log,
-        // 2026-08-06). `reclaim_completed` does the drop in thread context instead.
+    if let Some((pr, n)) = completed {
+        // SAFETY: `pr` owns the `ObjectRef` pinning this `MemoryObject`, and `pr` is a local
+        // — unreachable from any other CPU until it is published below.
+        unsafe { copy_into_memobj(pr.buffer.as_ptr(), pr.buf_offset, &tmp[..n]) };
+        crate::sched::complete_pending_op(pr.po.as_ptr(), 0, n as u64);
+        // **Nothing is dropped here, deliberately.** This DPC used to release the parked
+        // read's `po`/`buffer` refs, justified by "refcount decrements only — the caller's
+        // handles keep the objects alive". That is false: nothing cancels a parked read, so
+        // a process that submits one and exits leaves the *last* references here, and
+        // `ObjectRef::drop` then runs `dispatch_destroy` → `SlabCache::free` in DPC context
+        // — the same-CPU allocator deadlock fixed for `io::block` (decision log,
+        // 2026-08-06). Publishing the entry for thread context is the hand-off; doing it
+        // **last** is what keeps it from being freed while the pointers above are in use.
+        let mut g = CONSOLE.lock();
+        debug_assert!(g.to_drop.is_none(), "a second completion before a reclaim");
+        g.to_drop = Some(pr);
     }
 }
 
@@ -209,16 +214,11 @@ fn console_intr_dpc(_ctx: *mut ()) {
 /// [`submit_read`] before parking a new read.
 pub fn reclaim_completed() {
     // Take under the lock, drop outside it: a drop reaches the allocator.
-    let spent = {
+    let owed = {
         let mut g = CONSOLE.lock();
-        if g.spent {
-            g.spent = false;
-            g.parked.take()
-        } else {
-            None
-        }
+        g.to_drop.take()
     };
-    drop(spent);
+    drop(owed);
 }
 
 /// COM1 RX interrupt handler: drain every available byte into the ring, then — if a
