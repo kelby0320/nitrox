@@ -11996,3 +11996,40 @@ found exactly the real cases and nothing else.
 Worth keeping as a habit rather than a tool for now — it is six lines of throwaway script and
 the failure it catches has appeared in ten of the last twelve commits that inserted an item
 above another. If it recurs after this, it is worth a `check-docs` sub-check.
+
+### The input gate's first failure was the gate, not the driver
+
+CI failed on `check-input` — the gate added in the same PR — while every other job passed.
+Locally it was **40% flaky under KVM** and had passed the several times I ran it under TCG,
+which is the whole reason it reached CI.
+
+The failure modes varied: sometimes the key press never appeared, sometimes the release. That
+variety was the clue that it was not a logic error. Instrumenting the ISR with counters and
+dumping the full transcript showed the driver was innocent — `rx_kbd=1 ev_kbd=1 dpc=1`, the
+byte arrived, the event was queued, the DPC ran — and the transcript showed why:
+
+```
+input-testclient: kbdtest-stage: setup message + stdin stream verified ok
+input-testclient: kbdtest-harness: worker faulted @ rip= kind=0x00000000004034350 ; terminating
+```
+
+**The client's line was being shredded by other processes' output.** It printed each event as
+six separate `kprint` calls — tag, `" kind="`, the number, `" code="`, and so on — and a
+single `kprint` is atomic (it takes the serial lock) while a *sequence* of them is not.
+Anything else booting could write between two of them, so the harness's exact-string `expect`
+matched a line that had never existed as a contiguous whole.
+
+Fixed by building each line in a buffer and emitting it with **one** call: 12/12 clean
+afterwards, from 6/10.
+
+Two things worth keeping. **The gate caught its own bug before the driver's**, which is the
+right order but not the flattering one — a gate that is flakier than the thing it guards
+teaches people to re-run CI. And **the PR description had already flagged the risk in the
+wrong terms**: it said the expects were "robust to reordering, brittle to formatting". The
+real exposure was not formatting, it was *interleaving*, which is a property of the shared
+console rather than of the client — and that is the version of the caveat that would have
+predicted this failure.
+
+`ui-testclient` prints its `info id=… WxH role=…` line the same multi-call way. Nothing
+`expect`s on it, so it costs only occasionally-garbled log output rather than a flaky gate —
+left as-is, and named here so this does not read as a completed sweep.

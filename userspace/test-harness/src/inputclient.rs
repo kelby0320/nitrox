@@ -86,31 +86,62 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     if status != 0 || resolved == 0 { None } else { Some(resolved) }
 }
 
-fn print_u64(n: u64) {
-    if n == 0 {
-        kprint(b"0");
-        return;
-    }
-    let mut d = [0u8; 20];
-    let (mut i, mut n) = (0usize, n);
-    while n > 0 {
-        d[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    let mut out = [0u8; 20];
-    for j in 0..i {
-        out[j] = d[i - 1 - j];
-    }
-    kprint(&out[..i]);
+/// A line built in one buffer and emitted with a **single** `kprint`.
+///
+/// This is not tidiness. The console is shared and unsynchronised **between processes**: one
+/// `kprint` is atomic (it takes the serial lock) but a sequence of them is not, so a line
+/// assembled from six calls gets shredded by whatever else is booting. That is exactly how
+/// the first version of this client failed — the events arrived, the client printed them,
+/// and the harness saw `input-testclient: kbdtest-stage: setup message …` because another
+/// process wrote between the tag and the value.
+struct Line {
+    buf: [u8; 96],
+    len: usize,
 }
 
-fn print_i32(v: i32) {
-    if v < 0 {
-        kprint(b"-");
-        print_u64((-(v as i64)) as u64);
-    } else {
-        print_u64(v as u64);
+impl Line {
+    fn new() -> Self {
+        Self { buf: [0; 96], len: 0 }
+    }
+
+    fn str(&mut self, s: &[u8]) -> &mut Self {
+        let n = s.len().min(self.buf.len() - self.len);
+        self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
+        self.len += n;
+        self
+    }
+
+    fn u64(&mut self, n: u64) -> &mut Self {
+        if n == 0 {
+            return self.str(b"0");
+        }
+        let mut d = [0u8; 20];
+        let (mut i, mut v) = (0usize, n);
+        while v > 0 {
+            d[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            i += 1;
+        }
+        let mut out = [0u8; 20];
+        for j in 0..i {
+            out[j] = d[i - 1 - j];
+        }
+        self.str(&out[..i])
+    }
+
+    fn i32(&mut self, v: i32) -> &mut Self {
+        if v < 0 {
+            self.str(b"-").u64((-(v as i64)) as u64)
+        } else {
+            self.u64(v as u64)
+        }
+    }
+
+    /// Emit the whole line in one syscall, newline included.
+    fn emit(&mut self) {
+        self.str(b"\n");
+        kprint(&self.buf[..self.len]);
+        self.len = 0;
     }
 }
 
@@ -172,14 +203,15 @@ impl Reader {
                 ((base + 4) as *const i32).read_volatile(),
             )
         };
-        kprint(tag);
-        kprint(b" kind=");
-        print_u64(kind as u64);
-        kprint(b" code=");
-        print_u64(code as u64);
-        kprint(b" value=");
-        print_i32(value);
-        kprint(b"\n");
+        Line::new()
+            .str(tag)
+            .str(b" kind=")
+            .u64(kind as u64)
+            .str(b" code=")
+            .u64(code as u64)
+            .str(b" value=")
+            .i32(value)
+            .emit();
     }
 }
 
