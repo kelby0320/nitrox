@@ -259,6 +259,16 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
+**The console input DPC still frees in DPC context.** `console_intr_dpc` drops the parked
+read's `po`/`buffer` `ObjectRef`s, and if the submitting process has exited those can be the
+last references — so `dispatch_destroy` → `SlabCache::free` runs in DPC context, which is the
+deadlock fixed for `io::block` on 2026-08-06. It does not fire in CI (headless boots send no
+serial input) and needs a real remedy rather than a quick one: the IRP box could carry an
+intrusive link, but `ObjectRef`s cannot, so they need a bounded parking home and a policy for
+overflowing it — and "drop it anyway" is the bug. Trigger: the first interactive-console hang,
+or any work that gives deferred drops an unbounded home. Raised by the PR #177 review,
+2026-08-06.
+
 **Input: key repeat.** Held keys do not repeat. The record format reserves `value == 2` for
 it (`docs/design/input-subsystem.md` §3), so no wire change is needed, but it wants a timer
 in `libinput` and a policy for delay/rate. Trigger: the first text field — M4's toolkit.
@@ -962,6 +972,7 @@ decision log entry for the date shown.
 | fs-server block I/O in 4 KiB blocks | 2026-07-23 | `DiskReader`'s transfer unit is the 4 KiB block — ~8× fewer device round trips. |
 | Image assembly + QEMU smoke in CI | 2026-07-24 | A second CI job runs `xtask test-qemu` (which builds the image), with OVMF/gdisk/mtools/e2fsprogs installed. It had been deferred "until there is meaningful regression surface"; every Milestone 1 regression was caught by this gate and none would have failed the other jobs. |
 | Per-interrupt-context lock-order tracking | 2026-07-29 | `lockrank::enter_interrupt` gives every interrupt handler a fresh view of the held-rank stack, so the order restarts at an interrupt boundary as it actually does. This was a *prerequisite* for the tracker, not a refinement — flat ranking panicked about one boot in three. `tlb::LOCK` is now ranked normally and needs no exemption; `cargo xtask check-irq-scope` keeps every entry stub scoped. |
+| `test-qemu`'s intermittent hang | 2026-08-06 | Root-caused and fixed: `irp_complete_dpc` freed its `IrpBox` in DPC context, so a completion interrupt landing on a CPU that already held the `SlabCache` lock self-deadlocked against the frame beneath it. The box is now handed to thread context through an intrusive list drained by `reap_pending`. 64 consecutive clean boots against a ~6% base rate. Found by the QMP state dump `cmd_test_qemu` now takes on timeout. |
 | `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
 
 ## How to use this document

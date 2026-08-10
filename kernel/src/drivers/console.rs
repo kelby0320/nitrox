@@ -175,8 +175,22 @@ fn console_intr_dpc(_ctx: *mut ()) {
     if let Some((po, buffer, buf_offset, n)) = completed {
         copy_into_memobj(&buffer, buf_offset, &tmp[..n]);
         crate::sched::complete_pending_op(po.as_ptr(), 0, n as u64);
-        // `po` / `buffer` drop here (outside the lock) — refcount decrements only
-        // (the caller's handles keep the objects alive).
+        // `po` / `buffer` drop here, outside the lock.
+        //
+        // **This is a known hazard, not a safe pattern.** The justification that used to sit
+        // here — "refcount decrements only, the caller's handles keep the objects alive" —
+        // is an assumption that fails: nothing cancels a parked read, so a process that
+        // submits one and exits before a keystroke arrives leaves the *last* references
+        // here, and `ObjectRef::drop` then runs `dispatch_destroy` → `SlabCache::free` in
+        // DPC context. That is exactly the deadlock fixed in `io::block` (decision log,
+        // 2026-08-06): the slab lock is a plain `SpinLock`, so a DPC that frees can spin
+        // forever against an allocator holder it interrupted on the same CPU.
+        //
+        // Left as-is deliberately rather than half-fixed: the remedy is to park the refs for
+        // thread-context reclamation, and unlike the IRP box (which owns an intrusive link)
+        // that needs a bounded home and a policy for overflowing it. Filed in
+        // `docs/rationale/deferred-decisions.md`. It does not fire in CI — headless boots
+        // send no serial input — which is why it has survived (PR #177 review, finding 4).
     }
 }
 
