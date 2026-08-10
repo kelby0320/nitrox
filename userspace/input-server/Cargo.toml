@@ -1,0 +1,19 @@
+[package]
+name = "input-server"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+libkern = { path = "../libkern" }
+libheap = { path = "../libheap" }
+librsproto = { path = "../librsproto" }
+
+# A library + binary split, like `tty-server` and `compositor`: the library holds the
+# host-testable merge — the part with all the behaviour and none of the syscalls.
+[lib]
+name = "input_server"
+path = "src/lib.rs"
+
+[[bin]]
+name = "input-server"
+path = "src/main.rs"

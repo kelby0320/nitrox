@@ -2075,6 +2075,17 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+
+    // `input-server`'s merge — two devices' streams into one ordered batch, and what a slow
+    // consumer is owed. Same split and the same reason: all the behaviour, no syscalls.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("input-server")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     Ok(())
 }
 

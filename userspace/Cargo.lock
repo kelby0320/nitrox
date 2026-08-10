@@ -74,6 +74,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "input-server"
+version = "0.1.0"
+dependencies = [
+ "libheap",
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
 name = "libcrypto"
 version = "0.1.0"
 
