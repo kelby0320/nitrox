@@ -11970,3 +11970,29 @@ from `submit_read` before parking a new read.
 That closes the `console_intr_dpc` deferral raised by the PR #177 review, and it retires the
 "needs a bounded parking home and an overflow policy" objection that made me file it rather
 than fix it — that objection was an artifact of assuming the DPC had to *own* the refs.
+
+### Doc-comment orphaning, instances nine and ten — and the sweep that found them
+
+Asked to double-check doc comments before raising the PR, and the answer was two more, both
+introduced by this branch:
+
+- **`SPAWN_INPUTCLIENT` in init** carried `ui-testclient`'s doc, which named the wrong
+  program *and* the wrong device path ("resolves `/dev/draw/new`" on a static whose whole
+  purpose is `/dev/input/raw/*`). `SPAWN_UICLIENT` was left with none.
+- **`cmd_check_input` in xtask** carried `cmd_check_display`'s entire nineteen-line doc, and
+  `cmd_check_display` was left with none at all.
+
+Both are the same mechanism as the previous eight: an item inserted *above* another takes the
+comment that belonged to it. Neither is catchable by `missing_docs`, because in both cases
+some item still has *a* doc — the compiler cannot know it is the wrong one.
+
+**A sweep that works, and one that does not.** The obvious heuristic — flag items whose doc
+never mentions them — produced 242 hits, nearly all false: plenty of good documentation
+describes what a thing *does* without repeating its name. The one that works reads the
+**diff**: an *added* item sitting under a doc block that is entirely unchanged context is the
+orphaning signature, because a genuinely new item arrives with a genuinely new comment. That
+found exactly the real cases and nothing else.
+
+Worth keeping as a habit rather than a tool for now — it is six lines of throwaway script and
+the failure it catches has appeared in ten of the last twelve commits that inserted an item
+above another. If it recurs after this, it is worth a `check-docs` sub-check.

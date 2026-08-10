@@ -155,9 +155,10 @@ static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
-/// Spawn args for `ui-testclient` (display arm M2 Part D): no handles, inheriting a
-/// LOOKUP-only handle to init's root namespace so it resolves `/dev/draw/new`. **No
-/// syscaps** — authority over the display is the namespace binding, nothing more.
+/// Spawn args for `input-testclient` (display arm M3 Part A): no handles, inheriting a
+/// LOOKUP-only handle to init's root namespace so it resolves `/dev/input/raw/*`. **No
+/// syscaps** — authority over an input device is the namespace binding, nothing more, and
+/// that binding is the whole of the keylogging boundary.
 #[cfg(feature = "selftest")]
 static mut SPAWN_INPUTCLIENT: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/input-testclient
@@ -188,6 +189,9 @@ fn run_input_testclient(root_ns: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
 }
 
+/// Spawn args for `ui-testclient` (display arm M2 Part D): no handles, inheriting a
+/// LOOKUP-only handle to init's root namespace so it resolves `/dev/draw/new`. **No
+/// syscaps** — authority over the display is the namespace binding, nothing more.
 #[cfg(feature = "selftest")]
 static mut SPAWN_UICLIENT: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /initramfs/sbin/ui-testclient

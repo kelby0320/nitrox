@@ -877,25 +877,6 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     Ok(steps)
 }
 
-/// `cargo xtask check-display` — prove the pixels actually reach the screen.
-///
-/// **What a self-hash structurally cannot answer** (`docs/design/display-substrate.md`
-/// §8c): a compositor can hash its own buffer correctly while writing to the wrong base
-/// address, the wrong stride, or with the channels swapped. Nothing inside the guest can
-/// detect that, because the guest stays perfectly consistent with itself. So the picture
-/// has to be read from outside, which is what QEMU's `screendump` is for.
-///
-/// The division worth remembering: **`test-qemu` tests the compositor, this tests the
-/// framebuffer binding.**
-///
-/// **No golden image.** The expected picture is rendered here by the same `libdraw` the
-/// guest uses, so there is no binary artefact in the repo to regenerate, and no
-/// brittle-image maintenance problem. That is sound precisely because what is under test
-/// is the *binding* — base address, stride, channel order — not the compositing, which
-/// §8b already covers.
-///
-/// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
-/// so the plan runs it once per display-arm change.
 /// `cargo xtask check-input` — inject a keystroke and a click, and check they arrive.
 ///
 /// The counterpart to `check-display`, and the answer to the same class of problem. A
@@ -971,6 +952,25 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     Ok(())
 }
 
+/// `cargo xtask check-display` — prove the pixels actually reach the screen.
+///
+/// **What a self-hash structurally cannot answer** (`docs/design/display-substrate.md`
+/// §8c): a compositor can hash its own buffer correctly while writing to the wrong base
+/// address, the wrong stride, or with the channels swapped. Nothing inside the guest can
+/// detect that, because the guest stays perfectly consistent with itself. So the picture
+/// has to be read from outside, which is what QEMU's `screendump` is for.
+///
+/// The division worth remembering: **`test-qemu` tests the compositor, this tests the
+/// framebuffer binding.**
+///
+/// **No golden image.** The expected picture is rendered here by the same `libdraw` the
+/// guest uses, so there is no binary artefact in the repo to regenerate, and no
+/// brittle-image maintenance problem. That is sound precisely because what is under test
+/// is the *binding* — base address, stride, channel order — not the compositing, which
+/// §8b already covers.
+///
+/// A **smoke gate, not a per-commit one**: it boots a full image and compares an image,
+/// so the plan runs it once per display-arm change.
 fn cmd_check_display(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
