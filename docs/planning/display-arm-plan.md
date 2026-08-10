@@ -166,7 +166,10 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
 - [ ] **Part B — `docs/spec/rsproto-input-ops.md`.** <!-- check-docs: allow-missing --> Every rsproto category in the tree has a
       spec doc; this one also has to pin the `InputEvent` layout and the `EV_*`/`KEY_*`
       numbering, because they are a kernel↔userspace ABI living in at least two crates.
-- [ ] **Part B — the `EV_*`/`KEY_*` constants under `abi-sync-check`.** It already compares
+- [x] **Part B — the `EV_*`/`KEY_*` constants under `abi-sync-check`.** ✅ (2026-08-06) Done
+      early, in the PR #178 review: the kernel doc claimed a `userspace/libkern` mirror that
+      did not exist, so the mirror, a `U16Const` shape and 156 compared values landed
+      together. It already compares
       exactly this kind of constant family across the kernel/userspace boundary; a numbering
       that drifts between the driver and the server is a silent misrouting, not a build error.
 - [ ] **Part C — `libinput`, focus and routing.** `libinput` turns triples into logical
