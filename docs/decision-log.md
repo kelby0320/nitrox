@@ -12095,3 +12095,48 @@ Four contract docs were updated for the new binding and the driver's existence
 "input … do not [exist]" sentence, and `console-and-tty.md`'s four "waits on a real keyboard
 driver" claims), plus `device-node.md`, whose "when they arrive" prediction about an indexed
 char registry has now arrived.
+
+## 2026-08-06 — M3 Part B: the input contract, and a category collision found while writing it
+
+**Batch ordering, not global.** `input-subsystem.md` said `time_ns` lets the `input-server`
+order events correctly. It cannot, fully: to know no *older* mouse event is still coming, the
+server would have to hold every keystroke until the mouse had spoken. Settled with the
+maintainer: the server drains both nodes on each wakeup, sorts **that set** by `time_ns`, and
+forwards it; already-forwarded events are never reordered.
+
+That is exactly right for the case merging exists for — a click and a keystroke that happen
+together are both buffered by the time the server wakes, so shift-click sorts correctly — and
+honestly weaker than the design doc implied. The alternative, holding events for a 2–5 ms
+window to buy a global guarantee, adds latency to every keystroke to fix an ordering nobody
+observes, and adds a tunable that will be wrong on some machine. The design doc is corrected
+and `rsproto-input-ops.md` states it normatively.
+
+**Loss needs no back-pressure design, because the record format already has one.** A consumer
+that stops reading eventually has nowhere to put the next batch. Rather than invent flow
+control, the server discards the batch and precedes the next successful one with
+`EV_SYN`/`SYN_DROPPED` — the same contract the kernel's per-device ring uses. A slow consumer
+degrades to a resynchronising one.
+
+Worth distinguishing from the Surface protocol's open back-pressure question: there, a dropped
+`Release` is unrecoverable, because nothing tells the client its buffer is free again. Input is
+recoverable because `SYN_DROPPED` tells the consumer exactly what to do. Same-shaped problem,
+different answer, and the difference is whether the protocol can express "you missed
+something".
+
+**`Input` is `0x0Axx` — and allocating it uncovered a collision that had already shipped.**
+`librsproto`'s `OP_TTY_*` constants occupy `0x0900`–`0x0905`, one-for-one with `Surface`'s
+`0x0900`–`0x0904`: `OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` are both `0x0900`. The tty server
+took the range on 2026-08-03 without registering it in the wire-format table; `Surface` was
+assigned the same range on 2026-08-05, by a registry that had no idea.
+
+It is harmless on the wire — a channel carries one category's ops, so the channel
+disambiguates — which is exactly why nobody noticed and why it would have kept not being
+noticed. The registry is the contract; the code contradicts it; and a tool decoding a message
+without knowing its sender cannot tell a `Commit` from a `SetMode`. Filed rather than fixed
+here, because it is off this slice's path, and flagged in the wire spec so the next person
+allocating a category sees it before repeating it.
+
+The general lesson is about the registry, not the tty: **a table that nothing enforces
+records intentions, not facts.** Two servers picked ranges three days apart and the document
+recorded only one of them. `abi-sync-check` exists for exactly this class of drift on
+constants that cross the kernel boundary; nothing plays that role for category allocation.

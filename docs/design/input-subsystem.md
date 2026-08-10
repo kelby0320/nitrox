@@ -117,6 +117,19 @@ click depending on how the server was descheduled. Stamping at the interrupt is 
 place the true order still exists. Double-click and key-repeat timing are a second use, and
 the reason the field is 8 bytes rather than a counter: they need real time, not sequence.
 
+**The order is per batch, not global — and this document originally claimed more than that.**
+Strict global ordering is unobtainable without waiting: to know that no *older* mouse event
+is still coming, the server would have to hold every keystroke until the mouse had spoken,
+which buys a guarantee nobody asked for at the cost of latency on every key. What the server
+actually does is drain both nodes on each wakeup and sort **that set** by `time_ns` before
+forwarding; already-forwarded events are never reordered.
+
+That is exactly right for the case merging exists for — a click and a keystroke that happen
+together are both buffered by the time the server wakes, so they sort correctly — and it is
+honestly weaker than "the server decides the order" implies. A consumer that needs a total
+order across a long window must sort for itself, which `time_ns` lets it do. Settled with the
+maintainer 2026-08-06; `docs/spec/rsproto-input-ops.md` states it normatively.
+
 The shape is deliberately Linux's `evdev`, numbering included. Twenty-five years across
 mice, tablets, touchscreens, accelerometers and game controllers without a layout break is
 the strongest available evidence, and matching the numbering means existing knowledge about

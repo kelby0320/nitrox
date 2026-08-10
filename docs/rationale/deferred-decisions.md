@@ -259,6 +259,17 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
+**The `Tty` rsproto category is unregistered and collides with `Surface`.** `OP_TTY_*`
+occupies `0x0900`–`0x0905`, one-for-one with `Surface`'s `0x0900`–`0x0904` — `OP_TTY_READ_LINE`
+and `OP_CREATE_WINDOW` are both `0x0900`. The tty server took the range on 2026-08-03 without
+registering it in `rsproto-wire-format.md`; `Surface` was assigned the same range on
+2026-08-05. Harmless on the wire (a channel only ever carries one category's ops, so the
+channel disambiguates) and therefore not urgent, but the registry is the contract and the code
+contradicts it. The fix is to move `Tty` to a free category and add its row — everything is
+pre-v0.1 and rebuilt together, so it costs a recompile, not a migration. Deferred only because
+it is off the path of the slice that found it (M3 Part B, allocating `Input` at `0x0Axx`).
+Raised 2026-08-06.
+
 **Input: key repeat.** Held keys do not repeat. The record format reserves `value == 2` for
 it (`docs/design/input-subsystem.md` §3), so no wire change is needed, but it wants a timer
 in `libinput` and a policy for delay/rate. Trigger: the first text field — M4's toolkit.
