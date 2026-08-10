@@ -218,6 +218,29 @@ static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0,
 };
+/// Spawn args for the `input-server` (display arm M3 Part B): one moved handle — the
+/// control channel — and a LOOKUP-only namespace handle through which it resolves
+/// `/dev/input/raw/*`. **No syscaps**: like every resource server, it does not hold
+/// `BIND_NAMESPACE`; init binds its endpoint on its behalf.
+///
+/// **It is the only process that should ever resolve the raw nodes.** They are bound in the
+/// root namespace and nowhere else, and no session namespace projects them — reading one
+/// unfiltered is a keylogger, and the binding is the whole of that boundary
+/// (`docs/design/input-subsystem.md` §5).
+static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/input-server
+    handle_count: 1,
+    move_mask: 1, // move handle 0 (the control endpoint) to the child
+    arg0: 0,
+    handles: [0; 4],
+    // `TRANSFER` is the one that is easy to omit and fails late: `Meta::Ready` carries the
+    // forwarding endpoint as a handle transfer, so without it the server comes up, opens
+    // both devices, and only then cannot announce itself.
+    rights: [RIGHT_SEND | RIGHT_RECV | RIGHT_TRANSFER | RIGHT_WAIT, 0, 0, 0],
+    namespace: 0,
+    syscaps: 0, // a resource server holds no ambient capabilities
+};
+
 /// Spawn args for the `compositor` (display arm M2 Part B): no handles, and it inherits a
 /// LOOKUP-only handle to init's root namespace so it resolves `/dev/framebuffer`.
 /// **No syscaps** — it binds nothing; init does the binding, as for every other resource
@@ -890,6 +913,62 @@ fn bind_tty_server(root_ns: u64) -> bool {
     kprint(b"init: tty server bound at /dev/tty\n");
     // init keeps `ls_h` (the long-lived server's process handle).
     let _ = ls_h;
+    true
+}
+
+/// Spawn the input server and bind its endpoint at `/dev/input/new`.
+///
+/// The Resource Server Startup Protocol, as everywhere: spawn with a control channel, wait
+/// for `Meta::Ready`, bind the forwarding endpoint it carries. The server never binds
+/// anything itself and holds no `BIND_NAMESPACE`.
+///
+/// Returns `false` on any failure, which is not fatal to the boot: a machine with no i8042
+/// has no raw nodes, the server exits saying so, and everything else comes up normally.
+fn bind_input_server(root_ns: u64) -> bool {
+    // SAFETY: CTRL0/CTRL1 are valid writable out-params.
+    let cr = unsafe {
+        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL0) as u64, (&raw mut CTRL1) as u64, 4, 0)
+    };
+    if cr != 0 {
+        return false;
+    }
+    let (ctrl_init, ctrl_srv) = unsafe { ((&raw const CTRL0).read(), (&raw const CTRL1).read()) };
+
+    // SAFETY: SPAWN_INPUT_SERVER is a valid writable arg block.
+    let h = unsafe {
+        SPAWN_INPUT_SERVER.handles[0] = ctrl_srv;
+        spawn_program(root_ns, b"/initramfs/sbin/input-server", &raw mut SPAWN_INPUT_SERVER)
+    };
+    if h < 0 {
+        kprint(b"init: input-server spawn FAIL\n");
+        // SAFETY: closing our own control endpoint (ctrl_srv moved to the child).
+        unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+        return false;
+    }
+
+    let endpoint = match wait_ready(ctrl_init) {
+        Some(e) => e,
+        None => {
+            kprint(b"init: input-server Ready timeout/invalid\n");
+            // SAFETY: done with the control channel either way.
+            unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+            return false;
+        }
+    };
+    // SAFETY: closing init's own control endpoint — the `PeerClosed` the server expects.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ctrl_init) };
+
+    // SAFETY: binding the server's forwarding endpoint at /dev/input/new.
+    let br =
+        unsafe { syscall4(SYS_NS_BIND, root_ns, b"/dev/input/new".as_ptr() as u64, 14, endpoint) };
+    // The binding takes its own reference, so init's handle goes either way.
+    // SAFETY: closing init's reference to the endpoint.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
+    if br != 0 {
+        kprint(b"init: input-server bind FAIL at /dev/input/new\n");
+        return false;
+    }
+    kprint(b"init: input-server bound at /dev/input/new\n");
     true
 }
 
@@ -1884,6 +1963,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // inline framebuffer demo that proved M1 Part B.
     if !bind_compositor(root_ns) {
         kprint(b"init: no compositor; /dev/draw unavailable\n");
+    }
+
+    // The input server, before any consumer: it holds the raw device nodes and serves the
+    // merged stream at `/dev/input/new`. Not fatal — a machine with no i8042 has no raw
+    // nodes, the server says so and exits, and everything else comes up normally.
+    if !bind_input_server(root_ns) {
+        kprint(b"init: no input server; /dev/input/new unavailable\n");
     }
 
     #[cfg(feature = "selftest")]

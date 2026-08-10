@@ -84,6 +84,12 @@ pub const OP_FILE_RENAME: u16 = 0x0605;
 /// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
 /// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
+/// `Input::Events` — a batch of `InputEvent` records from the `input-server` to a consumer.
+///
+/// Server→consumer, no reply. The body is a whole number of 16-byte records, and a batch
+/// never splits a `SYN` group. See `docs/spec/rsproto-input-ops.md`.
+pub const OP_INPUT_EVENTS: u16 = 0x0A00;
+
 // The `Tty` category is `0x0Bxx`. It occupied `0x09xx` from 2026-08-03 without registering
 // itself in `rsproto-wire-format.md`, and `Surface` was assigned that range on 2026-08-05 —
 // so five ops collided exactly (`OP_TTY_READ_LINE` and `OP_CREATE_WINDOW` were both

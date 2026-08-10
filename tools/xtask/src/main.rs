@@ -259,6 +259,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("nxsh", None)?;
     build_userspace_bin("profile-server", None)?;
     build_userspace_bin("tty-server", None)?;
+    // `input-server` — holds the raw device nodes and serves the merged stream. A
+    // lib + bin split like `tty-server`: the merge is host-tested, this builds the bin.
+    build_userspace_bin("input-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
     // session-mgr fires the self-test verdict, so it takes the build-mode feature
@@ -885,10 +888,16 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 /// nothing about whether an interrupt ever produced an event. Both are cases where every
 /// self-contained check passes and the thing still does not work.
 ///
-/// The guest (`input-testclient`) resolves both raw nodes, parks its reads, and prints
-/// `listening`. Only then does this inject — a key delivered before the read is parked sits
-/// unread in the ring, and one delivered before the lookup is dropped entirely, so injecting
-/// on a timer would make this flaky in exactly the way a test of a rare path must not be.
+/// Since M3 Part B this runs through the **whole path**: i8042 → driver ring → raw node →
+/// `input-server` → merge → consumer channel → guest. The client consumes `/dev/input/new`
+/// rather than the raw nodes, which it can no longer open — the driver is single-reader per
+/// device and the server holds both, which is the exclusivity the keylogging boundary rests
+/// on, demonstrated rather than asserted.
+///
+/// The guest resolves `/dev/input/new`, prints `listening`, and only then does this inject:
+/// an event produced before the consumer channel exists is one the server has nowhere to
+/// send, so injecting on a timer would make this flaky in exactly the way a test of a rare
+/// path must not be.
 fn cmd_check_input(accel: Accel) -> R<()> {
     preflight_accel(accel)?;
     cmd_image(BuildMode::TestHarness)?;
@@ -926,25 +935,23 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // is in the identity range the decoder relies on, and because a wrong `E0` or release
     // bit shows up as a different code rather than as silence.
     qmp.send_key("a", true)?;
-    session.expect("input-testclient: kbd kind=1 code=30 value=1")?;
+    session.expect("input-testclient: ev kind=1 code=30 value=1")?;
     qmp.send_key("a", false)?;
-    session.expect("input-testclient: kbd kind=1 code=30 value=0")?;
-    session.expect("input-testclient: keyboard ok")?;
+    session.expect("input-testclient: ev kind=1 code=30 value=0")?;
 
     // Motion, then a click. The mouse reports positive-Y as up and `REL_Y` is positive-down,
     // so a downward injection must come back **negated** — that inversion is a one-line
     // mistake no host test can catch, because the host has no PS/2 wire to be wrong about.
     qmp.send_motion(5, 3)?;
-    session.expect("input-testclient: mouse kind=2 code=0 value=5")?;
+    session.expect("input-testclient: ev kind=2 code=0 value=5")?;
     // `REL_Y` must come back **+3**, matching the injected downward motion. The PS/2 wire
     // reports positive-Y as *up*, so this only holds because the driver negates — and a
     // missing negation is a one-line error no host test can catch, because the host has no
     // PS/2 wire to be wrong about. This assertion is the only thing standing between an
     // inverted mouse and a green build.
-    session.expect("input-testclient: mouse kind=2 code=1 value=3")?;
+    session.expect("input-testclient: ev kind=2 code=1 value=3")?;
     qmp.send_button("left", true)?;
-    session.expect("input-testclient: mouse kind=1 code=272 value=1")?;
-    session.expect("input-testclient: mouse ok")?;
+    session.expect("input-testclient: ev kind=1 code=272 value=1")?;
 
     session.expect("input-testclient: PASSED")?;
     let _ = fs::remove_file(&qmp_sock);
@@ -3402,7 +3409,8 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     //
     // Everything else is read from the real filesystem through the store and a profile,
     // like any other program.
-    let mut programs = vec!["init", "fs-server-ext4", "eshell", "profile-server", "compositor"];
+    let mut programs =
+        vec!["init", "fs-server-ext4", "eshell", "profile-server", "compositor", "input-server"];
     // The integration smoke-test harness is embedded only in selftest/test-harness
     // builds (it is also only built then) — never in a release image.
     if mode.features().is_some() {

@@ -12173,3 +12173,43 @@ would have caught it instantly; nothing plays it for category allocation. The wi
 says the rule out loud ("add the row in the same change that picks the number") rather than
 leaving it implied by a table, because the failure was not a disagreement about ownership —
 it was one server never writing itself down.
+
+### M3 Part B complete — the merged stream reaches a consumer
+
+`cargo xtask check-input` now asserts **through the server**: i8042 → driver ring → raw node
+→ `input-server` → merge → consumer channel → guest. Every event the harness injects comes
+back decoded, including `REL_Y` still negated after two more hops.
+
+**The old test client stopped working, and that was the design.** It read `/dev/input/raw/0`
+directly; once the server holds both nodes, a second reader gets `WouldBlock` — the driver is
+single-reader per device. So the exclusivity the keylogging boundary rests on is now
+*demonstrated* rather than asserted: the client was rewritten to consume `/dev/input/new`,
+which is the only way anything but the server can see input.
+
+**Four bugs, each found by running rather than reading.**
+
+*The control endpoint went across with no rights.* `SPAWN_INPUT_SERVER` had `rights: [0; 4]`,
+so `Meta::Ready` could not transfer the forwarding endpoint. The failure is late and quiet —
+the server comes up, opens both devices, prints nothing wrong, and only then cannot announce
+itself. `TRANSFER` is the right that matters and the easiest to leave out, because the send
+that needs it is the last thing a server does.
+
+*The server matched the wrong resolve suffix.* It checked `suffix == b"new"`, copied from the
+compositor — but the compositor is bound at the **subtree** `/dev/draw`, so `/dev/draw/new`
+leaves `new` behind, while this server is bound at the **leaf** `/dev/input/new` and gets an
+empty suffix. The two lines look identical and mean different things. Binding a subtree at
+`/dev/input` instead would collide with the kernel's `/dev/input/raw`.
+
+*The client waited for a record count.* `EXPECTED_EVENTS = 10` was wrong (nine: the motion is
+`REL_X`, `REL_Y`, `SYN`) and wrong in kind — how many records an injection produces is the
+driver's business, so a count needs updating whenever packet framing changes. It waits for the
+button press now, the last thing injected: the event that *means* the sequence finished.
+
+*And the crate was not in the test suite.* Eleven library tests sat in the tree while
+`cargo xtask test` reported the old number, and the first draft of that commit message quoted
+the number the gate did not yet produce. Wired in and the message corrected.
+
+**The gate catches the server, not just the driver.** Verified by breaking it two ways —
+never forwarding a batch, and never harvesting the mouse's completions — each of which fails
+`check-input` while every host test stays green. That is the property Part A's gate had for
+the driver and Part B needed for the server.

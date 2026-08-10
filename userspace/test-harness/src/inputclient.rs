@@ -7,9 +7,15 @@
 //! tests. A bound server that never answers, and an armed driver that never delivers, read
 //! identically from the outside.
 //!
-//! So this reads `/dev/input/raw/0` and `/dev/input/raw/1` and prints what arrives. The host
-//! side (`cargo xtask check-input`) injects the keystrokes and clicks over QMP and checks
-//! the decoded events against what it sent.
+//! So this consumes `/dev/input/new` — the **merged** stream from the `input-server` — and
+//! prints what arrives. The host side (`cargo xtask check-input`) injects the keystrokes and
+//! clicks over QMP and checks the decoded events against what it sent, which exercises the
+//! whole path: i8042 → driver ring → raw node → server → merge → channel → here.
+//!
+//! It read the raw nodes directly until M3 Part B. It cannot any more, and that is the
+//! design working: the driver is single-reader per device and the server now holds both, so
+//! a second reader gets `WouldBlock`. Reading a raw node unfiltered is a keylogger, and the
+//! binding is the whole of that boundary (`input-subsystem.md` §5).
 //!
 //! ## Why it announces itself first
 //!
@@ -24,8 +30,8 @@
 
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::{
-    IO_OPCODE_READ, IoOp, RIGHT_MAP_READ, RIGHT_MAP_WRITE, RIGHT_READ, SYS_IO_SUBMIT,
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint, syscall2, syscall4,
+    RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
+    syscall4,
 };
 
 /// One page for the read buffer.
@@ -34,8 +40,16 @@ const PAGE: u64 = 4096;
 /// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
 /// have gone unnoticed until this gate happened to run (PR #178 review).
 const EVENT_LEN: usize = INPUT_EVENT_LEN;
-/// Events to request per read.
-const READ_EVENTS: u64 = 16;
+/// The last thing the harness injects, and therefore what "done" means here.
+///
+/// **A sentinel rather than a record count.** Counting was the first attempt and it was both
+/// wrong (nine records, not ten — the motion is `REL_X`, `REL_Y`, `SYN`) and brittle for a
+/// worse reason: how many records an injection produces is the driver's business, so a count
+/// would need updating whenever the mouse packet framing changed. Waiting for the event that
+/// *means* the sequence finished does not.
+const DONE_CODE: u16 = libkern::abi::BTN_LEFT;
+/// Offset of the rsproto payload inside an `IpcMsg`.
+const PAYLOAD_OFF: usize = 24;
 
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
@@ -148,70 +162,83 @@ impl Line {
     }
 }
 
-/// A read buffer plus the device it reads.
-struct Reader {
-    device: u64,
-    buf_h: u64,
-    buf_addr: u64,
+/// The consumer end of `/dev/input/new`, and the last batch received on it.
+struct Stream {
+    channel: u64,
+    msg: [u8; 4096],
+    handles: [u64; 8],
+    count: u64,
 }
 
-impl Reader {
-    fn open(root_ns: u64, path: &[u8]) -> Option<Self> {
-        let device = lookup(root_ns, path, RIGHT_READ)?;
-        // SAFETY: register-only syscall.
-        let buf_h = unsafe { syscall4(SYS_MEMORY_CREATE, PAGE, 0, 0, 0) };
-        if buf_h < 0 {
-            return None;
-        }
-        // SAFETY: a fresh MemoryObject handle with full MAP rights.
-        let buf_addr = unsafe {
-            syscall4(SYS_MEMORY_MAP, buf_h as u64, 0, PAGE, RIGHT_MAP_READ | RIGHT_MAP_WRITE)
-        };
-        if buf_addr < 0 {
-            return None;
-        }
-        Some(Self { device, buf_h: buf_h as u64, buf_addr: buf_addr as u64 })
+impl Stream {
+    /// Resolve `/dev/input/new`, which mints a per-consumer channel.
+    fn open(root_ns: u64) -> Option<Self> {
+        let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
+        Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0 })
     }
 
-    /// Submit one read and block for it. Returns the number of whole events delivered.
-    fn read_events(&self) -> Option<usize> {
-        let op = IoOp {
-            opcode: IO_OPCODE_READ,
-            flags: 0,
-            buffer: self.buf_h,
-            buf_offset: 0,
-            offset: 0,
-            length: READ_EVENTS * EVENT_LEN as u64,
-        };
-        // SAFETY: a char DeviceNode with READ, and a valid `IoOp`.
-        let po = unsafe { syscall2(SYS_IO_SUBMIT, self.device, (&op as *const IoOp) as u64) };
-        if po < 0 {
-            return None;
+    /// Block for one `Input::Events` message and print every record it carries.
+    ///
+    /// Returns whether the batch contained [`DONE_CODE`]'s press, or `None` if the channel
+    /// failed.
+    fn pump(&mut self) -> Option<bool> {
+        loop {
+            // SAFETY: waiting on this process's own channel handle.
+            let waited = unsafe {
+                WAIT_HANDLES[0] = self.channel;
+                syscall4(
+                    SYS_WAIT,
+                    (&raw const WAIT_HANDLES) as u64,
+                    1,
+                    (&raw mut WAIT_RESULTS) as u64,
+                    u64::MAX,
+                )
+            };
+            if waited != 1 {
+                return None;
+            }
+            // SAFETY: valid recv out-params on a live endpoint.
+            let rr = unsafe {
+                syscall4(
+                    SYS_CHANNEL_RECV,
+                    self.channel,
+                    (&raw mut self.msg) as u64,
+                    (&raw mut self.handles) as u64,
+                    (&raw mut self.count) as u64,
+                )
+            };
+            if rr == libkern::error::KError::WouldBlock.as_i32() as i64 {
+                continue; // woken with nothing to take
+            }
+            if rr != 0 {
+                return None;
+            }
+            let payload_len =
+                u32::from_le_bytes([self.msg[4], self.msg[5], self.msg[6], self.msg[7]]) as usize;
+            let req = &self.msg[PAYLOAD_OFF..PAYLOAD_OFF + payload_len.min(4096 - PAYLOAD_OFF)];
+            let Ok(m) = librsproto::decode(req) else { return None };
+            if m.op != librsproto::OP_INPUT_EVENTS {
+                continue;
+            }
+            let n = m.body.len() / EVENT_LEN;
+            let mut done = false;
+            for i in 0..n {
+                let Some(ev) = InputEvent::read(&m.body[i * EVENT_LEN..]) else { return None };
+                if ev.kind == libkern::abi::EV_KEY && ev.code == DONE_CODE && ev.value == 1 {
+                    done = true;
+                }
+                Line::new()
+                    .str(b"input-testclient: ev")
+                    .str(b" kind=")
+                    .u64(ev.kind as u64)
+                    .str(b" code=")
+                    .u64(ev.code as u64)
+                    .str(b" value=")
+                    .i32(ev.value)
+                    .emit();
+            }
+            return Some(done);
         }
-        let (status, n) = po_wait(po as u64);
-        if status != 0 {
-            return None;
-        }
-        Some(n as usize / EVENT_LEN)
-    }
-
-    /// Print event `i` from the buffer in the form the harness matches on.
-    fn print_event(&self, tag: &[u8], i: usize) {
-        let base = self.buf_addr + (i * EVENT_LEN) as u64;
-        // SAFETY: `base + EVENT_LEN` is within the mapped page (`i < READ_EVENTS`), and the
-        // driver writes whole records only.
-        let bytes = unsafe { core::slice::from_raw_parts(base as *const u8, EVENT_LEN) };
-        let Some(ev) = InputEvent::read(bytes) else { return };
-        let (kind, code, value) = (ev.kind, ev.code, ev.value);
-        Line::new()
-            .str(tag)
-            .str(b" kind=")
-            .u64(kind as u64)
-            .str(b" code=")
-            .u64(code as u64)
-            .str(b" value=")
-            .i32(value)
-            .emit();
     }
 }
 
@@ -223,44 +250,29 @@ impl Reader {
 pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"input-testclient: up\n");
 
-    let Some(kbd) = Reader::open(root_ns, b"/dev/input/raw/0") else {
-        kprint(b"input-testclient: /dev/input/raw/0 FAILED\n");
-        exit(1);
-    };
-    let Some(mouse) = Reader::open(root_ns, b"/dev/input/raw/1") else {
-        kprint(b"input-testclient: /dev/input/raw/1 FAILED\n");
+    let Some(mut stream) = Stream::open(root_ns) else {
+        kprint(b"input-testclient: /dev/input/new FAILED\n");
         exit(1);
     };
 
-    // The harness waits for this before injecting: a keystroke delivered before the read is
-    // parked would sit in the ring unread, and one delivered before the lookup would be
-    // dropped entirely.
+    // The harness waits for this before injecting: an event delivered before the consumer
+    // channel exists is one the server has nowhere to send.
     kprint(b"input-testclient: listening\n");
 
-    // Keyboard first. The harness sends one key down and up, so this expects two groups —
-    // each an `EV_KEY` followed by its `EV_SYN`.
-    for _ in 0..2 {
-        let Some(n) = kbd.read_events() else {
-            kprint(b"input-testclient: keyboard read FAILED\n");
-            exit(1);
-        };
-        for i in 0..n {
-            kbd.print_event(b"input-testclient: kbd", i);
+    // Pump until the button press arrives — the last injection. Message boundaries are
+    // timing, not protocol: the server batches whatever is ready, so how the nine records
+    // split across messages varies run to run and neither the client nor the harness should
+    // depend on it.
+    loop {
+        match stream.pump() {
+            Some(true) => break,
+            Some(false) => {}
+            None => {
+                kprint(b"input-testclient: stream FAILED\n");
+                exit(1);
+            }
         }
     }
-    kprint(b"input-testclient: keyboard ok\n");
-
-    // Then the mouse: a motion and a button, which arrive as their own `SYN` groups.
-    for _ in 0..2 {
-        let Some(n) = mouse.read_events() else {
-            kprint(b"input-testclient: mouse read FAILED\n");
-            exit(1);
-        };
-        for i in 0..n {
-            mouse.print_event(b"input-testclient: mouse", i);
-        }
-    }
-    kprint(b"input-testclient: mouse ok\n");
 
     kprint(b"input-testclient: PASSED\n");
     exit(0);
