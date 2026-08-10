@@ -283,8 +283,11 @@ nothing.
 
 - **Buffer release semantics** (§4) — the protocol shape is settled, the exact release
   signal is not. Trigger: the first client that double-buffers.
-- **Mouse events** (§5) — the keyboard side is specified; pointer events, coordinates and
-  button state are not. Trigger: the compositor needing to move a window.
+- ~~**Mouse events** (§5)~~ — **settled 2026-08-06**, earlier than the trigger expected. The
+  guess was that window movement would force it; what actually forced it was M3 Part C's
+  deliverable, a client receiving a click. `PointerEvent` carries window-local signed
+  coordinates, a held-button mask and a `kind` so scroll and touch are additive; see
+  `rsproto-surface-ops.md`.
 - **USB HID** (§5) — PS/2 is what QEMU gives us. Real hardware is later, and the key-event
   boundary is chosen so that the driver changes and nothing above it does.
 - **A font rasterizer, and with it the first external crate in userspace** (§6). Trigger:

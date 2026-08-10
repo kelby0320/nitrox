@@ -7,11 +7,15 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 2 Part A
 (`docs/planning/display-arm-plan.md`); the namespace surface completed in Part B.
-`CreateWindow`, `AttachBuffer`, `Commit`, `Release` and `DestroyWindow` are defined, and
+`CreateWindow`, `AttachBuffer`, `Commit`, `Release`, `DestroyWindow`, `KeyEvent` and
+`PointerEvent` are defined, and
 two paths resolve: `/dev/draw/new` for a session and `/dev/draw/<N>/info` for a window's
-metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Input
-events, thumbnail capture, window movement and port wiring are later milestones and will
-extend this category.
+metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
+capture, window movement and port wiring are later milestones and will extend this category.
+
+**`KeyEvent` and `PointerEvent` are specified but not yet sent** (M3 Part C, in progress):
+the records and their ops are defined here and in `librsproto`, and the compositor does not
+consume `/dev/input/new` yet. This line is the one to correct when it does.
 
 ## Where it sits
 
@@ -263,6 +267,61 @@ commit.
 ### `Release` (`0x0903`)
 
 Server → client, 8 bytes: `window`, `buffer`. Sent for the buffer that *left* the screen.
+
+### `KeyEvent` (`0x0905`) and `PointerEvent` (`0x0906`)
+
+**Server → client, on the window's session channel. No reply.** How input reaches a window;
+the compositor sends them, a client never does.
+
+**These are Surface-layer events, not device records.** The device layer
+([`rsproto-input-ops.md`](rsproto-input-ops.md)) carries `InputEvent` triples with a `SYN`
+state machine and no notion of modifiers. `libinput` runs that machine on the compositor's
+side, so a window receives something already usable. A client that had to accumulate `SYN`
+groups to learn a key was pressed would be reimplementing the compositor's job, badly and
+once per application.
+
+`KeyEvent`, 8 bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | `keycode` — an `EV_KEY` code, unchanged from the device layer |
+| 2 | 2 | `pressed` — non-zero if the key went down |
+| 4 | 2 | `modifiers` — `MOD_SHIFT`/`MOD_CTRL`/`MOD_ALT`/`MOD_META`, held **at this transition** |
+| 6 | 2 | reserved, zero |
+
+**Modifiers travel with the key**, which is the whole reason the boundary sits at key events
+rather than characters: a byte stream cannot express Shift-Enter, because `\n` is `\n`
+whatever was held down (`display-substrate.md` §5). Left and right modifiers are not
+distinguished — a client asking "was shift held" should not have to ask twice — and splitting
+them later is a new bit, not a layout change.
+
+`PointerEvent`, 16 bytes:
+
+| Offset | Size | Type | Field |
+|---|---|---|---|
+| 0 | 2 | `u16` | `kind` — `0` motion, `1` button, `2` enter, `3` leave |
+| 2 | 2 | `u16` | `button` — a `BTN_*` code on a button event, else zero |
+| 4 | 2 | `u16` | `buttons` — every button held: `BTN_LEFT`→bit 0, `RIGHT`→1, `MIDDLE`→2 |
+| 6 | 2 | `u16` | `flags` — `POINTER_PRESSED` (bit 0) on a press |
+| 8 | 4 | **`i32`** | `x` — window-local, **signed** |
+| 12 | 4 | **`i32`** | `y` — window-local, signed |
+
+**Coordinates are window-local**, so a client can use them without knowing where it sits on
+screen and they stay correct when the window moves — which a client is not told about and
+should not have to be. They are **signed** because a drag can leave a window: a client reading
+them unsigned sees the pointer teleport.
+
+**New interaction kinds are new `kind` values**, not new ops — scroll and touch fit without a
+wire change, which is the same reason the device layer's extensibility lives in its enums.
+
+### Which window receives them
+
+- **`KeyEvent` goes to the focused window.** Focus is the topmost window whose role takes it;
+  a `panel` never does, so clicking a clock cannot steal input from a terminal
+  (`display-substrate.md` §4a). Click-to-focus is not implemented — with one client there is
+  nothing to switch between — and is a later decision, not an omission.
+- **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus.
+  A window that is not focused still sees the click that is about to focus it.
 
 ### `DestroyWindow` (`0x0904`)
 
