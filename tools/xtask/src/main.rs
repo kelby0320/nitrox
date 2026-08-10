@@ -272,6 +272,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
     check_userspace_lib("libui")?;
+    check_userspace_lib("libinput")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -2078,6 +2079,17 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("tty-server")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+
+    // `libinput` — the `SYN` state machine, modifier tracking and the keymap. Pure, and the
+    // one place both ends of the protocol interpret input, so it is tested once.
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libinput")
         .arg("--lib")
         .arg("--target")
         .arg(&host)

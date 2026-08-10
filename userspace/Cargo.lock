@@ -102,6 +102,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "libinput"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
+]
+
+[[package]]
 name = "libkern"
 version = "0.1.0"
 

@@ -187,9 +187,11 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
             `KeyEvent`, because `display-substrate.md` §9 had parked pointer events with the
             trigger "the compositor needing to move a window". Part C's own deliverable — a
             click reaching a client — turned out to be the earlier trigger.
-      - [ ] **C2 — `libinput`.** The `SYN` state machine, modifier tracking, and
-            keycode→character. Pure and host-tested; it is what turns device triples into
-            something a window can use, on both sides of the protocol.
+      - [x] **C2 — `libinput`.** ✅ (2026-08-06) The `SYN` state machine, modifier tracking,
+            and keycode→character. Pure and host-tested (21 tests, seven breaks); it is what
+            turns device triples into something a window can use, on both sides of the
+            protocol. It deliberately does **not** track pointer position — deltas need a
+            screen to clamp against, which the compositor owns.
       - [ ] **C3 — the compositor consumes `/dev/input/new`.** Focus (topmost window whose
             role takes it), pointer hit-testing, and sending. This is the checkbox that also
             corrects `rsproto-surface-ops.md`'s Status line, which currently says the records
