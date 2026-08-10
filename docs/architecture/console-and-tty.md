@@ -59,7 +59,8 @@ otherwise absorb by accident.
   foreground pipeline has to be expressed with the notification queue and process handles. That
   is its own design, and it is *not* a prerequisite for the rest of the rich REPL.
 - **Key events.** Shift-Enter continuation needs to distinguish a modifier, which a serial byte
-  stream structurally cannot express. That waits on a real keyboard driver (the display + input
+  stream structurally cannot express. The keyboard driver now exists (`/dev/input/raw/0`, M3 Part A); what remains is routing
+  those events to a terminal, which is the display + input
   slice), not on this. The rich REPL therefore splits: history, reverse-search and completion
   need cooked lines and can land here; anything needing modifiers cannot.
 - **Terminal emulation.** ANSI parsing, scrollback, and a rendered grid belong to the
@@ -163,10 +164,11 @@ right behaviour anyway.
    they host-test; the terminal work stays in the binary half.
 
    Stage 3 is complete except completion, which is a separate piece needing the schema
-   work. What remains of §11's rich REPL past that needs the input slice (modifier keys) or
+   work. What remains of §11's rich REPL past that needs the rest of the input arm — the driver landed in M3 Part A, but modifier
+   state and routing are `libinput` and the compositor (M3 Part C) — or
    a process-group concept (job control).
 4. Later, independently: job control (needs a process-group concept), key events (needs the
-   input slice), terminal emulation (needs the compositor).
+   input arm above the driver), terminal emulation (needs the compositor).
 
 ## Stage 3 — line editing, history, and where they belong
 
@@ -259,7 +261,8 @@ Reverse-search follows once the redraw model exists; completion is a separate pi
 the schema work. Splitting them keeps the first landing small enough to verify.
 
 Not in stage 3, unchanged: job control, key events needing modifiers (`Shift-Enter` cannot
-be expressed as a serial escape sequence — that waits on a real keyboard driver), and
+be expressed as a serial escape sequence — the driver exists as of M3 Part A, but the
+events do not reach a terminal until the compositor routes them), and
 terminal emulation.
 
 ## Resolved (2026-08-03)

@@ -155,6 +155,40 @@ static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: SYSCAP_BIND_NAMESPACE,
 };
+/// Spawn args for `input-testclient` (display arm M3 Part A): no handles, inheriting a
+/// LOOKUP-only handle to init's root namespace so it resolves `/dev/input/raw/*`. **No
+/// syscaps** — authority over an input device is the namespace binding, nothing more, and
+/// that binding is the whole of the keylogging boundary.
+#[cfg(feature = "selftest")]
+static mut SPAWN_INPUTCLIENT: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /initramfs/sbin/input-testclient
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+    syscaps: 0,
+};
+
+/// Spawn `input-testclient`, which proves the i8042 actually delivers events.
+///
+/// Spawn-and-forget like the UI client: it exits on its own once the harness has injected,
+/// and init cannot usefully wait for a program whose completion depends on a host action.
+#[cfg(feature = "selftest")]
+fn run_input_testclient(root_ns: u64) {
+    // SAFETY: SPAWN_INPUTCLIENT is a valid writable arg block.
+    let h = unsafe {
+        spawn_program(root_ns, b"/initramfs/sbin/input-testclient", &raw mut SPAWN_INPUTCLIENT)
+    };
+    if h < 0 {
+        kprint(b"init: input-testclient spawn FAIL\n");
+        return;
+    }
+    // SAFETY: closing init's reference; `reap_loop` reaps it when it exits.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+}
+
 /// Spawn args for `ui-testclient` (display arm M2 Part D): no handles, inheriting a
 /// LOOKUP-only handle to init's root namespace so it resolves `/dev/draw/new`. **No
 /// syscaps** — authority over the display is the namespace binding, nothing more.
@@ -1859,6 +1893,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // `check-display` compares, so it runs last and leaves the scene on screen.
     #[cfg(feature = "selftest")]
     run_ui_testclient(root_ns);
+
+    // The input client reads `/dev/input/raw/*`, which the i8042 driver published at boot.
+    // It parks its reads and announces `listening`; `cargo xtask check-input` injects from
+    // the host once it sees that line.
+    #[cfg(feature = "selftest")]
+    run_input_testclient(root_ns);
 
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.

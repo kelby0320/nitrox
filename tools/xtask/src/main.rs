@@ -118,6 +118,7 @@ fn main() -> ExitCode {
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
         Some("check-display") => cmd_check_display(accel),
+        Some("check-input") => cmd_check_input(accel),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -242,7 +243,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.features().is_some() {
-        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest", "ui-testclient"], None)?;
+        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest", "ui-testclient", "input-testclient"], None)?;
     }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
@@ -876,6 +877,81 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     Ok(steps)
 }
 
+/// `cargo xtask check-input` — inject a keystroke and a click, and check they arrive.
+///
+/// The counterpart to `check-display`, and the answer to the same class of problem. A
+/// display gate exists because the guest staying consistent with itself proves nothing about
+/// the device binding; an input gate exists because a driver that reports `armed` proves
+/// nothing about whether an interrupt ever produced an event. Both are cases where every
+/// self-contained check passes and the thing still does not work.
+///
+/// The guest (`input-testclient`) resolves both raw nodes, parks its reads, and prints
+/// `listening`. Only then does this inject — a key delivered before the read is parked sits
+/// unread in the ring, and one delivered before the lookup is dropped entirely, so injecting
+/// on a timer would make this flaky in exactly the way a test of a rare path must not be.
+fn cmd_check_input(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::TestHarness)?;
+    let ovmf = locate_ovmf()?;
+    let qmp_sock = build_cache().join("check-input.qmp");
+    fs::create_dir_all(build_cache())?;
+    let _ = fs::remove_file(&qmp_sock);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    println!("xtask: input gate — booting and injecting…\n");
+    let mut session = Session::spawn(cmd)?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+
+    session.expect("input-testclient: listening")?;
+
+    // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it
+    // is in the identity range the decoder relies on, and because a wrong `E0` or release
+    // bit shows up as a different code rather than as silence.
+    qmp.send_key("a", true)?;
+    session.expect("input-testclient: kbd kind=1 code=30 value=1")?;
+    qmp.send_key("a", false)?;
+    session.expect("input-testclient: kbd kind=1 code=30 value=0")?;
+    session.expect("input-testclient: keyboard ok")?;
+
+    // Motion, then a click. The mouse reports positive-Y as up and `REL_Y` is positive-down,
+    // so a downward injection must come back **negated** — that inversion is a one-line
+    // mistake no host test can catch, because the host has no PS/2 wire to be wrong about.
+    qmp.send_motion(5, 3)?;
+    session.expect("input-testclient: mouse kind=2 code=0 value=5")?;
+    // `REL_Y` must come back **+3**, matching the injected downward motion. The PS/2 wire
+    // reports positive-Y as *up*, so this only holds because the driver negates — and a
+    // missing negation is a one-line error no host test can catch, because the host has no
+    // PS/2 wire to be wrong about. This assertion is the only thing standing between an
+    // inverted mouse and a green build.
+    session.expect("input-testclient: mouse kind=2 code=1 value=3")?;
+    qmp.send_button("left", true)?;
+    session.expect("input-testclient: mouse kind=1 code=272 value=1")?;
+    session.expect("input-testclient: mouse ok")?;
+
+    session.expect("input-testclient: PASSED")?;
+    let _ = fs::remove_file(&qmp_sock);
+    println!("\nxtask: input gate PASSED — an injected key and click reached userspace ✓");
+    Ok(())
+}
+
 /// `cargo xtask check-display` — prove the pixels actually reach the screen.
 ///
 /// **What a self-hash structurally cannot answer** (`docs/design/display-substrate.md`
@@ -1133,6 +1209,38 @@ impl Qmp {
             r#"{{"execute":"human-monitor-command","arguments":{{"command-line":"{escaped}"}}}}"#
         ))?;
         Ok(unescape_json_return(&reply))
+    }
+
+    /// Inject a key press or release by QEMU `qcode` name (`"a"`, `"shift"`, `"esc"`).
+    ///
+    /// Injection is what makes an input driver testable at all: without it nothing can type
+    /// at the guest, so the ISR, the event ring and the parked read are exercised only by a
+    /// human (`display-substrate.md` §8d).
+    fn send_key(&mut self, qcode: &str, down: bool) -> R<()> {
+        self.execute(&format!(
+            r#"{{"execute":"input-send-event","arguments":{{"events":[{{"type":"key",
+               "data":{{"down":{down},"key":{{"type":"qcode","data":"{qcode}"}}}}}}]}}}}"#
+        ))?;
+        Ok(())
+    }
+
+    /// Inject a pointer button press or release (`"left"`, `"right"`, `"middle"`).
+    fn send_button(&mut self, button: &str, down: bool) -> R<()> {
+        self.execute(&format!(
+            r#"{{"execute":"input-send-event","arguments":{{"events":[{{"type":"btn",
+               "data":{{"down":{down},"button":"{button}"}}}}]}}}}"#
+        ))?;
+        Ok(())
+    }
+
+    /// Inject relative pointer motion.
+    fn send_motion(&mut self, dx: i32, dy: i32) -> R<()> {
+        self.execute(&format!(
+            r#"{{"execute":"input-send-event","arguments":{{"events":[
+               {{"type":"rel","data":{{"axis":"x","value":{dx}}}}},
+               {{"type":"rel","data":{{"axis":"y","value":{dy}}}}}]}}}}"#
+        ))?;
+        Ok(())
     }
 
     /// Capture the guest's display to `path` as a binary PPM.
@@ -2062,6 +2170,8 @@ enum AbiShape {
     EnumVariant,
     /// `pub const NAME: Rights = Rights(1 << k);`
     RightsBit,
+    /// `pub const NAME: u16 = <int>;` — the input event classes and codes.
+    U16Const,
 }
 
 /// The ABI surfaces `userspace/libkern` mirrors by hand, and therefore the ones that can
@@ -2090,6 +2200,13 @@ const ABI_FAMILIES: &[AbiFamily] = &[
         kernel_file: "kernel/src/libkern/handle.rs",
         user_file: "userspace/libkern/src/handle.rs",
         shape: AbiShape::RightsBit,
+        one_sided: &[],
+    },
+    AbiFamily {
+        what: "input event classes and codes",
+        kernel_file: "kernel/src/libkern/input.rs",
+        user_file: "userspace/libkern/src/abi.rs",
+        shape: AbiShape::U16Const,
         one_sided: &[],
     },
     AbiFamily {
@@ -2141,6 +2258,33 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
                 if let Some(v) = parse_int(val) {
                     out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::U16Const => {
+                // pub const NAME: u16 = <int>;  (and the i32 `KEY_*` values alongside them)
+                let Some(rest) = t.strip_prefix("pub const ") else { continue };
+                let Some((name, tail)) = rest.split_once(':') else { continue };
+                let Some((ty, val)) = tail.split_once('=') else { continue };
+                if ty.trim() != "u16" && ty.trim() != "i32" {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.trim().to_string(), v);
+                }
+            }
+            AbiShape::EnumVariant => {
+                // Name = <int>,
+                let Some(body) = t.strip_suffix(',') else { continue };
+                let Some((name, val)) = body.split_once('=') else { continue };
+                let name = name.trim();
+                if name.is_empty()
+                    || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
+                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+                {
+                    continue;
+                }
+                if let Some(v) = parse_int(val) {
+                    out.insert(name.to_string(), v);
                 }
             }
             AbiShape::EnumVariant => {
@@ -3255,6 +3399,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
         programs.push("test-stage");
         programs.push("display-selftest");
         programs.push("ui-testclient");
+        programs.push("input-testclient");
     }
     let mut ino = 3u32;
     for name in programs {

@@ -40,8 +40,9 @@ resource-agnostic so future resource kinds (char devices, sockets) reuse them.
 - **Returns a negative `KError` synchronously**, with **no** PO created, for
   *argument*, *permission*, and *allocation* failures: a bad `resource` handle or
   one lacking the required right, a malformed `IoOp` (unknown opcode, reserved
-  flag set, misaligned `offset`/`length` for a block device), a `buffer` that is
-  not a `MemoryObject` or is too small for `buf_offset + length`, or PO/handle
+  flag set, misaligned `offset`/`length` for a block device, a `length` below one
+  record for a **record-stream** char device), a `buffer` that is not a
+  `MemoryObject` or is too small for `buf_offset + length`, or PO/handle
   exhaustion. *Device/medium* failures (the disk NAKs, a bad sector) are
   **operation** outcomes and are delivered through the PO, not synchronously —
   the same split the namespace lookup uses (`syscall-abi.md` § Namespace).
@@ -103,17 +104,43 @@ by compile-time `offset_of!`/`size_of` asserts on both the kernel
 
 - **Block** devices (disks, partitions) follow the rules above: `offset`/`length`
   are logical-block multiples, translated into an [`Irp`](#relationship-to-the-irp).
-- **Char/stream** devices (the **serial console**, `/dev/console`) accept a `Read`
-  only (input). The block-alignment rules **do not apply**: `offset` is ignored
-  (a stream has no addressable position), and `length` is the **maximum** bytes to
-  read — the PO completes with `result` = the bytes actually delivered (≥ 1, ≤
-  `length`), which arrive when the device's RX interrupt fires (or immediately, if
-  bytes are already buffered). The bytes land in `buffer` exactly as for a block
-  read. `Write` to a char device is `Unsupported` in Phase 2 (output stays on the
-  kernel log path; symmetric console write is deferred). The `buffer` is still a
-  `MemoryObject` with `MAP_WRITE`, and `buf_offset + length <= buffer.size()` still
-  holds. The completion is delivered through the same `PendingOperation`; no
-  device-specific syscall exists.
+- **Char/stream** devices accept a `Read` only (input). The block-alignment rules
+  **do not apply**: `offset` is ignored (a stream has no addressable position), and
+  `length` is the **maximum** bytes to read — the PO completes with `result` = the
+  bytes actually delivered (≥ 1, ≤ `length`), which arrive when the device's RX
+  interrupt fires (or immediately, if bytes are already buffered). The bytes land in
+  `buffer` exactly as for a block read. `Write` to a char device is `Unsupported` in
+  Phase 2 (output stays on the kernel log path; symmetric console write is deferred).
+  The `buffer` is still a `MemoryObject` with `MAP_WRITE`, and
+  `buf_offset + length <= buffer.size()` still holds. The completion is delivered
+  through the same `PendingOperation`; no device-specific syscall exists.
+
+  Today's char nodes are the serial console at `/dev/console` and the raw input
+  devices at `/dev/input/raw/<n>`.
+
+### Byte-stream and record-stream char devices
+
+Char devices come in two flavours, and the difference is visible to a caller:
+
+- **Byte streams** — `/dev/console`. Exactly as above: any `length ≥ 1` is legal and
+  any `result` in `1..=length` is a normal completion.
+- **Record streams** — `/dev/input/raw/<n>`, which carry fixed-size
+  [`InputEvent`](../design/input-subsystem.md) records. `length` is **floored to a
+  whole number of records**, and `result` is always a whole multiple of the record
+  size. A `length` smaller than one record is **rejected synchronously** with
+  `InvalidArgument` and creates no PO.
+
+  This is not the block devices' alignment rule wearing a different hat. A block
+  device rejects a misaligned request because the medium is addressed in blocks; a
+  record stream truncates because **a partial record is unrecoverable**: the record
+  carries no sync word, so a reader that received half of one would misinterpret
+  every byte after it (`input-subsystem.md` §3a). Splitting a *read* across records
+  is fine — the reader buffers the remainder — but never splitting a record is what
+  makes that true.
+
+  A caller that does not know which flavour it holds should pass a `length` that is a
+  multiple of the largest record it expects; a byte stream ignores the alignment and a
+  record stream honours it.
 
 ## IoOpcode
 

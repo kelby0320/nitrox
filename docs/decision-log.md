@@ -11891,3 +11891,207 @@ The general lesson: when a bug is rare, buy observation rather than samples. Soa
 like progress and tooling feels like a detour, and the arithmetic says otherwise — at a 6%
 rate, telling "fixed" from "lucky" costs 60 boots per experiment, while the instrument that
 answered it took about an hour and is now permanent.
+
+### M3 Part A, step 2 — the i8042 wired up, and a flake that was not mine
+
+The driver boots: `ps2: keyboard mouse armed (kbd vec0x33, aux vec0x34)`, with
+`/dev/input/raw/0` and `/dev/input/raw/1` bound in the root namespace.
+
+**Bring-up is polled, and the ordering is load-bearing rather than stylistic.**
+`arch::ps2::init` disables both ports, programs the config byte once, resets each device and
+consumes every response — all with interrupts masked — before `arm` routes anything. The
+reason is the `0xAA` collision: the byte a device sends to report a passed self-test is
+byte-identical to `0x2A | 0x80`, an ordinary **Left Shift release**. Nothing in the stream
+distinguishes them; only time does. Arming first would deliver a phantom Shift release on
+every boot, and the "fix" would be to special-case `0xAA` in the decoder — which swallows
+every real Left Shift release instead. Consuming the responses before a byte can reach the
+decoder is the only version that is not wrong somewhere.
+
+**One config byte, written once**, for the reason the #176 review gave: enabling the mouse is
+a read-modify-write of the byte carrying the keyboard's IRQ-1 enable.
+
+**The drain loop is bounded, unlike the console's.** `IrqSpinLock` masks interrupts, so an
+unbounded drain is an unbounded interrupts-off window — a device that streams without pause
+(a mouse left reporting after a bad reset, a stuck repeating key) would hold the CPU
+forever. `drivers/console.rs` has the same shape and gets away with it because a UART with
+nothing arriving stops immediately; a controller with two attached devices is not that.
+64 bytes per interrupt, and whatever remains raises the line again.
+
+**A hang appeared while wiring this up, and it was not mine** — 2 timeouts in 20 runs
+with the driver and 2 in 20 without it. It is the `SlabCache` deadlock fixed earlier on
+this branch; the control that established it was innocent is recorded there.
+
+
+### M3 Part A complete — and the hazard I had just fixed, introduced again
+
+**`cargo xtask check-input` injects a keystroke and a click over QMP and checks the decoded
+events reach userspace.** It is the input equivalent of the display gate and exists for the
+same reason: every self-contained check can pass while the thing does not work. `ps2:
+keyboard mouse armed` proves bring-up ran and nothing more — a headless boot generates no
+input interrupt, so the ISR, the event ring and the parked read had never executed. Part A
+was "armed" for two commits, which is exactly the shape of the compositor that was bound and
+never answered through three green CI jobs (PR #174).
+
+It passed first try, which is worth noting only because the interesting part is what it can
+catch. Verified by breaking three things no host test can see:
+
+| break | result |
+|---|---|
+| the mouse's `dy` negation removed | gate fails — `REL_Y` comes back inverted |
+| the scancode identity off by one | gate fails — `a` decodes as keycode 31 |
+| the ISR stops queueing its DPC | gate fails — the reader parks forever |
+
+The `REL_Y` assertion is the one that justifies the whole gate. The PS/2 wire reports
+positive-Y as *up* and `REL_Y` is positive-*down*, so the driver negates — and a missing
+negation is a one-line error that **no host test can catch**, because the host has no PS/2
+wire to be wrong about. An injected downward motion coming back as `+3` is the only evidence
+that inversion works end to end.
+
+### The fix I had just shipped, broken again in the same milestone
+
+Answering "when should we take the `console_intr_dpc` hazard?", the honest answer turned out
+to be "immediately, because Part A is a third instance". `ps2_intr_dpc` moved the parked
+read's `po`/`buffer` out and dropped them **in DPC context** — the same same-CPU allocator
+deadlock fixed for `io::block` one PR earlier, written by the person who had just fixed it,
+in a driver modelled on the console driver that still had it.
+
+That is the useful data point: the pattern reproduces because it is what the surrounding code
+does. Copying a working driver copies its bugs, and a rule in `CLAUDE.md` does not stop that —
+the console's own comment *argued* the pattern was safe ("refcount decrements only"), which is
+worse than silence.
+
+**The fix generalises better than the one before it: the DPC never takes ownership.** It
+signals through a borrowed `*const ()` and marks the entry `spent`; the `ParkedRead` stays
+owned by the driver until thread context removes it. No new global machinery, no capacity to
+size, no overflow policy — the refs keep the objects alive for free while they wait. Applied
+to both `ps2` and `console`, drained from `sched::reap_pending` (which `idle_body` calls) and
+from `submit_read` before parking a new read.
+
+That closes the `console_intr_dpc` deferral raised by the PR #177 review, and it retires the
+"needs a bounded parking home and an overflow policy" objection that made me file it rather
+than fix it — that objection was an artifact of assuming the DPC had to *own* the refs.
+
+### Doc-comment orphaning, instances nine and ten — and the sweep that found them
+
+Asked to double-check doc comments before raising the PR, and the answer was two more, both
+introduced by this branch:
+
+- **`SPAWN_INPUTCLIENT` in init** carried `ui-testclient`'s doc, which named the wrong
+  program *and* the wrong device path ("resolves `/dev/draw/new`" on a static whose whole
+  purpose is `/dev/input/raw/*`). `SPAWN_UICLIENT` was left with none.
+- **`cmd_check_input` in xtask** carried `cmd_check_display`'s entire nineteen-line doc, and
+  `cmd_check_display` was left with none at all.
+
+Both are the same mechanism as the previous eight: an item inserted *above* another takes the
+comment that belonged to it. Neither is catchable by `missing_docs`, because in both cases
+some item still has *a* doc — the compiler cannot know it is the wrong one.
+
+**A sweep that works, and one that does not.** The obvious heuristic — flag items whose doc
+never mentions them — produced 242 hits, nearly all false: plenty of good documentation
+describes what a thing *does* without repeating its name. The one that works reads the
+**diff**: an *added* item sitting under a doc block that is entirely unchanged context is the
+orphaning signature, because a genuinely new item arrives with a genuinely new comment. That
+found exactly the real cases and nothing else.
+
+Worth keeping as a habit rather than a tool for now — it is six lines of throwaway script and
+the failure it catches has appeared in ten of the last twelve commits that inserted an item
+above another. If it recurs after this, it is worth a `check-docs` sub-check.
+
+### The input gate's first failure was the gate, not the driver
+
+CI failed on `check-input` — the gate added in the same PR — while every other job passed.
+Locally it was **40% flaky under KVM** and had passed the several times I ran it under TCG,
+which is the whole reason it reached CI.
+
+The failure modes varied: sometimes the key press never appeared, sometimes the release. That
+variety was the clue that it was not a logic error. Instrumenting the ISR with counters and
+dumping the full transcript showed the driver was innocent — `rx_kbd=1 ev_kbd=1 dpc=1`, the
+byte arrived, the event was queued, the DPC ran — and the transcript showed why:
+
+```
+input-testclient: kbdtest-stage: setup message + stdin stream verified ok
+input-testclient: kbdtest-harness: worker faulted @ rip= kind=0x00000000004034350 ; terminating
+```
+
+**The client's line was being shredded by other processes' output.** It printed each event as
+six separate `kprint` calls — tag, `" kind="`, the number, `" code="`, and so on — and a
+single `kprint` is atomic (it takes the serial lock) while a *sequence* of them is not.
+Anything else booting could write between two of them, so the harness's exact-string `expect`
+matched a line that had never existed as a contiguous whole.
+
+Fixed by building each line in a buffer and emitting it with **one** call: 12/12 clean
+afterwards, from 6/10.
+
+Two things worth keeping. **The gate caught its own bug before the driver's**, which is the
+right order but not the flattering one — a gate that is flakier than the thing it guards
+teaches people to re-run CI. And **the PR description had already flagged the risk in the
+wrong terms**: it said the expects were "robust to reordering, brittle to formatting". The
+real exposure was not formatting, it was *interleaving*, which is a property of the shared
+console rather than of the client — and that is the version of the caveat that would have
+predicted this failure.
+
+`ui-testclient` prints its `info id=… WxH role=…` line the same multi-call way. Nothing
+`expect`s on it, so it costs only occasionally-garbled log output rather than a flaky gate —
+left as-is, and named here so this does not read as a completed sweep.
+
+### Review of PR #178 — a use-after-free introduced while fixing a deadlock
+
+The blocking finding is the one the PR explicitly asked a reviewer to check, and the answer
+was that it was wrong.
+
+**The DPC published the `ParkedRead` as reclaimable before it stopped using it.** Both
+drivers set `spent = true` under the lock, released the lock, and *then* used the borrowed
+`po`/`buffer` pointers for the copy and the completion. `spent` is exactly what authorises
+`reclaim_completed` to take the entry and drop the last references — so for the whole
+duration of the copy, another CPU running `reap_pending` could free the `MemoryObject` and
+the `PendingOperation` out from under the DPC.
+
+The SAFETY comment is where the reasoning failed, and it is worth quoting because it reads
+as sound: *"`buffer` is still pinned by the `ObjectRef` left in `dev.parked`, which only
+thread context removes."* True, and **insufficient**: a DPC runs with interrupts masked,
+which excludes thread context *on its own CPU*. The other three run concurrently, and both
+gates boot `-smp 4`. I reasoned about the CPU I was on and wrote a guarantee about the
+machine.
+
+**The fix removes the borrow rather than reordering it.** The DPC now `take()`s the entry —
+owning it outright, unreachable from any other CPU — does the copy and the completion, and
+publishes it into a separate `to_drop` slot as its *last* action. Exclusive ownership is a
+much easier thing to be right about than a window, and it still never drops.
+
+Reordering was tempting and does not work: whatever is done last is done while the entry is
+either still reclaimable (freeing the `PendingOperation` before `complete_pending_op`) or not
+yet reclaimable (leaving the woken client's `submit_read` to find it and fail). Ownership
+sidesteps the ordering question entirely.
+
+**A dead clause, and two vacuous attempts to test it.** The review showed
+`a_ring_owing_a_loss_is_not_empty` passing against an `is_empty` with its `lost` check
+deleted — the assertion held with 128 records still buffered, so it was true for correct and
+broken alike. Trying to fix it produced a *second* vacuous test, and then a third that also
+passed against a broken `push`. That was the signal: the state `len == 0 && lost > 0` is
+**unreachable** — `lost` only rises when the ring is full, and the same push refills it, so a
+drain always announces before it can empty. The clause was dead code, and three failed
+attempts to cover it are a better argument for deleting it than for writing a fourth. Now
+`is_empty` is `len == 0`, with a `debug_assert` and a test pinning the invariant that makes
+it safe — verified by a break that the earlier versions survived.
+
+**The kernel claimed a userspace ABI mirror that did not exist.** `input.rs` said
+`InputEvent` was "mirrored byte-for-byte in `userspace/libkern/src/abi.rs`"; there was no
+such type, `abi-sync-check` did not cover the file, and the only consumer hardcoded `16` and
+read fields at literal offsets. A swap of `code` and `value` would have passed every
+compile-time check on both sides. The mirror now exists, the 31 keycodes and the `EV_*`/
+`REL_*`/`BTN_*` constants are compared by `abi-sync-check` (a new `U16Const` shape), and the
+client reads through `InputEvent::read` instead of by offset. The checker earned its keep
+immediately by failing until every keycode was mirrored.
+
+**And a spec the change made false.** `io-operation.md` defines char reads as byte streams:
+`length` is a maximum, `result` is ≥ 1, alignment rules explicitly do not apply. The raw
+input nodes floor `length` to a whole record and reject anything smaller *synchronously* —
+so the spec now distinguishes **byte-stream** from **record-stream** char devices, and says
+why the latter truncates: not because the medium is addressed in records, but because a
+partial record is unrecoverable when the record carries no sync word.
+
+Four contract docs were updated for the new binding and the driver's existence
+(`boot-flow.md`'s closed list of nine, `overview.md`'s Tier 1 line, root `CLAUDE.md`'s
+"input … do not [exist]" sentence, and `console-and-tty.md`'s four "waits on a real keyboard
+driver" claims), plus `device-node.md`, whose "when they arrive" prediction about an indexed
+char registry has now arrived.

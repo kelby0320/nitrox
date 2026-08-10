@@ -50,6 +50,11 @@ pub enum KernelServerId {
     /// `/initramfs/<path>` — a file from the boot CPIO blob, served as a
     /// read-only [`MemoryObject`] copy (see [`initramfs_server`]).
     Initramfs,
+    /// `/dev/input/raw/<n>` — the `n`-th raw input device (a char
+    /// [`DeviceNode`](crate::object::DeviceNode)) published by the i8042 driver:
+    /// `0` is the keyboard, `1` the mouse. One binding owns the subtree; the suffix
+    /// indexes it, exactly as `/dev/blk` does. See [`raw_input_server`].
+    RawInput,
     /// `/dev/blk/<n>` — the `n`-th discovered block device, served as a
     /// [`DeviceNode`](crate::object::DeviceNode) handle (see [`block_device_server`]).
     /// One binding (at `/dev/blk`) owns the whole subtree; the suffix indexes the
@@ -113,6 +118,7 @@ pub fn dispatch(id: KernelServerId, suffix: &[u8], requested: Rights) -> OpStatu
         KernelServerId::ProcSelfStatus => proc_self_status(suffix, requested),
         KernelServerId::Initramfs => initramfs_server(suffix, requested),
         KernelServerId::BlockDevice => block_device_server(suffix, requested),
+        KernelServerId::RawInput => raw_input_server(suffix, requested),
         KernelServerId::Console => console_server(suffix, requested),
         KernelServerId::Log => log_server(suffix, requested),
         KernelServerId::Framebuffer => framebuffer_server(suffix, requested),
@@ -272,6 +278,28 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
     };
     match crate::device::find_block_device(index) {
         Some(node) => OpStatus::Completed(node),
+        None => OpStatus::Rejected(KError::NotFound),
+    }
+}
+
+/// `/dev/input/raw/<n>` — the `n`-th raw input device, as a char
+/// [`DeviceNode`](crate::object::DeviceNode) the caller reads with `sys_io_submit(Read)`.
+/// A non-numeric suffix, or an index no device answered for, is *not found*.
+///
+/// **This binding is the authority to read one device unfiltered**, and it is meant for the
+/// `input-server` alone (`docs/design/input-subsystem.md` §5). That exclusivity is a
+/// constraint on whoever binds it, not a property of this code — the same gap the PR #176
+/// review found in `tty-server`'s precedent, where `session-mgr` still projects
+/// `/dev/console` into every session.
+///
+/// `requested` is accepted to match the RS contract but ignored — the binding's rights cap
+/// what the caller obtains, applied by the lookup syscall.
+fn raw_input_server(suffix: &[u8], _requested: Rights) -> OpStatus {
+    let Some(index) = parse_index(suffix) else {
+        return OpStatus::Rejected(KError::NotFound);
+    };
+    match crate::drivers::ps2::device_ref(index) {
+        Some(obj) => OpStatus::Completed(obj),
         None => OpStatus::Rejected(KError::NotFound),
     }
 }

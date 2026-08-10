@@ -2972,6 +2972,10 @@ pub fn reap_pending() {
     // allocator, which must not happen in IRQ or DPC context. Done first so the frees
     // happen even if there is nothing else to reap.
     crate::io::block::reclaim_completed();
+    // The char drivers park their completed reads for the same reason and need the same
+    // thread-context drop (decision log, 2026-08-06).
+    crate::drivers::console::reclaim_completed();
+    crate::drivers::ps2::reclaim_completed();
     loop {
         let mut buf: [Option<ObjectRef>; REAP_RESERVE + DEFERRED_DROP_RESERVE] =
             [const { None }; REAP_RESERVE + DEFERRED_DROP_RESERVE];

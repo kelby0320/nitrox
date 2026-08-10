@@ -5,7 +5,7 @@
 complete, 2026-07-21). Every stage below is exercised on each CI run by
 `cargo xtask test-qemu` (headless, adjudicated by `isa-debug-exit`) and
 `cargo xtask test-interactive` (expect-driven over the serial console).
-Verified against source 2026-08-05.
+Verified against source 2026-08-06.
 
 ## Overview
 

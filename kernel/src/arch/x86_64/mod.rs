@@ -16,6 +16,7 @@ pub mod paging;
 pub mod qemu;
 pub mod registers;
 pub mod regs;
+pub mod ps2;
 pub mod rtc;
 pub mod serial;
 pub mod smp;
