@@ -5,7 +5,8 @@
 //! ramdisk here; AHCI in Part 3). [`dispatch_block_irp`] builds an [`Irp`] for a
 //! read/write, wraps it in an owning [`IrpBox`], arms its completion DPC, and
 //! hands it to the backend. The backend completes the IRP asynchronously; the
-//! completion DPC signals the request's `PendingOperation` and reclaims the box.
+//! completion DPC signals the request's `PendingOperation` and hands the box to thread
+//! context for reclamation — it must not free it itself (see [`irp_complete_dpc`]).
 //!
 //! See `docs/architecture/drivers-and-irps.md` and `docs/spec/irp-layout.md`.
 
@@ -231,9 +232,6 @@ pub fn dispatch_block_irp_into_frame(
     Ok(())
 }
 
-/// The IRP completion DPC: signal the request's `PendingOperation` with the
-/// IRP's terminal status (and bytes transferred), then reclaim the `IrpBox`
-/// (dropping its owning references). `ctx` is the `*mut IrpBox` (== `*mut Irp`).
 /// Boxes whose IRP has completed, waiting to be reclaimed in **thread** context.
 ///
 /// An `IrqSpinLock` because [`irp_complete_dpc`] pushes from the interrupt-dispatch tail:
@@ -255,6 +253,12 @@ unsafe impl Send for ReclaimHead {}
 ///
 /// Called from `sched::reap_pending`, which is already the home for deferred drops: thread
 /// context, no `SCHED` held, not IRQ context.
+///
+/// **What accumulates between drains is larger than it looks.** Each parked box pins its
+/// `_buffer` — an `ObjectRef` to the transfer's `MemoryObject` — so a machine that never
+/// reaches a drain point holds every completed transfer's buffer object, not merely
+/// `size_of::<IrpBox>()` per completion. Bounded by "completions since the last
+/// `reap_pending`", which `idle_body` keeps small in practice (PR #177 review, finding 7).
 pub fn reclaim_completed() {
     // Take the whole list in one swap, then drop outside the lock — a drop reaches the
     // allocator, and holding an IRQ-masking lock across it would reintroduce a smaller
@@ -275,6 +279,9 @@ pub fn reclaim_completed() {
     }
 }
 
+/// The IRP completion DPC: signal the request's `PendingOperation` with the IRP's terminal
+/// status (and bytes transferred), then **hand the `IrpBox` to [`reclaim_completed`]** —
+/// it does not drop the box, and must not. `ctx` is the `*mut IrpBox` (== `*mut Irp`).
 fn irp_complete_dpc(ctx: *mut ()) {
     let bx_ptr = ctx as *mut IrpBox;
     // SAFETY: `ctx` is the box pointer armed in `dispatch_block_irp`; the box is

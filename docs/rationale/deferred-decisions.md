@@ -259,6 +259,16 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
+**The console input DPC still frees in DPC context.** `console_intr_dpc` drops the parked
+read's `po`/`buffer` `ObjectRef`s, and if the submitting process has exited those can be the
+last references — so `dispatch_destroy` → `SlabCache::free` runs in DPC context, which is the
+deadlock fixed for `io::block` on 2026-08-06. It does not fire in CI (headless boots send no
+serial input) and needs a real remedy rather than a quick one: the IRP box could carry an
+intrusive link, but `ObjectRef`s cannot, so they need a bounded parking home and a policy for
+overflowing it — and "drop it anyway" is the bug. Trigger: the first interactive-console hang,
+or any work that gives deferred drops an unbounded home. Raised by the PR #177 review,
+2026-08-06.
+
 **Input: key repeat.** Held keys do not repeat. The record format reserves `value == 2` for
 it (`docs/design/input-subsystem.md` §3), so no wire change is needed, but it wants a timer
 in `libinput` and a policy for delay/rate. Trigger: the first text field — M4's toolkit.

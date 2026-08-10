@@ -1284,6 +1284,10 @@ fn demangle(name: &str) -> String {
 }
 
 /// Name the function containing `addr`, if any.
+///
+/// Several symbols can share one address — aliased generic instantiations, say — and this
+/// returns an arbitrary one of the group. Read a resolved name as "this address is in this
+/// function's code", not as a unique identification.
 fn resolve_symbol(syms: &[ElfSym], addr: u64) -> Option<String> {
     let i = syms.partition_point(|s| s.addr <= addr).checked_sub(1)?;
     let s = &syms[i];
@@ -1615,6 +1619,29 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
     });
 
+    // **stderr gets its own drainer.** Piping it and never reading it loses exactly the
+    // messages you need when a run fails for a *host* reason — an unavailable accelerator, a
+    // bad image path, an option this QEMU does not know — leaving only
+    // "FAILED (qemu exit 1)". Worse, an undrained pipe blocks QEMU once it fills, which
+    // presents as a guest hang at the deadline: the precise misdiagnosis the rest of this
+    // change exists to prevent (PR #177 review, finding 1).
+    let stderr = child.stderr.take().ok_or("qemu stderr")?;
+    let errs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+    let esink = errs.clone();
+    let ereader = std::thread::spawn(move || {
+        use std::io::Read as _;
+        let mut r = stderr;
+        let mut buf = [0u8; 4096];
+        while let Ok(n) = r.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            if let Ok(mut g) = esink.lock() {
+                g.extend_from_slice(&buf[..n]);
+            }
+        }
+    });
+
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(TIMEOUT_SECS as u64);
     let mut timed_out = false;
     let status = loop {
@@ -1637,11 +1664,17 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
     };
     let _ = reader.join();
+    let _ = ereader.join();
     let _ = fs::remove_file(&qmp_sock);
 
     // Echo the captured serial log so the operator sees the boot + self-test output.
     if let Ok(g) = captured.lock() {
         std::io::stdout().write_all(&g)?;
+    }
+    if let Ok(g) = errs.lock()
+        && !g.is_empty()
+    {
+        std::io::stderr().write_all(&g)?;
     }
 
     if timed_out {
@@ -3778,3 +3811,132 @@ LLVM version: 22.1.2
     }
 }
 
+#[cfg(test)]
+mod diag_tests {
+    use super::*;
+
+    #[test]
+    fn a_qmp_return_string_is_unescaped() {
+        assert_eq!(unescape_json_return(r#"{"return": "a\nb"}"#), "a\nb");
+        assert_eq!(unescape_json_return(r#"{"return": "he said \"hi\""}"#), "he said \"hi\"");
+        assert_eq!(unescape_json_return(r#"{"return": "C:\\x"}"#), "C:\\x");
+        assert_eq!(unescape_json_return(r#"{"return": ""}"#), "", "an empty monitor reply");
+    }
+
+    #[test]
+    fn a_reply_without_a_return_field_yields_nothing_rather_than_garbage() {
+        assert_eq!(unescape_json_return(r#"{"error": {"class": "GenericError"}}"#), "");
+        assert_eq!(unescape_json_return("not json at all"), "");
+    }
+
+    #[test]
+    fn demangling_recovers_a_rust_path() {
+        assert_eq!(
+            demangle("_ZN13nitrox_kernel5sched9idle_body17h08d8be4e35d6ac8aE"),
+            "nitrox_kernel::sched::idle_body"
+        );
+    }
+
+    #[test]
+    fn demangling_drops_the_llvm_suffix_and_the_hash() {
+        assert_eq!(
+            demangle("_ZN13nitrox_kernel7drivers4ahci12issue_locked17h0ddde3632e042bdcE.llvm.29"),
+            "nitrox_kernel::drivers::ahci::issue_locked"
+        );
+    }
+
+    #[test]
+    fn an_unmangled_or_v0_name_comes_back_unchanged() {
+        // The failure this guards: a future rustc switches the kernel to v0 mangling and
+        // `demangle` silently passes everything through, leaving the next hang dump full of
+        // `_RNvNt…`. Passing through is the right behaviour — printing *something* beats
+        // printing nothing — but it must be a decision, not an accident.
+        assert_eq!(demangle("memcpy"), "memcpy");
+        assert_eq!(demangle("_RNvNtCs1234_4core3fmt5write"), "_RNvNtCs1234_4core3fmt5write");
+        assert_eq!(demangle("_ZN"), "_ZN", "truncated: not the shape we expect");
+        assert_eq!(demangle("_ZNxyz"), "_ZNxyz", "no length prefix");
+    }
+
+    #[test]
+    fn a_symbol_is_resolved_only_inside_its_extent() {
+        let syms = vec![
+            ElfSym { addr: 0x1000, size: 0x40, name: "a".into() },
+            ElfSym { addr: 0x2000, size: 0, name: "b".into() },
+        ];
+        assert_eq!(resolve_symbol(&syms, 0x1000).as_deref(), Some("a+0x0"));
+        assert_eq!(resolve_symbol(&syms, 0x1020).as_deref(), Some("a+0x20"));
+        // Past `a`'s extent but before `b`: unknown, rather than attributed to `a`. A dump
+        // that names the wrong function is worse than one that admits it does not know.
+        assert_eq!(resolve_symbol(&syms, 0x1040), None);
+        assert_eq!(resolve_symbol(&syms, 0x0), None, "below everything");
+        // A zero-size symbol still names its entry point.
+        assert_eq!(resolve_symbol(&syms, 0x2000).as_deref(), Some("b+0x0"));
+        assert_eq!(resolve_symbol(&syms, 0x9999).as_deref(), Some("b+0x7999"));
+    }
+
+    /// A minimal ELF64 with one section header table, one `SHT_SYMTAB` and its strtab,
+    /// carrying two `STT_FUNC` symbols and one non-func that must be ignored.
+    fn tiny_elf() -> Vec<u8> {
+        const SHOFF: usize = 0x100;
+        const SHENT: usize = 64;
+        let strtab: &[u8] = b"\0alpha\0beta\0notafunc\0";
+        let stroff = 0x300usize;
+        let symoff = 0x200usize;
+        let mut b = vec![0u8; 0x400];
+        b[..4].copy_from_slice(b"\x7fELF");
+        b[4] = 2; // ELF64
+        b[0x28..0x30].copy_from_slice(&(SHOFF as u64).to_le_bytes());
+        b[0x3A..0x3C].copy_from_slice(&(SHENT as u16).to_le_bytes());
+        b[0x3C..0x3E].copy_from_slice(&2u16.to_le_bytes()); // two section headers
+
+        // Section 0: the symtab. Section 1: its string table.
+        let sh = SHOFF;
+        b[sh + 4..sh + 8].copy_from_slice(&2u32.to_le_bytes()); // SHT_SYMTAB
+        b[sh + 0x18..sh + 0x20].copy_from_slice(&(symoff as u64).to_le_bytes());
+        b[sh + 0x20..sh + 0x28].copy_from_slice(&(24u64 * 3).to_le_bytes());
+        b[sh + 0x28..sh + 0x2C].copy_from_slice(&1u32.to_le_bytes()); // sh_link -> strtab
+        let sh1 = SHOFF + SHENT;
+        b[sh1 + 4..sh1 + 8].copy_from_slice(&3u32.to_le_bytes()); // SHT_STRTAB
+        b[sh1 + 0x18..sh1 + 0x20].copy_from_slice(&(stroff as u64).to_le_bytes());
+
+        b[stroff..stroff + strtab.len()].copy_from_slice(strtab);
+
+        let mut put_sym = |i: usize, nameoff: u32, info: u8, addr: u64, size: u64| {
+            let e = symoff + i * 24;
+            b[e..e + 4].copy_from_slice(&nameoff.to_le_bytes());
+            b[e + 4] = info;
+            b[e + 8..e + 16].copy_from_slice(&addr.to_le_bytes());
+            b[e + 16..e + 24].copy_from_slice(&size.to_le_bytes());
+        };
+        put_sym(0, 1, 2, 0x2000, 0x10); // "alpha", STT_FUNC — deliberately out of order
+        put_sym(1, 7, 2, 0x1000, 0x20); // "beta",  STT_FUNC
+        put_sym(2, 12, 1, 0x3000, 0x8); // "notafunc", STT_OBJECT — must be skipped
+        b
+    }
+
+    #[test]
+    fn the_elf_walker_reads_func_symbols_sorted_and_skips_the_rest() {
+        let dir = std::env::temp_dir().join("nitrox-xtask-elf-test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("tiny.elf");
+        fs::write(&path, tiny_elf()).unwrap();
+        let syms = elf_function_symbols(&path).unwrap();
+        let names: Vec<&str> = syms.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["beta", "alpha"], "sorted by address, and only STT_FUNC");
+        assert_eq!(syms[0].addr, 0x1000);
+        assert_eq!(syms[1].size, 0x10);
+        // And the resolver agrees with the walker's ordering.
+        assert_eq!(resolve_symbol(&syms, 0x2008).as_deref(), Some("alpha+0x8"));
+        let _ = fs::remove_file(&path);
+    }
+
+    #[test]
+    fn a_non_elf_is_refused_rather_than_misparsed() {
+        let dir = std::env::temp_dir().join("nitrox-xtask-elf-test");
+        let _ = fs::create_dir_all(&dir);
+        let path = dir.join("not.elf");
+        fs::write(&path, b"#!/bin/sh\necho hi\n").unwrap();
+        assert!(elf_function_symbols(&path).is_err());
+        let _ = fs::remove_file(&path);
+    }
+}

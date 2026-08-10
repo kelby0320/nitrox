@@ -733,6 +733,12 @@ fn stub_start_fill(
 /// DPC: write the stub byte into the cache frame, mark the page `Ready`, complete
 /// the fill PO (waking the parked faulter), and free the box.
 fn stub_fill_dpc(ctx: *mut ()) {
+    // Dropping `bx` here releases two `ObjectRef`s in DPC context, which the block path
+    // stopped doing (decision log, 2026-08-06) because a last-reference drop reaches
+    // `SlabCache::free` and can deadlock against an allocator holder on the same CPU. It is
+    // safe *here* only because `Producer::Stub` is constructed solely from `#[cfg(test)]`
+    // code, so this never runs on a real boot. Noted so it does not read as a live
+    // counter-example to the rule (PR #177 review, finding 6).
     let bx_ptr = ctx as *mut StubFillBox;
     // SAFETY: `ctx` is the `StubFillBox` we placed in `stub_start_fill`; reclaim it.
     let bx = unsafe { KBox::from_raw(NonNull::new_unchecked(bx_ptr)) };

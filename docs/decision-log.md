@@ -11850,7 +11850,17 @@ The DPC signals the `PendingOperation` as before — allocation-free — then pu
 an **intrusive list threaded through the box itself**, and `sched::reap_pending` drops the
 list outside any lock. This is the remedy `kernel/CLAUDE.md` already names ("freeing counts
 as allocating … park refs in `sched`'s `deferred_drops`") and that `wake_entropy_seed_waiters`
-already applies to the entropy path; the IRP completion was the instance that was missed.
+already applies to the entropy path.
+
+**This is not a completed sweep, and the first draft of this entry implied it was.** The
+review found the same live hazard in `console_intr_dpc`, which drops the parked read's
+`po`/`buffer` refs — last references, if the submitting process has exited — and whose
+in-line justification ("refcount decrements only") is precisely the assumption that fails.
+It survives because headless CI sends no serial input, so it never fires there. Filed rather
+than fixed here: the IRP box could carry an intrusive link, but `ObjectRef`s cannot, so they
+need a bounded parking home and a policy for overflowing it — and the only thing available on
+overflow is to drop anyway, which is the bug. `file_object.rs`'s `stub_fill_dpc` is the same
+pattern and is safe only because `Producer::Stub` is `#[cfg(test)]`-only; it now says so.
 
 Intrusive rather than a fixed-capacity array on purpose: an array needs an overflow policy,
 and the only action available in DPC context is to drop in place — which is the bug. A link

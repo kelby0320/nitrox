@@ -43,6 +43,7 @@ below entirely (`KLOG`, the TLB-shootdown serialiser, `DEVICES`, `PARTITIONS`,
 | leaf | GPT partition table (`PARTITIONS`)           | live as of Phase 2; as `DEVICES` |
 | leaf | Console input buffer (`CONSOLE`, **`IrqSpinLock`**)| live as of Phase 2; filled from the COM1 receive IRQ |
 | leaf | AHCI pending ring (per-port, **`IrqSpinLock`**)| live as of Phase 2; IRQ-side completion bookkeeping |
+| leaf | Completed-IRP reclaim list (`RECLAIM`, **`IrqSpinLock`**)| live as of Phase 4 (2026-08-06). Pushed from `irp_complete_dpc` at the interrupt-dispatch tail and drained by `reap_pending` in thread context; both sides take it with nothing else held, and the drain releases it *before* dropping, because a drop reaches the allocator. It exists because freeing the box in the DPC deadlocked against a same-CPU allocator holder |
 
 **Why the leaves are the bottom of the order, not "held alone".** They take nothing
 while held, so ranking them last costs nothing and reads more simply than a separate
