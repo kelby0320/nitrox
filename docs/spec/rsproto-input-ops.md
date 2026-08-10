@@ -2,7 +2,9 @@
 
 The `Input` category (`op = 0x0Axx`) of the resource-server protocol
 ([rsproto-wire-format.md](rsproto-wire-format.md)). This is how merged input reaches a
-privileged consumer — today the compositor, later a hotkey daemon or a VT switcher.
+privileged consumer. **Today's only consumer is `input-testclient`**, in test-harness builds;
+the compositor becomes one in Milestone 3 Part C, when focus and routing land, and a hotkey
+daemon or VT switcher could later.
 
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 3 Part B
 (`docs/planning/display-arm-plan.md`). `Events` is defined; hotkey registration and device
@@ -20,7 +22,7 @@ every raw device node (`/dev/input/raw/<n>`, served by the kernel's i8042 driver
 | Path | Held by | What it authorises |
 |---|---|---|
 | `/dev/input/raw/<n>` | the `input-server`, alone | reading one device unfiltered |
-| `/dev/input/new` | the compositor | receiving merged input for the whole machine |
+| `/dev/input/new` | the compositor, once M3 Part C lands routing; `input-testclient` today | receiving merged input for the whole machine |
 | *(nothing)* | ordinary clients | input arrives only via their Surface session |
 
 That the raw nodes reach nothing but the server is a **constraint on the supervisor**, not a
@@ -64,7 +66,7 @@ All fields little-endian. The numbering is Linux's `evdev`, deliberately:
 
 | `kind` | Meaning | `code` | `value` |
 |---|---|---|---|
-| `0x00` `EV_SYN` | group separator | `0` `SYN_REPORT`, `3` `SYN_DROPPED` | records lost, for `SYN_DROPPED` |
+| `0x00` `EV_SYN` | group separator | `0` `SYN_REPORT`, `3` `SYN_DROPPED` | **whole records** lost, for `SYN_DROPPED` — the same unit whichever producer sent it |
 | `0x01` `EV_KEY` | key or button | a keycode, or `0x110+` for buttons | `0` release, `1` press, `2` repeat |
 | `0x02` `EV_REL` | relative axis | `0x00` `REL_X`, `0x01` `REL_Y`, `0x08` `REL_WHEEL` | signed delta |
 | `0x03` `EV_ABS` | absolute axis | reserved | device-space position |
@@ -111,8 +113,13 @@ Consumers that genuinely need a total order over a long window have `time_ns` an
 
 Channels are finite (four messages), and input is high-rate; a consumer that stops reading
 will eventually have nowhere to put the next batch. When a send would fail, the server
-discards the batch and sets a pending-loss flag; the next batch that *does* go out is
-preceded by an `EV_SYN`/`SYN_DROPPED` record.
+discards the batch and adds **its record count** to a running total; the next batch that
+*does* go out is preceded by an `EV_SYN`/`SYN_DROPPED` carrying that total.
+
+The unit is load-bearing: a consumer cannot tell which producer sent a given `SYN_DROPPED`,
+so the kernel's per-device ring and the server must count the same thing. Both count whole
+records. Counting batches here would have made one field mean two things and left a stalled
+consumer under-reporting by the batch size.
 
 That is the same contract the kernel's per-device ring uses (`input-subsystem.md` §3a), and
 it means input needs no separate back-pressure design: **discard plus announce** is already

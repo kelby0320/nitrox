@@ -12213,3 +12213,56 @@ the number the gate did not yet produce. Wired in and the message corrected.
 never forwarding a batch, and never harvesting the mouse's completions — each of which fails
 `check-input` while every host test stays green. That is the property Part A's gate had for
 the driver and Part B needed for the server.
+
+### Review of PR #179 — one record type, two producers, two units
+
+The blocking finding is a units mismatch that no compile-time check could see and that both
+sides documented differently.
+
+**`SYN_DROPPED.value` meant records in the kernel and batches in the server.** The kernel's
+per-device ring increments its loss counter once per discarded *record*; the server
+incremented once per discarded *batch*. The spec said records and claimed the two were "the
+same contract". A consumer stalling through three 20-record batches would have been told it
+missed **3**.
+
+Fixed by changing the code, not the wording. Rewording would have been quicker and would have
+left the field meaning two things depending on who sent it — and a consumer cannot tell: a
+`SYN_DROPPED` arriving on `/dev/input/new` may have originated in the kernel's ring and been
+forwarded, or been minted by the server. `record_loss` now takes the batch's record count.
+The spec says the unit is load-bearing and why.
+
+Worth noting what did *not* catch this. Both sides are `#[repr(C)]` with layout asserts, the
+constants are compared by `abi-sync-check`, and the record round-trips through
+`InputEvent::read`. Every mechanism the project has for ABI drift was in place and none of
+them is about *meaning* — the field was the right width, at the right offset, with the right
+name, carrying a different quantity.
+
+**A consumer that sent anything was silently unsubscribed.** The kernel signals an IPC
+endpoint when its receive queue is non-empty *or* its peer is gone; the reap branch treated
+both as gone. Nothing sends on a consumer channel today, which is precisely why the bug would
+have waited for the first thing that did — a Part C hotkey registration, a `QueryCaps`, a
+stray reply from a client library — and cut its input stream with no error to either side.
+Now it recvs: `PeerClosed` reaps, a message is drained and logged.
+
+**Two silent error paths now speak.** A failed `sys_io_submit` drops a device out of the wait
+set, and on a quiet machine nothing wakes the loop to re-arm it — a device that stops
+delivering, permanently, with no output. A failed `sys_wait` spins the loop at 100% in
+silence. Neither is reachable today as far as anyone can show; both are one `kprint` from
+diagnosable, which is the difference between an hour and a day when they do happen.
+
+**And `CLAUDE.md` still said the `input-server` does not exist.** That sentence is the one
+telling a fresh session not to read `design/` as reality, so leaving it stale is the specific
+failure it was written to prevent — and the previous slice updated the same sentence for the
+driver. Five docs were updated in this PR and that one was missed; it is a fair sign that
+"update the docs" is not a step but a checklist.
+
+The doc-comment orphaning pattern struck for the **eleventh** time: the new
+`OP_INPUT_EVENTS` inherited `OP_AUTHENTICATE`'s doc line (pre-existing in `main`, where it sat
+on `OP_TTY_READ_LINE`), so `cargo doc` rendered the wrong first sentence for a newly public
+constant. Both now have their own.
+
+Finally, the reviewer verified `po_completion`'s zero-deadline re-wait and noted the thing
+nothing had written down: it clobbers `WAIT_RESULTS[0..24]` while `serve_loop` is iterating
+that buffer, and is safe only because the inner wait passes `count = 1` and the outer loop has
+already consumed the record it is on. Correct, load-bearing, and now stated at the function —
+widening that call would corrupt the loop silently.

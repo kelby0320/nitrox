@@ -34,8 +34,6 @@ use libkern::{
     syscall4,
 };
 
-/// One page for the read buffer.
-const PAGE: u64 = 4096;
 /// Bytes per record, from the shared ABI rather than a local literal — an earlier version
 /// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
 /// have gone unnoticed until this gate happened to run (PR #178 review).

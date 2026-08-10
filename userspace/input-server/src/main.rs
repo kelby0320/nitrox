@@ -126,6 +126,11 @@ impl Device {
         let po = unsafe { syscall2(SYS_IO_SUBMIT, self.node, (&op as *const IoOp) as u64) };
         if po > 0 {
             self.po = po as u64;
+        } else {
+            // The device drops out of the wait set until something else wakes the loop, and
+            // on a quiet machine nothing may — so this is a device that stops delivering.
+            // Diagnosable rather than silent (PR #179 review, finding 8).
+            kprint(b"input-server: read submit FAILED -- device may stall\n");
         }
     }
 
@@ -142,6 +147,7 @@ impl Device {
         unsafe { syscall4(SYS_HANDLE_CLOSE, self.po, 0, 0, 0) };
         self.po = 0;
         if status != 0 {
+            kprint(b"input-server: read completed with an error; events lost\n");
             return 0;
         }
         let n = (result as usize / INPUT_EVENT_LEN).min(out.len());
@@ -193,8 +199,15 @@ fn wait_one(h: u64) {
 /// Read a completed `PendingOperation`'s `(status, result)` from the last wait's records.
 ///
 /// Re-waits with an immediate deadline rather than trusting a stale record: a PO that has
-/// completed is level-signalled, so this returns at once, and it keeps the completion read
-/// next to its use instead of threading the wait's output through every caller.
+/// completed is **level**-signalled and is never consumed by a wait (unlike an
+/// `InterruptObject`), so this returns at once.
+///
+/// **It clobbers `WAIT_RESULTS[0..24]`, and that is only safe because of a fact worth
+/// stating.** `serve_loop` is iterating that same buffer when it calls this. The inner wait
+/// passes `count = 1`, so the kernel writes exactly one record — and the outer loop has
+/// already read the record for the handle it is currently processing. Widening this call to
+/// wait on more than one handle would silently corrupt the loop's iteration (PR #179 review,
+/// which verified the current form and noted nothing said why it holds).
 fn po_completion(po: u64) -> (i32, u64) {
     // SAFETY: one waiter, valid buffers; a completed PO is already signalled.
     let n = unsafe {
@@ -411,7 +424,9 @@ fn forward(srv: &mut Server, batch: &[InputEvent], now_ns: u64) {
         }
         match srv.consumers[i].frame(batch, now_ns, &mut framed) {
             Some(n) if send_events(srv.channels[i], &framed[..n]) => {}
-            Some(_) | None => srv.consumers[i].record_loss(),
+            // The batch's own length, so the announcement counts *records* — the unit the
+            // kernel's ring uses and the one the spec publishes.
+            Some(_) | None => srv.consumers[i].record_loss(batch.len()),
         }
     }
 }
@@ -505,6 +520,10 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             )
         };
         if waited < 1 {
+            // With an infinite deadline a successful wait returns at least one record, so
+            // this is the error path — and retrying it silently spins the loop at 100% with
+            // nothing to show for it.
+            kprint(b"input-server: sys_wait FAILED\n");
             continue;
         }
 
@@ -533,11 +552,35 @@ fn serve_loop(serve_end: u64, srv: &mut Server) -> ! {
             } else if h == srv.devices[MOUSE].po {
                 mouse_n = srv.devices[MOUSE].harvest(&mut mouse_buf);
             } else if let Some(slot) = srv.channels.iter().position(|&c| c == h && c != 0) {
-                // A consumer channel signals only when its peer closes — consumers never
-                // send. Reap the slot so a departed consumer stops costing a wait entry.
-                // SAFETY: closing our end of a channel whose peer is gone.
-                unsafe { syscall4(SYS_HANDLE_CLOSE, srv.channels[slot], 0, 0, 0) };
-                srv.channels[slot] = 0;
+                // **A signal here means one of two things, and they must be told apart.**
+                // The kernel signals an endpoint when its receive queue is non-empty *or*
+                // its peer is gone. Treating both as "gone" — which this did first — cuts
+                // the input stream of any consumer that ever sends, with no error to either
+                // side: a Part C hotkey registration, a `Meta::QueryCaps`, or a stray reply
+                // from a client library would all silently unsubscribe it
+                // (PR #179 review, finding 4). Nothing sends today, which is exactly why the
+                // bug would have waited for the consumer that does.
+                //
+                // SAFETY: valid recv out-params on a live endpoint.
+                let rr = unsafe {
+                    syscall4(
+                        SYS_CHANNEL_RECV,
+                        srv.channels[slot],
+                        (&raw mut RECV_MSG) as u64,
+                        (&raw mut RECV_HANDLES) as u64,
+                        (&raw mut RECV_COUNT) as u64,
+                    )
+                };
+                if rr == KError::PeerClosed.as_i32() as i64 {
+                    // SAFETY: closing our end of a channel whose peer is gone.
+                    unsafe { syscall4(SYS_HANDLE_CLOSE, srv.channels[slot], 0, 0, 0) };
+                    srv.channels[slot] = 0;
+                } else if rr == 0 {
+                    // A message from a consumer. This category has no consumer→server op
+                    // yet, so drain and ignore rather than guess — but say so, because a
+                    // client sending into silence is worth one line in the log.
+                    kprint(b"input-server: ignoring an unexpected message from a consumer\n");
+                }
             }
         }
 

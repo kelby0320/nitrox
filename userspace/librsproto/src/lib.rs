@@ -83,7 +83,6 @@ pub const OP_FILE_RENAME: u16 = 0x0605;
 /// pages, to tell the server about a write it structurally could not have seen. See
 /// [`file::touch_request`] and `docs/architecture/filesystem-data-path.md`.
 pub const OP_FILE_TOUCH: u16 = 0x0606;
-/// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
 /// `Input::Events` — a batch of `InputEvent` records from the `input-server` to a consumer.
 ///
 /// Server→consumer, no reply. The body is a whole number of 16-byte records, and a batch
@@ -145,6 +144,7 @@ pub const OP_TTY_INTERRUPT: u16 = 0x0B05;
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;
 
+/// `Auth::Authenticate` — validate a `(username, password)` credential. See [`auth`].
 pub const OP_AUTHENTICATE: u16 = 0x0800;
 
 /// A decoding/validation failure.

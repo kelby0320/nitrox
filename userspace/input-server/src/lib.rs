@@ -92,13 +92,20 @@ fn group_at(events: &[InputEvent], from: usize) -> Option<(usize, usize)> {
 
 /// What a consumer is owed: the events to send, and whether a loss must be announced first.
 ///
-/// The server discards a batch it cannot deliver and records the fact here; the next batch
-/// that does go out is preceded by `SYN_DROPPED`. That is the same contract the kernel's
-/// per-device ring uses, and it is why input needs no back-pressure design — a consumer that
-/// falls behind degrades to one that resynchronises.
+/// The server discards a batch it cannot deliver and records how many events went; the next
+/// batch that does go out is preceded by `SYN_DROPPED` carrying that count. Same contract as
+/// the kernel's per-device ring, **including the unit**, which is why input needs no
+/// back-pressure design — a consumer that falls behind degrades to one that resynchronises,
+/// and does not need to know which producer told it so.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Consumer {
-    /// Batches discarded since the last successful send.
+    /// **Records** discarded since the last successful send — not batches.
+    ///
+    /// The unit matters and was wrong here first. `SYN_DROPPED.value` means "how many whole
+    /// records were discarded" wherever it comes from: the kernel's per-device ring counts
+    /// records, the spec says records, and a consumer cannot tell which producer sent a given
+    /// marker — so counting batches here would have made the same field mean two things and
+    /// left a stalled consumer under-reporting by the batch size (PR #179 review, blocking 1).
     lost: u32,
 }
 
@@ -108,9 +115,12 @@ impl Consumer {
         Self { lost: 0 }
     }
 
-    /// Record that a batch could not be delivered.
-    pub fn record_loss(&mut self) {
-        self.lost = self.lost.saturating_add(1);
+    /// Record that a batch of `records` events could not be delivered.
+    ///
+    /// Takes the count rather than incrementing by one, so the announcement is in the same
+    /// unit the kernel's ring uses.
+    pub fn record_loss(&mut self, records: usize) {
+        self.lost = self.lost.saturating_add(records as u32);
     }
 
     /// Whether a loss is waiting to be announced.
@@ -267,8 +277,11 @@ mod tests {
     #[test]
     fn a_loss_is_announced_before_the_next_batch_and_only_once() {
         let mut c = Consumer::new();
-        c.record_loss();
-        c.record_loss();
+        // Two discarded batches of 20 and 6 records: the marker must say 26, not 2. The unit
+        // is the kernel ring's — whole records — because a consumer cannot tell which
+        // producer sent a `SYN_DROPPED` and must not have to.
+        c.record_loss(20);
+        c.record_loss(6);
         assert!(c.owes_announcement());
 
         let batch = [key(30, 10), syn(10)];
@@ -277,7 +290,7 @@ mod tests {
         assert_eq!(n, 3);
         assert_eq!(out[0].kind, EV_SYN);
         assert_eq!(out[0].code, SYN_DROPPED, "the announcement leads, before any survivor");
-        assert_eq!(out[0].value, 2, "and carries how many batches went");
+        assert_eq!(out[0].value, 26, "records lost, not batches");
         assert_eq!(&out[1..n], &batch);
 
         // Cleared: the next batch is clean.
@@ -291,7 +304,7 @@ mod tests {
         // Sending half a batch would deliver a partial group, which is the one thing the
         // protocol promises never to do.
         let mut c = Consumer::new();
-        c.record_loss();
+        c.record_loss(2);
         let batch = [key(30, 10), syn(10)];
         let mut out = [InputEvent::default(); 2]; // room for the batch but not the marker
         assert_eq!(c.frame(&batch, 99, &mut out), None);
