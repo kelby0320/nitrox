@@ -34,9 +34,21 @@ use librsproto::surface::{MOD_ALT, MOD_CTRL, MOD_META, MOD_SHIFT};
 
 pub mod keymap;
 
-/// Logical events the largest single group can produce: three button changes, a motion, and
-/// a loss marker.
+/// Transitions one group may hold before further ones are dropped.
+///
+/// Three buttons, a motion and a loss marker is the largest plausible group; a device
+/// sending more than this in one `SYN` is malfunctioning, and dropping the surplus beats
+/// growing a buffer on its say-so.
 pub const MAX_LOGICAL: usize = 5;
+
+/// How large an `out` slice [`Interpreter::feed`] needs to lose nothing: **one more than
+/// [`MAX_LOGICAL`]**.
+///
+/// The accumulated motion is appended at flush time rather than queued, so a full group of
+/// transitions plus a motion is `MAX_LOGICAL + 1` events. A caller sizing its buffer to
+/// `MAX_LOGICAL` — as this crate's own tests did — silently loses the motion in exactly
+/// that case, which reads as a cursor that stops while keys are held.
+pub const MAX_PER_GROUP: usize = MAX_LOGICAL + 1;
 
 /// One interpreted event — what happened, with the state that was true when it happened.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -76,15 +88,22 @@ pub enum Logical {
     Dropped,
 }
 
-/// Which modifier bit a keycode carries, if any.
-fn modifier_bit(keycode: u16) -> Option<u16> {
-    match keycode {
-        KEY_LEFTSHIFT | KEY_RIGHTSHIFT => Some(MOD_SHIFT),
-        KEY_LEFTCTRL | KEY_RIGHTCTRL => Some(MOD_CTRL),
-        KEY_LEFTALT | KEY_RIGHTALT => Some(MOD_ALT),
-        KEY_LEFTMETA | KEY_RIGHTMETA => Some(MOD_META),
-        _ => None,
-    }
+/// Every modifier key, and the mask bit it contributes to. Order fixes each key's slot in
+/// [`Interpreter::held_mods`].
+const MOD_KEYS: [(u16, u16); 8] = [
+    (KEY_LEFTSHIFT, MOD_SHIFT),
+    (KEY_RIGHTSHIFT, MOD_SHIFT),
+    (KEY_LEFTCTRL, MOD_CTRL),
+    (KEY_RIGHTCTRL, MOD_CTRL),
+    (KEY_LEFTALT, MOD_ALT),
+    (KEY_RIGHTALT, MOD_ALT),
+    (KEY_LEFTMETA, MOD_META),
+    (KEY_RIGHTMETA, MOD_META),
+];
+
+/// Which slot in the held-keys set a keycode occupies, if it is a modifier.
+fn modifier_slot(keycode: u16) -> Option<usize> {
+    MOD_KEYS.iter().position(|&(k, _)| k == keycode)
 }
 
 /// Which bit of the held-button mask a `BTN_*` code occupies.
@@ -104,7 +123,14 @@ fn button_bit(code: u16) -> Option<u16> {
 /// **one** motion, not two.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Interpreter {
-    modifiers: u16,
+    /// Which modifier **keys** are down, one bit per entry of [`MOD_KEYS`].
+    ///
+    /// The mask handed to consumers is *derived* from this rather than edited in place. The
+    /// first version tracked the mask directly and cleared `MOD_SHIFT` when either shift
+    /// came up — so holding both and releasing one reported no shift while a key was still
+    /// down. Tracking the keys and deriving the mask is how X11 and Wayland avoid the same
+    /// bug with a single `ShiftMask` bit: **the shared bit was never the defect**.
+    held_mods: u8,
     buttons: u16,
     /// Motion accumulated within the current group.
     dx: i32,
@@ -118,7 +144,7 @@ impl Interpreter {
     /// An interpreter with nothing held.
     pub const fn new() -> Self {
         Self {
-            modifiers: 0,
+            held_mods: 0,
             buttons: 0,
             dx: 0,
             dy: 0,
@@ -127,9 +153,20 @@ impl Interpreter {
         }
     }
 
-    /// Modifiers currently held.
+    /// Modifiers currently held, derived from which modifier keys are down.
+    ///
+    /// Left and right share a bit deliberately — a client asking "was shift held" should not
+    /// have to ask twice, which is what X11's `ShiftMask` and Wayland's xkb mask also do.
+    /// The *keycodes* stay distinct, so a consumer that genuinely needs the side reads them;
+    /// adding `MOD_*_R` bits later is additive.
     pub fn modifiers(&self) -> u16 {
-        self.modifiers
+        let mut m = 0;
+        for (i, &(_, bit)) in MOD_KEYS.iter().enumerate() {
+            if self.held_mods & (1 << i) != 0 {
+                m |= bit;
+            }
+        }
+        m
     }
 
     /// Buttons currently held, as a mask.
@@ -143,17 +180,18 @@ impl Interpreter {
         match e.kind {
             EV_KEY => {
                 let pressed = e.value != 0;
-                if let Some(bit) = modifier_bit(e.code) {
+                if let Some(slot) = modifier_slot(e.code) {
                     // **State updates before the event is built**, so pressing shift reports
                     // `MOD_SHIFT` set. "Modifiers held at this transition" includes the
                     // transition itself; the alternative reports shift-down with no shift,
                     // which no consumer expects.
                     if pressed {
-                        self.modifiers |= bit;
+                        self.held_mods |= 1 << slot;
                     } else {
-                        self.modifiers &= !bit;
+                        self.held_mods &= !(1 << slot);
                     }
                 }
+                let modifiers = self.modifiers();
                 if let Some(bit) = button_bit(e.code) {
                     if pressed {
                         self.buttons |= bit;
@@ -164,14 +202,10 @@ impl Interpreter {
                         button: e.code,
                         pressed,
                         buttons: self.buttons,
-                        modifiers: self.modifiers,
+                        modifiers,
                     });
                 } else {
-                    self.push(Logical::Key {
-                        keycode: e.code,
-                        pressed,
-                        modifiers: self.modifiers,
-                    });
+                    self.push(Logical::Key { keycode: e.code, pressed, modifiers });
                 }
                 0
             }
@@ -186,7 +220,7 @@ impl Interpreter {
             EV_SYN if e.code == SYN_DROPPED => {
                 // Everything accumulated is now a guess. Reset and say so — a consumer that
                 // keeps its held-key set across a gap is the phantom-modifier bug.
-                self.modifiers = 0;
+                self.held_mods = 0;
                 self.buttons = 0;
                 self.dx = 0;
                 self.dy = 0;
@@ -257,8 +291,8 @@ mod tests {
     }
 
     /// Feed a whole group and collect what it produced.
-    fn group(i: &mut Interpreter, events: &[InputEvent]) -> ([Logical; MAX_LOGICAL], usize) {
-        let mut out = [Logical::Dropped; MAX_LOGICAL];
+    fn group(i: &mut Interpreter, events: &[InputEvent]) -> ([Logical; MAX_PER_GROUP], usize) {
+        let mut out = [Logical::Dropped; MAX_PER_GROUP];
         let mut n = 0;
         for &e in events {
             n = i.feed(e, &mut out);
@@ -271,7 +305,7 @@ mod tests {
         // The property the whole accumulator exists for: a `SYN` is what completes a logical
         // event, so acting on each record would double-report a diagonal move.
         let mut i = Interpreter::new();
-        let mut out = [Logical::Dropped; MAX_LOGICAL];
+        let mut out = [Logical::Dropped; MAX_PER_GROUP];
         assert_eq!(i.feed(key(KEY_ESC, true), &mut out), 0, "the key alone completes nothing");
         assert_eq!(i.feed(syn(), &mut out), 1, "the SYN does");
     }
@@ -318,20 +352,47 @@ mod tests {
     }
 
     #[test]
-    fn left_and_right_modifiers_share_a_bit_but_not_a_lifetime() {
-        // They are deliberately not distinguished — but releasing one must not clear the
-        // other's contribution to nothing while it is still held. This is the case that
-        // makes a naive `&= !bit` wrong, and records the current behaviour honestly.
+    fn releasing_one_shift_while_the_other_is_held_keeps_shift_set() {
+        // The bug a naive `mask &= !bit` has, and the reason the mask is *derived* from held
+        // keys rather than edited: with both shifts down, releasing one must not report that
+        // no shift is held while a key is still physically down. X11 and Wayland avoid this
+        // with a single `ShiftMask` too — the shared bit was never the defect.
         let mut i = Interpreter::new();
         group(&mut i, &[key(KEY_LEFTSHIFT, true), syn()]);
         group(&mut i, &[key(KEY_RIGHTSHIFT, true), syn()]);
         assert_eq!(i.modifiers(), MOD_SHIFT);
+
         group(&mut i, &[key(KEY_LEFTSHIFT, false), syn()]);
+        assert_eq!(i.modifiers(), MOD_SHIFT, "the right shift is still down");
+
+        let (out, _) = group(&mut i, &[key(30, true), syn()]);
         assert_eq!(
-            i.modifiers(),
-            0,
-            "known limitation: one bit cannot count two keys, so releasing either clears it"
+            out[0],
+            Logical::Key { keycode: 30, pressed: true, modifiers: MOD_SHIFT },
+            "so a key typed now is still shifted"
         );
+
+        group(&mut i, &[key(KEY_RIGHTSHIFT, false), syn()]);
+        assert_eq!(i.modifiers(), 0, "and only when both are up does it clear");
+    }
+
+    #[test]
+    fn the_sides_are_tracked_separately_across_every_modifier() {
+        // The same asymmetry for ctrl/alt/meta, since one shared slot per pair would pass
+        // the shift test above by luck.
+        for (l, r, bit) in [
+            (KEY_LEFTCTRL, KEY_RIGHTCTRL, MOD_CTRL),
+            (KEY_LEFTALT, KEY_RIGHTALT, MOD_ALT),
+            (KEY_LEFTMETA, KEY_RIGHTMETA, MOD_META),
+        ] {
+            let mut i = Interpreter::new();
+            group(&mut i, &[key(l, true), syn()]);
+            group(&mut i, &[key(r, true), syn()]);
+            group(&mut i, &[key(l, false), syn()]);
+            assert_eq!(i.modifiers(), bit, "{l} released, {r} still held");
+            group(&mut i, &[key(r, false), syn()]);
+            assert_eq!(i.modifiers(), 0);
+        }
     }
 
     #[test]
@@ -380,7 +441,8 @@ mod tests {
         assert_eq!(i.modifiers(), MOD_SHIFT);
         assert_eq!(i.buttons(), 1);
 
-        let mut out = [Logical::Key { keycode: 0, pressed: false, modifiers: 0 }; MAX_LOGICAL];
+        let mut out =
+            [Logical::Key { keycode: 0, pressed: false, modifiers: 0 }; MAX_PER_GROUP];
         assert_eq!(i.feed(dropped(), &mut out), 1);
         assert_eq!(out[0], Logical::Dropped);
         assert_eq!(i.modifiers(), 0, "held keys across a gap are a guess");
@@ -388,9 +450,47 @@ mod tests {
     }
 
     #[test]
+    fn a_full_group_plus_motion_needs_the_whole_max_per_group() {
+        // Motion is appended at flush rather than queued, so it does not compete with the
+        // transitions for `MAX_LOGICAL` slots — it needs the extra one. Sized at
+        // `MAX_LOGICAL` this loses the motion, and a cursor that freezes while three
+        // buttons are held is a maddening bug to find from the symptom.
+        let mut i = Interpreter::new();
+        let mut out = [Logical::Dropped; MAX_PER_GROUP];
+        for e in [
+            key(BTN_LEFT, true),
+            key(BTN_RIGHT, true),
+            key(BTN_MIDDLE, true),
+            key(KEY_LEFTSHIFT, true),
+            key(KEY_LEFTCTRL, true),
+            rel(REL_X, 7),
+        ] {
+            i.feed(e, &mut out);
+        }
+        let n = i.feed(syn(), &mut out);
+        assert_eq!(n, MAX_PER_GROUP, "five transitions and the motion");
+        assert_eq!(out[MAX_PER_GROUP - 1], Logical::Motion { dx: 7, dy: 0 });
+
+        let mut small = [Logical::Dropped; MAX_LOGICAL];
+        for e in [
+            key(BTN_LEFT, true),
+            key(BTN_RIGHT, true),
+            key(BTN_MIDDLE, true),
+            key(KEY_LEFTSHIFT, true),
+            key(KEY_LEFTCTRL, true),
+            rel(REL_X, 7),
+        ] {
+            i.feed(e, &mut small);
+        }
+        let n = i.feed(syn(), &mut small);
+        assert_eq!(n, MAX_LOGICAL, "and one short, the motion is what falls off the end");
+        assert!(!small.iter().any(|l| matches!(l, Logical::Motion { .. })));
+    }
+
+    #[test]
     fn a_partial_group_interrupted_by_a_drop_does_not_leak_into_the_next() {
         let mut i = Interpreter::new();
-        let mut out = [Logical::Dropped; MAX_LOGICAL];
+        let mut out = [Logical::Dropped; MAX_PER_GROUP];
         i.feed(key(30, true), &mut out); // no SYN yet
         i.feed(dropped(), &mut out);
         let (out2, n) = group(&mut i, &[key(31, true), syn()]);

@@ -177,7 +177,7 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
       together. It already compares
       exactly this kind of constant family across the kernel/userspace boundary; a numbering
       that drifts between the driver and the server is a silent misrouting, not a build error.
-- [ ] **Part C — the Surface-layer events, `libinput`, focus and routing.** Everything up to
+- [x] **Part C — the Surface-layer events, `libinput`, focus and routing.** ✅ (2026-08-10) Everything up to
       and including *the compositor sending an event*. The boundary with Part D is the
       channel: C ends when a `KeyEvent` goes out; D begins when a client receives one.
 
@@ -192,10 +192,19 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
             turns device triples into something a window can use, on both sides of the
             protocol. It deliberately does **not** track pointer position — deltas need a
             screen to clamp against, which the compositor owns.
-      - [ ] **C3 — the compositor consumes `/dev/input/new`.** Focus (topmost window whose
-            role takes it), pointer hit-testing, and sending. This is the checkbox that also
-            corrects `rsproto-surface-ops.md`'s Status line, which currently says the records
-            are "specified but not yet sent".
+      - [x] **C3 — the compositor consumes `/dev/input/new`.** ✅ (2026-08-10) Focus
+            (topmost window whose role takes it), pointer hit-testing, and sending, as a
+            pure `InputRouter` in the compositor's library half (16 host tests, ten breaks
+            verified) plus the loop wiring in the bin. Two things the plan did not name and
+            the work required: an **implicit grab** from a press to its release, without
+            which a drag that ends outside a window delivers a press with no release; and an
+            **init ordering change** — the input server now binds before the compositor is
+            spawned, because the compositor resolves `/dev/input/new` before answering
+            `Meta::Ready`. `rsproto-surface-ops.md`'s Status line is corrected.
+
+            `cargo xtask check-input` asserts the compositor is **attached**
+            (`compositor: input connected`). It cannot yet assert a key reached a window:
+            nothing holds a window at injection time. That is Part D's gate.
 
 - [ ] **Part D — a client receives it.** `libui` delivers input into a window's event queue,
       and a test client echoes what arrived: a keystroke and a click injected by the harness

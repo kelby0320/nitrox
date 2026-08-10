@@ -12299,3 +12299,49 @@ consulted only at the start of a slice is a sketch.** The same failure produced 
 box ticked while the server never answered, and the `Tty` category that took a range without
 a registry row. Checking the plan when the work *changes* — not only when it starts — is what
 would have caught all three.
+
+## 2026-08-10 — Input routing: a shared modifier bit is fine, deriving it from the last transition is not
+
+M3 Part C3 wired the compositor to `/dev/input/new`. Two decisions in it are worth the record.
+
+**Left and right modifiers keep sharing a bit.** The C2 write-up flagged as a "known
+limitation" that `MOD_SHIFT` cannot tell the two shifts apart, and asked whether splitting
+them — as most systems are assumed to — was better. Checking rather than assuming: the split
+is in the **keycodes**, not the mask. X11 has `Shift_L`/`Shift_R` keysyms and a single
+`ShiftMask`; Wayland passes xkb's combined mask; Windows has `VK_LSHIFT`/`VK_RSHIFT`
+alongside a combined `VK_SHIFT`. So the shared bit is the mainstream design, and `KeyEvent`
+already carries the distinct keycode for anyone who needs the side.
+
+**The actual defect was elsewhere, and the "limitation" framing hid it.** With both shifts
+held, releasing one cleared `MOD_SHIFT` while a key was still physically down. That is not a
+consequence of sharing a bit — X11 has one bit and no such bug — it is a consequence of
+*editing the mask on each transition* instead of deriving it from which modifier keys are
+held. `Interpreter` now tracks the eight modifier keys and computes the mask; the ABI is
+unchanged, and `rsproto-surface-ops.md` states the derivation as an obligation on senders,
+because clearing the bit per release is the obvious implementation and is wrong.
+
+The method lesson: **a limitation recorded in a passing test is a bug with good manners.**
+The test asserted the wrong behaviour with a comment explaining why it was acceptable, which
+is exactly how it survived a review round. What made it visible was being asked to justify
+the design against how other systems do it — and finding that the comparison did not support
+the design *or* the limitation.
+
+**Two things the plan did not name.** An *implicit grab*: every pointer event from a press to
+its release goes to the window the press landed on, even after the cursor leaves. Without it
+a drag ending outside the window delivers a press with no release and the client believes a
+button is held forever; it is also why `PointerEvent`'s coordinates are signed, since during
+a grab window-local x is routinely negative. And an *init ordering change*: the input server
+now binds before the compositor is spawned, because the compositor resolves `/dev/input/new`
+during startup, before it answers `Meta::Ready`. Spawned the other way round it served the
+display with no input for the life of the boot, with only a log line to say so.
+
+**Two tests that did not bite, and what they were worth.** Ten deliberate breaks were run
+against the router; eight failed a test, two passed. One was a real gap — a clamp test pushed
+the cursor *left* with `i32::MIN`, which cannot overflow, because the cursor is already
+clamped to `>= 0`; only rightward overflows, and the fixed test catches `wrapping_add`. The
+other was more useful: a break that took the implicit grab *after* the click-to-focus raise
+passed every test, and passed correctly — hit-testing picks the topmost window containing the
+point, and raising that window leaves it topmost there, so the order cannot matter. The code
+comment claiming it prevented a "stolen press" was describing a hazard that cannot occur, and
+now says so. **A break that does not bite is either a missing test or a wrong comment**; the
+value is in finding out which before assuming the first.

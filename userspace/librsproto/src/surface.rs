@@ -540,9 +540,14 @@ const _: () = assert!(core::mem::size_of::<KeyEvent>() == 8);
 
 /// Modifier bits carried by [`KeyEvent::modifiers`] and [`PointerEvent`]'s reports.
 ///
-/// Left and right are **not** distinguished: a client asking "was shift held" should not have
-/// to ask twice, and nothing yet needs to tell the two apart. Splitting them later is a new
-/// bit, not a layout change.
+/// Left and right share a bit, as X11's `ShiftMask` and Wayland's xkb mask also do: a client
+/// asking "was shift held" should not have to ask twice. What stays distinct is the
+/// **keycode** — `KEY_LEFTSHIFT` and `KEY_RIGHTSHIFT` arrive unchanged — so a consumer that
+/// genuinely needs the side reads that, and adding `MOD_*_R` bits later is additive.
+///
+/// A sender must derive these from *which modifier keys are down*, not by clearing the bit on
+/// each release: with both shifts held, releasing one has to leave `MOD_SHIFT` set. That is a
+/// tracking obligation, not a layout one — see `libinput`'s `Interpreter::held_mods`.
 pub const MOD_SHIFT: u16 = 1 << 0;
 /// Either control key.
 pub const MOD_CTRL: u16 = 1 << 1;

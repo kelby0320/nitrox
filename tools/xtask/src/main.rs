@@ -930,6 +930,16 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     let mut session = Session::spawn(cmd)?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
 
+    // The compositor is a consumer of the same merged stream — it resolves `/dev/input/new`
+    // during startup, which is why init binds the input server first. Asserted *before* the
+    // test client's `listening`, which is the ordering init fixes: the compositor is spawned
+    // and answers `Meta::Ready` well before the selftest client runs.
+    //
+    // This proves the compositor is **attached**, not that a key reached a window: with no
+    // client holding a window at injection time there is nothing to route to. That end of
+    // the chain is Part D's gate, which brings an echo client that stays alive.
+    session.expect("compositor: input connected")?;
+
     session.expect("input-testclient: listening")?;
 
     // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it

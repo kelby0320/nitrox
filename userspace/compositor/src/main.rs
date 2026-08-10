@@ -32,17 +32,20 @@
 
 extern crate alloc;
 
+use compositor::input::{InputRouter, Outbound};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
 use libdraw::format::Rgb;
 use libdraw::framebuffer::{Framebuffer, RawFramebuffer};
+use libinput::Interpreter;
+use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE,
     SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
-use librsproto::surface::{OP_ATTACH_BUFFER, OP_RELEASE};
+use librsproto::surface::{OP_ATTACH_BUFFER, OP_KEY_EVENT, OP_POINTER_EVENT, OP_RELEASE};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// `alloc` backing — the window stack and its buffer lists allocate.
@@ -59,8 +62,14 @@ const BACKGROUND: Rgb = Rgb::new(0x0E, 0x14, 0x1B);
 /// Largest Surface request body (`AttachBuffer`/`Commit` are 24 bytes).
 const MAX_BODY: usize = 64;
 
-/// One less than the wait limit: the forwarding endpoint takes the first slot.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
+/// Two less than the wait limit: the forwarding endpoint takes the first slot and the
+/// input-server consumer channel the second.
+///
+/// It is `- 2` rather than `- 1` because the wait set is built from *all* of them at once.
+/// Leaving it at `- 1` would overrun `WAIT_HANDLES` by exactly one entry on the boot where
+/// every session slot is in use and input connected — the rarest configuration, and the
+/// only one that would ever have shown it.
+const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
 
 /// How many client-driven rejections get logged **per session** before the tap closes.
 ///
@@ -70,6 +79,15 @@ const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 1;
 /// no later one is ever logged (PR #175 review, finding 6). A session's counter resets when
 /// the slot is reused, which is also when the client behind it is a different program.
 const MAX_LOGGED_REJECTIONS: u32 = 8;
+
+/// How many routed input events get logged before the tap closes.
+///
+/// Bounded for the same reason as [`MAX_LOGGED_REJECTIONS`], but more urgently: input is
+/// *continuous*. An unbounded line per event turns a moving mouse into an unbroken stream
+/// of serial output, which on this machine is a slow synchronous device — the compositor
+/// would spend its time printing rather than compositing, and the klog ring would carry
+/// nothing but cursor positions.
+const MAX_LOGGED_ROUTES: u32 = 8;
 
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
@@ -88,6 +106,8 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
     [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
+/// Routed input events logged so far — see [`MAX_LOGGED_ROUTES`].
+static mut ROUTES_LOGGED: u32 = 0;
 static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
     [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
@@ -129,6 +149,23 @@ struct Server {
     conns: [Connection; MAX_SESSIONS],
     /// Mapped client buffers, in attach order.
     buffers: alloc::vec::Vec<MappedBuffer>,
+    /// Device triples → logical events. Reset by a `SYN_DROPPED` the server forwards.
+    interp: Interpreter,
+    /// Cursor, crossing state and the implicit grab.
+    router: InputRouter,
+    /// The consumer channel from `/dev/input/new`, or 0 if input is unavailable.
+    input_ch: u64,
+}
+
+impl Server {
+    /// The session slot owning `window`, if any.
+    ///
+    /// A window's owner is the connection that created it, which is the only connection
+    /// allowed to name it — so this is a search of the same table `dispatch` authorises
+    /// against, not a second notion of ownership that could disagree with it.
+    fn session_of(&self, window: u32) -> Option<usize> {
+        (0..MAX_SESSIONS).find(|&i| self.conns[i].owns(window))
+    }
 }
 
 impl BufferSource for Server {
@@ -280,6 +317,210 @@ fn send_release(session: u64, window: u32, buffer: u32) -> bool {
         return false;
     };
     reply_on_session(session, OP_RELEASE, 0, &body[..n])
+}
+
+/// Send one `Surface::KeyEvent` or `Surface::PointerEvent` to a session.
+///
+/// Server-initiated like [`send_release`], so no request id. A failed send is dropped: the
+/// only sender-side failure is a full channel, and a client that is not draining its input
+/// is one whose *stale* events are worthless — blocking here would stop the compositor
+/// serving every other client on account of the one that stopped reading.
+fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
+    reply_on_session(session, op, 0, body)
+}
+
+/// A diagnostic line, built in one buffer and emitted with a **single** `kprint`.
+///
+/// `kprint` takes the serial lock, so one call is atomic — a *sequence* of them is not.
+/// Six calls per line is how `cargo xtask check-input`'s own output arrived shredded and
+/// its assertions failed 40% of the time against a guest that was working correctly.
+struct Line {
+    buf: [u8; 64],
+    len: usize,
+}
+
+impl Line {
+    /// An empty line.
+    fn new() -> Self {
+        Self { buf: [0; 64], len: 0 }
+    }
+
+    /// Append bytes, silently truncating at the buffer's end.
+    fn s(&mut self, b: &[u8]) -> &mut Self {
+        for &c in b {
+            if self.len < self.buf.len() {
+                self.buf[self.len] = c;
+                self.len += 1;
+            }
+        }
+        self
+    }
+
+    /// Append a signed decimal.
+    fn n(&mut self, mut v: i64) -> &mut Self {
+        if v < 0 {
+            self.s(b"-");
+            v = -v;
+        }
+        let mut digits = [0u8; 20];
+        let mut i = digits.len();
+        loop {
+            i -= 1;
+            digits[i] = b'0' + (v % 10) as u8;
+            v /= 10;
+            if v == 0 {
+                break;
+            }
+        }
+        self.s(&digits[i..])
+    }
+
+    /// Emit the line.
+    fn end(&mut self) {
+        self.s(b"\n");
+        kprint(&self.buf[..self.len]);
+    }
+}
+
+/// Log a routed record, up to [`MAX_LOGGED_ROUTES`] of them.
+fn log_route(rec: &Outbound) {
+    // SAFETY: single-threaded server; this counter is touched only from the serve loop.
+    let n = unsafe { ROUTES_LOGGED };
+    if n > MAX_LOGGED_ROUTES {
+        return;
+    }
+    // SAFETY: as above.
+    unsafe { ROUTES_LOGGED = n + 1 };
+    if n == MAX_LOGGED_ROUTES {
+        kprint(b"compositor: (further routed input not logged)\n");
+        return;
+    }
+    let mut l = Line::new();
+    match rec {
+        Outbound::Key { window, event } => {
+            l.s(b"compositor: key win=").n(*window as i64);
+            l.s(b" code=").n(event.keycode as i64);
+            l.s(b" down=").n(event.pressed as i64);
+        }
+        Outbound::Pointer { window, event } => {
+            l.s(b"compositor: ptr win=").n(*window as i64);
+            l.s(b" kind=").n(event.kind as i64);
+            l.s(b" x=").n(event.x as i64).s(b" y=").n(event.y as i64);
+        }
+    }
+    l.end();
+}
+
+/// Deliver everything the router produced.
+///
+/// Records addressed to a window whose session has already gone are dropped rather than
+/// broadcast: `session_of` returning `None` means the owner disconnected between the event
+/// arriving and this running.
+fn deliver(srv: &Server, out: &[Outbound]) {
+    for rec in out {
+        let Some(slot) = srv.session_of(rec.window()) else {
+            continue;
+        };
+        log_route(rec);
+        // SAFETY: reading our own slot table for a slot `session_of` just matched.
+        let ch = unsafe { SESSION_CH[slot] };
+        if ch == 0 {
+            continue;
+        }
+        match rec {
+            Outbound::Key { event, .. } => {
+                let mut body = [0u8; 8];
+                if event.write(&mut body).is_some() {
+                    send_input(ch, OP_KEY_EVENT, &body);
+                }
+            }
+            Outbound::Pointer { event, .. } => {
+                let mut body = [0u8; 16];
+                if event.write(&mut body).is_some() {
+                    send_input(ch, OP_POINTER_EVENT, &body);
+                }
+            }
+        }
+    }
+}
+
+/// Resolve `/dev/input/new` and return the consumer channel, or `None` if there is none.
+///
+/// Not fatal. A machine with no i8042 has no input server, and a compositor that refused to
+/// start without one would take the display down with it — the screen is still worth having.
+fn connect_input(root_ns: u64) -> Option<u64> {
+    use libkern::handle::{RawHandle, Rights};
+    use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
+
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run;
+    // `borrow` never closes it.
+    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+    // SAFETY: `/dev/input/new` resolves to a channel endpoint — the input server mints one
+    // consumer per resolve, exactly as `/dev/draw/new` mints one session.
+    let ch = block_on(unsafe {
+        ns.lookup::<Resource, Only>("/dev/input/new", Rights::RECV | Rights::WAIT)
+    })
+    .ok()?;
+    Some(ch.into_raw().0)
+}
+
+/// Drain one `Input::Events` batch and route it. Returns `false` if the channel died.
+fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+    // SAFETY: valid recv out-params (an events batch carries no transferred handles).
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            srv.input_ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        // Anything but `PeerClosed` is transient — a spurious signal with nothing queued —
+        // and retrying next time round is right. `PeerClosed` means the input server is
+        // gone and the handle must leave the wait set, or the loop spins on it forever.
+        return rr != KError::PeerClosed.as_i32() as i64;
+    }
+
+    let mut out = alloc::vec::Vec::new();
+    let mut restacked = false;
+    // SAFETY: bounded read of the payload the kernel just wrote.
+    unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let msg = core::slice::from_raw_parts(
+            (&raw const RECV_MSG[PAYLOAD_OFF]) as *const u8,
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        let Ok(m) = decode(msg) else {
+            return true;
+        };
+        if m.op != librsproto::OP_INPUT_EVENTS {
+            return true;
+        }
+        // A trailing partial record is dropped rather than guessed at. `chunks_exact`
+        // says so at the type level; `chunks` would hand `read` a short slice and get
+        // `None`, which reads as "malformed" for a batch that is merely truncated.
+        for raw in m.body.chunks_exact(INPUT_EVENT_LEN) {
+            let Some(ev) = InputEvent::read(raw) else {
+                continue;
+            };
+            let mut logical = [libinput::Logical::Dropped; libinput::MAX_PER_GROUP];
+            let n = srv.interp.feed(ev, &mut logical);
+            for l in &logical[..n] {
+                restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+            }
+        }
+    }
+
+    deliver(srv, &out);
+    if restacked {
+        // A click raised a window, so what is on screen no longer matches the stack.
+        let bounds = fb.geometry().bounds();
+        srv.stack.compose_into(fb, BACKGROUND, srv, &[bounds]);
+    }
+    true
 }
 
 /// What a forwarded resolve under `/dev/draw` is asking for.
@@ -716,6 +957,10 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
+            if srv.input_ch != 0 {
+                WAIT_HANDLES[n] = srv.input_ch;
+                n += 1;
+            }
             for i in 0..MAX_SESSIONS {
                 if SESSION_CH[i] != 0 {
                     WAIT_HANDLES[n] = SESSION_CH[i];
@@ -752,6 +997,16 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             };
             if h == serve_end {
                 serve_signalled = true;
+                continue;
+            }
+            if srv.input_ch != 0 && h == srv.input_ch && !serve_input(srv, &mut fb) {
+                // The input server died. Close the endpoint and carry on serving the
+                // display — the alternative is a compositor that exits because a mouse
+                // went away.
+                kprint(b"compositor: input server gone\n");
+                // SAFETY: closing an endpoint this process owns and stops using.
+                unsafe { syscall4(libkern::SYS_HANDLE_CLOSE, srv.input_ch, 0, 0, 0) };
+                srv.input_ch = 0;
                 continue;
             }
             // SAFETY: scanning our own slot table for the signalled endpoint.
@@ -845,7 +1100,19 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
         buffers: alloc::vec::Vec::new(),
+        interp: Interpreter::new(),
+        // The router clamps the cursor to the screen it was told about, so it has to be the
+        // screen this compositor actually acquired — not a constant that happens to match.
+        router: InputRouter::new(fb.geometry().bounds()),
+        input_ch: 0,
     };
+    match connect_input(root_ns) {
+        Some(ch) => {
+            srv.input_ch = ch;
+            kprint(b"compositor: input connected\n");
+        }
+        None => kprint(b"compositor: no /dev/input/new -- display only\n"),
+    }
 
     // Clear **before** announcing readiness, so `Meta::Ready` means "I have taken the
     // screen" rather than "I am about to".

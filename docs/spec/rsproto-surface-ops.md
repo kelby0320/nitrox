@@ -13,9 +13,13 @@ two paths resolve: `/dev/draw/new` for a session and `/dev/draw/<N>/info` for a 
 metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
 capture, window movement and port wiring are later milestones and will extend this category.
 
-**`KeyEvent` and `PointerEvent` are specified but not yet sent** (M3 Part C, in progress):
-the records and their ops are defined here and in `librsproto`, and the compositor does not
-consume `/dev/input/new` yet. This line is the one to correct when it does.
+**`KeyEvent` and `PointerEvent` are sent** as of M3 Part C3 (2026-08-10). The compositor
+consumes `/dev/input/new`, interprets the stream with `libinput`, and routes it:
+keys to the topmost window whose role takes focus, pointer events to the window under the
+cursor, with an implicit grab from a press to its release. What is **not** yet built is the
+receiving end — `libui` does not deliver these into a window's event queue, so no client
+reads one yet (M3 Part D). There is also no cursor drawn on screen: the compositor knows
+where the pointer is and nothing shows it.
 
 ## Where it sits
 
@@ -291,9 +295,14 @@ once per application.
 
 **Modifiers travel with the key**, which is the whole reason the boundary sits at key events
 rather than characters: a byte stream cannot express Shift-Enter, because `\n` is `\n`
-whatever was held down (`display-substrate.md` §5). Left and right modifiers are not
-distinguished — a client asking "was shift held" should not have to ask twice — and splitting
-them later is a new bit, not a layout change.
+whatever was held down (`display-substrate.md` §5).
+
+**Left and right share a bit**, as X11's `ShiftMask` and Wayland's xkb mask do — a client
+asking "was shift held" should not have to ask twice. The `keycode` stays distinct, so a
+consumer needing the side reads that; adding `MOD_*_R` bits later is additive. A sender must
+derive the mask from *which modifier keys are down*: with both shifts held, releasing one
+leaves `MOD_SHIFT` set. Clearing the bit per release is the obvious implementation and is
+wrong — a tracking obligation, not a layout one.
 
 `PointerEvent`, 16 bytes:
 
