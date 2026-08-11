@@ -98,6 +98,65 @@ pub enum StackError {
     DuplicateBuffer,
 }
 
+/// How long a key must be held before it starts repeating, in nanoseconds.
+///
+/// Policy with no configuration surface yet. Both constants are what a settings service will
+/// eventually own; until there is one, they are named here rather than spelled inline so the
+/// eventual move is a change of provenance.
+pub const REPEAT_DELAY_NS: u64 = 400_000_000;
+
+/// How long between repeats once they start, in nanoseconds.
+pub const REPEAT_INTERVAL_NS: u64 = 40_000_000;
+
+/// A key held down, and when it next repeats.
+///
+/// **Compositor-side rather than per-client**, because the compositor knows which window has
+/// focus and can therefore stop a repeat when focus moves, with no client involvement. The
+/// alternative is Wayland's — publish a rate and let every client run its own timer — which
+/// is better when clients disagree about what should repeat, a distinction nothing here makes
+/// yet, and costs every client a timer and a state machine
+/// ([`widget-toolkit.md`](../design/widget-toolkit.md) §9.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Repeat {
+    /// The keycode being repeated.
+    pub keycode: u16,
+    /// Modifiers held when it went down.
+    ///
+    /// Frozen at the press rather than re-read: a repeat is that press continuing, so
+    /// releasing shift mid-repeat must not turn `A` into `a` halfway through a run.
+    pub modifiers: u16,
+    /// The window it is going to.
+    pub window: u32,
+    /// When the next repeat is due.
+    pub next_at: u64,
+}
+
+impl Repeat {
+    /// Start repeating `keycode` for `window`, first repeat one delay from `now`.
+    pub fn armed(keycode: u16, modifiers: u16, window: u32, now: u64) -> Self {
+        Self { keycode, modifiers, window, next_at: now.saturating_add(REPEAT_DELAY_NS) }
+    }
+
+    /// Whether a repeat is due at `now`; advances to the next one if so.
+    ///
+    /// **Advances by adding an interval to the deadline, not to `now`.** Adding to `now`
+    /// makes every late wake-up push the next repeat further out, so a busy compositor
+    /// repeats slower and slower — and the tick that wakes this is 10 ms, so late is the
+    /// normal case rather than the exception.
+    pub fn due(&mut self, now: u64) -> bool {
+        if now < self.next_at {
+            return false;
+        }
+        self.next_at = self.next_at.saturating_add(REPEAT_INTERVAL_NS);
+        // A wake-up long after the deadline — a stalled compositor, or a debugger — must not
+        // then fire a burst catching up on repeats nobody asked for.
+        if self.next_at <= now {
+            self.next_at = now.saturating_add(REPEAT_INTERVAL_NS);
+        }
+        true
+    }
+}
+
 /// The `(lost, gained)` pair a focus change implies, or `None` if focus did not move.
 ///
 /// **The comparison is the whole point.** `focus_candidate` is recomputed after anything that
@@ -344,6 +403,53 @@ impl WindowStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_repeat_waits_the_delay_and_then_runs_at_the_interval() {
+        let mut r = Repeat::armed(30, 0, 1, 1_000);
+        assert!(!r.due(1_000), "not immediately");
+        assert!(!r.due(1_000 + REPEAT_DELAY_NS - 1), "not a nanosecond early");
+        assert!(r.due(1_000 + REPEAT_DELAY_NS), "and then it fires");
+        assert!(!r.due(1_000 + REPEAT_DELAY_NS), "once per deadline");
+        assert!(r.due(1_000 + REPEAT_DELAY_NS + REPEAT_INTERVAL_NS), "then at the interval");
+    }
+
+    #[test]
+    fn a_late_wakeup_does_not_slow_the_repeat_rate() {
+        // Advancing by `now + interval` rather than `deadline + interval` makes every late
+        // wake-up push the next repeat further out, so a busy compositor repeats slower and
+        // slower. The tick that wakes this is 10 ms, so late is the normal case.
+        let start = 1_000;
+        let mut r = Repeat::armed(30, 0, 1, start);
+        let first = start + REPEAT_DELAY_NS;
+        assert!(r.due(first + REPEAT_INTERVAL_NS / 2), "fired half an interval late");
+        assert_eq!(
+            r.next_at,
+            first + REPEAT_INTERVAL_NS,
+            "the next one is still on the original cadence, not shifted by the lateness"
+        );
+    }
+
+    #[test]
+    fn a_very_late_wakeup_does_not_fire_a_burst() {
+        // A stalled compositor coming back must not deliver every repeat it missed. One
+        // repeat, then back on cadence from now.
+        let mut r = Repeat::armed(30, 0, 1, 0);
+        let much_later = REPEAT_DELAY_NS + REPEAT_INTERVAL_NS * 1_000;
+        assert!(r.due(much_later));
+        assert!(!r.due(much_later), "and only one");
+        assert_eq!(r.next_at, much_later + REPEAT_INTERVAL_NS);
+    }
+
+    #[test]
+    fn modifiers_are_frozen_at_the_press() {
+        // A repeat is that press continuing. Re-reading modifiers would turn `A` into `a`
+        // halfway through a held run if the user let go of shift.
+        let r = Repeat::armed(30, 0x0001, 7, 0);
+        assert_eq!(r.modifiers, 0x0001);
+        assert_eq!(r.keycode, 30);
+        assert_eq!(r.window, 7);
+    }
 
     #[test]
     fn focus_transition_is_silent_when_focus_did_not_move() {

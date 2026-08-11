@@ -1020,6 +1020,11 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // widget rather than a window. Everything in that chain is unit-tested; this is the only
     // thing that says the pieces are wired to each other.
     session.expect("input-testclient: widget key code=48 down=1")?;
+    // **Held, not released**: the compositor repeats it. Asserted before the release,
+    // because a repeat that only arrived after the key came up would be a bug that a test
+    // ordering these the other way round could not see.
+    session.expect("input-testclient: win repeat code=48")?;
+
     qmp.send_key("b", false)?;
     session.expect("input-testclient: win key code=48 down=0")?;
 

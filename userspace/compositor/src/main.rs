@@ -195,6 +195,8 @@ struct Server {
     router: InputRouter,
     /// The consumer channel from `/dev/input/new`, or 0 if input is unavailable.
     input_ch: u64,
+    /// The key currently repeating, if one is held.
+    repeat: Option<compositor::Repeat>,
     /// The window last told it has the keyboard, if any.
     ///
     /// Kept so a focus change can be *detected* rather than re-announced: `focus_candidate`
@@ -452,6 +454,50 @@ fn deliver(srv: &mut Server, out: &[Outbound]) {
     }
 }
 
+/// Send a repeat if one is due.
+///
+/// Queued through the outbox like every other record, so it cannot be displaced by input and
+/// arrives in order with the press it continues.
+fn fire_repeat(srv: &mut Server) {
+    let now = now_ns();
+    let Some(mut r) = srv.repeat else { return };
+    // **The whole reason repeat is compositor-side**, and checked here rather than cleared
+    // at each focus-moving site: a key held while focus moves must not keep typing into the
+    // window that lost it, and no client can know that happened. Validating against the
+    // stack means a *new* way to move focus cannot forget to stop the repeat — the same
+    // reasoning as `Router::prune` asking the tree rather than being told.
+    //
+    // **Not covered end to end**, and the comment says so rather than implying otherwise:
+    // `check-input` never moves focus while a key is held, because doing so needs a second
+    // windowed client. Removing this check leaves the gate green. `Repeat`'s *timing* is
+    // host-tested; this predicate is not.
+    if srv.stack.focus_candidate() != Some(r.window) {
+        srv.repeat = None;
+        return;
+    }
+    if !r.due(now) {
+        return;
+    }
+    srv.repeat = Some(r);
+    // The window may have gone since the key went down — the client exited mid-keystroke —
+    // in which case the repeat is dropped and the state with it.
+    let Some(slot) = srv.session_of(r.window) else {
+        srv.repeat = None;
+        return;
+    };
+    let rec = Outbound::Key {
+        window: r.window,
+        event: KeyEvent {
+            keycode: r.keycode,
+            pressed: librsproto::surface::KEY_REPEAT,
+            modifiers: r.modifiers,
+            _pad: 0,
+        },
+    };
+    log_route(&rec);
+    enqueue(srv, slot, rec);
+}
+
 /// Tell the affected windows if focus moved since the last announcement.
 ///
 /// **Called after anything that could move it** — a window created, destroyed, raised, or a
@@ -613,6 +659,7 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
 
     let mut out = alloc::vec::Vec::new();
     let mut restacked = false;
+    let now = now_ns();
     // SAFETY: bounded read of the payload the kernel just wrote.
     unsafe {
         let payload_len =
@@ -638,6 +685,31 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
                 restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+                // Repeat follows the *physical* key, so it is armed from the interpreted
+                // transition rather than from what the router decided to do with it: a key
+                // that reached no window still stops repeating when it comes up.
+                if let libinput::Logical::Key { keycode, pressed, modifiers } = *l {
+                    match (pressed, srv.stack.focus_candidate()) {
+                        (true, Some(window)) => {
+                            srv.repeat =
+                                Some(compositor::Repeat::armed(keycode, modifiers, window, now));
+                        }
+                        // Only the held key's own release disarms. Releasing a *modifier*
+                        // mid-repeat must not stop the run — which is the same reason the
+                        // modifiers are frozen at the press.
+                        (false, _)
+                            if srv.repeat.is_some_and(|r| r.keycode == keycode) =>
+                        {
+                            srv.repeat = None;
+                        }
+                        _ => {}
+                    }
+                }
+                // A `SYN_DROPPED` means the held-key set is a guess, so a repeat started
+                // from it is too — `libinput` has already reset what it accumulated.
+                if matches!(l, libinput::Logical::Dropped) {
+                    srv.repeat = None;
+                }
             }
         }
     }
@@ -1114,10 +1186,17 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                     n += 1;
                 }
             }
-            // Bounded **only** while something is parked, so an idle compositor still
-            // sleeps indefinitely and a busy one retries at the tick.
-            let deadline =
-                if parked { now_ns().saturating_add(RETRY_INTERVAL_NS) } else { u64::MAX };
+            // Bounded while something is parked **or** a key is repeating — the two
+            // deadline sources, whichever is sooner. An idle compositor with nothing held
+            // still sleeps indefinitely, which is what keeps this from becoming a poll.
+            let now = now_ns();
+            let mut deadline = u64::MAX;
+            if parked {
+                deadline = deadline.min(now.saturating_add(RETRY_INTERVAL_NS));
+            }
+            if let Some(r) = srv.repeat {
+                deadline = deadline.min(r.next_at);
+            }
             syscall4(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
@@ -1127,11 +1206,10 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             )
         };
         if waited < 1 {
-            // `TimedOut` with something parked is the retry tick, not an error: fall through
-            // to the flush below rather than spinning back into the wait.
-            if parked {
-                parked = flush_outboxes(srv);
-            }
+            // `TimedOut` is a tick, not an error: whichever deadline expired, do its work
+            // and go back to waiting rather than spinning.
+            fire_repeat(srv);
+            parked = flush_outboxes(srv);
             continue;
         }
 
@@ -1178,6 +1256,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
         // the common iteration — input arrived, no resolve — takes that `continue`. Flushing
         // only on the resolve path would leave every routed event sitting in its queue until
         // a client happened to connect.
+        fire_repeat(srv);
         parked = flush_outboxes(srv);
 
         if !serve_signalled {
@@ -1262,6 +1341,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
         buffers: alloc::vec::Vec::new(),
+        repeat: None,
         announced_focus: None,
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
         interp: Interpreter::new(),
