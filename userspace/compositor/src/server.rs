@@ -314,6 +314,55 @@ mod tests {
     }
 
     #[test]
+    fn a_create_moves_focus_and_is_not_an_applied() {
+        // **The trap, stated where a host test can hold it shut.** `focus_candidate` is the
+        // topmost focus-taking window and a create puts one on top, so focus moves on the
+        // create itself — before the client has attached a buffer, let alone committed. But
+        // create is the one op that answers with a window id, so it returns `Outcome::Reply`
+        // and never goes near the `Applied` path.
+        //
+        // The compositor announced focus from inside that path, so a create told nobody: the
+        // previously focused window kept blinking a caret it no longer owned while its keys
+        // went to a window that had not painted (PR #184 review, finding 2). `serve_session`
+        // now announces after every request whatever its outcome.
+        //
+        // **What this test does and does not hold shut.** It pins the *premise* — a create
+        // is a `Reply`, and focus moves on it — so anyone who reads `Applied` as "the ops
+        // that change things" is contradicted here. It does **not** catch the regression
+        // itself: `announce_focus`'s call site is in the bin, and moving it back inside the
+        // `Applied` arm leaves every assertion below still true. What catches that is the
+        // boot gate's ordering check — a window's *first* event must be its focus change —
+        // added for exactly this reason, because the gate as it stood passed with the bug
+        // reintroduced.
+        let mut stack = WindowStack::new();
+        let mut a = Connection::new();
+        let first = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert_eq!(stack.focus_candidate(), Some(first));
+
+        let mut body = [0u8; 32];
+        let n = build_create_window_request(
+            &mut body,
+            &CreateWindowRequest { width: 8, height: 8, role: Role::Normal },
+        )
+        .unwrap();
+        let mut reply = [0u8; 32];
+        let outcome = dispatch(&mut a, &mut stack, OP_CREATE_WINDOW, &body[..n], &mut reply);
+        assert!(
+            !matches!(outcome, Outcome::Applied { .. }),
+            "a create is not an Applied, so anything keyed on Applied misses it: {outcome:?}"
+        );
+        let Outcome::Reply(len) = outcome else { panic!("unexpected {outcome:?}") };
+        let second = parse_create_window_reply(&reply[..len]).unwrap();
+
+        assert_ne!(second, first);
+        assert_eq!(
+            stack.focus_candidate(),
+            Some(second),
+            "focus moved on the create alone — no attach, no commit, no Applied anywhere"
+        );
+    }
+
+    #[test]
     fn commit_reports_the_buffer_to_release() {
         let mut stack = WindowStack::new();
         let mut a = Connection::new();

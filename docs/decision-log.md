@@ -12828,3 +12828,205 @@ guard gap was also recorded nowhere outside the kernel source, despite being a s
 property of every user address space; it is now in `memory-management.md` and in
 `syscall-abi.md`, where a userspace author writing a thread-stack allocator would actually
 look.
+
+## 2026-08-11 — M4 Part B reviewed: two ways to be at the origin, and an op that replies
+
+PR #184's review ran 21 breaks and caught 19. Both survivors were the same shape as each
+other and as the thing the description had gone looking for, which is the part worth keeping.
+
+**The click test added the widget's own origin to a point already in the widget's coordinate
+space.** `route.rs` decides a click is "a release inside the widget that took the press", and
+compared `l.rect.contains(event.x + l.rect.origin.x, …)`. Layout rectangles are absolute
+within the window and `PointerEvent` arrives in that same space — which is exactly what
+`hit_test` twenty lines up relies on — so the addition is a second offset nothing asked for.
+For a widget at the window's top-left it changes nothing. For a button in a second column, or
+anything below a menu bar, or anything inside a `padding`, the release tested a point outside
+the widget and every click was silently cancelled.
+
+**It shipped green because the only test of the rule put its widget at (0, 0).** All 14 router
+tests pass against both the correct expression and the broken one — the fourth vacuous test in
+this repository, and the third of the "holds for both implementations" kind. The same test
+also discarded the press's return value, so an implementation firing on the press *as well as*
+the click — every button emitting twice — passed the file too. Both are now covered, and the
+new test asserts its own premise (`rect == Rect::new(500, 0, 100, 480)`) so it cannot quietly
+stop being about a widget away from the origin.
+
+**`announce_focus` was called from the "applied, no reply" arm, and create replies.**
+`focus_candidate` is the topmost focus-taking window and a create puts one on top, so focus
+moves at the create — before the client has attached a buffer. But `OP_CREATE_WINDOW` is the
+one op that answers with a window id, so it returns `Outcome::Reply` and never reached the
+announcement. A client that created a window and waited without committing left the previously
+focused window blinking a caret it no longer owned while its keys went elsewhere, indefinitely
+— the exact defect `FocusEvent` was added to prevent. The comment at that call site *named*
+create as one of the ops it covered, which is how it read as deliberate.
+
+**The fix is to delete the enumeration, not to extend it.** `announce_focus` already compares
+against what it last announced, so calling it after every request costs a comparison on the
+ops that do not move focus and removes the possibility of a list going stale. Three call sites
+in `serve_session`'s neighbourhood became one, placed after the reply — a client cannot make
+sense of gaining focus for a window whose id it has not been handed yet.
+
+**Where the test for that lives is the reusable part.** The call site is in `main.rs` and
+cannot be host-tested; the *premise* can, and it is what would silently change. A test in
+`server.rs` now asserts that a create moves `focus_candidate` **and** that its `Outcome` is
+not `Applied` — the two facts whose combination is the trap. This is the same move the PR
+itself made with `focus_transition`, applied one layer further out: when the decision cannot
+be tested where it is made, test the fact it depends on where that fact lives.
+
+**A duplicated match arm survived CI, and the class is invisible to the gates.**
+`send_outbound` carried two byte-identical `Outbound::Focus` arms; rustc reports
+`unreachable_patterns` and nothing fails on it, because no crate root or workflow sets
+`-D warnings`. `tools/xtask/src/main.rs` has carried the identical duplicate since before this
+branch. Removing the arm is the fix here; whether warnings should gate is a separate question
+and is not decided by this entry.
+
+**A correction to the fix, found by checking it rather than accepting it.** The review's
+`server.rs` test comment claimed it "fails if anyone reintroduces a list of 'the ops that move
+focus'". It does not: it pins the *premise* — a create is a `Reply`, and focus moves on it —
+and both assertions stay true wherever `announce_focus` is called from. Moving the call back
+inside the `Applied` arm leaves it green.
+
+Worse, **the boot gate did not catch it either**, which the review said and which was worth
+confirming: reintroducing the bug and running `check-input` passed. The transcript says why —
+focus was announced for the new window only because a *leftover pointer release from phase 1*
+happened to arrive and trip `serve_input`'s call. The gate's `win focus has=1` was satisfied by
+a coincidence of injection order, not by anything the fix does.
+
+So the gate now asserts **ordering rather than arrival**: a window's *first* event must be its
+focus change. Announced on the create itself, focus precedes any input the window can be
+routed; announced from anywhere that runs later, a pointer record arrives first. With the bug
+reintroduced the gate now times out, which it did not before.
+
+The general form is the one this milestone keeps producing in new costumes: **"the event
+arrived" and "the event arrived when it should have" are different assertions, and only the
+second one is about the mechanism.** The same distinction retired `same_kind` in #183 (damage
+arrived either way) and the coalescing claim in #181 (the flood passed either way).
+
+Also swept while here: `pub fn contains` in `route.rs` had no caller and is gone, and the
+duplicate `AbiShape::EnumVariant` arm in `xtask` — the same unreachable-pattern class as the
+one this branch introduced, pre-existing since before it — is removed, so the tree now builds
+with **zero warnings**. That matters because the review's finding 3 was found by reading
+compiler output rather than by any gate: nothing in CI passes `-D warnings`, so the class is
+uncatchable today. Getting to zero is the precondition for turning it on; turning it on is a
+separate change.
+
+**Follow-up: `ipc.rs` gets the test module it never had.** The review noted that
+`ChannelTransport`'s drop-oldest rested on the boot gate not hanging, and the reply deferred
+a test to Part C "rather than a rushed one here". That deferral was wrong, and the reason
+given did not survive being checked: the test is not rushed, it is cheap, and the only thing
+in its way was that the parking logic sat inline inside `request`, which issues syscalls.
+
+Splitting it into `ChannelTransport::park` makes it pure, and the rest was already testable
+without anyone noticing: `poll_event` drains parked entries *before* touching the channel, and
+`Drop` skips the close for handle `0`. So a host test can construct a transport on `0`, park
+past capacity, and drain — none of which reaches a syscall. **The seam was there; the
+deferral was an assumption that it was not.**
+
+Five breaks, all biting: dropping the newest instead of the oldest, shifting without
+shrinking the length, an off-by-one in `copy_within`, `>` for `>=` at the capacity boundary,
+and `took_loss` reporting forever instead of take-and-clear. The last of those matters more
+than it looks — `Window::pump` folds the flag into one `WindowEvent::Dropped`, so a sticky
+flag emits a `Dropped` per pump for the rest of the window's life.
+
+Worth stating as a rule: **"it needs syscalls, so it cannot be host-tested" is a claim about
+where a function's boundary is, not about the function.** Twice in this milestone the answer
+was to move the boundary — `focus_transition` out of the compositor's serve loop, `park` out
+of `request` — and both took minutes.
+
+**Part B was not finished when its checkbox was ticked.** Asked whether anything remained, the
+honest way to answer was to read `widget-toolkit.md` §7.1 against `route.rs` rather than to
+re-read the plan — and §7.1 makes two promises the router did not keep: **widget-local
+coordinates**, without which a widget cannot know where in *itself* it was clicked, and
+**crossing synthesis at widget boundaries**, without which a button has nothing to hang a
+hover on. Neither was caught by a test, because nothing tested for a promise that had no
+implementation to break.
+
+Implementing them turned up a layering error that neither document had noticed. The
+compositor's `POINTER_ENTER`/`LEAVE` are about the **window**; the toolkit's are about the
+**widget**. Forwarding the compositor's *and* synthesising its own handed a widget two enters
+for one cursor movement. The compositor's crossings are **inputs to the state machine, not
+events to forward** — and a window `LEAVE` leaves every widget in it, wherever the last
+coordinates happened to point.
+
+One deliberate constraint while doing it: **exactly one place changes coordinate space.**
+Everything internal — hit-testing, the click's containment check — stays in window
+coordinates, and `localise` runs only at the boundary where a handler is called. That rule
+exists because violating it is precisely what made every click away from the window's corner
+vanish, and a second translation site is how it would come back.
+
+The general lesson: **a ticked checkbox says the plan's summary was satisfied, not that the
+design was.** The plan's Part B line names hit-testing, capture and focus; §7.1 names five
+things. Reading the design doc against the code is a different check from reading the plan,
+and it is the one that found these.
+
+**Finishing Part B: the sweep found two more, and one of them was an unreachable design.**
+Having learned that reading `widget-toolkit.md` §7.1 against the code found two unkept
+promises, the obvious next move was to do the same for §7.2 and §9.1 rather than assume §7.1
+was where the gaps lived. It was not.
+
+**§7.2's motivating example could not happen.** The section explains bubbling with "that is
+how a menu accelerator works without every widget knowing about menus" — and `on_key` returned
+`Msg`, so *having* a handler meant *handling*. A focused text field would swallow every
+accelerator; the bullet described something the API forbade. `on_key` returns `Option<Msg>`
+now, and because a non-capturing closure coerces to a `fn` pointer,
+`.on_key(|k| Some(Msg::Key(k)))` costs nothing over the constructor form.
+
+That is a sharper version of the same lesson: **a design document's rationale is testable
+too.** "This is how X works" is a claim, and X being unreachable is a defect whether or not
+any code is wrong.
+
+**One divergence went the other way**, which is worth recording because the reflex is to
+change the code. §7.2 says widget focus is a *path*; the implementation holds an **id**. A
+path breaks under exactly the reordering that keys exist to survive — delete a row above the
+focused one and the path names its neighbour. The design predates `Widget::id`, which Part A
+added under review; the document is corrected, not the code. **A design doc is not
+automatically right about a decision made after it was written.**
+
+**Part B now has end-to-end coverage.** The PR flagged that `Router` had no boot gate — nothing
+in a running system called it — and left that as a boundary for Part C. That was the wrong
+place to leave it: routing *is* Part B's deliverable, so proving it is Part B's job. The test
+client now builds an `Element`, lays it out, diffs it and drives a `Router` with the events
+the compositor sends, and the gate asserts an injected keystroke reaches a **widget**. Routing
+keys by capture instead of focus now fails the gate, where before it failed only host tests.
+
+## 2026-08-11 — Overturning a decision by not reading it: the parked-`Release` reversal
+
+The PR #184 re-review found that `ChannelTransport::park` evicts the oldest parked entry with
+no regard for what it is — and that `Release` is one of the things that parks. Losing one
+strands a buffer forever: `acquire` waits with no timeout and the protocol has no resync op.
+
+**The part worth recording is how it happened.** `MAX_PARKED`'s own doc, twenty lines above
+the code, said: *"Overflow is an **error, not a drop**. The obvious cheap behaviour — discard
+one and carry on — is wrong here because the messages that park are mostly `Release`… a
+permanent hang… (PR #175 review, finding 9)."* I read the overflow branch, saw `return Err`,
+judged it wrong for failing an unrelated request, and changed it — **without reading the
+paragraph that existed to stop exactly that change.** Then I wrote a new doc-comment giving a
+different reason, so the module ended up carrying two contradictory arguments.
+
+The diagnosis I had for it at the time was right and incomplete: failing a *request* because
+unrelated traffic piled up really is wrong, and the churn probe really did die of it. What was
+missing is that "drop instead of failing" was already considered and rejected for a reason
+that still holds. **A finding can be correct and its fix still overturn something, and the
+place that says so is usually the doc-comment on the constant you are about to change.**
+
+The answer is neither of the two: **evict the oldest *losable* entry.** `Release` is never
+evicted; if the queue is entirely `Release`s and the arrival is losable, the arrival is
+dropped instead; only a `Release` arriving on a queue of eight `Release`s still errors, which
+is #175's original behaviour narrowed to where its argument applies. The line is
+recoverability, not importance — a lost `FocusEvent` is corrected by the next focus change, a
+lost motion supersedes itself, a lost `Release` has no next.
+
+Two smaller findings from the same round:
+
+**`on_press` fired on any button's release.** Left-press a widget, click the right button over
+it, release left: the right release satisfied "released inside the captured widget" and so did
+the left one, so one interaction produced two clicks. The router now records which button took
+the capture. Twelve lines below, the capture teardown had always checked `buttons == 0`; the
+click check had never checked anything about *which* button.
+
+**`FocusEvent` gained a window id.** Focus is per-window state and a session can hold several
+windows — a popup is created on its parent's connection — so both halves of a change arrive on
+one channel with nothing to attribute them to. It cost two bytes that were already reserved,
+because the record was a day old. `KeyEvent` and `PointerEvent` have the identical gap and are
+*shipped*, so they are filed with a trigger rather than widened: the first client with two
+windows, which is Part C's menus.

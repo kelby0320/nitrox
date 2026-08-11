@@ -276,11 +276,20 @@ which *window* has focus. The toolkit decides which *widget* within a window has
 Conflating them is the classic source of typing arriving in the wrong field, and it is why
 this milestone needs the compositor to start telling clients about the first one (§9.1).
 
-- **Widget focus is a path** to a node in the tree, held by the runtime.
+- ~~**Widget focus is a path** to a node in the tree~~ — **a widget id**, as built. A path
+  breaks under exactly the reordering that keys exist to survive: delete a row above the
+  focused one and the path now names its neighbour. The id was not in this document because
+  it did not exist when this was written; it arrived in Part A, and focus is the second thing
+  after the diff to need it. Paths are still how a *frame* reaches a widget — `path_to_id`
+  resolves one each time — but nothing stores one across frames.
 - **Tab traverses** it in tree order among widgets that accept focus.
-- A key goes to the focused widget; if unhandled it **bubbles to ancestors**, then to the
-  application. That is how a menu accelerator works without every widget knowing about
-  menus.
+- A key goes to the focused widget; if it has no handler **or its handler declines**, the
+  event bubbles to ancestors. That is how a menu accelerator works without every widget
+  knowing about menus — and declining is what makes it possible at all: with a handler that
+  cannot decline, a focused text field swallows every accelerator, and this bullet describes
+  something unreachable. `on_key` therefore returns `Option<Msg>`.
+- A key nothing claims returns nothing. There is no separate "reaches the application" step:
+  the caller *is* the application and still holds the event it passed in.
 - A caret blinks, and a focus ring is drawn, only when the widget has focus **and** the
   window does. Two conditions, from two sources, which is exactly why they are two fields.
 
@@ -327,17 +336,20 @@ They are described here because the toolkit cannot be designed without knowing t
 
 **Where each is recorded**, because they are not all the same kind of thing and a reader
 closing the loop should not have to guess. Key repeat (§9.2) is a filed deferral in
-[`deferred-decisions.md`](../rationale/deferred-decisions.md). The focus record (§9.1) and the
-cursor (§9.3) are **gaps recorded in the spec** — `rsproto-surface-ops.md` names both as gaps
-rather than designs — not deferral entries. All three are scheduled by
+[`deferred-decisions.md`](../rationale/deferred-decisions.md). The focus record (§9.1, **built
+in M4 Part B**) and the cursor (§9.3, still a gap) are **recorded in the spec** —
+`rsproto-surface-ops.md` is where each is either specified or named as missing — not deferral
+entries. All three are scheduled by
 [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4.
 
 ### 9.1 The compositor must tell a client about focus
 
-Today a client is never told when its window gains or loses focus
-(`rsproto-surface-ops.md` records this as a gap, not a design). A toolkit needs it: §7.2's
-caret and focus ring depend on it, and a window that keeps blinking a caret while another
-window has the keyboard is straightforwardly wrong.
+**Built in M4 Part B; `rsproto-surface-ops.md` now specifies it (`FocusEvent`, op `0x0907`),
+and that spec is the current contract.** The rest of this section is the design as it was
+argued, kept because §7.2 reads against it — not as a description of what is missing.
+
+A toolkit needs it: §7.2's caret and focus ring depend on it, and a window that keeps blinking
+a caret while another window has the keyboard is straightforwardly wrong.
 
 A new Surface record — one op, a boolean and padding — sent to a window when it gains or
 loses focus. The compositor already knows: `focus_candidate` changes, and it can compare
@@ -346,6 +358,9 @@ it cannot be displaced by input.
 
 The record is small; the care needed is in **when** it is sent. Focus changes on window
 creation, destruction, and raise, and each of those already has a path in the compositor.
+**Creation is the one that bit** — it is the only op that replies with a window id, so a
+compositor that announced from the "applied with no reply" path skipped it silently (PR #184
+review). The implementation announces after every request instead, and compares.
 
 ### 9.2 Key repeat
 

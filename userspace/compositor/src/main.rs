@@ -50,7 +50,8 @@ use libkern::debug::Line;
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
-    KeyEvent, OP_ATTACH_BUFFER, OP_KEY_EVENT, OP_POINTER_EVENT, OP_RELEASE, PointerEvent,
+    FocusEvent, KeyEvent, OP_ATTACH_BUFFER, OP_FOCUS_EVENT, OP_KEY_EVENT, OP_POINTER_EVENT,
+    OP_RELEASE, PointerEvent,
 };
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
@@ -194,6 +195,12 @@ struct Server {
     router: InputRouter,
     /// The consumer channel from `/dev/input/new`, or 0 if input is unavailable.
     input_ch: u64,
+    /// The window last told it has the keyboard, if any.
+    ///
+    /// Kept so a focus change can be *detected* rather than re-announced: `focus_candidate`
+    /// is recomputed after anything that could move it, and most of those do not. Announcing
+    /// unconditionally would send a `FocusEvent` on every commit.
+    announced_focus: Option<u32>,
     /// Pending messages per session, parallel to `SESSION_CH`.
     ///
     /// On the heap rather than in this struct by value: `Server` lives on `_start`'s stack,
@@ -422,6 +429,10 @@ fn log_route(rec: &Outbound) {
             l.s(b"compositor: rel win=").u(*window as u64);
             l.s(b" buf=").u(*buffer as u64);
         }
+        Outbound::Focus { window, focused } => {
+            l.s(b"compositor: focus win=").u(*window as u64);
+            l.s(b" has=").u(*focused as u64);
+        }
     }
     l.end();
 }
@@ -438,6 +449,38 @@ fn deliver(srv: &mut Server, out: &[Outbound]) {
         };
         log_route(rec);
         enqueue(srv, slot, *rec);
+    }
+}
+
+/// Tell the affected windows if focus moved since the last announcement.
+///
+/// **Called after anything that could move it** — a window created, destroyed, raised, or a
+/// session closed — rather than from each of those sites, because the question "did focus
+/// change" has one answer and four ways to provoke it. Comparing against what was last
+/// announced is what keeps a commit from producing a `FocusEvent`.
+///
+/// Both halves go out: the window that lost the keyboard is told, and so is the one that
+/// gained it. A client that only heard about gaining would keep a caret blinking behind
+/// whatever took focus from it.
+fn announce_focus(srv: &mut Server) {
+    let now = srv.stack.focus_candidate();
+    let Some((was, now)) = compositor::focus_transition(srv.announced_focus, now) else {
+        return;
+    };
+    srv.announced_focus = now;
+    if let Some(old) = was
+        && let Some(slot) = srv.session_of(old)
+    {
+        let rec = Outbound::Focus { window: old, focused: false };
+        log_route(&rec);
+        enqueue(srv, slot, rec);
+    }
+    if let Some(new) = now
+        && let Some(slot) = srv.session_of(new)
+    {
+        let rec = Outbound::Focus { window: new, focused: true };
+        log_route(&rec);
+        enqueue(srv, slot, rec);
     }
 }
 
@@ -508,6 +551,14 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             let mut body = [0u8; core::mem::size_of::<PointerEvent>()];
             match event.write(&mut body) {
                 Some(_) => send_input(ch, OP_POINTER_EVENT, &body),
+                None => true,
+            }
+        }
+        Outbound::Focus { window, focused } => {
+            let mut body = [0u8; core::mem::size_of::<FocusEvent>()];
+            let e = FocusEvent { focused: u16::from(*focused), _pad: 0, window: *window };
+            match e.write(&mut body) {
+                Some(_) => send_input(ch, OP_FOCUS_EVENT, &body),
                 None => true,
             }
         }
@@ -592,6 +643,8 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     }
 
     deliver(srv, &out);
+    // A click that raised a window moved focus with it.
+    announce_focus(srv);
     if restacked {
         // A click raised a window, so what is on screen no longer matches the stack.
         let bounds = fb.geometry().bounds();
@@ -770,6 +823,9 @@ fn close_session(slot: usize, srv: &mut Server) {
     // A client that exits without destroying its windows must not leave them on screen.
     disconnect(&mut srv.conns[slot], &mut srv.stack);
     srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
+    // Its windows are gone, so focus has almost certainly moved — and the *departing*
+    // session must not be told, which `session_of` handles by no longer finding it.
+    announce_focus(srv);
 }
 
 /// Map a client's transferred `MemoryObject` and record it for `BufferSource`.
@@ -1020,6 +1076,20 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             reply_error_on_session(ch, op, request_id, surface_errno(e));
         }
     }
+
+    // **After the request, whatever it was.** `announce_focus` compares against what was
+    // last announced, so an op that did not move focus costs a comparison and sends nothing
+    // — which means there is no list of focus-moving ops to keep correct here, and that is
+    // the point. An earlier version called this inside the `Applied` arm and named create as
+    // one of the ops it covered; create is the one op that replies with a window id, so it
+    // returns `Outcome::Reply` and never reached it. A new window goes on top of the stack
+    // and `focus_candidate` is topmost-focusable, so focus had already moved and neither
+    // client was told — the old window kept a caret it no longer owned while its keys went
+    // to a window that had not painted yet (PR #184 review, finding 2).
+    //
+    // After the reply rather than before it: a client cannot make sense of gaining focus for
+    // a window whose id it has not been handed yet.
+    announce_focus(srv);
     true
 }
 
@@ -1192,6 +1262,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
         buffers: alloc::vec::Vec::new(),
+        announced_focus: None,
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
         interp: Interpreter::new(),
         // The router clamps the cursor to the screen it was told about, so it has to be the

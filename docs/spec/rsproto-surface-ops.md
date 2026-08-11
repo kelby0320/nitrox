@@ -28,9 +28,9 @@ it. A client that stalls long enough to overrun that queue loses the oldest reco
 **is not told** — the protocol has no loss marker, which is a filed gap
 (`../rationale/deferred-decisions.md`).
 
-Still missing: no cursor is drawn on screen — the compositor knows where the pointer is and
-nothing shows it — and a client is not told when it gains or loses focus. Both are for
-Milestone 4, the toolkit being the first thing that needs either.
+**A client is now told when its window gains or loses the keyboard** (`FocusEvent`, M4 Part
+B). Still missing: no cursor is drawn on screen — the compositor knows where the pointer is
+and nothing shows it — which is Milestone 4 Part C.
 
 ## Where it sits
 
@@ -315,6 +315,26 @@ derive the mask from *which modifier keys are down*: with both shifts held, rele
 leaves `MOD_SHIFT` set. Clearing the bit per release is the obvious implementation and is
 wrong — a tracking obligation, not a layout one.
 
+`FocusEvent`, 8 bytes:
+
+| Offset | Size | Type | Field |
+|---|---|---|---|
+| 0 | 2 | `u16` | `focused` — non-zero if this window now has the keyboard |
+| 2 | 2 | | reserved, zero |
+| 4 | 4 | `u32` | `window` — which window this is about |
+
+**`window` is carried because one session can hold several.** A popup is created on its
+parent's connection and takes focus from it, so both halves of that change arrive on the one
+channel; without an id a client cannot attribute them, and per-window focus state is exactly
+what a toolkit keeps. `KeyEvent` and `PointerEvent` have the same shortcoming and do **not**
+carry one — a gap recorded in `../rationale/deferred-decisions.md` rather than fixed here,
+because widening a shipped record is a wire break where this one was a day old.
+
+**A toolkit needs this and cannot derive it.** A caret blinks only when *both* the widget has
+focus within its window and the window has the keyboard; those are two facts from two sources,
+and they must not share a field. Losing window focus does **not** clear widget focus —
+returning to a window has to put the caret back where it was.
+
 `PointerEvent`, 20 bytes:
 
 | Offset | Size | Type | Field |
@@ -353,9 +373,11 @@ wire change, which is the same reason the device layer's extensibility lives in 
 - **Click-to-focus is implemented.** A press on a window whose role takes focus **raises** it,
   and because focus *is* "topmost focusable", the raise is the focus change — there is no
   second piece of state to disagree with the stack. A press on a `panel` raises nothing, or a
-  stray click on a clock would cover a window with no way to get it back. **A client is not
-  told when it gains or loses focus**; if it paints a focus indicator it must infer this from
-  the keys and crossings it receives, which is a gap, not a design (Milestone 4).
+  stray click on a clock would cover a window with no way to get it back.
+- **A client is told when its window's focus changes**, by `FocusEvent` (`0x0907`). Sent when
+  the answer *changes*, so a raise that does not move focus sends nothing, and both halves go
+  out — the window that lost the keyboard is told, and so is the one that gained it. A client
+  told only about gaining would keep a caret blinking behind whatever took focus from it.
 - **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus
   and regardless of role — a panel that cannot take a keystroke can still be clicked. A window
   that is not focused still sees the click that is about to focus it.

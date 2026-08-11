@@ -10,20 +10,38 @@
 //! menu's open item — which the application has no opinion about and would be tedious to
 //! thread through messages.
 //!
-//! ## No message type yet
+//! ## Handlers are `fn` pointers, not boxed closures
 //!
-//! `docs/design/widget-toolkit.md` §2.2 gives `view` the signature
-//! `fn view(state: &App) -> Element<Msg>`. There is no `Msg` parameter here, because Part A
-//! has no event routing: nothing can fire a handler, so a handler field would be a value no
-//! code path reads. The parameter arrives in Part B alongside the routing that gives it a
-//! reason to exist. Recorded here so the mismatch with the design document reads as a build
-//! order rather than a disagreement.
+//! `Msg` arrived in Part B, with the routing that can fire it. A handler taking event data
+//! is `Option<fn(KeyEvent) -> Msg>` rather than `Option<Box<dyn Fn(..) -> Msg>>`, and the
+//! reason is that **a Rust tuple-variant constructor is already a `fn` pointer**: an
+//! application writes `.on_key(Msg::Key)` and gets exactly what Iced spells with a closure.
+//!
+//! **The reason is `Clone` and `Debug`, not allocation.** `Box<dyn Fn>` is neither, so
+//! `#[derive(Clone, Debug)]` on `Element` stops compiling and the diff's tests lose the
+//! `assert_eq!` they are written with; `Rc<dyn Fn>` restores `Clone` but still needs a
+//! hand-written `Debug`. A `fn` pointer is `Copy`, `Clone` and `Debug` for free, and reads
+//! identically at every call site we have.
+//!
+//! An earlier version of this comment also claimed a box would cost an allocation per
+//! handler on a hand-rolled heap. That argument does not survive contact with the rest of
+//! the type: `view` already allocates a `Vec` per container, a `Box` per `padding`/`sized`
+//! child and a `String` per `text`, so a handler box is a small fraction of a number that
+//! is already fine — and `view` runs on *events*, not at frame rate. The claim is struck
+//! rather than quietly deleted, because a justification nobody believes is worse than none.
+//!
+//! **The real limit is that a `fn` cannot capture**, and it is narrower than it sounds.
+//! `on_press` takes a *value*, so `Msg::Select(i)` captures `i` perfectly well. It bites
+//! only the handlers that take event data: a list row wanting both the event and its own
+//! index — `Msg::RowKey(i, event)` — cannot be spelled. Expect that in Part C or Milestone
+//! 5; the fix then is an `Rc<dyn Fn>` variant *alongside* this one, which is additive.
 
 use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
 use libdraw::geom::Size;
+use librsproto::surface::{KeyEvent, PointerEvent};
 
 /// Which edge a docked child is pinned to.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -70,11 +88,11 @@ impl Insets {
 
 /// A docked child and the edge it is pinned to.
 #[derive(Clone, Debug)]
-pub struct Docked {
+pub struct Docked<Msg> {
     /// Which edge it occupies.
     pub edge: Edge,
     /// The child itself.
-    pub element: Element,
+    pub element: Element<Msg>,
 }
 
 /// What an element *is*.
@@ -84,7 +102,7 @@ pub struct Docked {
 /// diff and layout need in order to be tested at all. The interactive widgets — button,
 /// menu, scrollbar — arrive in Part C, pulled into existence by the terminal.
 #[derive(Clone, Debug)]
-pub enum Node {
+pub enum Node<Msg> {
     /// A run of text, measured by the caller's [`Metrics`](crate::layout::Metrics).
     Text(String),
     /// Children stacked top to bottom.
@@ -92,14 +110,14 @@ pub enum Node {
         /// Gap between adjacent children.
         spacing: u32,
         /// The children, in order.
-        children: Vec<Element>,
+        children: Vec<Element<Msg>>,
     },
     /// Children stacked left to right.
     Row {
         /// Gap between adjacent children.
         spacing: u32,
         /// The children, in order.
-        children: Vec<Element>,
+        children: Vec<Element<Msg>>,
     },
     /// Children pinned to edges, with one child filling what remains.
     ///
@@ -108,21 +126,21 @@ pub enum Node {
     /// to the end of the list.
     Dock {
         /// Edge-pinned children, applied in order — each takes its slice of what is left.
-        edges: Vec<Docked>,
+        edges: Vec<Docked<Msg>>,
         /// The child that takes everything remaining.
-        fill: Box<Element>,
+        fill: Box<Element<Msg>>,
     },
     /// Children overlaid in paint order, each filling the whole area.
     ///
     /// The overlay node menus are drawn into. Painted first to last, so the last child is on
     /// top — and hit-tested in the reverse of that, once Part B hit-tests anything.
-    Stack(Vec<Element>),
+    Stack(Vec<Element<Msg>>),
     /// A child with space around it.
     Padding {
         /// How much space, per side.
         insets: Insets,
         /// The child.
-        child: Box<Element>,
+        child: Box<Element<Msg>>,
     },
     /// A child constrained on one or both axes.
     ///
@@ -139,7 +157,7 @@ pub enum Node {
         /// The constraint; zero on an axis means unconstrained.
         size: Size,
         /// The child.
-        child: Box<Element>,
+        child: Box<Element<Msg>>,
     },
     /// An application-drawn node: the escape hatch.
     ///
@@ -158,7 +176,7 @@ pub enum Node {
 
 /// A node, plus the properties every node carries.
 #[derive(Clone, Debug)]
-pub struct Element {
+pub struct Element<Msg> {
     /// Identity within the parent, for the diff.
     ///
     /// `None` means "pair me by position", which is right for the fixed structural nesting
@@ -168,13 +186,45 @@ pub struct Element {
     /// Share of a `Row`/`Column`'s leftover space; `0` means "just my measured size".
     pub flex: u16,
     /// What this element is.
-    pub node: Node,
+    pub node: Node<Msg>,
+    /// The message a click on this element produces.
+    ///
+    /// A *click* — a press and its release, both inside — rather than a bare press, because
+    /// pressing a button and sliding off it is how a user cancels, and a toolkit that fired
+    /// on the press removes that.
+    pub on_press: Option<Msg>,
+    /// Raw key events, while this element holds widget focus.
+    ///
+    /// The path the terminal grid uses: a `custom` widget that wants keycodes rather than a
+    /// toolkit's interpretation of them.
+    ///
+    /// **Returns `Option`, so a handler can decline** and let the key keep bubbling. Without
+    /// that, having a handler *means* handling: a focused text field would swallow Ctrl-O,
+    /// and the menu accelerator this design uses as its motivating example could never fire.
+    /// A non-capturing closure coerces to a `fn` pointer, so `.on_key(|k| Some(Msg::Key(k)))`
+    /// costs nothing.
+    pub on_key: Option<fn(KeyEvent) -> Option<Msg>>,
+    /// Raw pointer events routed to this element.
+    pub on_pointer: Option<fn(PointerEvent) -> Msg>,
+    /// Whether this element accepts keyboard focus.
+    ///
+    /// Opt-in, not derived from having an `on_key`: a scrollbar has neither and must still
+    /// be skipped by Tab, while a container may want focus without handling a key itself.
+    pub focusable: bool,
 }
 
-impl Element {
-    /// An element with no key and no flex.
-    pub fn new(node: Node) -> Self {
-        Self { key: None, flex: 0, node }
+impl<Msg> Element<Msg> {
+    /// An element with no key, no flex, and no handlers.
+    pub fn new(node: Node<Msg>) -> Self {
+        Self {
+            key: None,
+            flex: 0,
+            node,
+            on_press: None,
+            on_key: None,
+            on_pointer: None,
+            focusable: false,
+        }
     }
 
     /// Give this element an identity within its parent.
@@ -189,12 +239,42 @@ impl Element {
         self
     }
 
+    /// The message a click produces.
+    pub fn on_press(mut self, msg: Msg) -> Self {
+        self.on_press = Some(msg);
+        self
+    }
+
+    /// Take raw key events while focused. Implies [`focusable`](Self::focusable).
+    ///
+    /// Implied, because a handler for keys that can never be focused is dead code the
+    /// application would have to notice it wrote. Something that wants focus *without*
+    /// handling keys still says so explicitly.
+    pub fn on_key(mut self, f: fn(KeyEvent) -> Option<Msg>) -> Self {
+        self.on_key = Some(f);
+        self.focusable = true;
+        self
+    }
+
+    /// Take raw pointer events routed to this element.
+    pub fn on_pointer(mut self, f: fn(PointerEvent) -> Msg) -> Self {
+        self.on_pointer = Some(f);
+        self
+    }
+
+    /// Accept keyboard focus.
+    pub fn focusable(mut self) -> Self {
+        self.focusable = true;
+        self
+    }
+
     /// This element's children, if it has any, in paint order.
-    pub fn children(&self) -> impl Iterator<Item = &Element> {
+    pub fn children(&self) -> impl Iterator<Item = &Element<Msg>> {
         // One iterator type for every shape, so callers do not each re-derive the match.
         // `Dock` yields its edge children before the filler, which is also the order layout
         // consumes them in and the order they are painted.
-        let (a, b, c): (&[Element], Option<&Element>, Option<&Element>) = match &self.node {
+        let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) =
+            match &self.node {
             Node::Text(_) | Node::Custom { .. } => (&[], None, None),
             Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
                 (children.as_slice(), None, None)
@@ -202,7 +282,7 @@ impl Element {
             Node::Padding { child, .. } | Node::Sized { child, .. } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
-        let docked: Option<&Vec<Docked>> = match &self.node {
+        let docked: Option<&Vec<Docked<Msg>>> = match &self.node {
             Node::Dock { edges, .. } => Some(edges),
             _ => None,
         };
@@ -214,47 +294,47 @@ impl Element {
 }
 
 /// A run of text.
-pub fn text(s: impl Into<String>) -> Element {
+pub fn text<Msg>(s: impl Into<String>) -> Element<Msg> {
     Element::new(Node::Text(s.into()))
 }
 
 /// Children stacked top to bottom.
-pub fn column(children: impl Into<Vec<Element>>) -> Element {
+pub fn column<Msg>(children: impl Into<Vec<Element<Msg>>>) -> Element<Msg> {
     Element::new(Node::Column { spacing: 0, children: children.into() })
 }
 
 /// Children stacked left to right.
-pub fn row(children: impl Into<Vec<Element>>) -> Element {
+pub fn row<Msg>(children: impl Into<Vec<Element<Msg>>>) -> Element<Msg> {
     Element::new(Node::Row { spacing: 0, children: children.into() })
 }
 
 /// Children overlaid, last on top.
-pub fn stack(children: impl Into<Vec<Element>>) -> Element {
+pub fn stack<Msg>(children: impl Into<Vec<Element<Msg>>>) -> Element<Msg> {
     Element::new(Node::Stack(children.into()))
 }
 
 /// Edge-pinned children around one that fills the rest.
-pub fn dock(edges: impl Into<Vec<Docked>>, fill: Element) -> Element {
+pub fn dock<Msg>(edges: impl Into<Vec<Docked<Msg>>>, fill: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Dock { edges: edges.into(), fill: Box::new(fill) })
 }
 
 /// Pin `element` to `edge` inside a [`dock`].
-pub fn docked(edge: Edge, element: Element) -> Docked {
+pub fn docked<Msg>(edge: Edge, element: Element<Msg>) -> Docked<Msg> {
     Docked { edge, element }
 }
 
 /// A child with space around it.
-pub fn padding(insets: Insets, child: Element) -> Element {
+pub fn padding<Msg>(insets: Insets, child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Padding { insets, child: Box::new(child) })
 }
 
 /// A child constrained on one or both axes; a zero component means unconstrained.
-pub fn sized(size: Size, child: Element) -> Element {
+pub fn sized<Msg>(size: Size, child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Sized { size, child: Box::new(child) })
 }
 
 /// An application-drawn node.
-pub fn custom(kind: u32, size: Size) -> Element {
+pub fn custom<Msg>(kind: u32, size: Size) -> Element<Msg> {
     Element::new(Node::Custom { kind, size })
 }
 
@@ -262,7 +342,7 @@ pub fn custom(kind: u32, size: Size) -> Element {
 ///
 /// A no-op on anything else rather than an error: `spacing` is a layout hint, and refusing
 /// it on a `Text` would make every builder chain conditional on the node kind.
-pub fn with_spacing(mut e: Element, gap: u32) -> Element {
+pub fn with_spacing<Msg>(mut e: Element<Msg>, gap: u32) -> Element<Msg> {
     match &mut e.node {
         Node::Column { spacing, .. } | Node::Row { spacing, .. } => *spacing = gap,
         _ => {}
@@ -273,11 +353,15 @@ pub fn with_spacing(mut e: Element, gap: u32) -> Element {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
+    /// routing tests use a real enum; these are about shape, not about what a click means.
+    type Msg = ();
     use alloc::vec;
 
     #[test]
     fn builders_carry_key_and_flex_without_changing_the_node() {
-        let e = text("hi").key(7).flex(2);
+        let e: Element<Msg> = text("hi").key(7).flex(2);
         assert_eq!(e.key, Some(7));
         assert_eq!(e.flex, 2);
         assert!(matches!(e.node, Node::Text(ref s) if s == "hi"));
@@ -285,13 +369,16 @@ mod tests {
 
     #[test]
     fn children_yields_every_shape_and_nothing_extra() {
-        assert_eq!(text("a").children().count(), 0);
-        assert_eq!(custom(1, Size::new(4, 4)).children().count(), 0);
-        assert_eq!(column(vec![text("a"), text("b")]).children().count(), 2);
-        assert_eq!(row(vec![text("a")]).children().count(), 1);
-        assert_eq!(stack(vec![text("a"), text("b"), text("c")]).children().count(), 3);
-        assert_eq!(padding(Insets::all(1), text("a")).children().count(), 1);
-        assert_eq!(sized(Size::new(2, 2), text("a")).children().count(), 1);
+        // Counted through a pinned binding rather than a turbofish per line: every one of
+        // these is a `text("a")` whose `Msg` nothing else constrains.
+        let n = |e: Element<Msg>| e.children().count();
+        assert_eq!(n(text("a")), 0);
+        assert_eq!(n(custom(1, Size::new(4, 4))), 0);
+        assert_eq!(n(column(vec![text("a"), text("b")])), 2);
+        assert_eq!(n(row(vec![text("a")])), 1);
+        assert_eq!(n(stack(vec![text("a"), text("b"), text("c")])), 3);
+        assert_eq!(n(padding(Insets::all(1), text("a"))), 1);
+        assert_eq!(n(sized(Size::new(2, 2), text("a"))), 1);
     }
 
     #[test]
@@ -299,8 +386,9 @@ mod tests {
         // The order layout consumes them in and the order they are painted. The diff walks
         // this too, so a different order here would silently re-pair every docked child
         // with the filler.
-        let d = dock(vec![docked(Edge::Top, text("bar")), docked(Edge::Right, text("scroll"))],
-                     text("fill"));
+        let d: Element<Msg> =
+            dock(vec![docked(Edge::Top, text("bar")), docked(Edge::Right, text("scroll"))],
+                 text("fill"));
         let kinds: Vec<&str> = d
             .children()
             .map(|c| match &c.node {
@@ -313,12 +401,12 @@ mod tests {
 
     #[test]
     fn spacing_applies_to_the_two_nodes_that_have_it_and_is_ignored_elsewhere() {
-        let c = with_spacing(column(vec![text("a")]), 4);
+        let c: Element<Msg> = with_spacing(column(vec![text("a")]), 4);
         assert!(matches!(c.node, Node::Column { spacing: 4, .. }));
-        let r = with_spacing(row(vec![text("a")]), 3);
+        let r: Element<Msg> = with_spacing(row(vec![text("a")]), 3);
         assert!(matches!(r.node, Node::Row { spacing: 3, .. }));
         // Ignored rather than refused: a builder chain must not become conditional on kind.
-        let t = with_spacing(text("a"), 9);
+        let t: Element<Msg> = with_spacing(text("a"), 9);
         assert!(matches!(t.node, Node::Text(_)));
     }
 

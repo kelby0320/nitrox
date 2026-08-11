@@ -35,8 +35,8 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, CreateWindowRequest, OP_ATTACH_BUFFER, OP_COMMIT,
-    KeyEvent, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_KEY_EVENT, OP_POINTER_EVENT, OP_RELEASE,
-    PointerEvent, Role, SURFACE_FORMAT_XRGB8888,
+    FocusEvent, KeyEvent, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_FOCUS_EVENT, OP_KEY_EVENT,
+    OP_POINTER_EVENT, OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_XRGB8888,
     build_attach_buffer_request, build_commit_request, build_create_window_request,
     build_destroy_window_request, parse_create_window_reply, parse_release_event,
 };
@@ -83,6 +83,16 @@ pub trait Transport {
 
     /// Poll for a server-initiated event without blocking. `None` when there is none.
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError>;
+
+    /// Whether the transport discarded an event since this was last called, clearing the
+    /// flag.
+    ///
+    /// Defaulted to `false` so a transport that cannot lose anything — a test mock, or one
+    /// with an unbounded queue — says nothing. A transport that *can* must report it, or a
+    /// client tracking held keys carries a phantom modifier for the rest of its life.
+    fn took_loss(&mut self) -> bool {
+        false
+    }
 
     /// Block until a server-initiated event arrives, then return it.
     ///
@@ -134,6 +144,10 @@ impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
         (**self).poll_event(buf)
     }
+
+    fn took_loss(&mut self) -> bool {
+        (**self).took_loss()
+    }
 }
 
 /// How many input events a window queues before the oldest are discarded.
@@ -151,6 +165,14 @@ pub enum WindowEvent {
     Key(KeyEvent),
     /// Pointer motion, a button, or a crossing.
     Pointer(PointerEvent),
+    /// This window gained or lost the keyboard.
+    ///
+    /// **Not the same as widget focus**, which is the toolkit's and which this must not
+    /// disturb: a window returning to the foreground has to put the caret back where it was.
+    ///
+    /// Filtered to *this* window: one session can hold several, and a popup taking focus
+    /// from its parent sends both halves down the one channel.
+    Focus(bool),
     /// The queue overflowed and events were discarded.
     ///
     /// **Accumulated state must be discarded.** A client tracking which keys or buttons are
@@ -321,6 +343,13 @@ impl<T: Transport> Window<T> {
                     self.enqueue(WindowEvent::Pointer(e));
                 }
             }
+            OP_FOCUS_EVENT => {
+                if let Some(e) = FocusEvent::read(body)
+                    && e.window == self.id
+                {
+                    self.enqueue(WindowEvent::Focus(e.focused != 0));
+                }
+            }
             _ => {}
         }
     }
@@ -412,6 +441,11 @@ impl<T: Transport> Window<T> {
     /// [`next_free`]: Self::next_free
     pub fn pump(&mut self) -> Result<usize, UiError> {
         let mut seen = 0usize;
+        // Loss below this layer is loss to the client: fold it into the same flag the local
+        // queue overflowing sets, so both surface as one `WindowEvent::Dropped`.
+        if self.transport.took_loss() {
+            self.lost = true;
+        }
         let mut buf = [0u8; 64];
         while let Some((op, len)) = self.transport.poll_event(&mut buf)? {
             self.apply_event(op, &buf[..len]);
@@ -446,6 +480,8 @@ mod tests {
         /// How many times the client had to block.
         waits: usize,
         fail: bool,
+        /// Set by a test to model the real transport discarding a parked event.
+        lost: bool,
     }
 
     impl Transport for MockTransport {
@@ -473,6 +509,10 @@ mod tests {
             let Some((op, body)) = self.events.pop() else { return Ok(None) };
             buf[..body.len()].copy_from_slice(&body);
             Ok(Some((op, body.len())))
+        }
+
+        fn took_loss(&mut self) -> bool {
+            core::mem::take(&mut self.lost)
         }
 
         fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
@@ -715,6 +755,58 @@ mod tests {
             w.transport.sent.iter().rev().find(|(op, _, _)| *op == OP_COMMIT).unwrap();
         let req = librsproto::surface::parse_commit_request(body).unwrap();
         assert_eq!((req.damage_x, req.damage_y, req.damage_w, req.damage_h), (3, 5, 17, 9));
+    }
+
+    #[test]
+    fn transport_level_loss_surfaces_as_a_dropped_marker() {
+        // A transport that discarded a parked event must say so, or a client tracking held
+        // keys carries a phantom modifier for the rest of its life. Folded into the same
+        // flag the local queue sets, so both surface as one `Dropped`.
+        let mut w = window(2);
+        w.transport.lost = true;
+        w.pump().expect("pump");
+        assert_eq!(w.next_event(), Some(WindowEvent::Dropped));
+        assert_eq!(w.next_event(), None, "announced once, not on every drain");
+    }
+
+    #[test]
+    fn a_focus_event_reaches_the_queue_as_a_bool() {
+        let mut w = window(2);
+        for focused in [true, false] {
+            let e = FocusEvent { focused: u16::from(focused), _pad: 0, window: w.id() };
+            let mut b = [0u8; 8];
+            let n = e.write(&mut b).unwrap();
+            w.transport.events.insert(0, (OP_FOCUS_EVENT, b[..n].to_vec()));
+        }
+        w.pump().expect("pump");
+        assert_eq!(w.next_event(), Some(WindowEvent::Focus(true)));
+        assert_eq!(w.next_event(), Some(WindowEvent::Focus(false)));
+    }
+
+    #[test]
+    fn a_focus_event_for_another_window_is_not_this_windows_business() {
+        // One session can hold several windows — a popup is created on its parent's
+        // connection — so both halves of a focus change arrive on the one channel. Without
+        // the filter a parent would read its own loss as a gain (PR #184 re-review).
+        let mut w = window(2);
+        let other = w.id() + 1;
+        let e = FocusEvent { focused: 1, _pad: 0, window: other };
+        let mut b = [0u8; 8];
+        let n = e.write(&mut b).unwrap();
+        w.transport.events.insert(0, (OP_FOCUS_EVENT, b[..n].to_vec()));
+        w.pump().expect("pump");
+        assert_eq!(w.next_event(), None, "not addressed to this window");
+    }
+
+    #[test]
+    fn a_truncated_focus_event_is_ignored_rather_than_read_as_unfocused() {
+        // Reading a short record as `focused: false` would dim a window for a malformed
+        // message — the failure mode is invisible, because a dim window looks like a window
+        // that legitimately lost focus.
+        let mut w = window(2);
+        w.transport.events.insert(0, (OP_FOCUS_EVENT, vec![0u8; 7]));
+        w.pump().expect("pump");
+        assert_eq!(w.next_event(), None);
     }
 
     #[test]

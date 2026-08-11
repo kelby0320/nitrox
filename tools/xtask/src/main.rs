@@ -1000,10 +1000,26 @@ fn cmd_check_input(accel: Accel) -> R<()> {
         qmp.send_motion(-120, -120)?;
     }
 
+    // **The window was told it has the keyboard.** The second half of the two-focus rule:
+    // widget focus is the toolkit's, window focus is the compositor's, and a client needs
+    // both to know whether a caret should blink. Announced on the change, so this arrives
+    // once when the window becomes the topmost focusable one.
+    // **Ordering, not just arrival.** Focus is announced on the create itself, so it
+    // precedes any input this window could be routed. Asserting only that a focus event
+    // *arrived* passes against a compositor that announces it late — verified by
+    // reintroducing that bug and watching the gate stay green (PR #184 review, finding 2).
+    session.expect("input-testclient: first win event=focus")?;
+    session.expect("input-testclient: win focus has=1")?;
+
     // `b` is keycode 48. It goes to the *focused* window — this client's, being the topmost
     // that takes focus — not to whatever the cursor happens to be over.
     qmp.send_key("b", true)?;
     session.expect("input-testclient: win key code=48 down=1")?;
+    // **Through the toolkit**, which is Part B's actual deliverable: the same keystroke came
+    // out of `libui`'s router after `element -> layout -> diff -> route`, addressed to a
+    // widget rather than a window. Everything in that chain is unit-tested; this is the only
+    // thing that says the pieces are wired to each other.
+    session.expect("input-testclient: widget key code=48 down=1")?;
     qmp.send_key("b", false)?;
     session.expect("input-testclient: win key code=48 down=0")?;
 
@@ -1011,6 +1027,10 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // the record carries on every kind — the field that used to read zero here.
     qmp.send_button("left", true)?;
     session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
+    // Kind 1 is `POINTER_BUTTON`, and the coordinates are **widget-local**: the grid fills
+    // the window and sits at its origin, so they match — which is exactly why the host tests
+    // place a widget away from the origin as well.
+    session.expect("input-testclient: widget ptr kind=1")?;
     qmp.send_button("left", false)?;
 
     // ---- Park-and-retry ----
@@ -2391,21 +2411,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
                 if let Some(v) = parse_int(val) {
                     out.insert(name.trim().to_string(), v);
-                }
-            }
-            AbiShape::EnumVariant => {
-                // Name = <int>,
-                let Some(body) = t.strip_suffix(',') else { continue };
-                let Some((name, val)) = body.split_once('=') else { continue };
-                let name = name.trim();
-                if name.is_empty()
-                    || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    continue;
-                }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.to_string(), v);
                 }
             }
             AbiShape::EnumVariant => {

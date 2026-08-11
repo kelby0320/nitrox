@@ -63,7 +63,7 @@ pub enum Fingerprint {
 
 impl Fingerprint {
     /// The fingerprint of `e`'s own node, ignoring its children.
-    pub fn of(e: &Element) -> Self {
+    pub fn of<Msg>(e: &Element<Msg>) -> Self {
         match &e.node {
             Node::Text(s) => Fingerprint::Text(s.clone()),
             Node::Column { spacing, .. } => Fingerprint::Column(*spacing),
@@ -166,7 +166,7 @@ enum Keying {
 }
 
 impl Keying {
-    fn of_elements(children: &[&Element]) -> Option<Self> {
+    fn of_elements<Msg>(children: &[&Element<Msg>]) -> Option<Self> {
         Self::classify(children.iter().map(|c| c.key.is_some()))
     }
 
@@ -230,9 +230,9 @@ impl Tree {
     /// [`DiffError`] the tree is left **unchanged** and no damage is reported: a rejected
     /// frame must not leave half a tree paired, or the next frame diffs against a state
     /// neither the application nor the toolkit believes in.
-    pub fn update(
+    pub fn update<Msg>(
         &mut self,
-        element: &Element,
+        element: &Element<Msg>,
         layout: &Layout,
     ) -> Result<Option<Rect>, DiffError> {
         let mut damage = Damage::new();
@@ -285,9 +285,9 @@ impl Damage {
 }
 
 /// Pair one node, recursing into its children.
-fn reconcile(
+fn reconcile<Msg>(
     old: Option<&Widget>,
-    e: &Element,
+    e: &Element<Msg>,
     l: &Layout,
     damage: &mut Damage,
     path: &mut Vec<usize>,
@@ -327,15 +327,15 @@ fn reconcile(
 }
 
 /// Pair a parent's children, by key or by position.
-fn reconcile_children(
+fn reconcile_children<Msg>(
     old: &[Widget],
-    e: &Element,
+    e: &Element<Msg>,
     l: &Layout,
     damage: &mut Damage,
     path: &mut Vec<usize>,
     ids: &mut u64,
 ) -> Result<Vec<Widget>, DiffError> {
-    let elems: Vec<&Element> = e.children().collect();
+    let elems: Vec<&Element<Msg>> = e.children().collect();
     debug_assert_eq!(elems.len(), l.children.len(), "element and layout trees disagree");
 
     let Some(new_keying) = Keying::of_elements(&elems) else {
@@ -403,6 +403,10 @@ fn reconcile_children(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
+    /// routing tests use a real enum; these are about shape, not about what a click means.
+    type Msg = ();
     use crate::element::{Edge, Insets, column, custom, dock, docked, padding, row,
                          sized, stack, text, with_spacing};
     use crate::layout::{FixedCell, Layout, layout};
@@ -413,7 +417,7 @@ mod tests {
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
 
     /// Lay `e` out and diff it into `t`.
-    fn go(t: &mut Tree, e: &Element) -> Result<Option<Rect>, DiffError> {
+    fn go(t: &mut Tree, e: &Element<Msg>) -> Result<Option<Rect>, DiffError> {
         let l = layout(e, SCREEN, &CELL);
         t.update(e, &l)
     }
@@ -674,7 +678,7 @@ mod tests {
                 check(c);
             }
         }
-        let e = dock(
+        let e: Element<Msg> = dock(
             vec![docked(Edge::Top, sized(Size::new(0, 16), text("bar")))],
             stack(vec![
                 padding(Insets::all(4), column(vec![text("a"), text("b").flex(1)])),
@@ -690,18 +694,18 @@ mod tests {
         // for that reason anyway — so dropping either from the fingerprint left every test
         // passing. Belt and braces, asserted directly rather than through a side effect.
         assert_ne!(
-            Fingerprint::of(&padding(Insets::all(1), text("x"))),
-            Fingerprint::of(&padding(Insets::all(2), text("x")))
+            Fingerprint::of(&padding::<Msg>(Insets::all(1), text("x"))),
+            Fingerprint::of(&padding::<Msg>(Insets::all(2), text("x")))
         );
         assert_ne!(
-            Fingerprint::of(&with_spacing(column(vec![text("x")]), 1)),
-            Fingerprint::of(&with_spacing(column(vec![text("x")]), 2))
+            Fingerprint::of(&with_spacing(column::<Msg>(vec![text("x")]), 1)),
+            Fingerprint::of(&with_spacing(column::<Msg>(vec![text("x")]), 2))
         );
         // ...and children are *not* part of it, or a one-character edit in a leaf would
         // compare every ancestor unequal and repaint the window.
         assert_eq!(
-            Fingerprint::of(&column(vec![text("x")])),
-            Fingerprint::of(&column(vec![text("y"), text("z")]))
+            Fingerprint::of(&column::<Msg>(vec![text("x")])),
+            Fingerprint::of(&column::<Msg>(vec![text("y"), text("z")]))
         );
     }
 

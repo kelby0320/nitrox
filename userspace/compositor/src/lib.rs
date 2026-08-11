@@ -98,6 +98,24 @@ pub enum StackError {
     DuplicateBuffer,
 }
 
+/// The `(lost, gained)` pair a focus change implies, or `None` if focus did not move.
+///
+/// **The comparison is the whole point.** `focus_candidate` is recomputed after anything that
+/// *could* move focus — a create, a destroy, a raise, a session closing — and most of those
+/// do not move it. Announcing unconditionally would send a `FocusEvent` on every one of them,
+/// which for a client means a stream of messages saying nothing changed, on the same bounded
+/// queue its input arrives on.
+///
+/// Pure, and here rather than in the server, because "did focus change" is a question about
+/// two values and the boot gate can only observe that *a* focus event arrived — not that
+/// exactly one did (PR #183's lesson, applied before the review).
+pub fn focus_transition(
+    prev: Option<u32>,
+    now: Option<u32>,
+) -> Option<(Option<u32>, Option<u32>)> {
+    (prev != now).then_some((prev, now))
+}
+
 /// The compositor's window stack: bottom-first order, plus the id allocator.
 pub struct WindowStack {
     windows: Vec<Window>,
@@ -326,6 +344,22 @@ impl WindowStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focus_transition_is_silent_when_focus_did_not_move() {
+        // The case that happens on every commit: recomputed, unchanged, nothing sent.
+        assert_eq!(focus_transition(Some(3), Some(3)), None);
+        assert_eq!(focus_transition(None, None), None);
+    }
+
+    #[test]
+    fn focus_transition_names_both_halves() {
+        // Both, because a client told only that it *gained* focus would keep a caret
+        // blinking behind whatever took focus from it.
+        assert_eq!(focus_transition(Some(1), Some(2)), Some((Some(1), Some(2))));
+        assert_eq!(focus_transition(None, Some(2)), Some((None, Some(2))), "first window");
+        assert_eq!(focus_transition(Some(1), None), Some((Some(1), None)), "last window went");
+    }
     use alloc::collections::BTreeMap;
     use alloc::vec;
     use libdraw::framebuffer::MemFramebuffer;

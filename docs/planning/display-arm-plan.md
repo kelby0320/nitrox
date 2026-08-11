@@ -356,12 +356,53 @@ requirement, not a compromise.
       `MMAP_MAX` bounds only the `hint == 0` path. It lands in Part A rather than later
       because it is independent of the toolkit and wanted *before* the deep call chains
       exist.
-- [ ] **Part B — event routing**: hit testing, pointer capture during a drag, and
+- [x] **Part B — event routing** ✅ (2026-08-11): hit testing, pointer capture during a drag, and
       **widget-level keyboard focus**, which is a *second* focus concept — the compositor
       decides which window has focus, the toolkit decides which widget within it does.
       Conflating them is the classic source of text arriving in the wrong field. Carries the
       **focus record** the compositor owes a client, without which the toolkit has no way to
       know the first of those two.
+
+      `Element<Msg>` arrived here, with the routing that can fire a handler; handlers are
+      `fn` pointers because a tuple-variant constructor already is one. `libui::route` does
+      hit-testing, capture, Tab traversal, key bubbling, widget-local coordinates and
+      crossing synthesis; `FocusEvent` (op `0x0907`) carries window focus. 78 tests in
+      `libui`, 25 breaks verified.
+
+      **The gate routes through the toolkit**, so an injected keystroke reaches a *widget*
+      and not merely a window: `element -> layout -> diff -> route -> handler`, with events
+      that came from QMP through the i8042 driver, the input server, the compositor's router
+      and `libsurface`. Every link is unit-tested; this is the only thing asserting they are
+      wired to each other.
+
+      **Six things the plan did not anticipate**, each found by breaking something or by
+      reading the design against the code:
+
+      - A **click could only land at the window's origin.** The containment check added the
+        widget's own origin to a point already in that space, so a button in a second column
+        or below a menu bar had every click silently cancelled — and the one test of the rule
+        put its widget at (0, 0), where both expressions agree.
+      - **`announce_focus` never ran on a create**, because create is the one op that replies
+        with a window id and so returns `Outcome::Reply` rather than `Applied`. The gate could
+        not see it: focus was announced anyway by leftover input tripping another call site.
+        It now asserts **ordering** — a window's first event must be its focus change.
+      - **A second server-initiated message class broke `libsurface`.** `ChannelTransport`
+        failed a *request* when its parked queue overflowed, so an unrelated request died of
+        traffic it had nothing to do with. `MAX_PARKED = 8` was fine with one class and wrong
+        with two.
+      - **§7.1 promised two things the router did not do**: widget-local coordinates and
+        crossing synthesis. Found by reading the design against the code rather than by any
+        test. The compositor's `ENTER`/`LEAVE` turned out to be *inputs* to that state
+        machine rather than events to forward — its crossings are about windows, the
+        toolkit's about widgets, and forwarding both handed a widget two enters.
+      - **§7.2's motivating example was unreachable.** `on_key` returned `Msg`, so having a
+        handler *meant* handling — a focused text field would swallow every accelerator, and
+        "unhandled keys reach the menu" could not happen. It returns `Option<Msg>` now, and a
+        non-capturing closure still coerces to a `fn` pointer, so nothing is lost.
+      - **Widget focus is an id, not a path**, which is a divergence from §7.2 in the code's
+        favour: a path breaks under exactly the reordering keys exist to survive. The design
+        predates `Widget::id`, which Part A added; the doc is corrected rather than the code.
+
 - [ ] **Graduate two design docs to `architecture/`.**
       [`input-subsystem.md`](../design/input-subsystem.md) describes a subsystem that is now
       **built** — M3 finished it — and has been sitting in `design/`, which root `CLAUDE.md`
