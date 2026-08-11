@@ -271,7 +271,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
-    check_userspace_lib("libui")?;
+    check_userspace_lib("libsurface")?;
     check_userspace_lib("libinput")?;
 
     let kernel_dir = repo_root().join("kernel");
@@ -981,7 +981,7 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // ---- Through a window ----
     //
     // Everything above proves the *device* stream reached userspace. This proves the
-    // Surface path: the compositor routed it to a window and `libui` delivered it into that
+    // Surface path: the compositor routed it to a window and `libsurface` delivered it into that
     // window's queue. The client creates the window only now, so the two phases cannot
     // contend for its four-message session ring.
     session.expect("input-testclient: window ready")?;
@@ -2060,13 +2060,13 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
-    // `libui` host tests — the client-side buffer lifecycle behind a mock transport:
+    // `libsurface` host tests — the client-side buffer lifecycle behind a mock transport:
     // which buffer may be drawn into, why single buffering cannot work, and that a release
     // for another window frees nothing. The messages themselves are `librsproto`'s.
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")
-        .arg("libui")
+        .arg("libsurface")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;

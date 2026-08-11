@@ -2,9 +2,10 @@
 
 ## Status
 
-**Nothing is built.** `libui` today is a *Surface-protocol client* — window lifecycle,
-shared buffers, commit/release, and the input queue — not a toolkit. There are no widgets,
-no layout, and no notion of focus inside a window. This document specifies the toolkit that
+**The rename is done; the toolkit is not.** As of M4 Part A the Surface-protocol client —
+window lifecycle, shared buffers, commit/release, and the input queue — is `libsurface`,
+and the name `libui` is reserved for the toolkit described here. There are no widgets, no
+layout, and no notion of focus inside a window. This document specifies the toolkit that
 [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4 builds, and the three
 things below it that Milestone 4 forces into existence. Settled with the maintainer
 2026-08-10.
@@ -390,9 +391,9 @@ loop's cost becomes visible.
 
 ## 10. Crate boundary, and a rename
 
-`libui` today is window lifecycle, buffers, commit/release, and the input queue: a **client
-of the Surface protocol**, not a UI toolkit. The name was aspirational and the code went
-elsewhere.
+`libui` *was* window lifecycle, buffers, commit/release, and the input queue: a **client of
+the Surface protocol**, not a UI toolkit. The name was aspirational and the code went
+elsewhere. Renamed in M4 Part A.
 
 So:
 

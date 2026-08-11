@@ -37,9 +37,9 @@ use libkern::{
     syscall2, syscall4, syscall5,
 };
 use librsproto::surface::Role;
-use libui::{Window, WindowEvent, ipc::ChannelTransport};
+use libsurface::{Window, WindowEvent, ipc::ChannelTransport};
 
-/// `alloc` backing — `libui` holds its buffers and event queue on the heap.
+/// `alloc` backing — `libsurface` holds its buffers and event queue on the heap.
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 

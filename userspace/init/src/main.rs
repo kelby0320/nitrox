@@ -1741,7 +1741,7 @@ fn run_display_selftest(notif: u64, root_ns: u64) {
 /// its window on screen for the rest of the boot.
 ///
 /// This is the first test that exercises a client and the compositor together. Everything
-/// before it tested one half: `libui` against a mock, the compositor against nothing. That
+/// before it tested one half: `libsurface` against a mock, the compositor against nothing. That
 /// is how a one-way protocol shipped with green CI.
 #[cfg(feature = "selftest")]
 fn run_ui_testclient(root_ns: u64) {

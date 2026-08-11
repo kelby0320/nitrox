@@ -12,7 +12,7 @@
 //!
 //! **A client never reads the device stream.** Input reaches a window over its Surface
 //! session, routed by the compositor — so this crate is not "the client's input library". It
-//! owns *interpreting* input; `libui` owns *transporting* it to a window.
+//! owns *interpreting* input; `libsurface` owns *transporting* it to a window.
 //!
 //! ## What it deliberately does not do
 //!

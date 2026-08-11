@@ -66,7 +66,7 @@ this system already does with the console.
       └──────┬───────┘   focus and routing
              │  Surface protocol, on the client's existing session channel
              ▼
-         a window                                  libui delivers; libinput maps
+         a window                                  libsurface delivers; libinput maps
                                                    keycode+modifiers → text
 ```
 
@@ -186,7 +186,7 @@ wire break.
 | Triples → logical events; modifier state; click/drag synthesis | `libinput` | Consumer-side interpretation, shared by the compositor and any future privileged consumer |
 | Keycode + modifiers → text (layouts, dead keys, compose) | `libinput` | Policy and data; a layout must not be a rebuild of anything |
 | Focus, hit-testing, routing to a window | compositor | It owns stacking; routing anywhere else needs a second copy of that state |
-| Delivering input events to a window's event queue | `libui` | It arrives on the Surface session channel, alongside `Release` — that is already `libui`'s job |
+| Delivering input events to a window's event queue | `libsurface` | It arrives on the Surface session channel, alongside `Release` — that is already `libsurface`'s job |
 
 ### 4a. `libinput` is not the client's input library
 
@@ -197,9 +197,9 @@ switcher, or a test harness — all privileged.
 
 `libinput` is therefore used at *both ends for different reasons*: the compositor uses it to
 interpret the device stream, and a client uses it to turn a delivered keycode into text. It
-owns **interpreting** input; `libui` owns **transporting** it to a window. Same layer as
-`libui` and `libdraw`, and `libui` may depend on it — the tree already has that shape, since
-`libui` imports `libdraw`.
+owns **interpreting** input; `libsurface` owns **transporting** it to a window. Same layer as
+`libsurface` and `libdraw`, and `libsurface` may depend on it — the tree already has that shape, since
+`libsurface` imports `libdraw`.
 
 ### 4b. Two `KeyEvent`s, and neither is wrong
 

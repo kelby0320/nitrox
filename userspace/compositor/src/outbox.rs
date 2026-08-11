@@ -6,7 +6,7 @@
 //! consequences when they are lost, and until now they shared one four-message ring:
 //!
 //! - Losing a **motion** is cosmetic. The next one supersedes it.
-//! - Losing a **`Release`** hangs the client *permanently*: `libui`'s `Window::acquire`
+//! - Losing a **`Release`** hangs the client *permanently*: `libsurface`'s `Window::acquire`
 //!   blocks in `sys_wait` with no timeout, so the buffer stays busy and nothing ever wakes
 //!   it. The only trace is one line in the compositor's log.
 //!
@@ -107,7 +107,7 @@ impl Outbox {
         }
         let mut discarded = false;
         if self.q.len() >= OUTBOX_MAX {
-            // Oldest, for the same reason `libui`'s queue does: the newest describes the
+            // Oldest, for the same reason `libsurface`'s queue does: the newest describes the
             // world as it is now, and a client that has fallen this far behind is better
             // served by the present than by the past.
             self.q.remove(0);
@@ -237,7 +237,7 @@ mod tests {
 
     #[test]
     fn a_release_is_never_coalesced_away_by_input() {
-        // The message whose loss is unrecoverable: `libui`'s `acquire` blocks forever on a
+        // The message whose loss is unrecoverable: `libsurface`'s `acquire` blocks forever on a
         // buffer that is never released. A hundred motions must not cost it.
         let mut o = Outbox::new();
         o.push(Outbound::Release { window: 1, buffer: 7 });

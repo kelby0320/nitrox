@@ -1,4 +1,4 @@
-//! `libui` — the client side of the Surface protocol.
+//! `libsurface` — the client side of the Surface protocol.
 //!
 //! The role `librsproto` plays for the RS protocol: **the protocol gets a library, and
 //! clients use it**. The plan is explicit about why — if the first application hand-rolls
@@ -433,7 +433,7 @@ impl<T: Transport> Window<T> {
 mod tests {
     use super::*;
     use alloc::vec;
-    use librsproto::surface::{MOD_SHIFT, POINTER_BUTTON, POINTER_MOTION};
+    use librsproto::surface::{MOD_SHIFT, POINTER_MOTION};
 
     /// Records what was sent and lets a test hand back replies and events.
     #[derive(Default)]

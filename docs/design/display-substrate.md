@@ -3,7 +3,8 @@
 ## Status
 
 **Partly built.** Milestones 1–2 have landed: `libdraw`, the `/dev/framebuffer` binding,
-the compositor serving `/dev/draw`, and `libui`. Input (§5), text (§6), thumbnail capture
+the compositor serving `/dev/draw`, and `libsurface` (named `libui` until M4 Part A).
+Input (§5), text (§6), thumbnail capture
 (§4b) and global hotkeys (§5a) have **no code**. The build order is
 [`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
 when its **subsystem** is built, not when the first milestone touching it lands — the plan
