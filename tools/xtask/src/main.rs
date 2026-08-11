@@ -273,6 +273,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     check_userspace_lib("libdraw")?;
     check_userspace_lib("libsurface")?;
     check_userspace_lib("libinput")?;
+    check_userspace_lib("libui")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -2067,6 +2068,16 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libsurface")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libui` host tests — the toolkit's pure half: the element tree and the two-pass
+    // layout. Every function under test is a function of values, which is the whole reason
+    // the declarative model was chosen (`docs/design/widget-toolkit.md` §2).
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libui")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
