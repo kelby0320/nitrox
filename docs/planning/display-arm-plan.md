@@ -215,6 +215,54 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
       existed. What remains here is the client half and extending that gate to assert through
       `libui` rather than off the input server.
 
+      **Two deferred items are folded in**, and the ordering below is the reason: each one
+      needs the thing before it to exist. Folding them in was decided 2026-08-10, after
+      checking `deferred-decisions.md` rather than working from memory.
+
+      - [x] **D1 — the atomic log-line helper (`TODO(atomic-log-lines)`).** ✅ (2026-08-10) A `kprint`-style
+            helper that formats into a stack buffer and issues **one** syscall, in `libkern`,
+            plus a sweep of the call sites that build a line from several.
+
+            Its filed trigger was "the next torn line that costs debugging time, or any test
+            that needs to assert on a multi-part log line". **Both have now fired.**
+            `check-input` was 40% flaky through M3 Part A because six `kprint` calls per line
+            were shredded by concurrent output — and it was misdiagnosed as a guest bug first,
+            which is precisely the cost the trigger names. D2's gate is the second: an echo
+            client has to report keycode, modifiers and coordinates on one line for the
+            harness to match.
+
+            The stated reason for deferring — "the shape of the helper is worth deciding once
+            rather than per site" — is answered by two independent hand-rolled copies of the
+            same buffer (`compositor/src/main.rs`, `test-harness/src/inputclient.rs`). D2
+            would make it three. **First, so D2 is built on it rather than copying it again.**
+
+            Swept 47 multi-call sites across `init`, `eshell`, `service-mgr`, `session-mgr`,
+            `compositor` and `test-harness`. Verified by **diffing the whole boot transcript
+            before and after**: identical modulo addresses. That diff is what caught the
+            sweep's own bug — an over-eager transformer collapsed three separate
+            `ui-testclient` lines into one, which every gate still passed because each
+            asserted substring was present, just no longer on its own line.
+
+      - [ ] **D2 — `libui` delivery, the echo client, and the gate.** `KeyEvent` and
+            `PointerEvent` into a window's event queue, a client that echoes what arrived, and
+            `check-input` extended to assert **through `libui`** rather than off the input
+            server. This is the milestone's deliverable and the checkbox that retires
+            "`check-input` proves the compositor is attached, not that a key reached a window".
+
+            It also owes the compositor's side of what C3 left open: a client is not told when
+            it gains or loses focus (`rsproto-surface-ops.md` records this as a gap, not a
+            design), and there is still no cursor drawn on screen.
+
+      - [ ] **D3 — back-pressure for compositor→client messages.** Its re-trigger is literally
+            "Part D, when a second client exists", and D2 creates that client.
+
+            **After D2, not before.** The reason it stayed deferred is that with one
+            well-behaved client every candidate answer is untested theory; D2 is the first
+            thing that can characterise them. There is also a real chance D2 *hits* it — the
+            echo client receives continuous input on the same four-deep ring as `Release`, so
+            a client that stops draining while it renders has that ring filled by motion it
+            never asked for, and the next `Release` is the send that fails.
+
 **Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
 with window management in a later milestone; buttons and menus need clicks, and the toolkit
 (M4) comes before any application, so the mouse is needed here.

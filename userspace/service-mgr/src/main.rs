@@ -23,6 +23,7 @@ extern crate alloc;
 use alloc::format;
 use alloc::string::String;
 
+use libkern::debug::Line;
 use libkern::*;
 use service_mgr::service_toml::{self, Backoff, RestartConfig, RestartPolicy, ServiceDecl};
 
@@ -106,22 +107,6 @@ fn kprint(msg: &[u8]) {
     unsafe {
         syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0);
     }
-}
-
-/// Print a small unsigned decimal.
-fn kprint_u64(mut v: u64) {
-    let mut buf = [0u8; 20];
-    let mut i = buf.len();
-    if v == 0 {
-        kprint(b"0");
-        return;
-    }
-    while v > 0 {
-        i -= 1;
-        buf[i] = b'0' + (v % 10) as u8;
-        v /= 10;
-    }
-    kprint(&buf[i..]);
 }
 
 /// The display name of a restart policy (for logging).
@@ -341,15 +326,17 @@ fn load_declaration(root_ns: u64) -> Option<ServiceDecl> {
             return None;
         }
     };
-    kprint(b"service-mgr: parsed service '");
-    kprint(decl.name.as_bytes());
-    kprint(b"' (executable=");
-    kprint(decl.executable.as_bytes());
-    kprint(b", restart=");
-    kprint(restart_name(decl.restart.policy));
-    kprint(b", max_attempts=");
-    kprint_u64(decl.restart.max_attempts as u64);
-    kprint(b")\n");
+    Line::new()
+        .s(b"service-mgr: parsed service '")
+        .s(decl.name.as_bytes())
+        .s(b"' (executable=")
+        .s(decl.executable.as_bytes())
+        .s(b", restart=")
+        .s(restart_name(decl.restart.policy))
+        .s(b", max_attempts=")
+        .u(decl.restart.max_attempts as u64)
+        .s(b")")
+        .end();
     Some(decl)
 }
 
@@ -360,9 +347,7 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     // Resolve the declared executable to its ELF `MemoryObject` (path-based spawn).
     let image = ns_lookup(root_ns, decl.executable.as_bytes(), RIGHT_MAP_READ);
     if image == 0 {
-        kprint(b"service-mgr: image not found: ");
-        kprint(decl.executable.as_bytes());
-        kprint(b"\n");
+        Line::new().s(b"service-mgr: image not found: ").s(decl.executable.as_bytes()).end();
         return (-1, 0);
     }
     let (smgr_end, svc_end) = match create_control_channel() {
@@ -378,9 +363,7 @@ fn spawn_service(root_ns: u64, decl: &ServiceDecl) -> (i64, u64) {
     if log_ep == 0 {
         kprint(b"service-mgr: log endpoint resolve FAIL (spawning without logging)\n");
     }
-    kprint(b"service-mgr: starting service '");
-    kprint(decl.name.as_bytes());
-    kprint(b"'\n");
+    Line::new().s(b"service-mgr: starting service '").s(decl.name.as_bytes()).s(b"'").end();
     // SAFETY: SPAWN_SERVICE is a valid writable arg block. Move the control endpoint into
     // the child (RECV + WAIT only) at `rdx`. The spawn ABI delivers only one handle to a
     // register, so the log endpoint is handed over the control channel after spawn (below),
@@ -737,9 +720,7 @@ fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mu
     let mut requested_shutdown = false;
     // Demo: schedule the graceful-shutdown request.
     let shutdown_at = now_ns().saturating_add(DEMO_RUN_NS);
-    kprint(b"service-mgr: supervising '");
-    kprint(decl.name.as_bytes());
-    kprint(b"'\n");
+    Line::new().s(b"service-mgr: supervising '").s(decl.name.as_bytes()).s(b"'").end();
 
     loop {
         // Wait on the notification channel; while the service runs and no shutdown has
@@ -763,9 +744,11 @@ fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mu
         if waited < 1 {
             // Deadline reached with the service still running: request shutdown once.
             if running && !requested_shutdown {
-                kprint(b"service-mgr: requesting graceful shutdown of '");
-                kprint(decl.name.as_bytes());
-                kprint(b"'\n");
+                Line::new()
+                    .s(b"service-mgr: requesting graceful shutdown of '")
+                    .s(decl.name.as_bytes())
+                    .s(b"'")
+                    .end();
                 send_control(ctrl, CTRL_OP_SHUTDOWN);
                 requested_shutdown = true;
             }
@@ -796,54 +779,61 @@ fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mu
             service_h = 0;
             ctrl = 0;
             running = false;
-            kprint(b"service-mgr: '");
-            kprint(decl.name.as_bytes());
-            kprint(b"' exited pid=");
-            kprint_u64(cpid as u64);
-            kprint(b" code=");
-            kprint_u64(code as u64);
-            kprint(b"\n");
+            Line::new()
+                .s(b"service-mgr: '")
+                .s(decl.name.as_bytes())
+                .s(b"' exited pid=")
+                .u(cpid as u64)
+                .s(b" code=")
+                .u(code as u64)
+                .end();
 
             // A supervisor-requested shutdown is intentional — never restart it, even
             // under `policy = always`.
             if requested_shutdown {
-                kprint(b"service-mgr: '");
-                kprint(decl.name.as_bytes());
-                kprint(b"' stopped as requested (policy=");
-                kprint(restart_name(decl.restart.policy));
-                kprint(b" overridden -- not restarting)\n");
+                Line::new()
+                    .s(b"service-mgr: '")
+                    .s(decl.name.as_bytes())
+                    .s(b"' stopped as requested (policy=")
+                    .s(restart_name(decl.restart.policy))
+                    .s(b" overridden -- not restarting)")
+                    .end();
                 continue;
             }
 
             // Unexpected exit — apply the restart policy + backoff (Part D).
             if !should_restart(decl.restart.policy, code) {
-                kprint(b"service-mgr: '");
-                kprint(decl.name.as_bytes());
-                kprint(b"' stopped (policy=");
-                kprint(restart_name(decl.restart.policy));
-                kprint(b", not restarting)\n");
+                Line::new()
+                    .s(b"service-mgr: '")
+                    .s(decl.name.as_bytes())
+                    .s(b"' stopped (policy=")
+                    .s(restart_name(decl.restart.policy))
+                    .s(b", not restarting)")
+                    .end();
                 continue;
             }
             if decl.restart.max_attempts != 0 && attempts >= decl.restart.max_attempts {
-                kprint(b"service-mgr: '");
-                kprint(decl.name.as_bytes());
-                kprint(b"' gave up after ");
-                kprint_u64(attempts as u64);
-                kprint(b" restart(s)\n");
+                Line::new()
+                    .s(b"service-mgr: '")
+                    .s(decl.name.as_bytes())
+                    .s(b"' gave up after ")
+                    .u(attempts as u64)
+                    .s(b" restart(s)")
+                    .end();
                 continue;
             }
             let backoff = compute_backoff(&decl.restart, attempts);
-            kprint(b"service-mgr: restarting '");
-            kprint(decl.name.as_bytes());
-            kprint(b"' (attempt ");
-            kprint_u64((attempts + 1) as u64);
+            // Assembled across the `if` rather than emitted in pieces — the whole point of
+            // the helper is that a conditional fragment does not become its own line.
+            let mut l = Line::new();
+            l.s(b"service-mgr: restarting '")
+                .s(decl.name.as_bytes())
+                .s(b"' (attempt ")
+                .u((attempts + 1) as u64);
             if decl.restart.max_attempts != 0 {
-                kprint(b" of ");
-                kprint_u64(decl.restart.max_attempts as u64);
+                l.s(b" of ").u(decl.restart.max_attempts as u64);
             }
-            kprint(b") after ");
-            kprint_u64(backoff / 1_000_000);
-            kprint(b"ms backoff\n");
+            l.s(b") after ").u(backoff / 1_000_000).s(b"ms backoff").end();
             sleep_ns(timer_h, backoff);
             let (h, new_ctrl) = spawn_service(root_ns, &decl);
             if h > 0 {

@@ -310,6 +310,32 @@ Raised by the PR #175 review, 2026-08-06.
 > characterise them. Noted rather than fixed, because a fix chosen now would be a guess.
 > **Re-trigger: Part D, when a second client exists.**
 
+### Processes and memory
+
+**The default user stack is 32 KiB, and nothing has measured whether that is right.**
+`DEFAULT_USER_STACK_SIZE` (`kernel/src/arch/x86_64/abi.rs`) is 8 pages, bumped from 4 for the
+read-write fs-server, whose metadata mutation legitimately nests several 4 KiB block buffers.
+It is the **only** stack a process gets: there is no guard page and no growth-on-fault, so
+overrunning it corrupts whatever the loader placed below rather than faulting cleanly, and a
+process wanting more must `sys_memory_map` its own and switch to it.
+
+Raised during the PR #175 review — *"32k for a user stack is pretty small, we can probably
+make that bigger now"* — and correctly kept out of that PR, but never filed, so the decision
+existed only in a conversation. Filed 2026-08-10 to fix that.
+
+Three things are tangled here and only the first is cheap: **the number** (raising it costs
+address space, which is not scarce, and eager mapping, which is measurable at spawn — 105
+spawns a boot on the selftest image); **a guard page**, which is what turns a silent overrun
+into a diagnosable fault and is the part actually worth having; and **growth on fault**, which
+needs the fault path to distinguish a stack overrun from a stray access. The kernel already
+tracks its own deepest use (`kstack: deepest 6520 B of 16384`) — no equivalent exists for user
+stacks, so today nobody can say whether 32 KiB is generous or nearly exhausted.
+
+**Trigger:** a userspace stack overrun that costs debugging time, the toolkit (M4) putting
+deeper call chains under a client, or a measurement showing the real high-water mark. The
+measurement is the cheapest of the three and would settle the number without touching the
+kernel's fault path.
+
 ### Filesystems
 
 **A separate interrupt stack — `TODO(irq-stack)`.** Only `#DF` runs on a dedicated stack
@@ -522,12 +548,18 @@ into a `String` and emits once; **the pattern is everywhere else** — roughly 3
 across userspace use `kprint_u64`/`kprint_hex` mid-line, and `service-mgr` builds its
 service-declaration lines the same way.
 
-The fix is a small `kprintf`-style helper that formats into a stack buffer and issues one
-syscall, plus a sweep of the call sites. Deferred because it is a mechanical change across
-five services with no failure pressure behind it beyond diagnostics, and because the shape of
-the helper is worth deciding once rather than per site. **Trigger:** the next torn line that
-costs debugging time, or any test that needs to assert on a multi-part log line — the
-interactive suite now asserts on the one line that was fixed.
+~~The fix is a small `kprintf`-style helper…~~ **Done 2026-08-10 (M3 Part D1).**
+`libkern::debug::Line` formats into a 256-byte stack buffer and issues one `kprint`; every
+multi-call line in userspace was swept into it, and the three hand-rolled copies of the same
+buffer (`compositor`, `test-harness/inputclient`, `service-mgr`'s local `kprint_u64`) are
+gone. Both triggers had fired: `check-input` was 40% flaky for a milestone because its
+six-call lines arrived shredded — and was misdiagnosed as a guest bug first, which is the
+debugging cost the trigger named — and Part D2's gate has to assert on a line carrying a
+keycode, modifiers and coordinates together.
+
+A truncated line is marked `...` rather than silently shortened, because these lines are what
+the QEMU gates match on and a short line that reads as complete is worse than one that admits
+it was cut.
 
 **Control flow inside an expression — `TODO(control-flow-in-expression-position)`.**
 `eval` returns a *value*, so a block whose value is being taken has no channel for control

@@ -49,6 +49,7 @@ extern crate alloc;
 use libdraw::acquire::{self, AcquireError};
 use libdraw::hash::hash_visible;
 use libdraw::scene::{self, REFERENCE_HASH};
+use libkern::debug::Line;
 use libkern::{exit, kprint};
 
 /// `alloc` backing — `libdraw`'s scene rendering allocates its surface buffers.
@@ -63,26 +64,6 @@ fn kprint_hex64(n: u64) {
         buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
     }
     kprint(&buf);
-}
-
-/// Print `n` in decimal, without `format!`.
-fn kprint_u64(n: u64) {
-    if n == 0 {
-        kprint(b"0");
-        return;
-    }
-    let mut d = [0u8; 20];
-    let (mut i, mut n) = (0usize, n);
-    while n > 0 {
-        d[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    let mut out = [0u8; 20];
-    for j in 0..i {
-        out[j] = d[i - 1 - j];
-    }
-    kprint(&out[..i]);
 }
 
 /// Check 1: the reference scene's hash matches the constant the host asserts.
@@ -104,13 +85,15 @@ fn check_reference_hash() -> bool {
     // The picture, not just the number. A viewer can open this; the two hashes cannot
     // distinguish a stride skew from a swapped channel.
     let ppm = libdraw::ppm::to_ppm(&fb);
-    kprint(b"display-selftest: scene follows as hex-encoded P6 PPM (");
-    kprint_u64(ppm.len() as u64);
-    kprint(b" bytes, ");
-    kprint_u64(scene::SCREEN_WIDTH as u64);
-    kprint(b"x");
-    kprint_u64(scene::SCREEN_HEIGHT as u64);
-    kprint(b")\n");
+    Line::new()
+        .s(b"display-selftest: scene follows as hex-encoded P6 PPM (")
+        .u(ppm.len() as u64)
+        .s(b" bytes, ")
+        .u(scene::SCREEN_WIDTH as u64)
+        .s(b"x")
+        .u(scene::SCREEN_HEIGHT as u64)
+        .s(b")")
+        .end();
     // Emitted over serial so the picture actually leaves the guest. Without this the
     // encoder would exist and a failure would still report only two hex numbers, which
     // is the situation the dump is meant to end. Extract with:
@@ -151,13 +134,14 @@ fn check_framebuffer_binding(root_ns: u64) -> Result<(), AcquireError> {
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let (_fb, info) = unsafe { acquire::acquire(root_ns) }?;
 
-    kprint(b"display-selftest: framebuffer ");
-    kprint_u64(info.width as u64);
-    kprint(b"x");
-    kprint_u64(info.height as u64);
-    kprint(b" pitch=");
-    kprint_u64(info.pitch);
-    kprint(b"\n");
+    Line::new()
+        .s(b"display-selftest: framebuffer ")
+        .u(info.width as u64)
+        .s(b"x")
+        .u(info.height as u64)
+        .s(b" pitch=")
+        .u(info.pitch)
+        .end();
 
     kprint(b"display-selftest: framebuffer reachable\n");
     Ok(())

@@ -12391,3 +12391,47 @@ written and quietly stopped being true**:
 The last one is the general lesson: **when an invariant becomes spread across two constants,
 the comment that used to state it becomes a liability.** It reads as a guarantee, it is
 checked by nobody, and it is most convincing to exactly the person about to violate it.
+
+## 2026-08-10 — The log-line sweep, and the gate that could not see its own damage
+
+M3 Part D1 retired `TODO(atomic-log-lines)`: `libkern::debug::Line` assembles a line in a
+256-byte stack buffer and emits it with one `kprint`, and 47 multi-call sites across `init`,
+`eshell`, `service-mgr`, `session-mgr`, `compositor` and `test-harness` were swept into it.
+
+**The deferral was retired on its own terms, not on convenience.** Its filed trigger was "the
+next torn line that costs debugging time, or any test that needs to assert on a multi-part log
+line", and both had fired: `check-input` was 40% flaky for a milestone because its six-call
+lines arrived shredded — and was misdiagnosed as a guest bug first — while Part D2's gate has
+to match a line carrying a keycode, modifiers and coordinates together. The stated reason for
+deferring, "the shape of the helper is worth deciding once rather than per site", was answered
+by three independent hand-rolled copies of the same buffer having appeared in the meantime.
+
+**The interesting part is how the sweep was verified.** A mechanical rewrite of 47 log sites
+is exactly the kind of change where every test passes and the output is subtly wrong, because
+the tests assert on *substrings* and the thing that changed is where the newlines are. So the
+check was not the test suite: it was **diffing the entire boot transcript before and after**,
+normalised for addresses.
+
+That diff earned its keep immediately. The transformer collapsed three separate
+`ui-testclient` lines into one — `committed 4 frames over 2 buffersui-testclient: scene
+presented via /dev/drawui-testclient: PASSED` — because it stripped the newline from *any*
+literal that ended with one rather than only the last. **Every gate still passed**, including
+`check-display` and `test-qemu`, because each asserted substring was present; only its line
+had vanished. `Session::expect` scans for a substring and does not care about newlines, which
+is the right design for a matcher and the reason it cannot police this.
+
+The lesson generalises past logging: **when a change is mechanical and wide, the thing to
+compare is the output, not the assertions.** Assertions were written to catch the bugs someone
+anticipated; a sweep introduces the ones nobody did. A whole-transcript diff costs one boot and
+sees everything the assertions were not asked about.
+
+Two smaller notes from the same work:
+
+- `cargo xtask image` **does not build the selftest binaries**, so "image builds" is not
+  "everything builds". A type error in `input-testclient` survived several rounds of checking
+  the wrong command. `test-qemu` is the build check for anything under `test-harness/`.
+- The helper's `u()` initially shifted digits down on the assumption that `fmt_u64` returns a
+  *suffix* of its buffer. It returns the front for zero and a suffix otherwise, so `0` came out
+  as a NUL byte — caught by a test written for the suffix hazard, which found the opposite one.
+  The fix was to delete the cleverness: the buffer is a local, so nothing borrowed `self` and
+  no copy was needed at all.

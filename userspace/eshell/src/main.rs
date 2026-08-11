@@ -13,6 +13,7 @@
 #![no_main]
 
 use core::arch::asm;
+use libkern::debug::Line;
 use libkern::*;
 
 /// Page size (the read buffer is one page).
@@ -133,16 +134,13 @@ fn dispatch(line: &[u8], root_ns: u64) {
     match cmd {
         b"help" => cmd_help(),
         b"echo" => {
-            kprint(trim(args));
-            kprint(b"\r\n");
+            Line::new().s(trim(args)).s(b"\r").end();
         }
         b"lsblk" => cmd_lsblk(root_ns),
         b"cat" => cmd_cat(root_ns, trim(args)),
         b"mounts" => cmd_mounts(root_ns),
         _ => {
-            kprint(b"eshell: unknown command: ");
-            kprint(cmd);
-            kprint(b"\r\n(type 'help')\r\n");
+            Line::new().s(b"eshell: unknown command: ").s(cmd).s(b"\r\n(type 'help')\r").end();
         }
     }
 }
@@ -190,9 +188,7 @@ fn cmd_cat(root_ns: u64, path: &[u8]) {
     // Need MAP_READ (map+read) and INSPECT (stat for the size).
     let (st, h) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ | RIGHT_INSPECT);
     if st != 0 || h == 0 {
-        kprint(b"cat: cannot open: ");
-        kprint(path);
-        kprint(b"\r\n");
+        Line::new().s(b"cat: cannot open: ").s(path).s(b"\r").end();
         return;
     }
     // Stat for the byte size (the slice-9 `HandleInfo.size`).
@@ -249,8 +245,7 @@ fn cmd_lsblk(root_ns: u64) {
         if st != 0 || h == 0 {
             break; // no more devices
         }
-        kprint(&path[..n]);
-        kprint(b"\r\n");
+        Line::new().s(&path[..n]).s(b"\r").end();
         found += 1;
         // SAFETY: closing the handle we just resolved.
         unsafe { syscall1(SYS_HANDLE_CLOSE, h) };

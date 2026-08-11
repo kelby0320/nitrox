@@ -29,6 +29,7 @@
 #![no_main]
 
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
+use libkern::debug::Line;
 use libkern::{
     RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
     syscall4,
@@ -101,65 +102,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     if status != 0 || resolved == 0 { None } else { Some(resolved) }
 }
 
-/// A line built in one buffer and emitted with a **single** `kprint`.
-///
-/// This is not tidiness. The console is shared and unsynchronised **between processes**: one
-/// `kprint` is atomic (it takes the serial lock) but a sequence of them is not, so a line
-/// assembled from six calls gets shredded by whatever else is booting. That is exactly how
-/// the first version of this client failed — the events arrived, the client printed them,
-/// and the harness saw `input-testclient: kbdtest-stage: setup message …` because another
-/// process wrote between the tag and the value.
-struct Line {
-    buf: [u8; 96],
-    len: usize,
-}
-
-impl Line {
-    fn new() -> Self {
-        Self { buf: [0; 96], len: 0 }
-    }
-
-    fn str(&mut self, s: &[u8]) -> &mut Self {
-        let n = s.len().min(self.buf.len() - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
-        self.len += n;
-        self
-    }
-
-    fn u64(&mut self, n: u64) -> &mut Self {
-        if n == 0 {
-            return self.str(b"0");
-        }
-        let mut d = [0u8; 20];
-        let (mut i, mut v) = (0usize, n);
-        while v > 0 {
-            d[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-            i += 1;
-        }
-        let mut out = [0u8; 20];
-        for j in 0..i {
-            out[j] = d[i - 1 - j];
-        }
-        self.str(&out[..i])
-    }
-
-    fn i32(&mut self, v: i32) -> &mut Self {
-        if v < 0 {
-            self.str(b"-").u64((-(v as i64)) as u64)
-        } else {
-            self.u64(v as u64)
-        }
-    }
-
-    /// Emit the whole line in one syscall, newline included.
-    fn emit(&mut self) {
-        self.str(b"\n");
-        kprint(&self.buf[..self.len]);
-        self.len = 0;
-    }
-}
-
 /// The consumer end of `/dev/input/new`, and the last batch received on it.
 struct Stream {
     channel: u64,
@@ -226,14 +168,14 @@ impl Stream {
                     done = true;
                 }
                 Line::new()
-                    .str(b"input-testclient: ev")
-                    .str(b" kind=")
-                    .u64(ev.kind as u64)
-                    .str(b" code=")
-                    .u64(ev.code as u64)
-                    .str(b" value=")
-                    .i32(ev.value)
-                    .emit();
+                    .s(b"input-testclient: ev")
+                    .s(b" kind=")
+                    .u(ev.kind as u64)
+                    .s(b" code=")
+                    .u(ev.code as u64)
+                    .s(b" value=")
+                    .i(ev.value as i64)
+                    .end();
             }
             return Some(done);
         }

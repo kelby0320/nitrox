@@ -43,6 +43,7 @@ use libkern::{
     SENDMODE_NOBLOCK, SYS_CHANNEL_CREATE, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_HANDLE_CLOSE,
     SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_WAIT, exit, kprint, syscall2, syscall4, syscall5,
 };
+use libkern::debug::Line;
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
@@ -340,59 +341,6 @@ fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
     reply_on_session(session, op, 0, body)
 }
 
-/// A diagnostic line, built in one buffer and emitted with a **single** `kprint`.
-///
-/// `kprint` takes the serial lock, so one call is atomic — a *sequence* of them is not.
-/// Six calls per line is how `cargo xtask check-input`'s own output arrived shredded and
-/// its assertions failed 40% of the time against a guest that was working correctly.
-struct Line {
-    buf: [u8; 64],
-    len: usize,
-}
-
-impl Line {
-    /// An empty line.
-    fn new() -> Self {
-        Self { buf: [0; 64], len: 0 }
-    }
-
-    /// Append bytes, silently truncating at the buffer's end.
-    fn s(&mut self, b: &[u8]) -> &mut Self {
-        for &c in b {
-            if self.len < self.buf.len() {
-                self.buf[self.len] = c;
-                self.len += 1;
-            }
-        }
-        self
-    }
-
-    /// Append a signed decimal.
-    fn n(&mut self, mut v: i64) -> &mut Self {
-        if v < 0 {
-            self.s(b"-");
-            v = -v;
-        }
-        let mut digits = [0u8; 20];
-        let mut i = digits.len();
-        loop {
-            i -= 1;
-            digits[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-            if v == 0 {
-                break;
-            }
-        }
-        self.s(&digits[i..])
-    }
-
-    /// Emit the line.
-    fn end(&mut self) {
-        self.s(b"\n");
-        kprint(&self.buf[..self.len]);
-    }
-}
-
 /// Log a routed record, up to [`MAX_LOGGED_ROUTES`] of them.
 fn log_route(rec: &Outbound) {
     // SAFETY: single-threaded server; this counter is touched only from the serve loop.
@@ -409,14 +357,14 @@ fn log_route(rec: &Outbound) {
     let mut l = Line::new();
     match rec {
         Outbound::Key { window, event } => {
-            l.s(b"compositor: key win=").n(*window as i64);
-            l.s(b" code=").n(event.keycode as i64);
-            l.s(b" down=").n(event.pressed as i64);
+            l.s(b"compositor: key win=").u(*window as u64);
+            l.s(b" code=").u(event.keycode as u64);
+            l.s(b" down=").u(event.pressed as u64);
         }
         Outbound::Pointer { window, event } => {
-            l.s(b"compositor: ptr win=").n(*window as i64);
-            l.s(b" kind=").n(event.kind as i64);
-            l.s(b" x=").n(event.x as i64).s(b" y=").n(event.y as i64);
+            l.s(b"compositor: ptr win=").u(*window as u64);
+            l.s(b" kind=").u(event.kind as u64);
+            l.s(b" x=").i(event.x as i64).s(b" y=").i(event.y as i64);
         }
     }
     l.end();

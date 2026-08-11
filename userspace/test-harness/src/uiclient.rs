@@ -43,6 +43,7 @@ extern crate alloc;
 
 use libdraw::framebuffer::Framebuffer;
 use libdraw::scene;
+use libkern::debug::Line;
 use libkern::{
     SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2,
     syscall4,
@@ -78,25 +79,6 @@ const CHURN_CYCLES: usize = 128;
 const CHURN_W: u32 = 1024;
 /// Churn window height.
 const CHURN_H: u32 = 768;
-
-fn kprint_u64(n: u64) {
-    if n == 0 {
-        kprint(b"0");
-        return;
-    }
-    let mut d = [0u8; 20];
-    let (mut i, mut n) = (0usize, n);
-    while n > 0 {
-        d[i] = b'0' + (n % 10) as u8;
-        n /= 10;
-        i += 1;
-    }
-    let mut out = [0u8; 20];
-    for j in 0..i {
-        out[j] = d[i - 1 - j];
-    }
-    kprint(&out[..i]);
-}
 
 /// Create a `MemoryObject` of `len` bytes and map it read-write.
 ///
@@ -173,15 +155,16 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
     // had on its side of this exchange (PR #175 review, finding 1).
     let _ = obj.unmap(addr as *mut u8, 32);
 
-    kprint(b"ui-testclient: info id=");
-    kprint_u64(info.id as u64);
-    kprint(b" ");
-    kprint_u64(info.width as u64);
-    kprint(b"x");
-    kprint_u64(info.height as u64);
-    kprint(b" role=");
-    kprint_u64(info.role as u64);
-    kprint(b"\n");
+    Line::new()
+        .s(b"ui-testclient: info id=")
+        .u(info.id as u64)
+        .s(b" ")
+        .u(info.width as u64)
+        .s(b"x")
+        .u(info.height as u64)
+        .s(b" role=")
+        .u(info.role as u64)
+        .end();
 
     info.id == id
         && info.width == want_w
@@ -216,17 +199,13 @@ fn churn(root_ns: u64) -> bool {
         let mut w = match Window::new(t, CHURN_W, CHURN_H, Role::Normal, BUFFERS) {
             Ok(w) => w,
             Err(_) => {
-                kprint(b"churn: Window::new failed at cycle ");
-                kprint_u64(cycle as u64);
-                kprint(b"\n");
+                Line::new().s(b"churn: Window::new failed at cycle ").u(cycle as u64).end();
                 return false;
             }
         };
         // The allocation that fails first when the compositor is hoarding.
         let Some((handle, addr)) = shared_buffer(len) else {
-            kprint(b"churn: real buffer alloc failed at cycle ");
-            kprint_u64(cycle as u64);
-            kprint(b"\n");
+            Line::new().s(b"churn: real buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
         };
         if w.attach(0, CHURN_W, CHURN_H, pitch as u32, handle).is_err() {
@@ -247,9 +226,7 @@ fn churn(root_ns: u64) -> bool {
         // hand over an object nobody ever closed. Sent through the raw transport because
         // `libui` deliberately cannot express it.
         let Some((bogus_handle, bogus_addr)) = shared_buffer(len) else {
-            kprint(b"churn: bogus buffer alloc failed at cycle ");
-            kprint_u64(cycle as u64);
-            kprint(b"\n");
+            Line::new().s(b"churn: bogus buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
         };
         //
@@ -297,9 +274,10 @@ fn churn(root_ns: u64) -> bool {
         match t.request(bogus_op, &req[..rn], Some(bogus_handle), &mut reply) {
             Err(libui::UiError::Server) => {}
             _ => {
-                kprint(b"churn: bogus request was not refused at cycle ");
-                kprint_u64(cycle as u64);
-                kprint(b"\n");
+                Line::new()
+                    .s(b"churn: bogus request was not refused at cycle ")
+                    .u(cycle as u64)
+                    .end();
                 return false;
             }
         }
@@ -354,9 +332,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             fail(b"ui-testclient: CreateWindow FAILED (no reply?)\n");
         }
     };
-    kprint(b"ui-testclient: window ");
-    kprint_u64(win.id() as u64);
-    kprint(b"\n");
+    Line::new().s(b"ui-testclient: window ").u(win.id() as u64).end();
 
     // 2b. Read the window's own metadata back through the *numbered* path. This is the
     //     other half of Part B: `/dev/draw/new` mints a session, `/dev/draw/<N>/info`
@@ -377,9 +353,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // is not the only suspect. The `churn:` line above says which step failed.
         fail(b"ui-testclient: window churn FAILED (see the churn: line above)\n");
     }
-    kprint(b"ui-testclient: churned ");
-    kprint_u64(CHURN_CYCLES as u64);
-    kprint(b" windows\n");
+    Line::new().s(b"ui-testclient: churned ").u(CHURN_CYCLES as u64).s(b" windows").end();
 
     // 3. Shared memory. Rendered once; both buffers get the same picture, so whichever is
     //    on screen at the end is the one `check-display` expects.
@@ -424,9 +398,14 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         let b = match win.acquire() {
             Ok(b) => b,
             Err(_) => {
-                kprint(b"ui-testclient: STALLED at frame ");
-                kprint_u64(frame as u64);
-                fail(b" -- no buffer released\n");
+                // Built here rather than split across `fail`, which prints its argument as
+                // given: the frame number and the reason are one line.
+                Line::new()
+                    .s(b"ui-testclient: STALLED at frame ")
+                    .u(frame as u64)
+                    .s(b" -- no buffer released")
+                    .end();
+                fail(b"");
             }
         };
         if win.commit(b, (0, 0, w, h)).is_err() {
@@ -444,11 +423,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         fail(b"ui-testclient: final frame never acknowledged\n");
     }
 
-    kprint(b"ui-testclient: committed ");
-    kprint_u64(FRAMES as u64);
-    kprint(b" frames over ");
-    kprint_u64(BUFFERS as u64);
-    kprint(b" buffers\n");
+    Line::new()
+        .s(b"ui-testclient: committed ")
+        .u(FRAMES as u64)
+        .s(b" frames over ")
+        .u(BUFFERS as u64)
+        .s(b" buffers")
+        .end();
     kprint(b"ui-testclient: scene presented via /dev/draw\n");
     kprint(b"ui-testclient: PASSED\n");
 

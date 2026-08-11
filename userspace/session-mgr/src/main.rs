@@ -27,6 +27,7 @@
 
 extern crate alloc;
 
+use libkern::debug::Line;
 use libkern::*;
 
 /// `alloc` backing: the environment record and the setup-message codec both allocate.
@@ -636,9 +637,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
 
     match login(tty, auth_ch, &mut home, &mut user) {
         Some((hl, ul)) => {
-            kprint(b"session-mgr: login ok -> home=");
-            kprint(&home[..hl]);
-            kprint(b"\n");
+            Line::new().s(b"session-mgr: login ok -> home=").s(&home[..hl]).end();
             let session_ns = build_session_namespace(
                 root_ns,
                 fs_endpoint,
