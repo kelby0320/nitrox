@@ -72,6 +72,16 @@ pub struct InputRouter {
     inside: Option<u32>,
     /// The window holding the implicit grab, if a button is down.
     grab: Option<u32>,
+    /// Buttons held, mirrored from the last event that carried them.
+    ///
+    /// Stamped onto **every** record, not just `POINTER_BUTTON`. A drag is motion with a
+    /// button held, so a client told `buttons == 0` on motion cannot implement one without
+    /// re-accumulating the state itself — the duplication the Surface layer exists to
+    /// avoid (PR #180 review, finding 2).
+    buttons: u16,
+    /// Modifiers held, mirrored the same way — what makes shift-click and shift-drag
+    /// expressible on the wire rather than only in `libinput`.
+    modifiers: u16,
 }
 
 impl InputRouter {
@@ -84,7 +94,7 @@ impl InputRouter {
             screen.origin.x + (screen.size.w / 2) as i32,
             screen.origin.y + (screen.size.h / 2) as i32,
         );
-        Self { pointer, screen, inside: None, grab: None }
+        Self { pointer, screen, inside: None, grab: None, buttons: 0, modifiers: 0 }
     }
 
     /// Where the cursor is, in screen coordinates.
@@ -100,6 +110,16 @@ impl InputRouter {
     /// The window holding the implicit grab, if a button is down.
     pub fn grab(&self) -> Option<u32> {
         self.grab
+    }
+
+    /// Buttons held, as last reported.
+    pub fn buttons(&self) -> u16 {
+        self.buttons
+    }
+
+    /// Modifiers held, as last reported.
+    pub fn modifiers(&self) -> u16 {
+        self.modifiers
     }
 
     /// Route one logical event, appending what to send to `out`.
@@ -122,6 +142,23 @@ impl InputRouter {
             self.grab = None;
         }
 
+        // Mirror the interpreter's state before anything is emitted. Enter and leave are
+        // generated *by* the router rather than arriving as events, so they have no state of
+        // their own to read; taking it from the event that provoked them is what lets every
+        // record carry the same answer.
+        match *ev {
+            Logical::Key { modifiers, .. } => self.modifiers = modifiers,
+            Logical::Motion { buttons, modifiers, .. }
+            | Logical::Button { buttons, modifiers, .. } => {
+                self.buttons = buttons;
+                self.modifiers = modifiers;
+            }
+            Logical::Dropped => {
+                self.buttons = 0;
+                self.modifiers = 0;
+            }
+        }
+
         match *ev {
             Logical::Key { keycode, pressed, modifiers } => {
                 let Some(window) = stack.focus_candidate() else {
@@ -141,11 +178,11 @@ impl InputRouter {
                 false
             }
 
-            Logical::Motion { dx, dy } => {
+            Logical::Motion { dx, dy, .. } => {
                 self.move_by(dx, dy);
                 self.update_crossing(stack, out);
                 if let Some(window) = self.target(stack) {
-                    self.emit(window, POINTER_MOTION, 0, 0, 0, stack, out);
+                    self.emit(window, POINTER_MOTION, 0, 0, stack, out);
                 }
                 false
             }
@@ -153,6 +190,13 @@ impl InputRouter {
             Logical::Button { button, pressed, buttons, .. } => {
                 let mut restacked = false;
                 if pressed && self.grab.is_none() {
+                    // **Before the grab**, or the first click after boot is delivered to a
+                    // window that was never entered: nothing has moved the cursor, `inside`
+                    // is still `None`, and once grabbed the crossing pass early-returns —
+                    // so the enter would only be derived on release, after a whole click had
+                    // been processed for a pointer the client believes is elsewhere
+                    // (PR #180 review, finding 7).
+                    self.update_crossing(stack, out);
                     // The press decides the grab. Taking it before the raise reads as the
                     // careful order, but it is only the clearer one: hit-testing picks the
                     // topmost window *containing the point*, and raising that window leaves
@@ -170,7 +214,7 @@ impl InputRouter {
 
                 if let Some(window) = self.target(stack) {
                     let flags = if pressed { POINTER_PRESSED } else { 0 };
-                    self.emit(window, POINTER_BUTTON, button, buttons, flags, stack, out);
+                    self.emit(window, POINTER_BUTTON, button, flags, stack, out);
                 }
 
                 if !pressed && buttons == 0 {
@@ -235,11 +279,11 @@ impl InputRouter {
             return;
         }
         if let Some(old) = self.inside {
-            self.emit(old, POINTER_LEAVE, 0, 0, 0, stack, out);
+            self.emit(old, POINTER_LEAVE, 0, 0, stack, out);
         }
         self.inside = now;
         if let Some(new) = now {
-            self.emit(new, POINTER_ENTER, 0, 0, 0, stack, out);
+            self.emit(new, POINTER_ENTER, 0, 0, stack, out);
         }
     }
 
@@ -249,7 +293,6 @@ impl InputRouter {
         window: u32,
         kind: u16,
         button: u16,
-        buttons: u16,
         flags: u16,
         stack: &WindowStack,
         out: &mut Vec<Outbound>,
@@ -261,8 +304,10 @@ impl InputRouter {
         let event = PointerEvent {
             kind,
             button,
-            buttons,
+            buttons: self.buttons,
             flags,
+            modifiers: self.modifiers,
+            _pad: 0,
             // Signed and unclamped: under a grab the cursor is routinely outside the
             // window, and reporting a clamped edge position would make a drag look like it
             // stopped at the border.
@@ -277,7 +322,7 @@ impl InputRouter {
 mod tests {
     use super::*;
     use librsproto::surface::{
-        AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, Role,
+        AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge, MOD_SHIFT, Role,
         SURFACE_FORMAT_XRGB8888,
     };
 
@@ -323,7 +368,17 @@ mod tests {
     /// Put the cursor at an absolute screen position, discarding what that produced.
     fn warp(r: &mut InputRouter, s: &mut WindowStack, x: i32, y: i32) {
         let p = r.pointer();
-        go(r, s, Logical::Motion { dx: x - p.x, dy: y - p.y });
+        go(r, s, motion(x - p.x, y - p.y));
+    }
+
+    /// Motion with nothing held.
+    fn motion(dx: i32, dy: i32) -> Logical {
+        Logical::Motion { dx, dy, buttons: 0, modifiers: 0 }
+    }
+
+    /// Motion with the left button held — what `libinput` emits mid-drag.
+    fn drag(dx: i32, dy: i32) -> Logical {
+        Logical::Motion { dx, dy, buttons: 1, modifiers: 0 }
     }
 
     fn key(keycode: u16, pressed: bool) -> Logical {
@@ -417,7 +472,7 @@ mod tests {
         let mut r = InputRouter::new(SCREEN);
 
         warp(&mut r, &mut s, 50, 50);
-        let out = go(&mut r, &mut s, Logical::Motion { dx: 200, dy: 0 });
+        let out = go(&mut r, &mut s, motion(200, 0));
         let kinds: Vec<_> = out
             .iter()
             .map(|o| match o {
@@ -433,13 +488,93 @@ mod tests {
     }
 
     #[test]
+    fn every_record_carries_the_buttons_and_modifiers_held() {
+        // Not just `POINTER_BUTTON`. A client implementing the standard "on motion, if a
+        // button is down, move the object" needs it on motion, and a crossing generated by
+        // the router — which arrives as no event at all — must agree with its neighbours.
+        let mut s = WindowStack::new();
+        win(&mut s, Role::Normal, 0, 0, 100, 100);
+        let b = win(&mut s, Role::Normal, 200, 0, 100, 100);
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+
+        let out = go(&mut r, &mut s, Logical::Button {
+            button: BTN_LEFT,
+            pressed: true,
+            buttons: 1,
+            modifiers: MOD_SHIFT,
+        });
+        for o in &out {
+            let Outbound::Pointer { event, .. } = o else { unreachable!() };
+            assert_eq!((event.buttons, event.modifiers), (1, MOD_SHIFT), "kind {}", event.kind);
+        }
+
+        let out = go(&mut r, &mut s, Logical::Motion {
+            dx: 200,
+            dy: 0,
+            buttons: 1,
+            modifiers: MOD_SHIFT,
+        });
+        let Outbound::Pointer { event, .. } = out
+            .iter()
+            .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION))
+            .copied()
+            .expect("a motion")
+        else {
+            unreachable!()
+        };
+        assert_eq!(
+            (event.buttons, event.modifiers),
+            (1, MOD_SHIFT),
+            "a shift-drag is expressible from one record"
+        );
+
+        // And the release's crossing into `b`, which the router synthesises, agrees.
+        let out = go(&mut r, &mut s, Logical::Button {
+            button: BTN_LEFT,
+            pressed: false,
+            buttons: 0,
+            modifiers: MOD_SHIFT,
+        });
+        let entered = out
+            .iter()
+            .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_ENTER))
+            .expect("an enter");
+        assert_eq!(entered.window(), b);
+        let Outbound::Pointer { event, .. } = entered else { unreachable!() };
+        assert_eq!((event.buttons, event.modifiers), (0, MOD_SHIFT));
+    }
+
+    #[test]
+    fn the_first_click_after_boot_enters_the_window_before_the_press() {
+        // Nothing has moved the cursor, so `inside` is still `None` — and once the press
+        // takes the grab the crossing pass early-returns. Deriving it only on release means
+        // a client that arms hover state on `POINTER_ENTER` processes a whole click for a
+        // pointer it believes is elsewhere (PR #180 review, finding 7).
+        let mut s = WindowStack::new();
+        let w = win(&mut s, Role::Normal, 0, 0, 640, 480);
+        let mut r = InputRouter::new(SCREEN);
+        assert_eq!(r.inside(), None, "no motion since boot");
+
+        let out = go(&mut r, &mut s, button(true));
+        let kinds: Vec<_> = out
+            .iter()
+            .map(|o| match o {
+                Outbound::Pointer { window, event } => (*window, event.kind),
+                Outbound::Key { .. } => unreachable!(),
+            })
+            .collect();
+        assert_eq!(kinds, [(w, POINTER_ENTER), (w, POINTER_BUTTON)], "entered, then clicked");
+    }
+
+    #[test]
     fn coordinates_are_window_local() {
         let mut s = WindowStack::new();
         let w = win(&mut s, Role::Normal, 200, 100, 100, 100);
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 250, 130);
 
-        let out = go(&mut r, &mut s, Logical::Motion { dx: 5, dy: 5 });
+        let out = go(&mut r, &mut s, motion(5, 5));
         let Outbound::Pointer { window, event } =
             out.iter().find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION)).copied().expect("a motion")
         else {
@@ -461,7 +596,7 @@ mod tests {
 
         go(&mut r, &mut s, button(true));
         assert_eq!(r.grab(), Some(a));
-        let moved = go(&mut r, &mut s, Logical::Motion { dx: 200, dy: 0 });
+        let moved = go(&mut r, &mut s, drag(200, 0));
         assert!(
             s.window(b).expect("b").bounds().contains(r.pointer().x, r.pointer().y),
             "the cursor really did reach b — so the grab is what redirects, not geometry"
@@ -490,7 +625,7 @@ mod tests {
         warp(&mut r, &mut s, 250, 50);
 
         go(&mut r, &mut s, button(true));
-        let out = go(&mut r, &mut s, Logical::Motion { dx: -100, dy: 0 });
+        let out = go(&mut r, &mut s, drag(-100, 0));
         let Outbound::Pointer { event, .. } = out
             .iter()
             .find(|o| matches!(o, Outbound::Pointer { event, .. } if event.kind == POINTER_MOTION))
@@ -512,7 +647,7 @@ mod tests {
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 50, 50);
         go(&mut r, &mut s, button(true));
-        go(&mut r, &mut s, Logical::Motion { dx: 200, dy: 0 });
+        go(&mut r, &mut s, drag(200, 0));
         assert_eq!(r.inside(), Some(a), "suppressed while grabbed: still a, though over b");
 
         let out = go(&mut r, &mut s, button(false));
@@ -541,12 +676,12 @@ mod tests {
         let mut r = InputRouter::new(SCREEN);
         warp(&mut r, &mut s, 50, 50);
         go(&mut r, &mut s, button(true));
-        go(&mut r, &mut s, Logical::Motion { dx: 200, dy: 0 });
+        go(&mut r, &mut s, drag(200, 0));
         assert_eq!(r.grab(), Some(a));
 
         go(&mut r, &mut s, Logical::Dropped);
         assert_eq!(r.grab(), None);
-        let out = go(&mut r, &mut s, Logical::Motion { dx: 1, dy: 0 });
+        let out = go(&mut r, &mut s, motion(1, 0));
         assert!(out.iter().all(|o| o.window() == b), "later events follow the cursor again");
     }
 
@@ -562,7 +697,7 @@ mod tests {
         assert_eq!(r.grab(), Some(a));
 
         s.destroy(a).expect("destroy");
-        let out = go(&mut r, &mut s, Logical::Motion { dx: 200, dy: 0 });
+        let out = go(&mut r, &mut s, drag(200, 0));
         assert!(out.iter().all(|o| o.window() == b), "nothing addressed to the dead window");
         assert_eq!(r.grab(), None);
     }
@@ -571,9 +706,9 @@ mod tests {
     fn the_cursor_stops_at_the_screen_edge() {
         let mut s = WindowStack::new();
         let mut r = InputRouter::new(SCREEN);
-        go(&mut r, &mut s, Logical::Motion { dx: -10_000, dy: -10_000 });
+        go(&mut r, &mut s, motion(-10_000, -10_000));
         assert_eq!(r.pointer(), Point::new(0, 0));
-        go(&mut r, &mut s, Logical::Motion { dx: 10_000, dy: 10_000 });
+        go(&mut r, &mut s, motion(10_000, 10_000));
         assert_eq!(r.pointer(), Point::new(639, 479), "the last addressable pixel, not 640");
     }
 
@@ -588,7 +723,7 @@ mod tests {
         let mut s = WindowStack::new();
         let mut r = InputRouter::new(SCREEN);
         for _ in 0..3 {
-            go(&mut r, &mut s, Logical::Motion { dx: i32::MAX, dy: i32::MAX });
+            go(&mut r, &mut s, motion(i32::MAX, i32::MAX));
         }
         assert_eq!(r.pointer(), Point::new(639, 479), "still pinned to the far edge");
     }

@@ -45,7 +45,9 @@ use libkern::{
 };
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
-use librsproto::surface::{OP_ATTACH_BUFFER, OP_KEY_EVENT, OP_POINTER_EVENT, OP_RELEASE};
+use librsproto::surface::{
+    KeyEvent, OP_ATTACH_BUFFER, OP_KEY_EVENT, OP_POINTER_EVENT, OP_RELEASE, PointerEvent,
+};
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
 
 /// `alloc` backing — the window stack and its buffer lists allocate.
@@ -70,6 +72,15 @@ const MAX_BODY: usize = 64;
 /// every session slot is in use and input connected — the rarest configuration, and the
 /// only one that would ever have shown it.
 const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
+
+/// The wait-set bound, as a compile error rather than a comment.
+///
+/// The invariant is now spread across two constants, and the serve loop's `SAFETY` note used
+/// to assert `1 + MAX_SESSIONS` — true before the input channel joined the set and quietly
+/// false after. Anyone adding a third fixed handle (a notification channel, a second input
+/// stream) should be stopped by the compiler, not by re-reading prose (PR #180 review,
+/// finding 4).
+const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// How many client-driven rejections get logged **per session** before the tap closes.
 ///
@@ -428,14 +439,19 @@ fn deliver(srv: &Server, out: &[Outbound]) {
             continue;
         }
         match rec {
+            // Sized **from the types**, not from the byte counts the spec publishes.
+            // Widening `PointerEvent` to carry modifiers left a hand-written `[0u8; 16]`
+            // here, and `write` refuses a short buffer by returning `None` — so every
+            // pointer event would have been silently dropped, with the compositor and the
+            // spec both still saying it was sent.
             Outbound::Key { event, .. } => {
-                let mut body = [0u8; 8];
+                let mut body = [0u8; core::mem::size_of::<KeyEvent>()];
                 if event.write(&mut body).is_some() {
                     send_input(ch, OP_KEY_EVENT, &body);
                 }
             }
             Outbound::Pointer { event, .. } => {
-                let mut body = [0u8; 16];
+                let mut body = [0u8; core::mem::size_of::<PointerEvent>()];
                 if event.write(&mut body).is_some() {
                     send_input(ch, OP_POINTER_EVENT, &body);
                 }
@@ -953,7 +969,8 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
     kprint(b"compositor: serving /dev/draw\n");
     loop {
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
-        // `1 + MAX_SESSIONS`, which is that limit by construction.
+        // `2 + MAX_SESSIONS` — `serve_end`, the input channel when connected, then the
+        // sessions — which the `const _` beside `MAX_SESSIONS` holds to that limit.
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;

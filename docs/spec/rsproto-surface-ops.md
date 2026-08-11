@@ -304,7 +304,7 @@ derive the mask from *which modifier keys are down*: with both shifts held, rele
 leaves `MOD_SHIFT` set. Clearing the bit per release is the obvious implementation and is
 wrong — a tracking obligation, not a layout one.
 
-`PointerEvent`, 16 bytes:
+`PointerEvent`, 20 bytes:
 
 | Offset | Size | Type | Field |
 |---|---|---|---|
@@ -312,8 +312,18 @@ wrong — a tracking obligation, not a layout one.
 | 2 | 2 | `u16` | `button` — a `BTN_*` code on a button event, else zero |
 | 4 | 2 | `u16` | `buttons` — every button held: `BTN_LEFT`→bit 0, `RIGHT`→1, `MIDDLE`→2 |
 | 6 | 2 | `u16` | `flags` — `POINTER_PRESSED` (bit 0) on a press |
-| 8 | 4 | **`i32`** | `x` — window-local, **signed** |
-| 12 | 4 | **`i32`** | `y` — window-local, signed |
+| 8 | 2 | `u16` | `modifiers` — `MOD_SHIFT` and friends, as on `KeyEvent` |
+| 10 | 2 | | reserved, zero |
+| 12 | 4 | **`i32`** | `x` — window-local, **signed** |
+| 16 | 4 | **`i32`** | `y` — window-local, signed |
+
+**`buttons` and `modifiers` are meaningful on every kind**, unlike `button` and `flags` which
+are about the transition. A drag is motion with a button held, and shift-click is a click with
+a modifier held; a client told `buttons == 0` on motion would have to re-accumulate button
+state from the transitions, and one with no `modifiers` field would have to track shift from
+`KeyEvent`s — which works only while it also holds keyboard focus, so shift-clicking an
+unfocused window would silently behave as a plain click. Both are the per-application
+duplication this layer exists to prevent.
 
 **Coordinates are window-local**, so a client can use them without knowing where it sits on
 screen and they stay correct when the window moves — which a client is not told about and
@@ -327,10 +337,28 @@ wire change, which is the same reason the device layer's extensibility lives in 
 
 - **`KeyEvent` goes to the focused window.** Focus is the topmost window whose role takes it;
   a `panel` never does, so clicking a clock cannot steal input from a terminal
-  (`display-substrate.md` §4a). Click-to-focus is not implemented — with one client there is
-  nothing to switch between — and is a later decision, not an omission.
-- **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus.
-  A window that is not focused still sees the click that is about to focus it.
+  (`display-substrate.md` §4a). With nothing focusable, keys are dropped rather than sent to
+  whatever the cursor happens to rest on.
+- **Click-to-focus is implemented.** A press on a window whose role takes focus **raises** it,
+  and because focus *is* "topmost focusable", the raise is the focus change — there is no
+  second piece of state to disagree with the stack. A press on a `panel` raises nothing, or a
+  stray click on a clock would cover a window with no way to get it back. **A client is not
+  told when it gains or loses focus**; if it paints a focus indicator it must infer this from
+  the keys and crossings it receives, which is a gap, not a design (M3 Part D).
+- **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus
+  and regardless of role — a panel that cannot take a keystroke can still be clicked. A window
+  that is not focused still sees the click that is about to focus it.
+- **A press grabs, until its release.** Every pointer event from a press to the release of the
+  last held button goes to the window the press landed on, **even after the cursor leaves it**.
+  Without this a drag ending outside the window delivers a press with no release, and the
+  client believes a button is held forever. This is why the coordinates are signed: mid-drag,
+  window-local `x` is routinely negative, and such a record is legitimate rather than corrupt.
+  Enter and leave are suppressed for the duration — a window being told the cursor left while
+  it is still receiving that cursor's events is two contradictory statements at once — and
+  re-derived when the grab ends.
+- **Loss resets the grab.** An `Input::Events` batch carrying `SYN_DROPPED` may be the one that
+  lost a release, so the compositor ends any grab on it. A grab that outlives its button never
+  ends, and every later click would go to the wrong window for the rest of the session.
 
 ### `DestroyWindow` (`0x0904`)
 

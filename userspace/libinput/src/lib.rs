@@ -18,9 +18,9 @@
 //!
 //! **It does not track where the pointer is.** The device layer reports motion as deltas, and
 //! turning deltas into a position needs a screen to clamp against — which the compositor owns
-//! and this crate does not. Who owns accumulated pointer position is a filed question
-//! (`deferred-decisions.md`); until it is answered, [`Logical::Motion`] carries the delta and
-//! the caller decides what it means.
+//! and this crate does not. That is now **decided rather than deferred**
+//! (`deferred-decisions.md`, 2026-08-10): the compositor's `InputRouter` accumulates and
+//! clamps, and [`Logical::Motion`] carries the delta plus the state held during it.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -68,6 +68,16 @@ pub enum Logical {
         dx: i32,
         /// Vertical delta, positive down.
         dy: i32,
+        /// Every button held during this motion.
+        ///
+        /// Carried rather than left to the consumer because **a drag is motion plus a held
+        /// button**, and the alternative is every consumer re-accumulating button state
+        /// from the transitions — the per-application duplication this layer exists to
+        /// prevent. A first version omitted it, and the resulting `PointerEvent` reported
+        /// `buttons == 0` for every motion of every drag (PR #180 review, finding 2).
+        buttons: u16,
+        /// Modifiers held during this motion — what makes a shift-drag expressible.
+        modifiers: u16,
     },
     /// A pointer button transition.
     Button {
@@ -258,7 +268,12 @@ impl Interpreter {
         }
         self.pending_n = 0;
         if (self.dx != 0 || self.dy != 0) && n < out.len() {
-            out[n] = Logical::Motion { dx: self.dx, dy: self.dy };
+            out[n] = Logical::Motion {
+                dx: self.dx,
+                dy: self.dy,
+                buttons: self.buttons,
+                modifiers: self.modifiers(),
+            };
             n += 1;
         }
         self.dx = 0;
@@ -311,11 +326,31 @@ mod tests {
     }
 
     #[test]
+    fn a_motion_carries_the_buttons_held_during_it() {
+        // A drag is motion plus a held button. Without this a consumer implementing the
+        // standard "on motion, if a button is down, move the object" gets `buttons == 0`
+        // for every motion of every drag, and nothing ever drags (PR #180 review).
+        let mut i = Interpreter::new();
+        group(&mut i, &[key(BTN_LEFT, true), syn()]);
+        let (out, n) = group(&mut i, &[rel(REL_X, 4), syn()]);
+        assert_eq!(n, 1);
+        assert_eq!(out[0], Logical::Motion { dx: 4, dy: 0, buttons: 1, modifiers: 0 });
+
+        let (out, _) = group(&mut i, &[key(KEY_LEFTSHIFT, true), rel(REL_X, 2), syn()]);
+        let motion = out.iter().find(|l| matches!(l, Logical::Motion { .. })).expect("motion");
+        assert_eq!(
+            *motion,
+            Logical::Motion { dx: 2, dy: 0, buttons: 1, modifiers: MOD_SHIFT },
+            "a shift-drag is expressible without the consumer tracking either"
+        );
+    }
+
+    #[test]
     fn a_diagonal_move_is_one_motion_not_two() {
         let mut i = Interpreter::new();
         let (out, n) = group(&mut i, &[rel(REL_X, 5), rel(REL_Y, -3), syn()]);
         assert_eq!(n, 1);
-        assert_eq!(out[0], Logical::Motion { dx: 5, dy: -3 });
+        assert_eq!(out[0], Logical::Motion { dx: 5, dy: -3, buttons: 0, modifiers: 0 });
     }
 
     #[test]
@@ -469,7 +504,11 @@ mod tests {
         }
         let n = i.feed(syn(), &mut out);
         assert_eq!(n, MAX_PER_GROUP, "five transitions and the motion");
-        assert_eq!(out[MAX_PER_GROUP - 1], Logical::Motion { dx: 7, dy: 0 });
+        assert_eq!(
+            out[MAX_PER_GROUP - 1],
+            Logical::Motion { dx: 7, dy: 0, buttons: 7, modifiers: MOD_SHIFT | MOD_CTRL },
+            "and it carries the state the same group established"
+        );
 
         let mut small = [Logical::Dropped; MAX_LOGICAL];
         for e in [

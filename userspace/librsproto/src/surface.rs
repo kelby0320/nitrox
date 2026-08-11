@@ -538,7 +538,9 @@ pub struct KeyEvent {
 
 const _: () = assert!(core::mem::size_of::<KeyEvent>() == 8);
 
-/// Modifier bits carried by [`KeyEvent::modifiers`] and [`PointerEvent`]'s reports.
+/// Modifier bits.
+///
+/// Carried by both [`KeyEvent::modifiers`] and [`PointerEvent::modifiers`].
 ///
 /// Left and right share a bit, as X11's `ShiftMask` and Wayland's xkb mask also do: a client
 /// asking "was shift held" should not have to ask twice. What stays distinct is the
@@ -581,16 +583,29 @@ pub struct PointerEvent {
     /// The button for `POINTER_BUTTON` (a `BTN_*` code), otherwise zero.
     pub button: u16,
     /// Every button currently held, as `BTN_LEFT`→bit 0, `BTN_RIGHT`→bit 1, `BTN_MIDDLE`→bit 2.
+    ///
+    /// Meaningful on **every** kind, not only `POINTER_BUTTON` — a drag is motion with a
+    /// button held, and a client that has to re-derive this from the button events is doing
+    /// the accumulation this layer exists to do once.
     pub buttons: u16,
     /// `POINTER_PRESSED` on a press; zero on a release.
     pub flags: u16,
+    /// Modifiers held — `MOD_SHIFT` and friends — on every kind.
+    ///
+    /// Here for the same reason they ride [`KeyEvent`]: shift-click and shift-drag are not
+    /// expressible otherwise. A client that instead tracked shift from `KeyEvent`s would get
+    /// it right only while it also held keyboard focus, so shift-clicking an unfocused
+    /// window would silently behave as a plain click (PR #180 review, finding 3).
+    pub modifiers: u16,
+    /// Reserved; zero.
+    pub _pad: u16,
     /// Window-local x.
     pub x: i32,
     /// Window-local y.
     pub y: i32,
 }
 
-const _: () = assert!(core::mem::size_of::<PointerEvent>() == 16);
+const _: () = assert!(core::mem::size_of::<PointerEvent>() == 20);
 
 impl KeyEvent {
     /// Serialise into exactly 8 little-endian bytes.
@@ -620,23 +635,25 @@ impl KeyEvent {
 }
 
 impl PointerEvent {
-    /// Serialise into exactly 16 little-endian bytes.
+    /// Serialise into exactly 20 little-endian bytes.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < 16 {
+        if out.len() < 20 {
             return None;
         }
         out[0..2].copy_from_slice(&self.kind.to_le_bytes());
         out[2..4].copy_from_slice(&self.button.to_le_bytes());
         out[4..6].copy_from_slice(&self.buttons.to_le_bytes());
         out[6..8].copy_from_slice(&self.flags.to_le_bytes());
-        out[8..12].copy_from_slice(&self.x.to_le_bytes());
-        out[12..16].copy_from_slice(&self.y.to_le_bytes());
-        Some(16)
+        out[8..10].copy_from_slice(&self.modifiers.to_le_bytes());
+        out[10..12].copy_from_slice(&0u16.to_le_bytes());
+        out[12..16].copy_from_slice(&self.x.to_le_bytes());
+        out[16..20].copy_from_slice(&self.y.to_le_bytes());
+        Some(20)
     }
 
-    /// Parse from exactly 16 little-endian bytes.
+    /// Parse from exactly 20 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 16 {
+        if b.len() < 20 {
             return None;
         }
         Some(Self {
@@ -644,8 +661,10 @@ impl PointerEvent {
             button: u16::from_le_bytes([b[2], b[3]]),
             buttons: u16::from_le_bytes([b[4], b[5]]),
             flags: u16::from_le_bytes([b[6], b[7]]),
-            x: i32::from_le_bytes([b[8], b[9], b[10], b[11]]),
-            y: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            modifiers: u16::from_le_bytes([b[8], b[9]]),
+            _pad: 0,
+            x: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            y: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
         })
     }
 }
@@ -804,26 +823,30 @@ mod tests {
             button: 0x1112,
             buttons: 0x2122,
             flags: POINTER_PRESSED,
+            modifiers: MOD_SHIFT | MOD_CTRL,
+            _pad: 0,
             x: -3,
             y: -4,
         };
-        let mut b = [0u8; 16];
+        let mut b = [0u8; 20];
         e.write(&mut b).unwrap();
         assert_eq!(&b[0..2], &POINTER_BUTTON.to_le_bytes(), "kind @0");
         assert_eq!(&b[2..4], &0x1112u16.to_le_bytes(), "button @2");
         assert_eq!(&b[4..6], &0x2122u16.to_le_bytes(), "buttons @4");
         assert_eq!(&b[6..8], &POINTER_PRESSED.to_le_bytes(), "flags @6");
-        assert_eq!(&b[8..12], &(-3i32).to_le_bytes(), "x @8, signed");
-        assert_eq!(&b[12..16], &(-4i32).to_le_bytes(), "y @12, signed");
+        assert_eq!(&b[8..10], &(MOD_SHIFT | MOD_CTRL).to_le_bytes(), "modifiers @8");
+        assert_eq!(&b[10..12], &0u16.to_le_bytes(), "reserved @10, zero");
+        assert_eq!(&b[12..16], &(-3i32).to_le_bytes(), "x @12, signed");
+        assert_eq!(&b[16..20], &(-4i32).to_le_bytes(), "y @16, signed");
         assert_eq!(PointerEvent::read(&b), Some(e));
     }
 
     #[test]
     fn a_truncated_input_event_is_refused_rather_than_read_short() {
         assert_eq!(KeyEvent::read(&[0u8; 7]), None);
-        assert_eq!(PointerEvent::read(&[0u8; 15]), None);
+        assert_eq!(PointerEvent::read(&[0u8; 19]), None);
         assert_eq!(KeyEvent::default().write(&mut [0u8; 7]), None);
-        assert_eq!(PointerEvent::default().write(&mut [0u8; 15]), None);
+        assert_eq!(PointerEvent::default().write(&mut [0u8; 19]), None);
     }
 
     #[test]

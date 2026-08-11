@@ -12345,3 +12345,49 @@ point, and raising that window leaves it topmost there, so the order cannot matt
 comment claiming it prevented a "stolen press" was describing a hazard that cannot occur, and
 now says so. **A break that does not bite is either a missing test or a wrong comment**; the
 value is in finding out which before assuming the first.
+
+## 2026-08-10 — `PointerEvent` grows to 20 bytes: state a client needs, on every kind
+
+The PR #180 review found that `PointerEvent` reported `buttons == 0` on every motion, and
+carried no modifiers at all — while `librsproto`'s own doc said "every button currently held"
+and pointed at "[`PointerEvent`]'s reports" for the modifier bits. Both docs described a
+record that did not exist.
+
+**The fix is a wire change, taken now because now is when it is free.** `PointerEvent` gains
+`modifiers` and a reserved half-word, 16 → 20 bytes, and `Logical::Motion` gains the buttons
+and modifiers held during it. The alternative — narrowing the docs to "meaningful only on
+`POINTER_BUTTON`" — would have been honest and wrong: a drag is *motion with a button held*,
+so a client implementing one the obvious way would find nothing ever drags, and its only
+recourse would be to re-accumulate button state from the transitions. That per-application
+duplication is the thing the Surface layer exists to prevent. Shift-click is the same argument
+for modifiers, with a sharper failure: a client tracking shift from `KeyEvent`s gets it right
+only while it *also* holds keyboard focus, so shift-clicking an unfocused window would
+silently behave as a plain click.
+
+No client reads either record yet, so the cost today is two struct fields. After Part D writes
+one, it is a wire migration.
+
+**The widening immediately produced the bug it was warning about.** The compositor serialised
+into a hand-written `[0u8; 16]`, and `write` refuses a short buffer by returning `None` — so
+every pointer event would have been silently dropped, with the spec and the compositor both
+still claiming it was sent. Nothing caught it: the host tests exercise the router, which does
+not serialise, and the boot gate cannot yet assert a client received anything. The buffers are
+now sized `size_of::<PointerEvent>()`. **A published byte count copied into a literal is a
+constant with no owner**, and this is the second time that shape has bitten (the first was the
+`SYN_DROPPED` records-vs-batches mismatch in Part B).
+
+Two smaller corrections in the same round, both of the same kind — **prose that was true when
+written and quietly stopped being true**:
+
+- The Surface spec's routing section still said click-to-focus was not implemented and
+  described pointer routing with no mention of the implicit grab. The Status line at the top
+  of the same file described both correctly. The section a client reads to learn the rules
+  contradicted the line nobody reads twice.
+- The serve loop's `SAFETY` note asserted the wait set was bounded by `1 + MAX_SESSIONS`,
+  true until the input channel joined it. The bound now holds only because `MAX_SESSIONS`
+  moved to `- 2` in the same commit. That invariant is now a `const _: () = assert!(...)`, so
+  the next person to add a fixed handle gets a compile error rather than a comment to re-read.
+
+The last one is the general lesson: **when an invariant becomes spread across two constants,
+the comment that used to state it becomes a liability.** It reads as a guarantee, it is
+checked by nobody, and it is most convincing to exactly the person about to violate it.
