@@ -356,7 +356,7 @@ requirement, not a compromise.
       `MMAP_MAX` bounds only the `hint == 0` path. It lands in Part A rather than later
       because it is independent of the toolkit and wanted *before* the deep call chains
       exist.
-- [ ] **Part B — event routing**: hit testing, pointer capture during a drag, and
+- [x] **Part B — event routing** ✅ (2026-08-11): hit testing, pointer capture during a drag, and
       **widget-level keyboard focus**, which is a *second* focus concept — the compositor
       decides which window has focus, the toolkit decides which widget within it does.
       Conflating them is the classic source of text arriving in the wrong field. Carries the

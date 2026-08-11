@@ -1000,6 +1000,12 @@ fn cmd_check_input(accel: Accel) -> R<()> {
         qmp.send_motion(-120, -120)?;
     }
 
+    // **The window was told it has the keyboard.** The second half of the two-focus rule:
+    // widget focus is the toolkit's, window focus is the compositor's, and a client needs
+    // both to know whether a caret should blink. Announced on the change, so this arrives
+    // once when the window becomes the topmost focusable one.
+    session.expect("input-testclient: win focus has=1")?;
+
     // `b` is keycode 48. It goes to the *focused* window — this client's, being the topmost
     // that takes focus — not to whatever the cursor happens to be over.
     qmp.send_key("b", true)?;

@@ -328,6 +328,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     saw_press = true;
                 }
             }
+            WindowEvent::Focus(f) => {
+                // The *other* half of the two-focus rule: widget focus is the toolkit's,
+                // window focus is the compositor's, and a client needs both to know whether
+                // a caret should blink. Announced on the change, so it arrives once when
+                // this window becomes the topmost focusable one.
+                Line::new().s(b"input-testclient: win focus has=").u(u64::from(f)).end();
+            }
             WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
         }
     }
@@ -364,7 +371,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     saw_late_key = true;
                 }
             }
-            WindowEvent::Pointer(_) => {}
+            WindowEvent::Pointer(_) | WindowEvent::Focus(_) => {}
             WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
         }
     }

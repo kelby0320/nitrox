@@ -56,6 +56,13 @@ pub enum Outbound {
         /// The buffer the client may draw into again.
         buffer: u32,
     },
+    /// A `Surface::FocusEvent` — this window gained or lost the keyboard.
+    Focus {
+        /// Which window changed.
+        window: u32,
+        /// Whether it now has the keyboard.
+        focused: bool,
+    },
 }
 
 impl Outbound {
@@ -64,7 +71,8 @@ impl Outbound {
         match self {
             Outbound::Key { window, .. }
             | Outbound::Pointer { window, .. }
-            | Outbound::Release { window, .. } => *window,
+            | Outbound::Release { window, .. }
+            | Outbound::Focus { window, .. } => *window,
         }
     }
 
@@ -233,6 +241,30 @@ mod tests {
             event: PointerEvent { kind: POINTER_BUTTON, ..Default::default() },
         });
         assert_eq!(o.len(), 7);
+    }
+
+    #[test]
+    fn a_focus_change_is_never_coalesced_away_by_input() {
+        // Same reasoning as `Release`: input is continuous and a focus change is not, so on
+        // a shared queue the cheap message would evict the one whose loss leaves a window
+        // blinking a caret it does not own.
+        let mut o = Outbox::new();
+        o.push(Outbound::Focus { window: 1, focused: true });
+        for x in 0..100 {
+            o.push(motion(1, x));
+        }
+        assert_eq!(o.len(), 2);
+        assert_eq!(o.front(), Some(Outbound::Focus { window: 1, focused: true }));
+    }
+
+    #[test]
+    fn both_halves_of_a_focus_change_survive() {
+        // Losing and gaining are two messages to two different windows; collapsing them
+        // would leave one window believing it still has the keyboard.
+        let mut o = Outbox::new();
+        o.push(Outbound::Focus { window: 1, focused: false });
+        o.push(Outbound::Focus { window: 2, focused: true });
+        assert_eq!(o.len(), 2);
     }
 
     #[test]

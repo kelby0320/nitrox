@@ -51,6 +51,8 @@ pub struct ChannelTransport {
     recv_count: u64,
     /// Messages that arrived while waiting for a reply — drained by `poll_event`.
     parked: [(u16, [u8; MAX_BODY], usize); MAX_PARKED],
+    /// Whether a parked event was discarded since the last time anyone asked.
+    lost: bool,
     parked_len: usize,
 }
 
@@ -73,6 +75,7 @@ impl ChannelTransport {
             recv_handles: [0; libkern::abi::IPC_HANDLE_MAX],
             recv_count: 0,
             parked: [(0, [0; MAX_BODY], 0); MAX_PARKED],
+            lost: false,
             parked_len: 0,
         }
     }
@@ -233,7 +236,20 @@ impl Transport for ChannelTransport {
             let mut body = [0u8; MAX_BODY];
             body[..n].copy_from_slice(&m.body[..n]);
             if self.parked_len >= self.parked.len() {
-                return Err(UiError::Transport);
+                // **Drop the oldest event; do not fail the request.** These are server-
+                // initiated messages that happened to arrive while waiting for a reply, and
+                // failing here makes an unrelated request fail because of traffic it has
+                // nothing to do with. That is not hypothetical: a client that makes requests
+                // without draining events — the compositor's own churn probe — died on its
+                // ninth window the moment `FocusEvent` gave it a second thing to receive.
+                //
+                // Oldest, for the same reason `Window`'s queue drops oldest: the newest
+                // describes the world as it is now. The loss is reported through
+                // `took_loss`, so it surfaces as a `WindowEvent::Dropped` rather than
+                // vanishing.
+                self.parked.copy_within(1.., 0);
+                self.parked_len -= 1;
+                self.lost = true;
             }
             self.parked[self.parked_len] = (m.op, body, n);
             self.parked_len += 1;
@@ -264,6 +280,10 @@ impl Transport for ChannelTransport {
                 return Err(UiError::Transport);
             }
         }
+    }
+
+    fn took_loss(&mut self) -> bool {
+        core::mem::take(&mut self.lost)
     }
 
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {

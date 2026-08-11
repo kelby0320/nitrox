@@ -515,6 +515,8 @@ pub fn parse_destroy_window_request(body: &[u8]) -> Option<u32> {
 pub const OP_KEY_EVENT: u16 = 0x0905;
 /// `Surface::PointerEvent` — pointer motion, a button, or a crossing.
 pub const OP_POINTER_EVENT: u16 = 0x0906;
+/// `Surface::FocusEvent` — this window gained or lost the keyboard.
+pub const OP_FOCUS_EVENT: u16 = 0x0907;
 
 /// A key transition, as a window sees it.
 ///
@@ -606,6 +608,46 @@ pub struct PointerEvent {
 }
 
 const _: () = assert!(core::mem::size_of::<PointerEvent>() == 20);
+
+/// This window gained or lost the keyboard.
+///
+/// **A toolkit needs this and cannot derive it.** A caret blinks only when *both* the widget
+/// has focus within its window and the window has the keyboard; those are two facts from two
+/// sources, and a client with only the first would keep blinking behind another window.
+///
+/// Sent when the answer changes, not on every event that could have changed it — the
+/// compositor compares against what it last told each window, so a raise that does not move
+/// focus sends nothing.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct FocusEvent {
+    /// Non-zero if this window now has the keyboard.
+    pub focused: u16,
+    /// Reserved; zero.
+    pub _pad: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<FocusEvent>() == 4);
+
+impl FocusEvent {
+    /// Serialise into exactly 4 little-endian bytes.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 4 {
+            return None;
+        }
+        out[0..2].copy_from_slice(&self.focused.to_le_bytes());
+        out[2..4].copy_from_slice(&0u16.to_le_bytes());
+        Some(4)
+    }
+
+    /// Parse from exactly 4 little-endian bytes.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 4 {
+            return None;
+        }
+        Some(Self { focused: u16::from_le_bytes([b[0], b[1]]), _pad: 0 })
+    }
+}
 
 impl KeyEvent {
     /// Serialise into exactly 8 little-endian bytes.
@@ -842,6 +884,26 @@ mod tests {
     }
 
     #[test]
+    fn a_focus_event_round_trips_and_refuses_a_short_buffer() {
+        let e = FocusEvent { focused: 1, _pad: 0 };
+        let mut b = [0u8; 4];
+        assert_eq!(e.write(&mut b), Some(4));
+        assert_eq!(&b[0..2], &1u16.to_le_bytes(), "focused @0");
+        assert_eq!(&b[2..4], &0u16.to_le_bytes(), "reserved @2, zero");
+        assert_eq!(FocusEvent::read(&b), Some(e));
+
+        assert_eq!(FocusEvent::read(&[0u8; 3]), None);
+        assert_eq!(FocusEvent::default().write(&mut [0u8; 3]), None);
+
+        // A non-zero `focused` other than 1 still reads as focused: the field is a boolean
+        // on the wire, and a sender writing 2 must not read back as "not focused".
+        let e = FocusEvent { focused: 2, _pad: 0 };
+        let mut b = [0u8; 4];
+        e.write(&mut b).unwrap();
+        assert_ne!(FocusEvent::read(&b).unwrap().focused, 0);
+    }
+
+    #[test]
     fn a_truncated_input_event_is_refused_rather_than_read_short() {
         assert_eq!(KeyEvent::read(&[0u8; 7]), None);
         assert_eq!(PointerEvent::read(&[0u8; 19]), None);
@@ -854,8 +916,11 @@ mod tests {
         for op in [OP_CREATE_WINDOW, OP_ATTACH_BUFFER, OP_COMMIT, OP_RELEASE, OP_DESTROY_WINDOW] {
             assert_ne!(op, OP_KEY_EVENT);
             assert_ne!(op, OP_POINTER_EVENT);
+            assert_ne!(op, OP_FOCUS_EVENT);
         }
         assert_ne!(OP_KEY_EVENT, OP_POINTER_EVENT);
+        assert_ne!(OP_KEY_EVENT, OP_FOCUS_EVENT);
+        assert_ne!(OP_POINTER_EVENT, OP_FOCUS_EVENT);
     }
 
     #[test]
