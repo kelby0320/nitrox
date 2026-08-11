@@ -116,6 +116,21 @@ fn modifier_slot(keycode: u16) -> Option<usize> {
     MOD_KEYS.iter().position(|&(k, _)| k == keycode)
 }
 
+/// Whether `keycode` is a modifier key — shift, control, alt or meta, either side.
+///
+/// Modifiers arrive as ordinary [`Logical::Key`] events, because they *are* key transitions
+/// and a consumer may legitimately care about them. What a consumer must not do is treat them
+/// as ordinary text keys, and this is what lets it tell the difference without knowing the
+/// keycode table.
+///
+/// The compositor's key repeat is the case that named it: it armed a repeat from any key
+/// press, so holding Ctrl before a shortcut sent the focused window 25 `KEY_REPEAT`s a second,
+/// and pressing a modifier while another key was held replaced that key's repeat outright
+/// (PR #185 review, finding 2).
+pub fn is_modifier(keycode: u16) -> bool {
+    modifier_slot(keycode).is_some()
+}
+
 /// Which bit of the held-button mask a `BTN_*` code occupies.
 fn button_bit(code: u16) -> Option<u16> {
     match code {

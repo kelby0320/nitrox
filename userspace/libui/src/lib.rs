@@ -35,4 +35,7 @@ pub mod damage;
 pub mod diff;
 pub mod element;
 pub mod layout;
+pub mod paint;
+pub mod reference;
 pub mod route;
+pub mod widget;

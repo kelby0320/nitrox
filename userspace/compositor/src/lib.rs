@@ -98,6 +98,169 @@ pub enum StackError {
     DuplicateBuffer,
 }
 
+/// The pointer sprite: a plain arrow, `CURSOR_W × CURSOR_H`.
+///
+/// **One fixed shape, not a protocol.** Per-client cursors — an I-beam over a terminal grid,
+/// a resize arrow on an edge — are a Surface addition and are deliberately not in this
+/// milestone ([`widget-toolkit.md`](../design/widget-toolkit.md) §9.3); a single arrow is what
+/// makes a menu usable by a person, which is Part C's bar.
+///
+/// Two colours so it is visible against both: `#` is the body, `.` the outline, ` ` is
+/// transparent. Drawn from a string because a bitmap you can read is a bitmap you can fix.
+const CURSOR: [&str; CURSOR_H as usize] = [
+    ".",
+    "..",
+    ".#.",
+    ".##.",
+    ".###.",
+    ".####.",
+    ".#####.",
+    ".######.",
+    ".#######.",
+    ".########.",
+    ".#####....",
+    ".##.##.",
+    ".#. .##.",
+    "..   .##.",
+    "      .##.",
+    "       ..",
+];
+
+/// Cursor sprite width.
+pub const CURSOR_W: u32 = 12;
+/// Cursor sprite height.
+pub const CURSOR_H: u32 = 16;
+
+/// The cursor's fill colour (`#` in the sprite).
+pub const CURSOR_BODY: Rgb = Rgb::new(0xFF, 0xFF, 0xFF);
+/// The cursor's outline colour (`.` in the sprite), so it stays visible against white.
+pub const CURSOR_OUTLINE: Rgb = Rgb::new(0x00, 0x00, 0x00);
+
+/// The rectangle a cursor at `at` occupies.
+///
+/// The hotspot is the **top-left**, which is where an arrow points; a cursor whose hotspot is
+/// its centre clicks half a sprite away from where it looks like it is pointing.
+pub fn cursor_rect(at: Point) -> Rect {
+    Rect::new(at.x, at.y, CURSOR_W, CURSOR_H)
+}
+
+/// Draw the pointer sprite at `at`, clipped to `clip`.
+///
+/// Composited **after** the window stack, because a cursor under a window is not a cursor.
+pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
+    for (row, line) in CURSOR.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            let colour = match ch {
+                '#' => CURSOR_BODY,
+                '.' => CURSOR_OUTLINE,
+                _ => continue,
+            };
+            let x = at.x.saturating_add(col as i32);
+            let y = at.y.saturating_add(row as i32);
+            // Clipped by the caller's rectangle *and* by the buffer: a cursor at the screen
+            // edge is the ordinary case, not an error, and it must not wrap to the far side.
+            if x >= 0 && y >= 0 && clip.contains(x, y) {
+                fb.put_pixel(x as u32, y as u32, colour);
+            }
+        }
+    }
+}
+
+/// How long a key must be held before it starts repeating, in nanoseconds.
+///
+/// Policy with no configuration surface yet. Both constants are what a settings service will
+/// eventually own; until there is one, they are named here rather than spelled inline so the
+/// eventual move is a change of provenance.
+pub const REPEAT_DELAY_NS: u64 = 400_000_000;
+
+/// How long between repeats once they start, in nanoseconds.
+pub const REPEAT_INTERVAL_NS: u64 = 40_000_000;
+
+/// A key held down, and when it next repeats.
+///
+/// **Compositor-side rather than per-client**, because the compositor knows which window has
+/// focus and can therefore stop a repeat when focus moves, with no client involvement. The
+/// alternative is Wayland's — publish a rate and let every client run its own timer — which
+/// is better when clients disagree about what should repeat, a distinction nothing here makes
+/// yet, and costs every client a timer and a state machine
+/// ([`widget-toolkit.md`](../design/widget-toolkit.md) §9.2).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Repeat {
+    /// The keycode being repeated.
+    pub keycode: u16,
+    /// Modifiers held when it went down.
+    ///
+    /// Frozen at the press rather than re-read: a repeat is that press continuing, so
+    /// releasing shift mid-repeat must not turn `A` into `a` halfway through a run.
+    pub modifiers: u16,
+    /// The window it is going to.
+    pub window: u32,
+    /// When the next repeat is due.
+    pub next_at: u64,
+}
+
+impl Repeat {
+    /// Start repeating `keycode` for `window`, first repeat one delay from `now`.
+    pub fn armed(keycode: u16, modifiers: u16, window: u32, now: u64) -> Self {
+        Self { keycode, modifiers, window, next_at: now.saturating_add(REPEAT_DELAY_NS) }
+    }
+
+    /// Whether a repeat is due at `now`; advances to the next one if so.
+    ///
+    /// **Advances by adding an interval to the deadline, not to `now`.** Adding to `now`
+    /// makes every late wake-up push the next repeat further out, so a busy compositor
+    /// repeats slower and slower — and the tick that wakes this is 10 ms, so late is the
+    /// normal case rather than the exception.
+    pub fn due(&mut self, now: u64) -> bool {
+        if now < self.next_at {
+            return false;
+        }
+        self.next_at = self.next_at.saturating_add(REPEAT_INTERVAL_NS);
+        // A wake-up long after the deadline — a stalled compositor, or a debugger — must not
+        // then fire a burst catching up on repeats nobody asked for.
+        if self.next_at <= now {
+            self.next_at = now.saturating_add(REPEAT_INTERVAL_NS);
+        }
+        true
+    }
+
+    /// The repeat state after a key transition — arm, disarm, or leave alone.
+    ///
+    /// **Here rather than in the server loop**, for the reason [`focus_transition`] gives
+    /// below and finding 2 of PR #185's review proved: the arming *decision* is a function of
+    /// values, the server loop that held it needs syscalls to reach, and the two bugs it
+    /// carried were both decisions rather than plumbing. `Repeat::due` was host-tested from
+    /// the start and was correct; what was not tested was when a repeat starts.
+    ///
+    /// - **A modifier never arms and never disturbs.** Modifiers are ordinary
+    ///   [`Logical::Key`](libinput::Logical::Key) transitions, so an unqualified arm made
+    ///   holding Ctrl send 25 `KEY_REPEAT`s a second — and since there is one slot, pressing
+    ///   Shift while `a` was held replaced `a`'s repeat, after which releasing Shift cleared
+    ///   it and the still-held `a` never repeated again.
+    /// - **Only the repeating key's own release disarms**, which is the same rule from the
+    ///   other side: a repeat outlives any modifier moving under it.
+    /// - **A press with no focus candidate disarms**, rather than leaving the previous key
+    ///   repeating into a window that is no longer focused.
+    pub fn after_key(
+        current: Option<Repeat>,
+        keycode: u16,
+        pressed: bool,
+        modifiers: u16,
+        focus: Option<u32>,
+        now: u64,
+    ) -> Option<Repeat> {
+        if libinput::is_modifier(keycode) {
+            return current;
+        }
+        match (pressed, focus) {
+            (true, Some(window)) => Some(Repeat::armed(keycode, modifiers, window, now)),
+            (true, None) => None,
+            (false, _) if current.is_some_and(|r| r.keycode == keycode) => None,
+            (false, _) => current,
+        }
+    }
+}
+
 /// The `(lost, gained)` pair a focus change implies, or `None` if focus did not move.
 ///
 /// **The comparison is the whole point.** `focus_candidate` is recomputed after anything that
@@ -317,12 +480,21 @@ impl WindowStack {
         self.windows.iter().rev().find(|w| w.role.takes_focus()).map(|w| w.id)
     }
 
-    /// Composite the stack into `fb`, repainting `damage`.
+    /// Composite the stack into `fb`, repainting `damage` — **without the cursor**.
     ///
     /// Windows with no committed buffer, or whose buffer the source cannot resolve, are
     /// skipped rather than drawn as garbage — a client that has created a window but not
     /// yet drawn into it should show background, not whatever the memory held.
-    pub fn compose_into<F, S>(&self, fb: &mut F, background: Rgb, source: &S, damage: &[Rect])
+    ///
+    /// **`pub(crate)`, so the server binary cannot call it**, and must go through
+    /// [`present_into`](Self::present_into) instead. That is not stylistic: the cursor is
+    /// *drawn over* the composed stack rather than composited into it, so every path that
+    /// recomposes has to redraw it, and three of the four paths in the binary had forgotten
+    /// to (PR #185 review, finding 1) — a click erased the pointer until the mouse moved
+    /// next. Making "compose" unreachable from outside means the mistake cannot be made a
+    /// fourth time by adding a fifth path. If a caller ever genuinely wants the stack without
+    /// a pointer over it — a screenshot — widening this is a deliberate act with a reason.
+    pub(crate) fn compose_into<F, S>(&self, fb: &mut F, background: Rgb, source: &S, damage: &[Rect])
     where
         F: Framebuffer + ?Sized,
         S: BufferSource + ?Sized,
@@ -339,11 +511,154 @@ impl WindowStack {
         }
         compose(fb, background, &surfaces, damage);
     }
+
+    /// Put `damage` on the screen: composite the stack, then draw the pointer over it.
+    ///
+    /// **The one way a screen region is updated.** The pairing lives here rather than in the
+    /// server binary because the binary cannot be host-tested — its screen-update path takes a
+    /// `Server` and a `RawFramebuffer`, both of which need syscalls — so "the cursor survives
+    /// a recompose" had no test it could fail, and did not survive one. Moving the boundary
+    /// down one layer is what makes it testable, and `pub(crate)` on
+    /// [`compose_into`](Self::compose_into) is what makes it unavoidable.
+    ///
+    /// **The cursor goes on last.** A cursor under a window is not a cursor, and compositing
+    /// it into the stack would make it a window — with a position in the stacking order, a
+    /// client that could cover it, and hit-testing that would have to skip it.
+    pub fn present_into<F, S>(
+        &self,
+        fb: &mut F,
+        background: Rgb,
+        source: &S,
+        damage: &[Rect],
+        pointer: Point,
+    ) where
+        F: Framebuffer + ?Sized,
+        S: BufferSource + ?Sized,
+    {
+        self.compose_into(fb, background, source, damage);
+        for r in damage {
+            draw_cursor(fb, pointer, *r);
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use libkern::abi::{
+        KEY_LEFTALT, KEY_LEFTCTRL, KEY_LEFTMETA, KEY_LEFTSHIFT, KEY_RIGHTALT, KEY_RIGHTCTRL,
+        KEY_RIGHTMETA, KEY_RIGHTSHIFT,
+    };
+
+    /// Two ordinary (non-modifier) keycodes — `a` and `b` in the Linux table `libkern::abi`
+    /// mirrors. Named here rather than imported because `abi` exports the modifiers this
+    /// module cares about and not every letter.
+    const KEY_A: u16 = 30;
+    /// See [`KEY_A`].
+    const KEY_B: u16 = 48;
+
+    #[test]
+    fn the_cursors_hotspot_is_its_top_left() {
+        // Where an arrow points. A centre hotspot clicks half a sprite from where it looks.
+        let r = cursor_rect(Point::new(40, 30));
+        assert_eq!(r.origin, Point::new(40, 30));
+        assert_eq!(r.size, libdraw::geom::Size::new(CURSOR_W, CURSOR_H));
+    }
+
+    #[test]
+    fn the_sprite_matches_the_size_it_claims() {
+        // A row longer than `CURSOR_W` draws outside `cursor_rect`, so the damage the
+        // compositor computes from that rectangle would leave a trail behind the pointer.
+        assert_eq!(CURSOR.len(), CURSOR_H as usize);
+        for (i, line) in CURSOR.iter().enumerate() {
+            assert!(
+                line.chars().count() <= CURSOR_W as usize,
+                "row {i} is {} wide, past the declared {CURSOR_W}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_at_the_screen_edge_is_clipped_rather_than_wrapped() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Geometry, MemFramebuffer};
+        let mut fb = MemFramebuffer::new(Geometry::packed(40, 40, PixelFormat::XRGB8888));
+        let clip = Rect::new(0, 0, 40, 40);
+        // Off the right and bottom edges, and off the top-left with negative coordinates.
+        draw_cursor(&mut fb, Point::new(36, 36), clip);
+        draw_cursor(&mut fb, Point::new(-4, -4), clip);
+        // Nothing wrapped to the opposite side: the far corner from each is untouched.
+        assert_eq!(fb.get_pixel(0, 39), Some(Rgb::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn the_cursor_draws_only_inside_its_clip() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Geometry, MemFramebuffer};
+        let mut fb = MemFramebuffer::new(Geometry::packed(60, 60, PixelFormat::XRGB8888));
+        let bg = Rgb::new(0x11, 0x22, 0x33);
+        for y in 0..60 {
+            for x in 0..60 {
+                fb.put_pixel(x, y, bg);
+            }
+        }
+        draw_cursor(&mut fb, Point::new(10, 10), Rect::new(10, 10, 4, 4));
+        for y in 0..60u32 {
+            for x in 0..60u32 {
+                if !Rect::new(10, 10, 4, 4).contains(x as i32, y as i32) {
+                    assert_eq!(fb.get_pixel(x, y), Some(bg), "ink at ({x},{y}) outside the clip");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_repeat_waits_the_delay_and_then_runs_at_the_interval() {
+        let mut r = Repeat::armed(30, 0, 1, 1_000);
+        assert!(!r.due(1_000), "not immediately");
+        assert!(!r.due(1_000 + REPEAT_DELAY_NS - 1), "not a nanosecond early");
+        assert!(r.due(1_000 + REPEAT_DELAY_NS), "and then it fires");
+        assert!(!r.due(1_000 + REPEAT_DELAY_NS), "once per deadline");
+        assert!(r.due(1_000 + REPEAT_DELAY_NS + REPEAT_INTERVAL_NS), "then at the interval");
+    }
+
+    #[test]
+    fn a_late_wakeup_does_not_slow_the_repeat_rate() {
+        // Advancing by `now + interval` rather than `deadline + interval` makes every late
+        // wake-up push the next repeat further out, so a busy compositor repeats slower and
+        // slower. The tick that wakes this is 10 ms, so late is the normal case.
+        let start = 1_000;
+        let mut r = Repeat::armed(30, 0, 1, start);
+        let first = start + REPEAT_DELAY_NS;
+        assert!(r.due(first + REPEAT_INTERVAL_NS / 2), "fired half an interval late");
+        assert_eq!(
+            r.next_at,
+            first + REPEAT_INTERVAL_NS,
+            "the next one is still on the original cadence, not shifted by the lateness"
+        );
+    }
+
+    #[test]
+    fn a_very_late_wakeup_does_not_fire_a_burst() {
+        // A stalled compositor coming back must not deliver every repeat it missed. One
+        // repeat, then back on cadence from now.
+        let mut r = Repeat::armed(30, 0, 1, 0);
+        let much_later = REPEAT_DELAY_NS + REPEAT_INTERVAL_NS * 1_000;
+        assert!(r.due(much_later));
+        assert!(!r.due(much_later), "and only one");
+        assert_eq!(r.next_at, much_later + REPEAT_INTERVAL_NS);
+    }
+
+    #[test]
+    fn modifiers_are_frozen_at_the_press() {
+        // A repeat is that press continuing. Re-reading modifiers would turn `A` into `a`
+        // halfway through a held run if the user let go of shift.
+        let r = Repeat::armed(30, 0x0001, 7, 0);
+        assert_eq!(r.modifiers, 0x0001);
+        assert_eq!(r.keycode, 30);
+        assert_eq!(r.window, 7);
+    }
 
     #[test]
     fn focus_transition_is_silent_when_focus_did_not_move() {
@@ -441,6 +756,12 @@ mod tests {
 
     fn screen() -> MemFramebuffer {
         MemFramebuffer::new(Geometry::with_pitch(32, 16, 140, PixelFormat::XRGB8888).unwrap())
+    }
+
+    /// A screen with room for the 12×16 cursor sprite away from its edges — [`screen`] is
+    /// 32×16, so a sprite anywhere but the top-left corner falls off it.
+    fn big_screen() -> MemFramebuffer {
+        MemFramebuffer::new(Geometry::with_pitch(96, 96, 400, PixelFormat::XRGB8888).unwrap())
     }
 
     #[test]
@@ -805,6 +1126,157 @@ mod tests {
         let mut fb = screen();
         s.compose_into(&mut fb, Rgb::BLACK, &src, &[full]);
         assert_eq!(fb.get_pixel(0, 0), Some(red), "window 1 now is");
+    }
+
+    #[test]
+    fn a_modifier_press_neither_repeats_nor_hijacks_a_repeat_in_flight() {
+        // **The pair of bugs the arming decision carried while it lived in the server loop.**
+        // Modifiers arrive as ordinary key transitions, so an unqualified arm made holding
+        // Ctrl repeat it, and — one slot — made pressing Shift mid-run replace the run.
+        let now = 1_000;
+
+        // Holding a modifier with nothing repeating starts nothing.
+        assert_eq!(
+            Repeat::after_key(None, KEY_LEFTCTRL, true, 0, Some(7), now),
+            None,
+            "a modifier armed a repeat"
+        );
+
+        // Pressing a modifier while `a` repeats leaves `a`'s run exactly as it was...
+        let run = Repeat::armed(KEY_A, 0, 7, now);
+        let after_shift_down =
+            Repeat::after_key(Some(run), KEY_LEFTSHIFT, true, 0, Some(7), now + 50);
+        assert_eq!(after_shift_down, Some(run), "a modifier press hijacked the repeat");
+
+        // ...and releasing it leaves the run alone too, which is the half that was already
+        // guarded — it only held because the press half no longer overwrites `keycode`.
+        let after_shift_up = Repeat::after_key(
+            after_shift_down,
+            KEY_LEFTSHIFT,
+            false,
+            0,
+            Some(7),
+            now + 90,
+        );
+        assert_eq!(after_shift_up, Some(run), "a modifier release stopped the repeat");
+
+        // The held key's own release still stops it.
+        assert_eq!(
+            Repeat::after_key(after_shift_up, KEY_A, false, 0, Some(7), now + 120),
+            None,
+            "the repeating key's release must disarm"
+        );
+    }
+
+    #[test]
+    fn every_modifier_is_excluded_both_sides() {
+        // Named individually rather than trusting one representative: the table has eight
+        // entries and a keycode missing from it repeats.
+        for code in [
+            KEY_LEFTSHIFT,
+            KEY_RIGHTSHIFT,
+            KEY_LEFTCTRL,
+            KEY_RIGHTCTRL,
+            KEY_LEFTALT,
+            KEY_RIGHTALT,
+            KEY_LEFTMETA,
+            KEY_RIGHTMETA,
+        ] {
+            assert_eq!(
+                Repeat::after_key(None, code, true, 0, Some(1), 0),
+                None,
+                "keycode {code} armed a repeat"
+            );
+        }
+        // And an ordinary key still does, or the exclusion is too wide.
+        assert!(
+            Repeat::after_key(None, KEY_A, true, 0, Some(1), 0).is_some(),
+            "an ordinary key stopped repeating"
+        );
+    }
+
+    #[test]
+    fn a_press_with_no_focus_candidate_disarms_rather_than_leaving_a_stale_run() {
+        // The window a repeat targets is captured at the press. A press while nothing can
+        // take focus must not leave the *previous* key repeating into a window that is no
+        // longer the focus candidate.
+        let run = Repeat::armed(KEY_A, 0, 7, 0);
+        assert_eq!(Repeat::after_key(Some(run), KEY_B, true, 0, None, 100), None);
+    }
+
+    #[test]
+    fn presenting_leaves_the_pointer_on_screen_over_a_window() {
+        // **The test that was missing.** The cursor is drawn over the composed stack rather
+        // than composited into it, so every path that recomposes has to redraw it — and three
+        // of the four paths in the server binary did not (PR #185 review, finding 1): a click
+        // raised a window, recomposed the whole screen, and erased the pointer until the mouse
+        // moved next. Nothing could fail: the binary's screen-update path takes a `Server` and
+        // a `RawFramebuffer`, so it is unreachable from a host test, and the gate never sees it
+        // because the click that would trigger it is followed by a reply that repaints.
+        //
+        // Pairing the two here is what makes it testable, and `pub(crate)` on `compose_into`
+        // is what stops a fifth path from being added without it.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s
+            .create(&CreateWindowRequest { width: 64, height: 64, role: Role::Normal })
+            .unwrap();
+        s.attach(&attach(w, 0, 64, 64)).unwrap();
+        // A window colour the cursor's body is not, so "the pointer is there" cannot be
+        // satisfied by the window's own pixels.
+        let window_colour = Rgb::new(0x10, 0x80, 0x20);
+        src.put(w, 0, geom(64, 64), window_colour);
+        s.commit(&commit(w, 0)).unwrap();
+
+        let pointer = Point::new(20, 20);
+        let mut fb = big_screen();
+        let full = fb.geometry().bounds();
+        s.present_into(&mut fb, Rgb::BLACK, &src, &[full], pointer);
+
+        assert!(
+            body_pixels(&fb, pointer) > 0,
+            "the pointer is not on screen over the window it is above"
+        );
+        // And the window is still underneath it, rather than the cursor having replaced a
+        // recompose that never happened.
+        assert_eq!(fb.get_pixel(0, 0), Some(window_colour), "the stack did not compose");
+    }
+
+    /// Cursor body pixels inside the sprite's rectangle at `at`.
+    fn body_pixels(fb: &MemFramebuffer, at: Point) -> usize {
+        let r = cursor_rect(at);
+        let mut n = 0;
+        for y in r.origin.y..r.bottom() as i32 {
+            for x in r.origin.x..r.right() as i32 {
+                if fb.get_pixel(x as u32, y as u32) == Some(CURSOR_BODY) {
+                    n += 1;
+                }
+            }
+        }
+        n
+    }
+
+    #[test]
+    fn presenting_draws_the_pointer_into_every_damage_rectangle() {
+        // `repaint_cursor_move` passes the old and new cursor rectangles; a `present_into`
+        // that drew into only the first would leave the pointer erased at its destination
+        // whenever the two rectangles do not overlap.
+        let s = WindowStack::new();
+        let src = MapSource::default();
+        let pointer = Point::new(40, 40);
+        let mut fb = big_screen();
+        let elsewhere = Rect::new(0, 0, 8, 8);
+        s.present_into(
+            &mut fb,
+            Rgb::BLACK,
+            &src,
+            &[elsewhere, cursor_rect(pointer)],
+            pointer,
+        );
+        assert!(
+            body_pixels(&fb, pointer) > 0,
+            "the pointer was not drawn into the second damage rectangle"
+        );
     }
 
     #[test]

@@ -16,6 +16,16 @@ edition = "2024"
 # of through a 90-second boot. That is the whole point of the `Framebuffer` seam:
 # the piece that *looks* like it needs a screen does not.
 [dependencies]
+# Glyph rasterisation. Userspace's first external dependency, taken deliberately after
+# verifying it builds for `x86_64-unknown-nitrox` — see `userspace/CLAUDE.md` for the bar
+# every dependency clears, and the decision log (2026-08-11) for why `ab_glyph` over
+# `fontdue`. `libm` because `no_std` has no float transcendentals; without that feature the
+# crate fails to compile with errors that do not mention it.
+ab_glyph = { version = "0.2.32", default-features = false, features = ["libm"] }
+# `ceilf` and friends: `core` has no float transcendentals, and rounding a text extent up is
+# the difference between a box the text fits in and one that clips its last column. Already
+# in the tree beneath `ab_glyph`; named directly rather than leaned on transitively.
+libm = { version = "0.2", default-features = false }
 # Acquiring the framebuffer is the one part of this crate that touches syscalls, so it
 # sits behind the optional `io` feature — the same split `libstream` uses to keep its
 # wire core dependency-free. Off by default, so `cargo test -p libdraw` on the host

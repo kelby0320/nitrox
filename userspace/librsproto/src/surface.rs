@@ -518,6 +518,16 @@ pub const OP_POINTER_EVENT: u16 = 0x0906;
 /// `Surface::FocusEvent` — this window gained or lost the keyboard.
 pub const OP_FOCUS_EVENT: u16 = 0x0907;
 
+/// The key was released.
+pub const KEY_UP: u16 = 0;
+/// The key was pressed.
+pub const KEY_DOWN: u16 = 1;
+/// The key is still held and the repeat interval elapsed.
+///
+/// Distinct from [`KEY_DOWN`] so that a consumer counting presses does not count a held key
+/// forever — a shell's history stepping wants repeats, and a "press any key" prompt does not.
+pub const KEY_REPEAT: u16 = 2;
+
 /// A key transition, as a window sees it.
 ///
 /// The shape `display-substrate.md` §5 fixed, and the reason the boundary is key events
@@ -530,7 +540,13 @@ pub const OP_FOCUS_EVENT: u16 = 0x0907;
 pub struct KeyEvent {
     /// The keycode (an `EV_KEY` code from the device layer, unchanged).
     pub keycode: u16,
-    /// Non-zero if the key went down.
+    /// [`KEY_UP`], [`KEY_DOWN`] or [`KEY_REPEAT`].
+    ///
+    /// **Non-zero means "the key is down"**, which is what a client that ignores repeat
+    /// reads it as — so treating this as a boolean gives the behaviour most callers want
+    /// without them knowing repeat exists. One that cares tells a repeat from a fresh press
+    /// by the exact value, the same way the device layer's `InputEvent::value` does
+    /// (`input-subsystem.md` §3, which reserved `2` for this).
     pub pressed: u16,
     /// Modifiers held **at this transition** — see the `MOD_*` constants.
     pub modifiers: u16,

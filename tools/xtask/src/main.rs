@@ -232,7 +232,24 @@ const SYSTEM_SERVICES: &[&str] = &[
     "heartbeat",
     "fs-server-ext4",
     "tty-server",
+    // The display arm's two servers. They were initramfs-resident until 2026-08-11 for one
+    // reason — they predate `/bin` — and neither has a bootstrap role: a compositor cannot
+    // run before there is a root to read a font from, let alone before there is one to spawn
+    // it from. Moving them here cost a reordering in `init`, which now brings the display up
+    // after the profile server rather than before it.
+    "compositor",
+    "input-server",
 ];
+
+/// The test programs, packaged into a store package of their own in selftest/test-harness
+/// builds and absent from a release image entirely.
+///
+/// **A separate package from `system`**, so the system package keeps meaning "the services
+/// this OS is made of" rather than "those, plus whatever the test build needed". It also
+/// keeps the system package's content hash identical between a release and a test image,
+/// which is the property a content-addressed path is supposed to have.
+const TEST_PROGRAMS: &[&str] =
+    &["test-harness", "test-stage", "display-selftest", "ui-testclient", "input-testclient"];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
@@ -431,6 +448,7 @@ fn cmd_image(mode: BuildMode) -> R<()> {
         &limine_conf(),
         &initramfs,
         &image_path(),
+        mode,
     )?;
     println!("xtask: image at {}", image_path().display());
     Ok(())
@@ -1020,6 +1038,11 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // widget rather than a window. Everything in that chain is unit-tested; this is the only
     // thing that says the pieces are wired to each other.
     session.expect("input-testclient: widget key code=48 down=1")?;
+    // **Held, not released**: the compositor repeats it. Asserted before the release,
+    // because a repeat that only arrived after the key came up would be a bug that a test
+    // ordering these the other way round could not see.
+    session.expect("input-testclient: win repeat code=48")?;
+
     qmp.send_key("b", false)?;
     session.expect("input-testclient: win key code=48 down=0")?;
 
@@ -1140,6 +1163,29 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         return Err(format!("guest display is {w}x{h}, smaller than the {sw}x{sh} scene").into());
     }
 
+    // **The cursor is on screen**, which nothing else here checks: the comparison below walks
+    // only the scene's region at the top-left, and the pointer starts at the screen's centre.
+    // Without this the sprite could fail to draw at all and every gate would stay green.
+    let (cx, cy) = (w / 2, h / 2);
+    let body = (0xFFu8, 0xFFu8, 0xFFu8);
+    let mut cursor_px = 0usize;
+    for y in cy..(cy + 16).min(h) {
+        for x in cx..(cx + 12).min(w) {
+            let i = (y as usize * w as usize + x as usize) * 3;
+            if (pixels[i], pixels[i + 1], pixels[i + 2]) == body {
+                cursor_px += 1;
+            }
+        }
+    }
+    if cursor_px == 0 {
+        let _ = session.child.kill();
+        return Err(format!(
+            "no cursor at the screen centre ({cx},{cy}): the pointer sprite is not being drawn"
+        )
+        .into());
+    }
+    println!("  ok: cursor visible at ({cx},{cy}) — {cursor_px} body pixels");
+
     let mut mismatches = 0usize;
     let mut first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     for y in 0..sh {
@@ -1156,26 +1202,82 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         }
     }
 
+    // **The toolkit's window**, underneath the scene. Rendered here with the font read from
+    // `assets/fonts/` — the same file the image build stages at `/system/fonts/` — against a
+    // guest render made from the bytes it read off the disk. This is the only check anywhere
+    // that a font loads on the target at all, and the only one that puts `libui` on a screen.
+    //
+    // Compared everywhere *except* the scene's rectangle, which is a window above it. That
+    // exclusion is not a weakening: a compositor that stacked the two the other way would
+    // fail the scene comparison above, so the ordering is still covered.
+    let (uw, uh) = (libui::reference::WIDTH, libui::reference::HEIGHT);
+    let font_file = repo_root().join("assets/fonts/DejaVuSansMono.ttf");
+    let font = libdraw::text::Font::from_bytes(
+        fs::read(&font_file).map_err(|e| format!("read {}: {e}", font_file.display()))?,
+    )
+    .ok_or("the vendored font did not parse on the host")?;
+    let ui = libui::reference::render(&font);
+    let mut ui_mismatches = 0usize;
+    let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
+    let mut ui_compared = 0usize;
+    if w >= uw && h >= uh {
+        for y in 0..uh {
+            for x in 0..uw {
+                if x < sw && y < sh {
+                    continue; // the scene's window is on top here
+                }
+                ui_compared += 1;
+                let want = Framebuffer::get_pixel(&ui, x, y).unwrap_or_default();
+                let i = (y as usize * w as usize + x as usize) * 3;
+                let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
+                if got != (want.r, want.g, want.b) {
+                    ui_mismatches += 1;
+                    if ui_first.is_none() {
+                        ui_first = Some((x, y, got, (want.r, want.g, want.b)));
+                    }
+                }
+            }
+        }
+    }
+
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
 
-    if mismatches == 0 {
-        println!(
-            "\nxtask: display gate PASSED — the {sw}x{sh} scene on screen matches libdraw \
-             pixel for pixel ✓"
-        );
-        return Ok(());
+    if mismatches > 0 {
+        let (x, y, got, want) = first.expect("a mismatch was counted");
+        return Err(format!(
+            "display gate FAILED: {mismatches} of {} scene pixels differ.\n  \
+             first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
+             the capture is at {} — a whole-image shift suggests a base-address or stride \
+             error, and swapped components suggest a channel-order one",
+            sw as usize * sh as usize,
+            shot.display()
+        )
+        .into());
     }
-    let (x, y, got, want) = first.expect("a mismatch was counted");
-    Err(format!(
-        "display gate FAILED: {mismatches} of {} pixels differ.\n  \
-         first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
-         the capture is at {} — a whole-image shift suggests a base-address or stride \
-         error, and swapped components suggest a channel-order one",
-        sw as usize * sh as usize,
-        shot.display()
-    )
-    .into())
+    if w < uw || h < uh {
+        return Err(format!(
+            "guest display is {w}x{h}, smaller than the {uw}x{uh} reference UI"
+        )
+        .into());
+    }
+    if ui_mismatches > 0 {
+        let (x, y, got, want) = ui_first.expect("a mismatch was counted");
+        return Err(format!(
+            "display gate FAILED: {ui_mismatches} of {ui_compared} toolkit pixels differ.\n  \
+             first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
+             the capture is at {} — if the whole region is the background colour the guest \
+             never loaded /system/fonts/DejaVuSansMono.ttf or never presented its window; if \
+             only the glyphs differ, the target rasterised differently from the host",
+            shot.display()
+        )
+        .into());
+    }
+    println!(
+        "\nxtask: display gate PASSED — the {sw}x{sh} scene and {ui_compared} pixels of the \
+         {uw}x{uh} toolkit window match libdraw and libui pixel for pixel ✓"
+    );
+    Ok(())
 }
 
 /// Parse a binary PPM (P6) into `(width, height, rgb_bytes)`.
@@ -3422,6 +3524,43 @@ fn initramfs_path() -> PathBuf {
     build_cache().join("initramfs.cpio")
 }
 
+/// The programs in the boot image, each with **the reason it cannot come from the filesystem**.
+///
+/// A pair rather than a bare name, because the reason is the whole rule and a list of names
+/// does not carry it. This has now drifted twice — services accumulated here until
+/// 2026-08-03, and the display arm's two servers went back in over the following week — both
+/// times because adding a name to a list of names is a one-word change that looks like every
+/// other one. Adding an entry here means writing down why the program is special, and if you
+/// cannot, it belongs in the store like everything else.
+///
+/// The bar is "required to get from the bootloader to a mounted root, plus what cannot live
+/// on the filesystem it depends on". Everything else is projected into `/bin` by the profile
+/// server and spawned from there.
+const INITRAMFS_PROGRAMS: &[(&str, &str)] = &[
+    ("init", "the kernel boot-loads /sbin/init from here; nothing else is running yet"),
+    ("fs-server-ext4", "it *is* the root mount, and is the only possible restart image for it"),
+    ("eshell", "the recovery path *for a failed mount*, so it cannot live on that filesystem"),
+    (
+        "profile-server",
+        "/bin does not exist until it runs. The alternative — teach init to read the manifest \
+         and spawn it by store path — puts TOML parsing in the one process that must not fail",
+    ),
+];
+
+/// The largest the packed initramfs may be, in bytes.
+///
+/// Not a memory limit: it is a **tripwire on the rule above**. Nothing releases the initramfs
+/// (`sys_release_initramfs` is referenced in the docs and does not exist), so every byte here
+/// is held for the machine's uptime — but the reason for the ceiling is that the list drifts
+/// silently and a size is the one symptom that shows up without anyone looking. The four
+/// programs come to ~231 KB; this leaves room for them to grow by half again before anyone
+/// has to think about it, and fails immediately if a fifth is added.
+///
+/// A failure is a question, not a wall: either the new program has a bootstrap reason — in
+/// which case add it to [`INITRAMFS_PROGRAMS`] with that reason and raise this — or it does
+/// not, and it belongs in a store package.
+const INITRAMFS_MAX_BYTES: usize = 384 * 1024;
+
 /// Append one CPIO `newc` entry (header + NUL-terminated name + data, each region
 /// NUL-padded to a 4-byte boundary) to `out`. Matches `kernel/src/initramfs.rs`.
 fn cpio_entry(out: &mut Vec<u8>, ino: u32, name: &str, data: &[u8]) {
@@ -3503,33 +3642,13 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and
     // the spawners resolve their children by path (`/initramfs/sbin/<name>`), retiring
     // the kernel-embedded `ImageId` images. Built by `cmd_build` before this runs.
-    // **Only what is required to get from the bootloader to a mounted root**, plus the two
-    // programs that cannot live on the filesystem they depend on:
     //
-    // - `init` — the kernel boot-loads it from here.
-    // - `fs-server-ext4` — it *is* the mount; nothing else can provide it.
-    // - `eshell` — the recovery path *for a failed mount*, so it must not live on the
-    //   filesystem it exists to recover from.
-    // - `profile-server` — `/bin` does not exist until it runs, so it cannot come from
-    //   `/bin`. The alternative (teach `init` to read the manifest and spawn it by store
-    //   path) puts TOML parsing in the one process that must not fail; not worth it for
-    //   one small binary.
-    //
-    // Everything else is read from the real filesystem through the store and a profile,
-    // like any other program.
-    let mut programs =
-        vec!["init", "fs-server-ext4", "eshell", "profile-server", "compositor", "input-server"];
-    // The integration smoke-test harness is embedded only in selftest/test-harness
-    // builds (it is also only built then) — never in a release image.
-    if mode.features().is_some() {
-        programs.push("test-harness");
-        programs.push("test-stage");
-        programs.push("display-selftest");
-        programs.push("ui-testclient");
-        programs.push("input-testclient");
-    }
+    // **The list is the same in every build mode.** The initramfs a test boots is therefore
+    // the initramfs a release boots, so the boot path under test is the boot path that ships.
+    // Until 2026-08-11 a test image's was 680 KB against a release's 323 KB, and both carried
+    // programs with no bootstrap role at all.
     let mut ino = 3u32;
-    for name in programs {
+    for (name, _why) in INITRAMFS_PROGRAMS {
         let elf = userspace_bin_path(name);
         let bytes =
             fs::read(&elf).map_err(|e| format!("read {name} ELF {}: {e}", elf.display()))?;
@@ -3542,7 +3661,7 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     // store dir). See `docs/architecture/profiles-and-namespace-projection.md`.
     let sys_store = store_path_for_all(SYSTEM_SERVICES, "system", "0.1.0")?;
     let cu_store = store_path_for_all(&profile_programs(), "coreutils", "0.1.0")?;
-    let system_profile = format!(
+    let mut system_profile = format!(
         "# System profile manifest (generation 1).\n\
          [profile]\n\
          name = \"system\"\n\
@@ -3558,11 +3677,36 @@ fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
          version = \"0.1.0\"\n\
          path = \"{cu_store}\"\n"
     );
+    // The test package, in selftest/test-harness builds only. Projected into `/bin` like any
+    // other package, so `init` spawns `/bin/ui-testclient` by exactly the path it spawns
+    // `/bin/logging-service` by — one mechanism, not a test-only one.
+    if mode.features().is_some() {
+        let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
+        system_profile.push_str(&format!(
+            "\n[[package]]\n\
+             name = \"test\"\n\
+             version = \"0.1.0\"\n\
+             path = \"{test_store}\"\n"
+        ));
+    }
     cpio_entry(&mut buf, ino, "etc/profiles/system.toml", system_profile.as_bytes());
     cpio_entry(&mut buf, 0, "TRAILER!!!", b"");
+    // The tripwire. Checked before the write so a build that trips it does not leave an image
+    // behind that boots and looks fine.
+    if buf.len() > INITRAMFS_MAX_BYTES {
+        return Err(format!(
+            "the initramfs is {} bytes, over the {INITRAMFS_MAX_BYTES}-byte ceiling.\n  \
+             It carries only what cannot come from the filesystem — see INITRAMFS_PROGRAMS. \
+             If you added a program: does it have a bootstrap reason? If so, add it there \
+             *with that reason* and raise the ceiling. If not, put it in a store package and \
+             spawn it from /bin.",
+            buf.len()
+        )
+        .into());
+    }
     fs::write(out, &buf)?;
     println!(
-        "xtask: built initramfs ({} bytes) at {}",
+        "xtask: built initramfs ({} of {INITRAMFS_MAX_BYTES} bytes) at {}",
         buf.len(),
         out.display()
     );
@@ -3575,6 +3719,7 @@ fn assemble_image(
     conf: &Path,
     initramfs: &Path,
     out: &Path,
+    mode: BuildMode,
 ) -> R<()> {
     require_tool("sgdisk")?;
     require_tool("mformat")?;
@@ -3751,6 +3896,47 @@ fn assemble_image(
         "xtask: store package {sys_store}/bin/ ({} services)",
         SYSTEM_SERVICES.len()
     );
+
+    // The `test` package: the guest-side gates and the programs they drive. Absent from a
+    // release image — `cmd_build` does not even build them outside selftest modes.
+    if mode.features().is_some() {
+        let test_store = store_path_for_all(TEST_PROGRAMS, "test", "0.1.0")?;
+        let test_bin = staging.join(test_store.trim_start_matches('/')).join("bin");
+        fs::create_dir_all(&test_bin)?;
+        for prog in TEST_PROGRAMS {
+            fs::copy(userspace_bin_path(prog), test_bin.join(prog))
+                .map_err(|e| format!("stage {prog} into the store: {e}"))?;
+        }
+        println!(
+            "xtask: store package {test_store}/bin/ ({} test programs)",
+            TEST_PROGRAMS.len()
+        );
+    }
+
+    // `/system/fonts` — the system font, and its licence beside it.
+    //
+    // **Here and not in the initramfs**, which the plan settled before the code was written:
+    // nothing that draws text runs before the root is mounted, and at 343 KiB the file is
+    // larger than every program in the boot image put together. A client resolves
+    // `libdraw::text::SYSTEM_FONT_PATH` and demand-pages it in.
+    //
+    // The licence ships with it because the font is redistributed: DejaVu's terms are
+    // permissive but require the notice to travel with the files. Staged from the same source
+    // file the host tests `include_bytes!`, so the gate cannot pass against a different font
+    // from the one on the disk.
+    {
+        let fonts = staging.join("system").join("fonts");
+        fs::create_dir_all(&fonts)?;
+        let src = repo_root().join("assets/fonts");
+        let mut total = 0u64;
+        for name in ["DejaVuSansMono.ttf", "LICENSE-DejaVu.txt"] {
+            let from = src.join(name);
+            total += fs::copy(&from, fonts.join(name))
+                .map_err(|e| format!("stage {}: {e}", from.display()))?;
+        }
+        println!("xtask: seeded /system/fonts ({total} bytes)");
+    }
+
     let rootfs = work.join("rootfs.ext4");
     let blocks = (root_sectors * 512) / 4096; // 4 KiB block count
     run(Command::new("mke2fs")

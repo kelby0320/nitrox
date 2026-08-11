@@ -57,6 +57,8 @@ pub enum Fingerprint {
     Padding(Insets),
     /// [`Node::Sized`], with its size.
     Sized(libdraw::geom::Size),
+    /// [`Node::Fill`], with its colour — a recolour repaints, it does not rebuild.
+    Fill(libdraw::format::Rgb),
     /// [`Node::Custom`], with its discriminator and size.
     Custom(u32, libdraw::geom::Size),
 }
@@ -72,6 +74,7 @@ impl Fingerprint {
             Node::Stack(_) => Fingerprint::Stack,
             Node::Padding { insets, .. } => Fingerprint::Padding(*insets),
             Node::Sized { size, .. } => Fingerprint::Sized(*size),
+            Node::Fill(c) => Fingerprint::Fill(*c),
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
     }
@@ -407,10 +410,11 @@ mod tests {
     /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
     /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
-    use crate::element::{Edge, Insets, column, custom, dock, docked, padding, row,
+    use crate::element::{Edge, Insets, column, custom, dock, docked, fill, padding, row,
                          sized, stack, text, with_spacing};
     use crate::layout::{FixedCell, Layout, layout};
     use alloc::vec;
+    use libdraw::format::Rgb;
     use libdraw::geom::Size;
 
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
@@ -717,6 +721,30 @@ mod tests {
         assert_eq!(go(&mut t, &e).expect("ok"), None);
         t.clear();
         assert_eq!(go(&mut t, &e).expect("ok"), Some(SCREEN));
+    }
+
+    #[test]
+    fn recolouring_a_fill_damages_it() {
+        // **The whole widget set's hover and press feedback rests on this**, and nothing
+        // tested it: replacing `Fingerprint::Fill(*c)` with a constant left all 106 tests
+        // green (PR #185 review, finding 3). A `button` differs between rest and hover *only*
+        // in its face's colour, so a fingerprint that ignores the colour reports no damage and
+        // the button never visibly reacts to the pointer.
+        //
+        // Under a `Stack` on purpose: that is the shape `button` builds, and a `Fill` on its
+        // own would also be caught by a coarser check.
+        let mut t = Tree::new();
+        let red = Rgb::new(0xC0, 0x10, 0x10);
+        let blue = Rgb::new(0x10, 0x10, 0xC0);
+        let at_rest: Element<Msg> = stack(vec![fill(red), text("OK")]);
+        go(&mut t, &at_rest).expect("ok");
+        assert_eq!(go(&mut t, &at_rest).expect("ok"), None, "an unchanged frame is clean");
+
+        let hovered: Element<Msg> = stack(vec![fill(blue), text("OK")]);
+        assert!(
+            go(&mut t, &hovered).expect("ok").is_some(),
+            "a recoloured fill reported no damage — hover and press feedback never repaints"
+        );
     }
 
     #[test]

@@ -113,6 +113,21 @@ impl Layout {
 pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M) -> Size {
     let size = match &e.node {
         Node::Text(s) => m.text_size(s),
+        // A colour has no natural size, and a caller wanting a particular one wraps it in
+        // `sized` or gives it `flex`.
+        //
+        // **Zero, not `c.max`.** It was `c.max` until 2026-08-11, on the stated grounds that
+        // zero "would make a button's face collapse inside a `Column`" — which is not what
+        // happens, because `arrange` gives every `Stack` layer the whole rect regardless of
+        // what it measured. What `c.max` *did* do was make every `Stack`-based widget greedy:
+        // `button` and `menu_bar` are stacks over a `Fill`, so the first one in a `Row` or
+        // `Column` measured to the entire remaining extent and its siblings got nothing. A
+        // two-item menu bar laid its second item out at zero width, off the right edge.
+        //
+        // Nothing caught it because every widget test lays *one* widget into a fixed
+        // rectangle, where a greedy measure and a correct one give the same answer. Composing
+        // the widget set into one UI (`reference::view`) is what surfaced it.
+        Node::Fill(_) => Size::new(0, 0),
         Node::Custom { size, .. } => *size,
         Node::Sized { size, child } => {
             // Zero means unconstrained, so the child's own measure stands on that axis.
@@ -182,7 +197,7 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
         _ => rect,
     };
     let children = match &e.node {
-        Node::Text(_) | Node::Custom { .. } => Vec::new(),
+        Node::Text(_) | Node::Fill(_) | Node::Custom { .. } => Vec::new(),
 
         Node::Padding { insets, child } => {
             let inner = Rect::new(

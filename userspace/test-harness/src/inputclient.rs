@@ -373,6 +373,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     .s(b" mods=")
                     .u(k.modifiers as u64)
                     .end();
+                if k.pressed == librsproto::surface::KEY_REPEAT {
+                    // A held key repeating. Reported separately from a press so the gate can
+                    // tell them apart — a client counting presses must not count a held key
+                    // forever, which is the whole reason the value is distinct.
+                    Line::new()
+                        .s(b"input-testclient: win repeat code=")
+                        .u(k.keycode as u64)
+                        .end();
+                }
                 // ...and through the toolkit, which is the part Part B is about.
                 if let Some(Msg::Key(rk)) = router.key(&tree, &view, k) {
                     Line::new()

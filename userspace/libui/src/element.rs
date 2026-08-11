@@ -40,6 +40,7 @@ use alloc::boxed::Box;
 use alloc::string::String;
 use alloc::vec::Vec;
 
+use libdraw::format::Rgb;
 use libdraw::geom::Size;
 use librsproto::surface::{KeyEvent, PointerEvent};
 
@@ -159,6 +160,15 @@ pub enum Node<Msg> {
         /// The child.
         child: Box<Element<Msg>>,
     },
+    /// A rectangle of flat colour.
+    ///
+    /// The one painting primitive the composites need: a button's face, a scrollbar's track
+    /// and thumb, a menu's backing. Without it every widget that is not text would have to be
+    /// a `Custom`, and the application would end up painting the toolkit's own chrome.
+    ///
+    /// It measures to nothing and takes what it is given — a colour has no natural size, and
+    /// a caller that wants one wraps it in [`sized`].
+    Fill(Rgb),
     /// An application-drawn node: the escape hatch.
     ///
     /// Opaque to the toolkit — it measures to `size` and the application paints it. This is
@@ -275,7 +285,7 @@ impl<Msg> Element<Msg> {
         // consumes them in and the order they are painted.
         let (a, b, c): (&[Element<Msg>], Option<&Element<Msg>>, Option<&Element<Msg>>) =
             match &self.node {
-            Node::Text(_) | Node::Custom { .. } => (&[], None, None),
+            Node::Text(_) | Node::Fill(_) | Node::Custom { .. } => (&[], None, None),
             Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
                 (children.as_slice(), None, None)
             }
@@ -331,6 +341,11 @@ pub fn padding<Msg>(insets: Insets, child: Element<Msg>) -> Element<Msg> {
 /// A child constrained on one or both axes; a zero component means unconstrained.
 pub fn sized<Msg>(size: Size, child: Element<Msg>) -> Element<Msg> {
     Element::new(Node::Sized { size, child: Box::new(child) })
+}
+
+/// A rectangle of flat colour, filling whatever it is given.
+pub fn fill<Msg>(colour: Rgb) -> Element<Msg> {
+    Element::new(Node::Fill(colour))
 }
 
 /// An application-drawn node.

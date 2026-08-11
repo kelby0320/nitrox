@@ -13030,3 +13030,176 @@ one channel with nothing to attribute them to. It cost two bytes that were alrea
 because the record was a day old. `KeyEvent` and `PointerEvent` have the identical gap and are
 *shipped*, so they are filed with a trigger rather than widened: the first client with two
 windows, which is Part C's menus.
+
+## 2026-08-11 — The font goes on the root filesystem, and the initramfs is put back on its diet
+
+M4 Part C's last piece was shipping the font somewhere a client could load it at runtime. The
+plan had already settled *where* — the root filesystem, not the initramfs — so the question
+this entry answers is a different one: whether to also clean up the initramfs while standing
+in the same code, and what to do so the cleanup stops coming undone.
+
+### The font
+
+`/system/fonts/DejaVuSansMono.ttf`, staged by the image build alongside its licence, resolved
+by `libdraw::text::load` (behind the `io` feature, beside `acquire`) and demand-paged out of
+ext4. Nothing that draws text runs before the root is mounted, and the compositor never loads
+a font at all — clients render text into their own buffers.
+
+The licence ships next to it because the font is redistributed. Staged from the same file the
+host tests `include_bytes!`, so no gate can pass against a different font from the one on the
+disk.
+
+### The initramfs regression
+
+`initramfs-minimisation` was resolved on 2026-08-03: the boot image carries only what cannot
+come from a filesystem. **It regressed within the week.** The display arm added `compositor`
+and `input-server` for one reason — they predate `/bin` — and neither has a bootstrap role. In
+test builds five more programs rode along. A test image's initramfs was 680 KB against a
+release's 323 KB.
+
+I folded the cleanup into this change rather than filing it, because the alternative was
+touching the same forty lines of `assemble_image` twice, and because M5 adds more display
+servers to the same list.
+
+**What moved:** `compositor` and `input-server` into the `system` store package; the five test
+programs into a new `test` package, present only in selftest builds. What stayed, with the
+reason written down beside each: `init`, `fs-server-ext4`, `eshell`, `profile-server`.
+223,888 bytes in a release build and 232,668 in a test one — **the same program list either
+way**, the difference being that `init` itself carries the selftest feature. So the initramfs a
+test boots is, program for program, the one a release boots; before this it was 680 KB against
+323 KB and carried five programs a release never sees.
+
+`test-harness` moving out deserves a note, because "the harness must not depend on the thing
+it adjudicates" is a real argument and it does not apply: `run_test_harness` is called from
+`supervise`, after the mount, after `/bin`. A boot that fails the mount reaches `emergency`
+and never runs the harness either way.
+
+**Init's boot order changed as a consequence**: the display arm now comes up *after* the
+profile server, the logging service and the terminal server, because it is spawned from `/bin`
+like everything else. It used to come first purely because the initramfs is available from the
+first instruction.
+
+### Why it will not regress a third time
+
+Twice is a pattern, and both times the mechanism was the same: adding a name to a list of
+names is a one-word change that looks like every other one-word change. So the list is no
+longer a list of names. `INITRAMFS_PROGRAMS` is `(program, why it cannot come from the
+filesystem)`, and you cannot add an entry without writing the reason. Behind that,
+`INITRAMFS_MAX_BYTES` fails the build at 384 KiB with a message that asks the question.
+
+A ceiling is a crude instrument and it is the right one here: the failure mode is silent
+accretion, and size is the one symptom that shows up without anyone looking.
+
+### The gate: `libui::reference`
+
+Getting a font onto the disk proves nothing unless something reads it, so `ui-testclient`
+gained a second window presenting `libui::reference` — a fixed picture using one of each
+widget Part C built — drawn with the font it read from ext4. `check-display` renders the same
+function on the host and compares pixel for pixel.
+
+This is the first time the toolkit has been on a screen. Everything in `libui` was host-tested
+against a font compiled into the test binary, which cannot show that a font loads on the
+target, that the target rasterises as the host does, or that a toolkit-painted buffer survives
+the trip through the Surface protocol.
+
+**Two connections rather than two windows on one**, because `KeyEvent`/`PointerEvent` carry no
+window id (a gap recorded in `rsproto-surface-ops.md` with "the first client with two windows"
+as its trigger). A session each keeps the question from arising and costs one channel; it is
+not a dodge, since it is genuinely unambiguous.
+
+**The UI window is created first**, so the reference scene stacks above it. The comparison
+skips the scene's rectangle — which is not a weakening, because a compositor that stacked them
+the other way fails the *scene* comparison.
+
+Verified by breaking it twice: with the font unstaged the client reports `font load FAILED`
+and the gate times out; with one byte of the guest's render flipped the gate names the pixel.
+The first attempt at that second break flipped a byte inside the scene's rectangle and passed
+— the excluded region is real, and I would have believed a green run.
+
+### What the reference UI found on its first render
+
+A defect in the widget set, immediately: `Node::Fill` measured to `c.max`, and `button` and
+`menu_bar` are stacks over a `Fill`, so **the first widget in a `Row` or `Column` measured to
+the entire remaining extent and its siblings got none**. A two-item menu bar laid its second
+item out at zero width, off the right edge.
+
+`element.rs` had documented `Fill` as measuring "to nothing" all along; `layout.rs` returned
+`c.max` with a comment justifying it on the grounds that zero "would make a button's face
+collapse inside a `Column`" — which is not what happens, because `arrange` gives every `Stack`
+layer the whole rect regardless of what it measured. The justification was written before
+`button` existed.
+
+Nothing caught it because **every widget test lays one widget into a rectangle of its own**,
+where a greedy measure and a correct one give identical answers. That is the milestone's
+recurring shape again: the test observed something downstream of what it claimed to check.
+Two regression tests now state it both ways — two buttons side by side, and a button's
+measure being independent of the room around it.
+
+### The measurement the deferral had scheduled
+
+`deferred-decisions.md` scheduled a read-ahead revisit "after the desktop UI MVP", so I took
+the counters. The first finding was that **the trigger had already fired unobserved**: the
+recorded figure was 43 fills, and the tree before this change was at 2,778. The 2026-08-03
+store work moved the services onto ext4 and nobody re-read the counters. The scheduled revisit
+is what caught it, which is the argument for scheduling them.
+
+This change takes it to 3,021 fills (5.2 % of boot) — reproduced exactly across two runs. Read-ahead stays deferred, but for a new
+reason: **image materialisation is 656 ms, 83 % of spawn time**, and `sys_spawn` copies the
+whole ELF eagerly whether or not its pages are touched. Demand-paged program text subsumes
+most of what read-ahead would buy, so it goes first.
+
+## 2026-08-11 — Review of #185: two bugs that were both "the decision lives where nothing can test it"
+
+The review of PR #185 found one blocking bug and one that would have been felt by the first
+person to use a keyboard. They are the same bug twice, and the shape is worth naming.
+
+**Both live in `compositor/src/main.rs`.** That file takes a `Server` and a `RawFramebuffer`,
+so nothing in it can be reached from a host test — and both defects were *decisions* (when to
+redraw the pointer, when to start a repeat) sitting in the one file where a decision cannot be
+asserted. The state machines beside them were host-tested and correct: `Repeat::due`'s deadline
+advance, its burst guard, `draw_cursor`'s clip. What went wrong was never the mechanism, it was
+when the mechanism runs.
+
+### The cursor vanished on every click
+
+`draw_cursor` had one caller, `repaint_region`. Three other paths recomposed the screen
+directly — the restack after a click, a session dying, and the initial compose — so each
+erased the pointer. The click path is not rare: `WindowStack::raise` succeeds whenever the
+window exists, including when it is already topmost, so every click on a focusable window took
+it. The comment above it asserted the opposite, which is how it survived being read.
+
+**The fix is structural, not three fixes.** `compose_into` is now `pub(crate)`, so the server
+binary *cannot* compose without the cursor, and `present_into` — compose, then the pointer over
+every damage rectangle — is the only way a screen region is updated. Moving the pairing into
+the library is also what makes it testable: two tests now assert the pointer survives a
+recompose over a window, and that it is drawn into *every* damage rectangle rather than the
+first (which is what `repaint_cursor_move` passes two of).
+
+A fourth path added later cannot repeat the mistake, because there is no API for it.
+
+### Holding Ctrl typed 25 characters a second
+
+Modifiers arrive as ordinary `Logical::Key` transitions — correctly, they are key
+transitions — and the arming arm matched any press. So holding a modifier repeated it, and
+because `srv.repeat` is one slot, pressing Shift while `a` was held *replaced* `a`'s repeat;
+releasing Shift then cleared it, and the still-held `a` never repeated again. That is exactly
+what the release arm's comment said must not happen, defeated from the other side.
+
+`libinput::is_modifier` is the missing predicate — the keycode table belongs to `libinput`, the
+repeat policy to the compositor. And the arming *decision* moved into `Repeat::after_key`,
+where it is a function of values and has four tests, including one that names all eight
+modifier keycodes rather than trusting a representative.
+
+### The other three
+
+Two `Fill` behaviours had no test at all, and both were load-bearing: the colour in
+`Fingerprint::Fill` (without it a button never repaints on hover, which is the widget set's
+whole point) and `paint` filling to the clip rather than the node's rect (without it a partial
+repaint overdraws a neighbour the diff called clean). Neither break was visible to 106 passing
+tests. `paint`'s private `fill` is also gone in favour of `Framebuffer::fill_rect`, whose own
+doc warns against exactly the second copy that had grown here.
+
+And `docs/conventions/userspace-build.md` still instructed the reader to "add it to the
+`programs` list in `build_initramfs`" — a symbol this PR deleted, and the precise drift the
+new `(program, reason)` pairs exist to stop. A convention doc that dates badly is worse than
+none, because it is the thing a new session reads *instead of* the source.

@@ -47,6 +47,7 @@ pub mod geom;
 pub mod hash;
 pub mod ppm;
 pub mod scene;
+pub mod text;
 
 pub use compose::{SurfaceRef, compose, compose_full};
 pub use format::{Channel, PixelFormat, Rgb};
