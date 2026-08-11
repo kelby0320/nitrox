@@ -12581,3 +12581,57 @@ Two smaller notes:
   sites, faithfully preserving a pre-existing bug: `-1` printed as 18446744073709551615. A
   mechanical sweep preserves defects with the same fidelity it preserves behaviour, and that
   is the point of it — but it means the sweep is not the moment those defects get found.
+
+## 2026-08-11 — The toolkit is Elm-shaped, and `libui` is renamed to make room for it
+
+Milestone 4's design pass. `widget-toolkit.md` settles the five forks the plan named, plus
+two the plan did not.
+
+**Retained tree, declarative face.** The usual framing — "retained versus immediate" — turned
+out to be two axes wearing one name, and separating them was most of the decision. *Does a
+widget exist between frames?* Retained: yes, because immediate mode redraws everything and
+this whole arm is built on damage rectangles. *How does the application talk to that tree?*
+Declaratively: the application holds state and writes `view(&state) -> Element`, and the
+runtime diffs. Both Windows Forms and Iced are retained; they differ only on the second axis,
+and it is the second axis that decides what the code looks like.
+
+Elm's shape was taken for two reasons that are about **this** tree rather than about
+toolkits generally. `view` is a pure function, so it host-tests like `libinput`'s interpreter
+and the compositor's router and outbox — whereas a mutation toolkit's correctness lives in
+ordering, which is what host tests reach worst. And **damage is derived from the diff rather
+than remembered by each widget**: an `invalidate()` discipline is precisely the "the code
+does not do what its comment claims" failure this project keeps paying for, and a derived one
+cannot drift.
+
+The costs are recorded rather than argued away: allocation per update (bounded by rebuilding
+on events, not at frame rate — there is no animation loop), and widget identity becoming a
+real design problem, answered with optional keys and a *loud* failure for inconsistent
+keying rather than the silent mispairing that presents as "the wrong row remembered my
+selection".
+
+**`libui` becomes `libsurface`; the toolkit takes `libui`.** Today's `libui` is a
+Surface-protocol client — windows, buffers, events — and not a toolkit. The name was
+aspirational and the code went somewhere else, so every future application would have
+imported the aspirational name to get the thing it did not want. The rename is mechanical and
+is cheapest now, before a second client exists; it is the same argument this project applies
+to version numbers in filenames. Two crates rather than one because the toolkit will dwarf
+the transport and a single crate has no enforced direction.
+
+**A contradiction the design pass found in the plan.** Part C listed *a text area*, while
+Milestone 5 makes the terminal's grid a **custom-drawn widget of its own** specifically so it
+is not a generic text area. Both cannot hold: with the grid custom-drawn, nothing in M5 uses
+a text area, and the milestone's governing rule is that the terminal decides how much toolkit
+exists. The text area is out.
+
+That has a knock-on worth recording, because it is the kind of thing that rots quietly:
+`deferred-decisions.md` gives key repeat the trigger *"the first text field — M4's toolkit"*.
+With no text field, that wording says the trigger has not fired. It has — holding a key in
+the terminal must repeat, and the grid is a custom widget taking raw keys. **The trigger named
+the right milestone and the wrong widget**, which is a good argument for triggers naming the
+*need* rather than the artifact expected to embody it.
+
+**Three deferrals fold in**, each because M4 is its filed trigger: the focus record the
+compositor owes a client (without it the second focus concept has no source), key repeat, and
+a cursor on screen. Key repeat is generated **compositor-side** rather than Wayland's
+client-side rate — the compositor already has the timer loop the outbox retry gave it, and it
+knows which window has focus, so repeats stop on a focus change with no client involvement.

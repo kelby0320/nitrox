@@ -294,10 +294,23 @@ with window management in a later milestone; buttons and menus need clicks, and 
 
 ## Milestone 4 — the widget toolkit
 
-**Design pass first**: the toolkit gets its own document before this milestone starts, the way
-the substrate and the shell did. The forks it has to settle are retained-versus-immediate mode,
-the layout model, event routing and focus-within-a-window, how a widget's invalidation becomes a
-damage rectangle, and how much of it the terminal actually uses.
+**Design pass done** (2026-08-11): [`widget-toolkit.md`](../design/widget-toolkit.md) settles
+the five forks this line used to list. In short — a **retained tree with a declarative face**:
+the application holds state and writes `view(&state) -> Element`, the runtime diffs that against
+the tree it keeps, and **the diff is where damage comes from**. Elm's shape, by way of Iced, and
+taken for two reasons specific to this tree: `view` is a pure function so it host-tests like
+every other subsystem here, and derived damage cannot rot the way a hand-written
+`invalidate()` discipline does.
+
+Layout is measure/arrange with four containers. Routing mirrors the compositor one layer down —
+implicit pointer capture on press, and **widget focus kept strictly separate from window
+focus**. `Commit` carries one damage rectangle, so the toolkit unions; damage accumulates
+**per buffer**, which is the subtlety that is invisible until the compositor holds a buffer for
+more than a frame.
+
+**`libui` is renamed `libsurface`, and the toolkit takes the name `libui`.** Today's `libui` is
+a Surface-protocol client, not a toolkit; the name was aspirational and the code went elsewhere.
+The rename is mechanical and cheapest before a second client exists.
 
 **Deliverable: enough toolkit to build the terminal, and no more.**
 
@@ -313,9 +326,23 @@ requirement, not a compromise.
 - [ ] **Part B — event routing**: hit testing, pointer capture during a drag, and
       **widget-level keyboard focus**, which is a *second* focus concept — the compositor
       decides which window has focus, the toolkit decides which widget within it does.
-      Conflating them is the classic source of text arriving in the wrong field.
-- [ ] **Part C — the first widget set**, bounded by what the terminal needs: a text area, a
-      button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch.
+      Conflating them is the classic source of text arriving in the wrong field. Carries the
+      **focus record** the compositor owes a client, without which the toolkit has no way to
+      know the first of those two.
+- [ ] **Part C — the first widget set**, bounded by what the terminal needs: `text`, a
+      button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch. Plus key
+      repeat and the on-screen cursor, which are what make the set usable by a person rather
+      than only by the harness.
+
+      **No text area** — the design pass found this line contradicting Milestone 5, which
+      makes the terminal grid a *custom-drawn widget of its own* precisely so it is not a
+      generic text area. Nothing in M5 would then use one, and "the terminal decides how much
+      of it exists" is this milestone's governing rule. It returns when something needs it.
+
+**Three deferrals are folded in**, each because this milestone is its filed trigger: the
+compositor telling a client it gained or lost **focus** (Part B — the second focus concept has
+no source without it), **key repeat** (Part C), and **a cursor drawn on screen** (Part C). See
+`widget-toolkit.md` §9.
 
 **No ABI question today.** With everything statically linked, the toolkit is an ordinary Rust
 crate that applications link. The seam matters when dynamic linking lands — the phase plan
