@@ -12266,3 +12266,128 @@ nothing had written down: it clobbers `WAIT_RESULTS[0..24]` while `serve_loop` i
 that buffer, and is safe only because the inner wait passes `count = 1` and the outer loop has
 already consumed the record it is on. Correct, load-bearing, and now stated at the function —
 widening that call would corrupt the loop silently.
+
+### The plan drifted, and the maintainer caught it before the code did
+
+Part C was about to be built to a shape the plan did not describe. Worth recording because
+the failure is quiet and the correction is cheap only while it is early.
+
+**Two different drifts, and they pull opposite ways.**
+
+*Scope the plan did not name.* `PointerEvent` is a record type and a spec section; the plan's
+Part C mentioned only `KeyEvent`. That is not scope creep in the bad sense — a client
+receiving a click is Part C's own deliverable, and it turned out to be the trigger that
+`display-substrate.md` §9 had parked pointer events behind, earlier than the trigger that
+document guessed ("the compositor needing to move a window"). But the plan is the agreement
+about what is being built, and acquiring a wire contract without writing it down is exactly
+how the next person inherits a document that describes a different system.
+
+*Scope belonging to the next part.* The remaining-work list had `libui` delivery and the gate
+assertion inside Part C. Re-reading Part D — "plus a client that echoes what it received" —
+they are D's, and folding them forward would have left D as a checkbox with nothing behind
+it. That is worse than it sounds: the parts exist so each one lands with its own proof, and a
+part with no work has no proof either.
+
+**The boundary is now stated rather than implied: the channel.** Part C ends when the
+compositor sends a `KeyEvent`; Part D begins when a client receives one. Part C is
+sub-divided into C1 (records, done), C2 (`libinput`), C3 (the compositor consuming
+`/dev/input/new`) so each has a checkbox and C3 carries the correction of the Surface spec's
+"specified but not yet sent" Status line.
+
+The general lesson is one this project keeps relearning in different costumes: **a plan
+consulted only at the start of a slice is a sketch.** The same failure produced the M2 Part B
+box ticked while the server never answered, and the `Tty` category that took a range without
+a registry row. Checking the plan when the work *changes* — not only when it starts — is what
+would have caught all three.
+
+## 2026-08-10 — Input routing: a shared modifier bit is fine, deriving it from the last transition is not
+
+M3 Part C3 wired the compositor to `/dev/input/new`. Two decisions in it are worth the record.
+
+**Left and right modifiers keep sharing a bit.** The C2 write-up flagged as a "known
+limitation" that `MOD_SHIFT` cannot tell the two shifts apart, and asked whether splitting
+them — as most systems are assumed to — was better. Checking rather than assuming: the split
+is in the **keycodes**, not the mask. X11 has `Shift_L`/`Shift_R` keysyms and a single
+`ShiftMask`; Wayland passes xkb's combined mask; Windows has `VK_LSHIFT`/`VK_RSHIFT`
+alongside a combined `VK_SHIFT`. So the shared bit is the mainstream design, and `KeyEvent`
+already carries the distinct keycode for anyone who needs the side.
+
+**The actual defect was elsewhere, and the "limitation" framing hid it.** With both shifts
+held, releasing one cleared `MOD_SHIFT` while a key was still physically down. That is not a
+consequence of sharing a bit — X11 has one bit and no such bug — it is a consequence of
+*editing the mask on each transition* instead of deriving it from which modifier keys are
+held. `Interpreter` now tracks the eight modifier keys and computes the mask; the ABI is
+unchanged, and `rsproto-surface-ops.md` states the derivation as an obligation on senders,
+because clearing the bit per release is the obvious implementation and is wrong.
+
+The method lesson: **a limitation recorded in a passing test is a bug with good manners.**
+The test asserted the wrong behaviour with a comment explaining why it was acceptable, which
+is exactly how it survived a review round. What made it visible was being asked to justify
+the design against how other systems do it — and finding that the comparison did not support
+the design *or* the limitation.
+
+**Two things the plan did not name.** An *implicit grab*: every pointer event from a press to
+its release goes to the window the press landed on, even after the cursor leaves. Without it
+a drag ending outside the window delivers a press with no release and the client believes a
+button is held forever; it is also why `PointerEvent`'s coordinates are signed, since during
+a grab window-local x is routinely negative. And an *init ordering change*: the input server
+now binds before the compositor is spawned, because the compositor resolves `/dev/input/new`
+during startup, before it answers `Meta::Ready`. Spawned the other way round it served the
+display with no input for the life of the boot, with only a log line to say so.
+
+**Two tests that did not bite, and what they were worth.** Ten deliberate breaks were run
+against the router; eight failed a test, two passed. One was a real gap — a clamp test pushed
+the cursor *left* with `i32::MIN`, which cannot overflow, because the cursor is already
+clamped to `>= 0`; only rightward overflows, and the fixed test catches `wrapping_add`. The
+other was more useful: a break that took the implicit grab *after* the click-to-focus raise
+passed every test, and passed correctly — hit-testing picks the topmost window containing the
+point, and raising that window leaves it topmost there, so the order cannot matter. The code
+comment claiming it prevented a "stolen press" was describing a hazard that cannot occur, and
+now says so. **A break that does not bite is either a missing test or a wrong comment**; the
+value is in finding out which before assuming the first.
+
+## 2026-08-10 — `PointerEvent` grows to 20 bytes: state a client needs, on every kind
+
+The PR #180 review found that `PointerEvent` reported `buttons == 0` on every motion, and
+carried no modifiers at all — while `librsproto`'s own doc said "every button currently held"
+and pointed at "[`PointerEvent`]'s reports" for the modifier bits. Both docs described a
+record that did not exist.
+
+**The fix is a wire change, taken now because now is when it is free.** `PointerEvent` gains
+`modifiers` and a reserved half-word, 16 → 20 bytes, and `Logical::Motion` gains the buttons
+and modifiers held during it. The alternative — narrowing the docs to "meaningful only on
+`POINTER_BUTTON`" — would have been honest and wrong: a drag is *motion with a button held*,
+so a client implementing one the obvious way would find nothing ever drags, and its only
+recourse would be to re-accumulate button state from the transitions. That per-application
+duplication is the thing the Surface layer exists to prevent. Shift-click is the same argument
+for modifiers, with a sharper failure: a client tracking shift from `KeyEvent`s gets it right
+only while it *also* holds keyboard focus, so shift-clicking an unfocused window would
+silently behave as a plain click.
+
+No client reads either record yet, so the cost today is two struct fields. After Part D writes
+one, it is a wire migration.
+
+**The widening immediately produced the bug it was warning about.** The compositor serialised
+into a hand-written `[0u8; 16]`, and `write` refuses a short buffer by returning `None` — so
+every pointer event would have been silently dropped, with the spec and the compositor both
+still claiming it was sent. Nothing caught it: the host tests exercise the router, which does
+not serialise, and the boot gate cannot yet assert a client received anything. The buffers are
+now sized `size_of::<PointerEvent>()`. **A published byte count copied into a literal is a
+constant with no owner**, and this is the second time that shape has bitten (the first was the
+`SYN_DROPPED` records-vs-batches mismatch in Part B).
+
+Two smaller corrections in the same round, both of the same kind — **prose that was true when
+written and quietly stopped being true**:
+
+- The Surface spec's routing section still said click-to-focus was not implemented and
+  described pointer routing with no mention of the implicit grab. The Status line at the top
+  of the same file described both correctly. The section a client reads to learn the rules
+  contradicted the line nobody reads twice.
+- The serve loop's `SAFETY` note asserted the wait set was bounded by `1 + MAX_SESSIONS`,
+  true until the input channel joined it. The bound now holds only because `MAX_SESSIONS`
+  moved to `- 2` in the same commit. That invariant is now a `const _: () = assert!(...)`, so
+  the next person to add a fixed handle gets a compile error rather than a comment to re-read.
+
+The last one is the general lesson: **when an invariant becomes spread across two constants,
+the comment that used to state it becomes a liability.** It reads as a guarantee, it is
+checked by nobody, and it is most convincing to exactly the person about to violate it.

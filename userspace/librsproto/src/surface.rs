@@ -500,6 +500,175 @@ pub fn parse_destroy_window_request(body: &[u8]) -> Option<u32> {
     Some(get_u32(body, 0))
 }
 
+
+// ---------------------------------------------------------------------------
+// Input delivered to a window (M3 Part C).
+//
+// **Surface-layer events, not device records.** The device layer carries `InputEvent`
+// triples with a `SYN` state machine; a client should never see one. `libinput` runs that
+// machine on the compositor's side and hands a window something already usable — which is
+// the same split `display-substrate.md` §5 makes for the keyboard, and the reason its
+// `KeyEvent` carries modifiers the device layer has no field for.
+// ---------------------------------------------------------------------------
+
+/// `Surface::KeyEvent` — a key transition delivered to the focused window.
+pub const OP_KEY_EVENT: u16 = 0x0905;
+/// `Surface::PointerEvent` — pointer motion, a button, or a crossing.
+pub const OP_POINTER_EVENT: u16 = 0x0906;
+
+/// A key transition, as a window sees it.
+///
+/// The shape `display-substrate.md` §5 fixed, and the reason the boundary is key events
+/// rather than characters: **modifiers travel with the key**. A byte stream cannot express
+/// Shift-Enter — `\n` is `\n` whatever was held — and a terminal that wants it needs the
+/// modifier state at the instant the key went down, not whatever it is by the time a
+/// character arrives.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct KeyEvent {
+    /// The keycode (an `EV_KEY` code from the device layer, unchanged).
+    pub keycode: u16,
+    /// Non-zero if the key went down.
+    pub pressed: u16,
+    /// Modifiers held **at this transition** — see the `MOD_*` constants.
+    pub modifiers: u16,
+    /// Reserved; zero.
+    pub _pad: u16,
+}
+
+const _: () = assert!(core::mem::size_of::<KeyEvent>() == 8);
+
+/// Modifier bits.
+///
+/// Carried by both [`KeyEvent::modifiers`] and [`PointerEvent::modifiers`].
+///
+/// Left and right share a bit, as X11's `ShiftMask` and Wayland's xkb mask also do: a client
+/// asking "was shift held" should not have to ask twice. What stays distinct is the
+/// **keycode** — `KEY_LEFTSHIFT` and `KEY_RIGHTSHIFT` arrive unchanged — so a consumer that
+/// genuinely needs the side reads that, and adding `MOD_*_R` bits later is additive.
+///
+/// A sender must derive these from *which modifier keys are down*, not by clearing the bit on
+/// each release: with both shifts held, releasing one has to leave `MOD_SHIFT` set. That is a
+/// tracking obligation, not a layout one — see `libinput`'s `Interpreter::held_mods`.
+pub const MOD_SHIFT: u16 = 1 << 0;
+/// Either control key.
+pub const MOD_CTRL: u16 = 1 << 1;
+/// Either alt key.
+pub const MOD_ALT: u16 = 1 << 2;
+/// Either meta/"super" key.
+pub const MOD_META: u16 = 1 << 3;
+
+/// What a [`PointerEvent`] reports.
+pub const POINTER_MOTION: u16 = 0;
+/// A button went down or came up; `button` and `flags` say which and which way.
+pub const POINTER_BUTTON: u16 = 1;
+/// The pointer entered this window.
+pub const POINTER_ENTER: u16 = 2;
+/// The pointer left this window.
+pub const POINTER_LEAVE: u16 = 3;
+
+/// `POINTER_BUTTON` flag: the button went down. Absent means it came up.
+pub const POINTER_PRESSED: u16 = 1 << 0;
+
+/// A pointer event, as a window sees it.
+///
+/// **Coordinates are window-local**, so a client can use them without knowing where it sits
+/// on screen, and they stay correct when the window moves — which a client is not told about
+/// and should not have to be.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct PointerEvent {
+    /// `POINTER_MOTION`, `POINTER_BUTTON`, `POINTER_ENTER` or `POINTER_LEAVE`.
+    pub kind: u16,
+    /// The button for `POINTER_BUTTON` (a `BTN_*` code), otherwise zero.
+    pub button: u16,
+    /// Every button currently held, as `BTN_LEFT`→bit 0, `BTN_RIGHT`→bit 1, `BTN_MIDDLE`→bit 2.
+    ///
+    /// Meaningful on **every** kind, not only `POINTER_BUTTON` — a drag is motion with a
+    /// button held, and a client that has to re-derive this from the button events is doing
+    /// the accumulation this layer exists to do once.
+    pub buttons: u16,
+    /// `POINTER_PRESSED` on a press; zero on a release.
+    pub flags: u16,
+    /// Modifiers held — `MOD_SHIFT` and friends — on every kind.
+    ///
+    /// Here for the same reason they ride [`KeyEvent`]: shift-click and shift-drag are not
+    /// expressible otherwise. A client that instead tracked shift from `KeyEvent`s would get
+    /// it right only while it also held keyboard focus, so shift-clicking an unfocused
+    /// window would silently behave as a plain click (PR #180 review, finding 3).
+    pub modifiers: u16,
+    /// Reserved; zero.
+    pub _pad: u16,
+    /// Window-local x.
+    pub x: i32,
+    /// Window-local y.
+    pub y: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<PointerEvent>() == 20);
+
+impl KeyEvent {
+    /// Serialise into exactly 8 little-endian bytes.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 8 {
+            return None;
+        }
+        out[0..2].copy_from_slice(&self.keycode.to_le_bytes());
+        out[2..4].copy_from_slice(&self.pressed.to_le_bytes());
+        out[4..6].copy_from_slice(&self.modifiers.to_le_bytes());
+        out[6..8].copy_from_slice(&0u16.to_le_bytes());
+        Some(8)
+    }
+
+    /// Parse from exactly 8 little-endian bytes.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 8 {
+            return None;
+        }
+        Some(Self {
+            keycode: u16::from_le_bytes([b[0], b[1]]),
+            pressed: u16::from_le_bytes([b[2], b[3]]),
+            modifiers: u16::from_le_bytes([b[4], b[5]]),
+            _pad: 0,
+        })
+    }
+}
+
+impl PointerEvent {
+    /// Serialise into exactly 20 little-endian bytes.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 20 {
+            return None;
+        }
+        out[0..2].copy_from_slice(&self.kind.to_le_bytes());
+        out[2..4].copy_from_slice(&self.button.to_le_bytes());
+        out[4..6].copy_from_slice(&self.buttons.to_le_bytes());
+        out[6..8].copy_from_slice(&self.flags.to_le_bytes());
+        out[8..10].copy_from_slice(&self.modifiers.to_le_bytes());
+        out[10..12].copy_from_slice(&0u16.to_le_bytes());
+        out[12..16].copy_from_slice(&self.x.to_le_bytes());
+        out[16..20].copy_from_slice(&self.y.to_le_bytes());
+        Some(20)
+    }
+
+    /// Parse from exactly 20 little-endian bytes.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 20 {
+            return None;
+        }
+        Some(Self {
+            kind: u16::from_le_bytes([b[0], b[1]]),
+            button: u16::from_le_bytes([b[2], b[3]]),
+            buttons: u16::from_le_bytes([b[4], b[5]]),
+            flags: u16::from_le_bytes([b[6], b[7]]),
+            modifiers: u16::from_le_bytes([b[8], b[9]]),
+            _pad: 0,
+            x: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            y: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -631,6 +800,62 @@ mod tests {
         };
         build_attach_buffer_request(&mut buf, &req).unwrap();
         assert!(parse_attach_buffer_request(&buf).is_none());
+    }
+
+
+    #[test]
+    fn a_key_event_sits_at_the_offsets_the_spec_publishes() {
+        let e = KeyEvent { keycode: 0x1112, pressed: 1, modifiers: 0x3132, _pad: 0 };
+        let mut b = [0u8; 8];
+        e.write(&mut b).unwrap();
+        assert_eq!(&b[0..2], &0x1112u16.to_le_bytes(), "keycode @0");
+        assert_eq!(&b[2..4], &1u16.to_le_bytes(), "pressed @2");
+        assert_eq!(&b[4..6], &0x3132u16.to_le_bytes(), "modifiers @4");
+        assert_eq!(KeyEvent::read(&b), Some(e));
+    }
+
+    #[test]
+    fn a_pointer_event_sits_at_the_offsets_the_spec_publishes() {
+        // Signed coordinates: a pointer can be dragged past a window's left or top edge,
+        // and a client that read them unsigned would see it teleport.
+        let e = PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x1112,
+            buttons: 0x2122,
+            flags: POINTER_PRESSED,
+            modifiers: MOD_SHIFT | MOD_CTRL,
+            _pad: 0,
+            x: -3,
+            y: -4,
+        };
+        let mut b = [0u8; 20];
+        e.write(&mut b).unwrap();
+        assert_eq!(&b[0..2], &POINTER_BUTTON.to_le_bytes(), "kind @0");
+        assert_eq!(&b[2..4], &0x1112u16.to_le_bytes(), "button @2");
+        assert_eq!(&b[4..6], &0x2122u16.to_le_bytes(), "buttons @4");
+        assert_eq!(&b[6..8], &POINTER_PRESSED.to_le_bytes(), "flags @6");
+        assert_eq!(&b[8..10], &(MOD_SHIFT | MOD_CTRL).to_le_bytes(), "modifiers @8");
+        assert_eq!(&b[10..12], &0u16.to_le_bytes(), "reserved @10, zero");
+        assert_eq!(&b[12..16], &(-3i32).to_le_bytes(), "x @12, signed");
+        assert_eq!(&b[16..20], &(-4i32).to_le_bytes(), "y @16, signed");
+        assert_eq!(PointerEvent::read(&b), Some(e));
+    }
+
+    #[test]
+    fn a_truncated_input_event_is_refused_rather_than_read_short() {
+        assert_eq!(KeyEvent::read(&[0u8; 7]), None);
+        assert_eq!(PointerEvent::read(&[0u8; 19]), None);
+        assert_eq!(KeyEvent::default().write(&mut [0u8; 7]), None);
+        assert_eq!(PointerEvent::default().write(&mut [0u8; 19]), None);
+    }
+
+    #[test]
+    fn the_new_ops_do_not_collide_with_the_existing_surface_ops() {
+        for op in [OP_CREATE_WINDOW, OP_ATTACH_BUFFER, OP_COMMIT, OP_RELEASE, OP_DESTROY_WINDOW] {
+            assert_ne!(op, OP_KEY_EVENT);
+            assert_ne!(op, OP_POINTER_EVENT);
+        }
+        assert_ne!(OP_KEY_EVENT, OP_POINTER_EVENT);
     }
 
     #[test]

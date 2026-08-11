@@ -177,12 +177,43 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
       together. It already compares
       exactly this kind of constant family across the kernel/userspace boundary; a numbering
       that drifts between the driver and the server is a silent misrouting, not a build error.
-- [ ] **Part C — `libinput`, focus and routing.** `libinput` turns triples into logical
-      events and tracks modifier state; the compositor uses it to route to the focused
-      window and to stamp the Surface-layer `KeyEvent`. Keycode→character lives here too,
-      host-tested, and is what a client uses.
-- [ ] **Part D — QMP injection** in `test-interactive`, plus a client that echoes what it
-      received: a keystroke and a click injected by the harness reach a window and come back.
+- [x] **Part C — the Surface-layer events, `libinput`, focus and routing.** ✅ (2026-08-10) Everything up to
+      and including *the compositor sending an event*. The boundary with Part D is the
+      channel: C ends when a `KeyEvent` goes out; D begins when a client receives one.
+
+      - [x] **C1 — the Surface-layer records.** ✅ (2026-08-06) `KeyEvent` and `PointerEvent`
+            in `librsproto` and `rsproto-surface-ops.md`. **`PointerEvent` was not in this
+            plan** and is scope this milestone acquired honestly: the plan named only
+            `KeyEvent`, because `display-substrate.md` §9 had parked pointer events with the
+            trigger "the compositor needing to move a window". Part C's own deliverable — a
+            click reaching a client — turned out to be the earlier trigger.
+      - [x] **C2 — `libinput`.** ✅ (2026-08-06) The `SYN` state machine, modifier tracking,
+            and keycode→character. Pure and host-tested (21 tests, seven breaks); it is what
+            turns device triples into something a window can use, on both sides of the
+            protocol. It deliberately does **not** track pointer position — deltas need a
+            screen to clamp against, which the compositor owns.
+      - [x] **C3 — the compositor consumes `/dev/input/new`.** ✅ (2026-08-10) Focus
+            (topmost window whose role takes it), pointer hit-testing, and sending, as a
+            pure `InputRouter` in the compositor's library half (16 host tests, ten breaks
+            verified) plus the loop wiring in the bin. Two things the plan did not name and
+            the work required: an **implicit grab** from a press to its release, without
+            which a drag that ends outside a window delivers a press with no release; and an
+            **init ordering change** — the input server now binds before the compositor is
+            spawned, because the compositor resolves `/dev/input/new` before answering
+            `Meta::Ready`. `rsproto-surface-ops.md`'s Status line is corrected.
+
+            `cargo xtask check-input` asserts the compositor is **attached**
+            (`compositor: input connected`). It cannot yet assert a key reached a window:
+            nothing holds a window at injection time. That is Part D's gate.
+
+- [ ] **Part D — a client receives it.** `libui` delivers input into a window's event queue,
+      and a test client echoes what arrived: a keystroke and a click injected by the harness
+      reach a **window** and come back, which is the milestone's deliverable.
+
+      **QMP injection is already done**, pulled forward to Part A (`cargo xtask check-input`)
+      because a driver that is merely "armed" proves nothing — the same reason M2 Part D
+      existed. What remains here is the client half and extending that gate to assert through
+      `libui` rather than off the input server.
 
 **Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
 with window management in a later milestone; buttons and menus need clicks, and the toolkit

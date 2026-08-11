@@ -1961,15 +1961,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     // (`display-selftest`), not inline here: compositing is not init's job, and
     // `userspace/init/CLAUDE.md` calls this critical-path code. It supersedes the
     // inline framebuffer demo that proved M1 Part B.
-    if !bind_compositor(root_ns) {
-        kprint(b"init: no compositor; /dev/draw unavailable\n");
-    }
-
-    // The input server, before any consumer: it holds the raw device nodes and serves the
-    // merged stream at `/dev/input/new`. Not fatal — a machine with no i8042 has no raw
-    // nodes, the server says so and exits, and everything else comes up normally.
+    // The input server first, and **the order is load-bearing**: the compositor resolves
+    // `/dev/input/new` during its own startup, before it answers `Meta::Ready`. Spawned the
+    // other way round it would find nothing bound and serve the display with no input, for
+    // the life of the boot, with only a log line to say so. Not fatal either way — a machine
+    // with no i8042 has no raw nodes, the server says so and exits, and everything else
+    // comes up normally.
     if !bind_input_server(root_ns) {
         kprint(b"init: no input server; /dev/input/new unavailable\n");
+    }
+
+    if !bind_compositor(root_ns) {
+        kprint(b"init: no compositor; /dev/draw unavailable\n");
     }
 
     #[cfg(feature = "selftest")]

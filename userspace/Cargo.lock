@@ -17,6 +17,7 @@ version = "0.1.0"
 dependencies = [
  "libdraw",
  "libheap",
+ "libinput",
  "libkern",
  "libos",
  "librsproto",
@@ -99,6 +100,14 @@ name = "libheap"
 version = "0.1.0"
 dependencies = [
  "libkern",
+]
+
+[[package]]
+name = "libinput"
+version = "0.1.0"
+dependencies = [
+ "libkern",
+ "librsproto",
 ]
 
 [[package]]

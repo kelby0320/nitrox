@@ -16,6 +16,9 @@ edition = "2024"
 # this crate does not, and its host tests build without it.
 libdraw = { path = "../libdraw", features = ["io"] }
 librsproto = { path = "../librsproto" }
+# The router turns `libinput`'s logical events into per-window records; the interpretation
+# itself (SYN batching, modifiers) stays in the library both ends of the protocol share.
+libinput = { path = "../libinput" }
 libkern = { path = "../libkern" }
 libos = { path = "../libos" }
 libheap = { path = "../libheap" }

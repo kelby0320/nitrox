@@ -7,11 +7,19 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 2 Part A
 (`docs/planning/display-arm-plan.md`); the namespace surface completed in Part B.
-`CreateWindow`, `AttachBuffer`, `Commit`, `Release` and `DestroyWindow` are defined, and
+`CreateWindow`, `AttachBuffer`, `Commit`, `Release`, `DestroyWindow`, `KeyEvent` and
+`PointerEvent` are defined, and
 two paths resolve: `/dev/draw/new` for a session and `/dev/draw/<N>/info` for a window's
-metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Input
-events, thumbnail capture, window movement and port wiring are later milestones and will
-extend this category.
+metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
+capture, window movement and port wiring are later milestones and will extend this category.
+
+**`KeyEvent` and `PointerEvent` are sent** as of M3 Part C3 (2026-08-10). The compositor
+consumes `/dev/input/new`, interprets the stream with `libinput`, and routes it:
+keys to the topmost window whose role takes focus, pointer events to the window under the
+cursor, with an implicit grab from a press to its release. What is **not** yet built is the
+receiving end — `libui` does not deliver these into a window's event queue, so no client
+reads one yet (M3 Part D). There is also no cursor drawn on screen: the compositor knows
+where the pointer is and nothing shows it.
 
 ## Where it sits
 
@@ -263,6 +271,94 @@ commit.
 ### `Release` (`0x0903`)
 
 Server → client, 8 bytes: `window`, `buffer`. Sent for the buffer that *left* the screen.
+
+### `KeyEvent` (`0x0905`) and `PointerEvent` (`0x0906`)
+
+**Server → client, on the window's session channel. No reply.** How input reaches a window;
+the compositor sends them, a client never does.
+
+**These are Surface-layer events, not device records.** The device layer
+([`rsproto-input-ops.md`](rsproto-input-ops.md)) carries `InputEvent` triples with a `SYN`
+state machine and no notion of modifiers. `libinput` runs that machine on the compositor's
+side, so a window receives something already usable. A client that had to accumulate `SYN`
+groups to learn a key was pressed would be reimplementing the compositor's job, badly and
+once per application.
+
+`KeyEvent`, 8 bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 2 | `keycode` — an `EV_KEY` code, unchanged from the device layer |
+| 2 | 2 | `pressed` — non-zero if the key went down |
+| 4 | 2 | `modifiers` — `MOD_SHIFT`/`MOD_CTRL`/`MOD_ALT`/`MOD_META`, held **at this transition** |
+| 6 | 2 | reserved, zero |
+
+**Modifiers travel with the key**, which is the whole reason the boundary sits at key events
+rather than characters: a byte stream cannot express Shift-Enter, because `\n` is `\n`
+whatever was held down (`display-substrate.md` §5).
+
+**Left and right share a bit**, as X11's `ShiftMask` and Wayland's xkb mask do — a client
+asking "was shift held" should not have to ask twice. The `keycode` stays distinct, so a
+consumer needing the side reads that; adding `MOD_*_R` bits later is additive. A sender must
+derive the mask from *which modifier keys are down*: with both shifts held, releasing one
+leaves `MOD_SHIFT` set. Clearing the bit per release is the obvious implementation and is
+wrong — a tracking obligation, not a layout one.
+
+`PointerEvent`, 20 bytes:
+
+| Offset | Size | Type | Field |
+|---|---|---|---|
+| 0 | 2 | `u16` | `kind` — `0` motion, `1` button, `2` enter, `3` leave |
+| 2 | 2 | `u16` | `button` — a `BTN_*` code on a button event, else zero |
+| 4 | 2 | `u16` | `buttons` — every button held: `BTN_LEFT`→bit 0, `RIGHT`→1, `MIDDLE`→2 |
+| 6 | 2 | `u16` | `flags` — `POINTER_PRESSED` (bit 0) on a press |
+| 8 | 2 | `u16` | `modifiers` — `MOD_SHIFT` and friends, as on `KeyEvent` |
+| 10 | 2 | | reserved, zero |
+| 12 | 4 | **`i32`** | `x` — window-local, **signed** |
+| 16 | 4 | **`i32`** | `y` — window-local, signed |
+
+**`buttons` and `modifiers` are meaningful on every kind**, unlike `button` and `flags` which
+are about the transition. A drag is motion with a button held, and shift-click is a click with
+a modifier held; a client told `buttons == 0` on motion would have to re-accumulate button
+state from the transitions, and one with no `modifiers` field would have to track shift from
+`KeyEvent`s — which works only while it also holds keyboard focus, so shift-clicking an
+unfocused window would silently behave as a plain click. Both are the per-application
+duplication this layer exists to prevent.
+
+**Coordinates are window-local**, so a client can use them without knowing where it sits on
+screen and they stay correct when the window moves — which a client is not told about and
+should not have to be. They are **signed** because a drag can leave a window: a client reading
+them unsigned sees the pointer teleport.
+
+**New interaction kinds are new `kind` values**, not new ops — scroll and touch fit without a
+wire change, which is the same reason the device layer's extensibility lives in its enums.
+
+### Which window receives them
+
+- **`KeyEvent` goes to the focused window.** Focus is the topmost window whose role takes it;
+  a `panel` never does, so clicking a clock cannot steal input from a terminal
+  (`display-substrate.md` §4a). With nothing focusable, keys are dropped rather than sent to
+  whatever the cursor happens to rest on.
+- **Click-to-focus is implemented.** A press on a window whose role takes focus **raises** it,
+  and because focus *is* "topmost focusable", the raise is the focus change — there is no
+  second piece of state to disagree with the stack. A press on a `panel` raises nothing, or a
+  stray click on a clock would cover a window with no way to get it back. **A client is not
+  told when it gains or loses focus**; if it paints a focus indicator it must infer this from
+  the keys and crossings it receives, which is a gap, not a design (M3 Part D).
+- **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus
+  and regardless of role — a panel that cannot take a keystroke can still be clicked. A window
+  that is not focused still sees the click that is about to focus it.
+- **A press grabs, until its release.** Every pointer event from a press to the release of the
+  last held button goes to the window the press landed on, **even after the cursor leaves it**.
+  Without this a drag ending outside the window delivers a press with no release, and the
+  client believes a button is held forever. This is why the coordinates are signed: mid-drag,
+  window-local `x` is routinely negative, and such a record is legitimate rather than corrupt.
+  Enter and leave are suppressed for the duration — a window being told the cursor left while
+  it is still receiving that cursor's events is two contradictory statements at once — and
+  re-derived when the grab ends.
+- **Loss resets the grab.** An `Input::Events` batch carrying `SYN_DROPPED` may be the one that
+  lost a release, so the compositor ends any grab on it. A grab that outlives its button never
+  ends, and every later click would go to the wrong window for the rest of the session.
 
 ### `DestroyWindow` (`0x0904`)
 

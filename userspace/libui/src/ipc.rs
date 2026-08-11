@@ -109,8 +109,9 @@ impl Drop for ChannelTransport {
     /// `connect` takes ownership via `Handle::into_raw`, which suppresses the close, and
     /// nothing closed it afterwards. The compositor frees a session slot only on
     /// `PeerClosed`, which never arrives while the endpoint is open, so every dropped
-    /// transport cost a slot for the compositor's life. There are `MAX_WAIT_HANDLES - 1` =
-    /// 31 of them, shared by the whole machine: one client opening and dropping 31
+    /// transport cost a slot for the compositor's life. There are `MAX_WAIT_HANDLES - 2` =
+    /// 30 of them — the forwarding endpoint and the input-server consumer channel take the
+    /// other two — shared by the whole machine: one client opening and dropping 30
     /// connections makes `/dev/draw/new` fail for **every** process, permanently, while the
     /// offending client keeps running and looks healthy (PR #175 review, finding 4).
     fn drop(&mut self) {

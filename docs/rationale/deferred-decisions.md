@@ -274,10 +274,15 @@ additionally needs slot semantics on top of `SYN` grouping, as evdev did. Raised
 without knowing the device's resolution and the screen's, and nothing decides who maps them.
 Not needed until a touchscreen or a tablet. Raised 2026-08-06.
 
-**Input: who owns accumulated pointer position.** The `input-server` sees every device; the
-compositor owns the screen and draws the cursor. Deltas are unambiguous and accumulation is
-not, so one of them has to own the position and neither obviously should. Deferred until
-there is a second pointing device to disagree about it. Raised 2026-08-06.
+**~~Input: who owns accumulated pointer position.~~ Decided 2026-08-10 — the compositor
+owns it.** The `input-server` sees every device; the compositor owns the screen. What settled
+it was not a second pointing device but the *clamp*: a position is only meaningful bounded by
+a screen, and `input-server` has no screen and no reason to acquire one. M3 Part C3 put the
+accumulation in `compositor::input::InputRouter`, which clamps against the framebuffer
+geometry the compositor acquired; `libinput` emits deltas only and says so. **A second
+pointing device does not reopen this** — it merges into the same stream and moves the same
+cursor. What is still open is what a second *screen* means, which is a different question.
+Raised 2026-08-06, decided by PR #180.
 
 **Back-pressure for compositor→client messages.** A session channel holds four messages and
 the compositor sends `NOBLOCK`, so a client that lets its receive ring fill makes the send
@@ -292,6 +297,18 @@ Deferred until there is a second real client to characterise against — with on
 client that drains through `acquire`, every option is untested theory. Trigger: M3 input (a
 second event stream to the same channel) or the first client that is not `ui-testclient`.
 Raised by the PR #175 review, 2026-08-06.
+
+> **The trigger fired, 2026-08-10 (M3 Part C3), and the decision stays deferred.** The
+> compositor now sends `KeyEvent` and `PointerEvent` on the same session channel as `Release`,
+> through the same `SENDMODE_NOBLOCK` path and the same four-message ring. What changed is not
+> the mechanism but *who has to misbehave*: input is continuous, so a client that stops
+> draining while it renders a frame has its ring filled by motion events it never asked for,
+> and the next `Release` send is the one that fails. The client then blocks in `acquire`
+> forever with `compositor: DROPPED a Release` as the only trace. It is still deferred because
+> the reason has not changed — there is still exactly one real client, so all three candidate
+> answers remain untested theory, and Part D's echo client is the first thing that can
+> characterise them. Noted rather than fixed, because a fix chosen now would be a guess.
+> **Re-trigger: Part D, when a second client exists.**
 
 ### Filesystems
 
