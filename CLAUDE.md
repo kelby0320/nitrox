@@ -112,11 +112,11 @@ wrong about how something works:
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
   is what a subsystem *will* be. Today's documents describe the display system above
-  Milestone 2: `libdraw`, `/dev/framebuffer`, the compositor serving `/dev/draw`,
-  `libui`, the **i8042 input driver** serving `/dev/input/raw/<n>`, and the
-  **`input-server`** serving the merged stream at `/dev/input/new` exist; `libinput`, focus
-  and routing, the widget toolkit, the terminal and the desktop shell do not. `planning/` is what is intended, with checkboxes for what is
-  done. `archive/` is superseded. **Never conclude "the system does X" from any of them.**
+  Milestone 3: `libdraw`, `/dev/framebuffer`, the compositor serving `/dev/draw`,
+  `libui`, the **i8042 input driver** serving `/dev/input/raw/<n>`, the **`input-server`**
+  serving the merged stream at `/dev/input/new`, **`libinput`**, and the compositor's
+  **focus and routing** all exist; the widget toolkit, the terminal and the desktop shell do
+  not. `planning/` is what is intended, with checkboxes for what is done. `archive/` is superseded. **Never conclude "the system does X" from any of them.**
 - **`decision-log.md` is a dated record and is append-only.** Entries are true as of their
   date; correcting one to match today's code destroys the evidence. Append a new entry.
 

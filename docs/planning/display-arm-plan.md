@@ -115,8 +115,13 @@ still specifies input, text, capture and hotkeys with no code; `ui-composition-m
 specifies ports and desktops (M6); `desktop-shell.md` has nothing built at all. Moving a
 document to `architecture/` while most of it describes the future is precisely the confusion
 that directory split exists to prevent. Each carries an accurate Status line meanwhile, and
-graduates with the milestone that finishes its subsystem — the checkboxes live in M6 and M7
-below.
+graduates with the milestone that finishes its subsystem.
+
+**Where each checkbox lives.** `display-substrate.md` and `ui-composition-model.md` in M6,
+`desktop-shell.md` in M7 — and, added 2026-08-10 once there were five of these rather than
+three: `input-subsystem.md` and `widget-toolkit.md` in **M4**. `input-subsystem.md`'s
+subsystem finished with M3 and its box was simply never written, which is the failure this
+paragraph exists to prevent, one level up.
 - [x] **Part E — release semantics** ✅ (2026-08-06), settled by the first client that
       double-buffers, exactly as this box anticipated. Three rules came out of it, each
       found by something breaking rather than by design: `Release` names the buffer that
@@ -294,10 +299,23 @@ with window management in a later milestone; buttons and menus need clicks, and 
 
 ## Milestone 4 — the widget toolkit
 
-**Design pass first**: the toolkit gets its own document before this milestone starts, the way
-the substrate and the shell did. The forks it has to settle are retained-versus-immediate mode,
-the layout model, event routing and focus-within-a-window, how a widget's invalidation becomes a
-damage rectangle, and how much of it the terminal actually uses.
+**Design pass done** (2026-08-10): [`widget-toolkit.md`](../design/widget-toolkit.md) settles
+the five forks this line used to list. In short — a **retained tree with a declarative face**:
+the application holds state and writes `view(&state) -> Element`, the runtime diffs that against
+the tree it keeps, and **the diff is where damage comes from**. Elm's shape, by way of Iced, and
+taken for two reasons specific to this tree: `view` is a pure function so it host-tests like
+every other subsystem here, and derived damage cannot rot the way a hand-written
+`invalidate()` discipline does.
+
+Layout is measure/arrange with four containers. Routing mirrors the compositor one layer down —
+implicit pointer capture on press, and **widget focus kept strictly separate from window
+focus**. `Commit` carries one damage rectangle, so the toolkit unions; damage accumulates
+**per buffer**, which is the subtlety that is invisible until the compositor holds a buffer for
+more than a frame.
+
+**`libui` is renamed `libsurface`, and the toolkit takes the name `libui`.** Today's `libui` is
+a Surface-protocol client, not a toolkit; the name was aspirational and the code went elsewhere.
+The rename is mechanical and cheapest before a second client exists.
 
 **Deliverable: enough toolkit to build the terminal, and no more.**
 
@@ -309,13 +327,51 @@ lands. So it ships first, and **the terminal decides how much of it exists**. Mi
 requirement, not a compromise.
 
 - [ ] **Part A — the widget tree, layout, and invalidation.** Where a widget marking itself
-      dirty becomes a damage rectangle on a surface commit.
+      dirty becomes a damage rectangle on a surface commit. Carries the **crate rename**
+      (`libui` → `libsurface`), because everything after it imports the new names.
+
+      **Also the user stack: 32 KiB → 8 MiB, plus a guard gap.** One of the four deferred
+      items this milestone absorbs, and one whose filed trigger names it — a toolkit is recursive by
+      construction (measure, arrange, paint and diff are all tree walks), and `libui` already
+      documents a ~9 KiB struct held by value being enough to run a client off the end of its
+      stack, silently, before its first line of output.
+
+      Cheap because the stack is **demand-paged**: the cost is address space, not memory. The
+      guard gap is two small changes: `MMAP_MAX` currently tops out at exactly the stack's
+      lowest address, so leaving a gap means an overflow faults instead of landing in mapped
+      memory — **and `sys_memory_map` must refuse a hinted range inside the gap**, since
+      `MMAP_MAX` bounds only the `hint == 0` path. It lands in Part A rather than later
+      because it is independent of the toolkit and wanted *before* the deep call chains
+      exist.
 - [ ] **Part B — event routing**: hit testing, pointer capture during a drag, and
       **widget-level keyboard focus**, which is a *second* focus concept — the compositor
       decides which window has focus, the toolkit decides which widget within it does.
-      Conflating them is the classic source of text arriving in the wrong field.
-- [ ] **Part C — the first widget set**, bounded by what the terminal needs: a text area, a
-      button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch.
+      Conflating them is the classic source of text arriving in the wrong field. Carries the
+      **focus record** the compositor owes a client, without which the toolkit has no way to
+      know the first of those two.
+- [ ] **Graduate two design docs to `architecture/`.**
+      [`input-subsystem.md`](../design/input-subsystem.md) describes a subsystem that is now
+      **built** — M3 finished it — and has been sitting in `design/`, which root `CLAUDE.md`
+      tells every session never to read as current behaviour.
+      [`widget-toolkit.md`](../design/widget-toolkit.md) graduates when this milestone lands.
+      Both need their Status lines rewritten to describe what exists rather than what will.
+
+- [ ] **Part C — the first widget set**, bounded by what the terminal needs: `text`, a
+      button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch. Plus key
+      repeat and the on-screen cursor, which are what make the set usable by a person rather
+      than only by the harness.
+
+      **No text area** — the design pass found this line contradicting Milestone 5, which
+      makes the terminal grid a *custom-drawn widget of its own* precisely so it is not a
+      generic text area. Nothing in M5 would then use one, and "the terminal decides how much
+      of it exists" is this milestone's governing rule. It returns when something needs it.
+
+**Four deferred items are folded in**, each because this milestone is what triggers it: three
+from the display arm — the compositor telling a client it gained or lost **focus** (Part B —
+the second focus concept has no source without it), **key repeat** (Part C), and **a cursor
+drawn on screen** (Part C), all in `widget-toolkit.md` §9 — plus the **user stack** in Part A
+above. Of the four, only key repeat and the stack are entries in `deferred-decisions.md`; the
+focus record and the cursor are gaps recorded in `rsproto-surface-ops.md`.
 
 **No ABI question today.** With everything statically linked, the toolkit is an ordinary Rust
 crate that applications link. The seam matters when dynamic linking lands — the phase plan

@@ -12581,3 +12581,142 @@ Two smaller notes:
   sites, faithfully preserving a pre-existing bug: `-1` printed as 18446744073709551615. A
   mechanical sweep preserves defects with the same fidelity it preserves behaviour, and that
   is the point of it — but it means the sweep is not the moment those defects get found.
+
+## 2026-08-10 — The toolkit is Elm-shaped, and `libui` is renamed to make room for it
+
+Milestone 4's design pass. `widget-toolkit.md` settles the five forks the plan named, plus
+two the plan did not.
+
+**Retained tree, declarative face.** The usual framing — "retained versus immediate" — turned
+out to be two axes wearing one name, and separating them was most of the decision. *Does a
+widget exist between frames?* Retained: yes, because immediate mode redraws everything and
+this whole arm is built on damage rectangles. *How does the application talk to that tree?*
+Declaratively: the application holds state and writes `view(&state) -> Element`, and the
+runtime diffs. Both Windows Forms and Iced are retained; they differ only on the second axis,
+and it is the second axis that decides what the code looks like.
+
+Elm's shape was taken for two reasons that are about **this** tree rather than about
+toolkits generally. `view` is a pure function, so it host-tests like `libinput`'s interpreter
+and the compositor's router and outbox — whereas a mutation toolkit's correctness lives in
+ordering, which is what host tests reach worst. And **damage is derived from the diff rather
+than remembered by each widget**: an `invalidate()` discipline is precisely the "the code
+does not do what its comment claims" failure this project keeps paying for, and a derived one
+cannot drift.
+
+The costs are recorded rather than argued away: allocation per update (bounded by rebuilding
+on events, not at frame rate — there is no animation loop), and widget identity becoming a
+real design problem, answered with optional keys and a *loud* failure for inconsistent
+keying rather than the silent mispairing that presents as "the wrong row remembered my
+selection".
+
+**`libui` becomes `libsurface`; the toolkit takes `libui`.** Today's `libui` is a
+Surface-protocol client — windows, buffers, events — and not a toolkit. The name was
+aspirational and the code went somewhere else, so every future application would have
+imported the aspirational name to get the thing it did not want. The rename is mechanical and
+is cheapest now, before a second client exists; it is the same argument this project applies
+to version numbers in filenames. Two crates rather than one because the toolkit will dwarf
+the transport and a single crate has no enforced direction.
+
+**A contradiction the design pass found in the plan.** Part C listed *a text area*, while
+Milestone 5 makes the terminal's grid a **custom-drawn widget of its own** specifically so it
+is not a generic text area. Both cannot hold: with the grid custom-drawn, nothing in M5 uses
+a text area, and the milestone's governing rule is that the terminal decides how much toolkit
+exists. The text area is out.
+
+That has a knock-on worth recording, because it is the kind of thing that rots quietly:
+`deferred-decisions.md` gives key repeat the trigger *"the first text field — M4's toolkit"*.
+With no text field, that wording says the trigger has not fired. It has — holding a key in
+the terminal must repeat, and the grid is a custom widget taking raw keys. **The trigger named
+the right milestone and the wrong widget**, which is a good argument for triggers naming the
+*need* rather than the artifact expected to embody it.
+
+**Three deferrals fold in**, each because M4 is its filed trigger: the focus record the
+compositor owes a client (without it the second focus concept has no source), key repeat, and
+a cursor on screen. Key repeat is generated **compositor-side** rather than Wayland's
+client-side rate — the compositor already has the timer loop the outbox retry gave it, and it
+knows which window has focus, so repeats stop on a focus change with no client involvement.
+
+## 2026-08-10 — The user stack goes to 8 MiB, and a filed deferral had a false cost in it
+
+Folded into M4 Part A, which is one of the triggers the deferral itself named.
+
+**The entry that was supposed to inform this decision asserted a cost the code does not
+have.** It said raising the number costs "eager mapping, which is measurable at spawn — 105
+spawns a boot on the selftest image". The stack is mapped with `map_vma_lazy`, and there is a
+kernel test in `elf.rs` asserting *"stack must be demand-paged, not eagerly backed"*. Raising
+it costs address space and nothing else.
+
+That is worth more than the correction. **A deferral entry is written to make a future
+decision cheap, so a wrong cost in one is worse than no entry at all** — it does not merely
+fail to help, it argues for the wrong answer, and it does so at exactly the moment nobody is
+re-deriving the facts. This one was caught by the maintainer asking "isn't it demand paged?",
+which is the check the entry should not have needed.
+
+**8 MiB, matching Linux** (`RLIMIT_STACK`'s `_STK_LIM`, grown on demand; glibc gives pthreads
+the same). One stack per process — `sys_thread_create` makes every other thread supply its
+own — so this is 8 MiB of a 128 TiB user half.
+
+**The guard gap turns out to be arithmetic, not machinery**, and that is a consequence of the
+lazy mapping rather than a separate piece of luck. `MMAP_MAX` is
+`DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE`, so the mmap arena tops out at exactly the
+stack's lowest address — adjacent, no gap, which is *why* an overflow lands in mapped memory
+instead of faulting. Leaving a gap means an overflow hits addresses with no VMA. Linux ran
+this experiment already: a single guard page until Stack Clash (CVE-2017-1000364) showed a
+page could be jumped, 256 pages since. Taking the post-2017 default rather than re-learning it.
+
+**The guard gap matters more than the size.** `libui` already documents a ~9 KiB struct held
+by value being enough to run a client off its stack, *"which presents as a process that dies
+in its prologue and prints nothing at all, before its own first line"*. Silent. A bigger
+stack makes that rarer; the gap makes it diagnosable, and rarer-but-silent is the worse of
+the two.
+
+Also sharpened `widget-toolkit.md` §6.2 while here: it described per-buffer damage without
+saying that **per-buffer and per-frame are not alternatives**. They answer different
+questions — what the client must redraw versus what the compositor must copy — and tracking
+only the second under-redraws. The `Commit` damage is the per-buffer accumulation, a safe
+superset; sending a minimal rectangle is an optimisation needing a reason it does not yet
+have.
+
+## 2026-08-10 — The M4 design pass, reviewed: a thesis pointed back at its own diff
+
+PR #182's review found four things, and three of them were the second commit's own argument
+turned on the rest of the change. That commit's thesis was: *a deferral entry with a wrong
+cost is worse than no entry, because it argues for the wrong answer at the moment nobody is
+re-deriving the facts.* Applied to the diff that contained it:
+
+**Key repeat was decided in three places and left un-made in the two a future session reads.**
+`deferred-decisions.md` — the canonical index, and what `check-deferrals` gates against —
+still said repeat "wants a timer in `libinput`" with the trigger "the first text field", and
+`input-subsystem.md` still said it "Belongs in `libinput`". A Part C session would have
+searched for the item, found a trigger describing a widget this same PR deleted, concluded it
+had not fired, and — if it read on — implemented the option the design doc rejects. The
+user-stack entry got struck through and marked decided; three of the four folded items did
+not. **Deciding something in a design doc does not un-decide it anywhere else**, and the
+canonical file is the one that matters.
+
+Two smaller instances of the same:
+
+- *"It has the timer loop already"* overstated what the outbox retry left behind. The bounded
+  wait is armed **only while something is parked**, and a held key with an empty outbox is
+  exactly the not-parked case — the loop even documents the invariant repeat must break
+  ("an idle compositor still sleeps indefinitely"). The conclusion survives; the cost line
+  was wrong in the same way "eager mapping" was, one paragraph after correcting it.
+- *"The guard gap is arithmetic rather than machinery"* was true only for `hint == 0`.
+  `MMAP_MAX` bounds `find_free_range` alone; the hinted `sys_memory_map` path validates
+  alignment and `USER_VIRT_END` and nothing else, so a hinted mapping could sit inside the
+  gap and restore the silent overrun the gap exists to remove. Settled by deciding it:
+  `sys_memory_map` refuses a hinted range intersecting the gap, which makes the gap a
+  guarantee rather than a convention about where the kernel happens to place things.
+
+**The fourth was a document with no owner.** `widget-toolkit.md` was the fifth `design/` doc
+and had no graduation checkbox, because the plan's accounting named M6 and M7 back when there
+were three. `input-subsystem.md` had the same gap and was worse: its subsystem *finished* with
+M3, so a built subsystem has been sitting in the directory root `CLAUDE.md` tells every
+session never to read as current behaviour. Both now have boxes in M4, and the plan says where
+each of the five lives rather than gesturing at "M6 and M7 below".
+
+A method note worth keeping. The review's framing was that in a documentation-only change,
+**every claim about the code is a claim to verify** — and it verified them, line by line,
+including the ones that were right. That is the analogue of breaking a test to see it fail:
+a doc's value is that the next session builds from it without re-deriving, so an unverified
+claim in one is a defect whether or not it happens to be true.

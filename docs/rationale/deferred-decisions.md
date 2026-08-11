@@ -259,10 +259,23 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
 
-**Input: key repeat.** Held keys do not repeat. The record format reserves `value == 2` for
-it (`docs/design/input-subsystem.md` §3), so no wire change is needed, but it wants a timer
-in `libinput` and a policy for delay/rate. Trigger: the first text field — M4's toolkit.
-Raised 2026-08-06.
+~~**Input: key repeat.**~~ **Decided 2026-08-10: generated compositor-side, built in M4
+Part C.** Held keys do not repeat. The record format reserves `value == 2` for it
+(`docs/design/input-subsystem.md` §3), so no wire change is needed.
+
+**Two corrections to this entry.** It said repeat "wants a timer in `libinput`" — it does
+not: `libinput` is pure and has no syscalls, so a timer cannot live there. The compositor
+generates repeats, because it knows which window has focus and so can stop them when focus
+moves, with no client involvement. The alternative is Wayland's — send clients a repeat
+*rate* and let each run its own timer — which is better when clients disagree about what
+should repeat, a distinction nothing here makes yet, and costs every client a timer and a
+state machine. See [`widget-toolkit.md`](../design/widget-toolkit.md) §9.2.
+
+And the trigger said "the first text field — M4's toolkit". **It named the right milestone
+and the wrong widget.** M4 has no text field — M5's terminal grid is a custom-drawn widget by
+the plan's own decision, so a generic text area would have no user — but holding a key in
+that grid must still repeat. A trigger naming the *artifact* expected to embody a need rather
+than the need itself reads as un-fired exactly when it has fired. Raised 2026-08-06.
 
 **Input: USB HID, hotplug, multitouch slots, gesture recognition.** None exists; M3 builds
 PS/2 only. All of them land in the `input-server` or `libinput` rather than the kernel, which
@@ -342,29 +355,64 @@ rather than wrong. Trigger: any of them growing a server-initiated push stream.
 
 ### Processes and memory
 
-**The default user stack is 32 KiB, and nothing has measured whether that is right.**
+~~**The default user stack is 32 KiB…**~~ **Decided 2026-08-10: 8 MiB plus a guard gap,
+built in M4 Part A.**
+
 `DEFAULT_USER_STACK_SIZE` (`kernel/src/arch/x86_64/abi.rs`) is 8 pages, bumped from 4 for the
-read-write fs-server, whose metadata mutation legitimately nests several 4 KiB block buffers.
-It is the **only** stack a process gets: there is no guard page and no growth-on-fault, so
-overrunning it corrupts whatever the loader placed below rather than faulting cleanly, and a
-process wanting more must `sys_memory_map` its own and switch to it.
+read-write fs-server. It is the **only** stack the initial thread gets — `sys_thread_create`
+makes the caller supply its own for every other thread — and there is no guard page, so
+overrunning it lands silently in whatever is below rather than faulting.
 
-Raised during the PR #175 review — *"32k for a user stack is pretty small, we can probably
-make that bigger now"* — and correctly kept out of that PR, but never filed, so the decision
-existed only in a conversation. Filed 2026-08-10 to fix that.
+**A correction to this entry, which had a false claim in it.** The original filing said
+raising the number costs "eager mapping, which is measurable at spawn". That is wrong: the
+stack is mapped with `map_vma_lazy` (`kernel/src/mm/elf.rs`) and there is a kernel test
+asserting *"stack must be demand-paged, not eagerly backed"*. Raising it costs **address
+space and nothing else** — page tables materialise only for pages actually touched. The
+entry was written to inform this decision and asserted a cost the code explicitly does not
+have.
 
-Three things are tangled here and only the first is cheap: **the number** (raising it costs
-address space, which is not scarce, and eager mapping, which is measurable at spawn — 105
-spawns a boot on the selftest image); **a guard page**, which is what turns a silent overrun
-into a diagnosable fault and is the part actually worth having; and **growth on fault**, which
-needs the fault path to distinguish a stack overrun from a stray access. The kernel already
-tracks its own deepest use (`kstack: deepest 6520 B of 16384`) — no equivalent exists for user
-stacks, so today nobody can say whether 32 KiB is generous or nearly exhausted.
+**8 MiB, matching Linux**, whose `RLIMIT_STACK` default (`_STK_LIM`) is 8 MiB grown on
+demand; glibc gives pthreads the same. That is 8 MiB of a 128 TiB user half, for one stack
+per process.
 
-**Trigger:** a userspace stack overrun that costs debugging time, the toolkit (M4) putting
-deeper call chains under a client, or a measurement showing the real high-water mark. The
-measurement is the cheapest of the three and would settle the number without touching the
-kernel's fault path.
+**The guard gap is cheap, and that is a consequence of the lazy mapping.**
+`MMAP_MAX` (`kernel/src/mm/addr_space.rs`) is currently
+`DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE`, so the mmap arena tops out at exactly the
+stack's lowest address — adjacent, with no gap, which is why an overflow lands in mapped
+memory instead of faulting. Subtracting a gap from `MMAP_MAX` leaves addresses with no VMA,
+and a touch faults cleanly. Linux learned this the hard way: its gap was a single page until
+Stack Clash (CVE-2017-1000364) showed a page could be jumped, and the default is now 256
+pages. Nitrox takes the post-2017 lesson rather than repeating the experiment.
+
+**It is two changes, not one — an earlier draft of this entry said "arithmetic rather than
+machinery" and that was wrong.** `MMAP_MAX` bounds exactly one caller, `find_free_range`,
+whose own docstring scopes it to `sys_memory_map(hint = 0)`. The **hinted** path validates
+page alignment and `end > USER_VIRT_END` and nothing else
+(`kernel/src/syscall/table.rs`), so a hinted mapping can be placed inside the gap and an
+overrun lands in mapped memory again — silently, which is the single property the gap exists
+to remove.
+
+**So `sys_memory_map` refuses a hinted range intersecting the gap.** One range check, and it
+is what makes the gap a *guarantee* rather than a convention about where the kernel happens
+to place things. The alternative — document the gap as protecting only against kernel
+placement, roughly where Linux lands with `MAP_FIXED` — is coherent, but it keeps the failure
+this whole item is about, and keeps it silent. Nothing in userspace passes a non-zero hint
+today, so the cost is a check nobody currently trips.
+
+**What made this urgent** was M4, which is one of the triggers this entry named: a toolkit is
+recursive by construction — measure, arrange, paint and diff are all tree walks — and `libui`
+already documents a ~9 KiB struct held by value being *"enough to run a client off the end of
+its stack, which presents as a process that dies in its prologue and prints nothing at all"*.
+Silent, at 32 KiB, from one struct. The guard gap is what converts that into a diagnosable
+fault, and is worth more than the size.
+
+**Still open, and no longer blocking:** there is no user-side equivalent of the kernel's
+`kstack: deepest 6520 B of 16384` watermark, so nobody can say how deep a client actually
+goes. At 32 KiB that was load-bearing; at 8 MiB it is curiosity, and the reason to want it is
+to notice a client doing something silly rather than to size the stack. **Growth on fault**
+also stays deferred — it needs the fault path to distinguish a stack overrun from a stray
+access, and 8 MiB of demand-paged reservation makes it much less interesting. Trigger for
+either: a client that exhausts 8 MiB, or a stack-depth question that costs debugging time.
 
 ### Filesystems
 
