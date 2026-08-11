@@ -361,6 +361,21 @@ requirement, not a compromise.
       repeat and the on-screen cursor, which are what make the set usable by a person rather
       than only by the harness.
 
+      **Glyph rendering moves here from M5 Part A** (2026-08-11). Three of the four widgets
+      draw text, and a toolkit that cannot draw its own labels has no gate worth the name.
+      What moves is *glyphs* — the rasterizer, a glyph cache, and a blit; what stays in M5 is
+      the **ANSI/terminal render path**, which is terminal semantics rather than toolkit
+      capability.
+
+      **Real TrueType from the start, via `ab_glyph`** — userspace's first external
+      dependencies, verified to build for the custom target before the decision was taken
+      (`display-substrate.md` §6). No bitmap font and no PSF loader is written, because that
+      code would be deleted rather than grown. Coverage is thresholded to 1 bit until
+      `libdraw` can blend, which is one branch in the per-pixel callback.
+
+      **The font file ships on the root filesystem**, not the initramfs — a client that draws
+      text starts long after `fs-server-ext4` is mounted, and the compositor never needs it.
+
       **No text area** — the design pass found this line contradicting Milestone 5, which
       makes the terminal grid a *custom-drawn widget of its own* precisely so it is not a
       generic text area. Nothing in M5 would then use one, and "the terminal decides how much
@@ -382,8 +397,12 @@ pages, which is exactly when it starts to pay.
 
 **Deliverable: the shell running in a window, drivable by the harness over QMP.**
 
-- [ ] **Part A — glyph rendering** with the bitmap font, in `libdraw`. Host-tested; the
-      text/ANSI render path is pure logic.
+- [ ] **Part A — the text/ANSI render path**, in `libdraw`. Host-tested; pure logic.
+
+      **Glyph rendering left this part for M4 Part C** (2026-08-11): the toolkit's widgets
+      draw text a milestone earlier than the terminal does. What remains here is what is
+      actually terminal-shaped — escape-sequence interpretation, wrapping, and the grid's
+      render — rather than "how does a glyph become pixels", which M4 answers.
 - [ ] **Part B — the terminal client**, built on the toolkit: window chrome, menus and scrollbar
       from M4's widget set, with **the grid as a custom-drawn widget of its own**. A terminal's
       selection, wrapping and scrollback semantics are not a text editor's, and bending a

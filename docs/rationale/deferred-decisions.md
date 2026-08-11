@@ -257,7 +257,21 @@ the tens, or image materialisation past a few milliseconds, this stops being def
 
 **3D acceleration, OpenGL/Vulkan equivalents, GPU compute.** All deferred. Initial scope is 2D framebuffer rendering.
 
-**Text rendering, fonts, input methods, accessibility.** Downstream of the compositor.
+~~**Text rendering, fonts**~~ — **decided 2026-08-11: `ab_glyph`, real TrueType, built in M4
+Part C** (`display-substrate.md` §6). Userspace takes its first external dependencies:
+`ab_glyph` + `ab_glyph_rasterizer` + `owned_ttf_parser` + `ttf-parser` + `core_maths` +
+`libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
+future one has to clear is in `userspace/CLAUDE.md`.
+
+**Antialiasing is deferred, and it is a `libdraw` item rather than a font one.** `libdraw`
+composites opaque XRGB8888 and cannot blend, so glyph coverage is thresholded to 1 bit. The
+rasterizer already produces the 8-bit coverage; nothing can receive it. Trigger: `libdraw`
+growing an alpha-blend path, or text that looks bad enough to prompt one.
+
+**Input methods and accessibility** remain deferred, and accessibility is a **gap rather than
+an oversight** — no accessible tree, no screen-reader surface, and retrofitting one is
+substantially harder than designing it in (`widget-toolkit.md` §11). Trigger: neither has one
+yet; both want a deliberate discussion the way the rasterizer got.
 
 ~~**Input: key repeat.**~~ **Decided 2026-08-10: generated compositor-side, built in M4
 Part C.** Held keys do not repeat. The record format reserves `value == 2` for it

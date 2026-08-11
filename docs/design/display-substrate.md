@@ -189,6 +189,12 @@ application was never given.
 
 ## 6. Text
 
+> **Superseded 2026-08-11.** This section deferred the rasterizer question and asked for it to
+> be taken deliberately with its own discussion. That discussion happened; the answer is
+> **`ab_glyph`, real TrueType, from the start** — no bitmap font in userspace at all. What
+> follows is the original reasoning, kept because it is why the question was open, and then
+> what changed. `widget-toolkit.md` §9 and `display-arm-plan.md` M4 Part C carry the build.
+
 **Start with the 8×16 bitmap font that already boots the machine.** It is in the tree, it costs
 nothing, and it is enough for a terminal — the MVP flagship.
 
@@ -197,6 +203,35 @@ wants a rasterizer (`fontdue`, `ab_glyph`), and **userspace has zero external de
 today** — every crate in the tree is first-party. That is a decision worth taking deliberately,
 with its own discussion, and not one to make incidentally while trying to get the first pixels
 on screen. Trigger: the toolkit needing text at more than one size.
+
+### What changed
+
+The trigger never fired on its own terms — the toolkit still wants one size. What moved the
+decision was **the cost of the interim being higher than the cost of the answer**. A bitmap
+path means a PSF loader or an embedded glyph table, and then the same code deleted when real
+fonts arrive: expensive throwaway, which is the kind worth avoiding.
+
+Two assumptions in the paragraph above turned out to be wrong, and both were checked rather
+than reasoned about:
+
+- **"Will it even build?"** was the real objection, and it is answered: `ab_glyph` and
+  `fontdue` both compile for `x86_64-unknown-nitrox` under `-Z build-std`. Both need a feature
+  flag to say so — `ab_glyph` wants `libm`, `fontdue` wants `hashbrown` — and both fail
+  confusingly without it, which is why this was worth running rather than predicting.
+- **"Userspace has zero external dependencies"** describes a *state*, not a rule. The rule in
+  root `CLAUDE.md` is "no external crates **in the kernel**". Userspace's silence read as the
+  same prohibition, and it never was one. `userspace/CLAUDE.md` now states the bar.
+
+**The interim compromise moved from the font to the blend.** `libdraw` composites opaque
+XRGB8888 and cannot alpha-blend, so a rasterizer's 8-bit coverage is thresholded to 1 bit for
+now. That is one `if` in the per-pixel callback, and it becomes the fallback path rather than
+being deleted — cheap throwaway, in the place where it costs nothing later. **Antialiasing is
+blocked on `libdraw`, not on the font**, which is the opposite of what this section assumed.
+
+**The font file lives on the root filesystem**, not the initramfs. The initramfs carries what
+is needed to reach a mounted root and no more; a client that draws text starts long after
+`fs-server-ext4` is up. The compositor never needs it — clients render their own text into
+their own buffers and the compositor only composites.
 
 ## 7. Determinism
 
