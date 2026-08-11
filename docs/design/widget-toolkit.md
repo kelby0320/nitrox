@@ -7,7 +7,7 @@ shared buffers, commit/release, and the input queue — not a toolkit. There are
 no layout, and no notion of focus inside a window. This document specifies the toolkit that
 [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4 builds, and the three
 things below it that Milestone 4 forces into existence. Settled with the maintainer
-2026-08-11.
+2026-08-10.
 
 **Companion documents.** [`display-substrate.md`](display-substrate.md) states the
 principles this rests on — client-side rendering, damage-rectangle commits, the compositor
@@ -136,11 +136,22 @@ So: `Element` carries an optional **key**. Within a parent, keyed children pair 
 rather than by position. Unkeyed children pair positionally, which is right for the fixed
 structural nesting that makes up most of a UI.
 
-**The failure is made loud rather than avoided.** A parent whose children are keyed
-inconsistently — some keyed, some not — is a bug the runtime detects and reports, rather
-than a silent mispairing. Debug builds additionally assert that keys within a parent are
-unique. Both are cheap, and the alternative is the class of bug that presents as "the wrong
-row remembered my selection", which nobody diagnoses from the symptom.
+**The failure is made loud rather than avoided**, and the rule has to be about *change over
+time*, not only about one frame's internal consistency. Two things are errors the runtime
+detects and reports:
+
+- A parent whose children are keyed **inconsistently within a frame** — some keyed, some not.
+- A parent whose **keyed-ness changes between frames** — keyed last time, unkeyed this time,
+  or the reverse.
+
+The second matters because each frame can be internally consistent while the pair is not, and
+`view` being a pure function of state makes it easy to reach:
+`if state.compact { column(rows) } else { column(keyed_rows) }`. Neither the mixed-keying
+check nor a uniqueness assert fires, the diff silently falls back to positional pairing, and
+the result is exactly the "wrong row remembered my selection" bug this section exists to
+prevent. Debug builds additionally assert that keys within a parent are unique.
+
+All of it is cheap, and the alternative is a class of bug nobody diagnoses from the symptom.
 
 ---
 
@@ -311,8 +322,14 @@ knows better.
 
 ## 9. Three things below the toolkit that Milestone 4 forces
 
-All three are filed deferrals whose trigger is this milestone. They are described here
-because the toolkit cannot be designed without knowing their shape.
+They are described here because the toolkit cannot be designed without knowing their shape.
+
+**Where each is recorded**, because they are not all the same kind of thing and a reader
+closing the loop should not have to guess. Key repeat (§9.2) is a filed deferral in
+[`deferred-decisions.md`](../rationale/deferred-decisions.md). The focus record (§9.1) and the
+cursor (§9.3) are **gaps recorded in the spec** — `rsproto-surface-ops.md` names both as gaps
+rather than designs — not deferral entries. All three are scheduled by
+[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4.
 
 ### 9.1 The compositor must tell a client about focus
 
@@ -334,12 +351,20 @@ creation, destruction, and raise, and each of those already has a path in the co
 Held keys do not repeat. The record format already reserves `value == 2` for it
 ([`input-subsystem.md`](input-subsystem.md) §3), so no wire change is needed.
 
-**The compositor generates repeats**, not each client. It has the timer loop already — the
-outbox retry gave it a bounded wait — and it knows which window has focus, so a repeat stops
-when focus moves without any client involvement. The alternative is Wayland's: send clients
-a repeat *rate* and let each implement its own timer. That is better when clients differ in
-what they want repeated, which is a distinction nothing here makes yet, and it costs every
-client a timer and a state machine.
+**The compositor generates repeats**, not each client, because it knows which window has
+focus and so can stop a repeat when focus moves with no client involvement. The alternative
+is Wayland's: send clients a repeat *rate* and let each implement its own timer. That is
+better when clients differ in what they want repeated, which is a distinction nothing here
+makes yet, and it costs every client a timer and a state machine.
+
+**What this costs, stated accurately.** The outbox retry gave the serve loop a bounded wait,
+but it is armed *only while something is parked* — and a held key with an empty outbox is
+precisely the not-parked case. The loop also documents an invariant that repeat must break:
+"an idle compositor still sleeps indefinitely". So this is not "the timer is already there".
+It is a second deadline source `min`-ed with the retry one, per-focus-window held-key state,
+and re-deriving the deadline when focus moves. Small, but machinery — and saying otherwise
+would be the same class of error as the "eager mapping" cost this milestone already had to
+correct.
 
 Delay and rate are policy with no configuration surface yet: fixed initial delay, fixed
 repeat interval, both named constants with a note that a settings service owns them

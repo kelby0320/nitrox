@@ -12582,7 +12582,7 @@ Two smaller notes:
   mechanical sweep preserves defects with the same fidelity it preserves behaviour, and that
   is the point of it — but it means the sweep is not the moment those defects get found.
 
-## 2026-08-11 — The toolkit is Elm-shaped, and `libui` is renamed to make room for it
+## 2026-08-10 — The toolkit is Elm-shaped, and `libui` is renamed to make room for it
 
 Milestone 4's design pass. `widget-toolkit.md` settles the five forks the plan named, plus
 two the plan did not.
@@ -12636,7 +12636,7 @@ a cursor on screen. Key repeat is generated **compositor-side** rather than Wayl
 client-side rate — the compositor already has the timer loop the outbox retry gave it, and it
 knows which window has focus, so repeats stop on a focus change with no client involvement.
 
-## 2026-08-11 — The user stack goes to 8 MiB, and a filed deferral had a false cost in it
+## 2026-08-10 — The user stack goes to 8 MiB, and a filed deferral had a false cost in it
 
 Folded into M4 Part A, which is one of the triggers the deferral itself named.
 
@@ -12676,3 +12676,47 @@ questions — what the client must redraw versus what the compositor must copy �
 only the second under-redraws. The `Commit` damage is the per-buffer accumulation, a safe
 superset; sending a minimal rectangle is an optimisation needing a reason it does not yet
 have.
+
+## 2026-08-10 — The M4 design pass, reviewed: a thesis pointed back at its own diff
+
+PR #182's review found four things, and three of them were the second commit's own argument
+turned on the rest of the change. That commit's thesis was: *a deferral entry with a wrong
+cost is worse than no entry, because it argues for the wrong answer at the moment nobody is
+re-deriving the facts.* Applied to the diff that contained it:
+
+**Key repeat was decided in three places and left un-made in the two a future session reads.**
+`deferred-decisions.md` — the canonical index, and what `check-deferrals` gates against —
+still said repeat "wants a timer in `libinput`" with the trigger "the first text field", and
+`input-subsystem.md` still said it "Belongs in `libinput`". A Part C session would have
+searched for the item, found a trigger describing a widget this same PR deleted, concluded it
+had not fired, and — if it read on — implemented the option the design doc rejects. The
+user-stack entry got struck through and marked decided; three of the four folded items did
+not. **Deciding something in a design doc does not un-decide it anywhere else**, and the
+canonical file is the one that matters.
+
+Two smaller instances of the same:
+
+- *"It has the timer loop already"* overstated what the outbox retry left behind. The bounded
+  wait is armed **only while something is parked**, and a held key with an empty outbox is
+  exactly the not-parked case — the loop even documents the invariant repeat must break
+  ("an idle compositor still sleeps indefinitely"). The conclusion survives; the cost line
+  was wrong in the same way "eager mapping" was, one paragraph after correcting it.
+- *"The guard gap is arithmetic rather than machinery"* was true only for `hint == 0`.
+  `MMAP_MAX` bounds `find_free_range` alone; the hinted `sys_memory_map` path validates
+  alignment and `USER_VIRT_END` and nothing else, so a hinted mapping could sit inside the
+  gap and restore the silent overrun the gap exists to remove. Settled by deciding it:
+  `sys_memory_map` refuses a hinted range intersecting the gap, which makes the gap a
+  guarantee rather than a convention about where the kernel happens to place things.
+
+**The fourth was a document with no owner.** `widget-toolkit.md` was the fifth `design/` doc
+and had no graduation checkbox, because the plan's accounting named M6 and M7 back when there
+were three. `input-subsystem.md` had the same gap and was worse: its subsystem *finished* with
+M3, so a built subsystem has been sitting in the directory root `CLAUDE.md` tells every
+session never to read as current behaviour. Both now have boxes in M4, and the plan says where
+each of the five lives rather than gesturing at "M6 and M7 below".
+
+A method note worth keeping. The review's framing was that in a documentation-only change,
+**every claim about the code is a claim to verify** — and it verified them, line by line,
+including the ones that were right. That is the analogue of breaking a test to see it fail:
+a doc's value is that the next session builds from it without re-deriving, so an unverified
+claim in one is a defect whether or not it happens to be true.

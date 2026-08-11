@@ -257,8 +257,11 @@ sandboxed compositor a construction rather than a feature.
 - **USB HID, hotplug, multitouch slots, gesture recognition.** All land in the
   `input-server` or `libinput` when there is hardware to justify them. None requires a
   kernel change, which is the point of the arrangement.
-- **Key repeat.** Belongs in `libinput` (the `value == 2` case exists in the record for it),
-  but needs a timer story; deferred until something types.
+- **Key repeat.** ~~Belongs in `libinput`~~ — **decided 2026-08-10: the compositor generates
+  it** (M4 Part C, [`widget-toolkit.md`](widget-toolkit.md) §9.2). It cannot live in
+  `libinput`: that crate is pure and issues no syscalls, so it has nowhere to put a timer.
+  The compositor knows which window has focus, so a repeat stops on a focus change without
+  any client involvement. The `value == 2` case in the record is still what carries it.
 
 ## 7. Open questions
 
