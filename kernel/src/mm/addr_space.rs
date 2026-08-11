@@ -50,7 +50,9 @@
 use core::ptr;
 
 use crate::arch::Paging;
-use crate::arch::abi::{DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_VIRT_END};
+use crate::arch::abi::{
+    DEFAULT_USER_STACK_SIZE, DEFAULT_USER_STACK_TOP, USER_STACK_GUARD_SIZE, USER_VIRT_END,
+};
 use crate::arch::paging::{ArchPaging, MapError as ArchMapError, PageFlags};
 use crate::libkern::handle::KObjectType;
 use crate::libkern::{AllocError, KBox, KVec, SpinLock};
@@ -64,10 +66,22 @@ use crate::libkern::lockrank::LockRank;
 /// `0x40_0000`) and well below the default user stack. See `arch::abi`.
 const MMAP_BASE: u64 = 0x1_0000_0000;
 
-/// Exclusive upper bound of the mapping window — kept below the default user
-/// stack region so an "anywhere" mapping can never collide with the stack the
-/// ELF loader installs near [`DEFAULT_USER_STACK_TOP`].
-const MMAP_MAX: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE;
+/// Lowest address of the initial thread's stack region.
+pub const USER_STACK_BOTTOM: u64 = DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE;
+
+/// Lowest address of the guard gap below the stack. Nothing may be mapped in
+/// `[USER_STACK_GUARD_BOTTOM, USER_STACK_BOTTOM)`.
+pub const USER_STACK_GUARD_BOTTOM: u64 = USER_STACK_BOTTOM - USER_STACK_GUARD_SIZE;
+
+/// Exclusive upper bound of the mapping window — kept below the **guard gap**, so an
+/// "anywhere" mapping can never sit adjacent to the stack.
+///
+/// This bounds `find_free_range` and therefore only the `hint == 0` path. A *hinted*
+/// mapping is bounded by [`AddressSpace::in_stack_guard`] at the syscall, because
+/// `MMAP_MAX` alone would leave the gap protecting against the kernel's own placement and
+/// nothing else — and a hinted mapping inside it restores exactly the silent overrun the
+/// gap exists to remove (PR #182 review, finding 3).
+const MMAP_MAX: u64 = USER_STACK_GUARD_BOTTOM;
 
 /// Why [`AddressSpace::map_vma`] could not install a mapping.
 ///
@@ -621,6 +635,18 @@ impl AddressSpace {
         }
     }
 
+    /// Whether `[start, end)` overlaps the stack guard gap.
+    ///
+    /// **The gap is only a guarantee if the hinted path honours it.** `MMAP_MAX` bounds
+    /// `find_free_range`, which serves `sys_memory_map(hint = 0)` alone; a hinted mapping
+    /// validates page alignment and the user-half bound and nothing else. Without this
+    /// check the gap would protect against the kernel's own placement and no more, and a
+    /// stack overrun would once again land in mapped memory — silently, which is the single
+    /// property the gap exists to remove.
+    pub fn in_stack_guard(start: u64, end: u64) -> bool {
+        start < USER_STACK_BOTTOM && end > USER_STACK_GUARD_BOTTOM
+    }
+
     /// Find the lowest free virtual range of `size` bytes in the "anywhere"
     /// mapping window (`[MMAP_BASE, MMAP_MAX)`), for `sys_memory_map(hint=0)`.
     pub fn find_free_range(&self, size: u64) -> Option<VAddrRange> {
@@ -805,6 +831,62 @@ fn protection_to_page_flags(prot: Protection) -> PageFlags {
 
 #[cfg(test)]
 mod tests {
+
+    /// The guard gap sits directly below the stack, is non-empty, and the "anywhere"
+    /// window stops below it.
+    #[test]
+    fn the_mapping_window_stops_below_the_guard_gap() {
+        assert!(USER_STACK_GUARD_SIZE > 0, "a zero-width gap guards nothing");
+        assert_eq!(USER_STACK_GUARD_BOTTOM + USER_STACK_GUARD_SIZE, USER_STACK_BOTTOM);
+        assert_eq!(MMAP_MAX, USER_STACK_GUARD_BOTTOM);
+        // The property the gap exists for: the highest address the anywhere-window can hand
+        // out is strictly below the stack, with the whole gap in between.
+        assert!(MMAP_MAX + USER_STACK_GUARD_SIZE <= USER_STACK_BOTTOM);
+        assert!(MMAP_BASE < MMAP_MAX, "the window must not be empty");
+    }
+
+    /// `in_stack_guard` catches every way a range can touch the gap, and nothing else.
+    #[test]
+    fn in_stack_guard_catches_overlap_not_adjacency() {
+        let page = PAGE_SIZE as u64;
+        // Wholly inside.
+        assert!(AddressSpace::in_stack_guard(
+            USER_STACK_GUARD_BOTTOM + page,
+            USER_STACK_GUARD_BOTTOM + 2 * page
+        ));
+        // Straddling the bottom edge, which is the case a "contains the start" test misses.
+        assert!(AddressSpace::in_stack_guard(USER_STACK_GUARD_BOTTOM - page, USER_STACK_BOTTOM));
+        // Straddling the top edge, into the stack itself.
+        assert!(AddressSpace::in_stack_guard(USER_STACK_BOTTOM - page, USER_STACK_BOTTOM + page));
+        // Spanning the whole gap without either endpoint inside it — the case a
+        // "contains an endpoint" test misses, and the one a large mapping actually takes.
+        assert!(AddressSpace::in_stack_guard(
+            USER_STACK_GUARD_BOTTOM - page,
+            USER_STACK_BOTTOM + page
+        ));
+
+        // Ending exactly at the gap's first byte is *not* an overlap; refusing it would
+        // make the window one page smaller than it says it is.
+        assert!(!AddressSpace::in_stack_guard(
+            USER_STACK_GUARD_BOTTOM - page,
+            USER_STACK_GUARD_BOTTOM
+        ));
+        // Starting exactly at the stack's first byte is above the gap, not in it.
+        assert!(!AddressSpace::in_stack_guard(USER_STACK_BOTTOM, USER_STACK_BOTTOM + page));
+        // Far below.
+        assert!(!AddressSpace::in_stack_guard(MMAP_BASE, MMAP_BASE + page));
+    }
+
+    /// The stack is 8 MiB, and the guard is the size the post-Stack-Clash default is.
+    #[test]
+    fn the_stack_and_guard_are_the_sizes_the_rationale_claims() {
+        assert_eq!(DEFAULT_USER_STACK_SIZE, 8 * 1024 * 1024);
+        assert_eq!(USER_STACK_GUARD_SIZE, 256 * (PAGE_SIZE as u64));
+        // Both page-aligned, or the arithmetic above lands mid-page.
+        assert_eq!(DEFAULT_USER_STACK_SIZE % PAGE_SIZE as u64, 0);
+        assert_eq!(USER_STACK_GUARD_SIZE % PAGE_SIZE as u64, 0);
+        assert_eq!(USER_STACK_GUARD_BOTTOM % PAGE_SIZE as u64, 0);
+    }
     use super::*;
     use crate::arch::Paging;
     use crate::arch::paging::ArchPaging;
