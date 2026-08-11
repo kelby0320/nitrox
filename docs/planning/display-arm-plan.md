@@ -369,7 +369,14 @@ requirement, not a compromise.
       crossing synthesis; `FocusEvent` (op `0x0907`) carries window focus. 75 tests in
       `libui`, 21 breaks verified.
 
-      **Four things the plan did not anticipate**, each found by breaking something:
+      **The gate routes through the toolkit**, so an injected keystroke reaches a *widget*
+      and not merely a window: `element -> layout -> diff -> route -> handler`, with events
+      that came from QMP through the i8042 driver, the input server, the compositor's router
+      and `libsurface`. Every link is unit-tested; this is the only thing asserting they are
+      wired to each other.
+
+      **Six things the plan did not anticipate**, each found by breaking something or by
+      reading the design against the code:
 
       - A **click could only land at the window's origin.** The containment check added the
         widget's own origin to a point already in that space, so a button in a second column
@@ -388,6 +395,13 @@ requirement, not a compromise.
         test. The compositor's `ENTER`/`LEAVE` turned out to be *inputs* to that state
         machine rather than events to forward — its crossings are about windows, the
         toolkit's about widgets, and forwarding both handed a widget two enters.
+      - **§7.2's motivating example was unreachable.** `on_key` returned `Msg`, so having a
+        handler *meant* handling — a focused text field would swallow every accelerator, and
+        "unhandled keys reach the menu" could not happen. It returns `Option<Msg>` now, and a
+        non-capturing closure still coerces to a `fn` pointer, so nothing is lost.
+      - **Widget focus is an id, not a path**, which is a divergence from §7.2 in the code's
+        favour: a path breaks under exactly the reordering keys exist to survive. The design
+        predates `Widget::id`, which Part A added; the doc is corrected rather than the code.
 
 - [ ] **Graduate two design docs to `architecture/`.**
       [`input-subsystem.md`](../design/input-subsystem.md) describes a subsystem that is now

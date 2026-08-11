@@ -220,6 +220,7 @@ dependencies = [
  "librsproto",
  "libstream",
  "libsurface",
+ "libui",
 ]
 
 [[package]]

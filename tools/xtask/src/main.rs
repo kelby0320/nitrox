@@ -1015,6 +1015,11 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // that takes focus — not to whatever the cursor happens to be over.
     qmp.send_key("b", true)?;
     session.expect("input-testclient: win key code=48 down=1")?;
+    // **Through the toolkit**, which is Part B's actual deliverable: the same keystroke came
+    // out of `libui`'s router after `element -> layout -> diff -> route`, addressed to a
+    // widget rather than a window. Everything in that chain is unit-tested; this is the only
+    // thing that says the pieces are wired to each other.
+    session.expect("input-testclient: widget key code=48 down=1")?;
     qmp.send_key("b", false)?;
     session.expect("input-testclient: win key code=48 down=0")?;
 
@@ -1022,6 +1027,10 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // the record carries on every kind — the field that used to read zero here.
     qmp.send_button("left", true)?;
     session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
+    // Kind 1 is `POINTER_BUTTON`, and the coordinates are **widget-local**: the grid fills
+    // the window and sits at its origin, so they match — which is exactly why the host tests
+    // place a widget away from the origin as well.
+    session.expect("input-testclient: widget ptr kind=1")?;
     qmp.send_button("left", false)?;
 
     // ---- Park-and-retry ----

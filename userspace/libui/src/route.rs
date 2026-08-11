@@ -207,10 +207,15 @@ impl Router {
 
     /// Route a key event, returning the messages it produced.
     ///
-    /// The focused widget's `on_key` fires first; if it has none, the event **bubbles** to
-    /// each ancestor in turn. With nothing focused the event is dropped rather than sent to
-    /// whatever the pointer happens to be over, which would make typing depend on where the
-    /// mouse rests.
+    /// The focused widget's `on_key` fires first; if it has none **or returns `None`**, the
+    /// event bubbles to each ancestor in turn. Declining matters: a focused text field with a
+    /// handler would otherwise swallow every accelerator, and "unhandled keys reach the menu"
+    /// is the reason bubbling exists at all.
+    ///
+    /// With nothing focused the event is dropped rather than sent to whatever the pointer
+    /// happens to be over, which would make typing depend on where the mouse rests. And a key
+    /// nothing claims returns `None` — the caller *is* the application, and it still holds
+    /// the event it passed in, so there is no separate "reaches the application" path.
     pub fn key<Msg>(
         &self,
         tree: &Tree,
@@ -222,8 +227,10 @@ impl Router {
         // From the focused widget outward: `path`, then its parent, and so on to the root.
         for depth in (0..=path.len()).rev() {
             let e = element_at(element, &path[..depth])?;
-            if let Some(f) = e.on_key {
-                return Some(f(event));
+            if let Some(f) = e.on_key
+                && let Some(msg) = f(event)
+            {
+                return Some(msg);
             }
         }
         None
@@ -627,8 +634,8 @@ mod tests {
     #[test]
     fn a_key_goes_to_the_focused_widget_not_the_one_under_the_cursor() {
         let e: Element<Msg> = column(vec![
-            custom(1, Size::new(0, 0)).on_key(Msg::Key).flex(1),
-            custom(2, Size::new(0, 0)).on_key(Msg::Key).flex(1),
+            custom(1, Size::new(0, 0)).on_key(|k| Some(Msg::Key(k))).flex(1),
+            custom(2, Size::new(0, 0)).on_key(|k| Some(Msg::Key(k))).flex(1),
         ]);
         let (t, l) = build(&e);
         let second = t.root().unwrap().children[1].id;
@@ -646,7 +653,7 @@ mod tests {
     fn an_unhandled_key_bubbles_to_an_ancestor() {
         // How a menu accelerator works without every widget knowing about menus.
         let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()])
-            .on_key(Msg::Key);
+            .on_key(|k| Some(Msg::Key(k)));
         let (t, l) = build(&e);
         let _ = l;
         let leaf = t.root().unwrap().children[0].id;
@@ -656,10 +663,48 @@ mod tests {
     }
 
     #[test]
+    fn a_focused_widget_can_decline_a_key_and_let_it_bubble() {
+        // **The design's own motivating example, which the first API could not express.**
+        // With `on_key` returning `Msg` rather than `Option<Msg>`, having a handler *meant*
+        // handling — so a focused text field swallowed every accelerator and "unhandled keys
+        // reach the menu" was unreachable. Here the leaf takes ordinary keys and declines
+        // keycode 24, which the ancestor claims.
+        let e: Element<Msg> = column(vec![
+            custom(1, Size::new(0, 0))
+                .on_key(|k| (k.keycode != 24).then_some(Msg::Key(k)))
+                .flex(1),
+        ])
+        .on_key(|k| Some(Msg::Pressed(k.keycode as u8)));
+        let (t, _) = build(&e);
+        let leaf = t.root().unwrap().children[0].id;
+        let mut r = Router::new();
+        assert!(r.focus(&t, &e, leaf));
+
+        assert_eq!(r.key(&t, &e, key(30)), Some(Msg::Key(key(30))), "an ordinary key stays");
+        assert_eq!(
+            r.key(&t, &e, key(24)),
+            Some(Msg::Pressed(24)),
+            "the declined one reached the ancestor"
+        );
+    }
+
+    #[test]
+    fn a_key_nothing_claims_returns_none() {
+        // There is no separate "reaches the application" path: the caller *is* the
+        // application and still holds the event it passed in.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_key(|_| None).flex(1)]);
+        let (t, _) = build(&e);
+        let leaf = t.root().unwrap().children[0].id;
+        let mut r = Router::new();
+        assert!(r.focus(&t, &e, leaf));
+        assert_eq!(r.key(&t, &e, key(30)), None);
+    }
+
+    #[test]
     fn a_key_with_nothing_focused_is_dropped() {
         // Not sent to whatever the pointer is over, which would make typing depend on where
         // the mouse happens to rest — the same rule the compositor applies between windows.
-        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_key(Msg::Key)]);
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_key(|k| Some(Msg::Key(k)))]);
         let (t, _) = build(&e);
         let r = Router::new();
         assert_eq!(r.focused(), None);

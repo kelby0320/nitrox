@@ -276,11 +276,20 @@ which *window* has focus. The toolkit decides which *widget* within a window has
 Conflating them is the classic source of typing arriving in the wrong field, and it is why
 this milestone needs the compositor to start telling clients about the first one (§9.1).
 
-- **Widget focus is a path** to a node in the tree, held by the runtime.
+- ~~**Widget focus is a path** to a node in the tree~~ — **a widget id**, as built. A path
+  breaks under exactly the reordering that keys exist to survive: delete a row above the
+  focused one and the path now names its neighbour. The id was not in this document because
+  it did not exist when this was written; it arrived in Part A, and focus is the second thing
+  after the diff to need it. Paths are still how a *frame* reaches a widget — `path_to_id`
+  resolves one each time — but nothing stores one across frames.
 - **Tab traverses** it in tree order among widgets that accept focus.
-- A key goes to the focused widget; if unhandled it **bubbles to ancestors**, then to the
-  application. That is how a menu accelerator works without every widget knowing about
-  menus.
+- A key goes to the focused widget; if it has no handler **or its handler declines**, the
+  event bubbles to ancestors. That is how a menu accelerator works without every widget
+  knowing about menus — and declining is what makes it possible at all: with a handler that
+  cannot decline, a focused text field swallows every accelerator, and this bullet describes
+  something unreachable. `on_key` therefore returns `Option<Msg>`.
+- A key nothing claims returns nothing. There is no separate "reaches the application" step:
+  the caller *is* the application and still holds the event it passed in.
 - A caret blinks, and a focus ring is drawn, only when the widget has focus **and** the
   window does. Two conditions, from two sources, which is exactly why they are two fields.
 

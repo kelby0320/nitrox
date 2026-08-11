@@ -12958,3 +12958,33 @@ The general lesson: **a ticked checkbox says the plan's summary was satisfied, n
 design was.** The plan's Part B line names hit-testing, capture and focus; §7.1 names five
 things. Reading the design doc against the code is a different check from reading the plan,
 and it is the one that found these.
+
+**Finishing Part B: the sweep found two more, and one of them was an unreachable design.**
+Having learned that reading `widget-toolkit.md` §7.1 against the code found two unkept
+promises, the obvious next move was to do the same for §7.2 and §9.1 rather than assume §7.1
+was where the gaps lived. It was not.
+
+**§7.2's motivating example could not happen.** The section explains bubbling with "that is
+how a menu accelerator works without every widget knowing about menus" — and `on_key` returned
+`Msg`, so *having* a handler meant *handling*. A focused text field would swallow every
+accelerator; the bullet described something the API forbade. `on_key` returns `Option<Msg>`
+now, and because a non-capturing closure coerces to a `fn` pointer,
+`.on_key(|k| Some(Msg::Key(k)))` costs nothing over the constructor form.
+
+That is a sharper version of the same lesson: **a design document's rationale is testable
+too.** "This is how X works" is a claim, and X being unreachable is a defect whether or not
+any code is wrong.
+
+**One divergence went the other way**, which is worth recording because the reflex is to
+change the code. §7.2 says widget focus is a *path*; the implementation holds an **id**. A
+path breaks under exactly the reordering that keys exist to survive — delete a row above the
+focused one and the path names its neighbour. The design predates `Widget::id`, which Part A
+added under review; the document is corrected, not the code. **A design doc is not
+automatically right about a decision made after it was written.**
+
+**Part B now has end-to-end coverage.** The PR flagged that `Router` had no boot gate — nothing
+in a running system called it — and left that as a boundary for Part C. That was the wrong
+place to leave it: routing *is* Part B's deliverable, so proving it is Part B's job. The test
+client now builds an `Element`, lays it out, diffs it and drives a `Router` with the events
+the compositor sends, and the gate asserts an injected keystroke reaches a **widget**. Routing
+keys by capture instead of focus now fails the gate, where before it failed only host tests.

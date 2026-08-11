@@ -197,7 +197,13 @@ pub struct Element<Msg> {
     ///
     /// The path the terminal grid uses: a `custom` widget that wants keycodes rather than a
     /// toolkit's interpretation of them.
-    pub on_key: Option<fn(KeyEvent) -> Msg>,
+    ///
+    /// **Returns `Option`, so a handler can decline** and let the key keep bubbling. Without
+    /// that, having a handler *means* handling: a focused text field would swallow Ctrl-O,
+    /// and the menu accelerator this design uses as its motivating example could never fire.
+    /// A non-capturing closure coerces to a `fn` pointer, so `.on_key(|k| Some(Msg::Key(k)))`
+    /// costs nothing.
+    pub on_key: Option<fn(KeyEvent) -> Option<Msg>>,
     /// Raw pointer events routed to this element.
     pub on_pointer: Option<fn(PointerEvent) -> Msg>,
     /// Whether this element accepts keyboard focus.
@@ -244,7 +250,7 @@ impl<Msg> Element<Msg> {
     /// Implied, because a handler for keys that can never be focused is dead code the
     /// application would have to notice it wrote. Something that wants focus *without*
     /// handling keys still says so explicitly.
-    pub fn on_key(mut self, f: fn(KeyEvent) -> Msg) -> Self {
+    pub fn on_key(mut self, f: fn(KeyEvent) -> Option<Msg>) -> Self {
         self.on_key = Some(f);
         self.focusable = true;
         self

@@ -36,8 +36,12 @@ use libkern::{
     RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
     syscall2, syscall4, syscall5,
 };
-use librsproto::surface::Role;
+use librsproto::surface::{KeyEvent, PointerEvent, Role};
 use libsurface::{Window, WindowEvent, ipc::ChannelTransport};
+use libui::diff::Tree;
+use libui::element::{Element, custom};
+use libui::layout::{FixedCell, layout};
+use libui::route::Router;
 
 /// `alloc` backing — `libsurface` holds its buffers and event queue on the heap.
 #[global_allocator]
@@ -70,6 +74,21 @@ const STALL_NS: u64 = 1_500_000_000;
 /// The key the harness injects *after* the flood, and the one whose arrival proves nothing
 /// was dropped while the ring was full.
 const LATE_CODE: u16 = 46;
+
+/// The one widget this client builds: a `custom` node filling the window, which is the shape
+/// Milestone 5's terminal grid takes.
+const GRID: u32 = 1;
+
+/// What the toolkit hands back when an event reaches the widget.
+///
+/// Part B's whole claim is that an injected keystroke reaches a *widget* — not merely a
+/// window — so the gate needs something the router produced rather than something the
+/// window received. These are that something.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum Msg {
+    Key(KeyEvent),
+    Ptr(PointerEvent),
+}
 
 /// Bytes per record, from the shared ABI rather than a local literal — an earlier version
 /// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
@@ -277,6 +296,35 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         exit(1);
     };
 
+    // ---- The toolkit, driven by real events ----
+    //
+    // `element -> layout -> diff -> route -> handler`, the whole of Part B, with events that
+    // came from a QMP injection through the i8042 driver, the input server, the compositor's
+    // own router and `libsurface`. Everything below this line is unit-tested in `libui`; what
+    // the gate adds is that the pieces are wired to each other.
+    let view: Element<Msg> = custom(GRID, libdraw::geom::Size::new(WIN_W, WIN_H))
+        .on_key(|k| Some(Msg::Key(k)))
+        .on_pointer(Msg::Ptr)
+        .focusable();
+    let bounds = libdraw::geom::Rect::new(0, 0, WIN_W, WIN_H);
+    let cells = FixedCell { w: 8, h: 16 };
+    let laid = layout(&view, bounds, &cells);
+    let mut tree = Tree::new();
+    if tree.update(&view, &laid).is_err() {
+        kprint(b"input-testclient: toolkit diff FAILED\n");
+        exit(1);
+    }
+    let mut router = Router::new();
+    // Focus the grid, as a real client would on creation: it is the only focusable widget.
+    let grid_id = match tree.root().map(|w| w.id) {
+        Some(id) if router.focus(&tree, &view, id) => id,
+        _ => {
+            kprint(b"input-testclient: toolkit focus FAILED\n");
+            exit(1);
+        }
+    };
+    let _ = grid_id;
+
     // The second synchronisation point. The window has to exist before the harness injects
     // at it, for the same reason `listening` exists: a keystroke routed before there is a
     // focusable window is one the compositor correctly drops.
@@ -326,6 +374,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     .s(b" mods=")
                     .u(k.modifiers as u64)
                     .end();
+                // ...and through the toolkit, which is the part Part B is about.
+                if let Some(Msg::Key(rk)) = router.key(&tree, &view, k) {
+                    Line::new()
+                        .s(b"input-testclient: widget key code=")
+                        .u(rk.keycode as u64)
+                        .s(b" down=")
+                        .u(rk.pressed as u64)
+                        .end();
+                }
                 saw_key = true;
             }
             WindowEvent::Pointer(pe) => {
@@ -341,6 +398,18 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                     .s(b" y=")
                     .i(pe.y as i64)
                     .end();
+                for m in router.pointer(&tree, &view, &laid, pe).0 {
+                    if let Msg::Ptr(rp) = m {
+                        Line::new()
+                            .s(b"input-testclient: widget ptr kind=")
+                            .u(rp.kind as u64)
+                            .s(b" x=")
+                            .i(rp.x as i64)
+                            .s(b" y=")
+                            .i(rp.y as i64)
+                            .end();
+                    }
+                }
                 if pe.kind == librsproto::surface::POINTER_BUTTON
                     && pe.flags & librsproto::surface::POINTER_PRESSED != 0
                 {
@@ -348,6 +417,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 }
             }
             WindowEvent::Focus(f) => {
+                router.set_window_focused(f);
                 // The *other* half of the two-focus rule: widget focus is the toolkit's,
                 // window focus is the compositor's, and a client needs both to know whether
                 // a caret should blink. Announced on the change, so it arrives once when
