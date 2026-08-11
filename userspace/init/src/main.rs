@@ -26,6 +26,7 @@ extern crate alloc;
 use alloc::vec::Vec;
 use core::arch::asm;
 use init::manifest::{self, Mode, MountSpec};
+use libkern::debug::Line;
 use libkern::*;
 use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
 
@@ -347,9 +348,7 @@ fn ns_lookup_wait(ns: u64, path: &[u8], rights: u64) -> (i32, u64) {
 unsafe fn spawn_program(root_ns: u64, path: &[u8], args: *mut SpawnArgs) -> i64 {
     let (st, img) = ns_lookup_wait(root_ns, path, RIGHT_MAP_READ);
     if st != 0 || img == 0 {
-        kprint(b"init: image not found: ");
-        kprint(path);
-        kprint(b"\n");
+        Line::new().s(b"init: image not found: ").s(path).end();
         return -1;
     }
     // SAFETY: caller guarantees `args` is a valid writable SpawnArgs.
@@ -387,22 +386,26 @@ fn read_manifest(root_ns: u64) -> Option<Vec<MountSpec>> {
     let result = match core::str::from_utf8(&bytes[..len]) {
         Ok(text) => match manifest::parse(text) {
             Ok(mounts) => {
-                kprint(b"init: init.toml OK, ");
-                kprint_u64(mounts.len() as u64);
-                kprint(b" mount(s) (shallowest first):\n");
+                Line::new()
+                    .s(b"init: init.toml OK, ")
+                    .u(mounts.len() as u64)
+                    .s(b" mount(s) (shallowest first):")
+                    .end();
                 for m in &mounts {
-                    kprint(b"init:   ");
-                    kprint(m.mount_point.as_bytes());
-                    kprint(b": ");
-                    kprint(m.fs_server.as_bytes());
-                    kprint(b" on ");
-                    kprint(m.device.as_bytes());
-                    kprint(b" (");
-                    kprint(match m.mode {
-                        Mode::Ro => b"ro" as &[u8],
-                        Mode::Rw => b"rw",
-                    });
-                    kprint(b")\n");
+                    Line::new()
+                        .s(b"init:   ")
+                        .s(m.mount_point.as_bytes())
+                        .s(b": ")
+                        .s(m.fs_server.as_bytes())
+                        .s(b" on ")
+                        .s(m.device.as_bytes())
+                        .s(b" (")
+                        .s(match m.mode {
+                            Mode::Ro => b"ro" as &[u8],
+                            Mode::Rw => b"rw",
+                        })
+                        .s(b")")
+                        .end();
                 }
                 Some(mounts)
             }
@@ -433,9 +436,7 @@ fn mount_all(root_ns: u64, mounts: &[MountSpec]) -> bool {
     let mut ok = true;
     for m in mounts {
         if !mount_one(root_ns, m) {
-            kprint(b"init: mount FAILED for ");
-            kprint(m.mount_point.as_bytes());
-            kprint(b"\n");
+            Line::new().s(b"init: mount FAILED for ").s(m.mount_point.as_bytes()).end();
             ok = false;
         }
     }
@@ -447,9 +448,7 @@ fn mount_all(root_ns: u64, mounts: &[MountSpec]) -> bool {
 fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
     // Only `fs-server-ext4` exists in slice 7.
     if m.fs_server != "fs-server-ext4" {
-        kprint(b"init: unknown fs_server '");
-        kprint(m.fs_server.as_bytes());
-        kprint(b"'\n");
+        Line::new().s(b"init: unknown fs_server '").s(m.fs_server.as_bytes()).s(b"'").end();
         return false;
     }
     // 1. Resolve the block-device handle: READ (for the server's `sys_io_submit`)
@@ -457,9 +456,11 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
     let dev_path = match manifest::device_ns_path(&m.device) {
         Some(p) => p,
         None => {
-            kprint(b"init: unsupported device scheme '");
-            kprint(m.device.as_bytes());
-            kprint(b"'\n");
+            Line::new()
+                .s(b"init: unsupported device scheme '")
+                .s(m.device.as_bytes())
+                .s(b"'")
+                .end();
             return false;
         }
     };
@@ -471,9 +472,7 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
         RIGHT_READ | RIGHT_WRITE | RIGHT_TRANSFER | RIGHT_DUPLICATE,
     );
     if st != 0 || device == 0 {
-        kprint(b"init: device ");
-        kprint(dev_path.as_bytes());
-        kprint(b" not found\n");
+        Line::new().s(b"init: device ").s(dev_path.as_bytes()).s(b" not found").end();
         return false;
     }
 
@@ -623,15 +622,11 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
         unsafe { syscall1(SYS_HANDLE_CLOSE, endpoint) };
     }
     if br != 0 {
-        kprint(b"init: bind FAIL at ");
-        kprint(m.mount_point.as_bytes());
-        kprint(b"\n");
+        Line::new().s(b"init: bind FAIL at ").s(m.mount_point.as_bytes()).end();
         return false;
     }
 
-    kprint(b"init: mounted fs-server-ext4 at ");
-    kprint(m.mount_point.as_bytes());
-    kprint(b"\n");
+    Line::new().s(b"init: mounted fs-server-ext4 at ").s(m.mount_point.as_bytes()).end();
     // init keeps `fs_h` (the long-lived server's process handle).
     let _ = fs_h;
     true
@@ -1436,15 +1431,15 @@ fn read_large_file(root_ns: u64) {
         i += 1;
     }
     if mismatches == 0 {
-        kprint(b"init: large.bin verified ");
-        kprint_u64(LARGE_FILE_BYTES as u64);
-        kprint(b" bytes across ");
-        kprint_u64(LARGE_FILE_BYTES as u64 / PAGE);
-        kprint(b" demand-faulted pages ok\n");
+        Line::new()
+            .s(b"init: large.bin verified ")
+            .u(LARGE_FILE_BYTES as u64)
+            .s(b" bytes across ")
+            .u(LARGE_FILE_BYTES as u64 / PAGE)
+            .s(b" demand-faulted pages ok")
+            .end();
     } else {
-        kprint(b"init: large.bin MISMATCH count=");
-        kprint_u64(mismatches);
-        kprint(b"\n");
+        Line::new().s(b"init: large.bin MISMATCH count=").u(mismatches).end();
     }
     // SAFETY: closing our own handle (the mapping keeps the object alive meanwhile).
     unsafe { syscall1(SYS_HANDLE_CLOSE, fh) };
@@ -1866,11 +1861,14 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
             if kind == KIND_CHILD_EXITED {
                 let cpid = u32::from_le_bytes([body[0], body[1], body[2], body[3]]);
                 let code = i32::from_le_bytes([body[8], body[9], body[10], body[11]]);
-                kprint(b"init: reaped pid=");
-                kprint_u64(cpid as u64);
-                kprint(b" code=");
-                kprint_u64(code as u64);
-                kprint(b"\n");
+                Line::new()
+                    .s(b"init: reaped pid=")
+                    .u(cpid as u64)
+                    .s(b" code=")
+                    // `.i`, not `.u`: an exit code is signed, and `-1` widened through
+                    // `as u64` prints 18446744073709551615 (PR #181 review, finding 8).
+                    .i(code as i64)
+                    .end();
                 // Release init's reference to the primary child on its exit. Reparented
                 // orphans have no handle here — the kernel tears them down; init observes.
                 if parent_h != 0 {
@@ -1914,13 +1912,15 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
 pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) -> ! {
     kprint(b"init: up (pid 1)\n");
     let count = (notif != 0) as u64 + (root_ns != 0) as u64;
-    kprint(b"init: received ");
-    kprint_u64(count);
-    kprint(b" handles (notif=");
-    kprint_u64(notif);
-    kprint(b", ns=");
-    kprint_u64(root_ns);
-    kprint(b")\n");
+    Line::new()
+        .s(b"init: received ")
+        .u(count)
+        .s(b" handles (notif=")
+        .u(notif)
+        .s(b", ns=")
+        .u(root_ns)
+        .s(b")")
+        .end();
 
     // Read the manifest and process its mounts (spawn fs-servers → Ready → bind). A
     // missing/invalid manifest or a failed required mount is a **critical-path

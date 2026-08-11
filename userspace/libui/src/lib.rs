@@ -35,7 +35,8 @@ use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, CreateWindowRequest, OP_ATTACH_BUFFER, OP_COMMIT,
-    OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_RELEASE, Role, SURFACE_FORMAT_XRGB8888,
+    KeyEvent, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_KEY_EVENT, OP_POINTER_EVENT, OP_RELEASE,
+    PointerEvent, Role, SURFACE_FORMAT_XRGB8888,
     build_attach_buffer_request, build_commit_request, build_create_window_request,
     build_destroy_window_request, parse_create_window_reply, parse_release_event,
 };
@@ -135,11 +136,43 @@ impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
     }
 }
 
+/// How many input events a window queues before the oldest are discarded.
+///
+/// A bound, because a client that stops draining must not grow this without limit — and
+/// input is *continuous*, so "stops draining" is the ordinary state of a client rendering a
+/// frame rather than a misbehaviour. Sized for a burst of typing plus a drag, not for a
+/// client that has stopped reading.
+pub const EVENT_QUEUE_MAX: usize = 64;
+
+/// One input event, as a window receives it.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum WindowEvent {
+    /// A key transition, with the modifiers held at that moment.
+    Key(KeyEvent),
+    /// Pointer motion, a button, or a crossing.
+    Pointer(PointerEvent),
+    /// The queue overflowed and events were discarded.
+    ///
+    /// **Accumulated state must be discarded.** A client tracking which keys or buttons are
+    /// down has to assume it missed a release, exactly as `libinput` requires of a
+    /// `SYN_DROPPED`. A client that ignores this carries a phantom held modifier for the
+    /// rest of its life, which is the failure the marker exists to prevent.
+    Dropped,
+}
+
 /// A window and its buffers.
 pub struct Window<T: Transport> {
     transport: T,
     id: u32,
     buffers: Vec<ClientBuffer>,
+    /// Input delivered but not yet drained by the client.
+    events: alloc::collections::VecDeque<WindowEvent>,
+    /// Whether the next drain owes the client a [`WindowEvent::Dropped`].
+    ///
+    /// A flag rather than a count: the client's obligation is the same whether it missed one
+    /// event or forty — discard what you believed — so a number would be information nobody
+    /// can act on differently.
+    lost: bool,
 }
 
 impl<T: Transport> Window<T> {
@@ -169,7 +202,13 @@ impl<T: Transport> Window<T> {
             .request(OP_CREATE_WINDOW, &body[..n], None, &mut reply)?
             .ok_or(UiError::BadReply)?;
         let id = parse_create_window_reply(&reply[..len]).ok_or(UiError::BadReply)?;
-        Ok(Self { transport, id, buffers: Vec::new() })
+        Ok(Self {
+            transport,
+            id,
+            buffers: Vec::new(),
+            events: alloc::collections::VecDeque::new(),
+            lost: false,
+        })
     }
 
     /// Consume the window and hand back its connection.
@@ -257,13 +296,79 @@ impl<T: Transport> Window<T> {
     }
 
     /// Apply one server event. Shared by [`pump`](Self::pump) and [`acquire`](Self::acquire).
+    ///
+    /// Input is **queued here rather than returned**, so a client blocked in `acquire`
+    /// waiting for a buffer does not lose the keystrokes that arrive while it waits. That is
+    /// the ordinary case, not a corner: a client renders, commits, and blocks — which is
+    /// precisely when a user is looking at the result and typing.
     fn apply_event(&mut self, op: u16, body: &[u8]) {
-        if op == OP_RELEASE
-            && let Some((window, buffer)) = parse_release_event(body)
-            && window == self.id
-            && let Some(b) = self.buffers.iter_mut().find(|b| b.id == buffer)
-        {
-            b.busy = false;
+        match op {
+            OP_RELEASE => {
+                if let Some((window, buffer)) = parse_release_event(body)
+                    && window == self.id
+                    && let Some(b) = self.buffers.iter_mut().find(|b| b.id == buffer)
+                {
+                    b.busy = false;
+                }
+            }
+            OP_KEY_EVENT => {
+                if let Some(e) = KeyEvent::read(body) {
+                    self.enqueue(WindowEvent::Key(e));
+                }
+            }
+            OP_POINTER_EVENT => {
+                if let Some(e) = PointerEvent::read(body) {
+                    self.enqueue(WindowEvent::Pointer(e));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Queue an event, discarding the oldest if the queue is full.
+    ///
+    /// **Oldest, not newest.** The newest event is the one describing the world as it is now
+    /// — dropping it would leave a client acting on a stale button state forever, where
+    /// dropping the oldest only costs it history it is already behind on.
+    fn enqueue(&mut self, e: WindowEvent) {
+        if self.events.len() >= EVENT_QUEUE_MAX {
+            self.events.pop_front();
+            self.lost = true;
+        }
+        self.events.push_back(e);
+    }
+
+    /// Take the next queued input event, if any. Does not talk to the compositor.
+    ///
+    /// Call [`pump`](Self::pump) first to collect what has arrived.
+    pub fn next_event(&mut self) -> Option<WindowEvent> {
+        if self.lost {
+            // Announced before the surviving events, so a client resets its state and *then*
+            // applies what it still has, rather than the other way round.
+            self.lost = false;
+            return Some(WindowEvent::Dropped);
+        }
+        self.events.pop_front()
+    }
+
+    /// How many input events are queued.
+    pub fn events_pending(&self) -> usize {
+        self.events.len()
+    }
+
+    /// Block until an input event is available, then take it.
+    ///
+    /// Buffer releases arriving meanwhile are applied rather than discarded — they are the
+    /// same channel, and dropping one strands a buffer forever.
+    pub fn wait_event(&mut self) -> Result<WindowEvent, UiError> {
+        self.pump()?;
+        loop {
+            if let Some(e) = self.next_event() {
+                return Ok(e);
+            }
+            let mut buf = [0u8; 64];
+            let (op, len) = self.transport.wait_event(&mut buf)?;
+            self.apply_event(op, &buf[..len]);
         }
     }
 
@@ -328,6 +433,7 @@ impl<T: Transport> Window<T> {
 mod tests {
     use super::*;
     use alloc::vec;
+    use librsproto::surface::{MOD_SHIFT, POINTER_BUTTON, POINTER_MOTION};
 
     /// Records what was sent and lets a test hand back replies and events.
     #[derive(Default)]
@@ -387,6 +493,22 @@ mod tests {
     }
 
     impl MockTransport {
+        /// Queue a key event as the compositor would send it.
+        fn queue_key(&mut self, keycode: u16, pressed: bool, modifiers: u16) {
+            let e = KeyEvent { keycode, pressed: u16::from(pressed), modifiers, _pad: 0 };
+            let mut b = [0u8; 8];
+            let n = e.write(&mut b).unwrap();
+            self.events.insert(0, (OP_KEY_EVENT, b[..n].to_vec()));
+        }
+
+        /// Queue a pointer event as the compositor would send it.
+        fn queue_pointer(&mut self, kind: u16, x: i32, y: i32) {
+            let e = PointerEvent { kind, x, y, ..Default::default() };
+            let mut b = [0u8; 20];
+            let n = e.write(&mut b).unwrap();
+            self.events.insert(0, (OP_POINTER_EVENT, b[..n].to_vec()));
+        }
+
         fn queue_release(&mut self, window: u32, buffer: u32) {
             let mut b = [0u8; 8];
             let n = librsproto::surface::build_release_event(&mut b, window, buffer).unwrap();
@@ -594,4 +716,142 @@ mod tests {
         let req = librsproto::surface::parse_commit_request(body).unwrap();
         assert_eq!((req.damage_x, req.damage_y, req.damage_w, req.damage_h), (3, 5, 17, 9));
     }
+
+    #[test]
+    fn key_and_pointer_events_reach_the_queue_intact() {
+        let mut w = window(2);
+        w.transport.queue_key(30, true, MOD_SHIFT);
+        w.transport.queue_pointer(POINTER_MOTION, -7, 12);
+        assert_eq!(w.pump().expect("pump"), 2);
+
+        assert_eq!(
+            w.next_event(),
+            Some(WindowEvent::Key(KeyEvent {
+                keycode: 30,
+                pressed: 1,
+                modifiers: MOD_SHIFT,
+                _pad: 0
+            }))
+        );
+        // Signed coordinates survive the round trip — an unsigned read here is the
+        // "pointer teleports on a leftward drag" bug, one layer further out.
+        assert_eq!(
+            w.next_event(),
+            Some(WindowEvent::Pointer(PointerEvent {
+                kind: POINTER_MOTION,
+                x: -7,
+                y: 12,
+                ..Default::default()
+            }))
+        );
+        assert_eq!(w.next_event(), None);
+    }
+
+    #[test]
+    fn input_arriving_while_blocked_for_a_buffer_is_queued_not_lost() {
+        // The ordinary case, not a corner: a client renders, commits, and blocks — which is
+        // exactly when the user is looking at the result and typing into it.
+        let mut w = window(2);
+        let b = w.acquire().expect("a free buffer");
+        w.commit(b, (0, 0, 64, 32)).expect("commit");
+        let b2 = w.acquire().expect("the other buffer");
+        w.commit(b2, (0, 0, 64, 32)).expect("commit");
+
+        // Nothing free. The compositor sends a keystroke *and* the release during the block.
+        w.transport.queue_key(31, true, 0);
+        w.transport.deferred.push({
+            let mut bb = [0u8; 8];
+            let n = librsproto::surface::build_release_event(&mut bb, w.id(), b).unwrap();
+            (OP_RELEASE, bb[..n].to_vec())
+        });
+
+        assert_eq!(w.acquire().expect("released"), b);
+        assert_eq!(
+            w.next_event(),
+            Some(WindowEvent::Key(KeyEvent { keycode: 31, pressed: 1, modifiers: 0, _pad: 0 })),
+            "the keystroke that arrived while blocked survived"
+        );
+    }
+
+    #[test]
+    fn a_release_arriving_while_waiting_for_input_is_not_discarded() {
+        // The mirror of the case above, and the one a naive `wait_event` gets wrong by
+        // ignoring anything that is not input — which strands the buffer forever.
+        let mut w = window(2);
+        let b = w.acquire().expect("free");
+        w.commit(b, (0, 0, 64, 32)).expect("commit");
+        assert!(w.buffers().iter().find(|x| x.id == b).unwrap().busy);
+
+        // Both arrive **during the block**, release first. Queuing the release up front
+        // instead would have `pump` consume it before `wait_event` ever blocks — which is
+        // how a first version of this test passed against a `wait_event` that discarded
+        // releases outright.
+        w.transport.deferred.push({
+            let e = KeyEvent { keycode: 1, pressed: 1, modifiers: 0, _pad: 0 };
+            let mut bb = [0u8; 8];
+            let n = e.write(&mut bb).unwrap();
+            (OP_KEY_EVENT, bb[..n].to_vec())
+        });
+        w.transport.deferred.push({
+            let mut bb = [0u8; 8];
+            let n = librsproto::surface::build_release_event(&mut bb, w.id(), b).unwrap();
+            (OP_RELEASE, bb[..n].to_vec())
+        });
+
+        assert!(matches!(w.wait_event(), Ok(WindowEvent::Key(_))));
+        assert!(
+            !w.buffers().iter().find(|x| x.id == b).unwrap().busy,
+            "the release was applied, not thrown away"
+        );
+    }
+
+    #[test]
+    fn an_overflowing_queue_drops_the_oldest_and_says_so() {
+        let mut w = window(2);
+        for i in 0..(EVENT_QUEUE_MAX as u16 + 3) {
+            w.transport.queue_key(i, true, 0);
+        }
+        w.pump().expect("pump");
+        assert_eq!(w.events_pending(), EVENT_QUEUE_MAX);
+
+        // The marker comes first, so a client resets what it believed *before* applying
+        // what survived.
+        assert_eq!(w.next_event(), Some(WindowEvent::Dropped));
+        let Some(WindowEvent::Key(k)) = w.next_event() else { panic!("a key") };
+        assert_eq!(k.keycode, 3, "the three oldest went, not the three newest");
+
+        // And it is announced once, not on every subsequent drain.
+        while let Some(e) = w.next_event() {
+            assert_ne!(e, WindowEvent::Dropped);
+        }
+    }
+
+    #[test]
+    fn the_newest_event_is_the_one_kept() {
+        // Dropping the newest would leave a client acting on a stale button state forever;
+        // dropping the oldest only costs it history it is already behind on.
+        let mut w = window(2);
+        for i in 0..(EVENT_QUEUE_MAX as u16 + 1) {
+            w.transport.queue_key(i, true, 0);
+        }
+        w.pump().expect("pump");
+        let last = core::iter::from_fn(|| w.next_event())
+            .filter_map(|e| match e {
+                WindowEvent::Key(k) => Some(k.keycode),
+                _ => None,
+            })
+            .last();
+        assert_eq!(last, Some(EVENT_QUEUE_MAX as u16), "the most recent survived");
+    }
+
+    #[test]
+    fn a_malformed_input_record_is_ignored_rather_than_queued_as_garbage() {
+        let mut w = window(2);
+        w.transport.events.insert(0, (OP_POINTER_EVENT, vec![0u8; 19]));
+        w.transport.queue_key(42, true, 0);
+        w.pump().expect("pump");
+        assert_eq!(w.events_pending(), 1, "the short pointer record was dropped");
+        assert!(matches!(w.next_event(), Some(WindowEvent::Key(_))));
+    }
+
 }

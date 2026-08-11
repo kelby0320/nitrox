@@ -31,6 +31,7 @@
 extern crate alloc;
 
 use core::arch::asm;
+use libkern::debug::Line;
 use libkern::*;
 use libos::{Handle, Namespace, NsMutable, spawn, thread_create};
 use librsproto::session::{Dir, DirError};
@@ -513,9 +514,7 @@ fn worker_exception_demo(notif: u64) {
     }
     // SAFETY: the kernel wrote the 18-register snapshot into WORKER_REGS.
     let rip = unsafe { (&raw const WORKER_REGS.regs[REG_RIP]).read() };
-    kprint(b"test-harness: worker faulted @ rip=");
-    kprint_hex(rip);
-    kprint(b" ; terminating\n");
+    Line::new().s(b"test-harness: worker faulted @ rip=").x(rip).s(b" ; terminating").end();
 
     // 5. Terminate the worker (resume with the Terminate disposition, code 7).
     // SAFETY: register-only syscall.
@@ -605,9 +604,11 @@ fn block_send_demo() {
         i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]])
     };
     if waited == 1 && status == 0 {
-        kprint(b"test-harness: blocking send completed via PendingOperation (");
-        kprint_u64(filled);
-        kprint(b" queued, 1 blocked-then-delivered)\n");
+        Line::new()
+            .s(b"test-harness: blocking send completed via PendingOperation (")
+            .u(filled)
+            .s(b" queued, 1 blocked-then-delivered)")
+            .end();
     } else {
         kprint(b"test-harness: block-demo wait unexpected\n");
     }
@@ -786,9 +787,7 @@ fn ns_demo() {
         kprint(b"test-harness: ns_lookup wait unexpected\n");
         return;
     }
-    kprint(b"test-harness: ns_lookup -> resolved handle=");
-    kprint_u64(resolved);
-    kprint(b"\n");
+    Line::new().s(b"test-harness: ns_lookup -> resolved handle=").u(resolved).end();
 
     // (f) Use the resolved handle: map it read/write — proves the binding handed
     //     back a usable, rights-attenuated MemoryObject handle.
@@ -890,13 +889,17 @@ fn entropy_demo() {
         }
     }
     let first = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-    kprint(b"test-harness: entropy bytes[0..8]=");
-    kprint_hex(first);
+    // Assembled across the `if`: the verdict is part of the same line as the bytes it is a
+    // verdict about, and emitting it separately is how the two get interleaved with whatever
+    // else is booting.
+    let mut l = Line::new();
+    l.s(b"test-harness: entropy bytes[0..8]=").x(first);
     if differ {
-        kprint(b" (two reads differ) entropy ok\n");
+        l.s(b" (two reads differ) entropy ok");
     } else {
-        kprint(b" entropy-demo UNEXPECTED (reads identical)\n");
+        l.s(b" entropy-demo UNEXPECTED (reads identical)");
     }
+    l.end();
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
 }
@@ -956,9 +959,7 @@ fn dev_entropy_lookup_demo(root_ns: u64) {
         return;
     }
     let first = u64::from_le_bytes([a[0], a[1], a[2], a[3], a[4], a[5], a[6], a[7]]);
-    kprint(b"test-harness: /dev/entropy resolved+read ok bytes[0..8]=");
-    kprint_hex(first);
-    kprint(b"\n");
+    Line::new().s(b"test-harness: /dev/entropy resolved+read ok bytes[0..8]=").x(first).end();
 
     // SAFETY: closing our own handles.
     unsafe {
@@ -1097,9 +1098,7 @@ fn initramfs_demo(root_ns: u64) {
     // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the file's bytes;
     // read the first 16 in bounds (init.toml is far longer).
     let head = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 16) };
-    kprint(b"test-harness: /initramfs/etc/init.toml -> \"");
-    kprint(head);
-    kprint(b"...\"\n");
+    Line::new().s(b"test-harness: /initramfs/etc/init.toml -> \"").s(head).s(b"...\"").end();
     // SAFETY: closing our own handle.
     unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
 }
@@ -3144,18 +3143,22 @@ fn dead_log_source_demo(root_ns: u64) {
         }
     }
     if best + 1 < online {
-        kprint(b"test-harness: only ");
-        kprint_u64(best);
-        kprint(b" of ");
-        kprint_u64(online);
-        kprint(b" CPUs ever went idle\n");
+        Line::new()
+            .s(b"test-harness: only ")
+            .u(best)
+            .s(b" of ")
+            .u(online)
+            .s(b" CPUs ever went idle")
+            .end();
         return_fail(b"test-harness: a closed log source left a CPU spinning\n");
     }
-    kprint(b"test-harness: dead-log-source ok (");
-    kprint_u64(best);
-    kprint(b" of ");
-    kprint_u64(online);
-    kprint(b" CPUs idle -- the service let go)\n");
+    Line::new()
+        .s(b"test-harness: dead-log-source ok (")
+        .u(best)
+        .s(b" of ")
+        .u(online)
+        .s(b" CPUs idle -- the service let go)")
+        .end();
 }
 
 /// Read `/proc/sched/stats` into `f` as text. `false` if it could not be read.
@@ -3288,11 +3291,13 @@ fn reaper_demo(root_ns: u64) {
         return_fail(b"test-harness: no handles closed in exit context -- teardown is not running\n");
     }
 
-    kprint(b"test-harness: reaper ok (reaper pids: ");
-    kprint_u64(closed);
-    kprint(b", handles closed at exit: ");
-    kprint_u64(early);
-    kprint(b")\n");
+    Line::new()
+        .s(b"test-harness: reaper ok (reaper pids: ")
+        .u(closed)
+        .s(b", handles closed at exit: ")
+        .u(early)
+        .s(b")")
+        .end();
 }
 
 /// One `name=value` field from `/proc/sched/stats`. `0` if unreadable, which every caller
@@ -3654,9 +3659,10 @@ fn session_fanout_demo(root_ns: u64) {
         if st != 0 || h == 0 {
             // Report how far we got: "stopped at 7" and "stopped at 20" are very
             // different failures, and the count is the whole diagnosis.
-            kprint(b"test-harness: session fan-out stopped early at session ");
-            kprint_hex(i as u64);
-            kprint(b"\n");
+            Line::new()
+                .s(b"test-harness: session fan-out stopped early at session ")
+                .x(i as u64)
+                .end();
             return_fail(b"test-harness: could not open the full session table\n");
         }
         *slot = h;
@@ -4256,9 +4262,10 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
             if kind == KIND_CHILD_EXITED {
                 let code = i32::from_le_bytes([b[8], b[9], b[10], b[11]]);
                 if code != 0 {
-                    kprint(b"test-harness: hard-float worker FAILED code=");
-                    kprint_u64(code as u64);
-                    kprint(b"\n");
+                    Line::new()
+                        .s(b"test-harness: hard-float worker FAILED code=")
+                        .i(code as i64)
+                        .end();
                     exit(1);
                 }
                 got += 1;
@@ -4310,11 +4317,7 @@ fn sched_stats_demo(root_ns: u64) {
         kprint(b"test-harness: /proc/self/status content FAIL\n");
         exit(1);
     }
-    kprint(b"test-harness: /proc/self/status ok pid=");
-    kprint_u64(pid);
-    kprint(b" tid=");
-    kprint_u64(tid);
-    kprint(b"\n");
+    Line::new().s(b"test-harness: /proc/self/status ok pid=").u(pid).s(b" tid=").u(tid).end();
     // SAFETY: unmapping the page we mapped above (`text` is not used past here);
     // closing our own handle.
     unsafe {
@@ -4346,9 +4349,11 @@ fn sched_stats_demo(root_ns: u64) {
             // Echo the winning snapshot into the boot log (grep-visible
             // evidence of the milestone, alongside the machine-checked gate).
             let len = text.iter().position(|&b| b == 0).unwrap_or(text.len());
-            kprint(b"test-harness: /proc/sched/stats ok (");
-            kprint_u64(active);
-            kprint(b" CPUs with switches>0):\n");
+            Line::new()
+                .s(b"test-harness: /proc/sched/stats ok (")
+                .u(active)
+                .s(b" CPUs with switches>0):")
+                .end();
             kprint(&text[..len]);
         }
         // SAFETY: unmapping the page mapped above (`text` is not used past

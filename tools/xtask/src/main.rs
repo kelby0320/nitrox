@@ -942,6 +942,17 @@ fn cmd_check_input(accel: Accel) -> R<()> {
 
     session.expect("input-testclient: listening")?;
 
+    // **Wait for `ui-testclient` to finish before injecting anything.** Its leak probe churns
+    // 128 windows, and every one of them is a `Normal` window that becomes, for its brief
+    // life, the topmost window that takes focus — so a keystroke injected while it runs is
+    // routed to a window that is about to be destroyed. That is the compositor behaving
+    // correctly; it is the *gate* that was assuming a quiet stack. Diagnosed from the
+    // compositor's own routing log: `key win=9` while the client had announced `id=8`.
+    //
+    // Safe to wait for here rather than later: `listening` is printed milliseconds after
+    // spawn, the churn takes seconds, so this line always follows it.
+    session.expect("ui-testclient: PASSED")?;
+
     // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it
     // is in the identity range the decoder relies on, and because a wrong `E0` or release
     // bit shows up as a different code rather than as silence.
@@ -963,6 +974,65 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     session.expect("input-testclient: ev kind=2 code=1 value=3")?;
     qmp.send_button("left", true)?;
     session.expect("input-testclient: ev kind=1 code=272 value=1")?;
+    // Release it: phase 2 asserts on the button mask, and a press left held from here would
+    // make `buttons` already non-zero before its own click.
+    qmp.send_button("left", false)?;
+
+    // ---- Through a window ----
+    //
+    // Everything above proves the *device* stream reached userspace. This proves the
+    // Surface path: the compositor routed it to a window and `libui` delivered it into that
+    // window's queue. The client creates the window only now, so the two phases cannot
+    // contend for its four-message session ring.
+    session.expect("input-testclient: window ready")?;
+
+    // **A deliberate flood, and a weak one.** Twelve cursor movements are what broke this
+    // gate before M3 Part D3, when each became a `PointerEvent` sent `NOBLOCK` at a
+    // four-message ring and the keystroke behind them went on the floor.
+    //
+    // It proves less than it looks: the client drains in `wait_event` between injections, so
+    // thirteen messages never queue against a sixteen-slot ring and **no send is ever
+    // refused**. It covers neither coalescing nor retry — the phase-3 stall below is what
+    // covers those. Kept because it is still the historical regression, cheap, and the shape
+    // a real cursor movement takes.
+    for _ in 0..12 {
+        qmp.send_motion(-120, -120)?;
+    }
+
+    // `b` is keycode 48. It goes to the *focused* window — this client's, being the topmost
+    // that takes focus — not to whatever the cursor happens to be over.
+    qmp.send_key("b", true)?;
+    session.expect("input-testclient: win key code=48 down=1")?;
+    qmp.send_key("b", false)?;
+    session.expect("input-testclient: win key code=48 down=0")?;
+
+    // And a click, which is routed by hit-testing instead of focus. `buttons=1` is the mask
+    // the record carries on every kind — the field that used to read zero here.
+    qmp.send_button("left", true)?;
+    session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
+    qmp.send_button("left", false)?;
+
+    // ---- Park-and-retry ----
+    //
+    // The client stops draining. The flood then overruns its 16-slot ring: everything after
+    // that parks in the compositor's per-session outbox, where motion coalesces to a single
+    // record and the key queues behind it. On waking, the key must still arrive.
+    //
+    // This is the only assertion covering park-and-retry. The earlier flood covers neither
+    // it nor coalescing — with the client draining between injections a send is never
+    // refused at all, which is finding 3 of the PR #181 review.
+    session.expect("input-testclient: stalling")?;
+
+    // Comfortably past the 16-slot ring, so the outbox is genuinely holding messages.
+    for _ in 0..40 {
+        qmp.send_motion(3, 3)?;
+    }
+    // `c` is keycode 46. Injected *after* the ring is full, so it can only arrive if the
+    // compositor parked it and re-sent it — and only if it wakes itself to do so, since a
+    // client draining its own ring signals nothing to the compositor.
+    qmp.send_key("c", true)?;
+
+    session.expect("input-testclient: late key code=46")?;
 
     session.expect("input-testclient: PASSED")?;
     let _ = fs::remove_file(&qmp_sock);

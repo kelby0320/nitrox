@@ -12391,3 +12391,193 @@ written and quietly stopped being true**:
 The last one is the general lesson: **when an invariant becomes spread across two constants,
 the comment that used to state it becomes a liability.** It reads as a guarantee, it is
 checked by nobody, and it is most convincing to exactly the person about to violate it.
+
+## 2026-08-10 — The log-line sweep, and the gate that could not see its own damage
+
+M3 Part D1 retired `TODO(atomic-log-lines)`: `libkern::debug::Line` assembles a line in a
+256-byte stack buffer and emits it with one `kprint`, and 47 multi-call sites across `init`,
+`eshell`, `service-mgr`, `session-mgr`, `compositor` and `test-harness` were swept into it.
+
+**The deferral was retired on its own terms, not on convenience.** Its filed trigger was "the
+next torn line that costs debugging time, or any test that needs to assert on a multi-part log
+line", and both had fired: `check-input` was 40% flaky for a milestone because its six-call
+lines arrived shredded — and was misdiagnosed as a guest bug first — while Part D2's gate has
+to match a line carrying a keycode, modifiers and coordinates together. The stated reason for
+deferring, "the shape of the helper is worth deciding once rather than per site", was answered
+by three independent hand-rolled copies of the same buffer having appeared in the meantime.
+
+**The interesting part is how the sweep was verified.** A mechanical rewrite of 47 log sites
+is exactly the kind of change where every test passes and the output is subtly wrong, because
+the tests assert on *substrings* and the thing that changed is where the newlines are. So the
+check was not the test suite: it was **diffing the entire boot transcript before and after**,
+normalised for addresses.
+
+That diff earned its keep immediately. The transformer collapsed three separate
+`ui-testclient` lines into one — `committed 4 frames over 2 buffersui-testclient: scene
+presented via /dev/drawui-testclient: PASSED` — because it stripped the newline from *any*
+literal that ended with one rather than only the last. **Every gate still passed**, including
+`check-display` and `test-qemu`, because each asserted substring was present; only its line
+had vanished. `Session::expect` scans for a substring and does not care about newlines, which
+is the right design for a matcher and the reason it cannot police this.
+
+The lesson generalises past logging: **when a change is mechanical and wide, the thing to
+compare is the output, not the assertions.** Assertions were written to catch the bugs someone
+anticipated; a sweep introduces the ones nobody did. A whole-transcript diff costs one boot and
+sees everything the assertions were not asked about.
+
+Two smaller notes from the same work:
+
+- `cargo xtask image` **does not build the selftest binaries**, so "image builds" is not
+  "everything builds". A type error in `input-testclient` survived several rounds of checking
+  the wrong command. `test-qemu` is the build check for anything under `test-harness/`.
+- The helper's `u()` initially shifted digits down on the assumption that `fmt_u64` returns a
+  *suffix* of its buffer. It returns the front for zero and a suffix otherwise, so `0` came out
+  as a NUL byte — caught by a test written for the suffix hazard, which found the opposite one.
+  The fix was to delete the cleverness: the buffer is a local, so nothing borrowed `self` and
+  no copy was needed at all.
+
+## 2026-08-10 — D2: three bugs that were all the gate assuming a quiet system
+
+M3 Part D2 closed the loop: an injected keystroke and click reach a **window**. `libui`
+queues input per window; `input-testclient` grew a second phase that echoes what arrived;
+`check-input` asserts through `libui` rather than off the input server.
+
+**The echo half went into the existing client rather than a new binary.** Two processes
+would have meant two `listening` lines with no guaranteed order between them, and a gate
+whose `expect` cursor advances cannot wait for two things whose order it does not know. One
+process, one injection, both paths.
+
+**Its window is never committed to.** The compositor already skips windows with no committed
+buffer — "a client that has created a window but not yet drawn into it should show
+background" — so the client can hold a focusable, hit-testable window for a whole boot
+without disturbing `check-display`, which compares the screen pixel for pixel. That is not a
+trick; it is a real state the compositor already had a defined answer for.
+
+**Three failures, and none of them were in the code under test.** Each was the gate assuming
+something about the system that had never been true:
+
+1. *A window larger than the screen, because steering the cursor cost too much.* The first
+   version drove the cursor into a corner with twelve PS/2 motion events. Each became a
+   `PointerEvent` on the client's **four-message** session ring, and the keystroke behind
+   them was dropped. The fix was to stop needing the cursor moved: the window is bigger than
+   any screen, so the cursor is already inside it. This is the back-pressure deferral
+   (D3) making itself felt from the wrong side, and it is why D3 comes next rather than
+   sooner — the gate now keeps at most two messages in flight by construction.
+2. *The leak probe was still running.* `ui-testclient` churns 128 windows, each a `Normal`
+   window that is, for its brief life, the topmost window that takes focus. Keys injected
+   during it were routed to a window about to be destroyed. The compositor was right; the
+   gate was assuming a quiet stack. It now waits for `ui-testclient: PASSED` first.
+3. *The client's completion sentinel fired on the wrong event.* It ended its phase on any
+   button record, and the first to arrive was the *release* left over from phase 1 — so it
+   printed `PASSED` and exited while the harness was still asserting, and the compositor
+   correctly delivered the rest to whatever window remained. A button **press** is the
+   sentinel now, matching the raw phase's existing "a sentinel rather than a count" rule.
+
+All three were diagnosed from **the compositor's own routing log** — `key win=9` against a
+client that had announced `id=8`, then `key win=1` after `window ready id=130`. The log was
+added in C3 as a bounded diagnostic with no particular use in mind; it turned out to be the
+only thing in the system that could say *where an event went*, which is the one question
+every one of these failures was really asking. Its eight-line budget had to be raised by hand
+three times to see anything, which is the argument for making it adjustable rather than
+constant — filed as a nuisance, not a defect.
+
+The pattern across all three: **the gate's assumptions were the untested part.** The
+compositor, `libinput` and `libui` did exactly what their host tests said they would. What
+had never been checked was that a test harness injecting into a live multi-process system
+gets a system in the state it imagined.
+
+## 2026-08-10 — D3: the back-pressure question was never about depth
+
+M3 Part D3 retired the compositor→client back-pressure deferral. The filed question was "how
+deep, and what happens when it fills"; the answer turned out to be that depth was the wrong
+axis.
+
+**What a real second client revealed.** The deferral said all three candidate answers were
+untested theory until something other than `ui-testclient` existed, and that was right — but
+not for the reason expected. D2's gate lost a keystroke behind twelve cursor movements, and
+the shape of that failure is the whole argument: **input is a stream and a `Release` is not.**
+On a shared ring the cheap message reliably evicts the expensive one, and losing a motion is
+cosmetic while losing a `Release` hangs the client permanently in `acquire`. No depth fixes
+an asymmetry like that; it only moves the threshold, and a *rarer* permanent hang is worse to
+diagnose than a reproducible one.
+
+So the fix is a bounded per-session outbox with **motion coalescing** — at most one queued
+per window, removed and re-pushed at the back so a motion that happened after a keystroke is
+still delivered after it. X11 and Wayland both compress motion, and it works for the same
+reason in all three: a motion record carries an absolute position, so the newest says
+everything the older ones did. A refusal now parks the message at the head of the queue
+instead of dropping it, and `Release` rides the same queue, so input cannot displace it.
+
+**The ring went 4 → 16, and the interesting part is that 4 was never chosen.** It is a
+literal copied into every resource server in the tree — `auth-service`, `fs-server-ext4`,
+`hello`, `input-server`, `compositor` — and it is a *quarter* of the kernel's own
+`IPC_DEFAULT_QUEUE_DEPTH`, which is what passing `0` would have given. Five servers running
+below the system default by propagation rather than argument. The other four are left alone
+on purpose: they carry request/reply traffic, where the sender waits for an answer and cannot
+outrun the receiver, so they are undersized rather than wrong.
+
+**Two things this work got wrong first, both worth the record.**
+
+*A flush that was never called.* `flush_outboxes` was written and wired into nothing, and
+`cargo xtask test-qemu` passed anyway — which is itself the finding: that gate never
+exercises input delivery, so it cannot speak to any of this. `check-input` caught it
+immediately. A green gate is only evidence about what it touches.
+
+*A regression test that tested the wrong half.* The gate was extended with the exact flood
+that broke D2 and the comment claimed it as coalescing's regression test. Removing coalescing
+and re-running showed the gate still passing: twelve motions fit inside `OUTBOX_MAX`, so the
+queue never has to collapse them, and what the flood actually proves is the *retry* path.
+Coalescing earns its place by stopping a long drag from pushing discrete events out of a full
+queue, which is a host test. The comment now says which half is which. **The check that
+caught it — delete the mechanism, re-run the test that claims to cover it — costs one run and
+is the only thing that distinguishes a regression test from a coincidence.**
+
+## 2026-08-10 — A parked message needs a wakeup, and a gate that never refuses proves nothing
+
+The PR #181 review found three blocking defects in D3, and the two that matter are the same
+mistake seen from opposite ends.
+
+**A queue is not a fix without a wakeup.** D3 replaced drop-on-refusal with park-at-the-head,
+and the deferral recorded the consequence as *"a latency bound, not a loss"*. That is true for
+input and false for `Release`. A channel endpoint signals when it has something to **read**, so
+a client draining its own receive ring does not wake the compositor at all: the compositor
+sleeps in an infinite `sys_wait` holding a message the client is blocked waiting for, and
+neither side ever moves. That is the permanent hang the mechanism was built to prevent —
+reintroduced, and made *worse*, because the code it replaced at least printed
+`DROPPED a Release`. The fix is a bounded wait: while anything is parked the serve loop wakes
+on a 10 ms deadline, and with every outbox empty it still waits forever, so an idle compositor
+does not poll.
+
+The general form is worth keeping: **replacing "drop it" with "hold it" moves the failure from
+loss to liveness**, and liveness failures are silent by construction. Anything that parks work
+owes an answer to "what wakes me".
+
+**A gate that never provokes the condition tests nothing.** The same PR narrates catching one
+false coverage claim — a flood advertised as coalescing's regression test that passed with
+coalescing deleted — corrects the comment, and then re-makes the identical error one line
+down by claiming the flood covers *retry*. It does not: the client drains between injections,
+so thirteen messages never queue against a sixteen-slot ring and **no send is ever refused**.
+The reviewer demonstrated it by adding a log line to the refusal path and watching it never
+fire.
+
+Park-and-retry — the PR's central new behaviour — had no end-to-end coverage at all, which is
+also why the liveness bug above could not have been caught by any gate in it. The fix is a
+client that *stops draining*: `input-testclient` now sleeps 1.5 s while the harness floods
+forty motions and then injects a key, so the ring genuinely fills and the outbox genuinely
+parks. Both defects fail that assertion, verified by breaking each in turn.
+
+**The lesson about the correction, not the bug.** Correcting a false coverage claim once did
+not stop the same claim being made about the neighbouring mechanism, because what got fixed
+was the sentence rather than the method. The method is cheap and mechanical: *instrument the
+path the test claims to exercise and confirm it is entered.* A test that cannot be shown to
+reach its own subject is a coincidence, however carefully its comment is worded.
+
+Two smaller notes:
+
+- The D1 sweep's detector matched `kprint_u64`/`kprint_hex` but not locally-named helpers like
+  `kprint_hex64`, so it missed two torn lines in `test-harness/display.rs`. A sweep is only as
+  complete as the names its regex knows.
+- `Line::i` existed from D1 and the sweep still emitted `.u(code as u64)` at three exit-code
+  sites, faithfully preserving a pre-existing bug: `-1` printed as 18446744073709551615. A
+  mechanical sweep preserves defects with the same fidelity it preserves behaviour, and that
+  is the point of it — but it means the sweep is not the moment those defects get found.

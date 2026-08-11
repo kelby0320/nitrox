@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod input;
+pub mod outbox;
 pub mod server;
 
 use alloc::vec::Vec;

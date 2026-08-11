@@ -4,8 +4,10 @@
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
 self-hash, and the `screendump` smoke gate. **Milestones 1–2 are complete** (2026-08-06). A real client drives the compositor on every
 `test-qemu` run, and the display gate compares a picture that arrived through the whole
-Surface protocol. **Milestone 3 Part A is complete** (2026-08-06): P3 — the i8042 driver — is built and
-proven by `cargo xtask check-input`, which injects a keystroke and a click over QMP.
+Surface protocol. **Milestone 3 is complete** (2026-08-10): the i8042 driver, the
+`input-server`, `libinput`, the compositor's focus and hit-test routing, and `libui` delivery
+— proven end to end by `cargo xtask check-input`, which injects a keystroke and a click over
+QMP and asserts they reach a **window**.
 
 ## What this is
 
@@ -206,7 +208,7 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
             (`compositor: input connected`). It cannot yet assert a key reached a window:
             nothing holds a window at injection time. That is Part D's gate.
 
-- [ ] **Part D — a client receives it.** `libui` delivers input into a window's event queue,
+- [x] **Part D — a client receives it.** ✅ (2026-08-10) `libui` delivers input into a window's event queue,
       and a test client echoes what arrived: a keystroke and a click injected by the harness
       reach a **window** and come back, which is the milestone's deliverable.
 
@@ -214,6 +216,77 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
       because a driver that is merely "armed" proves nothing — the same reason M2 Part D
       existed. What remains here is the client half and extending that gate to assert through
       `libui` rather than off the input server.
+
+      **Two deferred items are folded in**, and the ordering below is the reason: each one
+      needs the thing before it to exist. Folding them in was decided 2026-08-10, after
+      checking `deferred-decisions.md` rather than working from memory.
+
+      - [x] **D1 — the atomic log-line helper (`TODO(atomic-log-lines)`).** ✅ (2026-08-10) A `kprint`-style
+            helper that formats into a stack buffer and issues **one** syscall, in `libkern`,
+            plus a sweep of the call sites that build a line from several.
+
+            Its filed trigger was "the next torn line that costs debugging time, or any test
+            that needs to assert on a multi-part log line". **Both have now fired.**
+            `check-input` was 40% flaky through M3 Part A because six `kprint` calls per line
+            were shredded by concurrent output — and it was misdiagnosed as a guest bug first,
+            which is precisely the cost the trigger names. D2's gate is the second: an echo
+            client has to report keycode, modifiers and coordinates on one line for the
+            harness to match.
+
+            The stated reason for deferring — "the shape of the helper is worth deciding once
+            rather than per site" — is answered by two independent hand-rolled copies of the
+            same buffer (`compositor/src/main.rs`, `test-harness/src/inputclient.rs`). D2
+            would make it three. **First, so D2 is built on it rather than copying it again.**
+
+            Swept 47 multi-call sites across `init`, `eshell`, `service-mgr`, `session-mgr`,
+            `compositor` and `test-harness`. Verified by **diffing the whole boot transcript
+            before and after**: identical modulo addresses. That diff is what caught the
+            sweep's own bug — an over-eager transformer collapsed three separate
+            `ui-testclient` lines into one, which every gate still passed because each
+            asserted substring was present, just no longer on its own line.
+
+      - [x] **D2 — `libui` delivery, the echo client, and the gate.** ✅ (2026-08-10) `KeyEvent` and
+            `PointerEvent` into a window's event queue, a client that echoes what arrived, and
+            `check-input` extended to assert **through `libui`** rather than off the input
+            server. This is the milestone's deliverable and the checkbox that retires
+            "`check-input` proves the compositor is attached, not that a key reached a window".
+
+            `Window` gained a bounded event queue (`EVENT_QUEUE_MAX`), `next_event`,
+            `wait_event`, and a `WindowEvent::Dropped` marker on overflow. Input arriving
+            while a client is blocked in `acquire` is **queued, not lost** — the ordinary
+            case, since a client blocks exactly when the user is looking at the result and
+            typing into it.
+
+            The echo half went into `input-testclient` rather than a new binary, so one
+            injection proves both paths and there is no cross-process print ordering to get
+            wrong. Its window is **never committed to**, so the compositor skips it when
+            compositing and `check-display` is unaffected — a window that has not drawn shows
+            background, which is a real state and not a trick.
+
+            **Still open, and not folded in here:** a client is not told when it gains or
+            loses focus (`rsproto-surface-ops.md` records this as a gap, not a design), and
+            there is still no cursor drawn on screen. Both belong to M4's toolkit work,
+            which is the first thing that needs them.
+
+      - [x] **D3 — back-pressure for compositor→client messages.** ✅ (2026-08-10) Its re-trigger is literally
+            "Part D, when a second client exists", and D2 creates that client.
+
+            **After D2, not before** — and D2 duly hit it, losing a keystroke behind twelve
+            cursor movements. That failure is what settled the design: the problem was never
+            depth. Input is a stream and a `Release` is not, so on a shared ring the cheap
+            message reliably evicts the expensive one, and no depth fixes that — it only
+            moves the threshold, turning a reproducible hang into a rare one.
+
+            A bounded per-session `Outbox` in the compositor's library half, with **motion
+            coalescing** (at most one queued per window, re-pushed at the back so ordering
+            survives), head-of-line flushing that parks on refusal instead of dropping, and
+            `Release` riding the same queue so input can never displace it. The ring went
+            4 → 16: the old value was a literal copied into every resource server and a
+            quarter of the kernel's own default, never a decision. 8 host tests, six breaks.
+
+            The gate now injects the exact flood that broke D2. It asserts the **retry**
+            half — coalescing is proven by host test, and the plan says so rather than
+            letting the gate imply coverage it does not have.
 
 **Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
 with window management in a later milestone; buttons and menus need clicks, and the toolkit

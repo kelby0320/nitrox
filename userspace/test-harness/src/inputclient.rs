@@ -28,11 +28,48 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
+use libkern::debug::Line;
 use libkern::{
     RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
-    syscall4,
+    syscall2, syscall4, syscall5,
 };
+use librsproto::surface::Role;
+use libui::{Window, WindowEvent, ipc::ChannelTransport};
+
+/// `alloc` backing — `libui` holds its buffers and event queue on the heap.
+#[global_allocator]
+static ALLOC: libheap::Heap = libheap::Heap;
+
+/// The invisible window's size.
+///
+/// **Nothing is ever committed to it**, so the compositor skips it when compositing — a
+/// window that has created buffers but not drawn shows background, which is a real state and
+/// not a trick. That is what lets this client hold a focusable, hit-testable window through
+/// a boot without disturbing `cargo xtask check-display`, which compares the screen against
+/// `ui-testclient`'s scene pixel for pixel.
+///
+/// **Larger than any screen, deliberately.** New windows land at `(0, 0)`, so a window this
+/// size contains the cursor wherever the compositor parked it — which means the gate can
+/// click without first driving the cursor somewhere known. That matters more than it sounds:
+/// steering the cursor takes a dozen PS/2 motion events, each of which becomes a
+/// `PointerEvent` on this client's session ring, and the first attempt at this gate lost the
+/// keystroke behind exactly that flood. The compositor clips, so an oversized window is
+/// ordinary — a maximised one is the same shape.
+const WIN_W: u32 = 2048;
+const WIN_H: u32 = 2048;
+
+/// How long phase 3 refuses to drain, in nanoseconds.
+///
+/// Long enough for the harness to see `stalling`, inject a flood over QMP, and for the
+/// compositor to fill the ring and start parking — sub-second would race the host round trip.
+const STALL_NS: u64 = 1_500_000_000;
+
+/// The key the harness injects *after* the flood, and the one whose arrival proves nothing
+/// was dropped while the ring was full.
+const LATE_CODE: u16 = 46;
 
 /// Bytes per record, from the shared ABI rather than a local literal — an earlier version
 /// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
@@ -49,6 +86,7 @@ const DONE_CODE: u16 = libkern::abi::BTN_LEFT;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 
+static mut CLOCK_BUF: u64 = 0;
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 
@@ -99,65 +137,6 @@ fn lookup(ns: u64, path: &[u8], rights: u64) -> Option<u64> {
     }
     let (status, resolved) = po_wait(po as u64);
     if status != 0 || resolved == 0 { None } else { Some(resolved) }
-}
-
-/// A line built in one buffer and emitted with a **single** `kprint`.
-///
-/// This is not tidiness. The console is shared and unsynchronised **between processes**: one
-/// `kprint` is atomic (it takes the serial lock) but a sequence of them is not, so a line
-/// assembled from six calls gets shredded by whatever else is booting. That is exactly how
-/// the first version of this client failed — the events arrived, the client printed them,
-/// and the harness saw `input-testclient: kbdtest-stage: setup message …` because another
-/// process wrote between the tag and the value.
-struct Line {
-    buf: [u8; 96],
-    len: usize,
-}
-
-impl Line {
-    fn new() -> Self {
-        Self { buf: [0; 96], len: 0 }
-    }
-
-    fn str(&mut self, s: &[u8]) -> &mut Self {
-        let n = s.len().min(self.buf.len() - self.len);
-        self.buf[self.len..self.len + n].copy_from_slice(&s[..n]);
-        self.len += n;
-        self
-    }
-
-    fn u64(&mut self, n: u64) -> &mut Self {
-        if n == 0 {
-            return self.str(b"0");
-        }
-        let mut d = [0u8; 20];
-        let (mut i, mut v) = (0usize, n);
-        while v > 0 {
-            d[i] = b'0' + (v % 10) as u8;
-            v /= 10;
-            i += 1;
-        }
-        let mut out = [0u8; 20];
-        for j in 0..i {
-            out[j] = d[i - 1 - j];
-        }
-        self.str(&out[..i])
-    }
-
-    fn i32(&mut self, v: i32) -> &mut Self {
-        if v < 0 {
-            self.str(b"-").u64((-(v as i64)) as u64)
-        } else {
-            self.u64(v as u64)
-        }
-    }
-
-    /// Emit the whole line in one syscall, newline included.
-    fn emit(&mut self) {
-        self.str(b"\n");
-        kprint(&self.buf[..self.len]);
-        self.len = 0;
-    }
 }
 
 /// The consumer end of `/dev/input/new`, and the last batch received on it.
@@ -226,14 +205,14 @@ impl Stream {
                     done = true;
                 }
                 Line::new()
-                    .str(b"input-testclient: ev")
-                    .str(b" kind=")
-                    .u64(ev.kind as u64)
-                    .str(b" code=")
-                    .u64(ev.code as u64)
-                    .str(b" value=")
-                    .i32(ev.value)
-                    .emit();
+                    .s(b"input-testclient: ev")
+                    .s(b" kind=")
+                    .u(ev.kind as u64)
+                    .s(b" code=")
+                    .u(ev.code as u64)
+                    .s(b" value=")
+                    .i(ev.value as i64)
+                    .end();
             }
             return Some(done);
         }
@@ -245,7 +224,7 @@ impl Stream {
 /// Called by the kernel's ELF entry with the standard bootstrap arguments; `root_ns` is this
 /// process's root namespace.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"input-testclient: up\n");
 
     let Some(mut stream) = Stream::open(root_ns) else {
@@ -272,8 +251,149 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
+    // ---- Phase 2: the same events, but through a *window* ----
+    //
+    // The window is created **after** phase 1 rather than up front. With no window, the
+    // compositor has nothing to route phase 1's events to and sends nothing; created early,
+    // its records would queue on this client's session channel while it was blocked reading
+    // the raw stream. That mattered when a refused send was simply dropped; since M3 Part D3
+    // the compositor parks and retries, so the phases are sequenced now for clarity rather
+    // than for safety — and phase 3 below exercises the parking deliberately.
+    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => t,
+        Err(_) => {
+            kprint(b"input-testclient: /dev/draw connect FAILED\n");
+            exit(1);
+        }
+    };
+    let Ok(mut win) = Window::new(
+        alloc::boxed::Box::new(transport),
+        WIN_W,
+        WIN_H,
+        Role::Normal,
+        2,
+    ) else {
+        kprint(b"input-testclient: Window::new FAILED\n");
+        exit(1);
+    };
+
+    // The second synchronisation point. The window has to exist before the harness injects
+    // at it, for the same reason `listening` exists: a keystroke routed before there is a
+    // focusable window is one the compositor correctly drops.
+    Line::new().s(b"input-testclient: window ready id=").u(win.id() as u64).end();
+
+    // **A button *press* is the sentinel**, for the same reason `DONE_CODE` is one for the
+    // raw stream: it is the last thing the harness injects. Accepting any button record
+    // ended the phase on the release left over from phase 1 — which arrives before anything
+    // aimed at this window — so the client printed `PASSED` and exited while the harness was
+    // still asserting, and the compositor correctly routed the remaining keys to whatever
+    // window was left. Diagnosed from `compositor: key win=1` after `window ready id=130`.
+    let (mut saw_key, mut saw_press) = (false, false);
+    while !(saw_key && saw_press) {
+        let ev = match win.wait_event() {
+            Ok(e) => e,
+            Err(_) => {
+                kprint(b"input-testclient: window stream FAILED\n");
+                exit(1);
+            }
+        };
+        match ev {
+            WindowEvent::Key(k) => {
+                Line::new()
+                    .s(b"input-testclient: win key code=")
+                    .u(k.keycode as u64)
+                    .s(b" down=")
+                    .u(k.pressed as u64)
+                    .s(b" mods=")
+                    .u(k.modifiers as u64)
+                    .end();
+                saw_key = true;
+            }
+            WindowEvent::Pointer(pe) => {
+                Line::new()
+                    .s(b"input-testclient: win ptr kind=")
+                    .u(pe.kind as u64)
+                    .s(b" btn=")
+                    .u(pe.button as u64)
+                    .s(b" buttons=")
+                    .u(pe.buttons as u64)
+                    .s(b" x=")
+                    .i(pe.x as i64)
+                    .s(b" y=")
+                    .i(pe.y as i64)
+                    .end();
+                if pe.kind == librsproto::surface::POINTER_BUTTON
+                    && pe.flags & librsproto::surface::POINTER_PRESSED != 0
+                {
+                    saw_press = true;
+                }
+            }
+            WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+        }
+    }
+
+    // ---- Phase 3: stop draining, and prove nothing is lost ----
+    //
+    // The phases above never exercise the compositor's park-and-retry: this client drains in
+    // `wait_event` between injections, so a send is never refused and the outbox never holds
+    // anything (PR #181 review, finding 3 — demonstrated by replacing retry with the old
+    // drop-on-refusal and watching the gate pass anyway).
+    //
+    // So stall deliberately. While this sleeps, the harness floods motion until the 16-slot
+    // ring is full and then injects a key. Every motion after the ring fills parks in the
+    // compositor's outbox and coalesces to one; the key queues behind it. On waking, the
+    // key must still arrive — under drop-on-refusal it would not, and under park-with-no-
+    // wakeup (the same review's finding 1) it would never be re-sent, because a client
+    // draining its own ring signals nothing to the compositor.
+    kprint(b"input-testclient: stalling\n");
+    sleep_ns(notif, STALL_NS);
+
+    let mut saw_late_key = false;
+    while !saw_late_key {
+        let ev = match win.wait_event() {
+            Ok(e) => e,
+            Err(_) => {
+                kprint(b"input-testclient: window stream FAILED\n");
+                exit(1);
+            }
+        };
+        match ev {
+            WindowEvent::Key(k) => {
+                Line::new().s(b"input-testclient: late key code=").u(k.keycode as u64).end();
+                if k.keycode == LATE_CODE {
+                    saw_late_key = true;
+                }
+            }
+            WindowEvent::Pointer(_) => {}
+            WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+        }
+    }
+
     kprint(b"input-testclient: PASSED\n");
     exit(0);
+}
+
+/// Sleep for `ns` by waiting on a handle that never signals.
+///
+/// No timer handle needed: `sys_wait` takes an absolute monotonic deadline and returns
+/// `TimedOut`, and this process's notification handle is signalled by nothing it does.
+fn sleep_ns(notif: u64, ns: u64) {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: the kernel wrote the ns count.
+    let deadline = unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns);
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    unsafe {
+        WAIT_HANDLES[0] = notif;
+        syscall5(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            deadline,
+            0,
+        );
+    }
 }
 
 #[panic_handler]
