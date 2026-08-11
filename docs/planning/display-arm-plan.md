@@ -410,7 +410,7 @@ requirement, not a compromise.
       [`widget-toolkit.md`](../design/widget-toolkit.md) graduates when this milestone lands.
       Both need their Status lines rewritten to describe what exists rather than what will.
 
-- [ ] **Part C — the first widget set**, bounded by what the terminal needs: `text`, a
+- [x] **Part C — the first widget set**, bounded by what the terminal needs: `text`, a
       button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch. Plus key
       repeat and the on-screen cursor, which are what make the set usable by a person rather
       than only by the harness.
@@ -429,6 +429,22 @@ requirement, not a compromise.
 
       **The font file ships on the root filesystem**, not the initramfs — a client that draws
       text starts long after `fs-server-ext4` is mounted, and the compositor never needs it.
+      Done: `/system/fonts/DejaVuSansMono.ttf`, staged by the image build with its licence and
+      loaded by `libdraw::text::load`.
+
+      **The initramfs cleanup was folded in** (2026-08-11), because the same forty lines of
+      `assemble_image` had to be touched either way and because M5 adds more display servers
+      to the same list. `compositor` and `input-server` moved into the `system` store package
+      and the five test programs into a new `test` one, so the boot image is 223,888 bytes in a
+      release build and 232,668 in a test one — **the same program list either way**, where it
+      used to be 323 KB against 680 KB. Init's boot order changed as a consequence: the
+      display arm now comes up after `/bin` exists. See the 2026-08-11 decision-log entry.
+
+      **The toolkit reached a screen** — `ui-testclient` presents `libui::reference` (one of
+      each widget, drawn with the font it read off the disk) in a second window, and
+      `check-display` renders the same function on the host and compares it pixel for pixel.
+      That first render found a real defect: `Node::Fill` measured to `c.max`, so the first
+      `button` in a row took the whole row and its siblings got nothing.
 
       **No text area** — the design pass found this line contradicting Milestone 5, which
       makes the terminal grid a *custom-drawn widget of its own* precisely so it is not a

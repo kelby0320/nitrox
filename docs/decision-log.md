@@ -13030,3 +13030,120 @@ one channel with nothing to attribute them to. It cost two bytes that were alrea
 because the record was a day old. `KeyEvent` and `PointerEvent` have the identical gap and are
 *shipped*, so they are filed with a trigger rather than widened: the first client with two
 windows, which is Part C's menus.
+
+## 2026-08-11 — The font goes on the root filesystem, and the initramfs is put back on its diet
+
+M4 Part C's last piece was shipping the font somewhere a client could load it at runtime. The
+plan had already settled *where* — the root filesystem, not the initramfs — so the question
+this entry answers is a different one: whether to also clean up the initramfs while standing
+in the same code, and what to do so the cleanup stops coming undone.
+
+### The font
+
+`/system/fonts/DejaVuSansMono.ttf`, staged by the image build alongside its licence, resolved
+by `libdraw::text::load` (behind the `io` feature, beside `acquire`) and demand-paged out of
+ext4. Nothing that draws text runs before the root is mounted, and the compositor never loads
+a font at all — clients render text into their own buffers.
+
+The licence ships next to it because the font is redistributed. Staged from the same file the
+host tests `include_bytes!`, so no gate can pass against a different font from the one on the
+disk.
+
+### The initramfs regression
+
+`initramfs-minimisation` was resolved on 2026-08-03: the boot image carries only what cannot
+come from a filesystem. **It regressed within the week.** The display arm added `compositor`
+and `input-server` for one reason — they predate `/bin` — and neither has a bootstrap role. In
+test builds five more programs rode along. A test image's initramfs was 680 KB against a
+release's 323 KB.
+
+I folded the cleanup into this change rather than filing it, because the alternative was
+touching the same forty lines of `assemble_image` twice, and because M5 adds more display
+servers to the same list.
+
+**What moved:** `compositor` and `input-server` into the `system` store package; the five test
+programs into a new `test` package, present only in selftest builds. What stayed, with the
+reason written down beside each: `init`, `fs-server-ext4`, `eshell`, `profile-server`.
+223,888 bytes in a release build and 232,668 in a test one — **the same program list either
+way**, the difference being that `init` itself carries the selftest feature. So the initramfs a
+test boots is, program for program, the one a release boots; before this it was 680 KB against
+323 KB and carried five programs a release never sees.
+
+`test-harness` moving out deserves a note, because "the harness must not depend on the thing
+it adjudicates" is a real argument and it does not apply: `run_test_harness` is called from
+`supervise`, after the mount, after `/bin`. A boot that fails the mount reaches `emergency`
+and never runs the harness either way.
+
+**Init's boot order changed as a consequence**: the display arm now comes up *after* the
+profile server, the logging service and the terminal server, because it is spawned from `/bin`
+like everything else. It used to come first purely because the initramfs is available from the
+first instruction.
+
+### Why it will not regress a third time
+
+Twice is a pattern, and both times the mechanism was the same: adding a name to a list of
+names is a one-word change that looks like every other one-word change. So the list is no
+longer a list of names. `INITRAMFS_PROGRAMS` is `(program, why it cannot come from the
+filesystem)`, and you cannot add an entry without writing the reason. Behind that,
+`INITRAMFS_MAX_BYTES` fails the build at 384 KiB with a message that asks the question.
+
+A ceiling is a crude instrument and it is the right one here: the failure mode is silent
+accretion, and size is the one symptom that shows up without anyone looking.
+
+### The gate: `libui::reference`
+
+Getting a font onto the disk proves nothing unless something reads it, so `ui-testclient`
+gained a second window presenting `libui::reference` — a fixed picture using one of each
+widget Part C built — drawn with the font it read from ext4. `check-display` renders the same
+function on the host and compares pixel for pixel.
+
+This is the first time the toolkit has been on a screen. Everything in `libui` was host-tested
+against a font compiled into the test binary, which cannot show that a font loads on the
+target, that the target rasterises as the host does, or that a toolkit-painted buffer survives
+the trip through the Surface protocol.
+
+**Two connections rather than two windows on one**, because `KeyEvent`/`PointerEvent` carry no
+window id (a gap recorded in `rsproto-surface-ops.md` with "the first client with two windows"
+as its trigger). A session each keeps the question from arising and costs one channel; it is
+not a dodge, since it is genuinely unambiguous.
+
+**The UI window is created first**, so the reference scene stacks above it. The comparison
+skips the scene's rectangle — which is not a weakening, because a compositor that stacked them
+the other way fails the *scene* comparison.
+
+Verified by breaking it twice: with the font unstaged the client reports `font load FAILED`
+and the gate times out; with one byte of the guest's render flipped the gate names the pixel.
+The first attempt at that second break flipped a byte inside the scene's rectangle and passed
+— the excluded region is real, and I would have believed a green run.
+
+### What the reference UI found on its first render
+
+A defect in the widget set, immediately: `Node::Fill` measured to `c.max`, and `button` and
+`menu_bar` are stacks over a `Fill`, so **the first widget in a `Row` or `Column` measured to
+the entire remaining extent and its siblings got none**. A two-item menu bar laid its second
+item out at zero width, off the right edge.
+
+`element.rs` had documented `Fill` as measuring "to nothing" all along; `layout.rs` returned
+`c.max` with a comment justifying it on the grounds that zero "would make a button's face
+collapse inside a `Column`" — which is not what happens, because `arrange` gives every `Stack`
+layer the whole rect regardless of what it measured. The justification was written before
+`button` existed.
+
+Nothing caught it because **every widget test lays one widget into a rectangle of its own**,
+where a greedy measure and a correct one give identical answers. That is the milestone's
+recurring shape again: the test observed something downstream of what it claimed to check.
+Two regression tests now state it both ways — two buttons side by side, and a button's
+measure being independent of the room around it.
+
+### The measurement the deferral had scheduled
+
+`deferred-decisions.md` scheduled a read-ahead revisit "after the desktop UI MVP", so I took
+the counters. The first finding was that **the trigger had already fired unobserved**: the
+recorded figure was 43 fills, and the tree before this change was at 2,778. The 2026-08-03
+store work moved the services onto ext4 and nobody re-read the counters. The scheduled revisit
+is what caught it, which is the argument for scheduling them.
+
+This change takes it to 3,021 fills (5.2 % of boot) — reproduced exactly across two runs. Read-ahead stays deferred, but for a new
+reason: **image materialisation is 656 ms, 83 % of spawn time**, and `sys_spawn` copies the
+whole ELF eagerly whether or not its pages are touched. Demand-paged program text subsumes
+most of what read-ahead would buy, so it goes first.

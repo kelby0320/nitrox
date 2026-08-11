@@ -151,6 +151,91 @@ impl Font {
     }
 }
 
+/// Where the system font is bound on the root filesystem.
+///
+/// **On the root filesystem, not in the initramfs.** The boot image carries only what cannot
+/// come from a filesystem — see `docs/rationale/deferred-decisions.md`
+/// (`initramfs-minimisation`) — and nothing that draws text runs before the root is mounted.
+/// A 343 KiB font would have been larger than every program in the boot image put together.
+pub const SYSTEM_FONT_PATH: &str = "/system/fonts/DejaVuSansMono.ttf";
+
+/// The largest font file [`load`] will read.
+///
+/// A bound rather than trust: the size comes from `sys_handle_stat` on a file this process
+/// does not own, and it is used to size an allocation.
+pub const MAX_FONT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Why loading a font from the namespace failed.
+#[cfg(feature = "io")]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum LoadError {
+    /// The path did not resolve — no font at that path in this namespace.
+    NoBinding,
+    /// The handle resolved but its metadata could not be read.
+    Unstattable,
+    /// The file is empty, or larger than [`MAX_FONT_BYTES`].
+    ImpossibleSize(u64),
+    /// The file resolved but could not be mapped.
+    Unmappable,
+    /// The bytes are not a font this rasteriser can parse.
+    NotAFont,
+}
+
+/// Load a font from `path` in `root_ns`.
+///
+/// The counterpart to [`acquire`](crate::acquire) for the other half of drawing: authority is
+/// the namespace binding, so this either finds the file or does not, and there is no font
+/// capability to ask for.
+///
+/// It maps, copies and unmaps rather than holding the mapping, because [`Font`] owns its
+/// bytes — `ab_glyph`'s parser keeps references into them, and a mapping is a thing another
+/// process could have unmapped underneath us.
+///
+/// # Safety
+///
+/// `root_ns` must be a live namespace handle owned by the caller for the duration of the
+/// call. It is borrowed, never closed.
+#[cfg(feature = "io")]
+pub unsafe fn load(root_ns: u64, path: &str) -> Result<Font, LoadError> {
+    use libkern::abi::HandleInfo;
+    use libkern::handle::{RawHandle, Rights};
+    use libkern::{SYS_HANDLE_STAT, syscall2};
+    use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
+
+    // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` yields a
+    // non-owning view that never closes it.
+    let ns = unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
+    // SAFETY: the path resolves to a read-mappable file object, or it does not resolve.
+    let obj = block_on(unsafe {
+        ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ | Rights::INSPECT)
+    })
+    .map_err(|_| LoadError::NoBinding)?;
+
+    // The exact byte length. Mapping is page-granular, so without this the parser would be
+    // handed however much zero padding the last page carries.
+    let mut info = HandleInfo { rights: 0, object_type: 0, generation: 0, size: 0 };
+    // SAFETY: `&mut info` is a valid 24-byte `HandleInfo` out-param, and `obj` is live.
+    let sr = unsafe { syscall2(SYS_HANDLE_STAT, obj.raw().0, (&mut info as *mut HandleInfo) as u64) };
+    if sr < 0 {
+        return Err(LoadError::Unstattable);
+    }
+    if info.size == 0 || info.size as usize > MAX_FONT_BYTES {
+        return Err(LoadError::ImpossibleSize(info.size));
+    }
+    let size = info.size as usize;
+
+    let addr = obj.map(size).map_err(|_| LoadError::Unmappable)?;
+    let mut data = Vec::new();
+    // Reserve up front: growing a 343 KiB vector by doubling would map, copy and unmap the
+    // whole thing several times over, which on a demand-paged file means faulting it in twice.
+    data.try_reserve_exact(size).map_err(|_| LoadError::ImpossibleSize(info.size))?;
+    // SAFETY: `map` returned a mapping of at least `size` readable bytes.
+    data.extend_from_slice(unsafe { core::slice::from_raw_parts(addr as *const u8, size) });
+    let _ = obj.unmap(addr as *mut u8, size);
+
+    Font::from_bytes(data).ok_or(LoadError::NotAFont)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

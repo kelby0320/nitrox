@@ -132,7 +132,7 @@ static mut SPAWN_TTY: SpawnArgs = SpawnArgs {
 };
 
 static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/logging-service
+    image: 0, // resolved at spawn from /bin/logging-service
     handle_count: 1,
     move_mask: 1, // move handle 0 (the control endpoint) to the child
     arg0: 0,
@@ -141,13 +141,13 @@ static mut SPAWN_LOGGING: SpawnArgs = SpawnArgs {
     namespace: 0,
     syscaps: 0, // a resource server holds no ambient capabilities
 };
-/// Spawn args for the integration test harness (`/initramfs/sbin/test-harness`): no
+/// Spawn args for the integration test harness (`/bin/test-harness`): no
 /// handles, inherit a LOOKUP-only handle to init's root namespace (so it resolves the
 /// kernel servers). It constructs fresh namespaces in its `ns`/`forward` checks, so init
 /// grants it `BIND_NAMESPACE`. Selftest builds only.
 #[cfg(feature = "selftest")]
 static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/test-harness
+    image: 0, // resolved at spawn from /bin/test-harness
     handle_count: 0,
     move_mask: 0,
     arg0: 0,
@@ -162,7 +162,7 @@ static mut SPAWN_HARNESS: SpawnArgs = SpawnArgs {
 /// that binding is the whole of the keylogging boundary.
 #[cfg(feature = "selftest")]
 static mut SPAWN_INPUTCLIENT: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/input-testclient
+    image: 0, // resolved at spawn from /bin/input-testclient
     handle_count: 0,
     move_mask: 0,
     arg0: 0,
@@ -180,7 +180,7 @@ static mut SPAWN_INPUTCLIENT: SpawnArgs = SpawnArgs {
 fn run_input_testclient(root_ns: u64) {
     // SAFETY: SPAWN_INPUTCLIENT is a valid writable arg block.
     let h = unsafe {
-        spawn_program(root_ns, b"/initramfs/sbin/input-testclient", &raw mut SPAWN_INPUTCLIENT)
+        spawn_program(root_ns, b"/bin/input-testclient", &raw mut SPAWN_INPUTCLIENT)
     };
     if h < 0 {
         kprint(b"init: input-testclient spawn FAIL\n");
@@ -195,7 +195,7 @@ fn run_input_testclient(root_ns: u64) {
 /// syscaps** — authority over the display is the namespace binding, nothing more.
 #[cfg(feature = "selftest")]
 static mut SPAWN_UICLIENT: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/ui-testclient
+    image: 0, // resolved at spawn from /bin/ui-testclient
     handle_count: 0,
     move_mask: 0,
     arg0: 0,
@@ -210,7 +210,7 @@ static mut SPAWN_UICLIENT: SpawnArgs = SpawnArgs {
 /// authority over the display is the namespace binding itself. Selftest builds only.
 #[cfg(feature = "selftest")]
 static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/display-selftest
+    image: 0, // resolved at spawn from /bin/display-selftest
     handle_count: 0,
     move_mask: 0,
     arg0: 0,
@@ -229,7 +229,7 @@ static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
 /// unfiltered is a keylogger, and the binding is the whole of that boundary
 /// (`docs/design/input-subsystem.md` §5).
 static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/input-server
+    image: 0, // resolved at spawn from /bin/input-server
     handle_count: 1,
     move_mask: 1, // move handle 0 (the control endpoint) to the child
     arg0: 0,
@@ -247,7 +247,7 @@ static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
 /// **No syscaps** — it binds nothing; init does the binding, as for every other resource
 /// server (`docs/rationale/why-supervisor-registration.md`).
 static mut SPAWN_COMPOSITOR: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/compositor
+    image: 0, // resolved at spawn from /bin/compositor
     handle_count: 1,
     move_mask: 1, // move handle 0 (the control endpoint) to the child
     arg0: 0,
@@ -284,7 +284,7 @@ static mut SPAWN_ESHELL: SpawnArgs = SpawnArgs {
 /// boots now (the selftest boot brings the login chain up after the demo chain reaps so
 /// it is exercised under `test-qemu`).
 static mut SPAWN_SERVICE_MGR: SpawnArgs = SpawnArgs {
-    image: 0, // resolved at spawn from /initramfs/sbin/service-mgr
+    image: 0, // resolved at spawn from /bin/service-mgr
     handle_count: 1,
     move_mask: 1, // move handle 0 (the handoff channel) to service-mgr
     arg0: 0,
@@ -932,7 +932,7 @@ fn bind_input_server(root_ns: u64) -> bool {
     // SAFETY: SPAWN_INPUT_SERVER is a valid writable arg block.
     let h = unsafe {
         SPAWN_INPUT_SERVER.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/initramfs/sbin/input-server", &raw mut SPAWN_INPUT_SERVER)
+        spawn_program(root_ns, b"/bin/input-server", &raw mut SPAWN_INPUT_SERVER)
     };
     if h < 0 {
         kprint(b"init: input-server spawn FAIL\n");
@@ -992,7 +992,7 @@ fn bind_compositor(root_ns: u64) -> bool {
     // SAFETY: SPAWN_COMPOSITOR is a valid writable arg block.
     let h = unsafe {
         SPAWN_COMPOSITOR.handles[0] = ctrl_srv;
-        spawn_program(root_ns, b"/initramfs/sbin/compositor", &raw mut SPAWN_COMPOSITOR)
+        spawn_program(root_ns, b"/bin/compositor", &raw mut SPAWN_COMPOSITOR)
     };
     if h < 0 {
         kprint(b"init: compositor spawn FAIL\n");
@@ -1625,7 +1625,7 @@ fn run_test_harness(notif: u64, root_ns: u64) -> bool {
     kprint(b"init: running integration test harness\n");
     // SAFETY: SPAWN_HARNESS is a valid writable arg block.
     let h =
-        unsafe { spawn_program(root_ns, b"/initramfs/sbin/test-harness", &raw mut SPAWN_HARNESS) };
+        unsafe { spawn_program(root_ns, b"/bin/test-harness", &raw mut SPAWN_HARNESS) };
     if h < 0 {
         kprint(b"init: test-harness spawn FAIL\n");
         return false;
@@ -1676,7 +1676,7 @@ fn run_test_harness(notif: u64, root_ns: u64) -> bool {
 fn run_display_selftest(notif: u64, root_ns: u64) {
     // SAFETY: SPAWN_DISPLAY is a valid writable arg block.
     let h = unsafe {
-        spawn_program(root_ns, b"/initramfs/sbin/display-selftest", &raw mut SPAWN_DISPLAY)
+        spawn_program(root_ns, b"/bin/display-selftest", &raw mut SPAWN_DISPLAY)
     };
     if h < 0 {
         kprint(b"init: display-selftest spawn FAIL\n");
@@ -1747,7 +1747,7 @@ fn run_display_selftest(notif: u64, root_ns: u64) {
 fn run_ui_testclient(root_ns: u64) {
     // SAFETY: SPAWN_UICLIENT is a valid writable arg block.
     let h = unsafe {
-        spawn_program(root_ns, b"/initramfs/sbin/ui-testclient", &raw mut SPAWN_UICLIENT)
+        spawn_program(root_ns, b"/bin/ui-testclient", &raw mut SPAWN_UICLIENT)
     };
     if h < 0 {
         kprint(b"init: ui-testclient spawn FAIL\n");
@@ -1957,38 +1957,6 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     #[cfg(feature = "selftest")]
     subtree_bind_test(root_ns);
 
-    // The display arm's guest-side gate runs as its own program
-    // (`display-selftest`), not inline here: compositing is not init's job, and
-    // `userspace/init/CLAUDE.md` calls this critical-path code. It supersedes the
-    // inline framebuffer demo that proved M1 Part B.
-    // The input server first, and **the order is load-bearing**: the compositor resolves
-    // `/dev/input/new` during its own startup, before it answers `Meta::Ready`. Spawned the
-    // other way round it would find nothing bound and serve the display with no input, for
-    // the life of the boot, with only a log line to say so. Not fatal either way — a machine
-    // with no i8042 has no raw nodes, the server says so and exits, and everything else
-    // comes up normally.
-    if !bind_input_server(root_ns) {
-        kprint(b"init: no input server; /dev/input/new unavailable\n");
-    }
-
-    if !bind_compositor(root_ns) {
-        kprint(b"init: no compositor; /dev/draw unavailable\n");
-    }
-
-    #[cfg(feature = "selftest")]
-    run_display_selftest(notif, root_ns);
-
-    // After the compositor is serving: the first client. Its committed buffer is what
-    // `check-display` compares, so it runs last and leaves the scene on screen.
-    #[cfg(feature = "selftest")]
-    run_ui_testclient(root_ns);
-
-    // The input client reads `/dev/input/raw/*`, which the i8042 driver published at boot.
-    // It parks its reads and announces `listening`; `cargo xtask check-input` injects from
-    // the host once it sees that line.
-    #[cfg(feature = "selftest")]
-    run_input_testclient(root_ns);
-
     // Spawn the system profile server and bind it at `/bin` (per init CLAUDE.md step 4).
     // Critical-path: without `/bin`, no program resolves for the services init launches.
     if !bind_profile_server(root_ns) {
@@ -2007,6 +1975,47 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
     if !bind_tty_server(root_ns) {
         kprint(b"init: no terminal server; sessions will have no /dev/tty\n");
     }
+
+    // ---- the display arm ----
+    //
+    // **After `/bin`, since 2026-08-11.** The compositor and the input server used to come up
+    // here *before* the profile server, for one reason: they were in the initramfs, which is
+    // available from the first instruction. They are store packages now — nothing about a
+    // display is needed to reach a mounted root, and a client cannot even load a font before
+    // there is a filesystem — so they are spawned from `/bin` like every other service, and
+    // that means after the thing that provides `/bin`.
+    //
+    // The display arm's guest-side gate runs as its own program (`display-selftest`), not
+    // inline here: compositing is not init's job, and `userspace/init/CLAUDE.md` calls this
+    // critical-path code. It supersedes the inline framebuffer demo that proved M1 Part B.
+    //
+    // The input server first, and **the order is load-bearing**: the compositor resolves
+    // `/dev/input/new` during its own startup, before it answers `Meta::Ready`. Spawned the
+    // other way round it would find nothing bound and serve the display with no input, for
+    // the life of the boot, with only a log line to say so. Not fatal either way — a machine
+    // with no i8042 has no raw nodes, the server says so and exits, and everything else
+    // comes up normally.
+    if !bind_input_server(root_ns) {
+        kprint(b"init: no input server; /dev/input/new unavailable\n");
+    }
+
+    if !bind_compositor(root_ns) {
+        kprint(b"init: no compositor; /dev/draw unavailable\n");
+    }
+
+    #[cfg(feature = "selftest")]
+    run_display_selftest(notif, root_ns);
+
+    // After the compositor is serving: the first client. Its committed buffers are what
+    // `check-display` compares, so it runs last and leaves the scene on screen.
+    #[cfg(feature = "selftest")]
+    run_ui_testclient(root_ns);
+
+    // The input client reads `/dev/input/raw/*`, which the i8042 driver published at boot.
+    // It parks its reads and announces `listening`; `cargo xtask check-input` injects from
+    // the host once it sees that line.
+    #[cfg(feature = "selftest")]
+    run_input_testclient(root_ns);
 
     supervise(notif, root_ns);
 }

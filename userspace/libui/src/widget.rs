@@ -359,6 +359,54 @@ mod tests {
         assert_eq!(l.rect.size.w, 200, "and spans the width it is given");
     }
 
+    #[test]
+    fn a_menu_bars_items_each_get_their_own_width() {
+        // **The test this file was missing.** Every other one here lays *one* widget into a
+        // rectangle of its own, where a widget that measures to "everything available" and one
+        // that measures to its content are indistinguishable. Put two beside each other and
+        // they are not: until 2026-08-11 `Node::Fill` measured to `c.max`, so the first
+        // `button` — a `Stack` over a `Fill` — took the whole row and the second laid out at
+        // zero width, off the right edge. The bar looked correct in every assertion above.
+        let p = Palette::default();
+        let items: vec::Vec<Element<Msg>> = vec![
+            button("File", (), WidgetState::default(), &p),
+            button("Edit", (), WidgetState::default(), &p),
+        ];
+        let e = menu_bar(items, 24, &p);
+        let l = layout(&e, Rect::new(0, 0, 200, 100), &CELL);
+        // sized -> stack -> [face fill, row] ; row -> the two buttons
+        let row = &l.children[0].children[1];
+        let (a, b) = (row.children[0].rect, row.children[1].rect);
+        assert!(a.size.w > 0, "the first item measured to nothing");
+        assert!(b.size.w > 0, "the second item got no width — the first one ate the row");
+        assert_eq!(b.origin.x, a.origin.x + a.size.w as i32, "and they sit side by side");
+        assert!(
+            b.right() <= 200,
+            "the second item runs off the bar: {:?}",
+            b
+        );
+    }
+
+    #[test]
+    fn a_button_measures_to_its_label_not_to_the_room_it_is_given() {
+        // The same defect stated as a property rather than as a composition. A button in a
+        // 400-pixel-tall column is not a 400-pixel-tall button.
+        let p = Palette::default();
+        let e: Element<Msg> = button("OK", (), WidgetState::default(), &p);
+        let big = crate::layout::measure(
+            &e,
+            crate::layout::Constraints::loose(libdraw::geom::Size::new(400, 400)),
+            &CELL,
+        );
+        let small = crate::layout::measure(
+            &e,
+            crate::layout::Constraints::loose(libdraw::geom::Size::new(100, 100)),
+            &CELL,
+        );
+        assert_eq!(big, small, "a button's size must not depend on the room around it");
+        assert!(big.h < 100, "a two-line-tall button: {big:?}");
+    }
+
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
 
     fn font() -> libdraw::text::Font {

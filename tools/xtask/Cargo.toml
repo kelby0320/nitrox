@@ -16,3 +16,7 @@ libcrypto = { path = "../../userspace/libcrypto" }
 # golden file checked into the repo. `libdraw`'s core is `core + alloc` with no
 # dependencies, so the host build is free; the `io` feature (syscalls) stays off.
 libdraw = { path = "../../userspace/libdraw" }
+# The toolkit, for the same reason: the display gate renders `libui::reference` here and
+# compares it against what the guest put on the screen. Its core is `core + alloc` over
+# `libdraw` and `librsproto`, so the host build stays free of syscalls.
+libui = { path = "../../userspace/libui" }

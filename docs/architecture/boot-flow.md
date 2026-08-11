@@ -5,7 +5,7 @@
 complete, 2026-07-21). Every stage below is exercised on each CI run by
 `cargo xtask test-qemu` (headless, adjudicated by `isa-debug-exit`) and
 `cargo xtask test-interactive` (expect-driven over the serial console).
-Verified against source 2026-08-06.
+Verified against source 2026-08-11 (the display arm's position in § 5 changed that day).
 
 ## Overview
 
@@ -28,6 +28,8 @@ UEFI firmware (OVMF under QEMU)
                           ├─ bind profile-server at /bin
                           ├─ bind logging-service at /log
                           ├─ bind tty-server at /dev/tty
+                          ├─ bind input-server at /dev/input/new
+                          ├─ bind compositor at /dev/draw
                           └─► service-mgr
                                 ├─► auth-service
                                 └─► session-mgr ─► login ─► nxsh
@@ -58,6 +60,16 @@ nitrox.hdd (128 MiB raw, GPT — two partitions)
 └── partition 2 (ext4, "nitrox-root", type 8300, rest of disk)
     └── the root filesystem: /system, /home, /store
 ```
+
+The initramfs holds **four programs and two manifests**, and the rule is narrow: a program is
+in the boot image only if it cannot come from a filesystem. `init` (the kernel boot-loads it),
+`fs-server-ext4` (it *is* the root mount), `eshell` (the recovery path *for a failed mount*),
+and `profile-server` (`/bin` does not exist until it runs). Everything else — the services,
+the coreutils, the display arm, the test programs — lives in the content-addressed store and
+is projected into `/bin`. The list is the same in every build mode, so the boot path a test
+exercises is the boot path that ships. See `tools/xtask/src/main.rs`'s `INITRAMFS_PROGRAMS`,
+which pairs each entry with its reason, and the ceiling that fails the build if the list
+grows.
 
 The second partition rides the same boot disk on purpose: the GPT driver enumerates every
 non-empty entry and binds `/dev/disk/by-partlabel/nitrox-root`, so no separate QEMU drive
@@ -157,7 +169,18 @@ than an implementation detail.
 
    The tty server is the one **non-fatal** binding: if it fails, init logs "no terminal
    server; sessions will have no `/dev/tty`" and continues.
-4. **Hand off** to `service-mgr` and stay resident as supervisor.
+4. **Bring up the display arm** — `input-server` at `/dev/input/new`, then `compositor` at
+   `/dev/draw`. Both non-fatal: a machine with no i8042 has no raw input nodes, the server
+   says so and exits, and everything else comes up normally.
+
+   **The order within the step is load-bearing**: the compositor resolves `/dev/input/new`
+   during its own startup, before it answers `Ready`. Spawned the other way round it would
+   serve the display with no input for the life of the boot, with only a log line to say so.
+
+   **This step is after step 3, not before it** (since 2026-08-11): both are spawned from
+   `/bin`, so they cannot start until the profile server has provided it. They used to come
+   first only because they were initramfs-resident.
+5. **Hand off** to `service-mgr` and stay resident as supervisor.
 
 Under the `selftest` / `test-harness` builds init additionally runs the filesystem demo
 chain (large-file read, overwrite, grow, create, subtree bind) between steps 2 and 3, and

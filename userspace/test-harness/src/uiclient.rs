@@ -35,6 +35,24 @@
 //! So failures are reported with `sys_test_exit` directly, and success **parks**: the
 //! window stays on screen for as long as the machine runs, which is what every real client
 //! does.
+//!
+//! ## The second window: the toolkit, and a font read from the disk
+//!
+//! Since M4 Part C it also presents [`libui::reference`] in a window of its own, which is the
+//! only thing on the target that has ever loaded a font. Everything about the toolkit was
+//! host-tested against a font compiled into the test binary; this reads
+//! `/system/fonts/DejaVuSansMono.ttf` through `fs-server-ext4` and rasterises with it, and
+//! `check-display` compares the result against the same render performed on the host.
+//!
+//! **Two connections, not two windows on one.** The compositor's `KeyEvent`/`PointerEvent`
+//! records carry no window id (a gap recorded in `docs/spec/rsproto-surface-ops.md`), so a
+//! single session with two windows could not tell which of them a keystroke was for. A
+//! session each keeps that question from arising, and costs one channel.
+//!
+//! **The UI window is created first**, so the reference scene — created second — stacks above
+//! it. That ordering is load-bearing for the gate: it compares the scene's 64×32 at the
+//! top-left and the toolkit's picture everywhere *else* the UI window covers, so a compositor
+//! that stacked them the other way fails the scene comparison rather than passing quietly.
 
 #![no_std]
 #![no_main]
@@ -287,6 +305,89 @@ fn churn(root_ns: u64) -> bool {
     true
 }
 
+/// Present [`libui::reference`] in a window of its own, drawn with the font from the disk.
+///
+/// Returns the window, which the caller must keep alive: dropping it closes the channel, the
+/// compositor destroys the window, and the picture leaves the screen.
+///
+/// Every failure here is fatal to the run. A font that does not load is exactly the
+/// regression this exists to catch — the file is staged into the ext4 root by the image
+/// build, so "it did not resolve" means the staging broke, and carrying on would leave a
+/// green boot with no text on screen.
+fn present_reference_ui(root_ns: u64) -> Window<alloc::boxed::Box<ChannelTransport>> {
+    use libdraw::text::{LoadError, SYSTEM_FONT_PATH, load};
+
+    // The font. Resolved through the namespace and demand-paged out of ext4 — the first time
+    // anything on the target has read one.
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let font = match unsafe { load(root_ns, SYSTEM_FONT_PATH) } {
+        Ok(f) => f,
+        Err(e) => {
+            let why: &[u8] = match e {
+                LoadError::NoBinding => b"did not resolve (is it staged into the rootfs?)",
+                LoadError::Unstattable => b"stat failed",
+                LoadError::ImpossibleSize(_) => b"empty, or larger than the cap",
+                LoadError::Unmappable => b"could not be mapped",
+                LoadError::NotAFont => b"is not a parseable font",
+            };
+            Line::new().s(b"ui-testclient: ").s(SYSTEM_FONT_PATH.as_bytes()).s(b" ").s(why).end();
+            fail(b"ui-testclient: font load FAILED\n");
+        }
+    };
+    kprint(b"ui-testclient: font loaded from /system/fonts\n");
+
+    let (w, h) = (libui::reference::WIDTH, libui::reference::HEIGHT);
+    let pitch = libui::reference::PITCH;
+    let len = pitch * h as usize;
+    // Rendered once. `into_bytes` hands back the buffer at exactly this pitch, so the copy
+    // below is a straight memcpy rather than the row-by-row translation the scene needs.
+    let picture = libui::reference::render(&font).into_bytes();
+    if picture.len() != len {
+        fail(b"ui-testclient: reference UI is not the size it declares\n");
+    }
+
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let t = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => alloc::boxed::Box::new(t),
+        Err(_) => fail(b"ui-testclient: second connect to /dev/draw FAILED\n"),
+    };
+    let mut win = match Window::new(t, w, h, Role::Normal, BUFFERS) {
+        Ok(win) => win,
+        Err(_) => fail(b"ui-testclient: reference UI CreateWindow FAILED\n"),
+    };
+    for i in 0..BUFFERS {
+        let Some((handle, addr)) = shared_buffer(len) else {
+            fail(b"ui-testclient: reference UI buffer alloc FAILED\n");
+        };
+        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
+        // regions are distinct allocations, so they cannot overlap.
+        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
+        if win.attach(i as u32, w, h, pitch as u32, handle).is_err() {
+            fail(b"ui-testclient: reference UI AttachBuffer FAILED\n");
+        }
+    }
+    // Commit both, then block for a release. One commit and one `acquire` would return the
+    // *other* free buffer immediately and prove nothing: the gate screendumps later, on a
+    // different channel, so without a receipt this window could still be uncomposited then.
+    for i in 0..BUFFERS {
+        if win.commit(i as u32, (0, 0, w, h)).is_err() {
+            fail(b"ui-testclient: reference UI Commit FAILED\n");
+        }
+    }
+    if win.acquire().is_err() {
+        fail(b"ui-testclient: reference UI never acknowledged\n");
+    }
+    Line::new()
+        .s(b"ui-testclient: reference UI presented, window ")
+        .u(win.id() as u64)
+        .s(b" ")
+        .u(w as u64)
+        .s(b"x")
+        .u(h as u64)
+        .end();
+    win
+}
+
 /// Report failure and end the run.
 ///
 /// Called instead of exiting with a code, because init cannot wait for this program: on
@@ -312,6 +413,11 @@ fn fail(msg: &[u8]) -> ! {
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"ui-testclient: up\n");
+
+    // 0. The toolkit's picture, in its own window, **before** the reference scene's — so the
+    //    scene stacks above it and the gate can compare both regions. Held for the process's
+    //    life; dropping it would close the channel and take the window off the screen.
+    let _ui_window = present_reference_ui(root_ns);
 
     // 1. A session. The compositor mints a channel per resolve of `/dev/draw/new`.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.

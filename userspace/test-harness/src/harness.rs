@@ -119,7 +119,7 @@ const STREAM_STACK_PAGES: u64 = 8;
 /// (the stage's bootstrap endpoint = the setup channel), `arg0` set at runtime to the
 /// bootstrap descriptor. Inherits parent's LOOKUP-only namespace.
 static mut SPAWN_STAGE: SpawnArgs = SpawnArgs {
-    image: 0,     // resolved at spawn from /initramfs/sbin/test-stage
+    image: 0,     // resolved at spawn from /bin/test-stage
     handle_count: 1,
     move_mask: 1, // move handle 0 (the setup channel) to the stage
     arg0: 0,      // set to `bootstrap_arg0(true)` at runtime
@@ -288,7 +288,7 @@ fn stage_spawn_demo(root_ns: u64, notif: u64) {
     const STAGE_ROWS: i64 = 500;
 
     // 1. Resolve the stage binary (the conforming `child` path).
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/test-stage", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, b"/bin/test-stage", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
         kprint(b"test-harness: stage image FAIL\n");
         exit(1);
@@ -1175,7 +1175,7 @@ fn timer_sleep_ms(ms: u64) {
 /// nonzero (→ init's fail path).
 fn exit_storm_demo(root_ns: u64, notif: u64) {
     kprint(b"test-harness: exit-storm start\n");
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/test-stage", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, b"/bin/test-stage", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
         kprint(b"test-harness: exit-storm image lookup FAIL\n");
         exit(1);
@@ -4193,7 +4193,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
     // Each worker's seed is passed conforming — via `argv` in the setup message
     // (`["fp", "<seed>"]`), never a role field in `arg0`.
     const SEEDS: [&str; FP_WORKERS] = ["1", "2", "3"];
-    let (st, img) = ns_lookup_wait(root_ns, b"/initramfs/sbin/test-stage", RIGHT_MAP_READ);
+    let (st, img) = ns_lookup_wait(root_ns, b"/bin/test-stage", RIGHT_MAP_READ);
     if st != 0 || img == 0 {
         kprint(b"test-harness: hard-float image lookup FAIL\n");
         exit(1);

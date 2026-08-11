@@ -61,7 +61,14 @@ const EXIT_USAGE: i64 = 64;
 /// for module imports on the grounds that a name crossing a file boundary should be
 /// explicit; a program name crosses the same boundary, and the real answer is namespace
 /// construction — a session sees the programs its namespace was built with.
-const PROGRAM_DIRS: &[&[u8]] = &[b"/bin/", b"/initramfs/sbin/"];
+///
+/// **`/initramfs/sbin` was the second entry and is gone (2026-08-11).** It was already
+/// unreachable — a session namespace holds no `/initramfs` binding (see
+/// `userspace/session-mgr/src/main.rs`), which is deliberate: a profile is a *choice* about
+/// what a user may run, and the boot image is an accident of bootstrapping. It has now also
+/// stopped being plausible: the boot image carries four programs, none of which anyone would
+/// type at a prompt.
+const PROGRAM_DIRS: &[&[u8]] = &[b"/bin/"];
 
 /// Cap on a captured stage output. Unbounded capture would let a spawned program run the
 /// shell out of memory.
