@@ -243,15 +243,28 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
             `ui-testclient` lines into one, which every gate still passed because each
             asserted substring was present, just no longer on its own line.
 
-      - [ ] **D2 — `libui` delivery, the echo client, and the gate.** `KeyEvent` and
+      - [x] **D2 — `libui` delivery, the echo client, and the gate.** ✅ (2026-08-10) `KeyEvent` and
             `PointerEvent` into a window's event queue, a client that echoes what arrived, and
             `check-input` extended to assert **through `libui`** rather than off the input
             server. This is the milestone's deliverable and the checkbox that retires
             "`check-input` proves the compositor is attached, not that a key reached a window".
 
-            It also owes the compositor's side of what C3 left open: a client is not told when
-            it gains or loses focus (`rsproto-surface-ops.md` records this as a gap, not a
-            design), and there is still no cursor drawn on screen.
+            `Window` gained a bounded event queue (`EVENT_QUEUE_MAX`), `next_event`,
+            `wait_event`, and a `WindowEvent::Dropped` marker on overflow. Input arriving
+            while a client is blocked in `acquire` is **queued, not lost** — the ordinary
+            case, since a client blocks exactly when the user is looking at the result and
+            typing into it.
+
+            The echo half went into `input-testclient` rather than a new binary, so one
+            injection proves both paths and there is no cross-process print ordering to get
+            wrong. Its window is **never committed to**, so the compositor skips it when
+            compositing and `check-display` is unaffected — a window that has not drawn shows
+            background, which is a real state and not a trick.
+
+            **Still open, and not folded in here:** a client is not told when it gains or
+            loses focus (`rsproto-surface-ops.md` records this as a gap, not a design), and
+            there is still no cursor drawn on screen. Both belong to M4's toolkit work,
+            which is the first thing that needs them.
 
       - [ ] **D3 — back-pressure for compositor→client messages.** Its re-trigger is literally
             "Part D, when a second client exists", and D2 creates that client.

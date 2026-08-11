@@ -942,6 +942,17 @@ fn cmd_check_input(accel: Accel) -> R<()> {
 
     session.expect("input-testclient: listening")?;
 
+    // **Wait for `ui-testclient` to finish before injecting anything.** Its leak probe churns
+    // 128 windows, and every one of them is a `Normal` window that becomes, for its brief
+    // life, the topmost window that takes focus — so a keystroke injected while it runs is
+    // routed to a window that is about to be destroyed. That is the compositor behaving
+    // correctly; it is the *gate* that was assuming a quiet stack. Diagnosed from the
+    // compositor's own routing log: `key win=9` while the client had announced `id=8`.
+    //
+    // Safe to wait for here rather than later: `listening` is printed milliseconds after
+    // spawn, the churn takes seconds, so this line always follows it.
+    session.expect("ui-testclient: PASSED")?;
+
     // A key down and up. `a` is scancode 0x1E in set 1, so keycode 30 — chosen because it
     // is in the identity range the decoder relies on, and because a wrong `E0` or release
     // bit shows up as a different code rather than as silence.
@@ -963,6 +974,37 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     session.expect("input-testclient: ev kind=2 code=1 value=3")?;
     qmp.send_button("left", true)?;
     session.expect("input-testclient: ev kind=1 code=272 value=1")?;
+    // Release it: phase 2 asserts on the button mask, and a press left held from here would
+    // make `buttons` already non-zero before its own click.
+    qmp.send_button("left", false)?;
+
+    // ---- Through a window ----
+    //
+    // Everything above proves the *device* stream reached userspace. This proves the
+    // Surface path: the compositor routed it to a window and `libui` delivered it into that
+    // window's queue. The client creates the window only now, so the two phases cannot
+    // contend for its four-message session ring.
+    session.expect("input-testclient: window ready")?;
+
+    // **The cursor is not moved.** The client's window is larger than the screen, so the
+    // cursor is already inside it. Steering it would take a dozen PS/2 motion events, each
+    // becoming a `PointerEvent` on a four-message session ring — the first version of this
+    // gate did exactly that and lost the keystroke behind the flood. One injection per
+    // assertion keeps at most two messages in flight, which is the discipline this gate
+    // needs until back-pressure is settled (M3 Part D3).
+
+    // `b` is keycode 48. It goes to the *focused* window — this client's, being the topmost
+    // that takes focus — not to whatever the cursor happens to be over.
+    qmp.send_key("b", true)?;
+    session.expect("input-testclient: win key code=48 down=1")?;
+    qmp.send_key("b", false)?;
+    session.expect("input-testclient: win key code=48 down=0")?;
+
+    // And a click, which is routed by hit-testing instead of focus. `buttons=1` is the mask
+    // the record carries on every kind — the field that used to read zero here.
+    qmp.send_button("left", true)?;
+    session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
+    qmp.send_button("left", false)?;
 
     session.expect("input-testclient: PASSED")?;
     let _ = fs::remove_file(&qmp_sock);

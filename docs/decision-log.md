@@ -12435,3 +12435,53 @@ Two smaller notes from the same work:
   as a NUL byte — caught by a test written for the suffix hazard, which found the opposite one.
   The fix was to delete the cleverness: the buffer is a local, so nothing borrowed `self` and
   no copy was needed at all.
+
+## 2026-08-10 — D2: three bugs that were all the gate assuming a quiet system
+
+M3 Part D2 closed the loop: an injected keystroke and click reach a **window**. `libui`
+queues input per window; `input-testclient` grew a second phase that echoes what arrived;
+`check-input` asserts through `libui` rather than off the input server.
+
+**The echo half went into the existing client rather than a new binary.** Two processes
+would have meant two `listening` lines with no guaranteed order between them, and a gate
+whose `expect` cursor advances cannot wait for two things whose order it does not know. One
+process, one injection, both paths.
+
+**Its window is never committed to.** The compositor already skips windows with no committed
+buffer — "a client that has created a window but not yet drawn into it should show
+background" — so the client can hold a focusable, hit-testable window for a whole boot
+without disturbing `check-display`, which compares the screen pixel for pixel. That is not a
+trick; it is a real state the compositor already had a defined answer for.
+
+**Three failures, and none of them were in the code under test.** Each was the gate assuming
+something about the system that had never been true:
+
+1. *A window larger than the screen, because steering the cursor cost too much.* The first
+   version drove the cursor into a corner with twelve PS/2 motion events. Each became a
+   `PointerEvent` on the client's **four-message** session ring, and the keystroke behind
+   them was dropped. The fix was to stop needing the cursor moved: the window is bigger than
+   any screen, so the cursor is already inside it. This is the back-pressure deferral
+   (D3) making itself felt from the wrong side, and it is why D3 comes next rather than
+   sooner — the gate now keeps at most two messages in flight by construction.
+2. *The leak probe was still running.* `ui-testclient` churns 128 windows, each a `Normal`
+   window that is, for its brief life, the topmost window that takes focus. Keys injected
+   during it were routed to a window about to be destroyed. The compositor was right; the
+   gate was assuming a quiet stack. It now waits for `ui-testclient: PASSED` first.
+3. *The client's completion sentinel fired on the wrong event.* It ended its phase on any
+   button record, and the first to arrive was the *release* left over from phase 1 — so it
+   printed `PASSED` and exited while the harness was still asserting, and the compositor
+   correctly delivered the rest to whatever window remained. A button **press** is the
+   sentinel now, matching the raw phase's existing "a sentinel rather than a count" rule.
+
+All three were diagnosed from **the compositor's own routing log** — `key win=9` against a
+client that had announced `id=8`, then `key win=1` after `window ready id=130`. The log was
+added in C3 as a bounded diagnostic with no particular use in mind; it turned out to be the
+only thing in the system that could say *where an event went*, which is the one question
+every one of these failures was really asking. Its eight-line budget had to be raised by hand
+three times to see anything, which is the argument for making it adjustable rather than
+constant — filed as a nuisance, not a defect.
+
+The pattern across all three: **the gate's assumptions were the untested part.** The
+compositor, `libinput` and `libui` did exactly what their host tests said they would. What
+had never been checked was that a test harness injecting into a live multi-process system
+gets a system in the state it imagined.

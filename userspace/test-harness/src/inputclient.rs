@@ -28,12 +28,38 @@
 #![no_std]
 #![no_main]
 
+extern crate alloc;
+
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::{
     RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
     syscall4,
 };
+use librsproto::surface::Role;
+use libui::{Window, WindowEvent, ipc::ChannelTransport};
+
+/// `alloc` backing — `libui` holds its buffers and event queue on the heap.
+#[global_allocator]
+static ALLOC: libheap::Heap = libheap::Heap;
+
+/// The invisible window's size.
+///
+/// **Nothing is ever committed to it**, so the compositor skips it when compositing — a
+/// window that has created buffers but not drawn shows background, which is a real state and
+/// not a trick. That is what lets this client hold a focusable, hit-testable window through
+/// a boot without disturbing `cargo xtask check-display`, which compares the screen against
+/// `ui-testclient`'s scene pixel for pixel.
+///
+/// **Larger than any screen, deliberately.** New windows land at `(0, 0)`, so a window this
+/// size contains the cursor wherever the compositor parked it — which means the gate can
+/// click without first driving the cursor somewhere known. That matters more than it sounds:
+/// steering the cursor takes a dozen PS/2 motion events, each of which becomes a
+/// `PointerEvent` on this client's **four-message** session ring, and the first attempt at
+/// this gate lost the keystroke behind exactly that flood. The compositor clips, so an
+/// oversized window is ordinary — a maximised one is the same shape.
+const WIN_W: u32 = 2048;
+const WIN_H: u32 = 2048;
 
 /// Bytes per record, from the shared ABI rather than a local literal — an earlier version
 /// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
@@ -211,6 +237,88 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 kprint(b"input-testclient: stream FAILED\n");
                 exit(1);
             }
+        }
+    }
+
+    // ---- Phase 2: the same events, but through a *window* ----
+    //
+    // The window is created **after** phase 1 rather than up front. With no window, the
+    // compositor has nothing to route phase 1's events to and sends nothing; created early,
+    // its records would queue on this client's session channel while it was blocked reading
+    // the raw stream, and that channel holds four messages before sends start failing. That
+    // is a real hazard and it is filed (`deferred-decisions.md`, compositor→client
+    // back-pressure) — sequencing the phases means this gate is not the thing that discovers
+    // it, and D3 can characterise it deliberately.
+    let transport = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => t,
+        Err(_) => {
+            kprint(b"input-testclient: /dev/draw connect FAILED\n");
+            exit(1);
+        }
+    };
+    let Ok(mut win) = Window::new(
+        alloc::boxed::Box::new(transport),
+        WIN_W,
+        WIN_H,
+        Role::Normal,
+        2,
+    ) else {
+        kprint(b"input-testclient: Window::new FAILED\n");
+        exit(1);
+    };
+
+    // The second synchronisation point. The window has to exist before the harness injects
+    // at it, for the same reason `listening` exists: a keystroke routed before there is a
+    // focusable window is one the compositor correctly drops.
+    Line::new().s(b"input-testclient: window ready id=").u(win.id() as u64).end();
+
+    // **A button *press* is the sentinel**, for the same reason `DONE_CODE` is one for the
+    // raw stream: it is the last thing the harness injects. Accepting any button record
+    // ended the phase on the release left over from phase 1 — which arrives before anything
+    // aimed at this window — so the client printed `PASSED` and exited while the harness was
+    // still asserting, and the compositor correctly routed the remaining keys to whatever
+    // window was left. Diagnosed from `compositor: key win=1` after `window ready id=130`.
+    let (mut saw_key, mut saw_press) = (false, false);
+    while !(saw_key && saw_press) {
+        let ev = match win.wait_event() {
+            Ok(e) => e,
+            Err(_) => {
+                kprint(b"input-testclient: window stream FAILED\n");
+                exit(1);
+            }
+        };
+        match ev {
+            WindowEvent::Key(k) => {
+                Line::new()
+                    .s(b"input-testclient: win key code=")
+                    .u(k.keycode as u64)
+                    .s(b" down=")
+                    .u(k.pressed as u64)
+                    .s(b" mods=")
+                    .u(k.modifiers as u64)
+                    .end();
+                saw_key = true;
+            }
+            WindowEvent::Pointer(pe) => {
+                Line::new()
+                    .s(b"input-testclient: win ptr kind=")
+                    .u(pe.kind as u64)
+                    .s(b" btn=")
+                    .u(pe.button as u64)
+                    .s(b" buttons=")
+                    .u(pe.buttons as u64)
+                    .s(b" x=")
+                    .i(pe.x as i64)
+                    .s(b" y=")
+                    .i(pe.y as i64)
+                    .end();
+                if pe.kind == librsproto::surface::POINTER_BUTTON
+                    && pe.flags & librsproto::surface::POINTER_PRESSED != 0
+                {
+                    saw_press = true;
+                }
+            }
+            WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
         }
     }
 
