@@ -125,6 +125,34 @@ impl Drop for ChannelTransport {
     }
 }
 
+impl ChannelTransport {
+    /// Hold an event that arrived while waiting for a reply, dropping the oldest if full.
+    ///
+    /// **Drop; do not fail the request.** These are server-initiated messages that happened
+    /// to arrive at the wrong moment, and failing here makes an unrelated request fail
+    /// because of traffic it has nothing to do with. Not hypothetical: a client that makes
+    /// requests without draining events — the compositor's own churn probe — died on its
+    /// ninth window the moment `FocusEvent` gave it a second thing to receive.
+    ///
+    /// **Oldest**, for the same reason `Window`'s queue drops oldest: the newest describes
+    /// the world as it is now. The loss is reported through
+    /// [`took_loss`](libsurface::Transport::took_loss), so it surfaces as a
+    /// `WindowEvent::Dropped` rather than vanishing.
+    ///
+    /// Split out of `request` so it can be tested: everything around it issues syscalls and
+    /// this does not. The shift arithmetic rested on the boot gate not hanging until it was
+    /// (PR #184 review).
+    fn park(&mut self, op: u16, body: [u8; MAX_BODY], n: usize) {
+        if self.parked_len >= self.parked.len() {
+            self.parked.copy_within(1.., 0);
+            self.parked_len -= 1;
+            self.lost = true;
+        }
+        self.parked[self.parked_len] = (op, body, n);
+        self.parked_len += 1;
+    }
+}
+
 impl Transport for ChannelTransport {
     fn request(
         &mut self,
@@ -235,24 +263,7 @@ impl Transport for ChannelTransport {
             let n = m.body.len().min(MAX_BODY);
             let mut body = [0u8; MAX_BODY];
             body[..n].copy_from_slice(&m.body[..n]);
-            if self.parked_len >= self.parked.len() {
-                // **Drop the oldest event; do not fail the request.** These are server-
-                // initiated messages that happened to arrive while waiting for a reply, and
-                // failing here makes an unrelated request fail because of traffic it has
-                // nothing to do with. That is not hypothetical: a client that makes requests
-                // without draining events — the compositor's own churn probe — died on its
-                // ninth window the moment `FocusEvent` gave it a second thing to receive.
-                //
-                // Oldest, for the same reason `Window`'s queue drops oldest: the newest
-                // describes the world as it is now. The loss is reported through
-                // `took_loss`, so it surfaces as a `WindowEvent::Dropped` rather than
-                // vanishing.
-                self.parked.copy_within(1.., 0);
-                self.parked_len -= 1;
-                self.lost = true;
-            }
-            self.parked[self.parked_len] = (m.op, body, n);
-            self.parked_len += 1;
+            self.park(m.op, body, n);
         }
     }
 
@@ -326,5 +337,119 @@ impl Transport for ChannelTransport {
         let n = m.body.len().min(buf.len());
         buf[..n].copy_from_slice(&m.body[..n]);
         Ok(Some((m.op, n)))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A transport on handle `0`, which is safe to construct and drop in a host test:
+    /// `Drop` skips the close for `0`, and every path exercised below returns before it
+    /// would issue a syscall.
+    fn transport() -> ChannelTransport {
+        // SAFETY: `0` is not a live endpoint, and nothing here sends or receives on it —
+        // `poll_event` drains parked entries before touching the channel, and `Drop` checks
+        // for `0`. This is the seam that lets the parking logic be tested at all.
+        unsafe { ChannelTransport::new(0) }
+    }
+
+    /// Park an event whose op is `n`, so the drain order is legible.
+    fn park(t: &mut ChannelTransport, n: u16) {
+        t.park(n, [0; MAX_BODY], 0);
+    }
+
+    /// Drain every parked event, oldest first.
+    fn drain(t: &mut ChannelTransport) -> alloc::vec::Vec<u16> {
+        let mut out = alloc::vec::Vec::new();
+        let mut buf = [0u8; 64];
+        while let Ok(Some((op, _))) = t.poll_event(&mut buf) {
+            out.push(op);
+        }
+        out
+    }
+
+    #[test]
+    fn parked_events_drain_oldest_first() {
+        let mut t = transport();
+        for n in 0..4 {
+            park(&mut t, n);
+        }
+        assert_eq!(drain(&mut t), [0, 1, 2, 3]);
+        assert!(!t.took_loss(), "nothing was dropped");
+    }
+
+    #[test]
+    fn filling_exactly_to_capacity_drops_nothing() {
+        // The boundary the overflow branch must not claim: `MAX_PARKED` entries fit.
+        let mut t = transport();
+        for n in 0..MAX_PARKED as u16 {
+            park(&mut t, n);
+        }
+        assert!(!t.took_loss());
+        let got = drain(&mut t);
+        assert_eq!(got.len(), MAX_PARKED);
+        assert_eq!(got[0], 0, "the first one is still there");
+    }
+
+    #[test]
+    fn overflowing_drops_the_oldest_and_keeps_the_order_of_the_rest() {
+        // The shift arithmetic: `copy_within(1.., 0)` then `parked_len -= 1` then write at
+        // the top. Getting it wrong duplicates an entry or loses the newest instead of the
+        // oldest, and neither is visible from outside — the boot gate only notices if the
+        // *request* fails, which is exactly what this branch stopped doing (PR #184 review).
+        let mut t = transport();
+        for n in 0..(MAX_PARKED as u16 + 3) {
+            park(&mut t, n);
+        }
+        let got = drain(&mut t);
+        assert_eq!(got.len(), MAX_PARKED, "still exactly full");
+        // The three oldest went; the rest kept their order and the newest survived.
+        let expected: alloc::vec::Vec<u16> = (3..(MAX_PARKED as u16 + 3)).collect();
+        assert_eq!(got, expected);
+    }
+
+    #[test]
+    fn a_drop_is_reported_once_and_then_cleared() {
+        // `took_loss` is take-and-clear, because `Window::pump` folds it into a flag that
+        // produces exactly one `WindowEvent::Dropped`. Reporting on every call would emit a
+        // `Dropped` per pump for the rest of the window's life.
+        let mut t = transport();
+        for n in 0..(MAX_PARKED as u16 + 1) {
+            park(&mut t, n);
+        }
+        assert!(t.took_loss(), "the overflow is reported");
+        assert!(!t.took_loss(), "and only once");
+    }
+
+    #[test]
+    fn a_drained_queue_makes_room_again() {
+        // Parking is not a one-way ratchet: a client that catches up stops losing events.
+        let mut t = transport();
+        for n in 0..MAX_PARKED as u16 {
+            park(&mut t, n);
+        }
+        drain(&mut t);
+        for n in 100..(100 + MAX_PARKED as u16) {
+            park(&mut t, n);
+        }
+        assert!(!t.took_loss(), "nothing dropped after draining");
+        assert_eq!(drain(&mut t).len(), MAX_PARKED);
+    }
+
+    #[test]
+    fn the_body_and_length_travel_with_the_op() {
+        // A shift that moved the ops but not their bodies would pass every test above.
+        let mut t = transport();
+        for n in 0..(MAX_PARKED as u16 + 1) {
+            let mut body = [0u8; MAX_BODY];
+            body[0] = n as u8;
+            t.park(n, body, 1);
+        }
+        let mut buf = [0u8; 64];
+        let (op, len) = t.poll_event(&mut buf).unwrap().expect("an event");
+        assert_eq!(op, 1, "keycode 0 was the one dropped");
+        assert_eq!(len, 1);
+        assert_eq!(buf[0], 1, "and its body came with it");
     }
 }

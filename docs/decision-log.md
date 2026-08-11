@@ -12909,3 +12909,26 @@ with **zero warnings**. That matters because the review's finding 3 was found by
 compiler output rather than by any gate: nothing in CI passes `-D warnings`, so the class is
 uncatchable today. Getting to zero is the precondition for turning it on; turning it on is a
 separate change.
+
+**Follow-up: `ipc.rs` gets the test module it never had.** The review noted that
+`ChannelTransport`'s drop-oldest rested on the boot gate not hanging, and the reply deferred
+a test to Part C "rather than a rushed one here". That deferral was wrong, and the reason
+given did not survive being checked: the test is not rushed, it is cheap, and the only thing
+in its way was that the parking logic sat inline inside `request`, which issues syscalls.
+
+Splitting it into `ChannelTransport::park` makes it pure, and the rest was already testable
+without anyone noticing: `poll_event` drains parked entries *before* touching the channel, and
+`Drop` skips the close for handle `0`. So a host test can construct a transport on `0`, park
+past capacity, and drain — none of which reaches a syscall. **The seam was there; the
+deferral was an assumption that it was not.**
+
+Five breaks, all biting: dropping the newest instead of the oldest, shifting without
+shrinking the length, an off-by-one in `copy_within`, `>` for `>=` at the capacity boundary,
+and `took_loss` reporting forever instead of take-and-clear. The last of those matters more
+than it looks — `Window::pump` folds the flag into one `WindowEvent::Dropped`, so a sticky
+flag emits a `Dropped` per pump for the rest of the window's life.
+
+Worth stating as a rule: **"it needs syscalls, so it cannot be host-tested" is a claim about
+where a function's boundary is, not about the function.** Twice in this milestone the answer
+was to move the boundary — `focus_transition` out of the compositor's serve loop, `park` out
+of `request` — and both took minutes.
