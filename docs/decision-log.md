@@ -12932,3 +12932,29 @@ Worth stating as a rule: **"it needs syscalls, so it cannot be host-tested" is a
 where a function's boundary is, not about the function.** Twice in this milestone the answer
 was to move the boundary — `focus_transition` out of the compositor's serve loop, `park` out
 of `request` — and both took minutes.
+
+**Part B was not finished when its checkbox was ticked.** Asked whether anything remained, the
+honest way to answer was to read `widget-toolkit.md` §7.1 against `route.rs` rather than to
+re-read the plan — and §7.1 makes two promises the router did not keep: **widget-local
+coordinates**, without which a widget cannot know where in *itself* it was clicked, and
+**crossing synthesis at widget boundaries**, without which a button has nothing to hang a
+hover on. Neither was caught by a test, because nothing tested for a promise that had no
+implementation to break.
+
+Implementing them turned up a layering error that neither document had noticed. The
+compositor's `POINTER_ENTER`/`LEAVE` are about the **window**; the toolkit's are about the
+**widget**. Forwarding the compositor's *and* synthesising its own handed a widget two enters
+for one cursor movement. The compositor's crossings are **inputs to the state machine, not
+events to forward** — and a window `LEAVE` leaves every widget in it, wherever the last
+coordinates happened to point.
+
+One deliberate constraint while doing it: **exactly one place changes coordinate space.**
+Everything internal — hit-testing, the click's containment check — stays in window
+coordinates, and `localise` runs only at the boundary where a handler is called. That rule
+exists because violating it is precisely what made every click away from the window's corner
+vanish, and a second translation site is how it would come back.
+
+The general lesson: **a ticked checkbox says the plan's summary was satisfied, not that the
+design was.** The plan's Part B line names hit-testing, capture and focus; §7.1 names five
+things. Reading the design doc against the code is a different check from reading the plan,
+and it is the one that found these.

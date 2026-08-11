@@ -30,8 +30,10 @@
 
 use alloc::vec::Vec;
 
-use libdraw::geom::Point;
-use librsproto::surface::{KeyEvent, POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+use libdraw::geom::{Point, Rect};
+use librsproto::surface::{
+    KeyEvent, POINTER_BUTTON, POINTER_ENTER, POINTER_LEAVE, POINTER_PRESSED, PointerEvent,
+};
 
 use crate::diff::{Tree, Widget};
 use crate::element::Element;
@@ -53,6 +55,8 @@ pub type Path = Vec<usize>;
 pub struct Router {
     focus: Option<u64>,
     capture: Option<u64>,
+    /// The widget the cursor is inside, for synthesising crossings.
+    inside: Option<u64>,
     window_focused: bool,
 }
 
@@ -94,7 +98,7 @@ impl Router {
     /// the compositor's first `FocusEvent` corrects this within a frame. Starting `false`
     /// would make a client's first paint dim.
     pub fn new() -> Self {
-        Self { focus: None, capture: None, window_focused: true }
+        Self { focus: None, capture: None, inside: None, window_focused: true }
     }
 
     /// The focused widget's id, if any.
@@ -105,6 +109,11 @@ impl Router {
     /// The widget holding the pointer capture, if a button is down.
     pub fn capture(&self) -> Option<u64> {
         self.capture
+    }
+
+    /// The widget the cursor is inside, if any.
+    pub fn inside(&self) -> Option<u64> {
+        self.inside
     }
 
     /// Whether the compositor says this window has the keyboard.
@@ -191,6 +200,9 @@ impl Router {
         if self.capture.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
             self.capture = None;
         }
+        if self.inside.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
+            self.inside = None;
+        }
     }
 
     /// Route a key event, returning the messages it produced.
@@ -240,12 +252,42 @@ impl Router {
         let target = self.capture.or_else(|| hit_test(tree.root(), layout, at));
 
         let mut out = Vec::new();
+
+        // **The compositor's crossings are inputs, not events to forward.** Its `ENTER` and
+        // `LEAVE` are about the *window*; a widget only ever sees crossings this router
+        // synthesises about *widgets*. Forwarding the window one as well handed a widget two
+        // enters for one cursor movement, which is the layering leaking through.
+        let window_crossing = matches!(event.kind, POINTER_ENTER | POINTER_LEAVE);
+        let left_window = event.kind == POINTER_LEAVE;
+
+        // Crossings first, so a widget hears "the cursor entered me" before the motion that
+        // brought it in. Suppressed while captured, for the compositor's own reason: telling
+        // a widget the cursor left while it is still receiving that cursor's events is two
+        // contradictory statements at once.
+        if self.capture.is_none() {
+            // The cursor leaving the window leaves every widget in it, wherever the last
+            // coordinates happened to point.
+            let now = if left_window { None } else { hit_test(tree.root(), layout, at) };
+            if now != self.inside {
+                if let Some(old) = self.inside {
+                    self.emit_crossing(tree, element, layout, old, POINTER_LEAVE, event, &mut out);
+                }
+                self.inside = now;
+                if let Some(new) = now {
+                    self.emit_crossing(tree, element, layout, new, POINTER_ENTER, event, &mut out);
+                }
+            }
+        }
+
         if let Some(id) = target
             && let Some(path) = path_to_id(tree.root(), id)
             && let Some(e) = element_at(element, &path)
         {
-            if let Some(f) = e.on_pointer {
-                out.push(f(event));
+            if !window_crossing
+                && let Some(f) = e.on_pointer
+                && let Some(l) = layout_at(layout, &path)
+            {
+                out.push(f(localise(event, l.rect)));
             }
             // A **click** is a release inside the widget that took the press. Releasing
             // outside is a cancel, which is why this is not simply "on release".
@@ -272,9 +314,71 @@ impl Router {
         }
 
         if released && event.buttons == 0 {
+            // The cursor may have been dragged somewhere else entirely while the button was
+            // held, so re-derive the crossing now that it is not suppressed.
             self.capture = None;
+            let now = hit_test(tree.root(), layout, at);
+            if now != self.inside {
+                if let Some(old) = self.inside {
+                    self.emit_crossing(tree, element, layout, old, POINTER_LEAVE, event, &mut out);
+                }
+                self.inside = now;
+                if let Some(new) = now {
+                    self.emit_crossing(tree, element, layout, new, POINTER_ENTER, event, &mut out);
+                }
+            }
         }
         (out, target)
+    }
+}
+
+impl Router {
+    /// Hand a synthesised crossing to `id`'s handler, if it has one.
+    fn emit_crossing<Msg>(
+        &self,
+        tree: &Tree,
+        element: &Element<Msg>,
+        layout: &Layout,
+        id: u64,
+        kind: u16,
+        cause: PointerEvent,
+        out: &mut Vec<Msg>,
+    ) {
+        let Some(path) = path_to_id(tree.root(), id) else { return };
+        let Some(e) = element_at(element, &path) else { return };
+        let Some(f) = e.on_pointer else { return };
+        let Some(l) = layout_at(layout, &path) else { return };
+        // The state that was true when the cursor crossed, from the event that moved it —
+        // a crossing has no buttons or modifiers of its own, and inventing zeroes would tell
+        // a widget the button it is about to be dragged with is not held.
+        let ev = PointerEvent {
+            kind,
+            button: 0,
+            buttons: cause.buttons,
+            flags: 0,
+            modifiers: cause.modifiers,
+            _pad: 0,
+            ..localise(cause, l.rect)
+        };
+        out.push(f(ev));
+    }
+}
+
+/// An event in `rect`'s coordinates.
+///
+/// **The only place a coordinate space changes.** Everything internal — hit-testing, the
+/// click's containment check — stays in window coordinates, because that is what a
+/// `PointerEvent` arrives in and what a `Layout` rectangle is expressed in. Translating in
+/// two places is how a release ended up tested against a point offset by the widget's own
+/// origin, so every click away from the window's corner was silently cancelled (PR #184
+/// review, finding 1). Handlers get widget-local because a widget cannot otherwise know
+/// where in *itself* it was clicked; the coordinates are signed, and mid-capture they are
+/// routinely negative.
+fn localise(event: PointerEvent, rect: Rect) -> PointerEvent {
+    PointerEvent {
+        x: event.x.saturating_sub(rect.origin.x),
+        y: event.y.saturating_sub(rect.origin.y),
+        ..event
     }
 }
 
@@ -369,8 +473,8 @@ mod tests {
     use crate::element::{column, custom, row, sized, stack, text};
     use crate::layout::{FixedCell, layout};
     use alloc::vec;
-    use libdraw::geom::{Rect, Size};
-    use librsproto::surface::{POINTER_ENTER, POINTER_MOTION};
+    use libdraw::geom::Size;
+    use librsproto::surface::{POINTER_ENTER, POINTER_LEAVE, POINTER_MOTION};
 
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
@@ -676,15 +780,134 @@ mod tests {
     }
 
     #[test]
-    fn a_crossing_event_routes_without_being_mistaken_for_a_button() {
-        // `kind` distinguishes them; reading only `flags` would make an enter with a stale
-        // flag take a capture.
+    fn the_compositors_window_crossing_becomes_one_widget_crossing_not_two() {
+        // Its `ENTER` is about the *window*; the widget's is about the *widget*. Forwarding
+        // both handed a widget two enters for one cursor movement.
         let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_pointer(Msg::Ptr).flex(1)]);
         let (t, l) = build(&e);
+        let leaf = t.root().unwrap().children[0].id;
         let mut r = Router::new();
+
         let enter = PointerEvent { kind: POINTER_ENTER, x: 5, y: 5, ..Default::default() };
         let (msgs, _) = r.pointer(&t, &e, &l, enter);
-        assert_eq!(msgs, [Msg::Ptr(enter)]);
+        assert_eq!(msgs.len(), 1, "one crossing, not two: {msgs:?}");
+        let Msg::Ptr(got) = &msgs[0] else { panic!("a pointer message") };
+        assert_eq!(got.kind, POINTER_ENTER);
+        assert_eq!(r.inside(), Some(leaf));
         assert_eq!(r.capture(), None, "a crossing is not a press");
+
+        // And leaving the window leaves the widget, wherever the coordinates point.
+        let leave = PointerEvent { kind: POINTER_LEAVE, x: 5, y: 5, ..Default::default() };
+        let (msgs, _) = r.pointer(&t, &e, &l, leave);
+        assert_eq!(msgs.len(), 1);
+        let Msg::Ptr(got) = &msgs[0] else { panic!("a pointer message") };
+        assert_eq!(got.kind, POINTER_LEAVE);
+        assert_eq!(r.inside(), None);
+    }
+
+    #[test]
+    fn moving_between_widgets_leaves_one_before_entering_the_next() {
+        // Order matters: a widget told it was entered before the previous one was left
+        // concludes two widgets are hovered at once.
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(50, 480), custom(1, Size::new(0, 0)).on_pointer(Msg::Ptr)),
+            custom(2, Size::new(0, 0)).on_pointer(Msg::Ptr).flex(1),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+
+        r.pointer(&t, &e, &l, motion(10, 10));
+        let (msgs, _) = r.pointer(&t, &e, &l, motion(400, 10));
+        let kinds: alloc::vec::Vec<u16> = msgs
+            .iter()
+            .map(|m| match m {
+                Msg::Ptr(p) => p.kind,
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            [POINTER_LEAVE, POINTER_ENTER, POINTER_MOTION],
+            "leave, then enter, then the motion that caused both"
+        );
+    }
+
+    #[test]
+    fn crossings_are_suppressed_during_a_capture_and_re_derived_on_release() {
+        // Telling a widget the cursor left while it is still receiving that cursor's events
+        // is two contradictory statements at once — the compositor's own rule, one layer
+        // down.
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(50, 480), custom(1, Size::new(0, 0)).on_pointer(Msg::Ptr)),
+            custom(2, Size::new(0, 0)).on_pointer(Msg::Ptr).flex(1),
+        ]);
+        let (t, l) = build(&e);
+        let left = t.root().unwrap().children[0].children[0].id;
+        let right = t.root().unwrap().children[1].id;
+        let mut r = Router::new();
+
+        r.pointer(&t, &e, &l, motion(10, 10));
+        r.pointer(&t, &e, &l, press(10, 10));
+        let (msgs, _) = r.pointer(&t, &e, &l, motion(400, 10));
+        assert_eq!(r.inside(), Some(left), "still inside, though over the other widget");
+        assert!(
+            msgs.iter().all(|m| !matches!(m, Msg::Ptr(p) if p.kind == POINTER_LEAVE)),
+            "no crossing while captured: {msgs:?}"
+        );
+
+        let (msgs, _) = r.pointer(&t, &e, &l, release(400, 10));
+        assert_eq!(r.inside(), Some(right), "re-derived once the capture ends");
+        let kinds: alloc::vec::Vec<u16> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                Msg::Ptr(p) if p.kind == POINTER_LEAVE || p.kind == POINTER_ENTER => Some(p.kind),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(kinds, [POINTER_LEAVE, POINTER_ENTER]);
+    }
+
+    #[test]
+    fn a_handler_gets_widget_local_coordinates() {
+        // A widget cannot otherwise know where in *itself* it was clicked. Every internal
+        // comparison stays in window coordinates; this is the only place the space changes.
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(500, 480), custom(1, Size::new(0, 0))),
+            sized(Size::new(100, 480), custom(2, Size::new(0, 0)).on_pointer(Msg::Ptr)),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        let (msgs, _) = r.pointer(&t, &e, &l, motion(550, 30));
+        let motion_msg = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::Ptr(p) if p.kind == POINTER_MOTION => Some(*p),
+                _ => None,
+            })
+            .expect("a motion");
+        assert_eq!((motion_msg.x, motion_msg.y), (50, 30), "window 550 minus the widget's 500");
+    }
+
+    #[test]
+    fn widget_local_coordinates_go_negative_during_a_capture() {
+        // The reason they are signed. Clamping would make every leftward drag look like it
+        // stopped at the widget's edge — the same rule as the compositor's window-local
+        // coordinates, one layer down.
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(500, 480), custom(1, Size::new(0, 0))),
+            sized(Size::new(100, 480), custom(2, Size::new(0, 0)).on_pointer(Msg::Ptr)),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        r.pointer(&t, &e, &l, press(550, 10));
+        let (msgs, _) = r.pointer(&t, &e, &l, motion(400, 10));
+        let m = msgs
+            .iter()
+            .find_map(|m| match m {
+                Msg::Ptr(p) if p.kind == POINTER_MOTION => Some(*p),
+                _ => None,
+            })
+            .expect("a motion");
+        assert_eq!(m.x, -100, "100px left of the captured widget's left edge");
     }
 }

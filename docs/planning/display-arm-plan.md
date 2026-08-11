@@ -362,6 +362,33 @@ requirement, not a compromise.
       Conflating them is the classic source of text arriving in the wrong field. Carries the
       **focus record** the compositor owes a client, without which the toolkit has no way to
       know the first of those two.
+
+      `Element<Msg>` arrived here, with the routing that can fire a handler; handlers are
+      `fn` pointers because a tuple-variant constructor already is one. `libui::route` does
+      hit-testing, capture, Tab traversal, key bubbling, widget-local coordinates and
+      crossing synthesis; `FocusEvent` (op `0x0907`) carries window focus. 75 tests in
+      `libui`, 21 breaks verified.
+
+      **Four things the plan did not anticipate**, each found by breaking something:
+
+      - A **click could only land at the window's origin.** The containment check added the
+        widget's own origin to a point already in that space, so a button in a second column
+        or below a menu bar had every click silently cancelled — and the one test of the rule
+        put its widget at (0, 0), where both expressions agree.
+      - **`announce_focus` never ran on a create**, because create is the one op that replies
+        with a window id and so returns `Outcome::Reply` rather than `Applied`. The gate could
+        not see it: focus was announced anyway by leftover input tripping another call site.
+        It now asserts **ordering** — a window's first event must be its focus change.
+      - **A second server-initiated message class broke `libsurface`.** `ChannelTransport`
+        failed a *request* when its parked queue overflowed, so an unrelated request died of
+        traffic it had nothing to do with. `MAX_PARKED = 8` was fine with one class and wrong
+        with two.
+      - **§7.1 promised two things the router did not do**: widget-local coordinates and
+        crossing synthesis. Found by reading the design against the code rather than by any
+        test. The compositor's `ENTER`/`LEAVE` turned out to be *inputs* to that state
+        machine rather than events to forward — its crossings are about windows, the
+        toolkit's about widgets, and forwarding both handed a widget two enters.
+
 - [ ] **Graduate two design docs to `architecture/`.**
       [`input-subsystem.md`](../design/input-subsystem.md) describes a subsystem that is now
       **built** — M3 finished it — and has been sitting in `design/`, which root `CLAUDE.md`
