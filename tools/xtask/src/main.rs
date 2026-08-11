@@ -993,6 +993,22 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // assertion keeps at most two messages in flight, which is the discipline this gate
     // needs until back-pressure is settled (M3 Part D3).
 
+    // **A deliberate flood.** Twelve cursor movements are exactly what broke this gate
+    // before M3 Part D3: each became a `PointerEvent` sent `NOBLOCK` at a four-message ring,
+    // and the keystroke behind them was dropped on the floor. What this asserts is the
+    // *retry* half of the fix — the compositor now queues per session and re-sends the head
+    // until the client takes it, so a flood delays a keystroke instead of losing it.
+    //
+    // It does **not** exercise coalescing: twelve motions fit inside `OUTBOX_MAX`, so the
+    // queue never has to collapse them, and the gate passes with coalescing removed (checked
+    // by removing it). Coalescing earns its place by stopping a long drag from pushing
+    // *discrete* events out of a full queue, which is a host test
+    // (`a_coalesced_motion_does_not_count_against_the_bound`) because provoking it from here
+    // would need thousands of injections to beat a client that drains promptly.
+    for _ in 0..12 {
+        qmp.send_motion(-120, -120)?;
+    }
+
     // `b` is keycode 48. It goes to the *focused* window — this client's, being the topmost
     // that takes focus — not to whatever the cursor happens to be over.
     qmp.send_key("b", true)?;

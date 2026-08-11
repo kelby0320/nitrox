@@ -284,31 +284,53 @@ pointing device does not reopen this** — it merges into the same stream and mo
 cursor. What is still open is what a second *screen* means, which is a different question.
 Raised 2026-08-06, decided by PR #180.
 
-**Back-pressure for compositor→client messages.** A session channel holds four messages and
-the compositor sends `NOBLOCK`, so a client that lets its receive ring fill makes the send
-fail and the message is simply gone. For a `Release` that is now unrecoverable: `libui`'s
-`Window::acquire` blocks in `sys_wait` with no timeout, so the buffer stays busy and the
-client never wakes. **Today the compositor only logs the drop** (`compositor: DROPPED a
-Release`) — enough to diagnose, not a fix. The three candidate answers each cost something:
-blocking the compositor lets one slow client stall every other window; a per-session outbound
-queue needs a bound and a policy for overrunning *that*; disconnecting the client turns an
-infinite hang into a definite error but kills a client whose ring was only transiently full.
-Deferred until there is a second real client to characterise against — with one well-behaved
-client that drains through `acquire`, every option is untested theory. Trigger: M3 input (a
-second event stream to the same channel) or the first client that is not `ui-testclient`.
-Raised by the PR #175 review, 2026-08-06.
+~~**Back-pressure for compositor→client messages.**~~ **Decided 2026-08-10 (M3 Part D3):
+a bounded per-session outbox in the compositor, with motion coalescing.**
 
-> **The trigger fired, 2026-08-10 (M3 Part C3), and the decision stays deferred.** The
-> compositor now sends `KeyEvent` and `PointerEvent` on the same session channel as `Release`,
-> through the same `SENDMODE_NOBLOCK` path and the same four-message ring. What changed is not
-> the mechanism but *who has to misbehave*: input is continuous, so a client that stops
-> draining while it renders a frame has its ring filled by motion events it never asked for,
-> and the next `Release` send is the one that fails. The client then blocks in `acquire`
-> forever with `compositor: DROPPED a Release` as the only trace. It is still deferred because
-> the reason has not changed — there is still exactly one real client, so all three candidate
-> answers remain untested theory, and Part D's echo client is the first thing that can
-> characterise them. Noted rather than fixed, because a fix chosen now would be a guess.
-> **Re-trigger: Part D, when a second client exists.**
+Of the three candidates filed, the second was taken — *a per-session outbound queue with a
+bound and a policy for overrunning it* — and the two rejected are worth recording. Blocking
+the compositor lets one slow client stall every other window, which is the same objection as
+before and did not get weaker. Disconnecting the client turns an infinite hang into a
+definite error, but it kills a client whose ring was only transiently full, and with input
+arriving continuously "transiently full" is the ordinary state of a client rendering a frame.
+
+What changed the answer was **what a real second client did**, which is exactly what the
+deferral was waiting for. Part D2's gate lost a keystroke behind twelve cursor movements:
+input is a *stream* and a `Release` is not, so on a shared ring the cheap message reliably
+evicts the expensive one. That reframes the problem — it was never about depth. No depth is
+enough against a stream, it only moves the threshold, and a rarer permanent hang is worse to
+diagnose than a reproducible one.
+
+The shape:
+
+- **Every unsolicited message goes through `compositor::outbox`**, releases included, so
+  ordering is preserved and a refusal parks the message at the head of the queue instead of
+  dropping it. `NOBLOCK`-and-forget is gone.
+- **At most one motion per window is queued.** A newer motion removes the older and takes its
+  place at the *back*, so a motion that happened after a keystroke is still delivered after
+  it. This is what X11 and Wayland do, and it works for the same reason: a motion record
+  carries an absolute window-local position, so the newest says everything the older ones did.
+- **The queue is flushed every loop iteration**, head-of-line, stopping at the first refusal.
+  There is no writability signal to wait on; a client that unblocks with no further input
+  pending keeps its queued messages until the next event wakes the compositor. That is a
+  latency bound, not a loss.
+- **The ring is 16, not 4.** The old value was never chosen — a literal copied into every
+  resource server in the tree, and a quarter of the kernel's own `IPC_DEFAULT_QUEUE_DEPTH`.
+  Sixteen is the kernel default and costs 128 KiB of kernel memory per session, since a slot
+  is a whole 4 KiB `IpcMsg` whatever the payload.
+
+**Still open, and smaller than it was:** the Surface protocol has **no loss marker**. If a
+session's outbox overflows — which needs a client stalled long enough to accumulate 32
+*discrete* events, since motion no longer accumulates — the compositor discards the oldest
+and logs it, and the client is never told. `libui` already has `WindowEvent::Dropped` for its
+own queue overflowing, so the client-side vocabulary exists; what is missing is a wire record.
+Trigger: the first observed outbox overflow that is not a deliberately wedged test client, or
+the toolkit (M4) needing to resynchronise held-key state after one. Raised 2026-08-10.
+
+**The `4` in the other resource servers** (`auth-service`, `fs-server-ext4`, `hello`,
+`input-server`) is left alone deliberately: those channels carry request/reply traffic, where
+the sender is waiting for an answer and cannot outrun the receiver. They are undersized
+rather than wrong. Trigger: any of them growing a server-initiated push stream.
 
 ### Processes and memory
 

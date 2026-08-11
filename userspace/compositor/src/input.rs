@@ -29,34 +29,7 @@ use librsproto::surface::{
 };
 
 use crate::WindowStack;
-
-/// One record, addressed to one window.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Outbound {
-    /// A `Surface::KeyEvent` for `window`.
-    Key {
-        /// Which window it is addressed to.
-        window: u32,
-        /// The record to send.
-        event: KeyEvent,
-    },
-    /// A `Surface::PointerEvent` for `window`.
-    Pointer {
-        /// Which window it is addressed to.
-        window: u32,
-        /// The record to send.
-        event: PointerEvent,
-    },
-}
-
-impl Outbound {
-    /// The window this record is addressed to.
-    pub fn window(&self) -> u32 {
-        match self {
-            Outbound::Key { window, .. } | Outbound::Pointer { window, .. } => *window,
-        }
-    }
-}
+use crate::outbox::Outbound;
 
 /// Cursor position, crossing state, and the implicit grab.
 ///
@@ -477,7 +450,7 @@ mod tests {
             .iter()
             .map(|o| match o {
                 Outbound::Pointer { window, event } => (*window, event.kind),
-                Outbound::Key { .. } => unreachable!("no keys here"),
+                other => unreachable!("the router emits no {other:?} here"),
             })
             .collect();
         assert_eq!(
@@ -561,7 +534,7 @@ mod tests {
             .iter()
             .map(|o| match o {
                 Outbound::Pointer { window, event } => (*window, event.kind),
-                Outbound::Key { .. } => unreachable!(),
+                other => unreachable!("the router emits no {other:?} here"),
             })
             .collect();
         assert_eq!(kinds, [(w, POINTER_ENTER), (w, POINTER_BUTTON)], "entered, then clicked");

@@ -32,7 +32,8 @@
 
 extern crate alloc;
 
-use compositor::input::{InputRouter, Outbound};
+use compositor::input::InputRouter;
+use compositor::outbox::{Outbound, Outbox};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
 use libdraw::format::Rgb;
@@ -167,6 +168,12 @@ struct Server {
     router: InputRouter,
     /// The consumer channel from `/dev/input/new`, or 0 if input is unavailable.
     input_ch: u64,
+    /// Pending messages per session, parallel to `SESSION_CH`.
+    ///
+    /// On the heap rather than in this struct by value: `Server` lives on `_start`'s stack,
+    /// and thirty inline queues would be tens of kilobytes against a 32 KiB user stack —
+    /// the same trap `libui` documents for holding a transport by value.
+    outbox: alloc::vec::Vec<Outbox>,
 }
 
 impl Server {
@@ -191,11 +198,33 @@ impl BufferSource for Server {
     }
 }
 
-/// Create a connected forwarding-channel pair. Returns `(kernel_end, serve_end)`.
-fn make_channel() -> Option<(u64, u64)> {
+/// Receive-ring depth for a client **session** channel.
+///
+/// Sixteen, which is the kernel's own `IPC_DEFAULT_QUEUE_DEPTH`. The previous value was
+/// `4` — not chosen, but a literal copied into every resource server in the tree, and a
+/// quarter of the system default by accident rather than by argument.
+///
+/// Depth alone was never the fix: no depth is "enough" against a continuous stream, it only
+/// moves the threshold, and a *rarer* permanent hang is worse to diagnose than a
+/// reproducible one. What makes sixteen sufficient is the coalescing in
+/// [`compositor::outbox`] — with at most one motion queued per window, what reaches this
+/// ring is discrete events, bounded by what a person can physically do.
+///
+/// It is not free: a slot is a whole 4 KiB `IpcMsg` whatever the payload, and both endpoints
+/// get one ring, so this is 128 KiB of kernel memory per session against 32 KiB before.
+const SESSION_QUEUE_DEPTH: u64 = 16;
+
+/// Create a connected channel pair with a `depth`-slot ring each. Returns `(a, b)`.
+fn make_channel(depth: u64) -> Option<(u64, u64)> {
     // SAFETY: CTRL_OUT0/CTRL_OUT1 are valid writable out-params.
     let cr = unsafe {
-        syscall4(SYS_CHANNEL_CREATE, (&raw mut CTRL_OUT0) as u64, (&raw mut CTRL_OUT1) as u64, 4, 0)
+        syscall4(
+            SYS_CHANNEL_CREATE,
+            (&raw mut CTRL_OUT0) as u64,
+            (&raw mut CTRL_OUT1) as u64,
+            depth,
+            0,
+        )
     };
     if cr != 0 {
         return None;
@@ -319,24 +348,11 @@ fn reply_on_session(session: u64, op: u16, request_id: u64, body: &[u8]) -> bool
     }
 }
 
-/// Tell a client a buffer has left the screen and may be drawn into again.
+/// Send one server-initiated record. Returns `false` if the channel would not take it.
 ///
-/// Server-initiated, so it carries no request id. Without it a double-buffered client
-/// stalls after its second commit, forever.
-fn send_release(session: u64, window: u32, buffer: u32) -> bool {
-    let mut body = [0u8; librsproto::surface::RELEASE_EVENT_LEN];
-    let Some(n) = librsproto::surface::build_release_event(&mut body, window, buffer) else {
-        return false;
-    };
-    reply_on_session(session, OP_RELEASE, 0, &body[..n])
-}
-
-/// Send one `Surface::KeyEvent` or `Surface::PointerEvent` to a session.
-///
-/// Server-initiated like [`send_release`], so no request id. A failed send is dropped: the
-/// only sender-side failure is a full channel, and a client that is not draining its input
-/// is one whose *stale* events are worthless — blocking here would stop the compositor
-/// serving every other client on account of the one that stopped reading.
+/// No request id: nothing asked for these. A refusal is **not** a drop any more — the caller
+/// leaves the message at the head of the session's outbox and tries again next time round,
+/// which is the whole difference between this and the `NOBLOCK`-and-forget it replaced.
 fn send_input(session: u64, op: u16, body: &[u8]) -> bool {
     reply_on_session(session, op, 0, body)
 }
@@ -366,43 +382,100 @@ fn log_route(rec: &Outbound) {
             l.s(b" kind=").u(event.kind as u64);
             l.s(b" x=").i(event.x as i64).s(b" y=").i(event.y as i64);
         }
+        Outbound::Release { window, buffer } => {
+            l.s(b"compositor: rel win=").u(*window as u64);
+            l.s(b" buf=").u(*buffer as u64);
+        }
     }
     l.end();
 }
 
-/// Deliver everything the router produced.
+/// Queue everything the router produced.
 ///
 /// Records addressed to a window whose session has already gone are dropped rather than
 /// broadcast: `session_of` returning `None` means the owner disconnected between the event
 /// arriving and this running.
-fn deliver(srv: &Server, out: &[Outbound]) {
+fn deliver(srv: &mut Server, out: &[Outbound]) {
     for rec in out {
         let Some(slot) = srv.session_of(rec.window()) else {
             continue;
         };
         log_route(rec);
-        // SAFETY: reading our own slot table for a slot `session_of` just matched.
+        enqueue(srv, slot, *rec);
+    }
+}
+
+/// Queue one message for a session, logging if the queue had to discard.
+fn enqueue(srv: &mut Server, slot: usize, rec: Outbound) {
+    if srv.outbox[slot].push(rec) {
+        // Bounded by the queue's own counter rather than a separate budget: this fires once
+        // per discard, and a client generating them continuously has a problem worth the
+        // lines. Silence here is what made the four-message ring's losses invisible.
+        Line::new()
+            .s(b"compositor: session ")
+            .u(slot as u64)
+            .s(b" outbox overflow, discarded ")
+            .u(srv.outbox[slot].dropped() as u64)
+            .end();
+    }
+}
+
+/// Push as much of each session's queue down its channel as the channel will take.
+///
+/// **Head-of-line, and it stops at the first refusal.** Skipping a stuck message to deliver
+/// a later one would reorder a client's event stream — a release arriving before the commit
+/// it answers, or a button before the motion that positioned it.
+///
+/// There is no writability signal to wait on, so this runs after every loop iteration and
+/// makes progress whenever the client has drained. A client that unblocks with no further
+/// input pending keeps its queued messages until the next event wakes the compositor; that
+/// is a latency bound, not a loss, and the alternative is polling a channel that is usually
+/// empty.
+fn flush_outboxes(srv: &mut Server) {
+    for slot in 0..MAX_SESSIONS {
+        // SAFETY: reading our own slot table.
         let ch = unsafe { SESSION_CH[slot] };
         if ch == 0 {
+            srv.outbox[slot].clear();
             continue;
         }
-        match rec {
-            // Sized **from the types**, not from the byte counts the spec publishes.
-            // Widening `PointerEvent` to carry modifiers left a hand-written `[0u8; 16]`
-            // here, and `write` refuses a short buffer by returning `None` — so every
-            // pointer event would have been silently dropped, with the compositor and the
-            // spec both still saying it was sent.
-            Outbound::Key { event, .. } => {
-                let mut body = [0u8; core::mem::size_of::<KeyEvent>()];
-                if event.write(&mut body).is_some() {
-                    send_input(ch, OP_KEY_EVENT, &body);
-                }
+        while let Some(rec) = srv.outbox[slot].front() {
+            if !send_outbound(ch, &rec) {
+                break;
             }
-            Outbound::Pointer { event, .. } => {
-                let mut body = [0u8; core::mem::size_of::<PointerEvent>()];
-                if event.write(&mut body).is_some() {
-                    send_input(ch, OP_POINTER_EVENT, &body);
-                }
+            srv.outbox[slot].pop();
+        }
+    }
+}
+
+/// Send one queued message. Returns `false` if the channel would not take it.
+fn send_outbound(ch: u64, rec: &Outbound) -> bool {
+    // Sized **from the types**, not from the byte counts the spec publishes. Widening
+    // `PointerEvent` to carry modifiers left a hand-written `[0u8; 16]` here, and `write`
+    // refuses a short buffer by returning `None` — so every pointer event would have been
+    // silently dropped, with the compositor and the spec both still saying it was sent.
+    match rec {
+        Outbound::Key { event, .. } => {
+            let mut body = [0u8; core::mem::size_of::<KeyEvent>()];
+            match event.write(&mut body) {
+                Some(_) => send_input(ch, OP_KEY_EVENT, &body),
+                // Unserialisable is not "retry forever": dropping it clears the queue head
+                // so everything behind it can still move.
+                None => true,
+            }
+        }
+        Outbound::Pointer { event, .. } => {
+            let mut body = [0u8; core::mem::size_of::<PointerEvent>()];
+            match event.write(&mut body) {
+                Some(_) => send_input(ch, OP_POINTER_EVENT, &body),
+                None => true,
+            }
+        }
+        Outbound::Release { window, buffer } => {
+            let mut body = [0u8; librsproto::surface::RELEASE_EVENT_LEN];
+            match librsproto::surface::build_release_event(&mut body, *window, *buffer) {
+                Some(n) => reply_on_session(ch, OP_RELEASE, 0, &body[..n]),
+                None => true,
             }
         }
     }
@@ -623,7 +696,7 @@ fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
     let Some(slot) = (unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == 0) }) else {
         return reply_resolve_error(serve_end, request_id, KError::OutOfHandles);
     };
-    let Some((client_end, server_end)) = make_channel() else {
+    let Some((client_end, server_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
         return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
     };
     // SAFETY: `slot` is free; recording our end and a fresh connection for it.
@@ -652,6 +725,8 @@ fn close_session(slot: usize, srv: &mut Server) {
             SESSION_CH[slot] = 0;
         }
     }
+    // Nothing queued for a closed session is owed to whoever reuses the slot.
+    srv.outbox[slot].clear();
     // A client that exits without destroying its windows must not leave them on screen.
     disconnect(&mut srv.conns[slot], &mut srv.stack);
     srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
@@ -873,17 +948,13 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // second client — observes a screen that has not caught up. Same shape as
             // announcing `Ready` before clearing the screen.
             repaint(srv, fb);
-            if let Some((window, buffer)) = release
-                && !send_release(ch, window, buffer)
-            {
-                // **A dropped `Release` is now a permanent client hang, not a slow frame.**
-                // These go out `NOBLOCK` on a channel four messages deep, so a client that
-                // commits several frames before draining makes the send simply fail — and
-                // since `Window::acquire` blocks with no timeout, the buffer stays `busy`
-                // and the client never wakes. Unlike a rejection this is **not**
-                // client-driven noise: it is the compositor losing a message it owed, so it
-                // is not subject to `MAX_LOGGED_REJECTIONS` (PR #175 review, finding 3).
-                kprint(b"compositor: DROPPED a Release (client receive ring full)\n");
+            if let Some((window, buffer)) = release {
+                // **Through the outbox, like everything else.** Sent directly it competed
+                // with input on the same ring, and input is continuous while a release is
+                // not, so the cheap message reliably evicted the expensive one. Queued, it
+                // holds its place ahead of anything arriving later and cannot be coalesced
+                // away — a release is never motion.
+                enqueue(srv, slot, Outbound::Release { window, buffer });
             }
         }
         Outcome::Failed(e) => {
@@ -983,6 +1054,12 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                 srv.stack.compose_into(&mut fb, BACKGROUND, srv, &[bounds]);
             }
         }
+        // **Before the early `continue`.** Everything above may have queued messages, and
+        // the common iteration — input arrived, no resolve — takes that `continue`. Flushing
+        // only on the resolve path would leave every routed event sitting in its queue until
+        // a client happened to connect.
+        flush_outboxes(srv);
+
         if !serve_signalled {
             continue;
         }
@@ -1057,7 +1134,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     };
     let _ = info;
 
-    let Some((kernel_end, serve_end)) = make_channel() else {
+    let Some((kernel_end, serve_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
         kprint(b"compositor: channel create FAIL\n");
         exit(1);
     };
@@ -1065,6 +1142,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         stack: WindowStack::new(),
         conns: core::array::from_fn(|_| Connection::new()),
         buffers: alloc::vec::Vec::new(),
+        outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
         interp: Interpreter::new(),
         // The router clamps the cursor to the screen it was told about, so it has to be the
         // screen this compositor actually acquired — not a constant that happens to match.

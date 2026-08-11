@@ -12485,3 +12485,49 @@ The pattern across all three: **the gate's assumptions were the untested part.**
 compositor, `libinput` and `libui` did exactly what their host tests said they would. What
 had never been checked was that a test harness injecting into a live multi-process system
 gets a system in the state it imagined.
+
+## 2026-08-10 — D3: the back-pressure question was never about depth
+
+M3 Part D3 retired the compositor→client back-pressure deferral. The filed question was "how
+deep, and what happens when it fills"; the answer turned out to be that depth was the wrong
+axis.
+
+**What a real second client revealed.** The deferral said all three candidate answers were
+untested theory until something other than `ui-testclient` existed, and that was right — but
+not for the reason expected. D2's gate lost a keystroke behind twelve cursor movements, and
+the shape of that failure is the whole argument: **input is a stream and a `Release` is not.**
+On a shared ring the cheap message reliably evicts the expensive one, and losing a motion is
+cosmetic while losing a `Release` hangs the client permanently in `acquire`. No depth fixes
+an asymmetry like that; it only moves the threshold, and a *rarer* permanent hang is worse to
+diagnose than a reproducible one.
+
+So the fix is a bounded per-session outbox with **motion coalescing** — at most one queued
+per window, removed and re-pushed at the back so a motion that happened after a keystroke is
+still delivered after it. X11 and Wayland both compress motion, and it works for the same
+reason in all three: a motion record carries an absolute position, so the newest says
+everything the older ones did. A refusal now parks the message at the head of the queue
+instead of dropping it, and `Release` rides the same queue, so input cannot displace it.
+
+**The ring went 4 → 16, and the interesting part is that 4 was never chosen.** It is a
+literal copied into every resource server in the tree — `auth-service`, `fs-server-ext4`,
+`hello`, `input-server`, `compositor` — and it is a *quarter* of the kernel's own
+`IPC_DEFAULT_QUEUE_DEPTH`, which is what passing `0` would have given. Five servers running
+below the system default by propagation rather than argument. The other four are left alone
+on purpose: they carry request/reply traffic, where the sender waits for an answer and cannot
+outrun the receiver, so they are undersized rather than wrong.
+
+**Two things this work got wrong first, both worth the record.**
+
+*A flush that was never called.* `flush_outboxes` was written and wired into nothing, and
+`cargo xtask test-qemu` passed anyway — which is itself the finding: that gate never
+exercises input delivery, so it cannot speak to any of this. `check-input` caught it
+immediately. A green gate is only evidence about what it touches.
+
+*A regression test that tested the wrong half.* The gate was extended with the exact flood
+that broke D2 and the comment claimed it as coalescing's regression test. Removing coalescing
+and re-running showed the gate still passing: twelve motions fit inside `OUTBOX_MAX`, so the
+queue never has to collapse them, and what the flood actually proves is the *retry* path.
+Coalescing earns its place by stopping a long drag from pushing discrete events out of a full
+queue, which is a host test. The comment now says which half is which. **The check that
+caught it — delete the mechanism, re-run the test that claims to cover it — costs one run and
+is the only thing that distinguishes a regression test from a coincidence.**

@@ -4,8 +4,10 @@
 **Milestone 1 is complete** (2026-08-05): the gate, the framebuffer binding, the
 self-hash, and the `screendump` smoke gate. **Milestones 1–2 are complete** (2026-08-06). A real client drives the compositor on every
 `test-qemu` run, and the display gate compares a picture that arrived through the whole
-Surface protocol. **Milestone 3 Part A is complete** (2026-08-06): P3 — the i8042 driver — is built and
-proven by `cargo xtask check-input`, which injects a keystroke and a click over QMP.
+Surface protocol. **Milestone 3 is complete** (2026-08-10): the i8042 driver, the
+`input-server`, `libinput`, the compositor's focus and hit-test routing, and `libui` delivery
+— proven end to end by `cargo xtask check-input`, which injects a keystroke and a click over
+QMP and asserts they reach a **window**.
 
 ## What this is
 
@@ -206,7 +208,7 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
             (`compositor: input connected`). It cannot yet assert a key reached a window:
             nothing holds a window at injection time. That is Part D's gate.
 
-- [ ] **Part D — a client receives it.** `libui` delivers input into a window's event queue,
+- [x] **Part D — a client receives it.** ✅ (2026-08-10) `libui` delivers input into a window's event queue,
       and a test client echoes what arrived: a keystroke and a click injected by the harness
       reach a **window** and come back, which is the milestone's deliverable.
 
@@ -266,15 +268,25 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
             there is still no cursor drawn on screen. Both belong to M4's toolkit work,
             which is the first thing that needs them.
 
-      - [ ] **D3 — back-pressure for compositor→client messages.** Its re-trigger is literally
+      - [x] **D3 — back-pressure for compositor→client messages.** ✅ (2026-08-10) Its re-trigger is literally
             "Part D, when a second client exists", and D2 creates that client.
 
-            **After D2, not before.** The reason it stayed deferred is that with one
-            well-behaved client every candidate answer is untested theory; D2 is the first
-            thing that can characterise them. There is also a real chance D2 *hits* it — the
-            echo client receives continuous input on the same four-deep ring as `Release`, so
-            a client that stops draining while it renders has that ring filled by motion it
-            never asked for, and the next `Release` is the send that fails.
+            **After D2, not before** — and D2 duly hit it, losing a keystroke behind twelve
+            cursor movements. That failure is what settled the design: the problem was never
+            depth. Input is a stream and a `Release` is not, so on a shared ring the cheap
+            message reliably evicts the expensive one, and no depth fixes that — it only
+            moves the threshold, turning a reproducible hang into a rare one.
+
+            A bounded per-session `Outbox` in the compositor's library half, with **motion
+            coalescing** (at most one queued per window, re-pushed at the back so ordering
+            survives), head-of-line flushing that parks on refusal instead of dropping, and
+            `Release` riding the same queue so input can never displace it. The ring went
+            4 → 16: the old value was a literal copied into every resource server and a
+            quarter of the kernel's own default, never a decision. 8 host tests, six breaks.
+
+            The gate now injects the exact flood that broke D2. It asserts the **retry**
+            half — coalescing is proven by host test, and the plan says so rather than
+            letting the gate imply coverage it does not have.
 
 **Pointer events are in this milestone, not deferred.** An earlier draft of this plan put them
 with window management in a later milestone; buttons and menus need clicks, and the toolkit
