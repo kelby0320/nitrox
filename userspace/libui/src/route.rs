@@ -1,0 +1,644 @@
+//! Where an event goes inside a window.
+//!
+//! The compositor decides which *window* has focus and which window a click lands on. This
+//! decides which *widget* — and the two must never share a field. Conflating them is the
+//! classic source of typing arriving in the wrong place: a window that regains focus has to
+//! put the caret back where it was, so widget focus outlives window focus rather than being
+//! derived from it.
+//!
+//! ## The rules, and where each came from
+//!
+//! **Hit-testing is topmost-first**, the reverse of paint order, so a menu overlaid on a grid
+//! takes the click that visually landed on it.
+//!
+//! **A press captures.** Every pointer event up to the release of the last button goes to the
+//! widget the press landed on, even after the cursor leaves it. This is the compositor's rule
+//! one layer down, and it exists for the same reason: a drag that ends outside a scrollbar
+//! must still deliver the release, or the scrollbar believes it is still being dragged
+//! forever.
+//!
+//! **A key goes to the focused widget, then bubbles.** Unhandled keys walk up the ancestors,
+//! then reach the application — which is how a menu accelerator works without every widget
+//! knowing about menus.
+//!
+//! ## What this module does not do
+//!
+//! It does not own the pointer's position — the compositor does, and `PointerEvent` carries
+//! window-local coordinates already. It does not decide *which window* anything goes to.
+//! And it holds no widget interaction state; that is the retained tree's, and Part C's
+//! widgets are what will put anything in it.
+
+use alloc::vec::Vec;
+
+use libdraw::geom::{Point, Rect};
+use librsproto::surface::{KeyEvent, POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
+
+use crate::diff::{Tree, Widget};
+use crate::element::Element;
+use crate::layout::Layout;
+
+/// A path from the root to a widget: the child index at each level.
+///
+/// A path rather than an id, because routing walks the tree and needs the ancestors on the
+/// way — bubbling is "the path minus its last element", repeatedly. The id it resolves to is
+/// what survives a reordering; the path is how this frame gets there.
+pub type Path = Vec<usize>;
+
+/// Which widget has keyboard focus inside this window, and what the pointer is doing.
+///
+/// Deliberately **not** merged with the compositor's window focus. See
+/// [`Focus::window_focused`].
+pub struct Router {
+    focus: Option<u64>,
+    capture: Option<u64>,
+    window_focused: bool,
+}
+
+/// Whether a caret should blink, spelled out rather than inferred at each call site.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Focus {
+    /// This widget holds keyboard focus within its window.
+    pub widget_focused: bool,
+    /// The compositor says this window has the keyboard.
+    pub window_focused: bool,
+}
+
+impl Focus {
+    /// Whether a caret should blink and a focus ring should be drawn.
+    ///
+    /// **Both, and that is the whole point of the type.** Two fields from two sources: a
+    /// window that lost the keyboard must stop blinking, and must not forget where the caret
+    /// was.
+    pub fn is_active(&self) -> bool {
+        self.widget_focused && self.window_focused
+    }
+}
+
+impl Default for Router {
+    /// Delegates to [`Router::new`].
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Router {
+    /// A router with nothing focused and nothing captured.
+    ///
+    /// `window_focused` starts **true**: a window is mapped because something wanted it, and
+    /// the compositor's first `FocusEvent` corrects this within a frame. Starting `false`
+    /// would make a client's first paint dim.
+    pub fn new() -> Self {
+        Self { focus: None, capture: None, window_focused: true }
+    }
+
+    /// The focused widget's id, if any.
+    pub fn focused(&self) -> Option<u64> {
+        self.focus
+    }
+
+    /// The widget holding the pointer capture, if a button is down.
+    pub fn capture(&self) -> Option<u64> {
+        self.capture
+    }
+
+    /// Whether the compositor says this window has the keyboard.
+    pub fn window_focused(&self) -> bool {
+        self.window_focused
+    }
+
+    /// Record a `Surface::FocusEvent`.
+    ///
+    /// **Widget focus is untouched.** Returning to a window must put the caret back where it
+    /// was; discarding it would make every window switch lose the user's place.
+    pub fn set_window_focused(&mut self, focused: bool) {
+        self.window_focused = focused;
+    }
+
+    /// How `widget` should paint itself.
+    pub fn focus_of(&self, widget: u64) -> Focus {
+        Focus {
+            widget_focused: self.focus == Some(widget),
+            window_focused: self.window_focused,
+        }
+    }
+
+    /// Give focus to `widget` if the tree says it can take it.
+    ///
+    /// Refused rather than silently accepted for a widget that is not focusable, or focus
+    /// could land somewhere Tab can never reach and the user would have no way out.
+    pub fn focus(&mut self, tree: &Tree, element: &Element<impl Sized>, widget: u64) -> bool {
+        if focusable_ids(tree, element).contains(&widget) {
+            self.focus = Some(widget);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move focus to the next focusable widget in tree order, wrapping.
+    ///
+    /// Returns the newly focused widget. With nothing focusable this is `None` and focus is
+    /// cleared — a window whose only focusable widget was just destroyed must not keep
+    /// pointing at it.
+    pub fn focus_next(&mut self, tree: &Tree, element: &Element<impl Sized>) -> Option<u64> {
+        self.step_focus(tree, element, 1)
+    }
+
+    /// Move focus to the previous focusable widget in tree order, wrapping.
+    pub fn focus_prev(&mut self, tree: &Tree, element: &Element<impl Sized>) -> Option<u64> {
+        self.step_focus(tree, element, -1)
+    }
+
+    fn step_focus(
+        &mut self,
+        tree: &Tree,
+        element: &Element<impl Sized>,
+        by: isize,
+    ) -> Option<u64> {
+        let order = focusable_ids(tree, element);
+        if order.is_empty() {
+            self.focus = None;
+            return None;
+        }
+        let next = match self.focus.and_then(|f| order.iter().position(|&id| id == f)) {
+            // Wrapping in both directions, computed on `isize` so that stepping back from
+            // the first lands on the last rather than underflowing to nothing.
+            Some(i) => (i as isize + by).rem_euclid(order.len() as isize) as usize,
+            // Nothing focused, or focus pointing at a widget that no longer exists: start
+            // from the appropriate end rather than refusing to move.
+            None if by >= 0 => 0,
+            None => order.len() - 1,
+        };
+        self.focus = Some(order[next]);
+        self.focus
+    }
+
+    /// Drop focus and capture if they name widgets the tree no longer has.
+    ///
+    /// Called after every diff. The router is not on the destroy path, and asking the tree
+    /// cannot go out of date the way a callback can — the same reasoning the compositor's
+    /// `InputRouter` uses for window ids.
+    pub fn prune(&mut self, tree: &Tree) {
+        if self.focus.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
+            self.focus = None;
+        }
+        if self.capture.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
+            self.capture = None;
+        }
+    }
+
+    /// Route a key event, returning the messages it produced.
+    ///
+    /// The focused widget's `on_key` fires first; if it has none, the event **bubbles** to
+    /// each ancestor in turn. With nothing focused the event is dropped rather than sent to
+    /// whatever the pointer happens to be over, which would make typing depend on where the
+    /// mouse rests.
+    pub fn key<Msg>(
+        &self,
+        tree: &Tree,
+        element: &Element<Msg>,
+        event: KeyEvent,
+    ) -> Option<Msg> {
+        let focused = self.focus?;
+        let path = path_to_id(tree.root(), focused)?;
+        // From the focused widget outward: `path`, then its parent, and so on to the root.
+        for depth in (0..=path.len()).rev() {
+            let e = element_at(element, &path[..depth])?;
+            if let Some(f) = e.on_key {
+                return Some(f(event));
+            }
+        }
+        None
+    }
+
+    /// Route a pointer event, returning the messages it produced.
+    ///
+    /// Returns `(messages, hit)` — the widget it went to, which a caller wants for
+    /// diagnostics and which the tests assert on.
+    pub fn pointer<Msg: Clone>(
+        &mut self,
+        tree: &Tree,
+        element: &Element<Msg>,
+        layout: &Layout,
+        event: PointerEvent,
+    ) -> (Vec<Msg>, Option<u64>) {
+        let at = Point::new(event.x, event.y);
+        let pressed = event.kind == POINTER_BUTTON && event.flags & POINTER_PRESSED != 0;
+        let released = event.kind == POINTER_BUTTON && event.flags & POINTER_PRESSED == 0;
+
+        // **The press decides the capture, from where the cursor is.** Anything else and a
+        // drag that leaves the widget stops being that widget's drag.
+        if pressed && self.capture.is_none() {
+            self.capture = hit_test(tree.root(), layout, at);
+        }
+        let target = self.capture.or_else(|| hit_test(tree.root(), layout, at));
+
+        let mut out = Vec::new();
+        if let Some(id) = target
+            && let Some(path) = path_to_id(tree.root(), id)
+            && let Some(e) = element_at(element, &path)
+        {
+            if let Some(f) = e.on_pointer {
+                out.push(f(event));
+            }
+            // A **click** is a release inside the widget that took the press. Releasing
+            // outside is a cancel, which is why this is not simply "on release".
+            if released
+                && let Some(msg) = e.on_press.clone()
+                && let Some(l) = layout_at(layout, &path)
+                && l.rect.contains(event.x + l.rect.origin.x, event.y + l.rect.origin.y)
+            {
+                out.push(msg);
+            }
+            // Click to focus, but only where focus can land.
+            if pressed && e.focusable {
+                self.focus = Some(id);
+            }
+        }
+
+        if released && event.buttons == 0 {
+            self.capture = None;
+        }
+        (out, target)
+    }
+}
+
+/// Every focusable widget's id, in tree order.
+fn focusable_ids(tree: &Tree, element: &Element<impl Sized>) -> Vec<u64> {
+    let mut out = Vec::new();
+    if let Some(root) = tree.root() {
+        collect_focusable(root, element, &mut out);
+    }
+    out
+}
+
+fn collect_focusable(w: &Widget, e: &Element<impl Sized>, out: &mut Vec<u64>) {
+    if e.focusable {
+        out.push(w.id);
+    }
+    for (cw, ce) in w.children.iter().zip(e.children()) {
+        collect_focusable(cw, ce, out);
+    }
+}
+
+/// The widget with `id`, if the tree has one.
+fn find_by_id(w: Option<&Widget>, id: u64) -> Option<&Widget> {
+    let w = w?;
+    if w.id == id {
+        return Some(w);
+    }
+    w.children.iter().find_map(|c| find_by_id(Some(c), id))
+}
+
+/// The index path from the root to `id`.
+fn path_to_id(root: Option<&Widget>, id: u64) -> Option<Path> {
+    fn walk(w: &Widget, id: u64, path: &mut Path) -> bool {
+        if w.id == id {
+            return true;
+        }
+        for (i, c) in w.children.iter().enumerate() {
+            path.push(i);
+            if walk(c, id, path) {
+                return true;
+            }
+            path.pop();
+        }
+        false
+    }
+    let root = root?;
+    let mut path = Path::new();
+    walk(root, id, &mut path).then_some(path)
+}
+
+/// The element at `path`, walking [`Element::children`] order.
+fn element_at<'a, Msg>(e: &'a Element<Msg>, path: &[usize]) -> Option<&'a Element<Msg>> {
+    let mut cur = e;
+    for &i in path {
+        cur = cur.children().nth(i)?;
+    }
+    Some(cur)
+}
+
+/// The layout at `path`.
+fn layout_at<'a>(l: &'a Layout, path: &[usize]) -> Option<&'a Layout> {
+    let mut cur = l;
+    for &i in path {
+        cur = cur.children.get(i)?;
+    }
+    Some(cur)
+}
+
+/// The topmost widget containing `at`, in window coordinates.
+///
+/// Children are searched in reverse — the last child paints on top, so it is hit first — and
+/// a parent is only a hit if none of its children was. Zero-extent rectangles can contain
+/// nothing and fall out of `contains` naturally.
+fn hit_test(root: Option<&Widget>, layout: &Layout, at: Point) -> Option<u64> {
+    fn walk(w: &Widget, l: &Layout, at: Point) -> Option<u64> {
+        if !l.rect.contains(at.x, at.y) {
+            return None;
+        }
+        for (cw, cl) in w.children.iter().zip(l.children.iter()).rev() {
+            if let Some(hit) = walk(cw, cl, at) {
+                return Some(hit);
+            }
+        }
+        Some(w.id)
+    }
+    walk(root?, layout, at)
+}
+
+/// Whether `rect` contains `at`. Re-exported shape so callers need not import `Rect`.
+pub fn contains(rect: Rect, at: Point) -> bool {
+    rect.contains(at.x, at.y)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::element::{column, custom, row, sized, stack, text};
+    use crate::layout::{FixedCell, layout};
+    use alloc::vec;
+    use libdraw::geom::Size;
+    use librsproto::surface::{POINTER_ENTER, POINTER_MOTION};
+
+    const CELL: FixedCell = FixedCell { w: 8, h: 16 };
+    const SCREEN: Rect = Rect::new(0, 0, 640, 480);
+
+    #[derive(Clone, PartialEq, Eq, Debug)]
+    enum Msg {
+        Pressed(u8),
+        Key(KeyEvent),
+        Ptr(PointerEvent),
+    }
+
+    /// Lay out and diff, returning the tree and layout the router works against.
+    fn build(e: &Element<Msg>) -> (Tree, Layout) {
+        let l = layout(e, SCREEN, &CELL);
+        let mut t = Tree::new();
+        t.update(e, &l).expect("a clean frame");
+        (t, l)
+    }
+
+    fn press(x: i32, y: i32) -> PointerEvent {
+        PointerEvent {
+            kind: POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: POINTER_PRESSED,
+            x,
+            y,
+            ..Default::default()
+        }
+    }
+
+    fn release(x: i32, y: i32) -> PointerEvent {
+        PointerEvent { kind: POINTER_BUTTON, button: 0x110, buttons: 0, flags: 0, x, y,
+                       ..Default::default() }
+    }
+
+    fn motion(x: i32, y: i32) -> PointerEvent {
+        PointerEvent { kind: POINTER_MOTION, buttons: 1, x, y, ..Default::default() }
+    }
+
+    fn key(code: u16) -> KeyEvent {
+        KeyEvent { keycode: code, pressed: 1, modifiers: 0, _pad: 0 }
+    }
+
+    #[test]
+    fn a_click_hits_the_topmost_widget_not_the_one_underneath() {
+        // The reverse of paint order: a menu overlaid on a grid takes the click that
+        // visually landed on it.
+        let e: Element<Msg> = stack(vec![
+            custom(1, Size::new(0, 0)).on_pointer(Msg::Ptr),
+            sized(Size::new(40, 40), custom(2, Size::new(0, 0)).on_pointer(Msg::Ptr)),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+
+        let (_, hit) = r.pointer(&t, &e, &l, press(10, 10));
+        let overlay = t.root().unwrap().children[1].children[0].id;
+        assert_eq!(hit, Some(overlay), "the overlay, not the base layer");
+
+        // ...and outside the overlay, the base layer takes it.
+        let mut r = Router::new();
+        let (_, hit) = r.pointer(&t, &e, &l, press(100, 100));
+        let base = t.root().unwrap().children[0].id;
+        assert_eq!(hit, Some(base));
+    }
+
+    #[test]
+    fn a_press_captures_and_a_drag_that_leaves_still_reports_to_it() {
+        // Without this the release lands on whatever is under the cursor, and a scrollbar
+        // believes it is still being dragged forever.
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(50, 480), custom(1, Size::new(0, 0)).on_pointer(Msg::Ptr)),
+            custom(2, Size::new(0, 0)).on_pointer(Msg::Ptr).flex(1),
+        ]);
+        let (t, l) = build(&e);
+        let left = t.root().unwrap().children[0].children[0].id;
+        let mut r = Router::new();
+
+        let (_, hit) = r.pointer(&t, &e, &l, press(10, 10));
+        assert_eq!(hit, Some(left));
+        assert_eq!(r.capture(), Some(left));
+
+        // Dragged far to the right, over the other widget.
+        let (_, hit) = r.pointer(&t, &e, &l, motion(400, 10));
+        assert_eq!(hit, Some(left), "still the widget that took the press");
+
+        let (_, hit) = r.pointer(&t, &e, &l, release(400, 10));
+        assert_eq!(hit, Some(left));
+        assert_eq!(r.capture(), None, "and the capture ends");
+    }
+
+    #[test]
+    fn releasing_outside_the_widget_is_a_cancel_rather_than_a_click() {
+        // Pressing a button and sliding off it is how a user changes their mind. Firing
+        // `on_press` on the press instead of the click removes that.
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(50, 480), custom(1, Size::new(0, 0)).on_press(Msg::Pressed(1))),
+            custom(2, Size::new(0, 0)).flex(1),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+
+        r.pointer(&t, &e, &l, press(10, 10));
+        let (msgs, _) = r.pointer(&t, &e, &l, release(400, 10));
+        assert!(msgs.is_empty(), "released outside: cancelled");
+
+        // ...and released inside, it fires.
+        let mut r = Router::new();
+        r.pointer(&t, &e, &l, press(10, 10));
+        let (msgs, _) = r.pointer(&t, &e, &l, release(20, 20));
+        assert_eq!(msgs, [Msg::Pressed(1)]);
+    }
+
+    #[test]
+    fn a_key_goes_to_the_focused_widget_not_the_one_under_the_cursor() {
+        let e: Element<Msg> = column(vec![
+            custom(1, Size::new(0, 0)).on_key(Msg::Key).flex(1),
+            custom(2, Size::new(0, 0)).on_key(Msg::Key).flex(1),
+        ]);
+        let (t, l) = build(&e);
+        let second = t.root().unwrap().children[1].id;
+        let mut r = Router::new();
+        assert!(r.focus(&t, &e, second));
+
+        // The pointer is over the first widget; the key still goes to the focused one.
+        let (_, hit) = r.pointer(&t, &e, &l, motion(10, 10));
+        assert_ne!(hit, Some(second));
+        assert_eq!(r.key(&t, &e, key(30)), Some(Msg::Key(key(30))));
+        assert_eq!(r.focused(), Some(second));
+    }
+
+    #[test]
+    fn an_unhandled_key_bubbles_to_an_ancestor() {
+        // How a menu accelerator works without every widget knowing about menus.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()])
+            .on_key(Msg::Key);
+        let (t, l) = build(&e);
+        let _ = l;
+        let leaf = t.root().unwrap().children[0].id;
+        let mut r = Router::new();
+        assert!(r.focus(&t, &e, leaf));
+        assert_eq!(r.key(&t, &e, key(1)), Some(Msg::Key(key(1))), "the parent took it");
+    }
+
+    #[test]
+    fn a_key_with_nothing_focused_is_dropped() {
+        // Not sent to whatever the pointer is over, which would make typing depend on where
+        // the mouse happens to rest — the same rule the compositor applies between windows.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_key(Msg::Key)]);
+        let (t, _) = build(&e);
+        let r = Router::new();
+        assert_eq!(r.focused(), None);
+        assert_eq!(r.key(&t, &e, key(30)), None);
+    }
+
+    #[test]
+    fn tab_traverses_focusable_widgets_in_tree_order_and_wraps() {
+        let e: Element<Msg> = column(vec![
+            custom(1, Size::new(0, 0)).focusable(),
+            custom(2, Size::new(0, 0)), // skipped: not focusable
+            custom(3, Size::new(0, 0)).focusable(),
+        ]);
+        let (t, _) = build(&e);
+        let kids = &t.root().unwrap().children;
+        let (a, c) = (kids[0].id, kids[2].id);
+        let mut r = Router::new();
+
+        assert_eq!(r.focus_next(&t, &e), Some(a));
+        assert_eq!(r.focus_next(&t, &e), Some(c), "the middle one is skipped");
+        assert_eq!(r.focus_next(&t, &e), Some(a), "and it wraps");
+        assert_eq!(r.focus_prev(&t, &e), Some(c), "backwards wraps too");
+    }
+
+    #[test]
+    fn focus_cannot_be_given_to_a_widget_tab_could_never_reach() {
+        // Otherwise focus lands somewhere traversal cannot leave, and the user is stuck.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0))]);
+        let (t, _) = build(&e);
+        let leaf = t.root().unwrap().children[0].id;
+        let mut r = Router::new();
+        assert!(!r.focus(&t, &e, leaf));
+        assert_eq!(r.focused(), None);
+    }
+
+    #[test]
+    fn window_focus_and_widget_focus_are_two_fields_from_two_sources() {
+        // The rule the design pass insisted on. A window that lost the keyboard stops
+        // blinking; when it returns, the caret is where it was.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()]);
+        let (t, _) = build(&e);
+        let leaf = t.root().unwrap().children[0].id;
+        let mut r = Router::new();
+        r.focus(&t, &e, leaf);
+        assert!(r.focus_of(leaf).is_active());
+
+        r.set_window_focused(false);
+        assert!(!r.focus_of(leaf).is_active(), "stops blinking");
+        assert_eq!(r.focused(), Some(leaf), "but does not forget where it was");
+
+        r.set_window_focused(true);
+        assert!(r.focus_of(leaf).is_active(), "and comes back to the same widget");
+    }
+
+    #[test]
+    fn a_click_focuses_a_focusable_widget_and_leaves_focus_alone_otherwise() {
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(50, 480), custom(1, Size::new(0, 0)).focusable()),
+            custom(2, Size::new(0, 0)).flex(1), // not focusable
+        ]);
+        let (t, l) = build(&e);
+        let focusable = t.root().unwrap().children[0].children[0].id;
+        let mut r = Router::new();
+
+        r.pointer(&t, &e, &l, press(10, 10));
+        r.pointer(&t, &e, &l, release(10, 10));
+        assert_eq!(r.focused(), Some(focusable));
+
+        // Clicking the non-focusable one must not clear focus — a scrollbar drag would
+        // otherwise steal the caret from the text beside it.
+        r.pointer(&t, &e, &l, press(400, 10));
+        assert_eq!(r.focused(), Some(focusable));
+    }
+
+    #[test]
+    fn focus_and_capture_are_dropped_when_their_widgets_go() {
+        // The router is not on the destroy path, so it asks the tree — which cannot go out
+        // of date the way a callback can.
+        let e: Element<Msg> = column(vec![
+            custom(1, Size::new(0, 0)).focusable().on_pointer(Msg::Ptr).flex(1),
+        ]);
+        let (mut t, l) = build(&e);
+        let leaf = t.root().unwrap().children[0].id;
+        let mut r = Router::new();
+        r.focus(&t, &e, leaf);
+        r.pointer(&t, &e, &l, press(10, 10));
+        assert_eq!(r.capture(), Some(leaf));
+
+        let e2: Element<Msg> = column(vec![text("nothing here")]);
+        let l2 = layout(&e2, SCREEN, &CELL);
+        t.update(&e2, &l2).expect("ok");
+        r.prune(&t);
+        assert_eq!(r.focused(), None);
+        assert_eq!(r.capture(), None);
+    }
+
+    #[test]
+    fn tab_from_a_stale_focus_starts_from_the_beginning_rather_than_refusing() {
+        // After a `prune` there is nothing focused; Tab must still move.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()]);
+        let (t, _) = build(&e);
+        let mut r = Router::new();
+        assert_eq!(r.focus_next(&t, &e), Some(t.root().unwrap().children[0].id));
+    }
+
+    #[test]
+    fn a_window_with_nothing_focusable_clears_focus_rather_than_pointing_at_a_ghost() {
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).focusable()]);
+        let (t, _) = build(&e);
+        let mut r = Router::new();
+        r.focus_next(&t, &e);
+        assert!(r.focused().is_some());
+
+        let e2: Element<Msg> = column(vec![custom(1, Size::new(0, 0))]);
+        let (t2, _) = build(&e2);
+        assert_eq!(r.focus_next(&t2, &e2), None);
+        assert_eq!(r.focused(), None);
+    }
+
+    #[test]
+    fn a_crossing_event_routes_without_being_mistaken_for_a_button() {
+        // `kind` distinguishes them; reading only `flags` would make an enter with a stale
+        // flag take a capture.
+        let e: Element<Msg> = column(vec![custom(1, Size::new(0, 0)).on_pointer(Msg::Ptr).flex(1)]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+        let enter = PointerEvent { kind: POINTER_ENTER, x: 5, y: 5, ..Default::default() };
+        let (msgs, _) = r.pointer(&t, &e, &l, enter);
+        assert_eq!(msgs, [Msg::Ptr(enter)]);
+        assert_eq!(r.capture(), None, "a crossing is not a press");
+    }
+}
