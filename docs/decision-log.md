@@ -12635,3 +12635,44 @@ compositor owes a client (without it the second focus concept has no source), ke
 a cursor on screen. Key repeat is generated **compositor-side** rather than Wayland's
 client-side rate — the compositor already has the timer loop the outbox retry gave it, and it
 knows which window has focus, so repeats stop on a focus change with no client involvement.
+
+## 2026-08-11 — The user stack goes to 8 MiB, and a filed deferral had a false cost in it
+
+Folded into M4 Part A, which is one of the triggers the deferral itself named.
+
+**The entry that was supposed to inform this decision asserted a cost the code does not
+have.** It said raising the number costs "eager mapping, which is measurable at spawn — 105
+spawns a boot on the selftest image". The stack is mapped with `map_vma_lazy`, and there is a
+kernel test in `elf.rs` asserting *"stack must be demand-paged, not eagerly backed"*. Raising
+it costs address space and nothing else.
+
+That is worth more than the correction. **A deferral entry is written to make a future
+decision cheap, so a wrong cost in one is worse than no entry at all** — it does not merely
+fail to help, it argues for the wrong answer, and it does so at exactly the moment nobody is
+re-deriving the facts. This one was caught by the maintainer asking "isn't it demand paged?",
+which is the check the entry should not have needed.
+
+**8 MiB, matching Linux** (`RLIMIT_STACK`'s `_STK_LIM`, grown on demand; glibc gives pthreads
+the same). One stack per process — `sys_thread_create` makes every other thread supply its
+own — so this is 8 MiB of a 128 TiB user half.
+
+**The guard gap turns out to be arithmetic, not machinery**, and that is a consequence of the
+lazy mapping rather than a separate piece of luck. `MMAP_MAX` is
+`DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE`, so the mmap arena tops out at exactly the
+stack's lowest address — adjacent, no gap, which is *why* an overflow lands in mapped memory
+instead of faulting. Leaving a gap means an overflow hits addresses with no VMA. Linux ran
+this experiment already: a single guard page until Stack Clash (CVE-2017-1000364) showed a
+page could be jumped, 256 pages since. Taking the post-2017 default rather than re-learning it.
+
+**The guard gap matters more than the size.** `libui` already documents a ~9 KiB struct held
+by value being enough to run a client off its stack, *"which presents as a process that dies
+in its prologue and prints nothing at all, before its own first line"*. Silent. A bigger
+stack makes that rarer; the gap makes it diagnosable, and rarer-but-silent is the worse of
+the two.
+
+Also sharpened `widget-toolkit.md` §6.2 while here: it described per-buffer damage without
+saying that **per-buffer and per-frame are not alternatives**. They answer different
+questions — what the client must redraw versus what the compositor must copy — and tracking
+only the second under-redraws. The `Commit` damage is the per-buffer accumulation, a safe
+superset; sending a minimal rectangle is an optimisation needing a reason it does not yet
+have.

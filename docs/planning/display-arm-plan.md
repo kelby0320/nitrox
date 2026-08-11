@@ -322,7 +322,20 @@ lands. So it ships first, and **the terminal decides how much of it exists**. Mi
 requirement, not a compromise.
 
 - [ ] **Part A — the widget tree, layout, and invalidation.** Where a widget marking itself
-      dirty becomes a damage rectangle on a surface commit.
+      dirty becomes a damage rectangle on a surface commit. Carries the **crate rename**
+      (`libui` → `libsurface`), because everything after it imports the new names.
+
+      **Also the user stack: 32 KiB → 8 MiB, plus a guard gap.** A fourth deferral folded in,
+      and this milestone is one of the triggers it names — a toolkit is recursive by
+      construction (measure, arrange, paint and diff are all tree walks), and `libui` already
+      documents a ~9 KiB struct held by value being enough to run a client off the end of its
+      stack, silently, before its first line of output.
+
+      Cheap because the stack is **demand-paged**: the cost is address space, not memory. The
+      guard gap is arithmetic rather than machinery — `MMAP_MAX` currently tops out at exactly
+      the stack's lowest address, so leaving a gap means an overflow faults instead of landing
+      in mapped memory. It lands in Part A rather than later because it is independent of the
+      toolkit and wanted *before* the deep call chains exist.
 - [ ] **Part B — event routing**: hit testing, pointer capture during a drag, and
       **widget-level keyboard focus**, which is a *second* focus concept — the compositor
       decides which window has focus, the toolkit decides which widget within it does.

@@ -189,17 +189,37 @@ than here.
 
 ### 6.2 Damage is per buffer, not per frame
 
-This is the subtlety that must be designed in rather than discovered.
+This is the subtlety that must be designed in rather than discovered, and the first thing to
+say is that **"per buffer" and "per frame" are not alternatives** — they answer different
+questions, and a first implementation typically notices only one of them:
+
+| Question | Answer |
+|---|---|
+| What must the **client redraw** into the buffer it just acquired? | Damage since *that buffer* was last drawn — **per buffer** |
+| What must the **compositor copy** to the screen? | Damage since the *last commit*, because the screen shows the last committed buffer — **per frame** |
 
 A window has **two or more buffers**. The client draws into a free one while the compositor
 reads another. Suppose damage in frame *n* is rectangle A and in frame *n+1* is rectangle B.
 Buffer 0 is drawn in frame *n* and released during *n+2*; when it comes back it is missing
-**both** A and B — its pixels are from frame *n−1*.
+**both** A and B — its pixels are from frame *n−1*. Repainting only the current frame's delta
+leaves the rest stale.
 
 So each buffer carries **its own accumulated damage** since it was last drawn. Every commit
 adds its damage rectangle to *every other* buffer's accumulation. On acquiring a buffer, the
 region to repaint is that buffer's accumulation, and drawing it resets that accumulation to
 empty.
+
+**The `Commit` damage sent to the compositor is that same accumulation.** It is a *superset*
+of what actually changed on screen, so the compositor copies slightly more than it must —
+which is safe, where copying less is not. Splitting the two quantities to send a minimal
+rectangle is a later optimisation and needs a reason; at one blit per frame there is none.
+
+The bookkeeping is one rectangle per buffer: union on commit, reset on acquire. That is
+small enough to be worth stating why the obvious cheaper design was not taken. **Redrawing
+the whole buffer every time** removes per-buffer state entirely and is always correct — but
+it permanently constrains every widget's paint to be cheap enough to run on every event, and
+for the terminal that is re-rendering every glyph per keystroke. The constraint outlives the
+ten lines it saves.
 
 Getting this wrong produces stale rectangles that appear only when the compositor is slow
 enough to hold a buffer for more than one frame — i.e. under load, and not in a test. It is
@@ -409,7 +429,11 @@ Mapping onto [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 
 
 - **Part A** — `Element`, the diff with keyed identity (§3, §4), layout (§5), and painting
   with per-buffer damage (§6). The whole of this is pure and host-testable; the crate
-  rename (§10) lands here because everything after it imports the new names.
+  rename (§10) lands here because everything after it imports the new names. So does the
+  **user stack going 32 KiB → 8 MiB with a guard gap**, which is a filed deferral this
+  milestone triggers: a toolkit is recursive by construction, and the stack is demand-paged
+  so the size costs address space rather than memory
+  ([`deferred-decisions.md`](../rationale/deferred-decisions.md)).
 - **Part B** — event routing: pointer capture, widget focus and traversal, key bubbling
   (§7) — plus §9.1's focus record, without which the second focus concept has no source.
 - **Part C** — the widget set (§8), plus §9.2 key repeat and §9.3 the cursor, which are what
