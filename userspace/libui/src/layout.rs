@@ -110,7 +110,7 @@ impl Layout {
 }
 
 /// The size `e` wants, within `c`.
-pub fn measure<M: Metrics + ?Sized>(e: &Element, c: Constraints, m: &M) -> Size {
+pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M) -> Size {
     let size = match &e.node {
         Node::Text(s) => m.text_size(s),
         Node::Custom { size, .. } => *size,
@@ -168,7 +168,7 @@ pub fn measure<M: Metrics + ?Sized>(e: &Element, c: Constraints, m: &M) -> Size 
 }
 
 /// Place `e` at `rect` and everything inside it.
-pub fn arrange<M: Metrics + ?Sized>(e: &Element, rect: Rect, m: &M) -> Layout {
+pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) -> Layout {
     // `Sized` is the one node that changes its *own* rectangle rather than only its
     // children's. It has to: hit-testing and damage both read a node's rect, so constraining
     // only the child would leave a 12-pixel scrollbar claiming the whole overlay it sits in.
@@ -227,7 +227,7 @@ pub fn arrange<M: Metrics + ?Sized>(e: &Element, rect: Rect, m: &M) -> Layout {
 }
 
 /// Measure and arrange `e` into `bounds` in one call.
-pub fn layout<M: Metrics + ?Sized>(e: &Element, bounds: Rect, m: &M) -> Layout {
+pub fn layout<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, bounds: Rect, m: &M) -> Layout {
     let size = measure(e, Constraints::tight(bounds.size), m);
     arrange(e, Rect::new(bounds.origin.x, bounds.origin.y, size.w, size.h), m)
 }
@@ -241,8 +241,8 @@ enum Axis {
 
 /// Lay children along `axis`: fixed children take what they measure, flexed children split
 /// what is left in proportion to their weight.
-fn arrange_linear<M: Metrics + ?Sized>(
-    children: &[Element],
+fn arrange_linear<M: Metrics + ?Sized, Msg>(
+    children: &[Element<Msg>],
     spacing: u32,
     rect: Rect,
     m: &M,
@@ -351,6 +351,22 @@ pub fn to_local(rect: Rect, p: Point) -> Point {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
+    /// routing tests use a real enum; these are about shape, not about what a click means.
+    type Msg = ();
+
+    /// `layout` with `Msg` and the metrics pinned, so a construction like
+    /// `column(vec![text("a")])` infers from the parameter instead of needing a turbofish
+    /// at every call.
+    fn lay(e: &Element<Msg>, bounds: Rect) -> Layout {
+        layout(e, bounds, &CELL)
+    }
+
+    /// `measure`, likewise.
+    fn meas(e: &Element<Msg>, c: Constraints) -> Size {
+        measure(e, c, &CELL)
+    }
     use crate::element::{Insets, column, custom, dock, docked, padding, row, sized, stack, text,
                          with_spacing};
     use alloc::vec;
@@ -370,11 +386,11 @@ mod tests {
 
     #[test]
     fn a_column_stacks_and_a_row_runs() {
-        let l = layout(&column(vec![text("ab"), text("cde")]), SCREEN, &CELL);
+        let l = lay(&column(vec![text("ab"), text("cde")]), SCREEN);
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 640, 16));
         assert_eq!(l.children[1].rect, Rect::new(0, 16, 640, 16));
 
-        let l = layout(&row(vec![text("ab"), text("cde")]), SCREEN, &CELL);
+        let l = lay(&row(vec![text("ab"), text("cde")]), SCREEN);
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 16, 480));
         assert_eq!(l.children[1].rect, Rect::new(16, 0, 24, 480));
     }
@@ -386,7 +402,7 @@ mod tests {
         // flex divides. A first version tested only the placements and passed against `n`
         // gaps, because the cursor never reads the total.
         let c = with_spacing(column(vec![text("a"), text("b"), text("c")]), 4);
-        let l = layout(&c, SCREEN, &CELL);
+        let l = lay(&c, SCREEN);
         assert_eq!(l.children[0].rect.origin.y, 0);
         assert_eq!(l.children[1].rect.origin.y, 20);
         assert_eq!(l.children[2].rect.origin.y, 40);
@@ -397,7 +413,7 @@ mod tests {
             column(vec![text("a"), text("b"), custom(1, Size::new(0, 0)).flex(1)]),
             4,
         );
-        let l = layout(&c, Rect::new(0, 0, 50, 100), &CELL);
+        let l = lay(&c, Rect::new(0, 0, 50, 100));
         assert_eq!(l.children[2].rect, Rect::new(0, 40, 50, 60));
     }
 
@@ -405,7 +421,7 @@ mod tests {
     fn flex_divides_only_what_the_fixed_children_leave() {
         // The terminal's shape: a fixed menu bar, a grid taking the rest.
         let c = column(vec![text("menu"), custom(1, Size::new(0, 0)).flex(1)]);
-        let l = layout(&c, Rect::new(0, 0, 640, 480), &CELL);
+        let l = lay(&c, Rect::new(0, 0, 640, 480));
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 640, 16), "fixed keeps its measure");
         assert_eq!(l.children[1].rect, Rect::new(0, 16, 640, 464), "flex takes the remainder");
     }
@@ -419,7 +435,7 @@ mod tests {
             custom(2, Size::new(0, 0)).flex(1),
             custom(3, Size::new(0, 0)).flex(1),
         ]);
-        let l = layout(&c, Rect::new(0, 0, 100, 10), &CELL);
+        let l = lay(&c, Rect::new(0, 0, 100, 10));
         let widths: Vec<u32> = l.children.iter().map(|c| c.rect.size.w).collect();
         assert_eq!(widths.iter().sum::<u32>(), 100, "every pixel is assigned");
         assert_eq!(widths, [33, 33, 34], "and the remainder goes to the last");
@@ -435,7 +451,7 @@ mod tests {
             ],
             custom(1, Size::new(0, 0)),
         );
-        let l = layout(&d, Rect::new(0, 0, 640, 480), &CELL);
+        let l = lay(&d, Rect::new(0, 0, 640, 480));
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 640, 16), "bar spans the full width");
         assert_eq!(
             l.children[1].rect,
@@ -459,8 +475,8 @@ mod tests {
                  docked(Edge::Top, sized(Size::new(0, 16), text("")))],
             text(""),
         );
-        let a = layout(&top_first, Rect::new(0, 0, 100, 100), &CELL);
-        let b = layout(&right_first, Rect::new(0, 0, 100, 100), &CELL);
+        let a = lay(&top_first, Rect::new(0, 0, 100, 100));
+        let b = lay(&right_first, Rect::new(0, 0, 100, 100));
         assert_eq!(a.children[0].rect, Rect::new(0, 0, 100, 16), "the bar spans everything");
         assert_eq!(b.children[1].rect, Rect::new(0, 0, 88, 16), "here the scrollbar took first");
     }
@@ -471,7 +487,7 @@ mod tests {
         // fill, which defeats the only reason the node exists.
         let d = dock(vec![docked(Edge::Top, text("x"))], text("y"));
         assert_eq!(
-            measure(&d, Constraints::loose(Size::new(200, 100)), &CELL),
+            meas(&d, Constraints::loose(Size::new(200, 100))),
             Size::new(200, 100)
         );
     }
@@ -479,8 +495,8 @@ mod tests {
     #[test]
     fn padding_insets_the_child_and_grows_the_parent() {
         let p = padding(Insets::all(4), text("ab"));
-        assert_eq!(measure(&p, Constraints::loose(Size::new(640, 480)), &CELL), Size::new(24, 24));
-        let l = layout(&p, Rect::new(10, 20, 100, 50), &CELL);
+        assert_eq!(meas(&p, Constraints::loose(Size::new(640, 480))), Size::new(24, 24));
+        let l = lay(&p, Rect::new(10, 20, 100, 50));
         assert_eq!(l.children[0].rect, Rect::new(14, 24, 92, 42));
     }
 
@@ -503,7 +519,7 @@ mod tests {
     #[test]
     fn padding_wider_than_its_space_still_fits_what_it_was_offered() {
         let p = padding(Insets::all(50), text("hello"));
-        let s = measure(&p, Constraints::loose(Size::new(20, 20)), &CELL);
+        let s = meas(&p, Constraints::loose(Size::new(20, 20)));
         assert!(s.w <= 20 && s.h <= 20, "clamped to what was offered, got {s:?}");
     }
 
@@ -511,10 +527,10 @@ mod tests {
     fn sized_constrains_the_axes_it_names_and_yields_the_ones_it_does_not() {
         // A zero component means "whatever the parent gives". Without it every fixed-size
         // child would have to name a cross-axis extent it does not care about.
-        let l = layout(&sized(Size::new(12, 0), text("")), Rect::new(0, 0, 100, 80), &CELL);
+        let l = lay(&sized(Size::new(12, 0), text("")), Rect::new(0, 0, 100, 80));
         assert_eq!(l.rect, Rect::new(0, 0, 12, 80), "a scrollbar strip");
         assert_eq!(l.children[0].rect, l.rect, "and the child gets exactly that");
-        let l = layout(&sized(Size::new(0, 16), text("")), Rect::new(0, 0, 100, 80), &CELL);
+        let l = lay(&sized(Size::new(0, 16), text("")), Rect::new(0, 0, 100, 80));
         assert_eq!(l.rect, Rect::new(0, 0, 100, 16), "a menu bar");
     }
 
@@ -524,26 +540,26 @@ mod tests {
         // area, so passing the parent rect straight through made `sized` a no-op there —
         // and Part C reaches for exactly this to place a scrollbar over a grid.
         let s = stack(vec![custom(1, Size::new(0, 0)), sized(Size::new(12, 20), text(""))]);
-        let l = layout(&s, Rect::new(0, 0, 200, 100), &CELL);
+        let l = lay(&s, Rect::new(0, 0, 200, 100));
         assert_eq!(l.children[0].rect, Rect::new(0, 0, 200, 100), "the base layer fills");
         assert_eq!(l.children[1].rect, Rect::new(0, 0, 12, 20), "the overlay does not");
     }
 
     #[test]
     fn sized_never_exceeds_the_slot_it_was_given() {
-        let l = layout(&sized(Size::new(500, 500), text("")), Rect::new(0, 0, 40, 30), &CELL);
+        let l = lay(&sized(Size::new(500, 500), text("")), Rect::new(0, 0, 40, 30));
         assert_eq!(l.rect, Rect::new(0, 0, 40, 30));
     }
 
     #[test]
     fn a_stack_overlays_every_layer_on_the_whole_area() {
         let s = stack(vec![custom(1, Size::new(10, 10)), custom(2, Size::new(20, 20))]);
-        let l = layout(&s, Rect::new(5, 5, 40, 30), &CELL);
+        let l = lay(&s, Rect::new(5, 5, 40, 30));
         assert_eq!(l.children[0].rect, Rect::new(5, 5, 40, 30));
         assert_eq!(l.children[1].rect, Rect::new(5, 5, 40, 30));
         // And it measures as the union, so a menu popup does not shrink its host.
         assert_eq!(
-            measure(&s, Constraints::loose(Size::new(640, 480)), &CELL),
+            meas(&s, Constraints::loose(Size::new(640, 480))),
             Size::new(20, 20)
         );
     }
@@ -556,7 +572,7 @@ mod tests {
             vec![docked(Edge::Top, text("bar")), docked(Edge::Left, text("side"))],
             column(vec![text("a"), text("b")]),
         );
-        let l = layout(&e, SCREEN, &CELL);
+        let l = lay(&e, SCREEN);
         assert_eq!(e.children().count(), l.children.len());
         for (child, cl) in e.children().zip(l.children.iter()) {
             assert_eq!(child.children().count(), cl.children.len());
@@ -567,16 +583,16 @@ mod tests {
     fn an_empty_container_lays_out_rather_than_panicking() {
         // `children.len() - 1` for the gap count underflows on an empty list, and an empty
         // container is what a `view` returns while a list is still loading.
-        let l = layout(&with_spacing(column(vec![]), 4), SCREEN, &CELL);
+        let l = lay(&with_spacing(column(vec![]), 4), SCREEN);
         assert!(l.children.is_empty());
-        assert_eq!(measure(&column(vec![]), Constraints::loose(SCREEN.size), &CELL).h, 0);
+        assert_eq!(meas(&column(vec![]), Constraints::loose(SCREEN.size)).h, 0);
     }
 
     #[test]
     fn a_child_larger_than_its_slot_is_clipped_by_the_slot_not_by_overflow() {
         // Arithmetic on a rect narrower than its content must not wrap. The child keeps its
         // requested size here — clipping is the painter's job — but nothing may go negative.
-        let l = layout(&row(vec![text("a very long line indeed")]), Rect::new(0, 0, 16, 16), &CELL);
+        let l = lay(&row(vec![text("a very long line indeed")]), Rect::new(0, 0, 16, 16));
         assert!(l.children[0].rect.size.w <= 16, "constrained, not wrapped");
     }
 }

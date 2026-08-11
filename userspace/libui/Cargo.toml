@@ -16,6 +16,7 @@ edition = "2024"
 # window arrive with event routing in Part B.
 [dependencies]
 libdraw = { path = "../libdraw" }
+librsproto = { path = "../librsproto" }
 
 [lib]
 name = "libui"
