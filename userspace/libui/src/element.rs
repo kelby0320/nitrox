@@ -17,11 +17,24 @@
 //! reason is that **a Rust tuple-variant constructor is already a `fn` pointer**: an
 //! application writes `.on_key(Msg::Key)` and gets exactly what Iced spells with a closure.
 //!
-//! That buys three things a box would cost. `Element` stays `Clone` and `Debug`, which the
-//! diff's tests lean on; nothing allocates per handler on a heap this system hand-rolls;
-//! and a `view` that runs on every event is not building closures sixty times a second. The
-//! limit is that a handler cannot capture — if one ever needs to, that is the moment to
-//! reach for `Rc<dyn Fn>`, and not before.
+//! **The reason is `Clone` and `Debug`, not allocation.** `Box<dyn Fn>` is neither, so
+//! `#[derive(Clone, Debug)]` on `Element` stops compiling and the diff's tests lose the
+//! `assert_eq!` they are written with; `Rc<dyn Fn>` restores `Clone` but still needs a
+//! hand-written `Debug`. A `fn` pointer is `Copy`, `Clone` and `Debug` for free, and reads
+//! identically at every call site we have.
+//!
+//! An earlier version of this comment also claimed a box would cost an allocation per
+//! handler on a hand-rolled heap. That argument does not survive contact with the rest of
+//! the type: `view` already allocates a `Vec` per container, a `Box` per `padding`/`sized`
+//! child and a `String` per `text`, so a handler box is a small fraction of a number that
+//! is already fine — and `view` runs on *events*, not at frame rate. The claim is struck
+//! rather than quietly deleted, because a justification nobody believes is worse than none.
+//!
+//! **The real limit is that a `fn` cannot capture**, and it is narrower than it sounds.
+//! `on_press` takes a *value*, so `Msg::Select(i)` captures `i` perfectly well. It bites
+//! only the handlers that take event data: a list row wanting both the event and its own
+//! index — `Msg::RowKey(i, event)` — cannot be spelled. Expect that in Part C or Milestone
+//! 5; the fix then is an `Rc<dyn Fn>` variant *alongside* this one, which is additive.
 
 use alloc::boxed::Box;
 use alloc::string::String;
