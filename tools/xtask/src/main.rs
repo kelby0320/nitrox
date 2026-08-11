@@ -986,25 +986,15 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // contend for its four-message session ring.
     session.expect("input-testclient: window ready")?;
 
-    // **The cursor is not moved.** The client's window is larger than the screen, so the
-    // cursor is already inside it. Steering it would take a dozen PS/2 motion events, each
-    // becoming a `PointerEvent` on a four-message session ring — the first version of this
-    // gate did exactly that and lost the keystroke behind the flood. One injection per
-    // assertion keeps at most two messages in flight, which is the discipline this gate
-    // needs until back-pressure is settled (M3 Part D3).
-
-    // **A deliberate flood.** Twelve cursor movements are exactly what broke this gate
-    // before M3 Part D3: each became a `PointerEvent` sent `NOBLOCK` at a four-message ring,
-    // and the keystroke behind them was dropped on the floor. What this asserts is the
-    // *retry* half of the fix — the compositor now queues per session and re-sends the head
-    // until the client takes it, so a flood delays a keystroke instead of losing it.
+    // **A deliberate flood, and a weak one.** Twelve cursor movements are what broke this
+    // gate before M3 Part D3, when each became a `PointerEvent` sent `NOBLOCK` at a
+    // four-message ring and the keystroke behind them went on the floor.
     //
-    // It does **not** exercise coalescing: twelve motions fit inside `OUTBOX_MAX`, so the
-    // queue never has to collapse them, and the gate passes with coalescing removed (checked
-    // by removing it). Coalescing earns its place by stopping a long drag from pushing
-    // *discrete* events out of a full queue, which is a host test
-    // (`a_coalesced_motion_does_not_count_against_the_bound`) because provoking it from here
-    // would need thousands of injections to beat a client that drains promptly.
+    // It proves less than it looks: the client drains in `wait_event` between injections, so
+    // thirteen messages never queue against a sixteen-slot ring and **no send is ever
+    // refused**. It covers neither coalescing nor retry — the phase-3 stall below is what
+    // covers those. Kept because it is still the historical regression, cheap, and the shape
+    // a real cursor movement takes.
     for _ in 0..12 {
         qmp.send_motion(-120, -120)?;
     }
@@ -1021,6 +1011,28 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     qmp.send_button("left", true)?;
     session.expect("input-testclient: win ptr kind=1 btn=272 buttons=1")?;
     qmp.send_button("left", false)?;
+
+    // ---- Park-and-retry ----
+    //
+    // The client stops draining. The flood then overruns its 16-slot ring: everything after
+    // that parks in the compositor's per-session outbox, where motion coalesces to a single
+    // record and the key queues behind it. On waking, the key must still arrive.
+    //
+    // This is the only assertion covering park-and-retry. The earlier flood covers neither
+    // it nor coalescing — with the client draining between injections a send is never
+    // refused at all, which is finding 3 of the PR #181 review.
+    session.expect("input-testclient: stalling")?;
+
+    // Comfortably past the 16-slot ring, so the outbox is genuinely holding messages.
+    for _ in 0..40 {
+        qmp.send_motion(3, 3)?;
+    }
+    // `c` is keycode 46. Injected *after* the ring is full, so it can only arrive if the
+    // compositor parked it and re-sent it — and only if it wakes itself to do so, since a
+    // client draining its own ring signals nothing to the compositor.
+    qmp.send_key("c", true)?;
+
+    session.expect("input-testclient: late key code=46")?;
 
     session.expect("input-testclient: PASSED")?;
     let _ = fs::remove_file(&qmp_sock);

@@ -785,7 +785,7 @@ fn supervise(notif: u64, root_ns: u64, decl: ServiceDecl, mut service_h: i64, mu
                 .s(b"' exited pid=")
                 .u(cpid as u64)
                 .s(b" code=")
-                .u(code as u64)
+                .i(code as i64)
                 .end();
 
             // A supervisor-requested shutdown is intentional — never restart it, even

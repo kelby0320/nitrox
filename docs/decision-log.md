@@ -12531,3 +12531,53 @@ Coalescing earns its place by stopping a long drag from pushing discrete events 
 queue, which is a host test. The comment now says which half is which. **The check that
 caught it — delete the mechanism, re-run the test that claims to cover it — costs one run and
 is the only thing that distinguishes a regression test from a coincidence.**
+
+## 2026-08-10 — A parked message needs a wakeup, and a gate that never refuses proves nothing
+
+The PR #181 review found three blocking defects in D3, and the two that matter are the same
+mistake seen from opposite ends.
+
+**A queue is not a fix without a wakeup.** D3 replaced drop-on-refusal with park-at-the-head,
+and the deferral recorded the consequence as *"a latency bound, not a loss"*. That is true for
+input and false for `Release`. A channel endpoint signals when it has something to **read**, so
+a client draining its own receive ring does not wake the compositor at all: the compositor
+sleeps in an infinite `sys_wait` holding a message the client is blocked waiting for, and
+neither side ever moves. That is the permanent hang the mechanism was built to prevent —
+reintroduced, and made *worse*, because the code it replaced at least printed
+`DROPPED a Release`. The fix is a bounded wait: while anything is parked the serve loop wakes
+on a 10 ms deadline, and with every outbox empty it still waits forever, so an idle compositor
+does not poll.
+
+The general form is worth keeping: **replacing "drop it" with "hold it" moves the failure from
+loss to liveness**, and liveness failures are silent by construction. Anything that parks work
+owes an answer to "what wakes me".
+
+**A gate that never provokes the condition tests nothing.** The same PR narrates catching one
+false coverage claim — a flood advertised as coalescing's regression test that passed with
+coalescing deleted — corrects the comment, and then re-makes the identical error one line
+down by claiming the flood covers *retry*. It does not: the client drains between injections,
+so thirteen messages never queue against a sixteen-slot ring and **no send is ever refused**.
+The reviewer demonstrated it by adding a log line to the refusal path and watching it never
+fire.
+
+Park-and-retry — the PR's central new behaviour — had no end-to-end coverage at all, which is
+also why the liveness bug above could not have been caught by any gate in it. The fix is a
+client that *stops draining*: `input-testclient` now sleeps 1.5 s while the harness floods
+forty motions and then injects a key, so the ring genuinely fills and the outbox genuinely
+parks. Both defects fail that assertion, verified by breaking each in turn.
+
+**The lesson about the correction, not the bug.** Correcting a false coverage claim once did
+not stop the same claim being made about the neighbouring mechanism, because what got fixed
+was the sentence rather than the method. The method is cheap and mechanical: *instrument the
+path the test claims to exercise and confirm it is entered.* A test that cannot be shown to
+reach its own subject is a coincidence, however carefully its comment is worded.
+
+Two smaller notes:
+
+- The D1 sweep's detector matched `kprint_u64`/`kprint_hex` but not locally-named helpers like
+  `kprint_hex64`, so it missed two torn lines in `test-harness/display.rs`. A sweep is only as
+  complete as the names its regex knows.
+- `Line::i` existed from D1 and the sweep still emitted `.u(code as u64)` at three exit-code
+  sites, faithfully preserving a pre-existing bug: `-1` printed as 18446744073709551615. A
+  mechanical sweep preserves defects with the same fidelity it preserves behaviour, and that
+  is the point of it — but it means the sweep is not the moment those defects get found.

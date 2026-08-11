@@ -56,32 +56,19 @@ use libkern::{exit, kprint};
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
 
-/// Print `n` in hex, zero-padded to 16 digits, without `format!`.
-fn kprint_hex64(n: u64) {
-    let mut buf = [b'0'; 16];
-    for i in 0..16 {
-        let nib = ((n >> (60 - i * 4)) & 0xF) as u8;
-        buf[i] = if nib < 10 { b'0' + nib } else { b'a' + nib - 10 };
-    }
-    kprint(&buf);
-}
-
 /// Check 1: the reference scene's hash matches the constant the host asserts.
 fn check_reference_hash() -> bool {
     let fb = scene::render_reference();
     let got = hash_visible(&fb);
     if got == REFERENCE_HASH {
-        kprint(b"display-selftest: reference hash 0x");
-        kprint_hex64(got);
-        kprint(b" OK\n");
+        Line::new().s(b"display-selftest: reference hash ").x(got).s(b" OK").end();
         return true;
     }
 
-    kprint(b"display-selftest: reference hash MISMATCH\n  guest 0x");
-    kprint_hex64(got);
-    kprint(b"\n  host  0x");
-    kprint_hex64(REFERENCE_HASH);
-    kprint(b"\n");
+    // Two lines, two calls — each complete on its own. The pair can still interleave with
+    // another process's output, but neither is *torn*, which is the property that matters.
+    Line::new().s(b"display-selftest: reference hash MISMATCH").end();
+    Line::new().s(b"  guest ").x(got).s(b"  host ").x(REFERENCE_HASH).end();
     // The picture, not just the number. A viewer can open this; the two hashes cannot
     // distinguish a stride skew from a swapped channel.
     let ppm = libdraw::ppm::to_ppm(&fb);

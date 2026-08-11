@@ -4264,7 +4264,7 @@ fn fp_hardfloat_demo(root_ns: u64, notif: u64) {
                 if code != 0 {
                     Line::new()
                         .s(b"test-harness: hard-float worker FAILED code=")
-                        .u(code as u64)
+                        .i(code as i64)
                         .end();
                     exit(1);
                 }

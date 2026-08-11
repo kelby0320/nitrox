@@ -1865,7 +1865,9 @@ fn reap_loop(notif: u64, root_ns: u64, mut parent_h: i64) -> ! {
                     .s(b"init: reaped pid=")
                     .u(cpid as u64)
                     .s(b" code=")
-                    .u(code as u64)
+                    // `.i`, not `.u`: an exit code is signed, and `-1` widened through
+                    // `as u64` prints 18446744073709551615 (PR #181 review, finding 8).
+                    .i(code as i64)
                     .end();
                 // Release init's reference to the primary child on its exit. Reparented
                 // orphans have no handle here — the kernel tears them down; init observes.

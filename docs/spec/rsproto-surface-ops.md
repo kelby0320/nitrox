@@ -16,10 +16,21 @@ capture, window movement and port wiring are later milestones and will extend th
 **`KeyEvent` and `PointerEvent` are sent** as of M3 Part C3 (2026-08-10). The compositor
 consumes `/dev/input/new`, interprets the stream with `libinput`, and routes it:
 keys to the topmost window whose role takes focus, pointer events to the window under the
-cursor, with an implicit grab from a press to its release. What is **not** yet built is the
-receiving end — `libui` does not deliver these into a window's event queue, so no client
-reads one yet (M3 Part D). There is also no cursor drawn on screen: the compositor knows
-where the pointer is and nothing shows it.
+cursor, with an implicit grab from a press to its release. **The receiving end is built too**
+as of M3 Part D (2026-08-10): `libui` delivers both records into a per-window event queue, and
+`cargo xtask check-input` injects a keystroke and a click over QMP and asserts they reach a
+window.
+
+Delivery is **queued and retried, not best-effort**. The compositor holds a bounded per-session
+outbox, coalesces pointer motion to at most one pending record per window, and re-sends the
+head until the client takes it, so a burst of motion delays a keystroke rather than displacing
+it. A client that stalls long enough to overrun that queue loses the oldest records and
+**is not told** — the protocol has no loss marker, which is a filed gap
+(`../rationale/deferred-decisions.md`).
+
+Still missing: no cursor is drawn on screen — the compositor knows where the pointer is and
+nothing shows it — and a client is not told when it gains or loses focus. Both are for
+Milestone 4, the toolkit being the first thing that needs either.
 
 ## Where it sits
 
@@ -344,7 +355,7 @@ wire change, which is the same reason the device layer's extensibility lives in 
   second piece of state to disagree with the stack. A press on a `panel` raises nothing, or a
   stray click on a clock would cover a window with no way to get it back. **A client is not
   told when it gains or loses focus**; if it paints a focus indicator it must infer this from
-  the keys and crossings it receives, which is a gap, not a design (M3 Part D).
+  the keys and crossings it receives, which is a gap, not a design (Milestone 4).
 - **`PointerEvent` goes to the window under the pointer**, topmost first, regardless of focus
   and regardless of role — a panel that cannot take a keystroke can still be clicked. A window
   that is not focused still sees the click that is about to focus it.

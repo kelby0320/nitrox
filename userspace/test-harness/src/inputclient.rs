@@ -34,7 +34,7 @@ use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::debug::Line;
 use libkern::{
     RIGHT_RECV, RIGHT_SEND, RIGHT_WAIT, SYS_CHANNEL_RECV, SYS_NS_LOOKUP, SYS_WAIT, exit, kprint,
-    syscall4,
+    syscall2, syscall4, syscall5,
 };
 use librsproto::surface::Role;
 use libui::{Window, WindowEvent, ipc::ChannelTransport};
@@ -55,11 +55,21 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// size contains the cursor wherever the compositor parked it — which means the gate can
 /// click without first driving the cursor somewhere known. That matters more than it sounds:
 /// steering the cursor takes a dozen PS/2 motion events, each of which becomes a
-/// `PointerEvent` on this client's **four-message** session ring, and the first attempt at
-/// this gate lost the keystroke behind exactly that flood. The compositor clips, so an
-/// oversized window is ordinary — a maximised one is the same shape.
+/// `PointerEvent` on this client's session ring, and the first attempt at this gate lost the
+/// keystroke behind exactly that flood. The compositor clips, so an oversized window is
+/// ordinary — a maximised one is the same shape.
 const WIN_W: u32 = 2048;
 const WIN_H: u32 = 2048;
+
+/// How long phase 3 refuses to drain, in nanoseconds.
+///
+/// Long enough for the harness to see `stalling`, inject a flood over QMP, and for the
+/// compositor to fill the ring and start parking — sub-second would race the host round trip.
+const STALL_NS: u64 = 1_500_000_000;
+
+/// The key the harness injects *after* the flood, and the one whose arrival proves nothing
+/// was dropped while the ring was full.
+const LATE_CODE: u16 = 46;
 
 /// Bytes per record, from the shared ABI rather than a local literal — an earlier version
 /// hardcoded `16` and read fields at literal offsets, so a kernel-side layout change would
@@ -76,6 +86,7 @@ const DONE_CODE: u16 = libkern::abi::BTN_LEFT;
 /// Offset of the rsproto payload inside an `IpcMsg`.
 const PAYLOAD_OFF: usize = 24;
 
+static mut CLOCK_BUF: u64 = 0;
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 
@@ -213,7 +224,7 @@ impl Stream {
 /// Called by the kernel's ELF entry with the standard bootstrap arguments; `root_ns` is this
 /// process's root namespace.
 #[unsafe(no_mangle)]
-pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
+pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"input-testclient: up\n");
 
     let Some(mut stream) = Stream::open(root_ns) else {
@@ -245,10 +256,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // The window is created **after** phase 1 rather than up front. With no window, the
     // compositor has nothing to route phase 1's events to and sends nothing; created early,
     // its records would queue on this client's session channel while it was blocked reading
-    // the raw stream, and that channel holds four messages before sends start failing. That
-    // is a real hazard and it is filed (`deferred-decisions.md`, compositor→client
-    // back-pressure) — sequencing the phases means this gate is not the thing that discovers
-    // it, and D3 can characterise it deliberately.
+    // the raw stream. That mattered when a refused send was simply dropped; since M3 Part D3
+    // the compositor parks and retries, so the phases are sequenced now for clarity rather
+    // than for safety — and phase 3 below exercises the parking deliberately.
     let transport = match unsafe { ChannelTransport::connect(root_ns) } {
         Ok(t) => t,
         Err(_) => {
@@ -322,8 +332,68 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
     }
 
+    // ---- Phase 3: stop draining, and prove nothing is lost ----
+    //
+    // The phases above never exercise the compositor's park-and-retry: this client drains in
+    // `wait_event` between injections, so a send is never refused and the outbox never holds
+    // anything (PR #181 review, finding 3 — demonstrated by replacing retry with the old
+    // drop-on-refusal and watching the gate pass anyway).
+    //
+    // So stall deliberately. While this sleeps, the harness floods motion until the 16-slot
+    // ring is full and then injects a key. Every motion after the ring fills parks in the
+    // compositor's outbox and coalesces to one; the key queues behind it. On waking, the
+    // key must still arrive — under drop-on-refusal it would not, and under park-with-no-
+    // wakeup (the same review's finding 1) it would never be re-sent, because a client
+    // draining its own ring signals nothing to the compositor.
+    kprint(b"input-testclient: stalling\n");
+    sleep_ns(notif, STALL_NS);
+
+    let mut saw_late_key = false;
+    while !saw_late_key {
+        let ev = match win.wait_event() {
+            Ok(e) => e,
+            Err(_) => {
+                kprint(b"input-testclient: window stream FAILED\n");
+                exit(1);
+            }
+        };
+        match ev {
+            WindowEvent::Key(k) => {
+                Line::new().s(b"input-testclient: late key code=").u(k.keycode as u64).end();
+                if k.keycode == LATE_CODE {
+                    saw_late_key = true;
+                }
+            }
+            WindowEvent::Pointer(_) => {}
+            WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+        }
+    }
+
     kprint(b"input-testclient: PASSED\n");
     exit(0);
+}
+
+/// Sleep for `ns` by waiting on a handle that never signals.
+///
+/// No timer handle needed: `sys_wait` takes an absolute monotonic deadline and returns
+/// `TimedOut`, and this process's notification handle is signalled by nothing it does.
+fn sleep_ns(notif: u64, ns: u64) {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe { syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64) };
+    // SAFETY: the kernel wrote the ns count.
+    let deadline = unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns);
+    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    unsafe {
+        WAIT_HANDLES[0] = notif;
+        syscall5(
+            SYS_WAIT,
+            (&raw const WAIT_HANDLES) as u64,
+            1,
+            (&raw mut WAIT_RESULTS) as u64,
+            deadline,
+            0,
+        );
+    }
 }
 
 #[panic_handler]

@@ -310,13 +310,21 @@ The shape:
   place at the *back*, so a motion that happened after a keystroke is still delivered after
   it. This is what X11 and Wayland do, and it works for the same reason: a motion record
   carries an absolute window-local position, so the newest says everything the older ones did.
-- **The queue is flushed every loop iteration**, head-of-line, stopping at the first refusal.
-  There is no writability signal to wait on; a client that unblocks with no further input
-  pending keeps its queued messages until the next event wakes the compositor. That is a
-  latency bound, not a loss.
-- **The ring is 16, not 4.** The old value was never chosen — a literal copied into every
-  resource server in the tree, and a quarter of the kernel's own `IPC_DEFAULT_QUEUE_DEPTH`.
-  Sixteen is the kernel default and costs 128 KiB of kernel memory per session, since a slot
+- **The queue is flushed every loop iteration**, head-of-line, stopping at the first refusal,
+  and the compositor **wakes itself** to retry. A channel endpoint signals only when it has
+  something to *read*, so a client draining its ring does not wake the compositor at all —
+  a parked message with no wakeup is not "a latency bound, not a loss", it is a permanent
+  hang on the one message whose loss is unrecoverable, and a *silent* one where the code it
+  replaced at least logged the drop. While anything is parked the serve loop waits on a
+  10 ms deadline instead of forever; with every outbox empty the wait is still infinite, so
+  an idle compositor does not poll (PR #181 review, finding 1).
+- **The ring is 16, not 4** — which is 4× the old threshold and *not* a different kind of
+  bound. Coalescing bounds the outbox, not the ring: two motions collapse only while both are
+  queued, and a compositor flushing every iteration sends each as its own message. What
+  removes the cliff is the retry; the depth only decides how long a stalled client goes before
+  its motion starts coalescing (PR #181 review, finding 4). The old value was never chosen —
+  a literal copied into every resource server in the tree, and a quarter of the kernel's own
+  `IPC_DEFAULT_QUEUE_DEPTH`. Sixteen costs 128 KiB of kernel memory per session, since a slot
   is a whole 4 KiB `IpcMsg` whatever the payload.
 
 **Still open, and smaller than it was:** the Surface protocol has **no loss marker**. If a
