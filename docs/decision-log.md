@@ -13147,3 +13147,59 @@ This change takes it to 3,021 fills (5.2 % of boot) — reproduced exactly acros
 reason: **image materialisation is 656 ms, 83 % of spawn time**, and `sys_spawn` copies the
 whole ELF eagerly whether or not its pages are touched. Demand-paged program text subsumes
 most of what read-ahead would buy, so it goes first.
+
+## 2026-08-11 — Review of #185: two bugs that were both "the decision lives where nothing can test it"
+
+The review of PR #185 found one blocking bug and one that would have been felt by the first
+person to use a keyboard. They are the same bug twice, and the shape is worth naming.
+
+**Both live in `compositor/src/main.rs`.** That file takes a `Server` and a `RawFramebuffer`,
+so nothing in it can be reached from a host test — and both defects were *decisions* (when to
+redraw the pointer, when to start a repeat) sitting in the one file where a decision cannot be
+asserted. The state machines beside them were host-tested and correct: `Repeat::due`'s deadline
+advance, its burst guard, `draw_cursor`'s clip. What went wrong was never the mechanism, it was
+when the mechanism runs.
+
+### The cursor vanished on every click
+
+`draw_cursor` had one caller, `repaint_region`. Three other paths recomposed the screen
+directly — the restack after a click, a session dying, and the initial compose — so each
+erased the pointer. The click path is not rare: `WindowStack::raise` succeeds whenever the
+window exists, including when it is already topmost, so every click on a focusable window took
+it. The comment above it asserted the opposite, which is how it survived being read.
+
+**The fix is structural, not three fixes.** `compose_into` is now `pub(crate)`, so the server
+binary *cannot* compose without the cursor, and `present_into` — compose, then the pointer over
+every damage rectangle — is the only way a screen region is updated. Moving the pairing into
+the library is also what makes it testable: two tests now assert the pointer survives a
+recompose over a window, and that it is drawn into *every* damage rectangle rather than the
+first (which is what `repaint_cursor_move` passes two of).
+
+A fourth path added later cannot repeat the mistake, because there is no API for it.
+
+### Holding Ctrl typed 25 characters a second
+
+Modifiers arrive as ordinary `Logical::Key` transitions — correctly, they are key
+transitions — and the arming arm matched any press. So holding a modifier repeated it, and
+because `srv.repeat` is one slot, pressing Shift while `a` was held *replaced* `a`'s repeat;
+releasing Shift then cleared it, and the still-held `a` never repeated again. That is exactly
+what the release arm's comment said must not happen, defeated from the other side.
+
+`libinput::is_modifier` is the missing predicate — the keycode table belongs to `libinput`, the
+repeat policy to the compositor. And the arming *decision* moved into `Repeat::after_key`,
+where it is a function of values and has four tests, including one that names all eight
+modifier keycodes rather than trusting a representative.
+
+### The other three
+
+Two `Fill` behaviours had no test at all, and both were load-bearing: the colour in
+`Fingerprint::Fill` (without it a button never repaints on hover, which is the widget set's
+whole point) and `paint` filling to the clip rather than the node's rect (without it a partial
+repaint overdraws a neighbour the diff called clean). Neither break was visible to 106 passing
+tests. `paint`'s private `fill` is also gone in favour of `Framebuffer::fill_rect`, whose own
+doc warns against exactly the second copy that had grown here.
+
+And `docs/conventions/userspace-build.md` still instructed the reader to "add it to the
+`programs` list in `build_initramfs`" — a symbol this PR deleted, and the precise drift the
+new `(program, reason)` pairs exist to stop. A convention doc that dates badly is worse than
+none, because it is the thing a new session reads *instead of* the source.

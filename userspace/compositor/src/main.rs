@@ -691,21 +691,14 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                 // transition rather than from what the router decided to do with it: a key
                 // that reached no window still stops repeating when it comes up.
                 if let libinput::Logical::Key { keycode, pressed, modifiers } = *l {
-                    match (pressed, srv.stack.focus_candidate()) {
-                        (true, Some(window)) => {
-                            srv.repeat =
-                                Some(compositor::Repeat::armed(keycode, modifiers, window, now));
-                        }
-                        // Only the held key's own release disarms. Releasing a *modifier*
-                        // mid-repeat must not stop the run — which is the same reason the
-                        // modifiers are frozen at the press.
-                        (false, _)
-                            if srv.repeat.is_some_and(|r| r.keycode == keycode) =>
-                        {
-                            srv.repeat = None;
-                        }
-                        _ => {}
-                    }
+                    srv.repeat = compositor::Repeat::after_key(
+                        srv.repeat,
+                        keycode,
+                        pressed,
+                        modifiers,
+                        srv.stack.focus_candidate(),
+                        now,
+                    );
                 }
                 // A `SYN_DROPPED` means the held-key set is a guess, so a repeat started
                 // from it is too — `libinput` has already reset what it accumulated.
@@ -720,14 +713,13 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     // A click that raised a window moved focus with it.
     announce_focus(srv);
     // Erase the cursor's old position and draw it at the new one. Skipped when a restack is
-    // about to repaint everything anyway, which also draws the cursor.
-    if !restacked {
-        repaint_cursor_move(srv, fb, cursor_was, srv.router.pointer());
-    }
+    // about to repaint everything anyway — which also draws the cursor, because `repaint`
+    // is the only thing here that touches the screen.
     if restacked {
         // A click raised a window, so what is on screen no longer matches the stack.
-        let bounds = fb.geometry().bounds();
-        srv.stack.compose_into(fb, BACKGROUND, srv, &[bounds]);
+        repaint(srv, fb);
+    } else {
+        repaint_cursor_move(srv, fb, cursor_was, srv.router.pointer());
     }
     true
 }
@@ -957,8 +949,7 @@ fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
 /// into the stack would make it a window — with a position in the stacking order, a client
 /// that could cover it, and hit-testing that would have to skip it.
 fn repaint_region(srv: &Server, fb: &mut RawFramebuffer, region: Rect) {
-    srv.stack.compose_into(fb, BACKGROUND, srv, &[region]);
-    compositor::draw_cursor(fb, srv.router.pointer(), region);
+    srv.stack.present_into(fb, BACKGROUND, srv, &[region], srv.router.pointer());
 }
 
 /// Repaint what the pointer moving from `was` to `now` disturbed.
@@ -1279,8 +1270,10 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                 && !serve_session(slot, srv, &mut fb)
             {
                 close_session(slot, srv);
-                let bounds = fb.geometry().bounds();
-                srv.stack.compose_into(&mut fb, BACKGROUND, srv, &[bounds]);
+                // Through `repaint`, so the pointer survives a client dying under it. It did
+                // not: this composed directly and nothing redrew the cursor afterwards, so it
+                // stayed gone until the next mouse movement (PR #185 review, finding 1).
+                repaint(srv, &mut fb);
             }
         }
         // **Before the early `continue`.** Everything above may have queued messages, and
@@ -1397,8 +1390,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
     // held `/dev/framebuffer` mapped read-write with nothing arbitrating. Ordering it here
     // costs nothing and removes the window entirely, where pacing it against a later signal
     // would only narrow it.
-    let bounds = fb.geometry().bounds();
-    srv.stack.compose_into(&mut fb, BACKGROUND, &srv, &[bounds]);
+    // The pointer is drawn here too, so it exists from the moment the compositor owns the
+    // screen rather than from whenever the mouse first moves — which on a machine with no
+    // client and no mouse activity was never.
+    repaint(&srv, &mut fb);
 
     if !send_ready(ctrl, kernel_end) {
         kprint(b"compositor: Ready send FAIL\n");

@@ -159,6 +159,16 @@ impl ScrollState {
 /// Built out of layout rather than arithmetic on a canvas: a `Column` of a spacer, the thumb
 /// and a filler places the thumb without any node needing to offset its child. That is why
 /// the toolkit has no `Offset` primitive — this was the thing that would have wanted one.
+///
+/// **`height` must be the height the parent will actually give it.** The bar sizes itself
+/// `width × 0` — full height of whatever slot it lands in, per `sized`'s zero-axis rule — but
+/// `height` is what the thumb's length and position are computed against, and the two are not
+/// connected. Pass a smaller number and the thumb stops short of the bottom at the last line;
+/// pass a larger one and it runs off the end. A caller in a `Dock` therefore has to subtract
+/// whatever the other edges took, which is what [`reference::view`](crate::reference::view)
+/// does. Making the widget measure itself would need a second layout pass, which the toolkit
+/// does not have; until it does, this is an obligation on the caller rather than a guarantee
+/// (PR #185 review, finding 7).
 pub fn scrollbar<Msg>(state: ScrollState, width: u32, height: u32, palette: &Palette) -> Element<Msg> {
     let (pos, len) = state.thumb(height);
     sized(

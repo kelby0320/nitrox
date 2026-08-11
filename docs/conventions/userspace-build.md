@@ -29,18 +29,35 @@ Rust's `x86_64-unknown-none` defaults toward PIE, so the crate forces:
 Verify the output: `readelf -h <elf>` → `Type: EXEC`; `readelf -l <elf>` →
 no `INTERP`, each `LOAD` has `VirtAddr % 0x1000 == Offset % 0x1000`.
 
-## Build ordering and the initramfs
+## Build ordering, the store, and the initramfs
 
-Programs are **packed into the initramfs** at `sbin/<name>`, not embedded in the
-kernel. `cargo xtask build` builds each userspace program (run from its crate dir,
-with `--target x86_64-unknown-none`, so its `.cargo/config.toml` applies); `cargo
-xtask image` then packs the built ELFs into the initramfs CPIO
-(`build_initramfs`). The kernel boot-loads `/sbin/init` from the initramfs, and
-each spawner resolves its children by path (`/initramfs/sbin/<name>` → a readable
-`MemoryObject` → `sys_process_spawn`; see the SpawnArgs spec). Because the kernel no
-longer `include_bytes!`s userspace artifacts, its compile no longer depends on them
-— but always build via `cargo xtask` so the ELFs exist before the image is
-assembled.
+Programs are **not embedded in the kernel**. `cargo xtask build` builds each userspace
+program (run from its crate dir, so its `.cargo/config.toml` selects the custom target);
+`cargo xtask image` then places the built ELFs. Because the kernel no longer
+`include_bytes!`s userspace artifacts, its compile no longer depends on them — but always
+build via `cargo xtask` so the ELFs exist before the image is assembled.
 
-To make a new program spawnable: add it to the `programs` list in `build_initramfs`
-(`tools/xtask`), and have its spawner resolve `/initramfs/sbin/<name>`.
+Where a program is placed is the part that matters, and there are two answers.
+
+**Almost everything goes in the content-addressed store**, at
+`/store/<hash>-<package>-<version>/bin/<name>` on the ext4 root, and is projected into `/bin`
+by the profile server. A spawner resolves `/bin/<name>` → a readable `MemoryObject` →
+`sys_process_spawn` (see the SpawnArgs spec).
+
+**The initramfs holds only what cannot come from a filesystem** — today `init`,
+`fs-server-ext4`, `eshell` and `profile-server`, at `sbin/<name>`. The kernel boot-loads
+`/sbin/init` from it. This list has drifted twice (2026-08-03 and again by 2026-08-11), both
+times because adding a name to a list of names is a one-word change, so it is now a list of
+`(program, why it cannot come from the filesystem)` pairs with a size ceiling behind it.
+
+**To make a new program spawnable**, in order of what to try:
+
+1. Add it to a store package — `SYSTEM_SERVICES` for a service, `COREUTILS` for a user
+   program, `TEST_PROGRAMS` for a gate — in `tools/xtask/src/main.rs`, and have its spawner
+   resolve `/bin/<name>`. This is the answer unless the next point applies.
+2. Only if it must run *before there is a filesystem to read it from*: add it to
+   `INITRAMFS_PROGRAMS` **with the reason**, raise `INITRAMFS_MAX_BYTES`, and resolve
+   `/initramfs/sbin/<name>`. If you cannot write a reason, it is not this case.
+
+Init's boot order follows from the same split: anything spawned from `/bin` must come up
+after `bind_profile_server`, which is what provides `/bin`.

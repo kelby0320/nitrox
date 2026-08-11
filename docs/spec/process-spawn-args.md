@@ -120,8 +120,9 @@ test harness — decision log, 2026-07-24.)
 
 The `image` handle names a `MemoryObject` holding the program's ELF. The **spawner
 resolves the executable path in userspace** (`sys_ns_lookup` → a readable object —
-today from the initramfs at `/initramfs/sbin/<name>`; later `/bin`, `/store`) and
-passes the resulting handle. `sys_process_spawn` reads the object's bytes and runs
+`/bin/<name>`, projected from the content-addressed store by the profile server, for every
+program that is not one of the four the initramfs still carries at `/initramfs/sbin/<name>`)
+and passes the resulting handle. `sys_process_spawn` reads the object's bytes and runs
 the in-kernel ELF loader (`kernel/src/mm/elf.rs`, static `ET_EXEC` only). **No
 filesystem code enters the kernel** — path resolution is the spawner's.
 

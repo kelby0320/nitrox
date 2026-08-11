@@ -95,22 +95,15 @@ pub fn paint<F, Msg, C>(
     F: Framebuffer + ?Sized,
     C: FnMut(u32, Rect, Rect, &mut F),
 {
-    fill(fb, damage, theme.background);
+    // `Framebuffer::fill_rect`, not a loop over `put_pixel`. There was a private copy of
+    // this here until 2026-08-11; the trait's own doc explains why that is the wrong shape —
+    // an earlier open-coded `y * pitch + x * bpp` left one of two copies silently correct
+    // when `offset_of` was broken to check the tests were not vacuous. It is also the faster
+    // one: `fill_rect` computes a row's start once and writes across it, where `put_pixel`
+    // recomputes the geometry and the offset per pixel, and `paint` clears the whole damage
+    // rectangle on every frame (PR #185 review, finding 6).
+    fb.fill_rect(damage, theme.background);
     draw(fb, font, theme, element, layout, damage, custom);
-}
-
-/// Fill `rect` with `colour`, clipped to the buffer.
-fn fill<F: Framebuffer + ?Sized>(fb: &mut F, rect: Rect, colour: Rgb) {
-    let g = fb.geometry();
-    let x0 = rect.origin.x.max(0) as u32;
-    let y0 = rect.origin.y.max(0) as u32;
-    let x1 = (rect.right().max(0) as u32).min(g.width);
-    let y1 = (rect.bottom().max(0) as u32).min(g.height);
-    for y in y0..y1 {
-        for x in x0..x1 {
-            fb.put_pixel(x, y, colour);
-        }
-    }
 }
 
 fn draw<F, Msg, C>(
@@ -149,7 +142,7 @@ fn draw<F, Msg, C>(
                 clip,
             );
         }
-        Node::Fill(colour) => fill(fb, clip, *colour),
+        Node::Fill(colour) => fb.fill_rect(clip, *colour),
         Node::Custom { kind, .. } => custom(*kind, l.rect, clip, fb),
         // Containers draw nothing of their own; their children are the picture. Painted in
         // `children()` order, so a `Stack`'s last layer lands on top — the reverse of the
@@ -167,7 +160,7 @@ fn draw<F, Msg, C>(
 mod tests {
     use super::*;
     use crate::diff::Tree;
-    use crate::element::{column, custom as custom_node, sized, stack, text};
+    use crate::element::{column, custom as custom_node, fill as fill_node, sized, stack, text};
     use crate::layout::layout;
     use alloc::vec;
     use alloc::vec::Vec;
@@ -253,6 +246,41 @@ mod tests {
                 assert_eq!(b.get_pixel(x, y), Some(marker), "({x},{y}) outside the damage");
             }
         }
+    }
+
+    #[test]
+    fn a_fill_straddling_the_damage_edge_stops_at_it() {
+        // **The gap the test above leaves.** It proves containment using only `text`, whose
+        // glyphs cover a fraction of their box — so a node that overdrew its clip by a few
+        // pixels might well not reach the assertions. `Fill` is the primitive that covers
+        // large areas, and the one a partial repaint would visibly overdraw with.
+        //
+        // Changing `fb.fill_rect(clip, ..)` to `fb.fill_rect(l.rect, ..)` in `draw` left the
+        // whole suite green (PR #185 review, finding 4): a `Fill` whose rect extends past the
+        // damage would repaint pixels the diff had just reported clean, which for a partial
+        // repaint means painting over a neighbour that did not change.
+        let (f, t) = (font(), Theme::default());
+        let mut b = fb();
+        let marker = Rgb::new(0xFF, 0x00, 0xFF);
+        for y in 0..H {
+            for x in 0..W {
+                b.put_pixel(x, y, marker);
+            }
+        }
+
+        // One `Fill` taking the whole buffer, damaged over only its top half.
+        let colour = Rgb::new(0x20, 0x90, 0x40);
+        let e: Element<Msg> = fill_node(colour);
+        let half = H / 2;
+        go(&mut b, &f, &t, &e, Rect::new(0, 0, W, half));
+
+        assert_eq!(b.get_pixel(0, 0), Some(colour), "the damaged half was not filled");
+        assert_eq!(
+            b.get_pixel(0, half),
+            Some(marker),
+            "the fill ran past the damage rectangle and repainted a clean row"
+        );
+        assert_eq!(b.get_pixel(W - 1, H - 1), Some(marker), "and past it at the far corner");
     }
 
     #[test]
