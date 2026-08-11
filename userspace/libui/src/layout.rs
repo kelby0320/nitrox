@@ -113,6 +113,10 @@ impl Layout {
 pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M) -> Size {
     let size = match &e.node {
         Node::Text(s) => m.text_size(s),
+        // A colour has no natural size: it takes what it is offered, and a caller wanting a
+        // particular one wraps it in `sized`. Measuring it as zero instead would make a
+        // button's face collapse inside a `Column`.
+        Node::Fill(_) => c.max,
         Node::Custom { size, .. } => *size,
         Node::Sized { size, child } => {
             // Zero means unconstrained, so the child's own measure stands on that axis.
@@ -182,7 +186,7 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
         _ => rect,
     };
     let children = match &e.node {
-        Node::Text(_) | Node::Custom { .. } => Vec::new(),
+        Node::Text(_) | Node::Fill(_) | Node::Custom { .. } => Vec::new(),
 
         Node::Padding { insets, child } => {
             let inner = Rect::new(

@@ -149,6 +149,7 @@ fn draw<F, Msg, C>(
                 clip,
             );
         }
+        Node::Fill(colour) => fill(fb, clip, *colour),
         Node::Custom { kind, .. } => custom(*kind, l.rect, clip, fb),
         // Containers draw nothing of their own; their children are the picture. Painted in
         // `children()` order, so a `Stack`'s last layer lands on top — the reverse of the

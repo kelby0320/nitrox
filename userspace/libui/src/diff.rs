@@ -57,6 +57,8 @@ pub enum Fingerprint {
     Padding(Insets),
     /// [`Node::Sized`], with its size.
     Sized(libdraw::geom::Size),
+    /// [`Node::Fill`], with its colour — a recolour repaints, it does not rebuild.
+    Fill(libdraw::format::Rgb),
     /// [`Node::Custom`], with its discriminator and size.
     Custom(u32, libdraw::geom::Size),
 }
@@ -72,6 +74,7 @@ impl Fingerprint {
             Node::Stack(_) => Fingerprint::Stack,
             Node::Padding { insets, .. } => Fingerprint::Padding(*insets),
             Node::Sized { size, .. } => Fingerprint::Sized(*size),
+            Node::Fill(c) => Fingerprint::Fill(*c),
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
     }

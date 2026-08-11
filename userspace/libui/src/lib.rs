@@ -37,3 +37,4 @@ pub mod element;
 pub mod layout;
 pub mod paint;
 pub mod route;
+pub mod widget;
