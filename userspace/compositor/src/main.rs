@@ -562,14 +562,6 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
                 None => true,
             }
         }
-        Outbound::Focus { focused, .. } => {
-            let mut body = [0u8; core::mem::size_of::<FocusEvent>()];
-            let e = FocusEvent { focused: u16::from(*focused), _pad: 0 };
-            match e.write(&mut body) {
-                Some(_) => send_input(ch, OP_FOCUS_EVENT, &body),
-                None => true,
-            }
-        }
         Outbound::Release { window, buffer } => {
             let mut body = [0u8; librsproto::surface::RELEASE_EVENT_LEN];
             match librsproto::surface::build_release_event(&mut body, *window, *buffer) {
@@ -1040,9 +1032,6 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             repaint(srv, fb);
         }
         Outcome::Applied { release } => {
-            // Create, destroy and raise all move `focus_candidate`; commit and attach do
-            // not, which is what the comparison in `announce_focus` is for.
-            announce_focus(srv);
             // A destroy is transitive, so drop every mapping whose window is gone.
             // Otherwise a client looping create/attach/destroy grows the compositor's
             // address space without bound.
@@ -1087,6 +1076,20 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             reply_error_on_session(ch, op, request_id, surface_errno(e));
         }
     }
+
+    // **After the request, whatever it was.** `announce_focus` compares against what was
+    // last announced, so an op that did not move focus costs a comparison and sends nothing
+    // — which means there is no list of focus-moving ops to keep correct here, and that is
+    // the point. An earlier version called this inside the `Applied` arm and named create as
+    // one of the ops it covered; create is the one op that replies with a window id, so it
+    // returns `Outcome::Reply` and never reached it. A new window goes on top of the stack
+    // and `focus_candidate` is topmost-focusable, so focus had already moved and neither
+    // client was told — the old window kept a caret it no longer owned while its keys went
+    // to a window that had not painted yet (PR #184 review, finding 2).
+    //
+    // After the reply rather than before it: a client cannot make sense of gaining focus for
+    // a window whose id it has not been handed yet.
+    announce_focus(srv);
     true
 }
 

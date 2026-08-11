@@ -288,6 +288,15 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // aimed at this window — so the client printed `PASSED` and exited while the harness was
     // still asserting, and the compositor correctly routed the remaining keys to whatever
     // window was left. Diagnosed from `compositor: key win=1` after `window ready id=130`.
+    // **The first event this window receives must be its focus change**, and asserting the
+    // *order* is what catches a compositor that announces focus late. Announced on the create
+    // itself, it precedes any input the window could be routed. Announced from somewhere that
+    // only runs later — an `Applied` on some other session, or the next input event — a
+    // pointer record arrives first, and the window spends that interval owning the keyboard
+    // without knowing it. The gate could not tell the two apart until this line existed
+    // (PR #184 review, finding 2).
+    let mut first_event_reported = false;
+
     let (mut saw_key, mut saw_press) = (false, false);
     while !(saw_key && saw_press) {
         let ev = match win.wait_event() {
@@ -297,6 +306,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 exit(1);
             }
         };
+        if !first_event_reported {
+            first_event_reported = true;
+            let what: &[u8] = match ev {
+                WindowEvent::Focus(_) => b"focus",
+                WindowEvent::Key(_) => b"key",
+                WindowEvent::Pointer(_) => b"pointer",
+                WindowEvent::Dropped => b"dropped",
+            };
+            Line::new().s(b"input-testclient: first win event=").s(what).end();
+        }
         match ev {
             WindowEvent::Key(k) => {
                 Line::new()

@@ -12828,3 +12828,84 @@ guard gap was also recorded nowhere outside the kernel source, despite being a s
 property of every user address space; it is now in `memory-management.md` and in
 `syscall-abi.md`, where a userspace author writing a thread-stack allocator would actually
 look.
+
+## 2026-08-11 — M4 Part B reviewed: two ways to be at the origin, and an op that replies
+
+PR #184's review ran 21 breaks and caught 19. Both survivors were the same shape as each
+other and as the thing the description had gone looking for, which is the part worth keeping.
+
+**The click test added the widget's own origin to a point already in the widget's coordinate
+space.** `route.rs` decides a click is "a release inside the widget that took the press", and
+compared `l.rect.contains(event.x + l.rect.origin.x, …)`. Layout rectangles are absolute
+within the window and `PointerEvent` arrives in that same space — which is exactly what
+`hit_test` twenty lines up relies on — so the addition is a second offset nothing asked for.
+For a widget at the window's top-left it changes nothing. For a button in a second column, or
+anything below a menu bar, or anything inside a `padding`, the release tested a point outside
+the widget and every click was silently cancelled.
+
+**It shipped green because the only test of the rule put its widget at (0, 0).** All 14 router
+tests pass against both the correct expression and the broken one — the fourth vacuous test in
+this repository, and the third of the "holds for both implementations" kind. The same test
+also discarded the press's return value, so an implementation firing on the press *as well as*
+the click — every button emitting twice — passed the file too. Both are now covered, and the
+new test asserts its own premise (`rect == Rect::new(500, 0, 100, 480)`) so it cannot quietly
+stop being about a widget away from the origin.
+
+**`announce_focus` was called from the "applied, no reply" arm, and create replies.**
+`focus_candidate` is the topmost focus-taking window and a create puts one on top, so focus
+moves at the create — before the client has attached a buffer. But `OP_CREATE_WINDOW` is the
+one op that answers with a window id, so it returns `Outcome::Reply` and never reached the
+announcement. A client that created a window and waited without committing left the previously
+focused window blinking a caret it no longer owned while its keys went elsewhere, indefinitely
+— the exact defect `FocusEvent` was added to prevent. The comment at that call site *named*
+create as one of the ops it covered, which is how it read as deliberate.
+
+**The fix is to delete the enumeration, not to extend it.** `announce_focus` already compares
+against what it last announced, so calling it after every request costs a comparison on the
+ops that do not move focus and removes the possibility of a list going stale. Three call sites
+in `serve_session`'s neighbourhood became one, placed after the reply — a client cannot make
+sense of gaining focus for a window whose id it has not been handed yet.
+
+**Where the test for that lives is the reusable part.** The call site is in `main.rs` and
+cannot be host-tested; the *premise* can, and it is what would silently change. A test in
+`server.rs` now asserts that a create moves `focus_candidate` **and** that its `Outcome` is
+not `Applied` — the two facts whose combination is the trap. This is the same move the PR
+itself made with `focus_transition`, applied one layer further out: when the decision cannot
+be tested where it is made, test the fact it depends on where that fact lives.
+
+**A duplicated match arm survived CI, and the class is invisible to the gates.**
+`send_outbound` carried two byte-identical `Outbound::Focus` arms; rustc reports
+`unreachable_patterns` and nothing fails on it, because no crate root or workflow sets
+`-D warnings`. `tools/xtask/src/main.rs` has carried the identical duplicate since before this
+branch. Removing the arm is the fix here; whether warnings should gate is a separate question
+and is not decided by this entry.
+
+**A correction to the fix, found by checking it rather than accepting it.** The review's
+`server.rs` test comment claimed it "fails if anyone reintroduces a list of 'the ops that move
+focus'". It does not: it pins the *premise* — a create is a `Reply`, and focus moves on it —
+and both assertions stay true wherever `announce_focus` is called from. Moving the call back
+inside the `Applied` arm leaves it green.
+
+Worse, **the boot gate did not catch it either**, which the review said and which was worth
+confirming: reintroducing the bug and running `check-input` passed. The transcript says why —
+focus was announced for the new window only because a *leftover pointer release from phase 1*
+happened to arrive and trip `serve_input`'s call. The gate's `win focus has=1` was satisfied by
+a coincidence of injection order, not by anything the fix does.
+
+So the gate now asserts **ordering rather than arrival**: a window's *first* event must be its
+focus change. Announced on the create itself, focus precedes any input the window can be
+routed; announced from anywhere that runs later, a pointer record arrives first. With the bug
+reintroduced the gate now times out, which it did not before.
+
+The general form is the one this milestone keeps producing in new costumes: **"the event
+arrived" and "the event arrived when it should have" are different assertions, and only the
+second one is about the mechanism.** The same distinction retired `same_kind` in #183 (damage
+arrived either way) and the coalescing claim in #181 (the flood passed either way).
+
+Also swept while here: `pub fn contains` in `route.rs` had no caller and is gone, and the
+duplicate `AbiShape::EnumVariant` arm in `xtask` — the same unreachable-pattern class as the
+one this branch introduced, pre-existing since before it — is removed, so the tree now builds
+with **zero warnings**. That matters because the review's finding 3 was found by reading
+compiler output rather than by any gate: nothing in CI passes `-D warnings`, so the class is
+uncatchable today. Getting to zero is the precondition for turning it on; turning it on is a
+separate change.

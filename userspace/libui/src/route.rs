@@ -30,7 +30,7 @@
 
 use alloc::vec::Vec;
 
-use libdraw::geom::{Point, Rect};
+use libdraw::geom::Point;
 use librsproto::surface::{KeyEvent, POINTER_BUTTON, POINTER_PRESSED, PointerEvent};
 
 use crate::diff::{Tree, Widget};
@@ -44,17 +44,23 @@ use crate::layout::Layout;
 /// what survives a reordering; the path is how this frame gets there.
 pub type Path = Vec<usize>;
 
-/// Which widget has keyboard focus inside this window, and what the pointer is doing.
+/// Which widget has keyboard focus inside this window, what the pointer is doing, and the
+/// last thing the compositor said about the window.
 ///
-/// Deliberately **not** merged with the compositor's window focus. See
-/// [`Focus::window_focused`].
+/// It holds all three, but **`focus` and `window_focused` are never merged into one field**:
+/// they come from two places and answer two questions, and [`Focus`] is what hands both to a
+/// caller at once.
 pub struct Router {
     focus: Option<u64>,
     capture: Option<u64>,
     window_focused: bool,
 }
 
-/// Whether a caret should blink, spelled out rather than inferred at each call site.
+/// The two focus facts a widget needs in order to paint itself, kept apart on purpose.
+///
+/// Widget focus is the toolkit's and window focus is the compositor's. Conflating them is the
+/// classic source of typing arriving in the wrong place, so they are two fields here and
+/// [`is_active`](Self::is_active) is the only thing that combines them.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Focus {
     /// This widget holds keyboard focus within its window.
@@ -243,10 +249,19 @@ impl Router {
             }
             // A **click** is a release inside the widget that took the press. Releasing
             // outside is a cancel, which is why this is not simply "on release".
+            //
+            // **Compared in window coordinates, with nothing added to either side.** A
+            // layout rect is already absolute within the window — `layout` is handed the
+            // window's bounds and every child is placed inside its parent's rect, not
+            // relative to it — and `event.x`/`event.y` arrive in that same space, which is
+            // exactly what `hit_test` relies on one screen up. An earlier version added
+            // `l.rect.origin` here, which agrees with `hit_test` only for a widget at the
+            // window's top-left corner: everything in a second column, below a menu bar, or
+            // inside a `padding` silently lost its clicks (PR #184 review, finding 1).
             if released
                 && let Some(msg) = e.on_press.clone()
                 && let Some(l) = layout_at(layout, &path)
-                && l.rect.contains(event.x + l.rect.origin.x, event.y + l.rect.origin.y)
+                && l.rect.contains(event.x, event.y)
             {
                 out.push(msg);
             }
@@ -348,18 +363,13 @@ fn hit_test(root: Option<&Widget>, layout: &Layout, at: Point) -> Option<u64> {
     walk(root?, layout, at)
 }
 
-/// Whether `rect` contains `at`. Re-exported shape so callers need not import `Rect`.
-pub fn contains(rect: Rect, at: Point) -> bool {
-    rect.contains(at.x, at.y)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::element::{column, custom, row, sized, stack, text};
     use crate::layout::{FixedCell, layout};
     use alloc::vec;
-    use libdraw::geom::Size;
+    use libdraw::geom::{Rect, Size};
     use librsproto::surface::{POINTER_ENTER, POINTER_MOTION};
 
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
@@ -463,7 +473,11 @@ mod tests {
         let (t, l) = build(&e);
         let mut r = Router::new();
 
-        r.pointer(&t, &e, &l, press(10, 10));
+        // **The press itself fires nothing.** Asserted rather than discarded: a first
+        // version threw this away, and an implementation firing on the press *as well as*
+        // the click — so every button emits twice — passed the whole file (PR #184 review).
+        let (msgs, _) = r.pointer(&t, &e, &l, press(10, 10));
+        assert!(msgs.is_empty(), "a press is not yet a click");
         let (msgs, _) = r.pointer(&t, &e, &l, release(400, 10));
         assert!(msgs.is_empty(), "released outside: cancelled");
 
@@ -472,6 +486,38 @@ mod tests {
         r.pointer(&t, &e, &l, press(10, 10));
         let (msgs, _) = r.pointer(&t, &e, &l, release(20, 20));
         assert_eq!(msgs, [Msg::Pressed(1)]);
+    }
+
+    #[test]
+    fn a_click_lands_on_a_widget_away_from_the_window_origin() {
+        // Every other click test puts its widget at (0, 0), where a containment check that
+        // adds the rect's own origin to the point is indistinguishable from one that does
+        // not. It is not indistinguishable here, and this is the shape a real window has:
+        // a button in a second column, or anything below a menu bar (PR #184 review).
+        let e: Element<Msg> = row(vec![
+            sized(Size::new(500, 480), custom(1, Size::new(0, 0))),
+            sized(Size::new(100, 480), custom(2, Size::new(0, 0)).on_press(Msg::Pressed(2))),
+        ]);
+        let (t, l) = build(&e);
+        let target = t.root().unwrap().children[1].children[0].id;
+        assert_eq!(
+            layout_at(&l, &path_to_id(t.root(), target).unwrap()).unwrap().rect,
+            Rect::new(500, 0, 100, 480),
+            "the premise: this widget is nowhere near the origin",
+        );
+
+        let mut r = Router::new();
+        let (_, hit) = r.pointer(&t, &e, &l, press(550, 10));
+        assert_eq!(hit, Some(target), "the press landed on it");
+        let (msgs, _) = r.pointer(&t, &e, &l, release(550, 10));
+        assert_eq!(msgs, [Msg::Pressed(2)], "released inside: a click");
+
+        // ...and the cancel still works out here, so this cannot be satisfied by dropping
+        // the containment check altogether.
+        let mut r = Router::new();
+        r.pointer(&t, &e, &l, press(550, 10));
+        let (msgs, _) = r.pointer(&t, &e, &l, release(50, 10));
+        assert!(msgs.is_empty(), "released back over the spacer: cancelled");
     }
 
     #[test]

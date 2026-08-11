@@ -1004,6 +1004,11 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     // widget focus is the toolkit's, window focus is the compositor's, and a client needs
     // both to know whether a caret should blink. Announced on the change, so this arrives
     // once when the window becomes the topmost focusable one.
+    // **Ordering, not just arrival.** Focus is announced on the create itself, so it
+    // precedes any input this window could be routed. Asserting only that a focus event
+    // *arrived* passes against a compositor that announces it late — verified by
+    // reintroducing that bug and watching the gate stay green (PR #184 review, finding 2).
+    session.expect("input-testclient: first win event=focus")?;
     session.expect("input-testclient: win focus has=1")?;
 
     // `b` is keycode 48. It goes to the *focused* window — this client's, being the topmost
@@ -2397,21 +2402,6 @@ fn extract_consts(text: &str, shape: AbiShape) -> BTreeMap<String, i128> {
                 }
                 if let Some(v) = parse_int(val) {
                     out.insert(name.trim().to_string(), v);
-                }
-            }
-            AbiShape::EnumVariant => {
-                // Name = <int>,
-                let Some(body) = t.strip_suffix(',') else { continue };
-                let Some((name, val)) = body.split_once('=') else { continue };
-                let name = name.trim();
-                if name.is_empty()
-                    || !name.chars().next().is_some_and(|c| c.is_ascii_uppercase())
-                    || !name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-                {
-                    continue;
-                }
-                if let Some(v) = parse_int(val) {
-                    out.insert(name.to_string(), v);
                 }
             }
             AbiShape::EnumVariant => {
