@@ -124,9 +124,19 @@ pub enum Node {
         /// The child.
         child: Box<Element>,
     },
-    /// A child forced to an exact size.
+    /// A child constrained on one or both axes.
+    ///
+    /// **A zero component means "whatever the parent gives"**, so `sized(12 × 0)` is a
+    /// full-height 12-wide strip — a scrollbar — and `sized(0 × 16)` is a full-width bar.
+    /// Without that convention every fixed-size child would have to name a cross-axis extent
+    /// it does not care about, and would then be wrong the moment the window resized.
+    ///
+    /// The constraint binds the node's **own** rectangle, not merely its measured extent. An
+    /// earlier version passed the parent's rectangle straight through, so a `sized` inside a
+    /// `Stack` took the whole overlay and the doc claiming "an exact size" was false
+    /// (PR #183 review, finding 5).
     Sized {
-        /// The size to force.
+        /// The constraint; zero on an axis means unconstrained.
         size: Size,
         /// The child.
         child: Box<Element>,
@@ -238,7 +248,7 @@ pub fn padding(insets: Insets, child: Element) -> Element {
     Element::new(Node::Padding { insets, child: Box::new(child) })
 }
 
-/// A child forced to an exact size.
+/// A child constrained on one or both axes; a zero component means unconstrained.
 pub fn sized(size: Size, child: Element) -> Element {
     Element::new(Node::Sized { size, child: Box::new(child) })
 }

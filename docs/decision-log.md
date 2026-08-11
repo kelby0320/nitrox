@@ -12781,3 +12781,50 @@ into their own buffers and the compositor only composites.
 `fs-server-ext4`, `eshell`, `profile-server`, `compositor`, `input-server` — which is already
 broader than "enough to reach a mounted root". Four of those could plausibly load from the
 root filesystem instead. Its own conversation, not this one's.
+
+## 2026-08-11 — M4 Part A reviewed: the same hole, one rule over
+
+PR #183's review ran 30 breaks and caught 27. The blocking finding is the pattern the PR
+description itself tabulated, applied to the rule next door — which is worth recording,
+because the description named the pattern and still did not go looking for its siblings.
+
+**`same_kind` compared `mem::discriminant`, so two `Custom` widgets with different `kind`
+values paired.** `Custom`'s `kind` is documented as "the discriminator, so a diff can tell two
+custom nodes apart", and a discriminant comparison cannot: both are `Custom`. Swapping a
+terminal grid for a different custom widget in the same slot kept the same `Widget::id`, and
+so would have kept focus and answered "am I new?" with no.
+
+**It survived because the only test for the kind rule asserted damage.** Damage is derived
+from the frame's layout, so the union of the old and new rectangles is identical whether the
+widget was rebuilt or merely repainted — `same_kind` hardcoded to `true` passed all 50 tests.
+That is *exactly* the failure the description had already listed twice ("Pairing asserted
+through `print`s and `key`s… both come from the new frame"), and the fix is the same one:
+assert through the id, which is the only thing that records what was retained.
+
+The lesson is not "check identity with ids". It is that **naming a failure pattern is not the
+same as sweeping for it.** The description tabulated six instances and treated the list as a
+retrospective; it was a search specification, and running it would have found this one.
+
+**Three smaller things worth keeping.**
+
+*A doc that oversells is a design decision deferred, not a wording problem.* `Sized` was
+documented as "a child forced to an exact size" while `arrange` passed the parent's rectangle
+straight through — so a `sized` inside a `Stack` took the whole overlay, which is precisely
+what Part C will reach for to place a scrollbar. Fixing the sentence was the cheap option;
+the right one was making the sentence true, including the node's *own* rectangle, because
+hit-testing and damage both read that rather than the child's. A zero component now means
+"whatever the parent gives", which is how the tests were already using it.
+
+*Removing a walk is a claim about an invariant, so assert the invariant.* `damage_subtree`
+existed because "a child can extend beyond its parent"; after the `Sized` fix nothing can, and
+the different-kind branch had never walked anyway — consistent only by accident. It is gone,
+and `every_child_is_contained_by_its_parent` now holds the reasoning up over every container
+at once.
+
+*The stack change falsified a current-behaviour doc by 256×.* `memory-management.md` still
+said "an initial 4-page stack VMA" and "just 16 KiB" — already stale before this PR, and this
+is the change that moved them. Root `CLAUDE.md` requires fixing that in the same change. The
+guard gap was also recorded nowhere outside the kernel source, despite being a structural
+property of every user address space; it is now in `memory-management.md` and in
+`syscall-abi.md`, where a userspace author writing a thread-stack allocator would actually
+look.

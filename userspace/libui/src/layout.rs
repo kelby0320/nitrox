@@ -114,7 +114,14 @@ pub fn measure<M: Metrics + ?Sized>(e: &Element, c: Constraints, m: &M) -> Size 
     let size = match &e.node {
         Node::Text(s) => m.text_size(s),
         Node::Custom { size, .. } => *size,
-        Node::Sized { size, .. } => *size,
+        Node::Sized { size, child } => {
+            // Zero means unconstrained, so the child's own measure stands on that axis.
+            let inner = measure(child, c, m);
+            Size::new(
+                if size.w == 0 { inner.w } else { size.w },
+                if size.h == 0 { inner.h } else { size.h },
+            )
+        }
         Node::Padding { insets, child } => {
             let inner = measure(child, c.shrink(insets.horizontal(), insets.vertical()), m);
             Size::new(
@@ -162,6 +169,18 @@ pub fn measure<M: Metrics + ?Sized>(e: &Element, c: Constraints, m: &M) -> Size 
 
 /// Place `e` at `rect` and everything inside it.
 pub fn arrange<M: Metrics + ?Sized>(e: &Element, rect: Rect, m: &M) -> Layout {
+    // `Sized` is the one node that changes its *own* rectangle rather than only its
+    // children's. It has to: hit-testing and damage both read a node's rect, so constraining
+    // only the child would leave a 12-pixel scrollbar claiming the whole overlay it sits in.
+    let rect = match &e.node {
+        Node::Sized { size, .. } => Rect::new(
+            rect.origin.x,
+            rect.origin.y,
+            if size.w == 0 { rect.size.w } else { size.w.min(rect.size.w) },
+            if size.h == 0 { rect.size.h } else { size.h.min(rect.size.h) },
+        ),
+        _ => rect,
+    };
     let children = match &e.node {
         Node::Text(_) | Node::Custom { .. } => Vec::new(),
 
@@ -175,6 +194,7 @@ pub fn arrange<M: Metrics + ?Sized>(e: &Element, rect: Rect, m: &M) -> Layout {
             alloc::vec![arrange(child, inner, m)]
         }
 
+        // `rect` is already the constrained one, computed above.
         Node::Sized { child, .. } => alloc::vec![arrange(child, rect, m)],
 
         Node::Stack(children) => {
@@ -485,6 +505,34 @@ mod tests {
         let p = padding(Insets::all(50), text("hello"));
         let s = measure(&p, Constraints::loose(Size::new(20, 20)), &CELL);
         assert!(s.w <= 20 && s.h <= 20, "clamped to what was offered, got {s:?}");
+    }
+
+    #[test]
+    fn sized_constrains_the_axes_it_names_and_yields_the_ones_it_does_not() {
+        // A zero component means "whatever the parent gives". Without it every fixed-size
+        // child would have to name a cross-axis extent it does not care about.
+        let l = layout(&sized(Size::new(12, 0), text("")), Rect::new(0, 0, 100, 80), &CELL);
+        assert_eq!(l.rect, Rect::new(0, 0, 12, 80), "a scrollbar strip");
+        assert_eq!(l.children[0].rect, l.rect, "and the child gets exactly that");
+        let l = layout(&sized(Size::new(0, 16), text("")), Rect::new(0, 0, 100, 80), &CELL);
+        assert_eq!(l.rect, Rect::new(0, 0, 100, 16), "a menu bar");
+    }
+
+    #[test]
+    fn sized_binds_inside_a_stack_where_the_slot_is_the_whole_area() {
+        // The case that exposed the doc overselling: `Stack` hands every layer the whole
+        // area, so passing the parent rect straight through made `sized` a no-op there —
+        // and Part C reaches for exactly this to place a scrollbar over a grid.
+        let s = stack(vec![custom(1, Size::new(0, 0)), sized(Size::new(12, 20), text(""))]);
+        let l = layout(&s, Rect::new(0, 0, 200, 100), &CELL);
+        assert_eq!(l.children[0].rect, Rect::new(0, 0, 200, 100), "the base layer fills");
+        assert_eq!(l.children[1].rect, Rect::new(0, 0, 12, 20), "the overlay does not");
+    }
+
+    #[test]
+    fn sized_never_exceeds_the_slot_it_was_given() {
+        let l = layout(&sized(Size::new(500, 500), text("")), Rect::new(0, 0, 40, 30), &CELL);
+        assert_eq!(l.rect, Rect::new(0, 0, 40, 30));
     }
 
     #[test]

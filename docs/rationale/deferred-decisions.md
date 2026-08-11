@@ -372,10 +372,11 @@ rather than wrong. Trigger: any of them growing a server-initiated push stream.
 ~~**The default user stack is 32 KiB…**~~ **Decided 2026-08-10: 8 MiB plus a guard gap,
 built in M4 Part A.**
 
-`DEFAULT_USER_STACK_SIZE` (`kernel/src/arch/x86_64/abi.rs`) is 8 pages, bumped from 4 for the
-read-write fs-server. It is the **only** stack the initial thread gets — `sys_thread_create`
-makes the caller supply its own for every other thread — and there is no guard page, so
-overrunning it lands silently in whatever is below rather than faulting.
+`DEFAULT_USER_STACK_SIZE` (`kernel/src/arch/x86_64/abi.rs`) **is 8 MiB** as of M4 Part A,
+raised from 8 pages, which had itself been raised from 4 for the read-write fs-server. It is
+the **only** stack the initial thread gets — `sys_thread_create` makes the caller supply its
+own for every other thread — and it now has a 1 MiB guard gap below it, so overrunning it
+faults rather than landing silently in whatever is mapped there.
 
 **A correction to this entry, which had a false claim in it.** The original filing said
 raising the number costs "eager mapping, which is measurable at spawn". That is wrong: the
@@ -390,25 +391,24 @@ demand; glibc gives pthreads the same. That is 8 MiB of a 128 TiB user half, for
 per process.
 
 **The guard gap is cheap, and that is a consequence of the lazy mapping.**
-`MMAP_MAX` (`kernel/src/mm/addr_space.rs`) is currently
-`DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE`, so the mmap arena tops out at exactly the
-stack's lowest address — adjacent, with no gap, which is why an overflow lands in mapped
-memory instead of faulting. Subtracting a gap from `MMAP_MAX` leaves addresses with no VMA,
-and a touch faults cleanly. Linux learned this the hard way: its gap was a single page until
+`MMAP_MAX` (`kernel/src/mm/addr_space.rs`) **was**
+`DEFAULT_USER_STACK_TOP - DEFAULT_USER_STACK_SIZE`, so the mmap arena topped out at exactly
+the stack's lowest address — adjacent, with no gap, which is why an overflow landed in mapped
+memory instead of faulting. It is now `USER_STACK_GUARD_BOTTOM`, leaving addresses with no VMA
+below the stack, and a touch faults cleanly. Linux learned this the hard way: its gap was a single page until
 Stack Clash (CVE-2017-1000364) showed a page could be jumped, and the default is now 256
 pages. Nitrox takes the post-2017 lesson rather than repeating the experiment.
 
 **It is two changes, not one — an earlier draft of this entry said "arithmetic rather than
 machinery" and that was wrong.** `MMAP_MAX` bounds exactly one caller, `find_free_range`,
-whose own docstring scopes it to `sys_memory_map(hint = 0)`. The **hinted** path validates
-page alignment and `end > USER_VIRT_END` and nothing else
-(`kernel/src/syscall/table.rs`), so a hinted mapping can be placed inside the gap and an
-overrun lands in mapped memory again — silently, which is the single property the gap exists
-to remove.
+whose own docstring scopes it to `sys_memory_map(hint = 0)`. The **hinted** path validated
+page alignment and `end > USER_VIRT_END` and nothing else, so a hinted mapping could be placed
+inside the gap and an overrun would land in mapped memory again — silently, which is the
+single property the gap exists to remove.
 
-**So `sys_memory_map` refuses a hinted range intersecting the gap.** One range check, and it
-is what makes the gap a *guarantee* rather than a convention about where the kernel happens
-to place things. The alternative — document the gap as protecting only against kernel
+**So `sys_memory_map` refuses a hinted range intersecting the gap** — implemented as
+`AddressSpace::in_stack_guard`. One range check, and it is what makes the gap a *guarantee*
+rather than a convention about where the kernel happens to place things. The alternative — document the gap as protecting only against kernel
 placement, roughly where Linux lands with `MAP_FIXED` — is coherent, but it keeps the failure
 this whole item is about, and keeps it silent. Nothing in userspace passes a non-zero hint
 today, so the cost is a check nobody currently trips.

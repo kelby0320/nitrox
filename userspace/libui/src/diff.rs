@@ -81,8 +81,21 @@ impl Fingerprint {
     /// Pairing uses this; damage uses full equality. A `Text` whose string changed is still
     /// the same widget — it repaints, it is not rebuilt — whereas a `Text` that became a
     /// `Row` is a different thing that happens to sit in the same slot.
+    ///
+    /// **`Custom` compares its discriminator too**, because for that node the payload *is*
+    /// the identity: `Custom { kind }` is documented as "so a diff can tell two custom nodes
+    /// apart", and a discriminant comparison cannot. Swapping a terminal grid for a
+    /// different custom widget in the same slot would otherwise keep the same
+    /// [`Widget::id`] — so it would keep focus, and answer "is this widget new?" with no
+    /// (PR #183 review, finding 1).
+    ///
+    /// Its `size` is *not* part of the kind: a custom widget that resized is the same
+    /// widget, the same way a `Text` that changed its string is.
     pub fn same_kind(&self, other: &Self) -> bool {
-        core::mem::discriminant(self) == core::mem::discriminant(other)
+        match (self, other) {
+            (Fingerprint::Custom(a, _), Fingerprint::Custom(b, _)) => a == b,
+            _ => core::mem::discriminant(self) == core::mem::discriminant(other),
+        }
     }
 }
 
@@ -183,10 +196,21 @@ impl Keying {
 }
 
 /// The retained tree, and the damage its last update produced.
-#[derive(Default)]
 pub struct Tree {
     root: Option<Widget>,
     next_id: u64,
+}
+
+impl Default for Tree {
+    /// Delegates to [`Tree::new`].
+    ///
+    /// **Not `#[derive(Default)]`.** That starts `next_id` at 0 while `new()` starts at 1, so
+    /// a defaulted tree would mint a widget with id 0 that `new()` never produces — awkward
+    /// the moment Part B wants 0 as a "no focus" sentinel. The same trap `WindowStack`
+    /// documents in the compositor (PR #183 review, finding 7).
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Tree {
@@ -364,29 +388,24 @@ fn reconcile_children(
     // Anything the new frame did not claim is gone: damage where it was.
     for (w, &m) in old.iter().zip(matched.iter()) {
         if !m {
+            // The subtree needs no walk: every container arranges its children inside its
+            // own rectangle, so a parent's rect covers all of them. An earlier version
+            // walked it and justified that with "nothing clips a `Sized` larger than its
+            // slot" — which was true then and is not now, and was inconsistent anyway with
+            // the different-kind branch, which never walked (PR #183 review, finding 8).
+            // `every_child_is_contained_by_its_parent` is what holds this up.
             damage.add(w.rect);
-            damage_subtree(w, damage);
         }
     }
     Ok(out)
 }
 
-/// Damage a removed widget and everything under it.
-///
-/// A child can extend beyond its parent — nothing clips a `Sized` larger than its slot — so
-/// walking the subtree is not redundant with damaging the parent.
-fn damage_subtree(w: &Widget, damage: &mut Damage) {
-    for c in &w.children {
-        damage.add(c.rect);
-        damage_subtree(c, damage);
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::element::{column, custom, row, sized, text};
-    use crate::layout::{FixedCell, layout};
+    use crate::element::{Edge, Insets, column, custom, dock, docked, padding, row,
+                         sized, stack, text, with_spacing};
+    use crate::layout::{FixedCell, Layout, layout};
     use alloc::vec;
     use libdraw::geom::Size;
 
@@ -427,11 +446,44 @@ mod tests {
     }
 
     #[test]
-    fn a_kind_change_damages_the_old_and_the_new() {
+    fn a_kind_change_rebuilds_the_widget_and_damages_both_rectangles() {
+        // **Asserted through the id**, not only the damage. The union of the old and new
+        // rectangles is the same whether the widget was rebuilt or merely repainted, so a
+        // damage assertion passes with `same_kind` hardcoded to `true` — which is how the
+        // `Custom` hole below survived (PR #183 review, finding 1).
         let mut t = Tree::new();
         go(&mut t, &column(vec![text("a"), text("b")])).expect("ok");
+        let before = ids(&t);
+
         let d = go(&mut t, &column(vec![text("a"), custom(1, Size::new(4, 4))])).expect("ok");
         assert_eq!(d, Some(Rect::new(0, 16, 640, 16)));
+        let after = ids(&t);
+        assert_eq!(after[0], before[0], "the untouched sibling kept its widget");
+        assert_ne!(after[1], before[1], "a text that became a custom is a new widget");
+    }
+
+    #[test]
+    fn two_custom_widgets_with_different_kinds_are_different_widgets() {
+        // `kind` is documented as the discriminator "so a diff can tell two custom nodes
+        // apart", and a `mem::discriminant` comparison cannot: both are `Custom`. Swapping
+        // a terminal grid for another custom widget in the same slot would keep the same
+        // id, and with it focus and "am I new?".
+        let mut t = Tree::new();
+        go(&mut t, &column(vec![custom(1, Size::new(40, 40))])).expect("ok");
+        let before = ids(&t);
+        go(&mut t, &column(vec![custom(2, Size::new(40, 40))])).expect("ok");
+        assert_ne!(ids(&t)[0], before[0], "a different kind is a different widget");
+    }
+
+    #[test]
+    fn a_custom_widget_that_only_resized_is_the_same_widget() {
+        // The other half of the rule: `size` is content, not identity, exactly as a
+        // `Text`'s string is. Rebuilding on resize would drop state on every window resize.
+        let mut t = Tree::new();
+        go(&mut t, &column(vec![custom(1, Size::new(40, 40))])).expect("ok");
+        let before = ids(&t);
+        go(&mut t, &column(vec![custom(1, Size::new(80, 40))])).expect("ok");
+        assert_eq!(ids(&t)[0], before[0]);
     }
 
     #[test]
@@ -512,40 +564,7 @@ mod tests {
         assert!(d.bottom() >= 48, "and the row \"b\" vacated, got {d:?}");
     }
 
-    #[test]
-    fn keys_survive_a_reorder_and_positional_pairing_does_not() {
-        // The case keys exist for. Reversing three keyed rows moves them, so the union of
-        // their old and new positions is damaged — but each widget keeps its identity.
-        let keyed = |s: &str, k: u64| text(s).key(k);
-        let mut t = Tree::new();
-        go(&mut t, &column(vec![keyed("a", 1), keyed("b", 2), keyed("c", 3)])).expect("ok");
-        go(&mut t, &column(vec![keyed("c", 3), keyed("b", 2), keyed("a", 1)])).expect("ok");
 
-        let root = t.root().expect("a root");
-        let prints: Vec<&Fingerprint> = root.children.iter().map(|w| &w.print).collect();
-        assert_eq!(
-            prints,
-            [
-                &Fingerprint::Text("c".into()),
-                &Fingerprint::Text("b".into()),
-                &Fingerprint::Text("a".into())
-            ]
-        );
-        // `b` did not move and was not rebuilt: its key found its own widget.
-        assert_eq!(root.children[1].key, Some(2));
-    }
-
-    #[test]
-    fn deleting_the_first_of_several_keyed_rows_does_not_shift_the_rest() {
-        // Positionally, dropping row 1 makes every later row pair with its neighbour, so
-        // row 2's widget state belongs to row 3 from then on. Keys are what prevent it.
-        let keyed = |s: &str, k: u64| text(s).key(k);
-        let mut t = Tree::new();
-        go(&mut t, &column(vec![keyed("a", 1), keyed("b", 2), keyed("c", 3)])).expect("ok");
-        go(&mut t, &column(vec![keyed("b", 2), keyed("c", 3)])).expect("ok");
-        let keys: Vec<Option<u64>> = t.root().unwrap().children.iter().map(|w| w.key).collect();
-        assert_eq!(keys, [Some(2), Some(3)]);
-    }
 
     #[test]
     fn mixing_keyed_and_unkeyed_children_is_an_error() {
@@ -631,6 +650,59 @@ mod tests {
 
         // And the next good frame still diffs cleanly against it.
         assert_eq!(go(&mut t, &column(vec![text("a"), text("b")])).expect("ok"), None);
+    }
+
+    #[test]
+    fn every_child_is_contained_by_its_parent() {
+        // The invariant that lets a removed widget be damaged by its own rectangle alone.
+        // Asserted over every container at once, because it is the sort of thing one node
+        // kind quietly stops honouring.
+        fn check(l: &Layout) {
+            for c in &l.children {
+                if c.rect.size.w == 0 || c.rect.size.h == 0 {
+                    continue; // covers no pixel; `union_opt` filters it either way
+                }
+                assert!(
+                    c.rect.origin.x >= l.rect.origin.x
+                        && c.rect.origin.y >= l.rect.origin.y
+                        && c.rect.right() <= l.rect.right()
+                        && c.rect.bottom() <= l.rect.bottom(),
+                    "child {:?} escapes parent {:?}",
+                    c.rect,
+                    l.rect
+                );
+                check(c);
+            }
+        }
+        let e = dock(
+            vec![docked(Edge::Top, sized(Size::new(0, 16), text("bar")))],
+            stack(vec![
+                padding(Insets::all(4), column(vec![text("a"), text("b").flex(1)])),
+                sized(Size::new(12, 20), custom(1, Size::new(4, 4))),
+            ]),
+        );
+        check(&layout(&e, SCREEN, &CELL));
+    }
+
+    #[test]
+    fn container_properties_are_part_of_a_nodes_fingerprint() {
+        // Changing a `Padding`'s insets or a `Column`'s spacing moves children, which damages
+        // for that reason anyway — so dropping either from the fingerprint left every test
+        // passing. Belt and braces, asserted directly rather than through a side effect.
+        assert_ne!(
+            Fingerprint::of(&padding(Insets::all(1), text("x"))),
+            Fingerprint::of(&padding(Insets::all(2), text("x")))
+        );
+        assert_ne!(
+            Fingerprint::of(&with_spacing(column(vec![text("x")]), 1)),
+            Fingerprint::of(&with_spacing(column(vec![text("x")]), 2))
+        );
+        // ...and children are *not* part of it, or a one-character edit in a leaf would
+        // compare every ancestor unequal and repaint the window.
+        assert_eq!(
+            Fingerprint::of(&column(vec![text("x")])),
+            Fingerprint::of(&column(vec![text("y"), text("z")]))
+        );
     }
 
     #[test]

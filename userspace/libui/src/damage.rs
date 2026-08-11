@@ -234,6 +234,18 @@ mod tests {
     }
 
     #[test]
+    fn resizing_the_buffer_count_damages_all_of_the_new_ones() {
+        // A client that adds a buffer must not have the new one start clean: it has never
+        // been drawn, so it holds whatever the memory held.
+        let mut d = settled();
+        d.resize(3, SCREEN);
+        assert_eq!(d.len(), 3);
+        for i in 0..3 {
+            assert_eq!(d.owed(i), Some(SCREEN), "buffer {i}");
+        }
+    }
+
+    #[test]
     fn union_covers_both_and_does_not_care_about_order() {
         assert_eq!(union(A, B), Rect::new(0, 0, 110, 110));
         assert_eq!(union(B, A), Rect::new(0, 0, 110, 110));

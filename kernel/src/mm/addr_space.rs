@@ -831,6 +831,7 @@ fn protection_to_page_flags(prot: Protection) -> PageFlags {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// The guard gap sits directly below the stack, is non-empty, and the "anywhere"
     /// window stops below it.
@@ -887,7 +888,6 @@ mod tests {
         assert_eq!(USER_STACK_GUARD_SIZE % PAGE_SIZE as u64, 0);
         assert_eq!(USER_STACK_GUARD_BOTTOM % PAGE_SIZE as u64, 0);
     }
-    use super::*;
     use crate::arch::Paging;
     use crate::arch::paging::ArchPaging;
     use crate::mm::test_support::init_global_heap;

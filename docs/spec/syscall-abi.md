@@ -414,7 +414,7 @@ fn sys_memory_map(
     rights: Rights,
 ) -> isize
 ```
-Maps `obj`'s frames into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window). `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), else `NoAccess`. `size` is rounded up to a page and must be ≤ the object's size. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
+Maps `obj`'s frames into the calling process's address space. `hint` is an advisory page-aligned address (`0` = "anywhere", chosen from a kernel mmap window). **A non-zero `hint` intersecting the stack guard gap is refused** with `InvalidArgument` — the gap below the initial thread's stack is reserved so that a stack overrun faults instead of landing in mapped memory, and the "anywhere" window's own bound cannot enforce that against a caller naming its own address. `rights` is the `MAP_*` subset to install; the handle must carry every requested `MAP_*` bit (so a mapping cannot amplify — e.g. mapping writable requires `MAP_WRITE`), else `NoAccess`. `size` is rounded up to a page and must be ≤ the object's size. Returns the mapped base virtual address. Mapping the same object twice **aliases the same physical memory** (the object owns the frames).
 
 ```rust
 fn sys_memory_unmap(addr: usize, size: usize) -> isize
