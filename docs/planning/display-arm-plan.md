@@ -366,8 +366,8 @@ requirement, not a compromise.
       `Element<Msg>` arrived here, with the routing that can fire a handler; handlers are
       `fn` pointers because a tuple-variant constructor already is one. `libui::route` does
       hit-testing, capture, Tab traversal, key bubbling, widget-local coordinates and
-      crossing synthesis; `FocusEvent` (op `0x0907`) carries window focus. 75 tests in
-      `libui`, 21 breaks verified.
+      crossing synthesis; `FocusEvent` (op `0x0907`) carries window focus. 78 tests in
+      `libui`, 25 breaks verified.
 
       **The gate routes through the toolkit**, so an injected keystroke reaches a *widget*
       and not merely a window: `element -> layout -> diff -> route -> handler`, with events

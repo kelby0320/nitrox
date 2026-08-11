@@ -12988,3 +12988,45 @@ place to leave it: routing *is* Part B's deliverable, so proving it is Part B's 
 client now builds an `Element`, lays it out, diffs it and drives a `Router` with the events
 the compositor sends, and the gate asserts an injected keystroke reaches a **widget**. Routing
 keys by capture instead of focus now fails the gate, where before it failed only host tests.
+
+## 2026-08-11 — Overturning a decision by not reading it: the parked-`Release` reversal
+
+The PR #184 re-review found that `ChannelTransport::park` evicts the oldest parked entry with
+no regard for what it is — and that `Release` is one of the things that parks. Losing one
+strands a buffer forever: `acquire` waits with no timeout and the protocol has no resync op.
+
+**The part worth recording is how it happened.** `MAX_PARKED`'s own doc, twenty lines above
+the code, said: *"Overflow is an **error, not a drop**. The obvious cheap behaviour — discard
+one and carry on — is wrong here because the messages that park are mostly `Release`… a
+permanent hang… (PR #175 review, finding 9)."* I read the overflow branch, saw `return Err`,
+judged it wrong for failing an unrelated request, and changed it — **without reading the
+paragraph that existed to stop exactly that change.** Then I wrote a new doc-comment giving a
+different reason, so the module ended up carrying two contradictory arguments.
+
+The diagnosis I had for it at the time was right and incomplete: failing a *request* because
+unrelated traffic piled up really is wrong, and the churn probe really did die of it. What was
+missing is that "drop instead of failing" was already considered and rejected for a reason
+that still holds. **A finding can be correct and its fix still overturn something, and the
+place that says so is usually the doc-comment on the constant you are about to change.**
+
+The answer is neither of the two: **evict the oldest *losable* entry.** `Release` is never
+evicted; if the queue is entirely `Release`s and the arrival is losable, the arrival is
+dropped instead; only a `Release` arriving on a queue of eight `Release`s still errors, which
+is #175's original behaviour narrowed to where its argument applies. The line is
+recoverability, not importance — a lost `FocusEvent` is corrected by the next focus change, a
+lost motion supersedes itself, a lost `Release` has no next.
+
+Two smaller findings from the same round:
+
+**`on_press` fired on any button's release.** Left-press a widget, click the right button over
+it, release left: the right release satisfied "released inside the captured widget" and so did
+the left one, so one interaction produced two clicks. The router now records which button took
+the capture. Twelve lines below, the capture teardown had always checked `buttons == 0`; the
+click check had never checked anything about *which* button.
+
+**`FocusEvent` gained a window id.** Focus is per-window state and a session can hold several
+windows — a popup is created on its parent's connection — so both halves of a change arrive on
+one channel with nothing to attribute them to. It cost two bytes that were already reserved,
+because the record was a day old. `KeyEvent` and `PointerEvent` have the identical gap and are
+*shipped*, so they are filed with a trigger rather than widened: the first client with two
+windows, which is Part C's menus.

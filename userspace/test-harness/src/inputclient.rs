@@ -316,14 +316,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     }
     let mut router = Router::new();
     // Focus the grid, as a real client would on creation: it is the only focusable widget.
-    let grid_id = match tree.root().map(|w| w.id) {
-        Some(id) if router.focus(&tree, &view, id) => id,
+    match tree.root().map(|w| w.id) {
+        Some(id) if router.focus(&tree, &view, id) => {}
         _ => {
             kprint(b"input-testclient: toolkit focus FAILED\n");
             exit(1);
         }
-    };
-    let _ = grid_id;
+    }
 
     // The second synchronisation point. The window has to exist before the harness injects
     // at it, for the same reason `listening` exists: a keystroke routed before there is a

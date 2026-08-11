@@ -315,12 +315,20 @@ derive the mask from *which modifier keys are down*: with both shifts held, rele
 leaves `MOD_SHIFT` set. Clearing the bit per release is the obvious implementation and is
 wrong — a tracking obligation, not a layout one.
 
-`FocusEvent`, 4 bytes:
+`FocusEvent`, 8 bytes:
 
 | Offset | Size | Type | Field |
 |---|---|---|---|
 | 0 | 2 | `u16` | `focused` — non-zero if this window now has the keyboard |
 | 2 | 2 | | reserved, zero |
+| 4 | 4 | `u32` | `window` — which window this is about |
+
+**`window` is carried because one session can hold several.** A popup is created on its
+parent's connection and takes focus from it, so both halves of that change arrive on the one
+channel; without an id a client cannot attribute them, and per-window focus state is exactly
+what a toolkit keeps. `KeyEvent` and `PointerEvent` have the same shortcoming and do **not**
+carry one — a gap recorded in `../rationale/deferred-decisions.md` rather than fixed here,
+because widening a shipped record is a wire break where this one was a day old.
 
 **A toolkit needs this and cannot derive it.** A caret blinks only when *both* the widget has
 focus within its window and the window has the keyboard; those are two facts from two sources,

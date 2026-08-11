@@ -625,27 +625,44 @@ pub struct FocusEvent {
     pub focused: u16,
     /// Reserved; zero.
     pub _pad: u16,
+    /// Which window this is about.
+    ///
+    /// **Focus is per-window state, and one session can hold several windows** — a menu
+    /// popup is created on its parent's connection and takes focus from it, so both halves
+    /// of that change arrive on one channel. Without an id a client cannot attribute them,
+    /// and per-window focus state is exactly what a toolkit keeps.
+    ///
+    /// `KeyEvent` and `PointerEvent` have the same shortcoming and are not fixed here: they
+    /// are shipped, and widening them is a wire break. This record was one commit old when
+    /// the gap was found, so it cost two bytes that were already reserved
+    /// (PR #184 re-review, finding 3). The others are filed.
+    pub window: u32,
 }
 
-const _: () = assert!(core::mem::size_of::<FocusEvent>() == 4);
+const _: () = assert!(core::mem::size_of::<FocusEvent>() == 8);
 
 impl FocusEvent {
-    /// Serialise into exactly 4 little-endian bytes.
+    /// Serialise into exactly 8 little-endian bytes.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
-        if out.len() < 4 {
+        if out.len() < 8 {
             return None;
         }
         out[0..2].copy_from_slice(&self.focused.to_le_bytes());
         out[2..4].copy_from_slice(&0u16.to_le_bytes());
-        Some(4)
+        out[4..8].copy_from_slice(&self.window.to_le_bytes());
+        Some(8)
     }
 
-    /// Parse from exactly 4 little-endian bytes.
+    /// Parse from exactly 8 little-endian bytes.
     pub fn read(b: &[u8]) -> Option<Self> {
-        if b.len() < 4 {
+        if b.len() < 8 {
             return None;
         }
-        Some(Self { focused: u16::from_le_bytes([b[0], b[1]]), _pad: 0 })
+        Some(Self {
+            focused: u16::from_le_bytes([b[0], b[1]]),
+            _pad: 0,
+            window: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+        })
     }
 }
 
@@ -885,20 +902,21 @@ mod tests {
 
     #[test]
     fn a_focus_event_round_trips_and_refuses_a_short_buffer() {
-        let e = FocusEvent { focused: 1, _pad: 0 };
-        let mut b = [0u8; 4];
-        assert_eq!(e.write(&mut b), Some(4));
+        let e = FocusEvent { focused: 1, _pad: 0, window: 0x0102_0304 };
+        let mut b = [0u8; 8];
+        assert_eq!(e.write(&mut b), Some(8));
         assert_eq!(&b[0..2], &1u16.to_le_bytes(), "focused @0");
         assert_eq!(&b[2..4], &0u16.to_le_bytes(), "reserved @2, zero");
+        assert_eq!(&b[4..8], &0x0102_0304u32.to_le_bytes(), "window @4");
         assert_eq!(FocusEvent::read(&b), Some(e));
 
-        assert_eq!(FocusEvent::read(&[0u8; 3]), None);
-        assert_eq!(FocusEvent::default().write(&mut [0u8; 3]), None);
+        assert_eq!(FocusEvent::read(&[0u8; 7]), None);
+        assert_eq!(FocusEvent::default().write(&mut [0u8; 7]), None);
 
         // A non-zero `focused` other than 1 still reads as focused: the field is a boolean
         // on the wire, and a sender writing 2 must not read back as "not focused".
-        let e = FocusEvent { focused: 2, _pad: 0 };
-        let mut b = [0u8; 4];
+        let e = FocusEvent { focused: 2, _pad: 0, window: 9 };
+        let mut b = [0u8; 8];
         e.write(&mut b).unwrap();
         assert_ne!(FocusEvent::read(&b).unwrap().focused, 0);
     }

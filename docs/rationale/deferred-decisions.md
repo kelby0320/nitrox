@@ -367,6 +367,17 @@ the toolkit (M4) needing to resynchronise held-key state after one. Raised 2026-
 the sender is waiting for an answer and cannot outrun the receiver. They are undersized
 rather than wrong. Trigger: any of them growing a server-initiated push stream.
 
+**`KeyEvent` and `PointerEvent` do not say which window they are for.** A Surface session can
+hold several windows — a popup is created on its parent's connection — and input records carry
+no window id, so a client with two windows on one connection cannot attribute a keystroke to
+either. `Release` carries one and `libsurface::Window` filters on it; `FocusEvent` gained one
+in M4 Part B while it was still a day old. These two are shipped, so widening them is a wire
+break rather than two spare bytes.
+
+Today nothing hits it: every client has one window per connection. **Trigger: the first client
+with two** — Part C's menus are the obvious candidate, since a popup is a second window on the
+parent's session. Raised by the PR #184 re-review, 2026-08-11.
+
 ### Processes and memory
 
 ~~**The default user stack is 32 KiB…**~~ **Decided 2026-08-10: 8 MiB plus a guard gap,

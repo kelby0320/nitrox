@@ -554,9 +554,9 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
                 None => true,
             }
         }
-        Outbound::Focus { focused, .. } => {
+        Outbound::Focus { window, focused } => {
             let mut body = [0u8; core::mem::size_of::<FocusEvent>()];
-            let e = FocusEvent { focused: u16::from(*focused), _pad: 0 };
+            let e = FocusEvent { focused: u16::from(*focused), _pad: 0, window: *window };
             match e.write(&mut body) {
                 Some(_) => send_input(ch, OP_FOCUS_EVENT, &body),
                 None => true,

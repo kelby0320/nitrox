@@ -55,6 +55,13 @@ pub type Path = Vec<usize>;
 pub struct Router {
     focus: Option<u64>,
     capture: Option<u64>,
+    /// Which button took that capture.
+    ///
+    /// A click is *that* button's release, not any release. Without this, left-pressing a
+    /// widget and then clicking the right button over it fires `on_press` — and the left
+    /// release fires it again, so one interaction produces two clicks (PR #184 re-review,
+    /// finding 2).
+    capture_button: Option<u16>,
     /// The widget the cursor is inside, for synthesising crossings.
     inside: Option<u64>,
     window_focused: bool,
@@ -98,7 +105,13 @@ impl Router {
     /// the compositor's first `FocusEvent` corrects this within a frame. Starting `false`
     /// would make a client's first paint dim.
     pub fn new() -> Self {
-        Self { focus: None, capture: None, inside: None, window_focused: true }
+        Self {
+            focus: None,
+            capture: None,
+            capture_button: None,
+            inside: None,
+            window_focused: true,
+        }
     }
 
     /// The focused widget's id, if any.
@@ -188,7 +201,8 @@ impl Router {
         self.focus
     }
 
-    /// Drop focus and capture if they name widgets the tree no longer has.
+    /// Drop focus, capture and the hovered widget if they name widgets the tree no longer
+    /// has.
     ///
     /// Called after every diff. The router is not on the destroy path, and asking the tree
     /// cannot go out of date the way a callback can — the same reasoning the compositor's
@@ -199,13 +213,14 @@ impl Router {
         }
         if self.capture.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
             self.capture = None;
+            self.capture_button = None;
         }
         if self.inside.is_some_and(|id| find_by_id(tree.root(), id).is_none()) {
             self.inside = None;
         }
     }
 
-    /// Route a key event, returning the messages it produced.
+    /// Route a key event, returning the message it produced.
     ///
     /// The focused widget's `on_key` fires first; if it has none **or returns `None`**, the
     /// event bubbles to each ancestor in turn. Declining matters: a focused text field with a
@@ -255,6 +270,7 @@ impl Router {
         // drag that leaves the widget stops being that widget's drag.
         if pressed && self.capture.is_none() {
             self.capture = hit_test(tree.root(), layout, at);
+            self.capture_button = Some(event.button);
         }
         let target = self.capture.or_else(|| hit_test(tree.root(), layout, at));
 
@@ -308,6 +324,7 @@ impl Router {
             // window's top-left corner: everything in a second column, below a menu bar, or
             // inside a `padding` silently lost its clicks (PR #184 review, finding 1).
             if released
+                && self.capture_button == Some(event.button)
                 && let Some(msg) = e.on_press.clone()
                 && let Some(l) = layout_at(layout, &path)
                 && l.rect.contains(event.x, event.y)
@@ -324,6 +341,7 @@ impl Router {
             // The cursor may have been dragged somewhere else entirely while the button was
             // held, so re-derive the crossing now that it is not suppressed.
             self.capture = None;
+            self.capture_button = None;
             let now = hit_test(tree.root(), layout, at);
             if now != self.inside {
                 if let Some(old) = self.inside {
@@ -629,6 +647,40 @@ mod tests {
         r.pointer(&t, &e, &l, press(550, 10));
         let (msgs, _) = r.pointer(&t, &e, &l, release(50, 10));
         assert!(msgs.is_empty(), "released back over the spacer: cancelled");
+    }
+
+    #[test]
+    fn only_the_capturing_buttons_release_is_a_click() {
+        // Left-press the widget, then press *and release* the right button over it, then
+        // release left. Without checking which button, the right release fires `on_press`
+        // and the left release fires it again — two clicks for one press-and-release of the
+        // button the user actually clicked (PR #184 re-review, finding 2).
+        let e: Element<Msg> = column(vec![
+            custom(1, Size::new(0, 0)).on_press(Msg::Pressed(1)).flex(1),
+        ]);
+        let (t, l) = build(&e);
+        let mut r = Router::new();
+
+        let (msgs, _) = r.pointer(&t, &e, &l, press(10, 10));
+        assert!(msgs.is_empty());
+
+        // Right button down (both held) and up again, without moving.
+        let right_down = PointerEvent {
+            kind: POINTER_BUTTON, button: 0x111, buttons: 3, flags: POINTER_PRESSED,
+            x: 10, y: 10, ..Default::default()
+        };
+        let right_up = PointerEvent {
+            kind: POINTER_BUTTON, button: 0x111, buttons: 1, flags: 0,
+            x: 10, y: 10, ..Default::default()
+        };
+        let (msgs, _) = r.pointer(&t, &e, &l, right_down);
+        assert!(msgs.is_empty(), "a second press is not a click");
+        let (msgs, _) = r.pointer(&t, &e, &l, right_up);
+        assert!(msgs.is_empty(), "and neither is its release: {msgs:?}");
+
+        // The left release — the button that took the capture — is the click, once.
+        let (msgs, _) = r.pointer(&t, &e, &l, release(10, 10));
+        assert_eq!(msgs, [Msg::Pressed(1)], "exactly one click");
     }
 
     #[test]

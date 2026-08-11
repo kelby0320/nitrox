@@ -169,6 +169,9 @@ pub enum WindowEvent {
     ///
     /// **Not the same as widget focus**, which is the toolkit's and which this must not
     /// disturb: a window returning to the foreground has to put the caret back where it was.
+    ///
+    /// Filtered to *this* window: one session can hold several, and a popup taking focus
+    /// from its parent sends both halves down the one channel.
     Focus(bool),
     /// The queue overflowed and events were discarded.
     ///
@@ -341,7 +344,9 @@ impl<T: Transport> Window<T> {
                 }
             }
             OP_FOCUS_EVENT => {
-                if let Some(e) = FocusEvent::read(body) {
+                if let Some(e) = FocusEvent::read(body)
+                    && e.window == self.id
+                {
                     self.enqueue(WindowEvent::Focus(e.focused != 0));
                 }
             }
@@ -768,8 +773,8 @@ mod tests {
     fn a_focus_event_reaches_the_queue_as_a_bool() {
         let mut w = window(2);
         for focused in [true, false] {
-            let e = FocusEvent { focused: u16::from(focused), _pad: 0 };
-            let mut b = [0u8; 4];
+            let e = FocusEvent { focused: u16::from(focused), _pad: 0, window: w.id() };
+            let mut b = [0u8; 8];
             let n = e.write(&mut b).unwrap();
             w.transport.events.insert(0, (OP_FOCUS_EVENT, b[..n].to_vec()));
         }
@@ -779,12 +784,27 @@ mod tests {
     }
 
     #[test]
+    fn a_focus_event_for_another_window_is_not_this_windows_business() {
+        // One session can hold several windows — a popup is created on its parent's
+        // connection — so both halves of a focus change arrive on the one channel. Without
+        // the filter a parent would read its own loss as a gain (PR #184 re-review).
+        let mut w = window(2);
+        let other = w.id() + 1;
+        let e = FocusEvent { focused: 1, _pad: 0, window: other };
+        let mut b = [0u8; 8];
+        let n = e.write(&mut b).unwrap();
+        w.transport.events.insert(0, (OP_FOCUS_EVENT, b[..n].to_vec()));
+        w.pump().expect("pump");
+        assert_eq!(w.next_event(), None, "not addressed to this window");
+    }
+
+    #[test]
     fn a_truncated_focus_event_is_ignored_rather_than_read_as_unfocused() {
         // Reading a short record as `focused: false` would dim a window for a malformed
         // message — the failure mode is invisible, because a dim window looks like a window
         // that legitimately lost focus.
         let mut w = window(2);
-        w.transport.events.insert(0, (OP_FOCUS_EVENT, vec![0u8; 3]));
+        w.transport.events.insert(0, (OP_FOCUS_EVENT, vec![0u8; 7]));
         w.pump().expect("pump");
         assert_eq!(w.next_event(), None);
     }
