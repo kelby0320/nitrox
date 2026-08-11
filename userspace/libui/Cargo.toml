@@ -17,6 +17,8 @@ edition = "2024"
 [dependencies]
 libdraw = { path = "../libdraw" }
 librsproto = { path = "../librsproto" }
+#  for the baseline:  has no float transcendentals, and the ascent is a float.
+libm = { version = "0.2", default-features = false }
 
 [lib]
 name = "libui"
