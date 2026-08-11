@@ -326,9 +326,22 @@ toolkit anyway: coupled to a terminal, and with a second copy due the moment the
 lands. So it ships first, and **the terminal decides how much of it exists**. Minimal is a
 requirement, not a compromise.
 
-- [ ] **Part A — the widget tree, layout, and invalidation.** Where a widget marking itself
-      dirty becomes a damage rectangle on a surface commit. Carries the **crate rename**
+- [x] **Part A — the widget tree, layout, and invalidation.** ✅ (2026-08-11) Where a widget
+      marking itself dirty becomes a damage rectangle on a surface commit — except that
+      nothing marks itself dirty: **the diff is where damage comes from**, which is the whole
+      reason the declarative model was chosen. Carried the **crate rename**
       (`libui` → `libsurface`), because everything after it imports the new names.
+
+      Four steps: the rename; the user stack; `element` + `layout`; `diff` + `damage`.
+      50 host tests in `libui`, 23 breaks verified across the four.
+
+      **Two things Part A found that the design pass had not.** The retained tree initially
+      *retained nothing* — every field was derived from the new frame, so keyed and
+      positional pairing produced identical trees and identical damage, and the reorder test
+      passed against pairing by position. Widgets now carry a stable id, which is also what
+      Part B's focus paths need. And the stack guard gap turned out to need **two** changes
+      rather than one: `MMAP_MAX` bounds only `sys_memory_map(hint = 0)`, so the hinted path
+      needed its own check or the gap guaranteed nothing.
 
       **Also the user stack: 32 KiB → 8 MiB, plus a guard gap.** One of the four deferred
       items this milestone absorbs, and one whose filed trigger names it — a toolkit is recursive by

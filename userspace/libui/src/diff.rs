@@ -28,6 +28,7 @@ use alloc::vec::Vec;
 
 use libdraw::geom::Rect;
 
+use crate::damage::union_opt;
 use crate::element::{Element, Insets, Node};
 use crate::layout::Layout;
 
@@ -251,29 +252,12 @@ impl Damage {
     }
 
     fn add(&mut self, r: Rect) {
-        if r.size.w == 0 || r.size.h == 0 {
-            // A zero-extent rectangle covers no pixel; unioning it would drag the result out
-            // to include a corner nothing is drawn in.
-            return;
-        }
-        self.0 = Some(match self.0 {
-            None => r,
-            Some(a) => union(a, r),
-        });
+        self.0 = union_opt(self.0, Some(r));
     }
 
     fn take(self) -> Option<Rect> {
         self.0
     }
-}
-
-/// The smallest rectangle containing both.
-fn union(a: Rect, b: Rect) -> Rect {
-    let x0 = a.origin.x.min(b.origin.x);
-    let y0 = a.origin.y.min(b.origin.y);
-    let x1 = a.right().max(b.right());
-    let y1 = a.bottom().max(b.bottom());
-    Rect::new(x0, y0, (x1 - x0 as i64) as u32, (y1 - y0 as i64) as u32)
 }
 
 /// Pair one node, recursing into its children.
@@ -669,16 +653,4 @@ mod tests {
         assert_eq!(d.take(), Some(Rect::new(100, 100, 10, 10)));
     }
 
-    #[test]
-    fn union_covers_both_rectangles() {
-        assert_eq!(
-            union(Rect::new(10, 10, 5, 5), Rect::new(100, 20, 5, 5)),
-            Rect::new(10, 10, 95, 15)
-        );
-        // Order must not matter.
-        assert_eq!(
-            union(Rect::new(100, 20, 5, 5), Rect::new(10, 10, 5, 5)),
-            Rect::new(10, 10, 95, 15)
-        );
-    }
 }

@@ -31,6 +31,7 @@
 
 extern crate alloc;
 
+pub mod damage;
 pub mod diff;
 pub mod element;
 pub mod layout;
