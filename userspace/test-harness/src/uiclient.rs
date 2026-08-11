@@ -1,6 +1,6 @@
 //! `ui-testclient` — the display arm's first real client (plan M2 Part D).
 //!
-//! Everything before this was one half of a conversation. `libui` had only met a mock and
+//! Everything before this was one half of a conversation. `libsurface` had only met a mock and
 //! the compositor had never answered anybody, which is how the Surface protocol shipped
 //! **one-way** through a PR with three green CI jobs and 1213 passing tests: the code that
 //! produced replies existed, and nothing consumed them.
@@ -52,8 +52,8 @@ use librsproto::surface::{
     AttachBufferRequest, CommitRequest, OP_ATTACH_BUFFER, OP_COMMIT, Role,
     SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
 };
-use libui::Transport;
-use libui::{Window, ipc::ChannelTransport};
+use libsurface::Transport;
+use libsurface::{Window, ipc::ChannelTransport};
 
 /// `alloc` backing — rendering the reference scene allocates.
 #[global_allocator]
@@ -224,7 +224,7 @@ fn churn(root_ns: u64) -> bool {
         // message whether or not the compositor accepts it, so an attach naming a window
         // that does not exist — one malformed message, which any client can send — used to
         // hand over an object nobody ever closed. Sent through the raw transport because
-        // `libui` deliberately cannot express it.
+        // `libsurface` deliberately cannot express it.
         let Some((bogus_handle, bogus_addr)) = shared_buffer(len) else {
             Line::new().s(b"churn: bogus buffer alloc failed at cycle ").u(cycle as u64).end();
             return false;
@@ -272,7 +272,7 @@ fn churn(root_ns: u64) -> bool {
         // else means the compositor accepted an attach to a window that does not exist.
         let mut reply = [0u8; 32];
         match t.request(bogus_op, &req[..rn], Some(bogus_handle), &mut reply) {
-            Err(libui::UiError::Server) => {}
+            Err(libsurface::UiError::Server) => {}
             _ => {
                 Line::new()
                     .s(b"churn: bogus request was not refused at cycle ")

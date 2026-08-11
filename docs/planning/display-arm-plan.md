@@ -326,9 +326,22 @@ toolkit anyway: coupled to a terminal, and with a second copy due the moment the
 lands. So it ships first, and **the terminal decides how much of it exists**. Minimal is a
 requirement, not a compromise.
 
-- [ ] **Part A — the widget tree, layout, and invalidation.** Where a widget marking itself
-      dirty becomes a damage rectangle on a surface commit. Carries the **crate rename**
+- [x] **Part A — the widget tree, layout, and invalidation.** ✅ (2026-08-11) Where a widget
+      marking itself dirty becomes a damage rectangle on a surface commit — except that
+      nothing marks itself dirty: **the diff is where damage comes from**, which is the whole
+      reason the declarative model was chosen. Carried the **crate rename**
       (`libui` → `libsurface`), because everything after it imports the new names.
+
+      Four steps: the rename; the user stack; `element` + `layout`; `diff` + `damage`.
+      50 host tests in `libui`, 23 breaks verified across the four.
+
+      **Two things Part A found that the design pass had not.** The retained tree initially
+      *retained nothing* — every field was derived from the new frame, so keyed and
+      positional pairing produced identical trees and identical damage, and the reorder test
+      passed against pairing by position. Widgets now carry a stable id, which is also what
+      Part B's focus paths need. And the stack guard gap turned out to need **two** changes
+      rather than one: `MMAP_MAX` bounds only `sys_memory_map(hint = 0)`, so the hinted path
+      needed its own check or the gap guaranteed nothing.
 
       **Also the user stack: 32 KiB → 8 MiB, plus a guard gap.** One of the four deferred
       items this milestone absorbs, and one whose filed trigger names it — a toolkit is recursive by
@@ -361,6 +374,21 @@ requirement, not a compromise.
       repeat and the on-screen cursor, which are what make the set usable by a person rather
       than only by the harness.
 
+      **Glyph rendering moves here from M5 Part A** (2026-08-11). Three of the four widgets
+      draw text, and a toolkit that cannot draw its own labels has no gate worth the name.
+      What moves is *glyphs* — the rasterizer, a glyph cache, and a blit; what stays in M5 is
+      the **ANSI/terminal render path**, which is terminal semantics rather than toolkit
+      capability.
+
+      **Real TrueType from the start, via `ab_glyph`** — userspace's first external
+      dependencies, verified to build for the custom target before the decision was taken
+      (`display-substrate.md` §6). No bitmap font and no PSF loader is written, because that
+      code would be deleted rather than grown. Coverage is thresholded to 1 bit until
+      `libdraw` can blend, which is one branch in the per-pixel callback.
+
+      **The font file ships on the root filesystem**, not the initramfs — a client that draws
+      text starts long after `fs-server-ext4` is mounted, and the compositor never needs it.
+
       **No text area** — the design pass found this line contradicting Milestone 5, which
       makes the terminal grid a *custom-drawn widget of its own* precisely so it is not a
       generic text area. Nothing in M5 would then use one, and "the terminal decides how much
@@ -382,8 +410,12 @@ pages, which is exactly when it starts to pay.
 
 **Deliverable: the shell running in a window, drivable by the harness over QMP.**
 
-- [ ] **Part A — glyph rendering** with the bitmap font, in `libdraw`. Host-tested; the
-      text/ANSI render path is pure logic.
+- [ ] **Part A — the text/ANSI render path**, in `libdraw`. Host-tested; pure logic.
+
+      **Glyph rendering left this part for M4 Part C** (2026-08-11): the toolkit's widgets
+      draw text a milestone earlier than the terminal does. What remains here is what is
+      actually terminal-shaped — escape-sequence interpretation, wrapping, and the grid's
+      render — rather than "how does a glyph become pixels", which M4 answers.
 - [ ] **Part B — the terminal client**, built on the toolkit: window chrome, menus and scrollbar
       from M4's widget set, with **the grid as a custom-drawn widget of its own**. A terminal's
       selection, wrapping and scrollback semantics are not a text editor's, and bending a

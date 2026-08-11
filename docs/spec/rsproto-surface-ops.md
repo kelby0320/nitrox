@@ -17,7 +17,7 @@ capture, window movement and port wiring are later milestones and will extend th
 consumes `/dev/input/new`, interprets the stream with `libinput`, and routes it:
 keys to the topmost window whose role takes focus, pointer events to the window under the
 cursor, with an implicit grab from a press to its release. **The receiving end is built too**
-as of M3 Part D (2026-08-10): `libui` delivers both records into a per-window event queue, and
+as of M3 Part D (2026-08-10): `libsurface` delivers both records into a per-window event queue, and
 `cargo xtask check-input` injects a keystroke and a click over QMP and asserts they reach a
 window.
 

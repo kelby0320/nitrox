@@ -1136,6 +1136,21 @@ pub fn sys_memory_map(obj_h: u64, hint: u64, size: u64, rights: u64) -> SysResul
         if end > USER_VIRT_END {
             return Err(KError::InvalidArgument);
         }
+        // The stack guard gap has to bind here too, or it is not a guarantee: `MMAP_MAX`
+        // bounds only the `hint == 0` search, so a hinted mapping could sit in the gap and
+        // an overrun would land in mapped memory again — silently, which is the one thing
+        // the gap removes.
+        //
+        // **Coverage boundary, stated rather than implied.** `in_stack_guard` is host-tested
+        // over its boundaries — including a range that spans the whole gap with neither
+        // endpoint inside it, which a "contains an endpoint" test would miss. *This call* is
+        // not covered end to end: reaching it needs a live process, and a guest probe would
+        // need the stack constants exported to userspace, which is arch-specific ABI surface
+        // this change has no other reason to add. Nothing in userspace passes a non-zero
+        // hint today.
+        if AddressSpace::in_stack_guard(hint, end) {
+            return Err(KError::InvalidArgument);
+        }
         VAddrRange::new(start, VirtAddr::new(end)).ok_or(KError::InvalidArgument)?
     };
 

@@ -1,0 +1,332 @@
+//! `Element` — what an application's `view` returns.
+//!
+//! An `Element` is a **description**, not a widget. It is built fresh every time `view` runs
+//! and dropped once the diff has consumed it; the retained widget that survives between
+//! frames is the diff's business, not this module's.
+//!
+//! That split decides where state may live, which is the part worth being firm about:
+//! **anything the application owns belongs in its state and arrives through `view`.** What
+//! a retained widget keeps is strictly *interaction* state — a scrollbar's drag origin, a
+//! menu's open item — which the application has no opinion about and would be tedious to
+//! thread through messages.
+//!
+//! ## No message type yet
+//!
+//! `docs/design/widget-toolkit.md` §2.2 gives `view` the signature
+//! `fn view(state: &App) -> Element<Msg>`. There is no `Msg` parameter here, because Part A
+//! has no event routing: nothing can fire a handler, so a handler field would be a value no
+//! code path reads. The parameter arrives in Part B alongside the routing that gives it a
+//! reason to exist. Recorded here so the mismatch with the design document reads as a build
+//! order rather than a disagreement.
+
+use alloc::boxed::Box;
+use alloc::string::String;
+use alloc::vec::Vec;
+
+use libdraw::geom::Size;
+
+/// Which edge a docked child is pinned to.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Edge {
+    /// Pinned to the top, full width.
+    Top,
+    /// Pinned to the bottom, full width.
+    Bottom,
+    /// Pinned to the left, full height of what remains.
+    Left,
+    /// Pinned to the right, full height of what remains.
+    Right,
+}
+
+/// Space added around a child, in pixels.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct Insets {
+    /// Space above.
+    pub top: u32,
+    /// Space to the right.
+    pub right: u32,
+    /// Space below.
+    pub bottom: u32,
+    /// Space to the left.
+    pub left: u32,
+}
+
+impl Insets {
+    /// The same inset on all four sides.
+    pub const fn all(n: u32) -> Self {
+        Self { top: n, right: n, bottom: n, left: n }
+    }
+
+    /// Total horizontal inset.
+    pub const fn horizontal(&self) -> u32 {
+        self.left + self.right
+    }
+
+    /// Total vertical inset.
+    pub const fn vertical(&self) -> u32 {
+        self.top + self.bottom
+    }
+}
+
+/// A docked child and the edge it is pinned to.
+#[derive(Clone, Debug)]
+pub struct Docked {
+    /// Which edge it occupies.
+    pub edge: Edge,
+    /// The child itself.
+    pub element: Element,
+}
+
+/// What an element *is*.
+///
+/// Deliberately short. `docs/design/widget-toolkit.md` §1's rule is that anything Milestone
+/// 5's terminal does not use is not in Milestone 4, and these are the structural nodes the
+/// diff and layout need in order to be tested at all. The interactive widgets — button,
+/// menu, scrollbar — arrive in Part C, pulled into existence by the terminal.
+#[derive(Clone, Debug)]
+pub enum Node {
+    /// A run of text, measured by the caller's [`Metrics`](crate::layout::Metrics).
+    Text(String),
+    /// Children stacked top to bottom.
+    Column {
+        /// Gap between adjacent children.
+        spacing: u32,
+        /// The children, in order.
+        children: Vec<Element>,
+    },
+    /// Children stacked left to right.
+    Row {
+        /// Gap between adjacent children.
+        spacing: u32,
+        /// The children, in order.
+        children: Vec<Element>,
+    },
+    /// Children pinned to edges, with one child filling what remains.
+    ///
+    /// The filler is a **named field rather than "the last child"**. A positional rule reads
+    /// fine and then silently changes meaning the first time somebody appends a docked child
+    /// to the end of the list.
+    Dock {
+        /// Edge-pinned children, applied in order — each takes its slice of what is left.
+        edges: Vec<Docked>,
+        /// The child that takes everything remaining.
+        fill: Box<Element>,
+    },
+    /// Children overlaid in paint order, each filling the whole area.
+    ///
+    /// The overlay node menus are drawn into. Painted first to last, so the last child is on
+    /// top — and hit-tested in the reverse of that, once Part B hit-tests anything.
+    Stack(Vec<Element>),
+    /// A child with space around it.
+    Padding {
+        /// How much space, per side.
+        insets: Insets,
+        /// The child.
+        child: Box<Element>,
+    },
+    /// A child constrained on one or both axes.
+    ///
+    /// **A zero component means "whatever the parent gives"**, so `sized(12 × 0)` is a
+    /// full-height 12-wide strip — a scrollbar — and `sized(0 × 16)` is a full-width bar.
+    /// Without that convention every fixed-size child would have to name a cross-axis extent
+    /// it does not care about, and would then be wrong the moment the window resized.
+    ///
+    /// The constraint binds the node's **own** rectangle, not merely its measured extent. An
+    /// earlier version passed the parent's rectangle straight through, so a `sized` inside a
+    /// `Stack` took the whole overlay and the doc claiming "an exact size" was false
+    /// (PR #183 review, finding 5).
+    Sized {
+        /// The constraint; zero on an axis means unconstrained.
+        size: Size,
+        /// The child.
+        child: Box<Element>,
+    },
+    /// An application-drawn node: the escape hatch.
+    ///
+    /// Opaque to the toolkit — it measures to `size` and the application paints it. This is
+    /// what Milestone 5's terminal grid is, and it is deliberately a first-class node rather
+    /// than an afterthought: the flagship application is an escape-hatch client, so the
+    /// toolkit supplies chrome, layout and input plumbing and gets out of the way where the
+    /// application knows better.
+    Custom {
+        /// Application-chosen discriminator, so a diff can tell two custom nodes apart.
+        kind: u32,
+        /// The size it wants.
+        size: Size,
+    },
+}
+
+/// A node, plus the properties every node carries.
+#[derive(Clone, Debug)]
+pub struct Element {
+    /// Identity within the parent, for the diff.
+    ///
+    /// `None` means "pair me by position", which is right for the fixed structural nesting
+    /// that makes up most of a UI. Dynamic lists — anything reordered, inserted into, or
+    /// removed from — must set it, or the diff pairs row 2's widget with row 3's element.
+    pub key: Option<u64>,
+    /// Share of a `Row`/`Column`'s leftover space; `0` means "just my measured size".
+    pub flex: u16,
+    /// What this element is.
+    pub node: Node,
+}
+
+impl Element {
+    /// An element with no key and no flex.
+    pub fn new(node: Node) -> Self {
+        Self { key: None, flex: 0, node }
+    }
+
+    /// Give this element an identity within its parent.
+    pub fn key(mut self, key: u64) -> Self {
+        self.key = Some(key);
+        self
+    }
+
+    /// Give this element a share of its parent's leftover space.
+    pub fn flex(mut self, flex: u16) -> Self {
+        self.flex = flex;
+        self
+    }
+
+    /// This element's children, if it has any, in paint order.
+    pub fn children(&self) -> impl Iterator<Item = &Element> {
+        // One iterator type for every shape, so callers do not each re-derive the match.
+        // `Dock` yields its edge children before the filler, which is also the order layout
+        // consumes them in and the order they are painted.
+        let (a, b, c): (&[Element], Option<&Element>, Option<&Element>) = match &self.node {
+            Node::Text(_) | Node::Custom { .. } => (&[], None, None),
+            Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
+                (children.as_slice(), None, None)
+            }
+            Node::Padding { child, .. } | Node::Sized { child, .. } => (&[], Some(child), None),
+            Node::Dock { fill, .. } => (&[], None, Some(fill)),
+        };
+        let docked: Option<&Vec<Docked>> = match &self.node {
+            Node::Dock { edges, .. } => Some(edges),
+            _ => None,
+        };
+        a.iter()
+            .chain(docked.into_iter().flatten().map(|d| &d.element))
+            .chain(b)
+            .chain(c)
+    }
+}
+
+/// A run of text.
+pub fn text(s: impl Into<String>) -> Element {
+    Element::new(Node::Text(s.into()))
+}
+
+/// Children stacked top to bottom.
+pub fn column(children: impl Into<Vec<Element>>) -> Element {
+    Element::new(Node::Column { spacing: 0, children: children.into() })
+}
+
+/// Children stacked left to right.
+pub fn row(children: impl Into<Vec<Element>>) -> Element {
+    Element::new(Node::Row { spacing: 0, children: children.into() })
+}
+
+/// Children overlaid, last on top.
+pub fn stack(children: impl Into<Vec<Element>>) -> Element {
+    Element::new(Node::Stack(children.into()))
+}
+
+/// Edge-pinned children around one that fills the rest.
+pub fn dock(edges: impl Into<Vec<Docked>>, fill: Element) -> Element {
+    Element::new(Node::Dock { edges: edges.into(), fill: Box::new(fill) })
+}
+
+/// Pin `element` to `edge` inside a [`dock`].
+pub fn docked(edge: Edge, element: Element) -> Docked {
+    Docked { edge, element }
+}
+
+/// A child with space around it.
+pub fn padding(insets: Insets, child: Element) -> Element {
+    Element::new(Node::Padding { insets, child: Box::new(child) })
+}
+
+/// A child constrained on one or both axes; a zero component means unconstrained.
+pub fn sized(size: Size, child: Element) -> Element {
+    Element::new(Node::Sized { size, child: Box::new(child) })
+}
+
+/// An application-drawn node.
+pub fn custom(kind: u32, size: Size) -> Element {
+    Element::new(Node::Custom { kind, size })
+}
+
+/// Set the gap between a `Row`'s or `Column`'s children.
+///
+/// A no-op on anything else rather than an error: `spacing` is a layout hint, and refusing
+/// it on a `Text` would make every builder chain conditional on the node kind.
+pub fn with_spacing(mut e: Element, gap: u32) -> Element {
+    match &mut e.node {
+        Node::Column { spacing, .. } | Node::Row { spacing, .. } => *spacing = gap,
+        _ => {}
+    }
+    e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use alloc::vec;
+
+    #[test]
+    fn builders_carry_key_and_flex_without_changing_the_node() {
+        let e = text("hi").key(7).flex(2);
+        assert_eq!(e.key, Some(7));
+        assert_eq!(e.flex, 2);
+        assert!(matches!(e.node, Node::Text(ref s) if s == "hi"));
+    }
+
+    #[test]
+    fn children_yields_every_shape_and_nothing_extra() {
+        assert_eq!(text("a").children().count(), 0);
+        assert_eq!(custom(1, Size::new(4, 4)).children().count(), 0);
+        assert_eq!(column(vec![text("a"), text("b")]).children().count(), 2);
+        assert_eq!(row(vec![text("a")]).children().count(), 1);
+        assert_eq!(stack(vec![text("a"), text("b"), text("c")]).children().count(), 3);
+        assert_eq!(padding(Insets::all(1), text("a")).children().count(), 1);
+        assert_eq!(sized(Size::new(2, 2), text("a")).children().count(), 1);
+    }
+
+    #[test]
+    fn a_docks_children_come_before_its_filler() {
+        // The order layout consumes them in and the order they are painted. The diff walks
+        // this too, so a different order here would silently re-pair every docked child
+        // with the filler.
+        let d = dock(vec![docked(Edge::Top, text("bar")), docked(Edge::Right, text("scroll"))],
+                     text("fill"));
+        let kinds: Vec<&str> = d
+            .children()
+            .map(|c| match &c.node {
+                Node::Text(s) => s.as_str(),
+                _ => unreachable!(),
+            })
+            .collect();
+        assert_eq!(kinds, ["bar", "scroll", "fill"]);
+    }
+
+    #[test]
+    fn spacing_applies_to_the_two_nodes_that_have_it_and_is_ignored_elsewhere() {
+        let c = with_spacing(column(vec![text("a")]), 4);
+        assert!(matches!(c.node, Node::Column { spacing: 4, .. }));
+        let r = with_spacing(row(vec![text("a")]), 3);
+        assert!(matches!(r.node, Node::Row { spacing: 3, .. }));
+        // Ignored rather than refused: a builder chain must not become conditional on kind.
+        let t = with_spacing(text("a"), 9);
+        assert!(matches!(t.node, Node::Text(_)));
+    }
+
+    #[test]
+    fn insets_sum_per_axis() {
+        let i = Insets { top: 1, right: 2, bottom: 3, left: 4 };
+        assert_eq!(i.horizontal(), 6);
+        assert_eq!(i.vertical(), 4);
+        assert_eq!(Insets::all(5).horizontal(), 10);
+    }
+}

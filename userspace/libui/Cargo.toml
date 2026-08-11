@@ -3,20 +3,19 @@ name = "libui"
 version = "0.1.0"
 edition = "2024"
 
-# `libui` — the client side of the Surface protocol (plan M2 Part C). The role
-# `librsproto` plays for the RS protocol: the protocol gets a library, and clients use it.
-# If the first application hand-rolls this, the surface protocol immediately has two
-# implementations and the second one lives in an application.
+# The widget toolkit. `docs/design/widget-toolkit.md` is the design; the short version is a
+# **retained tree with a declarative face** — an application holds state and writes
+# `view(&state) -> Element`, and the runtime diffs that description against the tree it keeps.
 #
-# The **buffer lifecycle** — which buffer a client may draw into, and why single-buffering
-# cannot work — sits behind a `Transport` trait, so it host-tests against a mock instead of
-# needing a running compositor. The syscall-backed transport is the same crate; only the
-# logic above it is exercised on the host.
+# The name used to belong to what is now `libsurface`, which is a Surface-protocol client
+# rather than a toolkit. This crate is what an application means by "the UI library", and it
+# sits above `libsurface` rather than replacing it.
+#
+# Part A is pure: the tree, layout, the diff, and damage bookkeeping are functions of values,
+# with no syscall in any of them, so they host-test in milliseconds. The parts that need a
+# window arrive with event routing in Part B.
 [dependencies]
 libdraw = { path = "../libdraw" }
-librsproto = { path = "../librsproto" }
-libkern = { path = "../libkern" }
-libos = { path = "../libos" }
 
 [lib]
 name = "libui"

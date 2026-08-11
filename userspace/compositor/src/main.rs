@@ -198,7 +198,7 @@ struct Server {
     ///
     /// On the heap rather than in this struct by value: `Server` lives on `_start`'s stack,
     /// and thirty inline queues would be tens of kilobytes against a 32 KiB user stack —
-    /// the same trap `libui` documents for holding a transport by value.
+    /// the same trap `libsurface` documents for holding a transport by value.
     outbox: alloc::vec::Vec<Outbox>,
 }
 

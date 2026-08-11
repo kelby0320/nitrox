@@ -144,13 +144,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "libui"
+name = "libsurface"
 version = "0.1.0"
 dependencies = [
  "libdraw",
  "libkern",
  "libos",
  "librsproto",
+]
+
+[[package]]
+name = "libui"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
 ]
 
 [[package]]
@@ -211,7 +218,7 @@ dependencies = [
  "libos",
  "librsproto",
  "libstream",
- "libui",
+ "libsurface",
 ]
 
 [[package]]

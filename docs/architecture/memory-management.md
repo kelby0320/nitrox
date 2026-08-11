@@ -1,7 +1,7 @@
 # Memory management
 
 **Status:** Implemented — buddy + slab allocators, VMA/address-space management and user
-access primitives under `kernel/src/mm/`. Verified 2026-08-05.
+access primitives under `kernel/src/mm/`. Verified 2026-08-11.
 
 Three layers, each owning a single concern:
 
@@ -485,10 +485,28 @@ a page-aligned VMA covering `[align_down(p_vaddr), align_up(p_vaddr
 + p_memsz))`, then copies file bytes `p_offset..p_offset + p_filesz`
 into the newly-allocated frames via the HHDM. BSS (the `p_memsz -
 p_filesz` tail) comes for free from `map_vma`'s zero-init step.
-After segments, an initial 4-page stack VMA is installed at the
+After segments, an initial **8 MiB** stack VMA is installed at the
 host architecture's `arch::abi::DEFAULT_USER_STACK_TOP` (on x86_64,
 `0x7FFF_FFFF_0000`); the returned [`EntryInfo`] carries the entry
 point and stack top for whatever launches the user thread later.
+
+**8 MiB costs address space, not memory.** The stack VMA is mapped
+lazily (`map_vma_lazy`), so pages materialise on first touch and a
+process using 12 KiB of it backs three. It matches Linux's
+`RLIMIT_STACK` default, and it is the *initial thread's* stack only —
+`sys_thread_create` requires the caller to allocate and map its own.
+
+**A 1 MiB guard gap sits below it**, `[USER_STACK_GUARD_BOTTOM,
+USER_STACK_BOTTOM)`, in which nothing may be mapped. Without it the
+"anywhere" mmap window ended at exactly the stack's lowest address,
+so running off the bottom of the stack wrote into whatever was mapped
+there — silently, which is what makes a stack overrun expensive to
+diagnose rather than merely a crash. Two things enforce it: `MMAP_MAX`
+stops the `hint == 0` search below the gap, and `sys_memory_map`
+refuses a **hinted** range that intersects it (`MMAP_MAX` bounds only
+the search). 256 pages rather than one because Linux's guard was a
+single page until Stack Clash (CVE-2017-1000364) showed a large frame
+can step over one.
 
 The loader itself is architecture-neutral: it lives outside
 `kernel/src/arch/` and consults [`arch::abi`](../../kernel/src/arch/x86_64/abi.rs)
@@ -514,7 +532,7 @@ unchanged.
 - **No argv / envp / auxv on the stack.** Nitrox passes argv / env
   as typed structural values; the handoff format belongs to "first
   userspace process" where the userspace runtime defines it. The
-  stack VMA today is just 16 KiB of writable, zero-initialised
+  stack VMA today is just writable, zero-initialised, demand-paged
   memory at a known address.
 - **No partial-load rollback.** A segment failure mid-load leaves
   the address space in a partial state; the caller drops it,

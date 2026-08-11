@@ -18,7 +18,7 @@ libheap = { path = "../libheap" }
 libstream = { path = "../libstream", features = ["io"] }
 # `io` for `acquire`: the selftest maps the real framebuffer.
 libdraw = { path = "../libdraw", features = ["io"] }
-libui = { path = "../libui" }
+libsurface = { path = "../libsurface" }
 
 [[bin]]
 name = "test-harness"

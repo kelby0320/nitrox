@@ -12720,3 +12720,111 @@ A method note worth keeping. The review's framing was that in a documentation-on
 including the ones that were right. That is the analogue of breaking a test to see it fail:
 a doc's value is that the next session builds from it without re-deriving, so an unverified
 claim in one is a defect whether or not it happens to be true.
+
+## 2026-08-11 — Userspace takes its first dependency: `ab_glyph`, and real TrueType from the start
+
+M4's toolkit needs to draw its own labels, which surfaced a question the substrate document
+had deliberately parked: bitmap font now, or a rasterizer.
+
+**The rule that seemed to forbid this was never the rule.** Root `CLAUDE.md` forbids "external
+crates **in the kernel**". Userspace having none was a *state*, and the state read as a
+prohibition because nothing said otherwise. It does now — `userspace/CLAUDE.md` carries the
+bar every future dependency has to clear.
+
+**The decision was made against an experiment rather than a prior.** The strongest objection
+was "will an arbitrary crate even build for `x86_64-unknown-nitrox` under `-Z build-std`, with
+a hard-float freestanding ABI and no sysroot" — a question with an empirical answer and no
+reliable intuition. Building it took under an hour and produced facts worth keeping:
+
+- `ttf-parser`, `fontdue` and `ab_glyph` all build for the custom target.
+- **All three fail confusingly without a feature flag.** `ttf-parser` needs `no-std-float`
+  (outline transforms want `sin`/`cos`/`tan`, which live in `std`, not `core`) and says so in
+  a deliberate compile error. `fontdue` with `default-features = false` produced 160 errors
+  including "cannot find trait `Clone`", because turning everything off removed `hashbrown`,
+  which is what its `no_std` path uses instead of `std::HashMap`. `ab_glyph` needs `libm`.
+- Nothing in either tree ships a `NOTICE` file, so Apache-2.0 §4(d) adds no obligation.
+
+The general lesson is the one this project keeps re-earning: **"it probably won't work" is a
+prediction, and predictions about build systems are worth less than fifteen minutes of
+building.** The objection that killed the rasterizer in the earlier discussion was mine, and
+it was wrong.
+
+**`ab_glyph` over `fontdue`**, and the reason is a seam rather than a licence.
+`outline_glyph(..).draw(|x, y, coverage|)` writes per pixel with no intermediate allocation,
+which is exactly what a damage-driven blitter wants; `fontdue::rasterize` returns an owned
+bitmap and carries an internal glyph cache, which would have been a second cache next to the
+toolkit's own atlas — four of its seven transitive crates exist to provide it. *A dependency
+you have to work around is worse than code you own.* Against: `ab_glyph` is Apache-2.0 only
+where `fontdue` is triple-licensed, and MIT could have been elected throughout. Bookkeeping,
+not a constraint.
+
+**Three things this reframes.**
+
+*The interim compromise moved from the font to the blend.* No PSF loader and no embedded
+glyph table gets written — that code would be deleted rather than grown, which is the
+expensive kind of throwaway. What remains interim is thresholding 8-bit coverage to 1 bit,
+because `libdraw` composites opaque XRGB8888 and cannot blend. That is one branch in the
+per-pixel callback, and it becomes the fallback rather than being removed. **Antialiasing is
+blocked on `libdraw`, not on the font**, which is the opposite of what the substrate assumed —
+so the deferral moved to `libdraw` where it belongs.
+
+*Glyph rendering moves from M5 Part A to M4 Part C.* Three of the four widgets draw text, and
+a toolkit that cannot draw a label has no gate worth the name. What stays in M5 is the
+ANSI/terminal render path, which is terminal semantics rather than toolkit capability.
+
+*The font file ships on the root filesystem, not the initramfs.* The initramfs carries what is
+needed to reach a mounted root and no more. A client that draws text starts long after
+`fs-server-ext4` is up, and the compositor never needs a font at all — clients render text
+into their own buffers and the compositor only composites.
+
+**Noted, not acted on:** the initramfs today is 648 KB and carries six programs — `init`,
+`fs-server-ext4`, `eshell`, `profile-server`, `compositor`, `input-server` — which is already
+broader than "enough to reach a mounted root". Four of those could plausibly load from the
+root filesystem instead. Its own conversation, not this one's.
+
+## 2026-08-11 — M4 Part A reviewed: the same hole, one rule over
+
+PR #183's review ran 30 breaks and caught 27. The blocking finding is the pattern the PR
+description itself tabulated, applied to the rule next door — which is worth recording,
+because the description named the pattern and still did not go looking for its siblings.
+
+**`same_kind` compared `mem::discriminant`, so two `Custom` widgets with different `kind`
+values paired.** `Custom`'s `kind` is documented as "the discriminator, so a diff can tell two
+custom nodes apart", and a discriminant comparison cannot: both are `Custom`. Swapping a
+terminal grid for a different custom widget in the same slot kept the same `Widget::id`, and
+so would have kept focus and answered "am I new?" with no.
+
+**It survived because the only test for the kind rule asserted damage.** Damage is derived
+from the frame's layout, so the union of the old and new rectangles is identical whether the
+widget was rebuilt or merely repainted — `same_kind` hardcoded to `true` passed all 50 tests.
+That is *exactly* the failure the description had already listed twice ("Pairing asserted
+through `print`s and `key`s… both come from the new frame"), and the fix is the same one:
+assert through the id, which is the only thing that records what was retained.
+
+The lesson is not "check identity with ids". It is that **naming a failure pattern is not the
+same as sweeping for it.** The description tabulated six instances and treated the list as a
+retrospective; it was a search specification, and running it would have found this one.
+
+**Three smaller things worth keeping.**
+
+*A doc that oversells is a design decision deferred, not a wording problem.* `Sized` was
+documented as "a child forced to an exact size" while `arrange` passed the parent's rectangle
+straight through — so a `sized` inside a `Stack` took the whole overlay, which is precisely
+what Part C will reach for to place a scrollbar. Fixing the sentence was the cheap option;
+the right one was making the sentence true, including the node's *own* rectangle, because
+hit-testing and damage both read that rather than the child's. A zero component now means
+"whatever the parent gives", which is how the tests were already using it.
+
+*Removing a walk is a claim about an invariant, so assert the invariant.* `damage_subtree`
+existed because "a child can extend beyond its parent"; after the `Sized` fix nothing can, and
+the different-kind branch had never walked anyway — consistent only by accident. It is gone,
+and `every_child_is_contained_by_its_parent` now holds the reasoning up over every container
+at once.
+
+*The stack change falsified a current-behaviour doc by 256×.* `memory-management.md` still
+said "an initial 4-page stack VMA" and "just 16 KiB" — already stale before this PR, and this
+is the change that moved them. Root `CLAUDE.md` requires fixing that in the same change. The
+guard gap was also recorded nowhere outside the kernel source, despite being a structural
+property of every user address space; it is now in `memory-management.md` and in
+`syscall-abi.md`, where a userspace author writing a thread-stack allocator would actually
+look.

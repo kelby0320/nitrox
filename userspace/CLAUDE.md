@@ -23,6 +23,36 @@ Userspace workspace constraints. Loaded when Claude Code reads files under `user
   see the decision log, 2026-07-21.
 - The `std` crate is not yet ported. When it lands, this guidance changes — until then, every userspace crate is `no_std`-with-alloc.
 
+## External dependencies
+
+**Userspace may take external crates. The kernel may not.** Root `CLAUDE.md`'s forbidden list
+says "external crates *in the kernel*", and userspace having none until 2026-08-11 was a state
+rather than a rule — one that read like a prohibition because nothing said otherwise. This
+section says otherwise.
+
+Every dependency must clear all of:
+
+- **Pure Rust.** No C, no build script that compiles native code, no `bindgen`. There is no
+  libc here and no linker beyond `rust-lld`.
+- **`no_std`, with `alloc` at most.** Anything reaching for `std` will not build.
+- **It builds for `x86_64-unknown-nitrox`** under `-Z build-std` — *verified by building it*,
+  not by reading the crate's `no_std` badge. The first two candidates both needed a
+  non-obvious feature flag to work (`ab_glyph` wants `libm`; `fontdue` wants `hashbrown`) and
+  both failed with misleading errors without it.
+- **Permissive licence** — MIT, Apache-2.0, BSD, Zlib or similar. Its text ships with the
+  distribution; note that Apache-2.0 §4(d) adds nothing unless the crate ships a `NOTICE`
+  file, and §4(b) bites only if we vendor and patch.
+- **Pinned, not floating**, for the same reason the toolchain is: an unpinned version makes
+  every build a fresh roll of the dice.
+- **The whole transitive tree clears the same bar.** Count it before agreeing to it — one
+  crate can bring six.
+
+**Prefer a first-party crate when the thing is small or when the seam matters.** The argument
+that carried `ab_glyph` over `fontdue` was not licence or benchmark, it was that its
+per-pixel `draw` callback is the right shape for a damage-driven blitter, where the
+alternative imposes a glyph cache we would have had to work around. A dependency you have to
+work around is worse than code you own.
+
 ## Crate layering
 
 The userspace runtime is layered. Don't reach below your layer:
