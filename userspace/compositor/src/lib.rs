@@ -98,6 +98,71 @@ pub enum StackError {
     DuplicateBuffer,
 }
 
+/// The pointer sprite: a plain arrow, `CURSOR_W × CURSOR_H`.
+///
+/// **One fixed shape, not a protocol.** Per-client cursors — an I-beam over a terminal grid,
+/// a resize arrow on an edge — are a Surface addition and are deliberately not in this
+/// milestone ([`widget-toolkit.md`](../design/widget-toolkit.md) §9.3); a single arrow is what
+/// makes a menu usable by a person, which is Part C's bar.
+///
+/// Two colours so it is visible against both: `#` is the body, `.` the outline, ` ` is
+/// transparent. Drawn from a string because a bitmap you can read is a bitmap you can fix.
+const CURSOR: [&str; CURSOR_H as usize] = [
+    ".",
+    "..",
+    ".#.",
+    ".##.",
+    ".###.",
+    ".####.",
+    ".#####.",
+    ".######.",
+    ".#######.",
+    ".########.",
+    ".#####....",
+    ".##.##.",
+    ".#. .##.",
+    "..   .##.",
+    "      .##.",
+    "       ..",
+];
+
+/// Cursor sprite width.
+pub const CURSOR_W: u32 = 12;
+/// Cursor sprite height.
+pub const CURSOR_H: u32 = 16;
+
+/// The rectangle a cursor at `at` occupies.
+///
+/// The hotspot is the **top-left**, which is where an arrow points; a cursor whose hotspot is
+/// its centre clicks half a sprite away from where it looks like it is pointing.
+pub fn cursor_rect(at: Point) -> Rect {
+    Rect::new(at.x, at.y, CURSOR_W, CURSOR_H)
+}
+
+/// Draw the pointer sprite at `at`, clipped to `clip`.
+///
+/// Composited **after** the window stack, because a cursor under a window is not a cursor.
+pub fn draw_cursor<F: Framebuffer + ?Sized>(fb: &mut F, at: Point, clip: Rect) {
+    let body = Rgb::new(0xFF, 0xFF, 0xFF);
+    let outline = Rgb::new(0x00, 0x00, 0x00);
+    for (row, line) in CURSOR.iter().enumerate() {
+        for (col, ch) in line.chars().enumerate() {
+            let colour = match ch {
+                '#' => body,
+                '.' => outline,
+                _ => continue,
+            };
+            let x = at.x.saturating_add(col as i32);
+            let y = at.y.saturating_add(row as i32);
+            // Clipped by the caller's rectangle *and* by the buffer: a cursor at the screen
+            // edge is the ordinary case, not an error, and it must not wrap to the far side.
+            if x >= 0 && y >= 0 && clip.contains(x, y) {
+                fb.put_pixel(x as u32, y as u32, colour);
+            }
+        }
+    }
+}
+
 /// How long a key must be held before it starts repeating, in nanoseconds.
 ///
 /// Policy with no configuration surface yet. Both constants are what a settings service will
@@ -403,6 +468,62 @@ impl WindowStack {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_cursors_hotspot_is_its_top_left() {
+        // Where an arrow points. A centre hotspot clicks half a sprite from where it looks.
+        let r = cursor_rect(Point::new(40, 30));
+        assert_eq!(r.origin, Point::new(40, 30));
+        assert_eq!(r.size, libdraw::geom::Size::new(CURSOR_W, CURSOR_H));
+    }
+
+    #[test]
+    fn the_sprite_matches_the_size_it_claims() {
+        // A row longer than `CURSOR_W` draws outside `cursor_rect`, so the damage the
+        // compositor computes from that rectangle would leave a trail behind the pointer.
+        assert_eq!(CURSOR.len(), CURSOR_H as usize);
+        for (i, line) in CURSOR.iter().enumerate() {
+            assert!(
+                line.chars().count() <= CURSOR_W as usize,
+                "row {i} is {} wide, past the declared {CURSOR_W}",
+                line.chars().count()
+            );
+        }
+    }
+
+    #[test]
+    fn a_cursor_at_the_screen_edge_is_clipped_rather_than_wrapped() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Geometry, MemFramebuffer};
+        let mut fb = MemFramebuffer::new(Geometry::packed(40, 40, PixelFormat::XRGB8888));
+        let clip = Rect::new(0, 0, 40, 40);
+        // Off the right and bottom edges, and off the top-left with negative coordinates.
+        draw_cursor(&mut fb, Point::new(36, 36), clip);
+        draw_cursor(&mut fb, Point::new(-4, -4), clip);
+        // Nothing wrapped to the opposite side: the far corner from each is untouched.
+        assert_eq!(fb.get_pixel(0, 39), Some(Rgb::new(0, 0, 0)));
+    }
+
+    #[test]
+    fn the_cursor_draws_only_inside_its_clip() {
+        use libdraw::format::PixelFormat;
+        use libdraw::framebuffer::{Geometry, MemFramebuffer};
+        let mut fb = MemFramebuffer::new(Geometry::packed(60, 60, PixelFormat::XRGB8888));
+        let bg = Rgb::new(0x11, 0x22, 0x33);
+        for y in 0..60 {
+            for x in 0..60 {
+                fb.put_pixel(x, y, bg);
+            }
+        }
+        draw_cursor(&mut fb, Point::new(10, 10), Rect::new(10, 10, 4, 4));
+        for y in 0..60u32 {
+            for x in 0..60u32 {
+                if !Rect::new(10, 10, 4, 4).contains(x as i32, y as i32) {
+                    assert_eq!(fb.get_pixel(x, y), Some(bg), "ink at ({x},{y}) outside the clip");
+                }
+            }
+        }
+    }
 
     #[test]
     fn a_repeat_waits_the_delay_and_then_runs_at_the_interval() {

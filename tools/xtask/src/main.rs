@@ -1145,6 +1145,29 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         return Err(format!("guest display is {w}x{h}, smaller than the {sw}x{sh} scene").into());
     }
 
+    // **The cursor is on screen**, which nothing else here checks: the comparison below walks
+    // only the scene's region at the top-left, and the pointer starts at the screen's centre.
+    // Without this the sprite could fail to draw at all and every gate would stay green.
+    let (cx, cy) = (w / 2, h / 2);
+    let body = (0xFFu8, 0xFFu8, 0xFFu8);
+    let mut cursor_px = 0usize;
+    for y in cy..(cy + 16).min(h) {
+        for x in cx..(cx + 12).min(w) {
+            let i = (y as usize * w as usize + x as usize) * 3;
+            if (pixels[i], pixels[i + 1], pixels[i + 2]) == body {
+                cursor_px += 1;
+            }
+        }
+    }
+    if cursor_px == 0 {
+        let _ = session.child.kill();
+        return Err(format!(
+            "no cursor at the screen centre ({cx},{cy}): the pointer sprite is not being drawn"
+        )
+        .into());
+    }
+    println!("  ok: cursor visible at ({cx},{cy}) — {cursor_px} body pixels");
+
     let mut mismatches = 0usize;
     let mut first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
     for y in 0..sh {

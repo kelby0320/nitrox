@@ -38,6 +38,7 @@ use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch
 use compositor::{BufferSource, WindowStack};
 use libdraw::format::Rgb;
 use libdraw::framebuffer::{Framebuffer, RawFramebuffer};
+use libdraw::geom::{Point, Rect};
 use libinput::Interpreter;
 use libkern::abi::{INPUT_EVENT_LEN, InputEvent};
 use libkern::abi::CLOCK_MONOTONIC;
@@ -660,6 +661,7 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     let mut out = alloc::vec::Vec::new();
     let mut restacked = false;
     let now = now_ns();
+    let cursor_was = srv.router.pointer();
     // SAFETY: bounded read of the payload the kernel just wrote.
     unsafe {
         let payload_len =
@@ -717,6 +719,11 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     deliver(srv, &out);
     // A click that raised a window moved focus with it.
     announce_focus(srv);
+    // Erase the cursor's old position and draw it at the new one. Skipped when a restack is
+    // about to repaint everything anyway, which also draws the cursor.
+    if !restacked {
+        repaint_cursor_move(srv, fb, cursor_was, srv.router.pointer());
+    }
     if restacked {
         // A click raised a window, so what is on screen no longer matches the stack.
         let bounds = fb.geometry().bounds();
@@ -941,7 +948,31 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
 /// yet exploit — a full repaint is always correct, and this milestone has one client.
 fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
     let bounds = fb.geometry().bounds();
-    srv.stack.compose_into(fb, BACKGROUND, srv, &[bounds]);
+    repaint_region(srv, fb, bounds);
+}
+
+/// Recompose `region` and draw the cursor over it.
+///
+/// **The cursor goes on last.** A cursor under a window is not a cursor, and compositing it
+/// into the stack would make it a window — with a position in the stacking order, a client
+/// that could cover it, and hit-testing that would have to skip it.
+fn repaint_region(srv: &Server, fb: &mut RawFramebuffer, region: Rect) {
+    srv.stack.compose_into(fb, BACKGROUND, srv, &[region]);
+    compositor::draw_cursor(fb, srv.router.pointer(), region);
+}
+
+/// Repaint what the pointer moving from `was` to `now` disturbed.
+///
+/// **Both rectangles**, because the cursor is drawn rather than composited: the pixels it
+/// covered are still on screen after it moves, and only recomposing where it *is* leaves a
+/// trail of arrows behind it. The same rule the toolkit's diff follows for a widget that
+/// moved, one layer up.
+fn repaint_cursor_move(srv: &Server, fb: &mut RawFramebuffer, was: Point, now: Point) {
+    if was == now {
+        return;
+    }
+    repaint_region(srv, fb, compositor::cursor_rect(was));
+    repaint_region(srv, fb, compositor::cursor_rect(now));
 }
 
 /// The wire error a rejected request reports.
