@@ -707,7 +707,7 @@ context menu near a window edge, or a combo box in a small dialog.
       makes every subsequent character wrap — looked identical to correct behaviour, and a
       paragraph would have descended one line per character.
 
-- [ ] **A5 — the render, and `libterm::reference`.**
+- [x] **A5 — the render, and `libterm::reference`.** ✅ 2026-08-12.
       `render(grid, font, &mut fb, damage)` — cells to pixels, with a block cursor. Cell
       metrics come from the font's advance, so the grid's pixel size is derived rather than
       assumed.
@@ -718,7 +718,26 @@ context menu near a window edge, or a combo box in a small dialog.
       the thing the toolkit's diff exists to avoid, one layer up.
 
       `libterm::reference` is the fixed grid the display gate compares: every attribute, a
-      wrapped line, a cursor, and content varying in both axes.
+      wrapped line, a cursor, and content varying in both axes. **Built through the real
+      parser**, not by calling `Grid` directly — it is the only place A3, A4 and A5 are
+      exercised together, and a mismatch in what an `Op` *means* would otherwise survive both
+      halves being individually right.
+
+      **The cursor is the cell drawn inverted**, not a shape over it: the character under it
+      stays readable and it needs no colour of its own, which would be a third thing to keep in
+      step with a theme.
+
+      **The palette claim from A2's review is now enforced.** `libterm` and `libui` are siblings
+      and neither may depend on the other, so their shared background colour had nowhere to be
+      checked — `xtask` links both, and a host test there fails the build if either side is
+      retuned.
+
+      Two more tests were passing for the wrong reason, both found by break-tests. The
+      underline test parked the cursor on the underlined cell, so the cell was drawn *inverted*
+      and filled with the foreground — the assertion passed on the inversion and stayed green
+      when the rule was moved into the next row. And a bounds check in `render_rows` turned out
+      to be redundant rather than defensive: `Grid::cell` is total, so two guards covered one
+      condition and only one was reachable.
 
 - [ ] **A6 — the input encoder: key events → bytes.**
       The direction nothing in the plan mentioned, and half of what a terminal *is*. `nxterm`

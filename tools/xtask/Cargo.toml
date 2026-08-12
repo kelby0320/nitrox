@@ -20,3 +20,8 @@ libdraw = { path = "../../userspace/libdraw" }
 # compares it against what the guest put on the screen. Its core is `core + alloc` over
 # `libdraw` and `librsproto`, so the host build stays free of syscalls.
 libui = { path = "../../userspace/libui" }
+# The terminal's cell vocabulary and render. Here for two reasons: the display gate will render
+# `libterm::reference` the way it renders `libui::reference`, and — before that — this is the
+# one place that can see `libterm` and `libui` at once, which is what makes their shared
+# background colour checkable rather than merely claimed (PR #189 review, finding 6).
+libterm = { path = "../../userspace/libterm" }

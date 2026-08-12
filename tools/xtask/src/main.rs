@@ -4409,4 +4409,31 @@ mod diag_tests {
         assert!(elf_function_symbols(&path).is_err());
         let _ = fs::remove_file(&path);
     }
+
+    /// The terminal's default palette agrees with the toolkit's default theme.
+    ///
+    /// **A cross-crate invariant that had nowhere to live.** `libterm::Palette::default` says
+    /// its background matches `libui`'s so a terminal does not flash against the chrome around
+    /// it — and `libterm` and `libui` are siblings, neither may depend on the other, and a
+    /// theme colour in `libdraw` would make the pixel layer own a theme. So the claim sat
+    /// unenforced through PR #189, as its review pointed out.
+    ///
+    /// `xtask` is the one place that links both. That is a slightly odd home for a colour
+    /// assertion, and it is better than a comment hoping two literals stay equal: retuning
+    /// either side now fails a build rather than being noticed by someone looking at a
+    /// screenshot.
+    #[test]
+    fn the_terminals_palette_agrees_with_the_toolkits_theme() {
+        let theme = libui::paint::Theme::default();
+        let palette = libterm::cell::Palette::default();
+        assert_eq!(
+            palette.background, theme.background,
+            "libterm's default background drifted from libui's — a terminal will flash \
+             against the chrome around it"
+        );
+        assert_eq!(
+            palette.foreground, theme.foreground,
+            "libterm's default foreground drifted from libui's"
+        );
+    }
 }

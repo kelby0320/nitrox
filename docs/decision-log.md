@@ -13814,3 +13814,60 @@ covered, and one was a live defect:
 The third is the interesting one, and it is the same shape as the parser's fourth bug: a test
 that stops at the first instance of a behaviour cannot see a state that only goes wrong on the
 second. `abcde` proves the wrap happens; `abcdefg` proves it happens *once*.
+
+## 2026-08-12 — M5 A5: the render, and two tests that passed for the wrong reason
+
+Cells to pixels — the one place `libterm` reaches for `libdraw`, and the reason it depends on
+it at all.
+
+### Cell metrics are derived, and the cursor is an inversion
+
+A cell is as wide as the font's advance and as tall as its line height, so a grid's pixel size
+falls out of the font rather than being asserted beside it. Choosing a cell size and hoping the
+font fits is how a terminal gets glyphs clipped on the right, and the two numbers would then
+have to be kept in step by hand. Width comes from one glyph's advance rather than an average:
+in a monospace font they are all equal, and a test checks that rather than assuming it — a
+proportional font passed here *should* produce a wrong grid, because it has no cell width.
+
+The cursor is the cell **drawn inverted**, not a shape drawn over it. The character under it
+stays readable, and it needs no colour of its own — which would be a third value to keep in
+step with a theme.
+
+### The reference grid goes through the parser
+
+`libterm::reference` is built by feeding a byte string through `Parser` into `Grid`, not by
+calling `Grid` directly. It is the only place A3, A4 and A5 meet, and a mismatch in what an
+`Op` *means* — the parser emitting one thing and the grid reading it as another — would
+survive both halves being individually correct.
+
+Its content is chosen so each line fails differently: plain text for the baseline and advance,
+every attribute for bold/underline/reverse, a coloured background then `EL` for the erase fill,
+a line longer than the row for deferred wrap, and a `CUP` for one-based addressing. A test
+asserts the *grid* contains all of that, because a reference that lost its attributes to a typo
+would still compare equal on both sides of the gate and prove nothing.
+
+### Two tests that passed for the wrong reason
+
+Both found by the routine break-test pass, and the first is the more instructive:
+
+- **The underline test parked the cursor on the underlined cell.** On a one-column grid the
+  cursor stays where it just wrote, so that cell was drawn *inverted* and filled with the
+  foreground — and the assertion "the cell contains the foreground colour" passed on the
+  inversion, not on the underline. It stayed green when the rule was moved into the next row,
+  which is the bug it exists to catch. It now parks the cursor two rows away and asserts the
+  cell contains *both* colours, so a filled cell fails as loudly as a missing rule.
+- **A bounds check in `render_rows` was redundant, not defensive.** Removing it changed
+  nothing: `Grid::cell` is total and the loop already continues on `None`. That is the opposite
+  conclusion from A3's `param()` bound, where removal reintroduced a reachable panic — and the
+  difference is exactly whether anything can reach the second guard. Two guards for one
+  condition is worse than one, because a reader has to work out which is load-bearing.
+
+### The cross-crate claim, discharged
+
+`Palette::default`'s comment said its background matches `libui`'s theme, and PR #189's review
+pointed out nothing enforced it. `libterm` and `libui` are siblings; neither may depend on the
+other, and a theme colour in `libdraw` would make the pixel layer own a theme.
+
+`xtask` links both, so the assertion lives there. It is an odd home for a colour test and it is
+better than a comment hoping two literals stay equal: retuning either side now fails a build.
+Verified by retuning one.
