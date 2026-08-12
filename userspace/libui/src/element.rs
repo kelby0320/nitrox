@@ -98,7 +98,7 @@ pub struct Docked<Msg> {
 
 /// What an element *is*.
 ///
-/// Deliberately short. `docs/design/widget-toolkit.md` §1's rule is that anything Milestone
+/// Deliberately short. `docs/architecture/widget-toolkit.md` §1's rule is that anything Milestone
 /// 5's terminal does not use is not in Milestone 4, and these are the structural nodes the
 /// diff and layout need in order to be tested at all. The interactive widgets — button,
 /// menu, scrollbar — arrive in Part C, pulled into existence by the terminal.

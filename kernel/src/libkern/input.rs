@@ -1,6 +1,6 @@
 //! The input event ABI — one record, from the driver to the compositor unchanged.
 //!
-//! `docs/design/input-subsystem.md` §3. A single `#[repr(C)]` record travels from a Tier 1
+//! `docs/architecture/input-subsystem.md` §3. A single `#[repr(C)]` record travels from a Tier 1
 //! driver, through the raw char node, through the userspace `input-server`, to the
 //! compositor. There is no translation step and no second format.
 //!

@@ -1,20 +1,48 @@
-# Nitrox: Input Subsystem — Design Notes (v1)
+# Nitrox: Input Subsystem
 
-## Status
+**Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11) —
+and this document describes what exists.** The whole path from an interrupt to a keystroke
+arriving in a widget runs on every boot:
 
-**Nothing is built.** No input driver of any kind exists — the only path from a human to
-this system today is the serial console's COM1 receive interrupt. This document specifies
-the whole path from an interrupt to a keystroke arriving in a window, and is the design
-`display-substrate.md` §5 sketched before there was any reason to think about a second
-input device. The build order is
-[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 3. Settled with the
-maintainer 2026-08-06.
+| Stage | Where |
+|---|---|
+| i8042 controller, keyboard + mouse, one driver | `kernel/src/drivers/ps2/` |
+| Per-device lossy ring with a `SYN_DROPPED` marker | `kernel/src/drivers/ps2/ring.rs` |
+| The `InputEvent` record crossing the kernel boundary | `kernel/src/libkern/input.rs` |
+| Raw device nodes at `/dev/input/raw/<n>` | `kernel/src/object/kernel_server.rs` |
+| The merged stream at `/dev/input/new` | `userspace/input-server/` |
+| Device stream → logical events, and the keymap | `userspace/libinput/` |
+| Focus, hit-testing, implicit grab, key repeat | `userspace/compositor/src/input.rs` |
+| Delivery to a widget | `userspace/libui/src/route.rs` |
 
-**Companion documents.** [`display-substrate.md`](display-substrate.md) §5 states the
+`cargo xtask check-input` injects a keystroke and a click over QMP and asserts both reach a
+widget, so the path is gated end to end rather than assumed.
+
+**What is specified here and not built:** USB HID (§1 — the seams are placed for it and
+nothing is written), and anything above one keyboard and one mouse — touchpads, gestures,
+absolute-coordinate devices. `SYN_DROPPED` is produced by the driver and honoured by
+`libinput`, but the Surface protocol has **no loss marker**, so a client is not told when the
+*compositor's* outbox overflows (§5, and `../rationale/deferred-decisions.md`).
+
+**Graduated from `design/` 2026-08-12**, as Milestone 5's first prerequisite. It had sat in
+`design/` since the subsystem finished, which root `CLAUDE.md` tells every session to read as
+"not current behaviour" — so a fresh session was told the input path did not exist while it
+was running on every boot. Verified against source 2026-08-12. Design settled with the
+maintainer 2026-08-06; the reasoning below is unchanged from that pass except where marked,
+and it remains the design `display-substrate.md` §5 sketched before there was any reason to
+think about a second input device.
+
+**The body was audited against source on 2026-08-12**, in the PR's review. Two claims of
+absence still stand and were re-checked rather than assumed: `session-mgr` does bind
+`/dev/console` into every session namespace unconditionally (§5's "the precedent this document
+leans on does not currently honour it"), and there is no userspace-facing interrupt syscall
+(§6).
+
+**Companion documents.** [`display-substrate.md`](../design/display-substrate.md) §5 states the
 principles this elaborates — key events not bytes, scancode→keycode in the kernel,
 keycode→character in userspace, the compositor owns focus. Nothing there is reversed here;
 §5's `KeyEvent` turns out to describe a *different layer* than the device stream, and this
-document names both. [`ui-composition-model.md`](ui-composition-model.md) owns what a window
+document names both. [`ui-composition-model.md`](../design/ui-composition-model.md) owns what a window
 is; input routing terminates there.
 
 ## 1. Why this is a subsystem and not a driver
@@ -74,7 +102,7 @@ this system already does with the console.
 fed by COM1's receive interrupt — and a userspace resource server holds it *exclusively*
 and serves `/dev/tty`. Input is the same arrangement with more devices below it. That
 pattern is built, in use, and documented in
-[`console-and-tty.md`](../architecture/console-and-tty.md). This design reuses it almost
+[`console-and-tty.md`](console-and-tty.md). This design reuses it almost
 unchanged — with **one** deliberate departure, in §3a: the raw node's ring is event-granular
 rather than byte-granular, because a fixed-size record over a ring that drops single bytes
 desynchronises permanently.
@@ -231,9 +259,10 @@ layers away.
   `tty-server` holds `/dev/console` exclusively by convention: `session-mgr` still binds the
   raw device into *every* session namespace unconditionally, a bind left vestigial when the
   shell moved to `/dev/tty`. Nothing in the mechanism prevented it. The keylogging argument
-  below is only as true as the binding discipline, so Part B must **not** bind
-  `/dev/input/raw/*` anywhere but the input-server's namespace, and a session's `/dev`
-  projection must not carry it.
+  below is only as true as the binding discipline, so the raw nodes are bound **only** into
+  the input-server's namespace, and a session's `/dev` projection does not carry them. That
+  holds today: the kernel binds `/dev/input/raw/<n>` into the root namespace at boot, and
+  `init` hands the input-server a namespace handle through which it resolves them.
 - Holding `/dev/input/new` is the authority to receive merged input for the whole machine.
   The compositor has it. Nothing else does, which is what makes keylogging a namespace
   question rather than a permission check.
@@ -263,16 +292,25 @@ sandboxed compositor a construction rather than a feature.
   The compositor knows which window has focus, so a repeat stops on a focus change without
   any client involvement. The `value == 2` case in the record is still what carries it.
 
-## 7. Open questions
+## 7. Questions this document opened, and where they landed
 
-- **Batch size and overflow.** How many records per rsproto message, and what a consumer
-  that stops reading does to the server. The compositor's session channel is four messages
-  deep, and PR #175 established that a silently-dropped message is worse than a slow one —
-  see the back-pressure entry in
-  [`deferred-decisions.md`](../rationale/deferred-decisions.md). Input has the same problem
-  and should not solve it differently.
-- **Absolute coordinates and screen scaling.** `EV_ABS` values are device-space; who maps
-  them to screen space, and where the resolution lives. Not needed until a touchscreen.
-- **Whether the input-server or the compositor owns pointer position.** The server sees
-  every device; the compositor owns the screen and the cursor. Deltas are unambiguous,
-  accumulation is not.
+Two of the three were answered by building it. Kept with their answers rather than deleted,
+because "why is it like this" is what a reader arrives with.
+
+- ~~**Batch size and overflow.**~~ **Answered, in two places.** The `input-server` merges both
+  devices into one batch ordered by `time_ns`, never splits a group across batches, and on
+  overflow discards a batch and precedes the next successful one with `SYN_DROPPED` carrying
+  the count of *records* lost — the same contract as the driver's ring (§3a), so a consumer
+  has one rule rather than two. Downstream, the compositor's session queue went from 4 to
+  **16** with a retry timer and motion coalescing rather than a deeper queue alone; that is
+  the back-pressure entry in [`deferred-decisions.md`](../rationale/deferred-decisions.md).
+
+  **The half that is still open** is not batch size: the Surface protocol has no loss marker,
+  so where `libinput` is *told* about a gap, a client is not. Filed, with a trigger.
+- **Absolute coordinates and screen scaling.** Still open. `EV_ABS` values are device-space;
+  who maps them to screen space, and where the resolution lives. Not needed until a
+  touchscreen, and none of the code below assumes an answer.
+- ~~**Whether the input-server or the compositor owns pointer position.**~~ **The compositor
+  owns it** — `InputRouter` holds a `Point` and `pointer()` is what draws the cursor and
+  hit-tests. The server stays stateless about position and forwards deltas, which is what
+  lets it serve a consumer that is not a compositor without inventing a screen for it.

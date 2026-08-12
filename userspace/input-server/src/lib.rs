@@ -6,7 +6,7 @@
 //! `/dev/input/new`, and sending on channels.
 //!
 //! See `docs/spec/rsproto-input-ops.md` for the contract this implements and
-//! `docs/design/input-subsystem.md` for why the server exists at all.
+//! `docs/architecture/input-subsystem.md` for why the server exists at all.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]

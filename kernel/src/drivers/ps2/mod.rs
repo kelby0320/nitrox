@@ -1,6 +1,6 @@
 //! The **i8042** controller driver (Tier 1) — PS/2 keyboard and mouse.
 //!
-//! `docs/design/input-subsystem.md`. One driver, because the keyboard and the mouse are two
+//! `docs/architecture/input-subsystem.md`. One driver, because the keyboard and the mouse are two
 //! *devices behind one controller*: they share data port `0x60`, are configured through
 //! command port `0x64`, and enabling the mouse is a read-modify-write of the same config
 //! byte that carries the keyboard's IRQ-1 enable. Two drivers initialising independently

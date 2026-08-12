@@ -1,6 +1,6 @@
 //! The per-device event ring: **whole records in, whole records out, losses announced**.
 //!
-//! `docs/design/input-subsystem.md` §3a. This is the design's one deliberate departure from
+//! `docs/architecture/input-subsystem.md` §3a. This is the design's one deliberate departure from
 //! reusing the console's mechanism unchanged, and it exists because the two obvious choices
 //! do not compose:
 //!

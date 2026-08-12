@@ -9,7 +9,7 @@ daemon or VT switcher could later.
 **Status:** Pre-stabilization. Introduced with display-arm Milestone 3 Part B
 (`docs/planning/display-arm-plan.md`). `Events` is defined; hotkey registration and device
 enumeration are later milestones and will extend this category. The design is
-[`input-subsystem.md`](../design/input-subsystem.md).
+[`input-subsystem.md`](../architecture/input-subsystem.md).
 
 ## Where it sits
 
@@ -133,7 +133,7 @@ Input is recoverable because a `SYN_DROPPED` tells the consumer exactly what to 
 
 ## See also
 
-- [`input-subsystem.md`](../design/input-subsystem.md) — the design: why a server, why this
+- [`input-subsystem.md`](../architecture/input-subsystem.md) — the design: why a server, why this
   record, where each concern lives.
 - [`rsproto-wire-format.md`](rsproto-wire-format.md) — the envelope every category shares.
 - [`rsproto-surface-ops.md`](rsproto-surface-ops.md) — the Surface category, whose

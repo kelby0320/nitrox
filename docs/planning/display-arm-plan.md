@@ -142,7 +142,7 @@ back.**
 
 **Four parts, not three** (revised 2026-08-06). The original three assumed a PS/2 driver
 that emitted finished key events straight to the compositor. That is one device away from
-wrong — see [`input-subsystem.md`](../design/input-subsystem.md) — so the driver shrinks to
+wrong — see [`input-subsystem.md`](../architecture/input-subsystem.md) — so the driver shrinks to
 raw event records and a userspace **`input-server`** takes the merge-and-policy role, which
 is the arrangement `tty-server` already uses over `/dev/console`. The extra part is the cost;
 what it buys is not relitigating the kernel boundary for USB HID, touchpads and touchscreens.
@@ -303,7 +303,7 @@ with window management in a later milestone; buttons and menus need clicks, and 
 
 ## Milestone 4 — the widget toolkit ✅ complete (2026-08-11)
 
-**Design pass done** (2026-08-10): [`widget-toolkit.md`](../design/widget-toolkit.md) settles
+**Design pass done** (2026-08-10): [`widget-toolkit.md`](../architecture/widget-toolkit.md) settles
 the five forks this line used to list. In short — a **retained tree with a declarative face**:
 the application holds state and writes `view(&state) -> Element`, the runtime diffs that against
 the tree it keeps, and **the diff is where damage comes from**. Elm's shape, by way of Iced, and
@@ -407,12 +407,13 @@ requirement, not a compromise.
         favour: a path breaks under exactly the reordering keys exist to survive. The design
         predates `Widget::id`, which Part A added; the doc is corrected rather than the code.
 
-- [ ] **Graduate two design docs to `architecture/`.**
-      [`input-subsystem.md`](../design/input-subsystem.md) describes a subsystem that is now
-      **built** — M3 finished it — and has been sitting in `design/`, which root `CLAUDE.md`
-      tells every session never to read as current behaviour.
-      [`widget-toolkit.md`](../design/widget-toolkit.md) graduates when this milestone lands.
-      Both need their Status lines rewritten to describe what exists rather than what will.
+- [x] **Graduate two design docs to `architecture/`.** Done 2026-08-12, as M5's P1.
+      [`input-subsystem.md`](../architecture/input-subsystem.md) and
+      [`widget-toolkit.md`](../architecture/widget-toolkit.md) both describe built subsystems and
+      had been sitting in `design/`, which root `CLAUDE.md` tells every session never to read
+      as current behaviour. Both Status lines now say what exists, what is specified and not
+      built, and where each part lives; the toolkit's build-order section became a record of
+      what landed and of the four places the code diverged from the document.
 
 - [x] **Part C — the first widget set**, bounded by what the terminal needs: `text`, a
       button, a menu, a scrollbar, and a **custom-drawn widget** escape hatch. Plus key
@@ -510,16 +511,19 @@ something this milestone forces. Both were dropped in review (PR #186); what M5 
 is an *offset within a stack*, which is a `libui` change and lives in Part B. See "Two
 prerequisites that were not" below for where those deferrals now stand.
 
-- [ ] **P1 — graduate `input-subsystem.md` and `widget-toolkit.md` to `architecture/`.**
-      M4's last box, listed there and repeated here because it is a prerequisite rather than
-      a loose end: root `CLAUDE.md` tells every session that `design/` never describes current
-      behaviour, so a subsystem finished in M3 currently reads as unbuilt to anyone starting
-      cold. A milestone that builds *on* the toolkit should not begin with the toolkit
-      documented as hypothetical.
+- [x] **P1 — graduate `input-subsystem.md` and `widget-toolkit.md` to `architecture/`.**
+      ✅ 2026-08-12. Both moved, both Status lines rewritten to describe what exists, what is
+      specified and not built, and where each piece lives. Two questions
+      `input-subsystem.md` §7 left open turned out to have been answered by building it —
+      batch overflow, and who owns pointer position — and are recorded with their answers
+      rather than deleted.
 
-      The same pass fixes root `CLAUDE.md`'s own line, which still says the widget toolkit
-      does not exist — the file every session loads before it reads anything else, telling it
-      that `libui` is hypothetical, which is the specific harm this box exists to prevent.
+      The same pass replaced root `CLAUDE.md`'s enumeration of what does and does not exist
+      with the invariant it was an instance of: `design/` now holds exactly the three
+      documents above Milestone 4, so the rule a session applies is "`design/` means not
+      built" rather than a list that goes stale every milestone. That list had already been
+      wrong for a day — it told every fresh session `libui` was hypothetical, which is the
+      specific harm this box exists to prevent.
 
 ### Two prerequisites that were not
 

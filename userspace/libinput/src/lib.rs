@@ -1,7 +1,7 @@
 //! `libinput` — interpreting input, at both ends of the protocol.
 //!
 //! Two jobs that look unrelated and are the same one, which is why they share a crate
-//! (`docs/design/input-subsystem.md` §4a):
+//! (`docs/architecture/input-subsystem.md` §4a):
 //!
 //! - **Compositor side:** device [`InputEvent`] triples → logical events. The device layer
 //!   has no notion of "shift is held" — shift is an ordinary key there — so somebody must

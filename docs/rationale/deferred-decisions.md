@@ -304,7 +304,7 @@ yet; both want a deliberate discussion the way the rasterizer got.
 
 ~~**Input: key repeat.**~~ **Decided 2026-08-10: generated compositor-side, built in M4
 Part C.** Held keys do not repeat. The record format reserves `value == 2` for it
-(`docs/design/input-subsystem.md` §3), so no wire change is needed.
+(`docs/architecture/input-subsystem.md` §3), so no wire change is needed.
 
 **Two corrections to this entry.** It said repeat "wants a timer in `libinput`" — it does
 not: `libinput` is pure and has no syscalls, so a timer cannot live there. The compositor
@@ -312,7 +312,7 @@ generates repeats, because it knows which window has focus and so can stop them 
 moves, with no client involvement. The alternative is Wayland's — send clients a repeat
 *rate* and let each run its own timer — which is better when clients disagree about what
 should repeat, a distinction nothing here makes yet, and costs every client a timer and a
-state machine. See [`widget-toolkit.md`](../design/widget-toolkit.md) §9.2.
+state machine. See [`widget-toolkit.md`](../architecture/widget-toolkit.md) §9.2.
 
 And the trigger said "the first text field — M4's toolkit". **It named the right milestone
 and the wrong widget.** M4 has no text field — M5's terminal grid is a custom-drawn widget by
@@ -322,7 +322,7 @@ than the need itself reads as un-fired exactly when it has fired. Raised 2026-08
 
 **Input: USB HID, hotplug, multitouch slots, gesture recognition.** None exists; M3 builds
 PS/2 only. All of them land in the `input-server` or `libinput` rather than the kernel, which
-is the point of the arrangement (`docs/design/input-subsystem.md` §1) — so none requires a
+is the point of the arrangement (`docs/architecture/input-subsystem.md` §1) — so none requires a
 kernel change when it arrives. Trigger: hardware, or a laptop touchpad. Multitouch
 additionally needs slot semantics on top of `SYN` grouping, as evdev did. Raised 2026-08-06.
 

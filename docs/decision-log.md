@@ -13366,3 +13366,112 @@ built, which is the argument for planning passes going through review at all.
 The mechanical remedy, for next time: **a plan that cites a symbol quotes it.** Claims 1, 3 and
 4 would not have survived pasting the line. Claim 2 would not have survived pasting the doc
 comment — which now appears in the plan, for that reason.
+
+## 2026-08-12 — P1: two docs graduate, and a list becomes an invariant
+
+Milestone 5's only prerequisite, and the smallest one in the plan: move
+`input-subsystem.md` and `widget-toolkit.md` from `design/` to `architecture/`. Worth an entry
+for two things that came out of doing it.
+
+### The rule that keeps failing is the one that enumerates
+
+Root `CLAUDE.md` told every session which subsystems exist, as a list, inside the paragraph
+explaining that `design/` never describes current behaviour. That list has now been wrong three
+times in ten days — it named the display system as it stood at M3 while M4 was merged, and
+before that at M2 while M3 was merged. Each time the fix was to edit the list, and each time it
+went stale at the next merge.
+
+It is replaced by the invariant it was an instance of: **`design/` holds exactly the documents
+above the current milestone, so "in `design/`" means "not built"**, full stop. The list of
+three remaining documents is there to make the claim checkable, not to be consulted. A session
+no longer has to trust a sentence that ages; it applies a rule to a directory listing.
+
+That is the same move as `INITRAMFS_PROGRAMS` becoming `(program, reason)` pairs a day earlier,
+and for the same reason: a list of names invites a one-word edit that looks like every other
+one. The general form is that **a document should encode a rule a reader can apply, not a
+snapshot a writer has to maintain.**
+
+### Two open questions had been answered by building the thing
+
+`input-subsystem.md` §7 listed three. Two were settled by M3 and nobody went back:
+
+- **Batch size and overflow** — the `input-server` merges by `time_ns`, never splits a group,
+  and marks loss with `SYN_DROPPED` carrying a *record* count, matching the driver's ring so a
+  consumer has one rule. Downstream the compositor's session queue went 4 → 16 with a retry
+  timer and motion coalescing. What is *still* open is narrower and was not what the question
+  asked: `libinput` is told about a gap and a Surface client is not.
+- **Who owns pointer position** — the compositor. `InputRouter` holds the `Point`; the server
+  stays stateless about position and forwards deltas, which is what lets it serve a consumer
+  that is not a compositor without inventing a screen for it.
+
+They are recorded with their answers rather than deleted, struck through in place. A question
+that was open and is now closed is more useful to a reader than one that was never asked —
+deleting it loses the fact that it was a real fork.
+
+### On the append-only rule, at a boundary
+
+The mechanical sweep that repointed every reference to the moved documents also rewrote one
+line of this file: a 2026-07 entry citing "`docs/design/input-subsystem.md`". That was reverted.
+The path in that sentence is not a link to follow, it is a statement about where the document
+was, and it was true on its date; rewriting it would make the entry assert a location that did
+not exist when it was written. Relative *links* in current-behaviour docs were repointed,
+because a link is a pointer rather than a claim — and `check-docs` requires them to resolve.
+
+The distinction is worth stating because the sweep was one command and the two cases looked
+identical to it.
+
+## 2026-08-12 — Review of #187: a Status line is a claim, and I made it without doing the work
+
+The graduation PR's review found three false statements in `widget-toolkit.md`, and auditing
+the rest for the same defect found a fourth. All four are the same failure, and it is worth
+recording because the failure was **specific to graduating a document** rather than to writing
+one.
+
+### What promotion means, and what I did instead
+
+Moving a document from `design/` to `architecture/` promotes its whole body from "what this
+will be" to a current-behaviour contract. Root `CLAUDE.md` is explicit: if an `architecture/`
+doc disagrees with the source, the source wins and **the doc is a bug**.
+
+I rewrote both Status lines carefully — what exists, what does not, where each piece lives —
+verified the claims *in the Status line*, wrote "Verified against source 2026-08-12", and did
+not check the four hundred lines the Status line vouches for. The sentence I wrote was
+"everything else below describes running code". It did not.
+
+- §9.2 said "Held keys do not repeat" and §9.3 said "Nothing draws the pointer". Both were
+  built in M4 Part C — **which §12 of the same document says**, two hundred lines below.
+- §11 said "`libdraw`'s font is a bitmap", the day after `libdraw` grew a TrueType rasteriser,
+  and directly contradicting the Status line I had just written above it.
+- §2.1 said "the kernel and userspace take no external dependencies", in a PR whose own diff
+  touches the `Cargo.toml` that takes one.
+- **§2.2 describes an application runtime that does not exist** — found by auditing after the
+  review rather than by the review. Every piece of the loop is built; nothing owns the
+  sequence, and exactly one application wires the pieces, for a fixed picture with no `update`
+  and no message dispatch.
+
+The fourth is the one that matters most, because it is the document's statement of the
+programming model. It is now an open question with M5's terminal named as what will answer it,
+which is what it should have been all along.
+
+### The pattern, and it is not "check your facts"
+
+§9.1 got this exactly right. It opens: *"Built in M4 Part B; `rsproto-surface-ops.md` now
+specifies it, and that spec is the current contract. The rest of this section is the design as
+it was argued... not as a description of what is missing."* I wrote that banner during M4 and
+then did not write it twice more in the same section.
+
+So the knowledge was present and applied once. What was missing was a **pass** — the mechanical
+act of reading the body with "is this true today?" as the only question. I skipped it because
+the Status line felt like the deliverable, and the body felt like something I had already read.
+
+That is the same failure as PR #186's five wrong claims, one level up: there, writing from a
+model of the code instead of the code; here, vouching for a document from a model of the
+document. Both times the tell was the same — the thing felt already-known, so it did not get
+looked at.
+
+**The rule that follows, for the next graduation:** a document moving into `architecture/` gets
+read end to end against the source, and the diff shows edits in its *body*, not only its
+header. A graduation whose diff is a `git mv` plus a rewritten Status line has not been done —
+it has been asserted. Both Status lines now say the audit happened and what it found, because
+"Verified against source" is itself a claim in the diff and the reviewer was right to hold the
+merge over it.
