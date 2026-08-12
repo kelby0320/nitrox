@@ -307,14 +307,18 @@ fn churn(root_ns: u64) -> bool {
 
 /// Present [`libui::reference`] in a window of its own, drawn with the font from the disk.
 ///
-/// Returns the window, which the caller must keep alive: dropping it closes the channel, the
-/// compositor destroys the window, and the picture leaves the screen.
+/// Returns the window **and the font**: the window must be kept alive — dropping it closes the
+/// channel, the compositor destroys the window, and the picture leaves the screen — and the
+/// font is handed on rather than loaded twice, so the two reference windows are provably drawn
+/// with the same bytes off the same disk.
 ///
 /// Every failure here is fatal to the run. A font that does not load is exactly the
 /// regression this exists to catch — the file is staged into the ext4 root by the image
 /// build, so "it did not resolve" means the staging broke, and carrying on would leave a
 /// green boot with no text on screen.
-fn present_reference_ui(root_ns: u64) -> Window<alloc::boxed::Box<ChannelTransport>> {
+fn present_reference_ui(
+    root_ns: u64,
+) -> (Window<alloc::boxed::Box<ChannelTransport>>, libdraw::text::Font) {
     use libdraw::text::{LoadError, SYSTEM_FONT_PATH, load};
 
     // The font. Resolved through the namespace and demand-paged out of ext4 — the first time
@@ -385,6 +389,72 @@ fn present_reference_ui(root_ns: u64) -> Window<alloc::boxed::Box<ChannelTranspo
         .s(b"x")
         .u(h as u64)
         .end();
+    (win, font)
+}
+
+/// Present [`libterm::render::reference`] in a window of its own, drawn with `font`.
+///
+/// The gate's third region, and the only place a terminal render is compared against pixels
+/// that actually reached a screen. Same shape as [`present_reference_ui`] and same contract:
+/// the caller keeps the window, and every failure here is fatal.
+///
+/// **The reference rather than `nxterm`'s window**, which is also on screen. A live terminal's
+/// first frame is deterministic but shows a boot banner — one plain line — whereas this stream
+/// is built so each of its lines fails differently. A gate should compare the picture that
+/// discriminates.
+fn present_reference_term(
+    root_ns: u64,
+    font: &libdraw::text::Font,
+) -> Window<alloc::boxed::Box<ChannelTransport>> {
+    use libterm::render::reference;
+
+    let size = reference::size(font);
+    let (w, h) = (size.w, size.h);
+    let pitch = reference::pitch(font);
+    let len = pitch * h as usize;
+    let picture = reference::render_with(font).into_bytes();
+    if picture.len() != len {
+        fail(b"ui-testclient: reference terminal is not the size it declares\n");
+    }
+
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let t = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => alloc::boxed::Box::new(t),
+        Err(_) => fail(b"ui-testclient: third connect to /dev/draw FAILED\n"),
+    };
+    let mut win = match Window::new(t, w, h, Role::Normal, BUFFERS) {
+        Ok(win) => win,
+        Err(_) => fail(b"ui-testclient: reference terminal CreateWindow FAILED\n"),
+    };
+    for i in 0..BUFFERS {
+        let Some((handle, addr)) = shared_buffer(len) else {
+            fail(b"ui-testclient: reference terminal buffer alloc FAILED\n");
+        };
+        // SAFETY: `addr` maps `len` writable bytes and `picture` holds exactly `len`; the two
+        // regions are distinct allocations, so they cannot overlap.
+        unsafe { core::ptr::copy_nonoverlapping(picture.as_ptr(), addr, len) };
+        if win.attach(i as u32, w, h, pitch as u32, handle).is_err() {
+            fail(b"ui-testclient: reference terminal AttachBuffer FAILED\n");
+        }
+    }
+    // Both buffers, then block for a release — see `present_reference_ui` for why one commit
+    // proves nothing.
+    for i in 0..BUFFERS {
+        if win.commit(i as u32, (0, 0, w, h)).is_err() {
+            fail(b"ui-testclient: reference terminal Commit FAILED\n");
+        }
+    }
+    if win.acquire().is_err() {
+        fail(b"ui-testclient: reference terminal never acknowledged\n");
+    }
+    Line::new()
+        .s(b"ui-testclient: reference terminal presented, window ")
+        .u(win.id() as u64)
+        .s(b" ")
+        .u(w as u64)
+        .s(b"x")
+        .u(h as u64)
+        .end();
     win
 }
 
@@ -414,10 +484,15 @@ fn fail(msg: &[u8]) -> ! {
 pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"ui-testclient: up\n");
 
-    // 0. The toolkit's picture, in its own window, **before** the reference scene's — so the
-    //    scene stacks above it and the gate can compare both regions. Held for the process's
-    //    life; dropping it would close the channel and take the window off the screen.
-    let _ui_window = present_reference_ui(root_ns);
+    // 0. The reference pictures, each in its own window, **before** the scene's and in
+    //    decreasing size — windows stack in creation order at the origin, so each must be
+    //    smaller than the one below or it would hide it entirely and the gate would compare a
+    //    region that is not on screen. Held for the process's life; dropping either closes its
+    //    channel and takes the window off the screen.
+    //
+    //    The toolkit's is 320x160, the terminal's 200x114 and the scene's 64x32.
+    let (_ui_window, font) = present_reference_ui(root_ns);
+    let _term_window = present_reference_term(root_ns, &font);
 
     // 1. A session. The compositor mints a channel per resolve of `/dev/draw/new`.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.

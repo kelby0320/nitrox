@@ -31,6 +31,7 @@ use libterm::cell::Palette;
 use libterm::grid::Grid;
 use libterm::parse::{MAX_PER_BYTE, Op, Parser};
 use libterm::render::Metrics;
+use librsproto::surface::{KEY_DOWN, KEY_REPEAT, KeyEvent, PointerEvent};
 use libui::element::{Edge, Element, Insets, custom, dock, docked, offset, padding, stack};
 use libui::widget::{Palette as UiPalette, ScrollState, WidgetState, button, menu_bar, scrollbar};
 
@@ -40,6 +41,24 @@ pub const GRID_KIND: u32 = 0x4772_6964;
 /// The key on the menu bar's one item, so [`libui::layout::locate`] can find where it landed
 /// and the popup can be placed under it.
 pub const MENU_ITEM_KEY: u64 = 1;
+
+/// The key on the grid, so the window can give it the keyboard on its first frame.
+///
+/// Focus has to start somewhere and the toolkit will not guess: `focus_next` would land on the
+/// menu button, being first in tree order, and a terminal whose first keystroke opens a menu is
+/// not a terminal. [`Tree::find_by_key`](libui::diff::Tree::find_by_key) turns this into the
+/// widget id the router takes.
+pub const GRID_KEY: u64 = 2;
+
+/// The key on the menu bar, and [`SCROLLBAR_KEY`] on the scrollbar.
+///
+/// **Keyed because [`GRID_KEY`] is.** The diff pairs a parent's children either all by key or
+/// all by position and refuses a mixture — deliberately, since a half-keyed list has two
+/// answers for which child is which. Naming one of the window's three regions therefore means
+/// naming all three, which they earn: they are fixed roles for the window's whole life.
+pub const BAR_KEY: u64 = 3;
+/// The key on the scrollbar — see [`BAR_KEY`].
+pub const SCROLLBAR_KEY: u64 = 4;
 
 /// Height of the menu bar, in pixels.
 pub const BAR_H: u32 = 24;
@@ -56,6 +75,14 @@ pub enum Msg {
     Clear,
     /// Erase the screen **and** the scrollback, and reset attributes.
     Reset,
+    /// A key reached the grid. Raw, because whether it types is the terminal's decision and
+    /// not the toolkit's: a release does not type, a **repeat does**, and `on_key` is a plain
+    /// function pointer with nothing to decide it with.
+    Key(KeyEvent),
+    /// Something happened to the scrollbar. Carries the raw event because most of them are not
+    /// a scroll: the router delivers motion whether or not a button is held, and a bar that
+    /// moved on hover would be unusable.
+    Scroll(PointerEvent),
 }
 
 /// Everything the terminal is.
@@ -78,6 +105,23 @@ pub struct App {
     pub metrics: Metrics,
     /// Colours for the cells.
     pub palette: Palette,
+    /// Where the viewport is, or `None` to follow the output.
+    ///
+    /// **`None` is not "line zero".** Following the bottom and being anchored at whatever the
+    /// bottom currently is are different states: the first stays at the bottom as output
+    /// arrives, the second is exactly what the user asked for when they scrolled away from it.
+    /// Collapsing them is how a terminal ends up scrolling itself back to where you were
+    /// reading half a second ago.
+    view_top: Option<u64>,
+    /// The viewport moved, so all of it repaints.
+    ///
+    /// **Not [`Grid::damage_all`], which was the first attempt** and is wrong for a reason
+    /// worth keeping: the grid's dirty flags name *screen* rows, and a view scrolled far
+    /// enough back holds none of them. Scrolling to the top of the history therefore damaged
+    /// every row the grid could name and not one row the user could see — the screen stayed on
+    /// the old page under a thumb that had moved. The two damage spaces meet in
+    /// [`damage_rows`](App::damage_rows) and nowhere else, so this is the half that lives here.
+    view_moved: bool,
 }
 
 impl App {
@@ -90,6 +134,8 @@ impl App {
             menu_anchor: None,
             metrics,
             palette: Palette::default(),
+            view_top: None,
+            view_moved: false,
         }
     }
 
@@ -120,7 +166,14 @@ impl App {
     ///
     /// **`\r` becomes `\r\n`** — see the module docs. Deleting this line is most of what
     /// Part C's line discipline has to take over.
+    ///
+    /// **Typing snaps the view back to the bottom**, which is what every terminal does and what
+    /// makes scrollback usable rather than a trap: the alternative is a prompt that answers
+    /// somewhere you cannot see, and a user who concludes the terminal has hung.
     pub fn loopback(&mut self, bytes: &[u8]) {
+        if !bytes.is_empty() {
+            self.snap_to_bottom();
+        }
         for &b in bytes {
             if b == b'\r' {
                 self.feed(b"\r\n");
@@ -128,6 +181,46 @@ impl App {
                 self.feed(&[b]);
             }
         }
+    }
+
+    /// Follow the output again, repainting if that moved the view.
+    pub fn snap_to_bottom(&mut self) {
+        if self.view_top.is_some_and(|t| self.grid.clamp_view(t) != self.grid.top_line()) {
+            self.view_moved = true;
+        }
+        self.view_top = None;
+    }
+
+    /// The absolute line number of the viewport's first row.
+    ///
+    /// Clamped on every read rather than corrected when the scrollback evicts: the grid is
+    /// where lines go, and an anchor kept in step by a callback is an anchor that is wrong
+    /// whenever somebody adds a second path into the grid.
+    pub fn view_line(&self) -> u64 {
+        match self.view_top {
+            Some(t) => self.grid.clamp_view(t),
+            None => self.grid.top_line(),
+        }
+    }
+
+    /// The **viewport** rows this frame must repaint, taking the grid's damage as it goes.
+    ///
+    /// The grid reports *screen* rows, which are the same thing only while the view is
+    /// following the bottom. Scrolled back by `k`, screen row `s` is on show at viewport row
+    /// `s + k` — and at `s + k >= rows` it is below the viewport entirely and repaints nothing.
+    ///
+    /// A moved viewport repaints all of itself, and the grid's record is still taken in that
+    /// case: [`Grid::take_damage`]'s contract is "I am about to draw these rows", which a full
+    /// repaint satisfies, and leaving it unread would carry stale rows into the next frame.
+    pub fn damage_rows(&mut self) -> Vec<usize> {
+        let back = (self.grid.top_line() - self.view_line()) as usize;
+        let rows = self.grid.rows();
+        let moved = core::mem::take(&mut self.view_moved);
+        let dirty = self.grid.take_damage();
+        if moved {
+            return (0..rows).collect();
+        }
+        dirty.into_iter().filter_map(|s| s.checked_add(back).filter(|v| *v < rows)).collect()
     }
 
     /// Apply a message from the chrome.
@@ -145,15 +238,79 @@ impl App {
                 self.grid = Grid::new(cols, rows);
                 self.parser = Parser::new();
                 self.menu_open = false;
+                self.view_top = None;
             }
+            Msg::Scroll(p) => self.scroll_to(p),
+            Msg::Key(k) => self.key(k),
         }
     }
 
-    /// The scrollbar's state: the screen is a window onto the screen plus the scrollback.
+    /// Type what a key produced, if it is a key that types.
+    ///
+    /// **A repeat types and a release does not.** A terminal sends on the way down, and a
+    /// repeat is that press continuing — which is the whole of what the compositor's key-repeat
+    /// generator is *for*, and the point at which it reaches something that acts on it rather
+    /// than a test client that prints it.
+    fn key(&mut self, k: KeyEvent) {
+        if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
+            return;
+        }
+        let mut out = [0u8; libterm::encode::MAX_ENCODED];
+        let n = libterm::encode::encode(k.keycode, k.modifiers, &mut out);
+        if n > 0 {
+            // **The loopback.** Part C replaces this one line with a write to the tty server's
+            // backend channel.
+            self.loopback(&out[..n]);
+        }
+    }
+
+    /// Move the view to where a scrollbar interaction points.
+    ///
+    /// Only while a button is held: the router delivers motion and crossings unconditionally,
+    /// and a bar that tracked the cursor on hover would scroll whenever the pointer passed over
+    /// it on its way somewhere else.
+    fn scroll_to(&mut self, p: PointerEvent) {
+        if p.buttons == 0 {
+            return;
+        }
+        let s = self.scroll();
+        self.scroll_to_line(self.grid.oldest_line() + s.offset_at(self.track_h(), p.y) as u64);
+    }
+
+    /// Anchor the viewport at absolute line `top`, clamped, repainting if that moved it.
+    ///
+    /// The one place the view changes, so that the mouse wheel and a `Shift-PageUp` are a
+    /// coordinate conversion away from working rather than a second copy of this.
+    pub fn scroll_to_line(&mut self, top: u64) {
+        let want = self.grid.clamp_view(top);
+        if want != self.view_line() {
+            self.view_moved = true;
+        }
+        // **Recorded even at the bottom**, rather than becoming `None` again: dragging the thumb
+        // to the end means "show me the last screen", and a program printing afterwards must not
+        // pull the view along with it. Following resumes when the user types.
+        self.view_top = Some(want);
+    }
+
+    /// The scrollbar's state: the viewport is a window onto the scrollback plus the screen.
     pub fn scroll(&self) -> ScrollState {
         let rows = self.grid.rows() as u32;
-        let back = self.grid.scrollback().len() as u32;
-        ScrollState { offset: back, visible: rows, total: back + rows }
+        let oldest = self.grid.oldest_line();
+        let back = (self.grid.top_line() - oldest) as u32;
+        ScrollState {
+            offset: (self.view_line() - oldest) as u32,
+            visible: rows,
+            total: back + rows,
+        }
+    }
+
+    /// The height the scrollbar's track is laid out at.
+    ///
+    /// The bar sizes itself to whatever the `Dock` leaves it, and `scrollbar` is told a height
+    /// separately for the thumb arithmetic — so this is the one number both the view and the
+    /// drag have to agree on, and it exists so they cannot disagree.
+    pub fn track_h(&self) -> u32 {
+        self.metrics.pixel_size(self.grid.cols(), self.grid.rows()).h
     }
 
     /// The element tree for the current state.
@@ -171,10 +328,15 @@ impl App {
         );
         let body = dock(
             vec![
-                docked(Edge::Top, bar),
-                docked(Edge::Right, scrollbar(self.scroll(), SCROLL_W, grid_px.h, &ui)),
+                docked(Edge::Top, bar.key(BAR_KEY)),
+                docked(
+                    Edge::Right,
+                    scrollbar(self.scroll(), SCROLL_W, self.track_h(), &ui)
+                        .on_pointer(Msg::Scroll)
+                        .key(SCROLLBAR_KEY),
+                ),
             ],
-            custom(GRID_KIND, grid_px),
+            custom(GRID_KIND, grid_px).key(GRID_KEY).on_key(|k| Some(Msg::Key(k))),
         );
 
         // **The popup is a layer over the whole window, not a child of the bar.** A `Stack`
@@ -223,6 +385,7 @@ pub fn rows_in(clip: Rect, grid_origin: libdraw::geom::Point, m: &Metrics, rows:
 mod tests {
     use super::*;
     use libdraw::text::Font;
+    use librsproto::surface::KEY_UP;
     use libui::layout::{FixedCell, layout, locate};
 
     const DEJAVU: &[u8] = include_bytes!("../../../assets/fonts/DejaVuSansMono.ttf");
@@ -232,10 +395,15 @@ mod tests {
         App::new(20, 6, Metrics::new(&f, 16.0))
     }
 
-    /// The grid's characters on `row`, trailing blanks trimmed.
+    /// The characters **on show** at viewport `row`, trailing blanks trimmed.
+    ///
+    /// Through the view rather than the screen, so that a test about a scrolled-back terminal
+    /// asks what the user can see. The two are the same thing while the view follows the
+    /// bottom, which is every test written before scrollback existed.
     fn line(a: &App, row: usize) -> alloc::string::String {
-        let s: alloc::string::String =
-            (0..a.grid.cols()).map(|c| a.grid.cell(row, c).unwrap().ch).collect();
+        let s: alloc::string::String = (0..a.grid.cols())
+            .map(|c| a.grid.view_cell(a.view_line(), row, c).map_or(' ', |x| x.ch))
+            .collect();
         s.trim_end().into()
     }
 
@@ -413,6 +581,219 @@ mod tests {
         let s = a.scroll();
         assert!(s.scrollable(), "ten lines scrolled off and the bar says nothing to scroll");
         assert_eq!(s.total, a.grid.scrollback().len() as u32 + 6);
+    }
+
+    /// A press-and-drag on the scrollbar to `y`, in widget-local coordinates.
+    fn grab(a: &mut App, y: i32) {
+        a.update(Msg::Scroll(PointerEvent {
+            kind: librsproto::surface::POINTER_BUTTON,
+            button: 0x110,
+            buttons: 1,
+            flags: librsproto::surface::POINTER_PRESSED,
+            y,
+            ..Default::default()
+        }));
+    }
+
+    /// Fill the scrollback with numbered lines.
+    fn produce(a: &mut App, n: usize) {
+        for i in 0..n {
+            a.feed(alloc::format!("{i}\r\n").as_bytes());
+        }
+    }
+
+    #[test]
+    fn dragging_the_scrollbar_moves_the_view_into_the_scrollback() {
+        let mut a = app();
+        produce(&mut a, 40);
+        assert_eq!(a.view_line(), a.grid.top_line(), "starts at the bottom");
+
+        grab(&mut a, 0);
+        assert_eq!(a.view_line(), a.grid.oldest_line(), "the top of the track is the oldest");
+        assert_eq!(line(&a, 0), "0", "and the oldest line is on show");
+
+        let bottom = a.track_h() as i32;
+        grab(&mut a, bottom);
+        assert_eq!(a.view_line(), a.grid.top_line(), "the bottom is the live screen again");
+    }
+
+    #[test]
+    fn a_pointer_over_the_scrollbar_with_no_button_held_does_not_scroll() {
+        // The router delivers motion and crossings unconditionally. A bar that tracked the
+        // cursor would scroll whenever the pointer crossed it on its way somewhere else.
+        let mut a = app();
+        produce(&mut a, 40);
+        grab(&mut a, 0);
+        let parked = a.view_line();
+
+        a.update(Msg::Scroll(PointerEvent {
+            kind: librsproto::surface::POINTER_MOTION,
+            buttons: 0,
+            y: a.track_h() as i32,
+            ..Default::default()
+        }));
+        assert_eq!(a.view_line(), parked, "a hover moved the view");
+    }
+
+    #[test]
+    fn typing_snaps_the_view_back_to_the_bottom() {
+        // What makes scrollback usable rather than a trap: the alternative is a prompt that
+        // answers somewhere off screen, and a user who concludes the terminal has hung.
+        let mut a = app();
+        produce(&mut a, 40);
+        grab(&mut a, 0);
+        assert_ne!(a.view_line(), a.grid.top_line(), "the premise: scrolled away");
+
+        let mut out = [0u8; libterm::encode::MAX_ENCODED];
+        let n = libterm::encode::encode(35, 0, &mut out); // h
+        a.loopback(&out[..n]);
+        assert_eq!(a.view_line(), a.grid.top_line(), "typing did not come back to the bottom");
+
+        // ...and a key that encodes to nothing does not, because it is not typing.
+        grab(&mut a, 0);
+        let scrolled = a.view_line();
+        let n = libterm::encode::encode(libkern::abi::KEY_LEFTSHIFT, 0, &mut out);
+        a.loopback(&out[..n]);
+        assert_eq!(a.view_line(), scrolled, "pressing Shift snapped the view");
+    }
+
+    #[test]
+    fn output_arriving_does_not_drag_a_scrolled_back_view_with_it() {
+        // **The reason the anchor is a line number.** With an offset counted from the bottom,
+        // every line a program prints moves the reader's page up by one.
+        let mut a = app();
+        produce(&mut a, 40);
+        grab(&mut a, 0);
+        let showing: alloc::vec::Vec<alloc::string::String> =
+            (0..a.grid.rows()).map(|r| line(&a, r)).collect();
+
+        a.feed(b"more\r\nand more\r\n");
+        let after: alloc::vec::Vec<alloc::string::String> =
+            (0..a.grid.rows()).map(|r| line(&a, r)).collect();
+        assert_eq!(showing, after, "the view moved under the reader");
+    }
+
+    #[test]
+    fn the_scrollbar_reports_where_the_view_is_not_only_how_much_there_is() {
+        // A bar whose offset was always the bottom would draw its thumb at the end while the
+        // user reads the top — the state and the picture disagreeing.
+        let mut a = app();
+        produce(&mut a, 40);
+        let s = a.scroll();
+        assert_eq!(s.offset, s.total - s.visible, "following: the thumb is at the end");
+
+        grab(&mut a, 0);
+        assert_eq!(a.scroll().offset, 0, "scrolled to the top: so is the thumb");
+    }
+
+    #[test]
+    fn damage_is_reported_in_viewport_rows_and_drops_what_is_below_the_view() {
+        // The grid names *screen* rows and the viewport may be somewhere else entirely. Getting
+        // this wrong repaints the wrong row — or, scrolled far back, repaints rows for changes
+        // that are not on screen at all.
+        let mut a = app();
+        produce(&mut a, 40);
+        let _ = a.damage_rows();
+
+        // Scrolled back by exactly one line: screen row 0 shows at viewport row 1.
+        let back_one = a.grid.top_line() - 1;
+        a.scroll_to_line(back_one);
+        let _ = a.damage_rows(); // the scroll itself damaged everything
+        a.feed(b"\x1b[1;1Hz"); // touch screen row 0
+        let d = a.damage_rows();
+        assert!(d.contains(&1), "screen row 0 should show at viewport row 1, got {d:?}");
+        assert!(!d.contains(&0), "and not at viewport row 0: {d:?}");
+
+        // Scrolled far back: the change is below the viewport and repaints nothing.
+        grab(&mut a, 0);
+        let _ = a.damage_rows();
+        a.feed(b"\x1b[1;1Hy");
+        assert!(a.damage_rows().is_empty(), "damage for a row that is not on screen");
+    }
+
+    #[test]
+    fn moving_the_view_repaints_all_of_it() {
+        // Every row shows different text afterwards, so a scroll that damaged nothing would
+        // leave the old page on screen under a thumb that had moved.
+        let mut a = app();
+        produce(&mut a, 40);
+        let _ = a.damage_rows();
+        assert!(a.damage_rows().is_empty(), "the premise: nothing outstanding");
+
+        grab(&mut a, 0);
+        assert_eq!(a.damage_rows().len(), a.grid.rows(), "a scroll must repaint the viewport");
+
+        // ...and snapping back does too.
+        let _ = a.damage_rows();
+        a.snap_to_bottom();
+        assert_eq!(a.damage_rows().len(), a.grid.rows());
+
+        // A scroll that lands where the view already is repaints nothing.
+        let _ = a.damage_rows();
+        a.snap_to_bottom();
+        assert!(a.damage_rows().is_empty(), "an idempotent snap still repainted");
+    }
+
+    /// A key event as the compositor sends it.
+    fn key_ev(code: u16, pressed: u16) -> KeyEvent {
+        KeyEvent { keycode: code, pressed, modifiers: 0, _pad: 0 }
+    }
+
+    /// The tree, layout and router of a live window, with the grid focused as `main` does it.
+    fn window(a: &App) -> (libui::diff::Tree, libui::layout::Layout, libui::route::Router) {
+        let bounds = Rect::new(0, 0, a.window_size().w, a.window_size().h);
+        let e = a.view();
+        let l = layout(&e, bounds, &FixedCell { w: 8, h: 16 });
+        let mut t = libui::diff::Tree::new();
+        t.update(&e, &l).expect("a clean frame");
+        let mut r = libui::route::Router::new();
+        let id = t.find_by_key(GRID_KEY).expect("the grid is keyed");
+        assert!(r.focus(&t, &e, id), "the grid must be able to take focus");
+        (t, l, r)
+    }
+
+    #[test]
+    fn a_key_repeat_reaches_the_grid_through_the_router_and_types() {
+        // **B4.** Repeat is generated compositor-side and already had a consumer that *prints*
+        // it; what is new is a repeat reaching a widget through `libui::route` and being
+        // encoded exactly like the press it continues. Held-down keys are how anyone deletes a
+        // line, so this is the difference between a demo and a terminal.
+        let mut a = app();
+        let (t, _l, r) = window(&a);
+        let e = a.view();
+
+        for msg in [
+            r.key(&t, &e, key_ev(35, KEY_DOWN)),   // h, pressed
+            r.key(&t, &e, key_ev(35, KEY_REPEAT)), // ...and held
+            r.key(&t, &e, key_ev(35, KEY_REPEAT)),
+        ] {
+            a.update(msg.expect("the focused grid claims the key"));
+        }
+        assert_eq!(line(&a, 0), "hhh", "a repeat did not type");
+    }
+
+    #[test]
+    fn a_key_release_reaching_the_grid_types_nothing() {
+        // The other half, and the one that goes wrong silently: a terminal sends on the way
+        // down, so acting on the release too doubles every character typed.
+        let mut a = app();
+        let (t, _l, r) = window(&a);
+        let e = a.view();
+        a.update(r.key(&t, &e, key_ev(35, KEY_DOWN)).unwrap());
+        a.update(r.key(&t, &e, key_ev(35, KEY_UP)).unwrap());
+        assert_eq!(line(&a, 0), "h", "the release typed as well");
+    }
+
+    #[test]
+    fn the_menu_bars_accelerator_path_still_works_while_the_grid_holds_the_keyboard() {
+        // The grid claims every key it is given, so a key can only reach the chrome by the
+        // chrome being focused. Asserted because the alternative — a grid that declines some
+        // keys — is a decision, and this records that it was not taken: the menu is reached
+        // with the pointer, and `route`'s bubbling is there for a keyboard menu that M6 owns.
+        let a = app();
+        let (t, _l, r) = window(&a);
+        let e = a.view();
+        assert!(matches!(r.key(&t, &e, key_ev(35, KEY_DOWN)), Some(Msg::Key(_))));
     }
 
     #[test]

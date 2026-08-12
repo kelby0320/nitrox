@@ -73,7 +73,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     gaps surfaced by the coreutils subproject".
   - **The display arm** — 🚧 in progress (**M1–M4 complete**: pixels + the gate 2026-08-05,
     a client with a surface 2026-08-06, input end to end 2026-08-10, the widget toolkit
-    2026-08-11. **M5 — the GUI terminal — planned in detail 2026-08-12**, not yet started).
+    2026-08-11. **M5 — the GUI terminal — 🚧 in progress**: Part A (terminal semantics —
+    `libterm`'s parser, grid, render and encoder, plus the blend that unblocked antialiasing)
+    and Part B (`nxterm` itself: window, chrome, scrollback, key repeat, and the display gate's
+    third region) both landed 2026-08-12; Part C — the tty server's second backend — is next).
     Design in
     [docs/design/display-substrate.md](../design/display-substrate.md) +
     [docs/design/ui-composition-model.md](../design/ui-composition-model.md);

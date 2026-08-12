@@ -272,6 +272,26 @@ impl Tree {
     pub fn next_id(&self) -> u64 {
         self.next_id
     }
+
+    /// The widget id of the element carrying `key`, if the tree has one.
+    ///
+    /// [`locate`](crate::layout::locate)'s companion, and needed for the same reason: an
+    /// application names an element with a key because it has something to say about *that*
+    /// one later. `locate` answers "where was it laid out"; this answers "which widget is it",
+    /// which is what [`Router::focus`](crate::route::Router::focus) takes — so a window that
+    /// wants a particular widget to hold the keyboard on its first frame can say which.
+    ///
+    /// The first match in tree order. Keys are the application's to keep distinct, exactly as
+    /// they are for the diff, which pairs siblings by them.
+    pub fn find_by_key(&self, key: u64) -> Option<u64> {
+        fn walk(w: &Widget, key: u64) -> Option<u64> {
+            if w.key == Some(key) {
+                return Some(w.id);
+            }
+            w.children.iter().find_map(|c| walk(c, key))
+        }
+        walk(self.root.as_ref()?, key)
+    }
 }
 
 /// A union of rectangles, accumulated as one.
@@ -433,6 +453,25 @@ mod tests {
     fn go(t: &mut Tree, e: &Element<Msg>) -> Result<Option<Rect>, DiffError> {
         let l = layout(e, SCREEN, &CELL);
         t.update(e, &l)
+    }
+
+    #[test]
+    fn a_keyed_element_can_be_found_by_its_key_and_an_absent_one_is_none() {
+        // What lets a window say which widget starts with the keyboard. `locate` answers
+        // "where"; this answers "which", and the router takes the latter.
+        let e: Element<()> = column(vec![
+            text("a").key(7),
+            row(vec![text("b").key(9)]).key(8),
+        ]);
+        let l = layout(&e, SCREEN, &CELL);
+        let mut t = Tree::new();
+        t.update(&e, &l).expect("a clean frame");
+
+        let deep = t.root().unwrap().children[1].children[0].id;
+        assert_eq!(t.find_by_key(9), Some(deep), "a key nested below the root");
+        assert_eq!(t.find_by_key(7), Some(t.root().unwrap().children[0].id));
+        assert_eq!(t.find_by_key(1234), None, "a key nothing carries");
+        assert_eq!(Tree::new().find_by_key(7), None, "and a tree with no root at all");
     }
 
     #[test]

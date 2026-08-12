@@ -14077,3 +14077,93 @@ mystery about why the desktop feels slow.
 the condition — one client — under which the shortcut held. What it could not do is notice when
 that stopped being true. A deferral whose trigger is a property of the *system* rather than of a
 line of code has no natural moment to fire.
+
+## 2026-08-12 — M5 B3/B4/B5: scrollback, keys through the router, and the gate's third region
+
+### The view is anchored to a line number, not to an offset from the bottom
+
+`Grid` counts lines *produced* (`top_line`) and lines *retained* (`oldest_line`), and a viewport
+is the absolute line its first row shows. The alternative — "n lines above the bottom" — is what
+most of this was written to avoid: output arriving while the user reads history pushes lines into
+the scrollback, so a bottom-relative offset makes the page creep upward at exactly the moment
+someone is trying to read it. Anchored to a line, a view showing lines 40..64 goes on showing
+lines 40..64 however much arrives below.
+
+The cost is that an anchor can fall out of the bounded ring, so `clamp_view` exists and is applied
+on every *read* rather than on eviction: the grid is where lines go, and an anchor kept in step by
+a callback is wrong the moment somebody adds a second path into the grid.
+
+**`view_cursor` returns `None` when the cursor is out of view**, which is the detail a render
+would otherwise get subtly wrong: scrolling back does not move the cursor, so drawing it at its
+screen row regardless would invert a cell of somebody's history, several screens above where the
+cursor actually is.
+
+### Two damage spaces, and a bug that only exists where they meet
+
+The grid names **screen** rows. The viewport may be somewhere else entirely, so `App::damage_rows`
+translates — screen row `s` shows at viewport row `s + k` when scrolled back `k`, and is invisible
+at `s + k >= rows`.
+
+The first version signalled "the view moved" with `Grid::damage_all`, and a test caught what that
+means: a view scrolled far enough back contains **none** of the screen's rows, so scrolling to the
+top of the history damaged every row the grid could name and not one row the user could see. The
+screen kept the old page under a thumb that had moved. `App` keeps its own `view_moved` flag now.
+Neither half was wrong alone — the grid's damage is correctly about screen rows, and the
+translation is correctly a filter — which is the recurring shape of these.
+
+### `ScrollState::offset_at`, and a justification that was false
+
+M4 shipped `thumb()` — where the thumb goes for an offset — and not its inverse, so a scrollbar
+was a picture of a scrollbar. The terminal is the first thing to want to *use* one, which is the
+milestone rule ("the terminal decides how much toolkit exists") working as intended.
+
+A first version rounded to nearest, with the stated reason that the last line was otherwise
+unreachable. **That is simply not true** — at the bottom `pos` is `span`, so `span * max / span`
+is `max` however it rounds — and a break-test confirmed it: deleting the `+ span/2` left every
+test green. It bought half a line of mid-drag accuracy with a claim that did not hold, so it is
+gone, and `offset_at` truncates like `thumb` does. This is the third time (`+127` in
+`Rgb::blend`, `Fingerprint::Offset`, now this) that break-testing the *reason* rather than the
+behaviour deleted something real.
+
+The round-trip test that goes with it asserts **within a pixel's worth of lines, not equality**:
+a thousand lines over a 384-pixel span puts ~3 lines on every pixel, and no inverse can tell 500
+from 501. The ends are exact, which is the part off-by-one errors break.
+
+### Keys go through the router, which needed one toolkit addition
+
+The grid is a focusable widget with an `on_key` now, so "typed a character" and "pressed a menu
+accelerator" are the same path with a different widget claiming it. Whether a key types at all —
+a repeat does, a release does not — stayed in `App`, because it is a fact about terminals rather
+than about routing.
+
+Two consequences. `Tree::find_by_key` is new: focus has to start somewhere and `focus_next` would
+land on the menu button, being first in tree order — a terminal whose first keystroke opens a menu
+is not a terminal. It is `locate`'s companion, answering "which widget is it" where `locate`
+answers "where was it laid out". And keying the grid meant **keying its two siblings**, because
+the diff pairs a parent's children all by key or all by position and refuses a mixture; the
+window's three regions are fixed roles for its whole life, so they earn the names.
+
+`main` re-asserts grid focus every frame while the menu is closed, rather than once at startup:
+clicking a button takes focus, and a terminal whose keyboard stays with the menu after you used it
+is a terminal you have to click back into.
+
+### The display gate compares a terminal now
+
+`libterm::render::reference` has been a fixture with tests on it since A5, its own doc naming Part
+B as the milestone that would put it on a screen. `ui-testclient` presents it in a window between
+the toolkit's and the scene's, and the gate compares 15,232 pixels of it against a host render.
+
+**The reference rather than `nxterm`'s own window**, which is also on screen and deterministic on
+its first frame. A live terminal shows a boot banner — one plain line — whereas the reference
+stream is built so each of its lines fails differently (attributes, erase-with-background,
+deferred wrap at the exact column, one-based `CUP`, a cursor left mid-row). A gate should compare
+the picture that discriminates, not the one that happens to be there.
+
+The three windows nest — 320×160, 180×96, 64×32 — because windows stack at the origin in creation
+order, and the gate excludes each region from the one beneath it. That makes the nesting
+load-bearing, so it is now **asserted** rather than assumed: a window that grew past its neighbour
+would silently hollow out a region the gate believes it is comparing.
+
+Break-tested both ways it can fail: attaching at `w * 4` instead of the padded pitch (3,479 pixels
+differ), and never presenting the window at all (12,571 differ — the region falls through to
+`nxterm`'s window underneath rather than to blank, which is itself worth knowing).

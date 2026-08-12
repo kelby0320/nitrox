@@ -23,7 +23,7 @@ use libdraw::geom::Rect;
 use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
 use libkern::debug::Line;
 use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, exit, kprint, syscall4};
-use librsproto::surface::{KEY_DOWN, KEY_REPEAT, Role};
+use librsproto::surface::Role;
 use libsurface::{Window, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 use libui::diff::Tree;
@@ -32,7 +32,7 @@ use libui::layout::{Layout, layout, locate};
 use libui::paint::FontMetrics;
 use libui::paint::{Theme, paint};
 use libui::route::Router;
-use nxterm::{App, GRID_KIND, MENU_ITEM_KEY, Msg, rows_in};
+use nxterm::{App, GRID_KEY, GRID_KIND, MENU_ITEM_KEY, Msg, rows_in};
 
 /// `alloc` backing — the element tree, the grid and the render all allocate.
 #[global_allocator]
@@ -101,12 +101,13 @@ fn draw(
     let m = app.metrics;
     let grid = &app.grid;
     let palette = app.palette;
+    let top = app.view_line();
     paint(fb, font, theme, ui, l, damage, &mut |kind, _rect, clip, fb: &mut MemFramebuffer| {
         if kind != GRID_KIND {
             return;
         }
         let rows = rows_in(clip, origin, &m, grid.rows());
-        libterm::render::render_rows(fb, grid, font, &m, &palette, origin, &rows);
+        libterm::render::render_view(fb, grid, font, &m, &palette, origin, top, &rows);
     });
 }
 
@@ -170,7 +171,6 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let bounds = Rect::new(0, 0, size.w, size.h);
     let mut tree = Tree::new();
     let mut router = Router::new();
-    let mut encoded = [0u8; libterm::encode::MAX_ENCODED];
 
     // A banner, so a screenshot of a fresh terminal is not an empty rectangle and so the
     // guest's log says the grid is live before any key arrives.
@@ -190,11 +190,26 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // beats painting something that pairs the wrong widgets.
             Err(_) => fail(b"nxterm: the view is not diffable\n"),
         };
+
+        // **The grid holds the keyboard whenever the menu is not open.** Focus has to start
+        // somewhere, and the toolkit will not guess: `focus_next` lands on the menu button,
+        // being first in tree order. Re-asserted every frame rather than only on the first,
+        // because clicking a button takes focus — and a terminal whose keyboard stays with the
+        // menu after you used it is a terminal you have to click back into.
+        if !app.menu_open
+            && let Some(id) = tree.find_by_key(GRID_KEY)
+        {
+            router.focus(&tree, &ui, id);
+        }
+
         let mut damage = ui_damage;
-        // The grid's own rows, in window coordinates, unioned in.
+        // The grid's own rows, in window coordinates, unioned in. **Viewport rows** — the
+        // translation from the grid's screen rows is `App::damage_rows`', because it is the
+        // half that knows where the view is anchored.
         let origin = app.grid_origin();
-        for row in app.grid.take_damage() {
-            let r = app.metrics.row_rect(row, app.grid.cols());
+        let cols = app.grid.cols();
+        for row in app.damage_rows() {
+            let r = app.metrics.row_rect(row, cols);
             let r = Rect::new(origin.x + r.origin.x, origin.y + r.origin.y, r.size.w, r.size.h);
             damage = union_opt(damage, Some(r));
         }
@@ -220,24 +235,17 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             exit(0);
         };
         match event {
+            // **Everything goes through the router**, including the keys that end up as text:
+            // the grid is a focusable widget with an `on_key`, so "typed a character" and
+            // "pressed a menu accelerator" are the same path with a different widget claiming
+            // it. Whether a key types at all — a repeat does, a release does not — is
+            // `App::key`'s, because it is a fact about terminals and not about routing.
             WindowEvent::Key(k) => {
-                // Presses and repeats type; releases do not. A terminal sends on the way down,
-                // and a repeat is that press continuing.
-                if k.pressed != KEY_DOWN && k.pressed != KEY_REPEAT {
-                    continue;
-                }
-                // The chrome gets first refusal — the toolkit's routing decides whether a
-                // focused widget claims the key — and anything it does not claim is text.
                 if let Some(msg) = router.key(&tree, &ui, k) {
                     app.update(msg);
-                    continue;
-                }
-                let n = libterm::encode::encode(k.keycode, k.modifiers, &mut encoded);
-                if n > 0 {
-                    // **The loopback.** Part C replaces this one line with a write to the tty
-                    // server's backend channel.
-                    app.loopback(&encoded[..n]);
-                    Line::new().s(b"nxterm: typed ").u(n as u64).s(b" byte(s)").end();
+                    if let Msg::Key(k) = msg {
+                        Line::new().s(b"nxterm: key ").u(k.keycode as u64).end();
+                    }
                 }
             }
             WindowEvent::Pointer(p) => {
