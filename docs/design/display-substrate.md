@@ -222,11 +222,17 @@ than reasoned about:
   root `CLAUDE.md` is "no external crates **in the kernel**". Userspace's silence read as the
   same prohibition, and it never was one. `userspace/CLAUDE.md` now states the bar.
 
-**The interim compromise moved from the font to the blend.** `libdraw` composites opaque
-XRGB8888 and cannot alpha-blend, so a rasterizer's 8-bit coverage is thresholded to 1 bit for
-now. That is one `if` in the per-pixel callback, and it becomes the fallback path rather than
-being deleted — cheap throwaway, in the place where it costs nothing later. **Antialiasing is
-blocked on `libdraw`, not on the font**, which is the opposite of what this section assumed.
+**The interim compromise moved from the font to the blend.** `libdraw` composited opaque
+XRGB8888 and could not alpha-blend, so a rasterizer's 8-bit coverage was thresholded to 1 bit.
+That was one `if` in the per-pixel callback. **Antialiasing was blocked on `libdraw`, not on
+the font**, which is the opposite of what this section assumed.
+
+> **Resolved 2026-08-12** (M5 Part A): `libdraw` blends, and glyphs are antialiased. One
+> prediction here was wrong — the threshold was **deleted, not kept as a fallback**. A fallback
+> is for a caller that cannot take the good path, and a caller that cannot read its own buffer
+> back cannot blend anything at all, which makes it a `Framebuffer` capability question rather
+> than a second glyph loop. No alpha channel was added: coverage is an argument, surfaces stay
+> opaque, and `compose` stays a copy.
 
 **The font file lives on the root filesystem**, not the initramfs. The initramfs carries what
 is needed to reach a mounted root and no more; a client that draws text starts long after

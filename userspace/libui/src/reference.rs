@@ -207,15 +207,58 @@ mod tests {
     fn the_text_actually_rasterised() {
         // Layout would place a label of the right size whether or not a glyph was ever drawn,
         // and `Theme::background` everywhere would still be "not a flat fill" thanks to the
-        // widgets. So look for ink in the foreground colour, which only `draw_str` produces.
-        let fb = render(&font());
-        let ink = Theme::default().foreground;
+        // widgets. So look for ink, which only `draw_str` produces.
+        //
+        // **Counted as "not the background", not as "exactly the foreground"** — the same
+        // correction `libdraw` made when glyphs started blending (PR #188 review). Exact-match
+        // counting asks "is any part of this glyph *solid*", and antialiasing moves most of a
+        // glyph's pixels off that value: the count here fell from 656 to 105 against a floor of
+        // 100 when blending landed, leaving a 5% margin on an assertion whose failure message
+        // says "the labels did not rasterise". Any later nudge to the font size, the theme or a
+        // label would have turned it red while the labels rasterised perfectly.
+        let f = font();
+        let fb = render(&f);
+        let palette = Palette::default();
+        // The widgets' own flat colours are not ink.
+        let chrome = [
+            Theme::default().background,
+            palette.face,
+            palette.focus_ring,
+            palette.track,
+            palette.thumb,
+        ];
+        // **And nor is the custom node's pattern**, which is 18,688 of the 20,012 non-chrome
+        // pixels in this picture. Counting "not chrome" without excluding it gives a test that
+        // passes with no text drawn at all — which the first attempt at this fix did.
+        let custom = custom_rect(&f);
         let n = (0..HEIGHT)
             .map(|y| {
-                (0..WIDTH).filter(|&x| Framebuffer::get_pixel(&fb, x, y).unwrap() == ink).count()
+                (0..WIDTH)
+                    .filter(|&x| {
+                        if custom.contains(x as i32, y as i32) {
+                            return false;
+                        }
+                        let c = Framebuffer::get_pixel(&fb, x, y).unwrap();
+                        !chrome.contains(&c)
+                    })
+                    .count()
             })
             .sum::<usize>();
-        assert!(n > 100, "only {n} foreground pixels — the labels did not rasterise");
+        assert!(n > 400, "only {n} ink pixels — the labels did not rasterise");
+    }
+
+    /// Where the custom node was laid out, so a test counting ink can exclude its pattern.
+    fn custom_rect(font: &Font) -> Rect {
+        fn find<Msg>(e: &Element<Msg>, l: &crate::layout::Layout) -> Option<Rect> {
+            if matches!(e.node, crate::element::Node::Custom { .. }) {
+                return Some(l.rect);
+            }
+            e.children().zip(l.children.iter()).find_map(|(c, cl)| find(c, cl))
+        }
+        let ui = view();
+        let bounds = Rect::new(0, 0, WIDTH, HEIGHT);
+        let l = layout(&ui, bounds, &FontMetrics::new(font, FONT_PX));
+        find(&ui, &l).expect("the reference UI has a custom node")
     }
 
     #[test]

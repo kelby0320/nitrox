@@ -552,15 +552,32 @@ context menu near a window edge, or a combo box in a small dialog.
 
 ### Part A — terminal semantics, and the blend that unblocks antialiasing
 
-- [ ] **A1 — `libdraw` learns to blend.**
+- [x] **A1 — `libdraw` learns to blend.** ✅ 2026-08-12.
       `Font::draw_str` thresholds `ab_glyph`'s 8-bit coverage to one bit because `libdraw`
       composites opaque XRGB8888 and has no alpha path. That was the right interim answer for
       a toolkit drawing a handful of labels. A terminal is *entirely* text, which is where
       the filed trigger — "text that looks bad enough to prompt one" — actually fires.
 
-      A `blend(dst, src, coverage)` on the pixel path and a `Font::draw_str` that uses it.
-      The threshold becomes the fallback rather than being deleted, as
-      `display-substrate.md` §6 said it would.
+      Built as `Rgb::blend` (pure colour arithmetic, host-tested for its endpoints, its
+      monotonicity and its asymmetry) plus `Framebuffer::blend_pixel` (the read-modify-write,
+      a provided method so the real framebuffer and the test one share it), with
+      `Font::draw_str` passing the rasteriser's coverage straight through.
+
+      **The threshold was deleted, not kept as a fallback** — a correction to this line and to
+      `display-substrate.md` §6. A fallback is for a caller that cannot take the good path;
+      thresholding is not that, it is only worse output. The one caller that could want it is a
+      surface that cannot be read back, which cannot blend anything at all and is therefore a
+      `Framebuffer` capability question rather than a second glyph loop.
+
+      **No alpha channel.** Coverage is an argument to a blend, not a fourth byte; surfaces
+      stay opaque XRGB8888 and `compose` stays a copy.
+
+      The gate that mattered was the existing one: `check-display` renders `libui::reference`
+      on the host and compares it against the guest pixel for pixel, so it now asserts that
+      floating-point rasterisation *and* the blend agree between a host build and a
+      `x86_64-unknown-nitrox` one. Both new host tests were checked against a reinstated
+      threshold; one of them passed and was rewritten — it compared whole buffers over two
+      backgrounds, and the pixels the glyph never touched satisfied it.
 
       **This is the deferral folded into this milestone**, and it is folded into Part A rather
       than done as a fourth prerequisite because it belongs with the text work and host-tests

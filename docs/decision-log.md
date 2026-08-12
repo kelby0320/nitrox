@@ -13475,3 +13475,123 @@ header. A graduation whose diff is a `git mv` plus a rewritten Status line has n
 it has been asserted. Both Status lines now say the audit happened and what it found, because
 "Verified against source" is itself a claim in the diff and the reviewer was right to hold the
 merge over it.
+
+## 2026-08-12 — M5 A1: `libdraw` blends, and the fallback that was not one
+
+The first code of Milestone 5, and the smallest part of it: glyph coverage stops being
+thresholded to one bit.
+
+### Where the operation goes
+
+Three pieces, at three layers, each testable where it lives:
+
+- **`Rgb::blend(under, coverage)`** — pure colour arithmetic in `format.rs`. Round-half-up, so
+  full coverage returns the source *exactly* and zero coverage returns the destination exactly.
+  Truncation loses both endpoints, and a glyph whose fully-covered interior is one shade off
+  its own colour is the kind of wrong that reads as a colour-management bug.
+- **`Framebuffer::blend_pixel`** — the read-modify-write, as a *provided* method. The trait's
+  own doc says drawing operations live there "so the real framebuffer and the test one share
+  one implementation of the logic rather than two that can drift", and this is the second time
+  that rule has caught something: `libui::paint` had grown a private `fill` beside
+  `fill_rect` and lost it in #185's review.
+- **`Font::draw_str`** — passes `ab_glyph`'s coverage through, rounded rather than truncated
+  (`255.0 * c` with `as u8` yields 254 at full coverage, so no glyph interior would ever be
+  exactly its own colour).
+
+### The fallback that was not one
+
+The plan, the deferral entry and `display-substrate.md` §6 all said the same thing: the
+threshold "becomes the fallback rather than being deleted". **It was deleted**, and the reason
+is worth stating because the prediction was made three times and was wrong each time.
+
+A fallback is for a caller that *cannot take the good path*. Thresholding is not that — it is
+the same path with worse output. The only caller that could genuinely want it is a surface that
+cannot be read back, and such a surface cannot blend *anything*: not glyphs, not translucent
+chrome, nothing. So it is a `Framebuffer` capability question, answered at the trait, rather
+than a second glyph loop kept alive in the font against a case nothing in the system has.
+
+**No alpha channel was added.** Coverage is an argument to a blend, not a fourth byte in a
+pixel; surfaces stay opaque XRGB8888 and `compose` stays a copy. What made the threshold
+necessary was the absence of the *operation*, not of a channel — which is also why the deferral
+was correctly filed against `libdraw` rather than against the font.
+
+### A vacuous test, caught by breaking the thing it tested
+
+Two host tests were added and both were checked against a reinstated threshold. **One of them
+passed.** `a_glyph_blends_against_what_is_already_there` rendered the same glyph over two
+different backgrounds and compared whole buffers — which of course differ, because the pixels
+the glyph never touched differ. The assertion was satisfied by the background.
+
+It compares only the *partially covered* pixels now, and fails under two independent breaks: a
+reinstated threshold, and a blend against a hardcoded black instead of the destination.
+
+This is the milestone-long pattern again — the test observed something downstream of what it
+claimed to check — and the only reason it did not ship is that breaking the production code is
+now routine rather than occasional.
+
+### What the display gate turned out to prove
+
+`check-display` renders `libui::reference` on the host and compares it against the guest's
+screen pixel for pixel. It stayed green through this change, which is a stronger statement than
+it looks: **floating-point glyph rasterisation and the blend now agree byte-for-byte between a
+host build and an `x86_64-unknown-nitrox` one.** That is exactly the class of divergence
+`display-substrate.md` §8b says a self-hash cannot catch, and it came free from a gate built
+for a different reason.
+
+## 2026-08-12 — Review of #188: two justifications that were checkable and false
+
+No blocking findings, and the three worth fixing share a shape that is different from the last
+few reviews and worth separating out. Nothing here was a wrong claim about *other* code. Each
+was a **reason given for a line I had just written**, stated confidently, and false.
+
+### The `+ 127` did not do what its comment said
+
+`Rgb::blend` rounds. The doc and the test comment both justified that by the endpoints:
+"truncation loses the endpoints", "gets this wrong by one for every channel but zero". It does
+not. At full coverage the numerator is `src * 255` and at zero it is `under * 255`; both divide
+exactly. Deleting `+ 127` left **every test in the module green**.
+
+What the constant actually buys is the 48.7% of the `(src, under, coverage)` space where
+rounding and truncation disagree — always downwards, so dropping it darkens every
+partially-covered pixel and uniformly thins every glyph edge. That is a much better reason than
+the one I gave, and it now has a test that fails without it: `Rgb::new(1,1,1).blend(BLACK, 200)`
+is `1` rounded and `0` truncated.
+
+The pattern: I wrote the constant for a reason I did not examine, then wrote the reason down
+with the confidence of someone who had, and tested the property I had named rather than the one
+the code depended on.
+
+### The short-circuit's "correctness" half was also false
+
+`blend_pixel` skips the blend at coverage 0 and 255. The doc said this was "not only for
+speed" — that a format with fewer than 8 bits per channel would not round-trip `decode` → blend
+→ `encode`. True at intermediate coverage; false at the endpoints, which is the only place the
+short-circuit applies. `blend` is the identity there, and a narrow channel *does* round-trip
+(`decode` replicates high bits, `encode` truncates them back). Verified over all 65,536 words
+of a 5-6-5 format, which is now a test rather than a claim.
+
+It is a worthwhile optimisation — it skips a read, and on a mapped aperture that read is
+uncached. That is the whole justification and it should have been the whole comment.
+
+### And a gate I left five pixels from lying
+
+The same review found `libui`'s `the_text_actually_rasterised` counting pixels *exactly equal*
+to the foreground — the measure this very PR retired inside `libdraw`, replacing `lit` with
+`inked`, without carrying the fix next door. Antialiasing moved the count from 656 to 105
+against a floor of 100. Any later nudge to the font size or the theme would have turned it red
+saying "the labels did not rasterise" while they rasterised perfectly.
+
+**The first fix was worse than the bug.** Counting "not a chrome colour" instead passes with no
+text drawn at all: the custom node's two-axis pattern is 18,688 of the picture's 20,012
+non-chrome pixels. Caught by measuring rather than by reasoning, and the test now excludes the
+custom node's laid-out rectangle — 1,324 ink pixels against a floor of 400, and 0 when glyph
+drawing is suppressed.
+
+### What to take from it
+
+The recurring failure in this milestone has been claims about code I had read. These are one
+step worse: claims about code I had *just written*, where the justification was invented at the
+same time as the line and never separated from it. The check that would have caught all three
+is the one already routine for tests — **break it and see** — applied to the *reason* rather
+than the behaviour: delete the constant, and if everything still passes, the stated reason is
+not the real one.

@@ -124,6 +124,31 @@ pub trait Framebuffer {
         self.bytes_mut()[off..off + 4].copy_from_slice(&word);
     }
 
+    /// Composite `colour` over what is already at `(x, y)` at `coverage`.
+    ///
+    /// A read-modify-write, which is why it is a method here rather than arithmetic at the
+    /// call site: the read must go through [`get_pixel`](Self::get_pixel) so a buffer whose
+    /// format decodes differently from the writer's assumption cannot silently blend against
+    /// the wrong colour.
+    ///
+    /// **The endpoints short-circuit, and that is purely an optimisation** — it skips a read,
+    /// which on a mapped framebuffer aperture is uncached memory. An earlier version of this
+    /// comment claimed it was also needed for correctness on formats with fewer than 8 bits
+    /// per channel, which is false: [`blend`](Rgb::blend) is the identity at both endpoints,
+    /// and a narrow channel does round-trip `decode` → `encode` (`decode` replicates the high
+    /// bits and `encode` truncates them back). Verified over all 65 536 words of a 5-6-5
+    /// format before the claim was removed rather than reasoned about a second time.
+    fn blend_pixel(&mut self, x: u32, y: u32, colour: Rgb, coverage: u8) {
+        match coverage {
+            0 => {}
+            255 => self.put_pixel(x, y, colour),
+            a => {
+                let Some(under) = self.get_pixel(x, y) else { return };
+                self.put_pixel(x, y, colour.blend(under, a));
+            }
+        }
+    }
+
     /// Fill `rect`, clipped to the visible area, with a solid colour.
     ///
     /// The row's starting offset comes from [`Geometry::offset_of`] rather than being
@@ -338,5 +363,70 @@ mod tests {
             fb.fill_rect(Rect::new(1, 1, 3, 1), Rgb::new(0xAA, 0xBB, 0xCC));
         }
         assert_eq!(raw.bytes(), mem.bytes());
+    }
+
+    #[test]
+    fn blend_pixel_covers_all_three_arms() {
+        // **`blend_pixel` had no test in its own module** when it landed (PR #188 review): all
+        // three arms were exercised only through `Font::draw_str`, and one of them not at all.
+        let mut fb = MemFramebuffer::new(geom());
+        let bg = Rgb::new(0x10, 0x20, 0x30);
+        let ink = Rgb::new(0xF0, 0xE0, 0xD0);
+        fb.clear(bg);
+
+        // Zero coverage: the pixel is not touched.
+        fb.blend_pixel(0, 0, ink, 0);
+        assert_eq!(fb.get_pixel(0, 0), Some(bg), "zero coverage wrote something");
+
+        // Full coverage: the pixel is the source, bit-exactly.
+        fb.blend_pixel(1, 0, ink, 255);
+        assert_eq!(fb.get_pixel(1, 0), Some(ink), "full coverage is not the source");
+
+        // Partial: strictly between, per channel, and reads the destination that is there.
+        fb.blend_pixel(2, 0, ink, 128);
+        let mid = fb.get_pixel(2, 0).unwrap();
+        for (m, (a, b)) in [(mid.r, (bg.r, ink.r)), (mid.g, (bg.g, ink.g)), (mid.b, (bg.b, ink.b))] {
+            assert!(m > a && m < b, "{m} is not between {a} and {b}");
+        }
+    }
+
+    #[test]
+    fn blend_pixel_outside_the_buffer_writes_nothing() {
+        // **The arm nothing covered**, because every `draw_str` test clips inside its buffer.
+        // A `get_pixel` that returns `None` must end the operation — reordering this arm to
+        // fall through to `put_pixel` would paint a glyph fringe at full intensity along a
+        // surface edge, and no other test in the tree would object.
+        let mut fb = MemFramebuffer::new(geom());
+        fb.clear(Rgb::new(0x10, 0x20, 0x30));
+        let before = fb.bytes().to_vec();
+        let g = fb.geometry();
+        for (x, y) in [(g.width, 0), (0, g.height), (g.width, g.height), (u32::MAX, 0)] {
+            // Every coverage class, since each takes a different path to the bounds check.
+            for a in [0u8, 1, 128, 254, 255] {
+                fb.blend_pixel(x, y, Rgb::new(0xFF, 0xFF, 0xFF), a);
+            }
+        }
+        assert_eq!(fb.bytes(), before.as_slice(), "an out-of-bounds blend wrote to the buffer");
+    }
+
+    #[test]
+    fn a_narrow_channel_format_round_trips_at_the_endpoints() {
+        // The claim the short-circuit's doc used to make, checked rather than repeated: a
+        // format with fewer than 8 bits per channel survives `decode` → blend → `encode` at
+        // both endpoints, so skipping the blend there is an optimisation and not a correction.
+        //
+        // 5-6-5 inside a 32-bit word, which `Geometry` accepts because the *word* is 32 bits.
+        let f = PixelFormat {
+            bits_per_pixel: 32,
+            red: crate::format::Channel::new(11, 5),
+            green: crate::format::Channel::new(5, 6),
+            blue: crate::format::Channel::new(0, 5),
+        };
+        let src = Rgb::new(0x9C, 0x41, 0x7B);
+        for w in 0..=0xFFFFu32 {
+            let under = f.decode(w);
+            assert_eq!(f.encode(src.blend(under, 0)), f.encode(under), "zero coverage at {w:#x}");
+            assert_eq!(f.encode(src.blend(under, 255)), f.encode(src), "full coverage at {w:#x}");
+        }
     }
 }
