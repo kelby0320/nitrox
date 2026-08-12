@@ -272,7 +272,6 @@ mod tests {
         MemFramebuffer::new(Geometry::packed(w, h, PixelFormat::XRGB8888))
     }
 
-    /// How many pixels of `colour` are set.
     /// Pixels the glyph touched at all — any coverage, not only full.
     ///
     /// **The measure `lit` stopped being** when glyphs started blending (2026-08-12). A stroke

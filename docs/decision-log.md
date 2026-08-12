@@ -13537,3 +13537,61 @@ it looks: **floating-point glyph rasterisation and the blend now agree byte-for-
 host build and an `x86_64-unknown-nitrox` one.** That is exactly the class of divergence
 `display-substrate.md` §8b says a self-hash cannot catch, and it came free from a gate built
 for a different reason.
+
+## 2026-08-12 — Review of #188: two justifications that were checkable and false
+
+No blocking findings, and the three worth fixing share a shape that is different from the last
+few reviews and worth separating out. Nothing here was a wrong claim about *other* code. Each
+was a **reason given for a line I had just written**, stated confidently, and false.
+
+### The `+ 127` did not do what its comment said
+
+`Rgb::blend` rounds. The doc and the test comment both justified that by the endpoints:
+"truncation loses the endpoints", "gets this wrong by one for every channel but zero". It does
+not. At full coverage the numerator is `src * 255` and at zero it is `under * 255`; both divide
+exactly. Deleting `+ 127` left **every test in the module green**.
+
+What the constant actually buys is the 48.7% of the `(src, under, coverage)` space where
+rounding and truncation disagree — always downwards, so dropping it darkens every
+partially-covered pixel and uniformly thins every glyph edge. That is a much better reason than
+the one I gave, and it now has a test that fails without it: `Rgb::new(1,1,1).blend(BLACK, 200)`
+is `1` rounded and `0` truncated.
+
+The pattern: I wrote the constant for a reason I did not examine, then wrote the reason down
+with the confidence of someone who had, and tested the property I had named rather than the one
+the code depended on.
+
+### The short-circuit's "correctness" half was also false
+
+`blend_pixel` skips the blend at coverage 0 and 255. The doc said this was "not only for
+speed" — that a format with fewer than 8 bits per channel would not round-trip `decode` → blend
+→ `encode`. True at intermediate coverage; false at the endpoints, which is the only place the
+short-circuit applies. `blend` is the identity there, and a narrow channel *does* round-trip
+(`decode` replicates high bits, `encode` truncates them back). Verified over all 65,536 words
+of a 5-6-5 format, which is now a test rather than a claim.
+
+It is a worthwhile optimisation — it skips a read, and on a mapped aperture that read is
+uncached. That is the whole justification and it should have been the whole comment.
+
+### And a gate I left five pixels from lying
+
+The same review found `libui`'s `the_text_actually_rasterised` counting pixels *exactly equal*
+to the foreground — the measure this very PR retired inside `libdraw`, replacing `lit` with
+`inked`, without carrying the fix next door. Antialiasing moved the count from 656 to 105
+against a floor of 100. Any later nudge to the font size or the theme would have turned it red
+saying "the labels did not rasterise" while they rasterised perfectly.
+
+**The first fix was worse than the bug.** Counting "not a chrome colour" instead passes with no
+text drawn at all: the custom node's two-axis pattern is 18,688 of the picture's 20,012
+non-chrome pixels. Caught by measuring rather than by reasoning, and the test now excludes the
+custom node's laid-out rectangle — 1,324 ink pixels against a floor of 400, and 0 when glyph
+drawing is suppressed.
+
+### What to take from it
+
+The recurring failure in this milestone has been claims about code I had read. These are one
+step worse: claims about code I had *just written*, where the justification was invented at the
+same time as the line and never separated from it. The check that would have caught all three
+is the one already routine for tests — **break it and see** — applied to the *reason* rather
+than the behaviour: delete the constant, and if everything still passes, the stated reason is
+not the real one.

@@ -86,10 +86,17 @@ impl Rgb {
     /// destination already in the buffer. Coverage is an argument, not a stored channel, so
     /// nothing gains a fourth byte and `compose` stays a memcpy.
     ///
-    /// Rounded rather than truncated: `(x + 127) / 255` is round-half-up, so full coverage
-    /// returns `self` exactly and zero coverage returns `under` exactly. Truncation loses the
-    /// endpoints, and a glyph whose fully-covered interior is one shade off its own colour is
-    /// the kind of wrong that looks like a colour-management bug.
+    /// **Rounded rather than truncated**, and the reason is not the endpoints. `+ 127` before
+    /// the divide makes this round-to-nearest (255 is odd, so no value is ever an exact tie).
+    /// The endpoints survive truncation too — at full coverage the numerator is `src * 255`
+    /// and at zero it is `under * 255`, both exactly divisible — so an earlier version of this
+    /// comment justified the constant with a property that does not need it.
+    ///
+    /// What it actually buys is every value *between*: rounding and truncation disagree on
+    /// **48.7%** of the `(src, under, coverage)` space, and truncation always disagrees
+    /// downwards. Dropping it darkens every partially-covered pixel by up to one level, which
+    /// on antialiased text is a uniform thinning of every glyph edge — the kind of wrong that
+    /// looks like a font-weight problem rather than an arithmetic one.
     pub const fn blend(self, under: Rgb, coverage: u8) -> Rgb {
         const fn mix(src: u8, dst: u8, a: u8) -> u8 {
             let (src, dst, a) = (src as u32, dst as u32, a as u32);
@@ -251,15 +258,47 @@ mod tests {
 
     #[test]
     fn the_blend_endpoints_are_exact() {
-        // **The property everything else rests on.** A glyph's interior is full coverage, so
-        // if 255 does not return the source exactly, no text is ever quite its own colour —
-        // and a truncating `src * a / 255` gets this wrong by one for every channel but zero.
-        // Zero coverage must likewise return the destination untouched, or a glyph's bounding
-        // box tints the background it does not cover.
+        // A glyph's interior is full coverage, so if 255 does not return the source exactly,
+        // no text is ever quite its own colour; zero coverage must likewise return the
+        // destination untouched, or a glyph's bounding box tints the background it does not
+        // cover.
+        //
+        // **This does not test the rounding**, which an earlier version of this comment
+        // claimed it did — see `rounding_is_to_nearest_not_downwards` below. Both endpoints
+        // hold under truncation as well.
         let src = Rgb::new(0xE0, 0x37, 0x91);
         let dst = Rgb::new(0x0E, 0x14, 0x1B);
         assert_eq!(src.blend(dst, 255), src, "full coverage is not the source");
         assert_eq!(src.blend(dst, 0), dst, "zero coverage disturbed the destination");
+    }
+
+    #[test]
+    fn rounding_is_to_nearest_not_downwards() {
+        // **The test the `+ 127` did not have.** Deleting that constant left every other test
+        // in this module green, because the endpoints survive truncation and the properties
+        // below (monotonic, strictly between, mirrored) hold for both rules. So the one piece
+        // of arithmetic a reader is most likely to read as a magic number had nothing
+        // asserting it, and its stated justification was checkable and false.
+        //
+        // A faint source over black is where the two rules separate: 200/255 of one level
+        // rounds to 1 and truncates to 0 — the difference between a visible glyph edge and a
+        // missing one.
+        assert_eq!(Rgb::new(1, 1, 1).blend(Rgb::BLACK, 200), Rgb::new(1, 1, 1));
+
+        // And in the large: truncation is never *higher* than rounding, and is strictly lower
+        // often enough that "they mostly agree" is not a defence.
+        let mut lower = 0usize;
+        for v in 0..=255u8 {
+            for a in 0..=255u8 {
+                let rounded = Rgb::new(v, 0, 0).blend(Rgb::BLACK, a).r as u32;
+                let truncated = (v as u32 * a as u32) / 255;
+                assert!(truncated <= rounded, "truncation exceeded rounding at v={v} a={a}");
+                if truncated < rounded {
+                    lower += 1;
+                }
+            }
+        }
+        assert!(lower > 20_000, "only {lower} of 65536 differ — is the rounding still there?");
     }
 
     #[test]
