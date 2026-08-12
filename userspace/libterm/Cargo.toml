@@ -3,9 +3,9 @@ name = "libterm"
 version = "0.1.0"
 edition = "2024"
 
-# Terminal semantics. Built so far: the cell vocabulary (A2) and the escape-sequence parser
-# (A3). Still to come in Milestone 5 Part A — see `docs/planning/display-arm-plan.md` — the cell
-# grid with its scrollback (A4), the render (A5), and the key encoder (A6).
+# Terminal semantics, and all of Milestone 5 Part A: the cell vocabulary (A2), the
+# escape-sequence parser (A3), the grid with its scrollback (A4), the render (A5) and the key
+# encoder (A6). See `docs/planning/display-arm-plan.md`.
 #
 # **Not in `libdraw`**, which the plan originally said and the M5 planning pass corrected.
 # `libdraw` is the pixel layer — geometry, formats, framebuffers, compositing. An escape-state
@@ -13,16 +13,29 @@ edition = "2024"
 # would make the pixel layer know what a cursor is. This crate sits above `libdraw` exactly as
 # `libui` does, and reaches for it only in the render.
 #
-# **One crate for both directions of the wire**, once A6 lands. The parser turns a program's
-# bytes into grid operations; the encoder will turn a person's key events back into bytes. They
-# are the two halves of one protocol, and keeping them together is what will let a test send
-# `encode(Up)` through `tty_server::Discipline` and get `Up` back — two independently-written
-# ends checked against each other rather than each against someone's belief about the other.
+# **One crate for both directions of the wire.** The parser turns a program's bytes into grid
+# operations; the encoder turns a person's key events back into bytes. They are the two halves
+# of one protocol, and keeping them together is what lets a test send `encode(Up)` through
+# `tty_server::Discipline` and get `Up` back — two independently-written ends checked against
+# each other rather than each against someone's belief about the other. That test found a
+# four-year-old shape of bug on its first run: the discipline ended a CSI at its first byte.
 [dependencies]
 libdraw = { path = "../libdraw" }
+# The keymap — keycode + modifiers to a character, control fold included. The encoder adds the
+# sequences a keymap cannot express and reimplements none of it.
+libinput = { path = "../libinput" }
+# `MOD_*`, and the keycode names, which are both type-level.
+librsproto = { path = "../librsproto" }
+libkern = { path = "../libkern" }
 # `ceilf` for cell metrics: `core` has no float transcendentals, and a font's line height is a
 # float that has to round *up* or a row of glyphs comes out a pixel short.
 libm = { version = "0.2", default-features = false }
+
+# `tty_server::Discipline` parses the input escape sequences this crate produces, so the two
+# ends of one wire can be checked against each other. A dev-dependency: nothing links the tty
+# server into a terminal, and Part C's direction of travel is the reverse of this one.
+[dev-dependencies]
+tty-server = { path = "../tty-server" }
 
 [lib]
 name = "libterm"

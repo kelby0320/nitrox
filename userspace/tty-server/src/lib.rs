@@ -140,13 +140,43 @@ impl Discipline {
                 return Step::None;
             }
             EscState::Csi => {
-                self.esc = EscState::Ground;
+                // **A CSI ends at its *final* byte, not at its first.** This consumed exactly
+                // one byte after `ESC [` and called the sequence over, which is right for
+                // `ESC [ A` and wrong for every sequence with a parameter: `ESC [ 3 ~` — the
+                // Delete key on any real terminal — ended at the `3`, and the `~` landed in the
+                // ground state as printable ASCII, so it was pushed onto the line **and
+                // echoed**. Typing Delete then `list /bin` handed the shell `~list /bin`.
+                //
+                // Live over the serial console since this discipline was written; found while
+                // reviewing `libterm`'s encoder, which produces the same four sequences
+                // (PR #191 review, finding 1). The old comment claimed "the sequence cannot
+                // leak into the line", which was the claim to check.
                 return match b {
-                    b'A' => Step::Key(Key::Up),
-                    b'B' => Step::Key(Key::Down),
-                    // Left/right and everything else: recognised as *ended*, so the
-                    // sequence cannot leak into the line, but not acted on.
-                    _ => Step::None,
+                    // Parameter and intermediate bytes belong to the sequence.
+                    0x20..=0x3F => Step::None,
+                    // `ESC` cancels and restarts, so an interrupted sequence cannot make the
+                    // next one disappear.
+                    0x1B => {
+                        self.esc = EscState::Esc;
+                        Step::None
+                    }
+                    // A final byte ends it.
+                    0x40..=0x7E => {
+                        self.esc = EscState::Ground;
+                        match b {
+                            b'A' => Step::Key(Key::Up),
+                            b'B' => Step::Key(Key::Down),
+                            // Left/right and everything else: recognised as *ended*, so the
+                            // sequence cannot leak into the line, but not acted on.
+                            _ => Step::None,
+                        }
+                    }
+                    // Malformed. End the sequence rather than swallowing the rest of the
+                    // stream, which is what a terminal going silent looks like.
+                    _ => {
+                        self.esc = EscState::Ground;
+                        Step::None
+                    }
                 };
             }
         }
@@ -435,7 +465,11 @@ mod tests {
 
     /// A bare ESC is a key with no meaning here, and must not swallow what follows.
     #[test]
-    fn a_bare_escape_does_not_eat_the_next_character() {
+    fn a_bare_escape_consumes_exactly_two_bytes() {
+        // Renamed 2026-08-12: it was `a_bare_escape_does_not_eat_the_next_character`, which
+        // promises the opposite of what it asserts — the `x` *is* consumed. That is correct
+        // (`ESC x` is how a terminal sends Alt-x, and this discipline does not act on it), but
+        // a name that contradicts its assertion is worse than no name (PR #191 review).
         let mut d = Discipline::new();
         d.feed(0x1b);
         match d.feed(b'x') {
@@ -444,6 +478,81 @@ mod tests {
             other => panic!("expected the sequence to end, got {other:?}"),
         }
         assert!(d.line().is_empty());
+        // And the byte after those two is ordinary text again.
+        d.feed(b'y');
+        assert_eq!(d.line(), b"y");
+    }
+
+    #[test]
+    fn a_parameterised_sequence_leaves_nothing_behind() {
+        // **The bug this state machine shipped with.** `ESC [ 3 ~` is Delete on every real
+        // terminal; ending the sequence at the `3` left the `~` to be typed and echoed.
+        for seq in [
+            &b"\x1b[3~"[..], // Delete
+            &b"\x1b[2~"[..], // Insert
+            &b"\x1b[5~"[..], // PageUp
+            &b"\x1b[6~"[..], // PageDown
+            &b"\x1b[H"[..],  // Home
+            &b"\x1b[F"[..],  // End
+            &b"\x1b[1;5D"[..], // a modified cursor key: two parameters and a separator
+        ] {
+            let mut d = Discipline::new();
+            for b in seq {
+                d.feed(*b);
+            }
+            for b in b"hi" {
+                d.feed(*b);
+            }
+            assert_eq!(d.line(), b"hi", "{seq:x?} leaked into the line");
+        }
+    }
+
+    #[test]
+    fn the_arrows_still_arrive_after_the_widening() {
+        // The sequences this discipline *does* act on must survive a change made for the ones
+        // it does not.
+        for (seq, key) in [(&b"\x1b[A"[..], Key::Up), (&b"\x1b[B"[..], Key::Down)] {
+            let mut d = Discipline::new();
+            let mut got = None;
+            for b in seq {
+                if let Step::Key(k) = d.feed(*b) {
+                    got = Some(k);
+                }
+            }
+            assert_eq!(got, Some(key), "{seq:x?}");
+        }
+    }
+
+    #[test]
+    fn an_escape_inside_a_sequence_starts_a_new_one() {
+        // A program interrupted mid-sequence emits a fresh one, and the new `ESC` must not be
+        // read as the old sequence's payload. Added with the widening above — and it had no
+        // test until a break-test said so, which is the same gap `libterm::parse` had at the
+        // same place.
+        let mut d = Discipline::new();
+        let mut got = None;
+        for b in b"\x1b[1\x1b[Ahi" {
+            if let Step::Key(k) = d.feed(*b) {
+                got = Some(k);
+            }
+        }
+        assert_eq!(got, Some(Key::Up), "the second sequence was eaten by the first");
+        assert_eq!(d.line(), b"hi");
+    }
+
+    #[test]
+    fn a_malformed_csi_does_not_swallow_the_stream() {
+        // Staying in the CSI state on a byte that can appear in no sequence would make the
+        // terminal go silent from one corrupt byte onward.
+        let mut d = Discipline::new();
+        for b in b"\x1b[1\x7fZhi" {
+            d.feed(*b);
+        }
+        // `0x7f` can appear in no CSI, so the sequence is abandoned there — and `Z` is then
+        // ordinary text rather than the tail of something. That is the same answer
+        // `libterm::parse` gives, and the alternative is a terminal that goes silent from one
+        // corrupt byte onward.
+        assert_eq!(d.line(), b"Zhi");
     }
 
     /// The redraw primitive: erase exactly what is displayed, then draw the new line.

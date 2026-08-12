@@ -13918,3 +13918,105 @@ the cross-crate colour claim was unenforced (this PR enforces it, and not by the
 comment predicted), and `libterm::reference` claimed the display gate compares it (nothing
 renders it outside its own tests until Part B). Corrected in place — they were written in this
 branch, and the reviewer was right that the next reader would have believed them.
+
+## 2026-08-12 — M5 A6: the input encoder, and a deferral that was not unblocked after all
+
+The direction a terminal is usually described without, and the last part of Milestone 5 Part A.
+
+### It delegates, and the delegation is the test
+
+`libinput::keymap::to_char` already folds control to C0. This crate adds what a keymap cannot
+express — a key whose encoding is a *sequence* — and reimplements none of it. The test that
+says so compares this module's answers to `to_char`'s directly for the text and control cases,
+with one assertion that the fold really is there so the comparison is not two `None`s agreeing.
+
+Two overrides, both places a terminal disagrees with a plain keymap: **Enter is `\r`** where the
+keymap says `\n`, which is the input-side half of `LF` being index; and **Backspace is `0x7F`**,
+which the keymap does not have at all.
+
+### The second round trip was the one that mattered
+
+The planned round trip — `Discipline::feed(encode(Up))` yields `Up` — works and covers two keys
+of eleven, exactly as the plan's corrected text predicted. The one I did not plan is better: a
+sequence the discipline does **not** know, `Home`, must be *consumed* rather than accumulated
+into the line being edited. A terminal that leaked it would put `[H` in someone's command.
+
+That is A3's never-leak invariant checked from the other end, by the other crate, and it is the
+kind of test that only exists because both ends of the wire live where one test can hold them.
+
+### Alt, and a modifier that vanishes
+
+`Alt` prefixes with `ESC` — xterm's `metaSendsEscape`. Without it a modifier a person pressed
+simply disappears, which is worse than a convention they may not know. It does *not* double an
+escape that is already there: `ESC ESC [ A` parses as nothing, and in this crate's own parser
+the second `ESC` cancels the first, so the whole sequence would be swallowed.
+
+### A deferral that was not unblocked after all
+
+`display-arm-plan.md`'s table of shell items said `Shift-Enter continuation` was waiting on
+"key events with modifiers (M3)", and M3 delivered those. **It is still blocked**, and writing
+the encoder is what showed why: modifiers on the sequence keys are dropped, so through a
+terminal `Shift-Enter` sends exactly what `Enter` sends. A widget can tell them apart; a byte
+stream cannot, and the shell is reading a byte stream.
+
+This is the same shape as the key-repeat trigger corrected on 2026-08-06 — a trigger that named
+the *artifact* expected to satisfy a need rather than the need itself, and therefore read as
+fired when it was not. Corrected in the table rather than left for whoever tries to implement
+it: it needs an encoding here (xterm's `ESC [ 1 3 ; 2 u`, or a `~` form), or a path to the
+shell that is not a byte stream at all.
+
+That last option is worth noticing, because this system has one. The shell could read key
+events from a channel rather than characters from a terminal — which is a real design fork, not
+an obvious win, and belongs to whoever picks the item up rather than to this part.
+
+## 2026-08-12 — Review of #191: the round-trip test found a live bug in the crate it round-trips against
+
+The encoder's blocking finding is the best argument yet for putting both directions of a wire
+where one test can hold them — and for the difference between probing an invariant and sweeping
+it.
+
+### Four of eleven sequences corrupted the command line
+
+`Discipline`'s CSI state consumed **exactly one byte** after `ESC [` and called the sequence
+over. Right for `ESC [ A`; wrong for every sequence with a parameter. `ESC [ 3 ~` — Delete on
+every real terminal — ended at the `3`, and the `~` landed in the ground state as printable
+ASCII, so it was pushed onto the line *and echoed*. Press Delete, type `list /bin`, press
+Enter, and the shell is handed `~list /bin`.
+
+**This has been live over the serial console since the discipline was written**, not merely
+latent for Part B: a host terminal sends `ESC [ 3 ~` for Delete today. The comment on the arm
+that did it read "recognised as *ended*, so the sequence cannot leak into the line" — a claim
+about behaviour, sitting directly above the code that made it false.
+
+### I probed the invariant with the one key that passes
+
+My test was named `a_sequence_the_discipline_does_not_know_leaks_nothing_into_a_line` — a
+general claim — and fed it `Home`, which is `ESC [ H`, three bytes, the one shape that works.
+The four `~` forms were added in the same commit and never fed to it.
+
+This is the third time in this milestone: A3's parameter-byte range, A4's `CUP 99` where the
+modulo and the clamp agree, and now this. **A rule stated over a set wants a test over the
+set.** The test now sweeps every key the encoder produces, and it asserts the echo as well as
+the line, because a leaked `~` is visible before it is submitted.
+
+The PR description even recorded the hazard — "I picked the one `Discipline` will silently drop
+rather than half-recognise" — for `Home`, and did not apply the same reasoning to the four keys
+added beside it. Seeing a hazard for one case is not the same as checking the case next to it.
+
+### A justification that pointed at the wrong parser
+
+The comment explaining why `Alt` does not double an `ESC` said the second one "would cancel the
+first sequence in this crate's own parser". It cancels, and then the sequence parses fine —
+`libterm::parse` reads `ESC ESC [ A` as a cursor-up. The real hazard is the *input* consumer,
+which is what these bytes are for: through `Discipline`, `ESC ESC [ A` types `[A` into the line.
+
+The behaviour was right and the stated reason was wrong, which is the same failure as the
+`+ 127` in `Rgb::blend` — and it had already been copied into two other documents by the time
+the review caught it.
+
+### Keypad Enter did nothing at all
+
+`KEY_KPENTER` is absent from `libinput`'s table and was absent here, so on a full-size keyboard
+finishing a command on the keypad did nothing and gave no sign the key existed. One line, beside
+`KEY_ENTER`, so the "a terminal sends `\r`" rule stays in one place rather than being split
+between a keymap and an override.

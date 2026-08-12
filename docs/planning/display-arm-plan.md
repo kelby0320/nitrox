@@ -747,7 +747,7 @@ context menu near a window edge, or a combo box in a small dialog.
       to be redundant rather than defensive: `Grid::cell` is total, so two guards covered one
       condition and only one was reachable.
 
-- [ ] **A6 — the input encoder: key events → bytes.**
+- [x] **A6 — the input encoder: key events → bytes.** ✅ 2026-08-12 — **Part A complete.**
       The direction nothing in the plan mentioned, and half of what a terminal *is*. `nxterm`
       receives `KeyEvent { keycode, pressed, modifiers }`; `nxsh` expects bytes.
 
@@ -773,6 +773,34 @@ context menu near a window edge, or a combo box in a small dialog.
       `Step::None` for everything else, so **the round-trip covers two keys of the several this
       adds**, byte at a time. It is worth having and it is not coverage of the encoder. Home,
       End and Delete need their own assertions against the sequences a real terminal emits.
+
+      Built with **a second round-trip that turned out to matter more**: a sequence the
+      discipline does *not* know must be consumed rather than accumulated into the line being
+      edited, or a terminal puts `[H` in someone's command. That is the same never-leak
+      invariant as A3's, checked from the other end.
+
+      **And it found a live bug in `tty-server`.** The first version of that test probed `Home`
+      alone and passed, because `ESC [ H` is three bytes and the discipline consumed exactly one
+      after `ESC [`. The four `~` forms are four bytes: `ESC [ 3 ~` ended at the `3` and the `~`
+      was typed **and echoed** — press Delete, type `list /bin`, and the shell is handed
+      `~list /bin`. Live over the serial console since the discipline was written, because that
+      is what a host terminal sends for Delete; the old comment there claimed "the sequence
+      cannot leak into the line", which was the claim to check. `Discipline` now ends a CSI at
+      its *final* byte, and `ESC` restarts from inside one.
+
+      **Three additions the plan did not name**, each because a keymap cannot express it and
+      dropping it silently would be worse: `Escape` sends `0x1b`; `Insert`/`PageUp`/`PageDown`
+      send their `~` forms alongside `Delete`; and **`Alt` prefixes with `ESC`**
+      (`metaSendsEscape`), without which a modifier a person pressed simply vanishes. Alt does
+      *not* double an escape that is already there — `ESC ESC [ A` parses as nothing, and in
+      this crate's own parser the second `ESC` cancels the first.
+
+      **Modifiers on the sequence keys are dropped**, so `Ctrl-Left` sends what `Left` sends.
+      xterm's `ESC [ 1 ; 5 D` is additive and nothing in this system reads it. **One
+      consequence is not merely missing**: through a terminal, `Shift-Enter` is
+      indistinguishable from `Enter`, so the filed `Shift-Enter continuation` shell item is
+      **not** unblocked by M3 as the table below says — it needs an encoding here, or a path
+      that is not a byte stream. Raised 2026-08-12.
 
 ### Part B — `nxterm`, the terminal client
 
@@ -946,7 +974,7 @@ Filed shell items waiting on this arm:
 | Item | Waiting on |
 |---|---|
 | `TODO(history-pager)` — list-style reverse-search | A terminal that can address the cursor (**M5 Part A**, not M4 — corrected 2026-08-12; M4 built the toolkit, and cursor addressing is the ANSI parser) |
-| Shift-Enter continuation | Key events with modifiers (M3) |
+| Shift-Enter continuation | Key events with modifiers (M3) — **and an encoding through the terminal, which A6 does not give it**: `Shift-Enter` currently sends what `Enter` sends |
 | The prompt's live `PipelineStatus` glyph | A redraw-capable surface (M4) |
 | Completion's *candidate list* UI | M4 (the engine itself is schema work, not display) |
 | **`form`** (composition §3) | Designed since v1, **never built**. It lands *late*, after the toolkit and the first applications — and it is more useful there: if `form` can be built from the existing widget set **without adding new widgets**, that is evidence the toolkit's abstractions were right. As the first consumer it would have shaped the toolkit around generated, spec-driven UI, which is the narrower case. |
