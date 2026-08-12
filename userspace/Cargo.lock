@@ -191,6 +191,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "libterm"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
+]
+
+[[package]]
 name = "libui"
 version = "0.1.0"
 dependencies = [

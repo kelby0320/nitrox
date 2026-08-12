@@ -13595,3 +13595,169 @@ same time as the line and never separated from it. The check that would have cau
 is the one already routine for tests — **break it and see** — applied to the *reason* rather
 than the behaviour: delete the constant, and if everything still passes, the stated reason is
 not the real one.
+
+## 2026-08-12 — M5 A2: `libterm` exists, and a cell stores a colour's name
+
+The crate the planning pass moved out of `libdraw`, with the vocabulary A3's parser writes and
+A5's render reads. A crate with nothing in it is not an increment, so the two land together.
+
+### A cell stores a name, not a pixel
+
+`Colour` is `Default` or one of sixteen named `Ansi` values, resolved against a `Palette` only
+at render time. The obvious alternative — resolve at parse time and store `Rgb` in the cell —
+is smaller and wrong twice over:
+
+- It **freezes the theme into the scrollback.** Changing the palette would recolour text
+  written after the change and leave everything above it in the old one.
+- It **loses the distinction between "default" and "the colour the default happens to be".**
+  `SGR 39` means "whatever the theme says", not "white". A stored `Rgb` cannot say that, and
+  reverse video is where it shows: reversing default-on-default has to give the theme's
+  background drawn on its foreground.
+
+### The sixteen are named, not indexed
+
+`Ansi` has sixteen variants rather than wrapping a `u8`. An index admits 240 values the system
+does not have, and every consumer then needs a rule for them — clamp, wrap, or default — which
+is three places to get it wrong for a case that cannot occur. Sixteen variants make the
+supported set the type, and 256-colour becomes a `Colour` variant if something ever emits one.
+That is what the plan meant by "a match arm rather than a reshape", made concrete a part early.
+
+### Two orderings, and both of them are the test
+
+`Attributes::resolve` does bold-brightens then reverse-swaps, and the order is the whole
+function:
+
+- **Reverse swaps the *resolved* colours.** Applied to the named ones instead, `Default` and
+  `Default` exchange to `Default` and `Default` — reverse video on default text would do
+  nothing at all, which is precisely where a shell uses it (a selected line, a highlighted
+  match). The bug is invisible in any test that reverses two *named* colours.
+- **Bold brightens.** `libdraw` has one font weight, so a bold that changed nothing would make
+  `SGR 1` invisible, and shells emit it constantly. This is what xterm and VTE do when no bold
+  face is available; a real bold face supersedes it rather than joining it. Bold moves the
+  foreground only, and a `Default` foreground has no bright counterpart to move to — inventing
+  one would make `SGR 1` a theme change.
+
+Both orderings fail their tests when reversed, checked rather than assumed.
+
+### On sizing an assertion at a thing rather than a number
+
+`a_cell_is_no_bigger_than_it_needs_to_be` asserts `size_of::<Cell>() <= 8`. It is not a
+requirement — nothing breaks at 12 — and it is not there to catch a regression. It is there so
+that a field added to `Cell` without thinking shows up as a decision: 80×24 is 1,920 cells
+before scrollback, and the ring multiplies that by every retained line. An assertion that fails
+with "a cell is 12 bytes" asks a question, which is the most a test can usefully do about a
+judgement call.
+
+## 2026-08-12 — M5 A3: the output parser, and four bugs the tests found first
+
+The escape-sequence state machine. Three design decisions and an observation about where its
+bugs were.
+
+### It emits operations rather than driving a grid
+
+`Parser::feed` returns `Op`s and touches no state but its own. The alternative — a parser
+holding a `&mut Grid` — fuses two state machines that fail differently: an escape-sequence bug
+and a wrapping bug would present identically, and neither could be tested without the other.
+This way A3 lands before A4 exists and each has tests that name what they are about.
+
+**Attributes stay the grid's state.** `SGR` emits an effect; the grid applies it. They are what
+`DECSC` saves and `RIS` resets, so an owner other than the terminal state would have to be kept
+in step with it — and a parser that also tracked attributes would be the second place they live.
+
+### UTF-8 was not in the plan and belongs here
+
+A2 made `Cell.ch` a `char`. If the parser only ever produced ASCII, that was the wrong type —
+so either A2 was wrong or A3 decodes UTF-8, and decoding is clearly right: `Print(b as char)`
+turns every multi-byte sequence into mojibake, which is worse than dropping it.
+
+The detail worth stating: a broken sequence yields one `U+FFFD` and **re-feeds the offending
+byte**. That byte is usually the start of something valid, and consuming it turns one malformed
+character into two — a stream that desynchronises then silently shortens, rather than showing a
+replacement character where the damage is.
+
+### Four bugs, and where they were
+
+Every one was found by a test written before I believed the code, and three were in the same
+place: **the boundary between "this sequence is over" and "the next byte is text"**.
+
+1. `ESC ( B` — a three-byte charset selection — was swallowed as two, so the `B` printed. The
+   exact failure the module's own doc-comment says it exists to prevent, written by the person
+   who wrote that comment.
+2. `ESC` did not cancel a sequence in flight. A program interrupted mid-sequence emits a fresh
+   one, and its `[31m` printed as text.
+3. A seventeen-parameter CSI indexed a sixteen-element array: a panic, from input any program
+   can send.
+4. **The fourth arrived with the fix for the second.** I put the ESC-restart in the CSI state
+   and not in the intermediate one — and the test I had just written checks *every*
+   mid-sequence state rather than one, so it failed on the same run.
+
+That fourth one is the argument for a particular test shape. `escape_restarts_from_every_state`
+loops over four prefixes instead of asserting the case I had in mind. Written as one case it
+would have passed, and the gap would have been found by someone whose charset-selecting program
+printed junk.
+
+### A defensive bound that no public test could reach
+
+Fixing bug 3 needed two changes: bound the `SGR` loop, and bound `param()`. With the loop fixed,
+`param()`'s bound is unreachable — the remaining callers read indices 0 and 1 — so breaking it
+changed nothing any public test observed. That is exactly the kind of bound that rots.
+
+It is tested directly against the private accessor, with a comment saying why. The alternative —
+delete it, since the callers make it unreachable — makes the safety a property of *all present
+callers* rather than of the function, and the next one that loops to `count` reintroduces the
+panic.
+
+## 2026-08-12 — Review of #189: nine bugs, one invariant, and the difference between sampling and sweeping
+
+The parser shipped with four bugs I had found and five I had not. **All nine were the same
+invariant failing at a different byte** — *an unrecognised sequence is consumed and never
+printed*, which is what the module's doc-comment says it exists to guarantee.
+
+That is the useful shape. Not nine unrelated mistakes: one rule, and nine places the code did
+not implement it, in a function whose entire job is that rule.
+
+### Sampling found four; sweeping found five
+
+My tests probed six sequences I thought of. The review swept `0x30..=0x3F` one byte at a time
+and found `:` — the single value of ECMA-48's parameter range with no arm — falling through to
+the malformed branch and leaking `2:255:0:0m` into the grid from a colon-form SGR. My six
+probes were all semicolon-form.
+
+The same sweep, run locally to reproduce it, turned up a sixth the review had not claimed:
+`ESC [ 38;2;255;0;0 m` read the colour's payload as ordinary SGR codes, so the two zeroes
+became **two spurious `Reset`s**. That one is worse than any leak, because a leak is visible
+and this silently clears attributes a prompt has just set.
+
+**The lesson is not "test more".** It is that a rule stated over a *range* — every byte in
+`0x30..=0x3F` is a parameter byte — wants a test over the range, not over the members I
+happened to think about. The tests that already had this shape did their job:
+`escape_restarts_from_every_state` caught the fourth bug the moment the fix for the second
+landed, and it caught it because it loops rather than asserting the case I had in mind.
+
+### The other three, and what each is really about
+
+- **`OSC`/`DCS` introducers** were consumed as two-byte escapes. Their payload is terminated by
+  `BEL` or `ST`, not by a final byte — so `\e]0;user@host\a`, the most common escape sequence
+  in existence, dumped `0;user@host` on every prompt. Nothing in-tree emits one *today*, which
+  is exactly why it would have shipped: `nxterm` runs whatever a person runs.
+- **An over-long UTF-8 encoding decoded to a control character** and was printed as a cell.
+  `E0 80 9B` is `U+001B`, and `ground()` refuses the direct byte `0x1B` with a test asserting
+  it. The fix rejects over-longs *and* filters the decoded scalar, because `C2 9B` is a
+  perfectly legal encoding of the 8-bit `CSI` and printing that is the same mistake with valid
+  input. Closing the class rather than the instance.
+- **A C0 control inside a CSI** both lost the control and leaked the sequence. I had weighed
+  two options in a comment and picked the less bad one; xterm's answer is a third — execute the
+  control and stay in the sequence — which loses neither. A comment that weighs two options is
+  worth re-reading for the third.
+
+### On a claim I made across a crate boundary
+
+`Palette::default`'s comment said its background "matches the toolkit's own clear colour". True,
+and it is now the fourth copy of that literal with nothing enforcing it. `libterm` and `libui`
+are siblings and neither may depend on the other; putting a theme colour in `libdraw` would make
+the pixel layer own a theme. So the comment now says it is an *intention*, names the other three
+copies, and records that it becomes checkable in A5 — when `check-display` renders `libterm`'s
+reference grid and `xtask` sees both crates at once.
+
+A claim with no enforcement should say so. That is cheaper than either inventing a dependency or
+quietly hoping.

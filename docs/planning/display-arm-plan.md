@@ -583,7 +583,7 @@ context menu near a window edge, or a combo box in a small dialog.
       than done as a fourth prerequisite because it belongs with the text work and host-tests
       alongside it.
 
-- [ ] **A2 — a new crate: `libterm`. Not `libdraw`.**
+- [x] **A2 — a new crate: `libterm`. Not `libdraw`.** ✅ 2026-08-12.
       The pre-existing line said "the text/ANSI render path, in `libdraw`". **That is the
       wrong home**, and this pass is where it gets corrected. `libdraw`'s own doc-comment
       calls it "the pixel layer: geometry, pixel formats, framebuffers, and compositing".
@@ -606,7 +606,24 @@ context menu near a window edge, or a combo box in a small dialog.
       the same split that let `fs-server-ext4`'s ext4 parser and `nxsh`'s evaluator be tested
       without booting.
 
-- [ ] **A3 — the output parser: bytes → grid operations.**
+      **Landed with the vocabulary A3 and A4 both need** (`userspace/libterm/src/cell.rs`),
+      because a crate with nothing in it is not an increment. Three decisions in it:
+
+      - **A cell stores a colour *name*, not a pixel.** `Colour::Ansi(Ansi::Red)` and
+        `Colour::Default`, resolved against a `Palette` at render time. Storing `Rgb` would
+        freeze the theme into the scrollback — re-theming would recolour new text only — and
+        `Default` is not a synonym for white: SGR 39 means "whatever the theme says".
+      - **The sixteen colours are named exhaustively** rather than held as a `u8` index, so the
+        supported set *is* the type and there are no 240 values every consumer needs a rule
+        for. 256-colour becomes a `Colour` variant when something emits one.
+      - **Bold brightens the foreground, and reverse swaps what results.** The order is the
+        whole of `Attributes::resolve`: a swap applied before resolution turns
+        default-on-default into default-on-default, so reverse video on default text — where a
+        shell actually uses it — would do nothing. Bold brightens because `libdraw` has one
+        font weight, so `SGR 1` would otherwise be invisible; a real bold face supersedes it.
+        Both orderings are host-tested and both fail when reversed.
+
+- [x] **A3 — the output parser: bytes → grid operations.** ✅ 2026-08-12.
       A state machine over the byte stream: ground, ESC, CSI, and parameter accumulation.
       What it must handle is bounded by what `nxsh` and the coreutils actually emit, plus
       what a person's `Ctrl-L` needs:
@@ -625,6 +642,35 @@ context menu near a window edge, or a combo box in a small dialog.
       **An unrecognised sequence is consumed and dropped, never printed.** The `Discipline`'s
       input parser learned this already — a stray sequence that leaks its bytes into the grid
       is how a terminal ends up with `[0m` scattered through it.
+
+      **It emits operations rather than driving a grid.** `Parser::feed` returns `Op`s and
+      touches no state but its own, so A3 lands before A4 and an escape-sequence bug and a
+      wrapping bug cannot present identically. Attributes stay the *grid's* state — `SGR`
+      emits an effect and the grid applies it — because they are what `DECSC` saves and `RIS`
+      resets, and splitting them across two owners is how they end up disagreeing.
+
+      **UTF-8 decoding was added to this list** (it was not in the plan). `Cell.ch` is a
+      `char`, chosen in A2, so a parser that only ever produced ASCII would mean A2 picked the
+      wrong type. A broken sequence yields one `U+FFFD` and **re-feeds the offending byte**,
+      because that byte is usually the start of something valid and eating it turns one
+      malformed character into two.
+
+      **Nine bugs in total**, four found by tests written before the code was believed and
+      five more by its review — and every one of the nine was the same invariant, *an
+      unrecognised sequence is consumed and never printed*, failing at a different byte. A three-byte `ESC ( B` was swallowed as two, leaking a `B`; `ESC`
+      did not cancel a sequence in flight, so an interrupted program's replacement sequence
+      printed as text; and a seventeen-parameter CSI indexed a sixteen-element array. The
+      fourth arrived *with the fix for the second*: the ESC-restart went into the CSI state and
+      not the intermediate one, and the test that checks **every** mid-sequence state rather
+      than one caught it immediately.
+
+      The review found five more, all by sweeping where I had sampled: `:` was the one byte of
+      ECMA-48's parameter range with no arm, so colon-form SGR leaked; `OSC`/`DCS` introducers
+      were treated as two-byte escapes, so every window-title sequence dumped its payload;
+      an over-long UTF-8 encoding decoded to a *control character* and printed as a cell; a C0
+      control mid-CSI both lost the control and leaked the rest; and — found by the same sweep,
+      unprompted — `ESC [ 38;2;r;g;b m` read the colour's payload as ordinary codes and emitted
+      **two spurious `Reset`s**, silently clearing attributes with nothing visible to say so.
 
 - [ ] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.**
       A cell is a `char` plus an attribute set. The grid is fixed at 80×24 for this milestone
