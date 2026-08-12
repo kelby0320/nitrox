@@ -13761,3 +13761,160 @@ reference grid and `xtask` sees both crates at once.
 
 A claim with no enforcement should say so. That is cheaper than either inventing a dependency or
 quietly hoping.
+
+## 2026-08-12 — M5 A4: the grid, and three rules that had no test until a break-test said so
+
+The screen, the cursor, and where lines go when they leave it. Two design decisions and a
+method note.
+
+### The erase fill, which A2 was expected to have wrong
+
+When A2 landed I flagged `Cell::BLANK` as the type decision I was least confident in, expecting
+A4 to force it. It did, and the answer is narrower than the concern: **`BLANK` was right and a
+second thing was missing.** A never-written cell *is* the default. An **erased** cell is a
+different thing — it takes the current background, because `ED` after `SGR 44` is how a program
+paints a coloured region, and a fill with the default background makes that impossible.
+
+Ink attributes go: a space has nothing to embolden or underline, and carrying them would make a
+later `reverse` repaint a region that looks erased. The foreground goes for the same reason —
+with the consequence that under `SGR 7`, `Attributes::resolve`'s swap means an erase while
+reversed fills with the *foreground*. That is what xterm does and it is what makes "reverse,
+erase line" paint a solid bar.
+
+### `LF` is index, and `ONLCR` is not this crate's job
+
+A line feed moves down and leaves the column alone. Returning to column 0 is `CR`'s, which is
+why a program emits `\r\n`. Folding the two would make `abc\ndef` — which *should* stairstep —
+look like two aligned lines, hiding a producer's bug rather than showing it.
+
+Translating a bare `\n` is the **line discipline's** job (Unix `ONLCR`), and this system already
+has a tty server that owns the discipline. That is a real Part C item rather than a shrug:
+`tty-server` writes `\r\n` where it echoes and does *not* translate on the `Tty::Write` path, so
+a program emitting bare `\n` will stairstep in the GUI terminal until Part C places that
+translation. Recorded in the plan so it is a decision rather than a surprise.
+
+Three of this part's tests were written believing the opposite, and failed on the first run.
+That is the cheap way to find out which of two conventions you are actually implementing.
+
+### Three rules with no test, found by breaking them
+
+The now-routine pass — break each rule, check something fails — found three that nothing
+covered, and one was a live defect:
+
+- **Cursor clamping.** The probe used `CUP 99` on a 3-row grid, and `98 % 3` is `2`, which is
+  also the clamped answer. A modulo and a clamp were indistinguishable. `CUP 4` separates them.
+- **`ED`'s damage.** The extent test asserts *contents* and says nothing about which rows are
+  reported dirty, so an erase that damaged only the cursor's row passed — and would have left
+  the rest of the screen showing what was erased.
+- **The pending-wrap flag being cleared after a wrap.** This one was real. The wrap test wrote
+  exactly one character past the margin and stopped, so a flag left set — which makes *every*
+  subsequent character wrap — looked identical to correct behaviour. A paragraph reaching the
+  right margin would have descended one line per character.
+
+The third is the interesting one, and it is the same shape as the parser's fourth bug: a test
+that stops at the first instance of a behaviour cannot see a state that only goes wrong on the
+second. `abcde` proves the wrap happens; `abcdefg` proves it happens *once*.
+
+## 2026-08-12 — M5 A5: the render, and two tests that passed for the wrong reason
+
+Cells to pixels — the one place `libterm` reaches for `libdraw`, and the reason it depends on
+it at all.
+
+### Cell metrics are derived, and the cursor is an inversion
+
+A cell is as wide as the font's advance and as tall as its line height, so a grid's pixel size
+falls out of the font rather than being asserted beside it. Choosing a cell size and hoping the
+font fits is how a terminal gets glyphs clipped on the right, and the two numbers would then
+have to be kept in step by hand. Width comes from one glyph's advance rather than an average:
+in a monospace font they are all equal, and a test checks that rather than assuming it — a
+proportional font passed here *should* produce a wrong grid, because it has no cell width.
+
+The cursor is the cell **drawn inverted**, not a shape drawn over it. The character under it
+stays readable, and it needs no colour of its own — which would be a third value to keep in
+step with a theme.
+
+### The reference grid goes through the parser
+
+`libterm::reference` is built by feeding a byte string through `Parser` into `Grid`, not by
+calling `Grid` directly. It is the only place A3, A4 and A5 meet, and a mismatch in what an
+`Op` *means* — the parser emitting one thing and the grid reading it as another — would
+survive both halves being individually correct.
+
+Its content is chosen so each line fails differently: plain text for the baseline and advance,
+every attribute for bold/underline/reverse, a coloured background then `EL` for the erase fill,
+a line longer than the row for deferred wrap, and a `CUP` for one-based addressing. A test
+asserts the *grid* contains all of that, because a reference that lost its attributes to a typo
+would still compare equal on both sides of the gate and prove nothing.
+
+### Two tests that passed for the wrong reason
+
+Both found by the routine break-test pass, and the first is the more instructive:
+
+- **The underline test parked the cursor on the underlined cell.** On a one-column grid the
+  cursor stays where it just wrote, so that cell was drawn *inverted* and filled with the
+  foreground — and the assertion "the cell contains the foreground colour" passed on the
+  inversion, not on the underline. It stayed green when the rule was moved into the next row,
+  which is the bug it exists to catch. It now parks the cursor two rows away and asserts the
+  cell contains *both* colours, so a filled cell fails as loudly as a missing rule.
+- **A bounds check in `render_rows` was redundant, not defensive.** Removing it changed
+  nothing: `Grid::cell` is total and the loop already continues on `None`. That is the opposite
+  conclusion from A3's `param()` bound, where removal reintroduced a reachable panic — and the
+  difference is exactly whether anything can reach the second guard. Two guards for one
+  condition is worse than one, because a reader has to work out which is load-bearing.
+
+### The cross-crate claim, discharged
+
+`Palette::default`'s comment said its background matches `libui`'s theme, and PR #189's review
+pointed out nothing enforced it. `libterm` and `libui` are siblings; neither may depend on the
+other, and a theme colour in `libdraw` would make the pixel layer own a theme.
+
+`xtask` links both, so the assertion lives there. It is an odd home for a colour test and it is
+better than a comment hoping two literals stay equal: retuning either side now fails a build.
+Verified by retuning one.
+
+## 2026-08-12 — Review of #190: a bug that was in neither half
+
+The blocking finding is worth an entry on its own, because it is a kind this project has not
+recorded before: **both parts were individually correct and the pair was wrong.**
+
+A4 reported no damage when the cursor moved, with a rationale written into the test —
+"the cursor is drawn by the render over whatever cell it sits on, so *moving* it dirties no
+cell". True of a design where the cursor is a separate overlay pass. A5 then drew the cursor
+**inside** `draw_cell`, which is simpler and makes the character under it readable — and which
+makes A4's sentence false.
+
+Neither change was wrong when it was made. The rationale was accurate when written and stopped
+being accurate two commits later, in the same PR, and nothing connected the two: A4's tests
+assert about a grid, A5's about pixels, and the failure only exists where the documented
+`take_damage` → `render_rows` pairing runs. A paragraph typed past the right margin would have
+left an inverted block at the end of every line.
+
+**The fix is the rule the compositor already follows.** `take_damage` reports the row the cursor
+left as well as the one it reached, for the same reason `repaint_cursor_move` repaints both
+rectangles: something drawn *over* a surface rather than composited into it owns both of its
+positions. That symmetry is worth noticing — the display arm has now met this at two layers,
+and both times the first version forgot the old position.
+
+**And the test is at the level the bug is.** Four tests catch it now, two on the grid and two
+driving the real pairing into a real framebuffer. The grid-level ones would have been enough to
+prevent it, but only the pixel-level ones would have *found* it, because the grid alone cannot
+say what "the cursor is drawn" means.
+
+### A rule documented three times and tested nowhere
+
+`blank()` keeps `REVERSE` while dropping `BOLD` and `UNDERLINE`, and that retention is the whole
+of "reverse, erase line paints a solid bar" — asserted in a doc comment, the decision log and
+the plan, and nowhere in a test. Deleting it left every test green.
+
+It is worse than an ordinary gap because `blank()`'s own summary says "a space in the current
+background, **with nothing else set**", which reads as though `REVERSE` goes too. A reader
+tidying the code to match its own summary would have removed a documented behaviour and seen a
+passing suite. Three prose statements of a rule are not one test of it.
+
+### Two claims that this PR made false
+
+Both from documentation not keeping up with the same PR's code: `Palette::default` still said
+the cross-crate colour claim was unenforced (this PR enforces it, and not by the mechanism the
+comment predicted), and `libterm::reference` claimed the display gate compares it (nothing
+renders it outside its own tests until Part B). Corrected in place — they were written in this
+branch, and the reviewer was right that the next reader would have believed them.

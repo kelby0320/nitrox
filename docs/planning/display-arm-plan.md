@@ -672,7 +672,7 @@ context menu near a window edge, or a combo box in a small dialog.
       unprompted — `ESC [ 38;2;r;g;b m` read the colour's payload as ordinary codes and emitted
       **two spurious `Reset`s**, silently clearing attributes with nothing visible to say so.
 
-- [ ] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.**
+- [x] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.** ✅ 2026-08-12.
       A cell is a `char` plus an attribute set. The grid is fixed at 80×24 for this milestone
       (see "Out of scope" — no resize until M6), with a scrollback ring above it.
 
@@ -686,7 +686,28 @@ context menu near a window edge, or a combo box in a small dialog.
       - **The cursor is clamped**, not wrapped, by cursor-addressing sequences: `CUP` past
         the last row is the last row.
 
-- [ ] **A5 — the render, and `libterm::reference`.**
+      **`Cell::BLANK` was right and the erase fill was missing**, which is the sharper version
+      of the concern raised when A2 landed. A never-written cell *is* the default; an **erased**
+      one takes the current background, because `ED` after `SGR 44` is how a program paints a
+      coloured region. Ink attributes go — a space has nothing to embolden — and with `SGR 7`
+      set the swap in `Attributes::resolve` means an erase while reversed fills with the
+      foreground, which is what makes "reverse, erase line" paint a solid bar.
+
+      **`LF` is index — down only.** Returning to column 0 is `CR`'s job, and translating a bare
+      `\n` is the *line discipline's* (Unix `ONLCR`), which this system has a tty server for.
+      **This is a Part C item**: `tty-server` writes `\r\n` where it echoes and does not
+      translate on the `Tty::Write` path, so a program emitting bare `\n` will stairstep in the
+      GUI terminal until Part C decides where that translation lives.
+
+      **Three rules had no test until a break-test said so**, which is the pattern worth
+      recording: cursor clamping (the probe used `CUP 99` on a 3-row grid, where `99 % 3` and
+      the clamp agree — 4 separates them), `ED`'s damage covering rows the cursor is not on, and
+      the pending-wrap flag being cleared *after* a wrap. That last was a real defect: the wrap
+      test wrote exactly one character past the margin and stopped, so a stale flag — which
+      makes every subsequent character wrap — looked identical to correct behaviour, and a
+      paragraph would have descended one line per character.
+
+- [x] **A5 — the render, and `libterm::reference`.** ✅ 2026-08-12.
       `render(grid, font, &mut fb, damage)` — cells to pixels, with a block cursor. Cell
       metrics come from the font's advance, so the grid's pixel size is derived rather than
       assumed.
@@ -697,7 +718,34 @@ context menu near a window edge, or a combo box in a small dialog.
       the thing the toolkit's diff exists to avoid, one layer up.
 
       `libterm::reference` is the fixed grid the display gate compares: every attribute, a
-      wrapped line, a cursor, and content varying in both axes.
+      wrapped line, a cursor, and content varying in both axes. **Built through the real
+      parser**, not by calling `Grid` directly — it is the only place A3, A4 and A5 are
+      exercised together, and a mismatch in what an `Op` *means* would otherwise survive both
+      halves being individually right.
+
+      **The cursor is the cell drawn inverted**, not a shape over it: the character under it
+      stays readable and it needs no colour of its own, which would be a third thing to keep in
+      step with a theme.
+
+      **The palette claim from A2's review is now enforced.** `libterm` and `libui` are siblings
+      and neither may depend on the other, so their shared background colour had nowhere to be
+      checked — `xtask` links both, and a host test there fails the build if either side is
+      retuned.
+
+      **A5's review found the bug that lived between the two parts**: the render paints the
+      cursor *into* its cell, and A4 reported no damage when the cursor moved — so the row the
+      cursor left kept an inverted block. Each half was defensible alone; the pair was wrong,
+      and the grid test's own comment argued the opposite. `take_damage` now reports both the
+      row the cursor left and the one it reached, which is the rule the compositor already
+      follows for the pointer and for the same reason: something drawn *over* a surface rather
+      than composited into it owns both of its positions.
+
+      Two more tests were passing for the wrong reason, both found by break-tests. The
+      underline test parked the cursor on the underlined cell, so the cell was drawn *inverted*
+      and filled with the foreground — the assertion passed on the inversion and stayed green
+      when the rule was moved into the next row. And a bounds check in `render_rows` turned out
+      to be redundant rather than defensive: `Grid::cell` is total, so two guards covered one
+      condition and only one was reachable.
 
 - [ ] **A6 — the input encoder: key events → bytes.**
       The direction nothing in the plan mentioned, and half of what a terminal *is*. `nxterm`

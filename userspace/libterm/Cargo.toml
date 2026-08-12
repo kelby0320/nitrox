@@ -20,6 +20,9 @@ edition = "2024"
 # ends checked against each other rather than each against someone's belief about the other.
 [dependencies]
 libdraw = { path = "../libdraw" }
+# `ceilf` for cell metrics: `core` has no float transcendentals, and a font's line height is a
+# float that has to round *up* or a row of glyphs comes out a pixel short.
+libm = { version = "0.2", default-features = false }
 
 [lib]
 name = "libterm"

@@ -26,4 +26,6 @@
 extern crate alloc;
 
 pub mod cell;
+pub mod grid;
 pub mod parse;
+pub mod render;
