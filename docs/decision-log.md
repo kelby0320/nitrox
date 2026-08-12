@@ -13203,3 +13203,104 @@ And `docs/conventions/userspace-build.md` still instructed the reader to "add it
 `programs` list in `build_initramfs`" — a symbol this PR deleted, and the precise drift the
 new `(program, reason)` pairs exist to stop. A convention doc that dates badly is worse than
 none, because it is the thing a new session reads *instead of* the source.
+
+## 2026-08-12 — M5 planning pass: the crate boundary the plan had wrong, and the half of a terminal nobody had written down
+
+A detailed planning pass over Milestone 5 before any of it is built, on the same argument as
+M4's: the M4 pass paid for itself by finding that the plan's "text area" contradicted
+Milestone 5's own decision to make the terminal grid a custom widget, and that was a
+contradiction between two documents nobody would have noticed until the widget was built.
+
+Five decisions came out of this one. Two are corrections to the plan.
+
+### `libterm`, not `libdraw`
+
+The plan said "Part A — the text/ANSI render path, **in `libdraw`**". That is the wrong home
+and it would have been discovered halfway through writing it.
+
+`libdraw`'s own doc-comment calls it "the pixel layer: geometry, pixel formats, framebuffers,
+and compositing". An escape-sequence state machine, a cell grid, scrollback and line wrapping
+contain no pixels — they are terminal semantics, and putting them there would make the pixel
+layer know what a cursor is. `libterm` sits above `libdraw` exactly as `libui` does, depends
+on it only for the render, and everything else in it is a function of values that host-tests
+in milliseconds.
+
+The tell was that the line named a *layer* and described *semantics*. Worth watching for.
+
+### The input encoder was missing entirely
+
+A terminal is two translations, not one: bytes in from the program, and **key events out to
+it**. The plan described only the first. `nxterm` receives `KeyEvent { keycode, pressed,
+modifiers }` and `nxsh` expects bytes; `libinput::keymap::to_char` covers text keys and stops,
+so control codes, the arrows, Home/End/Delete, Enter and Backspace have nowhere to be encoded.
+
+Putting it in `libterm` beside the parser — one crate owning both directions of the wire —
+buys a test that would otherwise not exist. `tty_server::Discipline` already *parses* input
+escape sequences, because a serial terminal sends them. So `Discipline::feed(encode(Up))` must
+yield `Up`: two independently-written halves of one protocol checked against each other rather
+than each against my belief about it.
+
+### The data flow inverts in Part C, and a pty is the shape
+
+The plan's Part C reads as "give `backend_write` a surface". It is more than that. Today the
+tty server holds `/dev/console` and *reads keystrokes from the device*. In a GUI terminal the
+keystrokes arrive at `nxterm` — a compositor client with focus — and the shell's output has to
+travel to `nxterm` to be rendered. The server stops being next to the device and becomes the
+thing between two userspace processes.
+
+That is a pty, and the mapping is exact: Unix puts the emulator on the master, the shell on the
+slave, and the kernel's line discipline between them. Here the tty server *is* the line
+discipline, so `nxterm` supplies a channel and the server uses it as that terminal's backend
+instead of the console. One line-discipline implementation, which is the property the backend
+seam was built for on 2026-08-03.
+
+**The backend is per-session, not per-terminal**, which does not fall out of the plan and does
+fall out of stage 1c: each program in a session resolves its *own* `/dev/tty`, and all of them
+must reach the same window exactly as all of them reach the same serial console today. The tty
+server has a flat table of terminals with no session concept, so this is new structure.
+
+**`session-mgr` spawns `nxterm` and registers it**, rather than the Unix shape where the
+terminal spawns its own shell. A terminal that spawned its shell would need spawn authority
+and a namespace to hand it, which is session-mgr's job and nobody else's — the same rule that
+keeps resource servers from self-registering.
+
+### Antialiasing folds into Part A
+
+`libdraw` cannot blend, so glyph coverage is thresholded to one bit. The filed trigger is "text
+that looks bad enough to prompt one", and a terminal is *entirely* text. Folded into Part A
+rather than made a fourth prerequisite: it is text work, it belongs with the text work, and it
+host-tests alongside it.
+
+### Three prerequisites, two of them wire breaks
+
+Before Part A: the doc graduation M4 left, **window ids on `KeyEvent`/`PointerEvent`**, and
+**popup placement**.
+
+The two protocol items are prerequisites rather than Part B work because Part B is what fires
+them — a menu popup is a second window on its parent's connection, which is the exact filed
+trigger for the window id, and a popup that cannot be positioned opens on top of its own menu
+bar. Right now one client and one toolkit are written against the current records. After Part B
+there is a terminal as well.
+
+On placement: Wayland refuses client-chosen position for toplevels and allows it for popups via
+a positioner (an anchor rectangle plus a gravity, so the compositor can flip a popup that would
+fall off screen). The recommendation is the cheap version — a position relative to the parent
+the record already names — **but keeping the anchor in the record**, because that is what lets
+the compositor clamp later without a second wire change, and clamping is the whole reason the
+positioner exists. Toplevel placement stays the compositor's; that is M6's.
+
+### What was deliberately kept out
+
+Selection and clipboard (no clipboard exists anywhere; inventing one for a terminal would
+decide its design by accident), resize and reflow (M6 owns move/resize, and reflowing scrollback
+is the hard part), the alternate screen buffer (`vi` and `less` use it; neither exists),
+256-colour SGR (nothing emits it — the parser's generic parameters make it a match arm), cursor
+blink, and job control. The grid is 80×24 and fixed.
+
+### The deferral this milestone is most likely to fire
+
+The Surface protocol has **no loss marker**: an overflowing outbox discards its oldest event and
+the client is never told. Its trigger is an *observed* overflow, and none has happened outside a
+deliberately wedged test client — so it stays deferred. But a terminal that silently drops a
+keystroke is the first thing anyone would notice, so if Part B drops input under load the wire
+record lands there rather than being worked around.

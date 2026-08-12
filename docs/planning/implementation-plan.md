@@ -71,7 +71,10 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
   - **Substrate gaps it surfaced** — exit-time handle reclamation, the wall clock, and file
     truncate — all ✅ (2026-07-24). See [phase-4-desktop.md](phase-4-desktop.md) → "Substrate
     gaps surfaced by the coreutils subproject".
-  - **The display arm** — 🚧 in progress (**M1–M2 complete** 2026-08-06; M3 input next). Design in
+  - **The display arm** — 🚧 in progress (**M1–M4 complete**: pixels + the gate 2026-08-05,
+    a client with a surface 2026-08-06, input end to end 2026-08-10, the widget toolkit
+    2026-08-11. **M5 — the GUI terminal — planned in detail 2026-08-12**, not yet started).
+    Design in
     [docs/design/display-substrate.md](../design/display-substrate.md) +
     [docs/design/ui-composition-model.md](../design/ui-composition-model.md);
     build order in [display-arm-plan.md](display-arm-plan.md). Milestone 1 is the test

@@ -7,7 +7,11 @@ self-hash, and the `screendump` smoke gate. **Milestones 1–2 are complete** (2
 Surface protocol. **Milestone 3 is complete** (2026-08-10): the i8042 driver, the
 `input-server`, `libinput`, the compositor's focus and hit-test routing, and `libui` delivery
 — proven end to end by `cargo xtask check-input`, which injects a keystroke and a click over
-QMP and asserts they reach a **window**.
+QMP and asserts they reach a **window**. **Milestone 4 is complete** (2026-08-11) bar one
+doc-graduation box, which M5 carries as a prerequisite: `libui` — the retained tree, layout,
+the keyed diff, per-buffer damage, event routing, painting, and the widget set — plus real
+TrueType glyphs, key repeat, an on-screen pointer, and the font on the root filesystem.
+**Milestone 5 is planned in detail** (2026-08-12) and not yet started.
 
 ## What this is
 
@@ -297,7 +301,7 @@ what it buys is not relitigating the kernel boundary for USB HID, touchpads and 
 with window management in a later milestone; buttons and menus need clicks, and the toolkit
 (M4) comes before any application, so the mouse is needed here.
 
-## Milestone 4 — the widget toolkit
+## Milestone 4 — the widget toolkit ✅ complete (2026-08-11)
 
 **Design pass done** (2026-08-10): [`widget-toolkit.md`](../design/widget-toolkit.md) settles
 the five forks this line used to list. In short — a **retained tree with a declarative face**:
@@ -465,24 +469,279 @@ pages, which is exactly when it starts to pay.
 
 ## Milestone 5 — the GUI terminal (the MVP flagship)
 
-**Deliverable: the shell running in a window, drivable by the harness over QMP.**
+**Deliverable: `nxsh` running in a compositor window, driven by keystrokes a person could
+have typed, rendering its output with a real font.**
 
-- [ ] **Part A — the text/ANSI render path**, in `libdraw`. Host-tested; pure logic.
+Planned in detail 2026-08-12, before any of it was built. Everything above this line was
+planned the same way, and the M4 pass earned its keep by finding a contradiction between the
+plan and Milestone 5 before either was written; this pass found the crate boundary below.
 
-      **Glyph rendering left this part for M4 Part C** (2026-08-11): the toolkit's widgets
-      draw text a milestone earlier than the terminal does. What remains here is what is
-      actually terminal-shaped — escape-sequence interpretation, wrapping, and the grid's
-      render — rather than "how does a glyph become pixels", which M4 answers.
-- [ ] **Part B — the terminal client**, built on the toolkit: window chrome, menus and scrollbar
-      from M4's widget set, with **the grid as a custom-drawn widget of its own**. A terminal's
-      selection, wrapping and scrollback semantics are not a text editor's, and bending a
-      generic text area to serve both would distort the whole text stack.
-- [ ] **Part C — the tty server's second backend.** `backend_write` finally has the compositor
-      surface it was built for, and a session chooses serial or GUI. **Both must keep working**
-      (governing decision 3).
+### What "done" means
 
-This is where `test-interactive` gains a GUI path alongside its serial one, and where the
-harness's QMP input channel stops being a test-only affordance.
+Two gates, because they prove different things and one of them cannot be pixel-exact:
+
+- **`cargo xtask check-terminal`** — boot, inject `whoami` and Enter over QMP, and assert the
+  answer appears **in the terminal's grid**. This is the whole loop: i8042 → `input-server` →
+  compositor → `nxterm` → `tty-server` → `nxsh` → back out. Asserted on the grid's contents
+  rather than on pixels, because what the shell prints is not fixed by this milestone.
+- **The display gate grows a third region** — `libterm::reference`, a fixed grid with every
+  attribute the renderer supports, rendered host-side and guest-side and compared pixel for
+  pixel. Same shape as `libui::reference`, for the same reason: the end-to-end gate above
+  would pass with the glyphs in the wrong colour, at the wrong cell, or absent from a row it
+  never checks.
+
+`test-interactive` gains a GUI path alongside its serial one, and the harness's QMP input
+channel stops being a test-only affordance.
+
+### Prerequisites, before Part A
+
+Three items that Part B would otherwise force mid-flight. Two are wire changes, and right
+now there is exactly one real client and one toolkit written against the current shape.
+
+- [ ] **P1 — graduate `input-subsystem.md` and `widget-toolkit.md` to `architecture/`.**
+      M4's last box, listed there and repeated here because it is a prerequisite rather than
+      a loose end: root `CLAUDE.md` tells every session that `design/` never describes current
+      behaviour, so a subsystem finished in M3 currently reads as unbuilt to anyone starting
+      cold. A milestone that builds *on* the toolkit should not begin with the toolkit
+      documented as hypothetical.
+
+- [ ] **P2 — `KeyEvent` and `PointerEvent` carry a window id.**
+      The filed trigger is "the first client with two windows", and a menu popup is exactly
+      that — it is created on its parent's connection, so both windows' input arrives on one
+      channel with nothing to attribute it by. M4 dodged this by giving `ui-testclient` two
+      *connections*; a terminal with a menu cannot.
+
+      Both records are shipped, so this is a wire break: `KeyEvent` 12 → 16 bytes,
+      `PointerEvent` 20 → 24. `FocusEvent` already carries one and is the shape to copy.
+      Doing it now costs updating `libsurface`, `libui::route` and two test clients; doing it
+      after Part B costs the terminal as well.
+
+- [ ] **P3 — a popup can be positioned.**
+      `CreateWindow` carries a `parent` for popups and no position; every window is created
+      at (0,0), and `WindowStack::set_origin` has no caller outside tests. A menu that opens
+      on top of its own menu bar is not a menu.
+
+      **The decision to take, not assume:** Wayland refuses client-chosen position for
+      toplevels and allows it for popups, via a *positioner* that describes an anchor
+      rectangle and a gravity so the compositor can flip the popup when it would fall off
+      screen. The cheap alternative is an absolute `(x, y)` on `CreateWindow` for popup roles
+      only. Recommendation is the cheap one **with the anchor kept in the record** — position
+      relative to the parent, plus the parent's id it already carries — because that is what
+      lets the compositor clamp a popup to the screen later without a second wire change, and
+      clamping is the whole reason the positioner exists.
+
+      Toplevel placement stays the compositor's. That is M6's subject and nothing here needs
+      it: one terminal window at the origin is the milestone.
+
+### Part A — terminal semantics, and the blend that unblocks antialiasing
+
+- [ ] **A1 — `libdraw` learns to blend.**
+      `Font::draw_str` thresholds `ab_glyph`'s 8-bit coverage to one bit because `libdraw`
+      composites opaque XRGB8888 and has no alpha path. That was the right interim answer for
+      a toolkit drawing a handful of labels. A terminal is *entirely* text, which is where
+      the filed trigger — "text that looks bad enough to prompt one" — actually fires.
+
+      A `blend(dst, src, coverage)` on the pixel path and a `Font::draw_str` that uses it.
+      The threshold becomes the fallback rather than being deleted, as
+      `display-substrate.md` §6 said it would.
+
+      **This is the deferral folded into this milestone**, and it is folded into Part A rather
+      than done as a fourth prerequisite because it belongs with the text work and host-tests
+      alongside it.
+
+- [ ] **A2 — a new crate: `libterm`. Not `libdraw`.**
+      The pre-existing line said "the text/ANSI render path, in `libdraw`". **That is the
+      wrong home**, and this pass is where it gets corrected. `libdraw`'s own doc-comment
+      calls it "the pixel layer: geometry, pixel formats, framebuffers, and compositing".
+      Escape-sequence interpretation, a cell grid, scrollback and line wrapping contain no
+      pixels; they are terminal semantics, and putting them in `libdraw` would make the pixel
+      layer know what a cursor is.
+
+      `libterm` sits above `libdraw` exactly as `libui` does, and depends on it only for the
+      render in A5:
+
+      ```text
+      nxterm            ← the client binary
+        ↓
+      libui   libterm   ← toolkit; terminal semantics
+        ↓         ↓
+      libdraw           ← pixels
+      ```
+
+      Everything in A3–A4 is a function of values and host-tests in milliseconds, which is
+      the same split that let `fs-server-ext4`'s ext4 parser and `nxsh`'s evaluator be tested
+      without booting.
+
+- [ ] **A3 — the output parser: bytes → grid operations.**
+      A state machine over the byte stream: ground, ESC, CSI, and parameter accumulation.
+      What it must handle is bounded by what `nxsh` and the coreutils actually emit, plus
+      what a person's `Ctrl-L` needs:
+
+      - `CUP`/`CUU`/`CUD`/`CUF`/`CUB` — cursor addressing, which is what the filed
+        `TODO(history-pager)` has been waiting on
+      - `ED`/`EL` — erase in display and line
+      - `SGR` — bold, underline, reverse, and the 16 colours (30–37/40–47 plus the bright
+        90–97/100–107)
+      - `CR`, `LF`, `BS`, `TAB`, `BEL` (ignored)
+
+      **Parameters are parsed generically**, so 256-colour and truecolour SGR become a match
+      arm rather than a reshape. They are not in this milestone: nothing emits them, and a
+      colour table nothing indexes is a guess.
+
+      **An unrecognised sequence is consumed and dropped, never printed.** The `Discipline`'s
+      input parser learned this already — a stray sequence that leaks its bytes into the grid
+      is how a terminal ends up with `[0m` scattered through it.
+
+- [ ] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.**
+      A cell is a `char` plus an attribute set. The grid is fixed at 80×24 for this milestone
+      (see "Out of scope" — no resize until M6), with a scrollback ring above it.
+
+      The parts worth naming because they are where terminals are subtly wrong:
+
+      - **Wrapping is deferred-wrap**, not wrap-on-write: writing to the last column leaves
+        the cursor *on* it with a pending-wrap flag, and the next character wraps. Writing
+        exactly 80 characters and then a newline must not produce a blank line, and the
+        naive implementation does.
+      - **Scroll moves lines into scrollback**, and the scrollback is a ring with a bound.
+      - **The cursor is clamped**, not wrapped, by cursor-addressing sequences: `CUP` past
+        the last row is the last row.
+
+- [ ] **A5 — the render, and `libterm::reference`.**
+      `render(grid, font, &mut fb, damage)` — cells to pixels, with a block cursor. Cell
+      metrics come from the font's advance, so the grid's pixel size is derived rather than
+      assumed.
+
+      **Damage is per-cell-row**, which is the whole point of doing this in a crate that
+      knows about cells: a keystroke dirties one row, and the union of dirty rows is the
+      rectangle that reaches `Commit`. A terminal that repaints its window per keystroke is
+      the thing the toolkit's diff exists to avoid, one layer up.
+
+      `libterm::reference` is the fixed grid the display gate compares: every attribute, a
+      wrapped line, a cursor, and content varying in both axes.
+
+- [ ] **A6 — the input encoder: key events → bytes.**
+      The direction nothing in the plan mentioned, and half of what a terminal *is*. `nxterm`
+      receives `KeyEvent { keycode, pressed, modifiers }`; `nxsh` expects bytes.
+      `libinput::keymap::to_char` covers text keys and stops there. What is missing is
+      control (`Ctrl-C` → `0x03`), the arrows (`ESC [ A`), Home/End/Delete, Enter → `\r`, and
+      Backspace → `0x7f`.
+
+      **It lives in `libterm`, beside the parser**, so one crate owns both directions of the
+      terminal's byte protocol — and that gives the test that would otherwise not exist:
+      **round-trip.** `tty_server::Discipline` already parses input escape sequences, because
+      a serial terminal sends them. So `Discipline::feed(encode(Up))` must yield `Up`. Two
+      independently-written halves of one wire, checked against each other rather than each
+      against my belief about it.
+
+### Part B — `nxterm`, the terminal client
+
+- [ ] **B1 — the window and its chrome.**
+      A `libui` tree: `menu_bar` docked top, `scrollbar` docked right, the grid filling the
+      rest. This is M4's widget set having its first real user, and the point at which
+      "bounded by what the terminal needs" gets audited — anything the terminal wants and the
+      toolkit lacks is a finding about M4, and belongs in the decision log as one.
+
+- [ ] **B2 — the grid as a `custom` widget.**
+      By the plan's own decision: a terminal's selection, wrapping and scrollback semantics
+      are not a text editor's. The `custom` node's paint callback draws A5's render; its
+      `on_key` takes raw key events and hands them to A6's encoder.
+
+- [ ] **B3 — scrollback wiring.**
+      The scrollbar's offset drives the grid's view. **Any keystroke snaps back to the
+      bottom**, which is what every terminal does and what makes scrollback usable rather
+      than a trap.
+
+      Mouse-wheel scrolling is *not* in this part: `PointerEvent` reserves `kind` for scroll
+      and nothing produces one yet. The scrollbar is the milestone's answer; the wheel is
+      additive and lands when the driver emits `REL_WHEEL`.
+
+- [ ] **B4 — key repeat reaching the grid.**
+      Already built compositor-side in M4 Part C and never yet consumed by anything: the grid
+      is the first widget for which holding a key must repeat. Expected to be free; listed
+      because "expected to be free" is how M3's `KEY_REPEAT` shipped without a consumer.
+
+### Part C — the tty server's second backend
+
+This is the part with a real design question in it, and it is not "add a write path".
+
+- [ ] **C1 — the data flow inverts, and the pty is the shape.**
+      Today the tty server holds `/dev/console` and *reads keystrokes from the device*. In a
+      GUI terminal the keystrokes arrive at `nxterm` — a compositor client with a window and
+      focus — and the shell's output has to reach `nxterm` to be rendered. The server is no
+      longer next to the device; it is between two userspace processes.
+
+      Unix solves this with a pty: the emulator holds the master, the shell gets the slave,
+      and the kernel's line discipline sits between them. **Here the tty server *is* the line
+      discipline**, so the same shape falls out: `nxterm` supplies a channel and the server
+      uses it as that terminal's backend instead of the serial console. One line-discipline
+      implementation, which is the property `console-and-tty.md` built the backend seam for.
+
+      Concretely: one new op (`Tty::AttachBackend`, `0x0B06`), and `backend_write` stops being
+      a free function that calls `kprint` and becomes a method on a backend that is either
+      the serial console or a channel.
+
+- [ ] **C2 — the backend is per-session, and `session-mgr` chooses it.**
+      **Not per-terminal.** A session's programs each resolve their own `/dev/tty` — that is
+      stage 1c's model — and all of them must reach the *same* window, exactly as all of them
+      reach the same serial console today.
+
+      The tty server currently has a flat table of terminals with no session concept and an
+      implicit single backend; grouping terminals by session is genuine new structure and
+      should be planned as such rather than discovered.
+
+      **`session-mgr` spawns `nxterm` and registers it**, then spawns the shell as it always
+      has. That keeps the architecture's rule — supervisors spawn and bind, servers do not
+      self-register — where the Unix-shaped alternative (the terminal spawns its own shell)
+      would need `nxterm` to hold spawn authority and construct a namespace, which is
+      session-mgr's job and nobody else's.
+
+      **Both backends must keep working** (governing decision 3), so the choice is a session
+      property and the serial path stays the default until the GUI one is proven.
+
+- [ ] **C3 — what happens when the window closes.**
+      Naming it because it is the failure that will otherwise be found by hand: `nxterm`
+      exiting drops the backend channel, and every terminal in that session is left with a
+      backend that is gone. The server sees `PeerClosed` — the same signal that already ends
+      a terminal when its *holder* exits — and the answer is presumably to end the session's
+      terminals, but "presumably" is why it is a checkbox.
+
+### Decisions taken in this pass
+
+1. **`libterm`, not `libdraw`** — the plan's own line was wrong, for the reason A2 gives.
+2. **The input encoder exists at all** — it was absent from the plan, and it is half of what
+   a terminal does.
+3. **Antialiasing folds into Part A** rather than becoming a prerequisite: it is text work
+   and belongs with the text work.
+4. **The backend is per-session** rather than per-terminal, which follows from stage 1c's
+   "each program resolves its own terminal" and is not otherwise obvious.
+5. **80×24 fixed, no resize** — M6 owns move and resize, and a resizable grid is a different
+   reflow problem than a fixed one.
+
+### Out of scope, deliberately
+
+Each of these is a thing a mature terminal has, and each would be a guess made a milestone
+early:
+
+- **Selection and clipboard.** There is no clipboard anywhere in the system; inventing one
+  for a terminal would decide its design by accident. M6/M7.
+- **Resize and reflow.** M6 owns move/resize. Reflowing scrollback on resize is the hard part
+  of it and wants its own pass.
+- **The alternate screen buffer.** `vi` and `less` use it; neither exists.
+- **256-colour and truecolour SGR.** Nothing emits them. A3's generic parameters make them a
+  match arm.
+- **Cursor blink.** A static block cursor. Blink needs a timer in the client and buys
+  nothing the milestone is measured on.
+- **Job control.** Needs process groups, which do not exist and cannot be built on signals.
+  Unchanged from `console-and-tty.md`.
+
+### The deferral this milestone is most likely to fire
+
+**The Surface protocol has no loss marker.** If a session's outbox overflows, the compositor
+discards the oldest event and the client is never told. Its filed trigger is "the toolkit
+needing to resynchronise held-key state after one", and a terminal that silently drops a
+keystroke is the first thing anyone would notice. It stays deferred — the trigger is an
+*observed* overflow and none has happened outside a deliberately wedged test client — but if
+Part B drops input under load, the wire record lands there rather than being worked around.
 
 ## Milestone 6 — windows, ports, desktops
 
