@@ -28,15 +28,16 @@
 use libinput::keymap;
 use libkern::abi::{
     KEY_BACKSPACE, KEY_DELETE, KEY_DOWN, KEY_END, KEY_ENTER, KEY_ESC, KEY_HOME, KEY_INSERT,
-    KEY_LEFT, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_UP,
+    KEY_KPENTER, KEY_LEFT, KEY_PAGEDOWN, KEY_PAGEUP, KEY_RIGHT, KEY_UP,
 };
 use librsproto::surface::MOD_ALT;
 
 /// The most bytes one key press can produce.
 ///
-/// The longest today is `ESC [ 3 ~` at four, plus one for an `ESC` prefix from Alt. Eight
-/// leaves room for the modified cursor forms (`ESC [ 1 ; 5 A`) if they ever land, which is the
-/// only thing that would grow it.
+/// The longest reachable today is **four** — `ESC [ 3 ~`. Alt's `ESC` prefix never adds to it,
+/// because it is only applied to encodings that do not already begin with one. Eight leaves
+/// room for the modified cursor forms (`ESC [ 1 ; 5 A`) if they ever land, which is the only
+/// thing that would grow it.
 pub const MAX_ENCODED: usize = 8;
 
 /// The sequence a key sends when it is not a character, or `None` if it is one.
@@ -58,7 +59,13 @@ const fn sequence(keycode: u16) -> Option<&'static [u8]> {
         KEY_PAGEUP => b"\x1b[5~",
         KEY_PAGEDOWN => b"\x1b[6~",
         // Not a sequence, but not what the keymap says either — see the module docs.
-        KEY_ENTER => b"\r",
+        //
+        // **The keypad's Enter is the same key.** The PS/2 driver emits `KEY_KPENTER` for it
+        // and `libinput`'s table has no entry, so it encoded to nothing at all: on a full-size
+        // keyboard, finishing a command on the keypad did nothing and said nothing (PR #191
+        // review, finding 4). The rest of the keypad is a gap in `libinput`'s table rather than
+        // this encoder's, and is left there.
+        KEY_ENTER | KEY_KPENTER => b"\r",
         KEY_BACKSPACE => b"\x7f",
         KEY_ESC => b"\x1b",
         _ => return None,
@@ -84,9 +91,14 @@ pub fn encode(keycode: u16, modifiers: u16, out: &mut [u8]) -> usize {
     let mut n = 0;
 
     if let Some(seq) = sequence(keycode) {
-        // Alt does not prefix a sequence that already starts with `ESC`: `ESC ESC [ A` is not
-        // a thing any program parses, and the second `ESC` would cancel the first sequence in
-        // this crate's own parser.
+        // Alt does not prefix a sequence that already starts with `ESC`.
+        //
+        // **Not because this crate's parser would swallow it** — an earlier version of this
+        // comment said the second `ESC` cancels the first, and it does, after which the
+        // sequence parses perfectly well: `libterm::parse` reads `ESC ESC [ A` as a cursor-up.
+        // The hazard is the *input* consumer, which is what these bytes are actually for:
+        // through `tty_server::Discipline`, `ESC ESC [ A` types `[A` into the line
+        // (PR #191 review, finding 2).
         if alt && seq[0] != 0x1b {
             out[n] = 0x1b;
             n += 1;
@@ -109,7 +121,7 @@ pub fn encode(keycode: u16, modifiers: u16, out: &mut [u8]) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use libkern::abi::{KEY_LEFTSHIFT, KEY_SPACE, KEY_TAB};
+    use libkern::abi::{KEY_KPENTER, KEY_LEFTSHIFT, KEY_SPACE, KEY_TAB};
     use librsproto::surface::{MOD_CTRL, MOD_SHIFT};
 
     /// Encode and return the bytes.
@@ -212,6 +224,16 @@ mod tests {
     }
 
     #[test]
+    fn the_keypad_enter_is_the_same_key_as_the_main_one() {
+        // The PS/2 driver emits `KEY_KPENTER` and `libinput`'s table has no entry, so this
+        // encoded to nothing: on a full-size keyboard, finishing a command on the keypad did
+        // nothing and gave no sign the key existed.
+        assert_eq!(keymap::to_char(KEY_KPENTER, 0), None, "the keymap grew a keypad enter");
+        assert_eq!(enc(KEY_KPENTER, 0), alloc::vec![b'\r']);
+        assert_eq!(enc(KEY_KPENTER, 0), enc(KEY_ENTER, 0));
+    }
+
+    #[test]
     fn nothing_overruns_the_buffer() {
         // `MAX_ENCODED` is a claim about the longest encoding, and a wrong one is an overrun
         // rather than a wrong answer. Swept over every keycode the tree names, with every
@@ -252,23 +274,36 @@ mod tests {
     }
 
     #[test]
-    fn a_sequence_the_discipline_does_not_know_leaks_nothing_into_a_line() {
-        // The other half of the round trip, and the more important one for a shell: `Home` is
-        // not a key the discipline acts on, so it must be *consumed* rather than accumulated
-        // into the line being edited. A terminal that leaked it would put `[H` in someone's
-        // command.
+    fn no_sequence_this_encodes_leaks_into_a_line() {
+        // The other half of the round trip, and the more important one for a shell: a key the
+        // discipline does not act on must be *consumed* rather than accumulated into the line
+        // being edited. A terminal that leaked one would put `[H` in someone's command.
+        //
+        // **Swept over every key this module encodes**, which the first version was not: it
+        // probed `Home` alone, stated the general claim in its name, and passed — because
+        // `ESC [ H` is three bytes and the discipline consumed exactly one after `ESC [`. The
+        // four `~` forms are four bytes, and the `~` was typed and echoed. Delete then
+        // `list /bin` handed the shell `~list /bin` (PR #191 review, finding 1).
         use tty_server::{Discipline, Step};
 
-        let mut d = Discipline::new();
-        for b in enc(KEY_HOME, 0) {
-            d.feed(b);
-        }
-        for b in b"hi" {
-            d.feed(*b);
-        }
-        match d.feed(b'\r') {
-            Step::Line { bytes, .. } => assert_eq!(bytes, b"hi", "the sequence leaked into the line"),
-            other => panic!("expected a line, got {other:?}"),
+        for key in [
+            KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_HOME, KEY_END, KEY_INSERT, KEY_DELETE,
+            KEY_PAGEUP, KEY_PAGEDOWN,
+        ] {
+            let mut d = Discipline::new();
+            for b in enc(key, 0) {
+                d.feed(b);
+            }
+            for b in b"hi" {
+                d.feed(*b);
+            }
+            match d.feed(b'\r') {
+                Step::Line { bytes, echo } => {
+                    assert_eq!(bytes, b"hi", "keycode {key} leaked into the line");
+                    assert_eq!(echo, b"\r\n", "keycode {key} echoed part of its sequence");
+                }
+                other => panic!("keycode {key}: expected a line, got {other:?}"),
+            }
         }
     }
 }

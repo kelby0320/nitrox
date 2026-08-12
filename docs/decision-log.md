@@ -13968,3 +13968,55 @@ shell that is not a byte stream at all.
 That last option is worth noticing, because this system has one. The shell could read key
 events from a channel rather than characters from a terminal — which is a real design fork, not
 an obvious win, and belongs to whoever picks the item up rather than to this part.
+
+## 2026-08-12 — Review of #191: the round-trip test found a live bug in the crate it round-trips against
+
+The encoder's blocking finding is the best argument yet for putting both directions of a wire
+where one test can hold them — and for the difference between probing an invariant and sweeping
+it.
+
+### Four of eleven sequences corrupted the command line
+
+`Discipline`'s CSI state consumed **exactly one byte** after `ESC [` and called the sequence
+over. Right for `ESC [ A`; wrong for every sequence with a parameter. `ESC [ 3 ~` — Delete on
+every real terminal — ended at the `3`, and the `~` landed in the ground state as printable
+ASCII, so it was pushed onto the line *and echoed*. Press Delete, type `list /bin`, press
+Enter, and the shell is handed `~list /bin`.
+
+**This has been live over the serial console since the discipline was written**, not merely
+latent for Part B: a host terminal sends `ESC [ 3 ~` for Delete today. The comment on the arm
+that did it read "recognised as *ended*, so the sequence cannot leak into the line" — a claim
+about behaviour, sitting directly above the code that made it false.
+
+### I probed the invariant with the one key that passes
+
+My test was named `a_sequence_the_discipline_does_not_know_leaks_nothing_into_a_line` — a
+general claim — and fed it `Home`, which is `ESC [ H`, three bytes, the one shape that works.
+The four `~` forms were added in the same commit and never fed to it.
+
+This is the third time in this milestone: A3's parameter-byte range, A4's `CUP 99` where the
+modulo and the clamp agree, and now this. **A rule stated over a set wants a test over the
+set.** The test now sweeps every key the encoder produces, and it asserts the echo as well as
+the line, because a leaked `~` is visible before it is submitted.
+
+The PR description even recorded the hazard — "I picked the one `Discipline` will silently drop
+rather than half-recognise" — for `Home`, and did not apply the same reasoning to the four keys
+added beside it. Seeing a hazard for one case is not the same as checking the case next to it.
+
+### A justification that pointed at the wrong parser
+
+The comment explaining why `Alt` does not double an `ESC` said the second one "would cancel the
+first sequence in this crate's own parser". It cancels, and then the sequence parses fine —
+`libterm::parse` reads `ESC ESC [ A` as a cursor-up. The real hazard is the *input* consumer,
+which is what these bytes are for: through `Discipline`, `ESC ESC [ A` types `[A` into the line.
+
+The behaviour was right and the stated reason was wrong, which is the same failure as the
+`+ 127` in `Rgb::blend` — and it had already been copied into two other documents by the time
+the review caught it.
+
+### Keypad Enter did nothing at all
+
+`KEY_KPENTER` is absent from `libinput`'s table and was absent here, so on a full-size keyboard
+finishing a command on the keypad did nothing and gave no sign the key existed. One line, beside
+`KEY_ENTER`, so the "a terminal sends `\r`" rule stays in one place rather than being split
+between a keymap and an override.

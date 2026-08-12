@@ -775,9 +775,18 @@ context menu near a window edge, or a combo box in a small dialog.
       End and Delete need their own assertions against the sequences a real terminal emits.
 
       Built with **a second round-trip that turned out to matter more**: a sequence the
-      discipline does *not* know — `Home` — must be consumed rather than accumulated into the
-      line being edited, or a terminal puts `[H` in someone's command. That is the same
-      never-leak invariant as A3's, checked from the other end.
+      discipline does *not* know must be consumed rather than accumulated into the line being
+      edited, or a terminal puts `[H` in someone's command. That is the same never-leak
+      invariant as A3's, checked from the other end.
+
+      **And it found a live bug in `tty-server`.** The first version of that test probed `Home`
+      alone and passed, because `ESC [ H` is three bytes and the discipline consumed exactly one
+      after `ESC [`. The four `~` forms are four bytes: `ESC [ 3 ~` ended at the `3` and the `~`
+      was typed **and echoed** — press Delete, type `list /bin`, and the shell is handed
+      `~list /bin`. Live over the serial console since the discipline was written, because that
+      is what a host terminal sends for Delete; the old comment there claimed "the sequence
+      cannot leak into the line", which was the claim to check. `Discipline` now ends a CSI at
+      its *final* byte, and `ESC` restarts from inside one.
 
       **Three additions the plan did not name**, each because a keymap cannot express it and
       dropping it silently would be worse: `Escape` sends `0x1b`; `Insert`/`PageUp`/`PageDown`
