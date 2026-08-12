@@ -583,7 +583,7 @@ context menu near a window edge, or a combo box in a small dialog.
       than done as a fourth prerequisite because it belongs with the text work and host-tests
       alongside it.
 
-- [ ] **A2 — a new crate: `libterm`. Not `libdraw`.**
+- [x] **A2 — a new crate: `libterm`. Not `libdraw`.** ✅ 2026-08-12.
       The pre-existing line said "the text/ANSI render path, in `libdraw`". **That is the
       wrong home**, and this pass is where it gets corrected. `libdraw`'s own doc-comment
       calls it "the pixel layer: geometry, pixel formats, framebuffers, and compositing".
@@ -605,6 +605,23 @@ context menu near a window edge, or a combo box in a small dialog.
       Everything in A3–A4 is a function of values and host-tests in milliseconds, which is
       the same split that let `fs-server-ext4`'s ext4 parser and `nxsh`'s evaluator be tested
       without booting.
+
+      **Landed with the vocabulary A3 and A4 both need** (`userspace/libterm/src/cell.rs`),
+      because a crate with nothing in it is not an increment. Three decisions in it:
+
+      - **A cell stores a colour *name*, not a pixel.** `Colour::Ansi(Ansi::Red)` and
+        `Colour::Default`, resolved against a `Palette` at render time. Storing `Rgb` would
+        freeze the theme into the scrollback — re-theming would recolour new text only — and
+        `Default` is not a synonym for white: SGR 39 means "whatever the theme says".
+      - **The sixteen colours are named exhaustively** rather than held as a `u8` index, so the
+        supported set *is* the type and there are no 240 values every consumer needs a rule
+        for. 256-colour becomes a `Colour` variant when something emits one.
+      - **Bold brightens the foreground, and reverse swaps what results.** The order is the
+        whole of `Attributes::resolve`: a swap applied before resolution turns
+        default-on-default into default-on-default, so reverse video on default text — where a
+        shell actually uses it — would do nothing. Bold brightens because `libdraw` has one
+        font weight, so `SGR 1` would otherwise be invisible; a real bold face supersedes it.
+        Both orderings are host-tested and both fail when reversed.
 
 - [ ] **A3 — the output parser: bytes → grid operations.**
       A state machine over the byte stream: ground, ESC, CSI, and parameter accumulation.

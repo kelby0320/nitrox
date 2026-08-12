@@ -13595,3 +13595,55 @@ same time as the line and never separated from it. The check that would have cau
 is the one already routine for tests — **break it and see** — applied to the *reason* rather
 than the behaviour: delete the constant, and if everything still passes, the stated reason is
 not the real one.
+
+## 2026-08-12 — M5 A2: `libterm` exists, and a cell stores a colour's name
+
+The crate the planning pass moved out of `libdraw`, with the vocabulary A3's parser writes and
+A5's render reads. A crate with nothing in it is not an increment, so the two land together.
+
+### A cell stores a name, not a pixel
+
+`Colour` is `Default` or one of sixteen named `Ansi` values, resolved against a `Palette` only
+at render time. The obvious alternative — resolve at parse time and store `Rgb` in the cell —
+is smaller and wrong twice over:
+
+- It **freezes the theme into the scrollback.** Changing the palette would recolour text
+  written after the change and leave everything above it in the old one.
+- It **loses the distinction between "default" and "the colour the default happens to be".**
+  `SGR 39` means "whatever the theme says", not "white". A stored `Rgb` cannot say that, and
+  reverse video is where it shows: reversing default-on-default has to give the theme's
+  background drawn on its foreground.
+
+### The sixteen are named, not indexed
+
+`Ansi` has sixteen variants rather than wrapping a `u8`. An index admits 240 values the system
+does not have, and every consumer then needs a rule for them — clamp, wrap, or default — which
+is three places to get it wrong for a case that cannot occur. Sixteen variants make the
+supported set the type, and 256-colour becomes a `Colour` variant if something ever emits one.
+That is what the plan meant by "a match arm rather than a reshape", made concrete a part early.
+
+### Two orderings, and both of them are the test
+
+`Attributes::resolve` does bold-brightens then reverse-swaps, and the order is the whole
+function:
+
+- **Reverse swaps the *resolved* colours.** Applied to the named ones instead, `Default` and
+  `Default` exchange to `Default` and `Default` — reverse video on default text would do
+  nothing at all, which is precisely where a shell uses it (a selected line, a highlighted
+  match). The bug is invisible in any test that reverses two *named* colours.
+- **Bold brightens.** `libdraw` has one font weight, so a bold that changed nothing would make
+  `SGR 1` invisible, and shells emit it constantly. This is what xterm and VTE do when no bold
+  face is available; a real bold face supersedes it rather than joining it. Bold moves the
+  foreground only, and a `Default` foreground has no bright counterpart to move to — inventing
+  one would make `SGR 1` a theme change.
+
+Both orderings fail their tests when reversed, checked rather than assumed.
+
+### On sizing an assertion at a thing rather than a number
+
+`a_cell_is_no_bigger_than_it_needs_to_be` asserts `size_of::<Cell>() <= 8`. It is not a
+requirement — nothing breaks at 12 — and it is not there to catch a regression. It is there so
+that a field added to `Cell` without thinking shows up as a decision: 80×24 is 1,920 cells
+before scrollback, and the ring multiplies that by every retained line. An assertion that fails
+with "a cell is 12 bytes" asks a question, which is the most a test can usefully do about a
+judgement call.

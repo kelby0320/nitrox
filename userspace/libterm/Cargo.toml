@@ -1,0 +1,25 @@
+[package]
+name = "libterm"
+version = "0.1.0"
+edition = "2024"
+
+# Terminal semantics: the escape-sequence parser, the cell grid with its scrollback, the
+# render, and the key encoder. `docs/planning/display-arm-plan.md` Milestone 5 Part A.
+#
+# **Not in `libdraw`**, which the plan originally said and the M5 planning pass corrected.
+# `libdraw` is the pixel layer — geometry, formats, framebuffers, compositing. An escape-state
+# machine, a cell grid, scrollback and line wrapping contain no pixels; putting them there
+# would make the pixel layer know what a cursor is. This crate sits above `libdraw` exactly as
+# `libui` does, and reaches for it only in the render.
+#
+# **One crate for both directions of the wire.** The parser turns a program's bytes into grid
+# operations; the encoder turns a person's key events back into bytes. They are the two halves
+# of one protocol, and keeping them together is what lets a test send `encode(Up)` through
+# `tty_server::Discipline` and get `Up` back — two independently-written ends checked against
+# each other rather than each against someone's belief about the other.
+[dependencies]
+libdraw = { path = "../libdraw" }
+
+[lib]
+name = "libterm"
+path = "src/lib.rs"

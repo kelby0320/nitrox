@@ -291,6 +291,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     check_userspace_lib("libsurface")?;
     check_userspace_lib("libinput")?;
     check_userspace_lib("libui")?;
+    check_userspace_lib("libterm")?;
 
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
@@ -2200,6 +2201,16 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libui")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `libterm` host tests — terminal semantics, all of which are functions of values: the
+    // escape-sequence parser, the cell grid with its scrollback, and the key encoder. The
+    // reason the crate is not part of `libdraw` (`display-arm-plan.md` M5 A2).
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("libterm")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
