@@ -135,7 +135,7 @@ paragraph exists to prevent, one level up.
       release that has not arrived yet is not one that never will. Single buffering is
       refused at construction — with one buffer there is never anything to release.
 
-## Milestone 3 — input
+## Milestone 3 — input ✅ complete (2026-08-10)
 
 **Deliverable: a keystroke and a click injected by the harness reach a client and are reported
 back.**
@@ -493,10 +493,22 @@ Two gates, because they prove different things and one of them cannot be pixel-e
 `test-interactive` gains a GUI path alongside its serial one, and the harness's QMP input
 channel stops being a test-only affordance.
 
-### Prerequisites, before Part A
+### Prerequisite, before Part A
 
-Three items that Part B would otherwise force mid-flight. Two are wire changes, and right
-now there is exactly one real client and one toolkit written against the current shape.
+One item, not three. The first draft of this plan listed two protocol prerequisites and
+justified both on the premise that the terminal's menu is a compositor-level popup **window**.
+The toolkit says otherwise, in the widget this milestone is going to use:
+
+> The popup half of a menu is not here: **an open menu is a `stack` layer the application adds
+> over its content**, which needs the popup positioned under its item and is Milestone 5's
+> first real requirement for it.
+> — `userspace/libui/src/widget.rs`, `menu_bar`
+
+`widget-toolkit.md` §5 agrees, listing `stack`'s reason for existing as "menu popups over the
+grid". So as scoped, **`nxterm` creates exactly one window**, and neither protocol change is
+something this milestone forces. Both were dropped in review (PR #186); what M5 actually needs
+is an *offset within a stack*, which is a `libui` change and lives in Part B. See "Two
+prerequisites that were not" below for where those deferrals now stand.
 
 - [ ] **P1 — graduate `input-subsystem.md` and `widget-toolkit.md` to `architecture/`.**
       M4's last box, listed there and repeated here because it is a prerequisite rather than
@@ -505,33 +517,34 @@ now there is exactly one real client and one toolkit written against the current
       cold. A milestone that builds *on* the toolkit should not begin with the toolkit
       documented as hypothetical.
 
-- [ ] **P2 — `KeyEvent` and `PointerEvent` carry a window id.**
-      The filed trigger is "the first client with two windows", and a menu popup is exactly
-      that — it is created on its parent's connection, so both windows' input arrives on one
-      channel with nothing to attribute it by. M4 dodged this by giving `ui-testclient` two
-      *connections*; a terminal with a menu cannot.
+      The same pass fixes root `CLAUDE.md`'s own line, which still says the widget toolkit
+      does not exist — the file every session loads before it reads anything else, telling it
+      that `libui` is hypothetical, which is the specific harm this box exists to prevent.
 
-      Both records are shipped, so this is a wire break: `KeyEvent` 12 → 16 bytes,
-      `PointerEvent` 20 → 24. `FocusEvent` already carries one and is the shape to copy.
-      Doing it now costs updating `libsurface`, `libui::route` and two test clients; doing it
-      after Part B costs the terminal as well.
+### Two prerequisites that were not
 
-- [ ] **P3 — a popup can be positioned.**
-      `CreateWindow` carries a `parent` for popups and no position; every window is created
-      at (0,0), and `WindowStack::set_origin` has no caller outside tests. A menu that opens
-      on top of its own menu bar is not a menu.
+Recorded rather than deleted, because "why is this not being done" is the question a reader
+of the next milestone will have.
 
-      **The decision to take, not assume:** Wayland refuses client-chosen position for
-      toplevels and allows it for popups, via a *positioner* that describes an anchor
-      rectangle and a gravity so the compositor can flip the popup when it would fall off
-      screen. The cheap alternative is an absolute `(x, y)` on `CreateWindow` for popup roles
-      only. Recommendation is the cheap one **with the anchor kept in the record** — position
-      relative to the parent, plus the parent's id it already carries — because that is what
-      lets the compositor clamp a popup to the screen later without a second wire change, and
-      clamping is the whole reason the positioner exists.
+**`KeyEvent` and `PointerEvent` still do not carry a window id, and M5 does not fire the
+trigger.** The filed trigger is "the first client with two windows"; `nxterm` has one. The
+record is structurally incomplete — a session *can* hold several windows and input cannot be
+attributed — but a wire break with no client that needs it is speculative work, and this
+project defers on triggers rather than on cost curves. **Corrected trigger: the first client
+that genuinely holds two compositor windows**, which is a `Role::Dialog` or a popup that must
+escape its parent — M6 or M7. (The size in the first draft was also wrong: `KeyEvent` is
+**8 bytes**, four `u16`s, asserted at `librsproto/src/surface.rs`. Adding a `u32 window` takes
+it 8 → 12, not 12 → 16, and there are two spare bytes at offset 6 rather than four.)
 
-      Toplevel placement stays the compositor's. That is M6's subject and nothing here needs
-      it: one terminal window at the origin is the milestone.
+**A `Role::Popup` window still cannot be positioned**, and M5 does not need one. This leaves a
+real tension in the existing documents, which is worth naming rather than leaving for whoever
+hits it: `rsproto-surface-ops.md` says a popup "may extend beyond its parent's bounds; **a menu
+clipped to its window is not a menu**", while the toolkit makes M5's menu an in-window layer
+that is clipped to its window by construction. Both are right for their case, and the boundary
+between them is the thing to state: **a menu that fits inside its window is a `stack` layer; a
+menu that must escape it is a `Role::Popup`.** M5's terminal is 80×24 with a menu bar along its
+top, so its dropdowns fit. Trigger for the compositor path: the first menu that does not — a
+context menu near a window edge, or a combo box in a small dialog.
 
 ### Part A — terminal semantics, and the blend that unblocks antialiasing
 
@@ -622,16 +635,29 @@ now there is exactly one real client and one toolkit written against the current
 - [ ] **A6 — the input encoder: key events → bytes.**
       The direction nothing in the plan mentioned, and half of what a terminal *is*. `nxterm`
       receives `KeyEvent { keycode, pressed, modifiers }`; `nxsh` expects bytes.
-      `libinput::keymap::to_char` covers text keys and stops there. What is missing is
-      control (`Ctrl-C` → `0x03`), the arrows (`ESC [ A`), Home/End/Delete, Enter → `\r`, and
-      Backspace → `0x7f`.
 
-      **It lives in `libterm`, beside the parser**, so one crate owns both directions of the
-      terminal's byte protocol — and that gives the test that would otherwise not exist:
-      **round-trip.** `tty_server::Discipline` already parses input escape sequences, because
-      a serial terminal sends them. So `Discipline::feed(encode(Up))` must yield `Up`. Two
-      independently-written halves of one wire, checked against each other rather than each
-      against my belief about it.
+      **The gap is narrower than the first draft claimed, and the shape of it is the
+      interesting part.** `libinput::keymap::to_char` does *not* stop at text: it folds control
+      to the C0 range, so `Ctrl-C` is already `0x03`, and its doc says why ("the convention
+      every terminal expects"). What is genuinely missing is:
+
+      - **the arrows, Home, End, Delete** — absent from the `US` table entirely, and they are
+        escape sequences (`ESC [ A`) rather than characters, so they could not live in a
+        `keycode → u8` function anyway;
+      - **Backspace** — keycode 14, absent from the table, wants `0x7f`;
+      - **Enter** — present, but encoded `\n`, where a terminal wants `\r`.
+
+      **So `libterm`'s encoder delegates to `to_char` for the text-and-control half** and adds
+      the sequences and the two overrides on top. It does not reimplement the C0 fold: two
+      copies of that would silently disagree, and one of them is already tested.
+
+      **The round-trip test, stated honestly.** `tty_server::Discipline` parses input escape
+      sequences because a serial terminal sends them, so `Discipline::feed(encode(Up))` must
+      yield `Up` — two independently-written halves of one wire checked against each other.
+      But `Discipline`'s `Key` enum is exactly `Up` and `Down`, and its CSI state returns
+      `Step::None` for everything else, so **the round-trip covers two keys of the several this
+      adds**, byte at a time. It is worth having and it is not coverage of the encoder. Home,
+      End and Delete need their own assertions against the sequences a real terminal emits.
 
 ### Part B — `nxterm`, the terminal client
 
@@ -640,6 +666,24 @@ now there is exactly one real client and one toolkit written against the current
       rest. This is M4's widget set having its first real user, and the point at which
       "bounded by what the terminal needs" gets audited — anything the terminal wants and the
       toolkit lacks is a finding about M4, and belongs in the decision log as one.
+
+- [ ] **B1a — the menu's popup half, which is a `libui` change and not a protocol one.**
+      `menu_bar` shipped without it, and its doc names this milestone: "an open menu is a
+      `stack` layer the application adds over its content, which needs the popup positioned
+      under its item and is Milestone 5's first real requirement for it."
+
+      Today `arrange` gives every `Stack` layer the parent's whole rectangle — "overlays that
+      want to be smaller wrap themselves in a `Sized` or a `Padding`" — so a popup *can* be
+      placed with computed insets today, by having the application derive `left` from the menu
+      item's laid-out rect. That works and it is the thing §5 rejected when it ruled out
+      absolute positioning: a layout engine written in application code.
+
+      **The decision to take:** whether `libui` grows a way to offset a stack layer (an
+      `offset` node, or an anchor on `Stack`), or whether `nxterm` computes insets. The first
+      is a small toolkit addition that every later menu reuses; the second is free now and
+      duplicated by the second application that wants a dropdown. Recommendation is the
+      toolkit addition, because M4's governing rule is "the terminal decides how much toolkit
+      exists" and the terminal is deciding.
 
 - [ ] **B2 — the grid as a `custom` widget.**
       By the plan's own decision: a terminal's selection, wrapping and scrollback semantics
@@ -655,10 +699,15 @@ now there is exactly one real client and one toolkit written against the current
       and nothing produces one yet. The scrollbar is the milestone's answer; the wheel is
       additive and lands when the driver emits `REL_WHEEL`.
 
-- [ ] **B4 — key repeat reaching the grid.**
-      Already built compositor-side in M4 Part C and never yet consumed by anything: the grid
-      is the first widget for which holding a key must repeat. Expected to be free; listed
-      because "expected to be free" is how M3's `KEY_REPEAT` shipped without a consumer.
+- [ ] **B4 — key repeat reaching a *widget*.**
+      Repeat is generated compositor-side (M4 Part C) and **already has a consumer and a
+      gate**: `input-testclient` prints `win repeat code=` and `cargo xtask check-input`
+      asserts it before the key is released. The first draft of this plan said it had neither,
+      which was wrong.
+
+      What is genuinely new is the *widget* half: a `KEY_REPEAT` reaching the grid through
+      `libui::route` and being encoded like a press. Smaller than "prove the unproven
+      mechanism", and a different test — the existing one asserts delivery to a **window**.
 
 ### Part C — the tty server's second backend
 
@@ -685,9 +734,13 @@ This is the part with a real design question in it, and it is not "add a write p
       stage 1c's model — and all of them must reach the *same* window, exactly as all of them
       reach the same serial console today.
 
-      The tty server currently has a flat table of terminals with no session concept and an
-      implicit single backend; grouping terminals by session is genuine new structure and
-      should be planned as such rather than discovered.
+      The tty server currently has a flat `Vec<Tty>` with no session concept and an implicit
+      single backend; grouping terminals by session is genuine new structure and should be
+      planned as such rather than discovered. Two consequences to handle in the same change:
+      `drive_input` broadcasts `Ctrl-C` to *every* terminal precisely because it cannot tell
+      them apart, and a comment in `tty-server/src/main.rs` asserts "a session has one"
+      terminal — an assumption this part overturns, so it should be corrected rather than left
+      to contradict the code around it.
 
       **`session-mgr` spawns `nxterm` and registers it**, then spawns the shell as it always
       has. That keeps the architecture's rule — supervisors spawn and bind, servers do not
@@ -698,12 +751,16 @@ This is the part with a real design question in it, and it is not "add a write p
       **Both backends must keep working** (governing decision 3), so the choice is a session
       property and the serial path stays the default until the GUI one is proven.
 
-- [ ] **C3 — what happens when the window closes.**
-      Naming it because it is the failure that will otherwise be found by hand: `nxterm`
-      exiting drops the backend channel, and every terminal in that session is left with a
-      backend that is gone. The server sees `PeerClosed` — the same signal that already ends
-      a terminal when its *holder* exits — and the answer is presumably to end the session's
-      terminals, but "presumably" is why it is a checkbox.
+- [ ] **C3 — does one dead backend end all of that session's terminals?**
+      `console-and-tty.md` already answers the single-terminal case: a terminal ends when its
+      holder exits, via `PeerClosed`. The new question is the plural one — `nxterm` exiting
+      drops the backend, and every terminal in that session is left with nowhere to write.
+
+      The answer is presumably yes, end them: a terminal whose window is gone cannot be
+      interacted with, and leaving it alive gives the shell a `/dev/tty` that silently
+      discards. Stated as a question rather than asserted because the alternative — keep them
+      and let a replacement `nxterm` reattach — is what a session that survives its terminal
+      would want, and nothing yet says whether one should.
 
 ### Decisions taken in this pass
 
@@ -773,7 +830,7 @@ Filed shell items waiting on this arm:
 
 | Item | Waiting on |
 |---|---|
-| `TODO(history-pager)` — list-style reverse-search | A terminal that can address the cursor (M4) |
+| `TODO(history-pager)` — list-style reverse-search | A terminal that can address the cursor (**M5 Part A**, not M4 — corrected 2026-08-12; M4 built the toolkit, and cursor addressing is the ANSI parser) |
 | Shift-Enter continuation | Key events with modifiers (M3) |
 | The prompt's live `PipelineStatus` glyph | A redraw-capable surface (M4) |
 | Completion's *candidate list* UI | M4 (the engine itself is schema work, not display) |
