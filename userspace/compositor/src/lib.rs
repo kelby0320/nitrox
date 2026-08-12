@@ -102,7 +102,7 @@ pub enum StackError {
 ///
 /// **One fixed shape, not a protocol.** Per-client cursors — an I-beam over a terminal grid,
 /// a resize arrow on an edge — are a Surface addition and are deliberately not in this
-/// milestone ([`widget-toolkit.md`](../design/widget-toolkit.md) §9.3); a single arrow is what
+/// milestone ([`widget-toolkit.md`](../architecture/widget-toolkit.md) §9.3); a single arrow is what
 /// makes a menu usable by a person, which is Part C's bar.
 ///
 /// Two colours so it is visible against both: `#` is the body, `.` the outline, ` ` is
@@ -183,7 +183,7 @@ pub const REPEAT_INTERVAL_NS: u64 = 40_000_000;
 /// alternative is Wayland's — publish a rate and let every client run its own timer — which
 /// is better when clients disagree about what should repeat, a distinction nothing here makes
 /// yet, and costs every client a timer and a state machine
-/// ([`widget-toolkit.md`](../design/widget-toolkit.md) §9.2).
+/// ([`widget-toolkit.md`](../architecture/widget-toolkit.md) §9.2).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct Repeat {
     /// The keycode being repeated.

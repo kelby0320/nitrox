@@ -287,7 +287,7 @@ fn block_device_server(suffix: &[u8], _requested: Rights) -> OpStatus {
 /// A non-numeric suffix, or an index no device answered for, is *not found*.
 ///
 /// **This binding is the authority to read one device unfiltered**, and it is meant for the
-/// `input-server` alone (`docs/design/input-subsystem.md` §5). That exclusivity is a
+/// `input-server` alone (`docs/architecture/input-subsystem.md` §5). That exclusivity is a
 /// constraint on whoever binds it, not a property of this code — the same gap the PR #176
 /// review found in `tty-server`'s precedent, where `session-mgr` still projects
 /// `/dev/console` into every session.

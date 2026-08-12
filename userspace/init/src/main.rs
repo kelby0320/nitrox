@@ -227,7 +227,7 @@ static mut SPAWN_DISPLAY: SpawnArgs = SpawnArgs {
 /// **It is the only process that should ever resolve the raw nodes.** They are bound in the
 /// root namespace and nowhere else, and no session namespace projects them — reading one
 /// unfiltered is a keylogger, and the binding is the whole of that boundary
-/// (`docs/design/input-subsystem.md` §5).
+/// (`docs/architecture/input-subsystem.md` §5).
 static mut SPAWN_INPUT_SERVER: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/input-server
     handle_count: 1,

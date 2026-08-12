@@ -146,7 +146,7 @@ affordable and not on a software renderer.
 
 ## 5. Input
 
-> **Elaborated, and one thing relocated.** [`input-subsystem.md`](input-subsystem.md) now
+> **Elaborated, and one thing relocated.** [`input-subsystem.md`](../architecture/input-subsystem.md) now
 > owns the mechanism, and every principle below survives it. The one correction: the
 > `KeyEvent` here is the **Surface-layer** event, compositor→client. The *device* layer
 > beneath it carries `InputEvent` triples, which have no modifiers field because shift and

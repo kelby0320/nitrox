@@ -1,18 +1,30 @@
-# Nitrox: The Widget Toolkit — Design Notes (v1)
+# Nitrox: The Widget Toolkit
 
-## Status
+**Status: built (2026-08-11), and this document describes what exists.** Milestone 4 built
+all of it: the retained tree and the declarative `view` (`userspace/libui/src/element.rs`),
+measure/arrange layout (`layout.rs`), the keyed diff that damage falls out of (`diff.rs`),
+per-buffer damage accumulation (`damage.rs`), event routing with implicit capture
+(`route.rs`), painting within a damage rectangle (`paint.rs`), and the widget set —
+`button`, `scrollbar`, `menu_bar`, and the `custom` escape hatch (`widget.rs`). Text is real
+TrueType through `libdraw::text`, rasterised from a font read off the root filesystem at
+runtime. `reference.rs` is the fixed picture `cargo xtask check-display` renders on the host
+and compares against the guest's screen pixel for pixel.
 
-**The rename is done; the toolkit is not.** As of M4 Part A the Surface-protocol client —
-window lifecycle, shared buffers, commit/release, and the input queue — is `libsurface`,
-and the name `libui` is reserved for the toolkit described here. There are no widgets, no
-layout, and no notion of focus inside a window. This document specifies the toolkit that
-[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4 builds, and the three
-things below it that Milestone 4 forces into existence. Settled with the maintainer
-2026-08-10.
+**What is specified here and not built**, each with its reason in place: the menu's **popup
+half** (§8 — an open menu is a `stack` layer, and positioning one is Milestone 5's first
+requirement for it), **theming** (§11), and the **text area** (§8, absent on purpose — the
+terminal's grid is a `custom` widget, so nothing yet needs one). Everything else below
+describes running code.
 
-**Companion documents.** [`display-substrate.md`](display-substrate.md) states the
+**Graduated from `design/` 2026-08-12**, as Milestone 5's first prerequisite. It sat in
+`design/` for a day after the code landed, which root `CLAUDE.md` tells every session to read
+as "not current behaviour" — so a fresh session was told the toolkit was hypothetical.
+Verified against source 2026-08-12. Design settled with the maintainer 2026-08-10; the
+reasoning below is unchanged from that pass except where marked.
+
+**Companion documents.** [`display-substrate.md`](../design/display-substrate.md) states the
 principles this rests on — client-side rendering, damage-rectangle commits, the compositor
-owning window focus. [`ui-composition-model.md`](ui-composition-model.md) owns what a window
+owning window focus. [`ui-composition-model.md`](../design/ui-composition-model.md) owns what a window
 *is*; this document owns what is inside one.
 [`input-subsystem.md`](input-subsystem.md) owns everything up to a `KeyEvent` arriving at a
 window; routing it to a widget starts here.
@@ -464,21 +476,39 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 
 ---
 
-## 12. Build order
+## 12. How it was built, and what building it changed
 
-Mapping onto [`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4:
+Milestone 4 of [`display-arm-plan.md`](../planning/display-arm-plan.md), in three parts, all
+landed by 2026-08-11:
 
-- **Part A** — `Element`, the diff with keyed identity (§3, §4), layout (§5), and painting
-  with per-buffer damage (§6). The whole of this is pure and host-testable; the crate
-  rename (§10) lands here because everything after it imports the new names. So does the
-  **user stack going 32 KiB → 8 MiB with a guard gap**, which is a filed deferral this
-  milestone triggers: a toolkit is recursive by construction, and the stack is demand-paged
-  so the size costs address space rather than memory
-  ([`deferred-decisions.md`](../rationale/deferred-decisions.md)).
-- **Part B** — event routing: pointer capture, widget focus and traversal, key bubbling
-  (§7) — plus §9.1's focus record, without which the second focus concept has no source.
-- **Part C** — the widget set (§8), plus §9.2 key repeat and §9.3 the cursor, which are what
-  make the set usable by a person rather than only by the harness.
+- **Part A** — `Element`, the keyed diff (§3, §4), layout (§5), and painting with per-buffer
+  damage (§6): pure and host-tested throughout. The crate rename (§10) landed here because
+  everything after it imports the new names, and so did the **user stack going 32 KiB →
+  8 MiB with a guard gap**, a filed deferral this milestone triggered — a toolkit is
+  recursive by construction, and the stack is demand-paged so the size costs address space
+  rather than memory.
+- **Part B** — event routing: pointer capture, widget focus and traversal, key bubbling (§7),
+  plus §9.1's focus record, without which the second focus concept had no source.
+- **Part C** — the widget set (§8), real TrueType glyphs, §9.2 key repeat and §9.3 the cursor,
+  and the font on the root filesystem.
 
-The gate throughout is the existing one extended: `cargo xtask check-input` already drives a
-real client through the compositor, and a toolkit client is the next thing it should drive.
+**Four places where the code diverged from this document, and the code won.** Recorded here
+because a reader comparing the two should know which corrections are already applied:
+
+- **`Element::on_key` returns `Option<Msg>`**, not `Msg`. §7.2's motivating example —
+  unhandled keys reaching the menu — was unreachable with a non-optional return, because
+  having a handler *meant* handling.
+- **Widget focus is an id, not a path.** A path breaks under exactly the reordering that keys
+  exist to survive. This document predates `Widget::id`, which Part A added.
+- **The compositor's `ENTER`/`LEAVE` are inputs to the router, not events it forwards.** Its
+  crossings are about windows and the toolkit's are about widgets; forwarding both handed a
+  widget two enters.
+- **Damage accumulates per buffer**, and §6.2 described that without saying which frame's
+  damage a newly-released buffer is charged.
+
+**The gate.** `cargo xtask check-input` injects a keystroke and a click and asserts both reach
+a *widget* through `route.rs`; `cargo xtask check-display` renders `libui::reference` on the
+host and compares it against the guest's screen pixel for pixel. That second gate found a
+defect on its first run — `Node::Fill` measured to the whole available space, so the first
+widget in a `Row` took it all and its siblings got none — which every widget test had missed
+by laying one widget into a rectangle of its own.

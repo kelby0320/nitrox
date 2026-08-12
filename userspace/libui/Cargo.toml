@@ -3,7 +3,7 @@ name = "libui"
 version = "0.1.0"
 edition = "2024"
 
-# The widget toolkit. `docs/design/widget-toolkit.md` is the design; the short version is a
+# The widget toolkit. `docs/architecture/widget-toolkit.md` is the design; the short version is a
 # **retained tree with a declarative face** — an application holds state and writes
 # `view(&state) -> Element`, and the runtime diffs that description against the tree it keeps.
 #

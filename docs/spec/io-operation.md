@@ -125,7 +125,7 @@ Char devices come in two flavours, and the difference is visible to a caller:
 - **Byte streams** — `/dev/console`. Exactly as above: any `length ≥ 1` is legal and
   any `result` in `1..=length` is a normal completion.
 - **Record streams** — `/dev/input/raw/<n>`, which carry fixed-size
-  [`InputEvent`](../design/input-subsystem.md) records. `length` is **floored to a
+  [`InputEvent`](../architecture/input-subsystem.md) records. `length` is **floored to a
   whole number of records**, and `result` is always a whole multiple of the record
   size. A `length` smaller than one record is **rejected synchronously** with
   `InvalidArgument` and creates no PO.

@@ -850,7 +850,7 @@ fn run_first_userspace() {
     //
     // **Bound into the root namespace only.** This is the authority to read one input
     // device unfiltered — a keylogger, if it reaches the wrong process — so no session
-    // namespace should ever project it (`docs/design/input-subsystem.md` §5).
+    // namespace should ever project it (`docs/architecture/input-subsystem.md` §5).
     let raw_input_binding_rights =
         Rights::READ | Rights::DUPLICATE | Rights::INSPECT | Rights::TRANSFER;
     if ns

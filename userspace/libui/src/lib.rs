@@ -2,7 +2,7 @@
 //!
 //! A **retained tree with a declarative face**: an application holds state and writes
 //! `view(&state) -> Element`, and the runtime diffs that description against the tree it
-//! keeps. See `docs/design/widget-toolkit.md` for why — the short version is that `view` is
+//! keeps. See `docs/architecture/widget-toolkit.md` for why — the short version is that `view` is
 //! a pure function, so it host-tests like everything else in this tree, and damage falls out
 //! of the diff rather than being remembered by each widget.
 //!
