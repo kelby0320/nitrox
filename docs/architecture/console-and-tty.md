@@ -1,9 +1,17 @@
 # Console and TTY
 
-**Status: stage 1a built (2026-08-03) — the server exists and `/dev/tty` is a capability.
-Its clients have not moved yet.** Written 2026-08-03 as a scoping pass, because "the console/tty
-server" is referenced as a gate in four documents without existing anywhere. This says what it
-owns, what it does not, and what has to be decided before it can be built.
+**Status: stages 1–3 built (2026-08-03).** The server exists, `/dev/tty` is a capability, and
+its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
+control is a request rather than a parameter, and the editing loop with history lives in the
+shell against the raw-read op. **Stage 4 — the compositor backend — is Milestone 5 Part C** of
+[`display-arm-plan.md`](../planning/display-arm-plan.md), planned 2026-08-12 and not built;
+job control and terminal emulation remain unbuilt. The Status line said "its clients have not
+moved yet" until 2026-08-12, contradicting the staging list in this same document, which had
+marked all three ✅ on the day they landed.
+
+Written 2026-08-03 as a scoping pass, because "the console/tty server" was referenced as a gate
+in four documents without existing anywhere. This says what it owns, what it does not, and what
+had to be decided before it could be built. Verified against source 2026-08-12.
 
 ## What exists today
 
