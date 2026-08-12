@@ -20,9 +20,21 @@ edition = "2024"
 # ends checked against each other rather than each against someone's belief about the other.
 [dependencies]
 libdraw = { path = "../libdraw" }
+# The keymap — keycode + modifiers to a character, control fold included. The encoder adds the
+# sequences a keymap cannot express and reimplements none of it.
+libinput = { path = "../libinput" }
+# `MOD_*`, and the keycode names, which are both type-level.
+librsproto = { path = "../librsproto" }
+libkern = { path = "../libkern" }
 # `ceilf` for cell metrics: `core` has no float transcendentals, and a font's line height is a
 # float that has to round *up* or a row of glyphs comes out a pixel short.
 libm = { version = "0.2", default-features = false }
+
+# `tty_server::Discipline` parses the input escape sequences this crate produces, so the two
+# ends of one wire can be checked against each other. A dev-dependency: nothing links the tty
+# server into a terminal, and Part C's direction of travel is the reverse of this one.
+[dev-dependencies]
+tty-server = { path = "../tty-server" }
 
 [lib]
 name = "libterm"

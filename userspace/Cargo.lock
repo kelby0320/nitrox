@@ -195,7 +195,11 @@ name = "libterm"
 version = "0.1.0"
 dependencies = [
  "libdraw",
+ "libinput",
+ "libkern",
  "libm",
+ "librsproto",
+ "tty-server",
 ]
 
 [[package]]
