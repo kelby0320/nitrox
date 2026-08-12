@@ -112,8 +112,18 @@ pub struct Palette {
 }
 
 impl Default for Palette {
-    /// A conventional dark palette, with `background` matching the toolkit's own clear colour
-    /// so a terminal does not flash against the chrome around it.
+    /// A conventional dark palette.
+    ///
+    /// `background` and `foreground` are **chosen to equal** `libui::paint::Theme::default()`,
+    /// so a terminal does not flash against the chrome around it — and **nothing enforces
+    /// that**. It is now the fourth copy of the literal (`libui`, `libdraw::scene`, the
+    /// compositor's clear colour, this), and retuning any one of them leaves the others where
+    /// they were. Stated as an intention rather than an invariant because it is one: `libterm`
+    /// and `libui` are siblings and neither may depend on the other, and putting a theme colour
+    /// in `libdraw` would make the pixel layer own a theme.
+    ///
+    /// It becomes checkable in A5, when `check-display` renders `libterm`'s reference grid and
+    /// `xtask` therefore sees both crates at once (PR #189 review, finding 6).
     fn default() -> Self {
         Self {
             ansi: [

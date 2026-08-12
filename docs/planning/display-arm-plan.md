@@ -655,13 +655,22 @@ context menu near a window edge, or a combo box in a small dialog.
       because that byte is usually the start of something valid and eating it turns one
       malformed character into two.
 
-      **Four bugs, all found by tests written before the code was believed** — which is the
-      part worth recording. A three-byte `ESC ( B` was swallowed as two, leaking a `B`; `ESC`
+      **Nine bugs in total**, four found by tests written before the code was believed and
+      five more by its review — and every one of the nine was the same invariant, *an
+      unrecognised sequence is consumed and never printed*, failing at a different byte. A three-byte `ESC ( B` was swallowed as two, leaking a `B`; `ESC`
       did not cancel a sequence in flight, so an interrupted program's replacement sequence
       printed as text; and a seventeen-parameter CSI indexed a sixteen-element array. The
       fourth arrived *with the fix for the second*: the ESC-restart went into the CSI state and
       not the intermediate one, and the test that checks **every** mid-sequence state rather
       than one caught it immediately.
+
+      The review found five more, all by sweeping where I had sampled: `:` was the one byte of
+      ECMA-48's parameter range with no arm, so colon-form SGR leaked; `OSC`/`DCS` introducers
+      were treated as two-byte escapes, so every window-title sequence dumped its payload;
+      an over-long UTF-8 encoding decoded to a *control character* and printed as a cell; a C0
+      control mid-CSI both lost the control and leaked the rest; and — found by the same sweep,
+      unprompted — `ESC [ 38;2;r;g;b m` read the colour's payload as ordinary codes and emitted
+      **two spurious `Reset`s**, silently clearing attributes with nothing visible to say so.
 
 - [ ] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.**
       A cell is a `char` plus an attribute set. The grid is fixed at 80×24 for this milestone

@@ -30,9 +30,10 @@ use crate::cell::{Ansi, Colour};
 
 /// The most operations one byte can complete.
 ///
-/// An `SGR` with a full parameter list is the only sequence that produces more than one, and
-/// [`MAX_PARAMS`] bounds it. Sized from that rather than guessed, the way `libinput`'s
-/// `MAX_PER_GROUP` is.
+/// Sized from the worst case rather than guessed, the way `libinput`'s `MAX_PER_GROUP` is: an
+/// `SGR` with a full parameter list, which [`MAX_PARAMS`] bounds. Two other paths produce more
+/// than one — a broken UTF-8 sequence emits a replacement *and* re-feeds the offending byte,
+/// and a C0 control inside a CSI executes in place — and both are bounded well below this.
 pub const MAX_PER_BYTE: usize = MAX_PARAMS;
 
 /// Parameters retained in one CSI sequence.
@@ -132,12 +133,19 @@ enum State {
     /// Inside a CSI this build does not implement — a private sequence such as `ESC [ ? 25 l`.
     /// Every byte is swallowed up to and including the final one.
     CsiIgnore,
+    /// Inside an `OSC`/`DCS`/`PM`/`APC` *string* sequence, whose payload runs until `BEL` or
+    /// `ST` (`ESC \\`) rather than until a final byte.
+    String,
+    /// `ESC` seen inside a string — `\\` ends it, anything else starts a new sequence.
+    StringEscape,
     /// Mid-character in a UTF-8 sequence.
     Utf8 {
         /// Bits decoded so far.
         acc: u32,
         /// Continuation bytes still expected.
         left: u8,
+        /// Smallest scalar this many bytes may legally encode — the shortest-form check.
+        min: u32,
     },
 }
 
@@ -162,6 +170,26 @@ impl Default for Parser {
 
 /// Replacement character, for a UTF-8 sequence that does not decode.
 const REPLACEMENT: char = '\u{FFFD}';
+
+/// Whether `c` is a C0 or C1 control, which has no glyph and must never reach a cell.
+const fn is_control(c: char) -> bool {
+    matches!(c, '\u{0}'..='\u{1F}' | '\u{7F}'..='\u{9F}')
+}
+
+/// The C0 control this build acts on, if any.
+///
+/// Shared by the ground state and the CSI state, which must agree: a control arriving
+/// mid-sequence is *executed* rather than dropped (see [`Parser::csi`]), and two copies of this
+/// mapping would be two chances for them to diverge.
+const fn c0_op(b: u8) -> Option<Op> {
+    Some(match b {
+        b'\r' => Op::CarriageReturn,
+        b'\n' => Op::LineFeed,
+        0x08 => Op::Backspace,
+        b'\t' => Op::Tab,
+        _ => return None,
+    })
+}
 
 impl Parser {
     /// A parser in the ground state.
@@ -191,6 +219,31 @@ impl Parser {
                 0
             }
             State::Csi => self.csi(b, out),
+            State::String => {
+                // **Swallowed to the terminator, not to a final byte.** `ESC ] 0 ; title BEL`
+                // is the most common escape sequence in the wild — every prompt that sets a
+                // window title emits one — and treating its introducer as a two-byte sequence
+                // dumps `0;title` into the grid on every redraw (PR #189 review, finding 2).
+                match b {
+                    0x07 => self.state = State::Ground,
+                    0x1B => self.state = State::StringEscape,
+                    _ => {}
+                }
+                0
+            }
+            State::StringEscape => {
+                if b == b'\\' {
+                    // `ST` — the proper terminator.
+                    self.state = State::Ground;
+                    0
+                } else {
+                    // A lone `ESC` inside a string is illegal, and this parser's rule
+                    // everywhere else is that `ESC` cancels and restarts. Applied here too, so
+                    // an unterminated string cannot swallow the rest of the session.
+                    self.state = State::Escape;
+                    self.escape(b)
+                }
+            }
             State::CsiIgnore => {
                 // Swallow to the final byte. A sequence abandoned halfway would spill its
                 // remaining bytes into the grid, which is the `[0m`-in-your-output failure.
@@ -201,7 +254,7 @@ impl Parser {
                 }
                 0
             }
-            State::Utf8 { acc, left } => self.utf8(b, acc, left, out),
+            State::Utf8 { acc, left, min } => self.utf8(b, acc, left, min, out),
         }
     }
 
@@ -219,27 +272,26 @@ impl Parser {
                 self.state = State::Escape;
                 return 0;
             }
-            b'\r' => Op::CarriageReturn,
-            b'\n' => Op::LineFeed,
-            0x08 => Op::Backspace,
-            b'\t' => Op::Tab,
-            // BEL, and every other C0 this build does not act on. Dropped rather than
+            // BEL and every other C0 this build does not act on are dropped rather than
             // printed: a control character rendered as a glyph is worse than a silent one.
-            0x00..=0x1F | 0x7F => return 0,
+            0x00..=0x1F | 0x7F => match c0_op(b) {
+                Some(op) => op,
+                None => return 0,
+            },
             0x20..=0x7E => Op::Print(b as char),
             // UTF-8. A lead byte starts a sequence; a stray continuation byte is a decoding
             // error on its own and becomes one replacement character rather than being
             // silently eaten, so a desynchronised stream shows up rather than shortening.
             0xC2..=0xDF => {
-                self.state = State::Utf8 { acc: (b & 0x1F) as u32, left: 1 };
+                self.state = State::Utf8 { acc: (b & 0x1F) as u32, left: 1, min: 0x80 };
                 return 0;
             }
             0xE0..=0xEF => {
-                self.state = State::Utf8 { acc: (b & 0x0F) as u32, left: 2 };
+                self.state = State::Utf8 { acc: (b & 0x0F) as u32, left: 2, min: 0x800 };
                 return 0;
             }
             0xF0..=0xF4 => {
-                self.state = State::Utf8 { acc: (b & 0x07) as u32, left: 3 };
+                self.state = State::Utf8 { acc: (b & 0x07) as u32, left: 3, min: 0x10000 };
                 return 0;
             }
             _ => Op::Print(REPLACEMENT),
@@ -263,6 +315,9 @@ impl Parser {
             // bytes, not two — swallowing two prints the third, which is how `\x1b(B` used to
             // leak a `B` into the grid.
             0x20..=0x2F => self.state = State::EscapeIntermediate,
+            // String introducers: `OSC`, `DCS`, `PM`, `APC`. Their payload is terminated by
+            // `BEL` or `ST`, not by their own second byte.
+            b']' | b'P' | b'^' | b'_' => self.state = State::String,
             // `ESC` and a final byte: `RIS`, keypad modes, `ESC 7`/`ESC 8`. None implemented
             // here; consumed whole.
             _ => self.state = State::Ground,
@@ -270,7 +325,7 @@ impl Parser {
         0
     }
 
-    fn utf8(&mut self, b: u8, acc: u32, left: u8, out: &mut [Op]) -> usize {
+    fn utf8(&mut self, b: u8, acc: u32, left: u8, min: u32, out: &mut [Op]) -> usize {
         if b & 0xC0 != 0x80 {
             // Not a continuation byte. The sequence is broken, and **the byte is re-fed**
             // rather than dropped: it is the start of something valid, and eating it would
@@ -281,14 +336,24 @@ impl Parser {
         }
         let acc = (acc << 6) | (b & 0x3F) as u32;
         if left > 1 {
-            self.state = State::Utf8 { acc, left: left - 1 };
+            self.state = State::Utf8 { acc, left: left - 1, min };
             return 0;
         }
         self.state = State::Ground;
-        // Surrogates and out-of-range values fail here; over-long encodings decode to a valid
-        // scalar and are not rejected, which is a security concern for a *filter* and not for
-        // a terminal that only draws the result.
-        out[0] = Op::Print(char::from_u32(acc).unwrap_or(REPLACEMENT));
+        // Surrogates and out-of-range values fail in `from_u32`. **Over-longs are rejected
+        // explicitly**, which an earlier version did not do on the grounds that they "decode to
+        // a valid scalar" — true, and the scalar can be a *control character*. `E0 80 9B`
+        // decoded to `U+001B` and was printed as a cell, bypassing the rule one branch up that
+        // drops the direct byte `0x1B` (PR #189 review, finding 3).
+        //
+        // Filtering the decoded scalar as well closes the class rather than that instance:
+        // `C2 9B` is a legal encoding of the 8-bit `CSI`, and printing *that* as a glyph is the
+        // same mistake with a valid encoding.
+        let c = match char::from_u32(acc) {
+            Some(c) if acc >= min && !is_control(c) => c,
+            _ => REPLACEMENT,
+        };
+        out[0] = Op::Print(c);
         1
     }
 
@@ -312,10 +377,34 @@ impl Parser {
                 }
                 0
             }
-            b';' => {
+            // `;` and `:` both advance to the next parameter. **`:` is a sub-parameter
+            // separator in ECMA-48**, not a different kind of byte, and it was the one value
+            // of the `0x30..=0x3F` parameter range with no arm here — so `ESC [ 38:2:255:0:0 m`
+            // fell to the malformed branch and leaked `2:255:0:0m` into the grid (PR #189
+            // review, finding 1). Treating it as a separator is an approximation — the
+            // sub-parameter grouping is lost — and it is enough for the one rule that matters:
+            // never leak.
+            b';' | b':' => {
                 self.count = self.count.saturating_add(1).max(2);
                 0
             }
+            // **A C0 control mid-sequence is executed, and the sequence continues.** That is
+            // what xterm does, and it is the only option of three that neither loses the
+            // control nor leaks the rest of the sequence: abandoning to `Ground` printed the
+            // remaining bytes, and swallowing to the final byte dropped the control (PR #189
+            // review, finding 7).
+            0x18 | 0x1A => {
+                // `CAN` and `SUB` cancel, which is their whole purpose.
+                self.state = State::Ground;
+                0
+            }
+            0x00..=0x17 | 0x19 | 0x1C..=0x1F => match c0_op(b) {
+                Some(op) => {
+                    out[0] = op;
+                    1
+                }
+                None => 0,
+            },
             // A private-parameter marker (`?`, `<`, `=`, `>`) means a sequence outside the
             // standard set — `ESC [ ? 25 l` hides the cursor, and this build has no cursor
             // visibility to hide. Swallowed to the final byte.
@@ -407,7 +496,22 @@ impl Parser {
         }
         let mut n = 0;
         for i in 0..self.count.min(MAX_PARAMS) {
-            let Some(effect) = Self::sgr_effect(self.param(i).unwrap_or(0)) else { continue };
+            let p = self.param(i).unwrap_or(0);
+            // **`38` and `48` stop the scan.** They introduce an extended colour whose
+            // sub-parameters this build does not implement, and whose *count* differs between
+            // the forms — `38;5;n`, `38;2;r;g;b`, and the ITU `38:2::r:g:b` with an empty
+            // colour-space slot. Reading past one misinterprets its payload as ordinary codes:
+            // `ESC [ 38;2;255;0;0 m` emitted **two spurious `Reset`s** from the two zeroes,
+            // silently clearing attributes a prompt had just set. That is worse than the leak
+            // in PR #189's finding 1, because nothing visible says it happened.
+            //
+            // Everything *before* the extended colour still applies; everything after is
+            // dropped. Implementing 256-colour turns this into a real parse rather than
+            // changing the shape.
+            if p == 38 || p == 48 {
+                break;
+            }
+            let Some(effect) = Self::sgr_effect(p) else { continue };
             out[n] = Op::Attr(effect);
             n += 1;
         }
@@ -467,6 +571,7 @@ mod tests {
             })
             .collect()
     }
+
 
     #[test]
     fn plain_text_is_printed_one_character_at_a_time() {
@@ -591,11 +696,115 @@ mod tests {
     }
 
     #[test]
+    fn every_byte_of_the_parameter_range_keeps_the_sequence_intact() {
+        // **Swept rather than sampled**, which is how PR #189's review found that `:` — the one
+        // value of ECMA-48's `0x30..=0x3F` parameter range with no arm here — fell to the
+        // malformed branch and leaked the rest of the sequence. The six hand-picked probes in
+        // `an_unknown_sequence_is_swallowed_whole` were all semicolon-form and missed it.
+        for b in 0x30u8..=0x3F {
+            let s = alloc::format!("a\x1b[1{}mZ", b as char);
+            assert_eq!(printed(&run(&s)), "aZ", "parameter byte {:#04x} leaked", b);
+        }
+        // The real sequences that byte appears in.
+        for seq in ["\x1b[38:2:255:0:0m", "\x1b[38:5:196m", "\x1b[4:3m", "\x1b[58:5:1m"] {
+            let ops = run(&alloc::format!("a{seq}Z"));
+            assert_eq!(printed(&ops), "aZ", "{seq:?} leaked");
+        }
+    }
+
+    #[test]
+    fn an_extended_colour_does_not_have_its_payload_read_as_codes() {
+        // The bug the sweep turned up beside the leak, and the worse of the two: `38`'s
+        // sub-parameters were read as ordinary SGR codes, so the two zeroes of an RGB triple
+        // became two `Reset`s — silently clearing attributes with nothing visible to say so.
+        assert_eq!(run("\x1b[38;2;255;0;0m"), alloc::vec![]);
+        assert_eq!(run("\x1b[48;5;0m"), alloc::vec![]);
+        // Codes *before* it still apply; codes after are dropped rather than misread.
+        assert_eq!(run("\x1b[1;38;2;0;0;0m"), alloc::vec![Op::Attr(Sgr::Bold)]);
+    }
+
+    #[test]
+    fn a_string_sequence_is_swallowed_to_its_terminator() {
+        // `ESC ] 0 ; title BEL` is the most common escape sequence in the wild — every prompt
+        // that sets a window title emits one — and treating its introducer as an ordinary
+        // two-byte escape dumped the payload into the grid on every redraw.
+        for seq in [
+            "\x1b]0;my title\x07",     // OSC, BEL-terminated
+            "\x1b]0;my title\x1b\\",   // OSC, ST-terminated
+            "\x1bP1;2q#0\x1b\\",       // DCS
+            "\x1b^private\x1b\\",      // PM
+            "\x1b_app\x1b\\",          // APC
+        ] {
+            assert_eq!(printed(&run(&alloc::format!("a{seq}Z"))), "aZ", "{seq:?} leaked");
+        }
+        // A payload containing what looks like a CSI final byte must not end it early.
+        assert_eq!(printed(&run("a\x1b]0;m[1H\x07Z")), "aZ");
+        // An unterminated string does not swallow the session: `ESC` restarts, as everywhere.
+        assert_eq!(
+            run("\x1b]0;oops\x1b[31mZ"),
+            alloc::vec![Op::Attr(Sgr::Foreground(Colour::Ansi(Ansi::Red))), Op::Print('Z')]
+        );
+    }
+
+    #[test]
+    fn a_control_character_never_reaches_a_cell_however_it_is_encoded() {
+        // The rule `ground` applies to a direct `0x1B` has to hold for an encoded one too.
+        // An over-long is the obvious hole; a *legal* encoding of a C1 control is the same
+        // mistake with valid input, which is why both are checked here.
+        for bytes in [
+            &b"\xE0\x80\x80"[..],     // over-long NUL
+            &b"\xE0\x80\x9B"[..],     // over-long ESC
+            &b"\xE0\x81\xBF"[..],     // over-long DEL
+            &b"\xF0\x80\x80\xA0"[..], // over-long space
+            &b"\xC2\x9B"[..],         // *legal* encoding of the 8-bit CSI
+            &b"\xC2\x80"[..],         // legal C1 PAD
+        ] {
+            let ops = run_bytes(bytes);
+            assert_eq!(ops.len(), 1, "{bytes:x?} produced {ops:?}");
+            match ops[0] {
+                Op::Print(c) => assert!(
+                    !is_control(c),
+                    "{bytes:x?} put control {c:?} in a cell"
+                ),
+                ref o => panic!("{bytes:x?} produced {o:?}"),
+            }
+        }
+        // And a shortest-form non-control still decodes normally.
+        assert_eq!(printed(&run_bytes(b"\xC3\xA9")), "\u{e9}");
+    }
+
+    #[test]
     fn a_malformed_csi_does_not_swallow_the_rest_of_the_stream() {
         // A byte that can appear in no CSI ends it. The alternative is a parser that eats
         // everything after one corrupt byte, which is a terminal that goes silent.
-        let ops = run("a\x1b[1\x01Zb");
-        assert_eq!(printed(&ops), "aZb", "the stream did not resynchronise");
+        //
+        // `0x7F` and anything above `0x7E` are the only such bytes now: C0 controls used to be
+        // here, and are executed in place since PR #189's review.
+        for bad in [0x7Fu8, 0x80, 0xFF] {
+            let mut s = alloc::vec::Vec::from(*b"a\x1b[1");
+            s.push(bad);
+            s.extend_from_slice(b"Zb");
+            assert_eq!(printed(&run_bytes(&s)), "aZb", "{bad:#04x} did not resynchronise");
+        }
+    }
+
+    #[test]
+    fn a_c0_control_inside_a_csi_executes_and_the_sequence_continues() {
+        // Three options and only one is right: abandoning to ground prints the rest of the
+        // sequence, swallowing to the final byte drops the control, and this loses neither.
+        assert_eq!(
+            run("\x1b[1\rm"),
+            alloc::vec![Op::CarriageReturn, Op::Attr(Sgr::Bold)],
+            "the carriage return was lost, or `m` leaked"
+        );
+        // **The parameter accumulates *across* the control**, so `1` and `2` are the one
+        // number 12 rather than two parameters. That is what "the sequence continues" means,
+        // and asserting `Bold` here instead would have been asserting a different design.
+        assert_eq!(run("\x1b[1\n2A"), alloc::vec![Op::LineFeed, Op::MoveBy { rows: -12, cols: 0 }]);
+        // `CAN` and `SUB` cancel instead — that is their purpose — and take the sequence with
+        // them without printing it.
+        assert_eq!(printed(&run("a\x1b[1\x18Zb")), "aZb");
+        assert_eq!(printed(&run("a\x1b[1\x1aZb")), "aZb");
     }
 
     #[test]

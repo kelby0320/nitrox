@@ -3,8 +3,9 @@ name = "libterm"
 version = "0.1.0"
 edition = "2024"
 
-# Terminal semantics: the escape-sequence parser, the cell grid with its scrollback, the
-# render, and the key encoder. `docs/planning/display-arm-plan.md` Milestone 5 Part A.
+# Terminal semantics. Built so far: the cell vocabulary (A2) and the escape-sequence parser
+# (A3). Still to come in Milestone 5 Part A — see `docs/planning/display-arm-plan.md` — the cell
+# grid with its scrollback (A4), the render (A5), and the key encoder (A6).
 #
 # **Not in `libdraw`**, which the plan originally said and the M5 planning pass corrected.
 # `libdraw` is the pixel layer — geometry, formats, framebuffers, compositing. An escape-state
@@ -12,11 +13,11 @@ edition = "2024"
 # would make the pixel layer know what a cursor is. This crate sits above `libdraw` exactly as
 # `libui` does, and reaches for it only in the render.
 #
-# **One crate for both directions of the wire.** The parser turns a program's bytes into grid
-# operations; the encoder turns a person's key events back into bytes. They are the two halves
-# of one protocol, and keeping them together is what lets a test send `encode(Up)` through
-# `tty_server::Discipline` and get `Up` back — two independently-written ends checked against
-# each other rather than each against someone's belief about the other.
+# **One crate for both directions of the wire**, once A6 lands. The parser turns a program's
+# bytes into grid operations; the encoder will turn a person's key events back into bytes. They
+# are the two halves of one protocol, and keeping them together is what will let a test send
+# `encode(Up)` through `tty_server::Discipline` and get `Up` back — two independently-written
+# ends checked against each other rather than each against someone's belief about the other.
 [dependencies]
 libdraw = { path = "../libdraw" }
 

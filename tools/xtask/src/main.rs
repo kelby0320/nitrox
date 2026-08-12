@@ -2204,9 +2204,10 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
-    // `libterm` host tests — terminal semantics, all of which are functions of values: the
-    // escape-sequence parser, the cell grid with its scrollback, and the key encoder. The
-    // reason the crate is not part of `libdraw` (`display-arm-plan.md` M5 A2).
+    // `libterm` host tests — terminal semantics, all of which are functions of values. Built
+    // so far: the cell vocabulary and the escape-sequence parser; the grid, the render and the
+    // key encoder follow in the rest of Milestone 5 Part A. The reason the crate is not part of
+    // `libdraw` (`display-arm-plan.md` M5 A2).
     run(Command::new("cargo")
         .arg("test")
         .arg("-p")

@@ -13706,3 +13706,58 @@ It is tested directly against the private accessor, with a comment saying why. T
 delete it, since the callers make it unreachable — makes the safety a property of *all present
 callers* rather than of the function, and the next one that loops to `count` reintroduces the
 panic.
+
+## 2026-08-12 — Review of #189: nine bugs, one invariant, and the difference between sampling and sweeping
+
+The parser shipped with four bugs I had found and five I had not. **All nine were the same
+invariant failing at a different byte** — *an unrecognised sequence is consumed and never
+printed*, which is what the module's doc-comment says it exists to guarantee.
+
+That is the useful shape. Not nine unrelated mistakes: one rule, and nine places the code did
+not implement it, in a function whose entire job is that rule.
+
+### Sampling found four; sweeping found five
+
+My tests probed six sequences I thought of. The review swept `0x30..=0x3F` one byte at a time
+and found `:` — the single value of ECMA-48's parameter range with no arm — falling through to
+the malformed branch and leaking `2:255:0:0m` into the grid from a colon-form SGR. My six
+probes were all semicolon-form.
+
+The same sweep, run locally to reproduce it, turned up a sixth the review had not claimed:
+`ESC [ 38;2;255;0;0 m` read the colour's payload as ordinary SGR codes, so the two zeroes
+became **two spurious `Reset`s**. That one is worse than any leak, because a leak is visible
+and this silently clears attributes a prompt has just set.
+
+**The lesson is not "test more".** It is that a rule stated over a *range* — every byte in
+`0x30..=0x3F` is a parameter byte — wants a test over the range, not over the members I
+happened to think about. The tests that already had this shape did their job:
+`escape_restarts_from_every_state` caught the fourth bug the moment the fix for the second
+landed, and it caught it because it loops rather than asserting the case I had in mind.
+
+### The other three, and what each is really about
+
+- **`OSC`/`DCS` introducers** were consumed as two-byte escapes. Their payload is terminated by
+  `BEL` or `ST`, not by a final byte — so `\e]0;user@host\a`, the most common escape sequence
+  in existence, dumped `0;user@host` on every prompt. Nothing in-tree emits one *today*, which
+  is exactly why it would have shipped: `nxterm` runs whatever a person runs.
+- **An over-long UTF-8 encoding decoded to a control character** and was printed as a cell.
+  `E0 80 9B` is `U+001B`, and `ground()` refuses the direct byte `0x1B` with a test asserting
+  it. The fix rejects over-longs *and* filters the decoded scalar, because `C2 9B` is a
+  perfectly legal encoding of the 8-bit `CSI` and printing that is the same mistake with valid
+  input. Closing the class rather than the instance.
+- **A C0 control inside a CSI** both lost the control and leaked the sequence. I had weighed
+  two options in a comment and picked the less bad one; xterm's answer is a third — execute the
+  control and stay in the sequence — which loses neither. A comment that weighs two options is
+  worth re-reading for the third.
+
+### On a claim I made across a crate boundary
+
+`Palette::default`'s comment said its background "matches the toolkit's own clear colour". True,
+and it is now the fourth copy of that literal with nothing enforcing it. `libterm` and `libui`
+are siblings and neither may depend on the other; putting a theme colour in `libdraw` would make
+the pixel layer own a theme. So the comment now says it is an *intention*, names the other three
+copies, and records that it becomes checkable in A5 — when `check-display` renders `libterm`'s
+reference grid and `xtask` sees both crates at once.
+
+A claim with no enforcement should say so. That is cheaper than either inventing a dependency or
+quietly hoping.
