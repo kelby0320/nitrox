@@ -623,7 +623,7 @@ context menu near a window edge, or a combo box in a small dialog.
         font weight, so `SGR 1` would otherwise be invisible; a real bold face supersedes it.
         Both orderings are host-tested and both fail when reversed.
 
-- [ ] **A3 — the output parser: bytes → grid operations.**
+- [x] **A3 — the output parser: bytes → grid operations.** ✅ 2026-08-12.
       A state machine over the byte stream: ground, ESC, CSI, and parameter accumulation.
       What it must handle is bounded by what `nxsh` and the coreutils actually emit, plus
       what a person's `Ctrl-L` needs:
@@ -642,6 +642,26 @@ context menu near a window edge, or a combo box in a small dialog.
       **An unrecognised sequence is consumed and dropped, never printed.** The `Discipline`'s
       input parser learned this already — a stray sequence that leaks its bytes into the grid
       is how a terminal ends up with `[0m` scattered through it.
+
+      **It emits operations rather than driving a grid.** `Parser::feed` returns `Op`s and
+      touches no state but its own, so A3 lands before A4 and an escape-sequence bug and a
+      wrapping bug cannot present identically. Attributes stay the *grid's* state — `SGR`
+      emits an effect and the grid applies it — because they are what `DECSC` saves and `RIS`
+      resets, and splitting them across two owners is how they end up disagreeing.
+
+      **UTF-8 decoding was added to this list** (it was not in the plan). `Cell.ch` is a
+      `char`, chosen in A2, so a parser that only ever produced ASCII would mean A2 picked the
+      wrong type. A broken sequence yields one `U+FFFD` and **re-feeds the offending byte**,
+      because that byte is usually the start of something valid and eating it turns one
+      malformed character into two.
+
+      **Four bugs, all found by tests written before the code was believed** — which is the
+      part worth recording. A three-byte `ESC ( B` was swallowed as two, leaking a `B`; `ESC`
+      did not cancel a sequence in flight, so an interrupted program's replacement sequence
+      printed as text; and a seventeen-parameter CSI indexed a sixteen-element array. The
+      fourth arrived *with the fix for the second*: the ESC-restart went into the CSI state and
+      not the intermediate one, and the test that checks **every** mid-sequence state rather
+      than one caught it immediately.
 
 - [ ] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.**
       A cell is a `char` plus an attribute set. The grid is fixed at 80×24 for this milestone

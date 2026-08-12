@@ -13647,3 +13647,62 @@ that a field added to `Cell` without thinking shows up as a decision: 80×24 is 
 before scrollback, and the ring multiplies that by every retained line. An assertion that fails
 with "a cell is 12 bytes" asks a question, which is the most a test can usefully do about a
 judgement call.
+
+## 2026-08-12 — M5 A3: the output parser, and four bugs the tests found first
+
+The escape-sequence state machine. Three design decisions and an observation about where its
+bugs were.
+
+### It emits operations rather than driving a grid
+
+`Parser::feed` returns `Op`s and touches no state but its own. The alternative — a parser
+holding a `&mut Grid` — fuses two state machines that fail differently: an escape-sequence bug
+and a wrapping bug would present identically, and neither could be tested without the other.
+This way A3 lands before A4 exists and each has tests that name what they are about.
+
+**Attributes stay the grid's state.** `SGR` emits an effect; the grid applies it. They are what
+`DECSC` saves and `RIS` resets, so an owner other than the terminal state would have to be kept
+in step with it — and a parser that also tracked attributes would be the second place they live.
+
+### UTF-8 was not in the plan and belongs here
+
+A2 made `Cell.ch` a `char`. If the parser only ever produced ASCII, that was the wrong type —
+so either A2 was wrong or A3 decodes UTF-8, and decoding is clearly right: `Print(b as char)`
+turns every multi-byte sequence into mojibake, which is worse than dropping it.
+
+The detail worth stating: a broken sequence yields one `U+FFFD` and **re-feeds the offending
+byte**. That byte is usually the start of something valid, and consuming it turns one malformed
+character into two — a stream that desynchronises then silently shortens, rather than showing a
+replacement character where the damage is.
+
+### Four bugs, and where they were
+
+Every one was found by a test written before I believed the code, and three were in the same
+place: **the boundary between "this sequence is over" and "the next byte is text"**.
+
+1. `ESC ( B` — a three-byte charset selection — was swallowed as two, so the `B` printed. The
+   exact failure the module's own doc-comment says it exists to prevent, written by the person
+   who wrote that comment.
+2. `ESC` did not cancel a sequence in flight. A program interrupted mid-sequence emits a fresh
+   one, and its `[31m` printed as text.
+3. A seventeen-parameter CSI indexed a sixteen-element array: a panic, from input any program
+   can send.
+4. **The fourth arrived with the fix for the second.** I put the ESC-restart in the CSI state
+   and not in the intermediate one — and the test I had just written checks *every*
+   mid-sequence state rather than one, so it failed on the same run.
+
+That fourth one is the argument for a particular test shape. `escape_restarts_from_every_state`
+loops over four prefixes instead of asserting the case I had in mind. Written as one case it
+would have passed, and the gap would have been found by someone whose charset-selecting program
+printed junk.
+
+### A defensive bound that no public test could reach
+
+Fixing bug 3 needed two changes: bound the `SGR` loop, and bound `param()`. With the loop fixed,
+`param()`'s bound is unreachable — the remaining callers read indices 0 and 1 — so breaking it
+changed nothing any public test observed. That is exactly the kind of bound that rots.
+
+It is tested directly against the private accessor, with a comment saying why. The alternative —
+delete it, since the callers make it unreachable — makes the safety a property of *all present
+callers* rather than of the function, and the next one that loops to `count` reintroduces the
+panic.
