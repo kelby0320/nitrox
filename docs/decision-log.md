@@ -13419,3 +13419,59 @@ because a link is a pointer rather than a claim — and `check-docs` requires th
 
 The distinction is worth stating because the sweep was one command and the two cases looked
 identical to it.
+
+## 2026-08-12 — Review of #187: a Status line is a claim, and I made it without doing the work
+
+The graduation PR's review found three false statements in `widget-toolkit.md`, and auditing
+the rest for the same defect found a fourth. All four are the same failure, and it is worth
+recording because the failure was **specific to graduating a document** rather than to writing
+one.
+
+### What promotion means, and what I did instead
+
+Moving a document from `design/` to `architecture/` promotes its whole body from "what this
+will be" to a current-behaviour contract. Root `CLAUDE.md` is explicit: if an `architecture/`
+doc disagrees with the source, the source wins and **the doc is a bug**.
+
+I rewrote both Status lines carefully — what exists, what does not, where each piece lives —
+verified the claims *in the Status line*, wrote "Verified against source 2026-08-12", and did
+not check the four hundred lines the Status line vouches for. The sentence I wrote was
+"everything else below describes running code". It did not.
+
+- §9.2 said "Held keys do not repeat" and §9.3 said "Nothing draws the pointer". Both were
+  built in M4 Part C — **which §12 of the same document says**, two hundred lines below.
+- §11 said "`libdraw`'s font is a bitmap", the day after `libdraw` grew a TrueType rasteriser,
+  and directly contradicting the Status line I had just written above it.
+- §2.1 said "the kernel and userspace take no external dependencies", in a PR whose own diff
+  touches the `Cargo.toml` that takes one.
+- **§2.2 describes an application runtime that does not exist** — found by auditing after the
+  review rather than by the review. Every piece of the loop is built; nothing owns the
+  sequence, and exactly one application wires the pieces, for a fixed picture with no `update`
+  and no message dispatch.
+
+The fourth is the one that matters most, because it is the document's statement of the
+programming model. It is now an open question with M5's terminal named as what will answer it,
+which is what it should have been all along.
+
+### The pattern, and it is not "check your facts"
+
+§9.1 got this exactly right. It opens: *"Built in M4 Part B; `rsproto-surface-ops.md` now
+specifies it, and that spec is the current contract. The rest of this section is the design as
+it was argued... not as a description of what is missing."* I wrote that banner during M4 and
+then did not write it twice more in the same section.
+
+So the knowledge was present and applied once. What was missing was a **pass** — the mechanical
+act of reading the body with "is this true today?" as the only question. I skipped it because
+the Status line felt like the deliverable, and the body felt like something I had already read.
+
+That is the same failure as PR #186's five wrong claims, one level up: there, writing from a
+model of the code instead of the code; here, vouching for a document from a model of the
+document. Both times the tell was the same — the thing felt already-known, so it did not get
+looked at.
+
+**The rule that follows, for the next graduation:** a document moving into `architecture/` gets
+read end to end against the source, and the diff shows edits in its *body*, not only its
+header. A graduation whose diff is a `git mv` plus a rewritten Status line has not been done —
+it has been asserted. Both Status lines now say the audit happened and what it found, because
+"Verified against source" is itself a claim in the diff and the reviewer was right to hold the
+merge over it.

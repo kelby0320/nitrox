@@ -10,17 +10,29 @@ TrueType through `libdraw::text`, rasterised from a font read off the root files
 runtime. `reference.rs` is the fixed picture `cargo xtask check-display` renders on the host
 and compares against the guest's screen pixel for pixel.
 
-**What is specified here and not built**, each with its reason in place: the menu's **popup
-half** (§8 — an open menu is a `stack` layer, and positioning one is Milestone 5's first
-requirement for it), **theming** (§11), and the **text area** (§8, absent on purpose — the
-terminal's grid is a `custom` widget, so nothing yet needs one). Everything else below
-describes running code.
+**What is specified here and not built**, each with its reason in place: the **application
+runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
+is the first application that will force the answer), the menu's **popup half** (§8 — an open
+menu is a `stack` layer, and positioning one is Milestone 5's first requirement for it),
+**theming** (§11), and the **text area** (§8, absent on purpose — the terminal's grid is a
+`custom` widget, so nothing yet needs one).
+
+Everything else below describes running code. Three sections carry a **banner** marking them as
+the design argument for something now built, rather than a description of a gap — §9.1 the
+focus record, §9.2 key repeat, §9.3 the cursor — and two bullets in §2.1 and §11 carry a
+parenthetical striking a claim that was true when written and is not now.
 
 **Graduated from `design/` 2026-08-12**, as Milestone 5's first prerequisite. It sat in
 `design/` for a day after the code landed, which root `CLAUDE.md` tells every session to read
 as "not current behaviour" — so a fresh session was told the toolkit was hypothetical.
-Verified against source 2026-08-12. Design settled with the maintainer 2026-08-10; the
-reasoning below is unchanged from that pass except where marked.
+
+**The body was audited against source line by line on 2026-08-12**, in the PR's review, after a
+first pass rewrote only this Status line and left the four hundred lines it vouches for
+unchecked. That pass shipped a document asserting that key repeat and the cursor did not exist,
+that `libdraw`'s font was a bitmap, that userspace took no external dependencies, and that a
+runtime existed which does not — while claiming to be verified. Design settled with the
+maintainer 2026-08-10; the reasoning below is unchanged from that pass except where a banner or
+a parenthetical says otherwise.
 
 **Companion documents.** [`display-substrate.md`](../design/display-substrate.md) states the
 principles this rests on — client-side rendering, damage-rectangle commits, the compositor
@@ -100,8 +112,14 @@ invalidation discipline is that failure mode by construction, and a derived one 
   is the same widget as the third child last time. §4 settles it, and gets it wrong loudly
   rather than quietly.
 - **More machinery than mutation**, for one application at first.
-- **It is a shape, not a port.** No ecosystem crate is involved; the kernel and userspace
-  take no external dependencies.
+- **It is a shape, not a port.** No ecosystem crate is involved — the toolkit is written here,
+  borrowing Elm's structure rather than any implementation of it.
+
+  (This bullet also asserted that "the kernel and userspace take no external dependencies",
+  which was true when it was written on 2026-08-10 and stopped being true the next day.
+  Userspace takes crates and the kernel does not; `userspace/CLAUDE.md` states the bar each one
+  clears, and `libdraw` takes `ab_glyph` and `libui` takes `libm` under it. The claim was never
+  the point being made here, and is struck rather than repaired.)
 
 ### 2.2 The application's loop
 
@@ -110,9 +128,21 @@ fn update(state: &mut App, msg: Msg);
 fn view(state: &App) -> Element<Msg>;
 ```
 
-The runtime owns everything else: wait for events, translate them to `Msg`, call `update`,
-call `view`, diff, paint the damage, commit. An application never touches a buffer, a
-damage rectangle, or the event queue.
+Everything else is: wait for events, translate them to `Msg`, call `update`, call `view`,
+diff, paint the damage, commit. An application should never touch a buffer, a damage
+rectangle, or the event queue.
+
+**The pieces of that loop are built and the loop itself is not.** `libui` has `Element` and
+`view`'s return type (§3), `Tree::update` for the diff (§4), `Router` for events (§7),
+`BufferDamage` for accumulation (§6.2) and `paint` (§6) — but there is no `libui` module that
+owns the sequence. An application wires them together, and so far exactly one does, for a
+fixed picture with no `update` and no `Msg` dispatch (`libui::reference`, which the display
+gate renders).
+
+Whether the loop becomes a `libui` runtime or stays the application's is **an open question
+this document should not pretend to have settled**, and Milestone 5's terminal is the first
+thing that will answer it: it is the first application with state, messages and a reason to
+re-`view`. The signatures above are the shape either answer takes.
 
 ---
 
@@ -346,13 +376,12 @@ knows better.
 
 They are described here because the toolkit cannot be designed without knowing their shape.
 
-**Where each is recorded**, because they are not all the same kind of thing and a reader
-closing the loop should not have to guess. Key repeat (§9.2) is a filed deferral in
-[`deferred-decisions.md`](../rationale/deferred-decisions.md). The focus record (§9.1, **built
-in M4 Part B**) and the cursor (§9.3, still a gap) are **recorded in the spec** —
-`rsproto-surface-ops.md` is where each is either specified or named as missing — not deferral
-entries. All three are scheduled by
-[`display-arm-plan.md`](../planning/display-arm-plan.md) Milestone 4.
+**All three are built** — the focus record in M4 Part B, key repeat and the cursor in Part C —
+and each section below carries a banner saying so before its design argument. Where each was
+*recorded* while it was still owed differed, and is worth keeping straight: key repeat was a
+filed deferral in [`deferred-decisions.md`](../rationale/deferred-decisions.md); the focus
+record and the cursor were gaps named in `rsproto-surface-ops.md`, which is now where the
+contract for all three lives.
 
 ### 9.1 The compositor must tell a client about focus
 
@@ -376,8 +405,14 @@ review). The implementation announces after every request instead, and compares.
 
 ### 9.2 Key repeat
 
-Held keys do not repeat. The record format already reserves `value == 2` for it
-([`input-subsystem.md`](input-subsystem.md) §3), so no wire change is needed.
+**Built in M4 Part C.** The compositor generates repeats: `Repeat::after_key` decides when one
+arms, `Repeat::due` advances it, and `KEY_REPEAT` (`value == 2`) reaches a widget through
+`libui::route`. `rsproto-surface-ops.md` is the current contract. The rest of this section is
+the design as it was argued, kept because it records *why* the compositor generates them — not
+as a description of what is missing.
+
+The record format already reserved `value == 2`
+([`input-subsystem.md`](input-subsystem.md) §3), so no wire change was needed.
 
 **The compositor generates repeats**, not each client, because it knows which window has
 focus and so can stop a repeat when focus moves with no client involvement. The alternative
@@ -385,32 +420,41 @@ is Wayland's: send clients a repeat *rate* and let each implement its own timer.
 better when clients differ in what they want repeated, which is a distinction nothing here
 makes yet, and it costs every client a timer and a state machine.
 
-**What this costs, stated accurately.** The outbox retry gave the serve loop a bounded wait,
-but it is armed *only while something is parked* — and a held key with an empty outbox is
-precisely the not-parked case. The loop also documents an invariant that repeat must break:
-"an idle compositor still sleeps indefinitely". So this is not "the timer is already there".
-It is a second deadline source `min`-ed with the retry one, per-focus-window held-key state,
-and re-deriving the deadline when focus moves. Small, but machinery — and saying otherwise
-would be the same class of error as the "eager mapping" cost this milestone already had to
-correct.
+**What it cost, stated accurately — and this was the estimate, which held.** The outbox retry
+gave the serve loop a bounded wait, but it is armed *only while something is parked*, and a
+held key with an empty outbox is precisely the not-parked case. So this was never "the timer is
+already there": it took a second deadline source `min`-ed with the retry one, held-key state,
+and re-deriving the deadline when focus moves. That is what was built. Two things the estimate
+did not foresee: focus validation is **self-enforcing** — `fire_repeat` checks the repeat's
+window is still the focus candidate, rather than clearing at every focus-moving site — and
+**modifiers must not arm a repeat**, which cost a bug found in review (holding Ctrl repeated it,
+and pressing Shift mid-run displaced the key that was actually held).
 
-Delay and rate are policy with no configuration surface yet: fixed initial delay, fixed
-repeat interval, both named constants with a note that a settings service owns them
-eventually.
+Delay and rate are policy with no configuration surface yet: `REPEAT_DELAY_NS` and
+`REPEAT_INTERVAL_NS` in the compositor, named rather than spelled inline so that a settings
+service owning them later is a change of provenance.
 
 ### 9.3 A cursor on screen
 
-Nothing draws the pointer. The compositor knows where it is; the screen does not show it.
-Tolerable for a gate that injects clicks at known coordinates, not for a person opening a
-menu.
+**Built in M4 Part C.** `WindowStack::present_into` composites the stack and then draws the
+pointer over every damage rectangle; `check-display` asserts it is on screen. The rest of this
+section is the design as it was argued — not as a description of what is missing.
 
-The compositor composites a fixed arrow after the window stack, and damages the union of the
-old and new cursor rectangles on every move. Per-client cursor shapes — a text I-beam over
+Before it, nothing drew the pointer: the compositor knew where it was and the screen did not
+show it. Tolerable for a gate that injects clicks at known coordinates, not for a person
+opening a menu.
+
+The compositor draws a fixed arrow after the window stack, and repaints both the old and the
+new cursor rectangles on every move — both, because the cursor is *drawn over* the composed
+stack rather than composited into it, so the pixels it covered are still on screen after it
+moves. That is also why `compose_into` is `pub(crate)` and `present_into` is the only way the
+server updates a region: three code paths recomposed without redrawing the pointer, and a click
+erased it until the mouse moved next. Per-client cursor shapes — a text I-beam over
 the grid, a resize arrow on an edge — are a protocol addition and are **not** in this
 milestone; a single arrow is what the terminal needs to be usable.
 
-Worth noting: this makes pointer motion damage the screen on every move, where today it
-damages nothing. The compositor's existing damage path handles it, but it is the first thing
+Worth noting: this makes pointer motion damage the screen on every move, where before it
+damaged nothing. The compositor's existing damage path absorbed it, but it is the first thing
 in the system that repaints because a person moved a mouse, and it is where the compositing
 loop's cost becomes visible.
 
@@ -425,9 +469,9 @@ elsewhere. Renamed in M4 Part A.
 So:
 
 ```
-libui        ← the toolkit: widgets, layout, focus, the diff   (new)
+libui        ← the toolkit: widgets, layout, focus, the diff
   ↓
-libsurface   ← window, buffers, events                          (today's libui, renamed)
+libsurface   ← window, buffers, events                (what `libui` used to be, renamed)
   ↓
 libdraw      ← pixels
 ```
@@ -462,9 +506,15 @@ Each of these would be reasonable in a mature toolkit and none is needed by the 
 - **Accessibility.** No accessible tree, no screen-reader surface. Worth stating plainly as
   a gap rather than leaving it unmentioned; retrofitting one is substantially harder than
   designing it in, and this is a deliberate deferral rather than an oversight.
-- **Text input methods, bidirectional text, complex shaping.** `libinput`'s keymap is
-  US-only and `libdraw`'s font is a bitmap. The whole text stack has one milestone's worth
-  of capability; the toolkit does not get ahead of it.
+- **Text input methods, bidirectional text, complex shaping.** `libinput`'s keymap is US-only,
+  with no dead keys and no compose sequences. The whole text stack has one milestone's worth of
+  capability; the toolkit does not get ahead of it.
+
+  (This said "and `libdraw`'s font is a bitmap", written the day before `libdraw` grew a real
+  TrueType rasteriser. Glyphs are `ab_glyph` at any size, from a font read off the root
+  filesystem at runtime; what the text stack still lacks is *shaping* — ligatures, bidi,
+  combining marks — which is a different thing from a rasteriser and is the thing this bullet
+  defers.)
 - **Subscriptions / async effects.** Iced's model for timers and streams. This system has a
   notification queue that would serve, but nothing needs it until an application wants to
   react to something other than input.

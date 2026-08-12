@@ -1,7 +1,8 @@
 # Nitrox: Input Subsystem
 
-**Status: built (2026-08-10), and this document describes what exists.** The whole path from
-an interrupt to a keystroke arriving in a widget runs on every boot:
+**Status: built — the device path in M3 (2026-08-10), the last two rows in M4 (2026-08-11) —
+and this document describes what exists.** The whole path from an interrupt to a keystroke
+arriving in a widget runs on every boot:
 
 | Stage | Where |
 |---|---|
@@ -30,6 +31,12 @@ was running on every boot. Verified against source 2026-08-12. Design settled wi
 maintainer 2026-08-06; the reasoning below is unchanged from that pass except where marked,
 and it remains the design `display-substrate.md` §5 sketched before there was any reason to
 think about a second input device.
+
+**The body was audited against source on 2026-08-12**, in the PR's review. Two claims of
+absence still stand and were re-checked rather than assumed: `session-mgr` does bind
+`/dev/console` into every session namespace unconditionally (§5's "the precedent this document
+leans on does not currently honour it"), and there is no userspace-facing interrupt syscall
+(§6).
 
 **Companion documents.** [`display-substrate.md`](../design/display-substrate.md) §5 states the
 principles this elaborates — key events not bytes, scancode→keycode in the kernel,
@@ -95,7 +102,7 @@ this system already does with the console.
 fed by COM1's receive interrupt — and a userspace resource server holds it *exclusively*
 and serves `/dev/tty`. Input is the same arrangement with more devices below it. That
 pattern is built, in use, and documented in
-[`console-and-tty.md`](../architecture/console-and-tty.md). This design reuses it almost
+[`console-and-tty.md`](console-and-tty.md). This design reuses it almost
 unchanged — with **one** deliberate departure, in §3a: the raw node's ring is event-granular
 rather than byte-granular, because a fixed-size record over a ring that drops single bytes
 desynchronises permanently.
@@ -252,9 +259,10 @@ layers away.
   `tty-server` holds `/dev/console` exclusively by convention: `session-mgr` still binds the
   raw device into *every* session namespace unconditionally, a bind left vestigial when the
   shell moved to `/dev/tty`. Nothing in the mechanism prevented it. The keylogging argument
-  below is only as true as the binding discipline, so Part B must **not** bind
-  `/dev/input/raw/*` anywhere but the input-server's namespace, and a session's `/dev`
-  projection must not carry it.
+  below is only as true as the binding discipline, so the raw nodes are bound **only** into
+  the input-server's namespace, and a session's `/dev` projection does not carry them. That
+  holds today: the kernel binds `/dev/input/raw/<n>` into the root namespace at boot, and
+  `init` hands the input-server a namespace handle through which it resolves them.
 - Holding `/dev/input/new` is the authority to receive merged input for the whole machine.
   The compositor has it. Nothing else does, which is what makes keylogging a namespace
   question rather than a permission check.
