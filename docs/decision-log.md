@@ -13871,3 +13871,50 @@ other, and a theme colour in `libdraw` would make the pixel layer own a theme.
 `xtask` links both, so the assertion lives there. It is an odd home for a colour test and it is
 better than a comment hoping two literals stay equal: retuning either side now fails a build.
 Verified by retuning one.
+
+## 2026-08-12 — Review of #190: a bug that was in neither half
+
+The blocking finding is worth an entry on its own, because it is a kind this project has not
+recorded before: **both parts were individually correct and the pair was wrong.**
+
+A4 reported no damage when the cursor moved, with a rationale written into the test —
+"the cursor is drawn by the render over whatever cell it sits on, so *moving* it dirties no
+cell". True of a design where the cursor is a separate overlay pass. A5 then drew the cursor
+**inside** `draw_cell`, which is simpler and makes the character under it readable — and which
+makes A4's sentence false.
+
+Neither change was wrong when it was made. The rationale was accurate when written and stopped
+being accurate two commits later, in the same PR, and nothing connected the two: A4's tests
+assert about a grid, A5's about pixels, and the failure only exists where the documented
+`take_damage` → `render_rows` pairing runs. A paragraph typed past the right margin would have
+left an inverted block at the end of every line.
+
+**The fix is the rule the compositor already follows.** `take_damage` reports the row the cursor
+left as well as the one it reached, for the same reason `repaint_cursor_move` repaints both
+rectangles: something drawn *over* a surface rather than composited into it owns both of its
+positions. That symmetry is worth noticing — the display arm has now met this at two layers,
+and both times the first version forgot the old position.
+
+**And the test is at the level the bug is.** Four tests catch it now, two on the grid and two
+driving the real pairing into a real framebuffer. The grid-level ones would have been enough to
+prevent it, but only the pixel-level ones would have *found* it, because the grid alone cannot
+say what "the cursor is drawn" means.
+
+### A rule documented three times and tested nowhere
+
+`blank()` keeps `REVERSE` while dropping `BOLD` and `UNDERLINE`, and that retention is the whole
+of "reverse, erase line paints a solid bar" — asserted in a doc comment, the decision log and
+the plan, and nowhere in a test. Deleting it left every test green.
+
+It is worse than an ordinary gap because `blank()`'s own summary says "a space in the current
+background, **with nothing else set**", which reads as though `REVERSE` goes too. A reader
+tidying the code to match its own summary would have removed a documented behaviour and seen a
+passing suite. Three prose statements of a rule are not one test of it.
+
+### Two claims that this PR made false
+
+Both from documentation not keeping up with the same PR's code: `Palette::default` still said
+the cross-crate colour claim was unenforced (this PR enforces it, and not by the mechanism the
+comment predicted), and `libterm::reference` claimed the display gate compares it (nothing
+renders it outside its own tests until Part B). Corrected in place — they were written in this
+branch, and the reviewer was right that the next reader would have believed them.

@@ -114,16 +114,16 @@ pub struct Palette {
 impl Default for Palette {
     /// A conventional dark palette.
     ///
-    /// `background` and `foreground` are **chosen to equal** `libui::paint::Theme::default()`,
-    /// so a terminal does not flash against the chrome around it — and **nothing enforces
-    /// that**. It is now the fourth copy of the literal (`libui`, `libdraw::scene`, the
-    /// compositor's clear colour, this), and retuning any one of them leaves the others where
-    /// they were. Stated as an intention rather than an invariant because it is one: `libterm`
-    /// and `libui` are siblings and neither may depend on the other, and putting a theme colour
-    /// in `libdraw` would make the pixel layer own a theme.
+    /// `background` and `foreground` **equal** `libui::paint::Theme::default()`'s, so a terminal
+    /// does not flash against the chrome around it — and since A5 that is **enforced**: a host
+    /// test in `xtask` fails the build if either side is retuned.
     ///
-    /// It becomes checkable in A5, when `check-display` renders `libterm`'s reference grid and
-    /// `xtask` therefore sees both crates at once (PR #189 review, finding 6).
+    /// `xtask` is an odd home for a colour assertion and it is the only one available.
+    /// `libterm` and `libui` are siblings, neither may depend on the other, and putting a theme
+    /// colour in `libdraw` would make the pixel layer own a theme; `xtask` links both. It also
+    /// did not need the display gate to grow a third region, which is what an earlier version
+    /// of this comment predicted the enforcement would wait for (PR #189 review, finding 6;
+    /// PR #190 review, finding 2).
     fn default() -> Self {
         Self {
             ansi: [

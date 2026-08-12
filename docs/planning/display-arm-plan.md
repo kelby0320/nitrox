@@ -732,6 +732,14 @@ context menu near a window edge, or a combo box in a small dialog.
       checked — `xtask` links both, and a host test there fails the build if either side is
       retuned.
 
+      **A5's review found the bug that lived between the two parts**: the render paints the
+      cursor *into* its cell, and A4 reported no damage when the cursor moved — so the row the
+      cursor left kept an inverted block. Each half was defensible alone; the pair was wrong,
+      and the grid test's own comment argued the opposite. `take_damage` now reports both the
+      row the cursor left and the one it reached, which is the rule the compositor already
+      follows for the pointer and for the same reason: something drawn *over* a surface rather
+      than composited into it owns both of its positions.
+
       Two more tests were passing for the wrong reason, both found by break-tests. The
       underline test parked the cursor on the underlined cell, so the cell was drawn *inverted*
       and filled with the foreground — the assertion passed on the inversion and stayed green

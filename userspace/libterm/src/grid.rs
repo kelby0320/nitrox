@@ -61,6 +61,12 @@ pub struct Grid {
     attrs: Attributes,
     /// Rows changed since [`Grid::take_damage`].
     dirty: Vec<bool>,
+    /// Where the cursor was when damage was last taken.
+    ///
+    /// The render paints the cursor **into its cell**, so moving it changes two cells' pixels
+    /// while changing no cell's *contents*. Remembering the reported position is what lets
+    /// [`take_damage`](Grid::take_damage) name the row that has to un-invert.
+    cursor_drawn: (usize, usize),
 }
 
 impl Default for Grid {
@@ -87,6 +93,7 @@ impl Grid {
             pending_wrap: false,
             attrs: Attributes::default(),
             dirty: vec![true; rows],
+            cursor_drawn: (0, 0),
         }
     }
 
@@ -129,7 +136,28 @@ impl Grid {
     /// **Per row, not one rectangle.** A keystroke dirties one row, and the render unions what
     /// it is given — so a grid that reported a bounding box would make a status line at the
     /// bottom and a prompt at the top repaint everything between them.
+    ///
+    /// **A moved cursor damages two rows**: the one it left and the one it arrived in. The
+    /// render paints the cursor by inverting the cell it sits on, so moving it changes pixels
+    /// in a cell whose *contents* did not change — and the row it left must repaint or the
+    /// inversion stays behind as a phantom block. That is the same rule the compositor follows
+    /// for the pointer, and for the same reason: something drawn *over* a surface rather than
+    /// composited into it owns both of its positions.
+    ///
+    /// An earlier version reported nothing for cursor movement, with a rationale that would
+    /// have held if the cursor were a separate overlay pass. A5 made it per-cell and the
+    /// rationale stopped being true — each half defensible, the pair wrong (PR #190 review).
+    ///
+    /// **Calling this means "I am about to draw these rows."** The cursor bookkeeping updates
+    /// here, so a caller that takes damage and does not render leaves the record ahead of the
+    /// screen — the same contract the dirty flags themselves have always had.
     pub fn take_damage(&mut self) -> Vec<usize> {
+        if self.cursor_drawn != (self.row, self.col) {
+            let (was_row, _) = self.cursor_drawn;
+            self.touch(was_row);
+            self.touch(self.row);
+            self.cursor_drawn = (self.row, self.col);
+        }
         let rows: Vec<usize> =
             self.dirty.iter().enumerate().filter(|(_, d)| **d).map(|(i, _)| i).collect();
         self.dirty.iter_mut().for_each(|d| *d = false);
@@ -562,6 +590,30 @@ mod tests {
     }
 
     #[test]
+    fn erasing_while_reversed_fills_with_the_foreground() {
+        // **`blank()` keeps `REVERSE` while dropping `BOLD` and `UNDERLINE`**, and that
+        // retention is the whole of "reverse, erase line paints a solid bar". It was documented
+        // in three places and asserted in none: adding `.without(Flags::REVERSE)` — deleting the
+        // behaviour outright — left every test green (PR #190 review, finding 4).
+        //
+        // Worse than an ordinary gap, because `blank()`'s own summary reads "a space in the
+        // current background, with nothing else set" — so a reader tidying the flags to match
+        // the summary would break a documented behaviour and see a passing suite.
+        let p = crate::cell::Palette::default();
+        let mut g = Grid::new(4, 1);
+        feed(&mut g, "\x1b[7m\x1b[2K");
+        let (fg, bg) = g.cell(0, 0).unwrap().attrs.resolve(&p);
+        assert_eq!(bg, p.foreground, "an erase under reverse did not paint a bar");
+        assert_eq!(fg, p.background);
+
+        // And without reverse it is the ordinary background, or the assertion above would hold
+        // for any erase at all.
+        let mut g = Grid::new(4, 1);
+        feed(&mut g, "\x1b[2K");
+        assert_eq!(g.cell(0, 0).unwrap().attrs.resolve(&p).1, p.background);
+    }
+
+    #[test]
     fn erase_in_line_covers_exactly_its_extent() {
         let mut g = Grid::new(6, 2);
         feed(&mut g, "abcdef\x1b[1;3H\x1b[K"); // cursor at column 2, erase to end
@@ -626,10 +678,16 @@ mod tests {
     #[test]
     fn damage_is_the_rows_that_changed_and_clears_when_taken() {
         let mut g = Grid::new(10, 4);
-        g.take_damage(); // drop the initial full-screen damage
-        feed(&mut g, "\x1b[3;1Hx");
+        feed(&mut g, "\x1b[3;1H");
+        g.take_damage(); // drop the initial full-screen damage *and* settle the cursor on row 2
+        feed(&mut g, "x");
         assert_eq!(g.take_damage(), alloc::vec![2], "only the written row should be dirty");
         assert_eq!(g.take_damage(), alloc::vec![], "damage was not cleared");
+
+        // Writing where the cursor already is stays one row; it is *moving* that costs two, and
+        // that is what the two tests below are about.
+        feed(&mut g, "y");
+        assert_eq!(g.take_damage(), alloc::vec![2]);
     }
 
     #[test]
@@ -664,14 +722,36 @@ mod tests {
     }
 
     #[test]
-    fn moving_the_cursor_alone_damages_nothing() {
-        // The cursor is drawn by the render over whatever cell it sits on, so *moving* it
-        // dirties no cell. A grid that damaged on movement would repaint a row per keystroke
-        // of a left-arrow, which is the cost the damage system exists to avoid.
+    fn moving_the_cursor_damages_the_row_it_left_and_the_one_it_reached() {
+        // **This test used to assert the opposite**, on the rationale that the render draws the
+        // cursor over whatever cell it sits on — which would hold if it were a separate overlay
+        // pass. A5 paints it *into* the cell, so the row the cursor left keeps an inverted
+        // block until something repaints it (PR #190 review, finding 1).
         let mut g = Grid::new(10, 4);
         g.take_damage();
-        feed(&mut g, "\x1b[2;5H\x1b[A\x1b[C");
+        feed(&mut g, "\x1b[2;5H");
+        assert_eq!(g.take_damage(), alloc::vec![0, 1], "left row 0, arrived in row 1");
+
+        // Within one row, one row.
+        feed(&mut g, "\x1b[C");
+        assert_eq!(g.take_damage(), alloc::vec![1]);
+
+        // And a cursor that did not move damages nothing, which is what keeps a still screen
+        // free.
         assert_eq!(g.take_damage(), alloc::vec![]);
+    }
+
+    #[test]
+    fn a_wrap_damages_the_row_the_cursor_left() {
+        // The ordinary print path, no cursor keys involved: `abcd` rests the cursor on the last
+        // column of row 0 (inverted), and `e` wraps it to row 1. Reporting only row 1 leaves a
+        // phantom block at the end of row 0 — one per line of any paragraph reaching the
+        // margin.
+        let mut g = Grid::new(4, 3);
+        feed(&mut g, "abcd");
+        g.take_damage();
+        feed(&mut g, "e");
+        assert_eq!(g.take_damage(), alloc::vec![0, 1], "the row the cursor left was not repainted");
     }
 
     #[test]

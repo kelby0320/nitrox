@@ -135,8 +135,21 @@ pub fn render_rows<F: Framebuffer + ?Sized>(
     origin: Point,
     rows: &[usize],
 ) {
+    render_each(fb, grid, font, m, palette, origin, rows.iter().copied());
+}
+
+/// The shared body of [`render`] and [`render_rows`].
+fn render_each<F: Framebuffer + ?Sized>(
+    fb: &mut F,
+    grid: &Grid,
+    font: &Font,
+    m: &Metrics,
+    palette: &Palette,
+    origin: Point,
+    rows: impl Iterator<Item = usize>,
+) {
     let (cursor_row, cursor_col) = grid.cursor();
-    for &row in rows {
+    for row in rows {
         for col in 0..grid.cols() {
             let Some(cell) = grid.cell(row, col) else { continue };
             let cursor = row == cursor_row && col == cursor_col;
@@ -154,16 +167,23 @@ pub fn render<F: Framebuffer + ?Sized>(
     palette: &Palette,
     origin: Point,
 ) {
-    let rows: alloc::vec::Vec<usize> = (0..grid.rows()).collect();
-    render_rows(fb, grid, font, m, palette, origin, &rows);
+    // Iterating rather than collecting a `Vec` of every index: a full repaint is not hot, and
+    // an allocation whose only purpose is to be immediately iterated is one a reader has to
+    // stop and think about.
+    render_each(fb, grid, font, m, palette, origin, 0..grid.rows());
 }
 
-/// The fixed grid the display gate compares, and the render of it.
+/// The fixed grid the display gate **will** compare, and the render of it.
 ///
 /// The same idea as [`libdraw::scene`] and `libui::reference`, for the third layer: both sides
 /// render *this* and compare pixel for pixel, so a target build that rasterises or lays out
 /// differently from the host shows up as a named pixel rather than as a picture someone has to
 /// judge.
+///
+/// **Nothing outside this module's own tests renders it yet.** `check-display` compares
+/// `libdraw::scene` and `libui::reference`; growing it a third region needs a guest-side client
+/// that draws a terminal, which is Part B. Until then this is a fixture with tests on it rather
+/// than a gate (PR #190 review, finding 3).
 pub mod reference {
     use super::*;
     use crate::parse::{MAX_PER_BYTE, Op, Parser};
@@ -256,6 +276,23 @@ mod tests {
         MemFramebuffer::new(Geometry::packed(s.w, s.h, PixelFormat::XRGB8888))
     }
 
+    /// Whether a cell is drawn *inverted* — the cursor's rendering.
+    ///
+    /// **Not "contains the foreground colour"**, which is what the first version of the phantom
+    /// test asked and which is true of any cell holding a glyph: ink is the foreground. An
+    /// inverted cell is foreground almost everywhere, so counting is what tells the two apart.
+    fn is_inverted(fb: &MemFramebuffer, r: Rect, p: &Palette) -> bool {
+        let mut fg = 0usize;
+        for y in r.origin.y..r.bottom() as i32 {
+            for x in r.origin.x..r.right() as i32 {
+                if fb.get_pixel(x as u32, y as u32) == Some(p.foreground) {
+                    fg += 1;
+                }
+            }
+        }
+        fg * 2 > (r.size.w * r.size.h) as usize
+    }
+
     /// Every distinct colour in a rectangle.
     fn colours(fb: &MemFramebuffer, r: Rect) -> alloc::vec::Vec<Rgb> {
         let mut v = alloc::vec::Vec::new();
@@ -330,10 +367,9 @@ mod tests {
         let mut fb = fb_for(&m, 2, 1);
         render(&mut fb, &g, &f, &m, &p, Point::new(0, 0));
 
-        let under_cursor = colours(&fb, m.cell_rect(0, 1));
         assert!(
-            under_cursor.contains(&p.foreground),
-            "the cursor cell is not filled with the foreground: {under_cursor:?}"
+            is_inverted(&fb, m.cell_rect(0, 1), &p),
+            "the cursor cell is not drawn inverted"
         );
         let elsewhere = colours(&fb, m.cell_rect(0, 0));
         assert!(elsewhere.contains(&p.background), "the non-cursor cell lost its background");
@@ -365,6 +401,63 @@ mod tests {
             Some(marker),
             "row 2 was drawn and should not have been"
         );
+    }
+
+    #[test]
+    fn the_damage_pairing_leaves_no_phantom_cursor() {
+        // **The bug that lived between A4 and A5**, and the level it had to be tested at.
+        // Each half was defensible on its own: the grid reported no damage for a cursor that
+        // moved, and the render painted the cursor into its cell. Driving the documented
+        // `take_damage` -> `render_rows` pairing is what shows the pair is wrong — a phantom
+        // inverted block left at the end of every line a paragraph wraps on.
+        let f = font();
+        let m = Metrics::new(&f, 16.0);
+        let p = Palette::default();
+        let mut g = Grid::new(4, 3);
+        let mut fb = fb_for(&m, 4, 3);
+
+        g.apply_all(&[Op::Print('a'), Op::Print('b'), Op::Print('c'), Op::Print('d')]);
+        let d = g.take_damage();
+        render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
+        assert!(is_inverted(&fb, m.cell_rect(0, 3), &p), "the cursor is not drawn where it rests");
+
+        // One more character wraps it to row 1.
+        g.apply(Op::Print('e'));
+        let d = g.take_damage();
+        render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
+        assert!(
+            is_inverted(&fb, m.cell_rect(1, 1), &p),
+            "the cursor did not appear on the row it wrapped to"
+        );
+        assert!(
+            !is_inverted(&fb, m.cell_rect(0, 3), &p),
+            "a phantom cursor block was left at the end of row 0"
+        );
+    }
+
+    #[test]
+    fn a_cursor_key_moves_the_block_on_screen() {
+        // Scenario A: no printing at all, just movement. The row the cursor left has to
+        // repaint or the block does not move.
+        let f = font();
+        let m = Metrics::new(&f, 16.0);
+        let p = Palette::default();
+        let mut g = Grid::new(4, 1);
+        let mut fb = fb_for(&m, 4, 1);
+
+        g.apply_all(&[Op::Print('h'), Op::Print('i')]);
+        let d = g.take_damage();
+        render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
+        assert!(is_inverted(&fb, m.cell_rect(0, 2), &p));
+
+        g.apply(Op::MoveBy { rows: 0, cols: -1 });
+        let d = g.take_damage();
+        render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &d);
+        assert!(
+            !is_inverted(&fb, m.cell_rect(0, 2), &p),
+            "the cursor block stayed where it was"
+        );
+        assert!(is_inverted(&fb, m.cell_rect(0, 1), &p), "the cursor did not arrive");
     }
 
     #[test]
@@ -435,6 +528,32 @@ mod tests {
     }
 
     #[test]
+    fn the_underline_clamp_keeps_a_tight_cell_in_bounds() {
+        // The clamp on the underline's `y` never engages for DejaVu at 16px — `ascent + 1` is
+        // comfortably inside the cell — so removing it fails nothing. That makes it *unproven*
+        // rather than redundant, which is the opposite of the bounds check removed from
+        // `render_rows`: a font whose line height equals its ascent reaches it.
+        //
+        // Constructed rather than found, because no font in the tree has those metrics.
+        let f = font();
+        let mut m = Metrics::new(&f, 16.0);
+        m.cell_h = m.ascent; // baseline flush with the bottom of the cell
+        let p = Palette::default();
+        let mut g = Grid::new(1, 2);
+        g.apply_all(&[
+            Op::Attr(Sgr::Underline),
+            Op::Print(' '),
+            Op::CarriageReturn,
+            Op::LineFeed,
+        ]);
+        let mut fb = fb_for(&m, 1, 2);
+        render_rows(&mut fb, &g, &f, &m, &p, Point::new(0, 0), &[0]);
+        // Row 1 was not drawn at all, so any ink there came from row 0's underline.
+        let row1 = colours(&fb, m.cell_rect(1, 0));
+        assert!(!row1.contains(&p.foreground), "the underline escaped its cell: {row1:?}");
+    }
+
+    #[test]
     fn the_reference_grid_exercises_what_it_claims() {
         // The gate compares pixels; this asserts the *picture* is worth comparing. A reference
         // that lost its attributes to a typo in `SOURCE` would still compare equal on both
@@ -497,3 +616,4 @@ mod tests {
         assert!(fb.geometry().pitch > fb.geometry().width as usize * 4);
     }
 }
+
