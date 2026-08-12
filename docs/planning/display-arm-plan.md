@@ -810,7 +810,8 @@ context menu near a window edge, or a combo box in a small dialog.
       "bounded by what the terminal needs" gets audited — anything the terminal wants and the
       toolkit lacks is a finding about M4, and belongs in the decision log as one.
 
-- [ ] **B1a — the menu's popup half, which is a `libui` change and not a protocol one.**
+- [x] **B1a — the menu's popup half, which is a `libui` change and not a protocol one.**
+      ✅ 2026-08-12 (the toolkit half; `nxterm`'s menu lands with B1).
       `menu_bar` shipped without it, and its doc names this milestone: "an open menu is a
       `stack` layer the application adds over its content, which needs the popup positioned
       under its item and is Milestone 5's first real requirement for it."
@@ -821,12 +822,24 @@ context menu near a window edge, or a combo box in a small dialog.
       item's laid-out rect. That works and it is the thing §5 rejected when it ruled out
       absolute positioning: a layout engine written in application code.
 
-      **The decision to take:** whether `libui` grows a way to offset a stack layer (an
-      `offset` node, or an anchor on `Stack`), or whether `nxterm` computes insets. The first
-      is a small toolkit addition that every later menu reuses; the second is free now and
-      duplicated by the second application that wants a dropdown. Recommendation is the
-      toolkit addition, because M4's governing rule is "the terminal decides how much toolkit
-      exists" and the terminal is deciding.
+      **Taken: the toolkit addition**, because M4's governing rule is "the terminal decides how
+      much toolkit exists" and the terminal is deciding. Two pieces, both small and both reused
+      by every later popup:
+
+      - **`offset(dx, dy, child)`** — a child shifted within its parent, at its own *measured*
+        size. §5 rules out absolute positioning for ordinary widgets, and that argument does
+        not reach a popup, whose whole definition is "here, under the item that opened it".
+        Like `Sized`, it changes its **own** rect rather than only its child's, or the
+        containment invariant `paint` uses to skip a subtree would not hold.
+      - **`locate(element, layout, key)`** — where a keyed element was laid out. Without it an
+        application computes the item's width from the font, which *is* the layout engine §5
+        refused, written in application code and wrong the moment a label changes.
+
+      A break-test removed one of these additions again: `Fingerprint::Offset` initially carried
+      `(dx, dy)` so that a moved popup would damage. It already did — `reconcile` damages on a
+      rect change and an offset *is* a rect change — so the field was dropped as redundant, the
+      same call as `libterm`'s `render_rows` bounds check. The test that found it stays, because
+      the property is worth holding whichever mechanism provides it.
 
 - [ ] **B2 — the grid as a `custom` widget.**
       By the plan's own decision: a terminal's selection, wrapping and scrollback semantics

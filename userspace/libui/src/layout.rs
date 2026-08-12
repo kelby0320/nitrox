@@ -129,6 +129,16 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
         // the widget set into one UI (`reference::view`) is what surfaced it.
         Node::Fill(_) => Size::new(0, 0),
         Node::Custom { size, .. } => *size,
+        // An offset child measures as itself: the shift moves it, it does not resize it. What
+        // the *parent* sees is the child's size plus the shift, so a `Stack` that sized itself
+        // to its layers would still contain the popup.
+        Node::Offset { dx, dy, child } => {
+            let inner = measure(child, c, m);
+            Size::new(
+                inner.w.saturating_add((*dx).max(0) as u32),
+                inner.h.saturating_add((*dy).max(0) as u32),
+            )
+        }
         Node::Sized { size, child } => {
             // Zero means unconstrained, so the child's own measure stands on that axis.
             let inner = measure(child, c, m);
@@ -184,9 +194,12 @@ pub fn measure<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, c: Constraints, m: &M
 
 /// Place `e` at `rect` and everything inside it.
 pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) -> Layout {
-    // `Sized` is the one node that changes its *own* rectangle rather than only its
-    // children's. It has to: hit-testing and damage both read a node's rect, so constraining
-    // only the child would leave a 12-pixel scrollbar claiming the whole overlay it sits in.
+    // `Sized` and `Offset` are the two nodes that change their *own* rectangle rather than
+    // only their children's. They have to: hit-testing and damage both read a node's rect, so
+    // constraining only the child would leave a 12-pixel scrollbar claiming the whole overlay
+    // it sits in — and an offset node whose rect stayed its parent's would break the
+    // containment invariant `paint` relies on to skip a subtree, since its child would sit
+    // outside it.
     let rect = match &e.node {
         Node::Sized { size, .. } => Rect::new(
             rect.origin.x,
@@ -194,6 +207,18 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
             if size.w == 0 { rect.size.w } else { size.w.min(rect.size.w) },
             if size.h == 0 { rect.size.h } else { size.h.min(rect.size.h) },
         ),
+        Node::Offset { dx, dy, child } => {
+            // The child takes the size it *measures*, not the space it is offered — that is
+            // what distinguishes this from `Padding`, which shrinks a child into the
+            // remainder. A popup is as big as its contents wherever it lands.
+            let want = measure(child, Constraints::loose(rect.size), m);
+            Rect::new(
+                rect.origin.x.saturating_add(*dx),
+                rect.origin.y.saturating_add(*dy),
+                want.w,
+                want.h,
+            )
+        }
         _ => rect,
     };
     let children = match &e.node {
@@ -211,6 +236,9 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
 
         // `rect` is already the constrained one, computed above.
         Node::Sized { child, .. } => alloc::vec![arrange(child, rect, m)],
+
+        // `rect` is already the offset one, computed above.
+        Node::Offset { child, .. } => alloc::vec![arrange(child, rect, m)],
 
         Node::Stack(children) => {
             // Every layer gets the whole area. Overlays that want to be smaller wrap
@@ -358,6 +386,29 @@ fn split(rect: Rect, edge: Edge, want: Size) -> (Rect, Rect) {
     }
 }
 
+/// Where the element with `key` was laid out, if it is in this tree.
+///
+/// **The other half of [`offset`](crate::element::offset).** A popup is placed *under the item
+/// that opened it*, so the application needs that item's rectangle — and the only thing that
+/// knows it is the layout. The alternatives are both worse: re-deriving the item's width from
+/// the font is the layout engine §5 refused, written in application code and wrong the moment a
+/// label changes; and walking the tree by index is a path that silently means something else
+/// the first time a container gains a child.
+///
+/// A key rather than a [`Widget::id`](crate::diff::Widget::id): ids are assigned by the diff
+/// and an application does not choose them, whereas a key is what an application already uses
+/// to say "this element, across frames".
+///
+/// Returns the **first** match in tree order. Duplicate keys within one parent are a
+/// [`DiffError`](crate::diff::DiffError); duplicates across different parents are legal and
+/// this does not disambiguate them.
+pub fn locate<Msg>(e: &Element<Msg>, l: &Layout, key: u64) -> Option<Rect> {
+    if e.key == Some(key) {
+        return Some(l.rect);
+    }
+    e.children().zip(l.children.iter()).find_map(|(c, cl)| locate(c, cl, key))
+}
+
 /// The point `p` in `rect`'s coordinates.
 pub fn to_local(rect: Rect, p: Point) -> Point {
     Point::new(p.x.saturating_sub(rect.origin.x), p.y.saturating_sub(rect.origin.y))
@@ -382,9 +433,10 @@ mod tests {
     fn meas(e: &Element<Msg>, c: Constraints) -> Size {
         measure(e, c, &CELL)
     }
-    use crate::element::{Insets, column, custom, dock, docked, padding, row, sized, stack, text,
-                         with_spacing};
+    use crate::element::{Insets, column, custom, dock, docked, fill, offset, padding, row,
+                         sized, stack, text, with_spacing};
     use alloc::vec;
+    use libdraw::format::Rgb;
 
     /// 8×16 cells, which is what a bitmap console font gives.
     const CELL: FixedCell = FixedCell { w: 8, h: 16 };
@@ -592,6 +644,86 @@ mod tests {
         for (child, cl) in e.children().zip(l.children.iter()) {
             assert_eq!(child.children().count(), cl.children.len());
         }
+    }
+
+    #[test]
+    fn an_offset_child_is_placed_at_its_shift_and_keeps_its_measured_size() {
+        let e: Element<Msg> = stack(vec![
+            fill(Rgb::BLACK),
+            offset(30, 12, sized(Size::new(40, 8), fill(Rgb::BLACK))),
+        ]);
+        let l = lay(&e, Rect::new(0, 0, 200, 100));
+        let popup = &l.children[1];
+        assert_eq!(popup.rect, Rect::new(30, 12, 40, 8));
+        // And it takes its *measured* size rather than the space it was offered — the
+        // distinction from `Padding`, which shrinks a child into the remainder.
+        assert_ne!(popup.rect.size, Size::new(170, 88));
+    }
+
+    #[test]
+    fn an_offset_node_owns_the_rectangle_its_child_sits_in() {
+        // The containment invariant `paint` relies on to skip a subtree whole: a node whose
+        // rect stayed its parent's would have a child outside it, and the skip could drop a
+        // popup that overlapped the damage.
+        let e: Element<Msg> = offset(20, 10, sized(Size::new(30, 6), fill(Rgb::BLACK)));
+        let l = lay(&e, Rect::new(0, 0, 100, 50));
+        assert_eq!(l.rect, Rect::new(20, 10, 30, 6));
+        assert_eq!(l.children[0].rect, l.rect, "the child escaped its parent");
+    }
+
+    #[test]
+    fn an_offset_is_relative_to_the_parent_not_the_screen() {
+        // A popup in a window-level stack must move with the window. Nested inside a padding
+        // so the parent's origin is not the screen's.
+        let e: Element<Msg> =
+            padding(Insets::all(5), offset(10, 4, sized(Size::new(8, 8), fill(Rgb::BLACK))));
+        let l = lay(&e, Rect::new(100, 200, 80, 60));
+        assert_eq!(l.children[0].rect.origin, Point::new(115, 209));
+    }
+
+    #[test]
+    fn locate_finds_a_keyed_element_wherever_it_is() {
+        let e: Element<Msg> = dock(
+            vec![docked(
+                Edge::Top,
+                sized(Size::new(0, 20), row(vec![
+                    sized(Size::new(30, 0), fill(Rgb::BLACK)).key(1),
+                    sized(Size::new(40, 0), fill(Rgb::BLACK)).key(2),
+                ])),
+            )],
+            fill(Rgb::BLACK),
+        );
+        let l = lay(&e, Rect::new(0, 0, 200, 100));
+        assert_eq!(locate(&e, &l, 1), Some(Rect::new(0, 0, 30, 20)));
+        assert_eq!(locate(&e, &l, 2), Some(Rect::new(30, 0, 40, 20)));
+        assert_eq!(locate(&e, &l, 99), None, "an absent key found something");
+    }
+
+    #[test]
+    fn locate_and_offset_place_a_popup_under_its_item() {
+        // The two additions doing the job they exist for, end to end: find the item, put the
+        // popup beneath it. This is the whole of what `nxterm`'s menu needs from the toolkit.
+        let bar = || -> Element<Msg> {
+            sized(
+                Size::new(0, 20),
+                row(vec![
+                    sized(Size::new(30, 0), fill(Rgb::BLACK)).key(1),
+                    sized(Size::new(40, 0), fill(Rgb::BLACK)).key(2),
+                ]),
+            )
+        };
+        let b = bar();
+        let l0 = lay(&b, Rect::new(0, 0, 200, 100));
+        let item = locate(&b, &l0, 2).expect("the item is in the tree");
+
+        let ui: Element<Msg> = stack(vec![
+            bar(),
+            offset(item.origin.x, item.bottom() as i32, sized(Size::new(60, 50), fill(Rgb::BLACK))),
+        ]);
+        let l = lay(&ui, Rect::new(0, 0, 200, 100));
+        let popup = l.children[1].rect;
+        assert_eq!(popup.origin, Point::new(30, 20), "the popup is not under its item");
+        assert_eq!(popup.size, Size::new(60, 50));
     }
 
     #[test]

@@ -59,6 +59,14 @@ pub enum Fingerprint {
     Sized(libdraw::geom::Size),
     /// [`Node::Fill`], with its colour — a recolour repaints, it does not rebuild.
     Fill(libdraw::format::Rgb),
+    /// [`Node::Offset`].
+    ///
+    /// **Without its shift**, deliberately. A first version carried `(dx, dy)` on the grounds
+    /// that a popup which moves must damage — true, and already handled: `reconcile` damages
+    /// whenever a node's *rect* changes, and an offset is a rect change by construction. A
+    /// break-test showed the two carried the same information and only one was reachable, the
+    /// same shape as the bounds check removed from `libterm`'s `render_rows`.
+    Offset,
     /// [`Node::Custom`], with its discriminator and size.
     Custom(u32, libdraw::geom::Size),
 }
@@ -75,6 +83,7 @@ impl Fingerprint {
             Node::Padding { insets, .. } => Fingerprint::Padding(*insets),
             Node::Sized { size, .. } => Fingerprint::Sized(*size),
             Node::Fill(c) => Fingerprint::Fill(*c),
+            Node::Offset { .. } => Fingerprint::Offset,
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
     }
@@ -410,8 +419,8 @@ mod tests {
     /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
     /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
-    use crate::element::{Edge, Insets, column, custom, dock, docked, fill, padding, row,
-                         sized, stack, text, with_spacing};
+    use crate::element::{Edge, Insets, column, custom, dock, docked, fill, offset, padding,
+                         row, sized, stack, text, with_spacing};
     use crate::layout::{FixedCell, Layout, layout};
     use alloc::vec;
     use libdraw::format::Rgb;
@@ -744,6 +753,30 @@ mod tests {
         assert!(
             go(&mut t, &hovered).expect("ok").is_some(),
             "a recoloured fill reported no damage — hover and press feedback never repaints"
+        );
+    }
+
+    #[test]
+    fn moving_an_offset_child_damages() {
+        // A menu popup opened under a *different* item moves without anything inside it
+        // changing, and must repaint — or it is drawn where it used to be, the same shape as
+        // the stale terminal cursor one layer up.
+        //
+        // **The damage comes from the rect, not the fingerprint.** This test was written
+        // expecting the opposite, and a break-test proved otherwise: with `(dx, dy)` removed
+        // from `Fingerprint::Offset` it still passes, because `reconcile` damages on
+        // `w.rect != l.rect` and an offset *is* a rect change. The fingerprint field was
+        // dropped as redundant; this test stays, because the property is the thing worth
+        // holding and it should not matter which mechanism provides it.
+        let mut t = Tree::new();
+        let at = |dx: i32| -> Element<Msg> {
+            stack(vec![fill(Rgb::new(1, 2, 3)), offset(dx, 20, text("File"))])
+        };
+        go(&mut t, &at(0)).expect("ok");
+        assert_eq!(go(&mut t, &at(0)).expect("ok"), None, "an unchanged frame is clean");
+        assert!(
+            go(&mut t, &at(40)).expect("ok").is_some(),
+            "a popup that moved reported no damage"
         );
     }
 
