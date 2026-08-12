@@ -672,7 +672,7 @@ context menu near a window edge, or a combo box in a small dialog.
       unprompted — `ESC [ 38;2;r;g;b m` read the colour's payload as ordinary codes and emitted
       **two spurious `Reset`s**, silently clearing attributes with nothing visible to say so.
 
-- [ ] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.**
+- [x] **A4 — the grid: cells, attributes, cursor, wrapping, scrollback.** ✅ 2026-08-12.
       A cell is a `char` plus an attribute set. The grid is fixed at 80×24 for this milestone
       (see "Out of scope" — no resize until M6), with a scrollback ring above it.
 
@@ -685,6 +685,27 @@ context menu near a window edge, or a combo box in a small dialog.
       - **Scroll moves lines into scrollback**, and the scrollback is a ring with a bound.
       - **The cursor is clamped**, not wrapped, by cursor-addressing sequences: `CUP` past
         the last row is the last row.
+
+      **`Cell::BLANK` was right and the erase fill was missing**, which is the sharper version
+      of the concern raised when A2 landed. A never-written cell *is* the default; an **erased**
+      one takes the current background, because `ED` after `SGR 44` is how a program paints a
+      coloured region. Ink attributes go — a space has nothing to embolden — and with `SGR 7`
+      set the swap in `Attributes::resolve` means an erase while reversed fills with the
+      foreground, which is what makes "reverse, erase line" paint a solid bar.
+
+      **`LF` is index — down only.** Returning to column 0 is `CR`'s job, and translating a bare
+      `\n` is the *line discipline's* (Unix `ONLCR`), which this system has a tty server for.
+      **This is a Part C item**: `tty-server` writes `\r\n` where it echoes and does not
+      translate on the `Tty::Write` path, so a program emitting bare `\n` will stairstep in the
+      GUI terminal until Part C decides where that translation lives.
+
+      **Three rules had no test until a break-test said so**, which is the pattern worth
+      recording: cursor clamping (the probe used `CUP 99` on a 3-row grid, where `99 % 3` and
+      the clamp agree — 4 separates them), `ED`'s damage covering rows the cursor is not on, and
+      the pending-wrap flag being cleared *after* a wrap. That last was a real defect: the wrap
+      test wrote exactly one character past the margin and stopped, so a stale flag — which
+      makes every subsequent character wrap — looked identical to correct behaviour, and a
+      paragraph would have descended one line per character.
 
 - [ ] **A5 — the render, and `libterm::reference`.**
       `render(grid, font, &mut fb, damage)` — cells to pixels, with a block cursor. Cell

@@ -13761,3 +13761,56 @@ reference grid and `xtask` sees both crates at once.
 
 A claim with no enforcement should say so. That is cheaper than either inventing a dependency or
 quietly hoping.
+
+## 2026-08-12 — M5 A4: the grid, and three rules that had no test until a break-test said so
+
+The screen, the cursor, and where lines go when they leave it. Two design decisions and a
+method note.
+
+### The erase fill, which A2 was expected to have wrong
+
+When A2 landed I flagged `Cell::BLANK` as the type decision I was least confident in, expecting
+A4 to force it. It did, and the answer is narrower than the concern: **`BLANK` was right and a
+second thing was missing.** A never-written cell *is* the default. An **erased** cell is a
+different thing — it takes the current background, because `ED` after `SGR 44` is how a program
+paints a coloured region, and a fill with the default background makes that impossible.
+
+Ink attributes go: a space has nothing to embolden or underline, and carrying them would make a
+later `reverse` repaint a region that looks erased. The foreground goes for the same reason —
+with the consequence that under `SGR 7`, `Attributes::resolve`'s swap means an erase while
+reversed fills with the *foreground*. That is what xterm does and it is what makes "reverse,
+erase line" paint a solid bar.
+
+### `LF` is index, and `ONLCR` is not this crate's job
+
+A line feed moves down and leaves the column alone. Returning to column 0 is `CR`'s, which is
+why a program emits `\r\n`. Folding the two would make `abc\ndef` — which *should* stairstep —
+look like two aligned lines, hiding a producer's bug rather than showing it.
+
+Translating a bare `\n` is the **line discipline's** job (Unix `ONLCR`), and this system already
+has a tty server that owns the discipline. That is a real Part C item rather than a shrug:
+`tty-server` writes `\r\n` where it echoes and does *not* translate on the `Tty::Write` path, so
+a program emitting bare `\n` will stairstep in the GUI terminal until Part C places that
+translation. Recorded in the plan so it is a decision rather than a surprise.
+
+Three of this part's tests were written believing the opposite, and failed on the first run.
+That is the cheap way to find out which of two conventions you are actually implementing.
+
+### Three rules with no test, found by breaking them
+
+The now-routine pass — break each rule, check something fails — found three that nothing
+covered, and one was a live defect:
+
+- **Cursor clamping.** The probe used `CUP 99` on a 3-row grid, and `98 % 3` is `2`, which is
+  also the clamped answer. A modulo and a clamp were indistinguishable. `CUP 4` separates them.
+- **`ED`'s damage.** The extent test asserts *contents* and says nothing about which rows are
+  reported dirty, so an erase that damaged only the cursor's row passed — and would have left
+  the rest of the screen showing what was erased.
+- **The pending-wrap flag being cleared after a wrap.** This one was real. The wrap test wrote
+  exactly one character past the margin and stopped, so a flag left set — which makes *every*
+  subsequent character wrap — looked identical to correct behaviour. A paragraph reaching the
+  right margin would have descended one line per character.
+
+The third is the interesting one, and it is the same shape as the parser's fourth bug: a test
+that stops at the first instance of a behaviour cannot see a state that only goes wrong on the
+second. `abcde` proves the wrap happens; `abcdefg` proves it happens *once*.
