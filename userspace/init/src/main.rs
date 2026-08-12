@@ -190,6 +190,46 @@ fn run_input_testclient(root_ns: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
 }
 
+/// Spawn args for `nxterm` (display arm M5 Part B): no handles, inheriting a LOOKUP-only
+/// handle to init's root namespace so it resolves `/dev/draw/new` and the system font. **No
+/// syscaps** — authority over the display is the namespace binding, nothing more.
+///
+/// Spawned under `selftest` only *for now*: in Part C it is `session-mgr` that starts a
+/// terminal, as part of building a session, which is where a program a person runs belongs.
+#[cfg(feature = "selftest")]
+static mut SPAWN_NXTERM: SpawnArgs = SpawnArgs {
+    image: 0, // resolved at spawn from /bin/nxterm
+    handle_count: 0,
+    move_mask: 0,
+    arg0: 0,
+    handles: [0; 4],
+    rights: [0; 4],
+    namespace: 0,
+    syscaps: 0,
+};
+
+/// Spawn `nxterm`, the GUI terminal.
+///
+/// **Before `ui-testclient`, and the order is load-bearing.** Windows are all created at the
+/// origin and stack in creation order, with no way to position one (the plan dropped popup
+/// placement when the toolkit turned out not to need it). The display gate compares fixed
+/// regions at the top-left, so a window created *after* those would cover what it compares.
+/// The terminal is the largest window and therefore has to be at the bottom.
+#[cfg(feature = "selftest")]
+fn run_nxterm(root_ns: u64) {
+    // SAFETY: SPAWN_NXTERM is a valid writable arg block.
+    let h = unsafe { spawn_program(root_ns, b"/bin/nxterm", &raw mut SPAWN_NXTERM) };
+    if h < 0 {
+        kprint(b"init: nxterm spawn FAIL
+");
+        #[cfg(feature = "test-harness")]
+        test_exit(false);
+        return;
+    }
+    // SAFETY: closing init's reference; the terminal runs on and is reaped if it exits.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, h as u64) };
+}
+
 /// Spawn args for `ui-testclient` (display arm M2 Part D): no handles, inheriting a
 /// LOOKUP-only handle to init's root namespace so it resolves `/dev/draw/new`. **No
 /// syscaps** — authority over the display is the namespace binding, nothing more.
@@ -2005,6 +2045,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _handle0: u64, _arg0: u64) ->
 
     #[cfg(feature = "selftest")]
     run_display_selftest(notif, root_ns);
+
+    // The terminal first, because windows stack in creation order at the origin and it is the
+    // largest — see `run_nxterm`.
+    #[cfg(feature = "selftest")]
+    run_nxterm(root_ns);
 
     // After the compositor is serving: the first client. Its committed buffers are what
     // `check-display` compares, so it runs last and leaves the scene on screen.

@@ -1,0 +1,29 @@
+[package]
+name = "nxterm"
+version = "0.1.0"
+edition = "2024"
+
+# The GUI terminal: Milestone 5 Part B of `docs/planning/display-arm-plan.md`.
+#
+# Split lib/bin like `tty-server` and `compositor`: state, `view` and `update` are functions of
+# values and host-test in milliseconds; the window, the shared buffers and the event pump are
+# the binary's. That split is what `libui`'s declarative model exists to make possible, and
+# this is its first real user.
+[dependencies]
+libterm = { path = "../libterm" }
+libui = { path = "../libui" }
+libdraw = { path = "../libdraw", features = ["io"] }
+libsurface = { path = "../libsurface" }
+librsproto = { path = "../librsproto" }
+libkern = { path = "../libkern" }
+libos = { path = "../libos" }
+libheap = { path = "../libheap" }
+libinput = { path = "../libinput" }
+
+[lib]
+name = "nxterm"
+path = "src/lib.rs"
+
+[[bin]]
+name = "nxterm"
+path = "src/main.rs"

@@ -285,6 +285,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // (`selftest`/`test-harness`) like init.
     build_userspace_bin("session-mgr", mode.features())?;
     build_userspace_bin("compositor", None)?;
+    // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
+    // the update are host-tested, the bin is the window and the event pump.
+    build_userspace_bin("nxterm", None)?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
@@ -2214,6 +2217,17 @@ fn cmd_test() -> R<()> {
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
+    // `nxterm` host tests — the terminal's state, view and update, which are functions of
+    // values. The first real application built on `libui`'s declarative model, and the reason
+    // that model was chosen (`widget-toolkit.md` §2).
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("nxterm")
+        .arg("--lib")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
     // `libcrypto` host tests (SHA-256 / HMAC / PBKDF2 against published vectors). A
     // plain `core`-only lib (no bare-target bin), host-tested like `librsproto`.
     run(Command::new("cargo")
@@ -3640,6 +3654,9 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
 fn profile_programs() -> Vec<&'static str> {
     let mut v = COREUTILS.to_vec();
     v.push("nxsh");
+    // The terminal is a program a person runs, not a service the system runs — the same class
+    // as the shell beside it. Part C's `session-mgr` will spawn it from `/bin` like any other.
+    v.push("nxterm");
     v
 }
 

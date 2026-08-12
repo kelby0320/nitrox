@@ -1123,9 +1123,11 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
                 // failure parks it forever, so say so — see `send_release` below.
                 kprint(b"compositor: DROPPED a reply (client receive ring full)\n");
             }
-            repaint(srv, fb);
+            // **No repaint.** The only request that replies is `CreateWindow`, and a window
+            // with no committed buffer contributes no pixels. This used to recomposite the
+            // whole screen; see `Outcome::Applied`'s `dirty`.
         }
-        Outcome::Applied { release } => {
+        Outcome::Applied { release, dirty } => {
             // A destroy is transitive, so drop every mapping whose window is gone.
             // Otherwise a client looping create/attach/destroy grows the compositor's
             // address space without bound.
@@ -1137,7 +1139,15 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // reports progress, and anything pacing off that — the display gate, or a
             // second client — observes a screen that has not caught up. Same shape as
             // announcing `Ready` before clearing the screen.
-            repaint(srv, fb);
+            match dirty {
+                // Nothing changed on screen — an attach, or a destroy of a window that was
+                // never committed.
+                Some(r) if r.size.w == 0 || r.size.h == 0 => {}
+                Some(r) => repaint_region(srv, fb, r),
+                // A request that could not name its region. Correct, and the thing this
+                // milestone stopped doing on every request.
+                None => repaint(srv, fb),
+            }
             if let Some((window, buffer)) = release {
                 // **Through the outbox, like everything else.** Sent directly it competed
                 // with input on the same ring, and input is continuous while a release is

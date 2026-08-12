@@ -26,6 +26,8 @@ use librsproto::surface::{
     parse_destroy_window_request,
 };
 
+use libdraw::geom::Rect;
+
 use crate::{StackError, WindowStack};
 
 /// A client connection: the identity a request arrives on, and the windows it owns.
@@ -58,6 +60,25 @@ impl Connection {
     }
 }
 
+/// The smallest rectangle containing both.
+///
+/// A local copy rather than `libui::damage::union`: `libui` is a sibling of this crate and
+/// neither may depend on the other, and a rectangle union in `libdraw` would be the third
+/// place to look for one. Six lines.
+fn union(a: Rect, b: Rect) -> Rect {
+    if a.size.w == 0 || a.size.h == 0 {
+        return b;
+    }
+    if b.size.w == 0 || b.size.h == 0 {
+        return a;
+    }
+    let x0 = a.origin.x.min(b.origin.x);
+    let y0 = a.origin.y.min(b.origin.y);
+    let x1 = a.right().max(b.right());
+    let y1 = a.bottom().max(b.bottom());
+    Rect::new(x0, y0, (x1 - x0 as i64) as u32, (y1 - y0 as i64) as u32)
+}
+
 /// What a dispatched request produced.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub enum Outcome {
@@ -68,6 +89,20 @@ pub enum Outcome {
         /// The `(window, buffer)` to release to the client, if any — **the buffer that
         /// left the screen**, never the one that arrived.
         release: Option<(u32, u32)>,
+        /// The screen region this request changed, in screen coordinates.
+        ///
+        /// **`None` means "everything"**, which is the safe answer and the one anything that
+        /// cannot name its region must give. `Some(empty)` means nothing changed on screen —
+        /// attaching a buffer, for instance, which a later commit will display.
+        ///
+        /// This exists because the compositor recomposited the **whole screen on every
+        /// request** until 2026-08-12, on a comment from Milestone 2 that said damage-bounded
+        /// repaint was "an optimisation the protocol already carries and this does not yet
+        /// exploit — a full repaint is always correct, and this milestone has one client".
+        /// The premise expired: with three clients and an 812×480 terminal window, a boot
+        /// spent a whole CPU compositing, which `test-harness`'s idle-occupancy check caught
+        /// as a starved core (M5 Part B).
+        dirty: Option<Rect>,
     },
     /// The request was rejected.
     Failed(SurfaceError),
@@ -135,7 +170,8 @@ pub fn dispatch(
                 return Outcome::Failed(SurfaceError::NotFound);
             }
             match stack.attach(&req) {
-                Ok(()) => Outcome::Applied { release: None },
+                // Attaching shows nothing: the buffer reaches the screen at the commit.
+                Ok(()) => Outcome::Applied { release: None, dirty: Some(Rect::new(0, 0, 0, 0)) },
                 Err(e) => Outcome::Failed(SurfaceError::Rejected(e)),
             }
         }
@@ -149,7 +185,27 @@ pub fn dispatch(
             }
             match stack.commit(&req) {
                 Ok(previous) => {
-                    Outcome::Applied { release: previous.map(|b| (req.window, b)) }
+                    // **The damage the client sent**, clipped to the window it belongs to and
+                    // translated into screen coordinates. Clipped because a client is not
+                    // trusted to bound its own rectangle, and a damage larger than the window
+                    // would repaint a neighbour's pixels from this window's buffer.
+                    let dirty = stack.window(req.window).map(|w| {
+                        let local = Rect::new(
+                            req.damage_x as i32,
+                            req.damage_y as i32,
+                            req.damage_w,
+                            req.damage_h,
+                        );
+                        let bounds = w.bounds();
+                        let moved = Rect::new(
+                            bounds.origin.x.saturating_add(local.origin.x),
+                            bounds.origin.y.saturating_add(local.origin.y),
+                            local.size.w,
+                            local.size.h,
+                        );
+                        moved.intersect(&bounds).unwrap_or(Rect::new(0, 0, 0, 0))
+                    });
+                    Outcome::Applied { release: previous.map(|b| (req.window, b)), dirty }
                 }
                 Err(e) => Outcome::Failed(SurfaceError::Rejected(e)),
             }
@@ -162,6 +218,8 @@ pub fn dispatch(
             if !conn.owns(window) {
                 return Outcome::Failed(SurfaceError::NotFound);
             }
+            let before: Vec<(u32, Rect)> =
+                stack.windows().iter().map(|w| (w.id, w.bounds())).collect();
             match stack.destroy(window) {
                 Ok(()) => {
                     // Destroy is transitive, so this connection's descendants of `window`
@@ -169,7 +227,19 @@ pub fn dispatch(
                     // the connection keeps claiming ownership of windows that do not
                     // exist — and a later id reuse would hand it someone else's window.
                     conn.owned.retain(|id| stack.window(*id).is_some());
-                    Outcome::Applied { release: None }
+                    // **The union of every window that vanished**, not just the named one:
+                    // destroy is transitive, so a popup's children go with it and their pixels
+                    // have to be repainted too.
+                    let mut dirty: Option<Rect> = None;
+                    for (id, bounds) in before {
+                        if stack.window(id).is_none() {
+                            dirty = Some(match dirty {
+                                Some(d) => union(d, bounds),
+                                None => bounds,
+                            });
+                        }
+                    }
+                    Outcome::Applied { release: None, dirty: Some(dirty.unwrap_or(Rect::new(0, 0, 0, 0))) }
                 }
                 Err(e) => Outcome::Failed(SurfaceError::Rejected(e)),
             }
@@ -203,6 +273,27 @@ fn parent_of(role: &librsproto::surface::Role) -> Option<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Assert an outcome applied, with the given release and whatever region.
+    ///
+    /// `dirty` has tests of its own below. Spelling a rectangle into every assertion here
+    /// would make each one about two things, and the release is what they were written for.
+    #[track_caller]
+    fn assert_applied(o: Outcome, release: Option<(u32, u32)>) {
+        match o {
+            Outcome::Applied { release: r, .. } => assert_eq!(r, release, "release"),
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
+
+    /// The region an outcome reports dirtying.
+    #[track_caller]
+    fn dirty_of(o: Outcome) -> Option<Rect> {
+        match o {
+            Outcome::Applied { dirty, .. } => dirty,
+            other => panic!("expected Applied, got {other:?}"),
+        }
+    }
     use librsproto::surface::{
         ATTACH_BUFFER_REQUEST_LEN, AttachBufferRequest, CommitRequest, CreateWindowRequest, Edge,
         Role, SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
@@ -240,6 +331,31 @@ mod tests {
         .unwrap();
         let mut reply = [0u8; 8];
         dispatch(conn, stack, OP_ATTACH_BUFFER, &body[..n], &mut reply)
+    }
+
+    /// `commit` with an explicit damage rectangle.
+    fn commit_damage(
+        conn: &mut Connection,
+        stack: &mut WindowStack,
+        window: u32,
+        buffer: u32,
+        d: (u32, u32, u32, u32),
+    ) -> Outcome {
+        let mut body = [0u8; 32];
+        let n = build_commit_request(
+            &mut body,
+            &CommitRequest {
+                window,
+                buffer,
+                damage_x: d.0,
+                damage_y: d.1,
+                damage_w: d.2,
+                damage_h: d.3,
+            },
+        )
+        .unwrap();
+        let mut reply = [0u8; 8];
+        dispatch(conn, stack, OP_COMMIT, &body[..n], &mut reply)
     }
 
     fn commit(conn: &mut Connection, stack: &mut WindowStack, window: u32, buffer: u32) -> Outcome {
@@ -288,6 +404,61 @@ mod tests {
         assert_eq!(commit(&mut b, &mut stack, owned_by_a, 0), Outcome::Failed(SurfaceError::NotFound));
         assert_eq!(destroy(&mut b, &mut stack, owned_by_a), Outcome::Failed(SurfaceError::NotFound));
         assert!(stack.window(owned_by_a).is_some(), "A's window survived B's attempts");
+    }
+
+    #[test]
+    fn a_commit_dirties_the_damage_it_named_and_no_more() {
+        // **The whole point of the field.** Until 2026-08-12 every request recomposited the
+        // screen, and with an 812×480 terminal window in the stack that cost a permanently
+        // busy CPU — caught by `test-harness`'s idle-occupancy check, which is the only thing
+        // in the tree that could have caught it.
+        let mut a = Connection::new();
+        let mut stack = WindowStack::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert_applied(attach(&mut a, &mut stack, w, 0), None);
+        let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (2, 3, 4, 5)));
+        assert_eq!(d, Some(Rect::new(2, 3, 4, 5)));
+    }
+
+    #[test]
+    fn a_commits_damage_is_clipped_to_its_own_window() {
+        // A client is not trusted to bound its own rectangle. A damage larger than the window
+        // would repaint a *neighbour's* pixels out of this window's buffer.
+        let mut a = Connection::new();
+        let mut stack = WindowStack::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert_applied(attach(&mut a, &mut stack, w, 0), None);
+        // The window is 8×8 at the origin; the client claims 400×400 of damage.
+        let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (0, 0, 400, 400)));
+        assert_eq!(d, Some(Rect::new(0, 0, 8, 8)));
+        // And damage entirely outside the window dirties nothing rather than something.
+        let d = dirty_of(commit_damage(&mut a, &mut stack, w, 0, (100, 100, 4, 4)));
+        assert_eq!(d.map(|r| (r.size.w, r.size.h)), Some((0, 0)));
+    }
+
+    #[test]
+    fn attaching_a_buffer_dirties_nothing() {
+        // The buffer reaches the screen at the commit. A repaint here is work for a picture
+        // that has not changed.
+        let mut a = Connection::new();
+        let mut stack = WindowStack::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        let d = dirty_of(attach(&mut a, &mut stack, w, 0)).expect("attach names a region");
+        assert!(d.size.w == 0 || d.size.h == 0, "attach dirtied {d:?}");
+    }
+
+    #[test]
+    fn destroying_dirties_what_vanished() {
+        // Destroy is transitive: a popup's children go with it, and their pixels have to be
+        // repainted too. Naming only the window in the request would leave a child's pixels
+        // on screen after it was gone.
+        let mut a = Connection::new();
+        let mut stack = WindowStack::new();
+        let parent = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert_applied(attach(&mut a, &mut stack, parent, 0), None);
+        assert_applied(commit(&mut a, &mut stack, parent, 0), None);
+        let d = dirty_of(destroy(&mut a, &mut stack, parent)).expect("destroy names a region");
+        assert_eq!(d, Rect::new(0, 0, 8, 8), "the destroyed window's own bounds");
     }
 
     #[test]
@@ -367,15 +538,12 @@ mod tests {
         let mut stack = WindowStack::new();
         let mut a = Connection::new();
         let w = create(&mut a, &mut stack, Role::Normal).unwrap();
-        assert_eq!(attach(&mut a, &mut stack, w, 0), Outcome::Applied { release: None });
-        assert_eq!(attach(&mut a, &mut stack, w, 1), Outcome::Applied { release: None });
+        assert_applied(attach(&mut a, &mut stack, w, 0), None);
+        assert_applied(attach(&mut a, &mut stack, w, 1), None);
 
-        assert_eq!(commit(&mut a, &mut stack, w, 0), Outcome::Applied { release: None });
-        assert_eq!(
-            commit(&mut a, &mut stack, w, 1),
-            Outcome::Applied { release: Some((w, 0)) },
-            "the buffer that left the screen"
-        );
+        assert_applied(commit(&mut a, &mut stack, w, 0), None);
+        // The buffer that left the screen, never the one that arrived.
+        assert_applied(commit(&mut a, &mut stack, w, 1), Some((w, 0)));
     }
 
     #[test]
@@ -389,7 +557,7 @@ mod tests {
         let sub = create(&mut a, &mut stack, Role::Popup { parent: menu }).unwrap();
         assert_eq!(a.owned().len(), 3);
 
-        assert_eq!(destroy(&mut a, &mut stack, w), Outcome::Applied { release: None });
+        assert_applied(destroy(&mut a, &mut stack, w), None);
         assert!(a.owned().is_empty(), "stale ids left on the connection: {:?}", a.owned());
         for gone in [w, menu, sub] {
             assert!(stack.window(gone).is_none());

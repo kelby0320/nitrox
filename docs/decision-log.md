@@ -14020,3 +14020,60 @@ the review caught it.
 finishing a command on the keypad did nothing and gave no sign the key existed. One line, beside
 `KEY_ENTER`, so the "a terminal sends `\r`" rule stays in one place rather than being split
 between a keymap and an override.
+
+## 2026-08-12 — M5 B1/B2: `nxterm` exists, and the first real client cost the compositor a CPU
+
+The terminal as a program: a `libui` window with a menu bar, a scrollbar and the grid as a
+`custom` widget, driven by a loopback until Part C wires the tty.
+
+### The loopback, and where `ONLCR` sits
+
+A key press is encoded by `libterm::encode` and fed straight back through `libterm::parse` into
+the grid. That is not a stub for its own sake: it exercises the whole of Part A — encoder,
+parser, grid, render — driven by real key events, and Part C replaces exactly one function call
+with a write to the backend channel.
+
+It translates `\r` to `\r\n`, because `LF` is index and Enter would otherwise return to column 0
+and overwrite the line just typed. That translation is the **line discipline's** — Unix's
+`ONLCR` — and Part C is what puts a discipline between these two halves. Keeping it in the
+loopback puts it in one obvious place to delete rather than three places to find.
+
+### The finding: the compositor ignored the damage rectangle clients send
+
+`test-qemu` failed the moment `nxterm` committed a window: `only 2 of 4 CPUs ever went idle`,
+every sample, deterministically. Neither process was looping — `nxterm` ran its event loop three
+times and blocked; the compositor's serve loop ran under 2,000 iterations across an entire boot.
+
+The variable turned out to be **window size**: a 200×114 terminal passed, an 812×480 one failed.
+Which pointed at compositing cost, and at a comment written in Milestone 2:
+
+> Damage-bounded repaint is an optimisation the protocol already carries and this does not yet
+> exploit — a full repaint is always correct, and **this milestone has one client**.
+
+The premise expired. The compositor recomposited the entire 1280×800 screen on **every request
+that replied and every request that applied** — and `ui-testclient`'s churn alone is several
+hundred requests, each now dragging an 812×480 window through the compositor.
+
+`Outcome::Applied` carries a `dirty: Option<Rect>` now. A commit reports the damage the client
+sent, clipped to its own window and translated to screen coordinates; an attach reports nothing,
+because a buffer reaches the screen at the commit; a destroy reports the union of every window
+that vanished, because destroy is transitive; and `None` still means "everything", which is what
+anything unable to name its region must say.
+
+**Three things about this are worth keeping.**
+
+*The clip is not politeness.* A client is not trusted to bound its own damage, and an unclipped
+rectangle would repaint a **neighbour's** pixels out of this window's buffer — a cross-client
+leak, not just wasted work.
+
+*Nothing else in the tree could have caught it.* Not a host test — the cost is in a real
+compositor with real windows. Not `check-display` — the picture was always correct. It took the
+idle-occupancy check added on 2026-07-31 for a different spin, whose own entry says it was
+rewritten once because the first version "passed with the bug reinstated". A test built to
+measure occupancy rather than switch rate is why this is a two-hour finding rather than a
+mystery about why the desktop feels slow.
+
+*The comment was honest and still went stale.* It said what it was deferring and why, and named
+the condition — one client — under which the shortcut held. What it could not do is notice when
+that stopped being true. A deferral whose trigger is a property of the *system* rather than of a
+line of code has no natural moment to fire.
