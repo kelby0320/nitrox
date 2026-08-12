@@ -5,13 +5,18 @@
 //! a mounted root. The compositor never loads one: clients render text into their own
 //! buffers and the compositor only composites.
 //!
-//! ## Coverage is thresholded, and that is a `libdraw` limitation rather than a font one
+//! ## Coverage is blended, since 2026-08-12
 //!
-//! `ab_glyph` hands back 8-bit coverage per pixel — antialiasing — and this crate composites
-//! **opaque** XRGB8888 with no alpha path. So coverage is thresholded to one bit here. It is
-//! one branch in [`Font::draw_str`]'s callback, and it becomes the fallback rather than being
-//! deleted when blending lands; the deferral is filed against `libdraw`, where the blocker
-//! actually is, and not against the font.
+//! `ab_glyph` hands back 8-bit coverage per pixel — antialiasing — and until M5 Part A this
+//! crate had no way to mix two colours, so coverage was thresholded to one bit. It is not any
+//! more: [`Rgb::blend`](crate::format::Rgb::blend) composites a covered source over what is
+//! already in the buffer, and [`Font::draw_str`] passes the rasteriser's coverage straight
+//! through to it.
+//!
+//! **There is still no alpha channel**, and that is the point of the shape. Surfaces stay
+//! opaque XRGB8888 and compositing stays a copy; coverage is an argument to a blend, not a
+//! fourth byte in a pixel. What made the threshold necessary was the absence of the operation,
+//! not the absence of a channel.
 //!
 //! ## Why a rasteriser rather than a bitmap font
 //!
@@ -118,10 +123,19 @@ impl Font {
                 let bounds = outlined.px_bounds();
                 let (ox, oy) = (bounds.min.x, bounds.min.y);
                 outlined.draw(|gx, gy, coverage| {
-                    // **Thresholded, not blended.** `libdraw` composites opaque XRGB8888;
-                    // the coverage is real and has nowhere to go until it can blend. One
-                    // branch, and it becomes the fallback rather than being deleted.
-                    if coverage <= 0.5 {
+                    // **Blended, since 2026-08-12.** `ab_glyph` hands back 8-bit coverage and
+                    // this used to threshold it at 0.5, because `libdraw` had no way to mix
+                    // two colours. `Rgb::blend` is that way, and the coverage now reaches the
+                    // pixel it was always about.
+                    //
+                    // The `<= 0.5` branch is **gone rather than kept as a fallback**, which is
+                    // a correction to the plan and to `display-substrate.md` §6. A fallback is
+                    // for a caller that cannot take the good path; thresholding is not that,
+                    // it is only worse output. The one caller that could genuinely want it is
+                    // a surface that cannot be read back — and such a surface cannot blend
+                    // *anything*, so that is a `Framebuffer` capability question rather than a
+                    // second glyph loop kept alive against a case nothing has.
+                    if coverage <= 0.0 {
                         return;
                     }
                     let x = ox + gx as f32;
@@ -130,11 +144,15 @@ impl Font {
                         return;
                     }
                     let (x, y) = (x as u32, y as u32);
+                    // Rounded, not truncated: coverage is `0.0..=1.0`, and `as u8` on `255.0 *
+                    // c` truncates, so a fully-covered pixel would come out 254 and no glyph
+                    // interior would ever be exactly its own colour.
+                    let a = libm::roundf(coverage.clamp(0.0, 1.0) * 255.0) as u8;
                     // Clipped by the caller's rectangle as well as the framebuffer's own
                     // bounds: a widget must not draw outside its slot even when the buffer
                     // would accept the write.
                     if clip.contains(x as i32, y as i32) {
-                        fb.put_pixel(x, y, colour);
+                        fb.blend_pixel(x, y, colour, a);
                     }
                 });
             }
@@ -255,12 +273,21 @@ mod tests {
     }
 
     /// How many pixels of `colour` are set.
-    fn lit(fb: &MemFramebuffer, colour: Rgb) -> usize {
+    /// Pixels the glyph touched at all — any coverage, not only full.
+    ///
+    /// **The measure `lit` stopped being** when glyphs started blending (2026-08-12). A stroke
+    /// thinner than a pixel now reaches *no* pixel at full coverage, so counting exact-colour
+    /// matches answers "is any part of this glyph solid" rather than "was anything drawn". The
+    /// `.notdef` box is exactly that case and it is what caught this: its outline is one pixel
+    /// wide at 16px, it renders correctly, and the exact-match count is zero.
+    ///
+    /// Buffers here start zeroed, so "not black" is "touched".
+    fn inked(fb: &MemFramebuffer) -> usize {
         let g = fb.geometry();
         let mut n = 0;
         for y in 0..g.height {
             for x in 0..g.width {
-                if fb.get_pixel(x, y) == Some(colour) {
+                if fb.get_pixel(x, y) != Some(Rgb::BLACK) {
                     n += 1;
                 }
             }
@@ -324,7 +351,7 @@ mod tests {
         let baseline = libm::ceilf(v.ascent) as i32;
         f.draw_str(&mut b, Point::new(10, baseline), "Hi", 16.0, ink, Rect::new(0, 0, 200, 40));
 
-        assert!(lit(&b, ink) > 0, "something was drawn");
+        assert!(inked(&b) > 0, "something was drawn");
         // Nothing to the left of the pen, and nothing below the descent.
         for y in 0..40u32 {
             for x in 0..10u32 {
@@ -344,11 +371,11 @@ mod tests {
 
         let mut wide = fb(200, 40);
         f.draw_str(&mut wide, Point::new(0, baseline), "MMMMMM", 16.0, ink, Rect::new(0, 0, 200, 40));
-        let unclipped = lit(&wide, ink);
+        let unclipped = inked(&wide);
 
         let mut narrow = fb(200, 40);
         f.draw_str(&mut narrow, Point::new(0, baseline), "MMMMMM", 16.0, ink, Rect::new(0, 0, 20, 40));
-        let clipped = lit(&narrow, ink);
+        let clipped = inked(&narrow);
 
         assert!(clipped > 0, "the first glyph still drew");
         assert!(clipped < unclipped, "and the rest were clipped: {clipped} vs {unclipped}");
@@ -383,11 +410,85 @@ mod tests {
 
         let mut blank = fb(60, 40);
         f.draw_str(&mut blank, Point::new(0, 20), "   ", 16.0, ink, clip);
-        assert_eq!(lit(&blank, ink), 0, "a space has no outline");
+        assert_eq!(inked(&blank), 0, "a space has no outline");
 
         let mut missing = fb(60, 40);
         f.draw_str(&mut missing, Point::new(0, 20), "\u{10FFFF}", 16.0, ink, clip);
-        assert!(lit(&missing, ink) > 0, "an unmapped codepoint shows .notdef");
+        assert!(inked(&missing) > 0, "an unmapped codepoint shows .notdef");
+    }
+
+    #[test]
+    fn glyph_edges_land_between_the_ink_and_the_background() {
+        // **The test that says antialiasing is happening.** Every other test here counts
+        // pixels and would pass identically against the thresholded path this replaced —
+        // including `something was drawn`, which is why the change needed its own assertion.
+        //
+        // A curved glyph on a non-black background, so a partially-covered pixel is a colour
+        // that is neither and cannot be produced by any threshold.
+        let f = font();
+        let ink = Rgb::new(0xFF, 0xFF, 0xFF);
+        let bg = Rgb::new(0x0E, 0x14, 0x1B);
+        let mut b = fb(60, 40);
+        b.clear(bg);
+        f.draw_str(&mut b, Point::new(2, 30), "S", 32.0, ink, Rect::new(0, 0, 60, 40));
+
+        let mut solid = 0usize;
+        let mut partial = 0usize;
+        for y in 0..40 {
+            for x in 0..60 {
+                match b.get_pixel(x, y) {
+                    Some(p) if p == ink => solid += 1,
+                    Some(p) if p != bg => partial += 1,
+                    _ => {}
+                }
+            }
+        }
+        assert!(solid > 0, "no pixel reached full coverage — the glyph did not draw");
+        assert!(
+            partial > solid / 4,
+            "only {partial} partial pixels against {solid} solid: this looks thresholded"
+        );
+    }
+
+    #[test]
+    fn a_glyph_blends_against_what_is_already_there() {
+        // The destination is *read*, not assumed: a blend hardcoded against black would still
+        // produce partial coverage and pass the test above, while being wrong on any
+        // background but black.
+        //
+        // **Compares only the partially-covered pixels**, which is the correction that made
+        // this test mean anything. A first version compared whole buffers and passed with
+        // thresholding reinstated — of course it did: the two backgrounds differ, so the
+        // pixels the glyph never touched differ, and the assertion was satisfied by the
+        // background rather than by the glyph.
+        let f = font();
+        let ink = Rgb::new(0xFF, 0xFF, 0xFF);
+        let draw = |bg: Rgb| {
+            let mut b = fb(60, 40);
+            b.clear(bg);
+            f.draw_str(&mut b, Point::new(2, 30), "S", 32.0, ink, Rect::new(0, 0, 60, 40));
+            b
+        };
+        let (bg_a, bg_b) = (Rgb::new(0x0E, 0x14, 0x1B), Rgb::new(0x80, 0x20, 0x60));
+        let (a, b) = (draw(bg_a), draw(bg_b));
+
+        let mut compared = 0usize;
+        for y in 0..40 {
+            for x in 0..60 {
+                let (pa, pb) = (a.get_pixel(x, y).unwrap(), b.get_pixel(x, y).unwrap());
+                // Partially covered in the first render: neither the ink nor its background.
+                if pa == ink || pa == bg_a {
+                    continue;
+                }
+                compared += 1;
+                assert_ne!(
+                    pa, pb,
+                    "({x},{y}) is partially covered and identical over both backgrounds — \
+                     the blend ignored the destination"
+                );
+            }
+        }
+        assert!(compared > 0, "no partially-covered pixel to compare");
     }
 
     #[test]

@@ -77,6 +77,30 @@ impl Rgb {
 
     /// Black.
     pub const BLACK: Rgb = Rgb::new(0, 0, 0);
+
+    /// `self` composited over `under` at `coverage`, where 0 is invisible and 255 is opaque.
+    ///
+    /// **There is no alpha channel anywhere in this crate**, and this is not the beginning of
+    /// one. Surfaces are opaque XRGB8888 and compositing is a copy; what needs blending is a
+    /// *source* that arrives with per-pixel coverage — a rasterised glyph — against a
+    /// destination already in the buffer. Coverage is an argument, not a stored channel, so
+    /// nothing gains a fourth byte and `compose` stays a memcpy.
+    ///
+    /// Rounded rather than truncated: `(x + 127) / 255` is round-half-up, so full coverage
+    /// returns `self` exactly and zero coverage returns `under` exactly. Truncation loses the
+    /// endpoints, and a glyph whose fully-covered interior is one shade off its own colour is
+    /// the kind of wrong that looks like a colour-management bug.
+    pub const fn blend(self, under: Rgb, coverage: u8) -> Rgb {
+        const fn mix(src: u8, dst: u8, a: u8) -> u8 {
+            let (src, dst, a) = (src as u32, dst as u32, a as u32);
+            ((src * a + dst * (255 - a) + 127) / 255) as u8
+        }
+        Rgb::new(
+            mix(self.r, under.r, coverage),
+            mix(self.g, under.g, coverage),
+            mix(self.b, under.b, coverage),
+        )
+    }
 }
 
 /// How pixels are laid out in a framebuffer or surface.
@@ -223,5 +247,65 @@ mod tests {
     #[test]
     fn bytes_per_pixel_follows_the_depth() {
         assert_eq!(PixelFormat::XRGB8888.bytes_per_pixel(), 4);
+    }
+
+    #[test]
+    fn the_blend_endpoints_are_exact() {
+        // **The property everything else rests on.** A glyph's interior is full coverage, so
+        // if 255 does not return the source exactly, no text is ever quite its own colour —
+        // and a truncating `src * a / 255` gets this wrong by one for every channel but zero.
+        // Zero coverage must likewise return the destination untouched, or a glyph's bounding
+        // box tints the background it does not cover.
+        let src = Rgb::new(0xE0, 0x37, 0x91);
+        let dst = Rgb::new(0x0E, 0x14, 0x1B);
+        assert_eq!(src.blend(dst, 255), src, "full coverage is not the source");
+        assert_eq!(src.blend(dst, 0), dst, "zero coverage disturbed the destination");
+    }
+
+    #[test]
+    fn every_channel_value_survives_full_coverage() {
+        // The endpoint above with one colour proves one colour. Rounding errors are
+        // value-dependent, so check the whole range rather than a sample.
+        for v in 0..=255u8 {
+            let c = Rgb::new(v, v, v);
+            assert_eq!(c.blend(Rgb::BLACK, 255), c, "{v} did not survive");
+            assert_eq!(Rgb::BLACK.blend(c, 0), c, "{v} was disturbed at zero coverage");
+        }
+    }
+
+    #[test]
+    fn half_coverage_lands_between_the_two() {
+        // Not asserting an exact midpoint — the rounding rule is what it is — but a blend that
+        // returned either endpoint, or something outside the interval, would be wrong in a way
+        // no endpoint test can see.
+        let out = Rgb::new(200, 100, 0).blend(Rgb::new(0, 200, 40), 128);
+        for (o, (a, b)) in [(out.r, (0u8, 200u8)), (out.g, (100, 200)), (out.b, (0, 40))] {
+            assert!(o > a.min(b) && o < a.max(b), "{o} is not strictly between {a} and {b}");
+        }
+    }
+
+    #[test]
+    fn blending_is_monotonic_in_coverage() {
+        // More coverage never moves a channel away from the source. A sign slip or an operand
+        // swap in `mix` passes both endpoint tests above and fails this.
+        let (src, dst) = (Rgb::new(255, 255, 255), Rgb::BLACK);
+        let mut last = 0u8;
+        for a in 0..=255u8 {
+            let v = src.blend(dst, a).r;
+            assert!(v >= last, "coverage {a} went backwards: {v} after {last}");
+            last = v;
+        }
+        assert_eq!(last, 255);
+    }
+
+    #[test]
+    fn the_operands_are_not_interchangeable() {
+        // `src.blend(dst, a)` is not `dst.blend(src, a)`. Stated as a test because the call
+        // reads like a symmetric mix and is not, and swapping them at a call site produces a
+        // picture that is subtly, uniformly wrong rather than obviously broken.
+        let a = Rgb::new(255, 0, 0);
+        let b = Rgb::new(0, 0, 255);
+        assert_ne!(a.blend(b, 64), b.blend(a, 64));
+        assert_eq!(a.blend(b, 64), b.blend(a, 255 - 64), "…and they are each other's mirror");
     }
 }

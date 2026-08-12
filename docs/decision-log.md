@@ -13475,3 +13475,65 @@ header. A graduation whose diff is a `git mv` plus a rewritten Status line has n
 it has been asserted. Both Status lines now say the audit happened and what it found, because
 "Verified against source" is itself a claim in the diff and the reviewer was right to hold the
 merge over it.
+
+## 2026-08-12 — M5 A1: `libdraw` blends, and the fallback that was not one
+
+The first code of Milestone 5, and the smallest part of it: glyph coverage stops being
+thresholded to one bit.
+
+### Where the operation goes
+
+Three pieces, at three layers, each testable where it lives:
+
+- **`Rgb::blend(under, coverage)`** — pure colour arithmetic in `format.rs`. Round-half-up, so
+  full coverage returns the source *exactly* and zero coverage returns the destination exactly.
+  Truncation loses both endpoints, and a glyph whose fully-covered interior is one shade off
+  its own colour is the kind of wrong that reads as a colour-management bug.
+- **`Framebuffer::blend_pixel`** — the read-modify-write, as a *provided* method. The trait's
+  own doc says drawing operations live there "so the real framebuffer and the test one share
+  one implementation of the logic rather than two that can drift", and this is the second time
+  that rule has caught something: `libui::paint` had grown a private `fill` beside
+  `fill_rect` and lost it in #185's review.
+- **`Font::draw_str`** — passes `ab_glyph`'s coverage through, rounded rather than truncated
+  (`255.0 * c` with `as u8` yields 254 at full coverage, so no glyph interior would ever be
+  exactly its own colour).
+
+### The fallback that was not one
+
+The plan, the deferral entry and `display-substrate.md` §6 all said the same thing: the
+threshold "becomes the fallback rather than being deleted". **It was deleted**, and the reason
+is worth stating because the prediction was made three times and was wrong each time.
+
+A fallback is for a caller that *cannot take the good path*. Thresholding is not that — it is
+the same path with worse output. The only caller that could genuinely want it is a surface that
+cannot be read back, and such a surface cannot blend *anything*: not glyphs, not translucent
+chrome, nothing. So it is a `Framebuffer` capability question, answered at the trait, rather
+than a second glyph loop kept alive in the font against a case nothing in the system has.
+
+**No alpha channel was added.** Coverage is an argument to a blend, not a fourth byte in a
+pixel; surfaces stay opaque XRGB8888 and `compose` stays a copy. What made the threshold
+necessary was the absence of the *operation*, not of a channel — which is also why the deferral
+was correctly filed against `libdraw` rather than against the font.
+
+### A vacuous test, caught by breaking the thing it tested
+
+Two host tests were added and both were checked against a reinstated threshold. **One of them
+passed.** `a_glyph_blends_against_what_is_already_there` rendered the same glyph over two
+different backgrounds and compared whole buffers — which of course differ, because the pixels
+the glyph never touched differ. The assertion was satisfied by the background.
+
+It compares only the *partially covered* pixels now, and fails under two independent breaks: a
+reinstated threshold, and a blend against a hardcoded black instead of the destination.
+
+This is the milestone-long pattern again — the test observed something downstream of what it
+claimed to check — and the only reason it did not ship is that breaking the production code is
+now routine rather than occasional.
+
+### What the display gate turned out to prove
+
+`check-display` renders `libui::reference` on the host and compares it against the guest's
+screen pixel for pixel. It stayed green through this change, which is a stronger statement than
+it looks: **floating-point glyph rasterisation and the blend now agree byte-for-byte between a
+host build and an `x86_64-unknown-nitrox` one.** That is exactly the class of divergence
+`display-substrate.md` §8b says a self-hash cannot catch, and it came free from a gate built
+for a different reason.

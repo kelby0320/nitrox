@@ -292,10 +292,27 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
-**Antialiasing is deferred, and it is a `libdraw` item rather than a font one.** `libdraw`
-composites opaque XRGB8888 and cannot blend, so glyph coverage is thresholded to 1 bit. The
-rasterizer already produces the 8-bit coverage; nothing can receive it. Trigger: `libdraw`
-growing an alpha-blend path, or text that looks bad enough to prompt one.
+~~**Antialiasing is deferred, and it is a `libdraw` item rather than a font one.**~~
+**Resolved 2026-08-12, in M5 Part A.** `libdraw` composited opaque XRGB8888 and could not
+blend, so glyph coverage was thresholded to 1 bit while the rasterizer produced 8. It blends
+now — `Rgb::blend` and `Framebuffer::blend_pixel` — and `Font::draw_str` passes coverage
+straight through.
+
+**The trigger fired on its second clause**, "text that looks bad enough to prompt one": a
+terminal is entirely text, so M5 is where one-bit coverage stops being tolerable. The first
+clause was circular in hindsight ("trigger: `libdraw` growing an alpha-blend path" is the work,
+not a reason to do it), which is worth noticing in a file whose value is its triggers.
+
+**The threshold was deleted rather than kept as a fallback**, which the entry, the plan and
+`display-substrate.md` §6 all said it would be. A fallback is for a caller that cannot take the
+good path; thresholding is not that, it is only worse output. The one caller that could
+genuinely want it is a surface that cannot be read back — and such a surface cannot blend
+*anything*, so that is a `Framebuffer` capability question rather than a second glyph loop kept
+alive against a case nothing has.
+
+**No alpha channel was added**, and that is the shape worth recording: coverage is an argument
+to a blend, not a fourth byte in a pixel. Surfaces stay opaque and `compose` stays a copy. What
+made the threshold necessary was the absence of the *operation*, not of a channel.
 
 **Input methods and accessibility** remain deferred, and accessibility is a **gap rather than
 an oversight** — no accessible tree, no screen-reader surface, and retrofitting one is

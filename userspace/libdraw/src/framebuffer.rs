@@ -124,6 +124,29 @@ pub trait Framebuffer {
         self.bytes_mut()[off..off + 4].copy_from_slice(&word);
     }
 
+    /// Composite `colour` over what is already at `(x, y)` at `coverage`.
+    ///
+    /// A read-modify-write, which is why it is a method here rather than arithmetic at the
+    /// call site: the read must go through [`get_pixel`](Self::get_pixel) so a buffer whose
+    /// format decodes differently from the writer's assumption cannot silently blend against
+    /// the wrong colour.
+    ///
+    /// **The endpoints short-circuit**, and not only for speed: full coverage must write
+    /// `colour` bit-exactly, and zero coverage must not touch the pixel at all. Going through
+    /// the blend for those would depend on the rounding being right, and a buffer whose format
+    /// has fewer than 8 bits per channel does not round-trip
+    /// [`decode`](crate::format::PixelFormat::decode) → blend → `encode` exactly.
+    fn blend_pixel(&mut self, x: u32, y: u32, colour: Rgb, coverage: u8) {
+        match coverage {
+            0 => {}
+            255 => self.put_pixel(x, y, colour),
+            a => {
+                let Some(under) = self.get_pixel(x, y) else { return };
+                self.put_pixel(x, y, colour.blend(under, a));
+            }
+        }
+    }
+
     /// Fill `rect`, clipped to the visible area, with a solid colour.
     ///
     /// The row's starting offset comes from [`Geometry::offset_of`] rather than being
