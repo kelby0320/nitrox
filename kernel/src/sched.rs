@@ -1058,11 +1058,6 @@ pub fn yield_now() {
 /// current quantum; on expiry it resets the quantum and, if another thread is
 /// ready, reschedules round-robin (reusing [`switch_to_next`]).
 pub fn on_timer_tick() {
-    // **Before any lock**: sweep up input the i8042's interrupt path can lose. Its output
-    // buffer holds one byte and its IRQ is an edge derived from a level, so a byte arriving
-    // while the line is already asserted raises nothing — and the buffer then stays full
-    // forever, which stops *all* input. See `drivers::ps2::poll`. One `inb` per tick.
-    crate::drivers::ps2::poll();
     let mut g = SCHED.lock();
     // Fire any deadlines that have elapsed FIRST, so a just-woken thread is in
     // `ready` and the reschedule below can pick it. This is the direct-wakeup

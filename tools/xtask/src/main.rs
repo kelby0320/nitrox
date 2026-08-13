@@ -637,7 +637,7 @@ fn cmd_test_interactive(accel: Accel) -> R<()> {
         .stderr(std::process::Stdio::null());
 
     println!("xtask: interactive session tests (release image, expect-driven)…\n");
-    let mut session = Session::spawn(cmd)?;
+    let mut session = Session::spawn(cmd, "test-interactive")?;
     let result = run_interactive_scenarios(&mut session);
     let transcript = session.finish();
 
@@ -961,7 +961,7 @@ fn cmd_check_input(accel: Accel) -> R<()> {
         .stderr(std::process::Stdio::null());
 
     println!("xtask: input gate — booting and injecting…\n");
-    let mut session = Session::spawn(cmd)?;
+    let mut session = Session::spawn(cmd, "check-input")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
 
     // The compositor is a consumer of the same merged stream — it resolves `/dev/input/new`
@@ -1163,7 +1163,7 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
         .stderr(std::process::Stdio::null());
 
     println!("xtask: terminal gate — booting and typing…\n");
-    let mut session = Session::spawn(cmd)?;
+    let mut session = Session::spawn(cmd, "check-terminal")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
 
     // The shell is up in the window: its banner reached the grid, which means the whole
@@ -1311,7 +1311,7 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         .stderr(std::process::Stdio::null());
 
     println!("xtask: display gate — booting and capturing the screen…\n");
-    let mut session = Session::spawn(cmd)?;
+    let mut session = Session::spawn(cmd, "check-display")?;
     let mut qmp = Qmp::connect(&qmp_sock)?;
 
     // The guest paces this: capture only once it says the scene is on the screen.
@@ -1996,6 +1996,11 @@ fn dump_guest_state(qmp: &mut Qmp) {
 /// A driven QEMU serial session: write lines, wait for text.
 struct Session {
     child: std::process::Child,
+    /// Which gate this is, so a failing run's transcript does not overwrite another gate's.
+    /// A batch of runs is usually what you are comparing, and a single fixed filename means
+    /// every failure destroys the evidence from the one before it — which happened to a
+    /// reviewer mid-review (PR #197).
+    gate: &'static str,
     /// Everything the guest has printed, accumulated by a reader thread.
     out: std::sync::Arc<std::sync::Mutex<String>>,
     /// How far `expect` has already matched, so each step scans only new output and a
@@ -2019,7 +2024,7 @@ impl Drop for Session {
 }
 
 impl Session {
-    fn spawn(mut cmd: Command) -> R<Session> {
+    fn spawn(mut cmd: Command, gate: &'static str) -> R<Session> {
         let mut child = cmd.spawn().map_err(|e| format!("spawn qemu: {e}"))?;
         let stdout = child.stdout.take().ok_or("qemu stdout")?;
         let out = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
@@ -2037,7 +2042,7 @@ impl Session {
                 }
             }
         });
-        Ok(Session { child, out, cursor: 0 })
+        Ok(Session { child, out, cursor: 0, gate })
     }
 
     /// Wait for `pat` in output not yet consumed. The guest paces the test.
@@ -2079,7 +2084,7 @@ impl Session {
                 // full and only ever printed truncated, which cost three separate
                 // investigations in M5 and M6 — each one reduced to guessing at a guest whose
                 // log existed and was thrown away.
-                let path = repo_root().join("tools/build-cache/guest-transcript.log");
+                let path = build_cache().join(format!("guest-transcript-{}.log", self.gate));
                 let saved = fs::write(&path, g.as_str()).is_ok();
                 let where_ = if saved {
                     format!("\n\nthe full transcript is at {}", path.display())

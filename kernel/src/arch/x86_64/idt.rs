@@ -482,6 +482,15 @@ fn timer_dispatch(_frame: *mut ExceptionFrame) {
     // SAFETY: ring-0, only ever reached from the timer IRQ after `Irq::init`
     // mapped the local APIC; a single MMIO write acknowledges the interrupt.
     unsafe { crate::arch::Irq::eoi() };
+    // Sweep up input the i8042's interrupt path can lose — see `drivers::ps2::poll`. One
+    // `inb` per tick when the controller is idle.
+    //
+    // **Before `run_pending`, not after.** `poll` enqueues the PS/2 DPC when it recovers a
+    // byte, and this tail is the thing that drains DPCs: enqueueing after the drain would
+    // park the wake-up until the *next* tick, adding 10 ms on precisely the path that only
+    // exists because an interrupt was already lost. Same shape as the fs-server "I/O hang"
+    // documented at the bottom of this file.
+    crate::drivers::ps2::poll();
     // Drain any pending DPCs before the tick's reschedule, so threads a device
     // DPC woke are already in `ready` when `on_timer_tick` picks the next one.
     crate::dpc::run_pending();

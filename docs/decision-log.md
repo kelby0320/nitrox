@@ -14956,15 +14956,50 @@ there"* — and that sentence is **false for this device**: the controller raise
 *becoming* available, not while one is available.
 
 A periodic sweep is the standard answer; Linux's i8042 carries a polling timer for the same class
-of fault. `drivers::ps2::poll()` runs from the timer tick, before any lock, and costs one `inb`
-per tick.
+of fault. `drivers::ps2::poll()` runs from the timer IRQ dispatcher — ahead of the DPC drain, so a
+recovered byte wakes its reader on this tick rather than 10 ms later — and costs one `inb` per
+tick. It is guarded by a `PRESENT` flag, because an absent controller floats its status port to
+`0xFF`, which has the output-full bit set; unguarded, a machine with no i8042 drains a floating
+bus on every tick forever (measured: **22,400** drains in a 40 s boot under `-M q35,i8042=off`,
+against **0** with the guard).
 
-### Result
+### Result, and what the numbers do and do not show
 
-`check-input` was **1 pass in 6**; it is now **6 in 6**. `check-terminal` gets materially further
-— it now reliably clicks, focuses and types four characters where it used to fail at the click —
-but **still fails at the fifth keystroke**, so it has a second, unrelated fault and is not claimed
-as fixed.
+**The efficacy claim in the first draft of this entry was not supported by the evidence cited for
+it, and the PR #197 review was right to block on it.** The number quoted was `check-input` going
+from 1-pass-in-6 to 6-in-6 — but those two measurements came from *different branches*: the 1-in-6
+was on `phase-4/m6-partb`, whose `MAX_SESSIONS` change is what provoked the failure, and the 6-in-6
+was on the fix branch, which does not contain it. The reviewer compiled `poll()` out and got 6-in-6
+anyway, which is exactly what that comparison should have predicted and what the entry claimed was
+impossible.
+
+What actually establishes efficacy is a **direct measurement of the mechanism**, taken afterwards:
+instrumenting `poll()` to count bytes it recovers that the ISR path missed.
+
+| configuration | bytes recovered per run | each woke a parked reader |
+|---|---|---|
+| `phase-4/m6-partb` (the failing one) | **14** | yes |
+| the fix branch (the reviewer's) | **2–4** | yes |
+
+And the gate outcome, split by *failure signature* rather than by pass count — the split matters,
+because `check-input` has two independent failure modes and only one of them is this bug:
+
+| signature | pre-fix | post-fix |
+|---|---|---|
+| input loss (past `ui-testclient: PASSED`, dies on an injected key or button) | 5 of 6 | **0 of 6** |
+| load timeout (never reaches `PASSED`; no key ever injected) | 1 of 6 | 3 of 6 |
+
+So: the controller loses bytes on **both** configurations. The gate is simply insensitive to
+losing two-to-four of them, because injected mouse motion is re-sent and a later injection
+satisfies the assertion. That insensitivity is why a pass count was the wrong instrument, and why
+`check-input` will **not** catch a regression that deletes `poll()`. Recording that as a known
+gap rather than papering over it: closing it needs a gate that asserts on the recovery counter,
+not on whether a key eventually arrived.
+
+`check-terminal` gets materially further — it now reliably clicks, focuses and types four
+characters where it used to fail at the click — but **still fails at the fifth keystroke**, so it
+has a second, unrelated fault and is not claimed as fixed. (A later experiment showed that fault is
+not the fifth *position* and not the letter `m`: reordering the word to `miwhoa` types all six.)
 
 ### The method note worth keeping
 
