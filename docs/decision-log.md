@@ -14874,3 +14874,43 @@ which is the one place in this category where one request yields two messages.
 Written now rather than with the rest of Part D, because a protocol change merging without its
 spec row is precisely what PR #195's finding 6 was about, and deferring it to a later PR would
 have reproduced the thing the finding warned against.
+
+## 2026-08-13 — PR #196 review: a PR that described three commits and contained one
+
+The review's first finding is that the branch held one commit of three. It was right, and the
+cause is worth writing down because it is the same shape as the two edit-placement errors earlier
+in this session.
+
+While fixing the misplaced Part D I ran `git checkout -b phase-4/m6-partd-fix`, which succeeded —
+so the two commits after it landed on *that* branch. The later `git push -u origin
+phase-4/m6-parta` then pushed the **local ref of that name**, which was still at the first commit,
+from a working tree that was on a different branch. Git did exactly what it was told; nothing
+failed; the push reported success.
+
+**Three times now, an operation has silently applied somewhere I was not looking**: an `xtask`
+edit into the wrong function, a plan section into the wrong milestone, and now commits onto the
+wrong branch. Two were caught by a compiler or a reader; this one was caught by a reviewer running
+`git ls-remote`. The pattern is not carelessness about any one step — it is **acting on a name
+without confirming what that name currently refers to**, and the cheap defence is to check the
+thing that will be read afterwards rather than the thing that was written.
+
+The PR description made it worse rather than better: it described the handshake in detail, and the
+detail made the absence harder to notice, not easier. A description written from what was
+*intended* rather than from the diff is a description that cannot catch this.
+
+### And the guarantee the API advertised was not the one it enforced
+
+`place` returning `Rect` removes the *ordering* trap — a caller can no longer compute damage after
+the mutation — but not the *forgetting* one. The review pointed at `stack.place(w, origin)?;`,
+which compiles silently and repaints nothing.
+
+`#[must_use]` on the function does **not** close that, which I checked rather than assumed: `?`
+consumes the `Result`, satisfying the attribute, and drops the `Rect` on the floor. The attribute
+has to be on the thing that survives the `?`. So `Damage(Rect)` is a `#[must_use]` newtype now,
+and the warning fired immediately on three existing call sites — all in tests that legitimately do
+not paint, now saying so with `let _ =`.
+
+That is the second time in this milestone that a guarantee had to move to where the compiler could
+see it. The first was `place` returning its damage at all; this is the same lesson applied one
+level further in, and it is only visible by asking *"what exactly does this stop someone doing?"*
+rather than *"is this better than before?"*.

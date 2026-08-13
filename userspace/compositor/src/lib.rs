@@ -76,6 +76,34 @@ pub fn union(a: Rect, b: Rect) -> Rect {
     Rect::new(x0, y0, (x1 - x0 as i64) as u32, (y1 - y0 as i64) as u32)
 }
 
+/// A region that must be repainted, returned by the mutations that create one.
+///
+/// **A newtype purely so it cannot be dropped in silence.** `#[must_use]` on `place` itself is
+/// not enough and the difference matters: `stack.place(id, p)?` *uses* the `Result`, so the
+/// attribute is satisfied and the `Rect` falls on the floor with no diagnostic — which is exactly
+/// how the M5 bug would come back through the API built to prevent it (PR #196 review, finding
+/// 3). The attribute has to be on the thing that survives the `?`.
+///
+/// A **zero-sized** damage is this crate's "nothing changed", the same thing
+/// `Outcome::Applied { dirty: Some(empty) }` means and distinct from its `None`, which means "I
+/// cannot name what changed, repaint everything". [`union`] treats it as the identity, so a
+/// caller folding one into a wider region gets the right answer without a special case.
+#[must_use = "a move's damage must be repainted, or the window's old pixels stay on screen"]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct Damage(pub Rect);
+
+impl Damage {
+    /// The rectangle, for a caller that is about to repaint it.
+    pub fn rect(self) -> Rect {
+        self.0
+    }
+
+    /// Whether it covers no pixels.
+    pub fn is_empty(self) -> bool {
+        self.0.size.w == 0 || self.0.size.h == 0
+    }
+}
+
 /// A window: an id, a fixed role, a position, and the buffer currently on screen.
 #[derive(Clone, Debug)]
 pub struct Window {
@@ -371,17 +399,24 @@ impl WindowStack {
     /// **A window that has never committed dirties nothing.** It is not on screen —
     /// [`present_into`](Self::present_into) skips windows with no committed buffer — so moving it
     /// paints over nothing and reveals nothing. This is the ordinary case rather than an edge
-    /// one: placing a window *before* its first commit is what a manager does.
-    pub fn place(&mut self, id: u32, origin: Point) -> Result<Rect, StackError> {
+    /// one: placing a window *before* its first commit is what a manager does. That case returns
+    /// a **zero-sized** rectangle, which is this crate's "nothing changed" — the same thing
+    /// `Outcome::Applied { dirty: Some(empty) }` means, and distinct from its `None`, which means
+    /// "I cannot name what changed, repaint everything". A caller unioning this into a `dirty`
+    /// gets the right answer for free, because [`union`] treats a zero rect as the identity.
+    ///
+    /// Returns [`Damage`] rather than a bare `Rect` so that forgetting it is a warning: see that
+    /// type for why `#[must_use]` on this function would not have been enough.
+    pub fn place(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         if w.committed.is_none() {
             w.origin = origin;
-            return Ok(Rect::new(origin.x, origin.y, 0, 0));
+            return Ok(Damage(Rect::new(origin.x, origin.y, 0, 0)));
         }
         let was = w.bounds();
         w.origin = origin;
         let now = w.bounds();
-        Ok(union(was, now))
+        Ok(Damage(union(was, now)))
     }
 
     /// Attach a buffer to a window.
@@ -1037,12 +1072,12 @@ mod tests {
         s.commit(&commit(w, 0)).unwrap();
 
         let dirty = s.place(w, Point::new(20, 10)).unwrap();
-        assert_eq!(dirty, Rect::new(0, 0, 28, 18), "the union of (0,0,8,8) and (20,10,8,8)");
+        assert_eq!(dirty.rect(), Rect::new(0, 0, 28, 18), "the union of (0,0,8,8) and (20,10,8,8)");
         assert_eq!(s.window(w).unwrap().bounds(), Rect::new(20, 10, 8, 8));
 
         // A move that changes nothing still names the window's own rectangle rather than
         // nothing — the union of a rect with itself — which is correct and costs one window.
-        assert_eq!(s.place(w, Point::new(20, 10)).unwrap(), Rect::new(20, 10, 8, 8));
+        assert_eq!(s.place(w, Point::new(20, 10)).unwrap().rect(), Rect::new(20, 10, 8, 8));
     }
 
     #[test]
@@ -1055,8 +1090,21 @@ mod tests {
         let mut s = WindowStack::new();
         let w = s.create(&CreateWindowRequest { width: 64, height: 64, role: Role::Normal }).unwrap();
         let dirty = s.place(w, Point::new(100, 100)).unwrap();
-        assert_eq!((dirty.size.w, dirty.size.h), (0, 0), "an unmapped window is not on screen");
+        assert!(dirty.is_empty(), "an unmapped window is not on screen");
         assert_eq!(s.window(w).unwrap().origin, Point::new(100, 100), "but it did move");
+    }
+
+    #[test]
+    fn a_zero_sized_damage_is_the_identity_when_folded_into_a_wider_region() {
+        // The convention this crate uses for "nothing changed", and the reason `place` can
+        // return one rather than an `Option`: a caller unioning it into a wider `dirty` needs no
+        // special case, and a caller repainting it directly paints nothing, because `Rect`'s
+        // bounds are exclusive.
+        let empty = Rect::new(100, 100, 0, 0);
+        let real = Rect::new(4, 4, 10, 10);
+        assert_eq!(union(empty, real), real);
+        assert_eq!(union(real, empty), real);
+        assert!(!empty.contains(100, 100), "a zero rect contains no pixel");
     }
 
     #[test]
@@ -1129,7 +1177,8 @@ mod tests {
         s.attach(&attach(b, 0, 8, 8)).unwrap();
         src.put(b, 0, geom(8, 8), blue);
         s.commit(&commit(b, 0)).unwrap();
-        s.place(b, Point::new(4, 4)).unwrap();
+        // Damage ignored: the test composites the whole screen below.
+        let _ = s.place(b, Point::new(4, 4)).unwrap();
 
         let mut fb = screen();
         let full = fb.geometry().bounds();
@@ -1519,7 +1568,8 @@ mod tests {
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         src.put(w, 0, geom(8, 8), Rgb::BLACK);
         s.commit(&commit(w, 0)).unwrap();
-        s.place(w, Point::new(-3, 12)).unwrap();
+        // Damage ignored: this test is about the reported geometry, not repainting.
+        let _ = s.place(w, Point::new(-3, 12)).unwrap();
 
         let info = s.info(w).unwrap();
         assert_eq!((info.width, info.height), (8, 8), "committed size once there is one");

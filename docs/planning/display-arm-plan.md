@@ -12,7 +12,9 @@ doc-graduation box, which M5 carries as a prerequisite: `libui` — the retained
 the keyed diff, per-buffer damage, event routing, painting, and the widget set — plus real
 TrueType glyphs, key repeat, an on-screen pointer, and the font on the root filesystem.
 **Milestone 5 is complete** (2026-08-13): the GUI terminal runs a real shell.
-**Milestone 6 is planned in detail** (2026-08-13) and not started.
+**Milestone 6 is in progress**: planned in detail 2026-08-13, and **Part A — geometry in
+the stack, plus the initial-configure handshake — landed the same day.** Parts B, C and D are
+not started.
 **Milestone 5 Parts A and B were complete** (2026-08-12): `libterm`'s parser, grid, render and
 encoder, the blend that unblocked antialiasing, and `nxterm` itself — window, chrome, scrollback,
 key repeat, and the display gate's third region. **Part C landed 2026-08-13 — `Tty::AttachBackend`,
@@ -1064,7 +1066,7 @@ Part B drops input under load, the wire record lands there rather than being wor
 
 ## Milestone 6 — window management
 
-**Planned in detail 2026-08-13**, not started.
+**Planned in detail 2026-08-13. Part A landed 2026-08-13; B, C and D are not started.**
 
 **Re-scoped 2026-08-12.** This milestone was "windows, ports, and desktops", which bundled three
 things at very different dependency depths: windows need only the compositor, while ports and
