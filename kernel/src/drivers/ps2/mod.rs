@@ -316,6 +316,34 @@ fn drain_controller() -> bool {
     g.devices.iter().any(|d| d.parked.is_some())
 }
 
+/// Collect anything the interrupt path missed. Called from the timer tick.
+///
+/// **This exists because an i8042 interrupt can be lost, and the loss is unrecoverable
+/// without it.** The controller has a *one-byte* output buffer and its IRQ line is a level
+/// that the interrupt controller turns into an edge. A byte that arrives after a drain's last
+/// status read but while the line is still asserted produces **no new edge** — and because
+/// nobody then reads the buffer, the line never drops, so no later byte can produce one
+/// either. The device and the driver deadlock: a byte sits in the buffer forever and every
+/// keystroke and mouse movement after it is discarded by a full controller.
+///
+/// That is not hypothetical. It is what made `check-input` and `check-terminal` intermittent
+/// through Milestones 5 and 6, and the state was captured directly: `status=0x1d` (output full,
+/// keyboard byte) with the ISR counters frozen and the last drain having exited on
+/// `status=0x1c` (output *empty*) — the driver did everything right and was never called again.
+///
+/// **The race cannot be closed by re-checking harder**: however many times the drain re-reads
+/// the status, there is a last read, and a byte can always arrive after it. A periodic sweep is
+/// the standard answer — Linux's i8042 carries a polling timer for the same class of fault —
+/// and one `inb` per tick is not a cost worth optimising.
+pub fn poll() {
+    if !crate::arch::ps2::output_pending() {
+        return;
+    }
+    if drain_controller() {
+        crate::dpc::enqueue(&PS2_DPC);
+    }
+}
+
 /// Keyboard interrupt (IRQ 1).
 extern "C" fn kbd_isr() {
     if drain_controller() {

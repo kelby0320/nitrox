@@ -183,6 +183,15 @@ pub fn read_byte() -> Option<(Port, u8)> {
     Some((port, unsafe { inb(DATA) }))
 }
 
+/// Whether the controller has a byte nobody has collected.
+///
+/// A status read with no side effects — it neither consumes the byte nor acknowledges
+/// anything, so it is safe to call from any context that can afford one `inb`.
+pub fn output_pending() -> bool {
+    // SAFETY: ring-0 read of the i8042 status port; reading it has no side effects.
+    unsafe { inb(CMD) & STATUS_OUTPUT_FULL != 0 }
+}
+
 /// What [`init`] found.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct Present {

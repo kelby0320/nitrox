@@ -14914,3 +14914,68 @@ That is the second time in this milestone that a guarantee had to move to where 
 see it. The first was `place` returning its damage at all; this is the same lesson applied one
 level further in, and it is only visible by asking *"what exactly does this stop someone doing?"*
 rather than *"is this better than before?"*.
+
+## 2026-08-13 — The i8042 loses interrupts, and that is what made every input gate flaky
+
+Three separate investigations across M5 and M6 ended in "the injection did not arrive, cause
+unknown": `check-terminal`'s intermittency, the PR #194 lead that *"input appears to stop reaching
+the compositor once `input-testclient` exits"*, and `check-input` collapsing from 4/4 to 1/6 when
+M6 Part B changed a constant. They are one bug.
+
+### What it is
+
+The i8042 has a **one-byte output buffer** and an IRQ line that the interrupt controller turns
+into an **edge**. A byte arriving after a drain's last status read, while the line is still
+asserted, produces **no new edge** — and because nobody then reads the buffer, the line never
+drops, so no later byte can produce one either. The device and the driver deadlock: one byte sits
+in the buffer forever and **every keystroke and mouse movement after it is discarded by a full
+controller**.
+
+### The evidence, because "an interrupt was lost" is easy to assert and hard to believe
+
+Captured from a stalled guest, printed once a second and never changing:
+
+```
+status=0x1d  kbdisr=3  auxisr=28  bytes=48  budget=0  exit=0x1c
+```
+
+- `status=0x1d` — output full (bit 0), AUX clear: a **keyboard** byte is waiting.
+- `kbdisr=3`, frozen — no interrupt has been delivered since.
+- `exit=0x1c` — the last drain exited with output **empty**. The driver did everything right.
+- `budget=0` — the drain never hit its 64-byte cap, killing the first hypothesis.
+
+And a matched experiment: injecting a mouse motion *after* the stall produces nothing either, so
+it is the controller that is wedged and not one device's queue.
+
+### Why re-checking harder cannot fix it
+
+However many times the drain re-reads the status, there is a last read, and a byte can always
+arrive after it. `drain_controller`'s comment asserted the opposite — *"Anything still waiting is
+picked up by the next interrupt, which the controller will raise because the byte is still
+there"* — and that sentence is **false for this device**: the controller raises on a byte
+*becoming* available, not while one is available.
+
+A periodic sweep is the standard answer; Linux's i8042 carries a polling timer for the same class
+of fault. `drivers::ps2::poll()` runs from the timer tick, before any lock, and costs one `inb`
+per tick.
+
+### Result
+
+`check-input` was **1 pass in 6**; it is now **6 in 6**. `check-terminal` gets materially further
+— it now reliably clicks, focuses and types four characters where it used to fail at the click —
+but **still fails at the fifth keystroke**, so it has a second, unrelated fault and is not claimed
+as fixed.
+
+### The method note worth keeping
+
+This took three attempts across two milestones, and the thing that finally cracked it was not
+insight — it was **making the failure observable**. `Session::expect` had been accumulating the
+entire guest transcript and printing 400 characters of it, so every investigation was reduced to
+guessing at a log that existed and was thrown away. Dumping it to a file (committed separately)
+turned a two-milestone mystery into an afternoon.
+
+Two probes were wrong before one was right, and both wrongnesses were informative: the first took
+the serial lock inside the PS/2 lock and the kernel's own lockdep panicked on it, which is that
+machinery doing exactly its job; the second reported only counters, which showed *that* input
+stopped but not *why*. The status register was the datum that mattered, and reading it required
+going through the neutral `crate::arch` interface — `check-arch` refused the shortcut.
