@@ -2071,8 +2071,23 @@ impl Session {
                 }
                 let tail: String = g.chars().rev().take(400).collect::<Vec<_>>()
                     .into_iter().rev().collect();
+                // **The whole transcript goes to a file, not just the tail.**
+                //
+                // The tail is what you read first and it is almost never enough: these gates
+                // fail *between* two things the guest said, so the interesting part is the
+                // hundred lines before the end. The transcript was already accumulated in
+                // full and only ever printed truncated, which cost three separate
+                // investigations in M5 and M6 — each one reduced to guessing at a guest whose
+                // log existed and was thrown away.
+                let path = repo_root().join("tools/build-cache/guest-transcript.log");
+                let saved = fs::write(&path, g.as_str()).is_ok();
+                let where_ = if saved {
+                    format!("\n\nthe full transcript is at {}", path.display())
+                } else {
+                    String::new()
+                };
                 return Err(format!(
-                    "timed out after {TIMEOUT:?} waiting for {pat:?}; last output was:\n{tail}"
+                    "timed out after {TIMEOUT:?} waiting for {pat:?}; last output was:\n{tail}{where_}"
                 )
                 .into());
             }
