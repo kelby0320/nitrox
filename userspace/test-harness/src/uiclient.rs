@@ -458,6 +458,22 @@ fn present_reference_term(
     win
 }
 
+/// Ask the manager channel to put `window` at `(x, y)`.
+///
+/// Errors are ignored: this is a test fixture asserting that the path *works*, and the display
+/// gate is what checks the result — a placement that silently failed shows up there as a window
+/// in the wrong place, which is a better assertion than a return code.
+fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) {
+    use librsproto::surface::{MgrPlace, OP_MGR_PLACE};
+    let mut body = [0u8; 12];
+    let req = MgrPlace { window, x, y };
+    if req.write(&mut body).is_none() {
+        return;
+    }
+    let mut reply = [0u8; 8];
+    let _ = mgr.request(OP_MGR_PLACE, &body, None, &mut reply);
+}
+
 /// Report failure and end the run.
 ///
 /// Called instead of exiting with a code, because init cannot wait for this program: on
@@ -485,10 +501,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     kprint(b"ui-testclient: up\n");
 
     // 0. The reference pictures, each in its own window, **before** the scene's and in
-    //    decreasing size — windows stack in creation order at the origin, so each must be
-    //    smaller than the one below or it would hide it entirely and the gate would compare a
-    //    region that is not on screen. Held for the process's life; dropping either closes its
-    //    channel and takes the window off the screen.
+    //    decreasing size — windows stack in creation order, so each must be smaller than the one
+    //    below or it would hide it entirely and the gate would compare a region that is not on
+    //    screen. Held for the process's life; dropping either closes its channel and takes the
+    //    window off the screen.
     //
     //    The toolkit's is 320x160, the terminal's 180x96 and the scene's 64x32.
     let (_ui_window, font) = present_reference_ui(root_ns);
@@ -611,6 +627,29 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         .u(BUFFERS as u64)
         .s(b" buffers")
         .end();
+    // **Place the reference windows explicitly, through the manager channel.**
+    //
+    // They land at the origin anyway — that is the compositor's default and M6 kept it — so this
+    // changes no pixel. What it changes is what the display gate *means*: its nesting assertion
+    // was an accident it relied on (windows cannot move, so they must overlap at the origin) and
+    // is now a placement this client performs. A gate that asserts a behaviour beats one that
+    // asserts the absence of a feature, and the seam gets its first consumer a milestone before
+    // the shell exists.
+    //
+    // Best-effort: a compositor with a manager already attached refuses, and this client is a
+    // test fixture rather than the manager of a real session.
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    if let Ok(mut mgr) = unsafe { ChannelTransport::manage(root_ns) } {
+        for (w, id) in [(&_ui_window, _ui_window.id()), (&_term_window, _term_window.id())] {
+            let _ = w;
+            place_window(&mut mgr, id, 0, 0);
+        }
+        place_window(&mut mgr, win.id(), 0, 0);
+        kprint(b"ui-testclient: reference windows placed via /dev/draw/manage\n");
+    } else {
+        kprint(b"ui-testclient: no manager channel; windows keep the default placement\n");
+    }
+
     kprint(b"ui-testclient: scene presented via /dev/draw\n");
     kprint(b"ui-testclient: PASSED\n");
 

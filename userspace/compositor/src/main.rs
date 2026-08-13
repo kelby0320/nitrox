@@ -34,6 +34,7 @@ extern crate alloc;
 
 use compositor::input::InputRouter;
 use compositor::outbox::{Outbound, Outbox};
+use compositor::manager::{self, MgrOutcome};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
 use libdraw::format::Rgb;
@@ -51,7 +52,8 @@ use libkern::debug::Line;
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
-    FocusEvent, KeyEvent, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_FOCUS_EVENT, OP_KEY_EVENT,
+    ConfigureEvent, FocusEvent, KeyEvent, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_FOCUS_EVENT,
+    OP_KEY_EVENT,
     OP_POINTER_EVENT,
     OP_RELEASE, PointerEvent,
 };
@@ -78,16 +80,18 @@ const MAX_BODY: usize = 64;
 /// Leaving it at `- 1` would overrun `WAIT_HANDLES` by exactly one entry on the boot where
 /// every session slot is in use and input connected — the rarest configuration, and the
 /// only one that would ever have shown it.
-const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
+const MAX_SESSIONS: usize = libkern::abi::MAX_WAIT_HANDLES - 3;
 
 /// The wait-set bound, as a compile error rather than a comment.
 ///
 /// The invariant is now spread across two constants, and the serve loop's `SAFETY` note used
 /// to assert `1 + MAX_SESSIONS` — true before the input channel joined the set and quietly
-/// false after. Anyone adding a third fixed handle (a notification channel, a second input
-/// stream) should be stopped by the compiler, not by re-reading prose (PR #180 review,
-/// finding 4).
-const _: () = assert!(2 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
+/// false after. Anyone adding a fixed handle should be stopped by the compiler, not by
+/// re-reading prose (PR #180 review, finding 4).
+///
+/// It worked: the manager channel is the **third** fixed handle (M6 Part B), and this line is
+/// what said so.
+const _: () = assert!(3 + MAX_SESSIONS <= libkern::abi::MAX_WAIT_HANDLES);
 
 /// How many client-driven rejections get logged **per session** before the tap closes.
 ///
@@ -134,6 +138,11 @@ static mut REPLY_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
 static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
     [0; libkern::abi::IPC_HANDLE_MAX];
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
+/// The manager's channel, or `0` when nobody is managing.
+///
+/// **One, not a table.** Two managers placing windows is a race with no arbiter, and the failure
+/// looks like windows moving on their own — so a second resolve is refused rather than served.
+static mut MANAGER_CH: u64 = 0;
 /// Routed input events logged so far — see [`MAX_LOGGED_ROUTES`].
 static mut ROUTES_LOGGED: u32 = 0;
 /// Input diagnostics logged so far — see [`MAX_LOGGED_INPUT_DIAGS`].
@@ -792,6 +801,8 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
 enum Resolved {
     /// `new` — mint a session.
     New,
+    /// `manage` — mint *the* manager channel.
+    Manage,
     /// `<N>/info` — that window's metadata.
     Info(u32),
     /// Anything else.
@@ -805,6 +816,9 @@ enum Resolved {
 fn classify(suffix: &[u8]) -> Resolved {
     if suffix == b"new" {
         return Resolved::New;
+    }
+    if suffix == b"manage" {
+        return Resolved::Manage;
     }
     if let Some(slash) = suffix.iter().position(|&c| c == b'/')
         && &suffix[slash + 1..] == b"info"
@@ -941,6 +955,129 @@ fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
         return false;
     }
     true
+}
+
+/// Tell `window`'s client the compositor would like it at this geometry.
+///
+/// **Sent to the window's own session**, found through the same ownership table `dispatch`
+/// authorises against — so there is no second notion of who owns a window that could disagree
+/// with the first. A window whose session has gone is silently skipped: the manager is allowed
+/// to be a moment behind, and a manager that had to be told about every teardown before it could
+/// speak would need a synchronous protocol.
+fn configure_window(srv: &Server, window: u32, width: u32, height: u32, origin: Point) {
+    let Some(slot) = srv.session_of(window) else { return };
+    // SAFETY: reading our own slot table.
+    let ch = unsafe { SESSION_CH[slot] };
+    if ch == 0 {
+        return;
+    }
+    let mut body = [0u8; 20];
+    let ev = ConfigureEvent { window, width, height, x: origin.x, y: origin.y };
+    if ev.write(&mut body).is_some() {
+        send_input(ch, OP_CONFIGURE, &body);
+    }
+}
+
+/// Handle one request on the manager channel. Returns `false` if the manager is gone.
+fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+    // SAFETY: reading our own manager slot and valid recv out-params.
+    let ch = unsafe { MANAGER_CH };
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        // `PeerClosed` means the manager exited. Anything else is an empty ring.
+        return rr != KError::PeerClosed.as_i32() as i64;
+    }
+    // SAFETY: bounded read-only slice over the just-received message.
+    let (op, request_id, body) = unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        match decode(req) {
+            Ok(m) => (m.op, m.request_id, m.body.to_vec()),
+            Err(_) => return true,
+        }
+    };
+    match manager::dispatch(&mut srv.stack, op, &body) {
+        MgrOutcome::Applied { dirty } => {
+            match dirty {
+                // Nothing on screen changed — placing a window that has not committed, which
+                // is the manager's ordinary case during the handshake.
+                Some(r) if r.size.w == 0 || r.size.h == 0 => {}
+                Some(r) => repaint_region(srv, fb, r),
+                None => repaint(srv, fb),
+            }
+            // **Focus may have moved.** A restack changes who is topmost-focusable, and the
+            // clients on either side of that have to be told — the same announcement
+            // click-to-focus makes, for the same reason.
+            announce_focus(srv);
+            reply_on_session(ch, op, request_id, &[]);
+        }
+        MgrOutcome::Configure { window, width, height, origin } => {
+            // Forwarded to the window's *client*, which is a third party: the manager asked,
+            // the client is told. Nothing changes on screen until that client commits.
+            configure_window(srv, window, width, height, origin);
+            reply_on_session(ch, op, request_id, &[]);
+        }
+        MgrOutcome::Failed(e) => {
+            reply_error_on_session(ch, op, request_id, surface_errno(e));
+        }
+    }
+    true
+}
+
+/// Mint the manager channel, or refuse because one is already attached.
+///
+/// **A capability by binding, and in Milestone 6 that binding gates nothing** — `/dev/draw` is
+/// bound unscoped into init's root namespace and every graphical client inherits it, so any of
+/// them could ask. What actually separates them here is *order*: the intended manager resolves
+/// first. That is written down as an ordering rather than dressed up as a capability —
+/// `TODO(manage-ungated)`, closed by Milestone 7's per-client namespaces.
+fn open_manager(serve_end: u64, request_id: u64) -> bool {
+    // SAFETY: single-threaded server reading its own state.
+    if unsafe { MANAGER_CH } != 0 {
+        // **Refused, not replaced.** Handing the channel to a second asker would silently
+        // depose the first, and two managers placing windows is a race with no arbiter.
+        kprint(b"compositor: a second manager was refused\n");
+        return reply_resolve_error(serve_end, request_id, KError::WouldBlock);
+    }
+    let Some((client_end, server_end)) = make_channel(SESSION_QUEUE_DEPTH) else {
+        return reply_resolve_error(serve_end, request_id, KError::OutOfMemory);
+    };
+    if !reply_session(serve_end, request_id, client_end) {
+        // SAFETY: the reply failed, so the manager never received its end; drop both.
+        unsafe {
+            syscall4(SYS_HANDLE_CLOSE, client_end, 0, 0, 0);
+            syscall4(SYS_HANDLE_CLOSE, server_end, 0, 0, 0);
+        }
+        return false;
+    }
+    // SAFETY: recording our end of the channel we just handed out.
+    unsafe { MANAGER_CH = server_end };
+    kprint(b"compositor: a manager attached\n");
+    true
+}
+
+/// Drop the manager channel — it went away, so the compositor manages itself again.
+fn close_manager() {
+    // SAFETY: closing our own endpoint and clearing the slot.
+    unsafe {
+        if MANAGER_CH != 0 {
+            syscall4(SYS_HANDLE_CLOSE, MANAGER_CH, 0, 0, 0);
+            MANAGER_CH = 0;
+        }
+    }
+    kprint(b"compositor: the manager went away\n");
 }
 
 /// Close session `slot` and destroy everything the client had on screen.
@@ -1294,13 +1431,18 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
     let mut parked = false;
     loop {
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
-        // `2 + MAX_SESSIONS` — `serve_end`, the input channel when connected, then the
-        // sessions — which the `const _` beside `MAX_SESSIONS` holds to that limit.
+        // `3 + MAX_SESSIONS` — `serve_end`, the input channel when connected, the manager
+        // channel when one is attached, then the sessions — which the `const _` beside
+        // `MAX_SESSIONS` holds to that limit.
         let waited = unsafe {
             WAIT_HANDLES[0] = serve_end;
             let mut n = 1usize;
             if srv.input_ch != 0 {
                 WAIT_HANDLES[n] = srv.input_ch;
+                n += 1;
+            }
+            if MANAGER_CH != 0 {
+                WAIT_HANDLES[n] = MANAGER_CH;
                 n += 1;
             }
             for i in 0..MAX_SESSIONS {
@@ -1366,6 +1508,13 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
                 srv.input_ch = 0;
                 continue;
             }
+            // SAFETY: reading our own manager slot.
+            if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
+                if !serve_manager(srv, &mut fb) {
+                    close_manager();
+                }
+                continue;
+            }
             // SAFETY: scanning our own slot table for the signalled endpoint.
             if let Some(slot) = unsafe { (0..MAX_SESSIONS).find(|&i| SESSION_CH[i] == h) }
                 && !serve_session(slot, srv, &mut fb)
@@ -1428,6 +1577,9 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
         match resolved {
             Resolved::New => {
                 open_session(serve_end, request_id, srv);
+            }
+            Resolved::Manage => {
+                open_manager(serve_end, request_id);
             }
             Resolved::Info(id) => {
                 reply_window_info(serve_end, request_id, srv, id);

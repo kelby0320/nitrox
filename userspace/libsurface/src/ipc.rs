@@ -108,19 +108,43 @@ impl ChannelTransport {
     ///
     /// `root_ns` must be a live namespace handle owned by the caller.
     pub unsafe fn connect(root_ns: u64) -> Result<Self, UiError> {
+        // SAFETY: the caller guarantees `root_ns` is live and owned.
+        unsafe { Self::resolve(root_ns, "/dev/draw/new") }
+    }
+
+    /// Resolve `/dev/draw/manage` — **the** manager channel.
+    ///
+    /// A window manager speaks the `Manage` ops over this about *any* window, not just windows
+    /// it created. There is one: a second resolve is refused, because two managers placing
+    /// windows is a race with no arbiter.
+    ///
+    /// **The capability is the binding**, and in Milestone 6 that binding gates nothing —
+    /// `/dev/draw` is bound unscoped into init's root namespace and every graphical client
+    /// inherits it. See `TODO(manage-ungated)`.
+    ///
+    /// # Safety
+    ///
+    /// `root_ns` must be a live namespace handle owned by the caller.
+    pub unsafe fn manage(root_ns: u64) -> Result<Self, UiError> {
+        // SAFETY: the caller guarantees `root_ns` is live and owned.
+        unsafe { Self::resolve(root_ns, "/dev/draw/manage") }
+    }
+
+    /// Resolve `path` and wrap the endpoint it answers with.
+    ///
+    /// # Safety
+    ///
+    /// `root_ns` must be a live namespace handle owned by the caller.
+    unsafe fn resolve(root_ns: u64, path: &str) -> Result<Self, UiError> {
         use libkern::handle::{RawHandle, Rights};
-        use libos::{Handle, Namespace, NsReadOnly, Resource, Only, block_on};
+        use libos::{Handle, Namespace, NsReadOnly, Only, Resource, block_on};
 
         // SAFETY: the caller guarantees `root_ns` is live and owned; `borrow` never closes.
         let ns =
             unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
-        // SAFETY: `/dev/draw/new` resolves to a channel endpoint, asserted by the type
-        // arguments. The compositor mints one session per resolve.
+        // SAFETY: both paths resolve to a channel endpoint, asserted by the type arguments.
         let ch = block_on(unsafe {
-            ns.lookup::<Resource, Only>(
-                "/dev/draw/new",
-                Rights::SEND | Rights::RECV | Rights::WAIT,
-            )
+            ns.lookup::<Resource, Only>(path, Rights::SEND | Rights::RECV | Rights::WAIT)
         })
         .map_err(|_| UiError::Transport)?;
         // SAFETY: a live endpoint this process now owns.
