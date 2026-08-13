@@ -14238,3 +14238,94 @@ Clipping a commit's damage *after* `stack.commit()` clips it to the **new** buff
 a window whose buffer shrank never repainted the band it vacated. Unreachable in-tree — every
 window in the image is fixed-size and M6 owns resize — which is precisely why it needed a test
 rather than a client to find it.
+
+## 2026-08-12 — The display arm re-scoped: the graphical column, and two supervisors rather than one
+
+M5 Part C said `session-mgr` spawns `nxterm` and registers it. The maintainer asked why: *"nxterm
+will be a desktop app the way gnome-terminal is a desktop app on Linux. When a user launches
+nxterm should it be the session-mgr that is spawning it, or should it be something else?"*
+
+The answer is something else, and finding out *what* exposed a hole big enough to change three
+milestones.
+
+### The top of a column was empty
+
+A grep of `docs/` for *display manager*, *graphical login*, *greeter* returns nothing.
+`ui-composition-model.md` §6 assigns "spawning applications" to the desktop shell, and §5a says
+the shell holds a full-rights handle to each application's namespace "because it *created* those
+namespaces at spawn". But nothing said who authenticates a graphical user, or who spawns the
+shell. So the plan reached for the only supervisor below `service-mgr` holding `BIND_NAMESPACE`
+— which is the serial column's, doing a graphical job.
+
+**The model is two parallel stacks**, as the maintainer put it: log in on serial and `session-mgr`
+gives you `nxsh`; log in on the keyboard and something gives you a `desktop-shell`. Linux's shape
+exactly — `getty`/`login` and `sshd` beside `gdm` → `gnome-session` → `gnome-shell` — and now
+written down in [`graphical-session.md`](design/graphical-session.md).
+
+### Two supervisors, sharing a crate — the PAM answer, not the logind one
+
+Considered: expanding `session-mgr` to serve both. **Rejected on governing decision 3.** Serial is
+the recovery path that `eshell`, `test-qemu` and headless CI all depend on; one process serving
+both logins means a graphical fault costs the serial console. Linux has never merged them either,
+and for the same reason.
+
+Linux unified its entry points twice and only one half applies. **PAM (1995) is a shared
+*library*** — `login`, `sshd` and every display manager link it, sharing the credential logic
+while each owns its entry mechanism. **`systemd-logind` (2011) is a central *registry*** of what
+sessions exist, which authenticates nobody. Nitrox takes the first and names the second as
+somewhere a future multi-seat answer could go. `auth-service` is PAM's *verifier* and must not
+drift into being logind: one question, one answer, no session state.
+
+There is a hard constraint on the shared crate: `session-mgr`'s `CLAUDE.md` restricts it to
+`libkern` + `librsproto` + `libstream` + `libheap`, because it is a supervisor whose death is a
+system fault. A graphical greeter is *itself a compositor client* and needs `libdraw` + `libui` +
+`libsurface`. So the shared core keeps the strict rule and the greeter stays in each supervisor —
+which is also the honest split, since presentation is exactly where the two differ.
+
+**Named `desktop-session-mgr`, not `display-mgr`.** "Display manager" is an X11 word — it managed
+X *displays* — and there are none here. `session-mgr` + `desktop-session-mgr` costs no rename and
+matches `desktop-shell`.
+
+### Two things the old Part C assumed that were not true
+
+*That `nxterm` spawning its own shell would need authority it should not have.* **There is no spawn
+syscap.** `sys_process_spawn` calls `require_syscap` nowhere; `SysCaps` has six bits and only
+`BIND_NAMESPACE` and `REAL_TIME` gate anything. `nxsh` spawns with `syscaps: 0`. The real
+constraint is namespace *construction*, and a child spawned with `namespace: 0` inherits — it
+constructs nothing. `ui-composition-model.md` §5's guarantee that "no application holds a handle
+to another's namespace" is untouched.
+
+*That a session's programs share one terminal.* They do not, and never did: a `Tty` is minted
+**per resolver**. `session-mgr` opens one for the login prompt, `nxsh` opens its own, every stage
+it spawns can open another — and `console-and-tty.md` already carries errata saying so. So "the
+backend is per-session, not per-terminal" was overturning a model that did not exist. Per-terminal
+is both correct for an application you can launch several of *and* less new structure, since the
+group key is a handle the server already holds.
+
+### The milestone shape
+
+The old M6 — "windows, ports, desktops" — bundled work at three depths: windows need only the
+compositor; desktops and ports need a shell; the shell needs a login. Split into **M6 window
+management**, **M7 the graphical session**, **M8 desktops/ports/templates**, with the old M7
+becoming **M9**.
+
+The state M6 starts from is worth recording, because it is easy to underestimate: **the compositor
+has no window management at all.** `set_origin` exists with no protocol op and one non-test caller
+(the pointer sprite); every window is created at (0,0) and stacks in creation order. M5 Part B ran
+into it directly — the display gate creates its three reference windows largest-first and asserts
+they nest, because nothing can move them.
+
+M6's real work is therefore not the mechanism but **the seam**: governing decision 2 puts
+placement policy in the shell, and there is no shell, so the compositor needs a default *and* a
+way to be overridden. Considered and rejected (maintainer's call): a throwaway thin shell in M6 to
+exercise that seam — either write one that evolves into the real shell, which is M7's job, or use
+a compositor default. A shell built to be discarded is a third thing to maintain and its feedback
+is worth less than it costs.
+
+### What this cost, and what found it
+
+One question about a single sentence in a plan. The sentence was defensible on its face — it cited
+the right architectural rule ("supervisors spawn and bind, servers do not self-register") and drew
+the wrong conclusion from it, because the process the rule pointed at did not exist. **A plan can
+be locally consistent and globally wrong**, and the thing that catches that is someone asking what
+a component *is* rather than whether a step follows.

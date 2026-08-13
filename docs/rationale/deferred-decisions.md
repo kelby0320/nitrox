@@ -292,6 +292,22 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`.** M5 Part C hands `nxterm`'s
+shell its terminal as a *handle* at spawn, the way `libstream` already passes streams. A
+`/dev/tty` resolved inside that window still reaches the session's console, because that binding
+belongs to a namespace `desktop-shell` will construct and no such process exists. Inert today —
+nothing in the tree resolves `/dev/tty` except `nxsh`, which will have been handed one — and
+wrong to fix in the tty server, because it is a property of how applications get their
+namespaces. Trigger: **Milestone 7**, the graphical session;
+[`graphical-session.md`](../design/graphical-session.md) §6.1 holds the three candidate shapes.
+
+**Concurrent serial and graphical sessions.** `session-and-auth.md` defers "one console, one
+session at a time"; two supervisors able to authenticate independently fires it. Serial must stay
+available while a graphical session runs — it is the recovery path, governing decision 3 — but
+whether that is two sessions or one session with two views is undecided, and the answer
+determines whether anything `logind`-shaped is eventually needed. Trigger: Milestone 7
+([`graphical-session.md`](../design/graphical-session.md) §6.2).
+
 **A scrollbar's grab offset — `TODO(scroll-grab)`.** `ScrollState::offset_at` puts the thumb's
 *centre* under the cursor, so grabbing a thumb near either of its ends makes it jump by up to
 half its length before the drag begins. Every toolkit that avoids this remembers where within

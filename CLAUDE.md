@@ -111,11 +111,12 @@ wrong about how something works:
   same change.
 - **`rationale/` explains why**, and is largely timeless.
 - **`design/`, `planning/` and `archive/` do not describe current behaviour.** `design/`
-  is what a subsystem *will* be. Today it holds exactly three documents, all describing the
-  display system **above Milestone 4**: `display-substrate.md` (the parts above the
-  compositor), `ui-composition-model.md` (ports, desktops, templates) and `desktop-shell.md`.
-  What is built has moved out — `input-subsystem.md` and `widget-toolkit.md` graduated to
-  `architecture/` on 2026-08-12 — so the rule to apply is simply "`design/` means not built".
+  is what a subsystem *will* be. Today it holds exactly four documents, all describing the
+  display system **above Milestone 5**: `display-substrate.md` (the parts above the
+  compositor), `ui-composition-model.md` (ports, desktops, templates), `desktop-shell.md`, and
+  `graphical-session.md` (who logs a graphical user in and spawns the shell). What is built has
+  moved out — `input-subsystem.md` and `widget-toolkit.md` graduated to `architecture/` on
+  2026-08-12 — so the rule to apply is simply "`design/` means not built".
   `planning/` is what is intended, with checkboxes for what is done. `archive/` is superseded.
   **Never conclude "the system does X" from any of them.**
 - **`decision-log.md` is a dated record and is append-only.** Entries are true as of their

@@ -77,6 +77,11 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     `libterm`'s parser, grid, render and encoder, plus the blend that unblocked antialiasing)
     and Part B (`nxterm` itself: window, chrome, scrollback, key repeat, and the display gate's
     third region) both landed 2026-08-12; Part C — the tty server's second backend — is next).
+    **Re-scoped 2026-08-12** after a gap surfaced while planning Part C: nothing said who logs a
+    *graphical* user in or spawns the desktop shell. That column is specified now in
+    [docs/design/graphical-session.md](../design/graphical-session.md), and the milestones above
+    M5 changed shape — M6 is window management, **M7 is the graphical session** (new), M8 is
+    desktops/ports/templates, M9 the composed desktop.
     Design in
     [docs/design/display-substrate.md](../design/display-substrate.md) +
     [docs/design/ui-composition-model.md](../design/ui-composition-model.md);

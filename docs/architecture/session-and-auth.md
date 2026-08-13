@@ -194,7 +194,10 @@ supervisor drops to on a critical-path failure — no longer the normal console.
   designed in [profiles-and-namespace-projection](profiles-and-namespace-projection.md);
   a session binds the system `/bin` only.
 - Session **tokens** and multi-session bookkeeping; logout / switch-user; concurrent
-  logins (one console, one session at a time).
+  logins (one console, one session at a time). The **graphical** column beside this one —
+  `desktop-session-mgr`, its login window, and the session it constructs — is designed in
+  [graphical-session.md](../design/graphical-session.md) (2026-08-12) and not built; it is
+  what fires the concurrency question above.
 - User *creation* and password *change* (the DB is read-only); persisted per-user
   state beyond the seeded home directory.
 - The real user shell (Phase 4).
