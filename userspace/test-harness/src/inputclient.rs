@@ -391,6 +391,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 WindowEvent::Key(_) => b"key",
                 WindowEvent::Pointer(_) => b"pointer",
                 WindowEvent::Dropped => b"dropped",
+                // Not this client's business: its window is fixed-size and it never moves.
+                WindowEvent::Configure { .. } => b"configure",
             };
             Line::new().s(b"input-testclient: first win event=").s(what).end();
         }
@@ -464,6 +466,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 Line::new().s(b"input-testclient: win focus has=").u(u64::from(f)).end();
             }
             WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+            // Ignored deliberately: a fixed-size window declining a resize is legal, and this
+            // one is 2048×2048 on purpose.
+            WindowEvent::Configure { .. } => {}
         }
     }
 
@@ -501,6 +506,9 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             }
             WindowEvent::Pointer(_) | WindowEvent::Focus(_) => {}
             WindowEvent::Dropped => kprint(b"input-testclient: win events DROPPED\n"),
+            // Ignored deliberately: a fixed-size window declining a resize is legal, and this
+            // one is 2048×2048 on purpose.
+            WindowEvent::Configure { .. } => {}
         }
     }
 

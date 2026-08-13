@@ -14735,3 +14735,182 @@ The pass named `check-display`'s dependency on origin placement and missed `chec
 whose click point was computed from where `ui-testclient`'s windows land — and `init`'s spawn-order
 comment, which A1 makes false. The third is the one that would bite hardest: a stale comment
 asserting a retired invariant is what the last two milestones each shipped once.
+
+## 2026-08-13 — M6 A1/A3/A4: placement, and returning damage instead of remembering to compute it
+
+The stack half of window management. Three ops and one API decision worth keeping.
+
+### `place` returns its damage
+
+Every other path in the compositor computes `dirty` from state captured *before* the mutation —
+`server.rs`'s commit reads `let was = …`, its destroy reads `let before: Vec<…>`. That is a
+discipline, and M5 shipped the bug that comes of forgetting it (PR #192, finding 3: a shrunk
+window never repainted what it vacated).
+
+`place` returns `Rect` instead. The union of where the window was and where it is comes back
+*from* the mutation, so there is no order for a caller to get wrong. **A known trap made
+unreachable beats a known trap documented**, and the cost is one return type.
+
+The plan had this as "there is a working pattern to copy". Copying it a third time would have
+worked; not needing to is better.
+
+### An uncommitted window dirties nothing, and that is the common case
+
+`present_into` skips windows with no committed buffer, so a window that has never committed is
+not on screen: moving it paints over nothing and reveals nothing. Reporting its bounds would
+repaint a region for no reason on **every window launch**, because placing a window before its
+first commit is exactly what a manager does — the whole point of M6's initial-configure
+handshake.
+
+Worth stating because it reads like an edge case and is the opposite.
+
+### `raise_above`, and the index that shifts under you
+
+Alt-tab needs "raise this one, but only to where that one was" — a full `raise` reorders every
+window between them, which the user sees as the rest of the stack shuffling behind the one they
+asked for.
+
+The implementation has one trap and the test names it: the target's index must be recomputed
+**after** the removal. Taking `id` out shifts everything above it down by one, so an index
+captured first is wrong by one whenever `id` sat below `other` — and only then, which is why the
+test moves a window in both directions.
+
+### The default placement policy: dropped, not deferred
+
+The plan left this open with three options. Building it settled it: **the default stays the
+origin.** A compositor-side cascade is a policy the shell then has to override, which is the
+failure mode the seam exists to avoid; and with a manager attached the manager places, so a
+cascade would only ever apply to the manager-less case — a test image and a degraded boot,
+neither better served by windows landing somewhere clever.
+
+That also dissolves most of the gate collision: `check-display` keeps working unchanged, and
+`ui-testclient` placing explicitly (Part B) becomes an improvement to the gate rather than a
+repair to it.
+
+## 2026-08-13 — Part D was added to the wrong milestone, and I said otherwise on the PR
+
+PR #195's review found that M6 had no checkbox for its spec work. I added a **Part D — the
+contract**, replied on the PR saying *"M6 has a **Part D** now"*, and it merged. It was in
+**Milestone 5**.
+
+The edit was `s.replace("### Out of scope, deliberately", block + anchor, 1)`, and M5 has a
+section by that name too — so the first occurrence won, and a completed milestone acquired two
+unticked boxes about work that belongs a milestone later. Found by the maintainer reading the plan,
+which is the only way it *could* be found: `check-docs` validates links and cited paths, not
+whether a section is under the right heading.
+
+**This is the second time in one session** that replacing the first occurrence of a non-unique
+anchor put an edit somewhere I did not look. The other was an `xtask` change that landed in
+`cmd_check_input` instead of `cmd_check_terminal`, caught within minutes because it failed to
+compile. This one had nothing to fail. The rule that would have caught both: **anchor an insertion
+to something unique, or locate the region first and search within it** — the corrected edit finds
+the M6 section's bounds and asserts the anchor falls inside them.
+
+The worse half is the reply. I told the reviewer the finding was addressed and named the section I
+had created, without looking at where it went. A claim about work just done is exactly the kind
+this repository has caught me on repeatedly, and "I just wrote it" is the weakest possible reason
+to believe something is where I think it is.
+
+Moved to M6, and while there: put after Part C rather than after "What done means", which D1's own
+text referred to as *"below"*; the op and event counts corrected against B2 and B3 (the review's
+finding 8 cut `Move`, so "six manager ops" was already stale); and "Out of scope" no longer says
+*"M6 gives `Move` as a state change"*, which contradicted B2 in the same document.
+
+## 2026-08-13 — M6 A2: the initial-configure handshake, and what it cost every client
+
+`Surface::Configure` (`0x0908`), server → client: where and how large the compositor would like a
+window to be. A *request* — the compositor cannot resize a client's buffer, because the client
+allocates it — and declining stays legal, because a fixed-size window is ordinary and a protocol
+that required compliance would make every client implement reflow before it could exist.
+
+The rule that matters is the ordering one: **a window is not composited until it has been
+configured**, so a client waits for its first `Configure` before its first `Commit`.
+
+### The wait is the client's, and that is the whole design
+
+A manager is a separate process, so placing a window before it is seen means *somebody* waits.
+The plan had already rejected the compositor withholding the `CreateWindow` reply until a manager
+answers — that puts a userspace process on the critical path of every window creation, where a
+wedged shell stops clients from starting at all. What the review found (PR #195, finding 2) is
+that rejecting it left nothing supplying the ordering at all: the interval between `CreateWindow`
+and the first `Commit` belongs to the *client*, which issues both sends back to back.
+
+Putting the wait in the client closes that without the cost. It is Wayland's shape and it is right
+here for Wayland's reason.
+
+**With no manager attached the compositor answers immediately**, echoing the request. So the wait
+is a formality today and becomes real in Part B without any client changing — which is the
+property worth having, and the reason to send the configure unconditionally now rather than only
+once a manager exists.
+
+### The compiler made every client acknowledge it
+
+`WindowEvent` is exhaustively matched, so adding `Configure` broke three call sites in
+`input-testclient` and one in `nxterm` until each said what it does about a resize. Both decline,
+and both now say why in a comment — `nxterm` because grid reflow is out of M6's scope, the test
+client because its window is oversized on purpose.
+
+That is friction working: an event a client can ignore is still an event a client should have
+*decided* to ignore, and a non-exhaustive match would have let four clients ignore it by accident.
+
+### A mock that owed the contract
+
+`libsurface`'s test transport replied to `CreateWindow` with an id and nothing else, so
+`Window::new` hung. The fix is not an accommodation — the mock now queues the configure exactly as
+the compositor does, because **a mock that does not honour a protocol's ordering is a mock that
+cannot catch a client violating it.**
+
+Its `wait_event` also counted a wait when an event was already queued, which the real transport
+does not (it polls first). That made the handshake look like a block and broke two `acquire` tests
+that count *buffer* waits. Fixed in the mock rather than in the assertions: the count means "had
+to block", and it should mean that in both implementations.
+
+### The spec row shipped with the op
+
+`rsproto-surface-ops.md` gained `Configure`, the handshake as a normative client obligation, and a
+row in the "which requests reply" table — `CreateWindow` now produces a reply *and* a configure,
+which is the one place in this category where one request yields two messages.
+
+Written now rather than with the rest of Part D, because a protocol change merging without its
+spec row is precisely what PR #195's finding 6 was about, and deferring it to a later PR would
+have reproduced the thing the finding warned against.
+
+## 2026-08-13 — PR #196 review: a PR that described three commits and contained one
+
+The review's first finding is that the branch held one commit of three. It was right, and the
+cause is worth writing down because it is the same shape as the two edit-placement errors earlier
+in this session.
+
+While fixing the misplaced Part D I ran `git checkout -b phase-4/m6-partd-fix`, which succeeded —
+so the two commits after it landed on *that* branch. The later `git push -u origin
+phase-4/m6-parta` then pushed the **local ref of that name**, which was still at the first commit,
+from a working tree that was on a different branch. Git did exactly what it was told; nothing
+failed; the push reported success.
+
+**Three times now, an operation has silently applied somewhere I was not looking**: an `xtask`
+edit into the wrong function, a plan section into the wrong milestone, and now commits onto the
+wrong branch. Two were caught by a compiler or a reader; this one was caught by a reviewer running
+`git ls-remote`. The pattern is not carelessness about any one step — it is **acting on a name
+without confirming what that name currently refers to**, and the cheap defence is to check the
+thing that will be read afterwards rather than the thing that was written.
+
+The PR description made it worse rather than better: it described the handshake in detail, and the
+detail made the absence harder to notice, not easier. A description written from what was
+*intended* rather than from the diff is a description that cannot catch this.
+
+### And the guarantee the API advertised was not the one it enforced
+
+`place` returning `Rect` removes the *ordering* trap — a caller can no longer compute damage after
+the mutation — but not the *forgetting* one. The review pointed at `stack.place(w, origin)?;`,
+which compiles silently and repaints nothing.
+
+`#[must_use]` on the function does **not** close that, which I checked rather than assumed: `?`
+consumes the `Result`, satisfying the attribute, and drops the `Rect` on the floor. The attribute
+has to be on the thing that survives the `?`. So `Damage(Rect)` is a `#[must_use]` newtype now,
+and the warning fired immediately on three existing call sites — all in tests that legitimately do
+not paint, now saying so with `let _ =`.
+
+That is the second time in this milestone that a guarantee had to move to where the compiler could
+see it. The first was `place` returning its damage at all; this is the same lesson applied one
+level further in, and it is only visible by asking *"what exactly does this stop someone doing?"*
+rather than *"is this better than before?"*.

@@ -416,6 +416,12 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // is the point: a client that silently ignored this would be wrong the moment it
             // started tracking anything.
             WindowEvent::Dropped => kprint(b"nxterm: input dropped\n"),
+            // **Declined, and legal.** Honouring a resize means resizing `libterm`'s grid and
+            // reflowing its scrollback, which M5 called "a different problem, not a parameter of
+            // this one" and which M6 keeps out of scope. A client that ignores a `Configure`
+            // simply keeps committing the size it has, and the compositor composites what it is
+            // given — see `docs/spec/rsproto-surface-ops.md`.
+            WindowEvent::Configure { .. } => {}
         }
         }
         let _ = &maps;

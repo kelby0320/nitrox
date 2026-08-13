@@ -307,7 +307,9 @@ mod tests {
         let id = stack
             .create(&CreateWindowRequest { role, width: w, height: h })
             .expect("create");
-        stack.set_origin(id, Point::new(x, y)).expect("origin");
+        // Damage ignored: this helper positions a window for a routing test, and nothing
+        // in these tests paints.
+        let _ = stack.place(id, Point::new(x, y)).expect("origin");
         stack
             .attach(&AttachBufferRequest {
                 window: id,

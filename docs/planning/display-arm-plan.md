@@ -12,7 +12,9 @@ doc-graduation box, which M5 carries as a prerequisite: `libui` — the retained
 the keyed diff, per-buffer damage, event routing, painting, and the widget set — plus real
 TrueType glyphs, key repeat, an on-screen pointer, and the font on the root filesystem.
 **Milestone 5 is complete** (2026-08-13): the GUI terminal runs a real shell.
-**Milestone 6 is planned in detail** (2026-08-13) and not started.
+**Milestone 6 is in progress**: planned in detail 2026-08-13, and **Part A — geometry in
+the stack, plus the initial-configure handshake — landed the same day.** Parts B, C and D are
+not started.
 **Milestone 5 Parts A and B were complete** (2026-08-12): `libterm`'s parser, grid, render and
 encoder, the blend that unblocked antialiasing, and `nxterm` itself — window, chrome, scrollback,
 key repeat, and the display gate's third region. **Part C landed 2026-08-13 — `Tty::AttachBackend`,
@@ -1036,22 +1038,6 @@ and Part C is what its title says: the tty server's second backend. `nxterm` sta
 5. **80×24 fixed, no resize** — M6 owns move and resize, and a resizable grid is a different
    reflow problem than a fixed one.
 
-### Part D — the contract
-
-- [ ] **D1 — `rsproto-surface-ops.md` grows M6's ops.** A resolve path (`manage`), six manager
-      ops, four manager events, `Surface::Configure` and `Surface::SetTitle`. The spec is the
-      canonical contract — its "How a client obtains a connection" section documents
-      `/dev/draw/new` as *the* way, and "Which requests reply, and why a client must drain" is
-      normative, so an op without a row is an op a second implementation gets wrong.
-
-      Listed as a checkbox rather than assumed, because the "What done means" section below lists
-      only tests and that is how doc work goes unwritten (PR #195 review, finding 6). The `Tty`
-      category spent months without a spec file for exactly this reason.
-
-- [ ] **D2 — the initial-configure handshake is documented as a client obligation**, not just as
-      a compositor behaviour. B4's rule only works if every client waits, and a client author
-      reading the spec is the person who needs to know.
-
 ### Out of scope, deliberately
 
 Each of these is a thing a mature terminal has, and each would be a guess made a milestone
@@ -1080,7 +1066,7 @@ Part B drops input under load, the wire record lands there rather than being wor
 
 ## Milestone 6 — window management
 
-**Planned in detail 2026-08-13**, not started.
+**Planned in detail 2026-08-13. Part A landed 2026-08-13; B, C and D are not started.**
 
 **Re-scoped 2026-08-12.** This milestone was "windows, ports, and desktops", which bundled three
 things at very different dependency depths: windows need only the compositor, while ports and
@@ -1178,10 +1164,16 @@ reflow.
 
 ### Part A — geometry in the stack
 
-- [ ] **A1 — placement, and a default policy.** `place(id, origin)` and a default for windows
-      nobody placed. The default is **not** free to choose: see the gate collision below.
+- [x] **A1 — placement, and a default policy.** ✅ 2026-08-13. `place(id, origin)` in the stack.
 
-- [ ] **A2 — `Surface::Configure`**, server → client, and the client half in `libsurface` —
+      **The default stays the origin, and cascade is dropped rather than deferred.** The plan
+      left this open; building it settled it. A compositor-side placement policy is a policy the
+      shell then has to override, which is the failure mode this milestone's seam exists to
+      avoid — and with a manager attached the manager places, so a cascade would only ever apply
+      to the manager-less case. That case is a test image and a degraded boot, neither of which
+      is better served by windows landing somewhere clever.
+
+- [x] **A2 — `Surface::Configure`** ✅ 2026-08-13, server → client, and the client half in `libsurface` —
       a `WindowEvent::Configure { origin, width, height }` a client may honour or ignore.
       Ignoring a *later* one is legal and must stay legal: a fixed-size window is an ordinary
       thing, and a protocol that required compliance would make every client implement reflow
@@ -1192,11 +1184,11 @@ reflow.
       answer is a placement, and a client that had to learn its position some other way would be
       back to two mechanisms.
 
-- [ ] **A3 — restack beyond `raise`.** `lower`, and `raise_above(id, other)` for the shell's
+- [x] **A3 — restack beyond `raise`.** ✅ 2026-08-13. `lower`, and `raise_above(id, other)` for the shell's
       alt-tab. `raise` exists and click-to-focus drives it; the others have no caller until M7,
       so they land with tests and the manage channel rather than on their own.
 
-- [ ] **A4 — damage for a moved window.** A move dirties the **union of the old and new
+- [x] **A4 — damage for a moved window.** ✅ 2026-08-13 — and the trap is now unreachable rather than known: `place` **returns** the damage, so it cannot be computed after the mutation. A move dirties the **union of the old and new
       rectangles**, exactly as M5's resize case does — and for the same reason, that a rectangle
       cannot express "old minus new". This is a real trap: `dirty` is computed *after* the
       mutation in most paths, and a move computed the same way repaints the destination and
@@ -1291,6 +1283,26 @@ reflow.
       in-window popup stops being the only option, so the toolkit's `offset` gets a doc note
       saying which to reach for.
 
+### Part D — the contract
+
+- [ ] **D1 — `rsproto-surface-ops.md` grows M6's ops.** A resolve path (`manage`), B2's five
+      manager ops, B3's five manager events, `Surface::Configure` and `Surface::SetTitle`. The spec is the
+      canonical contract — its "How a client obtains a connection" section documents
+      `/dev/draw/new` as *the* way, and "Which requests reply, and why a client must drain" is
+      normative, so an op without a row is an op a second implementation gets wrong.
+
+      Listed as a checkbox rather than assumed, because "What done means" lists only tests and
+      that is how doc work goes unwritten (PR #195 review, finding 6). The `Tty` category spent
+      months without a spec file for exactly this reason.
+
+- [x] **D2 — the initial-configure handshake is documented as a client obligation** ✅ 2026-08-13,
+      not just as a compositor behaviour. B4's rule only works if every client waits, and a client
+      author reading the spec is the person who needs to know.
+
+      **Landed with A2 rather than with the rest of Part D**, because A2 is what ships the op: a
+      protocol change merging without its spec row is the thing finding 6 was about, and holding
+      it for a later PR would have reproduced it.
+
 ### The gate collision, which is the first thing to resolve
 
 **Placement is load-bearing for two gates and one spawn order, all of which assume windows land
@@ -1352,10 +1364,11 @@ predict.
 
 - **Decorations.** Nobody draws titlebars in M6, so nothing has a titlebar to drag by. Whether
   they are client-side (`libui`) or shell-drawn is a real question and it belongs with the shell.
-- **Interactive move and resize** — the *gesture*. M6 gives `Move` as a state change; turning a
-  drag into a sequence of moves needs a grab offset, which is `TODO(scroll-grab)`'s question
-  ("M6's window management, which needs press-relative dragging for window moves anyway") and
-  needs decorations to grab. Both move together, to M7.
+- **Interactive move and resize** — the *gesture*. M6 gives `Place`, which sets an absolute
+  origin; turning a drag into a sequence of placements needs a grab offset, which is
+  `TODO(scroll-grab)`'s question ("M6's window management, which needs press-relative dragging
+  for window moves anyway") and needs a decoration to grab. Both move together, to M7 — and the
+  absence of the gesture is why B2 has no relative `Move`.
 - **Terminal reflow**, per question 3.
 - **Desktops, thumbnails, global hotkeys** — M8, M8, M7.
 
