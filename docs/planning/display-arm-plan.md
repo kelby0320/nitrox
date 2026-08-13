@@ -11,9 +11,12 @@ QMP and asserts they reach a **window**. **Milestone 4 is complete** (2026-08-11
 doc-graduation box, which M5 carries as a prerequisite: `libui` — the retained tree, layout,
 the keyed diff, per-buffer damage, event routing, painting, and the widget set — plus real
 TrueType glyphs, key repeat, an on-screen pointer, and the font on the root filesystem.
-**Milestone 5 Parts A and B are complete** (2026-08-12): `libterm`'s parser, grid, render and
+**Milestone 5 is complete** (2026-08-13): the GUI terminal runs a real shell.
+**Milestone 6 is planned in detail** (2026-08-13) and not started.
+**Milestone 5 Parts A and B were complete** (2026-08-12): `libterm`'s parser, grid, render and
 encoder, the blend that unblocked antialiasing, and `nxterm` itself — window, chrome, scrollback,
-key repeat, and the display gate's third region. **Part C is re-planned and not started.**
+key repeat, and the display gate's third region. **Part C landed 2026-08-13 — `Tty::AttachBackend`,
+per-backend routing, and `nxterm` hosting `nxsh` over what is a pty with the pieces renamed.**
 
 **The arm was re-scoped on 2026-08-12**, from a gap found while planning Part C: the plan had
 `session-mgr` spawning `nxterm`, which assigns a graphical job to the serial column's supervisor.
@@ -498,7 +501,7 @@ crate that applications link. The seam matters when dynamic linking lands — th
 schedules the two together, and notes that two applications each embedding the toolkit share no
 pages, which is exactly when it starts to pay.
 
-## Milestone 5 — the GUI terminal (the MVP flagship)
+## Milestone 5 — the GUI terminal (the MVP flagship) ✅ complete (2026-08-13)
 
 **Deliverable: `nxsh` running in a compositor window, driven by keystrokes a person could
 have typed, rendering its output with a real font.**
@@ -1033,6 +1036,22 @@ and Part C is what its title says: the tty server's second backend. `nxterm` sta
 5. **80×24 fixed, no resize** — M6 owns move and resize, and a resizable grid is a different
    reflow problem than a fixed one.
 
+### Part D — the contract
+
+- [ ] **D1 — `rsproto-surface-ops.md` grows M6's ops.** A resolve path (`manage`), six manager
+      ops, four manager events, `Surface::Configure` and `Surface::SetTitle`. The spec is the
+      canonical contract — its "How a client obtains a connection" section documents
+      `/dev/draw/new` as *the* way, and "Which requests reply, and why a client must drain" is
+      normative, so an op without a row is an op a second implementation gets wrong.
+
+      Listed as a checkbox rather than assumed, because the "What done means" section below lists
+      only tests and that is how doc work goes unwritten (PR #195 review, finding 6). The `Tty`
+      category spent months without a spec file for exactly this reason.
+
+- [ ] **D2 — the initial-configure handshake is documented as a client obligation**, not just as
+      a compositor behaviour. B4's rule only works if every client waits, and a client author
+      reading the spec is the person who needs to know.
+
 ### Out of scope, deliberately
 
 Each of these is a thing a mature terminal has, and each would be a guess made a milestone
@@ -1061,49 +1080,292 @@ Part B drops input under load, the wire record lands there rather than being wor
 
 ## Milestone 6 — window management
 
-Sketched; detail when M5 lands.
+**Planned in detail 2026-08-13**, not started.
 
 **Re-scoped 2026-08-12.** This milestone was "windows, ports, and desktops", which bundled three
 things at very different dependency depths: windows need only the compositor, while ports and
 desktops need a desktop shell that does not exist. They are split — windows here, ports and
 desktops in M8 — and the shell's own milestone (M7) sits between them.
 
-**The concrete state this starts from: the compositor has no window management at all.**
-`WindowStack::set_origin` exists, has no protocol op, and has **no non-test caller at all** —
-all three call sites are inside `#[cfg(test)]`. Every window is created at (0,0) and stacks in
-creation order. That is not a missing feature so much as a missing subsystem, and M5 Part B ran
-into it directly — the display gate has to create its three reference windows largest-first and
-*assert* they nest, because nothing can move them.
+### Where this starts from
 
-**The pointer sprite is not a counterexample**, and an earlier draft of this paragraph wrongly
-cited it as the live caller. The cursor has no window id: its position lives in the input router
-and it is drawn over the composed output, deliberately — `compositor/src/lib.rs:149`, *"Composited
-**after** the window stack, because a cursor under a window is not a cursor."* Reading it as a
-positioned window would suggest routing cursor motion through the new placement op, which is the
-one thing the compositor is built not to do (PR #193 review, finding 1).
+**The compositor has no window management at all.** `WindowStack::set_origin` exists, has no
+protocol op, and has **no non-test caller** — all three call sites are inside `#[cfg(test)]`.
+Every window is created at (0,0) and stacks in creation order. That is a missing subsystem rather
+than a missing feature, and M5 Part B ran into it directly: the display gate creates its three
+reference windows largest-first and *asserts* they nest, because nothing can move them.
 
-- [ ] **Placement, move, resize, restack**, and the protocol ops for each. Focus policy that is
-      not "the last window created".
+**The pointer sprite is not a counterexample.** The cursor has no window id: its position lives in
+the input router and it is drawn over the composed output, deliberately —
+`compositor/src/lib.rs:149`, *"Composited **after** the window stack, because a cursor under a
+window is not a cursor."* Reading it as a positioned window would suggest routing cursor motion
+through the new placement op, which is the one thing the compositor is built not to do (PR #193
+review, finding 1).
 
-- [ ] **The policy seam.** Placement policy belongs to the shell — [`desktop-shell.md`](../design/desktop-shell.md)
-      §8 lists **Window placement** among the operations it demands of the compositor — and there
-      is no shell here. (Governing decision 2 is *not* the citation for this: it puts windows,
-      input routing and focus in the compositor and never mentions placement. An earlier draft
-      cited it anyway — PR #193 review, finding 6.) So the compositor needs a default *and* a way for the shell to take over:
-      an op to place a window, and a shell-privileged channel that is told when one appears.
-      **Designing that seam is this milestone's real work** — the mechanism is
-      straightforward, and the failure mode is a default policy the shell cannot override, which
-      would be discovered in M7 with the shell half-written.
+**What is already here and does not need building:** roles (`normal`/`panel`/`popup`/`dialog`),
+panel struts and `work_area`, `raise`, `focus_candidate` (topmost-focusable), click-to-focus, and
+damage-bounded repaint. M6 adds geometry and the seam; it does not revisit those.
 
-      Considered and rejected: a throwaway thin shell in this milestone to exercise the seam.
-      The maintainer's call (2026-08-12) — either write a shell that evolves into the real one,
-      which is M7's job, or use a compositor default. A shell built to be discarded is a third
-      thing to maintain and its feedback is worth less than it costs.
+### The three questions this milestone exists to answer
 
-- [ ] **A `Role::Popup` window can be positioned**, which M5 deferred: `librsproto`'s roles carry
-      a parent but the compositor cannot place a child relative to it, so a menu that must escape
-      its window has nowhere to go. `libui`'s `offset` covers the in-window case and clips at the
-      parent's edge; this is the other half.
+Everything below follows from these, and getting them wrong is what would be discovered in M7
+with the shell half-written.
+
+**1. Who may position a window?** Three answers coexist in every real system and conflating them
+is the classic mistake:
+
+| Who | What | Why |
+|---|---|---|
+| a **manager** | place, move, restack, focus **any** window | the shell's job (M7) |
+| an **application** | place its **own popup**, relative to a parent it owns | a menu must land under its item; nobody else knows where that is |
+| an application, for a **normal** window | **nothing** | a window that positions itself is `libui` §5's rejected absolute positioning, one level up |
+
+The application carve-out is the same one `libui`'s `offset` makes and for the same reason: a
+popup's position is *derived* from another element's rect, not chosen. Everything else is the
+manager's.
+
+**2. What is a manager, before there is one?** A capability, held as a namespace binding:
+`/dev/draw/manage` resolves to a channel carrying the ops in Part B. The intended gating is that a
+supervisor binds it into the shell's namespace and nowhere else — the mechanism this system
+already uses for everything, and the shape `desktop-shell.md` §8 asks for when it says a
+comparable capability *"must be capability-gated, or any application could impersonate the
+launcher"* (that line is the **global hotkey** row, not the placement row — the argument
+generalises, the citation does not, and an earlier draft cited it as if it did).
+
+**In M6's configuration that binding gates nothing, and the plan must say so rather than imply
+otherwise** (PR #195 review, finding 1). Three facts compose:
+
+- `/dev/draw` is bound **unscoped** into init's root namespace (`init/src/main.rs:1063` — a
+  `base_len` of 0, which `syscall-abi.md` defines as a whole-tree mount).
+- Every graphical client is spawned with `namespace: 0` — inherit a LOOKUP-only handle to init's.
+- Resolves are classified by **suffix alone**, with no caller identity anywhere in the path
+  (`compositor/src/main.rs`'s `classify`). The compositor already records the consequence for a
+  different suffix: *"Any holder of `/dev/draw` can resolve `info` in a loop."*
+
+So `nxterm`, `ui-testclient` and `input-testclient` could all resolve `manage`, and the only thing
+separating them would be B1's first-come rule — which makes the **race** the gate, when B1 exists
+to avoid exactly that.
+
+**This is not a hole to plug in M6; it is M7's work arriving early.** Namespace-based gating needs
+*per-client namespaces*, and the process that constructs them is `desktop-shell`
+([`graphical-session.md`](../design/graphical-session.md) §3, §5a). Until it exists, no binding can
+be given to one client and withheld from another, because there is one namespace and everybody
+inherits it.
+
+What M6 does about that, explicitly:
+
+- **The op set and the events are designed as if the gating were real**, because they will be.
+- **`manage` is refused unless the resolver is the first to ask** (B1), and M6's image arranges
+  for that to be `ui-testclient` by spawning it before anything else that would want it. That is
+  an ordering, not a capability, and it is written down as such — `TODO(manage-ungated)`.
+- **M7 closes it** by binding `manage` only into the shell's session namespace, at which point the
+  first-come rule stops being load-bearing and becomes a belt-and-braces check.
+
+Nothing in M6 is a shell, so the manage channel is exercised by `ui-testclient` under the harness.
+That is the honest way to gate a seam with no consumer, and it is also the M7 shell's first
+integration test written a milestone early.
+
+**3. What does "resize" even mean here?** The compositor cannot resize a client's buffer — the
+client allocates it. So resize is a **request**: `Surface::Configure` (server → client) says "be
+this size", and the client answers by attaching and committing a buffer of that size.
+`Window::bounds()` already follows the committed buffer, so the compositor side of this is
+mostly already true.
+
+**Terminal reflow is not in this milestone.** `nxterm` honouring a `Configure` means resizing
+`libterm`'s grid and reflowing scrollback, which M5 called "a different problem, not a parameter
+of this one" and was right to. M6 defines the op and proves it with a client that has nothing to
+reflow.
+
+### Part A — geometry in the stack
+
+- [ ] **A1 — placement, and a default policy.** `place(id, origin)` and a default for windows
+      nobody placed. The default is **not** free to choose: see the gate collision below.
+
+- [ ] **A2 — `Surface::Configure`**, server → client, and the client half in `libsurface` —
+      a `WindowEvent::Configure { origin, width, height }` a client may honour or ignore.
+      Ignoring a *later* one is legal and must stay legal: a fixed-size window is an ordinary
+      thing, and a protocol that required compliance would make every client implement reflow
+      before it could exist.
+
+      **The first one is different**: a client waits for it before its first `Commit`, which is
+      what makes B4's ordering work. It carries an origin as well as a size because the manager's
+      answer is a placement, and a client that had to learn its position some other way would be
+      back to two mechanisms.
+
+- [ ] **A3 — restack beyond `raise`.** `lower`, and `raise_above(id, other)` for the shell's
+      alt-tab. `raise` exists and click-to-focus drives it; the others have no caller until M7,
+      so they land with tests and the manage channel rather than on their own.
+
+- [ ] **A4 — damage for a moved window.** A move dirties the **union of the old and new
+      rectangles**, exactly as M5's resize case does — and for the same reason, that a rectangle
+      cannot express "old minus new". This is a real trap: `dirty` is computed *after* the
+      mutation in most paths, and a move computed the same way repaints the destination and
+      leaves the source on screen. M5 shipped that bug once already (PR #192, finding 3), which
+      makes it a known shape rather than a surprise.
+
+      **And there is a working pattern to copy**, which an earlier draft's "everywhere else"
+      obscured: the two paths that need pre-mutation state already capture it — `server.rs`'s
+      commit reads `let was = …` before `stack.commit`, and its destroy reads `let before: Vec<…>`
+      before `stack.destroy`. A move is the third of the same shape, not a new problem
+      (PR #195 review, finding 10).
+
+### Part B — the manager seam
+
+- [ ] **B1 — `/dev/draw/manage`**, a second resolve path minting a manager channel. Bound by a
+      supervisor, held by nobody in M6. **One manager at a time**: a second resolve is refused
+      rather than served, because two managers placing windows is a race with no arbiter and the
+      failure would look like windows moving on their own.
+
+- [ ] **B2 — the manager's ops**: `Place`, `Raise`, `Lower`, `SetFocus`, `Configure`.
+      Every one names a window by id and none of them checks ownership — that *is* the
+      capability: a manager manages windows it did not create, which is the whole point, and the
+      binding is what bounds who may.
+
+      **`Move` is not on that list, and an earlier draft had it beside `Place` with no stated
+      difference** (PR #195 review, finding 8). Both set an origin, so one of them is redundant:
+      an absolute `Place` is what a manager wants — it computes positions from the work area and
+      from other windows, so it always knows the answer in screen coordinates — and a relative
+      `Move` would only serve an interactive drag, which is out of scope here and needs a grab
+      offset the compositor does not keep. It comes back with decorations, or not at all.
+
+- [ ] **B3 — the manager's events**: window created, destroyed, geometry changed, focus changed,
+      title changed. `desktop-shell.md` §8 lists *"Window list, focus and title notifications"* as
+      **"Implied, never specified"** — this is where they get specified. Titles need
+      `Surface::SetTitle`, which does not exist.
+
+      **What `created` carries matters as much as when it fires**: the id alone is useless to a
+      manager, which must know the **role** (a `panel` is not placed like a `normal`, and a
+      `popup` is placed by its own client) and the **requested geometry** (centring needs a
+      size). `CreateWindowRequest` already carries both, so this costs nothing — but it is the
+      seam M7 is written against, and an event that forces the shell to ask a follow-up question
+      is a seam with a round trip in it (PR #195 review, finding 9).
+
+      **`geometry changed` is on the list for the same reason**: A2 makes size changes routine,
+      and a window list that learned about them by polling would be the thing this event exists
+      to avoid.
+
+- [ ] **B4 — placement before first paint, which needs an ordering rule and not just an early
+      event.** A manager must place a window before the user sees it, or every launch visibly
+      jumps.
+
+      An earlier draft said the interval between `CreateWindow` and the first `Commit` was the
+      manager's window of opportunity, and that firing the created-event on create was "early
+      enough". **It is not, and the reason is that the interval is the client's** (PR #195 review,
+      finding 2): `CreateWindow` replies with an id, then `AttachBuffer` and `Commit` are silent
+      sends the client issues back to back — which is exactly what `ui-testclient` and `nxterm`
+      do. The manager is a different process and must be woken, scheduled, read the event and
+      send `Place`. Nothing orders that against a `Commit` already queued. The symptom is a
+      window that paints at the default origin and then jumps: intermittent, load-dependent, and
+      precisely what this item exists to prevent.
+
+      **The rule: a window is not composited until it has been configured.** `CreateWindow`
+      replies as it does now, and the client must wait for a `Surface::Configure` (A2) before its
+      first `Commit` — the compositor sends one immediately when no manager is attached, and
+      after the manager answers when one is. A **deadline** covers a manager that never answers,
+      so a wedged shell delays a window rather than losing it.
+
+      This is Wayland's initial-configure handshake and it is the right shape here for the reason
+      it is there: the round trip is the **client's** to wait out, not the compositor's. The
+      rejected alternative — the compositor blocking on the manager before replying to
+      `CreateWindow` — puts a userspace process on the critical path of every window creation,
+      where a wedged shell stops clients from starting at all. Waiting costs the client one round
+      trip at creation and nothing afterwards.
+
+      It follows that A2's `Configure` is **not optional at creation** even though honouring a
+      *later* one stays optional (see question 3): a client must commit at some size, and the
+      first `Configure` is where it learns whether anyone had an opinion.
+
+### Part C — popups, and what an application may do
+
+- [ ] **C1 — a popup is positioned relative to its parent.** `Role::Popup { parent }` carries the
+      parent already; what is missing is an offset. Placed by its **creator**, checked against
+      `conn.owns(parent)` — the ownership test the connection already performs.
+
+- [ ] **C2 — a popup is clipped to the screen, not to its parent.** *"A menu clipped to its window
+      is not a menu"* (`display-substrate.md` §4a) is the whole reason popups are windows rather
+      than `libui` nodes; `libui`'s `offset` clips at the parent's edge and that is correct one
+      level down. The screen is the only clip left.
+
+- [ ] **C3 — `nxterm`'s menu becomes a real popup**, which is the first honest consumer and the
+      thing that proves C1/C2 rather than asserting them. This is also the moment `libui`'s
+      in-window popup stops being the only option, so the toolkit's `offset` gets a doc note
+      saying which to reach for.
+
+### The gate collision, which is the first thing to resolve
+
+**Placement is load-bearing for two gates and one spawn order, all of which assume windows land
+at the origin.**
+
+- **`check-display`** creates three reference windows largest-first *because* they land at (0,0)
+  and nest, and asserts that nesting — with an error message that says so. Cascade them and every
+  region it compares moves.
+- **`check-terminal`** clicks at a point *"inside `nxterm` and clear of the reference windows
+  above its top-left corner (the largest is 320×160)"*. That coordinate was computed from where
+  `ui-testclient`'s windows land. Move one into its neighbourhood and the click focuses the wrong
+  window, the typed line never reaches the grid, **and the failure reads as a tty regression
+  rather than a placement change** (PR #195 review, finding 4).
+- **`init`'s spawn order** is commented as load-bearing for the same reason — *"the terminal
+  first, because windows stack in creation order at the origin and it is the largest"*. A1 makes
+  that comment false and must correct it, not leave it to contradict the code.
+
+The third is the one that would bite hardest, because a stale comment asserting a retired
+invariant is what the last two milestones each shipped once.
+
+Three ways out, and this should be decided before A1 rather than discovered:
+
+- **`ui-testclient` places its windows explicitly** through the manager channel, and the gate's
+  nesting assertion becomes a placement it performs rather than an accident it relies on. Best:
+  it makes the gate stronger *and* becomes B1's first consumer.
+- **The default stays the origin**, and cascade waits for the shell. Cheapest, and leaves M6
+  without a visible behaviour change.
+- **The gate learns the default** and computes expected positions. Worst: it couples a test to a
+  policy that is about to move to the shell.
+
+Recommendation: the first. It is the only one that leaves the seam exercised — and it must be
+evaluated against **both** gates, because moving a reference window to satisfy `check-display`
+is exactly what would break `check-terminal`'s click point. Whichever way it goes, `check-terminal`
+should stop deriving its click from an assumed layout: M6's `SetFocus` gives it a way to focus the
+terminal without a click at all, which is the more valuable outcome than a placement it can
+predict.
+
+### What "done" means
+
+- **Host tests in `compositor`**, which is where the stack already lives (82 tests today):
+  placement, move damage, restack order, focus after destroy, one-manager-at-a-time, popup
+  clipping.
+- **`cargo xtask check-display` grows a placement region** — two windows placed apart by the
+  manager, screendumped, each compared where it was put. The existing regions prove compositing;
+  this proves *geometry*, and a wrong sign or a swapped axis is exactly the class of error a
+  host test cannot see.
+- **`check-input` gains a two-window focus case**: two overlapping windows, click the lower,
+  assert the keystroke follows the raise. **Not because click-to-focus is untested** — an earlier
+  draft said that and it is false: `check-terminal` clicks a bottom-most window and asserts the
+  typed line reaches the grid, and its own comment says *"click-to-focus is what gives `nxterm`
+  the keyboard"* (PR #195 review, finding 5). What this adds is the *two-window* case, where a
+  raise has to reorder something rather than confirm an ordering that already held.
+
+- **`check-terminal` gets less fragile**, which is a by-product worth naming: `SetFocus` lets it
+  focus the terminal directly instead of clicking a coordinate derived from another client's
+  layout.
+
+### Out of scope, deliberately
+
+- **Decorations.** Nobody draws titlebars in M6, so nothing has a titlebar to drag by. Whether
+  they are client-side (`libui`) or shell-drawn is a real question and it belongs with the shell.
+- **Interactive move and resize** — the *gesture*. M6 gives `Move` as a state change; turning a
+  drag into a sequence of moves needs a grab offset, which is `TODO(scroll-grab)`'s question
+  ("M6's window management, which needs press-relative dragging for window moves anyway") and
+  needs decorations to grab. Both move together, to M7.
+- **Terminal reflow**, per question 3.
+- **Desktops, thumbnails, global hotkeys** — M8, M8, M7.
+
+### The risk worth naming
+
+**A seam designed with no consumer is a seam designed wrong.** The mitigation is B1's test client
+and the fact that M7 follows immediately: the shell is written against this within one milestone,
+so the feedback arrives while the design is still fresh. The alternative — a throwaway shell in
+M6 — was considered and rejected (maintainer's call, 2026-08-12): a shell built to be discarded is
+a third thing to maintain and its feedback is worth less than it costs.
 
 ## Milestone 7 — the graphical session
 
