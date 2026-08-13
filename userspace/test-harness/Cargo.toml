@@ -22,6 +22,7 @@ libsurface = { path = "../libsurface" }
 # Part B's router, so the gate proves an injected key reaches a *widget* rather than only a
 # window: element -> layout -> diff -> route -> handler, with real events from the compositor.
 libui = { path = "../libui" }
+libterm = { path = "../libterm" }
 
 [[bin]]
 name = "test-harness"

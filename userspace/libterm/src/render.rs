@@ -135,10 +135,29 @@ pub fn render_rows<F: Framebuffer + ?Sized>(
     origin: Point,
     rows: &[usize],
 ) {
-    render_each(fb, grid, font, m, palette, origin, rows.iter().copied());
+    render_view(fb, grid, font, m, palette, origin, grid.top_line(), rows);
 }
 
-/// The shared body of [`render`] and [`render_rows`].
+/// Draw `rows` of a view whose first line is absolute line `top`.
+///
+/// The scrolled-back render. `rows` are **viewport** rows, not screen rows, and everything the
+/// difference implies is [`Grid::view_cell`]'s and [`Grid::view_cursor`]'s: which half of the
+/// history a row comes from, and whether the cursor is in view at all. That keeps this loop the
+/// same loop it was for the live screen, which is what stops the two renders drifting apart.
+pub fn render_view<F: Framebuffer + ?Sized>(
+    fb: &mut F,
+    grid: &Grid,
+    font: &Font,
+    m: &Metrics,
+    palette: &Palette,
+    origin: Point,
+    top: u64,
+    rows: &[usize],
+) {
+    render_each(fb, grid, font, m, palette, origin, top, rows.iter().copied());
+}
+
+/// The shared body of [`render`], [`render_rows`] and [`render_view`].
 fn render_each<F: Framebuffer + ?Sized>(
     fb: &mut F,
     grid: &Grid,
@@ -146,13 +165,14 @@ fn render_each<F: Framebuffer + ?Sized>(
     m: &Metrics,
     palette: &Palette,
     origin: Point,
+    top: u64,
     rows: impl Iterator<Item = usize>,
 ) {
-    let (cursor_row, cursor_col) = grid.cursor();
+    let cursor_at = grid.view_cursor(top);
     for row in rows {
         for col in 0..grid.cols() {
-            let Some(cell) = grid.cell(row, col) else { continue };
-            let cursor = row == cursor_row && col == cursor_col;
+            let Some(cell) = grid.view_cell(top, row, col) else { continue };
+            let cursor = cursor_at == Some((row, col));
             draw_cell(fb, font, m, palette, origin, row, col, cell, cursor);
         }
     }
@@ -170,20 +190,25 @@ pub fn render<F: Framebuffer + ?Sized>(
     // Iterating rather than collecting a `Vec` of every index: a full repaint is not hot, and
     // an allocation whose only purpose is to be immediately iterated is one a reader has to
     // stop and think about.
-    render_each(fb, grid, font, m, palette, origin, 0..grid.rows());
+    render_each(fb, grid, font, m, palette, origin, grid.top_line(), 0..grid.rows());
 }
 
-/// The fixed grid the display gate **will** compare, and the render of it.
+/// The fixed grid the display gate compares, and the render of it.
 ///
 /// The same idea as [`libdraw::scene`] and `libui::reference`, for the third layer: both sides
 /// render *this* and compare pixel for pixel, so a target build that rasterises or lays out
 /// differently from the host shows up as a named pixel rather than as a picture someone has to
 /// judge.
 ///
-/// **Nothing outside this module's own tests renders it yet.** `check-display` compares
-/// `libdraw::scene` and `libui::reference`; growing it a third region needs a guest-side client
-/// that draws a terminal, which is Part B. Until then this is a fixture with tests on it rather
-/// than a gate (PR #190 review, finding 3).
+/// **On screen since M5 Part B**: `ui-testclient` presents it in a window of its own, between
+/// the toolkit's and the scene's, and `cargo xtask check-display` compares that region against
+/// this module rendered on the host. Until then it was a fixture with tests on it rather than a
+/// gate (PR #190 review, finding 3).
+///
+/// **This rather than `nxterm`'s own window**, which is also on screen and is deterministic on
+/// its first frame. A live terminal showing a boot banner exercises one plain line of text; this
+/// stream is built so that each of its lines fails differently, and a gate should compare the
+/// picture that discriminates rather than the one that happens to be there.
 pub mod reference {
     use super::*;
     use crate::parse::{MAX_PER_BYTE, Op, Parser};
@@ -233,6 +258,25 @@ pub mod reference {
         g
     }
 
+    /// The size the reference renders at with `font`.
+    ///
+    /// A function rather than a constant, unlike `libui::reference::WIDTH`: a terminal's size
+    /// *is* its cell metrics, so the number cannot exist before the font does. Both ends of the
+    /// gate have the font — the client reads it off the disk, the host reads it out of
+    /// `assets/` — so this is what they agree through.
+    pub fn size(font: &Font) -> libdraw::geom::Size {
+        Metrics::new(font, FONT_PX).pixel_size(COLS, ROWS)
+    }
+
+    /// The stride [`render_with`] uses, for `font`.
+    ///
+    /// **Padded**, for the reason `libdraw::scene::SCREEN_PITCH` is: code that computes a row
+    /// offset from the width rather than the pitch skews every row after the first, and equal
+    /// numbers hide it.
+    pub fn pitch(font: &Font) -> usize {
+        size(font).w as usize * 4 + 12
+    }
+
     /// Render the reference grid with `font`.
     pub fn render_with(font: &Font) -> libdraw::framebuffer::MemFramebuffer {
         use libdraw::format::PixelFormat;
@@ -240,11 +284,8 @@ pub mod reference {
 
         let g = grid();
         let m = Metrics::new(font, FONT_PX);
-        let size = m.pixel_size(COLS, ROWS);
-        // A padded stride, for the reason `libdraw::scene::SCREEN_PITCH` is padded: code that
-        // computes a row offset from the width rather than the pitch skews every row after the
-        // first, and equal numbers hide it.
-        let pitch = size.w as usize * 4 + 12;
+        let size = size(font);
+        let pitch = pitch(font);
         let geometry = Geometry::with_pitch(size.w, size.h, pitch, PixelFormat::XRGB8888)
             .expect("a padded pitch always holds a row");
         let mut fb = MemFramebuffer::new(geometry);

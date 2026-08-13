@@ -14020,3 +14020,221 @@ the review caught it.
 finishing a command on the keypad did nothing and gave no sign the key existed. One line, beside
 `KEY_ENTER`, so the "a terminal sends `\r`" rule stays in one place rather than being split
 between a keymap and an override.
+
+## 2026-08-12 — M5 B1/B2: `nxterm` exists, and the first real client cost the compositor a CPU
+
+The terminal as a program: a `libui` window with a menu bar, a scrollbar and the grid as a
+`custom` widget, driven by a loopback until Part C wires the tty.
+
+### The loopback, and where `ONLCR` sits
+
+A key press is encoded by `libterm::encode` and fed straight back through `libterm::parse` into
+the grid. That is not a stub for its own sake: it exercises the whole of Part A — encoder,
+parser, grid, render — driven by real key events, and Part C replaces exactly one function call
+with a write to the backend channel.
+
+It translates `\r` to `\r\n`, because `LF` is index and Enter would otherwise return to column 0
+and overwrite the line just typed. That translation is the **line discipline's** — Unix's
+`ONLCR` — and Part C is what puts a discipline between these two halves. Keeping it in the
+loopback puts it in one obvious place to delete rather than three places to find.
+
+### The finding: the compositor ignored the damage rectangle clients send
+
+`test-qemu` failed the moment `nxterm` committed a window: `only 2 of 4 CPUs ever went idle`,
+every sample, deterministically. Neither process was looping — `nxterm` ran its event loop three
+times and blocked; the compositor's serve loop ran under 2,000 iterations across an entire boot.
+
+The variable turned out to be **window size**: a 200×114 terminal passed, an 812×480 one failed.
+Which pointed at compositing cost, and at a comment written in Milestone 2:
+
+> Damage-bounded repaint is an optimisation the protocol already carries and this does not yet
+> exploit — a full repaint is always correct, and **this milestone has one client**.
+
+The premise expired. The compositor recomposited the entire 1280×800 screen on **every request
+that replied and every request that applied** — and `ui-testclient`'s churn alone is several
+hundred requests, each now dragging an 812×480 window through the compositor.
+
+`Outcome::Applied` carries a `dirty: Option<Rect>` now. A commit reports the damage the client
+sent, clipped to its own window and translated to screen coordinates; an attach reports nothing,
+because a buffer reaches the screen at the commit; a destroy reports the union of every window
+that vanished, because destroy is transitive; and `None` still means "everything", which is what
+anything unable to name its region must say.
+
+**Three things about this are worth keeping.**
+
+*The clip bounds work, and that is all it does.* This entry first said an unclipped rectangle
+would "repaint a neighbour's pixels out of this window's buffer — a cross-client leak". **That is
+not how compositing works here**, and the review demonstrated it: `libdraw::compose` clears the
+damaged area and then blits *every* surface clipped to its own bounds, so an over-large rectangle
+produces a correct recomposite of that area — from each window's own buffer — merely a
+needlessly large one. Corrected before the entry merged, so nothing is being rewritten. What a
+client genuinely controls is **cost**: unclipped, one commit is a full-screen recomposite, which
+is precisely the expense this change exists to remove. That is worth clipping for; it is not a
+confidentiality boundary, and calling it one would have put a security claim in the tree that the
+code does not support. The same overclaim was corrected in `surface_errno`'s comment during the
+PR #175 review, which makes this the second instance of one pattern: reaching for the most
+serious-sounding justification instead of the true one.
+
+*Nothing else in the tree could have caught it.* Not a host test — the cost is in a real
+compositor with real windows. Not `check-display` — the picture was always correct. It took the
+idle-occupancy check added on 2026-07-31 for a different spin, whose own entry says it was
+rewritten once because the first version "passed with the bug reinstated". A test built to
+measure occupancy rather than switch rate is why this is a two-hour finding rather than a
+mystery about why the desktop feels slow.
+
+*The comment was honest and still went stale.* It said what it was deferring and why, and named
+the condition — one client — under which the shortcut held. What it could not do is notice when
+that stopped being true. A deferral whose trigger is a property of the *system* rather than of a
+line of code has no natural moment to fire.
+
+## 2026-08-12 — M5 B3/B4/B5: scrollback, keys through the router, and the gate's third region
+
+### The view is anchored to a line number, not to an offset from the bottom
+
+`Grid` counts lines *produced* (`top_line`) and lines *retained* (`oldest_line`), and a viewport
+is the absolute line its first row shows. The alternative — "n lines above the bottom" — is what
+most of this was written to avoid: output arriving while the user reads history pushes lines into
+the scrollback, so a bottom-relative offset makes the page creep upward at exactly the moment
+someone is trying to read it. Anchored to a line, a view showing lines 40..64 goes on showing
+lines 40..64 however much arrives below.
+
+The cost is that an anchor can fall out of the bounded ring, so `clamp_view` exists and is applied
+on every *read* rather than on eviction: the grid is where lines go, and an anchor kept in step by
+a callback is wrong the moment somebody adds a second path into the grid.
+
+**`view_cursor` returns `None` when the cursor is out of view**, which is the detail a render
+would otherwise get subtly wrong: scrolling back does not move the cursor, so drawing it at its
+screen row regardless would invert a cell of somebody's history, several screens above where the
+cursor actually is.
+
+### Two damage spaces, and a bug that only exists where they meet
+
+The grid names **screen** rows. The viewport may be somewhere else entirely, so `App::damage_rows`
+translates — screen row `s` shows at viewport row `s + k` when scrolled back `k`, and is invisible
+at `s + k >= rows`.
+
+The first version signalled "the view moved" with `Grid::damage_all`, and a test caught what that
+means: a view scrolled far enough back contains **none** of the screen's rows, so scrolling to the
+top of the history damaged every row the grid could name and not one row the user could see. The
+screen kept the old page under a thumb that had moved. `App` keeps its own `view_moved` flag now.
+Neither half was wrong alone — the grid's damage is correctly about screen rows, and the
+translation is correctly a filter — which is the recurring shape of these.
+
+### `ScrollState::offset_at`, and a justification that was false
+
+M4 shipped `thumb()` — where the thumb goes for an offset — and not its inverse, so a scrollbar
+was a picture of a scrollbar. The terminal is the first thing to want to *use* one, which is the
+milestone rule ("the terminal decides how much toolkit exists") working as intended.
+
+A first version rounded to nearest, with the stated reason that the last line was otherwise
+unreachable. **That is simply not true** — at the bottom `pos` is `span`, so `span * max / span`
+is `max` however it rounds — and a break-test confirmed it: deleting the `+ span/2` left every
+test green. It bought half a line of mid-drag accuracy with a claim that did not hold, so it is
+gone, and `offset_at` truncates like `thumb` does. This is the third time (`+127` in
+`Rgb::blend`, `Fingerprint::Offset`, now this) that break-testing the *reason* rather than the
+behaviour deleted something real.
+
+The round-trip test that goes with it asserts **within a pixel's worth of lines, not equality**:
+a thousand lines over a 384-pixel span puts ~3 lines on every pixel, and no inverse can tell 500
+from 501. The ends are exact, which is the part off-by-one errors break.
+
+### Keys go through the router, which needed one toolkit addition
+
+The grid is a focusable widget with an `on_key` now, so "typed a character" and "pressed a menu
+accelerator" are the same path with a different widget claiming it. Whether a key types at all —
+a repeat does, a release does not — stayed in `App`, because it is a fact about terminals rather
+than about routing.
+
+Two consequences. `Tree::find_by_key` is new: focus has to start somewhere and `focus_next` would
+land on the menu button, being first in tree order — a terminal whose first keystroke opens a menu
+is not a terminal. It is `locate`'s companion, answering "which widget is it" where `locate`
+answers "where was it laid out". And keying the grid meant **keying its two siblings**, because
+the diff pairs a parent's children all by key or all by position and refuses a mixture; the
+window's three regions are fixed roles for its whole life, so they earn the names.
+
+`main` re-asserts grid focus every frame while the menu is closed, rather than once at startup:
+clicking a button takes focus, and a terminal whose keyboard stays with the menu after you used it
+is a terminal you have to click back into.
+
+### The display gate compares a terminal now
+
+`libterm::render::reference` has been a fixture with tests on it since A5, its own doc naming Part
+B as the milestone that would put it on a screen. `ui-testclient` presents it in a window between
+the toolkit's and the scene's, and the gate compares 15,232 pixels of it against a host render.
+
+**The reference rather than `nxterm`'s own window**, which is also on screen and deterministic on
+its first frame. A live terminal shows a boot banner — one plain line — whereas the reference
+stream is built so each of its lines fails differently (attributes, erase-with-background,
+deferred wrap at the exact column, one-based `CUP`, a cursor left mid-row). A gate should compare
+the picture that discriminates, not the one that happens to be there.
+
+The three windows nest — 320×160, 180×96, 64×32 — because windows stack at the origin in creation
+order, and the gate excludes each region from the one beneath it. That makes the nesting
+load-bearing, so it is now **asserted** rather than assumed: a window that grew past its neighbour
+would silently hollow out a region the gate believes it is comparing.
+
+Break-tested both ways it can fail: attaching at `w * 4` instead of the padded pitch (3,479 pixels
+differ), and never presenting the window at all (12,571 differ — the region falls through to
+`nxterm`'s window underneath rather than to blank, which is itself worth knowing).
+
+## 2026-08-12 — PR #192 review: two tests that asserted less than they looked, and a security claim that was not true
+
+The review break-tested twelve mechanisms and eleven failed a targeted test. The three findings
+worth keeping are about the twelfth, and about two things the diff said rather than did.
+
+### The clip is a work bound, not an isolation barrier
+
+I wrote — in a code comment, in the decision log, and in the PR description — that clipping a
+client's damage to its own window prevents it "repainting a neighbour's pixels out of this
+window's buffer": a cross-client leak. **That is not how compositing works here.**
+`libdraw::compose` clears the damaged area and then blits *every* surface, each clipped to its
+own bounds, so an over-large rectangle produces a correct recomposite of that area from each
+window's own buffer. The reviewer demonstrated it with a probe; I confirmed it by reading
+`compose`, which I had not done before making the claim.
+
+The clip is still right, for a reason a client *does* control: unclipped, one commit is a
+full-screen recomposite, which is exactly the cost the change exists to remove.
+
+**This is the second instance of one pattern** — `surface_errno`'s comment was corrected in the
+PR #175 review for the same thing. The pattern is reaching for the most serious-sounding
+justification rather than the true one, and its cost is specific: a security claim in the tree
+that the code does not support is worse than no claim, because the next person reasons from it.
+Worth naming as a habit rather than as two incidents.
+
+### A test named for transitivity that had nothing to be transitive about
+
+`destroying_dirties_what_vanished` created **one** window with no children and asserted the
+damage was its own bounds. The union it was named for — a destroyed parent taking its popup with
+it — was never exercised, and neither was `union()` itself. Replacing the union loop with the
+exact bug it guards passed all 81 tests.
+
+The cause was the test helpers: `create` and `attach` were hard-wired to 8×8, so *every* child
+was a subset of its parent and the union was indistinguishable from "the parent's rectangle".
+The fix needed a size parameter before it could need a test. **A helper that can only build one
+shape silently bounds what the whole file can assert** — worth watching for, because a fixture
+that constrains the tests is invisible from inside any one of them.
+
+### `Offset` broke the containment invariant, and the invariant's own test could not see it
+
+`every_child_is_contained_by_its_parent` exists because, in its own words, containment is "the
+sort of thing one node kind quietly stops honouring". `Offset` — added in this PR, the only
+absolute positioning in the toolkit — quietly stopped honouring it, and the test passed because
+its element tree had no `Offset` in it. `paint` skips a whole subtree whose rect misses the
+damage *on the strength of that invariant*, so an overhanging popup with damage in the overhang
+would simply not be drawn.
+
+The node's rect is clipped to its parent now, which makes an overlay larger than its container
+cut off rather than escaping — the same rule as "a menu clipped to its window is not a menu",
+one level down, and the reason a menu that must escape its window is a `Role::Popup` window
+rather than a node.
+
+**A test written to catch a class of bug is only as wide as its fixture.** This one named its
+own weakness in a comment and still had it: adding a node kind is exactly the moment to extend
+the trees such a test walks, and nothing prompts that.
+
+### And one regression the review caught before any client could
+
+Clipping a commit's damage *after* `stack.commit()` clips it to the **new** buffer's bounds, so
+a window whose buffer shrank never repainted the band it vacated. Unreachable in-tree — every
+window in the image is fixed-size and M6 owns resize — which is precisely why it needed a test
+rather than a client to find it.

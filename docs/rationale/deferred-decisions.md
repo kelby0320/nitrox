@@ -292,6 +292,16 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**A scrollbar's grab offset — `TODO(scroll-grab)`.** `ScrollState::offset_at` puts the thumb's
+*centre* under the cursor, so grabbing a thumb near either of its ends makes it jump by up to
+half its length before the drag begins. Every toolkit that avoids this remembers where within
+the thumb the press landed and subtracts it — which is interaction state retained between two
+pointer events, and `widget-toolkit.md` §3 reserves retained widget state for things the
+application has no opinion about. This qualifies, so it is a question of where it lives rather
+than whether it is allowed. Trigger: the first time someone drags a scrollbar and complains, or
+M6's window management, which needs press-relative dragging for window moves anyway and will
+have to answer the same question. Landed 2026-08-12 with M5 Part B (`userspace/libui/src/widget.rs`).
+
 ~~**Antialiasing is deferred, and it is a `libdraw` item rather than a font one.**~~
 **Resolved 2026-08-12, in M5 Part A.** `libdraw` composited opaque XRGB8888 and could not
 blend, so glyph coverage was thresholded to 1 bit while the rasterizer produced 8. It blends

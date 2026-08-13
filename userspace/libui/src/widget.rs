@@ -152,6 +152,43 @@ impl ScrollState {
         let pos = (span as u64 * self.offset.min(max_offset) as u64 / max_offset as u64) as u32;
         (pos, len)
     }
+
+    /// The offset that puts the thumb's **centre** at `y` pixels down a track of `track`.
+    ///
+    /// [`thumb`](Self::thumb)'s inverse, and the half M4 did not ship: the toolkit could say
+    /// where a thumb goes for a given offset but not what offset a grab means, so a scrollbar
+    /// was a picture of a scrollbar. The terminal is the first thing to want to *use* one,
+    /// which is the milestone rule working as intended — see the decision log, 2026-08-12.
+    ///
+    /// **The thumb's centre rather than its top**, so that clicking a spot on the track jumps
+    /// to it and a drag holds the thumb under the cursor. It follows that a grab anywhere on
+    /// the thumb re-centres it — the small jump every toolkit without a grab *offset* has, and
+    /// removing it needs interaction state the toolkit does not yet keep (`TODO(scroll-grab)`).
+    ///
+    /// `y` is signed because a drag routinely leaves the widget: the router hands a captured
+    /// widget negative coordinates rather than clamping, and this clamps at the ends instead —
+    /// which is what makes dragging past the bottom stay at the bottom.
+    pub fn offset_at(&self, track: u32, y: i32) -> u32 {
+        let max_offset = self.total.saturating_sub(self.visible);
+        if max_offset == 0 || track == 0 {
+            return 0;
+        }
+        let (_, len) = self.thumb(track);
+        let span = track.saturating_sub(len);
+        if span == 0 {
+            // A thumb filling its track cannot express a position. Anything but the top would
+            // be invented, and `MIN_THUMB` makes this reachable on a short bar.
+            return 0;
+        }
+        let pos = (y - len as i32 / 2).clamp(0, span as i32) as u32;
+        // **Truncating, like [`thumb`](Self::thumb)**, which is what keeps the pair consistent:
+        // the round trip is exact wherever the division is, and neither end needs help — at the
+        // bottom `pos` is `span`, so `span * max / span` is `max` however it rounds. A first
+        // version added `span / 2` here for the stated reason that the last line was otherwise
+        // unreachable, which is simply not true; deleting it left every test green, so it was
+        // half a line of mid-drag accuracy bought with a claim that did not hold.
+        ((pos as u64 * max_offset as u64) / span as u64) as u32
+    }
 }
 
 /// A vertical scrollbar `width` pixels across.
@@ -274,6 +311,80 @@ mod tests {
         let s = ScrollState { offset: 10_000, visible: 25, total: 100 };
         let (pos, len) = s.thumb(200);
         assert_eq!(pos + len, 200);
+    }
+
+    #[test]
+    fn a_grab_maps_back_to_the_offset_the_thumb_was_drawn_for() {
+        // `offset_at` is `thumb`'s inverse, and the two are the only pair in the toolkit that
+        // *must* agree: one decides where the thumb is painted, the other what grabbing it
+        // there means. A drift between them is a thumb that jumps away from the cursor.
+        //
+        // Over the whole range rather than one offset, because the arithmetic is two
+        // divisions and a clamp, and the ends are where each of them goes wrong.
+        //
+        // **Within a pixel's worth of lines, not exactly** — and that is a fact about
+        // scrollbars, not a weak assertion. A thousand lines over a ~390-pixel span puts
+        // roughly three lines on every pixel, so a thumb drawn for line 500 is at the same
+        // pixel as one drawn for 501, and no inverse can tell them apart. Demanding equality
+        // here would be demanding the impossible; **the ends are exact**, which is the part
+        // that matters and the part off-by-one errors break.
+        let s = ScrollState { offset: 0, visible: 24, total: 1024 };
+        let track = 400;
+        let (_, len) = s.thumb(track);
+        let per_pixel = (1000u32).div_ceil(track - len);
+        for offset in [0, 1, 7, 500, 999, 1000] {
+            let s = ScrollState { offset, ..s };
+            let (pos, len) = s.thumb(track);
+            let got = s.offset_at(track, pos as i32 + len as i32 / 2);
+            assert!(
+                got.abs_diff(offset) <= per_pixel,
+                "the thumb drawn for {offset} grabs as {got}, more than {per_pixel} lines out",
+            );
+        }
+        assert_eq!(ScrollState { offset: 0, ..s }.offset_at(track, {
+            let (p, l) = ScrollState { offset: 0, ..s }.thumb(track);
+            p as i32 + l as i32 / 2
+        }), 0, "the top is exactly the top");
+        assert_eq!(ScrollState { offset: 1000, ..s }.offset_at(track, {
+            let (p, l) = ScrollState { offset: 1000, ..s }.thumb(track);
+            p as i32 + l as i32 / 2
+        }), 1000, "and the bottom exactly the bottom");
+
+        // And where the arithmetic *can* be exact — fewer lines than pixels of span — it is,
+        // so the tolerance above is the quantisation and not a bug hiding inside it.
+        let s = ScrollState { offset: 0, visible: 10, total: 40 };
+        for offset in 0..=30 {
+            let s = ScrollState { offset, ..s };
+            let (pos, len) = s.thumb(400);
+            assert_eq!(s.offset_at(400, pos as i32 + len as i32 / 2), offset);
+        }
+    }
+
+    #[test]
+    fn dragging_past_either_end_of_the_track_stays_at_that_end() {
+        // The router hands a captured widget coordinates outside itself rather than clamping
+        // them — deliberately, so a drag is not indistinguishable from a drag that stopped at
+        // the edge. Something has to clamp, and this is it.
+        let s = ScrollState { offset: 300, visible: 24, total: 1024 };
+        assert_eq!(s.offset_at(400, -900), 0, "dragged far above the bar");
+        assert_eq!(s.offset_at(400, 9000), 1000, "and far below it");
+        // The bottom of the track is the last line, not one short of it: the rounding.
+        assert_eq!(s.offset_at(400, 400), 1000, "the very bottom is the end of the document");
+    }
+
+    #[test]
+    fn a_bar_with_nothing_to_scroll_reports_nothing_wherever_it_is_grabbed() {
+        // Otherwise a short document scrolls when its full-height thumb is dragged, which is
+        // the visible form of dividing by a zero span.
+        let s = ScrollState { offset: 0, visible: 24, total: 24 };
+        assert!(!s.scrollable());
+        for y in [-5, 0, 100, 4000] {
+            assert_eq!(s.offset_at(400, y), 0, "at y={y}");
+        }
+        // And a track so short that `MIN_THUMB` fills it — reachable, not hypothetical.
+        let s = ScrollState { offset: 5, visible: 24, total: 1024 };
+        assert_eq!(s.thumb(MIN_THUMB).1, MIN_THUMB, "the premise: the thumb fills the track");
+        assert_eq!(s.offset_at(MIN_THUMB, 8), 0, "a position it cannot express");
     }
 
     #[test]

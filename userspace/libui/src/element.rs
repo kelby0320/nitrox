@@ -169,6 +169,25 @@ pub enum Node<Msg> {
     /// It measures to nothing and takes what it is given — a colour has no natural size, and
     /// a caller that wants one wraps it in [`sized`].
     Fill(Rgb),
+    /// A child shifted within its parent, taking its own measured size.
+    ///
+    /// **The one place absolute positioning exists, and it exists for overlays.** §5 rules it
+    /// out for ordinary widgets — "a terminal is resized constantly and every widget would need
+    /// to recompute, which is a layout engine written in application code" — and that argument
+    /// does not reach a menu popup, whose whole definition is "here, under the item that opened
+    /// it". Without this a popup can only be placed by computing `Padding` insets in the
+    /// application, which *is* the layout engine §5 refused.
+    ///
+    /// The offset is relative to the parent's origin, so a popup inside a window-level `Stack`
+    /// is placed in window coordinates and moves with the window rather than with the screen.
+    Offset {
+        /// Rightward shift from the parent's origin.
+        dx: i32,
+        /// Downward shift from the parent's origin.
+        dy: i32,
+        /// The child, which takes the size it measures rather than the space it is offered.
+        child: Box<Element<Msg>>,
+    },
     /// An application-drawn node: the escape hatch.
     ///
     /// Opaque to the toolkit — it measures to `size` and the application paints it. This is
@@ -289,7 +308,9 @@ impl<Msg> Element<Msg> {
             Node::Column { children, .. } | Node::Row { children, .. } | Node::Stack(children) => {
                 (children.as_slice(), None, None)
             }
-            Node::Padding { child, .. } | Node::Sized { child, .. } => (&[], Some(child), None),
+            Node::Padding { child, .. }
+            | Node::Sized { child, .. }
+            | Node::Offset { child, .. } => (&[], Some(child), None),
             Node::Dock { fill, .. } => (&[], None, Some(fill)),
         };
         let docked: Option<&Vec<Docked<Msg>>> = match &self.node {
@@ -346,6 +367,11 @@ pub fn sized<Msg>(size: Size, child: Element<Msg>) -> Element<Msg> {
 /// A rectangle of flat colour, filling whatever it is given.
 pub fn fill<Msg>(colour: Rgb) -> Element<Msg> {
     Element::new(Node::Fill(colour))
+}
+
+/// A child shifted `(dx, dy)` from its parent's origin, at its own measured size.
+pub fn offset<Msg>(dx: i32, dy: i32, child: Element<Msg>) -> Element<Msg> {
+    Element::new(Node::Offset { dx, dy, child: Box::new(child) })
 }
 
 /// An application-drawn node.

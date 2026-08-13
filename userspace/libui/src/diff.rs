@@ -59,6 +59,14 @@ pub enum Fingerprint {
     Sized(libdraw::geom::Size),
     /// [`Node::Fill`], with its colour — a recolour repaints, it does not rebuild.
     Fill(libdraw::format::Rgb),
+    /// [`Node::Offset`].
+    ///
+    /// **Without its shift**, deliberately. A first version carried `(dx, dy)` on the grounds
+    /// that a popup which moves must damage — true, and already handled: `reconcile` damages
+    /// whenever a node's *rect* changes, and an offset is a rect change by construction. A
+    /// break-test showed the two carried the same information and only one was reachable, the
+    /// same shape as the bounds check removed from `libterm`'s `render_rows`.
+    Offset,
     /// [`Node::Custom`], with its discriminator and size.
     Custom(u32, libdraw::geom::Size),
 }
@@ -75,6 +83,7 @@ impl Fingerprint {
             Node::Padding { insets, .. } => Fingerprint::Padding(*insets),
             Node::Sized { size, .. } => Fingerprint::Sized(*size),
             Node::Fill(c) => Fingerprint::Fill(*c),
+            Node::Offset { .. } => Fingerprint::Offset,
             Node::Custom { kind, size } => Fingerprint::Custom(*kind, *size),
         }
     }
@@ -263,6 +272,26 @@ impl Tree {
     pub fn next_id(&self) -> u64 {
         self.next_id
     }
+
+    /// The widget id of the element carrying `key`, if the tree has one.
+    ///
+    /// [`locate`](crate::layout::locate)'s companion, and needed for the same reason: an
+    /// application names an element with a key because it has something to say about *that*
+    /// one later. `locate` answers "where was it laid out"; this answers "which widget is it",
+    /// which is what [`Router::focus`](crate::route::Router::focus) takes — so a window that
+    /// wants a particular widget to hold the keyboard on its first frame can say which.
+    ///
+    /// The first match in tree order. Keys are the application's to keep distinct, exactly as
+    /// they are for the diff, which pairs siblings by them.
+    pub fn find_by_key(&self, key: u64) -> Option<u64> {
+        fn walk(w: &Widget, key: u64) -> Option<u64> {
+            if w.key == Some(key) {
+                return Some(w.id);
+            }
+            w.children.iter().find_map(|c| walk(c, key))
+        }
+        walk(self.root.as_ref()?, key)
+    }
 }
 
 /// A union of rectangles, accumulated as one.
@@ -410,8 +439,8 @@ mod tests {
     /// Part A's tests carry no messages, and `()` is the simplest inhabited `Msg`. Part B's
     /// routing tests use a real enum; these are about shape, not about what a click means.
     type Msg = ();
-    use crate::element::{Edge, Insets, column, custom, dock, docked, fill, padding, row,
-                         sized, stack, text, with_spacing};
+    use crate::element::{Edge, Insets, column, custom, dock, docked, fill, offset, padding,
+                         row, sized, stack, text, with_spacing};
     use crate::layout::{FixedCell, Layout, layout};
     use alloc::vec;
     use libdraw::format::Rgb;
@@ -424,6 +453,25 @@ mod tests {
     fn go(t: &mut Tree, e: &Element<Msg>) -> Result<Option<Rect>, DiffError> {
         let l = layout(e, SCREEN, &CELL);
         t.update(e, &l)
+    }
+
+    #[test]
+    fn a_keyed_element_can_be_found_by_its_key_and_an_absent_one_is_none() {
+        // What lets a window say which widget starts with the keyboard. `locate` answers
+        // "where"; this answers "which", and the router takes the latter.
+        let e: Element<()> = column(vec![
+            text("a").key(7),
+            row(vec![text("b").key(9)]).key(8),
+        ]);
+        let l = layout(&e, SCREEN, &CELL);
+        let mut t = Tree::new();
+        t.update(&e, &l).expect("a clean frame");
+
+        let deep = t.root().unwrap().children[1].children[0].id;
+        assert_eq!(t.find_by_key(9), Some(deep), "a key nested below the root");
+        assert_eq!(t.find_by_key(7), Some(t.root().unwrap().children[0].id));
+        assert_eq!(t.find_by_key(1234), None, "a key nothing carries");
+        assert_eq!(Tree::new().find_by_key(7), None, "and a tree with no root at all");
     }
 
     #[test]
@@ -690,6 +738,27 @@ mod tests {
             ]),
         );
         check(&layout(&e, SCREEN, &CELL));
+
+        // **`Offset` deliberately, and offset far enough to overhang.** This node kind is the
+        // one that can escape its parent by construction — it is the only absolute positioning
+        // in the toolkit — and the check above was blind to it because no tree here had one.
+        // "The sort of thing one node kind quietly stops honouring" turned out to be literal
+        // (PR #192 review, finding 6).
+        let overhang: Element<Msg> = stack(vec![
+            sized(
+                Size::new(100, 100),
+                stack(vec![
+                    fill(libdraw::format::Rgb::new(0, 0, 0)),
+                    offset(90, 90, sized(Size::new(50, 50), text("x"))),
+                ]),
+            ),
+        ]);
+        let l = layout(&overhang, SCREEN, &CELL);
+        check(&l);
+        // ...and it is clipped rather than merely reported as contained: a zero-size rect would
+        // satisfy `check` while meaning the popup vanished.
+        let placed = l.children[0].children[0].children[1].rect;
+        assert_eq!(placed, Rect::new(90, 90, 10, 10), "the visible part of the overhang");
     }
 
     #[test]
@@ -744,6 +813,30 @@ mod tests {
         assert!(
             go(&mut t, &hovered).expect("ok").is_some(),
             "a recoloured fill reported no damage — hover and press feedback never repaints"
+        );
+    }
+
+    #[test]
+    fn moving_an_offset_child_damages() {
+        // A menu popup opened under a *different* item moves without anything inside it
+        // changing, and must repaint — or it is drawn where it used to be, the same shape as
+        // the stale terminal cursor one layer up.
+        //
+        // **The damage comes from the rect, not the fingerprint.** This test was written
+        // expecting the opposite, and a break-test proved otherwise: with `(dx, dy)` removed
+        // from `Fingerprint::Offset` it still passes, because `reconcile` damages on
+        // `w.rect != l.rect` and an offset *is* a rect change. The fingerprint field was
+        // dropped as redundant; this test stays, because the property is the thing worth
+        // holding and it should not matter which mechanism provides it.
+        let mut t = Tree::new();
+        let at = |dx: i32| -> Element<Msg> {
+            stack(vec![fill(Rgb::new(1, 2, 3)), offset(dx, 20, text("File"))])
+        };
+        go(&mut t, &at(0)).expect("ok");
+        assert_eq!(go(&mut t, &at(0)).expect("ok"), None, "an unchanged frame is clean");
+        assert!(
+            go(&mut t, &at(40)).expect("ok").is_some(),
+            "a popup that moved reported no damage"
         );
     }
 

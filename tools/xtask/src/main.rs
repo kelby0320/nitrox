@@ -285,6 +285,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // (`selftest`/`test-harness`) like init.
     build_userspace_bin("session-mgr", mode.features())?;
     build_userspace_bin("compositor", None)?;
+    // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
+    // the update are host-tested, the bin is the window and the event pump.
+    build_userspace_bin("nxterm", None)?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
@@ -1203,20 +1206,66 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         }
     }
 
-    // **The toolkit's window**, underneath the scene. Rendered here with the font read from
-    // `assets/fonts/` — the same file the image build stages at `/system/fonts/` — against a
-    // guest render made from the bytes it read off the disk. This is the only check anywhere
-    // that a font loads on the target at all, and the only one that puts `libui` on a screen.
-    //
-    // Compared everywhere *except* the scene's rectangle, which is a window above it. That
-    // exclusion is not a weakening: a compositor that stacked the two the other way would
-    // fail the scene comparison above, so the ordering is still covered.
-    let (uw, uh) = (libui::reference::WIDTH, libui::reference::HEIGHT);
+    // The font both reference renders are drawn with here — the same file the image build
+    // stages at `/system/fonts/`, against a guest render made from the bytes it read off the
+    // disk. This is the only check anywhere that a font loads on the target at all.
     let font_file = repo_root().join("assets/fonts/DejaVuSansMono.ttf");
     let font = libdraw::text::Font::from_bytes(
         fs::read(&font_file).map_err(|e| format!("read {}: {e}", font_file.display()))?,
     )
     .ok_or("the vendored font did not parse on the host")?;
+
+    // **The terminal's picture**, between the two. Same construction and the same argument as
+    // the toolkit's: `libterm` on the host renders the fixed reference stream, the guest renders
+    // it from the font it read off ext4, and the two are compared where the smaller windows
+    // above do not cover. This is the only place a terminal render is checked against pixels
+    // that actually reached a screen — every other check on it is the guest agreeing with
+    // itself.
+    let (uw, uh) = (libui::reference::WIDTH, libui::reference::HEIGHT);
+    let term = libterm::render::reference::render_with(&font);
+    let tsize = libterm::render::reference::size(&font);
+    let (tw, th) = (tsize.w, tsize.h);
+    // The stacking the exclusions below assume, stated rather than trusted: each window must sit
+    // wholly inside the one beneath it, or a region the gate believes it is comparing is covered
+    // by something it is not comparing against — a hole that would be silent.
+    if !(sw <= tw && sh <= th && tw <= uw && th <= uh) {
+        return Err(format!(
+            "the reference windows are no longer nested: scene {sw}x{sh}, terminal {tw}x{th}, \
+             toolkit {uw}x{uh}. `ui-testclient` creates them largest-first because windows stack \
+             at the origin in creation order; fix the sizes or the order before the exclusions \
+             below can mean anything"
+        )
+        .into());
+    }
+    let mut term_mismatches = 0usize;
+    let mut term_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
+    let mut term_compared = 0usize;
+    if w >= tw && h >= th {
+        for y in 0..th {
+            for x in 0..tw {
+                if x < sw && y < sh {
+                    continue; // the scene's window is on top here
+                }
+                term_compared += 1;
+                let want = Framebuffer::get_pixel(&term, x, y).unwrap_or_default();
+                let i = (y as usize * w as usize + x as usize) * 3;
+                let got = (pixels[i], pixels[i + 1], pixels[i + 2]);
+                if got != (want.r, want.g, want.b) {
+                    term_mismatches += 1;
+                    if term_first.is_none() {
+                        term_first = Some((x, y, got, (want.r, want.g, want.b)));
+                    }
+                }
+            }
+        }
+    }
+
+    // **The toolkit's window**, at the bottom of the three, and the only check that puts
+    // `libui` on a screen.
+    //
+    // Compared everywhere *except* the rectangles of the windows above it. That exclusion is
+    // not a weakening: a compositor that stacked them the other way would fail the comparisons
+    // above, so the ordering is still covered.
     let ui = libui::reference::render(&font);
     let mut ui_mismatches = 0usize;
     let mut ui_first: Option<(u32, u32, (u8, u8, u8), (u8, u8, u8))> = None;
@@ -1224,8 +1273,10 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     if w >= uw && h >= uh {
         for y in 0..uh {
             for x in 0..uw {
-                if x < sw && y < sh {
-                    continue; // the scene's window is on top here
+                if x < tw && y < th {
+                    // The terminal's window is on top here, and the scene's above that. One
+                    // exclusion rather than two, because the nesting was asserted above.
+                    continue;
                 }
                 ui_compared += 1;
                 let want = Framebuffer::get_pixel(&ui, x, y).unwrap_or_default();
@@ -1256,6 +1307,24 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         )
         .into());
     }
+    if w < tw || h < th {
+        return Err(
+            format!("guest display is {w}x{h}, smaller than the {tw}x{th} reference terminal")
+                .into(),
+        );
+    }
+    if term_mismatches > 0 {
+        let (x, y, got, want) = term_first.expect("a mismatch was counted");
+        return Err(format!(
+            "display gate FAILED: {term_mismatches} of {term_compared} terminal pixels differ.\n  \
+             first at ({x},{y}): screen {got:?}, expected {want:?}\n  \
+             the capture is at {} — if the whole region is one colour the guest never presented \
+             the reference terminal; if only some cells differ, suspect the attribute or cursor \
+             render rather than the binding",
+            shot.display()
+        )
+        .into());
+    }
     if w < uw || h < uh {
         return Err(format!(
             "guest display is {w}x{h}, smaller than the {uw}x{uh} reference UI"
@@ -1275,8 +1344,9 @@ fn cmd_check_display(accel: Accel) -> R<()> {
         .into());
     }
     println!(
-        "\nxtask: display gate PASSED — the {sw}x{sh} scene and {ui_compared} pixels of the \
-         {uw}x{uh} toolkit window match libdraw and libui pixel for pixel ✓"
+        "\nxtask: display gate PASSED — the {sw}x{sh} scene, {term_compared} pixels of the \
+         {tw}x{th} terminal and {ui_compared} pixels of the {uw}x{uh} toolkit window match \
+         libdraw, libterm and libui pixel for pixel ✓"
     );
     Ok(())
 }
@@ -2211,6 +2281,17 @@ fn cmd_test() -> R<()> {
         .arg("test")
         .arg("-p")
         .arg("libterm")
+        .arg("--target")
+        .arg(&host)
+        .current_dir(&userspace_dir))?;
+    // `nxterm` host tests — the terminal's state, view and update, which are functions of
+    // values. The first real application built on `libui`'s declarative model, and the reason
+    // that model was chosen (`widget-toolkit.md` §2).
+    run(Command::new("cargo")
+        .arg("test")
+        .arg("-p")
+        .arg("nxterm")
+        .arg("--lib")
         .arg("--target")
         .arg(&host)
         .current_dir(&userspace_dir))?;
@@ -3640,6 +3721,9 @@ fn store_path_for_all(bins: &[&str], name: &str, version: &str) -> R<String> {
 fn profile_programs() -> Vec<&'static str> {
     let mut v = COREUTILS.to_vec();
     v.push("nxsh");
+    // The terminal is a program a person runs, not a service the system runs — the same class
+    // as the shell beside it. Part C's `session-mgr` will spawn it from `/bin` like any other.
+    v.push("nxterm");
     v
 }
 

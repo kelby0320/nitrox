@@ -233,6 +233,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "nxterm"
+version = "0.1.0"
+dependencies = [
+ "libdraw",
+ "libheap",
+ "libkern",
+ "librsproto",
+ "libsurface",
+ "libterm",
+ "libui",
+]
+
+[[package]]
 name = "owned_ttf_parser"
 version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -279,6 +292,7 @@ dependencies = [
  "librsproto",
  "libstream",
  "libsurface",
+ "libterm",
  "libui",
 ]
 

@@ -280,6 +280,25 @@ Request, 24 bytes: `window`, `buffer`, then a damage rectangle
 (`x`, `y`, `w`, `h`) in buffer coordinates. A zero-area damage rectangle is a valid no-op
 commit.
 
+**The damage rectangle is binding on the client** (since 2026-08-12; before that the
+compositor ignored it and recomposited the whole screen, so no client could depend on it).
+The compositor repaints **only** the named region. A client that commits a buffer differing
+from the last one *outside* the rectangle it named leaves stale pixels on screen until
+something unrelated forces a repaint — a restack, a neighbour's destroy, the cursor passing
+over. The obligation is therefore: **name a superset of what changed.** Naming more than
+changed is always safe and merely costs work; naming less is a bug with a delayed and
+confusing symptom.
+
+The compositor clips the rectangle to the window's own bounds, so an over-large one is
+harmless rather than rejected. That clip is a bound on work — an unclipped rectangle makes
+every commit a full-screen recomposite — and **not** an isolation barrier: compositing draws
+each surface from its own buffer, so a rectangle covering a neighbour cannot read or write a
+neighbour's pixels.
+
+A window whose new buffer is a **different size** from its old one is repainted over the union
+of both, whatever it named: the region it vacated cannot be described in coordinates of a
+buffer that no longer covers it.
+
 ### `Release` (`0x0903`)
 
 Server → client, 8 bytes: `window`, `buffer`. Sent for the buffer that *left* the screen.

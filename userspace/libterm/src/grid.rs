@@ -67,6 +67,19 @@ pub struct Grid {
     /// while changing no cell's *contents*. Remembering the reported position is what lets
     /// [`take_damage`](Grid::take_damage) name the row that has to un-invert.
     cursor_drawn: (usize, usize),
+    /// How many lines have ever scrolled off the top — **the absolute line number of the
+    /// screen's first row**.
+    ///
+    /// This is what a scrolled-back view is anchored to, and the reason it is anchored to an
+    /// absolute number rather than to "n lines above the bottom": output arriving while the
+    /// user is reading history pushes lines into the scrollback, so a bottom-relative offset
+    /// would make the text creep upward under them at exactly the moment they are trying to
+    /// read it. Anchored here, a view showing lines 40..64 goes on showing lines 40..64
+    /// however much arrives below.
+    ///
+    /// It counts *lines produced*, not lines retained, so it does not move when the bounded
+    /// scrollback evicts its oldest line. [`oldest_line`](Grid::oldest_line) is the other end.
+    scrolled: u64,
 }
 
 impl Default for Grid {
@@ -94,6 +107,7 @@ impl Grid {
             attrs: Attributes::default(),
             dirty: vec![true; rows],
             cursor_drawn: (0, 0),
+            scrolled: 0,
         }
     }
 
@@ -129,6 +143,56 @@ impl Grid {
     /// Lines that have scrolled off, oldest first.
     pub fn scrollback(&self) -> impl ExactSizeIterator<Item = &Vec<Cell>> {
         self.scrollback.iter()
+    }
+
+    /// The absolute line number of the screen's first row.
+    ///
+    /// A view anchored here is at the bottom — following the output, which is what a terminal
+    /// does unless the user has scrolled away from it.
+    pub fn top_line(&self) -> u64 {
+        self.scrolled
+    }
+
+    /// The absolute line number of the oldest line still retained.
+    ///
+    /// It moves as the bounded scrollback evicts, which is why a view holds a line number and
+    /// asks [`clamp_view`](Grid::clamp_view) rather than assuming its anchor survives.
+    pub fn oldest_line(&self) -> u64 {
+        self.scrolled - self.scrollback.len() as u64
+    }
+
+    /// `top` brought inside the history that still exists.
+    pub fn clamp_view(&self, top: u64) -> u64 {
+        top.clamp(self.oldest_line(), self.top_line())
+    }
+
+    /// The cell at viewport `(row, col)` when the viewport's first line is absolute line `top`.
+    ///
+    /// The one place the two halves of the history meet: a viewport row is served from the
+    /// scrollback or from the live screen depending only on where its line number falls.
+    /// `None` outside the grid's width, or for a line that no longer exists — total, like
+    /// [`cell`](Grid::cell), so a caller with a stale anchor draws blanks rather than panicking.
+    pub fn view_cell(&self, top: u64, row: usize, col: usize) -> Option<Cell> {
+        if row >= self.rows || col >= self.cols {
+            return None;
+        }
+        let line = top.checked_add(row as u64)?;
+        if line >= self.scrolled {
+            self.cell((line - self.scrolled) as usize, col)
+        } else {
+            let i = line.checked_sub(self.oldest_line())? as usize;
+            self.scrollback.get(i).and_then(|l| l.get(col)).copied()
+        }
+    }
+
+    /// Where the cursor falls in a viewport whose first line is `top`, if it is in view at all.
+    ///
+    /// **`None` when it is not**, and that is the point: scrolling back does not move the
+    /// cursor, so a render that drew it at its screen row regardless would invert a cell of
+    /// somebody's history, several screens above where the cursor actually is.
+    pub fn view_cursor(&self, top: u64) -> Option<(usize, usize)> {
+        let row = (self.scrolled + self.row as u64).checked_sub(top)?;
+        (row < self.rows as u64).then_some((row as usize, self.col))
     }
 
     /// Which rows changed since this was last called, and clear the record.
@@ -298,6 +362,9 @@ impl Grid {
     fn scroll_up(&mut self) {
         let line = self.cells[0..self.cols].to_vec();
         self.scrollback.push_back(line);
+        // Counts lines *produced*, so it is incremented here and not adjusted by the eviction
+        // below: it is the top of the history, and the eviction moves the bottom.
+        self.scrolled += 1;
         while self.scrollback.len() > SCROLLBACK {
             self.scrollback.pop_front();
         }
@@ -511,6 +578,81 @@ mod tests {
             feed(&mut g, &alloc::format!("{}\r\n", i % 10));
         }
         assert_eq!(g.scrollback().len(), SCROLLBACK, "the ring grew past its bound");
+    }
+
+    #[test]
+    fn a_scrolled_back_view_reads_from_the_scrollback_and_the_screen_at_once() {
+        // The seam. A viewport straddling the boundary must serve its top rows from history
+        // and its bottom rows from the live screen, and the two halves are stored differently.
+        let mut g = Grid::new(4, 2);
+        for i in 0..6 {
+            feed(&mut g, &alloc::format!("{i}\r\n"));
+        }
+        // Six lines produced on a two-row screen: lines 0..4 are history, 4..6 on screen.
+        assert_eq!(g.top_line(), 5, "five lines scrolled off");
+        assert_eq!(g.oldest_line(), 0, "and none evicted");
+
+        let at = |top: u64, row: usize| g.view_cell(top, row, 0).map(|c| c.ch);
+        assert_eq!((at(5, 0), at(5, 1)), (Some('5'), Some(' ')), "the bottom: the live screen");
+        assert_eq!((at(3, 0), at(3, 1)), (Some('3'), Some('4')), "wholly in the scrollback");
+        assert_eq!(
+            (at(4, 0), at(4, 1)),
+            (Some('4'), Some('5')),
+            "straddling: history above, screen below",
+        );
+    }
+
+    #[test]
+    fn the_view_is_anchored_to_a_line_so_output_does_not_drag_it() {
+        // **Why the anchor is an absolute line number.** A view expressed as "n lines above
+        // the bottom" shows different text every time a line arrives — the reader's page
+        // creeping upward exactly while they are trying to read it.
+        let mut g = Grid::new(4, 2);
+        for i in 0..6 {
+            feed(&mut g, &alloc::format!("{i}\r\n"));
+        }
+        let before: alloc::vec::Vec<Option<char>> =
+            (0..2).map(|r| g.view_cell(2, r, 0).map(|c| c.ch)).collect();
+
+        for i in 6..9 {
+            feed(&mut g, &alloc::format!("{i}\r\n"));
+        }
+        let after: alloc::vec::Vec<Option<char>> =
+            (0..2).map(|r| g.view_cell(2, r, 0).map(|c| c.ch)).collect();
+        assert_eq!(before, after, "the anchored view moved when output arrived");
+        assert_eq!(before, [Some('2'), Some('3')]);
+    }
+
+    #[test]
+    fn an_anchor_the_scrollback_has_evicted_clamps_to_the_oldest_line_kept() {
+        // The bounded ring drops the oldest line, so an anchor that was valid stops being so.
+        // Clamping is what a real terminal does; the alternative is a viewport of blanks.
+        let mut g = Grid::new(4, 1);
+        for i in 0..(SCROLLBACK + 50) {
+            feed(&mut g, &alloc::format!("{}\r\n", i % 10));
+        }
+        assert_eq!(g.oldest_line(), (SCROLLBACK + 50 - SCROLLBACK) as u64, "50 evicted");
+        assert_eq!(g.clamp_view(0), g.oldest_line(), "an evicted anchor");
+        assert_eq!(g.clamp_view(u64::MAX), g.top_line(), "and one past the bottom");
+        assert_eq!(g.clamp_view(60), 60, "one that is still there is left alone");
+    }
+
+    #[test]
+    fn the_cursor_is_not_in_a_view_scrolled_away_from_it() {
+        // Scrolling back does not move the cursor. A render that drew it at its *screen* row
+        // regardless would invert a cell of somebody's history, several screens above where
+        // the cursor really is.
+        let mut g = Grid::new(4, 2);
+        for i in 0..6 {
+            feed(&mut g, &alloc::format!("{i}\r\n"));
+        }
+        assert_eq!(g.cursor(), (1, 0));
+        assert_eq!(g.view_cursor(g.top_line()), Some((1, 0)), "following: where it always was");
+        // One line back: the cursor's line is 6, the viewport covers 4 and 5 — just below it,
+        // which is the boundary case a `<=` here would get wrong.
+        assert_eq!(g.view_cursor(4), None, "one row past the bottom is still out of view");
+        assert_eq!(g.view_cursor(5), Some((1, 0)), "and the row before it is the last in view");
+        assert_eq!(g.view_cursor(0), None, "scrolled to the top: nowhere near it");
     }
 
     #[test]

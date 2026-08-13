@@ -12,10 +12,10 @@ and compares against the guest's screen pixel for pixel.
 
 **What is specified here and not built**, each with its reason in place: the **application
 runtime** (§2.2 — every piece of the loop exists and nothing owns the sequence; M5's terminal
-is the first application that will force the answer), the menu's **popup half** (§8 — an open
-menu is a `stack` layer, and positioning one is Milestone 5's first requirement for it),
-**theming** (§11), and the **text area** (§8, absent on purpose — the terminal's grid is a
-`custom` widget, so nothing yet needs one).
+assembles it by hand and is the first application to do so), **theming** (§11), and the
+**text area** (§8, absent on purpose — the terminal's grid is a `custom` widget, so nothing yet
+needs one). The menu's **popup half** left this list in M5 Part B: `offset` + `locate` place it,
+and `nxterm` uses both.
 
 Everything else below describes running code. Three sections carry a **banner** marking them as
 the design argument for something now built, rather than a description of a gap — §9.1 the
@@ -214,12 +214,25 @@ Containers, and no more than these:
 | `dock` | Pin children to an edge, the last child fills the rest | The scrollbar on the right of the grid |
 | `stack` | Overlay children in paint order, positioned within the parent | Menu popups over the grid |
 
-Plus `padding` and fixed `sized` wrappers. That is the whole layout vocabulary.
+Plus `padding`, fixed `sized`, and `offset` wrappers. That is the whole layout vocabulary.
 
 **Not a CSS box model.** Margins-collapsing, floats, and inline flow are an enormous surface
-for a system whose first application is a rectangle with a bar on top. **Not absolute
-positioning either**: a terminal is resized constantly and every widget would need to
-recompute, which is a layout engine written in application code.
+for a system whose first application is a rectangle with a bar on top.
+
+**Absolute positioning exists for exactly one thing: overlays.** `offset(dx, dy, child)` shifts
+a child within its parent at the child's own *measured* size. The general prohibition still
+holds and the reason is unchanged — a terminal is resized constantly, so a layout built from
+coordinates is a layout engine written in application code, recomputed by hand on every resize.
+That argument does not reach a popup, whose entire definition is "here, under the item that
+opened it": there is nothing to recompute, because the position is derived from another
+element's laid-out rectangle (`locate`) rather than chosen. Added in M5 Part B, when the
+terminal's menu became the first thing to need it.
+
+Two properties keep it from becoming general-purpose positioning by the back door. It changes
+its **own** rect, not merely its child's, so the containment invariant below holds. And that
+rect is **clipped to its parent**, so an overlay bigger than its container is cut off rather
+than escaping — which is the same rule as §5's "a menu clipped to its window is not a menu",
+one level down. A menu that must escape its *window* is a `Role::Popup` window, not a node.
 
 **Layout runs on the diff's result**, not on every event: a node is re-measured only when its
 own properties changed, or an ancestor's constraints did. A pointer moving across a static
@@ -363,6 +376,20 @@ first text field — M4's toolkit". With no text field in M4, that wording would
 trigger has not fired. It has, for a different reason: **holding a key in the terminal**
 must repeat, and the grid is a `custom` widget receiving raw keys. The trigger was right
 about the milestone and wrong about the widget.
+
+**What the terminal added, which is §1's rule leaving a trace.** M4 shipped the widgets above
+and stopped; M5's terminal then needed three things that were missing, and each is a small
+public addition rather than a redesign:
+
+| Added | Why the terminal needed it |
+|---|---|
+| `offset` + `layout::locate` | Placing the menu's popup under the item that opened it (§5) |
+| `ScrollState::offset_at` | `thumb()`'s inverse. M4 could say where a thumb goes for an offset but not what *grabbing* it means, so a scrollbar was a picture of a scrollbar |
+| `diff::Tree::find_by_key` | `locate`'s companion — "which widget is it", where `locate` answers "where was it laid out". A window has to name the widget that starts with the keyboard, and tree order would give it to the menu button |
+
+None of the three is speculative and none would have been designed right in the abstract:
+`offset_at`'s centring rule, in particular, is a decision about how a drag feels that only a
+real drag poses.
 
 The `custom` widget deserves emphasis rather than apology. A toolkit whose escape hatch is
 an afterthought forces its flagship application to fight it; here the flagship *is* an

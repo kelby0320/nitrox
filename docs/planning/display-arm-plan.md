@@ -804,13 +804,14 @@ context menu near a window edge, or a combo box in a small dialog.
 
 ### Part B — `nxterm`, the terminal client
 
-- [ ] **B1 — the window and its chrome.**
+- [x] **B1 — the window and its chrome.** ✅ 2026-08-12.
       A `libui` tree: `menu_bar` docked top, `scrollbar` docked right, the grid filling the
       rest. This is M4's widget set having its first real user, and the point at which
       "bounded by what the terminal needs" gets audited — anything the terminal wants and the
       toolkit lacks is a finding about M4, and belongs in the decision log as one.
 
-- [ ] **B1a — the menu's popup half, which is a `libui` change and not a protocol one.**
+- [x] **B1a — the menu's popup half, which is a `libui` change and not a protocol one.**
+      ✅ 2026-08-12 (the toolkit half; `nxterm`'s menu lands with B1).
       `menu_bar` shipped without it, and its doc names this milestone: "an open menu is a
       `stack` layer the application adds over its content, which needs the popup positioned
       under its item and is Milestone 5's first real requirement for it."
@@ -821,19 +822,31 @@ context menu near a window edge, or a combo box in a small dialog.
       item's laid-out rect. That works and it is the thing §5 rejected when it ruled out
       absolute positioning: a layout engine written in application code.
 
-      **The decision to take:** whether `libui` grows a way to offset a stack layer (an
-      `offset` node, or an anchor on `Stack`), or whether `nxterm` computes insets. The first
-      is a small toolkit addition that every later menu reuses; the second is free now and
-      duplicated by the second application that wants a dropdown. Recommendation is the
-      toolkit addition, because M4's governing rule is "the terminal decides how much toolkit
-      exists" and the terminal is deciding.
+      **Taken: the toolkit addition**, because M4's governing rule is "the terminal decides how
+      much toolkit exists" and the terminal is deciding. Two pieces, both small and both reused
+      by every later popup:
 
-- [ ] **B2 — the grid as a `custom` widget.**
+      - **`offset(dx, dy, child)`** — a child shifted within its parent, at its own *measured*
+        size. §5 rules out absolute positioning for ordinary widgets, and that argument does
+        not reach a popup, whose whole definition is "here, under the item that opened it".
+        Like `Sized`, it changes its **own** rect rather than only its child's, or the
+        containment invariant `paint` uses to skip a subtree would not hold.
+      - **`locate(element, layout, key)`** — where a keyed element was laid out. Without it an
+        application computes the item's width from the font, which *is* the layout engine §5
+        refused, written in application code and wrong the moment a label changes.
+
+      A break-test removed one of these additions again: `Fingerprint::Offset` initially carried
+      `(dx, dy)` so that a moved popup would damage. It already did — `reconcile` damages on a
+      rect change and an offset *is* a rect change — so the field was dropped as redundant, the
+      same call as `libterm`'s `render_rows` bounds check. The test that found it stays, because
+      the property is worth holding whichever mechanism provides it.
+
+- [x] **B2 — the grid as a `custom` widget.** ✅ 2026-08-12.
       By the plan's own decision: a terminal's selection, wrapping and scrollback semantics
       are not a text editor's. The `custom` node's paint callback draws A5's render; its
       `on_key` takes raw key events and hands them to A6's encoder.
 
-- [ ] **B3 — scrollback wiring.**
+- [x] **B3 — scrollback wiring.** ✅ 2026-08-12.
       The scrollbar's offset drives the grid's view. **Any keystroke snaps back to the
       bottom**, which is what every terminal does and what makes scrollback usable rather
       than a trap.
@@ -842,7 +855,7 @@ context menu near a window edge, or a combo box in a small dialog.
       and nothing produces one yet. The scrollbar is the milestone's answer; the wheel is
       additive and lands when the driver emits `REL_WHEEL`.
 
-- [ ] **B4 — key repeat reaching a *widget*.**
+- [x] **B4 — key repeat reaching a *widget*.** ✅ 2026-08-12.
       Repeat is generated compositor-side (M4 Part C) and **already has a consumer and a
       gate**: `input-testclient` prints `win repeat code=` and `cargo xtask check-input`
       asserts it before the key is released. The first draft of this plan said it had neither,
@@ -851,6 +864,32 @@ context menu near a window edge, or a combo box in a small dialog.
       What is genuinely new is the *widget* half: a `KEY_REPEAT` reaching the grid through
       `libui::route` and being encoded like a press. Smaller than "prove the unproven
       mechanism", and a different test — the existing one asserts delivery to a **window**.
+
+      Building it moved the whole key path through the router: the grid is a focusable widget
+      with an `on_key`, so "typed a character" and "pressed a menu accelerator" are the same
+      path with a different widget claiming it. Two things fell out. The toolkit gained
+      **`Tree::find_by_key`** — `locate`'s companion, answering "which widget is it" where
+      `locate` answers "where was it laid out" — because focus has to start somewhere and
+      `focus_next` lands on the menu button. And keying the grid meant **keying its two
+      siblings**, since the diff pairs a parent's children all by key or all by position and
+      refuses a mixture.
+
+- [x] **B5 — the display gate's third region.** ✅ 2026-08-12.
+      `libterm::render::reference` had been a fixture with tests on it since A5: "growing it a
+      third region needs a guest-side client that draws a terminal, which is Part B". It has one
+      now. `ui-testclient` presents it in a window between the toolkit's and the scene's, and
+      `check-display` compares 15,232 pixels of it against a host render — the only place a
+      terminal render is checked against pixels that reached a screen.
+
+      **The reference rather than `nxterm`'s own window**, which is also on screen and whose
+      first frame is deterministic. A live terminal shows a boot banner: one plain line. The
+      reference stream is built so each of its lines fails differently, and a gate should compare
+      the picture that discriminates rather than the one that happens to be there.
+
+      The three windows are nested — 320×160, 180×96, 64×32 — because windows stack at the
+      origin in creation order and each must be smaller than the one beneath it. The gate now
+      **asserts that nesting** rather than assuming it: its exclusions are what make each region
+      mean something, and a window that grew past its neighbour would silently hollow one out.
 
 ### Part C — the tty server's second backend
 
