@@ -14597,3 +14597,74 @@ in both the entry and the code comment.
 They also noted the *input* direction is the un-made half of the same trade: `Backend::typed` is
 still `NOBLOCK` and drops keystrokes on a full ring. Far harder to reach — eight queued messages —
 but the same silent loss, and now part of the same TODO.
+
+## 2026-08-13 — M6 planned: window management, and the three questions it exists to answer
+
+M5 closed, so M6 gets a details pass before code — the same order M5 used, and for the same
+reason: the expensive mistakes in that milestone were the ones already written down as plan text
+that nobody had attacked yet.
+
+M6 is window management in the compositor. The task list is short and unsurprising — place, move,
+restack, configure. The pass was worth doing for three questions the sketch did not ask.
+
+### Who may position a window
+
+Three answers coexist in every real system, and conflating them is the classic mistake: a
+**manager** places anything; an **application** places its own **popup** relative to a parent it
+owns; an application places its own *normal* window never.
+
+The carve-out for popups is the same one `libui`'s `offset` makes, and rests on the same
+distinction: a popup's position is *derived* from another element's rect, not chosen. That is why
+it is not the absolute positioning §5 refused — and why extending it to normal windows would be.
+
+### What a manager is, before there is one
+
+A capability held as a namespace binding: `/dev/draw/manage` resolves to a channel carrying the
+management ops, and a supervisor binds it into the shell's namespace and nowhere else. That is
+`desktop-shell.md` §8's "must be capability-gated, or any application could impersonate the
+launcher", answered with the mechanism this system already uses for everything else rather than a
+new one.
+
+**One manager at a time**, refused rather than served on a second resolve: two managers placing
+windows is a race with no arbiter, and the failure presents as windows moving on their own.
+
+**And placement must be possible before first paint**, or every launch visibly jumps. The window
+exists at `CreateWindow` and is composited at its first `Commit`, so the created-event fires early
+enough **without a round trip on the create path**. Worth stating because the obvious alternative
+— the compositor asking the manager before replying — puts a userspace process on the critical
+path of every window creation, where a wedged shell stops clients from starting at all.
+
+### What "resize" means when the client owns the buffer
+
+It cannot mean the compositor resizing anything. It is a request — `Surface::Configure` says "be
+this size" and the client answers by committing a buffer of that size — and **ignoring it stays
+legal**, because a fixed-size window is ordinary and a protocol that required compliance would
+make every client implement reflow before it could exist.
+
+Which keeps **terminal reflow out of M6**. `nxterm` honouring a `Configure` means resizing
+`libterm`'s grid and reflowing scrollback, and M5's grid doc already called that "a different
+problem, not a parameter of this one".
+
+### The finding: a default placement policy breaks the display gate
+
+`ui-testclient` creates three reference windows largest-first *because* they land at (0,0) and
+nest, and `check-display` asserts that nesting — in an error message that says exactly why. Any
+default that is not the origin moves every region the gate compares.
+
+Three ways out; the plan recommends the one that makes the gate **stronger**: have
+`ui-testclient` place its windows explicitly through the manager channel, so the nesting is
+something the gate performs rather than an accident it relies on — and the seam gets its first
+consumer a milestone before the shell exists.
+
+That is the shape worth noticing: a test that depends on an *absence* (nothing can move windows)
+becomes a test that depends on a *behaviour* the moment the absence is filled, and the good
+version of that transition is the one where the test starts asserting the new behaviour rather
+than working around it.
+
+### And one trap carried forward rather than rediscovered
+
+A move must dirty the **union of the old and new rectangles**. Everywhere else in the compositor
+`Outcome::Applied { dirty }` is computed after the mutation, and a move computed that way repaints
+the destination and leaves the source on screen. M5 shipped exactly that bug for a resized buffer
+(PR #192, finding 3), so it is a known shape here rather than a surprise — which is the whole
+value of having found it once.

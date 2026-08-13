@@ -76,7 +76,9 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     2026-08-11. **M5 — the GUI terminal — 🚧 in progress**: Part A (terminal semantics —
     `libterm`'s parser, grid, render and encoder, plus the blend that unblocked antialiasing)
     and Part B (`nxterm` itself: window, chrome, scrollback, key repeat, and the display gate's
-    third region) both landed 2026-08-12; Part C — the tty server's second backend — is next).
+    third region) both landed 2026-08-12, and Part C — the tty server's second backend, with
+    `nxterm` hosting a real `nxsh` — on 2026-08-13, closing M5. **M6, window management, is
+    planned in detail** (2026-08-13) and not started).
     **Re-scoped 2026-08-12** after a gap surfaced while planning Part C: nothing said who logs a
     *graphical* user in or spawns the desktop shell. That column is specified now in
     [docs/design/graphical-session.md](../design/graphical-session.md), and the milestones above
