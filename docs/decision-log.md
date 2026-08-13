@@ -14459,3 +14459,75 @@ states the three channel roles, the per-resolver rule, and the lifetime rules in
 **A category with no spec file is where a misreading goes to live**, because there is nowhere for
 the correction to be authoritative. That is a general claim about this repository's structure, and
 this is the second time it has cost something.
+
+## 2026-08-13 — M5 C3/C4: the terminal hosts a shell, and four things that were wrong underneath
+
+`nxterm` resolves `/dev/tty` like any program, hands the tty server the far end of a channel it
+made, and gives the terminal itself to the shell it spawns. What it keeps is the backend. That is
+a pty with the pieces renamed — the emulator holds what a master would be, and the line discipline
+is the tty server rather than the kernel.
+
+The shell's banner, its prompt and every keystroke's echo reach the grid. The loop works. Getting
+there turned up four separate faults, none of them in the design.
+
+### The terminal handle travels in the setup message
+
+`/dev/tty` is a namespace binding, so a program cannot resolve its way to a *particular* window.
+The handle is handed down instead, in the setup message — which is where
+`process-spawn-args.md` says everything beyond the four bootstrap registers belongs, and what
+Unix does by inheriting fd 0/1/2 rather than looking them up.
+
+`SetupPayload` gained a `terminal` flag and the handle rides after the streams. **Not one of
+`Streams`**: a terminal is not a stream — it answers `SetMode` and delivers `Interrupt`, and a
+program holds it *as well as* its stdin/stdout. The format's documented extensibility ("a newer
+sender may append fields an older reader ignores") was exercised in the direction that matters and
+now has a test for it, because a field that cannot be added without a flag day is not extensible.
+
+### `BLOCKED_RESERVE` was one process away from its limit
+
+Adding `nxterm`'s shell — one process — panicked the boot on `blocked list within reserve`. The
+list is **global, not per-CPU** at 16, so that is the number of threads the *whole system* may
+have parked in `sys_wait`; every resource server spends its life there. Raised to 64.
+
+Nothing said it was close. The failure mode is a panic at whatever moment the high-water mark is
+crossed, not a warning as it is approached — so the reserve was one spawn from panicking for
+however long it has been, and the next milestone would have hit it instead.
+
+### Terminal output was being silently discarded
+
+Every send in the tty server was `NOBLOCK`, which is correct for a *reply* — the client is waiting
+for exactly it, so the ring is empty by construction. It is wrong for **output**: the emulator is
+off drawing, and a `NOBLOCK` send onto a full ring drops a program's bytes with no error reaching
+anyone. The shell believes it printed; the user sees a line with a hole in it.
+
+Found as an intermittently-missing character, which is exactly how it would present in use.
+`Tty::Output` blocks now, which trades a *visible* stall for an *invisible* loss — the better half
+of a bad choice, with the answer that costs neither filed as `TODO(tty-output-queue)`.
+
+**The general form is worth keeping**: a send mode chosen once for a channel whose peer is always
+waiting became the default for a channel whose peer is usually busy. Nothing about the call site
+looked different.
+
+### A test client was squatting on the whole screen
+
+`input-testclient` creates a 2048×2048 window — larger than the screen — and, undriven, waited
+forever for an injection that only `check-input` sends. While it existed it was the topmost window
+everywhere and took every click and keystroke in the system. It has an idle deadline now, in both
+phases, and says so when it gives up.
+
+The first phase needed one too, and that is the part that took the longest to see: a click is
+*that* phase's sentinel, so the terminal gate's one click woke the client, which then created the
+screen-covering window and swallowed everything typed after the first character.
+
+### And the gate is not finished
+
+`check-terminal` passes and fails on the same build. The flakiness is in driving a GUI from QMP,
+not in the terminal — the banner, prompt and echo arrive every boot. It is in the tree, documented,
+and **not wired into CI**, because a gate that fails on a good build teaches people to ignore
+gates.
+
+One lead is worth writing down rather than losing: **input appears to stop reaching the compositor
+once `input-testclient` exits.** A motion injected before it goes reaches `nxterm`; the same motion
+after it does not. Observed, not explained. If it is what it looks like, one consumer of
+`/dev/input/new` disconnecting costs the *other* consumers their stream — an `input-server` bug,
+older than this milestone, that nothing until now had a reason to notice.

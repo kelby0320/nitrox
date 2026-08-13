@@ -81,7 +81,7 @@ pub const STREAM_STDOUT: u32 = 1 << 1;
 pub const STREAM_STDERR: u32 = 1 << 2;
 
 /// The three defined stream bits.
-const STREAM_MASK: u32 = STREAM_STDIN | STREAM_STDOUT | STREAM_STDERR;
+pub(crate) const STREAM_MASK: u32 = STREAM_STDIN | STREAM_STDOUT | STREAM_STDERR;
 
 /// A stage's standard-stream handles. Each is optional — a *source* stage has no
 /// `stdin`, a *sink* no `stdout`, and `stderr` is a shared diagnostic sink. The handles
@@ -166,6 +166,18 @@ pub struct SetupPayload {
     /// See `docs/planning/shell-coreutils-plan.md` § Milestone 3.5 and the decision log,
     /// 2026-07-30.
     pub env: Record,
+    /// A **terminal** handle follows the stream handles.
+    ///
+    /// Not one of [`Streams`], deliberately: a terminal is not a stream. It answers
+    /// `SetMode` and delivers `Interrupt`, and a program holds it *as well as* its
+    /// stdin/stdout rather than instead of them — `ls | less` inside a terminal has both.
+    ///
+    /// It exists because `/dev/tty` is a **namespace binding**, one per session, so a
+    /// program cannot resolve its way to a *particular* terminal. A terminal emulator hands
+    /// the shell it hosts the terminal it attached its backend to, the way Unix inherits
+    /// fd 0/1/2 rather than looking them up. See `docs/design/graphical-session.md` §6.1
+    /// for what closes this properly.
+    pub terminal: bool,
 }
 
 impl SetupPayload {
@@ -178,7 +190,8 @@ impl SetupPayload {
         let schema = Schema::new()
             .field("streams", TypeTag::Int, TypeModifiers::NONE)
             .field("argv", TypeTag::List, TypeModifiers::NONE)
-            .field("env", TypeTag::Record, TypeModifiers::NONE);
+            .field("env", TypeTag::Record, TypeModifiers::NONE)
+            .field("terminal", TypeTag::Int, TypeModifiers::NONE);
         let argv: Vec<Value> = self.argv.iter().map(|s| Value::Str(s.clone())).collect();
         let record = Record {
             schema,
@@ -186,6 +199,7 @@ impl SetupPayload {
                 Value::Int(self.streams as i64),
                 Value::List(Arc::from(argv)),
                 Value::Record(Arc::new(self.env.clone())),
+                Value::Int(self.terminal as i64),
             ],
         };
         let mut buf = Vec::new();
@@ -225,14 +239,19 @@ impl SetupPayload {
             .and_then(|v| v.as_record())
             .cloned()
             .unwrap_or_default();
-        Ok(SetupPayload { streams, argv, env })
+        // Absent `terminal` ⇒ none, so a sender that predates it is not an error case —
+        // the same rule as `env`, one field along.
+        let terminal = record.values.get(3).and_then(|v| v.as_int()).unwrap_or(0) != 0;
+        Ok(SetupPayload { streams, argv, env, terminal })
     }
 }
 
 // --- Syscall-backed stage runtime (Tier-1 spawn + bootstrap) ----------------
 
 #[cfg(feature = "io")]
-pub use self::io_stage::{Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env};
+pub use self::io_stage::{
+    Bootstrap, Setup, bootstrap, pipe, send_setup, send_setup_env, send_setup_full,
+};
 
 /// The sender (a shell spawning a stage) and receiver (`bootstrap().setup()`) sides of
 /// the setup message, over real IPC. Gated behind `io` so the pure protocol above stays
@@ -303,17 +322,37 @@ mod io_stage {
         argv: &[&str],
         env: &Record,
     ) -> Result<()> {
+        send_setup_full(channel, streams, None, argv, env)
+    }
+
+    /// The full form: streams, an optional **terminal**, `argv` and the environment.
+    ///
+    /// The terminal handle is **moved** like the streams, and rides *after* them in the
+    /// handle array — see [`SetupPayload::terminal`] for why it is not one of them. A
+    /// terminal emulator uses this to hand the shell it hosts the terminal it attached its
+    /// backend to; every other caller passes `None` and gets what it always got.
+    pub fn send_setup_full(
+        channel: u64,
+        streams: &Streams,
+        terminal: Option<u64>,
+        argv: &[&str],
+        env: &Record,
+    ) -> Result<()> {
         let owned: Vec<String> = argv.iter().map(|s| String::from(*s)).collect();
         let payload = SetupPayload {
             streams: streams.bitmap(),
             argv: owned,
             env: env.clone(),
+            terminal: terminal.is_some(),
         }
         // `encode` enforces `IPC_PAYLOAD_SIZE` and reports `SetupTooLarge` — deliberately
         // not `SinkFull`, since a full channel is a transport condition a caller may retry
         // and this never will be.
         .encode()?;
-        let handles = streams.ordered();
+        let mut handles = streams.ordered();
+        if let Some(t) = terminal {
+            handles.push(t);
+        }
         let mut buf: Box<[u8; IPC_MSG_SIZE]> = Box::new([0u8; IPC_MSG_SIZE]);
         buf[OFF_PAYLOAD_LEN..OFF_PAYLOAD_LEN + 4]
             .copy_from_slice(&(payload.len() as u32).to_le_bytes());
@@ -374,6 +413,13 @@ mod io_stage {
         /// no setup message. That is not a gap — a process spawned without one was given
         /// nothing to start from, which is the whole meaning of the tier.
         pub env: Record,
+        /// The terminal this stage was handed, if its parent gave it one.
+        ///
+        /// `None` is the ordinary case: a program finds its terminal by resolving
+        /// `/dev/tty`. A program launched *by a terminal emulator* is handed one instead,
+        /// because a namespace binding cannot name a particular window — see
+        /// [`SetupPayload::terminal`].
+        pub terminal: Option<u64>,
     }
 
     /// Wrap a process's four bootstrap registers (as received by `_start`).
@@ -455,11 +501,20 @@ mod io_stage {
                 return Err(WireError::UnexpectedEof);
             }
             let payload = SetupPayload::decode(&buf[OFF_PAYLOAD..OFF_PAYLOAD + n])?;
-            let streams = Streams::from_bitmap(payload.streams, &handles[..count])?;
+            // The streams come first and the terminal, if any, after them — so the split
+            // is by the bitmap's population count rather than by the handle count, which
+            // includes both.
+            let n = (payload.streams & super::STREAM_MASK).count_ones() as usize;
+            if n > count {
+                return Err(WireError::SchemaMismatch);
+            }
+            let streams = Streams::from_bitmap(payload.streams, &handles[..n])?;
+            let terminal = payload.terminal.then(|| handles.get(n).copied()).flatten();
             Ok(Setup {
                 streams,
                 argv: payload.argv,
                 env: payload.env,
+                terminal,
             })
         }
     }
@@ -473,6 +528,54 @@ mod tests {
     /// variant with a justification and nothing that checked it, which a control caught by
     /// passing.
     #[test]
+    fn a_terminal_survives_the_round_trip_and_its_absence_is_the_default() {
+        // The flag and the handle are carried separately — the flag in the payload, the
+        // handle in the message's transferred array — so a payload that claims a terminal
+        // and one that does not have to be distinguishable here.
+        let with = SetupPayload {
+            streams: STREAM_STDOUT,
+            argv: alloc::vec![String::from("nxsh")],
+            env: Record::default(),
+            terminal: true,
+        };
+        let got = SetupPayload::decode(&with.encode().unwrap()).unwrap();
+        assert_eq!(got, with);
+        assert!(got.terminal);
+
+        let without = SetupPayload { terminal: false, ..with.clone() };
+        let got = SetupPayload::decode(&without.encode().unwrap()).unwrap();
+        assert!(!got.terminal, "a payload with no terminal decoded as having one");
+        assert_ne!(with.encode().unwrap(), without.encode().unwrap());
+    }
+
+    #[test]
+    fn a_sender_that_predates_the_terminal_field_still_decodes() {
+        // **The extensibility the format claims, exercised in the direction that matters.**
+        // `decode` reads by position and treats everything past `argv` as optional, so a
+        // three-field message from before this field existed must still arrive — otherwise
+        // adding a field is a flag day across every stage in the image.
+        let schema = Schema::new()
+            .field("streams", TypeTag::Int, TypeModifiers::NONE)
+            .field("argv", TypeTag::List, TypeModifiers::NONE)
+            .field("env", TypeTag::Record, TypeModifiers::NONE);
+        let old = Record {
+            schema,
+            values: alloc::vec![
+                Value::Int(STREAM_STDIN as i64),
+                Value::List(Arc::from(alloc::vec![Value::Str(String::from("ls"))])),
+                Value::Record(Arc::new(Record::default())),
+            ],
+        };
+        let mut buf = alloc::vec::Vec::new();
+        write_value(&mut buf, &Value::Record(Arc::new(old))).unwrap();
+
+        let got = SetupPayload::decode(&buf).expect("a three-field message still decodes");
+        assert_eq!(got.streams, STREAM_STDIN);
+        assert_eq!(got.argv, alloc::vec![String::from("ls")]);
+        assert!(!got.terminal, "an absent field is not a terminal");
+    }
+
+    #[test]
     fn an_oversized_environment_is_refused_by_name() {
         let mut schema = Schema::new();
         let mut values = Vec::new();
@@ -482,6 +585,7 @@ mod tests {
             values.push(Value::Str(String::from("0123456789012345")));
         }
         let p = SetupPayload {
+            terminal: false,
             streams: 0,
             argv: alloc::vec![String::from("x")],
             env: Record { schema, values },
@@ -515,6 +619,7 @@ mod tests {
     #[test]
     fn env_round_trips_as_a_typed_record() {
         let p = SetupPayload {
+            terminal: false,
             streams: 0b011,
             argv: alloc::vec![String::from("list"), String::from("--long")],
             env: env_record(),
@@ -533,6 +638,7 @@ mod tests {
     #[test]
     fn an_absent_environment_is_empty_not_an_error() {
         let p = SetupPayload {
+            terminal: false,
             streams: 0,
             argv: alloc::vec![String::from("x")],
             env: Record::default(),
@@ -627,7 +733,8 @@ mod tests {
             vec![String::from("copy"), String::from("/a"), String::from("/b")],
             vec![String::from("echo"), String::from(""), String::from("héllo")],
         ] {
-            let p = SetupPayload { streams: STREAM_STDOUT | STREAM_STDERR, argv, env: Record::default() };
+            let p = SetupPayload {
+            terminal: false, streams: STREAM_STDOUT | STREAM_STDERR, argv, env: Record::default() };
             let bytes = p.encode().unwrap();
             assert_eq!(SetupPayload::decode(&bytes).unwrap(), p);
         }

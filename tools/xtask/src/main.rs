@@ -10,6 +10,7 @@
 //!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
 //!   check-docs      fail if a doc links to, or cites, a path that does not exist
 //!   check-display   boot + screendump; compare the screen against a libdraw render
+//!   check-terminal  boot + type into the GUI terminal; assert the shell answered
 //!   check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope
 //!   abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI
 //!   fetch-limine    download the pinned limine-binary tarball into the cache
@@ -118,6 +119,7 @@ fn main() -> ExitCode {
         Some("check-deferrals") => cmd_check_deferrals(),
         Some("check-docs") => cmd_check_docs(),
         Some("check-display") => cmd_check_display(accel),
+        Some("check-terminal") => cmd_check_terminal(accel),
         Some("check-input") => cmd_check_input(accel),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
@@ -287,7 +289,9 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("compositor", None)?;
     // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
     // the update are host-tested, the bin is the window and the event pump.
-    build_userspace_bin("nxterm", None)?;
+    // Built with `test-harness`, which makes the terminal report each completed grid line on
+    // the debug console — what `cargo xtask check-terminal` asserts on, rather than pixels.
+    build_userspace_bin("nxterm", Some("test-harness"))?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;
@@ -1085,6 +1089,166 @@ fn cmd_check_input(accel: Accel) -> R<()> {
     session.expect("input-testclient: PASSED")?;
     let _ = fs::remove_file(&qmp_sock);
     println!("\nxtask: input gate PASSED — an injected key and click reached userspace ✓");
+    Ok(())
+}
+
+/// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
+///
+/// **Status 2026-08-13: written, works, and is not yet reliable enough to gate on.** It passes
+/// and it fails on the same build, and the flakiness is in the *harness*, not in the terminal —
+/// the loop it exercises is demonstrably sound, with the shell's banner, prompt and per-keystroke
+/// echo all reaching the grid on every boot. What is not sound is driving a GUI from QMP:
+///
+/// - **Input appears to stop after `input-testclient` exits.** A motion injected before it goes
+///   reaches `nxterm`; the same motion after it does not. Observed, not explained — and if it is
+///   what it looks like, a consumer of `/dev/input/new` disconnecting is costing the *other*
+///   consumers their stream, which would be an `input-server` bug rather than this one's.
+/// - **A keystroke is not cheap.** The terminal repaints, waits for a free buffer and copies a
+///   window of pixels before it looks at input again, so keys injected as fast as QMP sends them
+///   outrun it. Pacing on the echo fixes that and is the right shape; it is not the whole story.
+///
+/// Deliberately **not wired into CI** and not listed in `--help` while that is true: a gate that
+/// fails on a good build teaches people to ignore gates. Kept in the tree because the diagnosis
+/// above is most of the work of finishing it, and deleting it would throw that away.
+
+///
+/// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →
+/// `tty-server` → `nxsh` → back out → the terminal's grid. Every piece of it has its own test;
+/// none of those can tell you the pieces are joined.
+///
+/// **Asserted on the grid's contents, not on pixels.** What a shell prints is not fixed by this
+/// milestone, so comparing pixels would pin it — and the display gate already compares a
+/// *fixed* terminal render, which is the part that must not drift. Under `test-harness`,
+/// `nxterm` reports each completed grid line on the debug console; that is what this reads.
+///
+/// **It clicks before it types**, which is not ceremony. `nxterm` is created first so it sits at
+/// the bottom of the stack (windows stack at the origin in creation order and it is the
+/// largest — see `init`), and keys follow the *topmost focusable* window. Click-to-focus raises
+/// it, which is both how a user would do it and the only mechanism available: there is no op to
+/// raise a window, and there will not be until Milestone 6.
+fn cmd_check_terminal(accel: Accel) -> R<()> {
+    preflight_accel(accel)?;
+    cmd_image(BuildMode::TestHarness)?;
+    let ovmf = locate_ovmf()?;
+
+    let work = repo_root().join("tools/build-cache");
+    fs::create_dir_all(&work).ok();
+    let qmp_sock = work.join("qmp-terminal.sock");
+    let _ = fs::remove_file(&qmp_sock);
+
+    let mut cmd = Command::new("qemu-system-x86_64");
+    qemu_base_args(&mut cmd, &ovmf, accel)?;
+    cmd.arg("-drive")
+        .arg(format!("format=raw,file={}", image_path().display()))
+        .arg("-display")
+        .arg("none")
+        .arg("-qmp")
+        .arg(format!("unix:{},server,nowait", qmp_sock.display()))
+        .arg("-chardev")
+        .arg("stdio,id=hostserial,signal=off")
+        .arg("-serial")
+        .arg("chardev:hostserial")
+        .arg("-smp")
+        .arg("4")
+        .arg("-no-reboot")
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+
+    println!("xtask: terminal gate — booting and typing…\n");
+    let mut session = Session::spawn(cmd)?;
+    let mut qmp = Qmp::connect(&qmp_sock)?;
+
+    // The shell is up in the window: its banner reached the grid, which means the whole
+    // output direction already works before a key is injected.
+    session.expect("nxterm: grid> nxsh: interactive shell")?;
+
+    // Wait for `ui-testclient` to finish churning windows before touching focus — a click
+    // landing mid-churn raises whatever exists at that instant. Same reason `check-input`
+    // waits for it.
+    session.expect("ui-testclient: PASSED")?;
+
+    // **And wait for `input-testclient` to leave.** It creates a 2048×2048 window — larger
+    // than the screen — as its second phase, and while that exists it is the topmost window
+    // everywhere and takes every click and keystroke. Undriven, it gives up after an idle
+    // deadline and says so. Waiting is not optional: a click sent before this *is* its first
+    // phase's sentinel, so it wakes the client, which then creates that window and swallows
+    // everything typed after the first character.
+    for _ in 0..20 {
+        qmp.send_motion(100, 100)?; // pin to the bottom-right corner (1279, 799)
+    }
+    for _ in 0..9 {
+        qmp.send_motion(-98, -56)?; // → about (397, 295)
+    }
+
+    session.expect("input-testclient: idle, releasing the window")?;
+
+
+
+    // Click inside `nxterm` and clear of the reference windows above its top-left corner
+    // (the largest is 320×160).
+    //
+    // **Pinned to a corner first, because injection is relative and the pointer is not where
+    // you left it.** `input-testclient` ends by driving it twelve times by (-120, -120), so it
+    // is at the top-left — a relative move computed from the screen centre lands nowhere near
+    // the intended point, and the first version of this gate clicked at (0, 0), which is
+    // inside the 64×32 scene window. Overshooting into the bottom-right corner clamps to a
+    // known position; everything after that is arithmetic.
+    // **In wire-sized steps.** A PS/2 mouse packet carries a 9-bit signed delta, so a single
+    // huge motion is not a big movement — it is a different, meaningless one. The first
+    // version of this sent (4000, 4000) and the cursor went somewhere unrelated.
+    qmp.send_button("left", true)?;
+    qmp.send_button("left", false)?;
+
+    // **Wait for the click to land before typing.** Click-to-focus is what gives `nxterm` the
+    // keyboard — it is created first and therefore bottom-most — and the raise is not
+    // instantaneous from the host's point of view. Injected back to back, the first keystroke
+    // races it and lands on whatever was on top; the failure is intermittent, which is worse
+    // than consistent. A focus *change* is not usable as the signal here, because the window
+    // may already have had focus and no event is sent for that.
+    session.expect("nxterm: clicked")?;
+
+    // **One character at a time, each waited for.** Two reasons, and the second is the one
+    // that cost an afternoon.
+    //
+    // Keys go to the topmost focusable window, and the click above is what raises `nxterm` —
+    // created first, so bottom-most until then. A word injected back to back races that raise.
+    //
+    // And a keystroke here is not cheap: the terminal repaints, waits for a free buffer and
+    // copies a window's worth of pixels before it looks at input again. Six keys injected as
+    // fast as QMP can send them outrun that, and the tail of the word lands on a client that
+    // is not looking. A human types slower than this loop; a harness does not.
+    //
+    // Waiting on the echo is not a workaround for the pacing — it *is* the assertion. Each
+    // character has gone `nxterm` → `tty-server` → `nxsh` → back before the next is sent.
+    let mut typed = String::from("/> ");
+    for k in ["w", "h", "o", "a", "m", "i"] {
+        qmp.send_key(k, true)?;
+        qmp.send_key(k, false)?;
+        typed.push_str(k);
+        session.expect(&format!("nxterm: grid> {typed}"))?;
+    }
+
+    // **The echo is the loop.** Every character above travelled to the shell and came back
+    // as output before it reached the grid — `nxterm` does not echo locally, and a terminal
+    // that did would pass this while talking to nobody.
+    qmp.send_key("ret", true)?;
+    qmp.send_key("ret", false)?;
+    session.expect("nxterm: grid> /> whoami")?;
+
+    // And the shell answered. **Its text is not asserted**, because a shell in a window has
+    // no session: `nxterm` inherits `init`'s root namespace, so `/session/user` — which is
+    // what `whoami` reads — is not bound, and it says so. That is the same gap as
+    // `TODO(gui-dev-tty)` seen from the other side, and Milestone 7 closes both when
+    // `desktop-shell` constructs a namespace per application.
+    session.expect("nxterm: grid> ")?;
+
+    let _ = session.child.kill();
+    let _ = fs::remove_file(&qmp_sock);
+    println!(
+        "\nxtask: terminal gate PASSED — a keystroke reached the shell and its answer \
+         reached the grid ✓"
+    );
     Ok(())
 }
 

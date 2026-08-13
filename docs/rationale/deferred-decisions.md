@@ -292,6 +292,17 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
+sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls the server for
+every terminal it serves. The alternative it replaced was worse and is why this is not simply
+left alone: a `NOBLOCK` send onto a full ring **silently discards a program's output** — no
+error reaches anyone, the shell believes it printed, and the user sees a line with a hole in
+it. `check-terminal` found it as an intermittently-missing character, which is exactly how it
+would present in use. The answer that costs neither is a per-backend queue the serve loop
+drains alongside everything else. Trigger: a second terminal emulator, or the first time a
+stalled client is observed to affect another. Landed 2026-08-13 with M5 Part C
+(`userspace/tty-server/src/main.rs`).
+
 **`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`.** M5 Part C hands `nxterm`'s
 shell its terminal as a *handle* at spawn, the way `libstream` already passes streams. A
 `/dev/tty` resolved inside that window still reaches the session's console, because that binding

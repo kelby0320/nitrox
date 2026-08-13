@@ -79,7 +79,7 @@ fn sink_write(sink: Sink, bytes: &[u8]) {
         // visible only on long lines.
         Sink::Channel(h) => {
             for part in bytes.chunks(MAX_BODY) {
-                reply(h, OP_TTY_OUTPUT, 0, part);
+                send_output(h, part);
             }
         }
     }
@@ -87,6 +87,47 @@ fn sink_write(sink: Sink, bytes: &[u8]) {
 
 /// The most payload one message can carry, leaving room for both headers.
 const MAX_BODY: usize = MSG_LEN - PAYLOAD_OFF - 64;
+
+/// Send one `Tty::Output` message, **blocking if the emulator's ring is full**.
+///
+/// Every other send in this server is `NOBLOCK`, and correctly so: a reply goes to a client
+/// that is waiting for exactly it, so the ring is empty by construction. Output is different —
+/// the emulator is off drawing, and a `NOBLOCK` send onto a full ring **silently discards a
+/// program's output**. That is invisible: no error reaches anyone, the shell believes it
+/// printed, and the user sees a line with a hole in it. `check-terminal` found it as an
+/// intermittently-missing character, which is exactly how it would present in use.
+///
+/// Blocking here means a wedged emulator can stall the server, which is a real cost and the
+/// reason this is not obviously right. Trading a *visible* stall for an *invisible* loss is
+/// the better half of a bad choice; the answer that costs neither is a per-backend output
+/// queue the serve loop drains, which is `TODO(tty-output-queue)`.
+fn send_output(ch: u64, body: &[u8]) {
+    // SAFETY: REPLY_MSG is a valid buffer owned by this module.
+    let po = unsafe {
+        let Some(rs_len) =
+            encode(&mut REPLY_MSG[PAYLOAD_OFF..], OP_TTY_OUTPUT, 0, 0, body, 0)
+        else {
+            return;
+        };
+        REPLY_MSG[4..8].copy_from_slice(&(rs_len as u32).to_le_bytes());
+        REPLY_MSG[8] = 0;
+        syscall6(
+            SYS_CHANNEL_SEND,
+            ch,
+            (&raw const REPLY_MSG) as u64,
+            (&raw const REPLY_HANDLES) as u64,
+            0,
+            SENDMODE_BLOCK,
+            u64::MAX,
+        )
+    };
+    if po >= 0 {
+        // The delivery is a `PendingOperation`; waiting it is what makes this blocking. Its
+        // status is ignored — a failed delivery means the emulator is gone, which the serve
+        // loop learns from `PeerClosed` on the same channel.
+        po_wait(po as u64);
+    }
+}
 
 /// Perform what the registry decided.
 fn perform(acts: &[Act]) {

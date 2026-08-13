@@ -94,6 +94,22 @@ pub trait Transport {
         false
     }
 
+    /// The handle a caller may `sys_wait` on to learn an event is pending, or `0` if this
+    /// transport has none.
+    ///
+    /// **For a client with a second source of work.** `wait_event` blocks on this transport
+    /// alone, which is right for a client whose only input is the compositor — and wrong for
+    /// one that also holds, say, a terminal backend: it would render the shell's output only
+    /// after the next keystroke, so a prompt would appear one keypress late. Such a client
+    /// waits on this handle *and* its own, then drains with
+    /// [`poll_event`](Self::poll_event).
+    ///
+    /// `0` for a transport that cannot be waited on — the test mock — so a caller that gets
+    /// one falls back to `wait_event` rather than spinning on a handle the kernel will reject.
+    fn wait_handle(&self) -> u64 {
+        0
+    }
+
     /// Block until a server-initiated event arrives, then return it.
     ///
     /// The counterpart `poll_event` cannot provide. A client that has drawn everything it
@@ -147,6 +163,10 @@ impl<T: Transport + ?Sized> Transport for alloc::boxed::Box<T> {
 
     fn took_loss(&mut self) -> bool {
         (**self).took_loss()
+    }
+
+    fn wait_handle(&self) -> u64 {
+        (**self).wait_handle()
     }
 }
 
@@ -389,6 +409,31 @@ impl<T: Transport> Window<T> {
     ///
     /// Buffer releases arriving meanwhile are applied rather than discarded — they are the
     /// same channel, and dropping one strands a buffer forever.
+    /// The handle to `sys_wait` on alongside a client's own — see
+    /// [`Transport::wait_handle`]. `0` if this transport cannot be waited on.
+    pub fn wait_handle(&self) -> u64 {
+        self.transport.wait_handle()
+    }
+
+    /// Take one event if one is already here, without blocking.
+    ///
+    /// The companion of [`wait_handle`](Self::wait_handle): a client waiting on several
+    /// sources blocks itself and then drains this until it returns `None`.
+    pub fn poll_event(&mut self) -> Result<Option<WindowEvent>, UiError> {
+        self.pump()?;
+        loop {
+            if let Some(e) = self.next_event() {
+                return Ok(Some(e));
+            }
+            let mut buf = [0u8; 64];
+            match self.transport.poll_event(&mut buf)? {
+                Some((op, len)) => self.apply_event(op, &buf[..len]),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    /// Block until a server-initiated event arrives, then return it.
     pub fn wait_event(&mut self) -> Result<WindowEvent, UiError> {
         self.pump()?;
         loop {

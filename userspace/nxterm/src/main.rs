@@ -17,11 +17,12 @@
 
 extern crate alloc;
 
+mod backend;
+
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::Rect;
 use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
-use libkern::debug::Line;
 use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, exit, kprint, syscall4};
 use librsproto::surface::Role;
 use libsurface::{Window, WindowEvent, ipc::ChannelTransport};
@@ -111,6 +112,52 @@ fn draw(
     });
 }
 
+/// Print the text of grid row `row`, trailing blanks trimmed.
+///
+/// The harness's window onto the grid. Deliberately the *grid* and not the pixels: what a
+/// shell prints is not fixed by this milestone, so a pixel comparison would pin it — the
+/// display gate covers the rendering separately, against a fixed reference.
+#[cfg(feature = "test-harness")]
+fn report_row(app: &App, row: usize) {
+    let mut buf = [0u8; 256];
+    let mut n = 0;
+    for col in 0..app.grid.cols() {
+        let Some(cell) = app.grid.view_cell(app.view_line(), row, col) else { break };
+        let mut enc = [0u8; 4];
+        let s = cell.ch.encode_utf8(&mut enc);
+        if n + s.len() > buf.len() {
+            break;
+        }
+        buf[n..n + s.len()].copy_from_slice(s.as_bytes());
+        n += s.len();
+    }
+    while n > 0 && buf[n - 1] == b' ' {
+        n -= 1;
+    }
+    if n > 0 {
+        libkern::debug::Line::new().s(b"nxterm: grid> ").s(&buf[..n]).end();
+    }
+}
+
+/// Block until either handle has something.
+///
+/// Both in one `sys_wait`, which is the whole point: waiting on them in turn would mean a
+/// keystroke could not be seen while the shell was quiet, or the reverse.
+fn wait_two(a: u64, b: u64) {
+    let handles = [a, b];
+    let mut results = [0u8; 48];
+    // SAFETY: a valid two-handle array and a result buffer sized for two records.
+    unsafe {
+        libkern::syscall4(
+            libkern::SYS_WAIT,
+            handles.as_ptr() as u64,
+            2,
+            results.as_mut_ptr() as u64,
+            u64::MAX,
+        )
+    };
+}
+
 /// Entry point.
 ///
 /// # Safety
@@ -172,9 +219,28 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     let mut tree = Tree::new();
     let mut router = Router::new();
 
-    // A banner, so a screenshot of a fresh terminal is not an empty rectangle and so the
-    // guest's log says the grid is live before any key arrives.
-    app.feed(b"nxterm ready\r\n");
+    // **The tty, and the shell on the other end of it.** Part C's whole point: the terminal is
+    // obtained like any program's, this process becomes its backend, and the terminal itself is
+    // handed to the shell it spawns. What was a loopback is now a pty.
+    //
+    // A terminal that cannot get one still runs — it draws, it takes input, it just has nobody
+    // to talk to. Failing the window instead would turn a tty-server problem into a blank
+    // screen, which is the harder thing to diagnose.
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let backend = match unsafe { backend::attach(root_ns) } {
+        Some((terminal, b)) => {
+            // SAFETY: `root_ns` is live and `terminal` is a channel this process owns until the
+            // spawn moves it.
+            if unsafe { backend::spawn_shell(root_ns, terminal) } < 0 {
+                kprint(b"nxterm: no shell\n");
+            }
+            Some(b)
+        }
+        None => {
+            app.feed(b"nxterm: no terminal available\r\n");
+            None
+        }
+    };
 
     loop {
         // ---- render ----
@@ -229,11 +295,81 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             }
         }
 
+        // ---- the tty ----
+        //
+        // **Both directions, every frame.** What the user typed goes out; whatever the server
+        // has sent comes in and goes through the parser. Done here rather than in the event
+        // arm because output arrives unprompted — the shell prints when it likes, and a
+        // terminal that only looked after a keystroke would show a prompt one keypress late.
+        if let Some(b) = &backend {
+            let out = app.take_outbox();
+            if !out.is_empty() && !b.typed(&out) {
+                kprint(b"nxterm: input did not reach the tty\n");
+            }
+            while let Some(bytes) = b.output() {
+                #[cfg(feature = "test-harness")]
+                let before = app.grid.cursor().0;
+                app.feed(bytes);
+                // Under the harness only: report a line once the cursor has left it, which is
+                // what makes `check-terminal` able to assert on the grid's *contents*.
+                #[cfg(feature = "test-harness")]
+                {
+                    // **Every row the cursor passed**, not just the one it started on: a
+                    // single message routinely completes several lines, and reporting only
+                    // the first prints a blank when the chunk begins with a newline — which
+                    // is exactly what the shell's banner does.
+                    let now = app.grid.cursor().0;
+                    // **Rows the cursor left, and the row it is on.** Both, because they
+                    // answer different questions and the gate asks both: a line the shell
+                    // *finished* is only in the first set (the banner, which arrives in a
+                    // chunk that ends two rows below it), and a line still being typed is
+                    // only in the second (`/> whoami`, which never completes until Enter).
+                    for row in before..now {
+                        report_row(&app, row);
+                    }
+                    report_row(&app, now);
+                }
+            }
+            if b.is_gone() {
+                kprint(b"nxterm: the terminal ended\n");
+                exit(0);
+            }
+        }
+
         // ---- wait for something to do ----
-        let Ok(event) = win.wait_event() else {
-            kprint(b"nxterm: the compositor went away\n");
-            exit(0);
-        };
+        //
+        // **Two sources.** `wait_event` blocks on the compositor alone, which would render the
+        // shell's output only after the next keystroke — a prompt one keypress late. So the
+        // window's handle and the backend's go into one `sys_wait`, and the events are drained
+        // non-blockingly afterwards. A terminal with no backend keeps the simple path.
+        let mut events: alloc::vec::Vec<WindowEvent> = alloc::vec::Vec::new();
+        match backend.as_ref().map(|b| b.channel).filter(|_| win.wait_handle() != 0) {
+            Some(bch) => {
+                loop {
+                    match win.poll_event() {
+                        Ok(Some(e)) => events.push(e),
+                        Ok(None) => break,
+                        Err(_) => {
+                            kprint(b"nxterm: the compositor went away\n");
+                            exit(0);
+                        }
+                    }
+                }
+                if events.is_empty() {
+                    wait_two(win.wait_handle(), bch);
+                    continue; // round again: drain both sources from the top
+                }
+            }
+            None => match win.wait_event() {
+                Ok(e) => events.push(e),
+                Err(_) => {
+                    kprint(b"nxterm: the compositor went away\n");
+                    exit(0);
+                }
+            },
+        }
+
+        for event in events {
         match event {
             // **Everything goes through the router**, including the keys that end up as text:
             // the grid is a focusable widget with an `on_key`, so "typed a character" and
@@ -243,23 +379,44 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             WindowEvent::Key(k) => {
                 if let Some(msg) = router.key(&tree, &ui, k) {
                     app.update(msg);
-                    if let Msg::Key(k) = msg {
-                        Line::new().s(b"nxterm: key ").u(k.keycode as u64).end();
-                    }
                 }
             }
             WindowEvent::Pointer(p) => {
+                // A button press means the compositor decided this window is under the cursor
+                // — and, since click-to-focus raises, that it is now the topmost focusable one
+                // and will get the keyboard. Reported under the harness because that is the
+                // only evidence a gate has that its click landed *here*: nothing else changes
+                // observably, and a focus *change* is not sent when the window already had it.
+                #[cfg(feature = "test-harness")]
+                if p.kind == librsproto::surface::POINTER_BUTTON
+                    && p.flags & librsproto::surface::POINTER_PRESSED != 0
+                {
+                    kprint(b"nxterm: clicked\n");
+                }
                 let (msgs, _hit) = router.pointer(&tree, &ui, &l, p);
                 for m in msgs {
                     app.update(m);
                 }
             }
-            WindowEvent::Focus(f) => router.set_window_focused(f),
+            WindowEvent::Focus(f) => {
+                // Reported under the harness because a gate that types has to know the
+                // keyboard arrived first: the compositor sends keys to the topmost focusable
+                // window, and `nxterm` is created first — so it is at the *bottom* until a
+                // click raises it. Without waiting for this, the gate injects a click and six
+                // keystrokes back to back and the keys race the raise.
+                #[cfg(feature = "test-harness")]
+                libkern::debug::Line::new()
+                    .s(b"nxterm: focus=")
+                    .u(u64::from(f))
+                    .end();
+                router.set_window_focused(f);
+            }
             // Everything accumulated about held keys is a guess now. This client keeps none —
             // modifiers arrive on each event — so there is nothing to discard, and saying so
             // is the point: a client that silently ignored this would be wrong the moment it
             // started tracking anything.
             WindowEvent::Dropped => kprint(b"nxterm: input dropped\n"),
+        }
         }
         let _ = &maps;
     }
