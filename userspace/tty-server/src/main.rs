@@ -59,6 +59,15 @@ static mut WAIT_HANDLES: [u64; libkern::abi::MAX_WAIT_HANDLES] =
     [0; libkern::abi::MAX_WAIT_HANDLES];
 static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
     [0; 24 * libkern::abi::MAX_WAIT_HANDLES];
+/// A separate pair for [`po_wait`], which waits *inside* the dispatch of a record the serve
+/// loop is still iterating.
+///
+/// Sharing the buffers above was correct only by accident of ordering: record 0 is read before
+/// anything in its handling can reach a `po_wait`. Any future wait earlier in a record's path
+/// would silently corrupt the dispatch of records 1..n — a class of bug with no symptom at the
+/// site that causes it (PR #194 review, optional 1).
+static mut PO_HANDLES: [u64; 1] = [0];
+static mut PO_RESULTS: [u8; 24] = [0; 24];
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 
@@ -97,10 +106,13 @@ const MAX_BODY: usize = MSG_LEN - PAYLOAD_OFF - 64;
 /// printed, and the user sees a line with a hole in it. `check-terminal` found it as an
 /// intermittently-missing character, which is exactly how it would present in use.
 ///
-/// Blocking here means a wedged emulator can stall the server, which is a real cost and the
-/// reason this is not obviously right. Trading a *visible* stall for an *invisible* loss is
-/// the better half of a bad choice; the answer that costs neither is a per-backend output
-/// queue the serve loop drains, which is `TODO(tty-output-queue)`.
+/// Blocking here means a wedged emulator stalls **this whole server** — one blocked send holds
+/// the single serve loop, so the login terminal and the serial console shell stall with it, not
+/// just that emulator's own terminals. It is a stall and not a deadlock: the compositor depends
+/// on nothing in the tty path, and the emulator's send back is `NOBLOCK`. Trading a *visible*
+/// stall for an *invisible* loss is the better half of a bad choice; the answer that costs
+/// neither is a per-backend output queue the serve loop drains, which is
+/// `TODO(tty-output-queue)`.
 fn send_output(ch: u64, body: &[u8]) {
     // SAFETY: REPLY_MSG is a valid buffer owned by this module.
     let po = unsafe {
@@ -163,23 +175,24 @@ fn ns_lookup(ns: u64, path: &[u8], rights: u64) -> u64 {
 
 /// Wait one handle and read `(status, value)` out of its `IoResult` (status @8, value @16).
 fn po_wait(po: u64) -> (i32, u64) {
-    // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+    // SAFETY: PO_HANDLES/PO_RESULTS are valid writable buffers owned by this function; one
+    // waiter. Deliberately **not** the serve loop's buffers — see their declaration.
     let waited = unsafe {
-        WAIT_HANDLES[0] = po;
+        PO_HANDLES[0] = po;
         syscall4(
             SYS_WAIT,
-            (&raw const WAIT_HANDLES) as u64,
+            (&raw const PO_HANDLES) as u64,
             1,
-            (&raw mut WAIT_RESULTS) as u64,
+            (&raw mut PO_RESULTS) as u64,
             u64::MAX,
         )
     };
     let (status, value) = unsafe {
         (
-            i32::from_le_bytes([WAIT_RESULTS[8], WAIT_RESULTS[9], WAIT_RESULTS[10], WAIT_RESULTS[11]]),
+            i32::from_le_bytes([PO_RESULTS[8], PO_RESULTS[9], PO_RESULTS[10], PO_RESULTS[11]]),
             u64::from_le_bytes([
-                WAIT_RESULTS[16], WAIT_RESULTS[17], WAIT_RESULTS[18], WAIT_RESULTS[19],
-                WAIT_RESULTS[20], WAIT_RESULTS[21], WAIT_RESULTS[22], WAIT_RESULTS[23],
+                PO_RESULTS[16], PO_RESULTS[17], PO_RESULTS[18], PO_RESULTS[19],
+                PO_RESULTS[20], PO_RESULTS[21], PO_RESULTS[22], PO_RESULTS[23],
             ]),
         )
     };

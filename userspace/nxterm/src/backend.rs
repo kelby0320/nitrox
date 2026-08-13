@@ -43,6 +43,9 @@ static mut CH1: u64 = 0;
 pub struct Backend {
     /// The channel the tty server writes output to and reads input from.
     pub channel: u64,
+    /// The server has closed its end — learned from the receive that found it, never from a
+    /// receive of its own. See [`output`](Backend::output).
+    gone: bool,
 }
 
 /// Wait one PO and read `(status, value)` out of its `IoResult`.
@@ -178,7 +181,7 @@ pub unsafe fn attach(root_ns: u64) -> Option<(u64, Backend)> {
         }
         return None;
     }
-    Some((tty, Backend { channel: near }))
+    Some((tty, Backend { channel: near, gone: false }))
 }
 
 /// Receive one message on `ch` and report whether it is a non-error reply.
@@ -220,10 +223,20 @@ impl Backend {
     /// Take one queued message of program output, if there is one.
     ///
     /// Returns `None` when the ring is empty, and `Some(&[])` never — an empty body would be
-    /// indistinguishable from "nothing to do". A `PeerClosed` is reported by
-    /// [`is_gone`](Self::is_gone) rather than here, so a caller cannot mistake the end of the
-    /// terminal for a quiet moment.
-    pub fn output(&self) -> Option<&'static [u8]> {
+    /// indistinguishable from "nothing to do".
+    ///
+    /// **This is the only receive on the backend**, and that is a correctness requirement
+    /// rather than tidiness. `sys_channel_recv` has no peek: it dequeues. A first version had
+    /// [`is_gone`](Self::is_gone) call it separately "to probe the ring", which meant every
+    /// turn of the event loop ate a message — and back-to-back messages are the norm, since
+    /// `sink_write` emits one per chunk and one per `Act::Write`. The bytes vanished, and
+    /// because the message *was* dequeued the channel stopped being signalled, so nothing woke
+    /// to retry: silent output loss with a hole in the line, the same failure this part fixed
+    /// one file over by making the server's send block (PR #194 review, finding 1).
+    ///
+    /// `PeerClosed` is recorded here for `is_gone` to report, because the receive that
+    /// discovers it is this one.
+    pub fn output(&mut self) -> Option<&'static [u8]> {
         // SAFETY: valid recv out-params.
         let rr = unsafe {
             syscall4(
@@ -235,6 +248,7 @@ impl Backend {
             )
         };
         if rr != 0 {
+            self.gone = rr == libkern::error::KError::PeerClosed.as_i32() as i64;
             return None;
         }
         // SAFETY: bounded read-only slice over the just-received message. `'static` is honest
@@ -254,18 +268,11 @@ impl Backend {
     }
 
     /// Whether the server has closed its end — the terminal is over.
+    ///
+    /// A plain read of what [`output`](Self::output) last saw. It performs no receive of its
+    /// own: there is no way to ask a channel a question without consuming from it.
     pub fn is_gone(&self) -> bool {
-        // SAFETY: a zero-length receive probes the ring without consuming a message.
-        let rr = unsafe {
-            syscall4(
-                SYS_CHANNEL_RECV,
-                self.channel,
-                (&raw mut MSG) as u64,
-                (&raw mut HANDLES) as u64,
-                (&raw mut RECV_COUNT) as u64,
-            )
-        };
-        rr == libkern::error::KError::PeerClosed.as_i32() as i64
+        self.gone
     }
 }
 
@@ -320,15 +327,20 @@ pub unsafe fn spawn_shell(root_ns: u64, terminal: u64) -> i64 {
         &libstream::wire::Record::default(),
     )
     .is_ok();
-    // SAFETY: closing our end of the setup channel and the terminal we moved on.
-    unsafe {
-        syscall1(SYS_HANDLE_CLOSE, setup_ours);
-        if sent {
-            syscall1(SYS_HANDLE_CLOSE, terminal);
-        }
-    }
+    // SAFETY: closing our end of the setup channel.
+    unsafe { syscall1(SYS_HANDLE_CLOSE, setup_ours) };
     if !sent {
+        // **The failure branch is the one that has to close it.** A successful send commits the
+        // move by closing the sender's handles itself, so closing here would be a no-op that
+        // errors; on failure the handle is still ours and nothing else will take it. The first
+        // version had these the wrong way round, which left the tty-server holding a terminal —
+        // and one of its fifteen wait slots — for the life of the boot, while the orphaned
+        // shell fell back to resolving `/dev/tty` and landed a second REPL on the serial
+        // console (PR #194 review, finding 5).
+        // SAFETY: the send failed, so the terminal handle is still ours.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, terminal) };
         kprint(b"nxterm: the shell's setup message did not send\n");
+        return -1;
     }
     child
 }

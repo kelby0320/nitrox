@@ -405,10 +405,6 @@ impl<T: Transport> Window<T> {
         self.events.len()
     }
 
-    /// Block until an input event is available, then take it.
-    ///
-    /// Buffer releases arriving meanwhile are applied rather than discarded — they are the
-    /// same channel, and dropping one strands a buffer forever.
     /// The handle to `sys_wait` on alongside a client's own — see
     /// [`Transport::wait_handle`]. `0` if this transport cannot be waited on.
     pub fn wait_handle(&self) -> u64 {
@@ -433,7 +429,10 @@ impl<T: Transport> Window<T> {
         }
     }
 
-    /// Block until a server-initiated event arrives, then return it.
+    /// Block until an input event is available, then take it.
+    ///
+    /// Buffer releases arriving meanwhile are applied rather than discarded — they are the
+    /// same channel, and dropping one strands a buffer forever.
     pub fn wait_event(&mut self) -> Result<WindowEvent, UiError> {
         self.pump()?;
         loop {

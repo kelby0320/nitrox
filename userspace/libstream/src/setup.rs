@@ -81,7 +81,7 @@ pub const STREAM_STDOUT: u32 = 1 << 1;
 pub const STREAM_STDERR: u32 = 1 << 2;
 
 /// The three defined stream bits.
-pub(crate) const STREAM_MASK: u32 = STREAM_STDIN | STREAM_STDOUT | STREAM_STDERR;
+const STREAM_MASK: u32 = STREAM_STDIN | STREAM_STDOUT | STREAM_STDERR;
 
 /// A stage's standard-stream handles. Each is optional — a *source* stage has no
 /// `stdin`, a *sink* no `stdout`, and `stderr` is a shared diagnostic sink. The handles
@@ -178,6 +178,27 @@ pub struct SetupPayload {
     /// fd 0/1/2 rather than looking them up. See `docs/design/graphical-session.md` §6.1
     /// for what closes this properly.
     pub terminal: bool,
+}
+
+/// Split a setup message's transferred handles into its streams and its terminal.
+///
+/// **Pure, and here rather than in the `io` module, so it can be tested.** It was inline in the
+/// receive path, which needs a kernel — and the bound it gets wrong is exactly the sort a host
+/// test catches for free: `handles` arrives as a fixed zero-initialised array, so an index
+/// inside *it* says nothing about whether a handle was actually transferred. A payload claiming
+/// a terminal with none attached read back as `Some(0)`, and a shell would then run its whole
+/// REPL against handle 0 (PR #194 review, finding 6).
+pub fn split_handles(
+    payload: &SetupPayload,
+    handles: &[u64],
+) -> Result<(Streams, Option<u64>)> {
+    let n = (payload.streams & STREAM_MASK).count_ones() as usize;
+    if n + usize::from(payload.terminal) > handles.len() {
+        return Err(WireError::SchemaMismatch);
+    }
+    let streams = Streams::from_bitmap(payload.streams, &handles[..n])?;
+    let terminal = if payload.terminal { Some(handles[n]) } else { None };
+    Ok((streams, terminal))
 }
 
 impl SetupPayload {
@@ -504,12 +525,7 @@ mod io_stage {
             // The streams come first and the terminal, if any, after them — so the split
             // is by the bitmap's population count rather than by the handle count, which
             // includes both.
-            let n = (payload.streams & super::STREAM_MASK).count_ones() as usize;
-            if n > count {
-                return Err(WireError::SchemaMismatch);
-            }
-            let streams = Streams::from_bitmap(payload.streams, &handles[..n])?;
-            let terminal = payload.terminal.then(|| handles.get(n).copied()).flatten();
+            let (streams, terminal) = super::split_handles(&payload, &handles[..count])?;
             Ok(Setup {
                 streams,
                 argv: payload.argv,
@@ -527,6 +543,38 @@ mod tests {
     /// The refusal is its own error, and it is asserted — an earlier pass added the
     /// variant with a justification and nothing that checked it, which a control caught by
     /// passing.
+    #[test]
+    fn a_claimed_terminal_with_no_handle_transferred_is_refused() {
+        // **Not `Some(0)`.** The handle array a receiver holds is fixed and zero-initialised,
+        // so being inside it proves nothing; only the transferred `count` does. A shell handed
+        // `Some(0)` would run its entire REPL against handle 0 and every read would fail in a
+        // way that looks like a dead terminal rather than a bad message.
+        let claims = SetupPayload {
+            streams: STREAM_STDOUT,
+            argv: alloc::vec![],
+            env: Record::default(),
+            terminal: true,
+        };
+        assert!(split_handles(&claims, &[7]).is_err(), "one handle is the stream's");
+        let (streams, terminal) = split_handles(&claims, &[7, 9]).expect("both transferred");
+        assert_eq!(streams.stdout, Some(7));
+        assert_eq!(terminal, Some(9), "the terminal follows the streams");
+    }
+
+    #[test]
+    fn a_payload_with_no_terminal_ignores_a_handle_beyond_its_streams() {
+        // The other direction: extra handles are not silently adopted as a terminal.
+        let none = SetupPayload {
+            streams: STREAM_STDIN,
+            argv: alloc::vec![],
+            env: Record::default(),
+            terminal: false,
+        };
+        let (streams, terminal) = split_handles(&none, &[3, 4]).expect("ok");
+        assert_eq!(streams.stdin, Some(3));
+        assert_eq!(terminal, None);
+    }
+
     #[test]
     fn a_terminal_survives_the_round_trip_and_its_absence_is_the_default() {
         // The flag and the handle are carried separately — the flag in the payload, the

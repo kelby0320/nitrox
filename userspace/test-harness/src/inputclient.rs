@@ -189,7 +189,7 @@ impl Stream {
         // window and take every click in the system. `check-terminal` found this the hard
         // way: its one click on the terminal was also this phase's sentinel, so the client
         // woke, created that window, and swallowed every keystroke after the first.
-        let deadline = deadline_ns(0, IDLE_LIMIT_NS);
+        let deadline = deadline_ns(IDLE_LIMIT_NS);
         loop {
             // SAFETY: waiting on this process's own channel handle.
             let waited = unsafe {
@@ -204,7 +204,7 @@ impl Stream {
                 )
             };
             if waited != 1 {
-                self.timed_out = deadline_ns(0, 0) >= deadline;
+                self.timed_out = deadline_ns(0) >= deadline;
                 return None;
             }
             // SAFETY: valid recv out-params on a live endpoint.
@@ -366,7 +366,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     let (mut saw_key, mut saw_press) = (false, false);
     while !(saw_key && saw_press) {
-        let ev = match wait_event_before(&mut win, notif, deadline_ns(notif, IDLE_LIMIT_NS)) {
+        let ev = match wait_event_before(&mut win, deadline_ns(IDLE_LIMIT_NS)) {
             Some(Ok(e)) => e,
             Some(Err(_)) => {
                 kprint(b"input-testclient: window stream FAILED\n");
@@ -516,7 +516,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 const IDLE_LIMIT_NS: u64 = 20_000_000_000;
 
 /// An absolute monotonic deadline `ns` from now.
-fn deadline_ns(_notif: u64, ns: u64) -> u64 {
+fn deadline_ns(ns: u64) -> u64 {
     // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
     unsafe {
         syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64)
@@ -532,7 +532,6 @@ fn deadline_ns(_notif: u64, ns: u64) -> u64 {
 /// `nxterm`: the waitable handle, and a non-blocking drain.
 fn wait_event_before(
     win: &mut Window<alloc::boxed::Box<ChannelTransport>>,
-    notif: u64,
     deadline: u64,
 ) -> Option<Result<WindowEvent, libsurface::UiError>> {
     loop {
@@ -545,14 +544,18 @@ fn wait_event_before(
         if h == 0 {
             return Some(win.wait_event());
         }
-        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; two waiters.
+        // **The window handle alone.** An earlier version also waited on this process's
+        // notification handle, which nothing here enqueues on and nothing here drains — so if
+        // one ever *were* pending it would return immediately every turn and this would spin
+        // until the deadline. The deadline is what bounds this loop; the notification handle
+        // added nothing but that risk (PR #194 review, optional 2).
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
         let waited = unsafe {
             WAIT_HANDLES[0] = h;
-            WAIT_HANDLES[1] = notif;
             syscall5(
                 SYS_WAIT,
                 (&raw const WAIT_HANDLES) as u64,
-                2,
+                1,
                 (&raw mut WAIT_RESULTS) as u64,
                 deadline,
                 0,

@@ -227,7 +227,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // to talk to. Failing the window instead would turn a tty-server problem into a blank
     // screen, which is the harder thing to diagnose.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
-    let backend = match unsafe { backend::attach(root_ns) } {
+    let mut backend = match unsafe { backend::attach(root_ns) } {
         Some((terminal, b)) => {
             // SAFETY: `root_ns` is live and `terminal` is a channel this process owns until the
             // spawn moves it.
@@ -301,7 +301,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // has sent comes in and goes through the parser. Done here rather than in the event
         // arm because output arrives unprompted — the shell prints when it likes, and a
         // terminal that only looked after a keystroke would show a prompt one keypress late.
-        if let Some(b) = &backend {
+        if let Some(b) = &mut backend {
             let out = app.take_outbox();
             if !out.is_empty() && !b.typed(&out) {
                 kprint(b"nxterm: input did not reach the tty\n");

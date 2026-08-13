@@ -289,9 +289,16 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("compositor", None)?;
     // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
     // the update are host-tested, the bin is the window and the event pump.
-    // Built with `test-harness`, which makes the terminal report each completed grid line on
-    // the debug console — what `cargo xtask check-terminal` asserts on, rather than pixels.
-    build_userspace_bin("nxterm", Some("test-harness"))?;
+    // **`test-harness` only**, not `mode.features()` — which is what `init` and `session-mgr`
+    // take, and would hand this `selftest` as well. The feature makes the terminal report each
+    // completed grid line on the debug console for `check-terminal` to assert on; a real build
+    // must not have it, because a terminal narrating itself to the kernel log undoes the point
+    // of the tty server owning output. A first version passed it unconditionally, so every
+    // image shipped the instrumentation (PR #194 review, finding 3).
+    build_userspace_bin(
+        "nxterm",
+        matches!(mode, BuildMode::TestHarness).then_some("test-harness"),
+    )?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
     check_userspace_lib("libdraw")?;

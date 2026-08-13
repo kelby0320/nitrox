@@ -329,6 +329,8 @@ pub mod routing {
     pub struct Tty {
         /// The server-side endpoint, opaque here.
         pub ch: u64,
+        /// This terminal's line-editing state — echo mode, the partial line, the escape
+        /// machine. One per terminal, because the mode is per terminal.
         pub disc: Discipline,
         /// The outstanding read, if the client is waiting for input.
         pub waiting: Option<(u64, ReadKind)>,
@@ -347,7 +349,10 @@ pub mod routing {
     /// deliverable to a terminal inside a window, and a queue shared between them makes that a
     /// matter of which terminal happened to ask first.
     pub struct Backend {
+        /// Stable within a run; terminals name their backend by it rather than by index, so
+        /// retiring one does not renumber the others.
         pub id: u32,
+        /// Where this backend's bytes come from and go to.
         pub sink: Sink,
         pending: VecDeque<u8>,
     }
@@ -462,13 +467,28 @@ pub mod routing {
             let Some(i) = self.ttys.iter().position(|t| t.ch == ch) else { return Vec::new() };
             let backend = self.ttys[i].backend;
             self.ttys.remove(i);
-            let orphan = (backend != CONSOLE && !self.ttys.iter().any(|t| t.backend == backend))
-                .then(|| self.backends.iter().find(|b| b.id == backend).map(|b| b.sink))
-                .flatten();
-            self.retire(backend);
-            match orphan {
-                Some(Sink::Channel(h)) => alloc::vec![h],
-                _ => Vec::new(),
+            match self.retire(backend) {
+                Some(h) => alloc::vec![h],
+                None => Vec::new(),
+            }
+        }
+
+        /// Put terminal `ch` on the existing backend `id`.
+        ///
+        /// Nothing calls this outside tests yet: a terminal joins a backend by *attaching* one
+        /// today, which is one terminal per emulator. It exists because the shared case is the
+        /// one `retire` has to get right — a backend with another terminal still on it must not
+        /// be handed back — and that is not otherwise reachable to test.
+        pub fn move_to(&mut self, ch: u64, id: u32) -> bool {
+            if !self.backends.iter().any(|b| b.id == id) {
+                return false;
+            }
+            match self.ttys.iter_mut().find(|t| t.ch == ch) {
+                Some(t) => {
+                    t.backend = id;
+                    true
+                }
+                None => false,
             }
         }
 
@@ -622,32 +642,45 @@ pub mod routing {
         /// a pty. One line discipline serves both, which is what
         /// `console-and-tty.md` built the backend seam for.
         ///
-        /// Returns the new backend's id, or `None` if `ch` is not a terminal.
+        /// Returns `(new backend id, any channel the caller must close)`, or `None` if `ch` is
+        /// not a terminal.
         ///
         /// **A terminal may be re-pointed**, and the old backend is dropped if nothing else uses
         /// it. Re-pointing while a read is outstanding keeps the read: it is the same terminal
         /// and the same client, and failing the read would make attaching a backend a visible
         /// hiccup for a program that never asked about backends.
-        pub fn attach_backend(&mut self, ch: u64, handle: u64) -> Option<u32> {
+        ///
+        /// **The orphaned channel comes back to the caller**, for the same reason
+        /// [`close_and_retire`](Self::close_and_retire)'s does: closing it is not bookkeeping,
+        /// it is how the *previous* emulator learns its terminal has ended. A first version
+        /// dropped the `Backend` and returned nothing, so a second `AttachBackend` on one
+        /// terminal leaked a handle per re-point and left the old emulator waiting forever for
+        /// a `PeerClosed` that could not arrive (PR #194 review, finding 4).
+        pub fn attach_backend(&mut self, ch: u64, handle: u64) -> Option<(u32, Option<u64>)> {
             let i = self.ttys.iter().position(|t| t.ch == ch)?;
             let old = self.ttys[i].backend;
             let id = self.next_backend;
             self.next_backend += 1;
             self.backends.push(Backend { id, sink: Sink::Channel(handle), pending: VecDeque::new() });
             self.ttys[i].backend = id;
-            self.retire(old);
-            Some(id)
+            Some((id, self.retire(old)))
         }
 
-        /// Drop backend `id` if it is not the console and no terminal is left on it.
+        /// Drop backend `id` if it is not the console and no terminal is left on it, returning
+        /// its channel for the caller to close.
         ///
         /// The console is never retired: it exists before anything can ask for it, and a
         /// terminal opened with no backend named has to land somewhere.
-        fn retire(&mut self, id: u32) {
+        fn retire(&mut self, id: u32) -> Option<u64> {
             if id == CONSOLE || self.ttys.iter().any(|t| t.backend == id) {
-                return;
+                return None;
             }
+            let orphan = self.backends.iter().find(|b| b.id == id).and_then(|b| match b.sink {
+                Sink::Channel(h) => Some(h),
+                Sink::Console => None,
+            });
             self.backends.retain(|b| b.id != id);
+            orphan
         }
 
         /// A `Write` request from terminal `ch`.
@@ -761,7 +794,7 @@ mod routing_tests {
         // one must not be deliverable to a program in the other. Before this, one flat queue
         // and one flat `Vec` meant the recipient was whichever terminal happened to be waiting.
         let mut r = console_ttys(2);
-        let other = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
+        let (other, _) = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
         assert_ne!(other, CONSOLE);
 
         // Terminal 2 is the only one reading, and the bytes arrive on the *console*.
@@ -781,7 +814,7 @@ mod routing_tests {
         // another — the flat version broadcast to every terminal in the system and justified it
         // with "a session has one", which was never true.
         let mut r = console_ttys(2);
-        let win = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
+        let (win, _) = r.attach_backend(2, 0xBEEF).expect("terminal 2 exists");
 
         let acts = r.feed(CONSOLE, &[0x03]);
         assert_eq!(replies_to(&acts, 1), [(OP_TTY_INTERRUPT, Vec::new())], "the console terminal");
@@ -836,7 +869,7 @@ mod routing_tests {
         // Echo is the subtle one: it is generated by the *discipline*, not by the client, so a
         // version that echoed to a fixed sink would type a window's password on the console.
         let mut r = console_ttys(1);
-        let win = r.attach_backend(1, 0xF00D).expect("terminal 1 exists");
+        let (win, _) = r.attach_backend(1, 0xF00D).expect("terminal 1 exists");
         r.read(1, 1, ReadKind::Line);
         let acts = r.feed(win, b"ab");
         assert_eq!(written(&acts, Sink::Channel(0xF00D)), b"ab");
@@ -869,6 +902,38 @@ mod routing_tests {
             got.iter().any(|(op, _)| *op == OP_TTY_INTERRUPT),
             "the interrupt was swallowed as data: {got:?}",
         );
+    }
+
+    #[test]
+    fn re_pointing_a_terminal_hands_back_the_backend_it_left() {
+        // Closing that channel is how the *previous* emulator learns its terminal has ended —
+        // `rsproto-tty-ops.md` § Lifetime — so a version that merely dropped the `Backend`
+        // leaked a handle per re-point and left that emulator waiting for a `PeerClosed` that
+        // could not arrive (PR #194 review, finding 4).
+        let mut r = console_ttys(1);
+        let (_first, orphan) = r.attach_backend(1, 0xAAA).expect("terminal 1 exists");
+        assert_eq!(orphan, None, "there was no channel backend before this one");
+
+        let (second, orphan) = r.attach_backend(1, 0xBBB).expect("terminal 1 exists");
+        assert_eq!(orphan, Some(0xAAA), "the channel it left was not handed back");
+        assert_eq!(r.backend_channels().collect::<Vec<_>>(), [0xBBB]);
+        assert_eq!(r.sink_of(1), Some(Sink::Channel(0xBBB)));
+
+        // ...and closing the terminal still hands back the one it ends on.
+        assert_eq!(r.close_and_retire(1), [0xBBB]);
+        let _ = second;
+    }
+
+    #[test]
+    fn a_backend_with_another_terminal_left_on_it_is_not_handed_back() {
+        // The other half of `retire`: two terminals on one backend, and closing the first must
+        // not close the channel the second is still using.
+        let mut r = console_ttys(2);
+        let (id, _) = r.attach_backend(1, 0xC0DE).expect("terminal 1 exists");
+        r.move_to(2, id);
+        assert_eq!(r.close_and_retire(1), Vec::<u64>::new(), "the channel was closed too early");
+        assert_eq!(r.sink_of(2), Some(Sink::Channel(0xC0DE)));
+        assert_eq!(r.close_and_retire(2), [0xC0DE], "and released when the last one goes");
     }
 
     #[test]

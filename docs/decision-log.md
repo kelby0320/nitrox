@@ -14531,3 +14531,69 @@ once `input-testclient` exits.** A motion injected before it goes reaches `nxter
 after it does not. Observed, not explained. If it is what it looks like, one consumer of
 `/dev/input/new` disconnecting costs the *other* consumers their stream — an `input-server` bug,
 older than this milestone, that nothing until now had a reason to notice.
+
+## 2026-08-13 — PR #194 review: the same bug twice, one file apart
+
+Seven findings, and the shape of the first one is the entry.
+
+### `is_gone()` was a second receive, and there is no such thing as a peek
+
+It carried the comment *"a zero-length receive probes the ring without consuming a message."*
+`sys_channel_recv` has no length argument and no peek mode: it dequeues. So every turn of
+`nxterm`'s event loop, immediately after draining output, a second identical call ate the next
+message — and back-to-back messages are the norm, since `sink_write` emits one per chunk and one
+per `Act::Write`. The bytes vanished, and because the message *was* dequeued the channel stopped
+being signalled, so nothing woke to retry.
+
+**That is the same bug this PR fixes one file over.** Silent output loss with a hole in the line
+is exactly what the `NOBLOCK` send was doing, and it is what the missing character in
+`check-terminal` was. Having just diagnosed and fixed it on the server side, I wrote it again on
+the client side within the hour — because the two look nothing alike at the call site. One is a
+send mode, one is an extra receive.
+
+The fix is structural rather than careful: `output` is now the **only** receive on the backend,
+and `is_gone` reads a flag it sets. There is no way to ask a channel a question without consuming
+from it, so the rule has to be "one reader, one call".
+
+### An extraction that only moved the bug out of reach of tests
+
+`Setup::decode` bounded the terminal handle by the *array* it lives in rather than by the
+transferred `count`, so a payload claiming a terminal with none attached decoded as `Some(0)` and
+a shell would run its REPL against handle 0.
+
+The first fix was one line, and it was untestable: the check sat in the `io`-gated module, which
+needs a kernel. Break-testing it confirmed that — no test failed. The real fix was to notice the
+logic is **pure** and had no business being there: `split_handles` is now beside the payload, with
+two tests, one of which fails when the bound goes back to the array.
+
+**A guard that no test can reach is a guard on trust.** The tell was that break-testing it changed
+nothing, which is the same signal that has now deleted two constants and moved this one.
+
+### Four smaller ones, each a real defect
+
+- **`attach_backend` leaked the old backend channel** on a re-point. `close_and_retire` exists
+  precisely to hand orphans back, and `retire` — one function away — dropped them. The spec file
+  written in this same PR says closing that channel is how an emulator learns its terminal ended.
+- **The `terminal` close was on the wrong branch.** A successful send commits the move by closing
+  the sender's handles, so `if sent { close }` is a no-op that errors; the failure path, where the
+  handle really is still ours, closed nothing. `attach()` twelve lines up gets it right and says
+  so, which makes this a case of not reading my own code.
+- **The release image shipped the harness instrumentation**, because `mode.features()` was copied
+  from `init` without noticing it also passes `selftest`. `nxterm`'s own manifest comment says the
+  feature must be off in a real build.
+- **An orphaned doc comment**: `wait_handle` was inserted above `wait_event` and inherited its
+  `///` block, so a `u64` getter documented buffer-release semantics. This has a memory note
+  against it and it happened anyway — inserting an item above another steals its doc comment, and
+  nothing in the toolchain objects.
+
+### And the trade I asked to be checked, corrected
+
+The reviewer agreed the `NOBLOCK` → `BLOCK` change is right and found the entry understated it:
+one blocked send holds the server's **single serve loop**, so a wedged emulator stalls every
+terminal in the system — the login terminal and the serial shell included — not just its own.
+"Stalls the server for every terminal it serves" read as per-backend; it is per-server. Corrected
+in both the entry and the code comment.
+
+They also noted the *input* direction is the un-made half of the same trade: `Backend::typed` is
+still `NOBLOCK` and drops keystrokes on a full ring. Far harder to reach — eight queued messages —
+but the same silent loss, and now part of the same TODO.
