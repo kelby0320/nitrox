@@ -194,8 +194,12 @@ fn run_input_testclient(root_ns: u64) {
 /// handle to init's root namespace so it resolves `/dev/draw/new` and the system font. **No
 /// syscaps** — authority over the display is the namespace binding, nothing more.
 ///
-/// Spawned under `selftest` only *for now*: in Part C it is `session-mgr` that starts a
-/// terminal, as part of building a session, which is where a program a person runs belongs.
+/// **Spawned under `selftest` only, and it stays that way through Part C.** This comment used to
+/// say `session-mgr` would start the terminal as part of building a session. That was reversed on
+/// 2026-08-12: `session-mgr` is the *serial* column's supervisor, and a terminal a person launches
+/// belongs to the graphical one — `desktop-shell`, spawned by `desktop-session-mgr`, neither of
+/// which exists yet. See `docs/design/graphical-session.md`. Until Milestone 7 there is nothing to
+/// launch `nxterm` from, so `init` does it in the test image and nowhere else.
 #[cfg(feature = "selftest")]
 static mut SPAWN_NXTERM: SpawnArgs = SpawnArgs {
     image: 0, // resolved at spawn from /bin/nxterm

@@ -11,7 +11,19 @@ QMP and asserts they reach a **window**. **Milestone 4 is complete** (2026-08-11
 doc-graduation box, which M5 carries as a prerequisite: `libui` — the retained tree, layout,
 the keyed diff, per-buffer damage, event routing, painting, and the widget set — plus real
 TrueType glyphs, key repeat, an on-screen pointer, and the font on the root filesystem.
-**Milestone 5 is planned in detail** (2026-08-12) and not yet started.
+**Milestone 5 Parts A and B are complete** (2026-08-12): `libterm`'s parser, grid, render and
+encoder, the blend that unblocked antialiasing, and `nxterm` itself — window, chrome, scrollback,
+key repeat, and the display gate's third region. **Part C is re-planned and not started.**
+
+**The arm was re-scoped on 2026-08-12**, from a gap found while planning Part C: the plan had
+`session-mgr` spawning `nxterm`, which assigns a graphical job to the serial column's supervisor.
+Nothing in `docs/` said who authenticates a graphical user or who spawns the desktop shell — the
+top of that column was empty. It is specified now in
+[`graphical-session.md`](../design/graphical-session.md), and the milestones below it changed
+shape: the old Milestone 6 ("windows, ports, desktops") bundled work at three different
+dependency depths, so it splits into **M6 — window management** (compositor only),
+**M7 — the graphical session** (new: login, `desktop-session-mgr`, `desktop-shell`), and
+**M8 — desktops, ports, templates**; the old M7 becomes **M9**.
 
 ## What this is
 
@@ -25,6 +37,8 @@ the source of truth for *the order*.
   — windows, ports, desktops, templates.
 - **The shell itself:** [`docs/design/desktop-shell.md`](../design/desktop-shell.md)
   — bars, applications modal, overview, and the operations it demands of the compositor.
+- **Who logs you in:** [`docs/design/graphical-session.md`](../design/graphical-session.md)
+  — the graphical column beside `session-mgr`'s serial one, and what the two share.
 
 The typed shell + coreutils subproject ([`shell-coreutils-plan.md`](shell-coreutils-plan.md)) is
 the CLI arm of the same phase and is complete through Milestone 4. Several of its deferred
@@ -96,7 +110,7 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
 - [x] **Part B — `/dev/draw` served.** ✅ (2026-08-06) `new` mints a session; `<N>/info`
       answers with a mapped `WindowInfo` snapshot; replies and `Release` events go out on
-      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 6. The same
+      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 8. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
 
@@ -114,18 +128,34 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
       from a real client's committed buffer rather than a synthetic one.
 **On graduating the design docs.** Root `CLAUDE.md` requires the milestone that builds a
 `design/` doc to carry its move to `architecture/` as a checkbox. That move is **not** M2's:
-the three documents describe subsystems that are only partly built — `display-substrate.md`
+the four documents describe subsystems that are only partly built — `display-substrate.md`
 still specifies input, text, capture and hotkeys with no code; `ui-composition-model.md`
-specifies ports and desktops (M6); `desktop-shell.md` has nothing built at all. Moving a
+specifies ports and desktops (M8); `desktop-shell.md` has nothing built at all. Moving a
 document to `architecture/` while most of it describes the future is precisely the confusion
 that directory split exists to prevent. Each carries an accurate Status line meanwhile, and
 graduates with the milestone that finishes its subsystem.
 
-**Where each checkbox lives.** `display-substrate.md` and `ui-composition-model.md` in M6,
-`desktop-shell.md` in M7 — and, added 2026-08-10 once there were five of these rather than
-three: `input-subsystem.md` and `widget-toolkit.md` in **M4**. `input-subsystem.md`'s
-subsystem finished with M3 and its box was simply never written, which is the failure this
-paragraph exists to prevent, one level up.
+**Where each checkbox lives**, as of the 2026-08-12 re-scope:
+
+| Document | Graduates in | Because |
+|---|---|---|
+| `input-subsystem.md` | **M4** ✅ | done 2026-08-12, as M5's P1 |
+| `widget-toolkit.md` | **M4** ✅ | done 2026-08-12, as M5's P1 |
+| `graphical-session.md` | **M7** | the milestone that builds the graphical login |
+| `desktop-shell.md` | **M7** | the milestone the shell lands in |
+| `ui-composition-model.md` | **M8** | ports and desktops, which M8 builds |
+| `display-substrate.md` | **M9** | input, text and capture are finished there |
+
+Added 2026-08-10 once there were five of these rather than three, because
+`input-subsystem.md`'s subsystem finished with M3 and its box was simply never written — the
+failure this paragraph exists to prevent, one level up.
+
+**It then suffered that failure itself.** The re-scope moved three of the six and added a
+fourth document, and the prose version of this list was left naming M6/M7 — misfiling
+`ui-composition-model.md` by two milestones and omitting `graphical-session.md` entirely (PR
+#193 review, finding 2). It is a table now, which is harder to leave half-updated, and the
+`display-substrate.md` row also corrects a discrepancy that predates the re-scope: the list said
+M6 while the document's own Status line said M7.
 - [x] **Part E — release semantics** ✅ (2026-08-06), settled by the first client that
       double-buffers, exactly as this box anticipated. Three rules came out of it, each
       found by something breaking rather than by design: `Release` names the buffer that
@@ -911,38 +941,76 @@ This is the part with a real design question in it, and it is not "add a write p
       a free function that calls `kprint` and becomes a method on a backend that is either
       the serial console or a channel.
 
-- [ ] **C2 — the backend is per-session, and `session-mgr` chooses it.**
-      **Not per-terminal.** A session's programs each resolve their own `/dev/tty` — that is
-      stage 1c's model — and all of them must reach the *same* window, exactly as all of them
-      reach the same serial console today.
+- [ ] **C2 — routing is per-terminal, keyed by the backend.**
+      **Not per-session**, which is what this said until 2026-08-12. The correction came from
+      the maintainer asking why `session-mgr` would spawn `nxterm` at all, and it is worth
+      keeping because the original was wrong in two independent ways.
 
-      The tty server currently has a flat `Vec<Tty>` with no session concept and an implicit
-      single backend; grouping terminals by session is genuine new structure and should be
-      planned as such rather than discovered. Two consequences to handle in the same change:
-      `drive_input` broadcasts `Ctrl-C` to *every* terminal precisely because it cannot tell
-      them apart, and a comment in `tty-server/src/main.rs` asserts "a session has one"
-      terminal — an assumption this part overturns, so it should be corrected rather than left
-      to contradict the code around it.
+      *It assumed a model the tty server does not have.* "A session's programs each reach the
+      same terminal" is not how this works: a `Tty` is minted **per resolver**, not per session
+      — `session-mgr` opens one for the login prompt, `nxsh` opens its own, and every stage
+      `nxsh` spawns can open another. `console-and-tty.md` already carries errata saying so.
+      Per-terminal is therefore not overturning a model; it is naming one that never existed.
 
-      **`session-mgr` spawns `nxterm` and registers it**, then spawns the shell as it always
-      has. That keeps the architecture's rule — supervisors spawn and bind, servers do not
-      self-register — where the Unix-shaped alternative (the terminal spawns its own shell)
-      would need `nxterm` to hold spawn authority and construct a namespace, which is
-      session-mgr's job and nobody else's.
+      *And it made `nxterm` a session fixture rather than an application.* A terminal emulator
+      is a program the user launches, possibly several of, exactly as `gnome-terminal` is. A
+      backend keyed per session gives the second one nowhere to route.
 
-      **Both backends must keep working** (governing decision 3), so the choice is a session
-      property and the serial path stays the default until the GUI one is proven.
+      So: each `nxterm` owns a backend, and the ttys routed to it are the ones minted against
+      it. The session's login shell keeps the serial console. This is *less* new structure than
+      session-grouping would have been — the group key is a handle the server already holds.
 
-- [ ] **C3 — does one dead backend end all of that session's terminals?**
+      Two consequences to handle in the same change: `drive_input` routes console bytes to the
+      first waiter in a flat `Vec` and broadcasts `Ctrl-C` to **every** open terminal, both
+      because it cannot tell terminals apart; and a comment in `tty-server/src/main.rs` asserts
+      "a session has one" terminal, which was already false and should be corrected rather than
+      left to contradict the code around it.
+
+      **Both backends must keep working** (governing decision 3), so the serial path stays the
+      default and the GUI one is additive.
+
+- [ ] **C3 — the shell inside the window, and the `/dev/tty` it cannot have yet.**
+      `nxterm` spawns `nxsh` itself, with `namespace: 0` — inherit — exactly as `nxsh` spawns
+      `ls`. It hands the tty channel down in the setup message, the way `libstream` already
+      passes streams and the way Unix inherits fd 0/1/2.
+
+      **This is not the rule violation the earlier draft thought it was.** That draft rejected
+      it because `nxterm` "would need to hold spawn authority and construct a namespace". There
+      is no spawn syscap at all — `sys_process_spawn` gates on nothing, and `nxsh` spawns with
+      `syscaps: 0` — so the only real constraint is namespace *construction*, and inheriting
+      does not construct. `ui-composition-model.md` §5's guarantee ("no application holds a
+      handle to another's namespace") is untouched: `nxterm` holds its own, and its child gets
+      the LOOKUP-only view of it that every spawned program gets.
+
+      **The gap this leaves, stated rather than hidden:** `/dev/tty` resolved *inside* the
+      window still reaches the session's console, because that binding belongs to the namespace
+      `desktop-shell` will construct. **No program that could run inside a window resolves
+      `/dev/tty` except `nxsh`**, which will have been handed one — so it is inert today, and it
+      is the wrong thing to fix here. (Not "nothing in the tree resolves it", which an earlier
+      draft claimed and is false: `session-mgr` resolves it for the login prompt and the test
+      harness resolves it in the gate. Neither runs in a window — PR #193 review, finding 7.) It gets a `TODO(gui-dev-tty)` and an entry in `deferred-decisions.md`
+      triggered on Milestone 7, where [`graphical-session.md`](../design/graphical-session.md)
+      §6.1 owns the question.
+
+- [ ] **C4 — does a dead backend end that terminal's ttys?**
       `console-and-tty.md` already answers the single-terminal case: a terminal ends when its
-      holder exits, via `PeerClosed`. The new question is the plural one — `nxterm` exiting
-      drops the backend, and every terminal in that session is left with nowhere to write.
+      holder exits, via `PeerClosed`. Per-terminal routing makes the plural question small —
+      `nxterm` exiting ends the ttys routed to *its* backend and touches nothing else in the
+      system, where a per-session backend would have taken every terminal in the session with
+      it.
 
       The answer is presumably yes, end them: a terminal whose window is gone cannot be
-      interacted with, and leaving it alive gives the shell a `/dev/tty` that silently
-      discards. Stated as a question rather than asserted because the alternative — keep them
-      and let a replacement `nxterm` reattach — is what a session that survives its terminal
-      would want, and nothing yet says whether one should.
+      interacted with, and leaving it alive gives its programs a `/dev/tty` that silently
+      discards. Stated as a question because the alternative — keep them and let a replacement
+      terminal reattach — is what session recovery would want, and nothing yet says whether it
+      should exist.
+
+**What Part C no longer contains.** An earlier draft had `session-mgr` spawning `nxterm` and
+registering it. That assigned a graphical job to the serial column's supervisor, and it did so
+because the process that should own it — `desktop-session-mgr` — did not exist in any document.
+It does now ([`graphical-session.md`](../design/graphical-session.md)), it lands in Milestone 7,
+and Part C is what its title says: the tty server's second backend. `nxterm` stays spawned by
+`init` in the test image until there is something to launch it from.
 
 ### Decisions taken in this pass
 
@@ -982,29 +1050,119 @@ keystroke is the first thing anyone would notice. It stays deferred — the trig
 *observed* overflow and none has happened outside a deliberately wedged test client — but if
 Part B drops input under load, the wire record lands there rather than being worked around.
 
-## Milestone 6 — windows, ports, desktops
+## Milestone 6 — window management
 
 Sketched; detail when M5 lands.
 
-- [ ] **Graduate `ui-composition-model.md`** to `docs/architecture/` — this milestone builds
-      the ports and desktops it specifies, which is the rest of that document.
+**Re-scoped 2026-08-12.** This milestone was "windows, ports, and desktops", which bundled three
+things at very different dependency depths: windows need only the compositor, while ports and
+desktops need a desktop shell that does not exist. They are split — windows here, ports and
+desktops in M8 — and the shell's own milestone (M7) sits between them.
 
-Multiple windows, stacking, move/resize, and **the overview** — thumbnail capture, the frozen
-image grid, and the desktop sidebar (desktop shell §6). Ports under windows, with
-`list` answering discovery. The **desktop shell** as a second process: `/dev/desktop`, desktop
-membership as a filtered view of the compositor's window set, moving windows between desktops.
+**The concrete state this starts from: the compositor has no window management at all.**
+`WindowStack::set_origin` exists, has no protocol op, and has **no non-test caller at all** —
+all three call sites are inside `#[cfg(test)]`. Every window is created at (0,0) and stacks in
+creation order. That is not a missing feature so much as a missing subsystem, and M5 Part B ran
+into it directly — the display gate has to create its three reference windows largest-first and
+*assert* they nest, because nothing can move them.
+
+**The pointer sprite is not a counterexample**, and an earlier draft of this paragraph wrongly
+cited it as the live caller. The cursor has no window id: its position lives in the input router
+and it is drawn over the composed output, deliberately — `compositor/src/lib.rs:149`, *"Composited
+**after** the window stack, because a cursor under a window is not a cursor."* Reading it as a
+positioned window would suggest routing cursor motion through the new placement op, which is the
+one thing the compositor is built not to do (PR #193 review, finding 1).
+
+- [ ] **Placement, move, resize, restack**, and the protocol ops for each. Focus policy that is
+      not "the last window created".
+
+- [ ] **The policy seam.** Placement policy belongs to the shell — [`desktop-shell.md`](../design/desktop-shell.md)
+      §8 lists **Window placement** among the operations it demands of the compositor — and there
+      is no shell here. (Governing decision 2 is *not* the citation for this: it puts windows,
+      input routing and focus in the compositor and never mentions placement. An earlier draft
+      cited it anyway — PR #193 review, finding 6.) So the compositor needs a default *and* a way for the shell to take over:
+      an op to place a window, and a shell-privileged channel that is told when one appears.
+      **Designing that seam is this milestone's real work** — the mechanism is
+      straightforward, and the failure mode is a default policy the shell cannot override, which
+      would be discovered in M7 with the shell half-written.
+
+      Considered and rejected: a throwaway thin shell in this milestone to exercise the seam.
+      The maintainer's call (2026-08-12) — either write a shell that evolves into the real one,
+      which is M7's job, or use a compositor default. A shell built to be discarded is a third
+      thing to maintain and its feedback is worth less than it costs.
+
+- [ ] **A `Role::Popup` window can be positioned**, which M5 deferred: `librsproto`'s roles carry
+      a parent but the compositor cannot place a child relative to it, so a menu that must escape
+      its window has nowhere to go. `libui`'s `offset` covers the in-window case and clips at the
+      parent's edge; this is the other half.
+
+## Milestone 7 — the graphical session
+
+Sketched. **New in the 2026-08-12 re-scope**, and the piece whose absence caused the M5 Part C
+misassignment: nothing in `docs/` said who authenticates a graphical user or who spawns the
+desktop shell. [`graphical-session.md`](../design/graphical-session.md) now specifies it.
+
+- [ ] **Graduate `graphical-session.md` and `desktop-shell.md`** to `docs/architecture/` — this
+      milestone builds both.
+
+- [ ] **The shared session core.** "Authenticate → construct the namespace → spawn the leader →
+      reap → tear down" is the same logic in both columns, against different arguments. It
+      factors into a crate both supervisors link — Linux's PAM precedent: a shared library, not a
+      merged process.
+
+      **Constraint attached:** the core must honour `session-mgr`'s dependency rule (`libkern` +
+      `librsproto` + `libstream` + `libheap`, no `libos`), because `session-mgr` links it. The
+      greeter — the part that draws — stays in each supervisor, which is where they diverge
+      anyway.
+
+- [ ] **`desktop-session-mgr`.** `session-mgr`'s graphical twin: spawned by `service-mgr` with
+      `BIND_NAMESPACE` re-delegated, plus the fs/profile/tty endpoints, an auth channel, and
+      — the new part — a `/dev/draw` connection, because its greeter is itself a compositor
+      client. Presents a login **window**, calls the *same* `auth-service` over the *same*
+      protocol, constructs a session namespace, spawns `desktop-shell` into it.
+
+      That `auth-service` needs no change is the evidence the existing split was drawn in the
+      right place. `/dev/console` is deliberately **not** bound into a graphical session —
+      governing decision 3's failure is on the record.
+
+- [ ] **`desktop-shell`, minimally**: the top bar, the applications modal, window placement
+      policy driving M6's ops, and — the load-bearing part — **constructing a namespace per
+      application it spawns**. `ui-composition-model.md` §5a requires this; §5's guarantee that
+      "an application cannot compose other applications" rests on the shell being the process
+      that built them.
+
+- [ ] **`nxterm` becomes launchable**, which is what makes this milestone visible: the
+      applications modal spawns it into a namespace the shell constructed, and M5 Part C's
+      `TODO(gui-dev-tty)` is discharged with a real `/dev/tty` binding
+      ([`graphical-session.md`](../design/graphical-session.md) §6.1).
+
+- [ ] **Decide concurrency** (`graphical-session.md` §6.2). Two supervisors able to authenticate
+      independently fires `session-and-auth.md`'s deferred "one console, one session at a time".
+      Serial must stay available while a graphical session runs — it is the recovery path — but
+      whether that is two sessions or one session with two views is undecided.
+
+## Milestone 8 — desktops, ports, templates
+
+Sketched. The remainder of the old Milestone 6, now resting on a shell that exists.
+
+- [ ] **Graduate `ui-composition-model.md`** to `docs/architecture/` — this milestone builds the
+      ports and desktops it specifies.
+
+Multiple desktops and **the overview** — thumbnail capture, the frozen image grid, the desktop
+sidebar (desktop shell §6). Ports under windows, with `list` answering discovery. Desktop
+membership as a filtered view of the compositor's window set; moving windows between desktops.
 Wiring by `sys_ns_bind` into an application's namespace, and the default-handler fallback.
 Templates: instantiate, extract, `open ./code.nxg | desktop`, `save`.
 
-## Milestone 7 — the composed desktop
+## Milestone 9 — the composed desktop
 
 Sketched. File browser and text editor; the patch canvas (Tier 1 drag-and-drop via
 `QueryCaps`, Tier 2 durable wiring); and the question the composition doc leaves open — what
 happens to a wired graph when an application crashes, and whether the desktop shell respawns
 and rewires it.
 
-- [ ] **Graduate `display-substrate.md` and `desktop-shell.md`** to `docs/architecture/` —
-      by the end of this milestone the substrate is fully built and the shell exists.
+- [ ] **Graduate `display-substrate.md`** to `docs/architecture/` — by the end of this milestone
+      the substrate is fully built.
 
 ## What this unblocks
 

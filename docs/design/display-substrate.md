@@ -8,7 +8,8 @@ Input (§5), text (§6), thumbnail capture
 (§4b) and global hotkeys (§5a) have **no code**. The build order is
 [`display-arm-plan.md`](../planning/display-arm-plan.md). It graduates to `architecture/`
 when its **subsystem** is built, not when the first milestone touching it lands — the plan
-carries that checkbox at Milestone 7, where input, text and capture are finished.
+carries that checkbox at Milestone 9, where input, text and capture are finished (Milestone 7
+in the numbering before the 2026-08-12 re-scope).
 
 The mechanism beneath the display: who owns the framebuffer, how a client's pixels reach it,
 where input comes from, how text is drawn, and how any of it is tested. Settled with the
