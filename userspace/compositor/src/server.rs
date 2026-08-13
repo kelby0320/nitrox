@@ -21,7 +21,8 @@
 use alloc::vec::Vec;
 
 use librsproto::surface::{
-    OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, build_create_window_reply,
+    ConfigureEvent, OP_ATTACH_BUFFER, OP_COMMIT, OP_CREATE_WINDOW, OP_DESTROY_WINDOW,
+    build_create_window_reply,
     parse_attach_buffer_request, parse_commit_request, parse_create_window_request,
     parse_destroy_window_request,
 };
@@ -65,6 +66,22 @@ impl Connection {
 pub enum Outcome {
     /// A reply body of this length was written.
     Reply(usize),
+    /// A window was created: reply with `reply_len` bytes, **then** send this `Configure`.
+    ///
+    /// Two messages for one request, which no other op needs, so it is a variant rather than a
+    /// field on [`Reply`](Outcome::Reply). The order is the contract: a client blocked in
+    /// `Window::new` reads the reply for the id and then waits for the configure, and a
+    /// compositor that sent them the other way round would deadlock every client at startup.
+    ///
+    /// **The configure is what makes the window compositable** — see
+    /// [`WindowStack::configure`]. Until it arrives the client has no size it is entitled to
+    /// commit at, which is the ordering that lets a manager place a window before it is seen.
+    Created {
+        /// Length of the `CreateWindow` reply body already written.
+        reply_len: usize,
+        /// The configure to send immediately after it.
+        configure: ConfigureEvent,
+    },
     /// Applied with no reply body.
     Applied {
         /// The `(window, buffer)` to release to the client, if any — **the buffer that
@@ -135,7 +152,24 @@ pub fn dispatch(
                 Ok(id) => {
                     conn.owned.push(id);
                     match build_create_window_reply(reply, id) {
-                        Some(n) => Outcome::Reply(n),
+                        Some(n) => {
+                            // **No manager exists yet, so the answer is immediate and is the
+                            // client's own request echoed back.** When one does (M6 Part B) this
+                            // is where its answer lands, and the client's wait becomes a real
+                            // wait rather than a formality. Sending it unconditionally now is
+                            // what makes that later change invisible to every client.
+                            let w = stack.window(id).expect("just created");
+                            Outcome::Created {
+                                reply_len: n,
+                                configure: ConfigureEvent {
+                                    window: id,
+                                    width: req.width,
+                                    height: req.height,
+                                    x: w.origin.x,
+                                    y: w.origin.y,
+                                },
+                            }
+                        }
                         None => Outcome::Failed(SurfaceError::Malformed),
                     }
                 }
@@ -326,7 +360,12 @@ mod tests {
         .unwrap();
         let mut reply = [0u8; 32];
         match dispatch(conn, stack, OP_CREATE_WINDOW, &body[..n], &mut reply) {
-            Outcome::Reply(len) => Ok(parse_create_window_reply(&reply[..len]).unwrap()),
+            // Create answers with a reply *and* the window's first `Configure` — the ordering
+            // that lets a manager place a window before it is seen. Most tests care only about
+            // the id; `create_configured` is for the ones that care about the configure.
+            Outcome::Created { reply_len, .. } => {
+                Ok(parse_create_window_reply(&reply[..reply_len]).unwrap())
+            }
             Outcome::Failed(e) => Err(e),
             other => panic!("unexpected {other:?}"),
         }
@@ -592,8 +631,11 @@ mod tests {
             !matches!(outcome, Outcome::Applied { .. }),
             "a create is not an Applied, so anything keyed on Applied misses it: {outcome:?}"
         );
-        let Outcome::Reply(len) = outcome else { panic!("unexpected {outcome:?}") };
-        let second = parse_create_window_reply(&reply[..len]).unwrap();
+        let Outcome::Created { reply_len, configure } = outcome else {
+            panic!("unexpected {outcome:?}")
+        };
+        let second = parse_create_window_reply(&reply[..reply_len]).unwrap();
+        assert_eq!(configure.window, second, "the configure names the window just created");
 
         assert_ne!(second, first);
         assert_eq!(

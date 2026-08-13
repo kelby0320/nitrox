@@ -517,6 +517,20 @@ pub const OP_KEY_EVENT: u16 = 0x0905;
 pub const OP_POINTER_EVENT: u16 = 0x0906;
 /// `Surface::FocusEvent` — this window gained or lost the keyboard.
 pub const OP_FOCUS_EVENT: u16 = 0x0907;
+/// `Surface::Configure` — where and how large the compositor would like this window to be.
+///
+/// **Server → client, unsolicited, no reply.** A *request*, not a command: the compositor cannot
+/// resize a client's buffer, because the client allocates it. A client answers by attaching and
+/// committing a buffer of that size, or declines by committing whatever it likes — and declining
+/// stays legal, because a fixed-size window is an ordinary thing and a protocol that required
+/// compliance would make every client implement reflow before it could exist.
+///
+/// **The first one is different, and it is an ordering rule rather than a stronger request.** A
+/// window is not composited until it has been configured, so a client waits for its first
+/// `Configure` before its first `Commit`. That is what lets a manager place a window *before* it
+/// is ever seen, without putting the manager on the critical path of window creation: the round
+/// trip belongs to the client. See `docs/spec/rsproto-surface-ops.md`.
+pub const OP_CONFIGURE: u16 = 0x0908;
 
 /// The key was released.
 pub const KEY_UP: u16 = 0;
@@ -653,6 +667,57 @@ pub struct FocusEvent {
     /// the gap was found, so it cost two bytes that were already reserved
     /// (PR #184 re-review, finding 3). The others are filed.
     pub window: u32,
+}
+
+/// The body of a [`Surface::Configure`](OP_CONFIGURE): where and how large.
+///
+/// Carries an **origin as well as a size** because the manager's answer to "where does this go"
+/// is a placement, and a client that had to learn its position through some other message would
+/// be reconciling two mechanisms that can disagree.
+#[repr(C)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct ConfigureEvent {
+    /// Which window this is about — one session can hold several.
+    pub window: u32,
+    /// Suggested width in pixels.
+    pub width: u32,
+    /// Suggested height in pixels.
+    pub height: u32,
+    /// Top-left corner in screen coordinates.
+    pub x: i32,
+    /// Top-left corner in screen coordinates.
+    pub y: i32,
+}
+
+const _: () = assert!(core::mem::size_of::<ConfigureEvent>() == 20);
+
+impl ConfigureEvent {
+    /// Serialise into exactly 20 little-endian bytes.
+    pub fn write(&self, out: &mut [u8]) -> Option<usize> {
+        if out.len() < 20 {
+            return None;
+        }
+        out[0..4].copy_from_slice(&self.window.to_le_bytes());
+        out[4..8].copy_from_slice(&self.width.to_le_bytes());
+        out[8..12].copy_from_slice(&self.height.to_le_bytes());
+        out[12..16].copy_from_slice(&self.x.to_le_bytes());
+        out[16..20].copy_from_slice(&self.y.to_le_bytes());
+        Some(20)
+    }
+
+    /// Parse from exactly 20 little-endian bytes.
+    pub fn read(b: &[u8]) -> Option<Self> {
+        if b.len() < 20 {
+            return None;
+        }
+        Some(Self {
+            window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
+            width: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
+            height: u32::from_le_bytes([b[8], b[9], b[10], b[11]]),
+            x: i32::from_le_bytes([b[12], b[13], b[14], b[15]]),
+            y: i32::from_le_bytes([b[16], b[17], b[18], b[19]]),
+        })
+    }
 }
 
 const _: () = assert!(core::mem::size_of::<FocusEvent>() == 8);

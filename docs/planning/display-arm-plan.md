@@ -1171,7 +1171,7 @@ reflow.
       to the manager-less case. That case is a test image and a degraded boot, neither of which
       is better served by windows landing somewhere clever.
 
-- [ ] **A2 — `Surface::Configure`**, server → client, and the client half in `libsurface` —
+- [x] **A2 — `Surface::Configure`** ✅ 2026-08-13, server → client, and the client half in `libsurface` —
       a `WindowEvent::Configure { origin, width, height }` a client may honour or ignore.
       Ignoring a *later* one is legal and must stay legal: a fixed-size window is an ordinary
       thing, and a protocol that required compliance would make every client implement reflow
@@ -1293,9 +1293,13 @@ reflow.
       that is how doc work goes unwritten (PR #195 review, finding 6). The `Tty` category spent
       months without a spec file for exactly this reason.
 
-- [ ] **D2 — the initial-configure handshake is documented as a client obligation**, not just as
-      a compositor behaviour. B4's rule only works if every client waits, and a client author
-      reading the spec is the person who needs to know.
+- [x] **D2 — the initial-configure handshake is documented as a client obligation** ✅ 2026-08-13,
+      not just as a compositor behaviour. B4's rule only works if every client waits, and a client
+      author reading the spec is the person who needs to know.
+
+      **Landed with A2 rather than with the rest of Part D**, because A2 is what ships the op: a
+      protocol change merging without its spec row is the thing finding 6 was about, and holding
+      it for a later PR would have reproduced it.
 
 ### The gate collision, which is the first thing to resolve
 

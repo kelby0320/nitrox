@@ -51,7 +51,8 @@ use libkern::debug::Line;
 use libkern::error::KError;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, resolve_reply};
 use librsproto::surface::{
-    FocusEvent, KeyEvent, OP_ATTACH_BUFFER, OP_FOCUS_EVENT, OP_KEY_EVENT, OP_POINTER_EVENT,
+    FocusEvent, KeyEvent, OP_ATTACH_BUFFER, OP_CONFIGURE, OP_FOCUS_EVENT, OP_KEY_EVENT,
+    OP_POINTER_EVENT,
     OP_RELEASE, PointerEvent,
 };
 use librsproto::{OP_NS_RESOLVE, RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -1130,6 +1131,30 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // **No repaint.** The only request that replies is `CreateWindow`, and a window
             // with no committed buffer contributes no pixels. This used to recomposite the
             // whole screen; see `Outcome::Applied`'s `dirty`.
+        }
+        Outcome::Created { reply_len, configure } => {
+            // **The reply first, then the configure**, in that order and on the same channel.
+            // The client is blocked in `Window::new` reading the reply for its id, and then
+            // waits for the configure before it may commit — so sending them the other way
+            // round would park every client at startup.
+            // SAFETY: `dispatch` wrote `reply_len` bytes at this offset in REPLY_MSG. Copy them
+            // out before `reply_on_session` re-encodes into the same buffer.
+            let mut body = [0u8; MAX_BODY];
+            let n = reply_len.min(MAX_BODY);
+            unsafe {
+                body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
+            }
+            let sent = reply_on_session(ch, op, request_id, &body[..n]);
+            if !sent {
+                kprint(b"compositor: a create reply did not send\n");
+            }
+            let mut cfg = [0u8; 20];
+            if sent && configure.write(&mut cfg).is_some() && !send_input(ch, OP_CONFIGURE, &cfg) {
+                // The client will wait for this and nothing else will produce it, so a silent
+                // failure parks it forever — the same reason the reply above says so.
+                kprint(b"compositor: a window's first configure did not send\n");
+            }
+            // **No repaint.** A window with no committed buffer contributes no pixels.
         }
         Outcome::Applied { release, dirty } => {
             // A destroy is transitive, so drop every mapping whose window is gone.

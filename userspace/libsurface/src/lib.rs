@@ -34,7 +34,8 @@ use alloc::vec::Vec;
 use libdraw::format::PixelFormat;
 use libdraw::framebuffer::Geometry;
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, CreateWindowRequest, OP_ATTACH_BUFFER, OP_COMMIT,
+    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, OP_ATTACH_BUFFER,
+    OP_COMMIT, OP_CONFIGURE,
     FocusEvent, KeyEvent, OP_CREATE_WINDOW, OP_DESTROY_WINDOW, OP_FOCUS_EVENT, OP_KEY_EVENT,
     OP_POINTER_EVENT, OP_RELEASE, PointerEvent, Role, SURFACE_FORMAT_XRGB8888,
     build_attach_buffer_request, build_commit_request, build_create_window_request,
@@ -193,6 +194,27 @@ pub enum WindowEvent {
     /// Filtered to *this* window: one session can hold several, and a popup taking focus
     /// from its parent sends both halves down the one channel.
     Focus(bool),
+    /// The compositor would like this window at this position and size.
+    ///
+    /// **A request, not a command.** The compositor cannot resize a client's buffer — the
+    /// client allocates it — so a client answers by committing a buffer of that size, or
+    /// declines by committing whatever it likes. Declining is legal and stays legal: a
+    /// fixed-size window is ordinary.
+    ///
+    /// The **first** one is not delivered here at all: [`Window::new`] waits for it and returns
+    /// once it has arrived, because a window is not composited until it has been configured.
+    /// What reaches a client through this variant is therefore always a *later* opinion — a
+    /// manager moving or resizing a window that is already on screen.
+    Configure {
+        /// Suggested width in pixels.
+        width: u32,
+        /// Suggested height in pixels.
+        height: u32,
+        /// Top-left corner in screen coordinates.
+        x: i32,
+        /// Top-left corner in screen coordinates.
+        y: i32,
+    },
     /// The queue overflowed and events were discarded.
     ///
     /// **Accumulated state must be discarded.** A client tracking which keys or buttons are
@@ -215,6 +237,14 @@ pub struct Window<T: Transport> {
     /// event or forty — discard what you believed — so a number would be information nobody
     /// can act on differently.
     lost: bool,
+    /// The most recent `Configure`, or `None` before the first has arrived.
+    configured: Option<ConfigureEvent>,
+    /// Whether the handshake configure has been seen.
+    ///
+    /// Separates "the compositor has answered, you may commit" from "the compositor has changed
+    /// its mind". Without it the first configure would reach the client as an event about a
+    /// window it has not drawn to yet — an opinion about a size nothing has been committed at.
+    mapped: bool,
 }
 
 impl<T: Transport> Window<T> {
@@ -244,13 +274,37 @@ impl<T: Transport> Window<T> {
             .request(OP_CREATE_WINDOW, &body[..n], None, &mut reply)?
             .ok_or(UiError::BadReply)?;
         let id = parse_create_window_reply(&reply[..len]).ok_or(UiError::BadReply)?;
-        Ok(Self {
+        let mut win = Self {
             transport,
             id,
             buffers: Vec::new(),
             events: alloc::collections::VecDeque::new(),
             lost: false,
-        })
+            configured: None,
+            mapped: false,
+        };
+        // **Wait for the first `Configure` before returning.** A window is not composited until
+        // it has been configured, which is what lets a manager place it before it is ever seen —
+        // and the round trip is deliberately the *client's* to wait out. The alternative, the
+        // compositor asking a manager before replying here, would put a userspace process on the
+        // critical path of every window creation, where a wedged shell stops clients starting at
+        // all.
+        //
+        // With no manager attached the compositor answers immediately, so this returns without
+        // blocking; the wait becomes real when one exists, and no client changes.
+        while win.configured.is_none() {
+            let mut buf = [0u8; 64];
+            let (op, n) = win.transport.wait_event(&mut buf)?;
+            win.apply_event(op, &buf[..n]);
+        }
+        Ok(win)
+    }
+
+    /// The compositor's most recent opinion of this window's position and size.
+    ///
+    /// Never `None` after [`new`](Self::new) returns: waiting for it is what `new` does last.
+    pub fn configured(&self) -> Option<ConfigureEvent> {
+        self.configured
     }
 
     /// Consume the window and hand back its connection.
@@ -368,6 +422,25 @@ impl<T: Transport> Window<T> {
                     && e.window == self.id
                 {
                     self.enqueue(WindowEvent::Focus(e.focused != 0));
+                }
+            }
+            OP_CONFIGURE => {
+                if let Some(e) = ConfigureEvent::read(body)
+                    && e.window == self.id
+                {
+                    self.configured = Some(e);
+                    // The first one is the handshake `Window::new` is waiting on and is not an
+                    // application event; only later ones are. A client that saw the first as an
+                    // event would act on a size it has not yet committed anything at.
+                    if self.mapped {
+                        self.enqueue(WindowEvent::Configure {
+                            width: e.width,
+                            height: e.height,
+                            x: e.x,
+                            y: e.y,
+                        });
+                    }
+                    self.mapped = true;
                 }
             }
             _ => {}
@@ -544,6 +617,24 @@ mod tests {
                 self.next_window += 1;
                 let n = librsproto::surface::build_create_window_reply(reply, self.next_window)
                     .ok_or(UiError::Malformed)?;
+                // **The mock owes the handshake, because the compositor does.** `Window::new`
+                // waits for the first `Configure` before returning, so a mock that replied with
+                // an id and nothing else would hang every test — which is the contract being
+                // modelled rather than an accommodation of it. The geometry echoes the request,
+                // as a compositor with no manager attached does.
+                let req = librsproto::surface::parse_create_window_request(body)
+                    .ok_or(UiError::Malformed)?;
+                let mut cfg = [0u8; 20];
+                ConfigureEvent {
+                    window: self.next_window,
+                    width: req.width,
+                    height: req.height,
+                    x: 0,
+                    y: 0,
+                }
+                .write(&mut cfg)
+                .ok_or(UiError::Malformed)?;
+                self.events.insert(0, (OP_CONFIGURE, cfg.to_vec()));
                 return Ok(Some(n));
             }
             Ok(None)
@@ -563,9 +654,17 @@ mod tests {
             // Models the real timing: nothing is queued *yet*, and the release only
             // materialises because we waited. `deferred` is what a test arranges to have
             // the compositor "send" during the block.
-            if self.events.is_empty()
-                && let Some(ev) = self.deferred.pop()
-            {
+            // **An event already queued is not a wait**, which the real transport gets right by
+            // polling before it blocks. Counting one here made `Window::new`'s handshake — which
+            // reads a configure the mock queued during the create — look like a block, and the
+            // two `acquire` tests that assert on the count are about *buffer* waits.
+            if !self.events.is_empty() {
+                return match self.poll_event(buf)? {
+                    Some(ev) => Ok(ev),
+                    None => Err(UiError::Transport),
+                };
+            }
+            if let Some(ev) = self.deferred.pop() {
                 self.events.push(ev);
             }
             self.waits += 1;
@@ -723,6 +822,63 @@ mod tests {
     fn a_pitch_too_small_for_a_row_is_refused_at_attach() {
         let mut w = window(2);
         assert_eq!(w.attach(9, 64, 32, 64 * 4 - 1, 1), Err(UiError::Malformed));
+    }
+
+    #[test]
+    fn a_new_window_has_been_configured_before_it_returns() {
+        // **The handshake.** A window is not composited until it has been configured, so
+        // `Window::new` does not hand back a window a client could commit on before the
+        // compositor has said where it goes. That is what lets a manager place a window before
+        // it is ever seen, with the round trip on the client's side rather than the
+        // compositor's.
+        let mut t = MockTransport::default();
+        t.next_window = 6;
+        let w = Window::new(t, 320, 200, Role::Normal, 2).expect("created");
+        let cfg = w.configured().expect("configured before new returned");
+        assert_eq!(cfg.window, w.id());
+        assert_eq!((cfg.width, cfg.height), (320, 200), "echoed, with no manager to disagree");
+        assert_eq!((cfg.x, cfg.y), (0, 0));
+    }
+
+    #[test]
+    fn the_handshake_configure_is_not_delivered_as_an_event() {
+        // A client acting on the first configure would be acting on a size it has committed
+        // nothing at — it is the permission to draw, not an opinion about a drawing. Only a
+        // *later* configure is news.
+        let mut t = MockTransport::default();
+        t.next_window = 1;
+        let mut w = Window::new(t, 64, 32, Role::Normal, 2).expect("created");
+        assert!(w.poll_event().expect("ok").is_none(), "the handshake leaked into the queue");
+
+        // A second one is a manager changing its mind, and that *is* an event.
+        let mut cfg = [0u8; 20];
+        ConfigureEvent { window: w.id(), width: 100, height: 50, x: 7, y: 9 }
+            .write(&mut cfg)
+            .unwrap();
+        w.transport.events.push((OP_CONFIGURE, cfg.to_vec()));
+        assert_eq!(
+            w.poll_event().expect("ok"),
+            Some(WindowEvent::Configure { width: 100, height: 50, x: 7, y: 9 }),
+        );
+        assert_eq!(w.configured().unwrap().x, 7, "and it updates what the window knows");
+    }
+
+    #[test]
+    fn a_configure_for_another_window_is_not_this_windows_business() {
+        // One session can hold several windows and they share a channel, so the id is what
+        // makes a configure attributable — the same reason `FocusEvent` carries one.
+        let mut t = MockTransport::default();
+        t.next_window = 3;
+        let mut w = Window::new(t, 8, 8, Role::Normal, 2).expect("created");
+        let before = w.configured().unwrap();
+
+        let mut cfg = [0u8; 20];
+        ConfigureEvent { window: w.id() + 1, width: 999, height: 999, x: 1, y: 1 }
+            .write(&mut cfg)
+            .unwrap();
+        w.transport.events.push((OP_CONFIGURE, cfg.to_vec()));
+        assert!(w.poll_event().expect("ok").is_none(), "somebody else's configure was queued");
+        assert_eq!(w.configured().unwrap(), before, "and it did not overwrite ours");
     }
 
     #[test]

@@ -173,7 +173,7 @@ sections, so it is stated once, normatively:
 
 | Op | On success | On failure |
 |---|---|---|
-| `CreateWindow` | reply carrying the window id | error reply |
+| `CreateWindow` | reply carrying the window id, **then a `Configure`** | error reply |
 | `AttachBuffer` | **silent** | error reply |
 | `Commit` | **silent** | error reply |
 | `DestroyWindow` | **silent** | error reply |
@@ -256,6 +256,12 @@ role. That is deliberate room for a future field, not an invariant to rely on �
 treat a zeroed word as proof of anything.
 
 Reply, 4 bytes: the new `window` id.
+
+**And then a `Configure`, on the same channel, before anything else.** `CreateWindow` is the one
+request that produces two messages: the reply, then the window's first
+[`Configure`](#configure-0x0908). A client must read both — see the handshake below — and a
+compositor must send them in that order, because a client blocked on the reply for its id cannot
+read anything else until it has it.
 
 ### `AttachBuffer` (`0x0901`)
 
@@ -417,6 +423,54 @@ wire change, which is the same reason the device layer's extensibility lives in 
 - **Loss resets the grab.** An `Input::Events` batch carrying `SYN_DROPPED` may be the one that
   lost a release, so the compositor ends any grab on it. A grab that outlives its button never
   ends, and every later click would go to the wrong window for the rest of the session.
+
+### `Configure` (`0x0908`)
+
+**Server → client. Unsolicited, `request_id` 0, no reply.** Body, 20 bytes:
+
+| Offset | Size | Field |
+|---|---|---|
+| 0 | 4 | `window` |
+| 4 | 4 | `width` |
+| 8 | 4 | `height` |
+| 12 | 4 | `x` — top-left in screen coordinates, signed |
+| 16 | 4 | `y` — top-left in screen coordinates, signed |
+
+**A request, not a command.** The compositor cannot resize a client's buffer, because the client
+allocates it. A client answers by attaching and committing a buffer of that size, or **declines**
+by committing whatever it likes — and declining is legal and stays legal: a fixed-size window is
+an ordinary thing, and a protocol that required compliance would make every client implement
+reflow before it could exist. The compositor composites whatever geometry it is given.
+
+It carries an **origin as well as a size** because a manager's answer to "where does this go" is a
+placement, and a client that learned its position through a separate message would be reconciling
+two mechanisms that can disagree.
+
+The `window` field matters because one connection can hold several windows on one channel — the
+same reason `FocusEvent` carries one.
+
+#### The initial-configure handshake — a client obligation
+
+> **A window is not composited until it has been configured.** After `CreateWindow` replies, a
+> client **must wait for that window's first `Configure` before its first `Commit`.**
+
+This is normative, and it is the only ordering rule in this category that a client can violate
+without an error being reported: a client that commits early is not refused, it simply may have
+its window placed after it has already painted, and the user sees the window jump.
+
+**Why the wait is the client's.** It is what lets a window manager place a window *before* it is
+ever seen. The manager is a separate process, so somebody has to wait for it — and the alternative,
+the compositor withholding the `CreateWindow` reply until the manager answers, puts a userspace
+process on the critical path of every window creation, where a wedged shell would stop clients
+from starting at all. Waiting costs the client one round trip at creation and nothing afterwards.
+
+**With no manager attached the compositor answers immediately**, echoing the requested size and
+the window's default origin, so the wait is a formality — which is the point: a client written
+against this rule needs no change when a manager appears.
+
+`libsurface` performs the wait inside `Window::new`, which returns only once the first `Configure`
+has arrived; the first one is **not** delivered to the application as an event, because it is
+permission to draw rather than an opinion about a drawing. Later ones are.
 
 ### `DestroyWindow` (`0x0904`)
 

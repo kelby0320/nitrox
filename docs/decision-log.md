@@ -14815,3 +14815,62 @@ Moved to M6, and while there: put after Part C rather than after "What done mean
 text referred to as *"below"*; the op and event counts corrected against B2 and B3 (the review's
 finding 8 cut `Move`, so "six manager ops" was already stale); and "Out of scope" no longer says
 *"M6 gives `Move` as a state change"*, which contradicted B2 in the same document.
+
+## 2026-08-13 — M6 A2: the initial-configure handshake, and what it cost every client
+
+`Surface::Configure` (`0x0908`), server → client: where and how large the compositor would like a
+window to be. A *request* — the compositor cannot resize a client's buffer, because the client
+allocates it — and declining stays legal, because a fixed-size window is ordinary and a protocol
+that required compliance would make every client implement reflow before it could exist.
+
+The rule that matters is the ordering one: **a window is not composited until it has been
+configured**, so a client waits for its first `Configure` before its first `Commit`.
+
+### The wait is the client's, and that is the whole design
+
+A manager is a separate process, so placing a window before it is seen means *somebody* waits.
+The plan had already rejected the compositor withholding the `CreateWindow` reply until a manager
+answers — that puts a userspace process on the critical path of every window creation, where a
+wedged shell stops clients from starting at all. What the review found (PR #195, finding 2) is
+that rejecting it left nothing supplying the ordering at all: the interval between `CreateWindow`
+and the first `Commit` belongs to the *client*, which issues both sends back to back.
+
+Putting the wait in the client closes that without the cost. It is Wayland's shape and it is right
+here for Wayland's reason.
+
+**With no manager attached the compositor answers immediately**, echoing the request. So the wait
+is a formality today and becomes real in Part B without any client changing — which is the
+property worth having, and the reason to send the configure unconditionally now rather than only
+once a manager exists.
+
+### The compiler made every client acknowledge it
+
+`WindowEvent` is exhaustively matched, so adding `Configure` broke three call sites in
+`input-testclient` and one in `nxterm` until each said what it does about a resize. Both decline,
+and both now say why in a comment — `nxterm` because grid reflow is out of M6's scope, the test
+client because its window is oversized on purpose.
+
+That is friction working: an event a client can ignore is still an event a client should have
+*decided* to ignore, and a non-exhaustive match would have let four clients ignore it by accident.
+
+### A mock that owed the contract
+
+`libsurface`'s test transport replied to `CreateWindow` with an id and nothing else, so
+`Window::new` hung. The fix is not an accommodation — the mock now queues the configure exactly as
+the compositor does, because **a mock that does not honour a protocol's ordering is a mock that
+cannot catch a client violating it.**
+
+Its `wait_event` also counted a wait when an event was already queued, which the real transport
+does not (it polls first). That made the handshake look like a block and broke two `acquire` tests
+that count *buffer* waits. Fixed in the mock rather than in the assertions: the count means "had
+to block", and it should mean that in both implementations.
+
+### The spec row shipped with the op
+
+`rsproto-surface-ops.md` gained `Configure`, the handshake as a normative client obligation, and a
+row in the "which requests reply" table — `CreateWindow` now produces a reply *and* a configure,
+which is the one place in this category where one request yields two messages.
+
+Written now rather than with the rest of Part D, because a protocol change merging without its
+spec row is precisely what PR #195's finding 6 was about, and deferring it to a later PR would
+have reproduced the thing the finding warned against.
