@@ -110,7 +110,7 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
       `sys_memory_create`/`_map`, handle transfer and notifications already exist.
 - [x] **Part B — `/dev/draw` served.** ✅ (2026-08-06) `new` mints a session; `<N>/info`
       answers with a mapped `WindowInfo` snapshot; replies and `Release` events go out on
-      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 6. The same
+      session channels. A bare `<N>` and `<N>/ports/…` are Milestone 8. The same
       `UserspaceServer` + subtree binding `/home` uses, so window paths are forwarded resolves
       and opening a window binds nothing.
 
@@ -128,18 +128,34 @@ screen edge, and a non-trivial stride. A solid fill would hash fine and prove ne
       from a real client's committed buffer rather than a synthetic one.
 **On graduating the design docs.** Root `CLAUDE.md` requires the milestone that builds a
 `design/` doc to carry its move to `architecture/` as a checkbox. That move is **not** M2's:
-the three documents describe subsystems that are only partly built — `display-substrate.md`
+the four documents describe subsystems that are only partly built — `display-substrate.md`
 still specifies input, text, capture and hotkeys with no code; `ui-composition-model.md`
-specifies ports and desktops (M6); `desktop-shell.md` has nothing built at all. Moving a
+specifies ports and desktops (M8); `desktop-shell.md` has nothing built at all. Moving a
 document to `architecture/` while most of it describes the future is precisely the confusion
 that directory split exists to prevent. Each carries an accurate Status line meanwhile, and
 graduates with the milestone that finishes its subsystem.
 
-**Where each checkbox lives.** `display-substrate.md` and `ui-composition-model.md` in M6,
-`desktop-shell.md` in M7 — and, added 2026-08-10 once there were five of these rather than
-three: `input-subsystem.md` and `widget-toolkit.md` in **M4**. `input-subsystem.md`'s
-subsystem finished with M3 and its box was simply never written, which is the failure this
-paragraph exists to prevent, one level up.
+**Where each checkbox lives**, as of the 2026-08-12 re-scope:
+
+| Document | Graduates in | Because |
+|---|---|---|
+| `input-subsystem.md` | **M4** ✅ | done 2026-08-12, as M5's P1 |
+| `widget-toolkit.md` | **M4** ✅ | done 2026-08-12, as M5's P1 |
+| `graphical-session.md` | **M7** | the milestone that builds the graphical login |
+| `desktop-shell.md` | **M7** | the milestone the shell lands in |
+| `ui-composition-model.md` | **M8** | ports and desktops, which M8 builds |
+| `display-substrate.md` | **M9** | input, text and capture are finished there |
+
+Added 2026-08-10 once there were five of these rather than three, because
+`input-subsystem.md`'s subsystem finished with M3 and its box was simply never written — the
+failure this paragraph exists to prevent, one level up.
+
+**It then suffered that failure itself.** The re-scope moved three of the six and added a
+fourth document, and the prose version of this list was left naming M6/M7 — misfiling
+`ui-composition-model.md` by two milestones and omitting `graphical-session.md` entirely (PR
+#193 review, finding 2). It is a table now, which is harder to leave half-updated, and the
+`display-substrate.md` row also corrects a discrepancy that predates the re-scope: the list said
+M6 while the document's own Status line said M7.
 - [x] **Part E — release semantics** ✅ (2026-08-06), settled by the first client that
       double-buffers, exactly as this box anticipated. Three rules came out of it, each
       found by something breaking rather than by design: `Release` names the buffer that
@@ -968,9 +984,11 @@ This is the part with a real design question in it, and it is not "add a write p
 
       **The gap this leaves, stated rather than hidden:** `/dev/tty` resolved *inside* the
       window still reaches the session's console, because that binding belongs to the namespace
-      `desktop-shell` will construct. Nothing in the tree resolves `/dev/tty` except `nxsh`
-      itself, which will have been handed one — so it is inert today, and it is the wrong thing
-      to fix here. It gets a `TODO(gui-dev-tty)` and an entry in `deferred-decisions.md`
+      `desktop-shell` will construct. **No program that could run inside a window resolves
+      `/dev/tty` except `nxsh`**, which will have been handed one — so it is inert today, and it
+      is the wrong thing to fix here. (Not "nothing in the tree resolves it", which an earlier
+      draft claimed and is false: `session-mgr` resolves it for the login prompt and the test
+      harness resolves it in the gate. Neither runs in a window — PR #193 review, finding 7.) It gets a `TODO(gui-dev-tty)` and an entry in `deferred-decisions.md`
       triggered on Milestone 7, where [`graphical-session.md`](../design/graphical-session.md)
       §6.1 owns the question.
 
@@ -1042,17 +1060,27 @@ desktops need a desktop shell that does not exist. They are split — windows he
 desktops in M8 — and the shell's own milestone (M7) sits between them.
 
 **The concrete state this starts from: the compositor has no window management at all.**
-`WindowStack::set_origin` exists and its only non-test caller is the pointer sprite; there is no
-protocol op for it. Every window is created at (0,0) and stacks in creation order. That is not a
-missing feature so much as a missing subsystem, and M5 Part B ran into it directly — the display
-gate has to create its three reference windows largest-first and *assert* they nest, because
-nothing can move them.
+`WindowStack::set_origin` exists, has no protocol op, and has **no non-test caller at all** —
+all three call sites are inside `#[cfg(test)]`. Every window is created at (0,0) and stacks in
+creation order. That is not a missing feature so much as a missing subsystem, and M5 Part B ran
+into it directly — the display gate has to create its three reference windows largest-first and
+*assert* they nest, because nothing can move them.
+
+**The pointer sprite is not a counterexample**, and an earlier draft of this paragraph wrongly
+cited it as the live caller. The cursor has no window id: its position lives in the input router
+and it is drawn over the composed output, deliberately — `compositor/src/lib.rs:149`, *"Composited
+**after** the window stack, because a cursor under a window is not a cursor."* Reading it as a
+positioned window would suggest routing cursor motion through the new placement op, which is the
+one thing the compositor is built not to do (PR #193 review, finding 1).
 
 - [ ] **Placement, move, resize, restack**, and the protocol ops for each. Focus policy that is
       not "the last window created".
 
-- [ ] **The policy seam.** Governing decision 2 puts placement policy in the shell, and there is
-      no shell here. So the compositor needs a default *and* a way for the shell to take over:
+- [ ] **The policy seam.** Placement policy belongs to the shell — [`desktop-shell.md`](../design/desktop-shell.md)
+      §8 lists **Window placement** among the operations it demands of the compositor — and there
+      is no shell here. (Governing decision 2 is *not* the citation for this: it puts windows,
+      input routing and focus in the compositor and never mentions placement. An earlier draft
+      cited it anyway — PR #193 review, finding 6.) So the compositor needs a default *and* a way for the shell to take over:
       an op to place a window, and a shell-privileged channel that is told when one appears.
       **Designing that seam is this milestone's real work** — the mechanism is
       straightforward, and the failure mode is a default policy the shell cannot override, which

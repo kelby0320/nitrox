@@ -296,9 +296,10 @@ future one has to clear is in `userspace/CLAUDE.md`.
 shell its terminal as a *handle* at spawn, the way `libstream` already passes streams. A
 `/dev/tty` resolved inside that window still reaches the session's console, because that binding
 belongs to a namespace `desktop-shell` will construct and no such process exists. Inert today —
-nothing in the tree resolves `/dev/tty` except `nxsh`, which will have been handed one — and
-wrong to fix in the tty server, because it is a property of how applications get their
-namespaces. Trigger: **Milestone 7**, the graphical session;
+no program that could run inside a window resolves `/dev/tty` except `nxsh`, which will have been
+handed one — and wrong to fix in the tty server, because it is a property of how applications get
+their namespaces. (`session-mgr` resolves it for the login prompt and the test harness in the
+gate; neither runs in a window.) Trigger: **Milestone 7**, the graphical session;
 [`graphical-session.md`](../design/graphical-session.md) §6.1 holds the three candidate shapes.
 
 **Concurrent serial and graphical sessions.** `session-and-auth.md` defers "one console, one

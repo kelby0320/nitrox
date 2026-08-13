@@ -14310,8 +14310,12 @@ management**, **M7 the graphical session**, **M8 desktops/ports/templates**, wit
 becoming **M9**.
 
 The state M6 starts from is worth recording, because it is easy to underestimate: **the compositor
-has no window management at all.** `set_origin` exists with no protocol op and one non-test caller
-(the pointer sprite); every window is created at (0,0) and stacks in creation order. M5 Part B ran
+has no window management at all.** `set_origin` exists with no protocol op and **no non-test
+caller** — all three call sites are inside `#[cfg(test)]`; every window is created at (0,0) and
+stacks in creation order. (An earlier draft of this entry said the pointer sprite was a live
+caller. It is not one, and it is not a window: the cursor's position lives in the input router and
+it is composited *after* the stack, because "a cursor under a window is not a cursor". Corrected
+before merge — this file is append-only afterwards.) M5 Part B ran
 into it directly — the display gate creates its three reference windows largest-first and asserts
 they nest, because nothing can move them.
 
@@ -14329,3 +14333,73 @@ the right architectural rule ("supervisors spawn and bind, servers do not self-r
 the wrong conclusion from it, because the process the rule pointed at did not exist. **A plan can
 be locally consistent and globally wrong**, and the thing that catches that is someone asking what
 a component *is* rather than whether a step follows.
+
+## 2026-08-12 — PR #193 review: three checkable claims, and an index that suffered the failure it was written to prevent
+
+A docs-only PR, and the review found seven things by rebuilding the factual claims from source
+rather than reading the description. Four are worth keeping.
+
+### Two claims I made without checking, in a re-scope whose whole point was checking claims
+
+**`set_origin` has no non-test caller.** The PR said "one non-test caller (the pointer sprite)".
+All three call sites are inside `#[cfg(test)]` — `input.rs:310` sits below a `mod tests` opening at
+`:294`, which is what fooled a grep that only looked at the line. Wrong twice: the count, and the
+mechanism. **The pointer sprite is not a window at all** — its position lives in the input router
+and it is drawn over the composed output, deliberately ("a cursor under a window is not a cursor").
+Reading it as a positioned window would suggest routing cursor motion through the new placement op,
+which is the one thing the compositor is built not to do.
+
+The correction makes the paragraph's own point *stronger*: zero callers is a better argument for
+"no window management at all" than one. **Claims that flatter the argument they support are the
+ones to check twice** — this one was doing work, and it was wrong.
+
+**"Nothing in the tree resolves `/dev/tty` except `nxsh`"** is false and takes one grep:
+`session-mgr` resolves it for the login prompt, the test harness resolves it in the gate. The
+deferral's conclusion survives, because the defensible claim — *no program that could run inside a
+window* resolves it — is the one that was actually needed. Reaching for the absolute when the
+scoped version carries the argument is the same habit as the cross-client-leak overclaim two PRs
+ago, in a milder form.
+
+Both were caught because the reviewer checked rather than read. Both were checkable in seconds.
+
+### The index written to prevent unwritten checkboxes went unwritten
+
+`display-arm-plan.md` carries a "Where each checkbox lives" paragraph, added 2026-08-10 with its
+own explanation: `input-subsystem.md`'s subsystem finished with M3 and its graduation box "was
+simply never written, which is the failure this paragraph exists to prevent".
+
+The re-scope moved three of the six documents and added a fourth — and left that paragraph naming
+the old milestones, misfiling `ui-composition-model.md` by two and omitting `graphical-session.md`
+entirely. **The prose form is what made it easy to miss**: a sentence listing three documents does
+not look incomplete when there are six. It is a table now, with a row per document, because a
+missing row is visible and a missing clause is not.
+
+Worth generalising: a doc that exists to catch drift needs a *shape* that shows drift. This one had
+the right content and a form that hid its own staleness.
+
+### A grant that ran at two rules the document cited as support
+
+`desktop-shell` holds `BIND_NAMESPACE` to construct application namespaces — and also *serves*
+`/dev/desktop/`. `syscaps.md` says `BIND_NAMESPACE` goes to "coordination processes that construct
+namespaces" and **never** to "an ordinary resource server (which registers via the supervisor)";
+`why-supervisor-registration.md` says a server granted it even once to self-register is a mistake
+because "the capability persists". `graphical-session.md` listed the second of those in its
+References as *supporting* the design.
+
+The reconciliation is in the first rule's parenthetical: the prohibited thing is *self-registration*,
+so the property to preserve is that **`desktop-shell` does not bind its own endpoint** —
+`desktop-session-mgr` does, exactly as `init` binds the tty server's. The document says that now,
+along with the two consequences: the trusted set genuinely widens, and if that stops being
+acceptable the serving half can split off.
+
+**The review question that found this was one the PR asked for.** "This grant is the one genuinely
+new thing — attack the argument" produced a finding that reading the section as written would not
+have. Asking a reviewer to attack a specific claim is cheap and it worked.
+
+### And a stale comment asserting the decision the PR reverses
+
+`init/src/main.rs` still said `session-mgr` would start the terminal in Part C — the sentence this
+PR spends a long entry rejecting. The next person to implement Part C would have read the source,
+found the old design asserted there, and re-derived it. **A docs-only PR can still fix a comment**,
+and the rule that source and docs must agree does not have a direction: this PR changed the doc, so
+this PR owed the comment.

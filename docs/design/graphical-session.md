@@ -132,6 +132,40 @@ that built them.
 leader — the counterpart of `nxsh`, which likewise spawns things, but with the addition that a GUI
 application needs a *constructed* namespace where a shell's child can inherit one.
 
+### The shell also serves, and that has to be reconciled
+
+`desktop-shell` is **both** a namespace constructor and a resource server:
+[`ui-composition-model.md`](ui-composition-model.md) has `/dev/desktop/` "served by the desktop
+shell", and `/dev/desktop/1/windows/` as a filtered view of the compositor's window set. That
+combination runs straight at two rules this document otherwise leans on, and an earlier draft cited
+them as support without noticing (PR #193 review, finding 4):
+
+- [`syscaps.md`](../architecture/syscaps.md): init delegates `BIND_NAMESPACE` to "coordination
+  processes that construct namespaces" and **never** to "an ordinary resource server (which
+  registers via the supervisor)".
+- [`why-supervisor-registration.md`](../rationale/why-supervisor-registration.md): "Even if a
+  resource server were granted `BIND_NAMESPACE` only to register itself once, the capability
+  persists… Better to never grant it."
+
+**The reconciliation is the parenthetical in the first rule.** The prohibited category is the
+*ordinary* resource server, and the reason given is that it would otherwise register itself. So the
+property to preserve is not "the shell must not serve" but:
+
+> **`desktop-shell` does not bind its own endpoint.** `desktop-session-mgr` binds `/dev/desktop`
+> into the session namespace, exactly as `init` binds the tty server's endpoint and `session-mgr`
+> binds `/dev/tty`. The shell holds `BIND_NAMESPACE` to construct *application* namespaces —
+> continuously, as its job — not to register itself once.
+
+That keeps the RS startup protocol intact: the shell sends `Meta::Ready` with its endpoint and a
+supervisor binds it, like every other server in the system.
+
+**Two things follow, and both are consequences rather than free.** The trusted set widens — a
+`BIND_NAMESPACE` holder that also draws on screen and parses input is a larger, more exposed
+process than `service-mgr` or `session-mgr`, and the "lateral expansion" objection applies to it in
+full. And if that ever stops being acceptable, the split is available: the serving half
+(`/dev/desktop`) can move to a separate process, leaving the constructor half in the shell. Naming
+that now is cheaper than discovering it is impossible later.
+
 ## 4. The session recipe, and what the two supervisors share
 
 Both supervisors run the same five steps. Only the first and last differ.
@@ -206,8 +240,8 @@ while the shell is the only thing spawning applications; it stops being right if
 services appear that must outlive or precede the shell.
 
 **6.4 — Which process places windows before `desktop-shell` exists?** Milestone 6 builds window
-management in the compositor with no shell running. Placement is *policy*, which governing
-decision 2 assigns to the shell — so the compositor needs a default and a seam the shell can take
+management in the compositor with no shell running. Placement is *policy*, which
+[`desktop-shell.md`](desktop-shell.md) §8 assigns to the shell — so the compositor needs a default and a seam the shell can take
 over through. Designing that seam is Milestone 6's job; naming it here is so it is not
 discovered in Milestone 7.
 
