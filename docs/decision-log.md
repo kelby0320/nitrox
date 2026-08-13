@@ -14786,3 +14786,32 @@ neither better served by windows landing somewhere clever.
 That also dissolves most of the gate collision: `check-display` keeps working unchanged, and
 `ui-testclient` placing explicitly (Part B) becomes an improvement to the gate rather than a
 repair to it.
+
+## 2026-08-13 — Part D was added to the wrong milestone, and I said otherwise on the PR
+
+PR #195's review found that M6 had no checkbox for its spec work. I added a **Part D — the
+contract**, replied on the PR saying *"M6 has a **Part D** now"*, and it merged. It was in
+**Milestone 5**.
+
+The edit was `s.replace("### Out of scope, deliberately", block + anchor, 1)`, and M5 has a
+section by that name too — so the first occurrence won, and a completed milestone acquired two
+unticked boxes about work that belongs a milestone later. Found by the maintainer reading the plan,
+which is the only way it *could* be found: `check-docs` validates links and cited paths, not
+whether a section is under the right heading.
+
+**This is the second time in one session** that replacing the first occurrence of a non-unique
+anchor put an edit somewhere I did not look. The other was an `xtask` change that landed in
+`cmd_check_input` instead of `cmd_check_terminal`, caught within minutes because it failed to
+compile. This one had nothing to fail. The rule that would have caught both: **anchor an insertion
+to something unique, or locate the region first and search within it** — the corrected edit finds
+the M6 section's bounds and asserts the anchor falls inside them.
+
+The worse half is the reply. I told the reviewer the finding was addressed and named the section I
+had created, without looking at where it went. A claim about work just done is exactly the kind
+this repository has caught me on repeatedly, and "I just wrote it" is the weakest possible reason
+to believe something is where I think it is.
+
+Moved to M6, and while there: put after Part C rather than after "What done means", which D1's own
+text referred to as *"below"*; the op and event counts corrected against B2 and B3 (the review's
+finding 8 cut `Move`, so "six manager ops" was already stale); and "Out of scope" no longer says
+*"M6 gives `Move` as a state change"*, which contradicted B2 in the same document.

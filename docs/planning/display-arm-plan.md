@@ -1036,22 +1036,6 @@ and Part C is what its title says: the tty server's second backend. `nxterm` sta
 5. **80×24 fixed, no resize** — M6 owns move and resize, and a resizable grid is a different
    reflow problem than a fixed one.
 
-### Part D — the contract
-
-- [ ] **D1 — `rsproto-surface-ops.md` grows M6's ops.** A resolve path (`manage`), six manager
-      ops, four manager events, `Surface::Configure` and `Surface::SetTitle`. The spec is the
-      canonical contract — its "How a client obtains a connection" section documents
-      `/dev/draw/new` as *the* way, and "Which requests reply, and why a client must drain" is
-      normative, so an op without a row is an op a second implementation gets wrong.
-
-      Listed as a checkbox rather than assumed, because the "What done means" section below lists
-      only tests and that is how doc work goes unwritten (PR #195 review, finding 6). The `Tty`
-      category spent months without a spec file for exactly this reason.
-
-- [ ] **D2 — the initial-configure handshake is documented as a client obligation**, not just as
-      a compositor behaviour. B4's rule only works if every client waits, and a client author
-      reading the spec is the person who needs to know.
-
 ### Out of scope, deliberately
 
 Each of these is a thing a mature terminal has, and each would be a guess made a milestone
@@ -1297,6 +1281,22 @@ reflow.
       in-window popup stops being the only option, so the toolkit's `offset` gets a doc note
       saying which to reach for.
 
+### Part D — the contract
+
+- [ ] **D1 — `rsproto-surface-ops.md` grows M6's ops.** A resolve path (`manage`), B2's five
+      manager ops, B3's five manager events, `Surface::Configure` and `Surface::SetTitle`. The spec is the
+      canonical contract — its "How a client obtains a connection" section documents
+      `/dev/draw/new` as *the* way, and "Which requests reply, and why a client must drain" is
+      normative, so an op without a row is an op a second implementation gets wrong.
+
+      Listed as a checkbox rather than assumed, because "What done means" lists only tests and
+      that is how doc work goes unwritten (PR #195 review, finding 6). The `Tty` category spent
+      months without a spec file for exactly this reason.
+
+- [ ] **D2 — the initial-configure handshake is documented as a client obligation**, not just as
+      a compositor behaviour. B4's rule only works if every client waits, and a client author
+      reading the spec is the person who needs to know.
+
 ### The gate collision, which is the first thing to resolve
 
 **Placement is load-bearing for two gates and one spawn order, all of which assume windows land
@@ -1358,10 +1358,11 @@ predict.
 
 - **Decorations.** Nobody draws titlebars in M6, so nothing has a titlebar to drag by. Whether
   they are client-side (`libui`) or shell-drawn is a real question and it belongs with the shell.
-- **Interactive move and resize** — the *gesture*. M6 gives `Move` as a state change; turning a
-  drag into a sequence of moves needs a grab offset, which is `TODO(scroll-grab)`'s question
-  ("M6's window management, which needs press-relative dragging for window moves anyway") and
-  needs decorations to grab. Both move together, to M7.
+- **Interactive move and resize** — the *gesture*. M6 gives `Place`, which sets an absolute
+  origin; turning a drag into a sequence of placements needs a grab offset, which is
+  `TODO(scroll-grab)`'s question ("M6's window management, which needs press-relative dragging
+  for window moves anyway") and needs a decoration to grab. Both move together, to M7 — and the
+  absence of the gesture is why B2 has no relative `Move`.
 - **Terminal reflow**, per question 3.
 - **Desktops, thumbnails, global hotkeys** — M8, M8, M7.
 
