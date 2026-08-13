@@ -212,12 +212,24 @@ pub fn arrange<M: Metrics + ?Sized, Msg>(e: &Element<Msg>, rect: Rect, m: &M) ->
             // what distinguishes this from `Padding`, which shrinks a child into the
             // remainder. A popup is as big as its contents wherever it lands.
             let want = measure(child, Constraints::loose(rect.size), m);
-            Rect::new(
+            let placed = Rect::new(
                 rect.origin.x.saturating_add(*dx),
                 rect.origin.y.saturating_add(*dy),
                 want.w,
                 want.h,
-            )
+            );
+            // **Clipped to the parent**, which is what keeps the containment invariant true for
+            // this node too. Shifting a child's own rect was enough for the child; the offset
+            // node itself could still overhang, and `paint` skips a whole subtree whose rect
+            // misses the damage — so an overhanging popup with damage in the overhang would
+            // simply not be drawn. `every_child_is_contained_by_its_parent` did not catch it
+            // because its tree had no `Offset` in it (PR #192 review, finding 6).
+            //
+            // The consequence is that a popup larger than its container is cut off rather than
+            // escaping it. That is the right answer inside a window — `widget-toolkit.md` §5's
+            // own line is "a menu clipped to its window is not a menu", which is why a menu that
+            // must escape is a `Role::Popup` *window* and not a node.
+            placed.intersect(&rect).unwrap_or(Rect::new(placed.origin.x, placed.origin.y, 0, 0))
         }
         _ => rect,
     };

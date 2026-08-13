@@ -1,7 +1,7 @@
-# Build config for the `compositor` userspace program.
+# Build config for the `nxterm` userspace program.
 #
 # Read by cargo when the build is invoked from this directory (xtask runs
-# `cargo build` with cwd = userspace/compositor), so it does not affect the other
+# `cargo build` with cwd = userspace/nxterm), so it does not affect the other
 # userspace crates (`init`, `libkern`) which still build for the host.
 #
 # The goal is a static, non-PIE ELF (ET_EXEC) in the low half: the kernel ELF

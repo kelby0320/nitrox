@@ -936,8 +936,12 @@ fn map_attached_buffer(srv: &mut Server, body: &[u8], handle: u64) -> bool {
 
 /// Recomposite the whole screen.
 ///
-/// Damage-bounded repaint is an optimisation the protocol already carries and this does not
-/// yet exploit — a full repaint is always correct, and this milestone has one client.
+/// **The fallback, not the norm, since M5 Part B.** `Outcome::Applied` names the region it
+/// dirtied and the serve loop repaints that; this is what an `Applied { dirty: None }` — "I
+/// cannot name what I changed" — and the first frame use. The comment that stood here said
+/// damage-bounded repaint was an optimisation the compositor did not yet exploit, "and this
+/// milestone has one client"; with an 812×480 terminal in the stack, recompositing 1280×800 on
+/// every request cost a permanently busy CPU. See the decision log, 2026-08-12.
 fn repaint(srv: &Server, fb: &mut RawFramebuffer) {
     let bounds = fb.geometry().bounds();
     repaint_region(srv, fb, bounds);

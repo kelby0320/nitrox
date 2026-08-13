@@ -490,7 +490,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //    region that is not on screen. Held for the process's life; dropping either closes its
     //    channel and takes the window off the screen.
     //
-    //    The toolkit's is 320x160, the terminal's 200x114 and the scene's 64x32.
+    //    The toolkit's is 320x160, the terminal's 180x96 and the scene's 64x32.
     let (_ui_window, font) = present_reference_ui(root_ns);
     let _term_window = present_reference_term(root_ns, &font);
 

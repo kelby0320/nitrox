@@ -183,12 +183,28 @@ pub fn dispatch(
             if !conn.owns(req.window) {
                 return Outcome::Failed(SurfaceError::NotFound);
             }
+            // **Read before the commit.** `Window::bounds` reports the *committed* buffer's
+            // geometry, so a window whose new buffer is smaller than its old one would have its
+            // damage clipped to the new, smaller rectangle — and the band the old buffer
+            // occupied and the new one does not would keep the old pixels until something
+            // unrelated forced a repaint. Before damage-bounded repaint the unconditional
+            // full recomposite covered that; now it has to be said (PR #192 review, finding 3).
+            let was = stack.window(req.window).map(|w| w.bounds());
             match stack.commit(&req) {
                 Ok(previous) => {
-                    // **The damage the client sent**, clipped to the window it belongs to and
-                    // translated into screen coordinates. Clipped because a client is not
-                    // trusted to bound its own rectangle, and a damage larger than the window
-                    // would repaint a neighbour's pixels from this window's buffer.
+                    // **The damage the client sent**, translated into screen coordinates and
+                    // clipped to the window it belongs to — old bounds unioned with new, so a
+                    // shrunk window still repaints what it vacated.
+                    //
+                    // **The clip is a bound on work, not a barrier against a leak.** An earlier
+                    // version of this comment claimed an unclipped rectangle would "repaint a
+                    // neighbour's pixels from this window's buffer", which is not how
+                    // compositing works here: `libdraw::compose` clears the damaged area and
+                    // blits *every* surface clipped to its own bounds, so an over-large
+                    // rectangle produces a correct recomposite of that area, just a needlessly
+                    // large one. What a client does control is how much work each commit costs
+                    // — unclipped, every commit is a full-screen recomposite, which is exactly
+                    // the cost this change exists to remove (PR #192 review, finding 4).
                     let dirty = stack.window(req.window).map(|w| {
                         let local = Rect::new(
                             req.damage_x as i32,
@@ -197,6 +213,14 @@ pub fn dispatch(
                             req.damage_h,
                         );
                         let bounds = w.bounds();
+                        // **A window that changed shape repaints both shapes, whatever it
+                        // said.** The vacated band cannot be in the client's damage — the
+                        // client is describing its *new* buffer — and a rectangle cannot
+                        // express "old minus new", so the union of the two is the tightest
+                        // correct answer.
+                        if let Some(before) = was.filter(|b| *b != bounds) {
+                            return union(before, bounds);
+                        }
                         let moved = Rect::new(
                             bounds.origin.x.saturating_add(local.origin.x),
                             bounds.origin.y.saturating_add(local.origin.y),
@@ -301,10 +325,22 @@ mod tests {
     };
 
     fn create(conn: &mut Connection, stack: &mut WindowStack, role: Role) -> Result<u32, SurfaceError> {
+        create_sized(conn, stack, role, 8, 8)
+    }
+
+    /// `create` at a stated size. Most tests do not care and use the 8×8 default; the ones
+    /// that do care are the ones where a child must *not* be a subset of its parent.
+    fn create_sized(
+        conn: &mut Connection,
+        stack: &mut WindowStack,
+        role: Role,
+        width: u32,
+        height: u32,
+    ) -> Result<u32, SurfaceError> {
         let mut body = [0u8; 32];
         let n = build_create_window_request(
             &mut body,
-            &CreateWindowRequest { width: 8, height: 8, role },
+            &CreateWindowRequest { width, height, role },
         )
         .unwrap();
         let mut reply = [0u8; 32];
@@ -316,15 +352,27 @@ mod tests {
     }
 
     fn attach(conn: &mut Connection, stack: &mut WindowStack, window: u32, buffer: u32) -> Outcome {
+        attach_sized(conn, stack, window, buffer, 8, 8)
+    }
+
+    /// `attach` at a stated size — see [`create_sized`].
+    fn attach_sized(
+        conn: &mut Connection,
+        stack: &mut WindowStack,
+        window: u32,
+        buffer: u32,
+        width: u32,
+        height: u32,
+    ) -> Outcome {
         let mut body = [0u8; ATTACH_BUFFER_REQUEST_LEN];
         let n = build_attach_buffer_request(
             &mut body,
             &AttachBufferRequest {
                 window,
                 buffer,
-                width: 8,
-                height: 8,
-                pitch: 32,
+                width,
+                height,
+                pitch: width * 4,
                 format: SURFACE_FORMAT_XRGB8888,
             },
         )
@@ -448,17 +496,58 @@ mod tests {
     }
 
     #[test]
-    fn destroying_dirties_what_vanished() {
+    fn destroying_dirties_what_vanished_including_a_child_bigger_than_its_parent() {
         // Destroy is transitive: a popup's children go with it, and their pixels have to be
-        // repainted too. Naming only the window in the request would leave a child's pixels
-        // on screen after it was gone.
+        // repainted too. Naming only the window in the request would leave a child's pixels on
+        // screen after it was gone.
+        //
+        // **The child is 16×16 to the parent's 8×8**, which is the whole point of the test. A
+        // first version created one childless window and asserted its own bounds — so an
+        // implementation that reported only the named window's rectangle passed the entire
+        // file, and neither the transitive union nor `union()` itself was exercised (PR #192
+        // review, finding 1). A child whose bounds are a subset of its parent's cannot tell
+        // the two apart either.
         let mut a = Connection::new();
         let mut stack = WindowStack::new();
         let parent = create(&mut a, &mut stack, Role::Normal).unwrap();
         assert_applied(attach(&mut a, &mut stack, parent, 0), None);
         assert_applied(commit(&mut a, &mut stack, parent, 0), None);
+
+        let popup = create_sized(&mut a, &mut stack, Role::Popup { parent }, 16, 16).unwrap();
+        assert_applied(attach_sized(&mut a, &mut stack, popup, 0, 16, 16), None);
+        assert_applied(commit_damage(&mut a, &mut stack, popup, 0, (0, 0, 16, 16)), None);
+        assert_eq!(
+            stack.window(popup).map(|w| w.bounds().size),
+            Some(libdraw::geom::Size::new(16, 16)),
+            "the premise: the child is larger than its parent",
+        );
+
         let d = dirty_of(destroy(&mut a, &mut stack, parent)).expect("destroy names a region");
-        assert_eq!(d, Rect::new(0, 0, 8, 8), "the destroyed window's own bounds");
+        assert!(stack.window(popup).is_none(), "the premise: destroy took the child too");
+        assert_eq!(d, Rect::new(0, 0, 16, 16), "the union of both, not the parent's 8×8");
+    }
+
+    #[test]
+    fn a_window_whose_buffer_shrinks_repaints_what_it_vacated() {
+        // `Window::bounds` reports the *committed* buffer, so damage clipped after the commit
+        // is clipped to the new, smaller rectangle — and the band the old buffer occupied and
+        // the new one does not keeps the old pixels until something unrelated forces a full
+        // repaint. Before damage-bounded repaint the unconditional recomposite covered it, so
+        // this was a regression this PR introduced (PR #192 review, finding 3).
+        //
+        // Not reachable in-tree today — every window in the image is fixed-size and M6 owns
+        // resize — which is exactly why it needs a test rather than a client to find it.
+        let mut a = Connection::new();
+        let mut stack = WindowStack::new();
+        let w = create(&mut a, &mut stack, Role::Normal).unwrap();
+        assert_applied(attach(&mut a, &mut stack, w, 0), None);
+        assert_applied(commit(&mut a, &mut stack, w, 0), None);
+
+        // A 4×4 buffer replaces the 8×8 one. The client honestly damages its whole new buffer.
+        assert_applied(attach_sized(&mut a, &mut stack, w, 1, 4, 4), None);
+        let d = dirty_of(commit_damage(&mut a, &mut stack, w, 1, (0, 0, 4, 4)))
+            .expect("a commit names a region");
+        assert_eq!(d, Rect::new(0, 0, 8, 8), "only the new 4x4 was repainted, vacating a band");
     }
 
     #[test]

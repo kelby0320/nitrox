@@ -220,8 +220,7 @@ fn run_nxterm(root_ns: u64) {
     // SAFETY: SPAWN_NXTERM is a valid writable arg block.
     let h = unsafe { spawn_program(root_ns, b"/bin/nxterm", &raw mut SPAWN_NXTERM) };
     if h < 0 {
-        kprint(b"init: nxterm spawn FAIL
-");
+        kprint(b"init: nxterm spawn FAILED\n");
         #[cfg(feature = "test-harness")]
         test_exit(false);
         return;

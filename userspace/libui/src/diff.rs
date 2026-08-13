@@ -738,6 +738,27 @@ mod tests {
             ]),
         );
         check(&layout(&e, SCREEN, &CELL));
+
+        // **`Offset` deliberately, and offset far enough to overhang.** This node kind is the
+        // one that can escape its parent by construction — it is the only absolute positioning
+        // in the toolkit — and the check above was blind to it because no tree here had one.
+        // "The sort of thing one node kind quietly stops honouring" turned out to be literal
+        // (PR #192 review, finding 6).
+        let overhang: Element<Msg> = stack(vec![
+            sized(
+                Size::new(100, 100),
+                stack(vec![
+                    fill(libdraw::format::Rgb::new(0, 0, 0)),
+                    offset(90, 90, sized(Size::new(50, 50), text("x"))),
+                ]),
+            ),
+        ]);
+        let l = layout(&overhang, SCREEN, &CELL);
+        check(&l);
+        // ...and it is clipped rather than merely reported as contained: a zero-size rect would
+        // satisfy `check` while meaning the popup vanished.
+        let placed = l.children[0].children[0].children[1].rect;
+        assert_eq!(placed, Rect::new(90, 90, 10, 10), "the visible part of the overhang");
     }
 
     #[test]

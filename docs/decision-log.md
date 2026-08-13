@@ -14062,9 +14062,18 @@ anything unable to name its region must say.
 
 **Three things about this are worth keeping.**
 
-*The clip is not politeness.* A client is not trusted to bound its own damage, and an unclipped
-rectangle would repaint a **neighbour's** pixels out of this window's buffer — a cross-client
-leak, not just wasted work.
+*The clip bounds work, and that is all it does.* This entry first said an unclipped rectangle
+would "repaint a neighbour's pixels out of this window's buffer — a cross-client leak". **That is
+not how compositing works here**, and the review demonstrated it: `libdraw::compose` clears the
+damaged area and then blits *every* surface clipped to its own bounds, so an over-large rectangle
+produces a correct recomposite of that area — from each window's own buffer — merely a
+needlessly large one. Corrected before the entry merged, so nothing is being rewritten. What a
+client genuinely controls is **cost**: unclipped, one commit is a full-screen recomposite, which
+is precisely the expense this change exists to remove. That is worth clipping for; it is not a
+confidentiality boundary, and calling it one would have put a security claim in the tree that the
+code does not support. The same overclaim was corrected in `surface_errno`'s comment during the
+PR #175 review, which makes this the second instance of one pattern: reaching for the most
+serious-sounding justification instead of the true one.
 
 *Nothing else in the tree could have caught it.* Not a host test — the cost is in a real
 compositor with real windows. Not `check-display` — the picture was always correct. It took the
@@ -14167,3 +14176,65 @@ would silently hollow out a region the gate believes it is comparing.
 Break-tested both ways it can fail: attaching at `w * 4` instead of the padded pitch (3,479 pixels
 differ), and never presenting the window at all (12,571 differ — the region falls through to
 `nxterm`'s window underneath rather than to blank, which is itself worth knowing).
+
+## 2026-08-12 — PR #192 review: two tests that asserted less than they looked, and a security claim that was not true
+
+The review break-tested twelve mechanisms and eleven failed a targeted test. The three findings
+worth keeping are about the twelfth, and about two things the diff said rather than did.
+
+### The clip is a work bound, not an isolation barrier
+
+I wrote — in a code comment, in the decision log, and in the PR description — that clipping a
+client's damage to its own window prevents it "repainting a neighbour's pixels out of this
+window's buffer": a cross-client leak. **That is not how compositing works here.**
+`libdraw::compose` clears the damaged area and then blits *every* surface, each clipped to its
+own bounds, so an over-large rectangle produces a correct recomposite of that area from each
+window's own buffer. The reviewer demonstrated it with a probe; I confirmed it by reading
+`compose`, which I had not done before making the claim.
+
+The clip is still right, for a reason a client *does* control: unclipped, one commit is a
+full-screen recomposite, which is exactly the cost the change exists to remove.
+
+**This is the second instance of one pattern** — `surface_errno`'s comment was corrected in the
+PR #175 review for the same thing. The pattern is reaching for the most serious-sounding
+justification rather than the true one, and its cost is specific: a security claim in the tree
+that the code does not support is worse than no claim, because the next person reasons from it.
+Worth naming as a habit rather than as two incidents.
+
+### A test named for transitivity that had nothing to be transitive about
+
+`destroying_dirties_what_vanished` created **one** window with no children and asserted the
+damage was its own bounds. The union it was named for — a destroyed parent taking its popup with
+it — was never exercised, and neither was `union()` itself. Replacing the union loop with the
+exact bug it guards passed all 81 tests.
+
+The cause was the test helpers: `create` and `attach` were hard-wired to 8×8, so *every* child
+was a subset of its parent and the union was indistinguishable from "the parent's rectangle".
+The fix needed a size parameter before it could need a test. **A helper that can only build one
+shape silently bounds what the whole file can assert** — worth watching for, because a fixture
+that constrains the tests is invisible from inside any one of them.
+
+### `Offset` broke the containment invariant, and the invariant's own test could not see it
+
+`every_child_is_contained_by_its_parent` exists because, in its own words, containment is "the
+sort of thing one node kind quietly stops honouring". `Offset` — added in this PR, the only
+absolute positioning in the toolkit — quietly stopped honouring it, and the test passed because
+its element tree had no `Offset` in it. `paint` skips a whole subtree whose rect misses the
+damage *on the strength of that invariant*, so an overhanging popup with damage in the overhang
+would simply not be drawn.
+
+The node's rect is clipped to its parent now, which makes an overlay larger than its container
+cut off rather than escaping — the same rule as "a menu clipped to its window is not a menu",
+one level down, and the reason a menu that must escape its window is a `Role::Popup` window
+rather than a node.
+
+**A test written to catch a class of bug is only as wide as its fixture.** This one named its
+own weakness in a comment and still had it: adding a node kind is exactly the moment to extend
+the trees such a test walks, and nothing prompts that.
+
+### And one regression the review caught before any client could
+
+Clipping a commit's damage *after* `stack.commit()` clips it to the **new** buffer's bounds, so
+a window whose buffer shrank never repainted the band it vacated. Unreachable in-tree — every
+window in the image is fixed-size and M6 owns resize — which is precisely why it needed a test
+rather than a client to find it.

@@ -16,9 +16,7 @@ libdraw = { path = "../libdraw", features = ["io"] }
 libsurface = { path = "../libsurface" }
 librsproto = { path = "../librsproto" }
 libkern = { path = "../libkern" }
-libos = { path = "../libos" }
 libheap = { path = "../libheap" }
-libinput = { path = "../libinput" }
 
 [lib]
 name = "nxterm"
