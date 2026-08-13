@@ -14735,3 +14735,54 @@ The pass named `check-display`'s dependency on origin placement and missed `chec
 whose click point was computed from where `ui-testclient`'s windows land — and `init`'s spawn-order
 comment, which A1 makes false. The third is the one that would bite hardest: a stale comment
 asserting a retired invariant is what the last two milestones each shipped once.
+
+## 2026-08-13 — M6 A1/A3/A4: placement, and returning damage instead of remembering to compute it
+
+The stack half of window management. Three ops and one API decision worth keeping.
+
+### `place` returns its damage
+
+Every other path in the compositor computes `dirty` from state captured *before* the mutation —
+`server.rs`'s commit reads `let was = …`, its destroy reads `let before: Vec<…>`. That is a
+discipline, and M5 shipped the bug that comes of forgetting it (PR #192, finding 3: a shrunk
+window never repainted what it vacated).
+
+`place` returns `Rect` instead. The union of where the window was and where it is comes back
+*from* the mutation, so there is no order for a caller to get wrong. **A known trap made
+unreachable beats a known trap documented**, and the cost is one return type.
+
+The plan had this as "there is a working pattern to copy". Copying it a third time would have
+worked; not needing to is better.
+
+### An uncommitted window dirties nothing, and that is the common case
+
+`present_into` skips windows with no committed buffer, so a window that has never committed is
+not on screen: moving it paints over nothing and reveals nothing. Reporting its bounds would
+repaint a region for no reason on **every window launch**, because placing a window before its
+first commit is exactly what a manager does — the whole point of M6's initial-configure
+handshake.
+
+Worth stating because it reads like an edge case and is the opposite.
+
+### `raise_above`, and the index that shifts under you
+
+Alt-tab needs "raise this one, but only to where that one was" — a full `raise` reorders every
+window between them, which the user sees as the rest of the stack shuffling behind the one they
+asked for.
+
+The implementation has one trap and the test names it: the target's index must be recomputed
+**after** the removal. Taking `id` out shifts everything above it down by one, so an index
+captured first is wrong by one whenever `id` sat below `other` — and only then, which is why the
+test moves a window in both directions.
+
+### The default placement policy: dropped, not deferred
+
+The plan left this open with three options. Building it settled it: **the default stays the
+origin.** A compositor-side cascade is a policy the shell then has to override, which is the
+failure mode the seam exists to avoid; and with a manager attached the manager places, so a
+cascade would only ever apply to the manager-less case — a test image and a degraded boot,
+neither better served by windows landing somewhere clever.
+
+That also dissolves most of the gate collision: `check-display` keeps working unchanged, and
+`ui-testclient` placing explicitly (Part B) becomes an improvement to the gate rather than a
+repair to it.

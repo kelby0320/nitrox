@@ -54,6 +54,28 @@ pub struct AttachedBuffer {
     pub geometry: Geometry,
 }
 
+/// The smallest rectangle containing both.
+///
+/// A local copy rather than `libui::damage::union`: `libui` is a sibling of this crate and
+/// neither may depend on the other, and a rectangle union in `libdraw` would be the third
+/// place to look for one. Six lines.
+///
+/// Lives here rather than in `server` because [`WindowStack::place`] returns a union too — the
+/// move damage — and a second copy one module away is how the two would come to disagree.
+pub fn union(a: Rect, b: Rect) -> Rect {
+    if a.size.w == 0 || a.size.h == 0 {
+        return b;
+    }
+    if b.size.w == 0 || b.size.h == 0 {
+        return a;
+    }
+    let x0 = a.origin.x.min(b.origin.x);
+    let y0 = a.origin.y.min(b.origin.y);
+    let x1 = a.right().max(b.right());
+    let y1 = a.bottom().max(b.bottom());
+    Rect::new(x0, y0, (x1 - x0 as i64) as u32, (y1 - y0 as i64) as u32)
+}
+
 /// A window: an id, a fixed role, a position, and the buffer currently on screen.
 #[derive(Clone, Debug)]
 pub struct Window {
@@ -337,11 +359,29 @@ impl WindowStack {
         Ok(id)
     }
 
-    /// Move a window's top-left corner.
-    pub fn set_origin(&mut self, id: u32, origin: Point) -> Result<(), StackError> {
+    /// Move a window's top-left corner, returning the region that must be repainted.
+    ///
+    /// **The damage comes back from the mutation, rather than being computed after it.** That is
+    /// not a style preference: a move dirties the *union* of where the window was and where it
+    /// now is, because a rectangle cannot express "old minus new" — and every other path in this
+    /// compositor computes `dirty` from state read *before* the change, which is a discipline a
+    /// caller can forget. M5 shipped exactly that bug for a resized buffer (PR #192, finding 3).
+    /// Returning it makes the trap unreachable here instead of merely known.
+    ///
+    /// **A window that has never committed dirties nothing.** It is not on screen —
+    /// [`present_into`](Self::present_into) skips windows with no committed buffer — so moving it
+    /// paints over nothing and reveals nothing. This is the ordinary case rather than an edge
+    /// one: placing a window *before* its first commit is what a manager does.
+    pub fn place(&mut self, id: u32, origin: Point) -> Result<Rect, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
+        if w.committed.is_none() {
+            w.origin = origin;
+            return Ok(Rect::new(origin.x, origin.y, 0, 0));
+        }
+        let was = w.bounds();
         w.origin = origin;
-        Ok(())
+        let now = w.bounds();
+        Ok(union(was, now))
     }
 
     /// Attach a buffer to a window.
@@ -414,6 +454,44 @@ impl WindowStack {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         let w = self.windows.remove(i);
         self.windows.push(w);
+        Ok(())
+    }
+
+    /// Send a window to the bottom of the stack.
+    ///
+    /// No caller until the shell (M7): click-to-focus only ever raises. It lands here with
+    /// [`raise_above`](Self::raise_above) because the three are one ordering rule, and a stack
+    /// that can only ever push in one direction is one nobody can write alt-tab against.
+    pub fn lower(&mut self, id: u32) -> Result<(), StackError> {
+        let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
+        let w = self.windows.remove(i);
+        self.windows.insert(0, w);
+        Ok(())
+    }
+
+    /// Put `id` directly above `other` in the stack.
+    ///
+    /// The op alt-tab needs: "raise this one, but only to where that one was" — a full
+    /// [`raise`](Self::raise) would reorder every window between them, which is visible as the
+    /// rest of the stack shuffling behind the one the user asked for.
+    ///
+    /// `id == other` is a no-op rather than an error: it is the degenerate case of a request
+    /// that is otherwise well-formed, and a shell iterating a window list should not have to
+    /// special-case the window it is already above.
+    pub fn raise_above(&mut self, id: u32, other: u32) -> Result<(), StackError> {
+        if self.window(id).is_none() || self.window(other).is_none() {
+            return Err(StackError::NoSuchWindow);
+        }
+        if id == other {
+            return Ok(());
+        }
+        let i = self.windows.iter().position(|w| w.id == id).expect("checked above");
+        let w = self.windows.remove(i);
+        // Recomputed *after* the removal: taking `id` out shifts everything above it down by
+        // one, so an index captured before would place the window one slot too high whenever
+        // `id` sat below `other`.
+        let j = self.windows.iter().position(|w| w.id == other).expect("checked above");
+        self.windows.insert(j + 1, w);
         Ok(())
     }
 
@@ -939,6 +1017,102 @@ mod tests {
         assert_eq!(s.focus_candidate(), None);
     }
 
+    /// The stack's window ids, bottom-first.
+    fn order(s: &WindowStack) -> Vec<u32> {
+        s.windows().iter().map(|w| w.id).collect()
+    }
+
+    #[test]
+    fn moving_a_window_dirties_where_it_was_and_where_it_is() {
+        // **A rectangle cannot express "old minus new"**, so the union is the tightest correct
+        // answer — and computing it after the move, the way every other path computes `dirty`,
+        // would repaint the destination and leave the window's old pixels on screen. M5 shipped
+        // that bug once for a resized buffer; `place` returns the damage so it cannot be
+        // computed the wrong way here.
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::new(1, 2, 3));
+        s.commit(&commit(w, 0)).unwrap();
+
+        let dirty = s.place(w, Point::new(20, 10)).unwrap();
+        assert_eq!(dirty, Rect::new(0, 0, 28, 18), "the union of (0,0,8,8) and (20,10,8,8)");
+        assert_eq!(s.window(w).unwrap().bounds(), Rect::new(20, 10, 8, 8));
+
+        // A move that changes nothing still names the window's own rectangle rather than
+        // nothing — the union of a rect with itself — which is correct and costs one window.
+        assert_eq!(s.place(w, Point::new(20, 10)).unwrap(), Rect::new(20, 10, 8, 8));
+    }
+
+    #[test]
+    fn placing_a_window_that_has_never_committed_dirties_nothing() {
+        // Not an edge case: placing a window *before* its first commit is exactly what a
+        // manager does, and it is the whole point of the initial-configure handshake. An
+        // uncommitted window is skipped by compositing, so moving it paints over nothing and
+        // reveals nothing — reporting its bounds would repaint a region for no reason on every
+        // window launch.
+        let mut s = WindowStack::new();
+        let w = s.create(&CreateWindowRequest { width: 64, height: 64, role: Role::Normal }).unwrap();
+        let dirty = s.place(w, Point::new(100, 100)).unwrap();
+        assert_eq!((dirty.size.w, dirty.size.h), (0, 0), "an unmapped window is not on screen");
+        assert_eq!(s.window(w).unwrap().origin, Point::new(100, 100), "but it did move");
+    }
+
+    #[test]
+    fn placing_a_window_that_does_not_exist_is_refused() {
+        let mut s = WindowStack::new();
+        assert_eq!(s.place(99, Point::new(1, 1)), Err(StackError::NoSuchWindow));
+    }
+
+    #[test]
+    fn lower_sends_a_window_under_everything_and_raise_brings_it_back() {
+        let mut s = WindowStack::new();
+        let ids: Vec<u32> = (0..3)
+            .map(|_| {
+                s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap()
+            })
+            .collect();
+        assert_eq!(order(&s), ids, "creation order is bottom-first");
+
+        s.lower(ids[2]).unwrap();
+        assert_eq!(order(&s), [ids[2], ids[0], ids[1]]);
+        s.raise(ids[2]).unwrap();
+        assert_eq!(order(&s), [ids[0], ids[1], ids[2]]);
+        assert_eq!(s.lower(99), Err(StackError::NoSuchWindow));
+    }
+
+    #[test]
+    fn raise_above_moves_one_window_and_leaves_the_rest_in_order() {
+        // What alt-tab needs. A full `raise` would put the window on top and reorder everything
+        // between, which the user sees as the rest of the stack shuffling behind the one they
+        // asked for.
+        let mut s = WindowStack::new();
+        let ids: Vec<u32> = (0..4)
+            .map(|_| {
+                s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap()
+            })
+            .collect();
+
+        // Move the bottom window to just above the second — the case where removing it shifts
+        // the target's index, which an index captured before the removal gets wrong by one.
+        s.raise_above(ids[0], ids[1]).unwrap();
+        assert_eq!(order(&s), [ids[1], ids[0], ids[2], ids[3]]);
+
+        // And downward, where no such shift happens: the two directions are different code
+        // paths through the same two lines.
+        s.raise_above(ids[3], ids[1]).unwrap();
+        assert_eq!(order(&s), [ids[1], ids[3], ids[0], ids[2]]);
+
+        // Already above it: a no-op, not an error — a shell walking a window list should not
+        // have to special-case the window it is already above.
+        let before = order(&s);
+        s.raise_above(ids[3], ids[3]).unwrap();
+        assert_eq!(order(&s), before);
+        assert_eq!(s.raise_above(ids[0], 99), Err(StackError::NoSuchWindow));
+        assert_eq!(s.raise_above(99, ids[0]), Err(StackError::NoSuchWindow));
+    }
+
     #[test]
     fn compositing_draws_committed_windows_bottom_first() {
         let mut s = WindowStack::new();
@@ -955,7 +1129,7 @@ mod tests {
         s.attach(&attach(b, 0, 8, 8)).unwrap();
         src.put(b, 0, geom(8, 8), blue);
         s.commit(&commit(b, 0)).unwrap();
-        s.set_origin(b, Point::new(4, 4)).unwrap();
+        s.place(b, Point::new(4, 4)).unwrap();
 
         let mut fb = screen();
         let full = fb.geometry().bounds();
@@ -1345,7 +1519,7 @@ mod tests {
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         src.put(w, 0, geom(8, 8), Rgb::BLACK);
         s.commit(&commit(w, 0)).unwrap();
-        s.set_origin(w, Point::new(-3, 12)).unwrap();
+        s.place(w, Point::new(-3, 12)).unwrap();
 
         let info = s.info(w).unwrap();
         assert_eq!((info.width, info.height), (8, 8), "committed size once there is one");

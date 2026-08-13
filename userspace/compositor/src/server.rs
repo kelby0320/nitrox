@@ -28,7 +28,7 @@ use librsproto::surface::{
 
 use libdraw::geom::Rect;
 
-use crate::{StackError, WindowStack};
+use crate::{union, StackError, WindowStack};
 
 /// A client connection: the identity a request arrives on, and the windows it owns.
 #[derive(Clone, Debug, Default)]
@@ -58,25 +58,6 @@ impl Connection {
     pub fn owned(&self) -> &[u32] {
         &self.owned
     }
-}
-
-/// The smallest rectangle containing both.
-///
-/// A local copy rather than `libui::damage::union`: `libui` is a sibling of this crate and
-/// neither may depend on the other, and a rectangle union in `libdraw` would be the third
-/// place to look for one. Six lines.
-fn union(a: Rect, b: Rect) -> Rect {
-    if a.size.w == 0 || a.size.h == 0 {
-        return b;
-    }
-    if b.size.w == 0 || b.size.h == 0 {
-        return a;
-    }
-    let x0 = a.origin.x.min(b.origin.x);
-    let y0 = a.origin.y.min(b.origin.y);
-    let x1 = a.right().max(b.right());
-    let y1 = a.bottom().max(b.bottom());
-    Rect::new(x0, y0, (x1 - x0 as i64) as u32, (y1 - y0 as i64) as u32)
 }
 
 /// What a dispatched request produced.

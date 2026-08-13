@@ -1178,8 +1178,14 @@ reflow.
 
 ### Part A — geometry in the stack
 
-- [ ] **A1 — placement, and a default policy.** `place(id, origin)` and a default for windows
-      nobody placed. The default is **not** free to choose: see the gate collision below.
+- [x] **A1 — placement, and a default policy.** ✅ 2026-08-13. `place(id, origin)` in the stack.
+
+      **The default stays the origin, and cascade is dropped rather than deferred.** The plan
+      left this open; building it settled it. A compositor-side placement policy is a policy the
+      shell then has to override, which is the failure mode this milestone's seam exists to
+      avoid — and with a manager attached the manager places, so a cascade would only ever apply
+      to the manager-less case. That case is a test image and a degraded boot, neither of which
+      is better served by windows landing somewhere clever.
 
 - [ ] **A2 — `Surface::Configure`**, server → client, and the client half in `libsurface` —
       a `WindowEvent::Configure { origin, width, height }` a client may honour or ignore.
@@ -1192,11 +1198,11 @@ reflow.
       answer is a placement, and a client that had to learn its position some other way would be
       back to two mechanisms.
 
-- [ ] **A3 — restack beyond `raise`.** `lower`, and `raise_above(id, other)` for the shell's
+- [x] **A3 — restack beyond `raise`.** ✅ 2026-08-13. `lower`, and `raise_above(id, other)` for the shell's
       alt-tab. `raise` exists and click-to-focus drives it; the others have no caller until M7,
       so they land with tests and the manage channel rather than on their own.
 
-- [ ] **A4 — damage for a moved window.** A move dirties the **union of the old and new
+- [x] **A4 — damage for a moved window.** ✅ 2026-08-13 — and the trap is now unreachable rather than known: `place` **returns** the damage, so it cannot be computed after the mutation. A move dirties the **union of the old and new
       rectangles**, exactly as M5's resize case does — and for the same reason, that a rectangle
       cannot express "old minus new". This is a real trap: `dirty` is computed *after* the
       mutation in most paths, and a move computed the same way repaints the destination and
