@@ -14403,3 +14403,59 @@ PR spends a long entry rejecting. The next person to implement Part C would have
 found the old design asserted there, and re-derived it. **A docs-only PR can still fix a comment**,
 and the rule that source and docs must agree does not have a direction: this PR changed the doc, so
 this PR owed the comment.
+
+## 2026-08-13 — M5 C1/C2: the tty server's routing, made testable before it was changed
+
+Part C's server half. The new op is three lines; the work was everywhere else.
+
+### The rules Part C changes were the two that could not be tested
+
+`drive_input` decided which terminal got a byte with `ttys.iter().position(|t| t.waiting.is_some())`
+— the first waiter anywhere — and broadcast `Ctrl-C` with `for t in ttys.iter_mut()`. Both are
+single lines, both were about to change, and neither could be stated except in prose because the
+whole routing layer lived in the binary as a flat `Vec<Tty>`, a global `VecDeque<u8>` and a
+`backend_write` that called `kprint`.
+
+So the first move was a `routing` module in the library half: handles are opaque `u64`s, effects
+come back as `Act`s for the binary to perform, and nothing in it does a syscall. Same shape as the
+compositor's `server::dispatch`, and for the same reason. **The refactor changed no behaviour** —
+`test-interactive`'s 22 steps, including the serial login, pass unchanged — which is the point:
+the rules moved somewhere they could be asserted *before* they were rewritten.
+
+Ten tests, all break-tested. The two that matter reinstate the old rules exactly:
+
+- input routed by `position(|t| t.waiting.is_some())` → `input_from_one_backend_never_reaches_a_terminal_on_another` fails
+- `Ctrl-C` to `ttys.iter_mut()` → `an_interrupt_reaches_every_terminal_on_its_backend_and_no_others` fails
+
+### The comment that justified the broadcast was wrong twice
+
+> Sent to every open terminal: a session has one, and a server that guessed which was "foreground"
+> would be inventing a concept this system does not have yet.
+
+A session does *not* have one terminal — a `Tty` is minted per resolver, and `console-and-tty.md`
+has carried errata saying so since August. And per-backend routing is not a foreground guess: a
+backend is a **physical** grouping, the same way a serial line is. Job control remains unbuilt and
+this does not approach it.
+
+### Two copies of a constant, and one of them was wrong
+
+The routing module first duplicated the op codes and error values, with a comment that the
+discipline's host tests should not need the wire format. `PeerClosed` came out as −32 instead of
+−13, and **no test could have caught it**, because the copy was the only thing the tests saw. Both
+crates are `no_std` and both host-test; the compositor's library half already depends on
+`librsproto` for exactly this reason. Deleted the copies.
+
+The general form is worth keeping: *a duplicated constant that only the duplicate's own tests
+check is not tested at all.* The instinct to keep a test-facing crate dependency-free produced a
+crate that agreed with itself and nothing else.
+
+### And the category got the spec file it never had
+
+Every other rsproto category has one — auth, block, file, input, namespace, surface. `Tty` did
+not, so its contract lived in doc comments and a design document, and the "one terminal per
+session" misreading survived in a code comment for months. `docs/spec/rsproto-tty-ops.md` now
+states the three channel roles, the per-resolver rule, and the lifetime rules in one place.
+
+**A category with no spec file is where a misreading goes to live**, because there is nowhere for
+the correction to be authoritative. That is a general claim about this repository's structure, and
+this is the second time it has cost something.

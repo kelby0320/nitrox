@@ -9,6 +9,9 @@ job control and terminal emulation remain unbuilt. The Status line said "its cli
 moved yet" until 2026-08-12, contradicting the staging list in this same document, which had
 marked all three ✅ on the day they landed.
 
+The wire contract is [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md) (written 2026-08-13,
+when Part C gave the category a second channel role); this document is the design behind it.
+
 Written 2026-08-03 as a scoping pass, because "the console/tty server" was referenced as a gate
 in four documents without existing anywhere. This says what it owns, what it does not, and what
 had to be decided before it could be built. Verified against source 2026-08-12.

@@ -141,6 +141,36 @@ pub const OP_TTY_CLOSE: u16 = 0x0B03;
 /// the shell drains it with a non-blocking receive at its own checkpoints.
 pub const OP_TTY_INTERRUPT: u16 = 0x0B05;
 
+/// `Tty::AttachBackend` — hand the server the other end of this terminal.
+///
+/// Sent by a terminal emulator on a terminal it resolved, moving **one handle**: a channel the
+/// emulator keeps the far end of. From then on that terminal's output arrives on the channel as
+/// [`OP_TTY_OUTPUT`] and its input is whatever the emulator sends back as [`OP_TTY_INPUT`],
+/// instead of the serial console.
+///
+/// **This is a pty, with the pieces named differently.** Unix puts the line discipline in the
+/// kernel between a master and a slave; here the tty server *is* the discipline, so the emulator
+/// holds what a master would be and the terminal itself is what it hands to the program it hosts.
+/// The emulator resolves `/dev/tty`, attaches its backend, and then gives the terminal away —
+/// it has no use for the client end.
+///
+/// Empty body. The reply is empty on success.
+pub const OP_TTY_ATTACH_BACKEND: u16 = 0x0B06;
+
+/// Server → emulator on a backend channel: **render these bytes.**
+///
+/// Unsolicited, `request_id` 0, no reply — the same shape as [`OP_TTY_INTERRUPT`]. Body is the
+/// bytes, already through the line discipline: this is what a serial console would have been
+/// sent, so an emulator is a terminal for the same byte stream rather than for a special one.
+pub const OP_TTY_OUTPUT: u16 = 0x0B07;
+
+/// Emulator → server on a backend channel: **the user typed these bytes.**
+///
+/// Unsolicited, `request_id` 0, no reply. Body is what a keyboard would have produced on a
+/// serial line, encoder output included — the server runs the discipline over it exactly as it
+/// does over console input, which is what keeps one implementation of `Ctrl-C`, erase, and echo.
+pub const OP_TTY_INPUT: u16 = 0x0B08;
+
 /// Bit 0 of `Tty::SetMode`'s flags byte: echo typed characters back.
 pub const TTY_MODE_ECHO: u8 = 1 << 0;
 

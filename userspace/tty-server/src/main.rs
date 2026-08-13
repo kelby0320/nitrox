@@ -25,17 +25,17 @@
 
 extern crate alloc;
 
-use alloc::collections::VecDeque;
 use alloc::vec::Vec;
 
 use libkern::*;
 use librsproto::error::error_body;
 use librsproto::namespace::{OBJECT_KIND_CHANNEL, parse_resolve_request, resolve_reply};
 use librsproto::{
-    OP_NS_RESOLVE, OP_TTY_CLOSE, OP_TTY_INTERRUPT, OP_TTY_READ, OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE,
-    RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_MODE_ECHO, decode, encode,
+    OP_NS_RESOLVE, OP_TTY_ATTACH_BACKEND, OP_TTY_CLOSE, OP_TTY_INPUT, OP_TTY_OUTPUT, OP_TTY_READ,
+    OP_TTY_READ_LINE, OP_TTY_SET_MODE, OP_TTY_WRITE, RS_FLAG_ERROR, RS_FLAG_REPLY, TTY_MODE_ECHO,
+    decode, encode,
 };
-use tty_server::{Discipline, Step};
+use tty_server::routing::{Act, CONSOLE, ReadKind, Registry, Sink};
 
 #[global_allocator]
 static ALLOC: libheap::Heap = libheap::Heap;
@@ -43,9 +43,10 @@ static ALLOC: libheap::Heap = libheap::Heap;
 /// IPC payload starts at offset 24 in the `IpcMsg` (after the 24-byte header).
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
-/// One `sys_wait` slot goes to the serving endpoint and one to the outstanding console
-/// read, so the rest bound how many terminals exist at once.
-const MAX_TTYS: usize = libkern::abi::MAX_WAIT_HANDLES - 2;
+/// One `sys_wait` slot goes to the serving endpoint and one to the outstanding console read.
+/// **The rest is halved**, because since Part C a terminal can also own a backend channel that
+/// has to be waited on — worst case one per terminal, when every terminal is a window's.
+const MAX_TTYS: usize = (libkern::abi::MAX_WAIT_HANDLES - 2) / 2;
 /// Bytes per console read submission.
 const READ_CHUNK: u64 = 64;
 
@@ -61,15 +62,40 @@ static mut WAIT_RESULTS: [u8; 24 * libkern::abi::MAX_WAIT_HANDLES] =
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 
-/// **The write backend.** Serial today via the kernel's debug write; a compositor surface
-/// later. The seam is deliberate — a terminal emulator is another backend for the same
-/// discipline, and discovering that after the fact would cost a rewrite.
+/// **Write to a sink.** The seam `console-and-tty.md` built the backend for, now with two
+/// implementations rather than one and a comment: serial via the kernel's debug write, or an
+/// `OP_TTY_OUTPUT` message to whoever holds the terminal's backend channel.
 ///
-/// That this is `SYS_DEBUG_KPRINT` is now an implementation detail of *one* server rather
-/// than the way every program prints.
-fn backend_write(bytes: &[u8]) {
-    if !bytes.is_empty() {
-        kprint(bytes);
+/// That the console case is `SYS_DEBUG_KPRINT` is an implementation detail of *one* server
+/// rather than the way every program prints.
+fn sink_write(sink: Sink, bytes: &[u8]) {
+    if bytes.is_empty() {
+        return;
+    }
+    match sink {
+        Sink::Console => kprint(bytes),
+        // Chunked, because a single write may exceed one message and the emulator has no way to
+        // ask for the rest — a terminal that dropped the tail of a long line would be a bug
+        // visible only on long lines.
+        Sink::Channel(h) => {
+            for part in bytes.chunks(MAX_BODY) {
+                reply(h, OP_TTY_OUTPUT, 0, part);
+            }
+        }
+    }
+}
+
+/// The most payload one message can carry, leaving room for both headers.
+const MAX_BODY: usize = MSG_LEN - PAYLOAD_OFF - 64;
+
+/// Perform what the registry decided.
+fn perform(acts: &[Act]) {
+    for a in acts {
+        match a {
+            Act::Write(sink, bytes) => sink_write(*sink, bytes),
+            Act::Reply { ch, op, request_id, body } => reply(*ch, *op, *request_id, body),
+            Act::Fail { ch, op, request_id, err } => reply_error(*ch, *op, *request_id, *err),
+        }
     }
 }
 
@@ -79,32 +105,6 @@ fn exit(code: i64) -> ! {
     loop {
         core::hint::spin_loop();
     }
-}
-
-/// What an outstanding read is waiting for.
-#[derive(Copy, Clone, PartialEq, Eq)]
-enum ReadKind {
-    /// `ReadLine`: completes when the discipline finishes a line.
-    Line,
-    /// `Read`: completes as soon as any byte is available, discipline not consulted.
-    Raw,
-}
-
-/// One terminal: its channel, its editing state, and the request it owes a reply to.
-struct Tty {
-    /// The server-side endpoint. `0` marks a freed slot.
-    ch: u64,
-    disc: Discipline,
-    /// The outstanding read, if the client is waiting for input.
-    waiting: Option<(u64, ReadKind)>,
-    /// An interrupt arrived while **nobody was reading**, so the next read completes
-    /// empty immediately (§11h).
-    ///
-    /// Without this the event is delivered and then nothing happens: the client's next
-    /// read blocks for a keystroke that has not been typed, so `Ctrl-C` at a prompt would
-    /// only take effect once the user pressed something else. The interrupt has to be able
-    /// to *end a read that has not started yet*.
-    interrupt_pending: bool,
 }
 
 /// Resolve `path` in `ns` requesting `rights`; `0` on failure.
@@ -243,8 +243,8 @@ fn reply_error(ch: u64, op: u16, request_id: u64, kerror: i32) {
 }
 
 /// Reply to a forwarded `/dev/tty` resolve with a fresh terminal channel.
-fn open_tty(serve_end: u64, request_id: u64, ttys: &mut Vec<Tty>) {
-    if ttys.len() >= MAX_TTYS {
+fn open_tty(serve_end: u64, request_id: u64, reg: &mut Registry) {
+    if reg.len() >= MAX_TTYS {
         reply_error(serve_end, OP_NS_RESOLVE, request_id, KError::WouldBlock.as_i32());
         return;
     }
@@ -279,12 +279,7 @@ fn open_tty(serve_end: u64, request_id: u64, ttys: &mut Vec<Tty>) {
         ) == 0
     };
     if sent {
-        ttys.push(Tty {
-            ch: server_end,
-            disc: Discipline::new(),
-            waiting: None,
-            interrupt_pending: false,
-        });
+        reg.open(server_end);
         kprint(b"tty-server: terminal opened\n");
     } else {
         // The reply did not go, so the client end never moved — reclaim both.
@@ -302,103 +297,20 @@ fn open_tty(serve_end: u64, request_id: u64, ttys: &mut Vec<Tty>) {
 /// process that outlived its session while holding a `/dev/tty` handle cannot have it taken
 /// away. The server declining to serve the channel is what makes teardown a guarantee
 /// rather than a convention — see `docs/architecture/console-and-tty.md`.
-fn free_tty(ttys: &mut Vec<Tty>, i: usize) {
+fn free_tty(reg: &mut Registry, ch: u64) {
+    // The backend goes with it if this was the last terminal on it — and if that backend was a
+    // channel, closing our end is what tells the emulator the terminal is gone.
+    for h in reg.close_and_retire(ch) {
+        // SAFETY: closing our own backend endpoint.
+        unsafe { syscall1(SYS_HANDLE_CLOSE, h) };
+    }
     // SAFETY: closing our own endpoint.
-    unsafe { syscall1(SYS_HANDLE_CLOSE, ttys[i].ch) };
-    ttys.remove(i);
+    unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
     kprint(b"tty-server: terminal closed\n");
 }
 
-/// Feed queued input into whichever terminal is waiting for a line, completing its read
-/// when a line is finished.
-///
-/// Input that arrives with nobody waiting stays queued rather than being dropped — typing
-/// ahead of a prompt is ordinary, and losing it would be a bug the user cannot see.
-fn drive_input(pending: &mut VecDeque<u8>, ttys: &mut Vec<Tty>) {
-    while !pending.is_empty() {
-        // **`Ctrl-C` is taken before anything else, and never queues.** It is an event
-        // about the terminal rather than input to it (§11h), so it is answered whether or
-        // not anybody is reading — which is the whole point, since during an evaluation
-        // nobody is. Sent to every open terminal: a session has one, and a server that
-        // guessed which was "foreground" would be inventing a concept this system does not
-        // have yet (job control is §11g, and unbuilt).
-        if pending.front() == Some(&0x03) {
-            pending.pop_front();
-            for t in ttys.iter_mut() {
-                reply(t.ch, OP_TTY_INTERRUPT, 0, &[]);
-                // **An outstanding read is completed, empty.** Otherwise a client sitting
-                // at a prompt stays blocked on a read whose byte just became an event, and
-                // could not redraw until the user typed something else. A raw read
-                // otherwise only ever completes with at least one byte, so an empty
-                // completion is unambiguous: "your read ended because of the interrupt".
-                match t.waiting.take() {
-                    Some((rid, kind)) => {
-                        let op = match kind {
-                            ReadKind::Line => OP_TTY_READ_LINE,
-                            ReadKind::Raw => OP_TTY_READ,
-                        };
-                        reply(t.ch, op, rid, &[]);
-                    }
-                    // Nobody is reading *yet* — the shell is between prompts, or busy.
-                    None => t.interrupt_pending = true,
-                }
-                t.disc.reset();
-            }
-            continue;
-        }
-        let Some(i) = ttys.iter().position(|t| t.waiting.is_some()) else {
-            return; // nobody is reading; hold the bytes
-        };
-        // A raw read takes everything available and returns immediately: the client is
-        // doing its own editing, so the discipline must not consume, echo, or interpret a
-        // single byte of it.
-        if let Some((rid, ReadKind::Raw)) = ttys[i].waiting {
-            // **Stop at an interrupt.** A raw read takes everything available in one go,
-            // which handed `Ctrl-C` to the client as an ordinary byte whenever it arrived
-            // in the same chunk as the keystrokes before it — the front-of-queue check
-            // above never saw it. Bytes typed *before* the interrupt are still input; the
-            // interrupt itself is picked up on the next turn of this loop.
-            let stop = pending.iter().position(|&b| b == 0x03).unwrap_or(pending.len());
-            let n = stop.min(READ_CHUNK as usize);
-            if n == 0 {
-                continue; // the interrupt is at the front; the branch above handles it
-            }
-            let mut out = Vec::with_capacity(n);
-            for _ in 0..n {
-                out.push(pending.pop_front().expect("non-empty"));
-            }
-            ttys[i].waiting = None;
-            reply(ttys[i].ch, OP_TTY_READ, rid, &out);
-            continue;
-        }
-        let b = pending.pop_front().expect("non-empty");
-        match ttys[i].disc.feed(b) {
-            Step::None => {}
-            Step::Echo(e) => backend_write(&e),
-            Step::Line { bytes, echo } => {
-                backend_write(&echo);
-                let (rid, _) = ttys[i].waiting.take().expect("waiting");
-                reply(ttys[i].ch, OP_TTY_READ_LINE, rid, &bytes);
-            }
-            // Canonical mode has no history to recall, so a cursor key is nothing here.
-            // A client that wants them reads raw and runs the discipline itself.
-            Step::Key(_) => {}
-            Step::Eof => {
-                // Ctrl-D at an empty prompt. Answered as an *error* rather than an empty
-                // line, because those are different answers and a reader that conflated
-                // them would either exit on a stray Enter or never exit at all.
-                // `PeerClosed` is the honest code: the input side has ended.
-                backend_write(b"\r\n");
-                let (rid, _) = ttys[i].waiting.take().expect("waiting");
-                reply_error(ttys[i].ch, OP_TTY_READ_LINE, rid, KError::PeerClosed.as_i32());
-            }
-        }
-    }
-}
-
 /// Handle one request on terminal `i`'s channel. Returns `false` if the terminal is gone.
-fn serve_tty(ttys: &mut Vec<Tty>, i: usize, pending: &mut VecDeque<u8>) -> bool {
-    let ch = ttys[i].ch;
+fn serve_tty(reg: &mut Registry, ch: u64) -> bool {
     // SAFETY: valid recv out-params.
     let rr = unsafe {
         syscall4(
@@ -428,35 +340,36 @@ fn serve_tty(ttys: &mut Vec<Tty>, i: usize, pending: &mut VecDeque<u8>) -> bool 
         }
     };
     match op {
-        OP_TTY_WRITE => {
-            backend_write(body);
-            reply(ch, OP_TTY_WRITE, request_id, &[]);
-        }
+        OP_TTY_WRITE => perform(&reg.write(ch, request_id, body)),
         OP_TTY_SET_MODE => {
             let flags = body.first().copied().unwrap_or(TTY_MODE_ECHO);
-            ttys[i].disc.set_echo(flags & TTY_MODE_ECHO != 0);
-            reply(ch, OP_TTY_SET_MODE, request_id, &[]);
+            perform(&reg.set_mode(ch, request_id, flags & TTY_MODE_ECHO != 0));
         }
         OP_TTY_READ_LINE | OP_TTY_READ => {
             let kind = if op == OP_TTY_READ { ReadKind::Raw } else { ReadKind::Line };
-            if ttys[i].waiting.is_some() {
-                // One outstanding read per terminal: two would race for the same input and
-                // there is no rule that says which should win.
-                reply_error(ch, op, request_id, KError::WouldBlock.as_i32());
-            } else if ttys[i].interrupt_pending {
-                // An interrupt arrived while nobody was reading: end this read before it
-                // starts, so `Ctrl-C` between prompts takes effect on the next read rather
-                // than on the next keystroke (§11h).
-                ttys[i].interrupt_pending = false;
-                reply(ch, op, request_id, &[]);
+            perform(&reg.read(ch, request_id, kind));
+        }
+        OP_TTY_ATTACH_BACKEND => {
+            // SAFETY: the kernel wrote `RECV_COUNT` handles into `RECV_HANDLES`.
+            let handle = unsafe {
+                if RECV_COUNT >= 1 { RECV_HANDLES[0] } else { 0 }
+            };
+            if handle == 0 {
+                // No handle moved: there is nothing to attach, and silently succeeding would
+                // leave the emulator waiting for output that goes to the console.
+                reply_error(ch, op, request_id, KError::InvalidArgument.as_i32());
             } else {
-                // A partial line from a previous canonical read must not leak into a raw
-                // one, or the shell's first keystroke arrives with somebody else's prefix.
-                if kind == ReadKind::Raw {
-                    ttys[i].disc.reset();
+                match reg.attach_backend(ch, handle) {
+                    Some(_) => {
+                        reply(ch, OP_TTY_ATTACH_BACKEND, request_id, &[]);
+                        kprint(b"tty-server: terminal attached to a backend channel\n");
+                    }
+                    None => {
+                        // SAFETY: closing the handle we were given and did not keep.
+                        unsafe { syscall1(SYS_HANDLE_CLOSE, handle) };
+                        reply_error(ch, op, request_id, KError::NotFound.as_i32());
+                    }
                 }
-                ttys[i].waiting = Some((request_id, kind));
-                drive_input(pending, ttys);
             }
         }
         OP_TTY_CLOSE => {
@@ -468,13 +381,53 @@ fn serve_tty(ttys: &mut Vec<Tty>, i: usize, pending: &mut VecDeque<u8>) -> bool 
     true
 }
 
+/// Read whatever a terminal emulator sent on backend `id`'s channel and feed it in.
+///
+/// Returns `false` if the emulator is gone, which ends every terminal on that backend — see
+/// `serve_loop`.
+fn serve_backend(reg: &mut Registry, id: u32, ch: u64) -> bool {
+    // SAFETY: valid recv out-params.
+    let rr = unsafe {
+        syscall4(
+            SYS_CHANNEL_RECV,
+            ch,
+            (&raw mut RECV_MSG) as u64,
+            (&raw mut RECV_HANDLES) as u64,
+            (&raw mut RECV_COUNT) as u64,
+        )
+    };
+    if rr != 0 {
+        return rr != KError::PeerClosed.as_i32() as i64;
+    }
+    // SAFETY: bounded read-only slice over the just-received message.
+    let (op, body) = unsafe {
+        let payload_len =
+            u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
+        let req = core::slice::from_raw_parts(
+            ((&raw const RECV_MSG) as *const u8).add(PAYLOAD_OFF),
+            payload_len.min(MSG_LEN - PAYLOAD_OFF),
+        );
+        match decode(req) {
+            Ok(m) => (m.op, m.body),
+            Err(_) => return true,
+        }
+    };
+    // Only input is expected here. Anything else is ignored rather than answered: this channel
+    // carries unsolicited messages in both directions, so there is no request to fail.
+    if op == OP_TTY_INPUT {
+        perform(&reg.feed(id, body));
+    }
+    true
+}
+
 /// The serve loop: the forwarding endpoint, every open terminal, and one outstanding
 /// console read, all in one `sys_wait`.
 fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
     kprint(b"tty-server: serving /dev/tty over the console\n");
-    let mut ttys: Vec<Tty> = Vec::new();
-    let mut pending: VecDeque<u8> = VecDeque::new();
+    let mut reg = Registry::new();
     let mut read_po: u64 = 0;
+    // Rebuilt each turn beside the wait set, so a handle's slot and its meaning cannot drift.
+    let mut backend_at: Vec<(u64, u32)> = Vec::new();
 
     loop {
         // **A console read is always outstanding.**
@@ -509,14 +462,25 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
             }
         }
 
+        backend_at.clear();
+        for h in reg.backend_channels() {
+            if let Some(id) = reg.backend_of_channel(h) {
+                backend_at.push((h, id));
+            }
+        }
         let count = {
             // SAFETY: WAIT_HANDLES has MAX_WAIT_HANDLES slots; `n` is bounded by
-            // 1 + MAX_TTYS + 1, which is that limit by construction.
+            // 1 + MAX_TTYS + MAX_TTYS + 1, which is that limit by construction — see
+            // `MAX_TTYS`, which is halved for exactly this.
             unsafe {
                 WAIT_HANDLES[0] = serve_end;
                 let mut n = 1usize;
-                for t in ttys.iter() {
-                    WAIT_HANDLES[n] = t.ch;
+                for ch in reg.channels() {
+                    WAIT_HANDLES[n] = ch;
+                    n += 1;
+                }
+                for (h, _) in backend_at.iter() {
+                    WAIT_HANDLES[n] = *h;
                     n += 1;
                 }
                 if read_po != 0 {
@@ -551,19 +515,30 @@ fn serve_loop(serve_end: u64, console: u64, buf_h: u64, buf_addr: u64) -> ! {
                 ])
             };
             if h == serve_end {
-                drain_resolves(serve_end, &mut ttys);
+                drain_resolves(serve_end, &mut reg);
             } else if read_po != 0 && h == read_po {
                 let n = console_bytes(off);
+                let mut bytes: Vec<u8> = Vec::with_capacity(n as usize);
                 // SAFETY: the kernel wrote `n` bytes into the mapped read buffer.
                 for k in 0..n {
-                    let b = unsafe { ((buf_addr + k) as *const u8).read_volatile() };
-                    pending.push_back(b);
+                    bytes.push(unsafe { ((buf_addr + k) as *const u8).read_volatile() });
                 }
                 read_po = 0; // consumed; the next iteration submits another
-                drive_input(&mut pending, &mut ttys);
-            } else if let Some(i) = ttys.iter().position(|t| t.ch == h) {
-                if !serve_tty(&mut ttys, i, &mut pending) {
-                    free_tty(&mut ttys, i);
+                perform(&reg.feed(CONSOLE, &bytes));
+            } else if reg.channels().any(|c| c == h) {
+                if !serve_tty(&mut reg, h) {
+                    free_tty(&mut reg, h);
+                }
+            } else if let Some((_, id)) = backend_at.iter().find(|(bh, _)| *bh == h).copied() {
+                if !serve_backend(&mut reg, id, h) {
+                    // **The emulator is gone, so every terminal on its backend ends.** A
+                    // terminal whose window has closed cannot be interacted with, and leaving
+                    // it alive would give its programs a `/dev/tty` that silently discards
+                    // everything written to it — the failure that looks like a hang.
+                    kprint(b"tty-server: a backend went away\n");
+                    for ch in reg.ttys_on(id) {
+                        free_tty(&mut reg, ch);
+                    }
                 }
             }
         }
@@ -591,7 +566,7 @@ fn console_bytes(off: usize) -> u64 {
 }
 
 /// Drain every queued forwarded resolve on the serving endpoint.
-fn drain_resolves(serve_end: u64, ttys: &mut Vec<Tty>) {
+fn drain_resolves(serve_end: u64, reg: &mut Registry) {
     loop {
         // SAFETY: valid recv out-params.
         let rr = unsafe {
@@ -626,7 +601,7 @@ fn drain_resolves(serve_end: u64, ttys: &mut Vec<Tty>) {
             }
         };
         if ok {
-            open_tty(serve_end, request_id, ttys);
+            open_tty(serve_end, request_id, reg);
         } else if op == OP_NS_RESOLVE {
             reply_error(serve_end, op, request_id, KError::NotFound.as_i32());
         } else {

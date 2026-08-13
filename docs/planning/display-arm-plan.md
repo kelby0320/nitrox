@@ -925,7 +925,7 @@ context menu near a window edge, or a combo box in a small dialog.
 
 This is the part with a real design question in it, and it is not "add a write path".
 
-- [ ] **C1 — the data flow inverts, and the pty is the shape.**
+- [x] **C1 — the data flow inverts, and the pty is the shape.** ✅ 2026-08-13.
       Today the tty server holds `/dev/console` and *reads keystrokes from the device*. In a
       GUI terminal the keystrokes arrive at `nxterm` — a compositor client with a window and
       focus — and the shell's output has to reach `nxterm` to be rendered. The server is no
@@ -941,7 +941,8 @@ This is the part with a real design question in it, and it is not "add a write p
       a free function that calls `kprint` and becomes a method on a backend that is either
       the serial console or a channel.
 
-- [ ] **C2 — routing is per-terminal, keyed by the backend.**
+- [x] **C2 — routing is per-terminal, keyed by the backend.** ✅ 2026-08-13 (the server half;
+      `nxterm` attaches in C3).
       **Not per-session**, which is what this said until 2026-08-12. The correction came from
       the maintainer asking why `session-mgr` would spawn `nxterm` at all, and it is worth
       keeping because the original was wrong in two independent ways.
