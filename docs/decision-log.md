@@ -14668,3 +14668,70 @@ A move must dirty the **union of the old and new rectangles**. Everywhere else i
 the destination and leaves the source on screen. M5 shipped exactly that bug for a resized buffer
 (PR #192, finding 3), so it is a known shape here rather than a surprise — which is the whole
 value of having found it once.
+
+## 2026-08-13 — PR #195 review: two design gaps in the part the pass asked to have attacked
+
+A docs-only planning pass, so there was nothing to break-test; the review went at the claims
+instead. Most held. The two that did not were both in the seam the PR explicitly asked to have
+attacked, which is the pass working rather than failing.
+
+### The capability I claimed does not exist yet
+
+`/dev/draw/manage` was described as a capability because "a supervisor binds it into the shell's
+namespace and nowhere else". In M6's configuration that gates nothing, and three facts compose to
+say so: `/dev/draw` is bound **unscoped** into init's root namespace; every graphical client
+inherits that namespace; and resolves are classified by **suffix alone**, with no caller identity
+in the path. The compositor already records the consequence for a different suffix — *"Any holder
+of `/dev/draw` can resolve `info` in a loop."*
+
+So `nxterm` and both test clients could resolve `manage`, and the only thing separating them would
+be the first-come rule — which makes the **race** the gate, when that rule exists to avoid one.
+
+**The design is right and the precondition is missing.** Namespace-based gating needs *per-client
+namespaces*, and the process that constructs them is `desktop-shell` — M7. There is one namespace
+until then and everybody inherits it, so no binding can be given to one client and withheld from
+another. M6 now says that plainly, arranges the ordering it actually relies on, and files
+`TODO(manage-ungated)` against M7 rather than describing an ordering as a capability.
+
+The general form: **a capability argument is only as good as the namespace construction underneath
+it**, and this system has exactly one place that builds namespaces per client. Reaching for
+"bound into its namespace and nowhere else" is right in shape and wrong in tense whenever that
+place does not exist yet.
+
+### "Early enough" was a race, and the fix is a handshake
+
+B4 said a manager could place a window between `CreateWindow` and the first `Commit`, and that
+firing the created-event on create made that interval usable. **The interval is the client's.**
+`CreateWindow` replies with an id, and then `AttachBuffer` and `Commit` are silent sends issued
+back to back — which is what both existing clients do. The manager is a different process: woken,
+scheduled, reads the event, sends `Place`. Nothing orders that against a `Commit` already queued.
+
+The rule is now **a window is not composited until it has been configured**: the client waits for
+its first `Surface::Configure` before its first `Commit`, the compositor sends one immediately
+when no manager is attached, and a deadline covers a manager that never answers.
+
+That is Wayland's initial-configure handshake, and it is right here for the reason it is right
+there: **the round trip is the client's to wait out, not the compositor's.** The alternative the
+plan had already rejected — the compositor blocking on the manager before replying — puts a
+userspace process on the critical path of every window creation. Rejecting that was correct; what
+was missing was noticing that rejecting it left nothing supplying the ordering.
+
+### And the pattern that keeps recurring: a citation doing work it cannot
+
+The plan quoted `desktop-shell.md` §8's *"must be capability-gated, or any application could
+impersonate the launcher"* as if it were about window placement. It is the **global hotkey** row;
+the placement row says only "Templates already need it". The argument generalises; the citation
+does not.
+
+**This is the third instance in this file** — PR #193's review corrected two of exactly this shape
+(governing decision 2 cited for placement policy, and a claim about `set_origin`'s callers). Three
+is a habit, not a coincidence: reaching for the nearest authoritative-sounding line rather than
+the one that says the thing. The cost is small each time and compounds, because a reader who
+checks one citation and finds it wrong stops trusting the others.
+
+### Two gates, not one
+
+The pass named `check-display`'s dependency on origin placement and missed `check-terminal`'s —
+whose click point was computed from where `ui-testclient`'s windows land — and `init`'s spawn-order
+comment, which A1 makes false. The third is the one that would bite hardest: a stale comment
+asserting a retired invariant is what the last two milestones each shipped once.
