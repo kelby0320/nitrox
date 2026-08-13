@@ -310,6 +310,10 @@ impl Transport for ChannelTransport {
         }
     }
 
+    fn wait_handle(&self) -> u64 {
+        self.channel
+    }
+
     fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
         loop {
             // A parked message counts: it is already here and older than anything on the

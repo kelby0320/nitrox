@@ -106,8 +106,10 @@ const DONE_CODE: u16 = libkern::abi::BTN_LEFT;
 const PAYLOAD_OFF: usize = 24;
 
 static mut CLOCK_BUF: u64 = 0;
-static mut WAIT_HANDLES: [u64; 1] = [0];
-static mut WAIT_RESULTS: [u8; 24] = [0; 24];
+/// Two slots: the window channel and this process's notification handle, which the bounded
+/// window-phase wait needs together.
+static mut WAIT_HANDLES: [u64; 2] = [0; 2];
+static mut WAIT_RESULTS: [u8; 48] = [0; 48];
 
 /// Wait for a `PendingOperation` and return `(status, result)`.
 fn po_wait(po: u64) -> (i32, u64) {
@@ -164,13 +166,17 @@ struct Stream {
     msg: [u8; 4096],
     handles: [u64; 8],
     count: u64,
+    /// The idle deadline passed rather than the channel failing. The two are
+    /// indistinguishable from `sys_wait`'s return, and they mean opposite things: one is
+    /// "nobody is driving this run", the other is a real fault the gate must not pass.
+    timed_out: bool,
 }
 
 impl Stream {
     /// Resolve `/dev/input/new`, which mints a per-consumer channel.
     fn open(root_ns: u64) -> Option<Self> {
         let channel = lookup(root_ns, b"/dev/input/new", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT)?;
-        Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0 })
+        Some(Self { channel, msg: [0; 4096], handles: [0; 8], count: 0, timed_out: false })
     }
 
     /// Block for one `Input::Events` message and print every record it carries.
@@ -178,19 +184,27 @@ impl Stream {
     /// Returns whether the batch contained [`DONE_CODE`]'s press, or `None` if the channel
     /// failed.
     fn pump(&mut self) -> Option<bool> {
+        // **Bounded, like the window phase.** An undriven boot must not leave this client
+        // waiting here forever, because the *next* thing it does is create a 2048×2048
+        // window and take every click in the system. `check-terminal` found this the hard
+        // way: its one click on the terminal was also this phase's sentinel, so the client
+        // woke, created that window, and swallowed every keystroke after the first.
+        let deadline = deadline_ns(IDLE_LIMIT_NS);
         loop {
             // SAFETY: waiting on this process's own channel handle.
             let waited = unsafe {
                 WAIT_HANDLES[0] = self.channel;
-                syscall4(
+                syscall5(
                     SYS_WAIT,
                     (&raw const WAIT_HANDLES) as u64,
                     1,
                     (&raw mut WAIT_RESULTS) as u64,
-                    u64::MAX,
+                    deadline,
+                    0,
                 )
             };
             if waited != 1 {
+                self.timed_out = deadline_ns(0) >= deadline;
                 return None;
             }
             // SAFETY: valid recv out-params on a live endpoint.
@@ -263,6 +277,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         match stream.pump() {
             Some(true) => break,
             Some(false) => {}
+            None if stream.timed_out => {
+                // Nothing is driving this run. Exiting *before* the window phase is what
+                // keeps this client out of every other gate's way — see `IDLE_LIMIT_NS`.
+                kprint(b"input-testclient: idle, releasing the window\n");
+                exit(0);
+            }
             None => {
                 kprint(b"input-testclient: stream FAILED\n");
                 exit(1);
@@ -346,11 +366,22 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     let (mut saw_key, mut saw_press) = (false, false);
     while !(saw_key && saw_press) {
-        let ev = match win.wait_event() {
-            Ok(e) => e,
-            Err(_) => {
+        let ev = match wait_event_before(&mut win, deadline_ns(IDLE_LIMIT_NS)) {
+            Some(Ok(e)) => e,
+            Some(Err(_)) => {
                 kprint(b"input-testclient: window stream FAILED\n");
                 exit(1);
+            }
+            // **Nothing is driving this run.** Exiting releases the window, and releasing it
+            // matters: it is 2048×2048 — larger than the screen — and created last, so while
+            // it exists it is the topmost window everywhere and takes every click and every
+            // keystroke. `check-input` drives this phase within a second of `window ready`;
+            // any other gate has no reason to, and before this the client sat here for the
+            // life of the boot with the whole screen under it. `cargo xtask check-terminal`
+            // is the gate that found it: its click on the terminal landed here instead.
+            None => {
+                kprint(b"input-testclient: idle, releasing the window\n");
+                exit(0);
             }
         };
         if !first_event_reported {
@@ -475,6 +506,65 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     kprint(b"input-testclient: PASSED\n");
     exit(0);
+}
+
+/// How long the window phase waits for the harness to start injecting before giving up.
+///
+/// Generous: `check-input` injects within a second of `window ready`, so this never fires
+/// there, and a slow CI machine has room. Its only job is to stop an undriven run from
+/// leaving a screen-covering window in place forever.
+const IDLE_LIMIT_NS: u64 = 20_000_000_000;
+
+/// An absolute monotonic deadline `ns` from now.
+fn deadline_ns(ns: u64) -> u64 {
+    // SAFETY: CLOCK_BUF is a valid writable u64 out-param.
+    unsafe {
+        syscall2(libkern::SYS_CLOCK_READ, libkern::abi::CLOCK_MONOTONIC, (&raw mut CLOCK_BUF) as u64)
+    };
+    // SAFETY: the kernel wrote the ns count.
+    unsafe { (&raw const CLOCK_BUF).read() }.saturating_add(ns)
+}
+
+/// Wait for a window event until `deadline`, or `None` if it passes first.
+///
+/// `Window::wait_event` blocks forever, which is right for a real client and wrong for a test
+/// one that may never be driven. Built from the pieces `libsurface` grew in M5 Part C for
+/// `nxterm`: the waitable handle, and a non-blocking drain.
+fn wait_event_before(
+    win: &mut Window<alloc::boxed::Box<ChannelTransport>>,
+    deadline: u64,
+) -> Option<Result<WindowEvent, libsurface::UiError>> {
+    loop {
+        match win.poll_event() {
+            Ok(Some(e)) => return Some(Ok(e)),
+            Err(e) => return Some(Err(e)),
+            Ok(None) => {}
+        }
+        let h = win.wait_handle();
+        if h == 0 {
+            return Some(win.wait_event());
+        }
+        // **The window handle alone.** An earlier version also waited on this process's
+        // notification handle, which nothing here enqueues on and nothing here drains — so if
+        // one ever *were* pending it would return immediately every turn and this would spin
+        // until the deadline. The deadline is what bounds this loop; the notification handle
+        // added nothing but that risk (PR #194 review, optional 2).
+        // SAFETY: WAIT_HANDLES/WAIT_RESULTS are valid writable buffers; one waiter.
+        let waited = unsafe {
+            WAIT_HANDLES[0] = h;
+            syscall5(
+                SYS_WAIT,
+                (&raw const WAIT_HANDLES) as u64,
+                1,
+                (&raw mut WAIT_RESULTS) as u64,
+                deadline,
+                0,
+            )
+        };
+        if waited < 1 {
+            return None; // the deadline passed
+        }
+    }
 }
 
 /// Sleep for `ns` by waiting on a handle that never signals.

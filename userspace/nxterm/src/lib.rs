@@ -6,17 +6,16 @@
 //!
 //! ## Where the bytes come from
 //!
-//! **A loopback, until Part C.** A key press is encoded by [`libterm::encode`] and fed straight
-//! back through [`libterm::parse`] into the grid, so typing works on screen with nothing else
-//! running. That is not a stub for its own sake: it exercises the whole of Part A — encoder,
-//! parser, grid, render — driven by real key events, and Part C replaces exactly one function
-//! call with a write to the tty server's backend channel.
+//! **A tty, since Part C.** A key press is encoded by [`libterm::encode`] into an *outbox*; the
+//! binary drains it to the tty server's backend channel, and what the server sends back —
+//! echo, and the shell's output — arrives at [`App::feed`] and goes through [`libterm::parse`]
+//! into the grid.
 //!
-//! **The loopback translates `\r` to `\r\n`.** A terminal receives `\r` from its own Enter key
-//! and `LF` is *index*, so without this typing Enter would return to column 0 and overwrite the
-//! line just typed. That translation is Unix's `ONLCR` and it belongs to the **line
-//! discipline**, which is what Part C puts between these two halves — so it lives here, in one
-//! obvious place, to be deleted rather than moved.
+//! Nothing here translates. A loopback stood in until Part C and turned `\r` into `\r\n`,
+//! because `LF` is *index* and Enter alone would overwrite the line just typed. **That is
+//! `ONLCR`, and it is the line discipline's** — which is now genuinely on the other side of the
+//! channel, so the translation left with it. The one comment worth keeping from that period:
+//! it lived in a single obvious place precisely so it could be deleted rather than found.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -105,6 +104,13 @@ pub struct App {
     pub metrics: Metrics,
     /// Colours for the cells.
     pub palette: Palette,
+    /// Bytes the user typed, waiting for the binary to send them to the tty.
+    ///
+    /// **An outbox rather than a call**, because this half has no syscalls: `update` is a
+    /// function of values, and "send this to a channel" is not one. It is the same shape as
+    /// the toolkit's messages — the application says what happened, the shell of a `main`
+    /// performs it.
+    outbox: Vec<u8>,
     /// Where the viewport is, or `None` to follow the output.
     ///
     /// **`None` is not "line zero".** Following the bottom and being anchored at whatever the
@@ -134,6 +140,7 @@ impl App {
             menu_anchor: None,
             metrics,
             palette: Palette::default(),
+            outbox: Vec::new(),
             view_top: None,
             view_moved: false,
         }
@@ -162,25 +169,22 @@ impl App {
         }
     }
 
-    /// Send what a key press produced back to ourselves.
-    ///
-    /// **`\r` becomes `\r\n`** — see the module docs. Deleting this line is most of what
-    /// Part C's line discipline has to take over.
+    /// Queue `bytes` for the program on the other end.
     ///
     /// **Typing snaps the view back to the bottom**, which is what every terminal does and what
     /// makes scrollback usable rather than a trap: the alternative is a prompt that answers
     /// somewhere you cannot see, and a user who concludes the terminal has hung.
-    pub fn loopback(&mut self, bytes: &[u8]) {
-        if !bytes.is_empty() {
-            self.snap_to_bottom();
+    pub fn send(&mut self, bytes: &[u8]) {
+        if bytes.is_empty() {
+            return;
         }
-        for &b in bytes {
-            if b == b'\r' {
-                self.feed(b"\r\n");
-            } else {
-                self.feed(&[b]);
-            }
-        }
+        self.snap_to_bottom();
+        self.outbox.extend_from_slice(bytes);
+    }
+
+    /// Take everything the user has typed since this was last called.
+    pub fn take_outbox(&mut self) -> Vec<u8> {
+        core::mem::take(&mut self.outbox)
     }
 
     /// Follow the output again, repainting if that moved the view.
@@ -257,11 +261,7 @@ impl App {
         }
         let mut out = [0u8; libterm::encode::MAX_ENCODED];
         let n = libterm::encode::encode(k.keycode, k.modifiers, &mut out);
-        if n > 0 {
-            // **The loopback.** Part C replaces this one line with a write to the tty server's
-            // backend channel.
-            self.loopback(&out[..n]);
-        }
+        self.send(&out[..n]);
     }
 
     /// Move the view to where a scrollbar interaction points.
@@ -407,44 +407,53 @@ mod tests {
         s.trim_end().into()
     }
 
-    #[test]
-    fn typing_goes_round_the_loopback_and_lands_on_the_grid() {
-        // The whole of Part A in one line: keycode -> bytes -> ops -> cells.
-        let mut a = app();
-        let mut out = [0u8; libterm::encode::MAX_ENCODED];
-        for code in [35u16, 23, 18] {
-            // h, i, e — arbitrary letters from the US table
-            let n = libterm::encode::encode(code, 0, &mut out);
-            a.loopback(&out[..n]);
-        }
-        assert_eq!(line(&a, 0), "hie");
+    /// Type `code` and return what the terminal would send to the tty.
+    fn typed(a: &mut App, code: u16) -> alloc::vec::Vec<u8> {
+        a.update(Msg::Key(key_ev(code, KEY_DOWN)));
+        a.take_outbox()
     }
 
     #[test]
-    fn enter_starts_a_new_line_rather_than_overwriting_the_last_one() {
-        // **The `ONLCR` the loopback owns.** Enter sends `\r`, and `LF` is index — so without
-        // the translation the cursor returns to column 0 and the next character overwrites
-        // what was just typed, on the same line.
+    fn a_key_press_becomes_bytes_in_the_outbox_and_nothing_on_the_grid() {
+        // **What Part C changed.** A keystroke goes *out*; what appears on screen is whatever
+        // comes back. Before Part C this looped internally, which made the two halves
+        // indistinguishable — and a terminal that echoed locally would double every character
+        // the moment a real shell echoed too.
         let mut a = app();
-        let mut out = [0u8; libterm::encode::MAX_ENCODED];
-        let mut key = |a: &mut App, code: u16| {
-            let n = libterm::encode::encode(code, 0, &mut out);
-            a.loopback(&out[..n]);
-        };
-        key(&mut a, 35); // h
-        key(&mut a, libkern::abi::KEY_ENTER);
-        key(&mut a, 23); // i
+        assert_eq!(typed(&mut a, 35), b"h", "h");
+        assert_eq!(line(&a, 0), "", "the keystroke drew itself without being echoed");
+
+        // ...and the bytes coming back are what lands.
+        a.feed(b"h");
         assert_eq!(line(&a, 0), "h");
-        assert_eq!(line(&a, 1), "i", "the newline did not reach the second row");
     }
 
     #[test]
-    fn a_key_with_no_encoding_types_nothing() {
+    fn the_terminal_translates_nothing_on_the_way_out() {
+        // Enter sends `\r` and only `\r`. The `\r\n` a user sees is the line discipline's
+        // `ONLCR`, which is on the other side of the channel since Part C — a terminal that
+        // translated here would send two bytes where a program expects one, and `read` of a
+        // single keystroke would return a spurious newline.
         let mut a = app();
-        let mut out = [0u8; libterm::encode::MAX_ENCODED];
-        let n = libterm::encode::encode(libkern::abi::KEY_LEFTSHIFT, 0, &mut out);
-        a.loopback(&out[..n]);
+        assert_eq!(typed(&mut a, libkern::abi::KEY_ENTER), b"\r");
+    }
+
+    #[test]
+    fn a_key_with_no_encoding_sends_nothing() {
+        let mut a = app();
+        assert!(typed(&mut a, libkern::abi::KEY_LEFTSHIFT).is_empty());
         assert_eq!(line(&a, 0), "");
+    }
+
+    #[test]
+    fn output_from_the_program_is_what_reaches_the_grid() {
+        // The other direction, end to end through the parser: this is what `Tty::Output`
+        // delivers.
+        let mut a = app();
+        a.feed(b"hi\r\n\x1b[1mbold\x1b[m");
+        assert_eq!(line(&a, 0), "hi");
+        assert_eq!(line(&a, 1), "bold");
+        assert!(a.grid.cell(1, 0).unwrap().attrs.flags.contains(libterm::cell::Flags::BOLD));
     }
 
     #[test]
@@ -644,16 +653,13 @@ mod tests {
         grab(&mut a, 0);
         assert_ne!(a.view_line(), a.grid.top_line(), "the premise: scrolled away");
 
-        let mut out = [0u8; libterm::encode::MAX_ENCODED];
-        let n = libterm::encode::encode(35, 0, &mut out); // h
-        a.loopback(&out[..n]);
+        typed(&mut a, 35); // h
         assert_eq!(a.view_line(), a.grid.top_line(), "typing did not come back to the bottom");
 
         // ...and a key that encodes to nothing does not, because it is not typing.
         grab(&mut a, 0);
         let scrolled = a.view_line();
-        let n = libterm::encode::encode(libkern::abi::KEY_LEFTSHIFT, 0, &mut out);
-        a.loopback(&out[..n]);
+        typed(&mut a, libkern::abi::KEY_LEFTSHIFT);
         assert_eq!(a.view_line(), scrolled, "pressing Shift snapped the view");
     }
 
@@ -769,7 +775,9 @@ mod tests {
         ] {
             a.update(msg.expect("the focused grid claims the key"));
         }
-        assert_eq!(line(&a, 0), "hhh", "a repeat did not type");
+        // Observed at the outbox, not on the grid: since Part C what a keystroke produces is
+        // bytes on their way to the shell, and what reaches the grid is whatever comes back.
+        assert_eq!(a.take_outbox(), b"hhh", "a repeat did not type");
     }
 
     #[test]
@@ -781,7 +789,7 @@ mod tests {
         let e = a.view();
         a.update(r.key(&t, &e, key_ev(35, KEY_DOWN)).unwrap());
         a.update(r.key(&t, &e, key_ev(35, KEY_UP)).unwrap());
-        assert_eq!(line(&a, 0), "h", "the release typed as well");
+        assert_eq!(a.take_outbox(), b"h", "the release typed as well");
     }
 
     #[test]

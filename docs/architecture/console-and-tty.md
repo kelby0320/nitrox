@@ -1,13 +1,21 @@
 # Console and TTY
 
-**Status: stages 1–3 built (2026-08-03).** The server exists, `/dev/tty` is a capability, and
+**Status: stages 1–4 built (2026-08-13).** The server exists, `/dev/tty` is a capability, and
 its clients have moved: `session-mgr`'s login and `nxsh`'s REPL both read through it, echo
 control is a request rather than a parameter, and the editing loop with history lives in the
-shell against the raw-read op. **Stage 4 — the compositor backend — is Milestone 5 Part C** of
-[`display-arm-plan.md`](../planning/display-arm-plan.md), planned 2026-08-12 and not built;
-job control and terminal emulation remain unbuilt. The Status line said "its clients have not
-moved yet" until 2026-08-12, contradicting the staging list in this same document, which had
-marked all three ✅ on the day they landed.
+shell against the raw-read op. **Stage 4 — the second backend — landed with Milestone 5
+Part C**: a terminal emulator hands the server a channel with `Tty::AttachBackend` and the
+discipline writes to it instead of the serial console, so `nxterm` hosts a real `nxsh`. Routing
+is **per backend**: input and `Ctrl-C` reach the terminals on the backend they came from and no
+others. Job control and terminal emulation remain unbuilt.
+
+This Status line has been wrong twice, in both directions, which is worth one sentence: it said
+"its clients have not moved yet" until 2026-08-12 while the staging list below had marked all
+three ✅ on the day they landed, and it said stage 4 was "not built" on the day the code merged
+until the PR #194 review caught it.
+
+The wire contract is [`rsproto-tty-ops.md`](../spec/rsproto-tty-ops.md) (written 2026-08-13,
+when Part C gave the category a second channel role); this document is the design behind it.
 
 Written 2026-08-03 as a scoping pass, because "the console/tty server" was referenced as a gate
 in four documents without existing anywhere. This says what it owns, what it does not, and what
@@ -72,8 +80,9 @@ otherwise absorb by accident.
   slice), not on this. The rich REPL therefore splits: history, reverse-search and completion
   need cooked lines and can land here; anything needing modifiers cannot.
 - **Terminal emulation.** ANSI parsing, scrollback, and a rendered grid belong to the
-  compositor terminal. This server should be shaped so that terminal is simply another
-  *backend* — serial today, a compositor surface later — but it should not contain one.
+  compositor terminal, and they do: `libterm` and `nxterm` own them. This server is shaped so
+  that terminal is simply another *backend* — the serial console, or an emulator's channel —
+  and it contains none of that emulation.
 
 ## Shape — the decisions
 
@@ -184,6 +193,24 @@ right behaviour anyway.
    a process-group concept (job control).
 4. Later, independently: job control (needs a process-group concept), key events (needs the
    input arm above the driver), terminal emulation (needs the compositor).
+
+### Stage 4 — the second backend ✅ 2026-08-13
+
+Milestone 5 Part C. A terminal emulator resolves `/dev/tty` like any program, hands the server
+the far end of a channel with `Tty::AttachBackend`, and gives the terminal itself to the shell
+it spawns — keeping the backend. That is a pty with the pieces renamed: the emulator holds what
+a master would be, and the discipline is here rather than in the kernel.
+
+Two things changed shape and are worth naming, because both were assumptions rather than code:
+
+- **Routing is per backend.** Input goes to a waiting terminal *on the backend it arrived from*,
+  and `Ctrl-C` reaches that backend's terminals and no others. It used to go to the first waiter
+  anywhere and broadcast to everything, justified by "a session has one" — see the errata below.
+- **The terminal handle is handed down, not resolved.** `/dev/tty` is a namespace binding, so a
+  program cannot resolve its way to a *particular* window; the emulator passes the handle in the
+  child's setup message. Making the *resolved* path work inside a window needs a namespace built
+  per application, which is [`graphical-session.md`](../design/graphical-session.md) §6.1's
+  question and Milestone 7's work (`TODO(gui-dev-tty)`).
 
 ## Stage 3 — line editing, history, and where they belong
 
@@ -298,9 +325,11 @@ tells it the session is over, and it stops honouring that channel regardless of 
 the other end. A resource holder declining to serve, not the kernel confiscating. That makes
 teardown a guarantee rather than a convention, and it costs one request.
 
-**Backend seam: serial now, compositor later.** The device side is pluggable from the start —
-the line discipline talks to a backend, and the backend is the serial console today and a
-terminal surface later. Building the seam now costs nothing; retrofitting it costs a rewrite.
+**Backend seam: both backends built (2026-08-13).** The device side was pluggable from the
+start — the line discipline talks to a backend, which is the serial console or a channel an
+emulator handed over. Building the seam early cost nothing; the claim that retrofitting it
+would have cost a rewrite went untested, because the seam held: Part C's server-side change was
+a `Sink` enum and a routing split, and the discipline itself was not touched.
 
 **`eshell` is separate, and has to be.** It is the path that runs when the filesystem failed,
 so the tty server does not exist when it matters. It keeps the raw `/dev/console` and

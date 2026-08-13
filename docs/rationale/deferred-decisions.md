@@ -292,6 +292,27 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
+sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
+server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and
+the serial console shell stall with it, not just the wedged emulator's own terminals. (This
+entry said "every terminal it serves", which reads as per-backend; it is per-server — PR #194
+review.) It is a stall and not a deadlock: the chain is tty-server → emulator → compositor, the
+compositor depends on nothing in the tty path, and the emulator's own send back is `NOBLOCK`.
+
+**The input direction is still the un-made half of the same trade.** `Backend::typed` is
+`NOBLOCK`, so on a full ring `nxterm` logs a line and drops the keystrokes — `take_outbox` has
+already emptied them. It needs the ring's eight messages to back up, so it is far harder to
+reach than the output side was, but it is the same silent loss and the queue should cover both
+directions. The alternative it replaced was worse and is why this is not simply
+left alone: a `NOBLOCK` send onto a full ring **silently discards a program's output** — no
+error reaches anyone, the shell believes it printed, and the user sees a line with a hole in
+it. `check-terminal` found it as an intermittently-missing character, which is exactly how it
+would present in use. The answer that costs neither is a per-backend queue the serve loop
+drains alongside everything else. Trigger: a second terminal emulator, or the first time a
+stalled client is observed to affect another. Landed 2026-08-13 with M5 Part C
+(`userspace/tty-server/src/main.rs`).
+
 **`/dev/tty` inside a graphical application — `TODO(gui-dev-tty)`.** M5 Part C hands `nxterm`'s
 shell its terminal as a *handle* at spawn, the way `libstream` already passes streams. A
 `/dev/tty` resolved inside that window still reaches the session's console, because that binding

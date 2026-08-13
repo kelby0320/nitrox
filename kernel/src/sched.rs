@@ -98,7 +98,19 @@ const IDLE_TID: u32 = u32::MAX;
 /// Pre-reserved capacity for the blocked-thread parking list. Like
 /// [`READY_RESERVE`], blocking beyond this is refused rather than allocating
 /// under the rank-1 lock.
-const BLOCKED_RESERVE: usize = 16;
+///
+/// **Global, not per-CPU** — unlike [`READY_RESERVE`] — so this is the number of
+/// threads the *whole system* may have parked in `sys_wait` at once. Every
+/// resource server spends its life there, so it scales with the process count
+/// and not with anything else.
+///
+/// Raised 16 → 64 on 2026-08-13, when M5 Part C added one process (`nxterm`
+/// spawning the shell it hosts) and the boot panicked on
+/// `blocked list within reserve`. Sixteen had been one process away from its
+/// limit for some time; nothing said so, because the failure mode is a panic at
+/// whatever moment the high-water mark is crossed rather than a warning as it is
+/// approached.
+const BLOCKED_RESERVE: usize = 64;
 
 /// Pre-reserved capacity for the exited-thread reap list. Holds the current
 /// thread plus any sibling threads a process exit tears down; sized like the

@@ -16,6 +16,7 @@ libdraw = { path = "../libdraw", features = ["io"] }
 libsurface = { path = "../libsurface" }
 librsproto = { path = "../librsproto" }
 libkern = { path = "../libkern" }
+libstream = { path = "../libstream", features = ["io"] }
 libheap = { path = "../libheap" }
 
 [lib]
@@ -25,3 +26,11 @@ path = "src/lib.rs"
 [[bin]]
 name = "nxterm"
 path = "src/main.rs"
+
+[features]
+# Report each completed line of the grid on the debug console, so
+# `cargo xtask check-terminal` can assert on **what the terminal shows** rather than on
+# pixels — the shell's exact output is not fixed by this milestone, and a pixel comparison
+# would pin it. Off in a real build: a terminal that narrated itself to the kernel log would
+# undo the point of the tty server owning output.
+test-harness = []

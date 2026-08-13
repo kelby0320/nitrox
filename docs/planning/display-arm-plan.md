@@ -515,6 +515,14 @@ Two gates, because they prove different things and one of them cannot be pixel-e
   answer appears **in the terminal's grid**. This is the whole loop: i8042 → `input-server` →
   compositor → `nxterm` → `tty-server` → `nxsh` → back out. Asserted on the grid's contents
   rather than on pixels, because what the shell prints is not fixed by this milestone.
+
+  **Written and passing, but not yet reliable** (2026-08-13). It passes and fails on the same
+  build, and the flakiness is in driving a GUI from QMP rather than in the terminal: the banner,
+  the prompt and the per-keystroke echo reach the grid on every boot. Two causes are known and
+  one is a lead worth following — **input appears to stop reaching the compositor once
+  `input-testclient` exits**, which if true is an `input-server` bug and not this milestone's.
+  Not wired into CI until it is deterministic; a gate that fails on a good build teaches people
+  to ignore gates. See `cmd_check_terminal`'s doc comment for the full diagnosis.
 - **The display gate grows a third region** — `libterm::reference`, a fixed grid with every
   attribute the renderer supports, rendered host-side and guest-side and compared pixel for
   pixel. Same shape as `libui::reference`, for the same reason: the end-to-end gate above
@@ -925,7 +933,7 @@ context menu near a window edge, or a combo box in a small dialog.
 
 This is the part with a real design question in it, and it is not "add a write path".
 
-- [ ] **C1 — the data flow inverts, and the pty is the shape.**
+- [x] **C1 — the data flow inverts, and the pty is the shape.** ✅ 2026-08-13.
       Today the tty server holds `/dev/console` and *reads keystrokes from the device*. In a
       GUI terminal the keystrokes arrive at `nxterm` — a compositor client with a window and
       focus — and the shell's output has to reach `nxterm` to be rendered. The server is no
@@ -941,7 +949,8 @@ This is the part with a real design question in it, and it is not "add a write p
       a free function that calls `kprint` and becomes a method on a backend that is either
       the serial console or a channel.
 
-- [ ] **C2 — routing is per-terminal, keyed by the backend.**
+- [x] **C2 — routing is per-terminal, keyed by the backend.** ✅ 2026-08-13 (the server half;
+      `nxterm` attaches in C3).
       **Not per-session**, which is what this said until 2026-08-12. The correction came from
       the maintainer asking why `session-mgr` would spawn `nxterm` at all, and it is worth
       keeping because the original was wrong in two independent ways.
@@ -969,7 +978,7 @@ This is the part with a real design question in it, and it is not "add a write p
       **Both backends must keep working** (governing decision 3), so the serial path stays the
       default and the GUI one is additive.
 
-- [ ] **C3 — the shell inside the window, and the `/dev/tty` it cannot have yet.**
+- [x] **C3 — the shell inside the window, and the `/dev/tty` it cannot have yet.** ✅ 2026-08-13.
       `nxterm` spawns `nxsh` itself, with `namespace: 0` — inherit — exactly as `nxsh` spawns
       `ls`. It hands the tty channel down in the setup message, the way `libstream` already
       passes streams and the way Unix inherits fd 0/1/2.
@@ -992,7 +1001,7 @@ This is the part with a real design question in it, and it is not "add a write p
       triggered on Milestone 7, where [`graphical-session.md`](../design/graphical-session.md)
       §6.1 owns the question.
 
-- [ ] **C4 — does a dead backend end that terminal's ttys?**
+- [x] **C4 — does a dead backend end that terminal's ttys?** ✅ 2026-08-13 — yes, it does.
       `console-and-tty.md` already answers the single-terminal case: a terminal ends when its
       holder exits, via `PeerClosed`. Per-terminal routing makes the plural question small —
       `nxterm` exiting ends the ttys routed to *its* backend and touches nothing else in the

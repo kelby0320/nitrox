@@ -654,7 +654,13 @@ fn po_wait(po: u64) -> (i32, u64) {
     }
 }
 
-fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record) -> i64 {
+fn run(
+    notif: u64,
+    namespace: u64,
+    argv: &[String],
+    env: libstream::wire::Record,
+    terminal: Option<u64>,
+) -> i64 {
     // Script mode has no terminal: §11h's checkpoint asks nobody.
     let mut host = NitroxHost { namespace, notif, tty: 0 };
 
@@ -687,7 +693,7 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
             }
         },
         // No script: the interactive loop (§11).
-        None => return repl(notif, namespace, env),
+        None => return repl(notif, namespace, env, terminal),
     };
 
     let script = match nxsh::parse_script(&source) {
@@ -731,18 +737,38 @@ fn run(notif: u64, namespace: u64, argv: &[String], env: libstream::wire::Record
 /// completion, no job control: those are §11's rich REPL, gated on the console/tty server
 /// and the compositor terminal, and building them against a raw character device would be
 /// a dependency inversion.
-fn repl(notif: u64, namespace: u64, env: libstream::wire::Record) -> i64 {
+fn repl(
+    notif: u64,
+    namespace: u64,
+    env: libstream::wire::Record,
+    terminal: Option<u64>,
+) -> i64 {
     // The session's terminal. A **channel**, not the raw device: the line discipline —
     // backspace, kill, echo, end-of-input — is the tty server's, and so is the write path,
     // which is what makes this shell's output an object something could redirect rather
     // than bytes shoved at an ambient debug syscall.
-    let Some(tty) = lookup_rights(
-        namespace,
-        b"/dev/tty",
-        libkern::handle::RIGHT_SEND | libkern::handle::RIGHT_RECV | libkern::handle::RIGHT_WAIT,
-    ) else {
-        kprint(b"nxsh: /dev/tty not found\r\n");
-        return EXIT_USAGE;
+    //
+    // **Handed down if the parent gave one, resolved otherwise.** A terminal emulator hands
+    // the shell it hosts the terminal whose backend it holds, because `/dev/tty` is a
+    // namespace binding and cannot name a *particular* window — the same reason Unix
+    // inherits fd 0/1/2 rather than looking them up. Resolving is still the ordinary path
+    // and is what a serial login does. See `docs/design/graphical-session.md` §6.1 for what
+    // makes the resolved path work inside a window too.
+    let tty = match terminal {
+        Some(t) => t,
+        None => {
+            let Some(t) = lookup_rights(
+                namespace,
+                b"/dev/tty",
+                libkern::handle::RIGHT_SEND
+                    | libkern::handle::RIGHT_RECV
+                    | libkern::handle::RIGHT_WAIT,
+            ) else {
+                kprint(b"nxsh: /dev/tty not found\r\n");
+                return EXIT_USAGE;
+            };
+            t
+        }
     };
 
     let mut interp = Interp::with_host(
@@ -1207,11 +1233,11 @@ pub extern "C" fn _start(notif: u64, ns: u64, endpoint: u64, arg0: u64) -> ! {
     let boot = bootstrap(notif, ns, endpoint, arg0);
     // The shell's own environment arrives the same way every stage's does — there is one
     // mechanism, not a special case for the shell.
-    let (argv, env) = match boot.setup() {
-        Some(Ok(s)) => (s.argv, s.env),
-        _ => (Vec::new(), libstream::wire::Record::default()),
+    let (argv, env, terminal) = match boot.setup() {
+        Some(Ok(s)) => (s.argv, s.env, s.terminal),
+        _ => (Vec::new(), libstream::wire::Record::default(), None),
     };
-    exit(run(notif, ns, &argv, env))
+    exit(run(notif, ns, &argv, env, terminal))
 }
 
 #[panic_handler]
