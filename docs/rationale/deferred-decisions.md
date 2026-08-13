@@ -292,6 +292,27 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**`/dev/draw/manage` gates nothing yet — `TODO(manage-ungated)`.** The manager channel's
+capability is meant to be the *binding*: a supervisor puts it in the shell's namespace and nowhere
+else, which is how everything else in this system is gated. In Milestone 6 that gates nothing, and
+three facts compose to say so: `/dev/draw` is bound **unscoped** into init's root namespace
+(`userspace/init/src/main.rs`), every graphical client is spawned with `namespace: 0` and inherits
+it, and the compositor classifies resolves by **suffix alone** with no caller identity — it already
+records the consequence for a different suffix, *"Any holder of `/dev/draw` can resolve `info` in a
+loop."*
+
+So any graphical client could resolve `manage`, and the only thing separating them is the
+first-come rule — which makes the **race** the gate, when that rule exists to avoid one. M6's image
+relies on an *ordering* (the intended manager resolves first) and this entry is the record that it
+is an ordering rather than a capability.
+
+**Not a hole to plug in M6.** Namespace-based gating needs *per-client namespaces*, and the process
+that constructs them is `desktop-shell` ([`graphical-session.md`](../design/graphical-session.md)
+§3, §5a). Until it exists there is one namespace and everybody inherits it, so no binding can be
+given to one client and withheld from another. Trigger: **Milestone 7**, which closes it by binding
+`manage` only into the shell's session namespace — at which point the first-come rule stops being
+load-bearing and becomes a belt-and-braces check.
+
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
 server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and
