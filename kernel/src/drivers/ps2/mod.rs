@@ -25,7 +25,7 @@ pub mod mouse;
 pub mod ring;
 pub mod scancode;
 
-use core::sync::atomic::{AtomicPtr, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 use crate::arch::ps2::Port;
 use crate::arch::timer::ArchTimer;
@@ -106,6 +106,10 @@ static PS2: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new());
 
 /// Completes parked reads after an ISR deposits events.
 static PS2_DPC: Dpc = Dpc::new(ps2_intr_dpc, core::ptr::null_mut());
+
+/// Set once a device has answered and the handlers are armed. Guards [`poll`] — see there for
+/// why an absent controller would otherwise be drained on every tick.
+static PRESENT: AtomicBool = AtomicBool::new(false);
 
 /// The leaked-`'static` device nodes, indexed by `DEV_*`. `device_ref` hands out counted
 /// references for `/dev/input/raw/<n>` lookups.
@@ -282,8 +286,14 @@ fn drain_controller() -> bool {
     // after a bad reset, a keyboard repeating a stuck key — would hold this CPU forever and
     // the machine simply stops. The console's equivalent loop is unbounded and gets away
     // with it because a UART with nothing arriving stops immediately; an input controller
-    // with two attached devices is not that. Anything still waiting is picked up by the
-    // next interrupt, which the controller will raise because the byte is still there.
+    // with two attached devices is not that.
+    //
+    // **Anything still waiting is collected by [`poll`], not by the next interrupt.** This
+    // comment used to say the opposite — "the controller will raise because the byte is still
+    // there" — and that is false for this device: it raises when a byte *becomes* available,
+    // so a byte already sitting in the output buffer produces no further edge, and the buffer
+    // stays full forever. That sentence cost three investigations; the tick-driven sweep is
+    // what actually recovers the byte.
     let mut budget = MAX_DRAIN_PER_IRQ;
     while budget > 0
         && let Some((port, byte)) = crate::arch::ps2::read_byte()
@@ -314,6 +324,45 @@ fn drain_controller() -> bool {
         }
     }
     g.devices.iter().any(|d| d.parked.is_some())
+}
+
+/// Collect anything the interrupt path missed. Called from the timer IRQ dispatcher, ahead of
+/// the DPC drain so a byte recovered here wakes its reader on this tick rather than the next.
+///
+/// **This exists because an i8042 interrupt can be lost, and the loss is unrecoverable
+/// without it.** The controller has a *one-byte* output buffer and its IRQ line is a level
+/// that the interrupt controller turns into an edge. A byte that arrives after a drain's last
+/// status read but while the line is still asserted produces **no new edge** — and because
+/// nobody then reads the buffer, the line never drops, so no later byte can produce one
+/// either. The device and the driver deadlock: a byte sits in the buffer forever and every
+/// keystroke and mouse movement after it is discarded by a full controller.
+///
+/// That is not hypothetical. It is what made `check-input` and `check-terminal` intermittent
+/// through Milestones 5 and 6, and the state was captured directly: `status=0x1d` (output full,
+/// keyboard byte) with the ISR counters frozen and the last drain having exited on
+/// `status=0x1c` (output *empty*) — the driver did everything right and was never called again.
+///
+/// **The race cannot be closed by re-checking harder**: however many times the drain re-reads
+/// the status, there is a last read, and a byte can always arrive after it. A periodic sweep is
+/// the standard answer — Linux's i8042 carries a polling timer for the same class of fault —
+/// and one `inb` per tick is not a cost worth optimising.
+pub fn poll() {
+    // **A machine with no i8042 must not pay for one.** An absent controller floats its
+    // status port high, so `output_pending` reads `0xFF` — which has `STATUS_OUTPUT_FULL`
+    // set — and an unguarded sweep would take the lock and run the full drain budget on
+    // every tick, forever: 128 port reads per tick per CPU with interrupts masked, buying
+    // nothing. Worse, `0xFF` also has the mouse packet's sync bit set, so three of them
+    // decode as a valid three-button-down packet. `arch::ps2::init` promises such a machine
+    // "reports both absent and the boot continues"; this is what keeps that true.
+    if !PRESENT.load(Ordering::Acquire) {
+        return;
+    }
+    if !crate::arch::ps2::output_pending() {
+        return;
+    }
+    if drain_controller() {
+        crate::dpc::enqueue(&PS2_DPC);
+    }
 }
 
 /// Keyboard interrupt (IRQ 1).
@@ -363,6 +412,16 @@ pub fn init() {
     // SAFETY: ring-0, after `IrqRouter::init` and after `arch::ps2::init`; both handlers
     // are valid for the kernel's lifetime and the rings are ready to receive.
     let (kbd_vec, aux_vec) = unsafe { crate::arch::ps2::arm(kbd_isr, aux_isr) };
+    // Only now may `poll` touch the ports: a device answered, so the status port is the
+    // controller's and not a floating bus.
+    //
+    // **Last, and that ordering is load-bearing in the other direction.** Setting this before
+    // `arch::ps2::init`'s polled handshake would let a tick's sweep consume the controller's
+    // own `0xFA`/`0xAA` replies as if they were scancodes — the phantom-modifier failure this
+    // module's header warns about. Today no tick can land here at all (the periodic timer
+    // starts in `sched_bringup`, after this runs), so the window is unreachable rather than
+    // merely harmless; storing last is what keeps it unreachable if that ever changes.
+    PRESENT.store(true, Ordering::Release);
     crate::kprintln!(
         "ps2: {}{}armed (kbd vec{:#x}, aux vec{:#x})",
         if present.keyboard { "keyboard " } else { "" },

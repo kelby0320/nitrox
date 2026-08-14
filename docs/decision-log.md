@@ -14914,3 +14914,134 @@ That is the second time in this milestone that a guarantee had to move to where 
 see it. The first was `place` returning its damage at all; this is the same lesson applied one
 level further in, and it is only visible by asking *"what exactly does this stop someone doing?"*
 rather than *"is this better than before?"*.
+
+## 2026-08-13 — The i8042 loses interrupts, and that is what made every input gate flaky
+
+Three separate investigations across M5 and M6 ended in "the injection did not arrive, cause
+unknown": `check-terminal`'s intermittency, the PR #194 lead that *"input appears to stop reaching
+the compositor once `input-testclient` exits"*, and `check-input` collapsing from 4/4 to 1/6 when
+M6 Part B changed a constant. They are one bug.
+
+### What it is
+
+The i8042 has a **one-byte output buffer** and an IRQ line that the interrupt controller turns
+into an **edge**. A byte arriving after a drain's last status read, while the line is still
+asserted, produces **no new edge** — and because nobody then reads the buffer, the line never
+drops, so no later byte can produce one either. The device and the driver deadlock: one byte sits
+in the buffer forever and **every keystroke and mouse movement after it is discarded by a full
+controller**.
+
+### The evidence, because "an interrupt was lost" is easy to assert and hard to believe
+
+Captured from a stalled guest, printed once a second and never changing:
+
+```
+status=0x1d  kbdisr=3  auxisr=28  bytes=48  budget=0  exit=0x1c
+```
+
+- `status=0x1d` — output full (bit 0), AUX clear: a **keyboard** byte is waiting.
+- `kbdisr=3`, frozen — no interrupt has been delivered since.
+- `exit=0x1c` — the last drain exited with output **empty**. The driver did everything right.
+- `budget=0` — the drain never hit its 64-byte cap, killing the first hypothesis.
+
+And a matched experiment: injecting a mouse motion *after* the stall produces nothing either, so
+it is the controller that is wedged and not one device's queue.
+
+### Why re-checking harder cannot fix it
+
+However many times the drain re-reads the status, there is a last read, and a byte can always
+arrive after it. `drain_controller`'s comment asserted the opposite — *"Anything still waiting is
+picked up by the next interrupt, which the controller will raise because the byte is still
+there"* — and that sentence is **false for this device**: the controller raises on a byte
+*becoming* available, not while one is available.
+
+A periodic sweep is the standard answer; Linux's i8042 carries a polling timer for the same class
+of fault. `drivers::ps2::poll()` runs from the timer IRQ dispatcher — ahead of the DPC drain, so a
+recovered byte wakes its reader on this tick rather than 10 ms later — and costs one `inb` per
+tick. It is guarded by a `PRESENT` flag, because an absent controller floats its status port to
+`0xFF`, which has the output-full bit set; unguarded, a machine with no i8042 drains a floating
+bus on every tick forever (measured: **22,400** drains in a 40 s boot under `-M q35,i8042=off`,
+against **0** with the guard).
+
+### Result, and what the numbers do and do not show
+
+**The efficacy claim in the first draft of this entry was not supported by the evidence cited for
+it, and the PR #197 review was right to block on it.** The number quoted was `check-input` going
+from 1-pass-in-6 to 6-in-6 — but those two measurements came from *different branches*: the 1-in-6
+was on `phase-4/m6-partb`, whose `MAX_SESSIONS` change is what provoked the failure, and the 6-in-6
+was on the fix branch, which does not contain it. The reviewer compiled `poll()` out and got 6-in-6
+anyway, which is exactly what that comparison should have predicted and what the entry claimed was
+impossible.
+
+What actually establishes efficacy is a **direct measurement of the mechanism**: instrumenting
+`poll()` to count the bytes *it* takes from the controller, and counting the parked reads the DPC
+it queues actually completes.
+
+**Measured on one host** — x86_64, QEMU TCG, idle, `-smp 4`, `check-input`, per run. The
+configuration matters and the spread is wide, so these are ranges over runs, not constants:
+
+| configuration | `poll` calls finding output pending | bytes `poll` itself drained | parked reads completed |
+|---|---|---|---|
+| `phase-4/m6-partb` (the failing one) | 0–12 | **0–52** | **0–9** |
+| this branch | 0–4 | 0–2 | 0–3 |
+| this branch, on the reviewer's host | 0–1 | **0** | 0 |
+
+A run that fails early — the load timeout below — contributes zeros throughout, because the guest
+never reaches key injection.
+
+**Two earlier numbers in this entry were wrong and are corrected above** (PR #197, review 2). The
+first draft of this table said "14 recovered" and "2–4 recovered, each woke a parked reader". Both
+columns measured something other than what they claimed:
+
+- The count was incremented *before* draining, so it counted **calls that found output pending**,
+  not bytes. Some of those drain nothing: the status read is unlocked, so another CPU's ISR can
+  take the byte in between. The reviewer caught exactly that case live.
+- "Woke a parked reader" was read off `drain_controller`'s return value — which is
+  `devices.iter().any(|d| d.parked.is_some())`, i.e. **"a reader is waiting"**, true whether or not
+  this drain produced anything for it. It is the same failure as the pass count one level down: an
+  assertion that holds equally for the working and the broken case. Establishing it properly means
+  counting completions in `ps2_intr_dpc`, where a `parked` entry is actually taken.
+
+And the gate outcome, split by *failure signature* rather than by pass count — the split matters,
+because `check-input` has two independent failure modes and only one of them is this bug:
+
+| signature | pre-fix | post-fix |
+|---|---|---|
+| input loss (past `ui-testclient: PASSED`, dies on an injected key or button) | 5 of 6 | **0 of 6** |
+| load timeout (never reaches `PASSED`; no key ever injected) | 1 of 6 | 3 of 6 |
+
+So: the controller loses bytes on this host in both configurations, and on the reviewer's host in
+neither — the wedge is timing-dependent, and how often it happens is a property of the host and the
+workload, not of the code. The gate is insensitive to small losses anyway, because injected mouse
+motion is re-sent and a later injection satisfies the assertion. That insensitivity is why a pass
+count was the wrong instrument, and why
+`check-input` will **not** catch a regression that deletes `poll()`. Recording that as a known
+gap rather than papering over it.
+
+**The cheapest way to close it is the reviewer's, and it is better than the one first proposed
+here.** Rather than assert on a recovery counter, boot the gate with the controller's IRQ config
+bits cleared, so the sweep is the *only* path into the driver — the review ran exactly this and
+the whole gate passed on `poll()` alone (17 recovery events, 142 bytes). That converts a fix which
+is otherwise exercised only when the hardware misbehaves into a **deterministic** test: delete
+`poll()` and it fails every run rather than one in six. It tests the recovery path directly
+instead of hoping the fast path breaks. Deferred out of this change as scope; tracked in
+`docs/rationale/deferred-decisions.md`.
+
+`check-terminal` gets materially further — it now reliably clicks, focuses and types four
+characters where it used to fail at the click — but **still fails at the fifth keystroke**, so it
+has a second, unrelated fault and is not claimed as fixed. (A later experiment showed that fault is
+not the fifth *position* and not the letter `m`: reordering the word to `miwhoa` types all six.)
+
+### The method note worth keeping
+
+This took three attempts across two milestones, and the thing that finally cracked it was not
+insight — it was **making the failure observable**. `Session::expect` had been accumulating the
+entire guest transcript and printing 400 characters of it, so every investigation was reduced to
+guessing at a log that existed and was thrown away. Dumping it to a file (committed separately)
+turned a two-milestone mystery into an afternoon.
+
+Two probes were wrong before one was right, and both wrongnesses were informative: the first took
+the serial lock inside the PS/2 lock and the kernel's own lockdep panicked on it, which is that
+machinery doing exactly its job; the second reported only counters, which showed *that* input
+stopped but not *why*. The status register was the datum that mattered, and reading it required
+going through the neutral `crate::arch` interface — `check-arch` refused the shortcut.

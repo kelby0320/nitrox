@@ -1162,6 +1162,17 @@ the boot chain does not already exercise, remains deferred. Trigger: a case that
 expressed as "the boot completes and the harness agrees". See
 `docs/conventions/qemu-integration-tests.md`.
 
+**A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
+`drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
+exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one
+host it drains up to 52 bytes a run, on another zero, so **no pass count catches a regression that
+deletes it**. The fix is to boot the gate with the controller's IRQ config bits cleared, making the
+sweep the only path into the driver — proven to work in the PR #197 review, where the entire gate
+passed on `poll()` alone (17 recovery events, 142 bytes). Then deleting `poll()` fails every run
+instead of one in six. Deferred as scope from the bug fix itself; it needs a `test-harness`-gated
+way to suppress the IRQ enables in `arch::ps2::arm` plus an xtask flag. Trigger: any further work
+on the sweep, or a second driver needing the same recovery shape (USB HID, i2c touchpad).
+
 **`libkern` mock-syscall test mode.** `userspace/libkern/CLAUDE.md` describes a feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
 
 ### Auditing and observability

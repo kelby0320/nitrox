@@ -98,6 +98,20 @@ this system already does with the console.
                                                    keycode+modifiers → text
 ```
 
+**The two IRQs are not the only way a byte enters the driver, and on the failure that matters
+they are not the way at all.** The i8042's line is a level the interrupt controller renders as
+an edge, so a byte arriving while the line is already asserted raises nothing; nobody then
+empties the one-byte buffer, and the line never falls, so no *later* byte can raise anything
+either. The controller and the driver deadlock with a byte in hand. `drivers::ps2::poll`,
+called from the timer IRQ dispatcher ahead of the DPC drain, is what breaks that — one status
+read per tick, a drain only when the buffer is full. The ISR is the fast path; the sweep is
+what makes the fast path's loss recoverable rather than fatal (2026-08-13; see the decision
+log).
+
+The lesson generalises past this controller: **a driver for a shared-buffer device with an
+edge-derived interrupt needs a recovery path that does not depend on that interrupt.** A USB
+HID or i2c touchpad driver arriving later should be designed knowing that, not rediscover it.
+
 **This is the `tty-server` shape.** The kernel owns `/dev/console` — a char `DeviceNode`
 fed by COM1's receive interrupt — and a userspace resource server holds it *exclusively*
 and serves `/dev/tty`. Input is the same arrangement with more devices below it. That
@@ -208,7 +222,7 @@ wire break.
 
 | Concern | Where | Why there |
 |---|---|---|
-| Port I/O, IRQ, controller state machine | kernel driver | Port I/O is ring 0; the i8042's one-byte output buffer needs a prompt ISR |
+| Port I/O, IRQ, controller state machine | kernel driver | Port I/O is ring 0; the i8042's one-byte output buffer needs a prompt ISR — *and* a tick-driven sweep for the bytes that buffer loses, see §2 |
 | Scancode → keycode | kernel driver | One small table every consumer would otherwise duplicate; getting it wrong is a bug, not a preference (`display-substrate.md` §5) |
 | Merging device streams; hotplug; device policy (acceleration, tap-to-click) | `input-server` | Policy, and it needs to see every device at once |
 | Triples → logical events; modifier state; click/drag synthesis | `libinput` | Consumer-side interpretation, shared by the compositor and any future privileged consumer |
