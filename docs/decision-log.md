@@ -15499,6 +15499,16 @@ reached on the one they did not, and the outcome the comment promised ("no waite
 queued, they'll be told to retry") is now actually produced by the mechanism rather than
 asserted.
 
+Extended in review to the waiter lists: `Timer`, `PendingOperation`, `InterruptObject`,
+`NotificationChannel` (its queue too) and `IpcChannel` all push under `SCHED` via
+`wait_on → obj_add_waiter`, with the identical `if len < MAX { try_push().expect(…) }` shape.
+All safe today — each reserves with `?` at construction, so `len < MAX ⟹ len < cap` — but the
+uniformity argument that justified converting the already-safe `sched.rs` pushes applies to
+them exactly: these are the neighbours a new waiter list is copied from. A seventh site fell
+out of that sweep, `IpcChannel::pending_sends`, and is the one that mattered most: its value
+owns an `ObjectRef`, and `try_push` **drops its argument** when growth fails — under `SCHED`,
+reaching `SlabCache::free`.
+
 Out of scope, deliberately: `namespace.rs`'s pushes look like the same shape and are not. They
 `try_reserve` explicitly, handle its failure by returning an error before moving an `ObjectRef`
 into the value, and run under a rank-4 lock rather than the rank-1/IRQ case F2 is about.

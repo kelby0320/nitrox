@@ -447,6 +447,25 @@ mod tests {
         s
     }
 
+    /// An **unreserved** waiter list reports itself full rather than allocating.
+    ///
+    /// This is the case `init`'s best-effort `try_reserve` leaves behind on failure, and the
+    /// one the length check cannot catch: `len() >= SEED_WAITERS_MAX` is `0 >= 4`, false, so
+    /// control reaches the push. Before 2026-08-14 that push *grew* — `kmalloc` under this
+    /// leaf-ranked lock, the very inversion `init`'s comment says the reserve exists to
+    /// avoid — and returned `Queued`. Every other test here builds through `reserved_state`,
+    /// so nothing exercised it (kernel audit C.1(e); PR #205 review, finding 4).
+    #[test]
+    fn register_reports_full_when_the_reserve_never_happened() {
+        crate::mm::test_support::init_global_heap();
+        let mut s = EntropyState::new(); // deliberately *not* `reserved_state()`
+        assert_eq!(s.seed_waiters.capacity(), 0);
+
+        assert!(matches!(s.register_waiter(po()), SeedWaitReg::Full(_)));
+        assert_eq!(s.seed_waiters.capacity(), 0, "refusing must not allocate");
+        assert_eq!(s.seed_waiters.len(), 0);
+    }
+
     #[test]
     fn register_returns_already_seeded_when_seeded() {
         let mut s = reserved_state();

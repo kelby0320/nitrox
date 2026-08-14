@@ -278,10 +278,13 @@ impl<T> Default for KVec<T> {
 #[cfg(test)]
 mod tests {
 
+    use super::*;
+
     /// The whole point: at capacity it refuses and hands the value back, rather than
     /// allocating — which under `SCHED` would reach the allocator's plain spinlock (F2).
     #[test]
     fn push_within_capacity_refuses_instead_of_growing() {
+        init_global_heap();
         let mut v: KVec<u32> = KVec::new();
         v.try_reserve(2).unwrap();
         let cap = v.capacity();
@@ -308,12 +311,12 @@ mod tests {
     /// assert sits *beside* a `try_push` that has already grown by then).
     #[test]
     fn push_within_capacity_on_an_unreserved_vector_allocates_nothing() {
+        init_global_heap();
         let mut v: KVec<u32> = KVec::new();
         assert_eq!(v.capacity(), 0);
         assert_eq!(v.push_within_capacity(1), Err(1));
         assert_eq!(v.capacity(), 0, "refusing must not allocate");
     }
-    use super::*;
     use crate::mm::test_support::init_global_heap;
     use core::sync::atomic::{AtomicUsize, Ordering};
 

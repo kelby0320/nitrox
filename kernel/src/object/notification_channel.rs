@@ -118,12 +118,14 @@ impl NotificationChannel {
         // waiters aren't double-woken when already wakeable.
         let was_signaled = !inner.queue.is_empty() || inner.dropped > 0;
         if inner.queue.len() < Self::QUEUE_CAP {
-            inner.queue.try_push(n).expect("within reserved queue capacity");
+            // Non-growing: enqueue runs under `SCHED` and `try_push` would `kmalloc` there
+            // (F11). `QUEUE_CAP` is reserved at construction, so this cannot refuse.
+            let _ = inner.queue.push_within_capacity(n);
         } else if n.is_exception() {
             // Evict the oldest non-exception entry to preserve fault info.
             if let Some(i) = inner.queue.iter().position(|e| !e.is_exception()) {
                 inner.queue.remove(i);
-                inner.queue.try_push(n).expect("freed a slot");
+                let _ = inner.queue.push_within_capacity(n);
             } else {
                 // All-exceptions and full: drop-count rather than grow/lose silently.
                 inner.dropped = inner.dropped.saturating_add(1);
@@ -174,7 +176,13 @@ impl NotificationChannel {
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
                 .waiters
-                .try_push(thread)
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
+                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
+                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
+                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
+                // but the type is what should say so, since this is the shape a new waiter
+                // list gets copied from (PR #205 review, optional 5).
+                .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
         } else {

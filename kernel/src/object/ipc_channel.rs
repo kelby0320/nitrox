@@ -508,7 +508,13 @@ impl IpcChannel {
         if inner.recv_waiters.len() < Self::MAX_WAITERS {
             inner
                 .recv_waiters
-                .try_push(thread)
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
+                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
+                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
+                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
+                // but the type is what should say so, since this is the shape a new waiter
+                // list gets copied from (PR #205 review, optional 5).
+                .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
         } else {
@@ -578,15 +584,25 @@ impl IpcChannel {
             held[i] = transfers[i].take();
         }
         // `po.clone()` bumps the refcount (atomic; no alloc/drop) — sound under SCHED.
+        // Non-growing, and here the value carries an `ObjectRef` (`po`): `try_push` drops
+        // its argument when a growth fails, which under `SCHED` would reach
+        // `SlabCache::free` (F2). Reserved to `MAX_PENDING_SENDS` at construction and
+        // length-checked above, so it cannot refuse — a seventh site of the shape audit
+        // C.1(c) describes, found while sweeping the six the review named.
         peer_inner
             .pending_sends
-            .try_push(PendingSend {
+            .push_within_capacity(PendingSend {
                 msg: *msg,
                 transfers: held,
                 po: po.clone(),
                 cancelled: false,
             })
-            .expect("within reserved pending-send capacity");
+            .unwrap_or_else(|held| {
+                // Unreachable: reserved at construction and length-checked above. Do not let
+                // `held` drop here — it owns an `ObjectRef` and `SCHED` is held.
+                core::mem::forget(held);
+                panic!("pending-send queue: reserve exhausted despite the length check above");
+            });
         BlockSendOutcome::Queued
     }
 

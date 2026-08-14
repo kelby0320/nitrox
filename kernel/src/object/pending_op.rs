@@ -184,7 +184,13 @@ impl PendingOperation {
         if inner.waiters.len() < Self::MAX_WAITERS {
             inner
                 .waiters
-                .try_push(thread)
+                // `push_within_capacity`, not `try_push`: this runs under `SCHED`
+                // (`wait_on` → `obj_add_waiter` with the guard held), and `try_push` grows,
+                // which is `kmalloc` under the rank-1 lock (F11). Safe either way today —
+                // construction reserves `MAX_WAITERS` with `?`, so `len < MAX ⟹ len < cap` —
+                // but the type is what should say so, since this is the shape a new waiter
+                // list gets copied from (PR #205 review, optional 5).
+                .push_within_capacity(thread)
                 .expect("within reserved waiter capacity");
             Ok(())
         } else {

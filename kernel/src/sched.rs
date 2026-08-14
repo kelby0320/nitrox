@@ -106,16 +106,31 @@ const IDLE_TID: u32 = u32::MAX;
 ///
 /// Raised 16 → 64 on 2026-08-13, when M5 Part C added one process (`nxterm`
 /// spawning the shell it hosts) and the boot panicked on
-/// `blocked list within reserve`. Sixteen had been one process away from its
+/// `blocked list within reserve` (the message reads `blocked list: reserve
+/// exhausted — …` since 2026-08-14). Sixteen had been one process away from its
 /// limit for some time; nothing said so, because the failure mode is a panic at
 /// whatever moment the high-water mark is crossed rather than a warning as it is
 /// approached.
 const BLOCKED_RESERVE: usize = 64;
 
-/// Pre-reserved capacity for the exited-thread reap list. Holds the current
-/// thread plus any sibling threads a process exit tears down; sized like the
-/// run queue so a whole process's threads fit without allocating under the lock.
-const REAP_RESERVE: usize = 16;
+/// Pre-reserved capacity for the exited-thread reap list. Holds the current thread plus any
+/// sibling threads a process exit tears down.
+///
+/// **Raised 16 → [`READY_RESERVE`] on 2026-08-14, because the comment here already said it
+/// was that.** It claimed to be "sized like the run queue"; the run queue went 16 → 32 for
+/// Phase 4 (F6) and this did not follow. Nothing noticed while an over-full push merely
+/// *grew* — badly, allocating under `SCHED` (F11), but silently. Since pushes now refuse, the
+/// number is load-bearing: `exit_process` sweeps every sibling of the exiting process into
+/// this list in one lock hold, so it is the cap on threads-per-process at exit
+/// (PR #205 review, finding 2).
+///
+/// **That cap is userspace-reachable and aborts the machine when crossed**, because
+/// `sys_thread_create` has no per-process limit: 33 threads that block and then exit will
+/// trip it. Refusing is still right — growing here is the forbidden pattern, and the
+/// alternative to the panic is not "grow" but "reap in batches", which is a real change to
+/// the exit path. Tracked in `docs/rationale/deferred-decisions.md`; until then this number
+/// is the bound and it is stated rather than implied.
+const REAP_RESERVE: usize = READY_RESERVE;
 
 /// Pre-reserved capacity for [`SchedState::deferred_drops`] — `ObjectRef`s a
 /// lock-held or IRQ-context path must release but cannot drop in place (a drop
@@ -3830,8 +3845,9 @@ fn park_reaper() {
 /// [`SchedState::ended_pids`], so a missed edge costs nothing.
 ///
 /// **A fifth placement site, and the only one that bypasses the policy.** It pushes onto
-/// `ready[this_cpu()]` directly: no affinity check, no [`cpu_accepts_work`], no capacity
-/// check beyond a `debug_assert!`. Sound today for a reason worth writing down rather than
+/// `ready[this_cpu()]` directly: no affinity check and no [`cpu_accepts_work`]. Its capacity
+/// check is [`push_reserved`]'s refusal, which is a real one — the `debug_assert!` that used
+/// to sit here was not, since the growth beside it happened first and succeeded. Sound today for a reason worth writing down rather than
 /// rediscovering — a CPU executing this code is by definition not parked, so the CPU it
 /// chooses always accepts work — but it is a fifth opinion on placement, in the same shape
 /// as the extra opinions on `online_mask` the audit found in § A. If placement policy grows
