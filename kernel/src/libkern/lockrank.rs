@@ -79,7 +79,8 @@
 //! masking — neither of which exists in a hosted test process.
 //!
 //! The scope arithmetic itself does not depend on any of that, so it is unit-tested
-//! host-side against a plain local state struct — see the tests at the bottom.
+//! host-side: the *rule* through [`classify`], which the tracker itself calls, and the
+//! *bookkeeping* against a plain local state struct — see the tests at the bottom.
 
 /// Where a lock sits in the acquisition order. **Smaller is acquired first** — a lock may
 /// only be taken while every rank already held is strictly smaller.
@@ -530,11 +531,20 @@ mod tracker {
 /// Host tests for the scope arithmetic.
 ///
 /// The *tracker* is compiled out under `cfg(test)` (module docs § Not under host
-/// `cfg(test)`) because its per-CPU state is invalid there. The arithmetic it performs is
-/// not — so it is reproduced here over a plain local struct, with no atomics, no CPU index
-/// and no interrupt masking, and exercised directly. This is the part that got the design
-/// wrong the first time; it should not go untested just because the plumbing cannot run on
-/// the host.
+/// `cfg(test)`) because its per-CPU state is invalid there. What that costs, and what it
+/// does not, is worth being exact about — the distinction is the reason for [`classify`]:
+///
+/// - **The rule** — what an acquisition means given what is held — is [`classify`], and the
+///   tests below call **that function**, the same one the tracker calls. It is not
+///   reimplemented here.
+/// - **The bookkeeping** — the stack, the depth, the floor — is the part that genuinely
+///   cannot run on the host, so `State` below models it over a plain local struct with no
+///   atomics, no CPU index and no interrupt masking.
+///
+/// It used to reproduce the rule here too, and the reproduction had silently lost the
+/// shootdown-lock contract branch (2026-08-14). If you are adding a rule, add it to
+/// `classify`; anything added to `State` is bookkeeping by definition, and a rule that lands
+/// there is invisible to the kernel.
 #[cfg(test)]
 mod tests {
     use super::LockRank;

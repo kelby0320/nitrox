@@ -63,8 +63,11 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 
 ## B. Interrupt and entry paths
 
-- [ ] **Every interrupt entry stub opens a lock-order scope.** `check-irq-scope` gates this —
+- [x] **Every interrupt entry stub opens a lock-order scope.** `check-irq-scope` gates this —
       audit the gate itself: does it actually see every stub, including the newest?
+      *Audited 2026-08-14: it did not. Two escapes (a guard bound to `_`; a renamed operand)
+      plus a cross-file name collision, all closed; the gate's remaining boundary is written
+      up in its own doc comment. Decision log, 2026-08-14.*
 - [ ] **Nothing allocates or frees in IRQ/DPC context**, remembering that an `ObjectRef` drop
       reaches the allocator. The PS/2 driver's `to_drop` hand-off exists for this; check every
       other DPC for the same hazard.

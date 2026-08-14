@@ -3457,26 +3457,6 @@ fn cmd_check_docs() -> R<()> {
     }
 }
 
-/// `cargo xtask check-irq-scope` — every interrupt entry opens a lock-ordering scope.
-///
-/// The kernel's lock-rank tracker (`kernel/src/libkern/lockrank.rs`) models interrupt
-/// context by having each handler start from an empty view of the held-rank stack, because
-/// the acquisition order genuinely restarts at an interrupt boundary — a tick that lands on
-/// a thread holding an allocator lock and takes `SCHED` is correct, and reads as an
-/// inversion otherwise. That is not a refinement: it is what makes the tracker sound, and
-/// getting it wrong is what got the first attempt withdrawn (decision log 2026-07-29).
-///
-/// A dispatcher that forgets the scope does not fail loudly. It just starts reporting
-/// phantom inversions from its own vector, days later, in whoever's boot log. So the scope
-/// is not left to the author of the next dispatcher:
-///
-/// 1. every `dispatch = sym NAME` in a naked entry stub must name a function defined by the
-///    `irq_dispatcher!` macro, which opens the scope itself; and
-/// 2. that macro must in fact still call `enter_interrupt` — otherwise rule 1 checks that
-///    everyone went through a door that no longer leads anywhere.
-///
-/// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it
-/// exists rather than the day someone remembers this check.
 /// How `irq_dispatcher!` binds the guard [`enter_interrupt`] returns.
 ///
 /// The distinction is the whole of rule 2. `enter_interrupt` opens the scope and its guard
@@ -3528,18 +3508,63 @@ const SYM_OPERAND_ALLOWLIST: &[&str] = &[
     "crate::sched::thread_enter",
 ];
 
+/// `cargo xtask check-irq-scope` — every interrupt entry opens a lock-ordering scope.
+///
+/// The kernel's lock-rank tracker (`kernel/src/libkern/lockrank.rs`) models interrupt
+/// context by having each handler start from an empty view of the held-rank stack, because
+/// the acquisition order genuinely restarts at an interrupt boundary — a tick that lands on
+/// a thread holding an allocator lock and takes `SCHED` is correct, and reads as an
+/// inversion otherwise. That is not a refinement: it is what makes the tracker sound, and
+/// getting it wrong is what got the first attempt withdrawn (decision log 2026-07-29).
+///
+/// A dispatcher that forgets the scope does not fail loudly. It just starts reporting
+/// phantom inversions from its own vector, days later, in whoever's boot log. So the scope
+/// is not left to the author of the next dispatcher:
+///
+/// 1. every `dispatch = sym NAME` in a naked entry stub must name a function defined by the
+///    `irq_dispatcher!` macro, which opens the scope itself; and
+/// 2. that macro must in fact still call `enter_interrupt` — otherwise rule 1 checks that
+///    everyone went through a door that no longer leads anywhere.
+///
+/// Arch-generic: it walks `kernel/src/arch`, so an aarch64 entry path is covered the day it
+/// exists rather than the day someone remembers this check.
+///
+/// ## What it cannot see (the ESCAPES boundary)
+///
+/// This is a textual scan, so its coverage is a convention rather than a proof. Three
+/// escapes are closed by construction — a guard bound to `_` or left as a temporary
+/// ([`ScopeBinding`]), a stub whose operand is renamed ([`SYM_OPERAND_ALLOWLIST`]), and a
+/// stub that leaves the scan's view entirely ([`EXPECTED_ENTRY_STUBS`]). Two are known and
+/// **not** closed, verified during the PR #202 review:
+///
+/// - A macro that puts the handler body *above* the `let` binding classifies as held and
+///   passes. The classifier reads the binding form, not the ordering.
+/// - The count notices a stub going missing, not a new one arriving in a form the scan does
+///   not parse — a positional `sym` operand, say. Adding one is invisible to all three
+///   guards.
+///
+/// Both need someone writing an entry stub in a deliberately unusual shape, which is a
+/// different threat from the accident this gate exists to catch. Stated so the next reader
+/// knows where the line is rather than assuming there isn't one.
 fn cmd_check_irq_scope() -> R<()> {
     let arch_dir = repo_root().join("kernel").join("src").join("arch");
     // Dispatchers named by a naked stub, as (file:line, file, name).
     let mut called: Vec<(String, String, String)> = Vec::new();
-    // Dispatchers the macro generated.
-    let mut generated: Vec<String> = Vec::new();
+    // Dispatchers the macro generated, as (file, name).
+    //
+    // **Per file, for the same reason as `user_entry` below.** Matched by name alone, a
+    // second architecture reusing an obvious name — `timer_dispatch`, `exception_dispatch` —
+    // would have its *unscoped* dispatcher exempted because x86_64 happens to generate one
+    // with that name. Demonstrated in the PR #202 review with a probe file, which passed
+    // green. The check advertises itself as arch-generic, so that is the live half of the
+    // escape rather than a hypothetical.
+    let mut generated: Vec<(String, String)> = Vec::new();
     // Dispatchers that are not interrupts and take the ring-3 entry discipline instead
     // (see `assert_user_entry_safe`): the order begins there rather than restarting.
     let mut user_entry: Vec<(String, String)> = Vec::new();
     // `<name> = sym …` operands that are not the `dispatch` this check keys on. The operand
     // name is a local choice in `naked_asm!`, so without this a stub leaves the check's view
-    // by being renamed — see the ESCAPES note on this function.
+    // by being renamed — see § What it cannot see on `cmd_check_irq_scope`.
     let mut stray_sym: Vec<(String, String)> = Vec::new();
     // Files that define the macro, and whether the definition still opens a scope.
     let mut macro_defs: Vec<(String, Option<ScopeBinding>)> = Vec::new();
@@ -3569,9 +3594,16 @@ fn cmd_check_irq_scope() -> R<()> {
 
             // Any *other* `<ident> = sym` operand. Allowlisted by target, not by operand
             // name, so renaming an operand cannot buy an exemption.
-            if let Some(before) = line.split("= sym").next()
-                && line.contains("= sym")
-                && !line.contains("dispatch = sym")
+            // Comment lines are skipped, as in the `assert_user_entry_safe` scan below and
+            // for the same reason: a doc comment quoting an operand is prose, not code.
+            // Whitespace is normalised first so `dispatch=sym` cannot slip past the
+            // convention by omitting the spaces.
+            let normalised = line.replace("=sym", "= sym").replace("= sym", "= sym");
+            if !trimmed.starts_with("//")
+                && !trimmed.starts_with("*")
+                && let Some(before) = normalised.split("= sym").next()
+                && normalised.contains("= sym")
+                && !normalised.contains("dispatch = sym")
             {
                 let operand: String = before
                     .trim_end()
@@ -3582,7 +3614,7 @@ fn cmd_check_irq_scope() -> R<()> {
                     .into_iter()
                     .rev()
                     .collect();
-                let target: String = line
+                let target: String = normalised
                     .split("= sym")
                     .nth(1)
                     .unwrap_or("")
@@ -3608,7 +3640,7 @@ fn cmd_check_irq_scope() -> R<()> {
                     .chars()
                     .take_while(|c| c.is_ascii_alphanumeric() || *c == '_')
                     .collect();
-                generated.push(name);
+                generated.push((path.display().to_string(), name));
                 pending_macro_body = false;
             }
 
@@ -3709,7 +3741,7 @@ fn cmd_check_irq_scope() -> R<()> {
         ));
     }
     for (site, file, name) in &called {
-        if !generated.iter().any(|g| g == name)
+        if !generated.iter().any(|(f, g)| f == file && g == name)
             && !user_entry.iter().any(|(f, u)| f == file && u == name)
         {
             violations.push(format!(
@@ -4559,6 +4591,39 @@ fn format_cmd(cmd: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The rule-2 classifier, on every form it has to tell apart.
+    ///
+    /// Table-tested because it *is* the fix: before this, the only thing proving the
+    /// classifier worked was a manual mutation of `idt.rs`, which is exactly the situation
+    /// the gate argues against. `Discarded` is the case that shipped green for months —
+    /// `let _ =` keeps `#[must_use]` quiet and closes the scope before the handler body.
+    #[test]
+    fn scope_binding_tells_a_held_guard_from_one_dropped_where_it_is_made() {
+        use super::{ScopeBinding, scope_binding};
+
+        // Held: any real binding, however it is spelt.
+        for line in [
+            "            let _lock_scope = crate::libkern::lockrank::enter_interrupt();",
+            "let g = enter_interrupt();",
+            "let mut g = enter_interrupt();",
+            "let g: IrqScope = enter_interrupt();",
+            "let mut g: IrqScope = enter_interrupt();",
+        ] {
+            assert_eq!(scope_binding(line), ScopeBinding::Held, "{line}");
+        }
+
+        // Discarded: the underscore *pattern*, not a name that begins with one.
+        assert_eq!(scope_binding("let _ = enter_interrupt();"), ScopeBinding::Discarded);
+        assert_eq!(scope_binding("  let _   =   enter_interrupt();"), ScopeBinding::Discarded);
+        assert_eq!(scope_binding("let _x = enter_interrupt();"), ScopeBinding::Held);
+
+        // Temporary: no binding at all, so it drops at the end of the statement.
+        assert_eq!(scope_binding("enter_interrupt();"), ScopeBinding::Temporary);
+        assert_eq!(scope_binding("        enter_interrupt();"), ScopeBinding::Temporary);
+        // A comment mentioning it is not a call site either.
+        assert_eq!(scope_binding("/// calls enter_interrupt()"), ScopeBinding::Temporary);
+    }
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
 
