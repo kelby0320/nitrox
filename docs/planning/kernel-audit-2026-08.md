@@ -76,8 +76,15 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
       budget with interrupts masked.
 - [ ] **EOI ordering and spurious interrupts.** Is an EOI ever issued twice, or skipped on an
       early return? What happens on a spurious vector?
-- [ ] **Preempt-disable/enable balance.** Every `preempt_disable` has a matching enable on
+- [x] **Preempt-disable/enable balance.** Every `preempt_disable` has a matching enable on
       every path including early returns; `RESCHED_PENDING` is replayed rather than dropped.
+      *Audited 2026-08-14. (a) balance and (b) latch-not-dropped both hold — confirmed, no
+      change. (c) the invariant was enforced on the involuntary paths only and (e)
+      `preempt_enable` could wrap the counter to `u32::MAX`: both closed, plus a third guard
+      at the ring-3 boundary for a leaked disable that never reaches a switch. (d) is not a
+      finding but the biggest one here — `switch_into` is reached by **no** host test, so the
+      whole switch path is covered only by booting; it belongs to § D. Decision log,
+      2026-08-14.*
 
 ## C. Cross-CPU lifetime and ownership
 

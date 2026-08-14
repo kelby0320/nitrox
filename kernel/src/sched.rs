@@ -516,6 +516,29 @@ fn clear_online_bit(identity_bound: bool, me: usize) {
     ONLINE_MASK.fetch_and(!(1u64 << me), Ordering::AcqRel);
 }
 
+/// Assert that a thread arriving from ring 3 has preemption enabled.
+///
+/// **The mirror of the underflow guard in [`preempt_enable`], for the imbalance that escapes
+/// every other check.** A *leaked* `preempt_disable` wedges a CPU exactly as the wrap did:
+/// `on_timer_tick` latches and returns forever, and a later enable goes 2 → 1 and never
+/// reaches 0, so neither the underflow assert nor the replay ever fires. `switch_into`'s
+/// assert catches it at the thread's next voluntary switch — but a thread that returns to
+/// ring 3 and makes only non-blocking syscalls never reaches `switch_into`, and that CPU
+/// simply stops preempting with nothing said.
+///
+/// This is the boundary where the truth is free, and it is the same argument
+/// `assert_user_entry_safe` already makes for locks one line above the call site: a thread
+/// that was executing in user mode cannot hold a kernel lock, and cannot have disabled
+/// kernel preemption either. Debug builds only (PR #203 review, optional 1).
+pub fn assert_user_entry_preempt_safe() {
+    debug_assert_eq!(
+        PREEMPT_OFF[SchedState::this_cpu()].load(Ordering::Relaxed),
+        0,
+        "entered a syscall from ring 3 with preemption disabled — a kernel path leaked a \
+         `preempt_disable`, and this CPU will stop preempting until something notices"
+    );
+}
+
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
 /// the thread running on that CPU (which, while nonzero, cannot migrate — that
 /// is the point); read by the same CPU's tick / reschedule-IPI handlers.
@@ -568,8 +591,32 @@ pub fn preempt_disable() {
 pub fn preempt_enable() {
     let prev = preempt_irqs_mask();
     let me = SchedState::this_cpu();
-    let replay = PREEMPT_OFF[me].fetch_sub(1, Ordering::Relaxed) == 1
-        && RESCHED_PENDING[me].swap(false, Ordering::AcqRel);
+    // **Saturating, not wrapping.** An unbalanced enable at depth 0 would set the counter to
+    // `u32::MAX`, and that CPU would never preempt again — the exact failure
+    // `preempt_disable`'s own comment names, reached from the other direction. `[profile.dev]`
+    // sets `overflow-checks = true` and it does not help here: an atomic RMW wraps by
+    // definition, so the dev profile is as silent as release (kernel audit B.5(e)).
+    //
+    // The `debug_assert` is the loud half and the saturation is the safe half: a build that
+    // checks catches the unbalanced enable at the moment it happens, and one that does not
+    // still refuses to brick the CPU.
+    //
+    // **Do not "simplify" this to a plain load/store.** The obvious argument for it — the
+    // counter is per-CPU and interrupts are masked here, so the RMW is redundant — holds on
+    // target and fails under `cfg(test)`, where `preempt_irqs_mask` is a no-op and
+    // `this_cpu()` collapses every host-test thread onto index 0. The atomicity is
+    // load-bearing for the host configuration even though it looks redundant on the one the
+    // comment above describes.
+    let depth_before = PREEMPT_OFF[me]
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
+        // unwrap_or: the closure is infallible, so `fetch_update` cannot return `Err` here.
+        .unwrap_or(0);
+    debug_assert_ne!(
+        depth_before, 0,
+        "preempt_enable with no matching preempt_disable — the counter would have wrapped \
+         to u32::MAX and this CPU would never preempt again"
+    );
+    let replay = depth_before == 1 && RESCHED_PENDING[me].swap(false, Ordering::AcqRel);
     preempt_irqs_restore(prev);
     if replay {
         // Mirror `on_reschedule_ipi`: resume an idle CPU into the scheduler; a
@@ -2250,6 +2297,24 @@ unsafe fn switch_into(
     // has interrupts masked, and blocking with a lock held is forbidden) — this is what
     // turns "already true" into "checked". Debug builds only; inert otherwise.
     crate::libkern::lockrank::assert_switch_safe();
+    // The same idea for the *other* per-CPU invariant, which the lock check cannot see.
+    // A plain-lock holder trips `assert_switch_safe` because it holds a rank; a bare
+    // `preempt_disable()` — the `tlb`, `handle::global` and `reap_pending` windows — holds
+    // nothing, so a yield or block inside one would switch away from a CPU that has asked
+    // not to be descheduled, and leave the counter raised on a thread no longer running.
+    //
+    // The involuntary paths already refuse: `on_timer_tick` and `resched_if_idle_locked`
+    // latch into `RESCHED_PENDING` instead of switching. Nothing checked the **voluntary**
+    // ones — `yield_now` and everything that blocks — which is the gap this closes (kernel
+    // audit B.5(c), decision log 2026-08-14). No reachable violation exists today; this is
+    // what keeps that true.
+    debug_assert_eq!(
+        PREEMPT_OFF[SchedState::this_cpu()].load(Ordering::Relaxed),
+        0,
+        "context switch with preemption disabled — a voluntary switch inside a \
+         preempt-critical region deschedules a CPU that asked not to be, and strands the \
+         raised counter on a thread that is no longer running"
+    );
     // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
     unsafe { arm_kernel_stack_for(next_obj) };
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root

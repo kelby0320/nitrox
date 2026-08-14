@@ -520,6 +520,14 @@ attempt and the guard drop lowers it after release. While the depth is nonzero
 the tick and reschedule IPI do their bookkeeping but skip the switch, latching
 it for `preempt_enable` to replay.
 
+**Enforced at runtime since 2026-08-14, in three places.** The invariant used to rest on
+review alone: `switch_into` asserts that nothing is switched away with the depth raised (the
+voluntary paths — `yield_now` and everything that blocks — which the involuntary ones already
+refuse); `preempt_enable` saturates rather than wrapping and asserts it was not already zero;
+and the ring-3 syscall boundary asserts the depth is zero on entry, which is where a *leaked*
+disable is caught on a thread that never blocks. Debug builds, which is every image `xtask`
+produces. See the decision log, 2026-08-14.
+
 The invariant this buys: **a plain-lock holder is never descheduled**, so every
 spinner waits on a *running* holder and the wait is bounded by the critical
 section. Without it, two deadlock poses were captured live (decision log,
