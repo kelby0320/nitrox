@@ -476,6 +476,15 @@ pub fn online_mask() -> u64 {
 /// [`ArchSmp::identity_bound`](crate::arch::smp::ArchSmp::identity_bound) is that check;
 /// the range check below is a separate, weaker guard and does not cover this — an unbound
 /// CPU's `0` is in range.
+///
+/// **The check errs toward doing nothing, including once where it arguably should act.**
+/// The BSP's bit is set by [`init`] (`main.rs:353`) before `bind_cpu_identity(0, …)`
+/// (`main.rs:432`), so a BSP panic in that window finds its own identity unbound and leaves
+/// its bit set. That is harmless rather than lucky: APs are not launched until after the
+/// binding, so in that window no other CPU exists to initiate a shootdown and wait on it.
+/// The asymmetry is deliberate — failing to clear a bit costs a hang on a machine that has
+/// already panicked, while clearing the wrong one costs silent memory corruption on a
+/// healthy one.
 pub fn leave_online() {
     use crate::arch::smp::ArchSmp;
     clear_online_bit(crate::arch::Smp::identity_bound(), crate::arch::Smp::current_cpu() as usize);
