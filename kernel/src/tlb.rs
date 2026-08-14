@@ -74,6 +74,11 @@ static LOCK: SpinLock<()> = SpinLock::new(LockRank::TlbShootdown, ());
 static REQUEST_ALL: AtomicBool = AtomicBool::new(false);
 /// The page to invalidate when `REQUEST_ALL == false` (linear address).
 static REQUEST_VA: AtomicU64 = AtomicU64::new(0);
+/// A dense CPU index must fit in [`ACKED`]'s bits. `on_ipi` shifts by `current_cpu()` with
+/// no range guard of its own — deliberately, since a CPU servicing an IPI has an identity by
+/// construction — so this is where that assumption is stated rather than assumed.
+const _: () = assert!(MAX_CPUS <= 64, "ACKED is a u64 bitmask indexed by dense CPU id");
+
 /// Bitmask of CPUs that have acknowledged the current request (dense index → bit).
 ///
 /// **A mask rather than a countdown, and that is a correctness choice.** A count cannot say
@@ -201,8 +206,11 @@ fn shootdown(va: Option<VirtAddr>) {
 /// Split out from the spin so the rule is pinned by a host test. **Not a timeout** — a live
 /// target that is merely slow stays in `still_online` and is still waited for.
 fn wait_satisfied(targets: u64, acked: u64, still_online: u64) -> bool {
+    // One clause, not two: `outstanding == 0` is already covered, since an empty set
+    // intersects nothing. An earlier version spelt both out and no test could tell them
+    // apart, which is a fair definition of dead code.
     let outstanding = targets & !acked;
-    outstanding == 0 || outstanding & still_online == 0
+    outstanding & still_online == 0
 }
 
 /// Handle an incoming TLB-shootdown IPI on this CPU: invalidate as the current

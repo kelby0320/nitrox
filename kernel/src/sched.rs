@@ -434,23 +434,29 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// sets its own bit as it comes online.
 ///
 /// **It mirrors the `SCHED`-guarded `cpu_online[]` on the way up but not on the way down**,
-/// because [`leave_online`] clears a bit here and does not touch `cpu_online[]`. So after a
-/// park the scheduler's placement paths (`pick_target_cpu`, the home-CPU fast path,
-/// `steal_one`) still regard that CPU as a target while shootdown no longer waits for it.
-/// **That divergence is reachable on a machine that otherwise keeps running**, which an
-/// earlier version of this comment got wrong by claiming only the panic path reaches it.
-/// `idt.rs`'s `dump_and_halt` parks on **any ring-0 fault** — a kernel `#PF` on an AP, say —
-/// and that CPU is fully online at the time. It leaves `ONLINE_MASK`, so shootdowns complete;
-/// `cpu_online[]` stays set, so the placement paths keep giving it threads, and each one
-/// hangs forever on a core that will never execute again. The AP-init park is clean by
-/// contrast: `ap_init` sets `cpu_online[]` only after its last fallible step.
+/// because [`leave_online`] clears a bit here and does not touch `cpu_online[]` — that needs
+/// `SCHED`, which the parking CPU may already hold. So the two disagree after a park, and
+/// that divergence is reachable on a machine that otherwise keeps running: `idt.rs`'s
+/// `dump_and_halt` parks on **any ring-0 fault**, a kernel `#PF` on an AP say, and that CPU
+/// is fully online at the time. (The AP-init park is clean by contrast: `ap_init` sets
+/// `cpu_online[]` only after its last fallible step.)
 ///
-/// That is a better failure than the whole-machine wedge it replaces, and it is not a
-/// regression — before `leave_online` existed, the same fault hung everything at the next
-/// shootdown. But it is not "bounded because the machine is already gone", and the honest
-/// fix is for the placement paths to intersect with [`online_mask`]. Tracked in
-/// `docs/rationale/deferred-decisions.md`. Do not add a reader of this mask that assumes
-/// the two agree.
+/// **Each consumer therefore has to decide which question it is asking**, and they do not
+/// all give the same answer:
+///
+/// - **Giving work** ([`cpu_accepts_work`], used by [`pick_target_cpu`] and
+///   [`pick_wake_cpu`]) requires *both*. A thread placed on a parked CPU is not delayed, it
+///   never runs.
+/// - **Taking work** (`steal_one`, `steal_available`) requires only `cpu_online[]`, so a
+///   parked CPU's queue stays drainable. That is how the threads it was already holding get
+///   rescued; gating the victim side would strand exactly them.
+/// - **TLB shootdown** ([`crate::tlb`]) reads this mask alone, and treats a CPU's departure
+///   from it as "will never acknowledge" rather than "not yet".
+///
+/// The asymmetry is deliberate in each direction. Do not add a reader that assumes the two
+/// agree, and do not "make the scheduler consistent" — the tests that pin this are
+/// `a_parked_cpu_takes_no_new_work_but_can_still_be_drained` and, for the shootdown half,
+/// `waiting_ends_on_acknowledgement_or_departure_but_never_on_lateness`.
 ///
 /// **A bit is cleared only by [`leave_online`], when a CPU parks forever.** There is
 /// still no CPU hot-unplug; this is the terminal case — a panic, a failed AP init, or
@@ -3184,10 +3190,6 @@ fn dequeue_front(g: &mut SchedState) -> Option<ObjectRef> {
     Some(g.ready[cpu].remove(best_i))
 }
 
-/// The least-loaded online CPU (fewest `ready` entries) that `obj`'s affinity
-/// permits — the placement target for a new thread. Falls back to CPU 0 if affinity
-/// somehow excludes every online CPU (defensive; `set_affinity` rejects that). Caller
-/// holds `SCHED`.
 /// Whether `cpu` may be **given** work: the scheduler has it online *and* it has not
 /// parked forever.
 ///
@@ -3203,17 +3205,28 @@ fn dequeue_front(g: &mut SchedState) -> Option<ObjectRef> {
 /// you want drained — gating them on this would strand the threads already queued there,
 /// which is the opposite of the fix. The asymmetry is the point; do not "make it
 /// consistent".
-fn cpu_accepts_work(g: &SchedState, cpu: usize) -> bool {
-    g.cpu_online[cpu] && online_mask() & (1u64 << cpu) != 0
+/// **`online` is passed in, not read here**, so the decision is a function of its inputs.
+/// Reading the global made every placement test share process-wide mutable state with every
+/// other, and `cargo test` runs them concurrently: on a 16-core host that was a 22 % failure
+/// rate across `sched::tests`, which CI happened not to hit (PR #199 review, blocking 1).
+/// Callers read [`online_mask`] once per placement decision, which also keeps a single scan
+/// from seeing two different online sets.
+fn cpu_accepts_work(g: &SchedState, cpu: usize, online: u64) -> bool {
+    g.cpu_online[cpu] && online & (1u64 << cpu) != 0
 }
 
-fn pick_target_cpu(g: &SchedState, obj: *mut ()) -> usize {
+/// The least-loaded online CPU (fewest `ready` entries) that `obj`'s affinity
+/// permits — the placement target for a new thread. Falls back to CPU 0 if affinity
+/// somehow excludes every CPU that accepts work (defensive; `set_affinity` rejects an
+/// affinity with no online CPU — but a permitted CPU can *park* after the fact, which makes
+/// this fallback reachable in a way it was not before). Caller holds `SCHED`.
+fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let mask = unsafe { Thread::cpu_mask(obj) };
     let mut best = usize::MAX;
     let mut best_len = usize::MAX;
     for c in 0..MAX_CPUS {
-        if !cpu_accepts_work(g, c) || mask & (1 << c) == 0 {
+        if !cpu_accepts_work(g, c, online) || mask & (1 << c) == 0 {
             continue;
         }
         let len = g.ready[c].len();
@@ -3231,18 +3244,18 @@ fn pick_target_cpu(g: &SchedState, obj: *mut ()) -> usize {
 /// (F6, decision log 2026-07-21) keeps a full home queue from being a fatal wake:
 /// the fallback's least-loaded pick has room unless *every* permitted queue is
 /// full — the only case [`place_thread`] still refuses. Caller holds `SCHED`.
-fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
+fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
     let mask = unsafe { Thread::cpu_mask(obj) };
     if home < MAX_CPUS
-        && cpu_accepts_work(g, home)
+        && cpu_accepts_work(g, home, online)
         && mask & (1 << home) != 0
         && g.ready[home].len() < g.ready[home].capacity()
     {
         return home;
     }
-    pick_target_cpu(g, obj)
+    pick_target_cpu(g, obj, online)
 }
 
 /// Enqueue a runnable thread `r` on a chosen CPU's run queue, seeding its vruntime
@@ -3252,10 +3265,12 @@ fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
 /// chosen queue is at its reserved capacity. Caller holds `SCHED`.
 fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), ObjectRef> {
     let obj = r.as_ptr();
+    // Read once for this whole placement decision, rather than per candidate CPU.
+    let online = online_mask();
     let cpu = if wake {
         // A wake re-homes to the thread's home CPU (`last_cpu`) when possible —
         // cache-warm, and it avoids a needless migration.
-        pick_wake_cpu(g, obj)
+        pick_wake_cpu(g, obj, online)
     } else {
         // A newly spawned thread — **user or kernel** — is placed on the
         // least-loaded permitted CPU, so userspace uses the APs from the start.
@@ -3266,7 +3281,7 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
         // descent, dense CPU indices are unique by construction, the shared
         // kernel-vmap is kept coherent by TLB shootdown, and the switch-out race
         // is closed by the `on_cpu` guard. See the decision log (2026-07-01).
-        pick_target_cpu(g, obj)
+        pick_target_cpu(g, obj, online)
     };
     if g.ready[cpu].len() >= g.ready[cpu].capacity() {
         return Err(r);
@@ -3869,24 +3884,34 @@ mod tests {
 
     /// Bring `n` CPUs online (0..n) with reserved ready queues, for placement tests.
     fn online_n(st: &mut SchedState, n: usize) {
-        // Both, because a genuinely online CPU is in both — `cpu_online[]` and the
-        // lock-free mask. Modelling only the first would make `cpu_accepts_work` reject
-        // every CPU and quietly turn the placement tests into fallback tests.
-        ONLINE_MASK.store(0, Ordering::Relaxed);
         for c in 0..n {
             st.cpu_online[c] = true;
-            ONLINE_MASK.fetch_or(1u64 << c, Ordering::Relaxed);
             st.ready[c].try_reserve(READY_RESERVE).unwrap();
         }
     }
 
-    /// A CPU that has parked forever must not be given work, even though `cpu_online[]`
-    /// still says it is up — and it must still be stealable *from*.
+    /// The online set a placement test passes in: `n` CPUs up, none parked.
+    ///
+    /// A value rather than the `ONLINE_MASK` global, deliberately — see
+    /// [`cpu_accepts_work`]. Writing the global here made these tests race each other.
+    fn all_up(n: usize) -> u64 {
+        (1u64 << n) - 1
+    }
+
+    /// A CPU that has parked forever must not be given work — and its queue must still be
+    /// drainable, which is how the threads it already holds get rescued.
     ///
     /// The two halves are the whole point. `leave_online` cannot clear `cpu_online[]` (that
     /// needs `SCHED`, which the parking CPU may hold), so after a ring-0 fault parks an AP
     /// the two disagree: placing on it hangs the thread forever, while draining its queue is
-    /// how the threads already there get rescued.
+    /// the rescue.
+    ///
+    /// **The steal half asserts against an emptied peer set on purpose.** The first version
+    /// of this test left a thread on CPU 1, so `steal_available` was satisfied by *that*
+    /// queue and the assertion passed even with the victim side wrongly gated — the exact
+    /// "consistency cleanup" the doc comments warn against would have gone green
+    /// (PR #199 review, blocking 2). CPU 2 must be the only stealable queue for this to mean
+    /// anything, and `steal_one` is checked too rather than inferred from `steal_available`.
     #[test]
     fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
         init_global_heap();
@@ -3897,24 +3922,39 @@ mod tests {
         // Load 0 and 1 so the least-loaded pick would otherwise land on CPU 2.
         st.ready[0].try_push(inert_ref(10)).unwrap();
         st.ready[1].try_push(inert_ref(11)).unwrap();
-        assert_eq!(pick_target_cpu(&st, t.as_ptr()), 2);
+        assert_eq!(pick_target_cpu(&st, t.as_ptr(), all_up(4)), 2);
 
-        // CPU 2 parks: out of the lock-free mask, still `true` in `cpu_online[]`.
-        ONLINE_MASK.fetch_and(!(1u64 << 2), Ordering::Relaxed);
+        // CPU 2 parks: gone from the online set, still `true` in `cpu_online[]`.
+        let parked = all_up(4) & !(1u64 << 2);
         assert!(st.cpu_online[2], "the park cannot clear this, which is why the bug existed");
-        assert_eq!(pick_target_cpu(&st, t.as_ptr()), 3, "placed on a CPU that will never run");
+        assert_eq!(
+            pick_target_cpu(&st, t.as_ptr(), parked),
+            3,
+            "placed on a CPU that will never run"
+        );
 
         // A waking thread whose home is the parked CPU goes elsewhere too.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
-        assert_ne!(pick_wake_cpu(&st, t.as_ptr()), 2, "woken onto a parked home CPU");
+        assert_ne!(pick_wake_cpu(&st, t.as_ptr(), parked), 2, "woken onto a parked home CPU");
 
-        // But its queue is still reachable: `steal_available` must see the thread parked
-        // there, or the threads it already holds are stranded.
+        // Now the rescue half. Empty every other queue so the parked CPU is the *only*
+        // source a steal could come from — otherwise this passes without testing anything.
+        drop(st.ready[0].pop().unwrap());
+        drop(st.ready[1].pop().unwrap());
+        for c in 0..MAX_CPUS {
+            assert!(st.ready[c].is_empty(), "cpu {c} must start this half empty");
+        }
         st.ready[2].try_push(inert_ref(12)).unwrap();
+
+        // Host `this_cpu()` is 0. Both paths must reach a parked CPU's queue: gating either
+        // on `cpu_accepts_work` strands the thread sitting on CPU 2 forever.
         assert!(
             steal_available(&st, 0),
             "a parked CPU's queue must stay drainable, or this fix strands what it holds"
         );
+        let stolen = steal_one(&mut st).expect("steal_one must reach a parked CPU's queue");
+        assert_eq!(unsafe { &*(stolen.as_ptr() as *const Thread) }.tid(), 12);
+        assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
     }
 
     #[test]
@@ -3924,17 +3964,17 @@ mod tests {
         online_n(&mut st, 4);
         // No affinity → least-loaded. With all queues empty, CPU 0 (first min) wins.
         let a = inert_ref(1);
-        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 0);
+        assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 0);
         // Load CPU 0 and 1; the least-loaded becomes CPU 2.
         st.ready[0].try_push(inert_ref(10)).unwrap();
         st.ready[1].try_push(inert_ref(11)).unwrap();
-        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 2);
+        assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 2);
         // Pinned to CPU 3 → must target CPU 3 regardless of load.
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
-        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 3);
+        assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 3);
         // Pinned to an offline CPU (5) → defensive fallback to CPU 0.
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
-        assert_eq!(pick_target_cpu(&st, a.as_ptr()), 0);
+        assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 0);
     }
 
     #[test]
@@ -3945,10 +3985,10 @@ mod tests {
         let t = inert_ref(1);
         // Home CPU 2 (last ran there) + affinity allows it → wake returns CPU 2.
         unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
-        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 2);
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 2);
         // Affinity now excludes the home → falls back to least-loaded (CPU 0).
         unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 0) };
-        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 0);
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
     }
 
     #[test]
@@ -3977,10 +4017,10 @@ mod tests {
         for tid in 100..(100 + READY_RESERVE as u32) {
             st.ready[0].try_push(inert_ref(tid)).unwrap();
         }
-        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 1);
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 1);
         // With room at home again, the cache-warm home pick returns.
         drop(st.ready[0].pop().unwrap());
-        assert_eq!(pick_wake_cpu(&st, t.as_ptr()), 0);
+        assert_eq!(pick_wake_cpu(&st, t.as_ptr(), all_up(4)), 0);
     }
 
     #[test]
