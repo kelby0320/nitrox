@@ -15439,3 +15439,33 @@ That was found the useful way. The assertion fired immediately — in the **host
 which targets the host triple and unwinds. It is now `cfg(not(test))`, and that failure is a
 better positive control than the scratch-file one it replaced: the guard demonstrably fires,
 in tree, on a real configuration.
+
+## 2026-08-14 — Correction: the wake paths were dropping an `ObjectRef` under `SCHED`
+
+Same day, correcting the entry above. That entry recorded `panic = "abort"` as load-bearing
+because the wake callers "panic while an `ObjectRef` temporary is live under `SCHED`". **The
+mechanism does not exist, and the bug it was excusing was real** (PR #204 review).
+
+An `if` condition is its own temporary scope. In `if place_thread(..).is_err() { panic!(..) }`
+the `Result<(), ObjectRef>` — and the ref inside it — drops at the **end of the condition**,
+before the branch body, on every panic strategy. So `ObjectRef::drop` → `dispatch_destroy` →
+`SlabCache::free` ran with `SCHED` held: a plain spinlock under the rank-1 lock, which
+`lock-ordering.md` forbids without qualification (F2). Verified out of tree before acting —
+the drop prints before the panic body.
+
+Not theoretical. Reserve exhaustion on a wake is the state those panics exist for; the drop
+spins on the allocator lock while another CPU's tick spins on `SCHED` with interrupts masked.
+The machine hangs instead of aborting with the diagnostic — the one output the path exists to
+produce.
+
+Both sites now bind the ref and `core::mem::forget` it before panicking. Leaking is honest
+here: nothing outlives an abort. `deferred_drops` is the documented alternative and is worse —
+pushing to it can itself grow under `SCHED` (audit C.1(c)), and nothing will ever drain it.
+
+The two *spawn* callers had this right all along, with a `match` that carries the ref out of
+the locked block and a comment saying why. Two sites did the opposite, and the entry above
+certified them as safe.
+
+The `panic = "abort"` assertion stays, re-justified: the rule it enforces is
+`kernel/CLAUDE.md`'s "no stack unwinding in the kernel", not the drop story. Its trigger
+remains a target change.

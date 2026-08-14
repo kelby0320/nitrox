@@ -222,8 +222,6 @@ unsafe fn pit_ch2_wait_until_done() {
     }
 }
 
-/// Convert a nanosecond interval to a LAPIC initial-count using the calibrated
-/// timer frequency, saturating into the 32-bit count register.
 /// Convert a raw TSC reading into nanoseconds since [`TSC_BASE`].
 ///
 /// **Saturating, not wrapping, and that is the whole of it.** `TSC_BASE` is captured once, on
@@ -237,9 +235,18 @@ unsafe fn pit_ch2_wait_until_done() {
 /// permanently ends periodic timers machine-wide.**
 ///
 /// Saturating reads 0 instead — that CPU's clock appears not to advance until its TSC passes
-/// the base, which is wrong but bounded, self-correcting, and fires nothing early. The
-/// tolerance for a negative skew is `now − base`, the time since calibration, which is
-/// *smallest exactly when the APs come up*.
+/// the base, which is wrong but bounded and self-correcting. The tolerance for a negative
+/// skew is `now − base`, the time since calibration, which is *smallest exactly when the APs
+/// come up*.
+///
+/// **It does not make early firing impossible, and an earlier version of this comment said it
+/// did** (PR #204 review, finding 4). A skewed AP is exactly the "CPU running behind" case
+/// `smp.md` § Deferred describes: a `sys_wait(10 ms)` *stamped* there reads `now` as 0 and
+/// arms `0 + 10 ms`, which a healthy CPU 30 ms into boot finds expired on its next sweep and
+/// returns to userspace as an immediate `TimedOut`. Firings *adjudicated on* the skewed CPU
+/// are late, never early; deadlines *stamped by* it can fire early elsewhere. The improvement
+/// is real and large — the same wait was previously armed ~292 years out and never fired at
+/// all — but it is a bound on the damage, not an end to it.
 ///
 /// This bounds the damage; it does not detect the skew. Verifying cross-CPU TSC
 /// synchronisation at bring-up is still deferred (F10, `smp.md` § Deferred). Split out of
@@ -252,6 +259,8 @@ fn elapsed_ns(now: u64, base: u64, mult: u64, shift: u64) -> u64 {
     (((delta as u128) * (mult as u128)) >> shift) as u64
 }
 
+/// Convert a nanosecond interval to a LAPIC initial-count using the calibrated
+/// timer frequency, saturating into the 32-bit count register.
 fn ns_to_timer_ticks(ns: u64) -> u32 {
     ns_to_ticks_with_hz(ns, TIMER_HZ.load(Ordering::Relaxed))
 }
@@ -288,6 +297,7 @@ fn compute_ns_mul_shift(tsc_hz: u64) -> (u64, u64) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
 
     /// A TSC reading *behind* the calibration base must read as no time elapsed, not as 292
     /// years.
@@ -302,7 +312,6 @@ mod tests {
     /// Numbers mirror the audit's replay: a 2 GHz TSC, base 25 ms into boot.
     #[test]
     fn a_tsc_behind_the_calibration_base_reads_zero_rather_than_wrapping() {
-        use super::elapsed_ns;
         // 2 GHz: 1 tick = 0.5 ns. mult/shift as `Timer::init` computes them.
         let (mult, shift) = (1u64 << 62, 63u64);
         let base = 50_000_000; // 25 ms in
@@ -323,7 +332,6 @@ mod tests {
             );
         }
     }
-    use super::*;
 
     /// Reference conversion using a full u128 division.
     fn ref_ns(delta: u64, tsc_hz: u64) -> u64 {
