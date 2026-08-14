@@ -516,6 +516,29 @@ fn clear_online_bit(identity_bound: bool, me: usize) {
     ONLINE_MASK.fetch_and(!(1u64 << me), Ordering::AcqRel);
 }
 
+/// Assert that a thread arriving from ring 3 has preemption enabled.
+///
+/// **The mirror of the underflow guard in [`preempt_enable`], for the imbalance that escapes
+/// every other check.** A *leaked* `preempt_disable` wedges a CPU exactly as the wrap did:
+/// `on_timer_tick` latches and returns forever, and a later enable goes 2 → 1 and never
+/// reaches 0, so neither the underflow assert nor the replay ever fires. `switch_into`'s
+/// assert catches it at the thread's next voluntary switch — but a thread that returns to
+/// ring 3 and makes only non-blocking syscalls never reaches `switch_into`, and that CPU
+/// simply stops preempting with nothing said.
+///
+/// This is the boundary where the truth is free, and it is the same argument
+/// `assert_user_entry_safe` already makes for locks one line above the call site: a thread
+/// that was executing in user mode cannot hold a kernel lock, and cannot have disabled
+/// kernel preemption either. Debug builds only (PR #203 review, optional 1).
+pub fn assert_user_entry_preempt_safe() {
+    debug_assert_eq!(
+        PREEMPT_OFF[SchedState::this_cpu()].load(Ordering::Relaxed),
+        0,
+        "entered a syscall from ring 3 with preemption disabled — a kernel path leaked a \
+         `preempt_disable`, and this CPU will stop preempting until something notices"
+    );
+}
+
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
 /// the thread running on that CPU (which, while nonzero, cannot migrate — that
 /// is the point); read by the same CPU's tick / reschedule-IPI handlers.
@@ -577,6 +600,13 @@ pub fn preempt_enable() {
     // The `debug_assert` is the loud half and the saturation is the safe half: a build that
     // checks catches the unbalanced enable at the moment it happens, and one that does not
     // still refuses to brick the CPU.
+    //
+    // **Do not "simplify" this to a plain load/store.** The obvious argument for it — the
+    // counter is per-CPU and interrupts are masked here, so the RMW is redundant — holds on
+    // target and fails under `cfg(test)`, where `preempt_irqs_mask` is a no-op and
+    // `this_cpu()` collapses every host-test thread onto index 0. The atomicity is
+    // load-bearing for the host configuration even though it looks redundant on the one the
+    // comment above describes.
     let depth_before = PREEMPT_OFF[me]
         .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
         // unwrap_or: the closure is infallible, so `fetch_update` cannot return `Err` here.

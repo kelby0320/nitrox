@@ -236,6 +236,11 @@ unsafe extern "C" fn syscall_dispatch(frame: *mut SyscallFrame) -> isize {
     // before it misattributes itself to a later, innocent one. Debug builds only.
     // (`cargo xtask check-irq-scope` knows this entry is exempt for this reason.)
     crate::libkern::lockrank::assert_user_entry_safe();
+    // The same boundary, the same ground truth, for the other per-CPU invariant: a thread
+    // that was running in user mode cannot have kernel preemption disabled. This is the one
+    // place a *leaked* `preempt_disable` is caught on a thread that never blocks — see
+    // `sched::assert_user_entry_preempt_safe`.
+    crate::sched::assert_user_entry_preempt_safe();
     // SAFETY: the stub built a complete frame at the kernel stack top and
     // passed its address; valid, aligned, and unaliased for this call.
     let f = unsafe { &mut *frame };

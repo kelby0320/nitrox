@@ -15360,6 +15360,21 @@ boot:
 With them the right way round, `test-qemu` passes — which now means something: every context
 switch and every preempt-enable in a whole boot satisfied both.
 
+### A third guard, from the review: the imbalance that escapes both
+
+A *leaked* `preempt_disable` wedges a CPU identically to the wrap — `on_timer_tick` latches
+and returns forever, and a later enable goes 2 → 1 and never reaches 0, so neither new
+assertion fires. `switch_into` catches it at the thread's next voluntary switch, which covers
+most cases; a thread that returns to ring 3 and makes only non-blocking syscalls never reaches
+`switch_into`, and that CPU simply stops preempting with nothing said.
+
+The syscall entry is where the truth is free, and the argument is one the code already makes
+one line earlier for locks: a thread that was executing in user mode holds no kernel lock, and
+cannot have disabled kernel preemption either. `assert_user_entry_preempt_safe` sits beside
+`assert_user_entry_safe` for that reason. Verified by injecting the defect rather than
+inverting the check — leaking one `preempt_disable` in a syscall handler panics the *next*
+syscall with the new assertion's message.
+
 **Not verified, and cannot be without creating the bug:** the saturation itself. No path today
 is unbalanced, so there is nothing to saturate; it is a net under a state that does not
 currently occur, and the `debug_assert` is what would catch the state occurring. Neither
