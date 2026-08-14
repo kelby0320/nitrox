@@ -114,10 +114,17 @@ fn enqueue_into(queue: &IrqSpinLock<KVec<usize>>, dpc: &Dpc) {
     }
     let addr = dpc as *const Dpc as usize;
     let mut q = queue.lock();
-    // The queue is bounded by the number of distinct DPCs (dedup above), so it
-    // stays within the reserve and `try_push` never allocates under the lock.
+    // The queue is bounded by the number of distinct DPCs (dedup above), so it stays within
+    // the reserve. **Enforced by the push, not by the assertion beside it**: `try_push`
+    // *grows*, and this runs at an interrupt tail, where `kmalloc` under the queue lock is
+    // the forbidden pattern outright. The `debug_assert` would not have caught it — growth
+    // happens first and succeeds, so the assertion never fires (kernel audit C.1(c)).
     debug_assert!(q.len() < q.capacity(), "DPC queue capacity exceeded");
-    q.try_push(addr).expect("DPC queue within reserve");
+    if q.push_within_capacity(addr).is_err() {
+        // `addr` is a `usize`; there is nothing to leak or drop. Losing a DPC would strand
+        // whatever it was going to complete, so this is fatal rather than silent.
+        panic!("DPC queue reserve exhausted — more distinct DPCs than the queue was sized for");
+    }
 }
 
 fn run_pending_in(queue: &IrqSpinLock<KVec<usize>>) {

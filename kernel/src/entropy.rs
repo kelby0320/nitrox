@@ -173,18 +173,28 @@ impl EntropyState {
     }
 
     /// Queue `po` to be woken on seeding, or hand it back (see [`SeedWaitReg`]).
-    /// Refs are *moved*, never dropped, here. The `seed_waiters` capacity is
-    /// reserved at [`init`], so `try_push` cannot allocate/fail.
+    /// Refs are *moved*, never dropped, here.
+    ///
+    /// **The push refuses rather than growing**, and the length check above is not what makes
+    /// that true. [`init`]'s reserve is best-effort: if it fails, `len() >= SEED_WAITERS_MAX`
+    /// is `0 >= 4` — false — so control reaches the push on an *unreserved* list, and
+    /// `try_push` would then `kmalloc` while this leaf-ranked lock is held. That is the
+    /// inversion `init`'s own comment says it is avoiding, reached by the path it did not
+    /// consider (kernel audit C.1(e), 2026-08-14). `push_within_capacity` cannot allocate, so
+    /// an unreserved list simply reports itself full — which is exactly what the caller
+    /// already handles.
     fn register_waiter(&mut self, po: ObjectRef) -> SeedWaitReg {
         if self.seeded {
-            SeedWaitReg::AlreadySeeded(po)
-        } else if self.seed_waiters.len() >= SEED_WAITERS_MAX {
-            SeedWaitReg::Full(po)
-        } else {
-            self.seed_waiters
-                .try_push(po)
-                .expect("within reserved seed-waiter capacity");
-            SeedWaitReg::Queued
+            return SeedWaitReg::AlreadySeeded(po);
+        }
+        if self.seed_waiters.len() >= SEED_WAITERS_MAX {
+            return SeedWaitReg::Full(po);
+        }
+        match self.seed_waiters.push_within_capacity(po) {
+            Ok(()) => SeedWaitReg::Queued,
+            // The reserve did not happen. Hand the ref back rather than dropping it here:
+            // an `ObjectRef` drop under this lock is the same inversion one step further on.
+            Err(returned) => SeedWaitReg::Full(returned),
         }
     }
 
@@ -224,8 +234,11 @@ pub fn init() {
     // lock — and do the reserving **outside** it, because allocating (slab, rank 6a) while
     // holding this leaf-ranked lock is itself the inversion we are trying to avoid. The
     // debug lock-order tracker rejects it (Slice D4 found this and the identical pattern in
-    // `dpc::init`). Best-effort: a failed reserve just means no waiters can be queued
-    // (they'll be told to retry), which only matters on no-HW-RNG boots.
+    // `dpc::init`). Best-effort, and the failure mode is the one
+    // `register_waiter` handles: an unreserved list reports itself full, so callers are told
+    // to retry. That is only true because the push there refuses instead of growing — an
+    // earlier version of this comment claimed the outcome without the mechanism, and the
+    // mechanism was missing (kernel audit C.1(e)).
     let mut waiters = KVec::new();
     let _ = waiters.try_reserve(SEED_WAITERS_MAX);
     let mut g = ENTROPY.lock();

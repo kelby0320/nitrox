@@ -15469,3 +15469,39 @@ certified them as safe.
 The `panic = "abort"` assertion stays, re-justified: the rule it enforces is
 `kernel/CLAUDE.md`'s "no stack unwinding in the kernel", not the drop story. Its trigger
 remains a target change.
+
+## 2026-08-14 — A push that grows is an allocation, and six of them were under `SCHED`
+
+Audit C.1(c). `KVec::try_push` **grows**: at capacity it calls `kmalloc`/`kfree` and only then
+writes. Nine pushes happen under the rank-1, IRQ-acquired `SCHED` lock; three refuse by
+construction, and the other six reached the allocator at the reserve boundary — F11 verbatim,
+the pattern `lock-ordering.md` forbids without qualification.
+
+**The `debug_assert!(len < capacity)` beside four of them is not a guard.** The growth happens
+first and *succeeds*, so the assertion never fires; the `.expect("within reserve")` fires only
+if the allocation itself fails. A reader sees two safety nets and there are none.
+
+`KVec::push_within_capacity` is the fix: it cannot allocate, and it hands the value **back**
+rather than dropping it — which matters for the same reason the wake paths now `forget` theirs,
+since an `ObjectRef` dropped there would reach `SlabCache::free` under the same held lock.
+
+Converted: every production push in `sched.rs` (including the three already guarded, so the
+shape is uniform and a new list cannot pick the wrong one by copying its neighbour), the DPC
+queue's push — which runs at an interrupt tail, where allocation is forbidden outright — and
+the entropy seed-waiter list.
+
+That last one is the audit's C.1(e) and is the clearest illustration of the class. `init`
+reserves best-effort and the code below it reads `len() >= SEED_WAITERS_MAX` as the guard. On
+an unreserved list that is `0 >= 4`, false — so control reaches the push, which grows, under the
+leaf-ranked `ENTROPY` lock. The comment three lines above says that inversion is what the
+best-effort reserve exists to avoid. It was avoided on the path the author considered and
+reached on the one they did not, and the outcome the comment promised ("no waiters can be
+queued, they'll be told to retry") is now actually produced by the mechanism rather than
+asserted.
+
+Out of scope, deliberately: `namespace.rs`'s pushes look like the same shape and are not. They
+`try_reserve` explicitly, handle its failure by returning an error before moving an `ObjectRef`
+into the value, and run under a rank-4 lock rather than the rank-1/IRQ case F2 is about.
+
+Break-tested: making `push_within_capacity` grow fails `push_within_capacity_refuses_instead_of_growing`
+on the capacity assertion.
