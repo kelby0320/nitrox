@@ -14,7 +14,9 @@ scheduler.md first for the policy; read this for the SMP machinery and the war
 stories. Anchors are `file:function` (line numbers drift; symbol names are
 stable).
 
-Status: implemented. The SMP bring-up verification below dates from 2026-07-01, when the
+Status: implemented; §8 last corrected 2026-08-13 (a parked CPU must leave the online set,
+and why the identity guard on that is the load-bearing half). The SMP bring-up verification
+below dates from 2026-07-01, when the
 boot leaf was still `eshell`; the system now boots through the login chain to `nxsh` on
 `-smp 4` with **user threads distributing across all cores and migrating via
 work-stealing**, verified at the time as 0 failures over 150 KVM boot-loops plus a
@@ -280,6 +282,28 @@ only on unmap / permission-restrict.
 Broadcast-to-all is correct but unoptimized; per-`AddressSpace` `active_cpus`
 (target only cores holding the root) is deferred (§Deferred).
 
+**A CPU that parks forever must leave the online set first** (`sched::leave_online`, called
+from `Cpu::halt_loop`, added 2026-08-13). The ack spin above waits for *every* CPU in
+`online_mask`, so one that halts with interrupts disabled while still counted there can never
+acknowledge, and the next shootdown — the next large `free` in any process — hangs, taking the
+serialising lock with it. This was the second whole-machine shootdown deadlock; the first was
+F1 above. It went unnoticed for two milestones because the parked CPU was harmless until
+something needed its acknowledgement, and it surfaced as a *terminal* freezing mid-repaint
+while freeing a glyph outline.
+
+The clear is **guarded by the CPU's identity**, and that guard matters more than the clear:
+`current_cpu()` reads `IA32_TSC_AUX`, whose reset default is `0`, so a CPU that has not adopted
+a dense index is indistinguishable from the BSP. Clearing on its behalf drops the *running*
+BSP from the target set — and since a CPU's own TLB is invalidated by the self-IPI described
+above, which only goes to CPUs in the mask, that turns a hang into a freed frame still
+reachable through a stale translation. **Clearing the wrong bit is worse than not clearing
+one**, so the guard errs toward doing nothing. A range check does not substitute: `0` is in
+range.
+
+What is *not* cleared is the `SCHED`-guarded `cpu_online[]` — `leave_online` cannot take
+`SCHED`, since the faulting CPU may already hold it — so placement and stealing still treat a
+parked core as a target. See §Deferred.
+
 ---
 
 ## Part 2 — The bugs: what, how found, fix
@@ -439,6 +463,13 @@ syscalls while migratable.
   is single-threaded today, so `exit_process` never has a live off-core sibling
   (the `has_live_siblings` scan already *sees* other cores' `current[]`; it just
   can't *stop* one). Lands with the first multi-threaded user process.
+- **Placement still targets a parked CPU** — `leave_online` clears `ONLINE_MASK` but not the
+  `SCHED`-guarded `cpu_online[]`, so `pick_target_cpu`, the home-CPU fast path and
+  `steal_one` keep giving runnable threads to a core that will never execute again, and each
+  hangs. Reachable while the rest of the machine runs: `dump_and_halt` parks on any ring-0
+  fault, including a kernel `#PF` on an AP. Strictly better than the whole-machine wedge it
+  replaced, which is why it is deferred; the fix is to intersect placement with
+  `online_mask()`. See `docs/rationale/deferred-decisions.md`.
 - **Per-`AddressSpace` `active_cpus`** — a bitmask of cores holding the root in CR3,
   maintained at the CR3 load in `switch_into`, so a shootdown targets only those
   cores instead of broadcasting to all online cores. A correctness-neutral

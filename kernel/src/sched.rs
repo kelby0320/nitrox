@@ -437,9 +437,20 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// because [`leave_online`] clears a bit here and does not touch `cpu_online[]`. So after a
 /// park the scheduler's placement paths (`pick_target_cpu`, the home-CPU fast path,
 /// `steal_one`) still regard that CPU as a target while shootdown no longer waits for it.
-/// That is bounded rather than tidy: the only park that reaches it with `cpu_online[]` set
-/// is the panic path, where the machine is already gone. Do not add a reader of this mask
-/// that assumes the two agree.
+/// **That divergence is reachable on a machine that otherwise keeps running**, which an
+/// earlier version of this comment got wrong by claiming only the panic path reaches it.
+/// `idt.rs`'s `dump_and_halt` parks on **any ring-0 fault** — a kernel `#PF` on an AP, say —
+/// and that CPU is fully online at the time. It leaves `ONLINE_MASK`, so shootdowns complete;
+/// `cpu_online[]` stays set, so the placement paths keep giving it threads, and each one
+/// hangs forever on a core that will never execute again. The AP-init park is clean by
+/// contrast: `ap_init` sets `cpu_online[]` only after its last fallible step.
+///
+/// That is a better failure than the whole-machine wedge it replaces, and it is not a
+/// regression — before `leave_online` existed, the same fault hung everything at the next
+/// shootdown. But it is not "bounded because the machine is already gone", and the honest
+/// fix is for the placement paths to intersect with [`online_mask`]. Tracked in
+/// `docs/rationale/deferred-decisions.md`. Do not add a reader of this mask that assumes
+/// the two agree.
 ///
 /// **A bit is cleared only by [`leave_online`], when a CPU parks forever.** There is
 /// still no CPU hot-unplug; this is the terminal case — a panic, a failed AP init, or
@@ -3662,9 +3673,16 @@ mod tests {
         super::clear_online_bit(false, 0);
         assert_eq!(super::online_mask(), 0b1011, "an unbound CPU cleared someone else's bit");
 
-        // Out of range: also ignored.
-        super::clear_online_bit(true, super::MAX_CPUS);
-        assert_eq!(super::online_mask(), 0b1011);
+        // Out of range: also ignored — and asserted at **64**, not `MAX_CPUS`.
+        //
+        // `MAX_CPUS` is 8, so deleting the range check leaves `0b1011 & !(1 << 8)` =
+        // `0b1011` and this assertion passes for the broken implementation too. A shift
+        // only misbehaves at the width of the type: `1u64 << 64` panics in debug and wraps
+        // to `1 << 0` in release — clearing **CPU 0's** bit, the same silent corruption the
+        // identity guard exists to prevent. Caught by a reviewer's negative control, which
+        // is the second time an assertion of mine held for both implementations.
+        super::clear_online_bit(true, 64);
+        assert_eq!(super::online_mask(), 0b1011, "an out-of-range index cleared a bit");
 
         // Its own identity: its own bit, and no other.
         super::clear_online_bit(true, 1);

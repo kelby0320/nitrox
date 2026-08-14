@@ -27,6 +27,19 @@ pub trait ArchCpu {
 
     /// Park the CPU forever: disable interrupts and `hlt` in a loop so a
     /// spurious wake-up cannot restart execution. Never returns.
+    ///
+    /// **An implementation must call [`crate::sched::leave_online`] before it stops.** This
+    /// is a contract, not an x86 implementation detail: `sched::online_mask` is the target
+    /// set for TLB-shootdown IPIs and the initiator waits for an acknowledgement from every
+    /// CPU in it, so a CPU that halts while still counted online wedges the machine's next
+    /// shootdown — i.e. the next large `free` in any process — permanently. That is how a
+    /// terminal ended up freezing mid-repaint for two milestones (2026-08-13; see the
+    /// decision log).
+    ///
+    /// `leave_online` guards itself against being called by a CPU that has no identity yet,
+    /// so an implementation does not need to reason about bring-up order — it needs only to
+    /// call it. Note there is no test or gate covering this for a *new* architecture: the
+    /// host test exercises the decision inside `leave_online`, not the call site.
     fn halt_loop() -> !;
 
     /// `true` if this CPU has an on-chip local interrupt controller (the one
