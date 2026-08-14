@@ -539,6 +539,41 @@ pub fn assert_user_entry_preempt_safe() {
     );
 }
 
+/// `panic = "abort"` is **load-bearing for a lock-order invariant**, not a size choice.
+///
+/// The two wake callers of [`place_thread`] are written `if place_thread(..).is_err() {
+/// panic!(..) }`. The `Result` is a temporary that lives to the end of the `if`, so on the
+/// `Err` branch it still holds an `ObjectRef` when `panic!` runs. Nothing drops it only
+/// because there is no unwinding: under an unwinding profile that temporary would drop an
+/// `ObjectRef` — reaching `dispatch_destroy` → `SlabCache::free` — **while `SCHED` is held**,
+/// which is F11/F2 exactly, an allocator lock taken under the rank-1 scheduler lock.
+///
+/// **What actually guarantees it is the target, not the manifest** — a correction to the
+/// audit finding, which attributed it to `kernel/Cargo.toml`. `x86_64-unknown-none` carries
+/// `panic="abort"` in its target spec (`rustc --target x86_64-unknown-none --print cfg`), so
+/// rustc forces abort here whatever a profile says: setting `panic = "unwind"` in the
+/// manifest changes nothing and the kernel still builds. The manifest lines are belt and
+/// braces.
+///
+/// **So this assertion cannot fire while the kernel stays on this target**, and saying so
+/// matters more than the assertion does — an assertion nobody can trip is decoration unless
+/// its trigger is named. Its trigger is a *target* change, which `kernel/CLAUDE.md`
+/// contemplates ("If we ever need a feature the built-in spec doesn't expose, we switch to a
+/// custom JSON at that point"): a hand-written spec that omits `panic-strategy: abort` would
+/// silently reintroduce unwinding, and this is what would stop it. Verified out of tree —
+/// the same `const _` compiled for a host target fails with this message
+/// (kernel audit C.3(b), 2026-08-14).
+/// Not under `cfg(test)`: the host suite builds this crate for the *host* triple, which
+/// unwinds, and the assertion fires there — which is how its trigger was demonstrated
+/// in-tree rather than in a scratch file. Nothing it protects runs host-side anyway; C.3(d)
+/// established that no host test reaches `place_thread` at all.
+#[cfg(not(test))]
+const _: () = assert!(
+    cfg!(panic = "abort"),
+    "the kernel requires panic = \"abort\": the wake paths panic while an ObjectRef \
+     temporary is live under SCHED, and unwinding would free it there"
+);
+
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
 /// the thread running on that CPU (which, while nonzero, cannot migrate — that
 /// is the point); read by the same CPU's tick / reschedule-IPI handlers.
@@ -2421,7 +2456,10 @@ fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     // *every* permitted queue is at reserve — e.g. a thread pinned to a single
     // CPU whose queue is full — which is genuine reserve exhaustion, still fatal.
     if place_thread(g, r, true).is_err() {
-        panic!("wake placement: every affinity-permitted ready queue is at reserve");
+        panic!(
+            "wake placement: no ready queue would take the thread — every affinity-permitted \
+             queue is at reserve, or no CPU accepts work and this one is at reserve"
+        );
     }
     true
 }
@@ -3066,7 +3104,10 @@ pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
     // Re-home on its CPU (a wake; a full home falls back to a permitted queue
     // with room — F6). Fails only when every permitted queue is at reserve.
     if place_thread(&mut g, r, true).is_err() {
-        panic!("resume placement: every affinity-permitted ready queue is at reserve");
+        panic!(
+            "resume placement: no ready queue would take the thread — every affinity-permitted \
+             queue is at reserve, or no CPU accepts work and this one is at reserve"
+        );
     }
     true
 }
@@ -3354,8 +3395,14 @@ fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
 /// is online, affinity-permitted, **and has queue room** (cache-warm, and avoids
 /// needless migration), otherwise the least-loaded permitted CPU. The room check
 /// (F6, decision log 2026-07-21) keeps a full home queue from being a fatal wake:
-/// the fallback's least-loaded pick has room unless *every* permitted queue is
-/// full — the only case [`place_thread`] still refuses. Caller holds `SCHED`.
+/// the fallback's least-loaded pick has room unless *every* permitted queue is full.
+///
+/// **That is not the only way [`place_thread`] refuses**, which this comment claimed until
+/// 2026-08-14 (kernel audit C.3(c)). [`pick_target_cpu`]'s last resort — reached when *no*
+/// CPU accepts work at all — returns this CPU without checking its queue, so a wake landing
+/// there with a full queue also refuses. That resort is deliberately not load-checked: when
+/// nothing accepts work there is no queue worth preferring, and the CPU executing this code
+/// is the only one known to be running. Caller holds `SCHED`.
 fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
@@ -3717,6 +3764,13 @@ fn park_reaper() {
     unsafe { switch_into(g, me_slot, me_obj, next_obj) };
 }
 
+/// **A fifth placement site, and the only one that bypasses the policy.** It pushes onto
+/// `ready[this_cpu()]` directly: no affinity check, no [`cpu_accepts_work`], no capacity
+/// check beyond a `debug_assert!`. Sound today for a reason worth writing down rather than
+/// rediscovering — a CPU executing this code is by definition not parked, so the CPU it
+/// chooses always accepts work — but it is a fifth opinion on placement, in the same shape
+/// as the extra opinions on `online_mask` the audit found in § A. If placement policy grows
+/// a rule, this is the site that will not have it (kernel audit C.3(e), 2026-08-14).
 /// Make the reaper runnable, if it is parked. Caller holds `SCHED`.
 ///
 /// A no-op when it is already running or queued — the wake is level-triggered off
