@@ -79,7 +79,8 @@
 //! masking — neither of which exists in a hosted test process.
 //!
 //! The scope arithmetic itself does not depend on any of that, so it is unit-tested
-//! host-side against a plain local state struct — see the tests at the bottom.
+//! host-side: the *rule* through [`classify`], which the tracker itself calls, and the
+//! *bookkeeping* against a plain local state struct — see the tests at the bottom.
 
 /// Where a lock sits in the acquisition order. **Smaller is acquired first** — a lock may
 /// only be taken while every rank already held is strictly smaller.
@@ -140,6 +141,46 @@ pub enum LockRank {
     /// the entropy pool, the console input buffer, the AHCI pending ring, the completed-IRP
     /// reclaim list.
     Leaf = 90,
+}
+
+/// What acquiring `rank` means, given what this CPU already holds **in the current
+/// interrupt scope**.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Acquisition {
+    /// Nothing broken.
+    Ok,
+    /// `tlb::LOCK`'s contract, which is stricter than its rank: *nothing* may be held when
+    /// it is taken. The rank cannot express this — `TlbShootdown` is 85, so taking it under
+    /// `Sched` (10) is not an inversion — so only this branch catches it.
+    ContractBroken { held: u8 },
+    /// An ordinary rank inversion: `rank` is not strictly above something already held.
+    Inverted { held: u8 },
+}
+
+/// The acquisition decision, as a function of its inputs.
+///
+/// **Split out so the host tests exercise the tracker's own logic rather than a
+/// reimplementation of it.** They used to reproduce the arithmetic over a local struct —
+/// a sound trade, since the real tracker's per-CPU state is invalid on the host, but it
+/// meant any drift between the two was invisible. The drift was not hypothetical: the copy
+/// never had the `ContractBroken` branch at all, so the one rule the rank order cannot
+/// express had no test on either side (found by the kernel audit, 2026-08-14).
+///
+/// `held` is the scope's slice — entries below the floor belong to an interrupted context
+/// and are not the caller's to violate.
+pub fn classify(rank: LockRank, held: &[u8]) -> Acquisition {
+    for &h in held {
+        if h == 0 {
+            continue;
+        }
+        if matches!(rank, LockRank::TlbShootdown) {
+            return Acquisition::ContractBroken { held: h };
+        }
+        if (rank as u8) <= h {
+            return Acquisition::Inverted { held: h };
+        }
+    }
+    Acquisition::Ok
 }
 
 /// Debug-build enforcement. Compiled out in release builds, and in host unit tests (see
@@ -256,23 +297,19 @@ mod tracker {
         // floor belong to a context this handler interrupted and will not resume until the
         // handler has released everything it took. Find the violation under the mask but
         // report outside it: `report` panics, and the panic path prints.
-        let mut violation = None;
-        let mut contract = None;
-        for i in floor..depth.min(MAX_HELD) {
-            let held = HELD[cpu][i].load(Ordering::Relaxed);
-            if held == 0 {
-                continue;
-            }
-            // The shootdown lock's own contract is stricter than its rank: *nothing* may be
-            // held when it is taken. Checked here because this is the machinery that knows.
-            if matches!(rank, LockRank::TlbShootdown) {
-                contract = Some(held);
-                break;
-            }
-            if (rank as u8) <= held {
-                violation = Some(held);
-                break;
-            }
+        // Snapshot the scope, then decide with `super::classify` — the same function the
+        // host tests call, so the rule cannot drift away from its coverage. Eight bytes
+        // under the mask; the decision itself is pure.
+        let mut scope = [0u8; MAX_HELD];
+        let n = depth.min(MAX_HELD).saturating_sub(floor);
+        for k in 0..n {
+            scope[k] = HELD[cpu][floor + k].load(Ordering::Relaxed);
+        }
+        let (mut violation, mut contract) = (None, None);
+        match super::classify(rank, &scope[..n]) {
+            super::Acquisition::Ok => {}
+            super::Acquisition::ContractBroken { held } => contract = Some(held),
+            super::Acquisition::Inverted { held } => violation = Some(held),
         }
         if depth < MAX_HELD {
             HELD[cpu][depth].store(rank as u8, Ordering::Relaxed);
@@ -494,11 +531,20 @@ mod tracker {
 /// Host tests for the scope arithmetic.
 ///
 /// The *tracker* is compiled out under `cfg(test)` (module docs § Not under host
-/// `cfg(test)`) because its per-CPU state is invalid there. The arithmetic it performs is
-/// not — so it is reproduced here over a plain local struct, with no atomics, no CPU index
-/// and no interrupt masking, and exercised directly. This is the part that got the design
-/// wrong the first time; it should not go untested just because the plumbing cannot run on
-/// the host.
+/// `cfg(test)`) because its per-CPU state is invalid there. What that costs, and what it
+/// does not, is worth being exact about — the distinction is the reason for [`classify`]:
+///
+/// - **The rule** — what an acquisition means given what is held — is [`classify`], and the
+///   tests below call **that function**, the same one the tracker calls. It is not
+///   reimplemented here.
+/// - **The bookkeeping** — the stack, the depth, the floor — is the part that genuinely
+///   cannot run on the host, so `State` below models it over a plain local struct with no
+///   atomics, no CPU index and no interrupt masking.
+///
+/// It used to reproduce the rule here too, and the reproduction had silently lost the
+/// shootdown-lock contract branch (2026-08-14). If you are adding a rule, add it to
+/// `classify`; anything added to `State` is bookkeeping by definition, and a rule that lands
+/// there is invisible to the kernel.
 #[cfg(test)]
 mod tests {
     use super::LockRank;
@@ -514,23 +560,25 @@ mod tests {
     }
 
     impl State {
-        /// `Ok(())`, or `Err(held_rank)` for the entry that the acquire inverted against.
+        /// `Ok(())`, or `Err(held_rank)` for the entry the acquire broke against.
+        ///
+        /// **The decision comes from [`super::classify`]** — the same function the real
+        /// tracker calls. This struct now models only the *bookkeeping* (the stack, the
+        /// depth, the floor), which is the part that genuinely cannot run on the host. It
+        /// used to reimplement the rule too, and the reimplementation had silently lost the
+        /// `TlbShootdown` contract branch.
         fn acquired(&mut self, rank: LockRank) -> Result<(), u8> {
-            let mut violation = None;
-            for i in self.floor..self.depth.min(MAX_HELD) {
-                let held = self.held[i];
-                if held != 0 && (rank as u8) <= held {
-                    violation = Some(held);
-                    break;
-                }
-            }
+            let hi = self.depth.min(MAX_HELD);
+            let scope = if hi > self.floor { &self.held[self.floor..hi] } else { &[][..] };
+            let verdict = super::classify(rank, scope);
             if self.depth < MAX_HELD {
                 self.held[self.depth] = rank as u8;
             }
             self.depth += 1;
-            match violation {
-                Some(h) => Err(h),
-                None => Ok(()),
+            match verdict {
+                super::Acquisition::Ok => Ok(()),
+                super::Acquisition::ContractBroken { held }
+                | super::Acquisition::Inverted { held } => Err(held),
             }
         }
 
@@ -557,6 +605,40 @@ mod tests {
         fn switch_safe(&self) -> bool {
             self.depth == 0 && self.floor == 0
         }
+    }
+
+    /// `tlb::LOCK`'s contract is stricter than its rank, and only [`classify`] enforces it.
+    ///
+    /// `TlbShootdown` is 85 — above `Sched` (10) and `HandleTable` (30) — so taking it while
+    /// holding either is **not** a rank inversion and the ordinary comparison waves it
+    /// through. The F1 caller contract is that *nothing* may be held. Untested on either
+    /// side until 2026-08-14: the tracker had the branch, the test copy did not, and the
+    /// drift was invisible because the tests exercised the copy.
+    #[test]
+    fn the_shootdown_lock_refuses_any_held_lock_even_one_it_outranks() {
+        use super::{Acquisition, LockRank, classify};
+
+        // Nothing held: fine.
+        assert_eq!(classify(LockRank::TlbShootdown, &[]), Acquisition::Ok);
+        assert_eq!(classify(LockRank::TlbShootdown, &[0, 0]), Acquisition::Ok);
+
+        // Holding a *lower* rank would pass the inversion test — and must still be refused.
+        let sched = LockRank::Sched as u8;
+        assert!(
+            (LockRank::TlbShootdown as u8) > sched,
+            "the premise: this is not a rank inversion, which is why the branch exists"
+        );
+        assert_eq!(
+            classify(LockRank::TlbShootdown, &[sched]),
+            Acquisition::ContractBroken { held: sched }
+        );
+
+        // A different lock over `Sched` is an ordinary inversion, not a contract break —
+        // so the branch is specific to the shootdown lock rather than to a held stack.
+        assert_eq!(
+            classify(LockRank::Sched, &[sched]),
+            Acquisition::Inverted { held: sched }
+        );
     }
 
     #[test]
