@@ -1168,31 +1168,6 @@ consecutive passes, or the next change to the terminal/tty stack — whichever c
 the only gate that exercises the whole path from a keystroke into a real shell and back, so the
 coverage it adds is not duplicated by `check-input` or `check-display`.
 
-**Thread placement still targets a CPU that has parked.** `sched::leave_online` clears a
-parked CPU's bit in `ONLINE_MASK`, but not its entry in the `SCHED`-guarded `cpu_online[]` —
-it cannot, because the faulting CPU may already hold `SCHED`. So `pick_target_cpu`, the
-home-CPU fast path and `steal_one` keep placing runnable threads on a core that will never
-execute again, and each placed thread hangs forever. Reachable on a machine that otherwise
-keeps running: `idt.rs`'s `dump_and_halt` parks on **any ring-0 fault**, including a kernel
-`#PF` on an AP. This is strictly better than the whole-machine shootdown wedge it replaced
-(2026-08-13) and is not a regression, which is why it is deferred rather than blocking. The
-fix is for the placement paths to intersect with `online_mask()`; it is a scheduler
-behaviour change and wants its own review rather than a drive-by in a bug fix. Trigger: any
-work on placement or stealing, or a second reachable park path.
-
-**`tlb::shootdown` waits on a CPU count that can go stale.** It snapshots `sched::online_mask`,
-sets `PENDING` from that count, then waits for exactly that many acknowledgements. A CPU that
-parks permanently *inside* that window — after the snapshot, before its ack — can never satisfy
-the count, and the round hangs exactly as the 2026-08-13 bug did. The window is microseconds wide, and narrower still in the
-other direction — `leave_online()` runs *before* the `cli` in `halt_loop`, so a CPU that has
-cleared its bit can still take and acknowledge an in-flight IPI for a few instructions. (An
-earlier version of this entry also argued "a permanent park happens at most once per boot";
-that is false — a ring-0 fault can park a second CPU later in the same boot.) The fix was
-left out of that change rather than grown into it. The principled version is for the wait to stop expecting acknowledgements
-from CPUs that have since left the mask, which needs an acked-bitmask the initiator can compare
-against a re-read of `online_mask`. Trigger: any further work on `tlb.rs`, or a second reachable
-park path.
-
 **A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
 `drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
 exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one
@@ -1222,6 +1197,8 @@ decision log entry for the date shown.
 
 | What was deferred | Resolved | How |
 |---|---|---|
+| Thread placement still targets a CPU that has parked | 2026-08-14 | `pick_target_cpu` and `pick_wake_cpu` now require the lock-free `online_mask` bit as well as `cpu_online[]`, so a core that parked forever is never *given* work. **Not applied to the stealing paths**, deliberately: `steal_one`/`steal_available` choose whom to take work *from*, and a parked CPU is exactly the queue you want drained — gating those would strand the threads it already holds. Demonstrated end-to-end by parking a CPU mid-boot: with the fix `test-qemu` passes, without it the boot self-test fails. |
+| `tlb::shootdown` waits on a CPU count that can go stale | 2026-08-14 | The countdown became a per-CPU acknowledgement **bitmask**, and the initiator stops waiting once every outstanding target has left `online_mask`. Sound because a bit is cleared only by `leave_online`, whose only caller is `halt_loop` — after which that CPU executes nothing but the halt loop forever and cannot use a stale translation. Not a timeout: a live but slow CPU stays in the mask and is still waited for. The mask also removes the count's own hazard, where a late decrement could silently satisfy the *next* request. |
 | `Ctrl-C` does not reach a running pipeline stage (`interrupt-reaches-a-stage`) | 2026-08-04 | **Two bugs, and my first diagnosis was wrong about both.** I had reported that the tty server never emitted the interrupt event for a line that starts a pipeline; re-probing showed it emits it every time. The event was reaching the shell's channel *before* the shell began waiting on it — and a channel signals its waiters at the moment a message is enqueued, so a waiter that arrives afterwards never sees that edge. The shell slept on a message already sitting in its queue. Both blocking points (the capture read of the tail, and `reap`) now **poll before blocking**. The second bug was `run_line`: the interrupt checkpoint lived only in `exec_block`, so a line typed at a prompt was checked inside its loops and never between its statements — the third time that same rule has been learned in this file, after `hoist_defs` and the stale `cd` guard. |
 | `try`/`catch` in expression position (`try-in-expression-position`) | 2026-08-04 | Milestone 4 Part C. The fix was the one the entry predicted — `try` joins `primary` alongside `if` and `match` — and the trigger arrived from two directions at once: Milestone 4 *is* the considered pass over §9c the entry asked to wait for, and retiring the `?` propagation operator left no way to default on failure in expression position, so the recovery form had to land in the same part. It is strictly more than `?` offered: the catch branch sees the error, so the fallback can vary by `kind`, log first, or re-raise. **One node, two entry points** — `exec_try` returns `Flow`, so statement position keeps propagating `break`/`continue`/`return` out of a `try` body (a real regression risk, now a test) while expression position reduces it and refuses control flow. Writing it also turned up that §8c's `primary` production never listed `block`, `if` or `match` either, which is why `try`'s absence had looked deliberate. |
 | The shell's console loop has no automated cover (`nxsh-console-tests`) | 2026-08-03 | Resolved by testing the *whole* interactive path rather than extracting the loop. `cargo xtask test-interactive` boots the **release image** — which nothing else boots; `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a fixed script — and drives login, a wrong password, a shell prompt, a spawned program, a failing stage, cross-line interpreter state, and `exit` → log in again. Expect-driven, so the guest paces it. The rejected alternative was extracting the byte loop into the library half: the continuation *decision* is already host-tested, leaving only ~60 lines of stable byte handling, and a refactor of the critical interactive path is its own risk — while the two bugs it could never have caught (console-lookup rights, session wiring) are precisely the ones that hurt. Non-vacuity checked by reverting the login-echo fix: the run fails at `\npassword:`. |

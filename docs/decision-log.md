@@ -15132,3 +15132,65 @@ me after a buffer-release bug that did not exist. Both were caught the same way 
 the instrument could produce a positive result at all before trusting a negative one. The thing
 that finally cracked it was not a kernel probe but `info registers -a` over QMP: the emulator knew
 where every vCPU was the whole time.
+
+## 2026-08-14 — What is true about a CPU that has stopped: placement, stealing, and the ack protocol
+
+Follow-on to 2026-08-13, which established that a permanently parked CPU must leave
+`sched::online_mask`. That fix was correct and incomplete: it left two gaps, both filed as
+deferrals at the time and both closed here. They are one idea — **the rest of the kernel has
+to agree about a CPU that has stopped** — so they are one change.
+
+### 1. Placement must exclude a parked CPU; stealing must not
+
+`leave_online` clears the lock-free mask but cannot clear the `SCHED`-guarded `cpu_online[]`
+— that needs `SCHED`, which the parking CPU may already hold. So the two disagree, and the
+scheduler was reading the wrong one: `pick_target_cpu` and `pick_wake_cpu` kept handing
+runnable threads to a core that will never execute again. Each one hangs forever, on a
+machine that otherwise looks healthy and passes its gates.
+
+Reachable while everything else runs: `idt.rs`'s `dump_and_halt` parks on **any ring-0
+fault**, including a kernel `#PF` on an AP.
+
+`cpu_accepts_work` now requires both. **The stealing paths deliberately still require only
+`cpu_online[]`**, and that asymmetry is the interesting part: `steal_one` and
+`steal_available` choose whom to take work *from*, and a parked core is precisely the queue
+you want drained. Gating the victim side would have stranded the threads already sitting
+there — the opposite of the fix, arrived at by following a review's list of call sites
+instead of asking what each one meant. The comment says so, because the next reader will be
+tempted to make it "consistent".
+
+What this cannot rescue is the thread that was *current* on the parked CPU. It is not on any
+queue; it is stranded with the core.
+
+### 2. The ack protocol must tolerate a CPU leaving mid-request
+
+`tlb::shootdown` sampled `online_mask`, set a countdown from its population count, and
+waited for zero. A CPU parking *between* the sample and its acknowledgement can never send
+one, so the request hung forever — holding the shootdown lock, and with it every later
+initiator. The same whole-machine deadlock, through a narrower window.
+
+The countdown is now a per-CPU **acknowledgement bitmask**, and the initiator stops waiting
+once every outstanding target has left the mask. Three things make that sound:
+
+- **It is a departure check, not a timeout.** A live CPU that is merely slow is still in the
+  mask and is still waited for, however long it takes.
+- **A departed CPU cannot observe the invalidation it never performed.** A bit is cleared
+  only by `leave_online`, whose only caller is `halt_loop`; after it, that CPU executes
+  nothing but the halt loop's own text, forever.
+- **A mask is safer than a count here.** A late decrement from a departing CPU could
+  silently satisfy the *next* request, completing it while a CPU still held a stale
+  translation. A late `fetch_or` can only set a bit for a CPU that has left the online set,
+  which no later request targets.
+
+### Evidence
+
+Both halves are break-tested host-side, and the placement half end to end. Parking CPU 2
+mid-boot on purpose, the way a ring-0 fault would:
+
+| configuration | result |
+|---|---|
+| with the placement fix | `xtask: integration tests PASSED` |
+| without it | `init: integration test harness FAILED` |
+
+That is the whole bug in two lines: a machine that survives losing a core, and one that does
+not.

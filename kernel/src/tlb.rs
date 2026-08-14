@@ -48,7 +48,7 @@
 //! layer (unmap / frame free), reached via `reap_pending` outside all locks,
 //! which satisfies this.
 
-use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use crate::arch::cpu::ArchCpu;
 use crate::arch::paging::ArchPaging;
@@ -74,8 +74,21 @@ static LOCK: SpinLock<()> = SpinLock::new(LockRank::TlbShootdown, ());
 static REQUEST_ALL: AtomicBool = AtomicBool::new(false);
 /// The page to invalidate when `REQUEST_ALL == false` (linear address).
 static REQUEST_VA: AtomicU64 = AtomicU64::new(0);
-/// Number of target CPUs that have not yet acknowledged the current request.
-static PENDING: AtomicU32 = AtomicU32::new(0);
+/// A dense CPU index must fit in [`ACKED`]'s bits. `on_ipi` shifts by `current_cpu()` with
+/// no range guard of its own — deliberately, since a CPU servicing an IPI has an identity by
+/// construction — so this is where that assumption is stated rather than assumed.
+const _: () = assert!(MAX_CPUS <= 64, "ACKED is a u64 bitmask indexed by dense CPU id");
+
+/// Bitmask of CPUs that have acknowledged the current request (dense index → bit).
+///
+/// **A mask rather than a countdown, and that is a correctness choice.** A count cannot say
+/// *which* CPU is outstanding, and [`shootdown`] now has to answer exactly that: a CPU that
+/// parks between the target snapshot and its acknowledgement can never send one, and the
+/// initiator must be able to tell that case from "not yet". A count also makes a late
+/// decrement dangerous — it would silently satisfy the *next* request — whereas a stale
+/// `fetch_or` can only set a bit for a CPU that has left the online set, which no later
+/// request targets.
+static ACKED: AtomicU64 = AtomicU64::new(0);
 
 /// Invalidate the translation for `va` on this CPU and every other online CPU,
 /// returning once all remote CPUs have done so. Call after the page-table edit
@@ -143,7 +156,7 @@ fn shootdown(va: Option<VirtAddr>) {
         // the targets' Acquire loads in `on_ipi`).
         REQUEST_ALL.store(va.is_none(), Ordering::Relaxed);
         REQUEST_VA.store(va.map(|v| v.as_u64()).unwrap_or(0), Ordering::Relaxed);
-        PENDING.store(online.count_ones(), Ordering::Release);
+        ACKED.store(0, Ordering::Release);
 
         // Signal every online CPU — including the one we are running on (a
         // self-IPI, serviced during the ack spin below). A CPU that comes
@@ -159,7 +172,23 @@ fn shootdown(va: Option<VirtAddr>) {
         // Wait for every target (self included) to acknowledge. Interrupts are
         // enabled, so this CPU services its own IPI — and any other initiator's
         // — while spinning.
-        while PENDING.load(Ordering::Acquire) != 0 {
+        //
+        // **Stop waiting on a target that has left the online set.** `online` was sampled
+        // before the IPIs went out; a CPU that parks inside that window has already run
+        // `sched::leave_online` and is on its way to `cli; hlt`, so its IPI is either
+        // unserviced or never will be — and waiting for it hangs this request forever,
+        // taking [`LOCK`] and every later initiator with it. That is the same
+        // whole-machine deadlock a park caused before it cleared its bit (2026-08-13); this
+        // closes the residual window the fix left open.
+        //
+        // **Skipping it is sound because the CPU is gone, not merely slow.** A bit is
+        // cleared only by `leave_online`, whose sole caller is `Cpu::halt_loop` — after
+        // which that CPU executes nothing but the halt loop's own text forever. It cannot
+        // use a stale translation, so the invalidation it never performed cannot be
+        // observed. This is *not* a timeout: a live CPU that is merely late is still in the
+        // mask and is still waited for, however long it takes.
+        while !wait_satisfied(online, ACKED.load(Ordering::Acquire), crate::sched::online_mask())
+        {
             core::hint::spin_loop();
         }
     }
@@ -169,6 +198,19 @@ fn shootdown(va: Option<VirtAddr>) {
     // Re-enable preemption last; a reschedule latched during the window (a
     // wake IPI aimed at this CPU, or a tick expiry) is replayed here.
     crate::sched::preempt_enable();
+}
+
+/// Whether the initiator may stop waiting: every target has either acknowledged, or has
+/// left the online set and so can never acknowledge.
+///
+/// Split out from the spin so the rule is pinned by a host test. **Not a timeout** — a live
+/// target that is merely slow stays in `still_online` and is still waited for.
+fn wait_satisfied(targets: u64, acked: u64, still_online: u64) -> bool {
+    // One clause, not two: `outstanding == 0` is already covered, since an empty set
+    // intersects nothing. An earlier version spelt both out and no test could tell them
+    // apart, which is a fair definition of dead code.
+    let outstanding = targets & !acked;
+    outstanding & still_online == 0
 }
 
 /// Handle an incoming TLB-shootdown IPI on this CPU: invalidate as the current
@@ -184,5 +226,41 @@ pub fn on_ipi() {
     unsafe { invalidate_local(va) };
     // Acknowledge after the invalidation is issued, so the initiator observes
     // completion only once this CPU can no longer use the stale translation.
-    PENDING.fetch_sub(1, Ordering::Release);
+    ACKED.fetch_or(1u64 << (Smp::current_cpu() as usize), Ordering::Release);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::wait_satisfied;
+
+    /// The initiator waits for a live target and gives up on a departed one — and nothing
+    /// else.
+    ///
+    /// The third case is the bug this exists for: before it, a CPU that parked between the
+    /// target snapshot and its acknowledgement hung the request forever, holding `LOCK` and
+    /// with it every later shootdown on the machine.
+    #[test]
+    fn waiting_ends_on_acknowledgement_or_departure_but_never_on_lateness() {
+        let targets = 0b1111;
+
+        // Nobody has acked yet, everyone is up: keep waiting.
+        assert!(!wait_satisfied(targets, 0b0000, 0b1111));
+
+        // All acked: done, regardless of who is still up.
+        assert!(wait_satisfied(targets, 0b1111, 0b1111));
+        assert!(wait_satisfied(targets, 0b1111, 0b0001));
+
+        // CPU 2 has not acked and has left the online set: it never will — stop.
+        assert!(wait_satisfied(targets, 0b1011, 0b1011));
+
+        // CPU 2 has not acked and is still up: it is merely late — keep waiting. This is
+        // what makes the rule a departure check and not a timeout.
+        assert!(!wait_satisfied(targets, 0b1011, 0b1111));
+
+        // Two outstanding, one departed and one still up: the live one still holds it.
+        assert!(!wait_satisfied(targets, 0b1001, 0b1101));
+
+        // A CPU that was never a target cannot hold the request up, however it is marked.
+        assert!(wait_satisfied(0b0011, 0b0011, 0b1111));
+    }
 }

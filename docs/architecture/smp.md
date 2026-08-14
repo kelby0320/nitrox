@@ -14,8 +14,9 @@ scheduler.md first for the policy; read this for the SMP machinery and the war
 stories. Anchors are `file:function` (line numbers drift; symbol names are
 stable).
 
-Status: implemented; §8 last corrected 2026-08-13 (a parked CPU must leave the online set,
-and why the identity guard on that is the load-bearing half). The SMP bring-up verification
+Status: implemented; §8 last corrected 2026-08-14 (a parked CPU must leave the online set,
+why the identity guard on that is the load-bearing half, and what placement, stealing and the
+ack protocol each do about a core that has gone). The SMP bring-up verification
 below dates from 2026-07-01, when the
 boot leaf was still `eshell`; the system now boots through the login chain to `nxsh` on
 `-smp 4` with **user threads distributing across all cores and migrating via
@@ -301,8 +302,18 @@ one**, so the guard errs toward doing nothing. A range check does not substitute
 range.
 
 What is *not* cleared is the `SCHED`-guarded `cpu_online[]` — `leave_online` cannot take
-`SCHED`, since the faulting CPU may already hold it — so placement and stealing still treat a
-parked core as a target. See §Deferred.
+`SCHED`, since the faulting CPU may already hold it. **Placement therefore requires both**
+(`cpu_accepts_work`, 2026-08-14): a core that parked is never given work, because a thread
+queued there is not merely delayed, it never runs. **Work-stealing deliberately requires only
+`cpu_online[]`**, so a parked core's queue stays drainable — that is how the threads it was
+already holding get rescued, and gating the victim side would strand exactly them. The
+asymmetry is intentional in both directions.
+
+The ack protocol itself tolerates a CPU leaving mid-request: the initiator tracks
+acknowledgements as a **bitmask** and stops waiting once every outstanding target has left
+`online_mask` (2026-08-14, closing the window the 08-13 fix left). That is not a timeout — a
+live but slow CPU is still in the mask and is still waited for — and it is sound because the
+only way to leave is `leave_online`, immediately before halting forever.
 
 ---
 
@@ -463,13 +474,6 @@ syscalls while migratable.
   is single-threaded today, so `exit_process` never has a live off-core sibling
   (the `has_live_siblings` scan already *sees* other cores' `current[]`; it just
   can't *stop* one). Lands with the first multi-threaded user process.
-- **Placement still targets a parked CPU** — `leave_online` clears `ONLINE_MASK` but not the
-  `SCHED`-guarded `cpu_online[]`, so `pick_target_cpu`, the home-CPU fast path and
-  `steal_one` keep giving runnable threads to a core that will never execute again, and each
-  hangs. Reachable while the rest of the machine runs: `dump_and_halt` parks on any ring-0
-  fault, including a kernel `#PF` on an AP. Strictly better than the whole-machine wedge it
-  replaced, which is why it is deferred; the fix is to intersect placement with
-  `online_mask()`. See `docs/rationale/deferred-decisions.md`.
 - **Per-`AddressSpace` `active_cpus`** — a bitmask of cores holding the root in CR3,
   maintained at the CR3 load in `switch_into`, so a shootdown targets only those
   cores instead of broadcasting to all online cores. A correctness-neutral
