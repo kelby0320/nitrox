@@ -1162,6 +1162,37 @@ the boot chain does not already exercise, remains deferred. Trigger: a case that
 expressed as "the boot completes and the harness agrees". See
 `docs/conventions/qemu-integration-tests.md`.
 
+**Promote `check-terminal` to CI.** It was excluded as flaky; the flake was the parked-CPU
+deadlock fixed 2026-08-13, and it now passes 4 of 4 locally. Trigger: a second clean run of ~10
+consecutive passes, or the next change to the terminal/tty stack — whichever comes first. It is
+the only gate that exercises the whole path from a keystroke into a real shell and back, so the
+coverage it adds is not duplicated by `check-input` or `check-display`.
+
+**Thread placement still targets a CPU that has parked.** `sched::leave_online` clears a
+parked CPU's bit in `ONLINE_MASK`, but not its entry in the `SCHED`-guarded `cpu_online[]` —
+it cannot, because the faulting CPU may already hold `SCHED`. So `pick_target_cpu`, the
+home-CPU fast path and `steal_one` keep placing runnable threads on a core that will never
+execute again, and each placed thread hangs forever. Reachable on a machine that otherwise
+keeps running: `idt.rs`'s `dump_and_halt` parks on **any ring-0 fault**, including a kernel
+`#PF` on an AP. This is strictly better than the whole-machine shootdown wedge it replaced
+(2026-08-13) and is not a regression, which is why it is deferred rather than blocking. The
+fix is for the placement paths to intersect with `online_mask()`; it is a scheduler
+behaviour change and wants its own review rather than a drive-by in a bug fix. Trigger: any
+work on placement or stealing, or a second reachable park path.
+
+**`tlb::shootdown` waits on a CPU count that can go stale.** It snapshots `sched::online_mask`,
+sets `PENDING` from that count, then waits for exactly that many acknowledgements. A CPU that
+parks permanently *inside* that window — after the snapshot, before its ack — can never satisfy
+the count, and the round hangs exactly as the 2026-08-13 bug did. The window is microseconds wide, and narrower still in the
+other direction — `leave_online()` runs *before* the `cli` in `halt_loop`, so a CPU that has
+cleared its bit can still take and acknowledge an in-flight IPI for a few instructions. (An
+earlier version of this entry also argued "a permanent park happens at most once per boot";
+that is false — a ring-0 fault can park a second CPU later in the same boot.) The fix was
+left out of that change rather than grown into it. The principled version is for the wait to stop expecting acknowledgements
+from CPUs that have since left the mask, which needs an acked-bitmask the initiator can compare
+against a re-read of `online_mask`. Trigger: any further work on `tlb.rs`, or a second reachable
+park path.
+
 **A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
 `drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
 exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one

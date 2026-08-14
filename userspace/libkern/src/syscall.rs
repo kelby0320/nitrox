@@ -96,10 +96,15 @@ pub const SYS_FILE_RENAME: u64 = 35;
 pub const SYS_PROCESS_TERMINATE: u64 = 36;
 /// Debug: write a user byte buffer to the kernel serial log. Not ABI-stable.
 pub const SYS_DEBUG_KPRINT: u64 = 0xFFFF_0000;
-/// Integration-test only: end the QEMU run with a harness verdict (the argument's
-/// low byte, via `isa-debug-exit`). Implemented by the kernel **only** under its
-/// `test-harness` feature (`cargo xtask test-qemu`); a production kernel returns
-/// `Unsupported`. Not ABI-stable. (`0xFFFF_0001` was the long-retired process-exit
+/// Integration-test only: report a harness verdict (the argument's low byte) to
+/// `isa-debug-exit`, which terminates QEMU. Implemented by the kernel **only** under its
+/// `test-harness` feature; a production kernel returns `Unsupported`. Not ABI-stable.
+///
+/// **This returns whenever the device is absent, which is the normal case for every gate
+/// except `test-qemu`** — they boot the `test-harness` image without the device because
+/// they need the guest alive afterwards. The answer is `Unsupported` there too, so it means
+/// "no verdict was delivered" rather than "wrong kernel build". Do not wrap this in a `-> !`
+/// helper. (`0xFFFF_0001` was the long-retired process-exit
 /// `sys_debug_exit`; this is a distinct syscall at the next number.) See
 /// `docs/conventions/qemu-integration-tests.md`.
 pub const SYS_TEST_EXIT: u64 = 0xFFFF_0002;

@@ -428,18 +428,86 @@ pub mod stats {
 /// can be freed safely (CR3 is the boot root before the reap).
 static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 
-/// Lock-free bitmask of online CPUs (dense index → bit), a duplicate of the
-/// `SCHED`-guarded `cpu_online[]` kept purely so subsystems that must not take the
-/// top-rank `SCHED` lock can read the online set without a lock — notably TLB
-/// shootdown ([`crate::tlb`]), which fires from the mm layer under lower locks.
-/// Each CPU sets its own bit as it comes online; bits are never cleared (no
-/// CPU hot-unplug).
+/// Lock-free bitmask of online CPUs (dense index → bit), kept so subsystems that must not
+/// take the top-rank `SCHED` lock can read the online set without a lock — notably TLB
+/// shootdown ([`crate::tlb`]), which fires from the mm layer under lower locks. Each CPU
+/// sets its own bit as it comes online.
+///
+/// **It mirrors the `SCHED`-guarded `cpu_online[]` on the way up but not on the way down**,
+/// because [`leave_online`] clears a bit here and does not touch `cpu_online[]`. So after a
+/// park the scheduler's placement paths (`pick_target_cpu`, the home-CPU fast path,
+/// `steal_one`) still regard that CPU as a target while shootdown no longer waits for it.
+/// **That divergence is reachable on a machine that otherwise keeps running**, which an
+/// earlier version of this comment got wrong by claiming only the panic path reaches it.
+/// `idt.rs`'s `dump_and_halt` parks on **any ring-0 fault** — a kernel `#PF` on an AP, say —
+/// and that CPU is fully online at the time. It leaves `ONLINE_MASK`, so shootdowns complete;
+/// `cpu_online[]` stays set, so the placement paths keep giving it threads, and each one
+/// hangs forever on a core that will never execute again. The AP-init park is clean by
+/// contrast: `ap_init` sets `cpu_online[]` only after its last fallible step.
+///
+/// That is a better failure than the whole-machine wedge it replaces, and it is not a
+/// regression — before `leave_online` existed, the same fault hung everything at the next
+/// shootdown. But it is not "bounded because the machine is already gone", and the honest
+/// fix is for the placement paths to intersect with [`online_mask`]. Tracked in
+/// `docs/rationale/deferred-decisions.md`. Do not add a reader of this mask that assumes
+/// the two agree.
+///
+/// **A bit is cleared only by [`leave_online`], when a CPU parks forever.** There is
+/// still no CPU hot-unplug; this is the terminal case — a panic, a failed AP init, or
+/// the harness verdict — where the CPU stops executing entirely.
 static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
 /// Used by [`crate::tlb`] to pick TLB-shootdown IPI targets without taking `SCHED`.
 pub fn online_mask() -> u64 {
     ONLINE_MASK.load(Ordering::Acquire)
+}
+
+/// Drop this CPU from the online set, because it is about to stop executing forever.
+///
+/// **Every permanent park must call this, and the reason is a whole-machine deadlock.**
+/// `online_mask` is the target set for TLB-shootdown IPIs, and [`crate::tlb::shootdown`]
+/// waits for an acknowledgement from *every* CPU in it. A CPU that halts while still
+/// counted online can never send that acknowledgement, so the next shootdown — which is
+/// any `sys_memory_unmap`, i.e. any large `free` in any process — spins forever, taking
+/// the initiating thread with it and, through the shootdown lock, every later one.
+///
+/// That is not hypothetical: it is exactly how a parked CPU froze `nxterm` mid-repaint
+/// under `check-terminal` (2026-08-13). The CPU had halted with interrupts disabled in
+/// `debug_exit`'s device-absent fallback ~6,000 ticks earlier, and nothing noticed until
+/// a glyph outline was freed.
+///
+/// **Does nothing unless this CPU's identity is its own.** A CPU that has not yet
+/// established one reports index `0` (x86's `IA32_TSC_AUX` reset default), so an
+/// unchecked version of this clears *the BSP's* bit when an AP with an unbound APIC id
+/// parks — leaving the running BSP out of the shootdown set, where the slow path's
+/// self-IPI is the only thing that invalidates its own TLB. The result is a freed frame
+/// still reachable through a stale translation: silent memory corruption, strictly worse
+/// than the deadlock this function exists to prevent (PR #198 review, blocking 1).
+/// [`ArchSmp::identity_bound`](crate::arch::smp::ArchSmp::identity_bound) is that check;
+/// the range check below is a separate, weaker guard and does not cover this — an unbound
+/// CPU's `0` is in range.
+///
+/// **The check errs toward doing nothing, including once where it arguably should act.**
+/// The BSP's bit is set by [`init`] (`main.rs:353`) before `bind_cpu_identity(0, …)`
+/// (`main.rs:432`), so a BSP panic in that window finds its own identity unbound and leaves
+/// its bit set. That is harmless rather than lucky: APs are not launched until after the
+/// binding, so in that window no other CPU exists to initiate a shootdown and wait on it.
+/// The asymmetry is deliberate — failing to clear a bit costs a hang on a machine that has
+/// already panicked, while clearing the wrong one costs silent memory corruption on a
+/// healthy one.
+pub fn leave_online() {
+    use crate::arch::smp::ArchSmp;
+    clear_online_bit(crate::arch::Smp::identity_bound(), crate::arch::Smp::current_cpu() as usize);
+}
+
+/// The decision half of [`leave_online`], split out so the rule that cost a review round is
+/// pinned by a host test rather than only by a comment.
+fn clear_online_bit(identity_bound: bool, me: usize) {
+    if !identity_bound || me >= MAX_CPUS {
+        return;
+    }
+    ONLINE_MASK.fetch_and(!(1u64 << me), Ordering::AcqRel);
 }
 
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
@@ -3585,6 +3653,42 @@ pub(crate) extern "C" fn thread_enter() -> ! {
 
 #[cfg(test)]
 mod tests {
+    /// A permanent park must clear this CPU's online bit — **and must not clear anyone
+    /// else's when it has no identity of its own.**
+    ///
+    /// The three cases in one test on purpose: `ONLINE_MASK` is a global, and separate
+    /// `#[test]` functions run concurrently, so splitting them would make them race.
+    ///
+    /// The middle case is the one that matters. `current_cpu()` reports `0` for a CPU that
+    /// never established an identity (x86's `IA32_TSC_AUX` reset default), so an unguarded
+    /// park clears the *running BSP's* bit — dropping it from the TLB-shootdown set, where
+    /// the slow path's self-IPI is the only thing that invalidates its own TLB. A freed
+    /// frame stays reachable through a stale translation. Note the range check does not
+    /// catch it: `0` is perfectly in range (PR #198 review, blocking 1).
+    #[test]
+    fn a_park_clears_its_own_bit_and_only_with_an_identity_of_its_own() {
+        super::ONLINE_MASK.store(0b1011, super::Ordering::Relaxed);
+
+        // No identity: nothing is cleared, though `me` is the plausible-looking `0`.
+        super::clear_online_bit(false, 0);
+        assert_eq!(super::online_mask(), 0b1011, "an unbound CPU cleared someone else's bit");
+
+        // Out of range: also ignored — and asserted at **64**, not `MAX_CPUS`.
+        //
+        // `MAX_CPUS` is 8, so deleting the range check leaves `0b1011 & !(1 << 8)` =
+        // `0b1011` and this assertion passes for the broken implementation too. A shift
+        // only misbehaves at the width of the type: `1u64 << 64` panics in debug and wraps
+        // to `1 << 0` in release — clearing **CPU 0's** bit, the same silent corruption the
+        // identity guard exists to prevent. Caught by a reviewer's negative control, which
+        // is the second time an assertion of mine held for both implementations.
+        super::clear_online_bit(true, 64);
+        assert_eq!(super::online_mask(), 0b1011, "an out-of-range index cleared a bit");
+
+        // Its own identity: its own bit, and no other.
+        super::clear_online_bit(true, 1);
+        assert_eq!(super::online_mask(), 0b1001);
+    }
+
     use super::*;
     use crate::mm::test_support::init_global_heap;
     use crate::object::header::test_probe;

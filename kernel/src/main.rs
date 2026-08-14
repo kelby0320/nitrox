@@ -1116,6 +1116,7 @@ fn panic(info: &PanicInfo) -> ! {
     // until the wall-clock timeout). `0x11` → QEMU exit 35 → the runner maps to fail.
     #[cfg(feature = "test-harness")]
     arch::debug_exit(0x11);
-    #[cfg(not(feature = "test-harness"))]
+    // Halt either way: `debug_exit` returns when no `isa-debug-exit` device is attached,
+    // and a panicked kernel must not run on regardless.
     arch::Cpu::halt_loop()
 }

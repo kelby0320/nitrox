@@ -304,7 +304,12 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
         SYS_FILE_SYNC => encode(sys_file_sync(a0)),
         SYS_DEBUG_KPRINT => encode(sys_kprint(a0, a1 as usize)),
         // Integration-test build only: end the QEMU run with the caller's verdict.
-        // Diverges (QEMU exits); never returns to dispatch/sysret.
+        //
+        // Diverges when the `isa-debug-exit` device is attached (`xtask test-qemu`), which
+        // is the adjudicated case. The other gates boot this image without the device, so
+        // the write is ignored and this **returns `Unsupported`** — the caller learns its
+        // verdict went nowhere and carries on. It must not park the CPU instead: doing so
+        // stranded this thread and deadlocked every later TLB shootdown (2026-08-13).
         #[cfg(feature = "test-harness")]
         SYS_TEST_EXIT => {
             // Every adjudicated run ends here, so it is the one place guaranteed to see
@@ -312,7 +317,8 @@ pub fn dispatch(nr: u64, a0: u64, a1: u64, a2: u64, a3: u64, a4: u64, a5: u64) -
             // because the consumer is a measurement, not a program.
             report_fill_stats();
             report_stack_watermark();
-            crate::arch::debug_exit(a0 as u32)
+            crate::arch::debug_exit(a0 as u32);
+            KError::Unsupported.as_isize()
         }
         // These diverge into the scheduler; they never return to dispatch/sysret.
         SYS_PROCESS_EXIT => sys_process_exit(a0 as i32),
