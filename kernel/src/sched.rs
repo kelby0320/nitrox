@@ -106,16 +106,31 @@ const IDLE_TID: u32 = u32::MAX;
 ///
 /// Raised 16 → 64 on 2026-08-13, when M5 Part C added one process (`nxterm`
 /// spawning the shell it hosts) and the boot panicked on
-/// `blocked list within reserve`. Sixteen had been one process away from its
+/// `blocked list within reserve` (the message reads `blocked list: reserve
+/// exhausted — …` since 2026-08-14). Sixteen had been one process away from its
 /// limit for some time; nothing said so, because the failure mode is a panic at
 /// whatever moment the high-water mark is crossed rather than a warning as it is
 /// approached.
 const BLOCKED_RESERVE: usize = 64;
 
-/// Pre-reserved capacity for the exited-thread reap list. Holds the current
-/// thread plus any sibling threads a process exit tears down; sized like the
-/// run queue so a whole process's threads fit without allocating under the lock.
-const REAP_RESERVE: usize = 16;
+/// Pre-reserved capacity for the exited-thread reap list. Holds the current thread plus any
+/// sibling threads a process exit tears down.
+///
+/// **Raised 16 → [`READY_RESERVE`] on 2026-08-14, because the comment here already said it
+/// was that.** It claimed to be "sized like the run queue"; the run queue went 16 → 32 for
+/// Phase 4 (F6) and this did not follow. Nothing noticed while an over-full push merely
+/// *grew* — badly, allocating under `SCHED` (F11), but silently. Since pushes now refuse, the
+/// number is load-bearing: `exit_process` sweeps every sibling of the exiting process into
+/// this list in one lock hold, so it is the cap on threads-per-process at exit
+/// (PR #205 review, finding 2).
+///
+/// **That cap is userspace-reachable and aborts the machine when crossed**, because
+/// `sys_thread_create` has no per-process limit: 33 threads that block and then exit will
+/// trip it. Refusing is still right — growing here is the forbidden pattern, and the
+/// alternative to the panic is not "grow" but "reap in batches", which is a real change to
+/// the exit path. Tracked in `docs/rationale/deferred-decisions.md`; until then this number
+/// is the bound and it is stated rather than implied.
+const REAP_RESERVE: usize = READY_RESERVE;
 
 /// Pre-reserved capacity for [`SchedState::deferred_drops`] — `ObjectRef`s a
 /// lock-held or IRQ-context path must release but cannot drop in place (a drop
@@ -196,7 +211,7 @@ mod deadline {
         if h.len() >= h.capacity() {
             return Err(AllocError);
         }
-        h.try_push(e).expect("within reserved heap capacity");
+        super::push_reserved(h, e, "deadline heap");
         let mut i = h.len() - 1;
         while i > 0 {
             let parent = (i - 1) / 2;
@@ -565,6 +580,31 @@ const _: () = assert!(
     "the kernel requires panic = \"abort\" (kernel/CLAUDE.md): a freestanding kernel has \
      no unwinder — if this fires, a target spec has dropped panic-strategy: abort"
 );
+
+/// Push onto a pre-reserved list held under `SCHED`, refusing rather than growing.
+///
+/// **`try_push` grows, and growth under this lock is the F11 deadlock.** `KVec::try_push`
+/// calls `kmalloc`/`kfree` when it is at capacity, so at the reserve boundary a push under
+/// the rank-1 IRQ-acquired `SCHED` lock reaches the allocator's plain spinlock — which
+/// `kernel/docs/lock-ordering.md` forbids without qualification. The `debug_assert!(len <
+/// capacity)` that sat beside several of these did not prevent it: the growth happens first
+/// and *succeeds*, so the assertion never fires and the inversion is silent. The `.expect()`
+/// fires only if the allocation itself fails (kernel audit C.1(c), 2026-08-14).
+///
+/// Every list here is sized so this cannot happen, and reaching it is a bug in that sizing —
+/// so this still ends the machine, exactly as the `.expect()` it replaces did. What changes
+/// is that it ends it *without having allocated first*, and with a message naming the list.
+///
+/// **The value is `forget`ten rather than dropped**, for the reason the wake paths now
+/// `forget` theirs: an `ObjectRef` drop reaches `dispatch_destroy` → `SlabCache::free`, the
+/// same plain spinlock under the same held lock. Nothing outlives the abort.
+#[track_caller]
+fn push_reserved<T>(list: &mut KVec<T>, val: T, what: &str) {
+    if let Err(returned) = list.push_within_capacity(val) {
+        core::mem::forget(returned);
+        panic!("{what}: reserve exhausted — this list is sized so that cannot happen");
+    }
+}
 
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
 /// the thread running on that CPU (which, while nonzero, cannot migrate — that
@@ -946,7 +986,7 @@ pub fn init() -> Result<(), AllocError> {
     g.deadlines = deadlines;
     g.deferred_drops = deferred_drops;
     g.ended_pids = ended_pids;
-    g.ready[0].try_push(reaper_ref).expect("run queue within reserve");
+    push_reserved(&mut g.ready[0], reaper_ref, "run queue (reaper install)");
     *g.cur_slot() = Some(boot_ref);
     *g.idle_slot() = Some(idle_ref);
     g.set_idle_addr(idle_addr);
@@ -1354,9 +1394,7 @@ fn wake_entropy_seed_waiters(g: &mut SchedState) {
             // A move within the reserve — no drop, no allocation under the lock.
             // Bounded: waiters queue only pre-seed and the drain fires post-seed,
             // so the lifetime total is ≤ SEED_WAITERS_MAX (< the reserve).
-            g.deferred_drops
-                .try_push(po)
-                .expect("deferred-drop list within reserve");
+            push_reserved(&mut g.deferred_drops, po, "deferred-drop list");
         }
     }
 }
@@ -2420,8 +2458,7 @@ fn block_current_and_switch(mut g: IrqSpinLockGuard<'_, SchedState>) {
     let prev_slot = unsafe { Thread::saved_sp_mut_ptr(prev_obj) };
 
     // Park prev in `blocked` (NOT ready/idle) — its `ObjectRef` keeps it alive.
-    debug_assert!(g.blocked.len() < g.blocked.capacity());
-    g.blocked.try_push(prev).expect("blocked list within reserve");
+    push_reserved(&mut g.blocked, prev, "blocked list");
     *g.cur_slot() = Some(next);
 
     // Switch into `next`; we resume here (lock-free) when a waker moves us back
@@ -2688,10 +2725,7 @@ fn switch_to_next(mut g: IrqSpinLockGuard<'_, SchedState>) {
         debug_assert!(g.idle_slot().is_none());
         *g.idle_slot() = Some(prev);
     } else {
-        debug_assert!(g.ready_slot().len() < g.ready_slot().capacity());
-        g.ready_slot()
-            .try_push(prev)
-            .expect("run queue within reserve");
+        push_reserved(g.ready_slot(), prev, "run queue (switch-out)");
     }
     *g.cur_slot() = Some(next);
 
@@ -2788,7 +2822,7 @@ fn reap_matching(list: &mut KVec<ObjectRef>, reap: &mut KVec<ObjectRef>, my_pid:
         let r = list.remove(i);
         // SAFETY: `r` pins the thread; `SCHED` held.
         unsafe { Thread::set_state(r.as_ptr(), ThreadState::Exited) };
-        reap.try_push(r).expect("reap within reserve");
+        push_reserved(reap, r, "reap list");
     }
 }
 
@@ -2836,7 +2870,7 @@ fn reap_blocked_matching(
             Thread::wait_clear(obj);
             Thread::set_state(obj, ThreadState::Exited);
         }
-        reap.try_push(r).expect("reap within reserve");
+        push_reserved(reap, r, "reap list");
     }
 }
 
@@ -2852,7 +2886,7 @@ fn finish_exit(mut g: IrqSpinLockGuard<'_, SchedState>, me: ObjectRef) -> ! {
     unsafe { Thread::set_state(me_obj, ThreadState::Exited) };
     let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
     // Park self for deferred reclamation.
-    g.reap_slot().try_push(me).expect("reap within reserve");
+    push_reserved(g.reap_slot(), me, "reap list (self)");
 
     // Switch to the next ready thread, else the idle thread (which always
     // exists post-init and is parked here, since `me` was current, not idle).
@@ -2964,7 +2998,7 @@ pub fn exit_process(status: ExitStatus) -> ! {
         // still marks the thread, so the per-CPU sweep remains a correct fallback if the
         // queue is full.
         if st.ended_pids.len() < st.ended_pids.capacity() {
-            let _ = st.ended_pids.try_push(me_pid);
+            let _ = st.ended_pids.push_within_capacity(me_pid);
             wake_reaper(st);
         }
         deliver_child_exited(st, me_obj, status);
@@ -3055,8 +3089,7 @@ pub fn suspend_with_fault(frame_ptr: usize, notif: Notification) -> ResumeDispos
             Thread::set_state(me_obj, ThreadState::Suspended);
         }
         let me_slot = unsafe { Thread::saved_sp_mut_ptr(me_obj) };
-        debug_assert!(g.suspended.len() < g.suspended.capacity());
-        g.suspended.try_push(me).expect("suspended list within reserve");
+        push_reserved(&mut g.suspended, me, "suspended list");
 
         // Switch to the next runnable thread (mirrors block_current_and_switch).
         // If nothing is runnable, this fault **stranded the scheduler**: no thread
@@ -3490,9 +3523,7 @@ fn place_thread(g: &mut SchedState, r: ObjectRef, wake: bool) -> Result<(), Obje
         return Err(r);
     }
     seed_vruntime(g, obj, cpu, wake);
-    g.ready[cpu]
-        .try_push(r)
-        .expect("push within reserved capacity is infallible");
+    push_reserved(&mut g.ready[cpu], r, "run queue (placement)");
     g.stats[cpu].placed += 1;
     // If the thread landed on a *different* CPU, poke that CPU with a reschedule
     // IPI so it runs the newcomer promptly (resuming it if idle) instead of waiting
@@ -3814,8 +3845,9 @@ fn park_reaper() {
 /// [`SchedState::ended_pids`], so a missed edge costs nothing.
 ///
 /// **A fifth placement site, and the only one that bypasses the policy.** It pushes onto
-/// `ready[this_cpu()]` directly: no affinity check, no [`cpu_accepts_work`], no capacity
-/// check beyond a `debug_assert!`. Sound today for a reason worth writing down rather than
+/// `ready[this_cpu()]` directly: no affinity check and no [`cpu_accepts_work`]. Its capacity
+/// check is [`push_reserved`]'s refusal, which is a real one — the `debug_assert!` that used
+/// to sit here was not, since the growth beside it happened first and succeeded. Sound today for a reason worth writing down rather than
 /// rediscovering — a CPU executing this code is by definition not parked, so the CPU it
 /// chooses always accepts work — but it is a fifth opinion on placement, in the same shape
 /// as the extra opinions on `online_mask` the audit found in § A. If placement policy grows
@@ -3827,8 +3859,7 @@ fn wake_reaper(g: &mut SchedState) {
     // SAFETY: `r` is the parked reaper, pinned by the slot's reference; `SCHED` held.
     unsafe { Thread::set_state(r.as_ptr(), ThreadState::Ready) };
     let cpu = SchedState::this_cpu();
-    debug_assert!(g.ready[cpu].len() < g.ready[cpu].capacity());
-    g.ready[cpu].try_push(r).expect("run queue within reserve");
+    push_reserved(&mut g.ready[cpu], r, "run queue (reaper wake)");
 }
 
 extern "C" fn idle_body(_arg: usize) {

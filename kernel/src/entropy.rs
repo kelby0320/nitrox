@@ -173,18 +173,28 @@ impl EntropyState {
     }
 
     /// Queue `po` to be woken on seeding, or hand it back (see [`SeedWaitReg`]).
-    /// Refs are *moved*, never dropped, here. The `seed_waiters` capacity is
-    /// reserved at [`init`], so `try_push` cannot allocate/fail.
+    /// Refs are *moved*, never dropped, here.
+    ///
+    /// **The push refuses rather than growing**, and the length check above is not what makes
+    /// that true. [`init`]'s reserve is best-effort: if it fails, `len() >= SEED_WAITERS_MAX`
+    /// is `0 >= 4` — false — so control reaches the push on an *unreserved* list, and
+    /// `try_push` would then `kmalloc` while this leaf-ranked lock is held. That is the
+    /// inversion `init`'s own comment says it is avoiding, reached by the path it did not
+    /// consider (kernel audit C.1(e), 2026-08-14). `push_within_capacity` cannot allocate, so
+    /// an unreserved list simply reports itself full — which is exactly what the caller
+    /// already handles.
     fn register_waiter(&mut self, po: ObjectRef) -> SeedWaitReg {
         if self.seeded {
-            SeedWaitReg::AlreadySeeded(po)
-        } else if self.seed_waiters.len() >= SEED_WAITERS_MAX {
-            SeedWaitReg::Full(po)
-        } else {
-            self.seed_waiters
-                .try_push(po)
-                .expect("within reserved seed-waiter capacity");
-            SeedWaitReg::Queued
+            return SeedWaitReg::AlreadySeeded(po);
+        }
+        if self.seed_waiters.len() >= SEED_WAITERS_MAX {
+            return SeedWaitReg::Full(po);
+        }
+        match self.seed_waiters.push_within_capacity(po) {
+            Ok(()) => SeedWaitReg::Queued,
+            // The reserve did not happen. Hand the ref back rather than dropping it here:
+            // an `ObjectRef` drop under this lock is the same inversion one step further on.
+            Err(returned) => SeedWaitReg::Full(returned),
         }
     }
 
@@ -224,8 +234,11 @@ pub fn init() {
     // lock — and do the reserving **outside** it, because allocating (slab, rank 6a) while
     // holding this leaf-ranked lock is itself the inversion we are trying to avoid. The
     // debug lock-order tracker rejects it (Slice D4 found this and the identical pattern in
-    // `dpc::init`). Best-effort: a failed reserve just means no waiters can be queued
-    // (they'll be told to retry), which only matters on no-HW-RNG boots.
+    // `dpc::init`). Best-effort, and the failure mode is the one
+    // `register_waiter` handles: an unreserved list reports itself full, so callers are told
+    // to retry. That is only true because the push there refuses instead of growing — an
+    // earlier version of this comment claimed the outcome without the mechanism, and the
+    // mechanism was missing (kernel audit C.1(e)).
     let mut waiters = KVec::new();
     let _ = waiters.try_reserve(SEED_WAITERS_MAX);
     let mut g = ENTROPY.lock();
@@ -432,6 +445,25 @@ mod tests {
         let mut s = EntropyState::new();
         s.seed_waiters.try_reserve(SEED_WAITERS_MAX).unwrap();
         s
+    }
+
+    /// An **unreserved** waiter list reports itself full rather than allocating.
+    ///
+    /// This is the case `init`'s best-effort `try_reserve` leaves behind on failure, and the
+    /// one the length check cannot catch: `len() >= SEED_WAITERS_MAX` is `0 >= 4`, false, so
+    /// control reaches the push. Before 2026-08-14 that push *grew* — `kmalloc` under this
+    /// leaf-ranked lock, the very inversion `init`'s comment says the reserve exists to
+    /// avoid — and returned `Queued`. Every other test here builds through `reserved_state`,
+    /// so nothing exercised it (kernel audit C.1(e); PR #205 review, finding 4).
+    #[test]
+    fn register_reports_full_when_the_reserve_never_happened() {
+        crate::mm::test_support::init_global_heap();
+        let mut s = EntropyState::new(); // deliberately *not* `reserved_state()`
+        assert_eq!(s.seed_waiters.capacity(), 0);
+
+        assert!(matches!(s.register_waiter(po()), SeedWaitReg::Full(_)));
+        assert_eq!(s.seed_waiters.capacity(), 0, "refusing must not allocate");
+        assert_eq!(s.seed_waiters.len(), 0);
     }
 
     #[test]

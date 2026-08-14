@@ -446,6 +446,17 @@ a zero-capacity `KVec`, and later pushes then allocate under whatever lock is
 held — drain pre-reserved `SCHED` collections by popping into fixed buffers
 instead (`sched::drain_pending_drops`).
 
+**Use `KVec::push_within_capacity`, not `try_push`, for anything pushed under a
+lock or in interrupt context** (2026-08-14). `try_push` *grows*, so at the reserve
+boundary it calls `kmalloc`/`kfree` under whatever is held, and a
+`debug_assert!(len < capacity)` beside it does not prevent that — the growth
+happens first and succeeds, so the assertion never fires and the inversion is
+silent. Six `SCHED`-held pushes were in that state until the audit found them
+(C.1(c)), along with the DPC queue's push at an interrupt tail and the entropy
+seed-waiter list. `push_within_capacity` cannot allocate and hands the value back
+rather than dropping it, which matters for the same reason as the rule above: a
+returned `ObjectRef` dropped there would reach `SlabCache::free`.
+
 ## Wait queues and the deadline heap live under rank 1 (Phase 1)
 
 `sys_wait`, the per-object waiter lists (inside a `Timer`, a

@@ -79,6 +79,33 @@ impl<T> KVec<T> {
         Ok(())
     }
 
+    /// Append `val` **without ever growing**, returning it back when the vector is full.
+    ///
+    /// **For anything pushing under a lock.** [`try_push`](Self::try_push) grows, and growth
+    /// is `kmalloc` + `kfree` — so at the reserve boundary a push under the rank-1 `SCHED`
+    /// lock reaches the allocator's plain spinlock, which `kernel/docs/lock-ordering.md`
+    /// forbids without qualification (F2/F11). A `debug_assert!(len < capacity)` beside such
+    /// a push does not prevent it: the growth happens first and succeeds, so the assertion
+    /// never fires and the inversion is silent (kernel audit C.1(c), 2026-08-14).
+    ///
+    /// Returning `Err(val)` rather than dropping it matters for the same reason: an
+    /// `ObjectRef` dropped here would reach `SlabCache::free` under the same lock. The caller
+    /// gets its value back and decides — carry it out of the locked block, park it, or
+    /// `forget` it.
+    ///
+    /// This is deliberately not `try_push`'s behaviour. A reserve-then-push caller wants the
+    /// refusal; a general caller wants the growth.
+    pub fn push_within_capacity(&mut self, val: T) -> Result<(), T> {
+        if self.len == self.cap {
+            return Err(val);
+        }
+        // SAFETY: `len < cap`, so the slot at `len` is allocated and uninitialised; the write
+        // initialises one more element. For a ZST the slot is a dangling no-op target.
+        unsafe { ptr::write(self.ptr.as_ptr().add(self.len), val) };
+        self.len += 1;
+        Ok(())
+    }
+
     /// Remove and return the last element, or `None` when empty.
     pub fn pop(&mut self) -> Option<T> {
         if self.len == 0 {
@@ -250,7 +277,46 @@ impl<T> Default for KVec<T> {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
+
+    /// The whole point: at capacity it refuses and hands the value back, rather than
+    /// allocating — which under `SCHED` would reach the allocator's plain spinlock (F2).
+    #[test]
+    fn push_within_capacity_refuses_instead_of_growing() {
+        init_global_heap();
+        let mut v: KVec<u32> = KVec::new();
+        v.try_reserve(2).unwrap();
+        let cap = v.capacity();
+        assert!(cap >= 2);
+
+        for i in 0..cap {
+            assert_eq!(v.push_within_capacity(i as u32), Ok(()));
+        }
+        assert_eq!(v.len(), cap);
+
+        // Full: the value comes back and the allocation is untouched.
+        assert_eq!(v.push_within_capacity(99), Err(99));
+        assert_eq!(v.capacity(), cap, "a refusal must not grow the buffer");
+        assert_eq!(v.len(), cap);
+
+        // Room again after a pop.
+        v.pop();
+        assert_eq!(v.push_within_capacity(99), Ok(()));
+        assert_eq!(v.capacity(), cap);
+    }
+
+    /// An empty, never-reserved vector has no room, so it refuses rather than allocating —
+    /// the case a `debug_assert!(len < capacity)` reads as fine (`0 < 0` is false, but the
+    /// assert sits *beside* a `try_push` that has already grown by then).
+    #[test]
+    fn push_within_capacity_on_an_unreserved_vector_allocates_nothing() {
+        init_global_heap();
+        let mut v: KVec<u32> = KVec::new();
+        assert_eq!(v.capacity(), 0);
+        assert_eq!(v.push_within_capacity(1), Err(1));
+        assert_eq!(v.capacity(), 0, "refusing must not allocate");
+    }
     use crate::mm::test_support::init_global_heap;
     use core::sync::atomic::{AtomicUsize, Ordering};
 

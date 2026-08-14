@@ -1168,6 +1168,16 @@ consecutive passes, or the next change to the terminal/tty stack — whichever c
 the only gate that exercises the whole path from a keystroke into a real shell and back, so the
 coverage it adds is not duplicated by `check-input` or `check-display`.
 
+**`REAP_RESERVE` is a userspace-reachable cap that aborts when crossed.** `exit_process`
+sweeps every sibling of the exiting process into `reap[this_cpu]` in one `SCHED` hold, and
+since 2026-08-14 an over-full push refuses rather than growing (growing was allocation under
+the rank-1 lock — F11 — so the refusal is right). `sys_thread_create` has no per-process
+thread limit, so a process with more than `REAP_RESERVE` (= `READY_RESERVE`, 32) threads that
+block and then exit panics the kernel. Fix shape when taken: reap in batches across several
+lock holds, or cap threads per process; both are changes to the exit path rather than to a
+constant. Trigger: a per-process thread cap landing, a real workload approaching 32 threads,
+or the first report of this panic.
+
 **Every device interrupt is pinned to the BSP, so a BSP park kills all I/O.**
 `install_isa_irq` (`kernel/src/arch/x86_64/ioapic.rs:370`) routes each GSI to `Irq::id()` —
 the boot CPU — in physical destination mode. `sched::leave_online` (2026-08-13) keeps the
