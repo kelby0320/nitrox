@@ -14973,13 +14973,34 @@ was on the fix branch, which does not contain it. The reviewer compiled `poll()`
 anyway, which is exactly what that comparison should have predicted and what the entry claimed was
 impossible.
 
-What actually establishes efficacy is a **direct measurement of the mechanism**, taken afterwards:
-instrumenting `poll()` to count bytes it recovers that the ISR path missed.
+What actually establishes efficacy is a **direct measurement of the mechanism**: instrumenting
+`poll()` to count the bytes *it* takes from the controller, and counting the parked reads the DPC
+it queues actually completes.
 
-| configuration | bytes recovered per run | each woke a parked reader |
-|---|---|---|
-| `phase-4/m6-partb` (the failing one) | **14** | yes |
-| the fix branch (the reviewer's) | **2–4** | yes |
+**Measured on one host** — x86_64, QEMU TCG, idle, `-smp 4`, `check-input`, per run. The
+configuration matters and the spread is wide, so these are ranges over runs, not constants:
+
+| configuration | `poll` calls finding output pending | bytes `poll` itself drained | parked reads completed |
+|---|---|---|---|
+| `phase-4/m6-partb` (the failing one) | 0–12 | **0–52** | **0–9** |
+| this branch | 0–4 | 0–2 | 0–3 |
+| this branch, on the reviewer's host | 0–1 | **0** | 0 |
+
+A run that fails early — the load timeout below — contributes zeros throughout, because the guest
+never reaches key injection.
+
+**Two earlier numbers in this entry were wrong and are corrected above** (PR #197, review 2). The
+first draft of this table said "14 recovered" and "2–4 recovered, each woke a parked reader". Both
+columns measured something other than what they claimed:
+
+- The count was incremented *before* draining, so it counted **calls that found output pending**,
+  not bytes. Some of those drain nothing: the status read is unlocked, so another CPU's ISR can
+  take the byte in between. The reviewer caught exactly that case live.
+- "Woke a parked reader" was read off `drain_controller`'s return value — which is
+  `devices.iter().any(|d| d.parked.is_some())`, i.e. **"a reader is waiting"**, true whether or not
+  this drain produced anything for it. It is the same failure as the pass count one level down: an
+  assertion that holds equally for the working and the broken case. Establishing it properly means
+  counting completions in `ps2_intr_dpc`, where a `parked` entry is actually taken.
 
 And the gate outcome, split by *failure signature* rather than by pass count — the split matters,
 because `check-input` has two independent failure modes and only one of them is this bug:
@@ -14989,12 +15010,22 @@ because `check-input` has two independent failure modes and only one of them is 
 | input loss (past `ui-testclient: PASSED`, dies on an injected key or button) | 5 of 6 | **0 of 6** |
 | load timeout (never reaches `PASSED`; no key ever injected) | 1 of 6 | 3 of 6 |
 
-So: the controller loses bytes on **both** configurations. The gate is simply insensitive to
-losing two-to-four of them, because injected mouse motion is re-sent and a later injection
-satisfies the assertion. That insensitivity is why a pass count was the wrong instrument, and why
+So: the controller loses bytes on this host in both configurations, and on the reviewer's host in
+neither — the wedge is timing-dependent, and how often it happens is a property of the host and the
+workload, not of the code. The gate is insensitive to small losses anyway, because injected mouse
+motion is re-sent and a later injection satisfies the assertion. That insensitivity is why a pass
+count was the wrong instrument, and why
 `check-input` will **not** catch a regression that deletes `poll()`. Recording that as a known
-gap rather than papering over it: closing it needs a gate that asserts on the recovery counter,
-not on whether a key eventually arrived.
+gap rather than papering over it.
+
+**The cheapest way to close it is the reviewer's, and it is better than the one first proposed
+here.** Rather than assert on a recovery counter, boot the gate with the controller's IRQ config
+bits cleared, so the sweep is the *only* path into the driver — the review ran exactly this and
+the whole gate passed on `poll()` alone (17 recovery events, 142 bytes). That converts a fix which
+is otherwise exercised only when the hardware misbehaves into a **deterministic** test: delete
+`poll()` and it fails every run rather than one in six. It tests the recovery path directly
+instead of hoping the fast path breaks. Deferred out of this change as scope; tracked in
+`docs/rationale/deferred-decisions.md`.
 
 `check-terminal` gets materially further — it now reliably clicks, focuses and types four
 characters where it used to fail at the click — but **still fails at the fifth keystroke**, so it

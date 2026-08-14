@@ -107,6 +107,10 @@ static PS2: IrqSpinLock<Inner> = IrqSpinLock::new(LockRank::Leaf, Inner::new());
 /// Completes parked reads after an ISR deposits events.
 static PS2_DPC: Dpc = Dpc::new(ps2_intr_dpc, core::ptr::null_mut());
 
+/// Set once a device has answered and the handlers are armed. Guards [`poll`] — see there for
+/// why an absent controller would otherwise be drained on every tick.
+static PRESENT: AtomicBool = AtomicBool::new(false);
+
 /// The leaked-`'static` device nodes, indexed by `DEV_*`. `device_ref` hands out counted
 /// references for `/dev/input/raw/<n>` lookups.
 static NODES: [AtomicPtr<()>; DEV_COUNT] =
@@ -361,10 +365,6 @@ pub fn poll() {
     }
 }
 
-/// Set once a device has answered and the handlers are armed. Guards [`poll`] — see there for
-/// why an absent controller would otherwise be drained on every tick.
-static PRESENT: AtomicBool = AtomicBool::new(false);
-
 /// Keyboard interrupt (IRQ 1).
 extern "C" fn kbd_isr() {
     if drain_controller() {
@@ -414,6 +414,13 @@ pub fn init() {
     let (kbd_vec, aux_vec) = unsafe { crate::arch::ps2::arm(kbd_isr, aux_isr) };
     // Only now may `poll` touch the ports: a device answered, so the status port is the
     // controller's and not a floating bus.
+    //
+    // **Last, and that ordering is load-bearing in the other direction.** Setting this before
+    // `arch::ps2::init`'s polled handshake would let a tick's sweep consume the controller's
+    // own `0xFA`/`0xAA` replies as if they were scancodes — the phantom-modifier failure this
+    // module's header warns about. Today no tick can land here at all (the periodic timer
+    // starts in `sched_bringup`, after this runs), so the window is unreachable rather than
+    // merely harmless; storing last is what keeps it unreachable if that ever changes.
     PRESENT.store(true, Ordering::Release);
     crate::kprintln!(
         "ps2: {}{}armed (kbd vec{:#x}, aux vec{:#x})",
