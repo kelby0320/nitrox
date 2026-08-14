@@ -15252,3 +15252,64 @@ CPU, is an interrupt-architecture change and wants its own analysis. Recorded in
 `deferred-decisions.md` with what was measured. It also answers, negatively, the audit
 checklist's question about whether the thread stranded on a parked CPU is the thing that
 matters — for the BSP it is not the thread, it is the interrupts.
+
+## 2026-08-14 — The guards that did not guard: `check-irq-scope`'s two escapes, and a test copy that had drifted
+
+Section B of the kernel audit went at the *checks* rather than the code, and found that two
+of them could be defeated silently. Neither was a live defect. Both were load-bearing
+protections that would not have fired.
+
+### `check-irq-scope` could be walked past two ways
+
+The gate exists because a dispatcher that forgets its interrupt scope does not fail loudly —
+it starts reporting phantom inversions from its own vector, days later, in someone's boot log.
+
+**Rule 2 was a substring match.** It asked whether the twelve lines after
+`macro_rules! irq_dispatcher` contained the text `enter_interrupt`. Calling it and *keeping
+the guard* are different things, and only the second is what the tracker needs. Changing
+`let _lock_scope =` to `let _ =` kept the gate green and the compiler silent — `#[must_use]`
+does not fire, because `let _ =` is the sanctioned way to suppress it — while restoring the
+floor **before** the handler body ran. That is precisely the flat-tracker behaviour that got
+the first tracker withdrawn (2026-07-29). The gate now classifies the binding: held, bound to
+`_`, or an unbound temporary, and names which it found.
+
+**The gate keyed on one literal operand name.** `dispatch = sym` is a local choice in
+`naked_asm!`, not a language requirement, and the tree already contains `enter = sym` for the
+thread trampoline. Renaming a stub's operand removed it from the gate's view entirely: no
+scope, green gate, clean build, and the only trace a count falling 7 → 6 in a success line
+nobody diffs. Two guards now: an expected-count constant, since the emptiness check only
+fires at *zero* and had no notion of an expected number, and a convention check that flags any
+other `= sym` operand — allowlisted **by target, not by operand name**, so a rename cannot buy
+the exemption.
+
+Smaller, from the same finding: the ring-3 exemption matched `assert_user_entry_safe`
+textually anywhere in a function *including its comments*, and pooled names across files, so a
+dispatcher whose doc comment merely mentioned the assertion was exempt. Now code lines only,
+and the same file.
+
+### The lock tracker's tests exercised a copy, and the copy had already drifted
+
+`lockrank.rs`'s tests reproduced the tracker's arithmetic over a plain local struct, because
+the real per-CPU state is invalid on the host. A sound trade — except that it made drift
+invisible, and the drift already existed: `tracker::acquired` has a branch enforcing the
+shootdown lock's contract (*nothing* may be held when `tlb::LOCK` is taken) that the copy
+never had. That rule cannot be expressed by rank — `TlbShootdown` is 85, above `Sched` at 10
+— so nothing else catches it, and it had no test on either side.
+
+The decision is now a pure `classify(rank, held)` that both the tracker and the tests call.
+The test struct keeps only the bookkeeping, which is the part that genuinely cannot run on the
+host. The contract branch has its own test, which asserts the premise first — that holding
+`Sched` under `TlbShootdown` is *not* a rank inversion — so the test says why the branch has to
+exist rather than merely that it does.
+
+### Evidence
+
+Every escape was reproduced before it was fixed and replayed after:
+
+| mutation | before | after |
+|---|---|---|
+| guard bound to `_` | gate ✓, no warning | named violation at the macro's line |
+| operand renamed to `handler` | gate ✓ (7 → 6, silent) | caught twice — count *and* convention |
+| contract branch deleted from `classify` | (had no test) | the new test fails by name |
+
+1678 host tests, zero warnings; every gate green.
