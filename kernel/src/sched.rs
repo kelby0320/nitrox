@@ -3188,13 +3188,32 @@ fn dequeue_front(g: &mut SchedState) -> Option<ObjectRef> {
 /// permits — the placement target for a new thread. Falls back to CPU 0 if affinity
 /// somehow excludes every online CPU (defensive; `set_affinity` rejects that). Caller
 /// holds `SCHED`.
+/// Whether `cpu` may be **given** work: the scheduler has it online *and* it has not
+/// parked forever.
+///
+/// **Both, because the two disagree after a park.** [`leave_online`] clears the lock-free
+/// mask but cannot clear `cpu_online[]` — that needs `SCHED`, which the parking CPU may
+/// already hold — so a CPU that halted in `dump_and_halt` on a ring-0 fault stays `true`
+/// there while the rest of the machine runs on. Placing on it is not a slowdown but a hang:
+/// nothing on that queue will ever be picked, and the thread waits forever on a machine
+/// that otherwise looks healthy.
+///
+/// **Deliberately not applied to the *victim* side of work-stealing.** `steal_one` and
+/// `steal_available` ask which CPU to take work *from*, and a parked CPU is exactly the one
+/// you want drained — gating them on this would strand the threads already queued there,
+/// which is the opposite of the fix. The asymmetry is the point; do not "make it
+/// consistent".
+fn cpu_accepts_work(g: &SchedState, cpu: usize) -> bool {
+    g.cpu_online[cpu] && online_mask() & (1u64 << cpu) != 0
+}
+
 fn pick_target_cpu(g: &SchedState, obj: *mut ()) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let mask = unsafe { Thread::cpu_mask(obj) };
     let mut best = usize::MAX;
     let mut best_len = usize::MAX;
     for c in 0..MAX_CPUS {
-        if !g.cpu_online[c] || mask & (1 << c) == 0 {
+        if !cpu_accepts_work(g, c) || mask & (1 << c) == 0 {
             continue;
         }
         let len = g.ready[c].len();
@@ -3217,7 +3236,7 @@ fn pick_wake_cpu(g: &SchedState, obj: *mut ()) -> usize {
     let home = unsafe { Thread::last_cpu(obj) } as usize;
     let mask = unsafe { Thread::cpu_mask(obj) };
     if home < MAX_CPUS
-        && g.cpu_online[home]
+        && cpu_accepts_work(g, home)
         && mask & (1 << home) != 0
         && g.ready[home].len() < g.ready[home].capacity()
     {
@@ -3850,10 +3869,52 @@ mod tests {
 
     /// Bring `n` CPUs online (0..n) with reserved ready queues, for placement tests.
     fn online_n(st: &mut SchedState, n: usize) {
+        // Both, because a genuinely online CPU is in both — `cpu_online[]` and the
+        // lock-free mask. Modelling only the first would make `cpu_accepts_work` reject
+        // every CPU and quietly turn the placement tests into fallback tests.
+        ONLINE_MASK.store(0, Ordering::Relaxed);
         for c in 0..n {
             st.cpu_online[c] = true;
+            ONLINE_MASK.fetch_or(1u64 << c, Ordering::Relaxed);
             st.ready[c].try_reserve(READY_RESERVE).unwrap();
         }
+    }
+
+    /// A CPU that has parked forever must not be given work, even though `cpu_online[]`
+    /// still says it is up — and it must still be stealable *from*.
+    ///
+    /// The two halves are the whole point. `leave_online` cannot clear `cpu_online[]` (that
+    /// needs `SCHED`, which the parking CPU may hold), so after a ring-0 fault parks an AP
+    /// the two disagree: placing on it hangs the thread forever, while draining its queue is
+    /// how the threads already there get rescued.
+    #[test]
+    fn a_parked_cpu_takes_no_new_work_but_can_still_be_drained() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 4);
+        let t = inert_ref(1);
+
+        // Load 0 and 1 so the least-loaded pick would otherwise land on CPU 2.
+        st.ready[0].try_push(inert_ref(10)).unwrap();
+        st.ready[1].try_push(inert_ref(11)).unwrap();
+        assert_eq!(pick_target_cpu(&st, t.as_ptr()), 2);
+
+        // CPU 2 parks: out of the lock-free mask, still `true` in `cpu_online[]`.
+        ONLINE_MASK.fetch_and(!(1u64 << 2), Ordering::Relaxed);
+        assert!(st.cpu_online[2], "the park cannot clear this, which is why the bug existed");
+        assert_eq!(pick_target_cpu(&st, t.as_ptr()), 3, "placed on a CPU that will never run");
+
+        // A waking thread whose home is the parked CPU goes elsewhere too.
+        unsafe { Thread::set_last_cpu(t.as_ptr(), 2) };
+        assert_ne!(pick_wake_cpu(&st, t.as_ptr()), 2, "woken onto a parked home CPU");
+
+        // But its queue is still reachable: `steal_available` must see the thread parked
+        // there, or the threads it already holds are stranded.
+        st.ready[2].try_push(inert_ref(12)).unwrap();
+        assert!(
+            steal_available(&st, 0),
+            "a parked CPU's queue must stay drainable, or this fix strands what it holds"
+        );
     }
 
     #[test]
