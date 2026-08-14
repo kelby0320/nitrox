@@ -1168,6 +1168,20 @@ consecutive passes, or the next change to the terminal/tty stack — whichever c
 the only gate that exercises the whole path from a keystroke into a real shell and back, so the
 coverage it adds is not duplicated by `check-input` or `check-display`.
 
+**Every device interrupt is pinned to the BSP, so a BSP park kills all I/O.**
+`install_isa_irq` (`kernel/src/arch/x86_64/ioapic.rs:370`) routes each GSI to `Irq::id()` —
+the boot CPU — in physical destination mode. `sched::leave_online` (2026-08-13) keeps the
+scheduler correct when a CPU parks, but nothing re-routes its interrupts, so a ring-0 fault on
+the BSP silently ends disk, serial and PS/2 I/O while the APs keep scheduling. Measured
+2026-08-14: parking CPU 3 mid-boot leaves `test-qemu` passing; parking the BSP at the same
+tick leaves the machine running — it completes the UI and input self-tests and prints
+`init: harness passed` — and then stalls at the login chain, which needs the filesystem. The
+parked CPU was running its *idle* thread, so this is interrupt routing and not a stranded
+thread. Fix shape when taken: route to a live CPU, and re-route (or broadcast) on park; that
+is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware bring-up,
+CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
+survive rather than merely diagnose.
+
 **A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
 `drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
 exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one

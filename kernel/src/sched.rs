@@ -3216,26 +3216,73 @@ fn cpu_accepts_work(g: &SchedState, cpu: usize, online: u64) -> bool {
 }
 
 /// The least-loaded online CPU (fewest `ready` entries) that `obj`'s affinity
-/// permits — the placement target for a new thread. Falls back to CPU 0 if affinity
-/// somehow excludes every CPU that accepts work (defensive; `set_affinity` rejects an
-/// affinity with no online CPU — but a permitted CPU can *park* after the fact, which makes
-/// this fallback reachable in a way it was not before). Caller holds `SCHED`.
+/// permits — the placement target for a new thread.
+///
+/// **When affinity permits no CPU that accepts work, it places on one that does anyway**,
+/// outside the affinity mask; see the fallback for why that beats both the alternatives.
+/// That case is reachable two ways, and an earlier version of this comment denied the
+/// second: a permitted CPU can *park* after the fact, and `sys_thread_set_affinity` does
+/// **not** reject an affinity naming no online CPU — it validates only that the mask is
+/// non-empty within `MAX_CPUS`. (The kernel audit refuted the claim that it did — evidence
+/// in the decision log, 2026-08-14.)
+///
+/// Caller holds `SCHED`.
 fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let mask = unsafe { Thread::cpu_mask(obj) };
     let mut best = usize::MAX;
     let mut best_len = usize::MAX;
+    // The same least-loaded scan, ignoring affinity — the fallback below wants a CPU that
+    // can *run* the thread, and "least loaded" is as much a part of that as "accepts work":
+    // a queue at `READY_RESERVE` makes `place_thread` return `Err`, which both wake callers
+    // turn into a `panic!`. Tracked in the same pass so the fallback is not load-blind
+    // (PR #201 review, finding 2); one loop rather than two, since every candidate is
+    // already being visited.
+    let mut spare = usize::MAX;
+    let mut spare_len = usize::MAX;
     for c in 0..MAX_CPUS {
-        if !cpu_accepts_work(g, c, online) || mask & (1 << c) == 0 {
+        if !cpu_accepts_work(g, c, online) {
             continue;
         }
         let len = g.ready[c].len();
+        if len < spare_len {
+            spare_len = len;
+            spare = c;
+        }
+        if mask & (1 << c) == 0 {
+            continue;
+        }
         if len < best_len {
             best_len = len;
             best = c;
         }
     }
-    if best == usize::MAX { 0 } else { best }
+    if best != usize::MAX {
+        return best;
+    }
+    // **Affinity permits no CPU that accepts work.** Prefer *runnable* over
+    // *affinity-correct*: a thread placed where nothing will ever schedule it hangs
+    // forever, while a thread running outside its affinity is a policy violation it
+    // survives — and `dequeue_front` applies no affinity filter anyway, so that
+    // distinction is already best-effort at the other end.
+    //
+    // **Falling back to CPU 0 unconditionally — what this did until 2026-08-14 —
+    // reintroduced the exact hang `cpu_accepts_work` exists to prevent, one line below
+    // it.** A ring-0 fault parks the BSP, a wake whose affinity excludes every remaining
+    // CPU lands on it, and the thread never runs again. Found by the kernel audit and
+    // written up in the decision log, 2026-08-14; the
+    // commit that added the guard even documented this fallback as newly reachable and
+    // then left it unguarded.
+    //
+    // Erroring instead is not available: both wake callers `panic!` on `Err`, so a
+    // parked BSP would become a kernel panic rather than a misplaced thread.
+    if spare != usize::MAX {
+        return spare;
+    }
+    // Nothing at all accepts work. We are executing this code, so this CPU is the
+    // least-wrong answer that exists — and if even that is false the machine is already
+    // gone.
+    SchedState::this_cpu()
 }
 
 /// The CPU to place a **waking** thread on: its home CPU (`last_cpu`) when that CPU
@@ -3957,6 +4004,65 @@ mod tests {
         assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
     }
 
+    /// When affinity permits no CPU that accepts work, placement must still land somewhere
+    /// that will run the thread — **not** on CPU 0 because it happened to be the fallback.
+    ///
+    /// This is the hang `cpu_accepts_work` exists to prevent, reintroduced one line below it
+    /// by `if best == usize::MAX { 0 }` (kernel audit; decision log 2026-08-14). Reachable
+    /// when a ring-0 fault parks
+    /// the BSP while APs keep running and a pinned thread wakes.
+    ///
+    /// Asserted as "the chosen CPU accepts work" rather than "the chosen CPU is 1 or 2", so
+    /// the test states the invariant instead of the current tie-break.
+    #[test]
+    fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 4);
+        // Pinned to CPU 3; CPUs 0 and 3 have both parked. Nothing permitted accepts work,
+        // and the old fallback answered 0 — which is parked.
+        let t = inert_ref(1);
+        unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 3) };
+        let parked = all_up(4) & !(1u64 << 0) & !(1u64 << 3);
+
+        let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
+        assert!(
+            cpu_accepts_work(&st, chosen, parked),
+            "fallback picked cpu {chosen}, which does not accept work — the thread would \
+             never be scheduled"
+        );
+
+        // **And the fallback is least-loaded, not first-found.** A CPU that accepts work but
+        // whose queue is at `READY_RESERVE` is not runnable either: `place_thread` returns
+        // `Err` and both wake callers turn that into a `panic!`. Filling CPU 1 must push the
+        // choice to CPU 2 rather than onto the full queue beside it (PR #201 review,
+        // finding 2).
+        for i in 0..READY_RESERVE {
+            st.ready[1].try_push(inert_ref(100 + i as u32)).unwrap();
+        }
+        let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
+        assert!(
+            cpu_accepts_work(&st, chosen, parked),
+            "fallback picked cpu {chosen}, which does not accept work"
+        );
+        assert!(
+            st.ready[chosen].len() < st.ready[chosen].capacity(),
+            "fallback picked cpu {chosen}, whose queue is at reserve — place_thread would \
+             return Err and the wake callers panic"
+        );
+
+        // The wake path delegates to the same fallback. (Its own `cpu_accepts_work` check on
+        // the home CPU is covered by `a_parked_cpu_takes_no_new_work_but_can_still_be_drained`
+        // — here the affinity mask rejects home 0 before that check is reached, so this
+        // asserts the delegation and nothing more.)
+        unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
+        let woken = pick_wake_cpu(&st, t.as_ptr(), parked);
+        assert!(
+            cpu_accepts_work(&st, woken, parked),
+            "wake fallback picked cpu {woken}, which does not accept work"
+        );
+    }
+
     #[test]
     fn placement_least_loaded_and_respects_affinity() {
         init_global_heap();
@@ -3972,9 +4078,20 @@ mod tests {
         // Pinned to CPU 3 → must target CPU 3 regardless of load.
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 3) };
         assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 3);
-        // Pinned to an offline CPU (5) → defensive fallback to CPU 0.
+        // Pinned to a CPU that is not online (5) → falls back **outside** the mask, to the
+        // least-loaded CPU that accepts work. This asserted CPU 0 unconditionally until
+        // 2026-08-14, when that turned out to be a hang rather than a defensive default:
+        // once a CPU can park, "CPU 0" is not necessarily a CPU that runs anything. Stated
+        // as the two properties rather than an index, so a tie-break change does not read
+        // as a contract change.
         unsafe { Thread::set_cpu_mask(a.as_ptr(), 1 << 5) };
-        assert_eq!(pick_target_cpu(&st, a.as_ptr(), all_up(4)), 0);
+        let chosen = pick_target_cpu(&st, a.as_ptr(), all_up(4));
+        assert!(cpu_accepts_work(&st, chosen, all_up(4)), "fallback chose cpu {chosen}");
+        assert_eq!(
+            st.ready[chosen].len(),
+            0,
+            "fallback chose loaded cpu {chosen} while an empty one accepted work"
+        );
     }
 
     #[test]

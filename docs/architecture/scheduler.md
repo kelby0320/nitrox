@@ -4,7 +4,7 @@
 fairness, work-stealing migration and reschedule IPIs are all live, and the `REAL_TIME`
 syscap gate landed with the capability system (Phase 3 slice 6, 2026-07-14). Remaining
 deferrals are marked inline. See [smp.md](smp.md) for the multi-core substrate.
-Verified 2026-08-05.
+Verified 2026-08-05; the affinity-fallback paragraph re-verified 2026-08-14.
 
 The kernel scheduler: how runnable threads are chosen, how that scales from one
 CPU to many, and the per-CPU substrate SMP stands on. This document is the design
@@ -220,11 +220,18 @@ others' TLBs or stale translations become a correctness bug. The kernel gains:
 - **`sys_thread_set_affinity`** becomes functional (replaces the `table.rs:384`
   no-op). Validation as implemented (corrected 2026-07-21, review F9): the mask is
   clamped to `MAX_CPUS` bits and rejected only if empty — it is **not** checked
-  against the *online* set, so a mask naming only offline CPUs is accepted and
-  placement falls back defensively to CPU 0 (`pick_target_cpu`), running the
-  thread outside its requested affinity rather than stranding it. Active
-  migration off an excluded current CPU is deferred (see [smp.md](smp.md)
-  § Deferred); the thread moves at its next reschedule.
+  against the *online* set, so a mask naming only offline CPUs is accepted.
+  Placement then falls back to **the least-loaded CPU that accepts work**, outside
+  the requested affinity, rather than stranding the thread (corrected 2026-08-14).
+  It fell back to *CPU 0 unconditionally* until then, which was a hang rather than a
+  defensive default once a CPU could park: a ring-0 fault parks the BSP and every
+  thread routed here stops running. Reachability grew the same day — a permitted CPU
+  can now *park* after the mask is set, not merely have been offline when it was.
+  **Leaving the affinity mask is deliberate**: `dequeue_front` applies no affinity
+  filter, so a thread placed outside its mask does run, and work-stealing can pull it
+  back onto a permitted CPU later; a thread placed where nothing schedules it never
+  runs at all. Active migration off an excluded current CPU is deferred (see
+  [smp.md](smp.md) § Deferred); the thread moves at its next reschedule.
 
 ## Data-structure changes
 

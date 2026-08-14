@@ -135,6 +135,26 @@ pub enum WaitPhase {
     Woken = 2,
 }
 
+/// A dense CPU index must fit in [`Thread`]'s `cpu_mask`, which is a `u8`.
+///
+/// **Stated in that field's comment since it was written, and asserted nowhere until
+/// 2026-08-14.** The audit raised `MAX_CPUS` to 9: the kernel built clean, all 622 host
+/// tests passed, and nothing objected — while `mask & (1 << c)` in `pick_target_cpu` and
+/// `stealable_to` became `1u8 << 8`, which panics in debug and in release wraps to bit 0, so
+/// CPU 8's affinity silently reads as CPU 0's. `sys_thread_set_affinity` separately truncates
+/// bit 8 away and rejects a pin to CPU 8 as invalid. The first build error anywhere appears
+/// at 16, incidentally, from an unrelated lint on a `u16` shift.
+///
+/// Raising `MAX_CPUS` past 8 therefore means widening this field, the shifts that read it,
+/// and the syscall's truncation **together**. `tlb.rs`'s `MAX_CPUS <= 64` assertion does not
+/// cover this: it is stated for a `u64` bitmask and would leave with it.
+const _: () = assert!(
+    crate::arch::MAX_CPUS <= 8,
+    "MAX_CPUS > 8 does not fit Thread::cpu_mask (u8) — widen the field, the `1 << c` shifts \
+     in sched.rs, and sys_thread_set_affinity's mask trim together"
+);
+
+
 /// A thread kernel object.
 ///
 /// `#[repr(C)]` with [`KObjectHeader`] first — see
@@ -230,7 +250,8 @@ pub struct Thread {
     /// home CPU (cache-warm, and minimizes cross-CPU migration). `0` until first run.
     last_cpu: u8,
     /// CPU **affinity** bitmask (bit `c` set ⇒ may run on CPU `c`); `MAX_CPUS ≤ 8`,
-    /// so a `u8` suffices. Default all-ones (no restriction). Placement and work
+    /// so a `u8` suffices — **enforced** by the `const _: () = assert!(…)` above this
+    /// struct, which also names what must be widened alongside this field. Default all-ones (no restriction). Placement and work
     /// stealing honour it; `sys_thread_set_affinity` writes it.
     cpu_mask: u8,
     /// **Mid-switch-out guard** (the SMP `on_cpu` invariant, after Linux's
