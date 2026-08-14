@@ -15195,7 +15195,7 @@ mid-boot on purpose, the way a ring-0 fault would:
 That is the whole bug in two lines: a machine that survives losing a core, and one that does
 not.
 
-## 2026-08-14 — Audit A.1(c) and the `MAX_CPUS` width: two fixes, and a third thing found while checking them
+## 2026-08-14 — The placement fallback and the `MAX_CPUS` width: two fixes, and a third thing found while checking them
 
 The kernel audit's section A found both of these. Neither is a new subsystem; both are holes
 in the parked-CPU work of 2026-08-13/14.

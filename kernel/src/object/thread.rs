@@ -250,7 +250,8 @@ pub struct Thread {
     /// home CPU (cache-warm, and minimizes cross-CPU migration). `0` until first run.
     last_cpu: u8,
     /// CPU **affinity** bitmask (bit `c` set ⇒ may run on CPU `c`); `MAX_CPUS ≤ 8`,
-    /// so a `u8` suffices. Default all-ones (no restriction). Placement and work
+    /// so a `u8` suffices — **enforced** by the `const _: () = assert!(…)` above this
+    /// struct, which also names what must be widened alongside this field. Default all-ones (no restriction). Placement and work
     /// stealing honour it; `sys_thread_set_affinity` writes it.
     cpu_mask: u8,
     /// **Mid-switch-out guard** (the SMP `on_cpu` invariant, after Linux's
