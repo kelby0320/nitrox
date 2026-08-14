@@ -92,6 +92,21 @@ impl ArchSmp for X86Smp {
         regs::rdtscp_aux()
     }
 
+    #[cfg(not(test))]
+    fn identity_bound() -> bool {
+        // The identity is ours only if the index in `IA32_TSC_AUX` maps back to *this*
+        // core's hardware APIC id. An unbound core reads the reset default 0 and would
+        // otherwise pass for the BSP — which is exactly how a park cleared the running
+        // BSP's online bit (PR #198 review, blocking 1).
+        apic_of_dense(regs::rdtscp_aux() as usize) == Some(hw_apic_id())
+    }
+
+    #[cfg(test)]
+    fn identity_bound() -> bool {
+        // Host tests model one CPU whose identity is by definition its own.
+        true
+    }
+
     #[cfg(test)]
     fn current_cpu() -> u32 {
         // Host tests model a single CPU. RDTSCP under `cargo test` would return the

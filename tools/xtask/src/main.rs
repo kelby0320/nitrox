@@ -1101,22 +1101,27 @@ fn cmd_check_input(accel: Accel) -> R<()> {
 
 /// `cargo xtask check-terminal` — prove a keystroke reaches a shell and its answer comes back.
 ///
-/// **Status 2026-08-13: written, works, and is not yet reliable enough to gate on.** It passes
-/// and it fails on the same build, and the flakiness is in the *harness*, not in the terminal —
-/// the loop it exercises is demonstrably sound, with the shell's banner, prompt and per-keystroke
-/// echo all reaching the grid on every boot. What is not sound is driving a GUI from QMP:
+/// **Status 2026-08-13 (superseding an earlier status the same day): the flake was real, and it
+/// was not in the harness.** This gate spent two milestones failing, and the standing diagnosis
+/// here blamed "driving a GUI from QMP" and suspected an `input-server` bug where a consumer
+/// disconnecting cost the others their stream. **Both were wrong**, and the second sent at least
+/// one investigation after a bug that does not exist.
 ///
-/// - **Input appears to stop after `input-testclient` exits.** A motion injected before it goes
-///   reaches `nxterm`; the same motion after it does not. Observed, not explained — and if it is
-///   what it looks like, a consumer of `/dev/input/new` disconnecting is costing the *other*
-///   consumers their stream, which would be an `input-server` bug rather than this one's.
-/// - **A keystroke is not cheap.** The terminal repaints, waits for a free buffer and copies a
-///   window of pixels before it looks at input again, so keys injected as fast as QMP sends them
-///   outrun it. Pacing on the echo fixes that and is the right shape; it is not the whole story.
+/// The cause was a kernel deadlock: the boot self-test's verdict syscall parked a CPU that the
+/// scheduler still counted online, so the next TLB shootdown — any large `free` in any process —
+/// waited forever for an acknowledgement it could never get. `nxterm` froze mid-repaint while
+/// freeing a glyph outline, which is why it looked like a terminal that stops on a particular
+/// keystroke. Fixed 2026-08-13; see the decision log.
 ///
-/// Deliberately **not wired into CI** and not listed in `--help` while that is true: a gate that
-/// fails on a good build teaches people to ignore gates. Kept in the tree because the diagnosis
-/// above is most of the work of finishing it, and deleting it would throw that away.
+/// One piece of the old diagnosis survives and is still load-bearing below: **a keystroke is not
+/// cheap.** The terminal repaints, waits for a free buffer and copies a window of pixels before
+/// it looks at input again, so keys injected as fast as QMP sends them outrun it. Pacing on the
+/// echo is the fix, and it is what the typing loop does.
+///
+/// Still **not wired into CI or listed in `--help`**, but now only because the evidence is one
+/// clean batch (4 of 4) rather than a run of them. Promotion is filed in
+/// `docs/rationale/deferred-decisions.md` with the bar it has to clear; that entry, not this
+/// comment, is the live record.
 
 ///
 /// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →

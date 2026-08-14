@@ -33,6 +33,18 @@ pub trait ArchSmp {
     /// hard-coded) so it stays correct once APs run.
     fn current_cpu() -> u32;
 
+    /// Whether [`current_cpu`](ArchSmp::current_cpu) is reporting an identity this CPU
+    /// actually established, rather than a default.
+    ///
+    /// **`current_cpu` cannot answer this itself, and the difference is dangerous.** On x86
+    /// the identity lives in `IA32_TSC_AUX`, whose reset default is `0` — so a CPU that has
+    /// not run [`init_this_cpu`](ArchSmp::init_this_cpu) reports `0`, indistinguishable from
+    /// a correctly-identified CPU 0. Any caller that would *act on another CPU's behalf* if
+    /// it guessed wrong — clearing its bit in a mask, taking its slot — must ask here first.
+    /// Callers that merely index per-CPU state defensively (the lock tracker folds an
+    /// out-of-range id onto 0) do not need it.
+    fn identity_bound() -> bool;
+
     /// Establish this CPU's logical `index` so [`current_cpu`](ArchSmp::current_cpu)
     /// reports it. Called once per CPU during its own early init (the BSP with `0`
     /// at boot; each AP with its index at SMP bring-up). On x86 this programs

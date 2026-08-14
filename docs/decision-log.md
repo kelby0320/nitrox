@@ -15104,6 +15104,16 @@ only decided *when* a glyph outline happened to be freed.
 - `sched::leave_online()` — drop this CPU's bit; called from `Cpu::halt_loop`, so **every**
   permanent park is covered, not just this one. The fatal-exception handler and a failed AP init
   park through the same primitive and had the same latent bug.
+- **Guarded by `ArchSmp::identity_bound`**, which the first version of this fix lacked and which
+  the review caught by measurement. `current_cpu()` is `IA32_TSC_AUX`, reset default `0`, so a CPU
+  that never adopted an index reports `0` — indistinguishable from the BSP. The unbound-AP park at
+  `main.rs:392` therefore cleared *the running BSP's* bit, dropping it from the shootdown set;
+  since the slow path invalidates a CPU's own TLB via a self-IPI it only sends to CPUs in the
+  mask, the BSP would then keep a stale translation to a frame already returned to the allocator.
+  A range check does not catch this — `0` is in range — so the predicate asks the hardware
+  instead: the index in `TSC_AUX` must map back to this core's own APIC id. **That is a worse
+  failure than the deadlock being fixed**, and it is a good argument for the rule that a fix
+  which generalises should be checked against the one call site that does not fit.
 - `debug_exit` returns instead of parking. The device being absent is information for the caller,
   not grounds to stop a CPU. `SYS_TEST_EXIT` returns `Unsupported`; the kernel panic path, the one
   caller that genuinely must not continue, halts itself.

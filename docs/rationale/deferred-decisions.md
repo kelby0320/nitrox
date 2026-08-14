@@ -1168,6 +1168,16 @@ consecutive passes, or the next change to the terminal/tty stack — whichever c
 the only gate that exercises the whole path from a keystroke into a real shell and back, so the
 coverage it adds is not duplicated by `check-input` or `check-display`.
 
+**`tlb::shootdown` waits on a CPU count that can go stale.** It snapshots `sched::online_mask`,
+sets `PENDING` from that count, then waits for exactly that many acknowledgements. A CPU that
+parks permanently *inside* that window — after the snapshot, before its ack — can never satisfy
+the count, and the round hangs exactly as the 2026-08-13 bug did. The window is microseconds and
+a permanent park happens at most once per boot, so the fix was left out of that change rather
+than grown into it. The principled version is for the wait to stop expecting acknowledgements
+from CPUs that have since left the mask, which needs an acked-bitmask the initiator can compare
+against a re-read of `online_mask`. Trigger: any further work on `tlb.rs`, or a second reachable
+park path.
+
 **A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
 `drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
 exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one
