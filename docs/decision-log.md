@@ -15194,3 +15194,61 @@ mid-boot on purpose, the way a ring-0 fault would:
 
 That is the whole bug in two lines: a machine that survives losing a core, and one that does
 not.
+
+## 2026-08-14 — Audit A.1(c) and the `MAX_CPUS` width: two fixes, and a third thing found while checking them
+
+The kernel audit's section A found both of these. Neither is a new subsystem; both are holes
+in the parked-CPU work of 2026-08-13/14.
+
+### The fallback that reintroduced the hang it sat below
+
+`pick_target_cpu` ended `if best == usize::MAX { 0 }`. When affinity permits no CPU that
+accepts work — a ring-0 fault parks the BSP, a thread pinned elsewhere wakes — it placed on
+CPU 0 without asking whether CPU 0 accepts work. That is exactly the hang `cpu_accepts_work`
+exists to prevent, one line below it, and **the commit that added the guard documented this
+fallback as newly reachable and then left it unguarded**. Writing the hazard down is not the
+same as handling it.
+
+It now falls back to any CPU that accepts work, outside the affinity mask. That ordering is
+deliberate: a thread placed where nothing will schedule it hangs forever, while a thread
+running outside its affinity is a policy violation it survives — and `dequeue_front` applies
+no affinity filter anyway, so the distinction is already best-effort at the other end.
+Returning an error was not available: both wake callers `panic!` on `Err`, so a parked BSP
+would have become a kernel panic.
+
+The audit also refuted the doc claim next to it — `sys_thread_set_affinity` does **not**
+reject an affinity naming no online CPU; it checks only that the mask is non-empty within
+`MAX_CPUS`. Corrected rather than fixed: making the syscall reject more is a policy change,
+and this fallback has to be correct either way.
+
+### `MAX_CPUS <= 8` was stated and never asserted
+
+`Thread::cpu_mask` is a `u8`, and its comment has said "`MAX_CPUS ≤ 8`, so a `u8` suffices"
+since it was written. Nothing enforced it. At `MAX_CPUS = 9` the kernel builds clean and all
+622 host tests pass while `mask & (1 << c)` becomes `1u8 << 8` — a debug panic, and in release
+a wrap to bit 0, so CPU 8's affinity silently reads as CPU 0's. The first build error anywhere
+is at 16, incidentally, from an unrelated lint.
+
+A `const _: () = assert!()` now sits beside the field, naming the three things that must be
+widened together. `tlb.rs`'s `MAX_CPUS <= 64` does not cover this — it is stated for a `u64`
+bitmask and would leave with it. Positive control: at 9 the build now fails with that message.
+
+### Found while verifying: **every device interrupt is pinned to the BSP**
+
+The audit noted it booted no guest, so the fix was checked against one. Parking an AP
+mid-boot is survivable — `test-qemu` passes with CPU 3 parked at tick 3000. Parking the **BSP**
+is not, at any tick tried, and the shape of the failure is the interesting part: the machine
+runs on, completes `ui-testclient` and `input-testclient`, prints `init: harness passed`, and
+then stalls at the login chain.
+
+Not a stranded thread — a probe showed CPU 0 was running its **idle** thread when parked. The
+cause is `install_isa_irq` (`arch/x86_64/ioapic.rs:370`), which routes every device IRQ to
+`Irq::id()` — the BSP — in physical destination mode. A parked BSP therefore takes all disk,
+serial and PS/2 interrupts with it. The scheduler keeps working, which is why the machine
+looks alive right up until it needs I/O.
+
+**Not fixed here**, deliberately: re-routing device interrupts on a park, or targeting a live
+CPU, is an interrupt-architecture change and wants its own analysis. Recorded in
+`deferred-decisions.md` with what was measured. It also answers, negatively, the audit
+checklist's question about whether the thread stranded on a parked CPU is the thing that
+matters — for the BSP it is not the thread, it is the interrupts.

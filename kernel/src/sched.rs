@@ -3216,10 +3216,16 @@ fn cpu_accepts_work(g: &SchedState, cpu: usize, online: u64) -> bool {
 }
 
 /// The least-loaded online CPU (fewest `ready` entries) that `obj`'s affinity
-/// permits — the placement target for a new thread. Falls back to CPU 0 if affinity
-/// somehow excludes every CPU that accepts work (defensive; `set_affinity` rejects an
-/// affinity with no online CPU — but a permitted CPU can *park* after the fact, which makes
-/// this fallback reachable in a way it was not before). Caller holds `SCHED`.
+/// permits — the placement target for a new thread.
+///
+/// **When affinity permits no CPU that accepts work, it places on one that does anyway**,
+/// outside the affinity mask; see the fallback for why that beats both the alternatives.
+/// That case is reachable two ways, and an earlier version of this comment denied the
+/// second: a permitted CPU can *park* after the fact, and `sys_thread_set_affinity` does
+/// **not** reject an affinity naming no online CPU — it validates only that the mask is
+/// non-empty within `MAX_CPUS` (audit A.1(d) refuted the claim that it did).
+///
+/// Caller holds `SCHED`.
 fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let mask = unsafe { Thread::cpu_mask(obj) };
@@ -3235,7 +3241,30 @@ fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
             best = c;
         }
     }
-    if best == usize::MAX { 0 } else { best }
+    if best != usize::MAX {
+        return best;
+    }
+    // **Affinity permits no CPU that accepts work.** Prefer *runnable* over
+    // *affinity-correct*: a thread placed where nothing will ever schedule it hangs
+    // forever, while a thread running outside its affinity is a policy violation it
+    // survives — and `dequeue_front` applies no affinity filter anyway, so that
+    // distinction is already best-effort at the other end.
+    //
+    // **Falling back to CPU 0 unconditionally — what this did until 2026-08-14 —
+    // reintroduced the exact hang `cpu_accepts_work` exists to prevent, one line below
+    // it.** A ring-0 fault parks the BSP, a wake whose affinity excludes every remaining
+    // CPU lands on it, and the thread never runs again. Found by audit A.1(c); the
+    // commit that added the guard even documented this fallback as newly reachable and
+    // then left it unguarded.
+    //
+    // Erroring instead is not available: both wake callers `panic!` on `Err`, so a
+    // parked BSP would become a kernel panic rather than a misplaced thread.
+    (0..MAX_CPUS)
+        .find(|&c| cpu_accepts_work(g, c, online))
+        // Nothing at all accepts work. We are executing this code, so this CPU is the
+        // least-wrong answer that exists — and if even that is false the machine is
+        // already gone.
+        .unwrap_or_else(SchedState::this_cpu)
 }
 
 /// The CPU to place a **waking** thread on: its home CPU (`last_cpu`) when that CPU
@@ -3955,6 +3984,43 @@ mod tests {
         let stolen = steal_one(&mut st).expect("steal_one must reach a parked CPU's queue");
         assert_eq!(unsafe { &*(stolen.as_ptr() as *const Thread) }.tid(), 12);
         assert!(st.ready[2].is_empty(), "the parked CPU's queue was not drained");
+    }
+
+    /// When affinity permits no CPU that accepts work, placement must still land somewhere
+    /// that will run the thread — **not** on CPU 0 because it happened to be the fallback.
+    ///
+    /// This is the hang `cpu_accepts_work` exists to prevent, reintroduced one line below it
+    /// by `if best == usize::MAX { 0 }` (audit A.1(c)). Reachable when a ring-0 fault parks
+    /// the BSP while APs keep running and a pinned thread wakes.
+    ///
+    /// Asserted as "the chosen CPU accepts work" rather than "the chosen CPU is 1 or 2", so
+    /// the test states the invariant instead of the current tie-break.
+    #[test]
+    fn placement_falls_back_to_a_cpu_that_accepts_work_not_to_cpu_zero() {
+        init_global_heap();
+        let mut st = test_state();
+        online_n(&mut st, 4);
+        // Pinned to CPU 3; CPUs 0 and 3 have both parked. Nothing permitted accepts work,
+        // and the old fallback answered 0 — which is parked.
+        let t = inert_ref(1);
+        unsafe { Thread::set_cpu_mask(t.as_ptr(), 1 << 3) };
+        let parked = all_up(4) & !(1u64 << 0) & !(1u64 << 3);
+
+        let chosen = pick_target_cpu(&st, t.as_ptr(), parked);
+        assert!(
+            cpu_accepts_work(&st, chosen, parked),
+            "fallback picked cpu {chosen}, which does not accept work — the thread would \
+             never be scheduled"
+        );
+
+        // The wake path reaches the same fallback through `pick_wake_cpu`, including when
+        // the thread's home CPU is the parked one.
+        unsafe { Thread::set_last_cpu(t.as_ptr(), 0) };
+        let woken = pick_wake_cpu(&st, t.as_ptr(), parked);
+        assert!(
+            cpu_accepts_work(&st, woken, parked),
+            "wake fallback picked cpu {woken}, which does not accept work"
+        );
     }
 
     #[test]
