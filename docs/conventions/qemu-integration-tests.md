@@ -27,6 +27,24 @@ through a kernel syscall, `SYS_TEST_EXIT` (`0xFFFF_0002`), which calls
 `arch::debug_exit`. This is what lets the verdict come from **after** userspace has
 run, covering the full boot rather than just `kernel_main`.
 
+### The device is attached by `test-qemu` only, and the verdict is a no-op elsewhere
+
+**Only `cargo xtask test-qemu` passes `-device isa-debug-exit`.** `check-input`,
+`check-display`, `check-terminal` and `test-interactive` boot the *same*
+`test-harness` image without it, because they need the guest alive and driveable long
+after the boot self-test has reached its verdict. For those gates the port write lands
+on no device, is ignored, and `SYS_TEST_EXIT` returns `Unsupported` to its caller,
+which carries on. That is the designed behaviour, not a misconfiguration.
+
+**`debug_exit` must therefore return rather than park the CPU**, and this is load-bearing
+rather than stylistic. It used to fall through to a `hlt` loop, on the belief that reaching
+there meant a broken host. The CPU halted with interrupts disabled while still counted in
+`sched::online_mask`, so the next TLB shootdown — i.e. the next large `free` in any process —
+waited forever for an acknowledgement it could never get, and the calling thread was stranded
+on a CPU that would never run again. Both failures were invisible for as long as nothing
+happened to need them, which is why `check-terminal` looked like a terminal that froze after
+a particular keystroke. See the decision log, 2026-08-13.
+
 ### Who fires the verdict
 
 | Situation | Verdict | Fired by |
@@ -52,7 +70,7 @@ behavior:
 |---|---|---|
 | Boot self-tests / demos | run | run |
 | After the demos | drop to the interactive `eshell` | fire the PASS verdict, exit QEMU |
-| On a kernel panic | print + halt (inspect in GDB) | fire the FAIL verdict, exit QEMU |
+| On a kernel panic | print + halt (inspect in GDB) | fire the FAIL verdict, exit QEMU (and halt if no device is attached) |
 | Display / serial | interactive | headless, serial captured |
 
 `test-harness` is compiled out of production kernels entirely: `SYS_TEST_EXIT`,

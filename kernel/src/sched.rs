@@ -432,14 +432,41 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// `SCHED`-guarded `cpu_online[]` kept purely so subsystems that must not take the
 /// top-rank `SCHED` lock can read the online set without a lock — notably TLB
 /// shootdown ([`crate::tlb`]), which fires from the mm layer under lower locks.
-/// Each CPU sets its own bit as it comes online; bits are never cleared (no
-/// CPU hot-unplug).
+/// Each CPU sets its own bit as it comes online.
+///
+/// **A bit is cleared only by [`leave_online`], when a CPU parks forever.** There is
+/// still no CPU hot-unplug; this is the terminal case — a panic, a failed AP init, or
+/// the harness verdict — where the CPU stops executing entirely.
 static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
 
 /// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
 /// Used by [`crate::tlb`] to pick TLB-shootdown IPI targets without taking `SCHED`.
 pub fn online_mask() -> u64 {
     ONLINE_MASK.load(Ordering::Acquire)
+}
+
+/// Drop this CPU from the online set, because it is about to stop executing forever.
+///
+/// **Every permanent park must call this, and the reason is a whole-machine deadlock.**
+/// `online_mask` is the target set for TLB-shootdown IPIs, and [`crate::tlb::shootdown`]
+/// waits for an acknowledgement from *every* CPU in it. A CPU that halts while still
+/// counted online can never send that acknowledgement, so the next shootdown — which is
+/// any `sys_memory_unmap`, i.e. any large `free` in any process — spins forever, taking
+/// the initiating thread with it and, through the shootdown lock, every later one.
+///
+/// That is not hypothetical: it is exactly how a parked CPU froze `nxterm` mid-repaint
+/// under `check-terminal` (2026-08-13). The CPU had halted with interrupts disabled in
+/// `debug_exit`'s device-absent fallback ~6,000 ticks earlier, and nothing noticed until
+/// a glyph outline was freed.
+///
+/// Safe to call before SMP is up: an out-of-range CPU index is ignored, the same way
+/// the lock tracker folds one onto CPU 0.
+pub fn leave_online() {
+    use crate::arch::smp::ArchSmp;
+    let me = crate::arch::Smp::current_cpu() as usize;
+    if me < MAX_CPUS {
+        ONLINE_MASK.fetch_and(!(1u64 << me), Ordering::AcqRel);
+    }
 }
 
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by

@@ -15045,3 +15045,80 @@ the serial lock inside the PS/2 lock and the kernel's own lockdep panicked on it
 machinery doing exactly its job; the second reported only counters, which showed *that* input
 stopped but not *why*. The status register was the datum that mattered, and reading it required
 going through the neutral `crate::arch` interface — `check-arch` refused the shortcut.
+
+## 2026-08-13 — A parked CPU must leave `online_mask`, and the harness verdict must not park one
+
+`check-terminal` had been failing since Milestone 5 in a way that read as a terminal bug: type
+into `nxterm` and it stops after a few characters. It is neither a terminal bug nor an input bug.
+**A CPU was halting forever while the scheduler still counted it online, and the first TLB
+shootdown afterwards deadlocked the machine.**
+
+### The chain, as measured
+
+`nxterm` hangs mid-repaint. Bisected inward, one layer at a time:
+
+| Layer | What it showed |
+|---|---|
+| the gate | stops after `whoa`, deterministically |
+| `nxterm` | receives `a`, never receives the next key |
+| `input-server` / compositor | both forward the next key; the compositor even routes and flushes it |
+| `nxterm` again | the key *is* delivered — it is queued while the client sits in `draw` |
+| `libterm::render` | inside `draw_cell`, drawing one glyph |
+| `libdraw::text` | `draw_str` **completes**; the hang is the `OutlinedGlyph` being dropped |
+| `libheap` | the drop is a large free → `SYS_MEMORY_UNMAP` |
+| `sys_memory_unmap` | the PTE work finishes; `tlb::shootdown_all` never returns |
+| QEMU `info registers -a` | one vCPU halted, `RFL=0x86` (**IF clear**), `RIP` in `qemu::debug_exit` |
+
+The scheduler's own counters made it plain once asked: that CPU's timer ticks had stopped at ~950
+while the others were past 7,000, and the shootdown's ack mask was missing exactly its bit.
+
+### The bug
+
+`SYS_TEST_EXIT` writes the harness verdict to QEMU's `isa-debug-exit` port. **Only
+`xtask test-qemu` attaches that device**; `check-input`, `check-display`, `check-terminal` and
+`test-interactive` boot the same `test-harness` image without it, because they need the guest
+alive afterwards. So the write is ignored — and `debug_exit` then did this:
+
+```rust
+// Device absent / write ignored: park this CPU. … we only reach here on a
+// misconfigured host.
+loop { asm!("hlt") }
+```
+
+The premise was wrong: that path is the **normal** one for four of the five gates. And parking
+there broke two invariants at once.
+
+1. **A CPU that will never service an interrupt again must not be in `online_mask`.** That mask is
+   the target set for TLB-shootdown IPIs, and `tlb::shootdown` waits for an ack from every CPU in
+   it. Halted with IF=0, the CPU could never ack, so the next shootdown — any `sys_memory_unmap`,
+   i.e. any large `free` in any process — spun forever and took the shootdown lock with it.
+2. **The parked CPU's current thread is stranded.** `session-mgr`'s thread called the verdict
+   syscall and never returned from it, so anything later waiting on `session-mgr` waited forever.
+
+Both are invisible until something needs them, which is why this survived two milestones and read
+as "the terminal freezes on a particular letter". The letters were never the variable: `a` and `m`
+only decided *when* a glyph outline happened to be freed.
+
+### The fix
+
+- `sched::leave_online()` — drop this CPU's bit; called from `Cpu::halt_loop`, so **every**
+  permanent park is covered, not just this one. The fatal-exception handler and a failed AP init
+  park through the same primitive and had the same latent bug.
+- `debug_exit` returns instead of parking. The device being absent is information for the caller,
+  not grounds to stop a CPU. `SYS_TEST_EXIT` returns `Unsupported`; the kernel panic path, the one
+  caller that genuinely must not continue, halts itself.
+
+Both halves are load-bearing, confirmed by break test: with only the first, the gate types the
+whole word and then hangs on the shell's reply (the stranded thread); with neither, it stops at the
+fifth keystroke. `check-terminal` goes from failing every run to **4 of 4 passing**, and it is
+worth promoting to CI now that it is not flaky — tracked in `deferred-decisions.md`.
+
+### The method note
+
+Two instruments were wrong before either answer was right, and both wrongnesses were silent.
+`check-terminal`'s stdout holds only xtask's own lines, so a probe grepping it counted zero every
+time; and an unlabelled `acquire blocked` probe reported a *different client's* window, which sent
+me after a buffer-release bug that did not exist. Both were caught the same way — by asking whether
+the instrument could produce a positive result at all before trusting a negative one. The thing
+that finally cracked it was not a kernel probe but `info registers -a` over QMP: the emulator knew
+where every vCPU was the whole time.

@@ -1162,6 +1162,12 @@ the boot chain does not already exercise, remains deferred. Trigger: a case that
 expressed as "the boot completes and the harness agrees". See
 `docs/conventions/qemu-integration-tests.md`.
 
+**Promote `check-terminal` to CI.** It was excluded as flaky; the flake was the parked-CPU
+deadlock fixed 2026-08-13, and it now passes 4 of 4 locally. Trigger: a second clean run of ~10
+consecutive passes, or the next change to the terminal/tty stack — whichever comes first. It is
+the only gate that exercises the whole path from a keystroke into a real shell and back, so the
+coverage it adds is not duplicated by `check-input` or `check-display`.
+
 **A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
 `drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
 exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one

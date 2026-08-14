@@ -54,6 +54,11 @@ impl ArchCpu for X86Cpu {
     }
 
     fn halt_loop() -> ! {
+        // **Leave the online set first.** This CPU is about to stop servicing
+        // interrupts for good, and a CPU counted online but unable to acknowledge a
+        // TLB-shootdown IPI deadlocks every later shootdown on the machine — see
+        // `sched::leave_online`, which carries the failure this fixed.
+        crate::sched::leave_online();
         loop {
             // SAFETY: `cli` and `hlt` are always valid in ring 0. Neither
             // touches memory; both are allowed under the kernel's lock
