@@ -15381,3 +15381,91 @@ currently occur, and the `debug_assert` is what would catch the state occurring.
 guard has a host test, because `PREEMPT_OFF` is a process-global that concurrent host tests
 already touch through `SpinLock` — writing one would reintroduce the cross-test race fixed in
 PR #199.
+
+## 2026-08-14 — A TSC that runs backwards, and three things the placement `Err` path did not say
+
+Audit section C. Two independent pieces; the first is one word of code and the largest
+consequence reduction in the section.
+
+### One cold AP could end periodic timers machine-wide, permanently
+
+`TSC_BASE` is captured **once, on the BSP**, at the end of calibration. Every CPU then reports
+`(its own TSC − that base) × scale`, so an AP whose TSC sits *behind* the BSP's produces a
+negative delta — and `read_ns` computed it with `wrapping_sub`, which turns that into
+~9.2×10¹⁸ ns, about 292 years.
+
+That is not a late clock, it is a poisoned one. `fire_expired_deadlines` finds every armed
+entry expired and drains the heap in a single pass; the periodic re-arm then writes
+`now + interval` back, ~292 years out, where the `saturating_add` does **not** clamp because
+the value is nowhere near `u64::MAX`. Healthy CPUs compare their own sane `now` against those
+entries and never fire them again.
+
+The tolerance for a negative skew is not a fixed budget — it is `now − base`, the time since
+calibration, which is **smallest exactly when the APs come up**, milliseconds after it, and
+when a cold TSC is most likely to disagree.
+
+`saturating_sub` reads 0 instead: that CPU's clock appears not to advance until its TSC passes
+the base. Wrong, but bounded, self-correcting, and it fires nothing early. This bounds the
+damage and does not detect the skew; verifying cross-CPU synchronisation at bring-up remains
+deferred (F10). Two claims in that deferral were also wrong and are corrected: the "saturating
+arithmetic" it credited guards *interval overflow*, not skew, and "merely delays a firing"
+describes one of two pairings — the other fires **early**, which for `sys_wait` is a premature
+`TimedOut` handed to userspace.
+
+### The placement `Err` path
+
+Three corrections, no behaviour change:
+
+- **`Err` is reachable two ways, not one.** `pick_wake_cpu`'s comment said it needs *every*
+  permitted queue full. `pick_target_cpu`'s last resort — reached when no CPU accepts work —
+  returns this CPU without checking its queue. That resort is deliberately not load-checked
+  (when nothing accepts work there is no queue worth preferring, and this CPU is the only one
+  known to be running), so the fix is the comment and the two panic messages, which claimed a
+  state that is not the one they fire in.
+- **`wake_reaper` is a fifth placement site** that bypasses the policy entirely — no affinity,
+  no `cpu_accepts_work`, no capacity check. Sound because a CPU executing it is not parked;
+  recorded because the next placement rule will not reach it.
+- **`panic = "abort"` is load-bearing for a lock-order invariant**: the wake callers panic
+  while an `ObjectRef` temporary is live under `SCHED`, and unwinding would free it there
+  (F11/F2). Now a `const` assertion.
+
+**The audit attributed that guarantee to `kernel/Cargo.toml`; it is the target.**
+`x86_64-unknown-none` carries `panic="abort"` in its spec, so rustc forces abort whatever the
+profile says — setting `panic = "unwind"` in the manifest changes nothing and the kernel still
+builds. The manifest lines are belt and braces. The assertion's real trigger is a *target*
+change, which `kernel/CLAUDE.md` explicitly contemplates.
+
+That was found the useful way. The assertion fired immediately — in the **host test** build,
+which targets the host triple and unwinds. It is now `cfg(not(test))`, and that failure is a
+better positive control than the scratch-file one it replaced: the guard demonstrably fires,
+in tree, on a real configuration.
+
+## 2026-08-14 — Correction: the wake paths were dropping an `ObjectRef` under `SCHED`
+
+Same day, correcting the entry above. That entry recorded `panic = "abort"` as load-bearing
+because the wake callers "panic while an `ObjectRef` temporary is live under `SCHED`". **The
+mechanism does not exist, and the bug it was excusing was real** (PR #204 review).
+
+An `if` condition is its own temporary scope. In `if place_thread(..).is_err() { panic!(..) }`
+the `Result<(), ObjectRef>` — and the ref inside it — drops at the **end of the condition**,
+before the branch body, on every panic strategy. So `ObjectRef::drop` → `dispatch_destroy` →
+`SlabCache::free` ran with `SCHED` held: a plain spinlock under the rank-1 lock, which
+`lock-ordering.md` forbids without qualification (F2). Verified out of tree before acting —
+the drop prints before the panic body.
+
+Not theoretical. Reserve exhaustion on a wake is the state those panics exist for; the drop
+spins on the allocator lock while another CPU's tick spins on `SCHED` with interrupts masked.
+The machine hangs instead of aborting with the diagnostic — the one output the path exists to
+produce.
+
+Both sites now bind the ref and `core::mem::forget` it before panicking. Leaking is honest
+here: nothing outlives an abort. `deferred_drops` is the documented alternative and is worse —
+pushing to it can itself grow under `SCHED` (audit C.1(c)), and nothing will ever drain it.
+
+The two *spawn* callers had this right all along, with a `match` that carries the ref out of
+the locked block and a comment saying why. Two sites did the opposite, and the entry above
+certified them as safe.
+
+The `panic = "abort"` assertion stays, re-justified: the rule it enforces is
+`kernel/CLAUDE.md`'s "no stack unwinding in the kernel", not the drop story. Its trigger
+remains a target change.

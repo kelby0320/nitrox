@@ -485,10 +485,19 @@ syscalls while migratable.
   unsynchronized and no stop IPI parks the other cores on a panic; diagnostics
   can garble under SMP. Tracked in `deferred-decisions.md`.
 - **Cross-CPU TSC synchronization is assumed, not verified** (review F10) — the
-  deadline heap compares `Timer::read_ns()` values captured on different cores;
-  saturating arithmetic makes a small skew merely delay a firing. Holds under
-  QEMU/KVM and on invariant-TSC hardware (the project baseline); verify (or
-  gate) at real-hardware bring-up.
+  deadline heap compares `Timer::read_ns()` values captured on different cores.
+  Two claims that stood here until 2026-08-14 were wrong, and the audit refuted
+  both (C.5). *"Saturating arithmetic"* named a `saturating_add` that guards
+  interval overflow, not skew — the subtraction that skew actually reaches was
+  `wrapping_sub`, since made saturating so a behind-TSC AP reads 0 rather than
+  ~292 years and poisons the shared heap. And *"merely delay a firing"* describes
+  one of two pairings: a deadline armed on a CPU running ahead fires late, the
+  reverse fires **early**, which for `sys_wait` is a premature `TimedOut`
+  returned to userspace.
+  What remains true: nothing verifies the synchronisation, the tolerance for a
+  negative skew is the time since calibration (smallest exactly at AP bring-up),
+  and it holds under QEMU/KVM and on invariant-TSC hardware (the project
+  baseline). Verify or gate at real-hardware bring-up.
 
 ## References
 

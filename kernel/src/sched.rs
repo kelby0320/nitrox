@@ -539,6 +539,33 @@ pub fn assert_user_entry_preempt_safe() {
     );
 }
 
+/// The kernel must be built with `panic = "abort"`.
+///
+/// **Not for the reason an earlier version of this comment gave.** It claimed the wake paths
+/// hold an `ObjectRef` temporary across their `panic!`, so unwinding would free it under
+/// `SCHED`. That is false — an `if` condition is its own temporary scope, so the ref dropped
+/// *before* the panic on every profile — and the real defect it was papering over is fixed at
+/// those two sites instead (PR #204 review, blocking 1).
+///
+/// The rule it does enforce is the documented one: `kernel/CLAUDE.md`, "`panic = "abort"` —
+/// no stack unwinding in the kernel." A freestanding kernel has no unwinder to run.
+///
+/// **What actually guarantees it today is the target, not the manifest.**
+/// `x86_64-unknown-none` carries `panic="abort"` in its spec
+/// (`rustc --target x86_64-unknown-none --print cfg`), so rustc forces abort whatever a
+/// profile says — setting `panic = "unwind"` in `kernel/Cargo.toml` changes nothing and the
+/// kernel still builds. The manifest lines are belt and braces, and this assertion's trigger
+/// is therefore a **target** change, which `kernel/CLAUDE.md` contemplates ("if we ever need
+/// a feature the built-in spec doesn't expose, we switch to a custom JSON"): a hand-written
+/// spec omitting `panic-strategy: abort` is what it is here to stop.
+///
+#[cfg(not(test))]
+const _: () = assert!(
+    cfg!(panic = "abort"),
+    "the kernel requires panic = \"abort\" (kernel/CLAUDE.md): a freestanding kernel has \
+     no unwinder — if this fires, a target spec has dropped panic-strategy: abort"
+);
+
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
 /// the thread running on that CPU (which, while nonzero, cannot migrate — that
 /// is the point); read by the same CPU's tick / reschedule-IPI handlers.
@@ -2420,8 +2447,32 @@ fn make_runnable(g: &mut SchedState, thread: *mut ()) -> bool {
     // least-loaded permitted queue with room — F6). This fails only when
     // *every* permitted queue is at reserve — e.g. a thread pinned to a single
     // CPU whose queue is full — which is genuine reserve exhaustion, still fatal.
-    if place_thread(g, r, true).is_err() {
-        panic!("wake placement: every affinity-permitted ready queue is at reserve");
+    if let Err(returned) = place_thread(g, r, true) {
+        // **Do not let `returned` drop here.** `SCHED` is held, and an `ObjectRef` drop can
+        // reach `dispatch_destroy` → `SlabCache::free` — a plain spinlock under the rank-1
+        // lock, which is F2 (`kernel/docs/lock-ordering.md`). The two spawn callers avoid it
+        // by carrying the ref out of the locked block with a `match`; here there is nowhere
+        // to carry it *to*, because the next statement ends the machine.
+        //
+        // `if place_thread(..).is_err()` used to do exactly the forbidden thing: an `if`
+        // condition is its own temporary scope, so the `Result` — and the `ObjectRef` inside
+        // it — dropped at the end of the condition, *before* the panic, with `SCHED` still
+        // held. An earlier version of this comment asserted the opposite and credited
+        // `panic = "abort"` with saving it; both were wrong (PR #204 review, blocking 1).
+        // The consequence was not theoretical: reserve exhaustion is the state this panic
+        // exists for, and the drop would spin on the allocator lock while another CPU's tick
+        // spins on `SCHED` with IRQs masked — a hang instead of the diagnostic.
+        //
+        // Leaked deliberately: `panic = "abort"` means nothing outlives this call, so a
+        // `forget` costs nothing and is honest about it. `deferred_drops` would be the
+        // documented alternative but is worse here — pushing to it can itself grow under
+        // `SCHED` (audit C.1(c)) and nothing will ever drain it.
+        core::mem::forget(returned);
+        panic!(
+            "wake placement: no ready queue would take the thread — every affinity-permitted \
+             queue is at reserve; or affinity permits no CPU that accepts work and every CPU \
+             that does is at reserve; or no CPU accepts work and this one is at reserve"
+        );
     }
     true
 }
@@ -3065,8 +3116,32 @@ pub fn resume_suspended(thread: *mut (), disp_tag: u8, disp_code: i32) -> bool {
     }
     // Re-home on its CPU (a wake; a full home falls back to a permitted queue
     // with room — F6). Fails only when every permitted queue is at reserve.
-    if place_thread(&mut g, r, true).is_err() {
-        panic!("resume placement: every affinity-permitted ready queue is at reserve");
+    if let Err(returned) = place_thread(&mut g, r, true) {
+        // **Do not let `returned` drop here.** `SCHED` is held, and an `ObjectRef` drop can
+        // reach `dispatch_destroy` → `SlabCache::free` — a plain spinlock under the rank-1
+        // lock, which is F2 (`kernel/docs/lock-ordering.md`). The two spawn callers avoid it
+        // by carrying the ref out of the locked block with a `match`; here there is nowhere
+        // to carry it *to*, because the next statement ends the machine.
+        //
+        // `if place_thread(..).is_err()` used to do exactly the forbidden thing: an `if`
+        // condition is its own temporary scope, so the `Result` — and the `ObjectRef` inside
+        // it — dropped at the end of the condition, *before* the panic, with `SCHED` still
+        // held. An earlier version of this comment asserted the opposite and credited
+        // `panic = "abort"` with saving it; both were wrong (PR #204 review, blocking 1).
+        // The consequence was not theoretical: reserve exhaustion is the state this panic
+        // exists for, and the drop would spin on the allocator lock while another CPU's tick
+        // spins on `SCHED` with IRQs masked — a hang instead of the diagnostic.
+        //
+        // Leaked deliberately: `panic = "abort"` means nothing outlives this call, so a
+        // `forget` costs nothing and is honest about it. `deferred_drops` would be the
+        // documented alternative but is worse here — pushing to it can itself grow under
+        // `SCHED` (audit C.1(c)) and nothing will ever drain it.
+        core::mem::forget(returned);
+        panic!(
+            "resume placement: no ready queue would take the thread — every affinity-permitted \
+             queue is at reserve; or affinity permits no CPU that accepts work and every CPU \
+             that does is at reserve; or no CPU accepts work and this one is at reserve"
+        );
     }
     true
 }
@@ -3354,8 +3429,24 @@ fn pick_target_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
 /// is online, affinity-permitted, **and has queue room** (cache-warm, and avoids
 /// needless migration), otherwise the least-loaded permitted CPU. The room check
 /// (F6, decision log 2026-07-21) keeps a full home queue from being a fatal wake:
-/// the fallback's least-loaded pick has room unless *every* permitted queue is
-/// full — the only case [`place_thread`] still refuses. Caller holds `SCHED`.
+/// the fallback's least-loaded pick has room unless *every* permitted queue is full.
+///
+/// **That is one of three ways [`place_thread`] refuses.** This comment claimed it was the
+/// only one until 2026-08-14 (kernel audit C.3(c)), and the correction that day named two;
+/// `pick_target_cpu` has three exits and all three reach `Err` (PR #204 review, finding 3):
+///
+/// 1. `best` — the least-loaded CPU that is both affinity-permitted and accepting work, when
+///    every such queue is at reserve. The case this paragraph describes.
+/// 2. `spare` — reached when affinity permits *no* CPU that accepts work, so placement leaves
+///    the mask: a thread pinned to a CPU that has parked, while every CPU still accepting
+///    work is full. Note what the panic must **not** say here — "every affinity-permitted
+///    queue is at reserve" is false, since the only permitted queue may be empty and merely
+///    parked.
+/// 3. `this_cpu()` — the last resort, when *nothing* accepts work, returned without checking
+///    its queue. Deliberately not load-checked: there is no queue worth preferring when
+///    nothing will run, and this CPU is the only one known to be executing.
+///
+/// Caller holds `SCHED`.
 fn pick_wake_cpu(g: &SchedState, obj: *mut (), online: u64) -> usize {
     // SAFETY: `obj` is a pinned Thread; `SCHED` held.
     let home = unsafe { Thread::last_cpu(obj) } as usize;
@@ -3721,6 +3812,14 @@ fn park_reaper() {
 ///
 /// A no-op when it is already running or queued — the wake is level-triggered off
 /// [`SchedState::ended_pids`], so a missed edge costs nothing.
+///
+/// **A fifth placement site, and the only one that bypasses the policy.** It pushes onto
+/// `ready[this_cpu()]` directly: no affinity check, no [`cpu_accepts_work`], no capacity
+/// check beyond a `debug_assert!`. Sound today for a reason worth writing down rather than
+/// rediscovering — a CPU executing this code is by definition not parked, so the CPU it
+/// chooses always accepts work — but it is a fifth opinion on placement, in the same shape
+/// as the extra opinions on `online_mask` the audit found in § A. If placement policy grows
+/// a rule, this is the site that will not have it (kernel audit C.3(e), 2026-08-14).
 fn wake_reaper(g: &mut SchedState) {
     let Some(r) = g.reaper.take() else {
         return;

@@ -136,14 +136,12 @@ impl ArchTimer for X86Timer {
     }
 
     fn read_ns() -> u64 {
-        let now = regs::rdtsc();
-        let base = TSC_BASE.load(Ordering::Relaxed);
-        let delta = now.wrapping_sub(base);
-        let mult = NS_MULT.load(Ordering::Relaxed);
-        let shift = NS_SHIFT.load(Ordering::Relaxed);
-        // u128 intermediate: `delta` and `mult` are each ≤ u64::MAX, and
-        // (2^64-1)^2 < 2^128-1, so the product never overflows.
-        (((delta as u128) * (mult as u128)) >> shift) as u64
+        elapsed_ns(
+            regs::rdtsc(),
+            TSC_BASE.load(Ordering::Relaxed),
+            NS_MULT.load(Ordering::Relaxed),
+            NS_SHIFT.load(Ordering::Relaxed),
+        )
     }
 
     unsafe fn start_periodic(period_ns: u64) {
@@ -224,6 +222,43 @@ unsafe fn pit_ch2_wait_until_done() {
     }
 }
 
+/// Convert a raw TSC reading into nanoseconds since [`TSC_BASE`].
+///
+/// **Saturating, not wrapping, and that is the whole of it.** `TSC_BASE` is captured once, on
+/// the BSP, at the end of calibration; every CPU then reports `(its own TSC − that base) ×
+/// scale`, so an AP whose TSC sits *behind* the BSP's produces a negative delta. Wrapping
+/// turned that into ~9.2×10¹⁸ ns — 292 years — which is not a late clock but a poisoned one:
+/// `fire_expired_deadlines` finds every armed entry expired and drains the heap in one pass,
+/// and the periodic re-arm writes `now + interval` back ~292 years out, where `saturating_add`
+/// does not clamp because the value is nowhere near `u64::MAX`. Healthy CPUs then compare
+/// their own sane `now` against those entries and never fire them again: **one cold AP
+/// permanently ends periodic timers machine-wide.**
+///
+/// Saturating reads 0 instead — that CPU's clock appears not to advance until its TSC passes
+/// the base, which is wrong but bounded and self-correcting. The tolerance for a negative
+/// skew is `now − base`, the time since calibration, which is *smallest exactly when the APs
+/// come up*.
+///
+/// **It does not make early firing impossible, and an earlier version of this comment said it
+/// did** (PR #204 review, finding 4). A skewed AP is exactly the "CPU running behind" case
+/// `smp.md` § Deferred describes: a `sys_wait(10 ms)` *stamped* there reads `now` as 0 and
+/// arms `0 + 10 ms`, which a healthy CPU 30 ms into boot finds expired on its next sweep and
+/// returns to userspace as an immediate `TimedOut`. Firings *adjudicated on* the skewed CPU
+/// are late, never early; deadlines *stamped by* it can fire early elsewhere. The improvement
+/// is real and large — the same wait was previously armed ~292 years out and never fired at
+/// all — but it is a bound on the damage, not an end to it.
+///
+/// This bounds the damage; it does not detect the skew. Verifying cross-CPU TSC
+/// synchronisation at bring-up is still deferred (F10, `smp.md` § Deferred). Split out of
+/// [`X86Timer::read_ns`] so the skew case is reachable by a host test — `rdtsc` is not
+/// (kernel audit C.5(b), 2026-08-14).
+fn elapsed_ns(now: u64, base: u64, mult: u64, shift: u64) -> u64 {
+    let delta = now.saturating_sub(base);
+    // u128 intermediate: `delta` and `mult` are each ≤ u64::MAX, and
+    // (2^64-1)^2 < 2^128-1, so the product never overflows.
+    (((delta as u128) * (mult as u128)) >> shift) as u64
+}
+
 /// Convert a nanosecond interval to a LAPIC initial-count using the calibrated
 /// timer frequency, saturating into the 32-bit count register.
 fn ns_to_timer_ticks(ns: u64) -> u32 {
@@ -263,6 +298,40 @@ fn compute_ns_mul_shift(tsc_hz: u64) -> (u64, u64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A TSC reading *behind* the calibration base must read as no time elapsed, not as 292
+    /// years.
+    ///
+    /// The failure this pins is not a late clock, it is a poisoned one: `wrapping_sub` put
+    /// `read_ns` at ~9.2×10¹⁸ ns, which makes `fire_expired_deadlines` drain the whole heap
+    /// in one pass and re-arm every periodic timer ~292 years out — a value `saturating_add`
+    /// does not clamp, because it is nowhere near `u64::MAX`. Healthy CPUs then never fire
+    /// those entries again, so **one cold AP ends periodic timers machine-wide, permanently**
+    /// (kernel audit C.5(b)).
+    ///
+    /// Numbers mirror the audit's replay: a 2 GHz TSC, base 25 ms into boot.
+    #[test]
+    fn a_tsc_behind_the_calibration_base_reads_zero_rather_than_wrapping() {
+        // 2 GHz: 1 tick = 0.5 ns. mult/shift as `Timer::init` computes them.
+        let (mult, shift) = (1u64 << 62, 63u64);
+        let base = 50_000_000; // 25 ms in
+        let one_ms = 2_000_000; // ticks
+
+        // Forwards: ordinary scaling still works.
+        assert_eq!(elapsed_ns(base, base, mult, shift), 0);
+        assert_eq!(elapsed_ns(base + one_ms, base, mult, shift), 1_000_000);
+
+        // Behind the base by any amount: zero, and specifically *not* astronomical.
+        for behind in [1u64, one_ms, 10 * one_ms, base] {
+            let ns = elapsed_ns(base - behind, base, mult, shift);
+            assert_eq!(ns, 0, "a TSC {behind} ticks behind the base must read 0");
+            assert!(
+                ns < 60_000_000_000,
+                "read {ns} ns from a behind-base TSC — anything this large drains the \
+                 deadline heap and re-arms periodic timers past any real deadline"
+            );
+        }
+    }
 
     /// Reference conversion using a full u128 division.
     fn ref_ns(delta: u64, tsc_hz: u64) -> u64 {
