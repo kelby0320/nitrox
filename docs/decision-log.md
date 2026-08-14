@@ -15313,3 +15313,56 @@ Every escape was reproduced before it was fixed and replayed after:
 | contract branch deleted from `classify` | (had no test) | the new test fails by name |
 
 1678 host tests, zero warnings; every gate green.
+
+## 2026-08-14 — Two preemption guards, and what "verified" means for a function no host test reaches
+
+Audit section B's remaining code findings. Neither is a live defect — both are invariants that
+hold today and were enforced nowhere.
+
+### A voluntary switch inside a preempt-critical region
+
+`PREEMPT_OFF` is honoured on the **involuntary** paths: `on_timer_tick` and
+`resched_if_idle_locked` latch into `RESCHED_PENDING` rather than descheduling. Nothing
+checked the voluntary ones. `yield_now`, and everything that blocks, reach `switch_into` — the
+choke point all five switch sites pass through — with no such check.
+
+`assert_switch_safe` covers it only by accident: it fires on a non-empty *lock* stack, so it
+catches a preempt-critical window that also holds a lock, and misses one raised by a bare
+`preempt_disable()` — the `tlb`, `handle::global` and `reap_pending` windows. A
+`debug_assert_eq!` beside it closes that, in the one place every switch passes through.
+
+### `preempt_enable` could wrap the counter to `u32::MAX`
+
+`fetch_sub(1)` at depth 0 wraps, and that CPU never preempts again — the failure
+`preempt_disable`'s own comment names, reached from the other direction. `[profile.dev]` sets
+`overflow-checks = true` and it does not help: an **atomic RMW wraps by definition**, so the
+dev profile was as silent as release. Now `fetch_update` with `saturating_sub`, plus a
+`debug_assert_ne!`: the assertion is the loud half, the saturation the safe half — a build
+that checks catches the unbalanced enable where it happens, and one that does not still
+refuses to brick the CPU.
+
+### What was actually verified, and what could not be
+
+The audit's own instrument failure is the reason to be careful here. It added an assertion to
+`switch_into`, saw 622 tests pass, and then established by **positive control** that
+`switch_into` is never reached by any host test at all — the whole switch path (FPU ordering,
+the `on_cpu` guard, CR3-before-stack-swap, `assert_switch_safe` itself) is covered only by
+booting. A green suite said nothing.
+
+So both assertions were proved *reachable* before being believed. Inverted, each panics a
+boot:
+
+| inverted assertion | boot result |
+|---|---|
+| `switch_into` preempt check | `KERNEL PANIC … context switch with preemption disabled` |
+| `preempt_enable` underflow check | `KERNEL PANIC … preempt_enable with no matching preempt_disable` |
+
+With them the right way round, `test-qemu` passes — which now means something: every context
+switch and every preempt-enable in a whole boot satisfied both.
+
+**Not verified, and cannot be without creating the bug:** the saturation itself. No path today
+is unbalanced, so there is nothing to saturate; it is a net under a state that does not
+currently occur, and the `debug_assert` is what would catch the state occurring. Neither
+guard has a host test, because `PREEMPT_OFF` is a process-global that concurrent host tests
+already touch through `SpinLock` — writing one would reintroduce the cross-test race fixed in
+PR #199.
