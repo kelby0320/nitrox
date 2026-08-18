@@ -86,7 +86,7 @@ Init reads files from the in-kernel initramfs resource server bound at `/initram
 
 Use the namespace handle and `sys_ns_lookup` + `sys_io_submit` (Read opcode) to access these. There's no special initramfs API — it's a regular resource server.
 
-After bootstrap is complete, init calls `sys_release_initramfs()` to free the initramfs memory. Init's own running image stays in memory; it just can't look up `/initramfs/...` paths anymore.
+**The initramfs is never released.** `sys_release_initramfs()` does not exist — it is specified in [`syscall-abi.md`](../../docs/spec/syscall-abi.md) and was never built, and the initramfs must stay resident regardless: the root fs-server's restart image can only come from it, since `/store/…/bin/fs-server-ext4` is unreadable without the very server being restarted. `/initramfs/...` paths stay valid for the life of the machine. See [`deferred-decisions.md`](../../docs/rationale/deferred-decisions.md). (This file said init calls the syscall after bootstrap until 2026-08-18; audit D.5f.)
 
 ## Reaping
 

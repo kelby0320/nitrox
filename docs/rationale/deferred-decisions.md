@@ -695,26 +695,6 @@ new ways.
 Trigger: a second filesystem (where the non-root case is real and the blast radius is
 small), or the first time an fs-server crash is observed in practice.
 
-**The three handle-validation paths check the same things in different orders —
-`TODO(handle-validation-order)`.**
-`docs/spec/handle-encoding.md` § "Validation algorithm" gives twelve steps and says "in order".
-`lookup` follows it. `close` and `restrict` do not: they fold the segment and slot bound checks
-into one test, and they read the object pointer **last**, where `lookup` reads it at step 6 —
-before generation and owner rather than after.
-
-Two consequences, neither fixed. The visible one is a **disclosure difference**: for one closed
-handle and a caller who is not the owner, `lookup` answers `InvalidHandle` while `close` and
-`restrict` answer `NotOwner` — telling a caller holding no capability that the slot is live and
-owned by someone else. The other is a trap for anyone testing this file: the input that isolates
-`restrict`'s object-null guard does not isolate `lookup`'s generation guard, because `lookup`
-answers at step 6 and never reads the generation. A test built on the wrong order passes against
-a build with the guard deleted, which is the vacuity PR #208 existed to remove.
-
-Not fixed there because reordering `close`/`restrict` changes observable error codes for
-existing callers, and unifying on the spec's order is a bigger change than the PR's scope.
-Found in review of PR #208 (2026-08-18). Trigger: the next change to any of the three ladders,
-or the first caller that distinguishes `NotOwner` from `InvalidHandle`.
-
 **Shell output bypasses the namespace — `TODO(tty-server)`.**
 `/dev/console` is a char `DeviceNode` a process must hold a handle to, so console *input* is a
 capability. Output is not: `CharBackend` has only `submit_read`, and every byte any program
@@ -1121,6 +1101,26 @@ a diagnostics-quality issue today; revisit with real-hardware bring-up or when a
 flaky-boot investigation is hampered by garbled panic output. From the 2026-07-21
 substrate review (decision log).
 
+**The three handle-validation paths check the same things in different orders —
+`TODO(handle-validation-order)`.**
+`docs/spec/handle-encoding.md` § "Validation algorithm" gives twelve steps and says "in order".
+`lookup` follows it. `close` and `restrict` do not: they fold the segment and slot bound checks
+into one test, and they read the object pointer **last**, where `lookup` reads it at step 6 —
+before generation and owner rather than after.
+
+Two consequences, neither fixed. The visible one is a **disclosure difference**: for one closed
+handle and a caller who is not the owner, `lookup` answers `InvalidHandle` while `close` and
+`restrict` answer `NotOwner` — telling a caller holding no capability that the slot is live and
+owned by someone else. The other is a trap for anyone testing this file: the input that isolates
+`restrict`'s object-null guard does not isolate `lookup`'s generation guard, because `lookup`
+answers at step 6 and never reads the generation. A test built on the wrong order passes against
+a build with the guard deleted, which is the vacuity PR #208 existed to remove.
+
+Not fixed there because reordering `close`/`restrict` changes observable error codes for
+existing callers, and unifying on the spec's order is a bigger change than the PR's scope.
+Found in review of PR #208 (2026-08-18). Trigger: the next change to any of the three ladders,
+or the first caller that distinguishes `NotOwner` from `InvalidHandle`.
+
 **Explicit grace-tracker quiescence on the syscall path — `TODO(smp)`.** The handle
 table's deferred-close reclamation waits for a grace period tracked per *context id*.
 
@@ -1336,10 +1336,21 @@ work, mirror it here.
 `cargo xtask check-deferrals` enforces **one direction** of that: every `TODO(tag)` in
 `kernel/src`, `userspace` or `tools/xtask/src` must name an entry here, and today all 20 do.
 It never asks the reverse question, and the reverse is where the rot is — measured 2026-08-18
-(audit D.5b), **10 of the 30 tagged open entries bind to no code marker at all**:
-`atomic-log-lines`, `history-pager`, `regex-named-captures`, `regex-replace`, `shell-bitwise`,
-`shell-cwd`, `shell-labelled-break`, `stack-attribution`, `tty-server`, `unicode-case`. Five of
-those exist nowhere in the repository outside this file.
+(audit D.5b) over the **open** section above, **9 of its 28 tagged entries bind to no code
+marker at all**: `atomic-log-lines`, `history-pager`, `regex-named-captures`, `regex-replace`,
+`shell-bitwise`, `shell-labelled-break`, `stack-attribution`, `tty-server`, `unicode-case`.
+
+Counted over the open section deliberately. A whole-file scrape is wrong in both directions and
+was wrong here first time: it picks up the prose `TODO(tag)` in this section, and it picks up
+tags named *narratively inside Resolved rows* — `shell-cwd` is one, where the row records that
+closing the deferral is what found two stale `TODO(shell-cwd)` markers in `nxsh` and deleted
+them. A closed entry with no marker is the lifecycle working, and counting it as rot would send
+the next person to reinstate the very marker that closing it removed.
+
+Searching for the `TODO(tag)` form outside this file and the audit that found them, four of the
+nine (`regex-named-captures`, `regex-replace`, `shell-labelled-break`, `unicode-case`) appear
+nowhere else at all; the other five survive only in `docs/planning/` and `docs/decision-log.md`,
+neither of which the gate scans.
 
 That is the direction that matters, because a deferral whose marker is gone is one nobody trips
 over while editing the code — which is exactly the failure the paragraph above describes. This

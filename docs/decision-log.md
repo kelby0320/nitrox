@@ -15750,20 +15750,37 @@ lines below `sys_device_map_mmio`, which carries a **Deferred** marker. It has n
 describes init calling it as boot step 8. `syscaps.md` — Status "Implemented" — lists
 `BIND_NAMESPACE` as gating it under a *second spelling*, `sys_ns_release_initramfs`, in three
 places. None of it exists; the initramfs stays resident because the root fs-server's restart
-image can only come from it, which `deferred-decisions.md` already knew and said. All four sites
-now say so. `check-docs` was right not to catch it: its syscall cross-check reads *numbered*
-table rows and prose bullets, and this signature is an unnumbered code block, invisible to it.
+image can only come from it, which `deferred-decisions.md` already knew and said.
+
+**There were five sites, not four.** My sweep grepped `docs/` and reported the job done;
+`userspace/init/CLAUDE.md` said "After bootstrap is complete, init calls
+`sys_release_initramfs()` to free the initramfs memory" and was missed — the one site that is
+*auto-loaded* into any session working in `userspace/init/`, and the one most likely to make
+someone treat `/initramfs` as invalid after boot, which is precisely the invariant the other
+four now protect. Found in review. All five now say so. `check-docs` was right not to catch any
+of it: its syscall cross-check reads *numbered* table rows and prose bullets, and this signature
+is an unnumbered code block, invisible to it.
 
 **The gate enforces one direction, and the document claimed otherwise.** `check-deferrals` walks
 the code for `TODO(tag)` and fails if the tag is absent here; all 20 pass. It never asks the
-reverse. Measured today: **10 of the 30 tagged open entries bind to no code marker at all**, five
-of them existing nowhere in the repository outside this file. So for a third of the tagged
-entries the "mechanical enforcement" the document advertised was an empty set — and it fails
+reverse. Measured today over the document's **open** section: **9 of its 28 tagged entries bind
+to no code marker at all**, four of them appearing nowhere else in the repository. So for a third
+of the tagged entries the "mechanical enforcement" the document advertised was an empty set — and
+it fails
 silently in the direction that matters, since a deferral whose marker is gone is one nobody trips
 over while editing. The claim is corrected with the measurement in it. Closing the gap needs a
 per-entry judgement (where would `TODO(shell-bitwise)` even go, for syntax that does not exist?)
 plus an exemption syntax for entries with no code site; filed as its own change so the judgement
 calls get reviewed as such.
+
+A measurement note, since the number moved twice. My first count was **10 of 30**, from
+scraping the whole file. That is wrong in both directions: it counts the prose `TODO(tag)` in
+"How to use this document", and it counts tags named *narratively inside Resolved rows* —
+`shell-cwd` is one, where the row records that closing the deferral is what found and deleted
+two stale `TODO(shell-cwd)` markers in `nxsh`. A closed entry with no marker is the lifecycle
+working; counting it as rot would have sent the follow-up PR to reinstate the marker that
+closing it removed. Counted over the open section alone the answer is 9 of 28 — which is what
+the audit reported, and my broader scrape was the thing that was wrong.
 
 Also filed, from the PR #208 review: `TODO(handle-validation-order)`. `lookup` follows the spec's
 twelve-step order; `close` and `restrict` fold the bound checks and read the object pointer last

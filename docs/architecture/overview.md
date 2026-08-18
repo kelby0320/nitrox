@@ -246,7 +246,7 @@ From power-on to running system:
 5. Init reads `/etc/init.toml` from the initramfs and processes its critical-path mounts in dependency order: spawn fs-server, wait for Ready, bind endpoint into the system namespace. Failure drops to eshell.
 6. Init reads the system manifest from the now-mounted filesystem, spawns the system profile server and binds it into the root namespace.
 7. Init spawns the service manager with delegated capabilities and the system namespace. The service manager reads its service declarations and brings up services in dependency order: logging, audit, device manager, namespace manager, time sync, authentication, package manager, session manager.
-8. *(Intended, not built.)* Once boot is stable, init would call `sys_release_initramfs()` and the kernel would unbind `/initramfs` and free its memory. **The syscall does not exist**, and the initramfs stays resident for the life of the machine — the root fs-server's restart image can only come from it. See `deferred-decisions.md`. <!-- check-docs: allow-missing -->
+8. *(Intended, not built.)* Once boot is stable, init would call `sys_release_initramfs()` and the kernel would unbind `/initramfs` and free its memory. **The syscall does not exist**, and the initramfs stays resident for the life of the machine — the root fs-server's restart image can only come from it. See `deferred-decisions.md`.
 9. Session manager presents login. After authentication, it constructs a per-user namespace and spawns the user's shell.
 
 See: [boot flow architecture](boot-flow.md) for the full sequence with handle flow and the per-step capability state.
