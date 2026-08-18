@@ -1135,6 +1135,15 @@ impl<'a> Parser<'a> {
     ///
     /// Needed only in `paren_args`, which must consume an identifier to see whether a `:`
     /// follows. Applies the postfix and binary tiers to the value already in hand.
+    ///
+    /// **This is a second copy of `postfix`'s tier and it has diverged from it** — the `(` arm
+    /// that builds an [`Expr::Call`] is missing here, so a call cannot appear in an argument
+    /// list: `format("add={}", add(2, 3))` fails as "expected `,` or `)`", because `add` parses
+    /// as a bare `Ident`, the loop below breaks on the `(` it cannot consume, and `paren_args`
+    /// reports that `(` as a missing comma. A parenthesised pipeline in the same position is
+    /// fine, which is why the gap went unnoticed. The fix is to delegate to `postfix` rather
+    /// than add the arm, so the tier stops being duplicated.
+    /// TODO(shell-nested-call): see `docs/rationale/deferred-decisions.md`.
     fn continue_expr_from(&mut self, first: Expr) -> Result<Expr> {
         let mut e = first;
         // Postfix tier.

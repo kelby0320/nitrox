@@ -811,6 +811,21 @@ not only in the doc that decided it.
   user meets it rather than only in the design doc. Trigger: the tables arriving for some other
   reason (text rendering in the compositor is the likely one), since carrying them for two shell
   operators alone is not the trade.
+- **A call cannot be nested in an argument list — `TODO(shell-nested-call)`.**
+  `format("add={}", add(2, 3))` is a parse error, "expected `,` or `)` in an argument list",
+  while `format("len={}", ("hello" | count))` parses: a *parenthesised pipeline* is fine, a
+  *call* is not. Root cause is a divergence between two copies of the same grammar tier.
+  `postfix` (`userspace/nxsh/src/parse.rs:678`) applies `.`, `?.`, `[`, `?` **and `(` →
+  `Expr::Call`**; `continue_expr_from` (`:1138`) exists because `paren_args` must consume an
+  identifier to see whether a `:` follows, re-implements that same postfix tier, and omits the
+  `(` arm. So `add` inside an argument list parses as a bare `Expr::Ident`, the loop breaks on
+  the `(` it cannot consume, and `paren_args` reports the `(` as a missing comma. The workaround
+  is the two-line form — `let sum = add(2, 3)` then `format("add={}", sum)` — which is what
+  `test-interactive` step 7 uses, with a comment, since it otherwise reads as a detour. Found
+  2026-08-18 while fixing that step's assertion. Fixing it means giving `continue_expr_from` the
+  call arm, or better, having it delegate to `postfix` so the tier stops being duplicated —
+  the divergence is the defect, and a second copy will drift again. Trigger: any script that
+  wants a call as an argument, which is most of them once user functions see real use.
 
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 
