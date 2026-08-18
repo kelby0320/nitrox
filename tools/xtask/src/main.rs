@@ -2017,6 +2017,21 @@ fn dump_guest_state(qmp: &mut Qmp) {
     println!("─────────────────────────────\n");
 }
 
+/// Which of `sent` — the lines typed since the last match — would satisfy `pat` by echo alone.
+///
+/// **A free function so it can be table-tested.** Inline in [`Session::expect`] the only thing
+/// proving it worked would be a manual mutation of the gate, which is the situation this guard
+/// exists to argue against; the same reasoning is written out at
+/// [`scope_binding`]. The live risk is not the predicate's logic but its inputs: `sent` is
+/// appended to in two places, and a later `send_line`-style wrapper that forgets to do so
+/// disarms the guard for those steps while every gate stays green.
+fn echo_source<'a>(sent: &'a [String], pat: &str) -> Option<&'a str> {
+    if pat.is_empty() {
+        return None;
+    }
+    sent.iter().find(|s| s.contains(pat)).map(|s| s.as_str())
+}
+
 /// A driven QEMU serial session: write lines, wait for text.
 struct Session {
     child: std::process::Child,
@@ -2030,10 +2045,18 @@ struct Session {
     /// How far `expect` has already matched, so each step scans only new output and a
     /// pattern cannot be satisfied by an earlier occurrence of itself.
     cursor: usize,
-    /// The text most recently typed at the guest, so [`expect`](Self::expect) can refuse a
-    /// pattern the guest's own echo would satisfy. Empty for gates that type over QMP
-    /// rather than the serial line, which is every gate but `test-interactive`.
-    last_sent: String,
+    /// Every line typed at the guest since the last successful [`expect`](Self::expect), so
+    /// that call can refuse a pattern the guest's own echo would satisfy. Empty for gates
+    /// that type over QMP rather than the serial line, which is every gate but
+    /// `test-interactive`.
+    ///
+    /// **A list, not the most recent line.** The unconsumed-echo window is not one send: two
+    /// sends before an `expect` leave *both* echoes ahead of the cursor, and a guard that
+    /// remembered only the second would wave the first one's text straight through — the one
+    /// shape that walks past a guard whose whole purpose is preventing recurrence. Cleared on
+    /// a successful match because the cursor has then advanced past those echoes, so they can
+    /// no longer satisfy anything.
+    sent_since_match: Vec<String>,
 }
 
 impl Drop for Session {
@@ -2070,7 +2093,7 @@ impl Session {
                 }
             }
         });
-        Ok(Session { child, out, cursor: 0, gate, last_sent: String::new() })
+        Ok(Session { child, out, cursor: 0, gate, sent_since_match: Vec::new() })
     }
 
     /// Wait for `pat` in output not yet consumed. The guest paces the test.
@@ -2085,14 +2108,22 @@ impl Session {
         // `run_interactive_scenarios`, at steps 12 and 13, along with the history of how it
         // was learned. It was still violated twice in that same function — a comment cannot
         // fail a build, so this does.
-        if !pat.is_empty() && self.last_sent.contains(pat) {
+        //
+        // **What this does not cover**, so nobody reads it as more than it is: it knows only
+        // what the harness typed. A line the guest *re-emits* from its own history (Up-arrow,
+        // Ctrl-R — steps 8-11) was never sent by us and is invisible here, which is why those
+        // steps assert on command output instead. Neither does it cover the other half of the
+        // problem — a pattern satisfied by a background service's logging rather than by the
+        // shell — because nothing can tell the harness what a service might print. See the
+        // 2026-08-18 decision-log entry.
+        if let Some(echoed) = echo_source(&self.sent_since_match, pat) {
             return Err(format!(
                 "expect({:?}) is satisfied by the guest's echo of the text just typed \
                  ({:?}), which it emits as the line is sent — so this step would pass \
                  against a guest that never evaluated the command. Wrap the answer so \
                  the pattern cannot occur in what was typed: \
                  `format(\"label={{}}\", …)` then expect(\"label=…\").",
-                pat, self.last_sent
+                pat, echoed
             )
             .into());
         }
@@ -2103,6 +2134,8 @@ impl Session {
                 let g = self.out.lock().map_err(|_| "transcript lock")?;
                 if let Some(i) = g[self.cursor..].find(pat) {
                     self.cursor += i + pat.len();
+                    // The cursor is now past those echoes; they cannot satisfy anything else.
+                    self.sent_since_match.clear();
                     println!("  ok: saw {pat:?}");
                     return Ok(());
                 }
@@ -2156,7 +2189,7 @@ impl Session {
     /// interrupt, and the two behaviours are exactly what the step is trying to tell apart.
     fn send_raw(&mut self, bytes: &str) -> R<()> {
         use std::io::Write as _;
-        self.last_sent = bytes.to_string();
+        self.sent_since_match.push(bytes.to_string());
         let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
         stdin.write_all(bytes.as_bytes()).map_err(|e| format!("write to guest: {e}"))?;
         stdin.flush().map_err(|e| format!("flush: {e}"))?;
@@ -2165,7 +2198,7 @@ impl Session {
 
     fn send(&mut self, line: &str) -> R<()> {
         use std::io::Write as _;
-        self.last_sent = line.to_string();
+        self.sent_since_match.push(line.to_string());
         let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
         stdin
             .write_all(format!("{line}\n").as_bytes())
@@ -4637,6 +4670,44 @@ fn format_cmd(cmd: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The echo guard's predicate, on the shapes it has to tell apart.
+    ///
+    /// The flagship pair is the last one: the exact command `test-interactive` step 14 sends,
+    /// against the pattern that shipped for months (`boom` — satisfied by the echo, so the
+    /// step passed with `try`/`catch` deleted) and the one that replaced it (`caught=boom` —
+    /// produced only by evaluating the catch block). A predicate that cannot separate those
+    /// two is decoration.
+    #[test]
+    fn echo_source_finds_a_pattern_the_guest_would_echo_back() {
+        use super::echo_source;
+
+        let none: [String; 0] = [];
+        // Gates that type over QMP send nothing, so the guard must stay inert for them.
+        assert_eq!(echo_source(&none, "anything"), None);
+
+        let one = [String::from("format(\"add={}\", sum)")];
+        assert_eq!(echo_source(&one, "add=5"), None, "the answer is not in the command");
+        assert_eq!(echo_source(&one, "sum"), Some("format(\"add={}\", sum)"));
+
+        // An empty pattern is contained in every string; it must not trip the guard.
+        assert_eq!(echo_source(&one, ""), None);
+
+        // **Two sends before one expect.** Both echoes are still ahead of the cursor, so the
+        // earlier one has to be caught too — a predicate holding only the latest send would
+        // return None here and wave the assertion through.
+        let two = [String::from("echo hello"), String::from("whoami")];
+        assert_eq!(echo_source(&two, "hello"), Some("echo hello"));
+        assert_eq!(echo_source(&two, "whoami"), Some("whoami"));
+        assert_eq!(echo_source(&two, "alice"), None, "the answer is in neither command");
+
+        // The regression, both directions.
+        let step14 = [String::from(
+            "try { fail \"boom\" } catch (e) { format(\"caught={}\", e.message) }",
+        )];
+        assert!(echo_source(&step14, "boom").is_some(), "the old pattern must be refused");
+        assert_eq!(echo_source(&step14, "caught=boom"), None, "the new one must be allowed");
+    }
 
     /// The rule-2 classifier, on every form it has to tell apart.
     ///

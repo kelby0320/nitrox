@@ -15543,7 +15543,10 @@ in an argument list ("expected , or ) in an argument list") — noted since it r
 arbitrary detour otherwise.
 
 **The mechanism, not a third comment.** `Session::expect` now refuses any pattern contained in
-the text most recently sent. A comment cannot fail a build; this returns an error naming the
+a line the harness has typed since the last successful match — every such line, not just the
+most recent one, because two sends before one `expect` leave both echoes ahead of the cursor
+and a guard remembering only the latest would wave the earlier one through. The predicate is a
+free function, `echo_source`, so it is table-tested rather than evidenced by manual mutation. A comment cannot fail a build; this returns an error naming the
 step, the echoed text, and the fix. Its negative control is the original bug: restoring
 `expect("boom")` verbatim now fails at that step instead of passing. Scope is exact — `last_sent`
 is only ever set by `send`/`send_raw`, which only `test-interactive` calls, so `check-terminal`'s
