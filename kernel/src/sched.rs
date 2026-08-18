@@ -594,6 +594,15 @@ fn clear_online_bit(identity_bound: bool, me: usize) {
 /// `assert_user_entry_safe` already makes for locks one line above the call site: a thread
 /// that was executing in user mode cannot hold a kernel lock, and cannot have disabled
 /// kernel preemption either. Debug builds only (PR #203 review, optional 1).
+pub fn assert_user_entry_preempt_safe() {
+    debug_assert_eq!(
+        with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed)),
+        0,
+        "entered a syscall from ring 3 with preemption disabled — a kernel path leaked a \
+         `preempt_disable`, and this CPU will stop preempting until something notices"
+    );
+}
+
 /// Assert that a *voluntary* context switch is not happening inside a preempt-critical window.
 ///
 /// Split out of [`switch_into`] rather than left inline, for the reason [`clear_online_bit`]
@@ -615,15 +624,6 @@ fn assert_switch_preempt_safe() {
         "context switch with preemption disabled — a voluntary switch inside a \
          preempt-critical region deschedules a CPU that asked not to be, and strands the \
          raised counter on a thread that is no longer running"
-    );
-}
-
-pub fn assert_user_entry_preempt_safe() {
-    debug_assert_eq!(
-        with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed)),
-        0,
-        "entered a syscall from ring 3 with preemption disabled — a kernel path leaked a \
-         `preempt_disable`, and this CPU will stop preempting until something notices"
     );
 }
 
@@ -2489,17 +2489,11 @@ unsafe fn switch_into(
     // has interrupts masked, and blocking with a lock held is forbidden) — this is what
     // turns "already true" into "checked". Debug builds only; inert otherwise.
     crate::libkern::lockrank::assert_switch_safe();
-    // The same idea for the *other* per-CPU invariant, which the lock check cannot see.
-    // A plain-lock holder trips `assert_switch_safe` because it holds a rank; a bare
-    // `preempt_disable()` — the `tlb`, `handle::global` and `reap_pending` windows — holds
-    // nothing, so a yield or block inside one would switch away from a CPU that has asked
-    // not to be descheduled, and leave the counter raised on a thread no longer running.
-    //
-    // The involuntary paths already refuse: `on_timer_tick` and `resched_if_idle_locked`
-    // latch into `RESCHED_PENDING` instead of switching. Nothing checked the **voluntary**
-    // ones — `yield_now` and everything that blocks — which is the gap this closes (kernel
-    // audit B.5(c), decision log 2026-08-14). No reachable violation exists today; this is
-    // what keeps that true.
+    // The same idea for the *other* per-CPU invariant, which the lock check cannot see: the
+    // involuntary paths (`on_timer_tick`, `resched_if_idle_locked`) latch into
+    // `RESCHED_PENDING` rather than switching, and nothing checked the **voluntary** ones —
+    // `yield_now` and everything that blocks — until kernel audit B.5(c). The reasoning is on
+    // the function, which is also where its test points; one copy, so the two cannot drift.
     assert_switch_preempt_safe();
     // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
     unsafe { arm_kernel_stack_for(next_obj) };
@@ -4081,11 +4075,20 @@ mod tests {
     /// Raise the depth on *this thread's* counter and put it back, whatever the test does.
     ///
     /// RAII rather than a bare increment-and-reset, because two of these tests panic while it
-    /// is alive. Test builds unwind (the `panic = "abort"` assertion in this file is
-    /// `cfg(not(test))`), so `Drop` runs during the unwind and the counter is restored — which
-    /// is what keeps `--test-threads=1` correct, where the whole suite shares one thread and a
-    /// leaked depth would make every later `SpinLock` acquire look nested. Verified: 640 green
-    /// at `--test-threads=1`.
+    /// is alive: cleanup written *after* the assert would simply not run. Test builds unwind
+    /// (the `panic = "abort"` assertion in this file is `cfg(not(test))`), so `Drop` runs
+    /// during the unwind and the restore is unconditional.
+    ///
+    /// **Nothing depends on that today**, and an earlier version of this comment claimed
+    /// otherwise — that it is what keeps `--test-threads=1` correct, "where the whole suite
+    /// shares one thread". It does not: libtest spawns a **fresh OS thread per test at every
+    /// concurrency level**, so a `thread_local!` cannot carry from one test to the next and the
+    /// leak this is said to prevent cannot happen. Measured on rustc 1.95.0 — at
+    /// `--test-threads=1` two tests report `ThreadId(2)` and `ThreadId(3)` — and confirmed the
+    /// other way: delete this `Drop` body and the suite is still 640 green at
+    /// `--test-threads=1`. The fixture is defensive against a future harness or `catch_unwind`
+    /// wrapper that *does* share a thread, which is a fine reason to keep it and not a reason
+    /// to claim it is load-bearing.
     struct PreemptRaised;
     impl PreemptRaised {
         fn new() -> Self {
@@ -4097,8 +4100,11 @@ mod tests {
     }
     impl Drop for PreemptRaised {
         fn drop(&mut self) {
+            // `fetch_sub`, not `store(0)`: zeroing would make this fixture unusable inside a
+            // held `SpinLock`, whose guard drop then reaches `preempt_enable` and trips its
+            // underflow assert — reporting a wrap that never happened.
             super::with_preempt_off(super::SchedState::this_cpu(), |c| {
-                c.store(0, core::sync::atomic::Ordering::Relaxed)
+                c.fetch_sub(1, core::sync::atomic::Ordering::Relaxed)
             });
         }
     }

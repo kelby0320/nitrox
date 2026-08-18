@@ -15841,14 +15841,35 @@ invert both (expect 1, not 0)  -> all four FAILED, for two different reasons:
                                   `should_panic` halves now do not
 ```
 
-Two corrections this change forced, both to comments I wrote in PR #203. The
-"do not simplify this to a plain load/store" note justified the atomic RMW by *this exact
-collapse* — "the atomicity is load-bearing for the host configuration" — which this change
-falsifies. The RMW stays, but the honest reason is narrower: it keeps the line's correctness
-from depending on `preempt_irqs_mask` staying exactly where it is. And the depth-raising fixture
-is RAII rather than a bare increment, because two tests panic while it is alive; test builds
-unwind, so `Drop` restores the counter, which is what keeps `--test-threads=1` correct.
+A correction this change forced, to a comment I wrote in PR #203. The "do not simplify this to
+a plain load/store" note justified the atomic RMW by *this exact collapse* — "the atomicity is
+load-bearing for the host configuration" — which this change falsifies. The RMW stays, but the
+honest reason is narrower: it keeps the line's correctness from depending on `preempt_irqs_mask`
+staying exactly where it is.
 
-Verified: 1696 host tests (+4), 640 of them the kernel crate; 640 green at `--test-threads=1`;
-each new test confirmed passing in isolation; five guest gates and six static gates green; zero
-warnings on the kernel target.
+**And a correction to this entry's own first draft, and to the 2026-08-18 `MOCK_IF` entry
+above.** Both said that under `--test-threads=1` "the whole suite shares one thread", so a
+thread-local becomes process-wide again and each test must establish its own prior state. That
+is false. **libtest spawns a fresh OS thread per test at every concurrency level** — measured on
+rustc 1.95.0, at `--test-threads=1` two tests report `ThreadId(2)` and `ThreadId(3)` — so a
+`thread_local!` never carries between tests and there is no mode in which these fixtures share
+state. The `MOCK_IF` entry's "Residual, stated because the fix does not cover it" paragraph is
+wrong in the same way; this log is append-only, so it stands as written and is corrected here.
+The comment in `spinlock.rs` that carried the claim has been rewritten in place.
+
+Worth stating plainly because of where it happened: PR #207 removed **four** comments in
+`spinlock.rs` asserting that `cargo test` runs those tests serially — that discovery *is* audit
+D.2(c) — and the replacement it wrote was a fifth claim of the same kind pointing the other way.
+The draft of this entry then made it a sixth, with a "Verified: 640 green at
+`--test-threads=1`" line attached. That line was vacuous: deleting the fixture's entire `Drop`
+body leaves the suite 640 green at `--test-threads=1`, so it passed identically with and without
+the thing it was offered as evidence for. Found in review of #210.
+
+The fixture stays, RAII, for a reason that survives: two of these tests panic while it is alive,
+so cleanup written after the assert would not run at all, and `Drop` makes the restore
+unconditional against a future harness or `catch_unwind` wrapper that *does* share a thread. It
+is defensive, not load-bearing.
+
+Verified: 1696 host tests (+4), 640 of them the kernel crate; each new test confirmed passing in
+isolation via `--exact`; each guard negative-controlled by deletion and by inversion; five guest
+gates and six static gates green; zero warnings on the kernel target in debug and release.
