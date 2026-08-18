@@ -15792,3 +15792,63 @@ halves, marker and entry, so it does not join the ten above.
 Verified: 1692 host tests; `test-qemu`, `test-interactive`, `check-terminal`, `check-input`,
 `check-display` green; six static gates green, including `check-deferrals` at 20 tags and
 `check-docs`; zero warnings.
+
+## 2026-08-18 — The last shared test global, and the two guards it was blocking
+
+Audit D.2's residual, and the payoff is the point rather than the fix.
+
+`PREEMPT_OFF` and `RESCHED_PENDING` are per-CPU arrays indexed by `SchedState::this_cpu()`,
+and under `cfg(test)` `current_cpu()` reports `0` for every thread. `SpinLock::lock` calls
+`preempt_disable`, so **every concurrent test taking any plain spinlock wrote the same two
+slots**. The PR #207 review found it after I claimed the class was closed; the reason my sweep
+missed it is worth more than the miss — I had asked which statics are written *from inside a
+`#[cfg(test)] mod`*, and this one is never named in a test module. It is written by production
+code that tests call. `ONLINE_MASK` would have been invisible to the same question had the
+placement tests reached it through `place_thread()` instead of writing it directly.
+
+Same two-backing treatment as `online_set`: the original arrays under `cfg(not(test))`, so
+production codegen is untouched, and a per-thread pair under `cfg(test)`. Scoped closure access
+rather than a leaked `'static`, because `kernel/CLAUDE.md` forbids `Box::leak` patterns.
+
+Measured, both directions:
+
+```
+per-thread backing   zz_nc_observer_sees_its_own_cpu_preempt_depth ... ok
+process-global       ... FAILED — left: 1, right: 0
+```
+
+**What it unblocks is why it was worth doing.** The 2026-08-14 preempt-guards entry says
+plainly: "Neither guard has a host test, because `PREEMPT_OFF` is a process-global that
+concurrent host tests already touch through `SpinLock` — writing one would reintroduce the
+cross-test race fixed in PR #199." That reason is now gone, and both guards have tests:
+
+| guard | test |
+|---|---|
+| ring-3 entry (`assert_user_entry_preempt_safe`) | `a_syscall_from_ring_3_with_preemption_disabled_is_refused` |
+| voluntary switch (`assert_switch_preempt_safe`) | `a_voluntary_switch_inside_a_preempt_critical_window_is_refused` |
+
+The second needed the guard **split out of `switch_into`**, for the reason `clear_online_bit`
+was split out of `leave_online`: `switch_into` manipulates real registers and stacks and is
+reached by no host test (audit B.5d), so an assertion inside it is pinned only by booting.
+
+Each guard is tested from both sides, and the controls say why that is not decoration:
+
+```
+delete the ring-3 guard        -> only  ..._ring_3_..._is_refused           FAILED
+delete the switch guard        -> only  ..._preempt_critical_window_..._    FAILED
+invert both (expect 1, not 0)  -> all four FAILED, for two different reasons:
+                                  the positive halves now panic, and the
+                                  `should_panic` halves now do not
+```
+
+Two corrections this change forced, both to comments I wrote in PR #203. The
+"do not simplify this to a plain load/store" note justified the atomic RMW by *this exact
+collapse* — "the atomicity is load-bearing for the host configuration" — which this change
+falsifies. The RMW stays, but the honest reason is narrower: it keeps the line's correctness
+from depending on `preempt_irqs_mask` staying exactly where it is. And the depth-raising fixture
+is RAII rather than a bare increment, because two tests panic while it is alive; test builds
+unwind, so `Drop` restores the counter, which is what keeps `--test-threads=1` correct.
+
+Verified: 1696 host tests (+4), 640 of them the kernel crate; 640 green at `--test-threads=1`;
+each new test confirmed passing in isolation; five guest gates and six static gates green; zero
+warnings on the kernel target.
