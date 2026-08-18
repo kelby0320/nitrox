@@ -496,7 +496,7 @@ Returns a `MemoryObject` handle for the MMIO region indexed by `region_idx` in t
 ```rust
 fn sys_release_initramfs() -> isize
 ```
-Unbinds `/initramfs` from the root namespace and frees the initramfs physical pages. One-shot — succeeds once, returns `AlreadyReleased` thereafter. Requires `BIND_NAMESPACE`.
+Unbinds `/initramfs` from the root namespace and frees the initramfs physical pages. One-shot — succeeds once, returns `AlreadyReleased` thereafter. Requires `BIND_NAMESPACE`. **Deferred** — not implemented, and neither is the `AlreadyReleased` error it names. The initramfs must currently stay resident because the root fs-server's restart image can only come from it (`deferred-decisions.md`, "Filesystem server restart"). Marked 2026-08-18: this signature carried no deferred marker for as long as it has existed, three lines below one that does, and `check-docs`' syscall cross-check reads *numbered* table rows and prose bullets, so an unnumbered code block is invisible to it (audit D.5f).
 
 ### High-Throughput Ring (additive optimization)
 

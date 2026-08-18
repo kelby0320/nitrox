@@ -582,6 +582,10 @@ impl HandleTable {
 
         // Validate under the lock. Plain loads suffice because no
         // other writer can race us — they would need the same lock.
+        // **This order is not `lookup`'s**, which reads the object pointer at step 6 — before
+        // generation and owner rather than after. The difference is observable: a non-owner
+        // closing a closed handle gets `NotOwner` here and `InvalidHandle` from `lookup`.
+        // TODO(handle-validation-order): see `docs/rationale/deferred-decisions.md`.
         let current_gen = entry.generation.load(Ordering::Relaxed);
         if current_gen != gen_expected {
             return Err(HandleError::InvalidHandle);
@@ -668,6 +672,8 @@ impl HandleTable {
         // SAFETY: as above.
         let entry = unsafe { &(*entries_ptr)[slot_id as usize] };
 
+        // Same ladder as `close`, and the same divergence from `lookup`'s.
+        // TODO(handle-validation-order): see `docs/rationale/deferred-decisions.md`.
         if entry.generation.load(Ordering::Relaxed) != gen_expected {
             return Err(HandleError::InvalidHandle);
         }
@@ -1418,7 +1424,8 @@ mod tests {
     // caller, `lookup` answers `InvalidHandle` and `close`/`restrict` answer `NotOwner` —
     // telling a caller without a capability that the slot is live and owned elsewhere. That
     // and the divergence from `docs/spec/handle-encoding.md` § "Validation algorithm" (twelve
-    // steps, "in order") are both pre-existing; neither is this section's to fix.
+    // steps, "in order") are both pre-existing; neither is this section's to fix — they are
+    // filed as `TODO(handle-validation-order)`, marked at the two ladders themselves.
     //
     // The tests below pin the ladder for all three entry points. Each is written so that the
     // guard under test is the **only** one that can reject its input — otherwise it passes
