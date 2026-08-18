@@ -38,7 +38,7 @@ Capability Bitmask"). Each is one bit of a `u64`:
 | Bit | Capability | Gates | Wired |
 |---|---|---|---|
 | `1<<0` | `LOAD_MODULE` | loading/unloading Tier-2 LKMs | **defined only** (no loader yet) |
-| `1<<1` | `BIND_NAMESPACE` | `sys_ns_bind`, `sys_ns_release_initramfs` | **this slice** |
+| `1<<1` | `BIND_NAMESPACE` | `sys_ns_bind` (`sys_ns_release_initramfs` does not exist) | **this slice** |
 | `1<<2` | `PHYSICAL_MEMORY` | mapping arbitrary physical memory | **defined only** (no phys-map syscall) |
 | `1<<3` | `REAL_TIME` | requesting the `RealTime` scheduling class | **this slice** |
 | `1<<4` | `SYSTEM_CLOCK` | setting the realtime-clock offset | **defined only** (clock is Monotonic-only) |
@@ -152,8 +152,10 @@ right returns, so userspace sees one "insufficient authority" story.
 
 ### The two gates wired this slice
 
-**`BIND_NAMESPACE` — on `sys_ns_bind`** (`table.rs:1025`) and
-`sys_ns_release_initramfs`. The existing `Rights::BIND`-on-the-handle check stays; the
+**`BIND_NAMESPACE` — on `sys_ns_bind`** (`table.rs:1025`). It was also specified to gate
+`sys_ns_release_initramfs`, which **has never existed** under that spelling or as
+`sys_release_initramfs` (audit D.5f, corrected 2026-08-18). The existing
+`Rights::BIND`-on-the-handle check stays; the
 syscap is an *additional* gate checked first:
 
 ```rust
@@ -230,7 +232,8 @@ passing under the new gate (init/parent granted appropriately), *and* that a pro
 
 - **In:** the `SysCaps` type (kernel + userspace mirror); the `Process.syscaps` field
   + inheritance (`child = parent & args.syscaps`) in `sys_process_spawn`; the boot
-  grant (init = full set); the `BIND_NAMESPACE` gate on `ns_bind`/`ns_release_initramfs`;
+  grant (init = full set); the `BIND_NAMESPACE` gate on `ns_bind` (there is no
+  `ns_release_initramfs` to gate);
   the `REAL_TIME` gate + the finalized `ThreadArgs` class/nice/affinity ABI; the
   `SpawnArgs.syscaps` field.
 - **Defined, not wired:** `LOAD_MODULE`, `PHYSICAL_MEMORY`, `SYSTEM_CLOCK`,

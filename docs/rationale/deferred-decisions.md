@@ -695,6 +695,26 @@ new ways.
 Trigger: a second filesystem (where the non-root case is real and the blast radius is
 small), or the first time an fs-server crash is observed in practice.
 
+**The three handle-validation paths check the same things in different orders —
+`TODO(handle-validation-order)`.**
+`docs/spec/handle-encoding.md` § "Validation algorithm" gives twelve steps and says "in order".
+`lookup` follows it. `close` and `restrict` do not: they fold the segment and slot bound checks
+into one test, and they read the object pointer **last**, where `lookup` reads it at step 6 —
+before generation and owner rather than after.
+
+Two consequences, neither fixed. The visible one is a **disclosure difference**: for one closed
+handle and a caller who is not the owner, `lookup` answers `InvalidHandle` while `close` and
+`restrict` answer `NotOwner` — telling a caller holding no capability that the slot is live and
+owned by someone else. The other is a trap for anyone testing this file: the input that isolates
+`restrict`'s object-null guard does not isolate `lookup`'s generation guard, because `lookup`
+answers at step 6 and never reads the generation. A test built on the wrong order passes against
+a build with the guard deleted, which is the vacuity PR #208 existed to remove.
+
+Not fixed there because reordering `close`/`restrict` changes observable error codes for
+existing callers, and unifying on the spec's order is a bigger change than the PR's scope.
+Found in review of PR #208 (2026-08-18). Trigger: the next change to any of the three ladders,
+or the first caller that distinguishes `NotOwner` from `InvalidHandle`.
+
 **Shell output bypasses the namespace — `TODO(tty-server)`.**
 `/dev/console` is a char `DeviceNode` a process must hold a handle to, so console *input* is a
 capability. Output is not: `CharBackend` has only `submit_read`, and every byte any program
@@ -708,15 +728,28 @@ came from two of them disagreeing about echoing CR/LF); password entry is echo-s
 parameter each caller must remember; and the driver's single-reader assumption is now
 maintained only by session-mgr and nxsh happening not to read at the same time.
 
-Designed 2026-08-03 in [console-and-tty.md](../architecture/console-and-tty.md): a userspace
-resource server owning the line discipline and the raw device, handing each session an IPC
-channel bound at `/dev/tty`, so a session cannot reach `/dev/console` at all. Deliberately
-excludes job control (needs process groups, which do not exist, and cannot use signals), key
-events (need a real keyboard driver), and terminal emulation (belongs to the compositor).
+**Built 2026-08-13, and this entry described it as merely designed until 2026-08-18 (audit
+D.5d).** The server exists: `userspace/tty-server` is a workspace member, `init` spawns
+`/bin/tty-server` and binds its endpoint at `/dev/tty`
+(`userspace/init/src/main.rs`), [console-and-tty.md](../architecture/console-and-tty.md) reads
+"**Status: stages 1–4 built (2026-08-13)**", and `cargo xtask check-terminal` drives a real
+`nxsh` through it every run. What the entry still said was that this was a design from
+2026-08-03 — which is how a reader concludes the whole capability hole is open when half of it
+is closed.
 
-Trigger: it gates the rich REPL (§11) and is the trigger for
-`TODO(session-metadata-server)`; and the ambient output path is a hole in the capability story
-independent of either.
+**The half that is still owed** is the one the headline names: *output*. `nxsh` prints through
+`kprint` (`userspace/nxsh/src/main.rs`), so the ambient `SYS_DEBUG_KPRINT` path above is
+unchanged for shell output even though input now goes through a capability. Nothing can
+redirect, pipe, capture or log it, because there is still no object to redirect. The three
+consequences listed above should be re-measured against the shipped server rather than trusted:
+they were written when nothing was built.
+
+Excluded from the design deliberately, and still absent: job control (needs process groups,
+which do not exist, and cannot use signals), key events (need a real keyboard driver), and
+terminal emulation (belongs to the compositor).
+
+Trigger: moving `nxsh`'s output off `kprint` and onto the `/dev/tty` channel it already holds.
+It also gates the rich REPL (§11) and is the trigger for `TODO(session-metadata-server)`.
 
 **Reverse-search shows one match, not a list — `TODO(history-pager)`.**
 `Ctrl-R` narrows to a single match and `Ctrl-R` again walks to the next older one, blind:
@@ -1089,17 +1122,27 @@ flaky-boot investigation is hampered by garbled panic output. From the 2026-07-2
 substrate review (decision log).
 
 **Explicit grace-tracker quiescence on the syscall path — `TODO(smp)`.** The handle
-table's deferred-close reclamation waits for a grace period tracked per *context id*, and
-`current_ctx_id()` returns **0 in production builds** — every CPU shares one context. Today
-nothing depends on the distinction: every handle syscall routes through a `HandleTable`
-method that takes and drops a read guard, marking the context quiescent on drop, so
-deferred closes are reclaimed on the next allocate/close. The `TODO(smp)` marks the case
-that would break it — a syscall path that touches the table *without* going through such a
-method, or a real per-CPU context id where one CPU's quiescence no longer implies
-another's. **Worth an explicit look during the pre-CLI hardening pass** rather than
-carrying as a comment: the sweep added for exit-time handle reclamation (2026-07-24) is a
-new writer on this path. Trigger: that review, a per-CPU `ctx_id`, or a non-method table
-access.
+table's deferred-close reclamation waits for a grace period tracked per *context id*.
+
+**Corrected 2026-08-18 (audit D.5c): this entry rested on a premise that had been false for
+seven weeks.** It said `current_ctx_id()` "returns **0 in production builds** — every CPU
+shares one context", and named "a real per-CPU context id, where one CPU's quiescence no
+longer implies another's" as the *future* case that would break things. That is the current
+implementation. `kernel/src/handle/mod.rs` returns `crate::arch::Smp::current_cpu()`, and has
+since `ef47861` (2026-06-29, Phase 3 slice 0) — while this entry was still being revised as
+late as 2026-07-24, citing that date's exit-time reclamation sweep. So the hazard it sent a
+reader looking for had already arrived, and the entry read as reassurance.
+
+What remains true is the argument that does not depend on the premise: every handle syscall
+routes through a `HandleTable` method that takes and drops a read guard, marking that
+context quiescent on drop, so deferred closes are reclaimed on the next allocate/close. What
+would break it is a syscall path touching the table *without* such a method. Audit A.5
+enumerated the syscalls against exactly that question and `restrict` came out as the one that
+mutates an entry outside the read guard — its guards are now pinned (PR #208) but the
+enumeration is the thing to redo when a new writer appears.
+
+Trigger: a non-method table access, or a `ctx_id` that stops being the CPU id (the Process
+slice intends `Process::current().ctx_id()`).
 
 **Priority inheritance for userspace synchronization.** Userspace mutex/condvar implementations built on `sys_wait` don't initially address priority inversion. Trigger: a real-time workload where priority inversion is a problem.
 
@@ -1173,11 +1216,7 @@ B/C, 2026-07-21: `tlb::shootdown`, IF-robust, broadcast on user-page unmap) — 
 *range* form is missing. Trigger: an unmap path whose per-page flush loop is measurable
 (large `munmap`, address-space teardown).
 
-**Debug-build lock-ordering enforcement.** `kernel/CLAUDE.md` documents that debug builds will track acquisition order and panic on violations. The mechanism doesn't yet exist; the only lock-ordering enforcement today is code review and `kernel/docs/lock-ordering.md`. Trigger: enough locks exist that the cost of building the rank-tracker outweighs the cost of a missed bug.
-
 ### Testing and CI
-
-**`xtask test-qemu` integration harness.** ~~A QEMU integration test today would amount to a single "did the kernel reach the end of `kernel_main`?" smoke via `isa-debug-exit`.~~ **Implemented 2026-07-14** (Phase 3, after the storage/fs/SMP stack gave real regression surface — the SMP migration hazard was caught by a boot loop, not a unit test). `cargo xtask test-qemu` boots the `test-harness` build headless and adjudicates the whole boot from QEMU's `isa-debug-exit` exit code. The self-test payload (`selftest` feature) *is* the suite; a per-case framework under `tests/qemu-tests/` remains deferred (trigger: a test that needs to assert something the boot chain doesn't already exercise). See `docs/conventions/qemu-integration-tests.md`.
 
 **Per-case QEMU test framework (`tests/qemu-tests/`).** `cargo xtask test-qemu` adjudicates
 the *whole boot* from one `isa-debug-exit` verdict — the self-test payload is the suite, and
@@ -1279,6 +1318,7 @@ decision log entry for the date shown.
 | Console DPC freeing in DPC context | 2026-08-06 | Fixed with the PS/2 driver, which turned out to have the same hazard: the DPC now signals through a *borrowed* pointer and marks the parked read `spent`, leaving its `ObjectRef`s owned by the driver until `reap_pending` drops them in thread context. The "needs a bounded parking home and an overflow policy" objection that deferred it was an artifact of assuming the DPC had to own the refs. |
 | `test-qemu`'s intermittent hang | 2026-08-06 | Root-caused and fixed: `irp_complete_dpc` freed its `IrpBox` in DPC context, so a completion interrupt landing on a CPU that already held the `SlabCache` lock self-deadlocked against the frame beneath it. The box is now handed to thread context through an intrusive list drained by `reap_pending`. 64 consecutive clean boots against a ~6% base rate. Found by the QMP state dump `cmd_test_qemu` now takes on timeout. |
 | `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
+| Debug-build lock-ordering enforcement | 2026-07-29 | `kernel/src/libkern/lockrank.rs` is the rank tracker `kernel/CLAUDE.md` promised — 777 lines, live in every image `xtask` builds, gated in CI by `cargo xtask check-irq-scope`, and (since PR #202) covered by tests that fail when its arithmetic is broken. The open entry claiming "the mechanism doesn't yet exist" was written 2026-05-19 (`b1a71f7`) and never revisited — so it outlived the mechanism (`e93d52c`, 2026-07-29) by **three weeks**, sitting 100 lines above the row below it, which only makes sense as a refinement *of the tracker it said was missing*. Found by the 2026-08 audit, D.5(a). |
 
 ## How to use this document
 
@@ -1291,7 +1331,22 @@ rediscover — exit-time handle reclamation, the wall clock, file truncate — w
 "recorded" somewhere else: a sentence in an architecture doc promising a later slice, a
 `TODO(...)` in the syscall table, a bullet in a crate's `CLAUDE.md`. None was in this list,
 so none was ever reviewed. If you write a stub, a `TODO`, or prose that promises future
-work, mirror it here. `cargo xtask check-deferrals` enforces the `TODO(tag)` half of that
-mechanically.
+work, mirror it here.
+
+`cargo xtask check-deferrals` enforces **one direction** of that: every `TODO(tag)` in
+`kernel/src`, `userspace` or `tools/xtask/src` must name an entry here, and today all 20 do.
+It never asks the reverse question, and the reverse is where the rot is — measured 2026-08-18
+(audit D.5b), **10 of the 30 tagged open entries bind to no code marker at all**:
+`atomic-log-lines`, `history-pager`, `regex-named-captures`, `regex-replace`, `shell-bitwise`,
+`shell-cwd`, `shell-labelled-break`, `stack-attribution`, `tty-server`, `unicode-case`. Five of
+those exist nowhere in the repository outside this file.
+
+That is the direction that matters, because a deferral whose marker is gone is one nobody trips
+over while editing the code — which is exactly the failure the paragraph above describes. This
+paragraph claimed the enforcement was mechanical; for a third of the tagged entries the
+enforced set was empty. Closing it needs a per-entry decision (where *would* the marker go for
+a feature that does not exist yet?) plus an exemption syntax for entries that genuinely have no
+code site, along the lines of `<!-- check-docs: allow-missing -->`. Filed as its own change
+rather than done here, so the judgement calls get reviewed as judgement calls.
 
 The decision log (`docs/decision-log.md`) is the place to record the actual decision when a deferred item moves into active work — what triggered it, what the implementation approach is, when the decision was made.

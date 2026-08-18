@@ -1419,6 +1419,7 @@ mod tests {
     // telling a caller without a capability that the slot is live and owned elsewhere. That
     // and the divergence from `docs/spec/handle-encoding.md` § "Validation algorithm" (twelve
     // steps, "in order") are both pre-existing; neither is this section's to fix.
+    // TODO(handle-validation-order): see `docs/rationale/deferred-decisions.md`.
     //
     // The tests below pin the ladder for all three entry points. Each is written so that the
     // guard under test is the **only** one that can reject its input — otherwise it passes

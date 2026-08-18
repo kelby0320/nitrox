@@ -15710,3 +15710,68 @@ data. The rule (baseline from `git show HEAD:`, per-mutant timeout, restore-on-e
 Verified: 1692 host tests (+6 from this change), each new test confirmed passing in isolation
 via `--exact`; `test-qemu`, `test-interactive`, `check-terminal`, `check-input` and
 `check-display` green; six static gates green; zero warnings on the kernel target.
+
+## 2026-08-18 — Five deferral entries that had stopped being true, and a gate that enforces one direction
+
+Audit D.5. A deferral list nobody trusts is worse than none, and this one had drifted in every
+way a list can: entries outliving what they describe, an entry filed twice, a premise falsified
+by a commit seven weeks earlier, and a syscall specified in three current-behaviour documents
+that has never existed.
+
+**Two entries were finished and still filed as open**, against the document's own rule that a
+resolved entry "should move to the Resolved table, not be left in place with a status note
+appended — an open section that mixes finished work with owed work cannot be scanned, which is
+how three deferrals went unnoticed until a consumer tripped over them."
+
+- *Debug-build lock-ordering enforcement* said "the mechanism doesn't yet exist". It was written
+  2026-05-19 (`b1a71f7`) and never revisited, so it outlived the mechanism (`e93d52c`,
+  2026-07-29) by three weeks — 777 lines of `lockrank.rs`, live in every image, gated in CI, and
+  since PR #202 covered by tests that fail when its arithmetic breaks. It sat 100 lines above a
+  Resolved row recording a *refinement of the tracker it said was missing*.
+- *`xtask test-qemu` integration harness* was filed **twice**: struck through in the open section
+  with "Implemented 2026-07-14" appended in place, and again as a Resolved row.
+
+**Two entries rested on premises that had become false.**
+
+- The `TODO(smp)` grace-tracker entry said `current_ctx_id()` "returns 0 in production builds —
+  every CPU shares one context", and named a real per-CPU context id as the *future* case that
+  would break things. It has returned `arch::Smp::current_cpu()` since `ef47861` (2026-06-29),
+  while the entry was still being revised on 2026-07-24. The hazard it sent readers looking for
+  had already arrived, and the entry read as reassurance. Audit A.5 and C.4(a) both turn on this.
+- The `TODO(tty-server)` entry described a server "Designed 2026-08-03" that has been shipping
+  since 2026-08-13 — a workspace member, spawned by `init`, bound at `/dev/tty`, driven by
+  `check-terminal` on every run. Half the entry is still owed: `nxsh` prints via `kprint`, so the
+  *output* direction is still ambient. That is exactly why it needed revising rather than
+  leaving — as written a reader cannot tell which half is real.
+
+**A syscall that exists only in documentation.** `sys_release_initramfs` is specified in
+`syscall-abi.md` with a signature, a one-shot contract and an `AlreadyReleased` error, three
+lines below `sys_device_map_mmio`, which carries a **Deferred** marker. It has none. `overview.md`
+describes init calling it as boot step 8. `syscaps.md` — Status "Implemented" — lists
+`BIND_NAMESPACE` as gating it under a *second spelling*, `sys_ns_release_initramfs`, in three
+places. None of it exists; the initramfs stays resident because the root fs-server's restart
+image can only come from it, which `deferred-decisions.md` already knew and said. All four sites
+now say so. `check-docs` was right not to catch it: its syscall cross-check reads *numbered*
+table rows and prose bullets, and this signature is an unnumbered code block, invisible to it.
+
+**The gate enforces one direction, and the document claimed otherwise.** `check-deferrals` walks
+the code for `TODO(tag)` and fails if the tag is absent here; all 20 pass. It never asks the
+reverse. Measured today: **10 of the 30 tagged open entries bind to no code marker at all**, five
+of them existing nowhere in the repository outside this file. So for a third of the tagged
+entries the "mechanical enforcement" the document advertised was an empty set — and it fails
+silently in the direction that matters, since a deferral whose marker is gone is one nobody trips
+over while editing. The claim is corrected with the measurement in it. Closing the gap needs a
+per-entry judgement (where would `TODO(shell-bitwise)` even go, for syntax that does not exist?)
+plus an exemption syntax for entries with no code site; filed as its own change so the judgement
+calls get reviewed as such.
+
+Also filed, from the PR #208 review: `TODO(handle-validation-order)`. `lookup` follows the spec's
+twelve-step order; `close` and `restrict` fold the bound checks and read the object pointer last
+rather than at step 6. The visible consequence is a disclosure difference — for a closed handle
+and a non-owner caller, `lookup` says `InvalidHandle` and `close`/`restrict` say `NotOwner`,
+telling a caller with no capability that the slot is live and owned elsewhere. Filed with both
+halves, marker and entry, so it does not join the ten above.
+
+Verified: 1692 host tests; `test-qemu`, `test-interactive`, `check-terminal`, `check-input`,
+`check-display` green; six static gates green, including `check-deferrals` at 20 tags and
+`check-docs`; zero warnings.
