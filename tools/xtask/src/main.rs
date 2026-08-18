@@ -700,10 +700,24 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 
     // 7. The interpreter keeps state across lines — a `def` typed at the prompt is
     //    callable afterwards.
+    //
+    //    **The answer is wrapped, for the reason steps 12 and 13 give.** It was `add(2, 3)`
+    //    asserted with a bare `expect("5")`, which is the weakest pattern in the gate: a
+    //    single character, in a stream that also carries heartbeat and service-manager
+    //    logging. A transcript of one passing run contains 22 occurrences of `5`, fourteen
+    //    of them before this step even runs — so the step passed on a `seq=` or `uptime_ns=`
+    //    digit as readily as on the shell's answer, and was observed doing exactly that.
+    //
+    //    The call is bound with `let` and formatted on the next line rather than nested as
+    //    `format("add={}", add(2, 3))`, which nxsh rejects — a user-function call inside an
+    //    argument list is a parse error ("expected , or ) in an argument list"). Both
+    //    constructs used here are already exercised by steps 12 and 14.
     s.send("def add(a, b) { a + b }")?;
     s.expect("/home>")?;
-    s.send("add(2, 3)")?;
-    s.expect("5")?;
+    s.send("let sum = add(2, 3)")?;
+    s.expect("/home>")?;
+    s.send("format(\"add={}\", sum)")?;
+    s.expect("add=5")?;
     steps += 1;
 
     // 8. **History.** `\x1b[A` is Up; `send` appends the Enter. Recalling `whoami` and
@@ -787,8 +801,13 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     //     with a message a script chose, `catch` binds it as an ordinary record, and `try`
     //     in value position supplies a fallback — the three halves of §2 that did not
     //     exist before Part C. `n=8080` rather than `8080` for the reason step 12 gives.
-    s.send("try { fail \"boom\" } catch (e) { e.message }")?;
-    s.expect("boom")?;
+    //
+    //     **The catch block formats its answer** so the assertion cannot be satisfied by the
+    //     terminal's echo of the command. `expect("boom")` matched the echoed line — the
+    //     word is in the text being typed — and so passed with the `try`/`catch` removed
+    //     from the command entirely. `caught=boom` appears only if the block ran.
+    s.send("try { fail \"boom\" } catch (e) { format(\"caught={}\", e.message) }")?;
+    s.expect("caught=boom")?;
     s.expect("/home>")?;
     s.send("let n = try { \"x\" | parse Int } catch { 8080 }")?;
     s.expect("/home>")?;
@@ -2011,6 +2030,10 @@ struct Session {
     /// How far `expect` has already matched, so each step scans only new output and a
     /// pattern cannot be satisfied by an earlier occurrence of itself.
     cursor: usize,
+    /// The text most recently typed at the guest, so [`expect`](Self::expect) can refuse a
+    /// pattern the guest's own echo would satisfy. Empty for gates that type over QMP
+    /// rather than the serial line, which is every gate but `test-interactive`.
+    last_sent: String,
 }
 
 impl Drop for Session {
@@ -2047,11 +2070,32 @@ impl Session {
                 }
             }
         });
-        Ok(Session { child, out, cursor: 0, gate })
+        Ok(Session { child, out, cursor: 0, gate, last_sent: String::new() })
     }
 
     /// Wait for `pat` in output not yet consumed. The guest paces the test.
     fn expect(&mut self, pat: &str) -> R<()> {
+        // **An `expect` the guest's echo can satisfy is not an assertion.** The terminal
+        // echoes what the harness types and `expect` takes the first match, which is always
+        // the echo — emitted as the line is sent, long before anything evaluates it. Such a
+        // step passes against a guest with the feature removed entirely.
+        //
+        // The convention is to wrap the answer so the expected text cannot appear in the
+        // command (`format("n={}", n)` → `n=3`), and it is stated twice in
+        // `run_interactive_scenarios`, at steps 12 and 13, along with the history of how it
+        // was learned. It was still violated twice in that same function — a comment cannot
+        // fail a build, so this does.
+        if !pat.is_empty() && self.last_sent.contains(pat) {
+            return Err(format!(
+                "expect({:?}) is satisfied by the guest's echo of the text just typed \
+                 ({:?}), which it emits as the line is sent — so this step would pass \
+                 against a guest that never evaluated the command. Wrap the answer so \
+                 the pattern cannot occur in what was typed: \
+                 `format(\"label={{}}\", …)` then expect(\"label=…\").",
+                pat, self.last_sent
+            )
+            .into());
+        }
         const TIMEOUT: std::time::Duration = std::time::Duration::from_secs(45);
         let deadline = std::time::Instant::now() + TIMEOUT;
         loop {
@@ -2112,6 +2156,7 @@ impl Session {
     /// interrupt, and the two behaviours are exactly what the step is trying to tell apart.
     fn send_raw(&mut self, bytes: &str) -> R<()> {
         use std::io::Write as _;
+        self.last_sent = bytes.to_string();
         let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
         stdin.write_all(bytes.as_bytes()).map_err(|e| format!("write to guest: {e}"))?;
         stdin.flush().map_err(|e| format!("flush: {e}"))?;
@@ -2120,6 +2165,7 @@ impl Session {
 
     fn send(&mut self, line: &str) -> R<()> {
         use std::io::Write as _;
+        self.last_sent = line.to_string();
         let stdin = self.child.stdin.as_mut().ok_or("qemu stdin")?;
         stdin
             .write_all(format!("{line}\n").as_bytes())
