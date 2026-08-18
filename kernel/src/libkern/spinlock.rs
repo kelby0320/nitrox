@@ -153,8 +153,9 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 ///
 /// On target, this drives the real CPU interrupt flag through the arch layer.
 /// Under `cfg(test)` (host `cargo test`, ring 3) the real `cli`/`sti` would
-/// `#GP`, so a single-threaded mock models `IF` in an `AtomicBool` — enough to
+/// `#GP`, so a mock models `IF` in a **per-thread** `Cell<bool>` — enough to
 /// exercise the lock's save/restore *logic* (the asm itself is QEMU-only).
+/// Per-thread, not process-global: see the `cfg(test)` arm below.
 #[cfg(not(test))]
 mod irq_backend {
     use crate::arch::Cpu;
@@ -185,7 +186,8 @@ mod irq_backend {
         /// `cli` masks interrupts on all of them — and a host test thread is what stands in
         /// for a core here. So the faithful model and the test isolation are the same change.
         ///
-        /// It was global, with three comments asserting that `cargo test` runs these serially.
+        /// It was global, with **four** comments in this file asserting that `cargo test` runs
+        /// these serially — the audit named three and this module's own doc was the fourth.
         /// It does not: there is no `--test-threads` setting anywhere in the repository, and
         /// the default is one thread per CPU. The tests were isolated by being fast. Forcing
         /// the interleaving with sleeps produced a false failure of
@@ -405,12 +407,17 @@ mod tests {
         assert_eq!(*g, 7);
     }
 
-    // The contested path (one CPU spinning while another holds the lock)
-    // is not exercised by host tests: `cargo test` runs single-threaded
-    // here, and even if it did, the std-thread version of contention has
-    // different semantics than the on-target one (a yielding scheduler vs.
-    // an HLT-less spin). An integration test under QEMU with SMP will
-    // cover this once a second CPU is brought up in Phase 3.
+    // The contested path (one CPU spinning while another holds the lock) is not exercised by
+    // host tests. **Not because they are serial** — they are not; cargo runs one thread per
+    // CPU and no `--test-threads` setting exists in this repository. It is that no test here
+    // arranges two threads to contend on one lock, and the std-thread version of contention
+    // would have different semantics from the on-target one anyway (a yielding scheduler vs.
+    // an HLT-less spin). An integration test under QEMU with SMP is the way to cover it.
+    //
+    // This comment used to say `cargo test` runs single-threaded here, which is the claim
+    // the per-thread mock flag below exists to refute — and it sits directly above an
+    // invitation to write that SMP test, where believing it would mean reaching for shared
+    // process-global state.
 
     // --- IrqSpinLock -------------------------------------------------------
     //

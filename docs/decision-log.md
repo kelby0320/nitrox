@@ -15567,8 +15567,25 @@ fires).
 
 ## 2026-08-18 — Two mock globals that tests shared, and the comments that said they didn't
 
-Audit D.2(c), plus the D.2(b) residual. Both are the same defect and my own sweep of
-`kernel/src` found exactly these two, so the class is closed rather than one instance of it.
+Audit D.2(c), plus the D.2(b) residual. Both are the same defect, so both are fixed here
+rather than one instance of it.
+
+**The class is not closed, and the limit is in the method.** My sweep asked which statics are
+written *from inside a `#[cfg(test)] mod` region*, and after this change the answer is none but
+two function-local `S` statics the audit already dismissed. That question cannot see a global
+written by **production code the tests call**, and there is at least one: `PREEMPT_OFF`.
+`SpinLock::lock` calls `preempt_disable`, which does
+`PREEMPT_OFF[SchedState::this_cpu()].fetch_add(…)`, and `current_cpu()` returns `0` for every
+host thread under `cfg(test)` — so every concurrent test taking any `SpinLock` writes the same
+`AtomicU32`. It is never named in a test module and my sweep was structurally blind to it.
+Neither would `ONLINE_MASK` have been, had the placement tests reached it through
+`place_thread()` instead of writing it directly.
+
+Latent, not live: the only assertions on `PREEMPT_OFF` are in `switch_into` and
+`assert_user_entry_preempt_safe`, neither reachable from a host test. That is exactly what the
+2026-08-14 preempt-guards entry above already says, and it gives this hazard as the reason those
+two guards have no host test. Giving `PREEMPT_OFF` the same two-backing treatment would unblock
+them; it is not done here because that payoff is the work, not the swap.
 
 **`irq_backend::MOCK_IF`** models `RFLAGS.IF` for host tests. Five `IrqSpinLock` tests wrote it
 and asserted on it, and three comments explained why that was safe — "Host tests are
@@ -15617,4 +15634,6 @@ prior state before acquiring, so neither mode depends on cross-test tidiness; th
 "tidy up the shared mock flag" call is gone, since it implied a dependency none of them has.
 `--test-threads=1` verified green (630).
 
-Verified: 630 host tests (+2 from the split), five guest gates, six static gates, zero warnings.
+Verified: 1686 host tests across `cargo xtask test` (+2 from the split; 630 of them are the
+kernel crate alone, which is the number `cargo test` prints in `kernel/` and not the population
+the entries above count), five guest gates, six static gates, zero warnings.

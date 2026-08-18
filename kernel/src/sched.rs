@@ -476,12 +476,15 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// **A bit is cleared only by [`leave_online`], when a CPU parks forever.** There is
 /// still no CPU hot-unplug; this is the terminal case — a panic, a failed AP init, or
 /// the harness verdict — where the CPU stops executing entirely.
+///
 /// **Two backings behind one interface.** On the machine this is a process-global atomic,
-/// as it must be. Under `cfg(test)` it is **per-thread**, because a host test thread stands
-/// in for a whole machine here and cargo runs tests concurrently by default: one shared set
-/// is the D.2 hazard that already produced a 33 % failure rate at `--test-threads=16` when
-/// the placement tests wrote it. Production codegen is unchanged — the `cfg(not(test))` arm
-/// is the original atomic, verbatim.
+/// as it must be. Under `cfg(test)` it is **per-thread** — and unlike the mock `IF` flag in
+/// [`crate::libkern::spinlock`], that is *not* a fidelity argument: the online set is
+/// machine-global by definition, and a host thread is not a machine. It is test isolation,
+/// which is reason enough on its own. Cargo runs tests concurrently by default, so one set
+/// is the D.2 hazard that already produced the 22 % failure rate across `sched::tests`
+/// recorded at [`cpu_accepts_work`], when the placement tests read this global. Production
+/// codegen is unchanged — the `cfg(not(test))` arm is the original atomic, verbatim.
 mod online_set {
     #[cfg(not(test))]
     mod backing {
