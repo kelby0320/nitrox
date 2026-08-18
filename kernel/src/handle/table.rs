@@ -1291,11 +1291,13 @@ mod tests {
         close_release(&t, h1, 1).unwrap();
         let h2 = t.allocate(1, mk_process(2), KObjectType::Process, sig()).unwrap();
         let (seg2, slot2, gen2) = h2.decode();
-        // For a fresh single-segment table the closed slot is the most
-        // recent freelist push, so LIFO returns it.
-        if seg1 == seg2 && slot1 == slot2 {
-            assert_ne!(gen1, gen2, "generation must bump on slot reuse");
-        }
+        // **Asserted, not conditional.** For a fresh single-segment table the closed slot is
+        // the most recent freelist push, so LIFO returns it — this used to be an
+        // `if seg1 == seg2 && slot1 == slot2`, which quietly tests nothing at all the day the
+        // allocator stops reusing the slot. Same reasoning as `reused_slot` below, and the
+        // reason that helper asserts too.
+        assert_eq!((seg1, slot1), (seg2, slot2), "the freed slot must be the one reused");
+        assert_ne!(gen1, gen2, "generation must bump on slot reuse");
         assert_eq!(
             t.lookup(h1, 1, Rights::empty()).unwrap_err(),
             HandleError::InvalidHandle,
@@ -1388,12 +1390,35 @@ mod tests {
 
     // --- The validation ladder ---------------------------------------
     //
-    // `lookup`, `close` and `restrict` each validate a handle through the same ladder —
-    // null, segment range, slot range, segment present, generation, owner, object non-null —
-    // and a mutation campaign over `table.rs` found **20 of 38 guards surviving deletion,
-    // all 20 of them REACHED**: tests execute every one and none fails when the guard is
-    // removed. That is not a coverage hole, it is an assertion-strength hole, in the file
-    // that enforces capability access.
+    // `lookup`, `close` and `restrict` each validate a handle before acting on it, and a
+    // mutation campaign over `table.rs` found **20 of 38 guards surviving deletion, all 20 of
+    // them REACHED**: tests execute every one and none fails when the guard is removed. That
+    // is not a coverage hole, it is an assertion-strength hole, in the file that enforces
+    // capability access.
+    //
+    // **They check the same seven things and not in the same order**, which decides how an
+    // input has to be built to isolate any one of them:
+    //
+    //   close/restrict:  null → seg|slot range → segment present → generation → owner
+    //                    → object non-null
+    //   lookup:          null → seg range → segment present → slot range → seqlock snapshot
+    //                    → object non-null → refcount → seq re-check → generation → owner
+    //                    → rights
+    //
+    // Two differences and both bite. `lookup` tests segment-present *before* slot range, and
+    // it rejects a null object at step 6 — **before** generation and owner, where
+    // `close`/`restrict` reach it last. So the state that isolates `restrict`'s object-null
+    // guard below (closed slot, generation deliberately unbumped, owner unchanged) does not
+    // isolate `lookup`'s generation guard: `lookup` answers at step 6 and never reads the
+    // generation. Build a lookup-side test from `close`'s order and it passes against a build
+    // with `lookup`'s generation check deleted, which is the vacuity this section exists to
+    // remove.
+    //
+    // A consequence worth knowing while you are here: for one closed handle and a non-owner
+    // caller, `lookup` answers `InvalidHandle` and `close`/`restrict` answer `NotOwner` —
+    // telling a caller without a capability that the slot is live and owned elsewhere. That
+    // and the divergence from `docs/spec/handle-encoding.md` § "Validation algorithm" (twelve
+    // steps, "in order") are both pre-existing; neither is this section's to fix.
     //
     // The tests below pin the ladder for all three entry points. Each is written so that the
     // guard under test is the **only** one that can reject its input — otherwise it passes

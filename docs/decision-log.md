@@ -15697,3 +15697,16 @@ seqlock retry (`:520`), which needs a genuinely torn read; `close_owned_batch`'s
 (`:814`, `:825`); and the drain path (`:893`, `:899`). Of these **`:893` is the one worth doing
 next** — it is `drain_expired`'s grace-period check, and deleting it reclaims a slot while a
 reader may still hold it, which is a use-after-free rather than a rejected syscall.
+
+**The campaign's own integrity, written down because getting it wrong cost twelve results.**
+The first run crashed on the hanging `:632` mutant and left `table.rs` mutated; the next run
+seeded its baseline from the working tree and so treated that mutant as pristine. Twelve
+verdicts later — including a `restrict` owner check permanently stubbed to `false`, which made
+unrelated mutants look killed by the one test it actually broke — a condition printing as
+`false` in the log gave it away. Green and red had swapped, and the output still looked like
+data. The rule (baseline from `git show HEAD:`, per-mutant timeout, restore-on-exit) is now
+`docs/conventions/mutation-campaigns.md`, since the `:893` work above will run another one.
+
+Verified: 1692 host tests (+6 from this change), each new test confirmed passing in isolation
+via `--exact`; `test-qemu`, `test-interactive`, `check-terminal`, `check-input` and
+`check-display` green; six static gates green; zero warnings on the kernel target.
