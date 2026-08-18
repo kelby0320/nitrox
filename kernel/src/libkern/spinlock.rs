@@ -176,18 +176,43 @@ mod irq_backend {
 
 #[cfg(test)]
 mod irq_backend {
-    use core::sync::atomic::{AtomicBool, Ordering};
-
-    /// Models `RFLAGS.IF` for host tests. Starts enabled (the boot default
-    /// once preemption is armed). Host tests are single-threaded.
-    pub(super) static MOCK_IF: AtomicBool = AtomicBool::new(true);
+    std::thread_local! {
+        /// Models `RFLAGS.IF` for host tests, **one flag per thread**. Starts enabled (the
+        /// boot default once preemption is armed).
+        ///
+        /// Per-thread because `IF` *is* per-CPU. A single process-global flag was not a
+        /// simplification of the hardware, it was a different machine — one where any core's
+        /// `cli` masks interrupts on all of them — and a host test thread is what stands in
+        /// for a core here. So the faithful model and the test isolation are the same change.
+        ///
+        /// It was global, with three comments asserting that `cargo test` runs these serially.
+        /// It does not: there is no `--test-threads` setting anywhere in the repository, and
+        /// the default is one thread per CPU. The tests were isolated by being fast. Forcing
+        /// the interleaving with sleeps produced a false failure of
+        /// `irq_lock_masks_while_held_and_restores_on_drop` — a test about interrupt-flag
+        /// save/restore, failing on another test's write.
+        ///
+        /// The tree already had this right in five other places;
+        /// [`crate::handle::FAIL_NEXT_ACQUIRE`] carries the reason in full.
+        static MOCK_IF: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    }
 
     pub(super) fn disable() -> bool {
-        MOCK_IF.swap(false, Ordering::SeqCst)
+        MOCK_IF.with(|f| f.replace(false))
     }
 
     pub(super) fn restore(prev: bool) {
-        MOCK_IF.store(prev, Ordering::SeqCst);
+        MOCK_IF.with(|f| f.set(prev));
+    }
+
+    /// The modelled flag, for tests asserting on it. Not part of the lock's interface.
+    pub(super) fn peek() -> bool {
+        MOCK_IF.with(|f| f.get())
+    }
+
+    /// Establish a prior interrupt state before acquiring, for tests that need one.
+    pub(super) fn force(enabled: bool) {
+        MOCK_IF.with(|f| f.set(enabled));
     }
 }
 
@@ -389,18 +414,20 @@ mod tests {
 
     // --- IrqSpinLock -------------------------------------------------------
     //
-    // These exercise the lock's interrupt-flag save/restore *logic* against
-    // the mock IF backend (`irq_backend::MOCK_IF`). The real `cli`/`sti` asm
-    // is QEMU-only. The tests run serially and reset MOCK_IF first, since they
-    // share the one global mock flag.
-
-    use core::sync::atomic::Ordering;
+    // These exercise the lock's interrupt-flag save/restore *logic* against the mock IF
+    // backend. The real `cli`/`sti` asm is QEMU-only.
+    //
+    // The flag is per-thread, so these do not interfere with each other however cargo
+    // schedules them; see `irq_backend`. Each still establishes its own prior state first,
+    // which is what keeps them correct under `--test-threads=1` as well — there the whole
+    // suite shares the main thread, and a test inheriting its predecessor's flag would be
+    // the same defect wearing a different hat.
 
     fn reset_mock_if(enabled: bool) {
-        irq_backend::MOCK_IF.store(enabled, Ordering::SeqCst);
+        irq_backend::force(enabled);
     }
     fn mock_if() -> bool {
-        irq_backend::MOCK_IF.load(Ordering::SeqCst)
+        irq_backend::peek()
     }
 
     #[test]
@@ -459,8 +486,9 @@ mod tests {
         let g2 = lock.lock();
         assert_eq!(*g2, 5);
         drop(g2);
-        // Tidy up the shared mock flag for any later test.
-        reset_mock_if(true);
+        // No tidy-up: the flag is this thread's, and every test above sets its own prior
+        // state before acquiring. Restoring it here would imply a later test depends on the
+        // value this one leaves behind, and none does.
     }
 
     #[test]

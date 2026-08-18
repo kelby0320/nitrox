@@ -15564,3 +15564,57 @@ the six static gates green; 1683 host tests; zero warnings. Three negative contr
 against a booted guest — the `def` never called (step 7 fails), `format` held constant with
 `try`/`catch` removed (step 14 fails), and the original `expect("boom")` restored (the guard
 fires).
+
+## 2026-08-18 — Two mock globals that tests shared, and the comments that said they didn't
+
+Audit D.2(c), plus the D.2(b) residual. Both are the same defect and my own sweep of
+`kernel/src` found exactly these two, so the class is closed rather than one instance of it.
+
+**`irq_backend::MOCK_IF`** models `RFLAGS.IF` for host tests. Five `IrqSpinLock` tests wrote it
+and asserted on it, and three comments explained why that was safe — "Host tests are
+single-threaded", "The tests run serially and reset MOCK_IF first", "Tidy up the shared mock
+flag for any later test". None of it is true. There is **no `--test-threads` setting anywhere in
+the repository** — not in any `.cargo/config.toml`, not in `Cargo.toml`, not in the workflows,
+not in `cmd_test` — and the default is one thread per CPU.
+
+The damning part is that the tree already knew. `handle::FAIL_NEXT_ACQUIRE` is a `thread_local!`
+whose comment says per-thread "so that one test setting the flag does not poison concurrent
+lookups on other threads — **cargo runs unit tests in parallel by default**". Five such
+thread-locals exist. `spinlock.rs` asserted the opposite, 200 lines from one of them.
+
+**The fix is the faithful model, not a lock.** `IF` *is* per-CPU; one flag shared by every test
+was not a simplification of the hardware but a different machine, one where any core's `cli`
+masks interrupts on all of them. A host test thread stands in for a core, so per-thread state
+and test isolation are the same change. The same argument moves `ONLINE_MASK` behind an
+`online_set` module with two backings — the original atomic under `cfg(not(test))`, so
+production codegen is untouched, and a thread-local under `cfg(test)`.
+
+That second one paid off immediately: the park/identity test was **three cases welded into one
+`#[test]`**, with a comment saying they could not be separate because the global would make them
+race. They are now three tests that fail on their own names.
+
+**What the measurement actually showed**, because the first version of this entry claimed more.
+Split against the shared global, the three park tests passed **40 runs out of 40** — the hazard
+does not fire on its own, exactly as the audit found for `MOCK_IF` over 20 full-suite runs. Both
+were isolated by being fast, which is not isolation. Forced with sleeps so one test's write lands
+inside another's window, each fails deterministically on the shared backing and passes on the
+per-thread one:
+
+```
+MOCK_IF     shared  -> irq_lock_masks_while_held_and_restores_on_drop FAILED (spinlock.rs:419)
+            per-thread, identical injection -> ok
+ONLINE_MASK shared  -> a_park_clears_its_own_bit_and_only_its_own     FAILED (sched.rs:3982)
+            per-thread, identical injection -> ok
+```
+
+Note the direction of the risk in both cases: today it produces a *spurious* failure, which is
+merely expensive. The same sharing could as easily mask a real one — a test asserting `!mock_if()`
+is satisfied by any other test having just masked.
+
+Residual, stated because the fix does not cover it: under `--test-threads=1` the whole suite
+shares one thread and a thread-local is process-wide again. Every test here establishes its own
+prior state before acquiring, so neither mode depends on cross-test tidiness; the trailing
+"tidy up the shared mock flag" call is gone, since it implied a dependency none of them has.
+`--test-threads=1` verified green (630).
+
+Verified: 630 host tests (+2 from the split), five guest gates, six static gates, zero warnings.
