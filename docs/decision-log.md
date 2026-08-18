@@ -15637,3 +15637,76 @@ prior state before acquiring, so neither mode depends on cross-test tidiness; th
 Verified: 1686 host tests across `cargo xtask test` (+2 from the split; 630 of them are the
 kernel crate alone, which is the number `cargo test` prints in `kernel/` and not the population
 the entries above count), five guest gates, six static gates, zero warnings.
+
+## 2026-08-18 — Twenty guards in the handle table that tests ran and none of them checked
+
+Audit D.1(c). The mutation campaign found `handle/table.rs` unlike anything else it measured:
+every one of its surviving mutants was **REACHED**. Elsewhere a survivor usually means no test
+runs the line; here tests ran all twenty and not one failed when the guard was deleted. A
+coverage hole is a gap; this is an assertion-strength hole, in the file that enforces
+capability access.
+
+I rebuilt the campaign rather than inherit the number, and it reproduces:
+
+```
+before   38 mutants   17 killed   20 survived   1 hung      (all 20 survivors REACHED)
+after    38 mutants   28 killed    9 survived   1 hung
+```
+
+**The sharpest instance, and why the existing test looks like coverage and is not.**
+`double_close_returns_invalid_on_second` closes a handle twice. After the first close the slot
+is *empty*, so the null-object check rejects the second — and `close`'s generation check is
+never load-bearing. Delete it and that test still passes, along with the other 629.
+
+The case where generation stands alone is a slot that has been **reused**: populated, so the
+null-object check passes, and reallocated to the same process, so the owner check passes. A
+stale handle closing it destroys an object its holder never had a capability for. Nothing
+exercised that for `close` — though `close_then_allocate_reuses_slot_with_new_generation` does
+build exactly that state and then checks it through **`lookup`**, which is why `lookup`'s
+generation check was pinned and `close`'s was not. One line of difference, and the audit found
+it by mutation rather than by reading.
+
+Eleven guards newly pinned across the three entry points that validate a handle — `lookup`,
+`close`, `restrict` — each confirmed by deleting it and watching a **named** new test fail:
+
+| guard | killed by |
+|---|---|
+| `close` generation (`:586`) | `close_rejects_a_stale_handle_whose_slot_was_reused` |
+| `restrict` generation (`:671`) | `restrict_rejects_a_stale_handle_whose_slot_was_reused` |
+| `restrict` object-null (`:677`) | `restrict_rejects_a_handle_whose_object_was_closed` |
+| null handle (`:566`, `:655`) | `the_null_handle_is_rejected_by_lookup_close_and_restrict` |
+| range (`:470`, `:480`, `:570`, `:659`) | `out_of_range_ids_are_rejected_by_lookup_close_and_restrict` |
+| segment-present (`:576`, `:665`) | `an_unpopulated_segment_is_rejected_by_lookup_close_and_restrict` |
+
+**Two of those kills are weaker than the rest and the table should not hide it.** Deleting a
+segment-present check dereferences a null pointer, so the mutant dies by `SIGABRT` — a
+non-unwinding panic that takes the harness down before it prints any test name. It is a red
+suite, which is what "killed" means, but the signal is "the runner died". Attribution was
+established by elimination instead: with the guard deleted, the new test **alone** aborts and
+the suite **without** it is green at 635. There is no way for a test to turn that into a clean
+assertion; the guard exists to prevent the dereference.
+
+**A third weak signal, not fixed here.** `close`'s defer-ring backpressure loop (`:632`) is the
+one mutant that **hangs** — delete its exit condition and nothing fails, the suite never
+finishes. In CI that is a job timeout. Same class as the audit's `sift_down` finding, recorded
+so the class has two members rather than one.
+
+Nine survivors remain, deliberately. `DeferredQueue`'s own bookkeeping (`:234`, `:245`, `:252`);
+table exhaustion at `DIRECTORY_LEN` segments (`:299`), which needs 256 segments built; the
+seqlock retry (`:520`), which needs a genuinely torn read; `close_owned_batch`'s early-outs
+(`:814`, `:825`); and the drain path (`:893`, `:899`). Of these **`:893` is the one worth doing
+next** — it is `drain_expired`'s grace-period check, and deleting it reclaims a slot while a
+reader may still hold it, which is a use-after-free rather than a rejected syscall.
+
+**The campaign's own integrity, written down because getting it wrong cost twelve results.**
+The first run crashed on the hanging `:632` mutant and left `table.rs` mutated; the next run
+seeded its baseline from the working tree and so treated that mutant as pristine. Twelve
+verdicts later — including a `restrict` owner check permanently stubbed to `false`, which made
+unrelated mutants look killed by the one test it actually broke — a condition printing as
+`false` in the log gave it away. Green and red had swapped, and the output still looked like
+data. The rule (baseline from `git show HEAD:`, per-mutant timeout, restore-on-exit) is now
+`docs/conventions/mutation-campaigns.md`, since the `:893` work above will run another one.
+
+Verified: 1692 host tests (+6 from this change), each new test confirmed passing in isolation
+via `--exact`; `test-qemu`, `test-interactive`, `check-terminal`, `check-input` and
+`check-display` green; six static gates green; zero warnings on the kernel target.
