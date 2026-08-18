@@ -811,6 +811,30 @@ not only in the doc that decided it.
   user meets it rather than only in the design doc. Trigger: the tables arriving for some other
   reason (text rendering in the compositor is the likely one), since carrying them for two shell
   operators alone is not the trade.
+- **A call cannot be nested in an argument list — `TODO(shell-nested-call)`.**
+  `format("add={}", add(2, 3))` and `format("x={}", utils.helper(1))` both fail with "expected
+  `,` or `)` in an argument list", while a parenthesised *pipeline* in the same position
+  (`format("len={}", ("hello" | count))`) parses — which is why the gap went unnoticed.
+  **Two independent causes, and a fix for either leaves the other broken; both were measured
+  in both directions on 2026-08-18, because the first version of this entry named one cause
+  that was wrong and prescribed a fix that does not work.**
+  - *Bare* `name(`: calls on a plain name are built in `command_or_ident`
+    (`userspace/nxsh/src/parse.rs:980`), which needs the **name** — it selects
+    `CallKind::Operator` vs `Def` by testing `OPERATORS`. `paren_args` has already consumed
+    that name to see whether a `:` follows, and hands `continue_expr_from` an `Expr`, from
+    which the classification can no longer be made. The fix routes bare-`Ident`-then-`(`
+    through that same construction; hardcoding `CallKind::Def` instead would silently change
+    dispatch for operator names like `count`.
+  - *Qualified* `a.b(`: this one **is** a divergence between two copies of one tier.
+    `postfix` (`:678`) has a `(` arm, but it matches exactly `Expr::Field(Ident, _)` — the
+    §9h qualified-name case — and returns early for anything else. `continue_expr_from`
+    (`:1138`) re-implements that tier and omits the arm. Delegating to `postfix` fixes this
+    shape and *only* this shape.
+
+  Workaround is the two-line form — `let sum = add(2, 3)` then `format("add={}", sum)` — which
+  is what `test-interactive` step 7 uses, with a comment, since it otherwise reads as a detour.
+  Found 2026-08-18 while fixing that step's assertion. Trigger: any script that wants a call as
+  an argument, which is most of them once user functions see real use.
 
 **Read-write FAT.** Initial FAT support is read-only. The ESP rarely changes after install; reading it is sufficient. Trigger: a need to update the bootloader from within the OS, or some other ESP-write workflow.
 

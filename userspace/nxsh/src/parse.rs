@@ -1135,6 +1135,24 @@ impl<'a> Parser<'a> {
     ///
     /// Needed only in `paren_args`, which must consume an identifier to see whether a `:`
     /// follows. Applies the postfix and binary tiers to the value already in hand.
+    ///
+    /// **No call can appear in an argument list**, and the two shapes fail for two different
+    /// reasons. `format("add={}", add(2, 3))` and `format("x={}", utils.helper(1))` both report
+    /// "expected `,` or `)` in an argument list"; a parenthesised *pipeline* in the same
+    /// position is fine, which is why the gap went unnoticed.
+    ///
+    /// A bare `name(` is not this function's to fix. Calls on a plain name are built in
+    /// [`Self::command_or_ident`], which needs the **name** — it picks `CallKind::Operator`
+    /// vs `Def` from `OPERATORS` — and `paren_args` has already consumed that name (to see
+    /// whether a `:` follows) and holds only an `Expr`. Routing bare-`Ident`-then-`(` through
+    /// that construction is what makes `add(2, 3)` parse, and it must keep the `OPERATORS`
+    /// test: hardcoding `CallKind::Def` silently changes dispatch for names like `count`.
+    ///
+    /// A qualified `a.b(` *is* this function's, and is the divergence from [`Self::postfix`]:
+    /// that tier's `(` arm handles exactly `Expr::Field(Ident, _)`, and this copy omits it.
+    ///
+    /// Neither fix covers the other — measured, both directions, 2026-08-18.
+    /// TODO(shell-nested-call): see `docs/rationale/deferred-decisions.md`.
     fn continue_expr_from(&mut self, first: Expr) -> Result<Expr> {
         let mut e = first;
         // Postfix tier.

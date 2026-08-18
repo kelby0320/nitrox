@@ -15515,3 +15515,52 @@ into the value, and run under a rank-4 lock rather than the rank-1/IRQ case F2 i
 
 Break-tested: making `push_within_capacity` grow fails `push_within_capacity_refuses_instead_of_growing`
 on the capacity assertion.
+
+## 2026-08-18 — Two steps in `test-interactive` asserted nothing, and the rule they broke was already written down twice
+
+Audit D.3(c) and D.3(d), and the thing worth recording is not the two fixes.
+
+`run_interactive_scenarios` states the rule at step 12 — "**The assertion is `n=3`, not `3`**:
+`expect` scans forward until it matches, so a bare digit finds the echo of the line that was
+just typed" — and again at step 13, and a third time at step 14 ("`n=8080` rather than `8080`
+for the reason step 12 gives"). Step 12's comment even records how the rule was learned: "found
+by breaking `break` and watching this step keep passing."
+
+Two steps in that same function broke it anyway.
+
+- **Step 14** sent `try { fail "boom" } catch (e) { e.message }` and asserted `expect("boom")`.
+  The word is *in the command*, so the terminal's echo satisfies the step as the line is sent,
+  long before the parser sees it. It passed with the `try`/`catch` replaced by `let boomless = 1`.
+- **Step 7** sent `add(2, 3)` and asserted `expect("5")` — one character, in a stream that also
+  carries heartbeat and service-manager logging. Instrumenting `expect` to record, per match, the
+  matched line and the pattern's frequency in the whole transcript: **`5` occurs 22 times in an
+  8.5 KB passing run, 14 of them before this step runs.** The audit caught it matching
+  `uptime_ns=1501346` in one of two unmutated runs.
+
+Both are now wrapped in the file's own `format("label={}", …)` idiom and occur exactly once.
+Step 7 binds the call with `let` first, because nxsh will not parse a user-function call nested
+in an argument list ("expected , or ) in an argument list") — noted since it reads like an
+arbitrary detour otherwise.
+
+**The mechanism, not a third comment.** `Session::expect` now refuses any pattern contained in
+a line the harness has typed since the last successful match — every such line, not just the
+most recent one, because two sends before one `expect` leave both echoes ahead of the cursor
+and a guard remembering only the latest would wave the earlier one through. The predicate is a
+free function, `echo_source`, so it is table-tested rather than evidenced by manual mutation. A comment cannot fail a build; this returns an error naming the
+step, the echoed text, and the fix. Its negative control is the original bug: restoring
+`expect("boom")` verbatim now fails at that step instead of passing. Scope is exact — `last_sent`
+is only ever set by `send`/`send_raw`, which only `test-interactive` calls, so `check-terminal`'s
+deliberate per-character echo assertions (typed over QMP) are untouched, as its passing run
+confirms.
+
+The ambient-noise half has no equivalent mechanical guard: nothing can tell the harness which
+patterns a background service might emit. What it has instead is the convention, now applied
+uniformly, and the measurement above — a pattern's occurrence count in a passing transcript is
+a cheap, rate-independent way to find the next one, and it does not require the step to have
+lost the race yet.
+
+Verified: `test-interactive`, `check-terminal`, `check-input`, `check-display`, `test-qemu` and
+the six static gates green; 1683 host tests; zero warnings. Three negative controls, each run
+against a booted guest — the `def` never called (step 7 fails), `format` held constant with
+`try`/`catch` removed (step 14 fails), and the original `expect("boom")` restored (the guard
+fires).
