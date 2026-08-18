@@ -448,6 +448,11 @@ impl Host for NitroxHost {
         }
     }
 
+    /// **Shell output is ambient.** `kprint` is `SYS_DEBUG_KPRINT`, which takes no handle,
+    /// so nothing can redirect, pipe, capture or log this — there is no object to redirect.
+    /// The *input* half of that hole closed when `tty-server` shipped (2026-08-13); this is
+    /// the half still owed, and this line is the whole of it.
+    /// TODO(tty-server): `docs/rationale/deferred-decisions.md`.
     fn out(&mut self, text: &str) {
         kprint(text.as_bytes());
     }

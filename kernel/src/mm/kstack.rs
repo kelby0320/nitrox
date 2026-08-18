@@ -180,6 +180,10 @@ impl KernelStack {
 /// standing record, and walks further down only when that word has been overwritten — i.e.
 /// only when a new record is genuinely being set, which happens a handful of times per
 /// boot. The mark is monotonic, so a thread that ran deep and returned still counts.
+///
+/// It records how deep and whose thread, but not *where* — that needs a return-address
+/// capture at the moment the record is set.
+/// TODO(stack-attribution): `docs/rationale/deferred-decisions.md`.
 #[cfg(feature = "test-harness")]
 pub mod watermark {
     use super::{KERNEL_STACK_BYTES, VirtAddr};

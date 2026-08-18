@@ -15873,3 +15873,53 @@ is defensive, not load-bearing.
 Verified: 1696 host tests (+4), 640 of them the kernel crate; each new test confirmed passing in
 isolation via `--exact`; each guard negative-controlled by deletion and by inversion; five guest
 gates and six static gates green; zero warnings on the kernel target in debug and release.
+
+## 2026-08-18 — `check-deferrals` now asks the question that was failing
+
+Audit D.5(b), the half PR #209 measured and deliberately did not close. The gate walked the
+code for `TODO(<tag>)` and failed if the tag was absent from `deferred-decisions.md`. It never
+asked the reverse, and the document claimed the enforcement was mechanical — while **9 of its
+28 open entries bound to no code marker at all**, four appearing nowhere else in the repository.
+So for a third of the tagged entries the advertised enforcement was an empty set, failing
+silently in the direction that matters: a deferral whose marker is gone is one nobody trips over
+while editing the code, which is the entire reason markers exist.
+
+**All nine got markers rather than exemptions.** That was the open question when this was split
+out — where does `TODO(shell-bitwise)` go, for syntax that does not exist? — and the answer in
+every case was that the prose already existed and only the searchable tag was missing:
+`upper`/`lower` already say "ASCII only", `replace` already says "literal, not a pattern", the
+`OPERATORS` table is where named bitwise operators would join, `Break` already says the parser
+enforces innermost-only, `kprint` is where per-call atomicity ends, the watermark module already
+says it records depth but not location, and `nxsh`'s `out()` is the whole of the still-owed
+output half of `TODO(tty-server)`. A marker at the place someone would change is worth more than
+a clean gate.
+
+The exemption exists anyway — `<!-- check-deferrals: no-code-site -->`, line-scoped, matching
+the `<!-- check-docs: allow-missing -->` precedent — with **no live user**, so it is covered by a
+unit test instead. An escape hatch nobody has opened is the thing that does not work the first
+time it is needed.
+
+**Open section only, and that cut is the whole subtlety.** A resolved entry has no marker
+because closing it deleted the marker. `open_section_tags` is a free function so that boundary
+is table-tested, including the case that made PR #209's first measurement wrong: a tag named
+narratively inside a Resolved row — `shell-cwd`, in a row describing how closing it found and
+deleted two stale markers in `nxsh`. Each branch negative-controlled: stop cutting at
+`## Resolved`, ignore the exemption, drop the plain-word check, stop de-duplicating — all four
+fail the named test.
+
+**Two self-references found on the way, one pre-existing and one mine.** The gate scans
+`tools/xtask/src`, so marker-shaped text in its *own* source counts:
+
+- `TODO(tag)` in this file's prose was being counted as a real marker named `tag` — inflating
+  the tally and making the gate depend on `deferred-decisions.md` continuing to contain the same
+  placeholder. Pre-existing; the placeholder is now spelt `TODO(<tag>)`, which fails the
+  plain-word check.
+- Writing the new table test's fixture longhand made the gate **fail on its own test data**,
+  reporting seven deferrals that do not exist. The fixture now assembles its markers at runtime.
+
+End-to-end, on the live gate: deleting one of the nine placed markers fails it by name; a new
+open entry with no marker fails it; marking that entry `no-code-site` passes it and the summary
+line counts it as exempt.
+
+Verified: 1696 host tests plus the new xtask test; the new test passing in isolation; five guest
+gates and six static gates green; zero warnings.

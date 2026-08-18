@@ -287,6 +287,9 @@ pub enum Stmt {
     /// `break` / `continue` (§9c). **Legal only inside a `for`/`while` body in the same
     /// function**, which the parser enforces — see `Parser::loop_depth`. Emitting them
     /// here at all therefore means the check has already passed.
+    ///
+    /// Unlabelled: both break the innermost loop only.
+    /// TODO(shell-labelled-break): `docs/rationale/deferred-decisions.md`.
     Break,
     Continue,
     /// `strict { … }` — first stage failure terminates the rest (§1). Deliberately a

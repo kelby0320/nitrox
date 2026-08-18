@@ -49,6 +49,11 @@ use crate::lex::{LexError, Lexer, Mode, Spanned, Tok};
 /// Generic value operators (§3, §5c, §10b). Closed at parse time because it selects the
 /// argument grammar; §5c's "the category is open" stays true semantically, since a
 /// user-defined generic `def` is called with parens and is syntactically distinct.
+///
+/// The bitwise family (`band`/`bor`/`bxor`/`shl`/`shr`) would join this table rather than
+/// take symbols, every conventional one being spoken for — `|` is the pipe, `&` the
+/// background suffix, `^` the force-external prefix.
+/// TODO(shell-bitwise): `docs/rationale/deferred-decisions.md`.
 const OPERATORS: &[&str] = &[
     "filter", "sort", "select", "save", "open", "each", "map", "display", "format", "last",
     "skip", "dedupe", "take", "count", "sum", "min", "max", "avg", "reduce",

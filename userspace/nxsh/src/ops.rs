@@ -360,6 +360,7 @@ pub fn trim(v: &Val) -> OpResult<Val> {
 
 /// `replace FROM TO` — **literal, not a pattern**. Pattern replacement is a different verb
 /// and waits on `capture`'s submatch work (§12).
+/// TODO(regex-replace): `docs/rationale/deferred-decisions.md`.
 pub fn replace(v: &Val, from: &str, to: &str) -> OpResult<Val> {
     if from.is_empty() {
         return Err(String::from("`replace` needs something to replace"));
@@ -370,6 +371,7 @@ pub fn replace(v: &Val, from: &str, to: &str) -> OpResult<Val> {
 /// `upper` / `lower` — **ASCII only**, said where a user meets it rather than only in the
 /// design doc. Full case folding needs Unicode tables this system does not carry, and a
 /// `lower` that quietly mangles non-ASCII is worse than one that documents its range.
+/// TODO(unicode-case): `docs/rationale/deferred-decisions.md`.
 pub fn upper(v: &Val) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "upper")?.to_ascii_uppercase()))
 }
