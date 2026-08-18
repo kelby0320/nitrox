@@ -1386,6 +1386,138 @@ mod tests {
         close_release(&t, h, 1).unwrap();
     }
 
+    // --- The validation ladder ---------------------------------------
+    //
+    // `lookup`, `close` and `restrict` each validate a handle through the same ladder —
+    // null, segment range, slot range, segment present, generation, owner, object non-null —
+    // and a mutation campaign over `table.rs` found **20 of 38 guards surviving deletion,
+    // all 20 of them REACHED**: tests execute every one and none fails when the guard is
+    // removed. That is not a coverage hole, it is an assertion-strength hole, in the file
+    // that enforces capability access.
+    //
+    // The tests below pin the ladder for all three entry points. Each is written so that the
+    // guard under test is the **only** one that can reject its input — otherwise it passes
+    // against a build with that guard deleted, which is the defect being fixed rather than a
+    // test of it. Every one was confirmed by deleting its guard and watching it fail by name.
+
+    /// A slot that has been freed and handed to a *new* object of the **same owner**.
+    ///
+    /// Returns `(stale, live)`. This is the only shape in which the generation check stands
+    /// alone: the slot is populated, so the null-object check passes, and the owner is
+    /// unchanged, so the owner check passes.
+    fn reused_slot(t: &HandleTable) -> (RawHandle, RawHandle) {
+        let stale = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
+        let (seg1, slot1, gen1) = stale.decode();
+        close_release(t, stale, 1).unwrap();
+        let live = t.allocate(1, mk_process(2), KObjectType::Process, sigterm()).unwrap();
+        let (seg2, slot2, gen2) = live.decode();
+        // **Asserted, not assumed.** The existing reuse test only checks the generation
+        // *if* the slot happens to repeat; if the allocator stopped returning the freed slot
+        // these tests would keep passing while testing nothing at all.
+        assert_eq!((seg1, slot1), (seg2, slot2), "the freed slot must be the one reused");
+        assert_ne!(gen1, gen2, "reuse must bump the generation");
+        (stale, live)
+    }
+
+    /// `close`'s generation check, with nothing else standing — audit D.1(c).
+    ///
+    /// The existing `double_close_returns_invalid_on_second` looks like this case and is not:
+    /// after a close the slot is empty, so the null-object check rejects the second close and
+    /// the generation check is never load-bearing. Delete the generation check and that test
+    /// still passes. Here the slot is *live*, and a stale handle that closed it would destroy
+    /// an object its holder never had a capability for.
+    #[test]
+    fn close_rejects_a_stale_handle_whose_slot_was_reused() {
+        let t = fresh_table();
+        let (stale, live) = reused_slot(&t);
+        assert_eq!(t.close(stale, 1).unwrap_err(), HandleError::InvalidHandle);
+        assert!(t.lookup(live, 1, sigterm()).is_ok(), "the live object was closed by a stale handle");
+        close_release(&t, live, 1).unwrap();
+    }
+
+    /// The same for `restrict`, which A.5 already singled out as the syscall that mutates a
+    /// table entry outside the read guard.
+    #[test]
+    fn restrict_rejects_a_stale_handle_whose_slot_was_reused() {
+        let t = fresh_table();
+        let (stale, live) = reused_slot(&t);
+        assert_eq!(t.restrict(stale, 1, Rights::empty()).unwrap_err(), HandleError::InvalidHandle);
+        let r = t.lookup(live, 1, sigterm()).expect("a stale restrict stripped the live handle");
+        drop(r);
+        close_release(&t, live, 1).unwrap();
+    }
+
+    /// `restrict`'s null-object check, with nothing else standing.
+    ///
+    /// `close` deliberately does **not** bump the generation (spec § "Generation counter
+    /// behavior"), and it leaves `owner_pid` alone, so on a closed-but-not-yet-reused slot
+    /// those two checks both pass and this one is all that is left.
+    #[test]
+    fn restrict_rejects_a_handle_whose_object_was_closed() {
+        let t = fresh_table();
+        let h = t.allocate(1, mk_process(1), KObjectType::Process, sigterm()).unwrap();
+        close_release(&t, h, 1).unwrap();
+        assert_eq!(t.restrict(h, 1, sig()).unwrap_err(), HandleError::InvalidHandle);
+    }
+
+    /// The null handle, on all three entry points.
+    #[test]
+    fn the_null_handle_is_rejected_by_lookup_close_and_restrict() {
+        let t = fresh_table();
+        assert_eq!(
+            t.lookup(RawHandle::NULL, 1, Rights::empty()).unwrap_err(),
+            HandleError::NullHandle,
+        );
+        assert_eq!(t.close(RawHandle::NULL, 1).unwrap_err(), HandleError::NullHandle);
+        assert_eq!(
+            t.restrict(RawHandle::NULL, 1, Rights::empty()).unwrap_err(),
+            HandleError::NullHandle,
+        );
+    }
+
+    /// Segment and slot indices past the end of the table, on all three entry points.
+    ///
+    /// Both fields are checked because they are separate guards — `lookup` tests them on two
+    /// different lines, and `close`/`restrict` fold them into one `||`, where an input that
+    /// trips only the left half leaves the right half unexercised.
+    #[test]
+    fn out_of_range_ids_are_rejected_by_lookup_close_and_restrict() {
+        let t = fresh_table();
+        let bad_seg = RawHandle::encode(DIRECTORY_LEN as u32, 0, 1);
+        let bad_slot = RawHandle::encode(0, SEGMENT_LEN as u32, 1);
+        for h in [bad_seg, bad_slot] {
+            assert_eq!(
+                t.lookup(h, 1, Rights::empty()).unwrap_err(),
+                HandleError::InvalidHandle,
+            );
+            assert_eq!(t.close(h, 1).unwrap_err(), HandleError::InvalidHandle);
+            assert_eq!(
+                t.restrict(h, 1, Rights::empty()).unwrap_err(),
+                HandleError::InvalidHandle,
+            );
+        }
+    }
+
+    /// A handle naming a segment that is in range but has never been brought online.
+    ///
+    /// `try_new` allocates segment 0 eagerly and no others, so segment 1 is a live null in
+    /// the directory — the case between "index out of range" and "slot is empty".
+    #[test]
+    fn an_unpopulated_segment_is_rejected_by_lookup_close_and_restrict() {
+        let t = fresh_table();
+        assert_eq!(t.segments_allocated(), 1, "the fixture must leave segment 1 absent");
+        let h = RawHandle::encode(1, 0, 1);
+        assert_eq!(
+            t.lookup(h, 1, Rights::empty()).unwrap_err(),
+            HandleError::InvalidHandle,
+        );
+        assert_eq!(t.close(h, 1).unwrap_err(), HandleError::InvalidHandle);
+        assert_eq!(
+            t.restrict(h, 1, Rights::empty()).unwrap_err(),
+            HandleError::InvalidHandle,
+        );
+    }
+
     // --- Duplicate ---------------------------------------------------
 
     #[test]
