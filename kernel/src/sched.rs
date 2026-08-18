@@ -476,12 +476,61 @@ static BOOT_ROOT: AtomicU64 = AtomicU64::new(0);
 /// **A bit is cleared only by [`leave_online`], when a CPU parks forever.** There is
 /// still no CPU hot-unplug; this is the terminal case — a panic, a failed AP init, or
 /// the harness verdict — where the CPU stops executing entirely.
-static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+///
+/// **Two backings behind one interface.** On the machine this is a process-global atomic,
+/// as it must be. Under `cfg(test)` it is **per-thread** — and unlike the mock `IF` flag in
+/// [`crate::libkern::spinlock`], that is *not* a fidelity argument: the online set is
+/// machine-global by definition, and a host thread is not a machine. It is test isolation,
+/// which is reason enough on its own. Cargo runs tests concurrently by default, so one set
+/// is the D.2 hazard that already produced the 22 % failure rate across `sched::tests`
+/// recorded at [`cpu_accepts_work`], when the placement tests read this global. Production
+/// codegen is unchanged — the `cfg(not(test))` arm is the original atomic, verbatim.
+mod online_set {
+    #[cfg(not(test))]
+    mod backing {
+        use core::sync::atomic::{AtomicU64, Ordering};
+
+        static ONLINE_MASK: AtomicU64 = AtomicU64::new(0);
+
+        pub(in crate::sched) fn load() -> u64 {
+            ONLINE_MASK.load(Ordering::Acquire)
+        }
+        pub(in crate::sched) fn add(cpu: usize) {
+            ONLINE_MASK.fetch_or(1u64 << cpu, Ordering::Release);
+        }
+        pub(in crate::sched) fn remove(cpu: usize) {
+            ONLINE_MASK.fetch_and(!(1u64 << cpu), Ordering::AcqRel);
+        }
+    }
+
+    #[cfg(test)]
+    mod backing {
+        std::thread_local! {
+            static ONLINE_MASK: core::cell::Cell<u64> = const { core::cell::Cell::new(0) };
+        }
+
+        pub(in crate::sched) fn load() -> u64 {
+            ONLINE_MASK.with(|m| m.get())
+        }
+        pub(in crate::sched) fn add(cpu: usize) {
+            ONLINE_MASK.with(|m| m.set(m.get() | (1u64 << cpu)));
+        }
+        pub(in crate::sched) fn remove(cpu: usize) {
+            ONLINE_MASK.with(|m| m.set(m.get() & !(1u64 << cpu)));
+        }
+        /// Establish a starting set. Test-only: the machine reaches its set by booting.
+        pub(in crate::sched) fn force(mask: u64) {
+            ONLINE_MASK.with(|m| m.set(mask));
+        }
+    }
+
+    pub(in crate::sched) use backing::*;
+}
 
 /// The set of online CPUs as a bitmask (dense index → bit), read lock-free.
 /// Used by [`crate::tlb`] to pick TLB-shootdown IPI targets without taking `SCHED`.
 pub fn online_mask() -> u64 {
-    ONLINE_MASK.load(Ordering::Acquire)
+    online_set::load()
 }
 
 /// Drop this CPU from the online set, because it is about to stop executing forever.
@@ -528,7 +577,7 @@ fn clear_online_bit(identity_bound: bool, me: usize) {
     if !identity_bound || me >= MAX_CPUS {
         return;
     }
-    ONLINE_MASK.fetch_and(!(1u64 << me), Ordering::AcqRel);
+    online_set::remove(me);
 }
 
 /// Assert that a thread arriving from ring 3 has preemption enabled.
@@ -979,7 +1028,7 @@ pub fn init() -> Result<(), AllocError> {
     let mut g = SCHED.lock();
     g.ready[0] = ready; // BSP is logical CPU 0; APs reserve their own in `ap_init`.
     g.cpu_online[0] = true; // the BSP; each AP sets its own bit in `ap_init`.
-    ONLINE_MASK.fetch_or(1, Ordering::Release); // lock-free mirror (BSP = bit 0)
+    online_set::add(0); // lock-free mirror (BSP = bit 0)
     g.blocked = blocked;
     g.suspended = suspended;
     g.reap[0] = reap;
@@ -1054,7 +1103,7 @@ fn ap_init() -> Result<(), AllocError> {
     // that reserved its queues, so no placement targets it before it is reserved).
     let cpu = SchedState::this_cpu();
     g.cpu_online[cpu] = true;
-    ONLINE_MASK.fetch_or(1 << cpu, Ordering::Release); // lock-free mirror
+    online_set::add(cpu); // lock-free mirror
     Ok(())
 }
 
@@ -3929,40 +3978,57 @@ pub(crate) extern "C" fn thread_enter() -> ! {
 
 #[cfg(test)]
 mod tests {
-    /// A permanent park must clear this CPU's online bit — **and must not clear anyone
-    /// else's when it has no identity of its own.**
-    ///
-    /// The three cases in one test on purpose: `ONLINE_MASK` is a global, and separate
-    /// `#[test]` functions run concurrently, so splitting them would make them race.
-    ///
-    /// The middle case is the one that matters. `current_cpu()` reports `0` for a CPU that
-    /// never established an identity (x86's `IA32_TSC_AUX` reset default), so an unguarded
-    /// park clears the *running BSP's* bit — dropping it from the TLB-shootdown set, where
-    /// the slow path's self-IPI is the only thing that invalidates its own TLB. A freed
-    /// frame stays reachable through a stale translation. Note the range check does not
-    /// catch it: `0` is perfectly in range (PR #198 review, blocking 1).
+    // --- leave_online's decision half ------------------------------------------
+    //
+    // **Three tests, not one.** They were a single `#[test]` because `ONLINE_MASK` was a
+    // process-global and separate tests run concurrently, so splitting them would have made
+    // them race — the old comment said exactly that. The set is now per-thread under
+    // `cfg(test)` (see `online_set`), so each case establishes its own starting set and fails
+    // on its own name.
+    //
+    // Measured rather than assumed, because the interesting part is how *weak* the natural
+    // signal is: split against the shared global these three passed **40 runs out of 40**.
+    // They would have been isolated by being fast, which is not isolation. Forcing the
+    // interleaving with sleeps — one test asserting 300 ms after its own write, another
+    // writing 100 ms in — fails `a_park_clears_its_own_bit_and_only_its_own` deterministically
+    // on the shared backing and passes on this one. Same shape, same result, as the mock `IF`
+    // flag in `libkern::spinlock`.
+
+    /// A permanent park must clear **its own** bit.
     #[test]
-    fn a_park_clears_its_own_bit_and_only_with_an_identity_of_its_own() {
-        super::ONLINE_MASK.store(0b1011, super::Ordering::Relaxed);
-
-        // No identity: nothing is cleared, though `me` is the plausible-looking `0`.
-        super::clear_online_bit(false, 0);
-        assert_eq!(super::online_mask(), 0b1011, "an unbound CPU cleared someone else's bit");
-
-        // Out of range: also ignored — and asserted at **64**, not `MAX_CPUS`.
-        //
-        // `MAX_CPUS` is 8, so deleting the range check leaves `0b1011 & !(1 << 8)` =
-        // `0b1011` and this assertion passes for the broken implementation too. A shift
-        // only misbehaves at the width of the type: `1u64 << 64` panics in debug and wraps
-        // to `1 << 0` in release — clearing **CPU 0's** bit, the same silent corruption the
-        // identity guard exists to prevent. Caught by a reviewer's negative control, which
-        // is the second time an assertion of mine held for both implementations.
-        super::clear_online_bit(true, 64);
-        assert_eq!(super::online_mask(), 0b1011, "an out-of-range index cleared a bit");
-
-        // Its own identity: its own bit, and no other.
+    fn a_park_clears_its_own_bit_and_only_its_own() {
+        super::online_set::force(0b1011);
         super::clear_online_bit(true, 1);
         assert_eq!(super::online_mask(), 0b1001);
+    }
+
+    /// …and must clear **nobody's** when it has no identity of its own.
+    ///
+    /// This is the case that matters. `current_cpu()` reports `0` for a CPU that never
+    /// established an identity (x86's `IA32_TSC_AUX` reset default), so an unguarded park
+    /// clears the *running BSP's* bit — dropping it from the TLB-shootdown set, where the
+    /// slow path's self-IPI is the only thing that invalidates its own TLB. A freed frame
+    /// stays reachable through a stale translation. Note the range check does not catch it:
+    /// `0` is perfectly in range (PR #198 review, blocking 1).
+    #[test]
+    fn a_park_with_no_identity_clears_nobodys_bit() {
+        super::online_set::force(0b1011);
+        super::clear_online_bit(false, 0);
+        assert_eq!(super::online_mask(), 0b1011, "an unbound CPU cleared someone else's bit");
+    }
+
+    /// An out-of-range index is ignored — and this is asserted at **64**, not `MAX_CPUS`.
+    ///
+    /// `MAX_CPUS` is 8, so deleting the range check leaves `0b1011 & !(1 << 8)` = `0b1011`
+    /// and an assertion at `MAX_CPUS` passes for the broken implementation too. A shift only
+    /// misbehaves at the width of the type: `1u64 << 64` panics in debug and wraps to
+    /// `1 << 0` in release — clearing **CPU 0's** bit, the same silent corruption the
+    /// identity guard exists to prevent. Caught by a reviewer's negative control.
+    #[test]
+    fn a_park_with_an_out_of_range_index_clears_nobodys_bit() {
+        super::online_set::force(0b1011);
+        super::clear_online_bit(true, 64);
+        assert_eq!(super::online_mask(), 0b1011, "an out-of-range index cleared a bit");
     }
 
     use super::*;

@@ -153,8 +153,9 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 ///
 /// On target, this drives the real CPU interrupt flag through the arch layer.
 /// Under `cfg(test)` (host `cargo test`, ring 3) the real `cli`/`sti` would
-/// `#GP`, so a single-threaded mock models `IF` in an `AtomicBool` — enough to
+/// `#GP`, so a mock models `IF` in a **per-thread** `Cell<bool>` — enough to
 /// exercise the lock's save/restore *logic* (the asm itself is QEMU-only).
+/// Per-thread, not process-global: see the `cfg(test)` arm below.
 #[cfg(not(test))]
 mod irq_backend {
     use crate::arch::Cpu;
@@ -176,18 +177,44 @@ mod irq_backend {
 
 #[cfg(test)]
 mod irq_backend {
-    use core::sync::atomic::{AtomicBool, Ordering};
-
-    /// Models `RFLAGS.IF` for host tests. Starts enabled (the boot default
-    /// once preemption is armed). Host tests are single-threaded.
-    pub(super) static MOCK_IF: AtomicBool = AtomicBool::new(true);
+    std::thread_local! {
+        /// Models `RFLAGS.IF` for host tests, **one flag per thread**. Starts enabled (the
+        /// boot default once preemption is armed).
+        ///
+        /// Per-thread because `IF` *is* per-CPU. A single process-global flag was not a
+        /// simplification of the hardware, it was a different machine — one where any core's
+        /// `cli` masks interrupts on all of them — and a host test thread is what stands in
+        /// for a core here. So the faithful model and the test isolation are the same change.
+        ///
+        /// It was global, with **four** comments in this file asserting that `cargo test` runs
+        /// these serially — the audit named three and this module's own doc was the fourth.
+        /// It does not: there is no `--test-threads` setting anywhere in the repository, and
+        /// the default is one thread per CPU. The tests were isolated by being fast. Forcing
+        /// the interleaving with sleeps produced a false failure of
+        /// `irq_lock_masks_while_held_and_restores_on_drop` — a test about interrupt-flag
+        /// save/restore, failing on another test's write.
+        ///
+        /// The tree already had this right in five other places;
+        /// [`crate::handle::FAIL_NEXT_ACQUIRE`] carries the reason in full.
+        static MOCK_IF: core::cell::Cell<bool> = const { core::cell::Cell::new(true) };
+    }
 
     pub(super) fn disable() -> bool {
-        MOCK_IF.swap(false, Ordering::SeqCst)
+        MOCK_IF.with(|f| f.replace(false))
     }
 
     pub(super) fn restore(prev: bool) {
-        MOCK_IF.store(prev, Ordering::SeqCst);
+        MOCK_IF.with(|f| f.set(prev));
+    }
+
+    /// The modelled flag, for tests asserting on it. Not part of the lock's interface.
+    pub(super) fn peek() -> bool {
+        MOCK_IF.with(|f| f.get())
+    }
+
+    /// Establish a prior interrupt state before acquiring, for tests that need one.
+    pub(super) fn force(enabled: bool) {
+        MOCK_IF.with(|f| f.set(enabled));
     }
 }
 
@@ -380,27 +407,34 @@ mod tests {
         assert_eq!(*g, 7);
     }
 
-    // The contested path (one CPU spinning while another holds the lock)
-    // is not exercised by host tests: `cargo test` runs single-threaded
-    // here, and even if it did, the std-thread version of contention has
-    // different semantics than the on-target one (a yielding scheduler vs.
-    // an HLT-less spin). An integration test under QEMU with SMP will
-    // cover this once a second CPU is brought up in Phase 3.
+    // The contested path (one CPU spinning while another holds the lock) is not exercised by
+    // host tests. **Not because they are serial** — they are not; cargo runs one thread per
+    // CPU and no `--test-threads` setting exists in this repository. It is that no test here
+    // arranges two threads to contend on one lock, and the std-thread version of contention
+    // would have different semantics from the on-target one anyway (a yielding scheduler vs.
+    // an HLT-less spin). An integration test under QEMU with SMP is the way to cover it.
+    //
+    // This comment used to say `cargo test` runs single-threaded here, which is the claim
+    // the per-thread mock flag below exists to refute — and it sits directly above an
+    // invitation to write that SMP test, where believing it would mean reaching for shared
+    // process-global state.
 
     // --- IrqSpinLock -------------------------------------------------------
     //
-    // These exercise the lock's interrupt-flag save/restore *logic* against
-    // the mock IF backend (`irq_backend::MOCK_IF`). The real `cli`/`sti` asm
-    // is QEMU-only. The tests run serially and reset MOCK_IF first, since they
-    // share the one global mock flag.
-
-    use core::sync::atomic::Ordering;
+    // These exercise the lock's interrupt-flag save/restore *logic* against the mock IF
+    // backend. The real `cli`/`sti` asm is QEMU-only.
+    //
+    // The flag is per-thread, so these do not interfere with each other however cargo
+    // schedules them; see `irq_backend`. Each still establishes its own prior state first,
+    // which is what keeps them correct under `--test-threads=1` as well — there the whole
+    // suite shares the main thread, and a test inheriting its predecessor's flag would be
+    // the same defect wearing a different hat.
 
     fn reset_mock_if(enabled: bool) {
-        irq_backend::MOCK_IF.store(enabled, Ordering::SeqCst);
+        irq_backend::force(enabled);
     }
     fn mock_if() -> bool {
-        irq_backend::MOCK_IF.load(Ordering::SeqCst)
+        irq_backend::peek()
     }
 
     #[test]
@@ -459,8 +493,9 @@ mod tests {
         let g2 = lock.lock();
         assert_eq!(*g2, 5);
         drop(g2);
-        // Tidy up the shared mock flag for any later test.
-        reset_mock_if(true);
+        // No tidy-up: the flag is this thread's, and every test above sets its own prior
+        // state before acquiring. Restoring it here would imply a later test depends on the
+        // value this one leaves behind, and none does.
     }
 
     #[test]

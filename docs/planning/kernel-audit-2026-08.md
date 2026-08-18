@@ -105,7 +105,7 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
       confirm the named test fails. Three of the last three reviews found an assertion that
       passed for both the correct and the broken implementation.
 - [ ] **No test writes a process-global** that another test reads. `ONLINE_MASK` did, and
-      produced a 33 % failure rate at `--test-threads=16` that CI never saw. Sweep for others;
+      produced a 22 % failure rate at `--test-threads=16` that CI never saw. Sweep for others;
       the fix shape is to pass state as a parameter, not to add a lock.
 - [ ] **Every gate assertion can fail.** Check each `session.expect` is reachable and not
       satisfied by earlier output — `expect` advances a cursor, so verify that is true of the
