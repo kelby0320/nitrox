@@ -426,9 +426,16 @@ mod tests {
     //
     // The flag is per-thread, so these do not interfere with each other however cargo
     // schedules them; see `irq_backend`. Each still establishes its own prior state first,
-    // which is what keeps them correct under `--test-threads=1` as well — there the whole
-    // suite shares the main thread, and a test inheriting its predecessor's flag would be
-    // the same defect wearing a different hat.
+    // which is simply good hygiene — it is not, as this comment claimed until 2026-08-18,
+    // what keeps them correct "under `--test-threads=1`, where the whole suite shares the
+    // main thread". **libtest spawns a fresh OS thread per test at every concurrency level**,
+    // so a `thread_local!` never carries from one test to the next and there is no mode in
+    // which these share a flag. Measured on rustc 1.95.0: at `--test-threads=1` two tests
+    // report `ThreadId(2)` and `ThreadId(3)`.
+    //
+    // Recorded rather than quietly deleted because this file is where PR #207 removed four
+    // comments asserting that `cargo test` runs these serially — and the replacement it wrote
+    // was a fifth claim of the same kind, in the other direction.
 
     fn reset_mock_if(enabled: bool) {
         irq_backend::force(enabled);

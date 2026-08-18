@@ -596,10 +596,34 @@ fn clear_online_bit(identity_bound: bool, me: usize) {
 /// kernel preemption either. Debug builds only (PR #203 review, optional 1).
 pub fn assert_user_entry_preempt_safe() {
     debug_assert_eq!(
-        PREEMPT_OFF[SchedState::this_cpu()].load(Ordering::Relaxed),
+        with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed)),
         0,
         "entered a syscall from ring 3 with preemption disabled — a kernel path leaked a \
          `preempt_disable`, and this CPU will stop preempting until something notices"
+    );
+}
+
+/// Assert that a *voluntary* context switch is not happening inside a preempt-critical window.
+///
+/// Split out of [`switch_into`] rather than left inline, for the reason [`clear_online_bit`]
+/// was: `switch_into` manipulates real registers and stacks and is reached by **no** host test
+/// (kernel audit B.5(d)), so an assertion living inside it is pinned only by booting. As a free
+/// function the rule is pinned by
+/// `a_voluntary_switch_inside_a_preempt_critical_window_is_refused`.
+///
+/// A plain-lock holder trips `assert_switch_safe` because it holds a rank; a bare
+/// [`preempt_disable`] — the `tlb`, `handle::global` and `reap_pending` windows — holds nothing,
+/// so a yield or block inside one would switch away from a CPU that has asked not to be
+/// descheduled, and strand the raised counter on a thread that is no longer running.
+///
+/// Debug builds only. No reachable violation exists today; this is what keeps that true.
+fn assert_switch_preempt_safe() {
+    debug_assert_eq!(
+        with_preempt_off(SchedState::this_cpu(), |c| c.load(Ordering::Relaxed)),
+        0,
+        "context switch with preemption disabled — a voluntary switch inside a \
+         preempt-critical region deschedules a CPU that asked not to be, and strands the \
+         raised counter on a thread that is no longer running"
     );
 }
 
@@ -658,12 +682,58 @@ fn push_reserved<T>(list: &mut KVec<T>, val: T, what: &str) {
 /// Per-CPU preemption-disable depth (see [`preempt_disable`]). Written only by
 /// the thread running on that CPU (which, while nonzero, cannot migrate — that
 /// is the point); read by the same CPU's tick / reschedule-IPI handlers.
+#[cfg(not(test))]
 static PREEMPT_OFF: [AtomicU32; MAX_CPUS] = [const { AtomicU32::new(0) }; MAX_CPUS];
 
 /// Set when a reschedule opportunity (tick expiry or reschedule IPI) was
 /// skipped because [`PREEMPT_OFF`] was raised; consumed by [`preempt_enable`],
 /// which replays the reschedule. Backstop: the CPU's next periodic tick.
+#[cfg(not(test))]
 static RESCHED_PENDING: [AtomicBool; MAX_CPUS] = [const { AtomicBool::new(false) }; MAX_CPUS];
+
+#[cfg(test)]
+std::thread_local! {
+    /// Host-test backing for [`PREEMPT_OFF`] and [`RESCHED_PENDING`], **one pair per thread**.
+    ///
+    /// Both are per-CPU arrays indexed by `SchedState::this_cpu()`, and under `cfg(test)`
+    /// `current_cpu()` reports `0` for every thread — so as process-globals every concurrent
+    /// test taking any [`SpinLock`](crate::libkern::SpinLock) wrote the same two slots, since
+    /// `lock()` calls [`preempt_disable`]. Nothing asserted on them from a host test, which is
+    /// the only reason it never fired; the 2026-08-14 preempt-guard entry records this hazard
+    /// as the reason those guards went untested. Per-thread, they can be.
+    ///
+    /// Scoped access rather than a leaked `'static` — `kernel/CLAUDE.md` forbids `Box::leak`
+    /// patterns, and the closure form costs nothing on the production path, which indexes the
+    /// static directly.
+    static PREEMPT_OFF_TLS: [AtomicU32; MAX_CPUS] =
+        const { [const { AtomicU32::new(0) }; MAX_CPUS] };
+    static RESCHED_PENDING_TLS: [AtomicBool; MAX_CPUS] =
+        const { [const { AtomicBool::new(false) }; MAX_CPUS] };
+}
+
+/// This CPU's preempt-disable counter. See [`PREEMPT_OFF`].
+#[cfg(not(test))]
+#[inline(always)]
+fn with_preempt_off<R>(cpu: usize, f: impl FnOnce(&AtomicU32) -> R) -> R {
+    f(&PREEMPT_OFF[cpu])
+}
+
+#[cfg(test)]
+fn with_preempt_off<R>(cpu: usize, f: impl FnOnce(&AtomicU32) -> R) -> R {
+    PREEMPT_OFF_TLS.with(|a| f(&a[cpu]))
+}
+
+/// This CPU's deferred-reschedule latch. See [`RESCHED_PENDING`].
+#[cfg(not(test))]
+#[inline(always)]
+fn with_resched_pending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
+    f(&RESCHED_PENDING[cpu])
+}
+
+#[cfg(test)]
+fn with_resched_pending<R>(cpu: usize, f: impl FnOnce(&AtomicBool) -> R) -> R {
+    RESCHED_PENDING_TLS.with(|a| f(&a[cpu]))
+}
 
 /// Disable preemption on the current CPU (nestable). While the depth is
 /// nonzero, the tick and the reschedule IPI will not deschedule the running
@@ -695,7 +765,7 @@ pub fn preempt_disable() {
     // Once the count is raised, descheduling is impossible, which is what makes
     // the per-CPU counter track the thread for the window's duration.
     let prev = preempt_irqs_mask();
-    PREEMPT_OFF[SchedState::this_cpu()].fetch_add(1, Ordering::Relaxed);
+    with_preempt_off(SchedState::this_cpu(), |c| c.fetch_add(1, Ordering::Relaxed));
     preempt_irqs_restore(prev);
 }
 
@@ -717,22 +787,30 @@ pub fn preempt_enable() {
     // checks catches the unbalanced enable at the moment it happens, and one that does not
     // still refuses to brick the CPU.
     //
-    // **Do not "simplify" this to a plain load/store.** The obvious argument for it — the
-    // counter is per-CPU and interrupts are masked here, so the RMW is redundant — holds on
-    // target and fails under `cfg(test)`, where `preempt_irqs_mask` is a no-op and
-    // `this_cpu()` collapses every host-test thread onto index 0. The atomicity is
-    // load-bearing for the host configuration even though it looks redundant on the one the
-    // comment above describes.
-    let depth_before = PREEMPT_OFF[me]
-        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
-        // unwrap_or: the closure is infallible, so `fetch_update` cannot return `Err` here.
-        .unwrap_or(0);
+    // **Do not "simplify" this to a plain load/store**, though the reason has changed and the
+    // old one is no longer true. It used to be that `this_cpu()` collapses every host-test
+    // thread onto index 0, so the RMW was load-bearing for the host configuration even though
+    // interrupts being masked makes it redundant on target. The counter is now per-thread
+    // under `cfg(test)` (see `PREEMPT_OFF_TLS`), so that collapse is gone and no *current*
+    // configuration needs the atomicity.
+    //
+    // It stays because the target argument is a claim about a masking window, not about the
+    // counter: `preempt_irqs_mask` is what makes the read-modify-write indivisible here, and a
+    // plain load/store would make this line's correctness depend on that mask staying exactly
+    // where it is. The RMW costs an uncontended `lock` prefix on a per-CPU line and removes
+    // the coupling.
+    let depth_before = with_preempt_off(me, |c| {
+        c.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |d| Some(d.saturating_sub(1)))
+            // unwrap_or: the closure is infallible, so `fetch_update` cannot return `Err`.
+            .unwrap_or(0)
+    });
     debug_assert_ne!(
         depth_before, 0,
         "preempt_enable with no matching preempt_disable — the counter would have wrapped \
          to u32::MAX and this CPU would never preempt again"
     );
-    let replay = depth_before == 1 && RESCHED_PENDING[me].swap(false, Ordering::AcqRel);
+    let replay =
+        depth_before == 1 && with_resched_pending(me, |c| c.swap(false, Ordering::AcqRel));
     preempt_irqs_restore(prev);
     if replay {
         // Mirror `on_reschedule_ipi`: resume an idle CPU into the scheduler; a
@@ -1314,9 +1392,9 @@ pub fn on_timer_tick() {
     // other CPUs spin on — see [`preempt_disable`]): do not deschedule it. The
     // bookkeeping above (deadlines, wakes, vruntime, quantum) still ran; latch
     // the skipped switch for `preempt_enable` / the next tick.
-    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
+    if with_preempt_off(me, |c| c.load(Ordering::Relaxed)) > 0 {
         if reschedule || (!ready_here && current_is_idle(&g) && steal_available(&g, me)) {
-            RESCHED_PENDING[me].store(true, Ordering::Release);
+            with_resched_pending(me, |c| c.store(true, Ordering::Release));
         }
         return; // guard drops — IF stays 0 (IRQ context) until iretq
     }
@@ -1344,8 +1422,8 @@ pub fn on_timer_tick() {
 /// enqueued and will be picked in turn or stolen. Consumes the guard.
 fn resched_if_idle_locked(g: IrqSpinLockGuard<'_, SchedState>) {
     let me = SchedState::this_cpu();
-    if PREEMPT_OFF[me].load(Ordering::Relaxed) > 0 {
-        RESCHED_PENDING[me].store(true, Ordering::Release);
+    if with_preempt_off(me, |c| c.load(Ordering::Relaxed)) > 0 {
+        with_resched_pending(me, |c| c.store(true, Ordering::Release));
         return; // guard drops
     }
     if current_is_idle(&g) && (!g.ready[me].is_empty() || steal_available(&g, me)) {
@@ -2411,24 +2489,12 @@ unsafe fn switch_into(
     // has interrupts masked, and blocking with a lock held is forbidden) — this is what
     // turns "already true" into "checked". Debug builds only; inert otherwise.
     crate::libkern::lockrank::assert_switch_safe();
-    // The same idea for the *other* per-CPU invariant, which the lock check cannot see.
-    // A plain-lock holder trips `assert_switch_safe` because it holds a rank; a bare
-    // `preempt_disable()` — the `tlb`, `handle::global` and `reap_pending` windows — holds
-    // nothing, so a yield or block inside one would switch away from a CPU that has asked
-    // not to be descheduled, and leave the counter raised on a thread no longer running.
-    //
-    // The involuntary paths already refuse: `on_timer_tick` and `resched_if_idle_locked`
-    // latch into `RESCHED_PENDING` instead of switching. Nothing checked the **voluntary**
-    // ones — `yield_now` and everything that blocks — which is the gap this closes (kernel
-    // audit B.5(c), decision log 2026-08-14). No reachable violation exists today; this is
-    // what keeps that true.
-    debug_assert_eq!(
-        PREEMPT_OFF[SchedState::this_cpu()].load(Ordering::Relaxed),
-        0,
-        "context switch with preemption disabled — a voluntary switch inside a \
-         preempt-critical region deschedules a CPU that asked not to be, and strands the \
-         raised counter on a thread that is no longer running"
-    );
+    // The same idea for the *other* per-CPU invariant, which the lock check cannot see: the
+    // involuntary paths (`on_timer_tick`, `resched_if_idle_locked`) latch into
+    // `RESCHED_PENDING` rather than switching, and nothing checked the **voluntary** ones —
+    // `yield_now` and everything that blocks — until kernel audit B.5(c). The reasoning is on
+    // the function, which is also where its test points; one copy, so the two cannot drift.
+    assert_switch_preempt_safe();
     // SAFETY: `next_obj` is the pinned incoming thread (re-arm its trap/syscall stack).
     unsafe { arm_kernel_stack_for(next_obj) };
     // SAFETY: `next_root` is a fully-formed PML4 (boot root, or a process root
@@ -3993,6 +4059,83 @@ mod tests {
     // writing 100 ms in — fails `a_park_clears_its_own_bit_and_only_its_own` deterministically
     // on the shared backing and passes on this one. Same shape, same result, as the mock `IF`
     // flag in `libkern::spinlock`.
+
+    // --- the two preemption guards ------------------------------------------------
+    //
+    // Both are `debug_assert`s added by PR #203 (audit B.5c, B.5e), and the 2026-08-14 entry
+    // recorded that **neither had a host test**, giving the reason: `PREEMPT_OFF` was a
+    // process-global that concurrent host tests already touched through `SpinLock::lock`, so
+    // raising the counter to test a guard would have raised it under every other test running
+    // at that moment. That is fixed above — the counter is per-thread under `cfg(test)` — and
+    // these are the tests it was blocking.
+    //
+    // Each pair is positive-and-negative on purpose: the `should_panic` half alone would pass
+    // against a guard that fires unconditionally.
+
+    /// Raise the depth on *this thread's* counter and put it back, whatever the test does.
+    ///
+    /// RAII rather than a bare increment-and-reset, because two of these tests panic while it
+    /// is alive: cleanup written *after* the assert would simply not run. Test builds unwind
+    /// (the `panic = "abort"` assertion in this file is `cfg(not(test))`), so `Drop` runs
+    /// during the unwind and the restore is unconditional.
+    ///
+    /// **Nothing depends on that today**, and an earlier version of this comment claimed
+    /// otherwise — that it is what keeps `--test-threads=1` correct, "where the whole suite
+    /// shares one thread". It does not: libtest spawns a **fresh OS thread per test at every
+    /// concurrency level**, so a `thread_local!` cannot carry from one test to the next and the
+    /// leak this is said to prevent cannot happen. Measured on rustc 1.95.0 — at
+    /// `--test-threads=1` two tests report `ThreadId(2)` and `ThreadId(3)` — and confirmed the
+    /// other way: delete this `Drop` body and the suite is still 640 green at
+    /// `--test-threads=1`. The fixture is defensive against a future harness or `catch_unwind`
+    /// wrapper that *does* share a thread, which is a fine reason to keep it and not a reason
+    /// to claim it is load-bearing.
+    struct PreemptRaised;
+    impl PreemptRaised {
+        fn new() -> Self {
+            super::with_preempt_off(super::SchedState::this_cpu(), |c| {
+                c.fetch_add(1, core::sync::atomic::Ordering::Relaxed)
+            });
+            PreemptRaised
+        }
+    }
+    impl Drop for PreemptRaised {
+        fn drop(&mut self) {
+            // `fetch_sub`, not `store(0)`: zeroing would make this fixture unusable inside a
+            // held `SpinLock`, whose guard drop then reaches `preempt_enable` and trips its
+            // underflow assert — reporting a wrap that never happened.
+            super::with_preempt_off(super::SchedState::this_cpu(), |c| {
+                c.fetch_sub(1, core::sync::atomic::Ordering::Relaxed)
+            });
+        }
+    }
+
+    #[test]
+    fn a_syscall_from_ring_3_with_preemption_enabled_is_accepted() {
+        super::assert_user_entry_preempt_safe();
+    }
+
+    /// B.5(c)'s ring-3 half: a kernel path that leaked a `preempt_disable` is caught at the
+    /// next syscall entry rather than silently stopping this CPU preempting.
+    #[test]
+    #[should_panic(expected = "entered a syscall from ring 3 with preemption disabled")]
+    fn a_syscall_from_ring_3_with_preemption_disabled_is_refused() {
+        let _raised = PreemptRaised::new();
+        super::assert_user_entry_preempt_safe();
+    }
+
+    #[test]
+    fn a_voluntary_switch_with_preemption_enabled_is_accepted() {
+        super::assert_switch_preempt_safe();
+    }
+
+    /// B.5(c) proper: the involuntary paths latch into `RESCHED_PENDING`; nothing checked the
+    /// voluntary ones until PR #203, and nothing tested that check until this one.
+    #[test]
+    #[should_panic(expected = "context switch with preemption disabled")]
+    fn a_voluntary_switch_inside_a_preempt_critical_window_is_refused() {
+        let _raised = PreemptRaised::new();
+        super::assert_switch_preempt_safe();
+    }
 
     /// A permanent park must clear **its own** bit.
     #[test]

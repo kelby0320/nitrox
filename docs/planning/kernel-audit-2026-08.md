@@ -104,9 +104,15 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 - [ ] **Negative-control every host test that claims to pin an invariant.** Delete the guard,
       confirm the named test fails. Three of the last three reviews found an assertion that
       passed for both the correct and the broken implementation.
-- [ ] **No test writes a process-global** that another test reads. `ONLINE_MASK` did, and
+- [x] **No test writes a process-global** that another test reads. `ONLINE_MASK` did, and
       produced a 22 % failure rate at `--test-threads=16` that CI never saw. Sweep for others;
       the fix shape is to pass state as a parameter, not to add a lock.
+      *Audited and closed 2026-08-18. Three instances, not one: `MOCK_IF` and the `ONLINE_MASK`
+      residual (PR #207), then `PREEMPT_OFF`/`RESCHED_PENDING` (PR #210) — which the first sweep
+      missed because it asked which statics are written from inside a `#[cfg(test)] mod`, and
+      those are written by production code the tests call. All three now have a `cfg(test)`
+      per-thread backing; production codegen unchanged. The payoff was the two preempt guards
+      that had no host test precisely because of the shared counter. Decision log, 2026-08-18.*
 - [ ] **Every gate assertion can fail.** Check each `session.expect` is reachable and not
       satisfied by earlier output — `expect` advances a cursor, so verify that is true of the
       gates that rely on it.
