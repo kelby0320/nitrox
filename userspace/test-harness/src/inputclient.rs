@@ -280,7 +280,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             None if stream.timed_out => {
                 // Nothing is driving this run. Exiting *before* the window phase is what
                 // keeps this client out of every other gate's way — see `IDLE_LIMIT_NS`.
-                kprint(b"input-testclient: idle, releasing the window\n");
+                //
+                // **A distinct message from the phase-2 one below, and that matters to a
+                // gate.** Both used to print "idle, releasing the window", which is only
+                // true of one of them: here no window has been created yet, so a gate that
+                // waits for this may act immediately. There it announces an *intention* —
+                // the 2048×2048 window is still up and stays up through `exit`, the kernel's
+                // teardown, and the compositor noticing the peer closed. A gate cannot tell
+                // those apart from one string, and the difference decides whether its next
+                // click lands on the terminal or on a window the size of the screen.
+                kprint(b"input-testclient: idle before the window phase\n");
                 exit(0);
             }
             None => {
@@ -380,6 +389,11 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
             // life of the boot with the whole screen under it. `cargo xtask check-terminal`
             // is the gate that found it: its click on the terminal landed here instead.
             None => {
+                // **This is an announcement, not a completion.** The window outlives the
+                // line: `exit` has not run, the kernel has not torn the process down, and
+                // the compositor has not yet noticed the peer closed. A gate that clicks on
+                // seeing this can still land on a 2048×2048 window. Named distinctly from
+                // the phase-1 message above so the two states are not one signal.
                 kprint(b"input-testclient: idle, releasing the window\n");
                 exit(0);
             }

@@ -1212,7 +1212,14 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
         qmp.send_motion(-98, -56)?; // → about (397, 295)
     }
 
-    session.expect("input-testclient: idle, releasing the window")?;
+    // **The phase-1 message specifically.** The client has two idle exits and they used to
+    // print the same line: this one before the window phase, where nothing has been created
+    // and acting immediately is safe, and one *after* the 2048×2048 window exists, where the
+    // line is an announcement and the window outlives it through `exit`, the kernel's
+    // teardown and the compositor noticing the peer closed. Waiting on the ambiguous string
+    // meant this gate could resume in either state; the click that follows lands on the
+    // terminal in one and on a screen-sized window in the other.
+    session.expect("input-testclient: idle before the window phase")?;
 
 
 
@@ -1230,6 +1237,16 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // version of this sent (4000, 4000) and the cursor went somewhere unrelated.
     qmp.send_button("left", true)?;
     qmp.send_button("left", false)?;
+
+    // **Assert where the click went before asserting that it worked.** These two steps split
+    // a failure that used to be one opaque timeout into its two distinguishable causes: the
+    // pointer not being where the arithmetic above says it is, and the pointer being right
+    // while `nxterm` still does not receive the press. Before this, either produced the same
+    // bare `timed out waiting for "nxterm: clicked"` with nothing in the transcript to tell
+    // them apart — which is precisely what happened to the one observed failure of this gate,
+    // and why it is still unexplained. Measured over 40 loaded runs the position is
+    // bit-identical, so a change here is a real signal rather than noise.
+    session.expect("compositor: press at x=397 y=295")?;
 
     // **Wait for the click to land before typing.** Click-to-focus is what gives `nxterm` the
     // keyboard — it is created first and therefore bottom-most — and the raise is not

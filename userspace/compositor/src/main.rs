@@ -688,6 +688,26 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
                 restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+                // **Where a press landed, always — not through `log_route`.** That path is
+                // capped at `MAX_LOGGED_ROUTES` and only sees records that were *delivered*,
+                // so the two things a failing gate most needs are exactly the two it cannot
+                // get: a click that hit no window logs nothing at all, and by the time a
+                // gate has moved the cursor the cap is long spent. A press is rare — one
+                // line per click — so this is not the log volume the cap exists to bound.
+                if let libinput::Logical::Button { pressed: true, .. } = *l {
+                    let p = srv.router.pointer();
+                    let mut pl = Line::new();
+                    pl.s(b"compositor: press at x=").i(p.x as i64).s(b" y=").i(p.y as i64);
+                    match srv.router.grab() {
+                        Some(w) => {
+                            pl.s(b" win=").u(w as u64);
+                        }
+                        None => {
+                            pl.s(b" win=none");
+                        }
+                    }
+                    pl.end();
+                }
                 // Repeat follows the *physical* key, so it is armed from the interpreted
                 // transition rather than from what the router decided to do with it: a key
                 // that reached no window still stops repeating when it comes up.

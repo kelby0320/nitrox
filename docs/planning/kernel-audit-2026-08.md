@@ -116,8 +116,8 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 - [ ] **Every gate assertion can fail.** Check each `session.expect` is reachable and not
       satisfied by earlier output — `expect` advances a cursor, so verify that is true of the
       gates that rely on it.
-- [ ] **Promote `check-terminal` to CI** once it has a clean run of ~10, and build
-      `check-input --no-ps2-irq` (boot with the controller's IRQ bits cleared so the recovery
+- [ ] **Promote `check-terminal` to CI** ✅ *(done 2026-08-18)* once it has a clean run of ~10,
+      and build `check-input --no-ps2-irq` *(still open)* (boot with the controller's IRQ bits cleared so the recovery
       sweep is the only path). Both are filed in `deferred-decisions.md`. These convert "one
       run in six" into "every run" and are the only things that have caught this class.
 - [x] **Audit `deferred-decisions.md` against reality.** At least one entry ("Debug-build

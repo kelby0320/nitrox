@@ -198,6 +198,22 @@ jobs:
       - name: cargo xtask test-interactive --kvm
         run: cargo xtask test-interactive --kvm
 
+      # The **windowed** path, which neither gate above reaches: a click that raises
+      # `nxterm`, keys travelling nxterm -> tty-server -> nxsh and echoing back into the
+      # grid, and the shell's answer rendered there. `check-input` stops at the test
+      # client's event log and `check-display` never types, so nothing else in CI covers
+      # the compositor-to-shell round trip.
+      #
+      # **Promoted 2026-08-18** on 64 consecutive passes (24 idle, 15 loaded and 5 --kvm
+      # from the audit; 24 loaded and 16 instrumented since). One failure remains
+      # unexplained, seen once during the audit at the click step under concurrent build
+      # load and never reproduced. What changed to make promotion defensible is not the
+      # count but that the failure is now legible: the gate asserts *where* the press
+      # landed before asserting that `nxterm` received it, so a recurrence in CI reports
+      # coordinates instead of a bare timeout. See docs/decision-log.md, 2026-08-18.
+      - name: cargo xtask check-terminal --kvm
+        run: cargo xtask check-terminal --kvm
+
       # The fault dump prints raw addresses, and a local rebuild of the same commit
       # does **not** reproduce CI's code layout — symbolizing CI addresses against a
       # local binary yields nonsense. Upload the exact ELF so `addr2line` can resolve
