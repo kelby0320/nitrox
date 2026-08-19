@@ -64,15 +64,34 @@ enum BuildMode {
     /// `test-qemu`: everything `Selftest` runs, plus the `isa-debug-exit` verdict path
     /// so the run self-adjudicates headlessly (`test-harness` feature).
     TestHarness,
+    /// `check-input --no-ps2-irq`: [`TestHarness`](Self::TestHarness) plus the kernel's
+    /// `no-ps2-irq`, which leaves the i8042's interrupt generation off so the tick-driven
+    /// `ps2::poll` sweep is the only path from a keystroke to the guest.
+    TestHarnessNoPs2Irq,
 }
 
 impl BuildMode {
-    /// The cargo `--features` value for the kernel + `init` builds (`None` = no flag).
+    /// The cargo `--features` value for the **userspace** builds `init` and `session-mgr`
+    /// (`None` = no flag).
     fn features(self) -> Option<&'static str> {
         match self {
             BuildMode::Normal => None,
             BuildMode::Selftest => Some("selftest"),
-            BuildMode::TestHarness => Some("test-harness"),
+            BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq => Some("test-harness"),
+        }
+    }
+
+    /// The same, for the **kernel**, which has one feature userspace does not.
+    ///
+    /// Split rather than appended to [`features`](Self::features) because that value also
+    /// reaches `init` and `session-mgr`, and `no-ps2-irq` is a statement about the i8042 that
+    /// has no meaning in a userspace crate. Declaring it there as a no-op — the way
+    /// `session-mgr` declares `selftest` — would make `--features` valid at the cost of
+    /// putting a hardware setting in two crates that cannot act on it.
+    fn kernel_features(self) -> Option<&'static str> {
+        match self {
+            BuildMode::TestHarnessNoPs2Irq => Some("test-harness,no-ps2-irq"),
+            other => other.features(),
         }
     }
 }
@@ -90,6 +109,9 @@ fn main() -> ExitCode {
     // reach for it: speed (a boot loop runs in a fraction of the time), and hosts whose
     // QEMU predates 9.0 and therefore cannot emulate the x2APIC this kernel requires —
     // KVM has no such limit. Stripped before the rest is forwarded to QEMU.
+    // `--no-ps2-irq` (check-input only) boots a kernel whose i8042 never asserts its IRQs, so
+    // the tick-driven recovery sweep is the only path input can take. See `cmd_check_input`.
+    let no_ps2_irq = rest.iter().any(|a| a == "--no-ps2-irq");
     let accel = if rest.iter().any(|a| a == "--kvm") {
         Accel::Kvm
     } else {
@@ -97,7 +119,7 @@ fn main() -> ExitCode {
     };
     let qargs: Vec<String> = rest
         .iter()
-        .filter(|a| *a != "--selftest" && *a != "--kvm")
+        .filter(|a| *a != "--selftest" && *a != "--kvm" && *a != "--no-ps2-irq")
         .cloned()
         .collect();
     let mode = if selftest {
@@ -120,7 +142,7 @@ fn main() -> ExitCode {
         Some("check-docs") => cmd_check_docs(),
         Some("check-display") => cmd_check_display(accel),
         Some("check-terminal") => cmd_check_terminal(accel),
-        Some("check-input") => cmd_check_input(accel),
+        Some("check-input") => cmd_check_input(accel, no_ps2_irq),
         Some("check-irq-scope") => cmd_check_irq_scope(),
         Some("abi-sync-check") => cmd_abi_sync_check(),
         Some("fetch-limine") => cmd_fetch_limine().map(|_| ()),
@@ -157,6 +179,8 @@ fn print_help() {
            test-interactive  boot the release image and drive a real login + shell\n  \
            check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
            check-input       inject a key and a click; check both reach a userspace client\n  \
+           \x20                `--no-ps2-irq` boots with the i8042's IRQs off, so the\n  \
+           \x20                tick-driven recovery sweep is the only path input takes\n  \
            check-display     boot + screendump; compare the screen to a libdraw render\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
@@ -314,7 +338,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     let kernel_dir = repo_root().join("kernel");
     let mut k = Command::new("cargo");
     k.arg("build");
-    if let Some(f) = mode.features() {
+    if let Some(f) = mode.kernel_features() {
         k.arg("--features").arg(f);
     }
     run(k.current_dir(&kernel_dir))?;
@@ -956,9 +980,26 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
 /// an event produced before the consumer channel exists is one the server has nowhere to
 /// send, so injecting on a timer would make this flaky in exactly the way a test of a rare
 /// path must not be.
-fn cmd_check_input(accel: Accel) -> R<()> {
+fn cmd_check_input(accel: Accel, no_ps2_irq: bool) -> R<()> {
     preflight_accel(accel)?;
-    cmd_image(BuildMode::TestHarness)?;
+    // **`--no-ps2-irq` boots the same image with the i8042's interrupt generation left off**,
+    // so every byte has to be recovered by the tick-driven `ps2::poll` sweep rather than
+    // arriving on IRQ 1 / 12. The assertions below are unchanged — that is the point. A
+    // keystroke and a click still have to reach a userspace client; only the road they take
+    // is different.
+    //
+    // It exists because **no pass count can catch deleting that sweep.** On healthy hardware
+    // the interrupt path carries every byte and the sweep never fires, so it is pure
+    // redundancy: remove it and every gate in the tree still passes. This flag makes the
+    // redundancy load-bearing, which is the only way its absence becomes observable. The
+    // sweep itself was added 2026-08-13 for the i8042's one-byte output buffer losing edges —
+    // a bug that made every input gate intermittently flaky and was written off as flakiness
+    // for weeks.
+    cmd_image(if no_ps2_irq {
+        BuildMode::TestHarnessNoPs2Irq
+    } else {
+        BuildMode::TestHarness
+    })?;
     let ovmf = locate_ovmf()?;
     let qmp_sock = build_cache().join("check-input.qmp");
     fs::create_dir_all(build_cache())?;

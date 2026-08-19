@@ -1249,17 +1249,6 @@ is an interrupt-architecture change, not a scheduler one. Trigger: real-hardware
 CPU hot-unplug, or any work that makes a ring-0 fault on the BSP something the system should
 survive rather than merely diagnose.
 
-**A deterministic gate for the i8042 recovery sweep (`check-input --no-ps2-irq`).**
-`drivers::ps2::poll` recovers bytes the controller's interrupt path loses (2026-08-13). It is
-exercised only when the hardware actually misbehaves, which is timing- and host-dependent: on one
-host it drains up to 52 bytes a run, on another zero, so **no pass count catches a regression that
-deletes it**. The fix is to boot the gate with the controller's IRQ config bits cleared, making the
-sweep the only path into the driver — proven to work in the PR #197 review, where the entire gate
-passed on `poll()` alone (17 recovery events, 142 bytes). Then deleting `poll()` fails every run
-instead of one in six. Deferred as scope from the bug fix itself; it needs a `test-harness`-gated
-way to suppress the IRQ enables in `arch::ps2::arm` plus an xtask flag. Trigger: any further work
-on the sweep, or a second driver needing the same recovery shape (USB HID, i2c touchpad).
-
 **`libkern` mock-syscall test mode.** `userspace/libkern/CLAUDE.md` describes a feature-flagged mock that records and replays syscalls for host-side tests of layers above. The crate is a `cargo new` placeholder in Phase 0. Trigger: real syscalls are defined.
 
 ### Auditing and observability
@@ -1312,6 +1301,7 @@ decision log entry for the date shown.
 | Console DPC freeing in DPC context | 2026-08-06 | Fixed with the PS/2 driver, which turned out to have the same hazard: the DPC now signals through a *borrowed* pointer and marks the parked read `spent`, leaving its `ObjectRef`s owned by the driver until `reap_pending` drops them in thread context. The "needs a bounded parking home and an overflow policy" objection that deferred it was an artifact of assuming the DPC had to own the refs. |
 | `test-qemu`'s intermittent hang | 2026-08-06 | Root-caused and fixed: `irp_complete_dpc` freed its `IrpBox` in DPC context, so a completion interrupt landing on a CPU that already held the `SlabCache` lock self-deadlocked against the frame beneath it. The box is now handed to thread context through an intrusive list drained by `reap_pending`. 64 consecutive clean boots against a ~6% base rate. Found by the QMP state dump `cmd_test_qemu` now takes on timeout. |
 | `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
+| A deterministic gate for the i8042 recovery sweep | 2026-08-19 | `cargo xtask check-input --no-ps2-irq` boots the same image with the kernel's `no-ps2-irq` feature, which skips only the `CONFIG_KBD_IRQ \| CONFIG_AUX_IRQ` write in `arch::ps2::arm` — the controller never asserts either line, so `drivers::ps2::poll` is the only path a byte can take, and the gate's assertions are unchanged. Measured with the sweep deleted: this fails on the first injected key while `check-input`, `check-terminal`, `check-display` and `test-qemu` all still pass, so it is the only gate in the tree that can. Runs in the input workflow. Decision log, 2026-08-19. |
 | Promote `check-terminal` to CI | 2026-08-18 | Runs as `check-terminal --kvm` in the QEMU integration job, unconditional — its coverage is the compositor-to-shell round trip, which `check-input` (stops at the client's event log) and `check-display` (never types) do not reach, so there is no useful path filter. The stated trigger was ~10 consecutive passes; it had 64. The blocker was never the count but the **one unreproduced failure** the audit logged at the click step: it is still unexplained, and what made promotion defensible is that the gate now asserts *where* the press landed before asserting that `nxterm` received it, so a recurrence reports coordinates rather than a bare timeout. That assertion also closed a blind spot — the old gate passed with a motion packet dropped, having never checked the cursor reached the point its arithmetic named. Decision log, 2026-08-18. |
 | Debug-build lock-ordering enforcement | 2026-07-29 | `kernel/src/libkern/lockrank.rs` is the rank tracker `kernel/CLAUDE.md` promised — 777 lines, live in every image `xtask` builds, gated in CI by `cargo xtask check-irq-scope`, and (since PR #202) covered by tests that fail when its arithmetic is broken. The open entry claiming "the mechanism doesn't yet exist" was written 2026-05-19 (`b1a71f7`) and never revisited — so it outlived the mechanism (`e93d52c`, 2026-07-29) by **three weeks**, sitting 100 lines above the row below it, which only makes sense as a refinement *of the tracker it said was missing*. Found by the 2026-08 audit, D.5(a). |
 

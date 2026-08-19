@@ -278,6 +278,15 @@ pub unsafe fn arm(kbd: extern "C" fn(), aux: extern "C" fn()) -> (u8, u8) {
 
     // Enable the controller's interrupt generation last, so neither line can fire before
     // both handlers are routed.
+    //
+    // **Skipped under `no-ps2-irq`**, which is the whole of that feature: the vectors above are
+    // still routed and both devices are still enabled, but the controller never asserts either
+    // line, so every byte has to be recovered by the tick-driven `ps2::poll` sweep. That sweep
+    // exists because the i8042's one-byte output buffer loses edges (2026-08-13), and nothing
+    // else in the tree can fail when it is deleted — on healthy hardware the interrupt path
+    // carries every byte and the sweep is pure redundancy. `cargo xtask check-input
+    // --no-ps2-irq` makes the redundancy load-bearing so its absence is observable.
+    #[cfg(not(feature = "no-ps2-irq"))]
     if command(CMD_READ_CONFIG)
         && let Some(config) = read_data()
     {

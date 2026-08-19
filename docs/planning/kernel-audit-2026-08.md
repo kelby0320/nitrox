@@ -116,15 +116,19 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 - [ ] **Every gate assertion can fail.** Check each `session.expect` is reachable and not
       satisfied by earlier output — `expect` advances a cursor, so verify that is true of the
       gates that rely on it.
-- [ ] **Two gate items**, one done and one open. These convert "one run in six" into "every
+- [x] **Two gate items**, both done. These convert "one run in six" into "every
       run" and are the only things that have caught this class.
       - [x] **Promote `check-terminal` to CI.** *Done 2026-08-18 on 64 consecutive passes. The
         stated bar (~10 clean runs) was never the blocker; the audit's one unreproduced failure
         at the click step was, and it is still unexplained. What made promotion defensible is
         that the gate now asserts where the press landed before asserting the click, so a
         recurrence reports coordinates. Decision log, 2026-08-18.*
-      - [ ] **Build `check-input --no-ps2-irq`** — boot with the controller's IRQ bits cleared
-        so the recovery sweep is the only path. Filed in `deferred-decisions.md`.
+      - [x] **Build `check-input --no-ps2-irq`** — boot with the controller's IRQ bits cleared
+        so the recovery sweep is the only path. *Done 2026-08-19. The kernel's `no-ps2-irq`
+        feature skips only the IRQ-enable write in `arch::ps2::arm`; the gate's assertions are
+        unchanged. Measured with `ps2::poll()` deleted: this fails on the first injected key
+        while `check-input`, `check-terminal`, `check-display` and `test-qemu` all still pass —
+        so it is the only gate in the tree that can. Decision log, 2026-08-19.*
 - [x] **Audit `deferred-decisions.md` against reality.** At least one entry ("Debug-build
       lock-ordering enforcement") describes as missing a mechanism that landed 2026-07-29 and
       demonstrably works. Find the others; a deferral list nobody trusts is worse than none.

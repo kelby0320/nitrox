@@ -82,3 +82,17 @@ jobs:
 
       - name: cargo xtask check-input
         run: cargo xtask check-input --kvm
+
+      # The same assertions, on a kernel whose i8042 never asserts its IRQs — so every byte
+      # has to come back through the tick-driven `ps2::poll` recovery sweep instead of on
+      # IRQ 1 / 12.
+      #
+      # **This is the only gate in the tree that can fail when that sweep is deleted.**
+      # Measured: with the `ps2::poll()` call removed, this fails on the first injected key
+      # while `check-input`, `check-terminal`, `check-display` and `test-qemu` all still
+      # pass. On healthy hardware the interrupt path carries every byte, so the sweep is
+      # pure redundancy and no pass count can notice it going missing — which is exactly how
+      # the bug it fixes (the i8042's one-byte buffer losing edges) survived for weeks being
+      # written off as gate flakiness.
+      - name: cargo xtask check-input --no-ps2-irq
+        run: cargo xtask check-input --no-ps2-irq --kvm

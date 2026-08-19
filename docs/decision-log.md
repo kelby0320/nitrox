@@ -16026,3 +16026,56 @@ than none: they are edge-triggered, one per real click or genuine loss, so
 
 Verified: `check-terminal` green under TCG and `--kvm`; 40 loaded runs across the investigation;
 1698 host tests; the other four guest gates and six static gates green; zero warnings.
+
+## 2026-08-19 — A gate that can fail for the right reason
+
+Audit D.4's second half, and the last item on the checklist. The audit called it "the strongest
+single argument in this section", and the reason is worth restating: it is the one place where
+the project had already worked out that **a gate cannot fail for the right reason**, and written
+the fix down.
+
+`drivers::ps2::poll` recovers bytes the i8042's interrupt path loses — the one-byte output
+buffer dropping edges, found 2026-08-13 after weeks of the input gates being written off as
+flaky. It runs *only* when the hardware misbehaves, which is timing- and host-dependent: on one
+host it drained 52 bytes a run, on another zero. So on healthy hardware it is pure redundancy,
+and **no pass count can notice it going missing.**
+
+`cargo xtask check-input --no-ps2-irq` makes the redundancy load-bearing. The kernel's
+`no-ps2-irq` feature skips exactly one thing — the `CONFIG_KBD_IRQ | CONFIG_AUX_IRQ` write at
+the end of `arch::ps2::arm`. Vectors are still routed, both devices are still reset and
+enabled; the controller simply never asserts IRQ 1 or 12, so every byte has to come back through
+the tick-driven sweep. The gate's assertions are **unchanged**, which is the point: the same
+keystroke and click must reach the same userspace client, by a different road.
+
+**The control was designed before the gate**, and it is the whole justification:
+
+```
+ps2::poll() deleted:
+  check-input --no-ps2-irq   FAILED — timed out on "ev kind=1 code=30 value=1"
+  check-input                PASSED
+  check-terminal             PASSED
+  check-display              PASSED
+  test-qemu                  PASSED
+```
+
+One gate fails; four do not. That is the property the deferral asked for, measured rather than
+argued — and it is also what proves the feature took effect, since a build where the `cfg` had
+silently not applied would have passed with the other four.
+
+Two implementation notes. The feature is **kernel-only**, so `BuildMode` grew a
+`kernel_features()` beside `features()` rather than appending to it: that value also reaches
+`init` and `session-mgr`, and `no-ps2-irq` is a statement about the i8042 with no meaning in a
+userspace crate. Declaring it there as a no-op — the way `session-mgr` declares `selftest` —
+would have made `--features` valid at the cost of putting a hardware setting in two crates that
+cannot act on it. And the flag runs in the input workflow next to plain `check-input`, not in
+the main CI job: it is the same gate on a different boot, and the workflow is already
+path-filtered to the files that could break it.
+
+Verified: `check-input --no-ps2-irq` green under TCG and `--kvm` (the CI form); plain
+`check-input`, `check-terminal`, `check-display`, `test-interactive` and `test-qemu` green; 1698
+host tests; six static gates; zero warnings.
+
+**This closes the August 2026 kernel audit.** Sections A–D are all ticked. What remains from it
+is one item that is not a patch: C.4, the machine-wide consequences of a parked CPU, which with
+the BSP-interrupt-routing deferral amount to "a ring-0 fault is not survivable" — a design
+decision rather than a fix.
