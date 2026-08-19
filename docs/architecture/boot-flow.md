@@ -130,8 +130,11 @@ each step's rationale is in the source comments:
 8. **DPC queue**, then the **interrupt router** (IOAPIC).
 9. **Global handle table.**
 10. **Scheduler** (`sched_bringup`), then **AP bring-up** (`bring_up_aps`) via Limine's SMP
-    response — capped at `MAX_CPUS`, extras left parked. Absent an SMP response the system
-    stays single-CPU.
+    response — capped at `MAX_CPUS`, extras left parked (a supported configuration, not a
+    failure). Absent an SMP response the system stays single-CPU. **Fatal** since 2026-08-19
+    if a CPU we launched fails to come online within 5 s, whether it faulted on the way in or
+    never reached our code: the kernel's view of the machine must match the machine, so it
+    stops rather than booting a topology nobody chose. See `docs/decision-log.md`.
 11. **Display aperture** — record Limine's framebuffer (physical base, geometry, channel
     layout) so `/dev/framebuffer` can serve it. Must precede the next step, which binds
     that path into init's namespace.

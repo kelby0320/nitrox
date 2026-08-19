@@ -14,9 +14,11 @@ scheduler.md first for the policy; read this for the SMP machinery and the war
 stories. Anchors are `file:function` (line numbers drift; symbol names are
 stable).
 
-Status: implemented; §8 last corrected 2026-08-14 (a parked CPU must leave the online set,
-why the identity guard on that is the load-bearing half, and what placement, stealing and the
-ack protocol each do about a core that has gone). The SMP bring-up verification
+Status: implemented; **bring-up failure corrected 2026-08-19** — a CPU we intended to run and
+could not bring up now fails the boot rather than parking (§4, and the adopt-index paragraph
+above it); only cores beyond `MAX_CPUS` are parked. §8 last corrected 2026-08-14 (a parked CPU
+must leave the online set, why the identity guard on that is the load-bearing half, and what
+placement, stealing and the ack protocol each do about a core that has gone). The SMP bring-up verification
 below dates from 2026-07-01, when the
 boot leaf was still `eshell`; the system now boots through the login chain to `nxsh` on
 `-smp 4` with **user threads distributing across all cores and migrating via
@@ -75,7 +77,12 @@ is established as follows (`arch/x86_64/smp.rs`):
   Each core then **adopts its own** index: `adopt_dense_index()` reads its hardware
   APIC id (`CPUID.01H:EBX[31:24]`), finds the matching `DENSE_TO_APIC[]` slot, and
   `wrmsr(IA32_TSC_AUX, that_index)`. A core whose APIC id was never bound **parks**
-  rather than guessing an index that could collide.
+  rather than guessing an index that could collide — and since 2026-08-19 that also
+  **fails the boot**: the core prints why (raw bytes, not `kprintln!` — with no identity
+  it would index the BSP's per-CPU slots) and halts, and the BSP's 5 s wait deadline
+  panics the machine. A CPU we intended to run and could not bring up is fatal; only
+  cores beyond `MAX_CPUS` are parked and tolerated. See `docs/decision-log.md`,
+  2026-08-19.
 
 > **Why not hand the index to the AP?** An earlier scheme passed the index through
 > Limine's `extra_argument` and leaned on the TSC_AUX reset-default for the BSP.
@@ -101,10 +108,13 @@ thread that *adopts* the `_start` context (`Thread::try_new_boot`, tid 0, no
    context switch, classes, and vruntime while still single-core.
 4. **AP bring-up** — `bring_up_aps` (`main.rs`) binds the identity map, then
    releases each parked AP by storing `ap_entry` into its Limine `goto_address`.
-   Each AP runs `ap_entry` → `adopt_dense_index()` (or parks) → `ap_cpu_init`
+   Each AP runs `ap_entry` → `adopt_dense_index()` (or **fails the boot**) → `ap_cpu_init`
    (its GDT/TSS/IDT, x2APIC, its LAPIC timer) → `ap_init` (`sched.rs`: its own
    `current` (a transient AP boot thread) + `idle` thread + `ready`/`reap`
-   reserves, sets its `cpu_online` bit and the lock-free `ONLINE_MASK`). The AP's
+   reserves, sets its `cpu_online` bit and the lock-free `ONLINE_MASK`). `ap_init` is
+   called from `ap_entry`, and the AP reports itself online **only once it returns
+   `Ok`** — counting it earlier meant a failed allocation left the BSP counting a CPU
+   that never joined. Its failure is fatal too. The AP's
    boot thread then `exit_thread`s, switching the AP into its idle loop; the AP
    runs `idle_body` (`reap_pending(); idle_halt();`, where `idle_halt` is `sti;
    hlt`) until the timer or a reschedule IPI gives it work. After this point **any

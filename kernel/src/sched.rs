@@ -1130,13 +1130,15 @@ pub fn init() -> Result<(), AllocError> {
 ///
 /// The global run/blocked/reap/deadline structures are *not* (re)built here —
 /// [`init`] did that once on the BSP; an AP only adds its own per-CPU slots.
+/// Retire this AP's boot thread into the scheduler. Diverges.
+///
+/// **[`ap_init`] must have succeeded first.** The two were one function until 2026-08-19;
+/// splitting them is what lets `ap_entry` report the CPU online only *after* its scheduler
+/// context exists. While the init was in here, `AP_ONLINE` had already been incremented by
+/// the time it ran, so a failure left the BSP counting a CPU that never joined — and outside
+/// a `test-harness` build, where the panic hits `debug_exit`, the machine simply booted on
+/// with one fewer core. That is the state this change exists to remove.
 pub fn ap_run() -> ! {
-    if ap_init().is_err() {
-        // Out of memory building this CPU's scheduler context — park the AP
-        // rather than corrupt the run queue.
-        crate::kprintln!("smp: AP scheduler init FAILED — parking CPU");
-        Cpu::halt_loop();
-    }
     // SAFETY: this CPU's `current` (boot) and `idle` slots are set, so a timer
     // tick can schedule. Arm preemption, then retire the boot thread into the
     // run loop (the AP continues as its idle thread until `ready` has work).
@@ -1150,7 +1152,7 @@ pub fn ap_run() -> ! {
 /// Per-CPU scheduler-context setup for an AP: a boot thread (adopting the running
 /// context) as `current`, plus this CPU's idle thread. Mirrors the per-CPU half of
 /// [`init`] without the one-time global reserves.
-fn ap_init() -> Result<(), AllocError> {
+pub fn ap_init() -> Result<(), AllocError> {
     // A fresh tid for this AP's (transient) boot thread; the idle thread reuses
     // `IDLE_TID` (idle identity is its object address, via `idle_addr`).
     let boot_tid = {
