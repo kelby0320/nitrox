@@ -376,6 +376,7 @@ pub fn upper(v: &Val) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "upper")?.to_ascii_uppercase()))
 }
 
+/// `lower` — the other half of `upper`'s contract, and ASCII-only for the same reason.
 pub fn lower(v: &Val) -> OpResult<Val> {
     Ok(Val::str(as_str(v, "lower")?.to_ascii_lowercase()))
 }

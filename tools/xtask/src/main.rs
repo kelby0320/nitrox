@@ -2739,11 +2739,16 @@ fn cmd_check_nightly() -> R<()> {
     }
 }
 
-/// The placeholder is spelt `TODO(<tag>)` throughout this file, not `TODO(tag)`, and that is
-/// load-bearing: this gate scans `tools/xtask/src`, so the literal in its own prose was being
-/// counted as a real marker named `tag` — inflating the tally and, worse, making the gate
-/// depend on `deferred-decisions.md` continuing to contain the same placeholder. The angle
-/// brackets fail the alphanumeric check, so the parser skips them.
+/// The placeholder is spelt `TODO(<tag>)` throughout this file — angle brackets included — and
+/// that is load-bearing: this gate scans `tools/xtask/src`, so the bare form in its own prose
+/// was being counted as a real marker named `tag`, inflating the tally and, worse, making the
+/// gate depend on `deferred-decisions.md` continuing to contain the same placeholder. The
+/// angle brackets fail the plain-word check, so [`markers_in_line`] skips them.
+///
+/// This sentence used to spell the bare form out to explain itself, which was invisible only
+/// because the code scan stopped at the first marker on a line and that one was the bracketed
+/// version. Sharing [`markers_in_line`] between both directions surfaced it immediately — the
+/// third self-reference in this file, and the one the previous bug was hiding.
 ///
 /// Every `TODO(<tag>)` in the shipping source must have a matching entry in
 /// `docs/rationale/deferred-decisions.md`.
@@ -3135,26 +3140,17 @@ fn cmd_check_deferrals() -> R<()> {
         visit_rs_files_skipping(&src_root, &["target"], &mut |path| {
             let text = fs::read_to_string(path)?;
             for (i, line) in text.lines().enumerate() {
-                let Some(rest) = line.split_once("TODO(") else {
-                    continue;
-                };
-                let Some((tag, _)) = rest.1.split_once(')') else {
-                    continue;
-                };
-                // A tag has to be a plain word to be searchable; anything else is prose
-                // that happens to contain the marker.
-                if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                    continue;
-                }
-                if !tags.iter().any(|t| t == tag) {
-                    tags.push(tag.to_string());
-                }
-                if !doc.contains(&format!("todo({})", tag.to_lowercase())) {
-                    violations.push(format!(
-                        "{}:{}: TODO({tag}) has no entry in deferred-decisions.md",
-                        path.display(),
-                        i + 1
-                    ));
+                for tag in markers_in_line(line) {
+                    if !tags.iter().any(|t| t == tag) {
+                        tags.push(tag.to_string());
+                    }
+                    if !doc.contains(&format!("todo({})", tag.to_lowercase())) {
+                        violations.push(format!(
+                            "{}:{}: TODO({tag}) has no entry in deferred-decisions.md",
+                            path.display(),
+                            i + 1
+                        ));
+                    }
                 }
             }
             Ok(())
@@ -3165,7 +3161,7 @@ fn cmd_check_deferrals() -> R<()> {
     // code-to-doc leaves the failure that actually happens unchecked: an entry whose marker was
     // deleted or never written is one nobody trips over while editing the code, which is the
     // whole reason the markers exist. Audit D.5(b) measured 9 of 28 open entries binding to
-    // nothing, five of them appearing nowhere else in the repository.
+    // nothing, four of them appearing nowhere else in the repository.
     let raw = fs::read_to_string(&doc_path)
         .map_err(|e| format!("read {}: {e}", doc_path.display()))?;
     let open_tags = open_section_tags(&raw);
@@ -3207,6 +3203,33 @@ fn cmd_check_deferrals() -> R<()> {
     }
 }
 
+/// Every `TODO(<name>)` marker on one line, in order, skipping anything that is not a plain
+/// searchable word.
+///
+/// **One helper because the two directions disagreed.** The code scan used a single
+/// `split_once`, so it saw only the *first* marker on a line and skipped the rest of the line
+/// entirely when that one failed the plain-word check; the doc scan looped. While only the
+/// code-to-doc direction existed that asymmetry cost silent under-enforcement. Once the
+/// reverse direction depends on the code scan being complete it becomes a false failure: two
+/// markers written on one line, and the gate reports the second as missing while pointing at
+/// the line it is on.
+fn markers_in_line(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some((_, after)) = rest.split_once("TODO(") {
+        let Some((tag, tail)) = after.split_once(')') else {
+            break;
+        };
+        rest = tail;
+        // A tag has to be a plain word to be searchable; anything else is prose that happens
+        // to contain the marker — including this module's own `TODO(<tag>)` placeholder.
+        if !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            out.push(tag);
+        }
+    }
+    out
+}
+
 /// Marker exempting one deferral entry from the doc-to-code direction.
 const NO_CODE_SITE: &str = "<!-- check-deferrals: no-code-site -->";
 
@@ -3228,17 +3251,15 @@ fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
     let mut out: Vec<(String, bool)> = Vec::new();
     for line in open.lines() {
         let exempt = line.contains(NO_CODE_SITE);
-        let mut rest = line;
-        while let Some((_, after)) = rest.split_once("TODO(") {
-            let Some((tag, tail)) = after.split_once(')') else {
-                break;
-            };
-            rest = tail;
-            if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                continue;
-            }
-            if !out.iter().any(|(t, _)| t == tag) {
-                out.push((tag.to_string(), exempt));
+        for tag in markers_in_line(line) {
+            // **Exemption ORs across occurrences, it does not take the first.** A tag is
+            // routinely named on an earlier line than its own entry — `tty-server`'s entry
+            // cross-references `TODO(session-metadata-server)` 170 lines above that entry —
+            // and first-occurrence-wins would then discard a marker written on the entry
+            // itself, failing the gate while telling you to do the thing you just did.
+            match out.iter_mut().find(|(t, _)| t == tag) {
+                Some(e) => e.1 |= exempt,
+                None => out.push((tag.to_string(), exempt)),
             }
         }
     }
@@ -4740,6 +4761,44 @@ fn format_cmd(cmd: &Command) -> String {
 #[cfg(test)]
 mod tests {
 
+    /// The line scanner both directions share.
+    ///
+    /// It exists because they did not share one: the code side stopped at the first marker
+    /// per line, so two markers on one line meant the second was reported missing while the
+    /// error pointed at the line carrying it. The bracketed-placeholder case is not
+    /// hypothetical either — this file's own prose contains one, and the first-marker-only
+    /// behaviour was hiding a *bare* marker written after it on the same line.
+    #[test]
+    fn markers_in_line_finds_every_plain_word_marker_and_no_others() {
+        use super::markers_in_line;
+
+        // Assembled, for the reason the neighbouring test gives.
+        fn m(name: &str) -> String {
+            format!("TODO{}{}{}", '(', name, ')')
+        }
+
+        assert_eq!(markers_in_line("nothing here"), Vec::<&str>::new());
+        assert_eq!(markers_in_line(&format!("// {}", m("alpha"))), ["alpha"]);
+
+        // Two on one line — the case that produced a false failure.
+        assert_eq!(
+            markers_in_line(&format!("// {} and {}: see the doc.", m("alpha"), m("beta"))),
+            ["alpha", "beta"]
+        );
+
+        // A bracketed placeholder is skipped and does not stop the scan: a real marker
+        // after it on the same line is still found.
+        assert_eq!(
+            markers_in_line(&format!("// spelt {} not {}", m("<tag>"), m("tag"))),
+            ["tag"]
+        );
+
+        // Not markers.
+        assert_eq!(markers_in_line(&format!("// {}", m("has space"))), Vec::<&str>::new());
+        assert_eq!(markers_in_line(&format!("// {}", m(""))), Vec::<&str>::new());
+        assert_eq!(markers_in_line("// TODO(unclosed"), Vec::<&str>::new());
+    }
+
     /// The doc-to-code direction's extractor, on the shapes that decide what it enforces.
     ///
     /// The Resolved cases are the reason this is a table test and not a live-document check:
@@ -4766,12 +4825,25 @@ mod tests {
         }
 
         let doc = format!(
-            "# Deferred\n             **Thing one — `{alpha}`.** Words.\n             **Thing two — `{beta}`.** More words.\n             **Thing three — `{gamma}`.** No code site yet. {ncs}\n             **Two on one line — `{delta}` and `{epsilon}`.**\n             **Repeat — `{alpha}` again.**\n             **Not a tag — `{spaced}` and `{empty}`.**\n             \n## Resolved (kept for the record)\n             | Thing four (`{zeta}`) | closing it deleted its markers |\n             \n## How to use this document\n             Every `{eta}` must appear here.\n",
+            "# Deferred\n\
+             **Thing one — `{alpha}`.** Words.\n\
+             **Thing two — `{beta}`.** More words.\n\
+             **Thing three — `{gamma}`.** No code site yet. {ncs}\n\
+             **Two on one line — `{delta}` and `{epsilon}`.**\n\
+             **Repeat — `{alpha}` again.**\n\
+             **Cross-reference — also the trigger for `{theta}`.**\n\
+             **The real one — `{theta}`.** No code site. {ncs}\n\
+             **Not a tag — `{spaced}` and `{empty}`.**\n\
+             \n## Resolved (kept for the record)\n\
+             | Thing four (`{zeta}`) | closing it deleted its markers |\n\
+             \n## How to use this document\n\
+             Every `{eta}` must appear here.\n",
             alpha = m("alpha"),
             beta = m("beta"),
             gamma = m("gamma"),
             delta = m("delta"),
             epsilon = m("epsilon"),
+            theta = m("theta"),
             spaced = m("has space"),
             empty = m(""),
             zeta = m("zeta"),
@@ -4781,12 +4853,20 @@ mod tests {
 
         let got = open_section_tags(&doc);
         let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
-        assert_eq!(names, ["alpha", "beta", "gamma", "delta", "epsilon"]);
+        assert_eq!(names, ["alpha", "beta", "gamma", "delta", "epsilon", "theta"]);
 
         // Only the marked line is exempt.
         let exempt: Vec<&str> =
             got.iter().filter(|(_, e)| *e).map(|(t, _)| t.as_str()).collect();
-        assert_eq!(exempt, ["gamma"], "the no-code-site marker must scope to its own line");
+        // `theta` is named on an earlier line as a cross-reference and exempted on its own
+        // line below — the geometry `tty-server` -> `session-metadata-server` already has in
+        // the real document. First-occurrence-wins drops the exemption and fails the gate
+        // while telling you to write the marker you just wrote.
+        assert_eq!(
+            exempt,
+            ["gamma", "theta"],
+            "the no-code-site marker must be honoured wherever in the entry it appears"
+        );
 
         // The three that must NOT appear, and the reason each is excluded.
         assert!(!names.contains(&"zeta"), "a Resolved row's tag is not an open entry");

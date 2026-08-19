@@ -1363,12 +1363,9 @@ hatch nobody has opened is exactly the thing that does not work the first time i
 Reach for it only when the alternative is a marker nobody would ever edit past; a note at the
 place someone *would* change is worth more than a clean gate.
 
-That is the direction that matters, because a deferral whose marker is gone is one nobody trips
-over while editing the code — which is exactly the failure the paragraph above describes. This
-paragraph claimed the enforcement was mechanical; for a third of the tagged entries the
-enforced set was empty. Closing it needs a per-entry decision (where *would* the marker go for
-a feature that does not exist yet?) plus an exemption syntax for entries that genuinely have no
-code site, along the lines of `<!-- check-docs: allow-missing -->`. Filed as its own change
-rather than done here, so the judgement calls get reviewed as judgement calls.
+That per-entry question — *where would the marker go for a feature that does not exist yet?* —
+was the reason the reverse direction was filed separately from the audit that found it. The
+answer turned out to be that every one of the nine had somewhere honest: the prose describing
+each limitation already existed, and only the searchable tag was missing.
 
 The decision log (`docs/decision-log.md`) is the place to record the actual decision when a deferred item moves into active work — what triggered it, what the implementation approach is, when the decision was made.
