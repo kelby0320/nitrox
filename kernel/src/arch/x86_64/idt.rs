@@ -46,7 +46,7 @@
 
 use core::arch::asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::Cpu;
 use crate::arch::cpu::ArchCpu;
@@ -747,6 +747,20 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
+/// Set once a CPU has decided the machine is going down, before it sends the stop NMIs.
+///
+/// Read by every CPU's vector-2 handler to tell "we are being stopped" from a genuine
+/// hardware NMI. `Release`/`Acquire`: a target must not observe the flag before the store,
+/// and the store happens-before the IPI it precedes.
+pub(crate) static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// Vector 2 with [`STOPPING`] set: another CPU is taking the machine down and this is our
+/// notice. Halt without dumping — the CPU that decided has already printed the diagnosis, and
+/// N cores writing register dumps into an unsynchronised serial port would bury it.
+fn stop_notice() -> ! {
+    Cpu::halt_loop()
+}
+
 irq_dispatcher! {
 /// Common handler for every CPU exception except `#PF`. A **ring-3** fault
 /// suspends the faulting thread (delivering a [`Notification`] to its process)
@@ -763,6 +777,15 @@ fn exception_dispatch(frame: *mut ExceptionFrame) {
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
     let f = unsafe { &mut *frame };
+    // **The stop notice, before anything else.** An NMI arriving while `STOPPING` is set is
+    // not a fault to diagnose, it is this CPU being told the machine is going down. Checked
+    // ahead of the ring test because the CPUs most worth stopping are in ring 0 — spinning on
+    // a lock the faulting CPU holds — and the generic ring-0 path would send each of them
+    // through `dump_and_halt`, burying the real diagnosis under N register dumps and
+    // re-entering the stop from every core.
+    if f.vector == 2 && STOPPING.load(Ordering::Acquire) {
+        stop_notice();
+    }
     if is_user_fault(f) {
         // Suspend → supervised resume/terminate (no CR2 for non-#PF vectors).
         user_fault(f, None);
@@ -912,9 +935,12 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "  r13 {:#018x}  r14 {:#018x}", f.r13, f.r14);
     let _ = writeln!(w, "  r15 {:#018x}", f.r15);
     dump_return_addresses(f, &mut w);
-    let _ = writeln!(w, "halting.");
+    let _ = writeln!(w, "stopping every CPU.");
 
-    Cpu::halt_loop()
+    // **Stop the machine, not just this CPU.** Printed first, so the diagnosis is out before
+    // the other cores are frozen and before this one stops; the dump above is what a reader
+    // gets, and a stop that preceded it could cut the line in half.
+    Cpu::stop_the_machine()
 }
 
 /// Scan the faulting stack for values that look like kernel-text addresses and

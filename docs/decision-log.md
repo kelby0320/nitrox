@@ -16217,3 +16217,64 @@ CPU counted online but unable to answer a TLB shootdown still deadlocks every la
 Verified: `test-qemu` and `check-terminal` green unmodified; the injected identity failure produces
 a clean fail verdict with the reason under both TCG and `--kvm`; 1698 host tests; six guest gates;
 six static gates; zero warnings.
+
+## 2026-08-19 — `stop_the_machine`: the mechanism behind the promise
+
+The second half of C.4. The 2026-08-19 entry above decided that a ring-0 fault stops the
+machine; until now "fatal" meant a panic, which halts only the panicking CPU. This is what
+makes the promise true.
+
+**NMI, not a vector.** `Cpu::stop_the_machine` sets `idt::STOPPING`, sends an NMI to every
+other online CPU, then halts. The delivery mode is the whole design: the CPUs most in need of
+stopping are the ones spinning on a lock the faulting CPU holds, and an `IrqSpinLock` holder
+spins with **interrupts masked**. A Fixed-delivery IPI would be taken by every CPU except
+exactly those — the naive version fixes every case but the one that matters. `send_ipi`
+hardcoded Fixed (`delivery mode 000`); `send_nmi` writes `100` instead and leaves the vector
+field zero, which NMI delivery ignores.
+
+**The flag is stored before the IPIs, and read before the ring test.** Vector 2 already had a
+stub routing into `exception_dispatch`, so without a check an NMI would reach `dump_and_halt`
+on every ring-0 CPU — N register dumps into an unsynchronised serial port, burying the real
+diagnosis, each re-entering the stop. `exception_dispatch` now answers `vector == 2 &&
+STOPPING` first and halts quietly.
+
+**Measured, both directions.** A ring-0 fault injected on CPU 2 during boot:
+
+```
+halt_loop (old):          xtask: integration tests PASSED     — CPU 2 dead, the machine boots on
+stop_the_machine (new):   xtask: integration tests TIMED OUT  — no verdict; everything stopped
+```
+
+The `PASSED` line is the audit's original observation reproduced from the other side: a machine
+that loses a CPU mid-boot and completes anyway is what this whole thread of work started from.
+
+**Two attempts at that control failed first, and the reason is worth keeping.** Faulting inside
+`timer_dispatch` and watching for output to stop discriminated nothing — both behaviours ended
+the transcript, because a CPU halted mid-tick wedges the others anyway (finding C.4b, in
+action). And `check-terminal` produces little spontaneous output, so "output stopped" is a weak
+observable. The verdict from `test-qemu` is a strong one: it says whether the machine finished
+its boot, which is exactly the difference.
+
+**The APIC-not-ready fallback is the common case, not a corner.** An AP that has not run
+`ap_cpu_init` has not entered x2APIC mode, and writing the ICR MSR there `#GP`s — faulting
+inside the fault handler. Early boot is where that state exists and where panics are most
+likely, so `stop_the_machine` checks `x2apic_enabled_here()` and, failing it, halts this core
+and leaves the killing to whoever is watching — today the BSP's AP-online deadline from the
+entry above. That is the same division of labour the identity-failed AP already uses.
+
+**A known asymmetry, deliberately not closed.** In a `test-harness` build a *panic* writes a
+fail verdict (`debug_exit`) and a *ring-0 fault* does not, so a fault reports as a gate timeout
+rather than a failure. Adding `debug_exit` to `dump_and_halt` would fix the legibility — and
+would also destroy the control above, since both behaviours would then exit QEMU identically
+and the stop would no longer be observable. Keeping the discriminating measurement is worth
+more right now than a tidier verdict; the asymmetry predates this change.
+
+**F8 is retired, half of it.** The deferral asked for exactly this ("a panic-broadcast NMI/IPI
+parking other CPUs, then unsynchronized output is genuinely exclusive"). Its other half — the
+emergency writer interleaving with another CPU's locked serial writes — is narrower now rather
+than gone: output is exclusive once the others are stopped, but the window between the fault and
+the NMIs landing is still shared.
+
+Verified: `test-qemu`, `test-interactive`, `check-terminal`, `check-input`, `check-display` and
+`check-input --no-ps2-irq` green unmodified; the injected-fault control above; 1698 host tests;
+six static gates; zero warnings.

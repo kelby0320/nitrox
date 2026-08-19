@@ -42,6 +42,18 @@ pub trait ArchCpu {
     /// host test exercises the decision inside `leave_online`, not the call site.
     fn halt_loop() -> !;
 
+    /// Stop **every** CPU, then halt this one. Diverges.
+    ///
+    /// The mechanism behind the 2026-08-19 promise that a ring-0 fault stops the machine
+    /// (`docs/decision-log.md`). Distinct from [`halt_loop`](Self::halt_loop), which stops
+    /// only the caller and remains correct for a core that never joined — see
+    /// `bring_up_aps`.
+    ///
+    /// Must be usable from the panic and exception paths, including before this CPU's
+    /// interrupt hardware is initialised: an implementation that cannot signal the others
+    /// halts itself rather than faulting inside a fault.
+    fn stop_the_machine() -> !;
+
     /// `true` if this CPU has an on-chip local interrupt controller (the one
     /// [`crate::arch::Irq`] brings up). On x86_64 this is the on-chip APIC
     /// CPUID feature bit.

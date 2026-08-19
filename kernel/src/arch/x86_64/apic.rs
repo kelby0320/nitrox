@@ -182,6 +182,40 @@ pub(crate) unsafe fn send_ipi(target: u32, vector: u8) {
     unsafe { regs::wrmsr(MSR_X2APIC_ICR, icr) };
 }
 
+/// Send an **NMI** to `target`, whatever that CPU is doing.
+///
+/// The one delivery mode that reaches a CPU which cannot take an ordinary interrupt, and
+/// therefore the only one usable for stopping the machine: the CPUs most in need of stopping
+/// are the ones spinning on a lock the faulting CPU holds, and an `IrqSpinLock` holder spins
+/// with **interrupts masked**. A Fixed-delivery IPI would be taken by every CPU except those.
+///
+/// The vector field is ignored for NMI delivery — the target takes vector 2 regardless — so it
+/// is left zero rather than given a meaningless value.
+///
+/// # Safety
+/// Ring-0; x2APIC must be enabled on the calling CPU ([`x2apic_enabled_here`]).
+pub(crate) unsafe fn send_nmi(target: u32) {
+    // Delivery mode is ICR[10:8]; NMI is 0b100.
+    const ICR_DELIVERY_NMI: u64 = 0b100 << 8;
+    let icr = ((target as u64) << 32) | ICR_ASSERT | ICR_DELIVERY_NMI;
+    // SAFETY: writing the x2APIC ICR MSR is the architected way to send an IPI;
+    // valid in ring 0 once x2APIC is enabled.
+    unsafe { regs::wrmsr(MSR_X2APIC_ICR, icr) };
+}
+
+/// `true` if **this** CPU has entered x2APIC mode, so `wrmsr` to the ICR is legal.
+///
+/// Not the same question as [`has_x2apic`], which asks what the part supports. An AP that has
+/// not yet run `ap_cpu_init` supports x2APIC and has not enabled it, and writing the ICR MSR
+/// there `#GP`s — which matters because the paths that want to stop the machine include early
+/// boot, where that is exactly the state a panicking core is in.
+pub(crate) fn x2apic_enabled_here() -> bool {
+    const WANT: u64 = APIC_BASE_GLOBAL_ENABLE | APIC_BASE_X2APIC_ENABLE;
+    // SAFETY: reading `IA32_APIC_BASE` is valid in ring 0 on any CPU with an APIC.
+    let base = unsafe { regs::rdmsr(MSR_IA32_APIC_BASE) };
+    base & WANT == WANT
+}
+
 /// `true` if the CPU advertises x2APIC (`CPUID.01H:ECX[21]`).
 fn has_x2apic() -> bool {
     let (_, _, ecx, _) = regs::cpuid(1, 0);

@@ -2,6 +2,7 @@
 //! install, the boot-time memory-protection enables (NX, SMEP, SMAP), the
 //! trap kernel-stack setter, halting, and CPUID feature queries.
 
+use core::sync::atomic::Ordering;
 use core::arch::asm;
 
 use crate::arch::cpu::ArchCpu;
@@ -51,6 +52,39 @@ impl ArchCpu for X86Cpu {
 
     fn set_kernel_stack(top: u64) {
         gdt::set_kernel_stack(top);
+    }
+
+    fn stop_the_machine() -> ! {
+        // **Announce first, then send.** A target must not take the NMI before `STOPPING` is
+        // visible, or its vector-2 handler reads the flag clear and treats the stop notice as
+        // a hardware NMI — which on a ring-0 CPU means `dump_and_halt`, i.e. exactly the
+        // register-dump storm this exists to avoid.
+        super::idt::STOPPING.store(true, Ordering::Release);
+
+        // **Only if this CPU can actually send.** An AP that has not run `ap_cpu_init` has not
+        // entered x2APIC mode, and writing the ICR MSR there `#GP`s — inside the panic path,
+        // which would fault while handling a fault. Early boot is precisely where that state
+        // occurs, and precisely where panics are most likely, so this is the common case
+        // rather than a corner: such a core prints, halts, and lets whoever is watching it
+        // (today the BSP's AP-online deadline) take the machine down.
+        if super::apic::x2apic_enabled_here() {
+            let me = super::smp::hw_apic_id();
+            for cpu in 0..crate::arch::MAX_CPUS {
+                if crate::sched::online_mask() & (1u64 << cpu) == 0 {
+                    continue;
+                }
+                let Some(apic) = super::smp::apic_of_dense(cpu) else {
+                    continue;
+                };
+                if apic == me {
+                    continue;
+                }
+                // SAFETY: ring 0, x2APIC enabled on this CPU (checked above); `apic` came
+                // from the identity map, so it names a core that was brought up.
+                unsafe { super::apic::send_nmi(apic) };
+            }
+        }
+        <Self as ArchCpu>::halt_loop()
     }
 
     fn halt_loop() -> ! {

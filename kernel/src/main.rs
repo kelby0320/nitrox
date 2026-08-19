@@ -1229,7 +1229,12 @@ fn panic(info: &PanicInfo) -> ! {
     // until the wall-clock timeout). `0x11` → QEMU exit 35 → the runner maps to fail.
     #[cfg(feature = "test-harness")]
     arch::debug_exit(0x11);
-    // Halt either way: `debug_exit` returns when no `isa-debug-exit` device is attached,
-    // and a panicked kernel must not run on regardless.
-    arch::Cpu::halt_loop()
+    // **Stop every CPU**, not just this one: a panicked kernel must not run on, and until
+    // 2026-08-19 "must not run on" meant only the panicking core while the rest kept
+    // scheduling on whatever it had been holding. `debug_exit` returns when no
+    // `isa-debug-exit` device is attached, so this runs either way.
+    //
+    // Safe from any core, including one whose APIC is not up yet — `stop_the_machine` checks
+    // and falls back to halting itself, which is the early-boot case `ap_entry` relies on.
+    arch::Cpu::stop_the_machine()
 }

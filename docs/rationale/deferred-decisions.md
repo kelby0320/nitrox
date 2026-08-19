@@ -1087,20 +1087,6 @@ than wall time — a `time` builtin, per-process scheduler statistics beyond the
 
 ### Concurrency primitives
 
-**SMP panic path: unsynchronized emergency serial, no stop-IPI (review F8).** The
-panic/exception handlers write through `serial::emergency_writer()` — lock-free by
-design (a fault while `SERIAL` is held must not deadlock) — which was sound
-single-CPU but under SMP can interleave with another CPU's locked serial writes
-(garbled diagnostics, not corruption). And a panicking CPU does not stop the
-others: no halt/stop IPI exists, so the other CPUs keep scheduling and mutating
-state while the panic prints (and, under `test-harness`, while the verdict is
-written — a fail verdict still terminates QEMU promptly, so adjudication is
-unaffected). Fix shape when taken: a panic-broadcast NMI/IPI parking other CPUs
-(`cli; hlt`), then unsynchronized output is genuinely exclusive. Deferred: purely
-a diagnostics-quality issue today; revisit with real-hardware bring-up or when a
-flaky-boot investigation is hampered by garbled panic output. From the 2026-07-21
-substrate review (decision log).
-
 **The three handle-validation paths check the same things in different orders —
 `TODO(handle-validation-order)`.**
 `docs/spec/handle-encoding.md` § "Validation algorithm" gives twelve steps and says "in order".
@@ -1301,6 +1287,7 @@ decision log entry for the date shown.
 | Console DPC freeing in DPC context | 2026-08-06 | Fixed with the PS/2 driver, which turned out to have the same hazard: the DPC now signals through a *borrowed* pointer and marks the parked read `spent`, leaving its `ObjectRef`s owned by the driver until `reap_pending` drops them in thread context. The "needs a bounded parking home and an overflow policy" objection that deferred it was an artifact of assuming the DPC had to own the refs. |
 | `test-qemu`'s intermittent hang | 2026-08-06 | Root-caused and fixed: `irp_complete_dpc` freed its `IrpBox` in DPC context, so a completion interrupt landing on a CPU that already held the `SlabCache` lock self-deadlocked against the frame beneath it. The box is now handed to thread context through an intrusive list drained by `reap_pending`. 64 consecutive clean boots against a ~6% base rate. Found by the QMP state dump `cmd_test_qemu` now takes on timeout. |
 | `xtask test-qemu` integration harness | 2026-07-14 | Boots the `test-harness` build headless and adjudicates from `isa-debug-exit`. A per-case framework under `tests/qemu-tests/` is still open (below). |
+| SMP panic path: no stop-IPI (review F8) | 2026-08-19 | `Cpu::stop_the_machine` sends an **NMI** to every other online CPU, then halts. NMI rather than a fixed vector because the CPUs most in need of stopping are the ones spinning on a lock the faulting CPU holds, and an `IrqSpinLock` holder spins with interrupts masked — a Fixed-delivery IPI reaches every CPU *except* those. Wired to `dump_and_halt` and the panic handler. Measured with a ring-0 fault injected on CPU 2 during boot: `halt_loop` leaves `test-qemu` **PASSED** (the machine boots on without that core), `stop_the_machine` leaves it with no verdict at all. The other half of F8 — interleaved emergency serial output — is **not** fixed and is now narrower: output is exclusive once the others are stopped, but the window between the fault and the NMIs landing is still shared. Decision log, 2026-08-19. |
 | A deterministic gate for the i8042 recovery sweep | 2026-08-19 | `cargo xtask check-input --no-ps2-irq` boots the same image with the kernel's `no-ps2-irq` feature, which skips only the `CONFIG_KBD_IRQ \| CONFIG_AUX_IRQ` write in `arch::ps2::arm` — the controller never asserts either line, so `drivers::ps2::poll` is the only path a byte can take, and the gate's assertions are unchanged. Measured with the sweep deleted: this fails on the first injected key while `check-input`, `check-terminal`, `check-display` and `test-qemu` all still pass, so it is the only gate in the tree that can. Runs in the input workflow. Decision log, 2026-08-19. |
 | Promote `check-terminal` to CI | 2026-08-18 | Runs as `check-terminal --kvm` in the QEMU integration job, unconditional — its coverage is the compositor-to-shell round trip, which `check-input` (stops at the client's event log) and `check-display` (never types) do not reach, so there is no useful path filter. The stated trigger was ~10 consecutive passes; it had 64. The blocker was never the count but the **one unreproduced failure** the audit logged at the click step: it is still unexplained, and what made promotion defensible is that the gate now asserts *where* the press landed before asserting that `nxterm` received it, so a recurrence reports coordinates rather than a bare timeout. That assertion also closed a blind spot — the old gate passed with a motion packet dropped, having never checked the cursor reached the point its arithmetic named. Decision log, 2026-08-18. |
 | Debug-build lock-ordering enforcement | 2026-07-29 | `kernel/src/libkern/lockrank.rs` is the rank tracker `kernel/CLAUDE.md` promised — 777 lines, live in every image `xtask` builds, gated in CI by `cargo xtask check-irq-scope`, and (since PR #202) covered by tests that fail when its arithmetic is broken. The open entry claiming "the mechanism doesn't yet exist" was written 2026-05-19 (`b1a71f7`) and never revisited — so it outlived the mechanism (`e93d52c`, 2026-07-29) by **three weeks**, sitting 100 lines above the row below it, which only makes sense as a refinement *of the tracker it said was missing*. Found by the 2026-08 audit, D.5(a). |
