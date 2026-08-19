@@ -17,6 +17,14 @@ path = "src/main.rs"
 # during boot. Off by default: a normal boot goes straight to userspace. Enabled by
 # `cargo xtask qemu --selftest` (and the future `xtask test-qemu` for CI).
 selftest = []
+# **Boot with the i8042's interrupt generation left off.** The controller is configured and
+# both devices are reset and enabled exactly as normal; only the final `CONFIG_KBD_IRQ |
+# CONFIG_AUX_IRQ` write in `arch::ps2::arm` is skipped, so the controller never asserts IRQ 1
+# or 12 and the tick-driven `ps2::poll` recovery sweep is the *only* path from a keystroke to
+# the guest. Exists so `cargo xtask check-input --no-ps2-irq` can fail when that sweep is
+# deleted — no pass count can, because on healthy hardware the interrupt path carries every
+# byte and the sweep never runs. Never in a production kernel.
+no-ps2-irq = []
 # Integration-test build (`cargo xtask test-qemu`): everything `selftest` runs,
 # plus the `isa-debug-exit` primitive + `SYS_DEBUG_EXIT` gated syscall, and boot
 # failures/panics terminate QEMU with a fail verdict instead of dropping to eshell

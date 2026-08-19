@@ -40,25 +40,31 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 
 ## A. Invariants that are stated somewhere and might not hold
 
-- [ ] **`online_mask` vs `cpu_online[]` has exactly three consumers, and they disagree on
+- [x] **`online_mask` vs `cpu_online[]` has exactly three consumers, and they disagree on
+      *Audited 2026-08-14, session 1 (§ A.1). Fix in PR #201.*
       purpose.** Giving work needs both bits (`cpu_accepts_work`); taking work needs only
       `cpu_online[]` (`steal_one`, `steal_available`); `tlb::shootdown` reads the mask alone
       and treats departure as "never". Enumerate every reader of each and confirm no fourth
       has appeared with a fourth opinion. `sched.rs` § `ONLINE_MASK` doc.
-- [ ] **Every permanent park routes through `Cpu::halt_loop`.** Grep every `hlt` in the tree;
+- [x] **Every permanent park routes through `Cpu::halt_loop`.** Grep every `hlt` in the tree;
+      *Audited 2026-08-14, session 1 (§ A.2). Holds; the park that did not was fixed in PR #199.*
       confirm the others (`Cpu::halt`, the idle `sti; hlt`) are genuinely resumable. A park
       that bypasses `halt_loop` skips `leave_online` and reintroduces the 08-13 deadlock.
-- [ ] **`leave_online`'s identity guard cannot be defeated.** It must refuse for a CPU whose
+- [x] **`leave_online`'s identity guard cannot be defeated.** It must refuse for a CPU whose
+      *Audited 2026-08-14, session 1 (§ A.3). Holds; guard added in PR #199, its vacuous assertion fixed in PR #201.*
       `TSC_AUX` index does not map back to its own APIC id. Check the boundary: a rebound
       identity, an index at `MAX_CPUS`, and the BSP before `bind_cpu_identity`.
-- [ ] **No IPI target waits on a CPU that cannot answer.** Shootdown is fixed; check
+- [x] **No IPI target waits on a CPU that cannot answer.** Shootdown is fixed; check
+      *Audited 2026-08-14, session 1 (§ A.4). No finding.*
       `send_reschedule_ipi` and any wake IPI for the same shape — is any of them
       acknowledgement-based rather than fire-and-forget?
-- [ ] **The grace-tracker claim in `TODO(smp)`.** The deferral says it is safe because *every*
+- [x] **The grace-tracker claim in `TODO(smp)`.** The deferral says it is safe because *every*
+      *Audited 2026-08-14, session 1 (§ A.5). The enumeration holds; the entry's premise was false and was corrected in PR #209, and `restrict`'s guards pinned in PR #208.*
       handle syscall routes through a `HandleTable` method that takes and drops a read guard.
       That is falsifiable: enumerate the syscalls and find one that touches the table without
       one. If it holds, say so with the enumeration.
-- [ ] **`MAX_WAIT_HANDLES` kernel-stack budget.** A compile-time check exists in `thread.rs`;
+- [x] **`MAX_WAIT_HANDLES` kernel-stack budget.** A compile-time check exists in `thread.rs`;
+      *Audited 2026-08-14, session 1 (cross-cutting). `MAX_CPUS` had the same gap and no protection; assertion added in PR #201.*
       confirm it covers every array that scales with it, not just the ones it names.
 
 ## B. Interrupt and entry paths
@@ -68,13 +74,16 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
       *Audited 2026-08-14: it did not. Two escapes (a guard bound to `_`; a renamed operand)
       plus a cross-file name collision, all closed; the gate's remaining boundary is written
       up in its own doc comment. Decision log, 2026-08-14.*
-- [ ] **Nothing allocates or frees in IRQ/DPC context**, remembering that an `ObjectRef` drop
+- [x] **Nothing allocates or frees in IRQ/DPC context**, remembering that an `ObjectRef` drop
+      *Audited 2026-08-14, session 2 (§ B.2). Fixes in PR #205.*
       reaches the allocator. The PS/2 driver's `to_drop` hand-off exists for this; check every
       other DPC for the same hazard.
-- [ ] **`ps2::poll` from `timer_dispatch`.** It takes an `IrqSpinLock` in interrupt context
+- [x] **`ps2::poll` from `timer_dispatch`.** It takes an `IrqSpinLock` in interrupt context
+      *Audited 2026-08-14, session 2 (§ B.3). No finding.*
       ahead of the DPC drain. Confirm the rank is right and that a drain cannot exceed its
       budget with interrupts masked.
-- [ ] **EOI ordering and spurious interrupts.** Is an EOI ever issued twice, or skipped on an
+- [x] **EOI ordering and spurious interrupts.** Is an EOI ever issued twice, or skipped on an
+      *Audited 2026-08-14, session 2 (§ B.4). No finding.*
       early return? What happens on a spurious vector?
 - [x] **Preempt-disable/enable balance.** Every `preempt_disable` has a matching enable on
       every path including early returns; `RESCHED_PENDING` is replayed rather than dropped.
@@ -88,20 +97,25 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 
 ## C. Cross-CPU lifetime and ownership
 
-- [ ] **`deferred_drops` cannot grow unbounded**, and every producer has a drainer that runs.
-- [ ] **The switch-out race (`on_cpu` guard) still holds** — it was fixed once (2026-07-01);
+- [x] **`deferred_drops` cannot grow unbounded**, and every producer has a drainer that runs.
+      *Audited 2026-08-14, session 3 (§ C.1). Fixes in PR #205.*
+- [x] **The switch-out race (`on_cpu` guard) still holds** — it was fixed once (2026-07-01);
+      *Audited 2026-08-14, session 3 (§ C.2). Holds.*
       confirm no path re-reads `current` without it.
-- [ ] **`place_thread`'s `Err(r)` capacity path** hands the ref back for a drop outside the
+- [x] **`place_thread`'s `Err(r)` capacity path** hands the ref back for a drop outside the
+      *Audited 2026-08-14, session 3 (§ C.3). Fix in PR #204.*
       lock, on every caller.
 - [ ] **The thread stranded on a parked CPU.** Known and unfixed: it is on no queue and cannot
       be rescued. Confirm it cannot hold anything the rest of the machine needs (a lock, a
       channel endpoint others block on) — if it can, that is a finding.
-- [ ] **Cross-CPU TSC comparisons** in the deadline heap (F10). Saturating arithmetic is the
+- [x] **Cross-CPU TSC comparisons** in the deadline heap (F10). Saturating arithmetic is the
+      *Audited 2026-08-14, session 3 (§ C.5). Fix in PR #204.*
       stated mitigation; check it holds for the largest plausible skew, not just a small one.
 
 ## D. The evidence layer — highest value, least glamorous
 
-- [ ] **Negative-control every host test that claims to pin an invariant.** Delete the guard,
+- [x] **Negative-control every host test that claims to pin an invariant.** Delete the guard,
+      *Audited 2026-08-14, session 4 (§ D.1). 162 mutants; `handle/table.rs`'s ladder pinned in PR #208. The wider coverage gap in `sched.rs` is recorded there, not closed.*
       confirm the named test fails. Three of the last three reviews found an assertion that
       passed for both the correct and the broken implementation.
 - [x] **No test writes a process-global** that another test reads. `ONLINE_MASK` did, and
@@ -113,18 +127,23 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
       those are written by production code the tests call. All three now have a `cfg(test)`
       per-thread backing; production codegen unchanged. The payoff was the two preempt guards
       that had no host test precisely because of the shared counter. Decision log, 2026-08-18.*
-- [ ] **Every gate assertion can fail.** Check each `session.expect` is reachable and not
+- [x] **Every gate assertion can fail.** Check each `session.expect` is reachable and not
+      *Audited 2026-08-14, session 4 (§ D.3). Two vacuous steps fixed in PR #206; `check-terminal`'s press assertion added in PR #212.*
       satisfied by earlier output — `expect` advances a cursor, so verify that is true of the
       gates that rely on it.
-- [ ] **Two gate items**, one done and one open. These convert "one run in six" into "every
+- [x] **Two gate items**, both done. These convert "one run in six" into "every
       run" and are the only things that have caught this class.
       - [x] **Promote `check-terminal` to CI.** *Done 2026-08-18 on 64 consecutive passes. The
         stated bar (~10 clean runs) was never the blocker; the audit's one unreproduced failure
         at the click step was, and it is still unexplained. What made promotion defensible is
         that the gate now asserts where the press landed before asserting the click, so a
         recurrence reports coordinates. Decision log, 2026-08-18.*
-      - [ ] **Build `check-input --no-ps2-irq`** — boot with the controller's IRQ bits cleared
-        so the recovery sweep is the only path. Filed in `deferred-decisions.md`.
+      - [x] **Build `check-input --no-ps2-irq`** — boot with the controller's IRQ bits cleared
+        so the recovery sweep is the only path. *Done 2026-08-19. The kernel's `no-ps2-irq`
+        feature skips only the IRQ-enable write in `arch::ps2::arm`; the gate's assertions are
+        unchanged. Measured with `ps2::poll()` deleted: this fails on the first injected key
+        while `check-input`, `check-terminal`, `check-display` and `test-qemu` all still pass —
+        so it is the only gate in the tree that can. Decision log, 2026-08-19.*
 - [x] **Audit `deferred-decisions.md` against reality.** At least one entry ("Debug-build
       lock-ordering enforcement") describes as missing a mechanism that landed 2026-07-29 and
       demonstrably works. Find the others; a deferral list nobody trusts is worse than none.
