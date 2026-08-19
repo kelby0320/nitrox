@@ -105,9 +105,14 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
 - [x] **`place_thread`'s `Err(r)` capacity path** hands the ref back for a drop outside the
       *Audited 2026-08-14, session 3 (§ C.3). Fix in PR #204.*
       lock, on every caller.
-- [ ] **The thread stranded on a parked CPU.** Known and unfixed: it is on no queue and cannot
+- [x] **The thread stranded on a parked CPU.** Known and unfixed: it is on no queue and cannot
       be rescued. Confirm it cannot hold anything the rest of the machine needs (a lock, a
       channel endpoint others block on) — if it can, that is a finding.
+      *Audited 2026-08-14, session 3 (§ C.4) — it can hold a lock the rest of the machine
+      needs, three ways, all confirmed. Escalated as a design question rather than fixed, and
+      decided 2026-08-19: a ring-0 fault stops the machine, which makes all three states
+      unreachable rather than fixed. Policy in this change; the machine-wide stop follows.
+      Survival is written up in `docs/design/fault-survival.md`. Decision log, 2026-08-19.*
 - [x] **Cross-CPU TSC comparisons** in the deadline heap (F10). Saturating arithmetic is the
       *Audited 2026-08-14, session 3 (§ C.5). Fix in PR #204.*
       stated mitigation; check it holds for the largest plausible skew, not just a small one.

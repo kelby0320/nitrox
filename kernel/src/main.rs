@@ -17,6 +17,7 @@
 #![no_std]
 #![no_main]
 
+use core::fmt::Write as _;
 use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
@@ -385,10 +386,43 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
     let idx = match arch::adopt_dense_index() {
         Some(i) => i,
         None => {
-            // Our APIC id was never bound — a bring-up bug. Running with a
-            // default/guessed index would collide with another core's GDT/TSS/
-            // scheduler slots (the migration hazard). Park this core safely
-            // instead; the rest of the system continues without it.
+            // Our APIC id was never bound — a bring-up bug, and now a **fatal** one.
+            //
+            // Running with a default/guessed index would collide with another core's
+            // GDT/TSS/scheduler slots (the migration hazard), so this core cannot
+            // continue either way. What changed 2026-08-19 is that the machine no
+            // longer continues without it: a CPU we intended to run and failed to
+            // bring up means the topology does not match what the kernel believes,
+            // and the kernel stops rather than running a configuration nobody asked
+            // for. The decision is in `docs/decision-log.md`, 2026-08-19.
+            //
+            // **This core cannot be the one that stops the machine**, for two
+            // reasons, so it only diagnoses and the BSP does the killing:
+            //
+            //   * `ap_cpu_init` has not run, so this core has no local APIC and
+            //     cannot send an IPI;
+            //   * with no identity, `this_cpu()` reads the `IA32_TSC_AUX` reset
+            //     default and reports **0**, so anything touching per-CPU state —
+            //     including `kprintln!`, whose `IrqSpinLock` raises
+            //     `PREEMPT_OFF[this_cpu()]` — would corrupt the *BSP's* slots. That
+            //     is the same collision this branch exists to avoid, reached from
+            //     the other side.
+            //
+            // So: the unsynchronised emergency writer, which is port I/O and touches
+            // neither. Printing at all is new — this branch used to halt silently,
+            // and the only signal was the BSP's spin-timeout roughly two billion
+            // iterations later, by which point the reason was gone.
+            //
+            // No APIC id in the message: reading it needs `hw_apic_id`, which is
+            // arch-internal and not on the neutral `ArchSmp` trait, and widening that
+            // trait to name one core in one diagnostic is not the trade. The BSP's
+            // panic says how many failed; this says why one of them did.
+            let mut w = arch::serial::emergency_writer();
+            let _ = writeln!(
+                w,
+                "\nsmp: FATAL — an AP's hardware APIC id has no bound dense index \
+                 (bring-up bug); halting this core, the BSP will stop the machine"
+            );
             arch::Cpu::halt_loop();
         }
     };
@@ -460,18 +494,54 @@ fn bring_up_aps() {
     if launched == 0 {
         return;
     }
-    // Spin (bounded) until every launched AP reports online.
-    let mut spins: u64 = 0;
+    // Wait (bounded) until every launched AP reports online.
+    //
+    // **A wall-clock deadline, not a spin count.** The cap was `2_000_000_000`
+    // iterations, which is not a duration: it means different things on KVM and TCG,
+    // and on a loaded host it outlives the gates. Measured 2026-08-19 by forcing an AP
+    // to fail identity adoption — the count had not expired when `test-qemu`'s 90 s
+    // timeout fired, so the boot reported "likely a hang" and the panic below never
+    // ran. That was tolerable while this was a warning and is not now that it is fatal:
+    // failing fast is the whole point, and a fatal path that never fires is a hang.
+    //
+    // Five seconds is three orders of magnitude above a real bring-up (which is
+    // microseconds of emulated instructions) and well inside every gate's timeout. The
+    // calibrated timer is live here — `sched_bringup` runs before this and says so.
+    const AP_ONLINE_DEADLINE_NS: u64 = 5_000_000_000;
+    let deadline = arch::Timer::read_ns() + AP_ONLINE_DEADLINE_NS;
     while AP_ONLINE.load(Ordering::Acquire) < launched {
         core::hint::spin_loop();
-        spins += 1;
-        if spins > 2_000_000_000 {
-            kprintln!(
-                "smp: WARNING — only {}/{} APs online after wait cap",
+        if arch::Timer::read_ns() > deadline {
+            // **Fatal, not a warning.** A CPU we launched and that never reported in
+            // means either it faulted before `ap_run` or it never reached our code at
+            // all; both say something is wrong underneath, and neither leaves the
+            // kernel's view of the machine matching the machine. Continuing would run
+            // a topology nobody chose, silently.
+            //
+            // Measured 2026-08-19 by forcing one AP's identity adoption to fail, on
+            // the code this replaces (a `kprintln!` and a `return`):
+            //
+            //   `--kvm`, which is what CI runs:
+            //       smp: WARNING — only 2/3 APs online after wait cap
+            //       xtask: integration tests PASSED (qemu exit 33)
+            //   TCG:
+            //       xtask: integration tests TIMED OUT after 90s (likely a hang)
+            //
+            // So **CI passed with a CPU missing**, and locally the same fault looked
+            // like a hang with no diagnosis — the gate adjudicates on the exit code and
+            // never reads the log.
+            //
+            // The only tolerated shortfall is `MAX_CPUS`, which is handled at launch
+            // time above: those cores are never given a `goto_address`, never enter
+            // our code, and are reported as the supported configuration limit they
+            // are. See `docs/decision-log.md`, 2026-08-19.
+            panic!(
+                "smp: only {}/{} launched APs came online within {} ms — a CPU we \
+                 intended to run failed to start",
                 AP_ONLINE.load(Ordering::Acquire),
-                launched
+                launched,
+                AP_ONLINE_DEADLINE_NS / 1_000_000
             );
-            return;
         }
     }
     kprintln!("smp: {} CPU(s) online (1 BSP + {} AP)", launched + 1, launched);

@@ -1132,10 +1132,17 @@ pub fn init() -> Result<(), AllocError> {
 /// [`init`] did that once on the BSP; an AP only adds its own per-CPU slots.
 pub fn ap_run() -> ! {
     if ap_init().is_err() {
-        // Out of memory building this CPU's scheduler context — park the AP
-        // rather than corrupt the run queue.
-        crate::kprintln!("smp: AP scheduler init FAILED — parking CPU");
-        Cpu::halt_loop();
+        // **Fatal.** Out of memory building this CPU's scheduler context: parking the
+        // AP would avoid corrupting the run queue, but it would also leave the machine
+        // running a topology nobody chose — and an allocation this small failing out of
+        // a fresh boot heap says the sizing is wrong, not that memory is tight.
+        //
+        // Unlike the identity failure in `ap_entry`, this core *can* speak for itself:
+        // `ap_cpu_init` has run, so it has an identity, per-CPU state and a local APIC.
+        // Panicking here is therefore a normal panic, and once `stop_the_machine` lands
+        // it will stop every CPU rather than only this one. See `docs/decision-log.md`,
+        // 2026-08-19.
+        panic!("smp: AP scheduler init failed (out of memory building its context)");
     }
     // SAFETY: this CPU's `current` (boot) and `idle` slots are set, so a timer
     // tick can schedule. Arm preemption, then retire the boot thread into the

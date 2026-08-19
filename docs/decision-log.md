@@ -16087,3 +16087,92 @@ Reconciled: 22 of 23 boxes ticked, each with the findings-file section it was au
 PR that closed it where one exists. The remaining box is **C.4** — the thread stranded on a
 parked CPU — which is deliberately open. With the BSP-interrupt-routing deferral it amounts to
 "a ring-0 fault is not survivable", and that is a design decision rather than a fix.
+
+## 2026-08-19 — What the kernel promises when ring 0 faults, and a CPU that never joined
+
+Audit C.4, decided rather than patched. The audit escalated it as a design question and it stayed
+open through the rest of the audit; this settles the promise, and the mechanism follows in a
+second change.
+
+**The state it settles.** A ring-0 fault reached `dump_and_halt` → `halt_loop`, which parked that
+CPU and left the rest of the machine running. There is no stop-IPI (deferred F8), so that
+continuation is the *design's* intent — and the implementation cannot deliver it. The audit
+confirmed three ways the parked thread wedges the machine anyway: it can hold the handle table's
+grace read section (hanging `sys_handle_close` machine-wide, 256 closes later), it can hold
+`SCHED` or any plain spinlock (`dump_and_halt` releases nothing and cannot — it has an
+`&ExceptionFrame` and no idea what the interrupted code held), and it holds its process open
+forever, so no peer blocked on its IPC endpoints is ever released. On the BSP it additionally
+ends all device I/O, because `install_isa_irq` pins every ISA GSI there.
+
+So the promise and the mechanism disagreed, and either could move.
+
+**The decision.** *A ring-0 fault or a failed kernel invariant stops the machine. A CPU beyond
+`MAX_CPUS` is parked and reported, and that is a supported configuration.*
+
+Fail fast rather than survive, for now. The reasoning is that the third state — one CPU halted,
+the rest running on its debris — is not a partial implementation of survival but a state neither
+Linux nor Windows enters, and it is worse than either coherent answer. What survival would take
+is written down in [`docs/design/fault-survival.md`](design/fault-survival.md) rather than left as
+an intention; the short version is that it needs lock ownership and breakability, force-quiescable
+grace contexts, and I/O routable to any core — a subsystem, not a patch.
+
+It also makes the three C.4 findings **moot rather than fixed**: there is no surviving machine to
+wedge, so none of the three states is reachable. Three confirmed findings close without three
+fixes.
+
+**This change is the policy half.** It makes failures fatal; the machine-wide stop
+(`stop_the_machine`, an NMI-delivered stop-IPI) is the mechanism half and lands next, because the
+failing CPU is not always able to kill the machine itself and that needs its own review. Until it
+does, "fatal" means a panic, which halts the panicking CPU — and since the BSP owns every device
+IRQ, a BSP panic already ends the machine in practice.
+
+**A failed AP bring-up is fatal too**, which is the part that changed most. Two sites parked a
+core and continued:
+
+- `ap_entry`'s identity adoption failing — "our APIC id was never bound", the kernel's own
+  diagnosis of a bring-up bug. Its comment framed the choice as *park vs corrupt* ("running with a
+  default/guessed index would collide with another core's GDT/TSS/scheduler slots"), and against
+  those two options parking is right. Failing the boot was never on the menu.
+- an AP whose scheduler context could not be allocated. Out of a fresh boot heap that says the
+  sizing is wrong, not that memory is tight.
+
+Both now stop the boot. `MAX_CPUS`-exceeded is untouched: those cores are never given a
+`goto_address`, never enter our code, and are already reported as the configuration limit they are.
+
+**Two things the measurements changed.**
+
+*The old behaviour passed CI with a CPU missing.* Forcing one AP's identity adoption to fail, on
+the code this replaces:
+
+```
+--kvm, which is what CI runs:   smp: WARNING — only 2/3 APs online after wait cap
+                                xtask: integration tests PASSED (qemu exit 33)
+TCG:                            xtask: integration tests TIMED OUT after 90s (likely a hang)
+```
+
+After: both accelerators report `FAILED (qemu exit 35)` and name the reason. So this buys CI
+coverage of AP bring-up that did not exist — worth having, given the SMP migration hazard that
+cost a debugging session was exactly a bring-up-identity bug.
+
+*The wait cap had to become a duration.* It was `2_000_000_000` spin iterations, which is not a
+time: the first control run showed it had not expired when `test-qemu`'s 90 s timeout fired, so the
+new panic never ran and the boot still reported "likely a hang". A fatal path that does not fire is
+a hang. It is now a 5 s wall-clock deadline off the calibrated timer — three orders of magnitude
+above a real bring-up and well inside every gate.
+
+**The identity-failed AP diagnoses but does not kill.** It has not run `ap_cpu_init`, so it has no
+local APIC and cannot send an IPI; and with no identity, `this_cpu()` reads the `IA32_TSC_AUX`
+reset default and reports **0**, so `kprintln!` — whose `IrqSpinLock` raises
+`PREEMPT_OFF[this_cpu()]` — would corrupt the *BSP's* per-CPU slots. That is the same collision the
+branch exists to avoid, reached from the other side. It uses the unsynchronised emergency writer
+(port I/O, no lock, no per-CPU state) and halts; the BSP's deadline kills the machine. Printing at
+all is new: the branch used to halt silently, and the only signal was the wait cap expiring long
+after the reason was gone.
+
+`leave_online()` stays necessary despite all of this. There is a real window between one CPU
+halting and the machine stopping — up to the full deadline for the identity case — and during it a
+CPU counted online but unable to answer a TLB shootdown still deadlocks every later shootdown.
+
+Verified: `test-qemu` and `check-terminal` green unmodified; the injected identity failure produces
+a clean fail verdict with the reason under both TCG and `--kvm`; 1698 host tests; six guest gates;
+six static gates; zero warnings.
