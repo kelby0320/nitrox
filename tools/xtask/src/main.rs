@@ -154,6 +154,10 @@ fn print_help() {
            qemu-debug    build + launch QEMU paused for GDB on :1234\n  \
            test          host-side unit tests (kernel lib + tools)\n  \
            test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
+           test-interactive  boot the release image and drive a real login + shell\n  \
+           check-terminal    click into nxterm, type, and check the shell's answer renders\n  \
+           check-input       inject a key and a click; check both reach a userspace client\n  \
+           check-display     boot + screendump; compare the screen to a libdraw render\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
            check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
@@ -166,9 +170,9 @@ fn print_help() {
          \n\
          `--selftest` (build/image/qemu) compiles + runs the boot self-tests / demos;\n         \
          without it the build boots straight to userspace.\n         \
-         `--kvm` (qemu/qemu-debug/test-qemu) runs under hardware virtualisation instead\n         \
-         of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG emulates\n         \
-         x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
+         `--kvm` (any command that boots a guest) runs under hardware virtualisation\n         \
+         instead of TCG — faster, and required on a host whose QEMU predates 9.0 (TCG\n         \
+         emulates x2APIC only from 9.0, and this kernel is x2APIC-only).\n         \
          Other args after `qemu` / `qemu-debug` are forwarded to QEMU.\n"
     );
 }
@@ -1137,10 +1141,13 @@ fn cmd_check_input(accel: Accel) -> R<()> {
 /// it looks at input again, so keys injected as fast as QMP sends them outrun it. Pacing on the
 /// echo is the fix, and it is what the typing loop does.
 ///
-/// Still **not wired into CI or listed in `--help`**, but now only because the evidence is one
-/// clean batch (4 of 4) rather than a run of them. Promotion is filed in
-/// `docs/rationale/deferred-decisions.md` with the bar it has to clear; that entry, not this
-/// comment, is the live record.
+/// **Wired into CI** since 2026-08-18 (`.github/workflows/ci.yml`, the QEMU integration job,
+/// unconditional), on 64 consecutive passes. The bar was never the count: the audit logged one
+/// unreproduced failure at the click step, and what made promotion defensible is that this gate
+/// now asserts *where* the press landed before asserting that `nxterm` received it, so a
+/// recurrence reports coordinates rather than a bare timeout. That failure is still
+/// unexplained. The deferral entry that used to hold this record has moved to the resolved
+/// table; the live record is now `docs/decision-log.md`, 2026-08-18.
 
 ///
 /// **The whole loop, in one assertion**: i8042 → `input-server` → compositor → `nxterm` →

@@ -16011,5 +16011,18 @@ its coverage is the compositor-to-shell round trip, which `check-input` (stops a
 event log) and `check-display` (never types) do not reach, so there is no useful path filter.
 The residual is stated rather than closed — if it recurs, CI now reports coordinates.
 
+**Added in review: the drop is logged too.** The transcript now says *where* a press landed,
+but the mechanism this entry measured and discarded — a lost input batch — was still the one
+thing it could not report. `input-server` increments a per-consumer loss counter and announces
+`SYN_DROPPED`; `libinput` turns that into `Logical::Dropped`; and nothing on that path printed
+anything, so the only mechanism that can move a press off its computed point was invisible.
+Per-consumer accounting also means `input-testclient` could never cover it — a loss on the
+compositor's slot never reaches the client's dump. One line now distinguishes "a batch was
+dropped" from "the arithmetic is wrong", which is the fork a recurrence actually needs. Both
+diagnostic lines sit under a separate generous bound (`MAX_LOGGED_INPUT_DIAGS = 256`) rather
+than none: they are edge-triggered, one per real click or genuine loss, so
+`MAX_LOGGED_ROUTES`' continuous-stream argument does not apply — but its argument for having
+*a* bound on synchronous serial writes does.
+
 Verified: `check-terminal` green under TCG and `--kvm`; 40 loaded runs across the investigation;
 1698 host tests; the other four guest gates and six static gates green; zero warnings.

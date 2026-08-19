@@ -394,7 +394,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 // the compositor has not yet noticed the peer closed. A gate that clicks on
                 // seeing this can still land on a 2048×2048 window. Named distinctly from
                 // the phase-1 message above so the two states are not one signal.
-                kprint(b"input-testclient: idle, releasing the window\n");
+                kprint(b"input-testclient: releasing the window (still up)\n");
                 exit(0);
             }
         };
