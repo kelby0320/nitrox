@@ -17,7 +17,6 @@
 #![no_std]
 #![no_main]
 
-use core::fmt::Write as _;
 use core::panic::PanicInfo;
 
 use nitrox_kernel::arch;
@@ -413,16 +412,33 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
             // and the only signal was the BSP's spin-timeout roughly two billion
             // iterations later, by which point the reason was gone.
             //
+            // **Raw bytes, not `writeln!`.** `<SerialPort as fmt::Write>::write_str`
+            // tees into the kernel log ring *first* — `klog::push` takes `KLOG`, an
+            // `IrqSpinLock`, whose `lockrank::acquired` indexes `FLOOR[cpu]`/`DEPTH[cpu]`
+            // by `this_cpu()`. On this core that is 0, the BSP's slots, and the BSP is
+            // concurrently spinning in `bring_up_aps`. So the formatted writer touches
+            // exactly the per-CPU state this branch exists to stay out of, and the rank
+            // tracker is live in every image the project boots (`cmd_build` builds dev,
+            // not release). `write_byte` is the port I/O on its own.
+            //
+            // This is the same class as PR #198's blocking finding — an unbound AP
+            // reporting index 0 and clobbering the BSP's — which `leave_online` guards
+            // with `identity_bound()`. Found in review of PR #214; the first version of
+            // this branch used `writeln!` and claimed it touched no per-CPU state.
+            //
             // No APIC id in the message: reading it needs `hw_apic_id`, which is
             // arch-internal and not on the neutral `ArchSmp` trait, and widening that
-            // trait to name one core in one diagnostic is not the trade. The BSP's
-            // panic says how many failed; this says why one of them did.
-            let mut w = arch::serial::emergency_writer();
-            let _ = writeln!(
-                w,
-                "\nsmp: FATAL — an AP's hardware APIC id has no bound dense index \
-                 (bring-up bug); halting this core, the BSP will stop the machine"
-            );
+            // trait to name one core in one diagnostic is not the trade. The BSP's panic
+            // says how many failed; this says why one of them did.
+            let w = arch::serial::emergency_writer();
+            for &b in b"\nsmp: FATAL - an AP's hardware APIC id has no bound dense index \
+(bring-up bug); halting this core, the BSP will stop the machine\n"
+            {
+                if b == b'\n' {
+                    w.write_byte(b'\r');
+                }
+                w.write_byte(b);
+            }
             arch::Cpu::halt_loop();
         }
     };
@@ -434,10 +450,27 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
     unsafe {
         arch::Timer::start_periodic(sched::TICK_NS);
     }
+    // 4. Build this CPU's scheduler context — and only then report it online.
+    //
+    // **The order matters.** `ap_init` was inside `ap_run` below, which runs *after* this
+    // increment, so a failure left the BSP counting a CPU that never joined: it would exit
+    // its wait loop, print the online count and boot on. In a `test-harness` build the
+    // panic reaches `debug_exit` and the gate fails, which is the path that was measured —
+    // but in a production build the panic handler prints and halts this one core, and the
+    // machine boots to userspace on one fewer CPU than it was told to use. That is exactly
+    // the "topology nobody chose, silently" this change exists to remove, so the commit
+    // point moved rather than the diagnosis. Found in review of PR #214.
+    if sched::ap_init().is_err() {
+        // Out of memory building this CPU's scheduler context. Unlike the identity failure
+        // above, this core can speak for itself: `ap_cpu_init` has run, so it has an
+        // identity, per-CPU state and a local APIC. An allocation this small failing out of
+        // a fresh boot heap says the sizing is wrong, not that memory is tight.
+        panic!("smp: AP scheduler init failed (out of memory building its context)");
+    }
     AP_ONLINE.fetch_add(1, Ordering::Release);
     kprintln!("smp: cpu {} online (AP)", idx);
 
-    // 4. Retire into the scheduler (enables interrupts; diverges).
+    // 5. Retire into the scheduler (enables interrupts; diverges).
     sched::ap_run();
 }
 
@@ -508,6 +541,16 @@ fn bring_up_aps() {
     // microseconds of emulated instructions) and well inside every gate's timeout. The
     // calibrated timer is live here — `sched_bringup` runs before this and says so.
     const AP_ONLINE_DEADLINE_NS: u64 = 5_000_000_000;
+    // **The deadline is only a deadline if the clock runs.** `Timer::read_ns` returns a
+    // constant 0 before `Timer::init` (its base and multiplier are zeroed statics), so a boot
+    // reordering that moved calibration after this point would turn the wait into an infinite
+    // spin — back to "TIMED OUT after 90 s, likely a hang", the exact symptom this replaced,
+    // with nothing to notice. The ordering is documented on `sched_bringup`; this makes the
+    // dependency self-checking rather than a comment.
+    debug_assert!(
+        arch::Timer::monotonic_hz() != 0,
+        "AP wait deadline needs a calibrated timer — Timer::init must run before bring_up_aps"
+    );
     let deadline = arch::Timer::read_ns() + AP_ONLINE_DEADLINE_NS;
     while AP_ONLINE.load(Ordering::Acquire) < launched {
         core::hint::spin_loop();
