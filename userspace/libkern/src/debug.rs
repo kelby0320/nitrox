@@ -10,6 +10,10 @@ use crate::syscall::{SYS_DEBUG_KPRINT, SYS_PROCESS_EXIT, syscall4};
 use core::arch::asm;
 
 /// Write `msg` to the kernel serial log (`sys_kprint`).
+///
+/// **Atomic per call and nothing more.** A line assembled from several `kprint`s can be
+/// split down the middle by any other process logging in between.
+/// TODO(atomic-log-lines): `docs/rationale/deferred-decisions.md`.
 pub fn kprint(msg: &[u8]) {
     // SAFETY: passes a valid (ptr, len) pair the kernel copies from; no handles.
     unsafe {

@@ -7,7 +7,7 @@
 //!   qemu-debug      build + launch QEMU paused for GDB on :1234
 //!   test            host-side unit tests (kernel lib + tools workspace)
 //!   test-qemu       boot a headless self-test image; adjudicate via isa-debug-exit
-//!   check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry
+//!   check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry
 //!   check-docs      fail if a doc links to, or cites, a path that does not exist
 //!   check-display   boot + screendump; compare the screen against a libdraw render
 //!   check-terminal  boot + type into the GUI terminal; assert the shell answered
@@ -156,7 +156,7 @@ fn print_help() {
            test-qemu     boot a headless self-test image; pass/fail via isa-debug-exit\n  \
            check-arch    fail if kernel code outside arch/ uses arch internals\n  \
            check-nightly fail if any crate uses a nightly `#![feature(...)]`\n  \
-           check-deferrals fail if a `TODO(tag)` has no deferred-decisions.md entry\n  \
+           check-deferrals fail if a `TODO(<tag>)` has no deferred-decisions.md entry\n  \
            check-docs      fail if a doc links to, or cites, a path that does not exist\n  \
            check-irq-scope fail if an interrupt entry stub skips the lock-ordering scope\n  \
            abi-sync-check  fail if userspace/libkern has drifted from the kernel ABI\n  \
@@ -2739,7 +2739,18 @@ fn cmd_check_nightly() -> R<()> {
     }
 }
 
-/// Every `TODO(tag)` in the shipping source must have a matching entry in
+/// The placeholder is spelt `TODO(<tag>)` throughout this file — angle brackets included — and
+/// that is load-bearing: this gate scans `tools/xtask/src`, so the bare form in its own prose
+/// was being counted as a real marker named `tag`, inflating the tally and, worse, making the
+/// gate depend on `deferred-decisions.md` continuing to contain the same placeholder. The
+/// angle brackets fail the plain-word check, so [`markers_in_line`] skips them.
+///
+/// This sentence used to spell the bare form out to explain itself, which was invisible only
+/// because the code scan stopped at the first marker on a line and that one was the bracketed
+/// version. Sharing [`markers_in_line`] between both directions surfaced it immediately — the
+/// third self-reference in this file, and the one the previous bug was hiding.
+///
+/// Every `TODO(<tag>)` in the shipping source must have a matching entry in
 /// `docs/rationale/deferred-decisions.md`.
 ///
 /// This exists because of a specific, repeated failure: the three deferrals that cost the
@@ -3129,43 +3140,59 @@ fn cmd_check_deferrals() -> R<()> {
         visit_rs_files_skipping(&src_root, &["target"], &mut |path| {
             let text = fs::read_to_string(path)?;
             for (i, line) in text.lines().enumerate() {
-                let Some(rest) = line.split_once("TODO(") else {
-                    continue;
-                };
-                let Some((tag, _)) = rest.1.split_once(')') else {
-                    continue;
-                };
-                // A tag has to be a plain word to be searchable; anything else is prose
-                // that happens to contain the marker.
-                if tag.is_empty() || !tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
-                    continue;
-                }
-                if !tags.iter().any(|t| t == tag) {
-                    tags.push(tag.to_string());
-                }
-                if !doc.contains(&format!("todo({})", tag.to_lowercase())) {
-                    violations.push(format!(
-                        "{}:{}: TODO({tag}) has no entry in deferred-decisions.md",
-                        path.display(),
-                        i + 1
-                    ));
+                for tag in markers_in_line(line) {
+                    if !tags.iter().any(|t| t == tag) {
+                        tags.push(tag.to_string());
+                    }
+                    if !doc.contains(&format!("todo({})", tag.to_lowercase())) {
+                        violations.push(format!(
+                            "{}:{}: TODO({tag}) has no entry in deferred-decisions.md",
+                            path.display(),
+                            i + 1
+                        ));
+                    }
                 }
             }
             Ok(())
         })?;
     }
 
+    // **The other direction**, which the gate did not ask until 2026-08-18. Enforcing only
+    // code-to-doc leaves the failure that actually happens unchecked: an entry whose marker was
+    // deleted or never written is one nobody trips over while editing the code, which is the
+    // whole reason the markers exist. Audit D.5(b) measured 9 of 28 open entries binding to
+    // nothing, four of them appearing nowhere else in the repository.
+    let raw = fs::read_to_string(&doc_path)
+        .map_err(|e| format!("read {}: {e}", doc_path.display()))?;
+    let open_tags = open_section_tags(&raw);
+    let exempt_count = open_tags.iter().filter(|(_, e)| *e).count();
+    for (tag, exempt) in &open_tags {
+        if *exempt || tags.iter().any(|t| t.eq_ignore_ascii_case(tag)) {
+            continue;
+        }
+        violations.push(format!(
+            "deferred-decisions.md: TODO({tag}) is an open entry with no TODO({tag}) marker \
+             anywhere in kernel/src, userspace or tools/xtask/src — put one where someone \
+             changing that code will trip over it, or mark the entry `{NO_CODE_SITE}` if the \
+             feature genuinely has no code site yet"
+        ));
+    }
+
     if violations.is_empty() {
         println!(
-            "check-deferrals: {} TODO tag(s) — every one is recorded in deferred-decisions.md ✓",
-            tags.len()
+            "check-deferrals: {} tag(s) in code, all recorded; {} open entr(ies), all backed \
+             by a marker ({} exempt) ✓",
+            tags.len(),
+            open_tags.len(),
+            exempt_count
         );
         Ok(())
     } else {
         let mut msg = String::from(
-            "every `TODO(tag)` must have a matching entry in \
-             docs/rationale/deferred-decisions.md — a deferral only exists if it is in the \
-             canonical list (see that document's closing section):\n",
+            "`TODO(<tag>)` and deferred-decisions.md must agree in **both** directions — a \
+             deferral only exists if it is in the canonical list, and one nobody can trip \
+             over while editing the code is one nobody will act on (see that document's \
+             closing section):\n",
         );
         for v in &violations {
             msg.push_str("  ");
@@ -3174,6 +3201,69 @@ fn cmd_check_deferrals() -> R<()> {
         }
         Err(msg.into())
     }
+}
+
+/// Every `TODO(<name>)` marker on one line, in order, skipping anything that is not a plain
+/// searchable word.
+///
+/// **One helper because the two directions disagreed.** The code scan used a single
+/// `split_once`, so it saw only the *first* marker on a line and skipped the rest of the line
+/// entirely when that one failed the plain-word check; the doc scan looped. While only the
+/// code-to-doc direction existed that asymmetry cost silent under-enforcement. Once the
+/// reverse direction depends on the code scan being complete it becomes a false failure: two
+/// markers written on one line, and the gate reports the second as missing while pointing at
+/// the line it is on.
+fn markers_in_line(line: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut rest = line;
+    while let Some((_, after)) = rest.split_once("TODO(") {
+        let Some((tag, tail)) = after.split_once(')') else {
+            break;
+        };
+        rest = tail;
+        // A tag has to be a plain word to be searchable; anything else is prose that happens
+        // to contain the marker — including this module's own `TODO(<tag>)` placeholder.
+        if !tag.is_empty() && tag.chars().all(|c| c.is_ascii_alphanumeric() || c == '-') {
+            out.push(tag);
+        }
+    }
+    out
+}
+
+/// Marker exempting one deferral entry from the doc-to-code direction.
+const NO_CODE_SITE: &str = "<!-- check-deferrals: no-code-site -->";
+
+/// Every `TODO(<tag>)` in the document's **open** section, paired with whether its line
+/// exempts it from needing a code marker.
+///
+/// **Open section only, and that boundary is the whole subtlety.** A resolved entry has no
+/// code marker *because closing it deleted the marker* — that is the lifecycle working. A
+/// first pass at this measurement scraped the whole file, counted `shell-cwd` (named
+/// narratively inside a Resolved row, describing the deletion of its own markers) as rot, and
+/// would have sent the follow-up work to reinstate the very marker `check-deferrals` had
+/// caught. The same cut excludes the prose `TODO(<tag>)` in the closing "How to use this
+/// document" section, which sits below `## Resolved`.
+fn open_section_tags(doc: &str) -> Vec<(String, bool)> {
+    let open = match doc.find("\n## Resolved") {
+        Some(i) => &doc[..i],
+        None => doc,
+    };
+    let mut out: Vec<(String, bool)> = Vec::new();
+    for line in open.lines() {
+        let exempt = line.contains(NO_CODE_SITE);
+        for tag in markers_in_line(line) {
+            // **Exemption ORs across occurrences, it does not take the first.** A tag is
+            // routinely named on an earlier line than its own entry — `tty-server`'s entry
+            // cross-references `TODO(session-metadata-server)` 170 lines above that entry —
+            // and first-occurrence-wins would then discard a marker written on the entry
+            // itself, failing the gate while telling you to do the thing you just did.
+            match out.iter_mut().find(|(t, _)| t == tag) {
+                Some(e) => e.1 |= exempt,
+                None => out.push((tag.to_string(), exempt)),
+            }
+        }
+    }
+    out
 }
 
 /// `cargo xtask check-docs` — the documentation cannot point at things that do not exist.
@@ -4670,6 +4760,123 @@ fn format_cmd(cmd: &Command) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// The line scanner both directions share.
+    ///
+    /// It exists because they did not share one: the code side stopped at the first marker
+    /// per line, so two markers on one line meant the second was reported missing while the
+    /// error pointed at the line carrying it. The bracketed-placeholder case is not
+    /// hypothetical either — this file's own prose contains one, and the first-marker-only
+    /// behaviour was hiding a *bare* marker written after it on the same line.
+    #[test]
+    fn markers_in_line_finds_every_plain_word_marker_and_no_others() {
+        use super::markers_in_line;
+
+        // Assembled, for the reason the neighbouring test gives.
+        fn m(name: &str) -> String {
+            format!("TODO{}{}{}", '(', name, ')')
+        }
+
+        assert_eq!(markers_in_line("nothing here"), Vec::<&str>::new());
+        assert_eq!(markers_in_line(&format!("// {}", m("alpha"))), ["alpha"]);
+
+        // Two on one line — the case that produced a false failure.
+        assert_eq!(
+            markers_in_line(&format!("// {} and {}: see the doc.", m("alpha"), m("beta"))),
+            ["alpha", "beta"]
+        );
+
+        // A bracketed placeholder is skipped and does not stop the scan: a real marker
+        // after it on the same line is still found.
+        assert_eq!(
+            markers_in_line(&format!("// spelt {} not {}", m("<tag>"), m("tag"))),
+            ["tag"]
+        );
+
+        // Not markers.
+        assert_eq!(markers_in_line(&format!("// {}", m("has space"))), Vec::<&str>::new());
+        assert_eq!(markers_in_line(&format!("// {}", m(""))), Vec::<&str>::new());
+        assert_eq!(markers_in_line("// TODO(unclosed"), Vec::<&str>::new());
+    }
+
+    /// The doc-to-code direction's extractor, on the shapes that decide what it enforces.
+    ///
+    /// The Resolved cases are the reason this is a table test and not a live-document check:
+    /// a first pass at this measurement scraped the whole file and counted a tag named inside
+    /// a Resolved row — narrating the *deletion* of its own markers — as an unbacked entry.
+    /// Acting on that would have reinstated the stale marker that closing it removed.
+    ///
+    /// The exemption case has no user in the document today, so this is the only thing
+    /// exercising it. An escape hatch nobody has opened is exactly the sort of thing that
+    /// turns out not to work the first time someone needs it.
+    ///
+    /// **The fixture assembles its markers rather than spelling them.** `check-deferrals`
+    /// scans `tools/xtask/src`, so a literal `TODO` + `(name)` in this file *is* a marker as
+    /// far as the gate is concerned: writing the fixture out longhand made the gate fail on
+    /// its own test data, reporting seven deferrals that do not exist. Same trap as the
+    /// `TODO(<tag>)` placeholder in this module's prose, one level further in.
+    #[test]
+    fn open_section_tags_counts_open_entries_and_nothing_else() {
+        use super::open_section_tags;
+
+        // Assembled at runtime; see the note above.
+        fn m(name: &str) -> String {
+            format!("TODO{}{}{}", '(', name, ')')
+        }
+
+        let doc = format!(
+            "# Deferred\n\
+             **Thing one — `{alpha}`.** Words.\n\
+             **Thing two — `{beta}`.** More words.\n\
+             **Thing three — `{gamma}`.** No code site yet. {ncs}\n\
+             **Two on one line — `{delta}` and `{epsilon}`.**\n\
+             **Repeat — `{alpha}` again.**\n\
+             **Cross-reference — also the trigger for `{theta}`.**\n\
+             **The real one — `{theta}`.** No code site. {ncs}\n\
+             **Not a tag — `{spaced}` and `{empty}`.**\n\
+             \n## Resolved (kept for the record)\n\
+             | Thing four (`{zeta}`) | closing it deleted its markers |\n\
+             \n## How to use this document\n\
+             Every `{eta}` must appear here.\n",
+            alpha = m("alpha"),
+            beta = m("beta"),
+            gamma = m("gamma"),
+            delta = m("delta"),
+            epsilon = m("epsilon"),
+            theta = m("theta"),
+            spaced = m("has space"),
+            empty = m(""),
+            zeta = m("zeta"),
+            eta = m("eta"),
+            ncs = NO_CODE_SITE,
+        );
+
+        let got = open_section_tags(&doc);
+        let names: Vec<&str> = got.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(names, ["alpha", "beta", "gamma", "delta", "epsilon", "theta"]);
+
+        // Only the marked line is exempt.
+        let exempt: Vec<&str> =
+            got.iter().filter(|(_, e)| *e).map(|(t, _)| t.as_str()).collect();
+        // `theta` is named on an earlier line as a cross-reference and exempted on its own
+        // line below — the geometry `tty-server` -> `session-metadata-server` already has in
+        // the real document. First-occurrence-wins drops the exemption and fails the gate
+        // while telling you to write the marker you just wrote.
+        assert_eq!(
+            exempt,
+            ["gamma", "theta"],
+            "the no-code-site marker must be honoured wherever in the entry it appears"
+        );
+
+        // The three that must NOT appear, and the reason each is excluded.
+        assert!(!names.contains(&"zeta"), "a Resolved row's tag is not an open entry");
+        assert!(!names.contains(&"eta"), "the closing section's prose is not an entry");
+        assert!(!names.contains(&"has space"), "a tag must be a plain word");
+
+        // A document with no Resolved heading is open all the way down.
+        let all_open = open_section_tags(&format!("**One — `{}`.**\n", m("solo")));
+        assert_eq!(all_open, vec![(String::from("solo"), false)]);
+    }
 
     /// The echo guard's predicate, on the shapes it has to tell apart.
     ///

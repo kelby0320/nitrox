@@ -120,9 +120,16 @@ IRP cancellation, deschedule IPI) are **not** audit targets — they are absent,
       `check-input --no-ps2-irq` (boot with the controller's IRQ bits cleared so the recovery
       sweep is the only path). Both are filed in `deferred-decisions.md`. These convert "one
       run in six" into "every run" and are the only things that have caught this class.
-- [ ] **Audit `deferred-decisions.md` against reality.** At least one entry ("Debug-build
+- [x] **Audit `deferred-decisions.md` against reality.** At least one entry ("Debug-build
       lock-ordering enforcement") describes as missing a mechanism that landed 2026-07-29 and
       demonstrably works. Find the others; a deferral list nobody trusts is worse than none.
+      *Audited and closed 2026-08-18. Five entries were wrong: two finished and still filed as
+      open (one outliving its mechanism by three weeks), two resting on premises falsified by
+      commits weeks earlier, and a syscall specified in five current-behaviour documents under
+      two spellings that has never existed (PR #209). The gate's own overclaim was the sixth —
+      it enforced code→doc only, and 9 of 28 open entries bound to nothing; both directions are
+      now enforced, with an exemption for entries that genuinely have no code site (PR #211).
+      Decision log, 2026-08-18.*
 
 ---
 

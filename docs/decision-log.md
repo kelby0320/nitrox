@@ -15873,3 +15873,76 @@ is defensive, not load-bearing.
 Verified: 1696 host tests (+4), 640 of them the kernel crate; each new test confirmed passing in
 isolation via `--exact`; each guard negative-controlled by deletion and by inversion; five guest
 gates and six static gates green; zero warnings on the kernel target in debug and release.
+
+## 2026-08-18 — `check-deferrals` now asks the question that was failing
+
+Audit D.5(b), the half PR #209 measured and deliberately did not close. The gate walked the
+code for `TODO(<tag>)` and failed if the tag was absent from `deferred-decisions.md`. It never
+asked the reverse, and the document claimed the enforcement was mechanical — while **9 of its
+28 open entries bound to no code marker at all**, four appearing nowhere else in the repository.
+So for a third of the tagged entries the advertised enforcement was an empty set, failing
+silently in the direction that matters: a deferral whose marker is gone is one nobody trips over
+while editing the code, which is the entire reason markers exist.
+
+**All nine got markers rather than exemptions.** That was the open question when this was split
+out — where does `TODO(shell-bitwise)` go, for syntax that does not exist? — and the answer in
+every case was that the prose already existed and only the searchable tag was missing:
+`upper`/`lower` already say "ASCII only", `replace` already says "literal, not a pattern", the
+`OPERATORS` table is where named bitwise operators would join, `Break` already says the parser
+enforces innermost-only, `kprint` is where per-call atomicity ends, the watermark module already
+says it records depth but not location, and `nxsh`'s `out()` is the whole of the still-owed
+output half of `TODO(tty-server)`. A marker at the place someone would change is worth more than
+a clean gate.
+
+The exemption exists anyway — `<!-- check-deferrals: no-code-site -->`, line-scoped, matching
+the `<!-- check-docs: allow-missing -->` precedent — with **no live user**, so it is covered by a
+unit test instead. An escape hatch nobody has opened is the thing that does not work the first
+time it is needed.
+
+**Open section only, and that cut is the whole subtlety.** A resolved entry has no marker
+because closing it deleted the marker. `open_section_tags` is a free function so that boundary
+is table-tested, including the case that made PR #209's first measurement wrong: a tag named
+narratively inside a Resolved row — `shell-cwd`, in a row describing how closing it found and
+deleted two stale markers in `nxsh`. Each branch negative-controlled: stop cutting at
+`## Resolved`, ignore the exemption, drop the plain-word check, stop de-duplicating — all four
+fail the named test.
+
+**Three self-references found on the way**, because the gate scans `tools/xtask/src` and
+marker-shaped text in its *own* source counts:
+
+- the bare placeholder in this file's prose was being counted as a real marker named `tag` —
+  inflating the tally and making the gate depend on `deferred-decisions.md` continuing to
+  contain the same placeholder. Pre-existing; it is now spelt with angle brackets, which fail
+  the plain-word check.
+- writing the new table test's fixture longhand made the gate **fail on its own test data**,
+  reporting seven deferrals that do not exist. The fixture now assembles its markers at runtime.
+- and the third only surfaced in review, from fixing something else: the sentence explaining
+  the second one spelt the bare form out to contrast it, which the *old* code scan could not
+  see because it stopped at the first marker on a line and that one was the bracketed version.
+  Sharing one scanner between the directions exposed it immediately. A bug hiding a bug.
+
+**Two defects the review found, both in the seam between the directions.** They are worth
+recording because each fails in the same shape — the gate telling you to do the thing you have
+already done:
+
+- **The exemption was dropped when the tag appeared on an earlier line.** `open_section_tags`
+  de-duplicated first-occurrence-wins and kept that occurrence's flag, so a `no-code-site`
+  marker on the entry's own line lost to a bare cross-reference above it. That geometry is
+  already in the document — `tty-server`'s entry cross-references
+  `TODO(session-metadata-server)` 170 lines above that entry. The flag now ORs across
+  occurrences. Note where this bit: the exemption's *only* coverage was the unit test, and that
+  test exercised a repeated tag and an exempt tag but never the two together — so the escape
+  hatch nobody had opened was broken in exactly the way that argument predicts.
+- **The two directions disagreed about how many markers a line can hold.** The code scan used a
+  single `split_once` — first marker only, and it skipped the rest of the line when that one
+  failed the plain-word check — while the doc scan looped. While only code→doc existed, that
+  cost silent under-enforcement; once doc→code depends on the code scan being complete it
+  becomes a *false failure*, reporting a marker missing while pointing at the line carrying it.
+  Both now share `markers_in_line`, which is table-tested.
+
+End-to-end, on the live gate: deleting one of the nine placed markers fails it by name; a new
+open entry with no marker fails it; marking that entry `no-code-site` passes it and the summary
+line counts it as exempt.
+
+Verified: 1696 host tests plus the new xtask test; the new test passing in isolation; five guest
+gates and six static gates green; zero warnings.

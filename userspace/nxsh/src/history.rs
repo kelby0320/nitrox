@@ -1,5 +1,8 @@
 //! Command history and reverse-search.
 //!
+//! Reverse-search steps through matches one at a time rather than showing a list.
+//! TODO(history-pager): `docs/rationale/deferred-decisions.md`.
+//!
 //! Pure logic, so it lives in the library half and host-tests in milliseconds — the same
 //! rule as the rest of `nxsh`. The terminal work (reading keys, redrawing) is the binary
 //! half's; deciding *what* to recall is here.

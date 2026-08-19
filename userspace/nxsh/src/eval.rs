@@ -1602,7 +1602,9 @@ impl Interp {
             // apart. `capture` is the only operator with real engine work behind it —
             // submatch slots in the Pike VM — and the only one that returns `null` for a
             // failure rather than raising, because "did not match" is an ordinary answer
-            // that `??` and `== null` already handle (§9e).
+            // that `??` and `== null` already handle (§9e). Groups are positional; naming
+            // them needs a name table threaded through the compiler.
+            // TODO(regex-named-captures): `docs/rationale/deferred-decisions.md`.
             "capture" => {
                 let v = need(operand)?;
                 let Some(Value::Str(text)) = v.as_data() else {

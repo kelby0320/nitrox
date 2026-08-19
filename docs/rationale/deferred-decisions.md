@@ -1333,31 +1333,39 @@ rediscover — exit-time handle reclamation, the wall clock, file truncate — w
 so none was ever reviewed. If you write a stub, a `TODO`, or prose that promises future
 work, mirror it here.
 
-`cargo xtask check-deferrals` enforces **one direction** of that: every `TODO(tag)` in
-`kernel/src`, `userspace` or `tools/xtask/src` must name an entry here, and today all 20 do.
-It never asks the reverse question, and the reverse is where the rot is — measured 2026-08-18
-(audit D.5b) over the **open** section above, **9 of its 28 tagged entries bind to no code
-marker at all**: `atomic-log-lines`, `history-pager`, `regex-named-captures`, `regex-replace`,
-`shell-bitwise`, `shell-labelled-break`, `stack-attribution`, `tty-server`, `unicode-case`.
+`cargo xtask check-deferrals` enforces **both directions** of that, since 2026-08-18:
 
-Counted over the open section deliberately. A whole-file scrape is wrong in both directions and
-was wrong here first time: it picks up the prose `TODO(tag)` in this section, and it picks up
-tags named *narratively inside Resolved rows* — `shell-cwd` is one, where the row records that
-closing the deferral is what found two stale `TODO(shell-cwd)` markers in `nxsh` and deleted
-them. A closed entry with no marker is the lifecycle working, and counting it as rot would send
-the next person to reinstate the very marker that closing it removed.
+- every `TODO(<tag>)` in `kernel/src`, `userspace` or `tools/xtask/src` names an entry here;
+- every tagged entry in the **open** section above has a marker somewhere in that code.
 
-Searching for the `TODO(tag)` form outside this file and the audit that found them, four of the
-nine (`regex-named-captures`, `regex-replace`, `shell-labelled-break`, `unicode-case`) appear
-nowhere else at all; the other five survive only in `docs/planning/` and `docs/decision-log.md`,
-neither of which the gate scans.
+Until then it asked only the first question, and the second is where the rot was — 9 of the 28
+open entries bound to no marker at all (`atomic-log-lines`, `history-pager`,
+`regex-named-captures`, `regex-replace`, `shell-bitwise`, `shell-labelled-break`,
+`stack-attribution`, `tty-server`, `unicode-case`), four of them appearing nowhere else in the
+repository. So for a third of the tagged entries the enforcement this paragraph advertised was
+an empty set, failing silently in the direction that matters: a deferral whose marker is gone is
+one nobody trips over while editing the code. All nine now have markers, placed where the
+limitation actually lives rather than where it was convenient.
 
-That is the direction that matters, because a deferral whose marker is gone is one nobody trips
-over while editing the code — which is exactly the failure the paragraph above describes. This
-paragraph claimed the enforcement was mechanical; for a third of the tagged entries the
-enforced set was empty. Closing it needs a per-entry decision (where *would* the marker go for
-a feature that does not exist yet?) plus an exemption syntax for entries that genuinely have no
-code site, along the lines of `<!-- check-docs: allow-missing -->`. Filed as its own change
-rather than done here, so the judgement calls get reviewed as judgement calls.
+**Open section only, and that boundary is the point.** A resolved entry has no marker *because
+closing it deleted the marker* — that is the lifecycle working, and the first attempt at this
+measurement got it wrong: a whole-file scrape counts the prose `TODO(<tag>)` in this section,
+and counts tags named narratively inside Resolved rows. `shell-cwd` is one, in a row that
+records how closing that deferral found two stale `TODO(shell-cwd)` markers in `nxsh` and
+deleted them. Counting that as rot would have sent this very change to reinstate the marker
+whose removal the row describes.
+
+**If a deferral genuinely has no code site yet**, mark the entry
+`<!-- check-deferrals: no-code-site -->` on the same line as its tag and the gate will accept
+it. Nothing uses that today — every open entry turned out to have somewhere honest to put a
+marker — so it is covered by a unit test rather than by a live example, deliberately: an escape
+hatch nobody has opened is exactly the thing that does not work the first time it is needed.
+Reach for it only when the alternative is a marker nobody would ever edit past; a note at the
+place someone *would* change is worth more than a clean gate.
+
+That per-entry question — *where would the marker go for a feature that does not exist yet?* —
+was the reason the reverse direction was filed separately from the audit that found it. The
+answer turned out to be that every one of the nine had somewhere honest: the prose describing
+each limitation already existed, and only the searchable tag was missing.
 
 The decision log (`docs/decision-log.md`) is the place to record the actual decision when a deferred item moves into active work — what triggered it, what the implementation approach is, when the decision was made.
