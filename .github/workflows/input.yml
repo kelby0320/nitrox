@@ -24,6 +24,14 @@ on:
       # either side can leave a reader blocked forever with the driver still reporting armed.
       - 'kernel/src/sched.rs'
       - 'kernel/src/dpc.rs'
+      # **The tick, and the sweep's only call site.** `drivers::ps2::poll()` is called from
+      # exactly one place in the tree — `timer_dispatch` — so the regression
+      # `check-input --no-ps2-irq` exists to catch is a one-file diff to this file. Without it
+      # in the filter that PR merges with this workflow never scheduled, and nothing else
+      # notices: `ci.yml` does not run `check-input`, and `poll` is a `pub fn` in a `pub mod`
+      # so deleting its only call raises no dead-code warning. `idt.rs` also owns the
+      # documented ordering constraint that the sweep runs *before* `dpc::run_pending`.
+      - 'kernel/src/arch/x86_64/idt.rs'
       # The whole harness crate: `inputclient.rs` is what reads the nodes and prints the
       # lines this gate matches on, and `Cargo.toml` registers it.
       - 'userspace/test-harness/**'

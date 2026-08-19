@@ -16075,7 +16075,15 @@ Verified: `check-input --no-ps2-irq` green under TCG and `--kvm` (the CI form); 
 `check-input`, `check-terminal`, `check-display`, `test-interactive` and `test-qemu` green; 1698
 host tests; six static gates; zero warnings.
 
-**This closes the August 2026 kernel audit.** Sections A–D are all ticked. What remains from it
-is one item that is not a patch: C.4, the machine-wide consequences of a parked CPU, which with
-the BSP-interrupt-routing deferral amount to "a ring-0 fault is not survivable" — a design
-decision rather than a fix.
+**This closes the August 2026 kernel audit** — and the claim is now checkable, which it was not
+when first written. That sentence originally said "sections A–D are all ticked" while
+`kernel-audit-2026-08.md` carried **16 unticked boxes**, including two in section D itself. Every
+one had in fact been audited (sessions 1–4, 2026-08-14) and most had produced fixes that landed;
+nobody had reconciled the checklist with the work. Found in review of this PR, and the failure it
+would have caused is the one the D.5 entry above exists to prevent: a reader following the
+pointer lands on a document that contradicts it and then trusts neither.
+
+Reconciled: 22 of 23 boxes ticked, each with the findings-file section it was audited in and the
+PR that closed it where one exists. The remaining box is **C.4** — the thread stranded on a
+parked CPU — which is deliberately open. With the BSP-interrupt-routing deferral it amounts to
+"a ring-0 fault is not survivable", and that is a design decision rather than a fix.

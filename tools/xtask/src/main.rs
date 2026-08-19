@@ -81,6 +81,19 @@ impl BuildMode {
         }
     }
 
+    /// Whether this is a harness build — the images that carry the guest-side gates.
+    ///
+    /// A predicate rather than a `matches!` at each site, because a new variant otherwise has
+    /// to be remembered in every one of them, and the first time that happened it was missed:
+    /// `TestHarnessNoPs2Irq` was added to [`features`](Self::features) and not to the arm that
+    /// decides whether `nxterm` is built with its instrumentation, so `--no-ps2-irq` quietly
+    /// shipped an image missing the terminal's harness lines. Harmless then — nothing that
+    /// gate asserts comes from `nxterm` — but it made "the same image" false at the point the
+    /// comments claimed it.
+    fn is_test_harness(self) -> bool {
+        matches!(self, BuildMode::TestHarness | BuildMode::TestHarnessNoPs2Irq)
+    }
+
     /// The same, for the **kernel**, which has one feature userspace does not.
     ///
     /// Split rather than appended to [`features`](Self::features) because that value also
@@ -112,6 +125,20 @@ fn main() -> ExitCode {
     // `--no-ps2-irq` (check-input only) boots a kernel whose i8042 never asserts its IRQs, so
     // the tick-driven recovery sweep is the only path input can take. See `cmd_check_input`.
     let no_ps2_irq = rest.iter().any(|a| a == "--no-ps2-irq");
+    // **Rejected before dispatch, not in a match arm.** A flag that exists to make an
+    // invisible path visible must not be silently ignored: someone reproducing a sweep bug
+    // interactively would otherwise get a boot with the i8042's IRQs *on* and nothing said
+    // about it. (`--selftest` is tolerated on commands that do not read it — a pre-existing
+    // looseness that costs less, because it cannot make a boot quietly unlike the one asked
+    // for.) Checked here because a guard arm placed after the per-command arms never runs.
+    if no_ps2_irq && cmd.as_deref() != Some("check-input") {
+        eprintln!(
+            "xtask: `--no-ps2-irq` is only meaningful for `check-input` — it boots a kernel \
+             whose i8042 never asserts its IRQs, so the tick-driven recovery sweep is the \
+             only path input can take"
+        );
+        return ExitCode::FAILURE;
+    }
     let accel = if rest.iter().any(|a| a == "--kvm") {
         Accel::Kvm
     } else {
@@ -325,7 +352,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // image shipped the instrumentation (PR #194 review, finding 3).
     build_userspace_bin(
         "nxterm",
-        matches!(mode, BuildMode::TestHarness).then_some("test-harness"),
+        mode.is_test_harness().then_some("test-harness"),
     )?;
     // A library with no consumer yet — see `check_userspace_lib`. `compositor` no longer
     // needs one: its own bin compiles it for the target.
