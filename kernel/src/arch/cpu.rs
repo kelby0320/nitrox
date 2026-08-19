@@ -42,6 +42,26 @@ pub trait ArchCpu {
     /// host test exercises the decision inside `leave_online`, not the call site.
     fn halt_loop() -> !;
 
+    /// Stop every **online** CPU, then halt this one. Diverges.
+    ///
+    /// The mechanism behind the 2026-08-19 promise that a ring-0 fault stops the machine
+    /// (`docs/decision-log.md`). Distinct from [`halt_loop`](Self::halt_loop), which stops
+    /// only the caller and remains correct for a core that never joined — see
+    /// `bring_up_aps`.
+    ///
+    /// Must be usable from the panic and exception paths, including before this CPU's
+    /// interrupt hardware is initialised: an implementation that cannot signal the others
+    /// halts itself rather than faulting inside a fault.
+    ///
+    /// **"Online" is the target set, and it is narrower than "every core executing".** A CPU
+    /// joins it in `sched::ap_init`, after its interrupt hardware is up, so a core partway
+    /// through bring-up can take an NMI and is not sent one. That set is right because it is
+    /// the one the rest of the kernel already treats as participating — the same set
+    /// `tlb::shootdown` expects acknowledgements from — and widening it would mean signalling
+    /// cores that may not yet have an IDT. A core still in bring-up is instead responsible for
+    /// checking that a stop began before it makes itself schedulable; see `ap_entry`.
+    fn stop_the_machine() -> !;
+
     /// `true` if this CPU has an on-chip local interrupt controller (the one
     /// [`crate::arch::Irq`] brings up). On x86_64 this is the on-chip APIC
     /// CPUID feature bit.

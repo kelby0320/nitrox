@@ -4,7 +4,8 @@
 //! spurious vector (`0xFF`).
 //!
 //! Exception handling splits by privilege: a **ring-0 (kernel)** fault prints
-//! the faulting state and halts (`dump_and_halt`); a **ring-3 (user)** fault
+//! the faulting state and then **stops every online CPU** (`dump_and_halt` →
+//! `Cpu::stop_the_machine`, since 2026-08-19); a **ring-3 (user)** fault
 //! **suspends** the faulting thread — a `Notification` (`SegFault` /
 //! `IllegalInsn` / `DivideByZero`) is delivered to the faulting process and a
 //! supervisor decides via `sys_exception_resume` whether to retry the
@@ -46,7 +47,7 @@
 
 use core::arch::asm;
 use core::fmt::Write;
-use core::sync::atomic::{AtomicUsize, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
 use crate::arch::Cpu;
 use crate::arch::cpu::ArchCpu;
@@ -747,6 +748,40 @@ fn vector_name(vector: u64) -> &'static str {
     }
 }
 
+/// Set once a CPU has decided the machine is going down, before it sends the stop NMIs.
+///
+/// Read by every CPU's vector-2 handler to tell "we are being stopped" from a genuine
+/// hardware NMI. `Release`/`Acquire`: a target must not observe the flag before the store,
+/// and the store happens-before the IPI it precedes.
+pub(crate) static STOPPING: AtomicBool = AtomicBool::new(false);
+
+/// `true` once some CPU has begun taking the machine down.
+///
+/// For code that must not commit itself to a machine that is stopping — a core still in
+/// bring-up, which `stop_the_machine` does not target because it is not yet online.
+pub fn stopping() -> bool {
+    STOPPING.load(Ordering::Acquire)
+}
+
+/// Whether this exception is a stop notice rather than a fault to diagnose.
+///
+/// A free function so the rule is pinned by a host test rather than only by its position in
+/// [`exception_dispatch`] — the same reasoning as `sched::clear_online_bit`. The *ordering*
+/// (this decides before the ring test) is still structural rather than tested, which is why
+/// [`dump_and_halt`] checks [`STOPPING`] as well: the property that matters — a stopped CPU
+/// must not print a register dump over the real diagnosis — then holds even if this check is
+/// moved or missed.
+pub(crate) fn is_stop_notice(vector: u64, stopping: bool) -> bool {
+    vector == 2 && stopping
+}
+
+/// Vector 2 with [`STOPPING`] set: another CPU is taking the machine down and this is our
+/// notice. Halt without dumping — the CPU that decided has already printed the diagnosis, and
+/// N cores writing register dumps into an unsynchronised serial port would bury it.
+fn stop_notice() -> ! {
+    Cpu::halt_loop()
+}
+
 irq_dispatcher! {
 /// Common handler for every CPU exception except `#PF`. A **ring-3** fault
 /// suspends the faulting thread (delivering a [`Notification`] to its process)
@@ -763,6 +798,15 @@ fn exception_dispatch(frame: *mut ExceptionFrame) {
     // stack top and passed its address in RDI. It is valid, 8-byte
     // aligned, and not aliased for the duration of this call.
     let f = unsafe { &mut *frame };
+    // **The stop notice, before anything else.** An NMI arriving while `STOPPING` is set is
+    // not a fault to diagnose, it is this CPU being told the machine is going down. Checked
+    // ahead of the ring test because the CPUs most worth stopping are in ring 0 — spinning on
+    // a lock the faulting CPU holds — and the generic ring-0 path would send each of them
+    // through `dump_and_halt`, burying the real diagnosis under N register dumps and
+    // re-entering the stop from every core.
+    if is_stop_notice(f.vector, STOPPING.load(Ordering::Acquire)) {
+        stop_notice();
+    }
     if is_user_fault(f) {
         // Suspend → supervised resume/terminate (no CR2 for non-#PF vectors).
         user_fault(f, None);
@@ -884,10 +928,19 @@ fn pf_fault_kind(error_code: u64) -> FaultKind {
     }
 }
 
-/// Dump the faulting state to the serial console and halt. Shared
+/// Dump the faulting state to the serial console, then **stop the machine**. Shared
 /// between [`exception_dispatch`] (always) and [`pf_dispatch`] (only on
 /// faults that miss the user-access exception table).
 fn dump_and_halt(f: &ExceptionFrame) -> ! {
+    // **Defence in depth for the property that actually matters.** A CPU already being
+    // stopped must not print a register dump: N of them into an unsynchronised serial port
+    // bury the diagnosis the deciding CPU just wrote. `exception_dispatch` catches this
+    // earlier and more precisely, but that check is a *position* in a function, and this one
+    // holds regardless of where it sits — including for any future path that reaches here
+    // without passing through it.
+    if STOPPING.load(Ordering::Acquire) {
+        stop_notice();
+    }
     // The emergency writer bypasses `SERIAL`'s lock: the fault may have
     // occurred while that lock was held. Sound under Phase 1's
     // single-CPU, interrupts-masked model.
@@ -912,9 +965,12 @@ fn dump_and_halt(f: &ExceptionFrame) -> ! {
     let _ = writeln!(w, "  r13 {:#018x}  r14 {:#018x}", f.r13, f.r14);
     let _ = writeln!(w, "  r15 {:#018x}", f.r15);
     dump_return_addresses(f, &mut w);
-    let _ = writeln!(w, "halting.");
+    let _ = writeln!(w, "stopping every CPU.");
 
-    Cpu::halt_loop()
+    // **Stop the machine, not just this CPU.** Printed first, so the diagnosis is out before
+    // the other cores are frozen and before this one stops; the dump above is what a reader
+    // gets, and a stop that preceded it could cut the line in half.
+    Cpu::stop_the_machine()
 }
 
 /// Scan the faulting stack for values that look like kernel-text addresses and
@@ -1007,7 +1063,19 @@ pub fn init() {
     for (vector, &stub) in STUBS.iter().enumerate() {
         // #DF (vector 8) runs on IST1 so it has a known-good stack even
         // if the fault was caused by a stack overflow.
-        let ist = if vector == 8 { 1 } else { 0 };
+        //
+        // **NMI (vector 2) runs on IST2**, live since `stop_the_machine` made it a delivered
+        // vector — before that nothing in the tree sent an NMI. An IST=0 gate does not switch
+        // stacks, and NMI can arrive when RSP is not a kernel stack: `syscall_entry` has a
+        // two-instruction window after `swapgs` where RSP is still the *user* stack. The
+        // frame push would `#PF` under SMAP, take that fault on the same bad stack, and
+        // `#DF` — the machine still stops, but over a misleading double-fault dump instead of
+        // the real diagnosis.
+        let ist = match vector {
+            8 => 1,
+            2 => 2,
+            _ => 0,
+        };
         idt[vector].set_handler(stub as usize as u64, ist);
     }
 
@@ -1068,6 +1136,23 @@ unsafe fn load_idt(ptr: &IdtPointer) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The stop-notice predicate, on every shape it has to tell apart.
+    ///
+    /// Vector 2 is the *only* vector that can be a stop notice, and only while a stop is under
+    /// way — a hardware NMI outside one is a real fault to diagnose, and every other vector
+    /// during a stop is a fault the stopping CPU took on its way down and should be reported.
+    #[test]
+    fn is_stop_notice_is_vector_2_during_a_stop_and_nothing_else() {
+        use super::is_stop_notice;
+
+        assert!(is_stop_notice(2, true), "vector 2 during a stop is the notice");
+        assert!(!is_stop_notice(2, false), "a hardware NMI outside a stop is a real fault");
+        for v in [0u64, 1, 3, 6, 8, 13, 14, 32, 255] {
+            assert!(!is_stop_notice(v, true), "vector {v} during a stop is not the notice");
+            assert!(!is_stop_notice(v, false), "vector {v} outside a stop is not the notice");
+        }
+    }
 
     #[test]
     fn set_handler_splits_address() {

@@ -96,8 +96,24 @@ const DF_STACK_SIZE: usize = 16 * 1024;
 static mut GDTS: [[u64; GDT_LEN]; MAX_CPUS] = [[0; GDT_LEN]; MAX_CPUS];
 
 /// One 64-bit Task State Segment **per CPU**. Each CPU's `ist[0]` (IST1) points
-/// at its own `#DF` stack, and `rsp[0]` at its current thread's kernel stack.
-static mut TSSES: [Tss; MAX_CPUS] = [const { Tss::new(0) }; MAX_CPUS];
+/// at its own `#DF` stack, `ist[1]` (IST2) at its own NMI stack, and `rsp[0]` at
+/// its current thread's kernel stack.
+static mut TSSES: [Tss; MAX_CPUS] = [const { Tss::new(0, 0) }; MAX_CPUS];
+
+/// Backing storage for the per-CPU **NMI** IST stacks.
+///
+/// NMI needs its own stack for the same reason `#DF` does, and for one more: it can arrive at
+/// a moment when RSP is not a kernel stack at all. `syscall_entry` has a two-instruction
+/// window after `swapgs` where RSP still points at the **user** stack, and an IST=0 gate does
+/// not switch stacks — the CPU would push the interrupt frame there, `#PF` under SMAP, take
+/// that fault on the same bad stack, and `#DF`. The machine would still stop, but it would
+/// print a full and entirely misleading double-fault dump over the real diagnosis, which is
+/// the outcome the `STOPPING` check exists to prevent, through a door that check cannot
+/// cover.
+///
+/// Live since 2026-08-19, when `stop_the_machine` made vector 2 a delivered vector; before
+/// that nothing in the tree sent an NMI.
+static mut NMI_STACKS: [DfStack; MAX_CPUS] = [const { DfStack([0; DF_STACK_SIZE]) }; MAX_CPUS];
 
 /// Backing storage for the per-CPU double-fault IST stacks. The CPU loads RSP
 /// directly from IST1 on a `#DF`, so 16-byte alignment is baked in.
@@ -131,15 +147,15 @@ struct Tss {
 const _: () = assert!(size_of::<Tss>() == 104);
 
 impl Tss {
-    /// Construct a zeroed TSS whose IST1 entry is `ist1`. `const` so it
+    /// Construct a zeroed TSS whose IST1/IST2 entries are `ist1`/`ist2`. `const` so it
     /// can initialise the [`TSS`] static; [`init`] rewrites it with the
     /// real stack address.
-    const fn new(ist1: u64) -> Self {
+    const fn new(ist1: u64, ist2: u64) -> Self {
         Tss {
             reserved0: 0,
             rsp: [0; 3],
             reserved1: 0,
-            ist: [ist1, 0, 0, 0, 0, 0, 0],
+            ist: [ist1, ist2, 0, 0, 0, 0, 0],
             reserved2: 0,
             reserved3: 0,
             iomap_base: size_of::<Tss>() as u16,
@@ -177,18 +193,20 @@ pub fn init() {
     // panic in the boot path, and each CPU touches only its own slots.
     // SAFETY: `cpu < MAX_CPUS` (a dense id from `this_cpu`); `add(cpu)` stays in
     // bounds. No references into the `static mut`s are formed.
-    let (df_ptr, tss_ptr, gdt_ptr) = unsafe {
+    let (df_ptr, nmi_ptr, tss_ptr, gdt_ptr) = unsafe {
         (
             (&raw const DF_STACKS).cast::<DfStack>().add(cpu),
+            (&raw const NMI_STACKS).cast::<DfStack>().add(cpu),
             (&raw mut TSSES).cast::<Tss>().add(cpu),
             (&raw mut GDTS).cast::<[u64; GDT_LEN]>().add(cpu),
         )
     };
 
-    // 1. Point IST1 at the top of this CPU's double-fault stack (stacks grow
-    //    down) and write the completed TSS.
+    // 1. Point IST1 at the top of this CPU's double-fault stack and IST2 at the top of its
+    //    NMI stack (stacks grow down), then write the completed TSS.
     let df_top = (df_ptr as usize as u64) + DF_STACK_SIZE as u64;
-    let tss = Tss::new(df_top);
+    let nmi_top = (nmi_ptr as usize as u64) + DF_STACK_SIZE as u64;
+    let tss = Tss::new(df_top, nmi_top);
     // SAFETY: `tss_ptr` is this CPU's live, correctly-sized `Tss` slot, owned
     // exclusively by this CPU with no outstanding reference.
     unsafe {

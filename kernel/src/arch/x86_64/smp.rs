@@ -30,7 +30,7 @@ static DENSE_TO_APIC: [AtomicU32; MAX_CPUS] =
 /// is enabled or `IA32_TSC_AUX` is set — and unique per core. Sufficient while
 /// `MAX_CPUS <= 255` (APIC ids fit in 8 bits); a >255-CPU system would read the
 /// 32-bit x2APIC id from `CPUID.0BH` instead.
-fn hw_apic_id() -> u32 {
+pub(super) fn hw_apic_id() -> u32 {
     let (_, ebx, _, _) = regs::cpuid(1, 0);
     ebx >> 24
 }

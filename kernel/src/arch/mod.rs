@@ -51,6 +51,12 @@ pub use x86_64::{abi, ps2, serial};
 #[cfg(all(target_arch = "x86_64", feature = "test-harness"))]
 pub use x86_64::qemu::debug_exit;
 
+/// `true` once some CPU has begun taking the machine down — see
+/// [`Cpu::stop_the_machine`](cpu::ArchCpu::stop_the_machine). For code that must not commit
+/// itself to a machine that is stopping, such as a core still in bring-up.
+#[cfg(target_arch = "x86_64")]
+pub use x86_64::idt::stopping;
+
 // Architecture-trait implementations, re-exported under neutral names (see
 // `docs/conventions/arch-boundary.md`): one trait per divergent behavioural
 // subsystem, mirroring `paging::ArchPaging` → `Paging`.

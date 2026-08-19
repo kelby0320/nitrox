@@ -387,11 +387,12 @@ path that drives the UART directly. The lock cannot be force-unlocked,
 so a handler that tried to lock `SERIAL` after a fault that struck while
 the lock was held would deadlock. Bypassing the lock is sound only
 because Phase 1 is single-CPU: at fault time no other context can be driving
-the UART. Under SMP this can garble diagnostics (another CPU's locked writes
-interleave) and a panicking CPU does not stop the others — reviewed 2026-07-21
-(finding F8) and deliberately deferred with a tracking entry in
-`docs/rationale/deferred-decisions.md` § Concurrency primitives (the fix shape
-is a panic-broadcast stop IPI).
+the UART. Under SMP this can garble diagnostics (another CPU's locked writes interleave). Since
+2026-08-19 a panicking CPU **does** stop the others — `Cpu::stop_the_machine` broadcasts an NMI
+and they halt — so the emergency writer is exclusive once they have stopped; the window between
+the fault and the NMIs landing is still shared, which is the remaining half of finding F8
+(2026-07-21). See `docs/decision-log.md`, 2026-08-19, and the resolved row in
+`docs/rationale/deferred-decisions.md`.
 
 The syscall path (`sys_kprint`) takes only `SERIAL`, at rank 7, and holds
 **no** lock across the user-memory copy: `copy_slice_from_user` runs its

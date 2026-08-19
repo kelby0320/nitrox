@@ -467,6 +467,16 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
         // a fresh boot heap says the sizing is wrong, not that memory is tight.
         panic!("smp: AP scheduler init failed (out of memory building its context)");
     }
+    // **Do not join a machine that is stopping.** `stop_the_machine` targets the *online*
+    // set, which this core is about to enter — so a stop that began while it was still in
+    // bring-up sent it no NMI and would leave it running on a machine whose other cores are
+    // halted wherever they were, several of them possibly holding `SCHED`. That is not
+    // hypothetical: `bring_up_aps`' deadline panic is *about* APs missing from the online
+    // set, so the stop it triggers skips exactly the cores it is complaining about, and a
+    // merely-slow one would arrive here afterwards. Found in review of PR #215.
+    if arch::stopping() {
+        arch::Cpu::halt_loop();
+    }
     AP_ONLINE.fetch_add(1, Ordering::Release);
     kprintln!("smp: cpu {} online (AP)", idx);
 
@@ -1229,7 +1239,12 @@ fn panic(info: &PanicInfo) -> ! {
     // until the wall-clock timeout). `0x11` → QEMU exit 35 → the runner maps to fail.
     #[cfg(feature = "test-harness")]
     arch::debug_exit(0x11);
-    // Halt either way: `debug_exit` returns when no `isa-debug-exit` device is attached,
-    // and a panicked kernel must not run on regardless.
-    arch::Cpu::halt_loop()
+    // **Stop every CPU**, not just this one: a panicked kernel must not run on, and until
+    // 2026-08-19 "must not run on" meant only the panicking core while the rest kept
+    // scheduling on whatever it had been holding. `debug_exit` returns when no
+    // `isa-debug-exit` device is attached, so this runs either way.
+    //
+    // Safe from any core, including one whose APIC is not up yet — `stop_the_machine` checks
+    // and falls back to halting itself, which is the early-boot case `ap_entry` relies on.
+    arch::Cpu::stop_the_machine()
 }

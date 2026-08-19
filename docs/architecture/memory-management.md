@@ -594,7 +594,7 @@ management story.
   (success retries the instruction); a fault that cannot be served —
   no covering VMA, a protection violation, or a non-user fault — is
   fatal (a ring-3 fault becomes a `SegFault` notification + suspend;
-  a kernel fault dump-and-halts).
+  a kernel fault dumps and stops the machine).
 - **User-access protections enabled at boot.**
   [`arch::init_protections`](../../kernel/src/arch/x86_64/paging.rs)
   runs in `paging_init`. On x86_64 it enables NX, SMEP, and SMAP
