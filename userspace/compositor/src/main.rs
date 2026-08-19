@@ -107,6 +107,16 @@ const MAX_LOGGED_REJECTIONS: u32 = 8;
 /// nothing but cursor positions.
 const MAX_LOGGED_ROUTES: u32 = 8;
 
+/// How many *input diagnostics* — a press and where it landed, a dropped batch — get logged.
+///
+/// A separate, far larger bound than [`MAX_LOGGED_ROUTES`] because the thing that constant
+/// argues about does not apply: these are **edge-triggered**, one line per real click or per
+/// genuine loss, not one per event in a continuous stream. A moving mouse produces none of
+/// them. But the argument for having *a* bound survives — serial is a slow synchronous device
+/// and an hour of desktop clicking should not fill the klog ring with press lines — so this is
+/// generous rather than absent: any gate needs a handful, and 256 outlives every one of them.
+const MAX_LOGGED_INPUT_DIAGS: u32 = 256;
+
 static mut CTRL_OUT0: u64 = 0;
 static mut CTRL_OUT1: u64 = 0;
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -126,6 +136,8 @@ static mut REPLY_HANDLES: [u64; libkern::abi::IPC_HANDLE_MAX] =
 static mut SESSION_CH: [u64; MAX_SESSIONS] = [0; MAX_SESSIONS];
 /// Routed input events logged so far — see [`MAX_LOGGED_ROUTES`].
 static mut ROUTES_LOGGED: u32 = 0;
+/// Input diagnostics logged so far — see [`MAX_LOGGED_INPUT_DIAGS`].
+static mut INPUT_DIAGS_LOGGED: u32 = 0;
 /// Scratch for `sys_clock_read`.
 static mut CLOCK_BUF: u64 = 0;
 
@@ -688,6 +700,56 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             let n = srv.interp.feed(ev, &mut logical);
             for l in &logical[..n] {
                 restacked |= srv.router.route(l, &mut srv.stack, &mut out);
+                // **Where a press landed, always — not through `log_route`.** That path is
+                // capped at `MAX_LOGGED_ROUTES` and only sees records that were *delivered*,
+                // so the two things a failing gate most needs are exactly the two it cannot
+                // get: a click that hit no window logs nothing at all, and by the time a
+                // gate has moved the cursor the cap is long spent. A press is rare — one
+                // line per click — so this is not the log volume the cap exists to bound.
+                // **And a dropped batch, which is the other half of the same question.**
+                // `input-server` increments a per-consumer loss counter and announces it as
+                // `SYN_DROPPED`; `libinput` turns that into `Logical::Dropped`. Nothing on
+                // that path prints anything, so a lost batch is invisible — and a lost batch
+                // is the *only* mechanism that moves a press off the point the injector
+                // computed. Without this, a transcript can say the press landed somewhere
+                // unexpected but not whether input was lost getting there, which is exactly
+                // the fork a recurrence needs. Per-consumer accounting also means
+                // `input-testclient` cannot cover it: a loss on the compositor's slot never
+                // reaches the client's event dump.
+                let diag = match *l {
+                    libinput::Logical::Button { pressed: true, .. } => true,
+                    libinput::Logical::Dropped => true,
+                    _ => false,
+                };
+                // SAFETY: single-threaded server; this counter is touched only from the
+                // serve loop, as `ROUTES_LOGGED` is.
+                let logged = unsafe { INPUT_DIAGS_LOGGED };
+                if diag && logged < MAX_LOGGED_INPUT_DIAGS {
+                    // SAFETY: as above.
+                    unsafe { INPUT_DIAGS_LOGGED = logged + 1 };
+                    let mut pl = Line::new();
+                    match *l {
+                        libinput::Logical::Dropped => {
+                            pl.s(b"compositor: input batch DROPPED (SYN_DROPPED)");
+                        }
+                        _ => {
+                            let p = srv.router.pointer();
+                            pl.s(b"compositor: press at x=")
+                                .i(p.x as i64)
+                                .s(b" y=")
+                                .i(p.y as i64);
+                            match srv.router.grab() {
+                                Some(w) => {
+                                    pl.s(b" win=").u(w as u64);
+                                }
+                                None => {
+                                    pl.s(b" win=none");
+                                }
+                            }
+                        }
+                    }
+                    pl.end();
+                }
                 // Repeat follows the *physical* key, so it is armed from the interpreted
                 // transition rather than from what the router decided to do with it: a key
                 // that reached no window still stops repeating when it comes up.

@@ -15946,3 +15946,83 @@ line counts it as exempt.
 
 Verified: 1696 host tests plus the new xtask test; the new test passing in isolation; five guest
 gates and six static gates green; zero warnings.
+## 2026-08-18 — `check-terminal` promoted, and the failure it could not have explained
+
+Audit D.4, first half. The deferral asked for promotion "once it has a clean run of ~10". The
+count was never the hard part: the audit itself logged 24 idle, 15 loaded and 5 `--kvm` passes,
+and this session added 24 more under 6-way host load. What the audit also logged was **one
+failure in 25, at `nxterm: clicked`, under concurrent build load, never reproduced** — and its
+own advice was that the promotion "should own that rather than inherit 10 of 10".
+
+**I did not reproduce it and I did not root-cause it.** 24 loaded runs were clean; at a 1-in-25
+rate that is a 38 % chance of seeing nothing, so it is unmeasured rather than absolved.
+
+What the investigation did establish is why the one observation yielded nothing, and that is
+the thing worth fixing:
+
+- `nxterm: clicked` carries no coordinates.
+- `MAX_LOGGED_ROUTES` is **8**, and the 29 motion packets that position the cursor exhaust it
+  long before the click.
+- `deliver` skips `log_route` entirely for a record whose window has no session — so a click
+  landing on *nothing* logs nothing at all.
+
+So the single most likely explanation produced, by construction, zero evidence. A gate promoted
+in that state fails in CI and tells you only that it failed.
+
+**A hypothesis, measured and discarded.** The gate's typing loop injects one character at a
+time and waits for each echo, with a comment explaining that unpaced injection outruns the
+guest; the 29 motion packets are sent open-loop. `mouse.rs` documents that a lost byte puts the
+decoder out of phase and "the pointer wanders" until it resyncs. That fits — load-sensitive,
+rare, wrong click position. It is wrong: instrumenting the press site and running 16 loaded
+boots gave `x=397 y=295 win=1` **bit-identical every time**, so the pointer is not wandering and
+the press is not hitting the wrong window.
+
+**What changed.** The compositor now logs where a press landed and which window took it, at the
+router call site rather than through `log_route` — outside the cap, and firing even when the
+press hits nothing, which are exactly the two cases the cap and the delivery check removed. The
+gate then asserts the position *before* asserting the click, splitting one opaque timeout into
+its two distinguishable causes.
+
+That is stronger than diagnostics, which is the part I did not expect. Dropping one of the nine
+return motions — the lost-packet scenario above — puts the press at `x=495 y=351`, one delta
+off, and still inside `nxterm`:
+
+```
+new gate:  timed out waiting for "compositor: press at x=397 y=295"
+           compositor: press at x=495 y=351 win=1
+old gate:  terminal gate PASSED
+```
+
+The old gate passed. It never checked that the cursor went where its arithmetic said, only that
+*something* got clicked, so drift up to the window's edge was invisible to it.
+
+**A second defect, latent here.** `input-testclient` had two idle exits printing the identical
+line: one *before* the window phase, where nothing exists and a gate may act at once, and one
+*after* the 2048×2048 window is up, where the line is an announcement — the window outlives it
+through `exit`, the kernel's teardown, and the compositor noticing the peer closed. A gate
+waiting on that string could resume in either state, and the click that follows lands on the
+terminal in one and on a screen-sized window in the other. The comment at that second site
+records `check-terminal` as the gate that originally found the window-swallows-clicks problem.
+Not reachable from this gate today — its only press comes after the wait — so this is not the
+unexplained failure. The two messages are now distinct and the gate names the phase-1 one.
+
+Promoted to the CI QEMU job as `check-terminal --kvm`, unconditional rather than path-filtered:
+its coverage is the compositor-to-shell round trip, which `check-input` (stops at the client's
+event log) and `check-display` (never types) do not reach, so there is no useful path filter.
+The residual is stated rather than closed — if it recurs, CI now reports coordinates.
+
+**Added in review: the drop is logged too.** The transcript now says *where* a press landed,
+but the mechanism this entry measured and discarded — a lost input batch — was still the one
+thing it could not report. `input-server` increments a per-consumer loss counter and announces
+`SYN_DROPPED`; `libinput` turns that into `Logical::Dropped`; and nothing on that path printed
+anything, so the only mechanism that can move a press off its computed point was invisible.
+Per-consumer accounting also means `input-testclient` could never cover it — a loss on the
+compositor's slot never reaches the client's dump. One line now distinguishes "a batch was
+dropped" from "the arithmetic is wrong", which is the fork a recurrence actually needs. Both
+diagnostic lines sit under a separate generous bound (`MAX_LOGGED_INPUT_DIAGS = 256`) rather
+than none: they are edge-triggered, one per real click or genuine loss, so
+`MAX_LOGGED_ROUTES`' continuous-stream argument does not apply — but its argument for having
+*a* bound on synchronous serial writes does.
+
+Verified: `check-terminal` green under TCG and `--kvm`; 40 loaded runs across the investigation;
+1698 host tests; the other four guest gates and six static gates green; zero warnings.

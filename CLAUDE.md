@@ -52,6 +52,7 @@ cargo xtask qemu-debug     # launch QEMU with the GDB stub enabled
 cargo xtask test           # host-side unit tests
 cargo xtask test-qemu      # boot a headless self-test image; pass/fail via isa-debug-exit
 cargo xtask check-display  # boot + screendump; compare the screen to a libdraw render
+cargo xtask check-terminal # click into nxterm, type, and check the shell's answer renders
 ```
 
 `cargo xtask test-qemu` boots the self-test build (`test-harness` feature)
@@ -59,6 +60,11 @@ headless and adjudicates the whole boot (kernel → init → mount → userspace
 from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
+
+`cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
+`nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer
+rendered there. It runs unconditionally in CI's QEMU job (promoted 2026-08-18); `check-input`
+stops at the test client's event log and `check-display` never types, so nothing else covers it.
 
 `cargo xtask check-display` is the display arm's **smoke gate**, not a per-commit one:
 it boots an image and compares the guest's screen against a `libdraw` render over QMP
