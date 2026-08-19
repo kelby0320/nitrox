@@ -467,6 +467,16 @@ extern "C" fn ap_entry(_info: *const SmpInfo) -> ! {
         // a fresh boot heap says the sizing is wrong, not that memory is tight.
         panic!("smp: AP scheduler init failed (out of memory building its context)");
     }
+    // **Do not join a machine that is stopping.** `stop_the_machine` targets the *online*
+    // set, which this core is about to enter — so a stop that began while it was still in
+    // bring-up sent it no NMI and would leave it running on a machine whose other cores are
+    // halted wherever they were, several of them possibly holding `SCHED`. That is not
+    // hypothetical: `bring_up_aps`' deadline panic is *about* APs missing from the online
+    // set, so the stop it triggers skips exactly the cores it is complaining about, and a
+    // merely-slow one would arrive here afterwards. Found in review of PR #215.
+    if arch::stopping() {
+        arch::Cpu::halt_loop();
+    }
     AP_ONLINE.fetch_add(1, Ordering::Release);
     kprintln!("smp: cpu {} online (AP)", idx);
 

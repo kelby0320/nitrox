@@ -327,6 +327,30 @@ only way to leave is `leave_online`, immediately before halting forever.
 
 ---
 
+### 9. The stop NMI
+
+The third cross-CPU signal, after the reschedule IPI (§6) and the shootdown IPI (§8), and the
+only one that is **not** a fixed vector.
+
+`Cpu::stop_the_machine` is the mechanism behind the 2026-08-19 promise that a ring-0 fault
+stops the machine (`docs/decision-log.md`). It masks interrupts, sets `idt::STOPPING`, sends an
+NMI to every **online** CPU but itself, and halts. Each target takes vector 2, sees `STOPPING`,
+and halts without dumping — `exception_dispatch` answers that before the ring test, and
+`dump_and_halt` re-checks it, so a stopped CPU cannot print a register dump over the diagnosis
+the deciding CPU just wrote.
+
+Three things about it are load-bearing and easy to get wrong:
+
+- **NMI, not a vector.** The CPUs most in need of stopping are the ones spinning on a lock the
+  faulting CPU holds, and an `IrqSpinLock` holder spins with interrupts masked. A
+  Fixed-delivery IPI reaches every CPU *except* those.
+- **Vector 2 runs on IST2.** An IST=0 gate does not switch stacks, and NMI can arrive while RSP
+  is still the user stack (`syscall_entry`'s window after `swapgs`), which would `#PF` and then
+  `#DF`.
+- **"Online" is narrower than "executing".** A core joins the online set in `sched::ap_init`,
+  so one partway through bring-up is not a target. It checks `arch::stopping()` in `ap_entry`
+  before making itself schedulable rather than being signalled.
+
 ## Part 2 — The bugs: what, how found, fix
 
 Bringing SMP from "APs online, userspace pinned to the BSP" to "userspace migrates
@@ -491,23 +515,13 @@ syscalls while migratable.
 - **`sys_thread_set_affinity`-driven active migration** — changing affinity to
   exclude a thread's current core does not yet forcibly migrate it mid-slice
   (it moves on its next reschedule).
-- **SMP panic path** (review F8, 2026-07-21) — the emergency serial writer is
-  unsynchronized and no stop IPI parks the other cores on a panic; diagnostics
-  can garble under SMP. Tracked in `deferred-decisions.md`.
-- **Cross-CPU TSC synchronization is assumed, not verified** (review F10) — the
-  deadline heap compares `Timer::read_ns()` values captured on different cores.
-  Two claims that stood here until 2026-08-14 were wrong, and the audit refuted
-  both (C.5). *"Saturating arithmetic"* named a `saturating_add` that guards
-  interval overflow, not skew — the subtraction that skew actually reaches was
-  `wrapping_sub`, since made saturating so a behind-TSC AP reads 0 rather than
-  ~292 years and poisons the shared heap. And *"merely delay a firing"* describes
-  one of two pairings: a deadline armed on a CPU running ahead fires late, the
-  reverse fires **early**, which for `sys_wait` is a premature `TimedOut`
-  returned to userspace.
-  What remains true: nothing verifies the synchronisation, the tolerance for a
-  negative skew is the time since calibration (smallest exactly at AP bring-up),
-  and it holds under QEMU/KVM and on invariant-TSC hardware (the project
-  baseline). Verify or gate at real-hardware bring-up.
+- **SMP panic path** (review F8, 2026-07-21) — **half resolved 2026-08-19.** A panicking or
+faulting CPU now *does* stop the others: `Cpu::stop_the_machine` sends an **NMI** to every
+online CPU and they halt without dumping (NMI rather than a fixed vector because the CPUs most
+worth stopping spin on a lock with interrupts masked, where a fixed-vector IPI never lands).
+What remains is the other half: the emergency serial writer is unsynchronised, so output can
+still interleave with another CPU's locked writes in the window between the fault and the NMIs
+landing. See `docs/decision-log.md`, 2026-08-19.
 
 ## References
 

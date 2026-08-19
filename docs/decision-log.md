@@ -16275,6 +16275,42 @@ emergency writer interleaving with another CPU's locked serial writes — is nar
 than gone: output is exclusive once the others are stopped, but the window between the fault and
 the NMIs landing is still shared.
 
+**Four things review added, all of which the control above could not have reached.**
+
+*Interrupts are masked for the whole send.* `stop_the_machine` inherited the caller's IF, which
+from `dump_and_halt` is 0 but from `panic!` is whatever the context held — and IF=1 in ring 0 is
+reachable: `tlb::shootdown` spins for acknowledgements with interrupts deliberately enabled. A
+tick landing inside the send loop deschedules the panicking thread, leaving `STOPPING` latched,
+no NMI sent and the machine running; worse, if it resumes on another CPU the captured `me` names
+the old one, so the loop NMIs the core it is now running on and takes itself out partway through
+the scan.
+
+*Vector 2 runs on IST2.* This change is what made vector 2 a delivered vector — nothing in the
+tree sent an NMI before it — and an IST=0 gate does not switch stacks. `syscall_entry` has a
+two-instruction window after `swapgs` where RSP is still the *user* stack; the frame push would
+`#PF` under SMAP, take that fault on the same bad stack, and `#DF`. The machine would still stop,
+but over a misleading double-fault dump — the outcome the `STOPPING` check exists to prevent,
+through a door it does not cover.
+
+*"Online" is narrower than "executing", and the trait said "every".* A core joins the online set
+in `sched::ap_init`, so one partway through bring-up can take an NMI and is not sent one — and
+`bring_up_aps`' deadline panic is *about* APs missing from that set, so the stop it triggers
+skips exactly the cores it is complaining about. The contract now says "online" and explains why
+that set is the right target; `ap_entry` checks `arch::stopping()` before making itself
+schedulable, which is the half that actually closes the window.
+
+*`STOPPING` is set inside the branch that sends.* It was stored before the `x2apic_enabled_here`
+check, so the fallback path announced a stop it then did not perform and never cleared — leaving
+a flag that would silently convert any genuine hardware NMI, on any core, into an undiagnosed
+halt.
+
+**On pinning the dispatch rule.** The predicate is now `is_stop_notice(vector, stopping)`, a free
+function with a host test, following `clear_online_bit`'s precedent. Its *ordering* — deciding
+before the ring test — is still structural rather than tested, so `dump_and_halt` re-checks
+`STOPPING` independently: the property that matters, a stopped CPU not printing a register dump
+over the diagnosis, then holds even if the earlier check is moved or missed.
+
 Verified: `test-qemu`, `test-interactive`, `check-terminal`, `check-input`, `check-display` and
-`check-input --no-ps2-irq` green unmodified; the injected-fault control above; 1698 host tests;
-six static gates; zero warnings.
+`check-input --no-ps2-irq` green unmodified; the injected-fault control re-run after every edit
+(`halt_loop` → PASSED, `stop_the_machine` → TIMED OUT); 1699 host tests; six static gates; zero
+warnings in debug and release.
