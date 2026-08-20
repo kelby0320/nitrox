@@ -23,6 +23,7 @@
 extern crate alloc;
 
 pub mod input;
+pub mod manager;
 pub mod outbox;
 pub mod server;
 

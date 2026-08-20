@@ -9,8 +9,8 @@ buffer, commit it with a damage rectangle, and receive it back when the composit
 (`docs/planning/display-arm-plan.md`); the namespace surface completed in Part B.
 `CreateWindow`, `AttachBuffer`, `Commit`, `Release`, `DestroyWindow`, `KeyEvent` and
 `PointerEvent` are defined, and
-two paths resolve: `/dev/draw/new` for a session and `/dev/draw/<N>/info` for a window's
-metadata. A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
+three paths resolve: `/dev/draw/new` for a session, `/dev/draw/<N>/info` for a window's
+metadata, and `/dev/draw/manage` for the **manager channel** (M6 Part B, 2026-08-19). A bare `/dev/draw/<N>` and `/dev/draw/<N>/ports/…` do not resolve yet. Thumbnail
 capture, window movement and port wiring are later milestones and will extend this category.
 
 **`KeyEvent` and `PointerEvent` are sent** as of M3 Part C3 (2026-08-10). The compositor
@@ -43,12 +43,21 @@ is in the loop (`docs/design/ui-composition-model.md` §2a).
 **Authority is the binding.** A process can create windows if and only if `/dev/draw` is
 in its namespace. There is no display capability bit and no registration call.
 
-**Window ids are scoped to the connection that created them.** A client may only name its
-own windows: `AttachBuffer`, `Commit` and `DestroyWindow` against an id belonging to
-another connection are `NotFound`, exactly as if the id did not exist. Nothing about the id
-space itself enforces this — ids are unique compositor-wide so that a desktop shell holding
-`/dev/draw` with broader rights can address any of them — so **the server keeps the
-per-connection set** and checks membership before dispatch.
+**Window ids are scoped to the connection that created them — on a *session* channel.** A
+client may only name its own windows: `AttachBuffer`, `Commit` and `DestroyWindow` against an
+id belonging to another connection are `NotFound`, exactly as if the id did not exist. Nothing
+about the id space itself enforces this — ids are unique compositor-wide so that a desktop
+shell holding `/dev/draw` with broader rights can address any of them — so **the server keeps
+the per-connection set** and checks membership before dispatch.
+
+**The manager channel is the deliberate exception, and that is what it is for.** Every op on
+it names a window by id and none checks ownership: managing windows one did not create is the
+whole capability, and the *binding* is what bounds who may hold it. In M6 that binding gates
+nothing — `/dev/draw` is bound unscoped into init's root namespace, so any graphical client
+could ask, and what separates the intended manager from the rest is **order**: the first to
+resolve `manage` gets it and a second resolve is refused (`WouldBlock`) rather than served,
+because two managers placing windows is a race with no arbiter. Recorded as
+`TODO(manage-ungated)` and closed by M7's per-client namespaces.
 
 Without that rule, holding `/dev/draw` (which this spec makes the whole of the authority to
 create windows) would also be the authority to destroy anyone else's. The composition
@@ -178,6 +187,7 @@ sections, so it is stated once, normatively:
 | `Commit` | **silent** | error reply |
 | `DestroyWindow` | **silent** | error reply |
 | `Release` | server-initiated; never a reply | — |
+| `Place`, `Raise`, `Lower`, `RaiseAbove`, `SetFocus`, `Configure` (manager channel) | **empty-body reply** | error reply |
 
 An error reply carries `RS_FLAG_REPLY | RS_FLAG_ERROR` with the **same op and request id** as
 the request it refuses. Two consequences a client must handle:
@@ -480,6 +490,55 @@ popup parented to a popup; leaving it alive with a dead parent gives it no defin
 position and still lets it take focus.
 
 `NotFound` if the id does not belong to this connection.
+
+## The manager channel (`0x0910`–`0x0915`)
+
+Resolved at `/dev/draw/manage`, one holder at a time — see the scoping note above. Every op
+names a window by id and **none checks ownership**; that is the capability. Each replies with an
+**empty body** on success and an error reply on failure.
+
+### `Place` (`0x0910`)
+
+Request, 12 bytes: `window` (u32), `x` (i32), `y` (i32). Sets the window's origin in screen
+coordinates. `NotFound` if no such window.
+
+**Absolute, and there is no relative `Move`.** A manager computes positions from the work area
+and from other windows, so it always knows the answer in screen coordinates; a relative move
+would only serve an interactive drag, which needs a grab offset the compositor does not keep.
+It comes back with decorations, or not at all.
+
+### `Raise` (`0x0911`), `Lower` (`0x0912`), `SetFocus` (`0x0914`)
+
+Request, 8 bytes: `window` (u32), `other` (u32, ignored). Restacking. `NotFound` if no such
+window.
+
+**`SetFocus` is `Raise`.** Focus is a consequence of stacking rather than a field: the
+compositor's focus candidate is the topmost focusable window, so "give this window the
+keyboard" *is* "raise it", and a separate focus field would be a second piece of state to
+disagree with the stack.
+
+### `RaiseAbove` (`0x0913`)
+
+Request, 8 bytes: `window` (u32), `other` (u32). Places `window` directly above `other` in the
+stack. `NotFound` if either id is unknown.
+
+### `Configure` (`0x0915`)
+
+Request: the same body as the client-facing [`Configure`](#configure-0x0908) — `window`,
+`width`, `height`, `x`, `y`. Asks the window's **client** to adopt that geometry; it is the
+manager's half of the handshake a client completes on create.
+
+The reply says the compositor accepted the request, **not** that the client has adopted it: the
+`Configure` is forwarded to a third party, and whether it arrives is a property of that client's
+receive ring. `NotFound` if no such window.
+
+## Reserved, not yet implemented
+
+`SetTitle` (`0x0907`… see `surface.rs`) and the manager **event** ops `0x0918`–`0x091C`
+(`WindowCreated`, `WindowDestroyed`, `WindowGeometry`, `WindowFocus`, `WindowTitle`) are
+defined in `librsproto` and **not implemented by the compositor**. They are M6 Part B3, which
+is open. Nothing sends or receives them today; the encodings are declared so B3 does not have
+to renumber, and this section exists so a second implementation does not read them as live.
 
 ## See also
 
