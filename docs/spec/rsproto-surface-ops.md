@@ -508,8 +508,9 @@ from starting at all. Waiting costs the client one round trip at creation and no
 the window's default origin, so the wait is a formality — which is the point: a client written
 against this rule needs no change when a manager appears.
 
-**With a manager attached the compositor holds the first `Configure`** and sends
-`WindowCreated` (see "Manager events" below) instead. It is released by whichever comes first:
+**With a manager attached the compositor holds the first `Configure`** — for a `normal` or a
+`panel`, the two roles a manager places — and sends `WindowCreated` (see "Manager events" below)
+instead. It is released by whichever comes first:
 
 | Trigger | The client is told |
 | --- | --- |
@@ -517,6 +518,14 @@ against this rule needs no change when a manager appears.
 | The manager sends any other request naming the window (`Place`, `Raise`, `RaiseAbove`, `Lower`, `SetFocus`) | the window's geometry as it now stands — the placed origin, at the requested size |
 | Nothing, for **200 ms** | the requested size at the default origin |
 | The manager disconnects | the same, at once rather than after the remaining wait |
+
+**A `popup` or a `dialog` is never held.** It is placed by its creator, through the offset in its
+`CreateWindow`, so there is nobody to wait for: the compositor sends `WindowCreated` to the
+manager *and* the first `Configure` to the client, immediately, exactly as it would with no
+manager attached. None of the four triggers above applies to one.
+
+This is not a refinement — it is the difference between a menu that opens and a menu that takes
+200 ms to open, on every use, as soon as a shell is running.
 
 A manager that wants to set position *and* size should use `Configure` rather than `Place`
 followed by `Configure`: the `Place` releases the hold, so the `Configure` after it arrives as an
@@ -533,6 +542,17 @@ for.
 `Configure`** — it would be waiting for an answer only it can give, and would be released only by
 the deadline. It must issue `CreateWindow` and service the manager channel separately rather than
 using a helper that does both. `libsurface`'s `Window::new` is such a helper.
+
+**This does not apply to a popup or a dialog**, which is never held — so a shell opening its own
+menu, the obvious case, may block on that window's configure like any other client. It applies to
+the `normal` and `panel` windows such a process creates.
+
+**Create a popup only after its parent's first `Configure`.** The offset resolves against the
+parent's origin *as it stands at that moment*, so a popup created while its parent is still held
+resolves against the default origin — and, being exempt from the hold itself, is composited there
+while the parent is still invisible, and stays there when the manager finally places the parent.
+A client that waits for its parent's configure before opening a menu cannot reach this;
+`libsurface`'s `Window::new` waits, so nothing built on it can.
 
 `libsurface` performs the wait inside `Window::new`, which returns only once the first `Configure`
 has arrived; the first one is **not** delivered to the application as an event, because it is

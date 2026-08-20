@@ -534,7 +534,10 @@ const MGR_EVENT_TRIES: u32 = 20;
 ///
 /// Bimodal, not a tolerance: a popup that is exempt from the initial-configure hold is answered
 /// in the same handler that created it, and one that is held waits out `CONFIGURE_DEADLINE_NS`
-/// — 200 ms. Anything in between does not happen, so this sits far from both.
+/// — 200 ms. Anything in between does not happen, so 50 ms sits far from both.
+///
+/// **Slices that expired**, not iterations: a record that was already queued returns at once and
+/// must not spend the budget, or the bound is "five other events" rather than 50 ms.
 const POPUP_CONFIGURE_SLICE_NS: u64 = 10_000_000;
 const POPUP_CONFIGURE_SLICES: u32 = 5;
 
@@ -757,9 +760,18 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     );
 
     // 3. **Not held.** Nothing here answered as the manager, so a popup that was held would
-    //    still be waiting. Bounded well under the deadline — see `POPUP_CONFIGURE_SLICES`.
+    //    still be waiting. Bounded by *elapsed time*, not by iterations — see
+    //    `POPUP_CONFIGURE_SLICES`.
+    //
+    //    **Only an empty slice counts.** `wait_event_timeout` returns a queued record without
+    //    waiting, so counting every iteration would spend the budget on other people's events
+    //    rather than on time: two of the five were already gone before this ever ran, on the
+    //    parent's own configure and the focus change that followed it. One more record ahead of
+    //    the popup — a pointer crossing the parent, a third window in this probe — and the gate
+    //    would report "a popup waited for the manager" about a compositor that is perfectly
+    //    fine (PR #219 review, finding 1).
     let mut buf = [0u8; 64];
-    let mut slices = 0;
+    let mut empty_slices = 0;
     loop {
         match t.wait_event_timeout(&mut buf, POPUP_CONFIGURE_SLICE_NS) {
             Ok(Some((OP_CONFIGURE, n))) => {
@@ -768,12 +780,17 @@ fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
                     _ => {}
                 }
             }
-            Ok(_) => {}
+            // Somebody else's record. It cost no time, so it costs no budget.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                empty_slices += 1;
+                if empty_slices >= POPUP_CONFIGURE_SLICES {
+                    fail(
+                        b"ui-testclient: a popup waited for the manager, which never places popups\n",
+                    );
+                }
+            }
             Err(_) => fail(b"ui-testclient: C1 session channel error\n"),
-        }
-        slices += 1;
-        if slices >= POPUP_CONFIGURE_SLICES {
-            fail(b"ui-testclient: a popup waited for the manager, which never places popups\n");
         }
     }
 

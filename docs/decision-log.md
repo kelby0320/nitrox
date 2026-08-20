@@ -16521,7 +16521,11 @@ rather than left for a reviewer to find.
 
 **`CreateWindowRequest` grew from 16 to 24 bytes**, gaining a signed `offset_x`/`offset_y` pair
 that is role-specific in exactly the way the aux words already are: meaningful for `popup` and
-`dialog`, written and read as zero for `normal` and `panel`. A wire break taken deliberately
+`dialog`, written and read as zero for `normal` and `panel`. **Dialogs move with popups throughout**,
+which the framing of this work mostly does not say: a `dialog` used to land at `(0, 0)` and be
+held for the manager, and now lands on its parent's origin and is never held. Nothing in the tree
+creates one outside tests, so nothing regressed — but "a popup is placed by its creator" is the
+short name for a rule that governs both parented roles. A wire break taken deliberately
 while the ABI is pre-stabilisation.
 
 The alternative — a `Surface::PlacePopup` op sent between `CreateWindow` and the first `Commit` —
@@ -16557,11 +16561,17 @@ bytes" and the encoder could drift apart silently, on the record every client se
 lengths are asserted now.
 
 *`libsurface` allows one window per connection, and that blocks C3.* `Window` owns its
-`Transport`, so a client gets the transport back only by destroying the window — while a popup may
-only name a parent its own connection owns. `nxterm` cannot hold its terminal and its menu at
-once until `libsurface` grows a session type. The protocol never had this limit; the API does.
-Discovered by writing C1's gate probe, which works around it with the raw transport.
-`TODO(libsurface-multi-window)`, and it is now the first thing C3 builds.
+`Transport`, so holding a window means holding the only handle to that connection. `into_transport`
+does hand it back without destroying anything — what a client gives up is the `Window` value, and
+with it the ability to `attach` or `commit` to a window the server still has — so the limit is
+"one *usable* window per connection", not "destroy it to get the transport back" as an earlier
+draft of this entry said. Either way a client cannot drive a parent and its child at the same
+time, and a popup may only name a parent its own connection owns.
+
+`nxterm` therefore cannot hold its terminal and its menu at once until `libsurface` grows a
+session type that owns the transport and mints windows from it. The protocol never had this
+limit; the API does. Discovered by writing C1's gate probe, which works around it with the raw
+transport. `TODO(libsurface-multi-window)`, and it is now the first thing C3 builds.
 
 Also: the 66 `CreateWindowRequest` literals in the tree became `::new`/`::at` constructors. The
 same edit count as adding two zero fields everywhere, and the next role-specific word costs

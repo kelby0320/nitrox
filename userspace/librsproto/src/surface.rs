@@ -1292,7 +1292,11 @@ mod tests {
         let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
         let req = CreateWindowRequest::new(4, 4, Role::Normal);
         build_create_window_request(&mut buf, &req).unwrap();
-        assert_eq!(&buf[10..16], &[0, 0, 0, 0, 0, 0]);
+        // **10..24, not 10..16.** The record grew two words in C1 and the invariant covers them:
+        // the offset is meaningless without a parent, so a `normal` request that left those
+        // bytes alone would put the caller's stack contents on the wire and two identical
+        // requests would differ (PR #219 review, finding 4).
+        assert_eq!(&buf[10..24], &[0u8; 14]);
     }
 
     #[test]

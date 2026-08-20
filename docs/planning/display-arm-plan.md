@@ -1342,6 +1342,10 @@ item. Two facts found while detailing changed the shape of the work:
       role-specific words: `x` and `y`, the offset from the parent's origin, zero for roles that
       have no parent. A wire break, taken deliberately while the ABI is pre-stabilisation.
 
+      **"Popup" is shorthand for both parented roles.** A `dialog` is placed by its creator and
+      exempt from the hold on exactly the same terms; nothing in the tree creates one outside
+      tests, which is why the wording throughout says popup.
+
       The alternative — a new `Surface::PlacePopup` op sent between `CreateWindow` and the first
       `Commit` — was rejected: it puts a second message on the path of every menu open, and it
       creates the popup at `(0, 0)` before moving it. Nothing would *see* it there, since a

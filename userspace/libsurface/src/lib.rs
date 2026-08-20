@@ -271,6 +271,18 @@ impl<T: Transport> Window<T> {
     ///
     /// `role` must be [`Role::Popup`] or [`Role::Dialog`]; for anything else the offset is
     /// written as zero and a manager places the window as usual.
+    ///
+    /// # This cannot yet create a popup — `TODO(libsurface-multi-window)`
+    ///
+    /// A popup may only name a parent **its own connection owns**, and a [`Window`] owns its
+    /// [`Transport`] — so a client already holding the parent has no transport left to create
+    /// the child with, and one that uses a second connection is refused with `NotFound`. The
+    /// protocol has no such limit; this API does, until it grows a session type that owns the
+    /// transport and mints windows from it.
+    ///
+    /// Usable today for a [`Role::Dialog`] or popup whose parent is on **another** window of
+    /// the same connection — which nothing can currently be — so in practice this is here for
+    /// the offset encoding and for the caller that arrives with the session type.
     pub fn new_at(
         transport: T,
         width: u32,
