@@ -730,12 +730,12 @@ fn serve_input(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
                     libinput::Logical::Dropped => true,
                     _ => false,
                 };
-                // SAFETY: single-threaded server; this counter is touched only from the
-                // serve loop, as `ROUTES_LOGGED` is.
-                let logged = unsafe { INPUT_DIAGS_LOGGED };
+                // Already inside the enclosing `unsafe` block, so no inner one: the
+                // justification is that this is a single-threaded server and the counter is
+                // touched only from the serve loop, as `ROUTES_LOGGED` is.
+                let logged = INPUT_DIAGS_LOGGED;
                 if diag && logged < MAX_LOGGED_INPUT_DIAGS {
-                    // SAFETY: as above.
-                    unsafe { INPUT_DIAGS_LOGGED = logged + 1 };
+                    INPUT_DIAGS_LOGGED = logged + 1;
                     let mut pl = Line::new();
                     match *l {
                         libinput::Logical::Dropped => {
