@@ -543,6 +543,16 @@ The compositor queues the record and retries rather than dropping it — a manag
 `WindowCreated` would hold a window list that is wrong forever, with no resync op to repair it.
 The queue is bounded; on overflow the oldest are discarded and the compositor logs the count.
 
+**A manager is told about the future, not the past.** Events are generated as things happen and
+sent to whoever holds the channel at that moment; there is no enumeration op and no resync. A
+manager that attaches while windows already exist is never told about them, and its list stays
+missing them until each is destroyed and recreated. **A manager must therefore attach before any
+client creates a window** — which today means being started by the same supervisor that binds
+`/dev/draw`, before it binds it to anyone else. This is a real constraint, not an oversight: the
+alternative is an enumeration op that has to answer "what is on screen" atomically against a
+stack that changes under it, and nothing needs it until a desktop shell can be restarted
+independently of the compositor (M7). Until then a manager restart requires a compositor restart.
+
 **Scoped to the whole screen, not to a connection.** Every other op in this document names
 windows within the connection that created them; these name windows the manager did not create
 and cannot otherwise see. That is the manager channel's purpose and the reason only one exists.
@@ -551,7 +561,7 @@ and cannot otherwise see. That is the manager channel's purpose and the reason o
 | -------- | ---------------- | ------------------- | ---------------------------------------------- |
 | `0x0918` | `WindowCreated`  | `MgrWindowCreated`  | A window exists, with the role and size its client asked for |
 | `0x0919` | `WindowDestroyed`| `MgrWindowRef`      | A window is gone (`other` unused, zero)        |
-| `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's position or size changed            |
+| `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's committed rectangle changed — place *or* commit |
 | `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
 
 `WindowCreated` fires when the window is created, **before** its client has committed anything
@@ -566,12 +576,20 @@ for everything it still held.
 not. A manager that assumed its own `Place` needed no confirmation would have two sources of
 truth for where a window is; there is one, and it is this event.
 
+**The rectangle is the committed one**, identical to what `/dev/draw/<id>/info` answers with —
+the committed buffer's size, not the size named at `CreateWindow`. The two differ whenever a
+client commits a buffer of a different size, which is supported. It follows that a **commit can
+be a geometry change on its own**: a client that reflows and commits a taller buffer is reported
+without any manager involvement. Restricting the event to manager-initiated moves would leave
+polling as the only way to see a client resize itself, which is what this event exists to
+remove.
+
 `WindowFocus` reports both halves of a transition: the window losing focus, then the window
 gaining it. Either may be absent — nothing had focus, or nothing takes it.
 
 ## Reserved, not yet implemented
 
-`SetTitle` (`0x0907`… see `surface.rs`) and the manager event op `0x091C` (`WindowTitle`) are
+`SetTitle` (`0x0909`) and the manager event op `0x091C` (`WindowTitle`) are
 defined in `librsproto` and **not implemented by the compositor**. They are M6 Part B3b, which
 is open: a title needs a client-facing op to set one and a variable-length body to carry it,
 neither of which the four events above needed. Nothing sends or receives them today; the

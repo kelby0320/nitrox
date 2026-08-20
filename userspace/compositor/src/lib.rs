@@ -345,6 +345,22 @@ pub struct WindowStack {
     /// The bin drains this after every dispatch whether or not a manager is attached, so it
     /// holds at most one call's worth and cannot grow while nobody is listening.
     removed_log: Vec<u32>,
+    /// Every id whose [`bounds`](Window::bounds) changed since the last
+    /// [`take_geometry_changes`](Self::take_geometry_changes).
+    ///
+    /// **Recorded where bounds change, not where a request is dispatched.** A window's
+    /// on-screen rectangle moves for more than one reason — a manager `Place`, and a client
+    /// committing a buffer of a different size — and `WindowGeometry` promises to report it
+    /// *for any reason*. Emitting from the one op the feature was written for is how the
+    /// commit case silently goes unreported, leaving a manager to poll `/dev/draw/<id>/info`
+    /// for the thing this event exists to save it from (PR #217 review, finding 2).
+    ///
+    /// **Including the changes a manager caused itself.** A manager that had to remember which
+    /// moves were its own would be keeping a second copy of the stack, which is the duplicate
+    /// state this event exists to make unnecessary.
+    ///
+    /// Drained like [`removed_log`](Self::removed_log), and for the same reason.
+    geometry_log: Vec<u32>,
 }
 
 impl Default for WindowStack {
@@ -362,7 +378,12 @@ impl Default for WindowStack {
 impl WindowStack {
     /// An empty stack.
     pub fn new() -> Self {
-        Self { windows: Vec::new(), next_id: 1, removed_log: Vec::new() }
+        Self {
+            windows: Vec::new(),
+            next_id: 1,
+            removed_log: Vec::new(),
+            geometry_log: Vec::new(),
+        }
     }
 
     /// Windows, bottom-first.
@@ -421,13 +442,19 @@ impl WindowStack {
     /// type for why `#[must_use]` on this function would not have been enough.
     pub fn place(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
-        if w.committed.is_none() {
-            w.origin = origin;
-            return Ok(Damage(Rect::new(origin.x, origin.y, 0, 0)));
-        }
+        let uncommitted = w.committed.is_none();
         let was = w.bounds();
         w.origin = origin;
         let now = w.bounds();
+        if was != now {
+            self.geometry_log.push(id);
+        }
+        if uncommitted {
+            // A window with nothing on screen has no pixels to repaint, but it has still
+            // *moved*: `bounds()` is taken from the requested size at this point, so the
+            // record above fires and a manager learns where it will appear.
+            return Ok(Damage(Rect::new(origin.x, origin.y, 0, 0)));
+        }
         Ok(Damage(union(was, now)))
     }
 
@@ -464,19 +491,41 @@ impl WindowStack {
             return Err(StackError::NoSuchBuffer);
         }
         let previous = w.committed;
+        let was = w.bounds();
         w.committed = Some(req.buffer);
+        // **A commit can resize the window.** The committed buffer's geometry is what
+        // `bounds()` reports, so a client that reflows and commits a taller buffer has
+        // changed its on-screen rectangle without any manager involvement at all.
+        if w.bounds() != was {
+            self.geometry_log.push(req.window);
+        }
         // Re-committing the same buffer releases nothing: the client already knows it owns
         // no other buffer, and reporting a release here would let it draw into the buffer
         // now on screen.
         Ok(previous.filter(|&p| p != req.buffer))
     }
 
-    /// Destroy a window and everything attached to it.
     /// Take every id removed since the last call, parent before the popups it took with it.
     ///
     /// Draining is the point: see [`removed_log`](Self::removed_log).
     pub fn take_removed(&mut self) -> Vec<u32> {
         core::mem::take(&mut self.removed_log)
+    }
+
+    /// Take every id whose bounds changed since the last call, each reported once.
+    ///
+    /// Deduplicated because one dispatch can change a window's rectangle twice — a place and
+    /// a commit in the same batch — and a manager gains nothing from hearing the same
+    /// rectangle described a second time. Draining is the point: see
+    /// [`geometry_log`](Self::geometry_log).
+    pub fn take_geometry_changes(&mut self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for id in core::mem::take(&mut self.geometry_log) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
     }
 
     /// Destroy a window and everything attached to it, recording every id removed.
@@ -1610,6 +1659,61 @@ mod tests {
         assert_eq!((info.width, info.height), (8, 8), "committed size once there is one");
         assert_eq!((info.x, info.y), (-3, 12));
         assert_eq!(info.id, w);
+    }
+
+    /// A geometry change reports the rectangle that is **on screen**, and reports one for a
+    /// commit as well as for a place.
+    ///
+    /// Two defects in one test, because they share a cause — the event was built at the one
+    /// op it was written for, from the field that op happened to have. It reported the
+    /// *requested* size while `/dev/draw/<id>/info` reports the *committed* one, so a manager
+    /// and a namespace read disagreed about the same window at the same instant; and a client
+    /// that resized itself by committing a different buffer produced no event at all, leaving
+    /// polling as the only way to notice — which is what this event exists to remove
+    /// (PR #217 review, findings 1 and 2).
+    #[test]
+    fn a_geometry_change_reports_committed_bounds_and_fires_for_a_commit_too() {
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 100, height: 50, role: Role::Normal }).unwrap();
+        // Creating alone changes no bounds: there is no previous rectangle to differ from.
+        assert!(s.take_geometry_changes().is_empty(), "create is not a geometry change");
+
+        // A commit that resizes the window — no manager involved anywhere.
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::BLACK);
+        s.commit(&commit(w, 0)).unwrap();
+        assert_eq!(s.take_geometry_changes(), vec![w], "a commit that resizes is reported");
+
+        let _ = s.place(w, Point::new(-3, 12)).unwrap();
+        assert_eq!(s.take_geometry_changes(), vec![w], "and so is a place");
+
+        // The rectangle a manager would be handed must equal the one `info` answers with.
+        let b = s.window(w).unwrap().bounds();
+        let info = s.info(w).unwrap();
+        assert_eq!(
+            (b.origin.x, b.origin.y, b.size.w, b.size.h),
+            (info.x, info.y, info.width, info.height),
+            "the event and /dev/draw/<id>/info must describe one window the same way"
+        );
+        assert_eq!((b.size.w, b.size.h), (8, 8), "committed, not the 100x50 requested");
+
+        // Re-committing the same buffer changes nothing, so it announces nothing.
+        s.commit(&commit(w, 0)).unwrap();
+        assert!(s.take_geometry_changes().is_empty(), "a commit that does not resize is silent");
+    }
+
+    /// One dispatch that both moves and resizes a window reports it once, not twice.
+    #[test]
+    fn geometry_changes_are_deduplicated() {
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 100, height: 50, role: Role::Normal }).unwrap();
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::BLACK);
+        s.commit(&commit(w, 0)).unwrap();
+        let _ = s.place(w, Point::new(5, 5)).unwrap();
+        assert_eq!(s.take_geometry_changes(), vec![w], "one id, however many times it moved");
     }
 
     #[test]

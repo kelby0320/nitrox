@@ -520,9 +520,12 @@ fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i3
 
 /// How long one `wait_event_timeout` slice waits for a manager event, and how many slices.
 ///
-/// ~2s in total: generous next to a compositor that flushes its manager outbox every loop
-/// iteration, and short enough that a missing event is reported *by name* here rather than
-/// by the gate's wall-clock timeout, which cannot say which event never came.
+/// **Up to ~2s, not a 2s budget.** An event of the wrong kind consumes a slice without
+/// waiting, so the wall-clock floor is only reached when nothing arrives at all. That is the
+/// case this bound exists for; with the handful of strays this probe can see, the count is
+/// ample either way. Generous next to a compositor that flushes its manager outbox every loop
+/// iteration, and short enough that a missing event is reported *by name* here rather than by
+/// the gate's wall-clock timeout, which cannot say which event never came.
 const MGR_EVENT_SLICE_NS: u64 = 100_000_000;
 const MGR_EVENT_TRIES: u32 = 20;
 
@@ -649,9 +652,35 @@ fn verify_manager_events(
         fail(b"ui-testclient: WindowFocus did not say the new window gained focus\n");
     }
 
-    // 3. Geometry — **after a move to somewhere that is not the default.** `(0, 0)` is where
-    //    the compositor already puts windows, so a geometry event reporting the origin cannot
-    //    be told from one that echoed the request without the window having moved.
+    // 3. Geometry — **after a move to somewhere that is not the default, on a window whose
+    //    committed size is not the size it asked for.** `(0, 0)` is where the compositor
+    //    already puts windows, so a geometry event reporting the origin cannot be told from one
+    //    that echoed the request without the window having moved. And the two sizes must
+    //    differ, or an event reporting the *requested* size looks identical to one reporting
+    //    what is actually on screen — which is exactly how that defect survived this gate the
+    //    first time (PR #217 review, finding 1).
+    let (cw, ch) = (32u32, 16u32);
+    let cpitch = cw as usize * 4;
+    let Some((chandle, caddr)) = shared_buffer(cpitch * ch as usize) else {
+        fail(b"ui-testclient: probe buffer alloc FAILED\n");
+    };
+    if w.attach(0, cw, ch, cpitch as u32, chandle).is_err() {
+        fail(b"ui-testclient: probe attach FAILED\n");
+    }
+    if w.commit(0, (0, 0, cw, ch)).is_err() {
+        fail(b"ui-testclient: probe commit FAILED\n");
+    }
+    // A commit that resizes is itself a geometry change, and it is announced. Take that one
+    // off the wire before placing, so step 3 below reads the event for the *move*.
+    await_mgr(
+        mgr,
+        OP_MGR_WINDOW_GEOMETRY,
+        id,
+        geometry_window,
+        &mut buf,
+        b"ui-testclient: no WindowGeometry for a commit that resized the window\n",
+    );
+
     let (px, py) = (29i32, 41i32);
     if !place_window(mgr, id, px, py) {
         fail(b"ui-testclient: probe Place was refused\n");
@@ -673,6 +702,13 @@ fn verify_manager_events(
             .s(b" at ").i(g.x as i64).s(b",").i(g.y as i64).end();
         fail(b"ui-testclient: WindowGeometry did not report the position placed\n");
     }
+    if (g.width, g.height) != (cw, ch) {
+        Line::new()
+            .s(b"ui-testclient: WindowGeometry size ").u(g.width as u64).s(b"x").u(g.height as u64)
+            .s(b", committed ").u(cw as u64).s(b"x").u(ch as u64)
+            .s(b", requested ").u(pw as u64).s(b"x").u(ph as u64).end();
+        fail(b"ui-testclient: WindowGeometry reported a size that is not what is on screen\n");
+    }
 
     // 4. Destroyed.
     if w.destroy().is_err() {
@@ -686,6 +722,10 @@ fn verify_manager_events(
         &mut buf,
         b"ui-testclient: no WindowDestroyed for the probe window\n",
     );
+    // The client's own half of the buffer; `attach` transferred the handle away.
+    // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, caddr as u64, (cpitch * ch as usize) as u64) };
+
     kprint(b"ui-testclient: manager saw created, focus, geometry and destroyed\n");
 
     // **Handed back rather than dropped.** Closing this session would make the compositor

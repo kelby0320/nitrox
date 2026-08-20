@@ -5,10 +5,9 @@
 //! resolve is the introduction; this channel is the conversation.
 
 use libkern::error::KError;
-use libkern::abi::CLOCK_MONOTONIC;
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT, syscall2,
-    syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT,
+    abi::CLOCK_MONOTONIC, syscall2, syscall4, syscall5,
 };
 use librsproto::surface::OP_RELEASE;
 use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};

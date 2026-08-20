@@ -631,24 +631,38 @@ fn flush_outboxes(srv: &mut Server) -> bool {
     (0..MAX_SESSIONS).any(|i| !srv.outbox[i].is_empty()) || !srv.mgr_outbox.is_empty()
 }
 
-/// Queue one event for the manager, if there is one. Logs a discard the way `enqueue` does.
+/// Announce everything the stack recorded since this was last called — moves, then removals.
 ///
-/// **A no-op with no manager attached**, rather than an error: M6 has no manager in the boot
-/// path at all, and the compositor manages itself perfectly well without one. The events exist
-/// for whoever holds the channel, and nobody holding it is the ordinary case.
-/// Announce every window that has left the stack since this was last called.
-///
-/// **Called after every dispatch, not only after `DestroyWindow`.** A client disconnecting
-/// destroys its windows too, and one destroy removes a whole menu chain — so the set of ids
-/// that vanished is not something a call site can name from the op it just handled. Draining
-/// unconditionally also keeps [`WindowStack::take_removed`]'s log from growing while no
-/// manager is attached, because it is emptied either way.
-fn drain_removed(srv: &mut Server) {
+/// **Called after every dispatch, not only after the ops that obviously change something.** A
+/// client disconnecting destroys its windows, one destroy removes a whole menu chain, and a
+/// commit can resize a window — so what changed is not something a call site can name from the
+/// op it just handled. Draining unconditionally also keeps the stack's logs from growing while
+/// no manager is attached, because they are emptied either way.
+fn drain_stack_events(srv: &mut Server) {
+    for window in srv.stack.take_geometry_changes() {
+        // Gone already — destroyed in the same batch that moved it. Its removal is announced
+        // just below; a rectangle for a window that no longer exists is not.
+        let Some(w) = srv.stack.window(window) else { continue };
+        let b = w.bounds();
+        let ev = ConfigureEvent {
+            window,
+            width: b.size.w,
+            height: b.size.h,
+            x: b.origin.x,
+            y: b.origin.y,
+        };
+        mgr_emit(srv, MgrEvent::Geometry(ev));
+    }
     for window in srv.stack.take_removed() {
         mgr_emit(srv, MgrEvent::Destroyed { window });
     }
 }
 
+/// Queue one event for the manager, if there is one. Logs a discard the way `enqueue` does.
+///
+/// **A no-op with no manager attached**, rather than an error: M6 has no manager in the boot
+/// path at all, and the compositor manages itself perfectly well without one. The events exist
+/// for whoever holds the channel, and nobody holding it is the ordinary case.
 fn mgr_emit(srv: &mut Server, ev: MgrEvent) {
     // SAFETY: reading our own manager slot.
     if unsafe { MANAGER_CH } == 0 {
@@ -667,41 +681,61 @@ fn mgr_emit(srv: &mut Server, ev: MgrEvent) {
     }
 }
 
+/// A manager event that would not serialise: log it, and let the queue move on.
+///
+/// **Logged, unlike the client-facing equivalent in [`send_outbound`].** These events are
+/// queued precisely because losing one leaves a manager's window list wrong forever with no
+/// resync op, so the one path that can still lose one must not do it quietly.
+fn unserialisable(what: &[u8]) -> bool {
+    let mut l = Line::new();
+    l.s(b"compositor: manager ").s(what).s(b" would not serialise; dropped");
+    l.end();
+    // `true` means "the queue may move on". Retrying forever would wedge every event behind
+    // a record that cannot be written no matter how often it is tried.
+    true
+}
+
 /// Send one queued manager event. `false` if the channel would not take it.
 fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
     use librsproto::surface::{
-        OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS,
-        OP_MGR_WINDOW_GEOMETRY,
+        MgrWindowCreated, MgrWindowRef, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
+        OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY,
     };
+    // Sized **from the types**, not from the byte counts the spec publishes — the same rule
+    // `send_outbound` states and for the same reason: widening `PointerEvent` left a
+    // hand-written `[0u8; 16]` there, and `write` refuses a short buffer by returning `None`,
+    // so every event of that kind would have been dropped with the spec still saying it was
+    // sent. A queue whose purpose is that nothing is lost must not be one field away from
+    // losing everything (PR #217 review, finding 5).
     match ev {
         MgrEvent::Created(c) => {
-            let mut body = [0u8; 20];
+            let mut body = [0u8; core::mem::size_of::<MgrWindowCreated>()];
             match c.write(&mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_CREATED, &body[..n]),
-                None => true,
+                None => unserialisable(b"WindowCreated"),
             }
         }
         MgrEvent::Destroyed { window } => {
-            let mut body = [0u8; 8];
-            let r = librsproto::surface::MgrWindowRef { window: *window, other: 0 };
+            let mut body = [0u8; core::mem::size_of::<MgrWindowRef>()];
+            let r = MgrWindowRef { window: *window, other: 0 };
             match r.write(&mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_DESTROYED, &body[..n]),
-                None => true,
+                None => unserialisable(b"WindowDestroyed"),
             }
         }
         MgrEvent::Geometry(g) => {
-            let mut body = [0u8; 20];
+            let mut body = [0u8; core::mem::size_of::<ConfigureEvent>()];
             match g.write(&mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_GEOMETRY, &body[..n]),
-                None => true,
+                None => unserialisable(b"WindowGeometry"),
             }
         }
         MgrEvent::Focus { window, focused } => {
-            let mut body = [0u8; 8];
+            let mut body = [0u8; core::mem::size_of::<FocusEvent>()];
             let e = FocusEvent { focused: u16::from(*focused), _pad: 0, window: *window };
             match e.write(&mut body) {
                 Some(n) => send_input(ch, OP_MGR_WINDOW_FOCUS, &body[..n]),
-                None => true,
+                None => unserialisable(b"WindowFocus"),
             }
         }
     }
@@ -1156,25 +1190,9 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         }
     };
     let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
-    drain_removed(srv);
+    drain_stack_events(srv);
     match mgr_outcome {
         MgrOutcome::Applied { dirty } => {
-            // **Geometry changes are announced even when the manager caused them.** A manager
-            // that had to remember which moves were its own would be keeping a second copy of
-            // the stack, and the event exists precisely so a window list never has to poll.
-            if op == librsproto::surface::OP_MGR_PLACE
-                && let Some(req) = librsproto::surface::MgrPlace::read(&body)
-                && let Some(w) = srv.stack.window(req.window)
-            {
-                let ev = ConfigureEvent {
-                    window: w.id,
-                    width: w.size.0,
-                    height: w.size.1,
-                    x: w.origin.x,
-                    y: w.origin.y,
-                };
-                mgr_emit(srv, MgrEvent::Geometry(ev));
-            }
             match dirty {
                 // Nothing on screen changed — placing a window that has not committed, which
                 // is the manager's ordinary case during the handshake.
@@ -1271,7 +1289,7 @@ fn close_session(slot: usize, srv: &mut Server) {
     srv.outbox[slot].clear();
     // A client that exits without destroying its windows must not leave them on screen.
     disconnect(&mut srv.conns[slot], &mut srv.stack);
-    drain_removed(srv);
+    drain_stack_events(srv);
     srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
     // Its windows are gone, so focus has almost certainly moved — and the *departing*
     // session must not be told, which `session_of` handles by no longer finding it.
@@ -1468,7 +1486,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             &mut REPLY_MSG[PAYLOAD_OFF + 16..],
         )
     };
-    drain_removed(srv);
+    drain_stack_events(srv);
 
     // **Map only after `dispatch` accepted the attach.** Mapping first would record the
     // client's memory under ids it does not own: `dispatch` would answer `NotFound`, the

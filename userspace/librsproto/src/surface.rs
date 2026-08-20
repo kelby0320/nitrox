@@ -713,11 +713,6 @@ pub const OP_MGR_CONFIGURE: u16 = 0x0915;
 /// the manager ask a follow-up question would be a seam with a round trip in it.
 ///
 /// Body: [`MgrWindowCreated`], 20 bytes.
-///
-/// **Carries the role and the requested geometry, not just an id.** A manager cannot place from
-/// an id alone: a `panel` is not placed like a `normal`, a `popup` is placed by its own client,
-/// and centring needs a size. All of it is already in the create request, so an event that made
-/// the manager ask a follow-up question would be a seam with a round trip in it.
 pub const OP_MGR_WINDOW_CREATED: u16 = 0x0918;
 /// `Manage::WindowDestroyed` — server → manager, when a window goes away.
 ///
@@ -731,6 +726,14 @@ pub const OP_MGR_WINDOW_DESTROYED: u16 = 0x0919;
 /// `Place`** — a manager that had to remember which changes were its own would be keeping a
 /// second copy of the stack. A window list that learned about size changes by polling is the
 /// thing this exists to avoid.
+///
+/// **"Any reason" includes a commit, and the size is the committed one.** A window's bounds
+/// are its *committed* buffer's rectangle, which is what `/dev/draw/<id>/info` reports and
+/// what is actually on screen — not the size the client named at `CreateWindow`. So a client
+/// that reflows and commits a different-sized buffer has changed its bounds with no manager
+/// involved, and is reported. Sending the requested size here instead would put the manager
+/// and a namespace read in disagreement about one window at one instant (PR #217 review,
+/// findings 1 and 2).
 ///
 /// Body: [`ConfigureEvent`], 20 bytes — the same layout the client-facing `Configure` uses,
 /// because it says the same thing about the same window.
@@ -814,6 +817,8 @@ pub struct MgrWindowRef {
     pub other: u32,
 }
 
+const _: () = assert!(core::mem::size_of::<MgrWindowRef>() == 8);
+
 impl MgrWindowRef {
     /// Serialise into exactly 8 little-endian bytes.
     pub fn write(&self, out: &mut [u8]) -> Option<usize> {
@@ -871,6 +876,8 @@ pub struct MgrWindowCreated {
     /// The height the client asked for.
     pub height: u32,
 }
+
+const _: () = assert!(core::mem::size_of::<MgrWindowCreated>() == 20);
 
 impl MgrWindowCreated {
     /// Serialise into exactly 20 little-endian bytes.
@@ -1047,12 +1054,57 @@ impl PointerEvent {
 mod tests {
     use super::*;
 
-    /// `MgrWindowCreated`'s 20-byte layout, which ships with no sender and no receiver.
+    /// `for_role` puts the role in the same two aux words `CreateWindowRequest` does — for
+    /// **every** role, not just the one a gate happens to create.
     ///
-    /// B3 is open, so nothing exercises this encoding end to end — and an event that carries
-    /// role and geometry so a manager need not ask a follow-up question is exactly the kind of
-    /// struct a byte-offset slip goes unnoticed in. `MgrPlace` and `MgrWindowRef` are at least
-    /// driven through `manager::dispatch`; this had nothing (PR #216 review, finding 5).
+    /// The mirror is the whole contract: a manager reads `WindowCreated` and must arrive at
+    /// the role the client asked for. The two encoders are separate code with the same match
+    /// arms, so nothing but a test holds them together — and every gate in the tree creates
+    /// `Role::Normal`, where all three branches agree on `(0, 0)` and any mix-up is invisible.
+    /// Swapping `(dock.tag(), reserve)` to `(reserve as u16, dock as u32)` leaves the suite
+    /// green without this (PR #217 review, finding 6).
+    #[test]
+    fn for_role_encodes_every_role_the_way_a_create_request_does() {
+        for role in [
+            Role::Normal,
+            Role::Panel { dock: Edge::Top, reserve: 24 },
+            Role::Panel { dock: Edge::Left, reserve: 0 },
+            Role::Popup { parent: 7 },
+            Role::Dialog { parent: 9 },
+        ] {
+            let mut req = [0u8; CREATE_WINDOW_REQUEST_LEN];
+            build_create_window_request(&mut req, &CreateWindowRequest {
+                width: 640,
+                height: 480,
+                role,
+            })
+            .expect("request encodes");
+
+            let ev = MgrWindowCreated::for_role(3, role, 640, 480);
+            assert_eq!(ev.role, get_u16(&req, 8), "role tag for {role:?}");
+            assert_eq!(ev.aux16, get_u16(&req, 10), "aux16 for {role:?}");
+            assert_eq!(ev.aux32, get_u32(&req, 12), "aux32 for {role:?}");
+
+            // And the whole way round: what a manager decodes is the role that was asked for.
+            let mut body = [0u8; 20];
+            let n = ev.write(&mut body).expect("event encodes");
+            let back = MgrWindowCreated::read(&body[..n]).expect("event decodes");
+            let parsed = parse_create_window_request(&req).expect("request parses");
+            assert_eq!(parsed.role, role, "the request round-trips to the same role");
+            assert_eq!((back.role, back.aux16, back.aux32), (ev.role, ev.aux16, ev.aux32));
+            assert_eq!((back.width, back.height), (640, 480));
+        }
+    }
+
+    /// `MgrWindowCreated`'s 20-byte layout.
+    ///
+    /// Written when this struct had no sender and no receiver — B3 was open, so nothing
+    /// exercised the encoding end to end, and an event carrying role and geometry so a manager
+    /// need not ask a follow-up question is exactly the kind of struct a byte-offset slip goes
+    /// unnoticed in. `MgrPlace` and `MgrWindowRef` were at least driven through
+    /// `manager::dispatch`; this had nothing (PR #216 review, finding 5). Both ends exist as of
+    /// PR #217 — the compositor sends it and `ui-testclient` decodes it — so this now pins a
+    /// layout that is on the wire rather than one that is only declared.
     #[test]
     fn mgr_window_created_round_trips_including_the_role_aux_fields() {
         let cases = [
