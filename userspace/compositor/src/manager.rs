@@ -35,6 +35,13 @@ pub enum MgrOutcome {
     /// pixels change depends on every overlap in the stack, and computing that exactly would be a
     /// second compositor.
     Applied {
+        /// The window the request named.
+        ///
+        /// Carried rather than left for the caller to re-decode: acting on a window is what
+        /// releases its held initial `Configure` (M6 B4), and reading the id back out of the
+        /// request body would depend on every manager op happening to put it at offset 0 —
+        /// true today, and exactly the kind of coincidence that stops being true quietly.
+        window: u32,
         /// The region this request changed, or `None` for "repaint everything".
         dirty: Option<Rect>,
     },
@@ -76,7 +83,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 return MgrOutcome::Failed(SurfaceError::Malformed);
             };
             match stack.place(req.window, Point::new(req.x, req.y)) {
-                Ok(d) => MgrOutcome::Applied { dirty: Some(d.rect()) },
+                Ok(d) => MgrOutcome::Applied { window: req.window, dirty: Some(d.rect()) },
                 Err(e) => refused(e),
             }
         }
@@ -99,7 +106,7 @@ pub fn dispatch(stack: &mut WindowStack, op: u16, body: &[u8]) -> MgrOutcome {
                 // **A restack repaints everything.** Which pixels change depends on every
                 // overlap in the stack; deriving the exact region would be a second compositor,
                 // and a restack is a user-scale event rather than a per-frame one.
-                Ok(()) => MgrOutcome::Applied { dirty: None },
+                Ok(()) => MgrOutcome::Applied { window: req.window, dirty: None },
                 Err(e) => refused(e),
             }
         }
@@ -170,7 +177,7 @@ mod tests {
         // and its first `Commit`, when the window is not on screen at all. Reporting a region
         // there would repaint on every window launch.
         let (mut s, ids) = stack_with(1);
-        let MgrOutcome::Applied { dirty } = dispatch(&mut s, OP_MGR_PLACE, &place_body(ids[0], 5, 5))
+        let MgrOutcome::Applied { dirty, .. } = dispatch(&mut s, OP_MGR_PLACE, &place_body(ids[0], 5, 5))
         else {
             panic!("expected Applied")
         };
@@ -189,7 +196,7 @@ mod tests {
             (OP_MGR_LOWER, ref_body(ids[0], 0)),
             (OP_MGR_SET_FOCUS, ref_body(ids[1], 0)),
         ] {
-            assert_eq!(dispatch(&mut s, op, &body), MgrOutcome::Applied { dirty: None });
+            assert!(matches!(dispatch(&mut s, op, &body), MgrOutcome::Applied { dirty: None, .. }));
         }
     }
 

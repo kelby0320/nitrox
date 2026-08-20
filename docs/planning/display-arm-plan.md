@@ -1271,9 +1271,27 @@ reflow.
       and a window list that learned about them by polling would be the thing this event exists
       to avoid.
 
-- [ ] **B4 — placement before first paint, which needs an ordering rule and not just an early
+- [x] **B4 — placement before first paint, which needs an ordering rule and not just an early
       event.** A manager must place a window before the user sees it, or every launch visibly
       jumps.
+
+      ✅ 2026-08-20 — the rule is enforced, not merely asked for: `Window.configured` gates
+      compositing, so a client that jumps the handshake paints *nothing* rather than painting at
+      the default origin. With a manager attached the compositor holds the first `Configure` and
+      releases it on the manager's first request naming the window — `Configure` answers position
+      and size together, which is why that op carries an origin — or on a **200 ms deadline**, or
+      when the manager disconnects.
+
+      Gated three ways in `check-display`, each with a control that fires: the configure is
+      *withheld* (a client that sees one before answering as manager fails), it *carries the
+      placement* (releasing at the default origin fails, naming both positions), and the
+      *deadline* releases a window whose manager never answers (asserted from the compositor's
+      own log, since a client cannot see why it was released).
+
+      One consequence worth writing down: **a process that is both manager and client must not
+      block on its own window's configure**, which `Window::new` does. B3's probe does exactly
+      that and is released by the deadline — which is what makes it a deterministic trigger for
+      the deadline assertion, and why B4's probe splits create from wait using the raw transport.
 
       An earlier draft said the interval between `CreateWindow` and the first `Commit` was the
       manager's window of opportunity, and that firing the created-event on create was "early

@@ -465,8 +465,10 @@ same reason `FocusEvent` carries one.
 > client **must wait for that window's first `Configure` before its first `Commit`.**
 
 This is normative, and it is the only ordering rule in this category that a client can violate
-without an error being reported: a client that commits early is not refused, it simply may have
-its window placed after it has already painted, and the user sees the window jump.
+without an error being reported. A client that commits early is not refused — and **nothing it
+commits reaches the screen** until its first `Configure` has been sent. It is enforced rather
+than merely asked for, because the alternative to enforcing it is the symptom the rule exists to
+prevent: a window painted at the default origin that jumps when the manager places it.
 
 **Why the wait is the client's.** It is what lets a window manager place a window *before* it is
 ever seen. The manager is a separate process, so somebody has to wait for it — and the alternative,
@@ -477,6 +479,32 @@ from starting at all. Waiting costs the client one round trip at creation and no
 **With no manager attached the compositor answers immediately**, echoing the requested size and
 the window's default origin, so the wait is a formality — which is the point: a client written
 against this rule needs no change when a manager appears.
+
+**With a manager attached the compositor holds the first `Configure`** and sends
+`WindowCreated` (see "Manager events" below) instead. It is released by whichever comes first:
+
+| Trigger | The client is told |
+| --- | --- |
+| The manager sends `Configure` (`0x0915`) for the window | exactly what the manager asked for — that op carries an origin *and* a size, so one message answers both halves |
+| The manager sends any other request naming the window (`Place`, `Raise`, `Lower`, `SetFocus`) | the window's geometry as it now stands — the placed origin, at the requested size |
+| Nothing, for **200 ms** | the requested size at the default origin |
+| The manager disconnects | the same, at once rather than after the remaining wait |
+
+A manager that wants to set position *and* size should use `Configure` rather than `Place`
+followed by `Configure`: the `Place` releases the hold, so the `Configure` after it arrives as an
+ordinary later configure — after the window has been painted once. This is why `Configure` carries
+an origin.
+
+**The deadline is the guarantee that a shell can delay a window but never lose one.** A manager
+that never answers costs a launch 200 ms; it cannot leave a client blocked in `Window::new`
+forever. A compositor that omitted it would make every client's startup depend on a userspace
+process being alive and willing, which is what withholding the `CreateWindow` reply was rejected
+for.
+
+**A process that is both the manager and a client must not block on its own window's first
+`Configure`** — it would be waiting for an answer only it can give, and would be released only by
+the deadline. It must issue `CreateWindow` and service the manager channel separately rather than
+using a helper that does both. `libsurface`'s `Window::new` is such a helper.
 
 `libsurface` performs the wait inside `Window::new`, which returns only once the first `Configure`
 has arrived; the first one is **not** delivered to the application as an event, because it is

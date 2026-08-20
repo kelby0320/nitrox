@@ -67,7 +67,8 @@ use libkern::{
     syscall4,
 };
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, ConfigureEvent, FocusEvent, MgrWindowCreated,
+    AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent,
+    MgrWindowCreated, OP_CONFIGURE,
     MgrWindowRef, OP_ATTACH_BUFFER, OP_COMMIT, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
     OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, ROLE_NORMAL, Role,
     SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
@@ -583,6 +584,104 @@ fn drain_mgr(mgr: &mut ChannelTransport) {
     while let Ok(Some(_)) = mgr.poll_event(&mut buf) {}
 }
 
+/// **A window is not shown until it has been configured, and the manager configures it** — M6 B4.
+///
+/// The interleaving is the whole test, and it is why this cannot use `Window::new`: that call
+/// creates the window *and* blocks for the configure, so a single-threaded client that is also
+/// the manager would be waiting for an answer only it can give. (B3's probe does exactly that
+/// and is released by the deadline instead — which is a fair test of the deadline and no test
+/// at all of the manager path.) Splitting the two with the raw transport is also the pattern a
+/// real manager-and-client process has to follow, so it is worth showing once.
+///
+/// Three things are asserted, in order:
+///   1. the `CreateWindow` **reply** arrives at once — only the configure is held;
+///   2. no configure arrives while the manager has not answered;
+///   3. the configure that does arrive carries the origin **the manager placed**, not the
+///      default — which is the launch-without-a-jump this milestone item exists for.
+fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
+    drain_mgr(mgr);
+
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => alloc::boxed::Box::new(t),
+        Err(_) => fail(b"ui-testclient: B4 connect to /dev/draw FAILED\n"),
+    };
+
+    // 1. Create, without waiting for the configure.
+    let (bw, bh) = (40u32, 20u32);
+    let mut req = [0u8; librsproto::surface::CREATE_WINDOW_REQUEST_LEN];
+    if librsproto::surface::build_create_window_request(
+        &mut req,
+        &CreateWindowRequest { width: bw, height: bh, role: Role::Normal },
+    )
+    .is_none()
+    {
+        fail(b"ui-testclient: B4 could not build CreateWindow\n");
+    }
+    let mut reply = [0u8; 32];
+    let n = match t.request(librsproto::surface::OP_CREATE_WINDOW, &req, None, &mut reply) {
+        Ok(Some(n)) => n,
+        _ => fail(b"ui-testclient: B4 CreateWindow got no reply\n"),
+    };
+    let Some(id) = librsproto::surface::parse_create_window_reply(&reply[..n]) else {
+        fail(b"ui-testclient: B4 CreateWindow reply did not decode\n");
+    };
+
+    // 2. **Nothing yet.** The reply came back, so the compositor has handled the request in
+    //    full; a configure sent unconditionally would already be here. Polled rather than
+    //    waited, because the assertion is an absence and waiting for one proves nothing.
+    let mut buf = [0u8; 64];
+    if let Ok(Some((op, _))) = t.poll_event(&mut buf)
+        && op == OP_CONFIGURE
+    {
+        fail(b"ui-testclient: a configure arrived before the manager had answered\n");
+    }
+
+    // 3. Now answer, as the manager, with an origin nothing else would produce.
+    await_mgr(
+        mgr,
+        OP_MGR_WINDOW_CREATED,
+        id,
+        created_window,
+        &mut buf,
+        b"ui-testclient: no WindowCreated for the B4 window\n",
+    );
+    let (px, py) = (137i32, 89i32);
+    if !place_window(mgr, id, px, py) {
+        fail(b"ui-testclient: B4 Place was refused\n");
+    }
+
+    // 4. And the held configure arrives, carrying where the manager put it.
+    let mut waited = 0;
+    let cfg = loop {
+        match t.wait_event_timeout(&mut buf, MGR_EVENT_SLICE_NS) {
+            Ok(Some((OP_CONFIGURE, n))) => break ConfigureEvent::read(&buf[..n]),
+            Ok(_) => {}
+            Err(_) => fail(b"ui-testclient: B4 session channel error\n"),
+        }
+        waited += 1;
+        if waited >= MGR_EVENT_TRIES {
+            fail(b"ui-testclient: the held configure never arrived after the manager placed\n");
+        }
+    };
+    let Some(cfg) = cfg else {
+        fail(b"ui-testclient: B4 configure body did not decode\n");
+    };
+    if cfg.window != id || cfg.x != px || cfg.y != py {
+        Line::new()
+            .s(b"ui-testclient: configure for ").u(cfg.window as u64)
+            .s(b" at ").i(cfg.x as i64).s(b",").i(cfg.y as i64)
+            .s(b", placed ").i(px as i64).s(b",").i(py as i64).end();
+        fail(b"ui-testclient: the first configure did not carry the manager's placement\n");
+    }
+
+    kprint(b"ui-testclient: the first configure carried the manager's placement\n");
+
+    // Held open for the same reason the B3 probe's session is: closing it makes the compositor
+    // tear the session down and repaint the whole screen.
+    core::mem::forget(t);
+}
+
 /// **One window's whole life, watched from the manager channel** — M6 B3.
 ///
 /// The manager is told about windows it did not create, which is the half of the seam B1
@@ -919,6 +1018,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // whole arrangement exists to keep away from the moment a gate starts looking at, or
         // clicking on, the screen.
         probe_session = Some(verify_manager_events(&mut mgr, root_ns));
+        verify_initial_configure(&mut mgr, root_ns);
 
         // **Move one window somewhere that is not the default, and read it back**, before
         // putting everything at the origin. Placing only at `(0, 0)` proves nothing: that is

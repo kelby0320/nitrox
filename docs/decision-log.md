@@ -16436,3 +16436,61 @@ once the binding was hoisted).
 
 All four events were negative-controlled by breaking each emission in turn and confirming the
 *named* client assertion fires.
+
+## 2026-08-20 — M6 B4: a window is not shown until it has been configured
+
+The rule was already written down as a **client obligation** (A2, spec D2): after `CreateWindow`
+replies, a client must wait for its first `Configure` before its first `Commit`. What did not
+exist was any reason for that to be true. The compositor sent the configure immediately and
+unconditionally, so the wait was a formality, and nothing stopped a client that ignored it.
+
+B4 makes it an ordering the compositor enforces, in two halves.
+
+**`Window.configured` gates compositing.** A window that has committed but never been configured
+contributes no pixels. A well-behaved client cannot reach that state, which is exactly why the
+gate needs a test — without one it is unreachable code and nothing would fail if compositing
+stopped checking it. What it buys is that a client which jumps the handshake paints *nothing*
+rather than painting at the default origin and jumping when the manager places it. The spec's
+claim that such a client "may have its window placed after it has already painted" was true when
+written and is now false; corrected in the same change.
+
+**With a manager attached the first `Configure` is held.** It is released by the manager's first
+request naming the window, by a 200 ms deadline, or by the manager disconnecting.
+
+Three decisions inside that:
+
+*The manager's `Configure` carries an origin, and that is why.* For a held window it **is** the
+initial configure: one message answers position and size together, so the window neither jumps
+nor resizes after it is first painted. `Place` also releases the hold — a manager that only wants
+to position a window must not have to wait out the deadline — with the consequence that
+`Place`-then-`Configure` resizes after first paint. Documented, with `Configure` named as the
+right op when both are wanted.
+
+*The deadline is what makes a shell able to delay a window but never lose one.* A client blocked
+forever in `Window::new` because nobody ran the desktop is a worse failure than a window that
+appears where the compositor put it. This is the same argument that rejected the compositor
+withholding the `CreateWindow` reply until the manager answers: no userspace process belongs on
+the critical path of every window creation.
+
+*`MgrOutcome::Applied` now carries the window id.* Acting on a window is what releases its held
+configure, and the alternative — reading the id back out of the request body — depends on every
+manager op happening to put it at offset 0. True today, and the kind of coincidence that stops
+being true quietly.
+
+**A process that is both manager and client must not block on its own window's configure.** It
+would be waiting for an answer only it can give. This is not hypothetical: B3's probe does
+precisely that, and B4 turned it into a 200 ms stall released by the deadline. Rather than
+"fixing" it, it is now the **deterministic trigger** for the deadline assertion — a manager that
+provably cannot answer, produced on purpose — and B4's own probe splits create from wait using
+the raw transport, which is the pattern a real manager-and-client process has to follow.
+
+Each of the three paths has a control that fires: withholding (a configure seen before the
+manager answered), the placement (released at the default origin — "configure for 134 at 0,0,
+placed 137,89"), and the deadline (removed, the gate names the missing line rather than timing
+out bare).
+
+**Not exercised by any gate:** releasing held configures when the manager *disconnects*. The
+deadline covers those clients, so this is a latency optimisation rather than a correctness fix,
+and the only way to reach it in `ui-testclient` would be to leave a window held while dropping
+the manager channel — distinguishable from the deadline path only by timing. Recorded here
+rather than left for a reviewer to find.

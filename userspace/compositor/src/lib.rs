@@ -120,6 +120,14 @@ pub struct Window {
     pub buffers: Vec<AttachedBuffer>,
     /// The buffer last committed, if any — what compositing reads.
     pub committed: Option<u32>,
+    /// Whether this window's first `Configure` has been sent to its client.
+    ///
+    /// **A window is not composited until it has been configured** — M6 B4. The client is
+    /// obliged to wait for its first `Configure` before committing, so a well-behaved one
+    /// cannot reach the screen early anyway; this flag is what makes that an enforced ordering
+    /// rather than a convention, and it is the gate a manager's window of opportunity is built
+    /// from. Set by [`mark_configured`](WindowStack::mark_configured).
+    pub configured: bool,
 }
 
 impl Window {
@@ -416,9 +424,29 @@ impl WindowStack {
             size: (req.width, req.height),
             buffers: Vec::new(),
             committed: None,
+            // Created unconfigured, whether or not anyone is going to answer. Whoever sends the
+            // first `Configure` — the compositor at once, or a manager, or the deadline —
+            // marks it, and until then the window exists without being on screen.
+            configured: false,
         });
         Ok(id)
     }
+
+    /// Record that `window`'s first `Configure` has gone out, making it compositable.
+    ///
+    /// Idempotent, and returns whether this was the transition. The caller uses that to send
+    /// the record exactly once: a manager may `Place` a pending window and then `Configure` it,
+    /// and the client is owed one initial configure, not two.
+    pub fn mark_configured(&mut self, window: u32) -> bool {
+        match self.windows.iter_mut().find(|w| w.id == window) {
+            Some(w) if !w.configured => {
+                w.configured = true;
+                true
+            }
+            _ => false,
+        }
+    }
+
 
     /// Move a window's top-left corner, returning the region that must be repainted.
     ///
@@ -698,6 +726,13 @@ impl WindowStack {
     {
         let mut surfaces: Vec<SurfaceRef<'_>> = Vec::new();
         for w in &self.windows {
+            // **Not composited until configured** (M6 B4). A client that commits before its
+            // first `Configure` — an older one, or one that ignores the obligation — would
+            // otherwise paint at the default origin and then jump when the manager places it,
+            // which is the whole symptom this ordering exists to remove.
+            if !w.configured {
+                continue;
+            }
             let Some(buffer_id) = w.committed else { continue };
             let Some(b) = w.buffers.iter().find(|b| b.id == buffer_id) else { continue };
             let Some(px) = source.pixels(w.id, buffer_id) else { continue };
@@ -940,6 +975,18 @@ mod tests {
         }
     }
 
+    /// Create a window and mark it configured — which is what the bin does the instant a
+    /// window is created with no manager attached.
+    ///
+    /// Compositing has been gated on the initial `Configure` since B4, so a test that creates,
+    /// attaches and commits without one is modelling a client that jumped the handshake, and
+    /// gets what that client gets: nothing on screen.
+    fn shown(s: &mut WindowStack, req: &CreateWindowRequest) -> u32 {
+        let id = s.create(req).expect("create");
+        s.mark_configured(id);
+        id
+    }
+
     fn commit(window: u32, buffer: u32) -> CommitRequest {
         CommitRequest {
             window,
@@ -1110,8 +1157,8 @@ mod tests {
     #[test]
     fn focus_skips_panels_and_follows_the_top_of_the_stack() {
         let mut s = WindowStack::new();
-        let a = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
-        let b = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        let a = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
+        let b = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
         s.create(&CreateWindowRequest {
             width: 32,
             height: 4,
@@ -1252,12 +1299,12 @@ mod tests {
         let red = Rgb::new(0xC0, 0x10, 0x10);
         let blue = Rgb::new(0x10, 0x10, 0xC0);
 
-        let a = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        let a = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
         s.attach(&attach(a, 0, 8, 8)).unwrap();
         src.put(a, 0, geom(8, 8), red);
         s.commit(&commit(a, 0)).unwrap();
 
-        let b = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        let b = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
         s.attach(&attach(b, 0, 8, 8)).unwrap();
         src.put(b, 0, geom(8, 8), blue);
         s.commit(&commit(b, 0)).unwrap();
@@ -1415,9 +1462,7 @@ mod tests {
         let red = Rgb::new(0xC0, 0x10, 0x10);
         let blue = Rgb::new(0x10, 0x10, 0xC0);
         for (id, colour) in [(1u32, red), (2u32, blue)] {
-            let w = s
-                .create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal })
-                .unwrap();
+            let w = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
             assert_eq!(w, id);
             s.attach(&attach(w, 0, 8, 8)).unwrap();
             src.put(w, 0, geom(8, 8), colour);
@@ -1525,9 +1570,7 @@ mod tests {
         // is what stops a fifth path from being added without it.
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
-        let w = s
-            .create(&CreateWindowRequest { width: 64, height: 64, role: Role::Normal })
-            .unwrap();
+        let w = shown(&mut s, &CreateWindowRequest { width: 64, height: 64, role: Role::Normal });
         s.attach(&attach(w, 0, 64, 64)).unwrap();
         // A window colour the cursor's body is not, so "the pointer is there" cannot be
         // satisfied by the window's own pixels.
@@ -1601,7 +1644,7 @@ mod tests {
         );
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
-        let w = s.create(&CreateWindowRequest { width: 64, height: 32, role: Role::Normal }).unwrap();
+        let w = shown(&mut s, &CreateWindowRequest { width: 64, height: 32, role: Role::Normal });
         s.attach(&AttachBufferRequest {
             window: w,
             buffer: 0,
@@ -1714,6 +1757,42 @@ mod tests {
         s.commit(&commit(w, 0)).unwrap();
         let _ = s.place(w, Point::new(5, 5)).unwrap();
         assert_eq!(s.take_geometry_changes(), vec![w], "one id, however many times it moved");
+    }
+
+    /// A window that has committed but has **not** been configured stays off the screen.
+    ///
+    /// This is M6 B4's ordering rule, and it is the whole of it. A client is obliged to wait
+    /// for its first `Configure` before committing, so a well-behaved one cannot get here —
+    /// which is exactly why the rule needs a test: without one, the gate is unreachable and
+    /// nothing would fail if compositing stopped checking it. What it buys is that a client
+    /// which jumps the handshake paints nothing rather than painting at the default origin
+    /// and jumping when the manager places it.
+    #[test]
+    fn an_unconfigured_window_is_not_composited_however_much_it_commits() {
+        let screen = Geometry::packed(16, 16, PixelFormat::XRGB8888);
+        let mut fb = MemFramebuffer::new(screen);
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+
+        let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::new(0xFF, 0xFF, 0xFF));
+        s.commit(&commit(w, 0)).unwrap();
+
+        s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
+        assert_eq!(
+            fb.get_pixel(0, 0),
+            Some(Rgb::new(0, 0, 0)),
+            "committed, but never configured: the client jumped the handshake and is not on screen"
+        );
+
+        // The configure arrives — from the compositor, a manager, or the deadline; the stack
+        // does not care which — and the same pixels appear with no further commit.
+        assert!(s.mark_configured(w), "this is the transition");
+        s.compose_into(&mut fb, Rgb::new(0, 0, 0), &src, &[screen.bounds()]);
+        assert_eq!(fb.get_pixel(0, 0), Some(Rgb::new(0xFF, 0xFF, 0xFF)), "configured: now it composites");
+
+        assert!(!s.mark_configured(w), "marking twice is not a second transition");
     }
 
     #[test]
