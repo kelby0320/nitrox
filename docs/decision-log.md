@@ -16314,3 +16314,42 @@ Verified: `test-qemu`, `test-interactive`, `check-terminal`, `check-input`, `che
 `check-input --no-ps2-irq` green unmodified; the injected-fault control re-run after every edit
 (`halt_loop` → PASSED, `stop_the_machine` → TIMED OUT); 1699 host tests; six static gates; zero
 warnings in debug and release.
+
+## 2026-08-19 — M6 B1: the manager seam, and what "done" meant for it
+
+Picking Part B back up after the audit. The parked branch (`phase-4/m6-partb`, 61 commits behind)
+held two commits worth keeping — B2's manager protocol and dispatch, and a WIP B1 wiring — plus
+two that had already landed on main by other routes during the audit (the i8042 fix, PR #197, and
+the xtask transcript dump). Cherry-picked the two real ones onto today's main; both applied
+without conflict, which was better than expected given the compositor has changed underneath
+them.
+
+**B1's code was essentially complete and B1 was not**, and the gap is the interesting part. The
+`manage` resolve path minted a channel, the one-manager refusal was written, and `ui-testclient`
+placed its reference windows through it. But the client falls back to the compositor's default
+placement when the resolve fails — deliberately, since it is a fixture rather than a real
+session's manager — and **the reference windows land at the origin either way, because the origin
+is the default**. So every gate passed whether the manager seam worked or not. Confirmed by
+breaking the resolve: nothing failed.
+
+Worse, the rule B1 exists to state — *one manager at a time* — was implemented in `open_manager`
+and **executed by nothing**. One client asking once never reaches the second-resolve branch.
+
+So B1's remaining work was evidence, not code:
+
+- `ui-testclient` now asks a second time, and treats being *served* as the failure — a second
+  holder would silently depose the first, which is precisely the outcome the rule prevents.
+- `check-display` asserts both the placement and the refusal.
+
+Negative-controlled, each control killing its own assertion: removing the one-manager rule fails
+the refusal line, breaking the resolve fails the placement line.
+
+A method note, since it nearly cost a wrong conclusion: the manage lines are printed near the end
+of `ui-testclient`'s output, and a first pass grepping the boot log with `head -8` showed neither
+of them. The path looked dead. It was the pager, not the path.
+
+Also fixed in passing: two `unused_unsafe` warnings the compositor has carried on main since
+#212. They survived because no verification sweep in this project ever built userspace for its
+real target — the kernel and xtask were checked and reported as "zero warnings", and the one time
+`cargo build -p compositor` was run directly it failed to link (the bin targets
+`x86_64-unknown-nitrox`), where `grep -c "^warning"` returns 0 and reads exactly like clean.

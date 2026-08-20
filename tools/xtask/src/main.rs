@@ -1438,6 +1438,19 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // client sharing memory with the compositor — rather than being written straight to
     // the aperture. The client emits this only after a `Release` acknowledges its final
     // commit, so the frame is composited by the time we capture.
+    // **The manager seam, asserted rather than attempted (M6 B1).** `ui-testclient` places its
+    // reference windows through `/dev/draw/manage` and falls back to the compositor's default
+    // placement if the resolve fails — deliberately, since it is a test fixture and not a real
+    // session's manager. That fallback is silent by design, which means without these two lines
+    // the whole manager path could break and every gate would still pass: the windows land at
+    // the origin either way, because the origin *is* the default.
+    //
+    // The second line is the contract B1 exists to state: one manager at a time. The compositor
+    // refuses a second resolve rather than deposing the first, and until the client asked twice
+    // that branch was unreachable, so the rule was pinned by nothing at all.
+    session.expect("ui-testclient: reference windows placed via /dev/draw/manage")?;
+    session.expect("ui-testclient: a second /dev/draw/manage was refused")?;
+
     session.expect("ui-testclient: scene presented via /dev/draw")?;
     qmp.screendump(&shot)?;
 

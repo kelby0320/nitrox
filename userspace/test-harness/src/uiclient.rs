@@ -646,7 +646,26 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         }
         place_window(&mut mgr, win.id(), 0, 0);
         kprint(b"ui-testclient: reference windows placed via /dev/draw/manage\n");
+
+        // **Exercise the one-manager rule, which is the whole of B1's contract.** The
+        // compositor refuses a second resolve rather than deposing the first, because two
+        // managers placing windows is a race with no arbiter and the failure would look like
+        // windows moving on their own. That refusal was implemented and never executed: with
+        // one client asking once, the branch was unreachable, so the rule was pinned by
+        // nothing. Asking twice from the client that already holds the channel is the
+        // cheapest honest exercise of it.
+        //
+        // A *success* here is the failure: it means the channel was handed out twice, and the
+        // second holder would silently depose the first.
+        // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+        match unsafe { ChannelTransport::manage(root_ns) } {
+            Ok(_) => fail(b"ui-testclient: a second /dev/draw/manage was SERVED\n"),
+            Err(_) => kprint(b"ui-testclient: a second /dev/draw/manage was refused\n"),
+        }
     } else {
+        // Kept as a distinguishable line rather than a `fail`: the gate asserts the success
+        // line above, so this path already fails the run — and it says *which* way it failed,
+        // which a panic here would not.
         kprint(b"ui-testclient: no manager channel; windows keep the default placement\n");
     }
 
