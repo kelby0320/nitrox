@@ -153,11 +153,14 @@ pub fn dispatch(
                     conn.owned.push(id);
                     match build_create_window_reply(reply, id) {
                         Some(n) => {
-                            // **No manager exists yet, so the answer is immediate and is the
-                            // client's own request echoed back.** When one does (M6 Part B) this
-                            // is where its answer lands, and the client's wait becomes a real
-                            // wait rather than a formality. Sending it unconditionally now is
-                            // what makes that later change invisible to every client.
+                            // **The default answer: the client's own request echoed back.**
+                            // This is what the client is told when nobody has an opinion — no
+                            // manager attached, or one that did not answer in time.
+                            //
+                            // A manager's answer does *not* land here. The bin holds this
+                            // record when a manager is attached and releases it with the
+                            // geometry as it stands once the manager has acted (M6 B4), so
+                            // this library half stays free of both the manager and the clock.
                             let w = stack.window(id).expect("just created");
                             Outcome::Created {
                                 reply_len: n,
@@ -364,7 +367,14 @@ mod tests {
             // that lets a manager place a window before it is seen. Most tests care only about
             // the id; `create_configured` is for the ones that care about the configure.
             Outcome::Created { reply_len, .. } => {
-                Ok(parse_create_window_reply(&reply[..reply_len]).unwrap())
+                let id = parse_create_window_reply(&reply[..reply_len]).unwrap();
+                // **Standing in for the bin**, which marks a window configured the instant it
+                // sends the first `Configure` — immediately, when no manager is attached, which
+                // is the case every test in this module models. Without it these windows are
+                // held, and since B4 a held window is neither composited, focusable, nor
+                // clickable.
+                stack.mark_configured(id);
+                Ok(id)
             }
             Outcome::Failed(e) => Err(e),
             other => panic!("unexpected {other:?}"),
@@ -638,10 +648,24 @@ mod tests {
         assert_eq!(configure.window, second, "the configure names the window just created");
 
         assert_ne!(second, first);
+
+        // **Since B4 the create alone is not enough: focus follows the configure.** A window
+        // that is not on screen must not hold the keyboard, and one whose configure is held is
+        // not on screen. The premise this test exists for survives — focus still moves without
+        // an attach, a commit, or an `Applied` — but the step that moves it is the first
+        // `Configure`, which the bin sends immediately when no manager is attached and holds
+        // when one is (PR #218 review, finding 3).
+        assert_eq!(
+            stack.focus_candidate(),
+            Some(first),
+            "held: the new window is on top of the stack but is not on screen, so focus stays"
+        );
+
+        stack.mark_configured(second);
         assert_eq!(
             stack.focus_candidate(),
             Some(second),
-            "focus moved on the create alone — no attach, no commit, no Applied anywhere"
+            "configured: focus moved with no attach, no commit, no Applied anywhere"
         );
     }
 

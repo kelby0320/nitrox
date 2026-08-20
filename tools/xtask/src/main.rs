@@ -1443,6 +1443,18 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // client sharing memory with the compositor — rather than being written straight to
     // the aperture. The client emits this only after a `Release` acknowledges its final
     // commit, so the frame is composited by the time we capture.
+    // **The deadline that keeps a held configure from becoming a lost window (M6 B4).**
+    //
+    // Asserted from the compositor's own log because the client cannot see *why* it was
+    // released — a configure is a configure. The trigger is deterministic rather than lucky:
+    // the B3 probe below calls `Window::new` while holding the manager channel, so it blocks
+    // waiting for an answer that only it could give and provably will not. That is exactly the
+    // wedged-shell case, produced on purpose.
+    //
+    // Without this line the deadline is still load-bearing — remove it and the probe hangs —
+    // but the gate would report a 45-second timeout rather than naming what broke.
+    session.expect("compositor: no manager answer for window")?;
+
     // **The other half of the seam (M6 B3): the manager is *told*, not just obeyed.** B1
     // proved a manager can act on the compositor; nothing proved the compositor reports back.
     // The client watches one window's whole life on the manager channel — created, focus,
@@ -1453,6 +1465,14 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // window is the noisiest thing this client does, so it happens before the placements
     // rather than leaving a full-screen repaint racing the capture.
     session.expect("ui-testclient: manager saw created, focus, geometry and destroyed")?;
+
+    // **Placement before first paint (M6 B4): the ordering rule, not just the event.** The
+    // client creates a window through the raw transport, checks that no configure has arrived,
+    // answers as the manager with an origin nothing else produces, and only then reads the
+    // configure — asserting it carries that origin. A compositor that sent the configure at
+    // once still passes every other gate here: the window would simply appear at the default
+    // origin and jump when placed, which no screen comparison taken afterwards can see.
+    session.expect("ui-testclient: the first configure carried the manager's placement")?;
 
     // **The manager seam, asserted rather than attempted (M6 B1).** `ui-testclient` places its
     // reference windows through `/dev/draw/manage` and falls back to the compositor's default
