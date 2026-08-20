@@ -532,13 +532,51 @@ The reply says the compositor accepted the request, **not** that the client has 
 `Configure` is forwarded to a third party, and whether it arrives is a property of that client's
 receive ring. `NotFound` if no such window.
 
+## Manager events (`0x0918`–`0x091B`)
+
+Sent by the compositor **to** the manager channel, unsolicited. They are records, not
+requests: there is no reply, and the manager cannot refuse one.
+
+**Delivery is queued, not best-effort.** A manager event is generated while the compositor is
+serving some other client's request, so the manager's receive ring may be full at that moment.
+The compositor queues the record and retries rather than dropping it — a manager that missed a
+`WindowCreated` would hold a window list that is wrong forever, with no resync op to repair it.
+The queue is bounded; on overflow the oldest are discarded and the compositor logs the count.
+
+**Scoped to the whole screen, not to a connection.** Every other op in this document names
+windows within the connection that created them; these name windows the manager did not create
+and cannot otherwise see. That is the manager channel's purpose and the reason only one exists.
+
+| Op       | Name             | Body                | Meaning                                        |
+| -------- | ---------------- | ------------------- | ---------------------------------------------- |
+| `0x0918` | `WindowCreated`  | `MgrWindowCreated`  | A window exists, with the role and size its client asked for |
+| `0x0919` | `WindowDestroyed`| `MgrWindowRef`      | A window is gone (`other` unused, zero)        |
+| `0x091A` | `WindowGeometry` | `ConfigureEvent`    | A window's position or size changed            |
+| `0x091B` | `WindowFocus`    | `FocusEvent`        | A window gained or lost the keyboard           |
+
+`WindowCreated` fires when the window is created, **before** its client has committed anything
+— that is what lets a manager place a window before it is first seen.
+
+`WindowDestroyed` fires once per window removed, and **one `DestroyWindow` can produce several**:
+destroy is transitive, so a popup goes with its parent and a submenu with that popup. The parent
+is reported before the children it took with it. A client disconnecting produces the same records
+for everything it still held.
+
+`WindowGeometry` is sent for a move the *manager itself* requested as well as for one it did
+not. A manager that assumed its own `Place` needed no confirmation would have two sources of
+truth for where a window is; there is one, and it is this event.
+
+`WindowFocus` reports both halves of a transition: the window losing focus, then the window
+gaining it. Either may be absent — nothing had focus, or nothing takes it.
+
 ## Reserved, not yet implemented
 
-`SetTitle` (`0x0907`… see `surface.rs`) and the manager **event** ops `0x0918`–`0x091C`
-(`WindowCreated`, `WindowDestroyed`, `WindowGeometry`, `WindowFocus`, `WindowTitle`) are
-defined in `librsproto` and **not implemented by the compositor**. They are M6 Part B3, which
-is open. Nothing sends or receives them today; the encodings are declared so B3 does not have
-to renumber, and this section exists so a second implementation does not read them as live.
+`SetTitle` (`0x0907`… see `surface.rs`) and the manager event op `0x091C` (`WindowTitle`) are
+defined in `librsproto` and **not implemented by the compositor**. They are M6 Part B3b, which
+is open: a title needs a client-facing op to set one and a variable-length body to carry it,
+neither of which the four events above needed. Nothing sends or receives them today; the
+encodings are declared so B3b does not have to renumber, and this section exists so a second
+implementation does not read them as live.
 
 ## See also
 

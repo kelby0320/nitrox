@@ -33,7 +33,7 @@
 extern crate alloc;
 
 use compositor::input::InputRouter;
-use compositor::outbox::{Outbound, Outbox};
+use compositor::outbox::{MgrEvent, MgrOutbox, Outbound, Outbox};
 use compositor::manager::{self, MgrOutcome};
 use compositor::server::{Connection, Outcome, SurfaceError, disconnect, dispatch};
 use compositor::{BufferSource, WindowStack};
@@ -232,6 +232,8 @@ struct Server {
     /// and thirty inline queues would be tens of kilobytes against a 32 KiB user stack —
     /// the same trap `libsurface` documents for holding a transport by value.
     outbox: alloc::vec::Vec<Outbox>,
+    /// Events owed to the manager, if one is attached. See [`MgrOutbox`].
+    mgr_outbox: MgrOutbox,
 }
 
 impl Server {
@@ -542,6 +544,15 @@ fn announce_focus(srv: &mut Server) {
         return;
     };
     srv.announced_focus = now;
+    // **The manager hears about every transition, including ones no session owns.** A window
+    // whose client has gone still leaves focus, and a manager tracking who has the keyboard
+    // needs that edge as much as the client that gained it does.
+    if let Some(old) = was {
+        mgr_emit(srv, MgrEvent::Focus { window: old, focused: false });
+    }
+    if let Some(new) = now {
+        mgr_emit(srv, MgrEvent::Focus { window: new, focused: true });
+    }
     if let Some(old) = was
         && let Some(slot) = srv.session_of(old)
     {
@@ -602,7 +613,98 @@ fn flush_outboxes(srv: &mut Server) -> bool {
             srv.outbox[slot].pop();
         }
     }
-    (0..MAX_SESSIONS).any(|i| !srv.outbox[i].is_empty())
+    // The manager's events drain the same way and for the same reason: a manager whose ring is
+    // briefly full must not lose a `created`, because unlike a dropped input event that is a
+    // window it will never place and never hear about again.
+    // SAFETY: reading our own manager slot.
+    let mgr = unsafe { MANAGER_CH };
+    if mgr == 0 {
+        srv.mgr_outbox.clear();
+    } else {
+        while let Some(ev) = srv.mgr_outbox.front() {
+            if !send_mgr_event(mgr, &ev) {
+                break;
+            }
+            srv.mgr_outbox.pop();
+        }
+    }
+    (0..MAX_SESSIONS).any(|i| !srv.outbox[i].is_empty()) || !srv.mgr_outbox.is_empty()
+}
+
+/// Queue one event for the manager, if there is one. Logs a discard the way `enqueue` does.
+///
+/// **A no-op with no manager attached**, rather than an error: M6 has no manager in the boot
+/// path at all, and the compositor manages itself perfectly well without one. The events exist
+/// for whoever holds the channel, and nobody holding it is the ordinary case.
+/// Announce every window that has left the stack since this was last called.
+///
+/// **Called after every dispatch, not only after `DestroyWindow`.** A client disconnecting
+/// destroys its windows too, and one destroy removes a whole menu chain — so the set of ids
+/// that vanished is not something a call site can name from the op it just handled. Draining
+/// unconditionally also keeps [`WindowStack::take_removed`]'s log from growing while no
+/// manager is attached, because it is emptied either way.
+fn drain_removed(srv: &mut Server) {
+    for window in srv.stack.take_removed() {
+        mgr_emit(srv, MgrEvent::Destroyed { window });
+    }
+}
+
+fn mgr_emit(srv: &mut Server, ev: MgrEvent) {
+    // SAFETY: reading our own manager slot.
+    if unsafe { MANAGER_CH } == 0 {
+        return;
+    }
+    if srv.mgr_outbox.push(ev) {
+        let n = srv.mgr_outbox.dropped();
+        if n <= MAX_LOGGED_OVERFLOWS {
+            let mut l = Line::new();
+            l.s(b"compositor: manager outbox overflow, discarded ").u(n as u64);
+            if n == MAX_LOGGED_OVERFLOWS {
+                l.s(b" (further discards not logged)");
+            }
+            l.end();
+        }
+    }
+}
+
+/// Send one queued manager event. `false` if the channel would not take it.
+fn send_mgr_event(ch: u64, ev: &MgrEvent) -> bool {
+    use librsproto::surface::{
+        OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED, OP_MGR_WINDOW_FOCUS,
+        OP_MGR_WINDOW_GEOMETRY,
+    };
+    match ev {
+        MgrEvent::Created(c) => {
+            let mut body = [0u8; 20];
+            match c.write(&mut body) {
+                Some(n) => send_input(ch, OP_MGR_WINDOW_CREATED, &body[..n]),
+                None => true,
+            }
+        }
+        MgrEvent::Destroyed { window } => {
+            let mut body = [0u8; 8];
+            let r = librsproto::surface::MgrWindowRef { window: *window, other: 0 };
+            match r.write(&mut body) {
+                Some(n) => send_input(ch, OP_MGR_WINDOW_DESTROYED, &body[..n]),
+                None => true,
+            }
+        }
+        MgrEvent::Geometry(g) => {
+            let mut body = [0u8; 20];
+            match g.write(&mut body) {
+                Some(n) => send_input(ch, OP_MGR_WINDOW_GEOMETRY, &body[..n]),
+                None => true,
+            }
+        }
+        MgrEvent::Focus { window, focused } => {
+            let mut body = [0u8; 8];
+            let e = FocusEvent { focused: u16::from(*focused), _pad: 0, window: *window };
+            match e.write(&mut body) {
+                Some(n) => send_input(ch, OP_MGR_WINDOW_FOCUS, &body[..n]),
+                None => true,
+            }
+        }
+    }
 }
 
 /// Send one queued message. Returns `false` if the channel would not take it.
@@ -1053,8 +1155,26 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             Err(_) => return true,
         }
     };
-    match manager::dispatch(&mut srv.stack, op, &body) {
+    let mgr_outcome = manager::dispatch(&mut srv.stack, op, &body);
+    drain_removed(srv);
+    match mgr_outcome {
         MgrOutcome::Applied { dirty } => {
+            // **Geometry changes are announced even when the manager caused them.** A manager
+            // that had to remember which moves were its own would be keeping a second copy of
+            // the stack, and the event exists precisely so a window list never has to poll.
+            if op == librsproto::surface::OP_MGR_PLACE
+                && let Some(req) = librsproto::surface::MgrPlace::read(&body)
+                && let Some(w) = srv.stack.window(req.window)
+            {
+                let ev = ConfigureEvent {
+                    window: w.id,
+                    width: w.size.0,
+                    height: w.size.1,
+                    x: w.origin.x,
+                    y: w.origin.y,
+                };
+                mgr_emit(srv, MgrEvent::Geometry(ev));
+            }
             match dirty {
                 // Nothing on screen changed — placing a window that has not committed, which
                 // is the manager's ordinary case during the handshake.
@@ -1121,7 +1241,13 @@ fn open_manager(serve_end: u64, request_id: u64) -> bool {
 }
 
 /// Drop the manager channel — it went away, so the compositor manages itself again.
-fn close_manager() {
+///
+/// **Clears the event queue with it.** Anything still queued describes windows as they were
+/// while the departed manager was watching; handing that backlog to whoever attaches next
+/// would tell a fresh manager about creations it never saw and, after enough churn, about
+/// windows that no longer exist — with no resync op to repair the picture.
+fn close_manager(srv: &mut Server) {
+    srv.mgr_outbox.clear();
     // SAFETY: closing our own endpoint and clearing the slot.
     unsafe {
         if MANAGER_CH != 0 {
@@ -1145,6 +1271,7 @@ fn close_session(slot: usize, srv: &mut Server) {
     srv.outbox[slot].clear();
     // A client that exits without destroying its windows must not leave them on screen.
     disconnect(&mut srv.conns[slot], &mut srv.stack);
+    drain_removed(srv);
     srv.buffers.retain(|b| srv.stack.window(b.window).is_some());
     // Its windows are gone, so focus has almost certainly moved — and the *departing*
     // session must not be told, which `session_of` handles by no longer finding it.
@@ -1341,6 +1468,7 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             &mut REPLY_MSG[PAYLOAD_OFF + 16..],
         )
     };
+    drain_removed(srv);
 
     // **Map only after `dispatch` accepted the attach.** Mapping first would record the
     // client's memory under ids it does not own: `dispatch` would answer `NotFound`, the
@@ -1394,6 +1522,20 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             let n = reply_len.min(MAX_BODY);
             unsafe {
                 body[..n].copy_from_slice(&REPLY_MSG[PAYLOAD_OFF + 16..PAYLOAD_OFF + 16 + n]);
+            }
+            // **The manager hears about it, with the role and the size the client asked for.**
+            // An id alone is useless to a manager: a panel is not placed like a normal window,
+            // a popup is placed by its own client, and centring needs a size. All of it is
+            // already known here, so an event that made the shell ask a follow-up question
+            // would be a seam with a round trip in it (M6 B3).
+            if let Some(w) = srv.stack.window(configure.window) {
+                let ev = librsproto::surface::MgrWindowCreated::for_role(
+                    configure.window,
+                    w.role,
+                    configure.width,
+                    configure.height,
+                );
+                mgr_emit(srv, MgrEvent::Created(ev));
             }
             let sent = reply_on_session(ch, op, request_id, &body[..n]);
             if !sent {
@@ -1563,7 +1705,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             // SAFETY: reading our own manager slot.
             if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
                 if !serve_manager(srv, &mut fb) {
-                    close_manager();
+                    close_manager(srv);
                 }
                 continue;
             }
@@ -1674,6 +1816,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, ctrl: u64) -> ! {
         repeat: None,
         announced_focus: None,
         outbox: (0..MAX_SESSIONS).map(|_| Outbox::new()).collect(),
+        mgr_outbox: MgrOutbox::new(),
         interp: Interpreter::new(),
         // The router clamps the cursor to the screen it was told about, so it has to be the
         // screen this compositor actually acquired — not a constant that happens to match.

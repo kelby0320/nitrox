@@ -334,6 +334,17 @@ pub fn focus_transition(
 pub struct WindowStack {
     windows: Vec<Window>,
     next_id: u32,
+    /// Every id that has left the stack since the last [`take_removed`](Self::take_removed).
+    ///
+    /// **A log rather than a return value because one destroy can remove several windows and
+    /// two different callers trigger it.** `DestroyWindow` and a client disconnecting both end
+    /// up in [`destroy`](Self::destroy), and a manager owed a `WindowDestroyed` event needs
+    /// both. Threading an out-param through `dispatch` would put it in the signature of every
+    /// op that cannot remove anything; recording it where the removal happens does not.
+    ///
+    /// The bin drains this after every dispatch whether or not a manager is attached, so it
+    /// holds at most one call's worth and cannot grow while nobody is listening.
+    removed_log: Vec<u32>,
 }
 
 impl Default for WindowStack {
@@ -351,7 +362,7 @@ impl Default for WindowStack {
 impl WindowStack {
     /// An empty stack.
     pub fn new() -> Self {
-        Self { windows: Vec::new(), next_id: 1 }
+        Self { windows: Vec::new(), next_id: 1, removed_log: Vec::new() }
     }
 
     /// Windows, bottom-first.
@@ -461,9 +472,25 @@ impl WindowStack {
     }
 
     /// Destroy a window and everything attached to it.
+    /// Take every id removed since the last call, parent before the popups it took with it.
+    ///
+    /// Draining is the point: see [`removed_log`](Self::removed_log).
+    pub fn take_removed(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.removed_log)
+    }
+
+    /// Destroy a window and everything attached to it, recording every id removed.
+    ///
+    /// **The removed set is recorded because one `DestroyWindow` can remove several windows.**
+    /// A menu chain goes with its parent, transitively, so a caller that has to tell someone
+    /// else which windows disappeared — the manager's `WindowDestroyed` event — cannot work it
+    /// out from the id it passed in. Diffing the stack around the call would be the alternative
+    /// and is worse: it makes every caller responsible for a snapshot, and gets the order wrong
+    /// (the parent should be reported before the popups it took with it).
     pub fn destroy(&mut self, id: u32) -> Result<(), StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         self.windows.remove(i);
+        self.removed_log.push(id);
         // Descendants cannot outlive an ancestor: a popup or dialog with no parent has no
         // defined desktop or stacking position, and `create` refuses to produce one.
         //
@@ -474,9 +501,16 @@ impl WindowStack {
         loop {
             let live: Vec<u32> = self.windows.iter().map(|w| w.id).collect();
             let before = self.windows.len();
-            self.windows.retain(|w| match w.role {
-                Role::Popup { parent } | Role::Dialog { parent } => live.contains(&parent),
-                _ => true,
+            let removed = &mut self.removed_log;
+            self.windows.retain(|w| {
+                let keep = match w.role {
+                    Role::Popup { parent } | Role::Dialog { parent } => live.contains(&parent),
+                    _ => true,
+                };
+                if !keep {
+                    removed.push(w.id);
+                }
+                keep
             });
             if self.windows.len() == before {
                 break;
@@ -1606,5 +1640,47 @@ mod tests {
         let mut req = attach(w, 0, 8, 8);
         req.pitch = 8 * 4 - 1; // cannot hold a row
         assert_eq!(s.attach(&req), Err(StackError::BadGeometry));
+    }
+
+    /// `take_removed` reports **every** window that went, parent first, and then drains.
+    ///
+    /// The set is what the manager's `WindowDestroyed` event is built from, and a menu chain
+    /// means one `DestroyWindow` can remove several windows — so a stack that recorded only
+    /// the id it was passed would leave a manager holding windows that no longer exist and
+    /// will never be mentioned again. It drains because the bin calls it after every dispatch
+    /// whether or not a manager is attached; a log that did not clear would re-announce the
+    /// same destruction on every later call, and grow without bound when nobody is listening.
+    #[test]
+    fn take_removed_reports_the_whole_subtree_parent_first_then_drains() {
+        let mut s = WindowStack::new();
+        let root = s
+            .create(&CreateWindowRequest { width: 100, height: 80, role: Role::Normal })
+            .unwrap();
+        let menu = s
+            .create(&CreateWindowRequest { width: 40, height: 20, role: Role::Popup { parent: root } })
+            .unwrap();
+        let submenu = s
+            .create(&CreateWindowRequest { width: 30, height: 15, role: Role::Popup { parent: menu } })
+            .unwrap();
+        // An unrelated window must not appear in the removed set.
+        let other = s
+            .create(&CreateWindowRequest { width: 10, height: 10, role: Role::Normal })
+            .unwrap();
+
+        assert!(s.take_removed().is_empty(), "nothing has been destroyed yet");
+
+        s.destroy(root).unwrap();
+        let gone = s.take_removed();
+
+        assert_eq!(gone[0], root, "the window asked for is reported first");
+        assert!(gone.contains(&menu), "a popup goes with its parent");
+        assert!(gone.contains(&submenu), "and so does a popup of that popup");
+        assert!(!gone.contains(&other), "an unrelated window is not reported");
+        assert_eq!(gone.len(), 3, "exactly the subtree, no duplicates");
+        assert!(s.window(other).is_some(), "the unrelated window survives");
+        assert!(
+            s.take_removed().is_empty(),
+            "the log drained: a second read must not re-announce the same subtree"
+        );
     }
 }

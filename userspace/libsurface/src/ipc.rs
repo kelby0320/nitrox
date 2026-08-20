@@ -5,8 +5,10 @@
 //! resolve is the introduction; this channel is the conversation.
 
 use libkern::error::KError;
+use libkern::abi::CLOCK_MONOTONIC;
 use libkern::{
-    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_WAIT, syscall4, syscall5,
+    SENDMODE_NOBLOCK, SYS_CHANNEL_RECV, SYS_CHANNEL_SEND, SYS_CLOCK_READ, SYS_WAIT, syscall2,
+    syscall4, syscall5,
 };
 use librsproto::surface::OP_RELEASE;
 use librsproto::{RS_FLAG_ERROR, RS_FLAG_REPLY, decode, encode};
@@ -172,6 +174,60 @@ impl Drop for ChannelTransport {
 }
 
 impl ChannelTransport {
+    /// Read the next event, waiting up to `timeout_ns` from now for one to arrive.
+    ///
+    /// `Ok(None)` means the time passed with nothing to read — a timeout, not an error.
+    ///
+    /// **Blocking with a deadline rather than spinning on
+    /// [`poll_event`](Transport::poll_event).** A client waiting for an event the compositor
+    /// has not sent yet must not busy-poll: on a single-CPU guest that starves the very
+    /// process it is waiting for, and the wait would then expire because of the spin rather
+    /// than because the event was missing.
+    ///
+    /// **`timeout_ns` is relative and `sys_wait` takes an absolute deadline**, so this reads
+    /// the monotonic clock and adds. Passing the relative value straight through is a
+    /// deadline a fraction of a second after boot — permanently in the past, so every wait
+    /// returns `TimedOut` at once and the call silently degrades to a non-blocking poll that
+    /// still *looks* like it works wherever the event happened to be queued already.
+    pub fn wait_event_timeout(
+        &mut self,
+        buf: &mut [u8],
+        timeout_ns: u64,
+    ) -> Result<Option<(u16, usize)>, UiError> {
+        let mut now: u64 = 0;
+        // SAFETY: a valid out-pointer for one u64; `sys_clock_read` writes exactly that.
+        unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
+        let deadline = now.saturating_add(timeout_ns);
+        loop {
+            // A parked message counts: it is already here and older than anything on the
+            // wire, so blocking first would be wrong.
+            if let Some(ev) = self.poll_event(buf)? {
+                return Ok(Some(ev));
+            }
+            let handles = [self.channel];
+            let mut results = [0u8; 24];
+            // SAFETY: a valid handle array and result buffer for one waiter. `sys_wait` is
+            // where the thread blocks — never inside the recv.
+            let waited = unsafe {
+                syscall4(
+                    SYS_WAIT,
+                    handles.as_ptr() as u64,
+                    1,
+                    results.as_mut_ptr() as u64,
+                    deadline,
+                )
+            };
+            if waited == KError::TimedOut.as_i32() as i64 {
+                // The deadline, not a failure. Poll once more: an event that landed between
+                // the poll above and the wait would otherwise be reported as a timeout.
+                return self.poll_event(buf);
+            }
+            if waited != 1 {
+                return Err(UiError::Transport);
+            }
+        }
+    }
+
     /// Hold an event that arrived while waiting for a reply, dropping the oldest if full.
     ///
     /// **Drop; do not fail the request.** These are server-initiated messages that happened
@@ -339,28 +395,10 @@ impl Transport for ChannelTransport {
     }
 
     fn wait_event(&mut self, buf: &mut [u8]) -> Result<(u16, usize), UiError> {
-        loop {
-            // A parked message counts: it is already here and older than anything on the
-            // wire, so blocking first would be wrong.
-            if let Some(ev) = self.poll_event(buf)? {
-                return Ok(ev);
-            }
-            let handles = [self.channel];
-            let mut results = [0u8; 24];
-            // SAFETY: a valid handle array and result buffer for one waiter. `sys_wait` is
-            // where the thread blocks — never inside the recv.
-            let waited = unsafe {
-                syscall4(
-                    SYS_WAIT,
-                    handles.as_ptr() as u64,
-                    1,
-                    results.as_mut_ptr() as u64,
-                    u64::MAX,
-                )
-            };
-            if waited != 1 {
-                return Err(UiError::Transport);
-            }
+        match self.wait_event_timeout(buf, u64::MAX)? {
+            Some(ev) => Ok(ev),
+            // Unreachable with no deadline: `sys_wait` returns 1 or the loop goes round again.
+            None => Err(UiError::Transport),
         }
     }
 
@@ -368,6 +406,14 @@ impl Transport for ChannelTransport {
         core::mem::take(&mut self.lost)
     }
 
+    /// Take the next event if one is already here, without blocking.
+    ///
+    /// `Ok(None)` means nothing is waiting, which is the common case and not an error.
+    ///
+    /// Callable from outside because [`manage`](ChannelTransport::manage) hands back a
+    /// transport whose entire purpose is to *receive* — a manager is told about windows it
+    /// did not create — and a caller with no way to read it holds half an API. Bring
+    /// [`Transport`] into scope to use it.
     fn poll_event(&mut self, buf: &mut [u8]) -> Result<Option<(u16, usize)>, UiError> {
         // Parked messages first: a `Release` that arrived while we were waiting for a reply
         // is still an event the client needs, and it is older than anything on the wire.

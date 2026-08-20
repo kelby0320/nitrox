@@ -345,3 +345,98 @@ mod tests {
         assert_eq!(o.dropped(), 0);
     }
 }
+
+/// One server→manager event, queued rather than sent.
+///
+/// **A separate queue from the session [`Outbox`], deliberately.** The two differ in every
+/// property that shapes one: these are addressed to a *channel* rather than to a window, none of
+/// them coalesces (there is no manager-side equivalent of pointer motion), and losing one is not
+/// a shortened event stream but a **corrupted window list** — a manager that missed a `created`
+/// has a window it will never place and never hear about again.
+///
+/// They are queued for the same reason session records are: sent directly with `NOBLOCK`, a
+/// manager whose receive ring is briefly full silently loses the event, and the compositor has
+/// no way to know. That exact defect was found in the manager's `Configure` path in review of
+/// PR #216.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MgrEvent {
+    /// A window was created: id, role and the geometry its client asked for.
+    Created(librsproto::surface::MgrWindowCreated),
+    /// A window went away.
+    Destroyed {
+        /// Which window.
+        window: u32,
+    },
+    /// A window's position or size changed, for any reason.
+    Geometry(librsproto::surface::ConfigureEvent),
+    /// The keyboard moved to or from a window.
+    Focus {
+        /// Which window.
+        window: u32,
+        /// Whether it now has the keyboard.
+        focused: bool,
+    },
+}
+
+/// How many manager events queue before the oldest are discarded.
+///
+/// Deeper than [`OUTBOX_MAX`] because the burst shape is different: a session's queue holds
+/// what a *person* can do while a client drains, but a manager's holds what the *machine* can
+/// do — `ui-testclient`'s churn probe creates and destroys 128 windows as fast as it can, which
+/// is 256 events with no user pacing them. Sized to carry that without discarding, since a
+/// discard here is a window list that has silently gone wrong.
+pub const MGR_OUTBOX_MAX: usize = 512;
+
+/// The manager's pending events, oldest first.
+#[derive(Default)]
+pub struct MgrOutbox {
+    q: Vec<MgrEvent>,
+    dropped: u32,
+}
+
+impl MgrOutbox {
+    /// An empty queue.
+    pub fn new() -> Self {
+        Self { q: Vec::new(), dropped: 0 }
+    }
+
+    /// Queue an event, discarding the oldest if full. `true` if something was discarded.
+    pub fn push(&mut self, ev: MgrEvent) -> bool {
+        let mut discarded = false;
+        if self.q.len() >= MGR_OUTBOX_MAX {
+            self.q.remove(0);
+            self.dropped = self.dropped.saturating_add(1);
+            discarded = true;
+        }
+        self.q.push(ev);
+        discarded
+    }
+
+    /// The oldest queued event, if any.
+    pub fn front(&self) -> Option<MgrEvent> {
+        self.q.first().copied()
+    }
+
+    /// Discard the oldest — call after it has been sent.
+    pub fn pop(&mut self) {
+        if !self.q.is_empty() {
+            self.q.remove(0);
+        }
+    }
+
+    /// Whether anything is queued.
+    pub fn is_empty(&self) -> bool {
+        self.q.is_empty()
+    }
+
+    /// How many events have been discarded.
+    pub fn dropped(&self) -> u32 {
+        self.dropped
+    }
+
+    /// Forget everything queued — the manager went away.
+    pub fn clear(&mut self) {
+        self.q.clear();
+        self.dropped = 0;
+    }
+}

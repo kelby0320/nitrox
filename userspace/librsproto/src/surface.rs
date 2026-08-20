@@ -705,34 +705,51 @@ pub const OP_MGR_SET_FOCUS: u16 = 0x0914;
 /// initial-configure handshake; sent later it is an ordinary request the client may decline.
 pub const OP_MGR_CONFIGURE: u16 = 0x0915;
 
-/// `Manage::WindowCreated` — server → manager. **Reserved: encoding defined, not implemented.**
+/// `Manage::WindowCreated` — server → manager, when a window is created.
 ///
-/// The five `OP_MGR_WINDOW_*` ops below and [`OP_SET_TITLE`] are Milestone 6 **Part B3**, which
-/// is open: nothing in the tree sends or receives any of them. They are declared so B3 does not
-/// have to renumber, and said so here because `cargo doc` is this project's code-level reference
-/// and the present indicative reads as built (PR #216 review, finding 5). The same separation
-/// the docs make between `design/` and `architecture/`, one layer down.
+/// **Carries the role and the requested geometry, not just an id.** A manager cannot place from
+/// an id alone: a `panel` is not placed like a `normal`, a `popup` is placed by its own client,
+/// and centring needs a size. All of it is already in the create request, so an event that made
+/// the manager ask a follow-up question would be a seam with a round trip in it.
+///
+/// Body: [`MgrWindowCreated`], 20 bytes.
 ///
 /// **Carries the role and the requested geometry, not just an id.** A manager cannot place from
 /// an id alone: a `panel` is not placed like a `normal`, a `popup` is placed by its own client,
 /// and centring needs a size. All of it is already in the create request, so an event that made
 /// the manager ask a follow-up question would be a seam with a round trip in it.
 pub const OP_MGR_WINDOW_CREATED: u16 = 0x0918;
-/// `Manage::WindowDestroyed` — server → manager. **Reserved**, as above.
+/// `Manage::WindowDestroyed` — server → manager, when a window goes away.
+///
+/// Body: [`MgrWindowRef`], 8 bytes; `other` is unused and sent as 0. Reusing the request shape
+/// rather than minting a 4-byte one keeps the manager channel to three body layouts, and the
+/// request side already spends `other` the same way on `Raise`/`Lower`/`SetFocus`.
 pub const OP_MGR_WINDOW_DESTROYED: u16 = 0x0919;
 /// `Manage::WindowGeometry` — server → manager: this window's position or size changed.
-/// **Reserved**, as above.
 ///
-/// Will be sent whenever a window's bounds change for any reason, including the manager's own `Place`.
-/// A window list that learned about size changes by polling is the thing this exists to avoid.
+/// Sent whenever a window's bounds change for any reason, **including the manager's own
+/// `Place`** — a manager that had to remember which changes were its own would be keeping a
+/// second copy of the stack. A window list that learned about size changes by polling is the
+/// thing this exists to avoid.
+///
+/// Body: [`ConfigureEvent`], 20 bytes — the same layout the client-facing `Configure` uses,
+/// because it says the same thing about the same window.
 pub const OP_MGR_WINDOW_GEOMETRY: u16 = 0x091A;
-/// `Manage::WindowFocus` — server → manager: the keyboard moved. **Reserved**, as above.
+/// `Manage::WindowFocus` — server → manager: the keyboard moved.
+///
+/// Body: [`FocusEvent`], 8 bytes — the same layout the client-facing `FocusEvent` uses.
 pub const OP_MGR_WINDOW_FOCUS: u16 = 0x091B;
-/// `Manage::WindowTitle` — server → manager: this window's title changed. **Reserved**, as above.
+/// `Manage::WindowTitle` — server → manager: this window's title changed.
+///
+/// **Reserved: encoding defined, not implemented — `TODO(m6-b3b-titles)`.** It and
+/// [`OP_SET_TITLE`] are the title half of Part B3, which needs a client-facing op and a
+/// variable-length body; the four lifecycle events above are built. Declared so the title
+/// work does not renumber.
 pub const OP_MGR_WINDOW_TITLE: u16 = 0x091C;
 
-/// `Surface::SetTitle` — a client naming its own window. **Reserved**, as above: no client
-/// sends it and the compositor does not answer it. Would be client → server, silent on success.
+/// `Surface::SetTitle` — a client naming its own window. **Reserved: not implemented.** No
+/// client sends it and the compositor does not answer it. Would be client → server, silent on
+/// success.
 ///
 /// Body: the window id, then UTF-8 bytes, up to [`MAX_TITLE`]. A title is the one piece of a
 /// window a *manager* needs and only the *client* knows.
@@ -817,6 +834,23 @@ impl MgrWindowRef {
             window: u32::from_le_bytes([b[0], b[1], b[2], b[3]]),
             other: u32::from_le_bytes([b[4], b[5], b[6], b[7]]),
         })
+    }
+}
+
+impl MgrWindowCreated {
+    /// Build the event for a window of `role` with the geometry it asked for.
+    ///
+    /// The `role`/`aux16`/`aux32` split is the **same encoding `CreateWindowRequest` uses** —
+    /// tag, then the role's extra field: a panel's dock edge and strut reserve, a popup's or
+    /// dialog's parent. Sharing it rather than inventing a second one means a manager decoding
+    /// this reads the role exactly as the compositor did.
+    pub fn for_role(window: u32, role: Role, width: u32, height: u32) -> Self {
+        let (aux16, aux32) = match role {
+            Role::Normal => (0, 0),
+            Role::Panel { dock, reserve } => (dock.tag(), reserve),
+            Role::Popup { parent } | Role::Dialog { parent } => (0, parent),
+        };
+        Self { window, role: role.tag(), aux16, aux32, width, height }
     }
 }
 

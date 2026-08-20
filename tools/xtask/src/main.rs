@@ -1374,6 +1374,11 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     );
     Ok(())
 }
+/// How many screendumps the display gate takes waiting for two in a row to match, and how
+/// long it waits between them. ~3s of budget, against a repaint measured in tens of ms.
+const SCREEN_SETTLE_TRIES: usize = 12;
+const SCREEN_SETTLE_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
 
 /// `cargo xtask check-display` — prove the pixels actually reach the screen.
 ///
@@ -1448,13 +1453,60 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // The second line is the contract B1 exists to state: one manager at a time. The compositor
     // refuses a second resolve rather than deposing the first, and until the client asked twice
     // that branch was unreachable, so the rule was pinned by nothing at all.
+    // **The other half of the seam (M6 B3): the manager is *told*, not just obeyed.** B1
+    // proved a manager can act on the compositor; nothing proved the compositor reports back.
+    // The client watches one window's whole life on the manager channel — created, focus,
+    // geometry after a move, destroyed — and `fail()`s naming whichever record did not
+    // arrive, so a broken event path reports itself here rather than as a screen that happens
+    // to still match. The probe window is destroyed before the scene is captured, so it
+    // changes no pixel this gate compares, and it runs *first* — creating and destroying a
+    // window is the noisiest thing this client does, so it happens before the placements
+    // rather than leaving a full-screen repaint racing the capture.
+    session.expect("ui-testclient: manager saw created, focus, geometry and destroyed")?;
+
     session.expect("ui-testclient: reference windows placed via /dev/draw/manage")?;
     session.expect("ui-testclient: a second /dev/draw/manage was refused")?;
 
     session.expect("ui-testclient: scene presented via /dev/draw")?;
-    qmp.screendump(&shot)?;
-
-    let captured = fs::read(&shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
+    // **Capture a screen that has stopped changing, rather than the first one offered.**
+    //
+    // The client's line says *it* is done, not that the compositor is: a repaint is work the
+    // compositor does after the request that caused it was answered, and recompositing
+    // 1280x800 is not instant. Capturing immediately caught a torn frame — background filled,
+    // windows not yet composited, no cursor — about half the time once `ui-testclient` began
+    // creating and destroying a window near the end of its run (M6 B3).
+    //
+    // Two identical consecutive dumps, not a sleep: a fixed delay is a guess that either
+    // wastes time or is too short on a loaded machine, and silently becomes too short again
+    // the next time the scene grows. This waits for the property the gate actually needs, and
+    // it cannot pass a screen that is wrong but stable — the comparison below still runs.
+    let captured = {
+        let mut prev: Option<Vec<u8>> = None;
+        let mut settled = None;
+        for _ in 0..SCREEN_SETTLE_TRIES {
+            qmp.screendump(&shot)?;
+            let bytes =
+                fs::read(&shot).map_err(|e| format!("read screendump {}: {e}", shot.display()))?;
+            if prev.as_deref() == Some(bytes.as_slice()) {
+                settled = Some(bytes);
+                break;
+            }
+            prev = Some(bytes);
+            std::thread::sleep(SCREEN_SETTLE_WAIT);
+        }
+        match settled {
+            Some(b) => b,
+            None => {
+                let _ = session.child.kill();
+                return Err(format!(
+                    "the guest's screen never stopped changing over {SCREEN_SETTLE_TRIES} \
+                     captures {SCREEN_SETTLE_WAIT:?} apart — a compositor repainting \
+                     continuously is itself the bug"
+                )
+                .into());
+            }
+        }
+    };
     let (w, h, pixels) = parse_ppm(&captured)?;
     println!("  captured {w}x{h} from the guest's display");
 
