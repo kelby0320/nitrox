@@ -230,7 +230,12 @@ impl InputRouter {
             .windows()
             .iter()
             .rev()
-            .find(|w| w.bounds().contains(self.pointer.x, self.pointer.y))
+            // **Only what is on screen can be clicked.** An unconfigured window still occupies
+            // its rectangle in the stack — at the default origin, at its requested size — so
+            // without this a click anywhere inside it lands on a window the compositor has
+            // decided not to draw, in front of the visible one underneath (PR #218 review,
+            // finding 3).
+            .find(|w| w.configured && w.bounds().contains(self.pointer.x, self.pointer.y))
             .map(|w| w.id)
     }
 
@@ -302,11 +307,17 @@ mod tests {
     const SCREEN: Rect = Rect::new(0, 0, 640, 480);
     const BTN_LEFT: u16 = 0x110;
 
-    /// A window at `(x, y)` of `w × h`, with a committed buffer so `bounds()` is its size.
+    /// A window at `(x, y)` of `w × h`, committed **and configured** — a window that is on
+    /// screen, which is the only kind routing has anything to say about.
+    ///
+    /// Configured because since B4 neither hit-testing nor focus considers a window that is
+    /// not: a held window occupies its rectangle in the stack but is not drawn, and routing a
+    /// click or a keystroke to it would send input somewhere nobody can see.
     fn win(stack: &mut WindowStack, role: Role, x: i32, y: i32, w: u32, h: u32) -> u32 {
         let id = stack
             .create(&CreateWindowRequest { role, width: w, height: h })
             .expect("create");
+        stack.mark_configured(id);
         // Damage ignored: this helper positions a window for a routing test, and nothing
         // in these tests paints.
         let _ = stack.place(id, Point::new(x, y)).expect("origin");
@@ -383,6 +394,41 @@ mod tests {
         let out = go(&mut r, &mut s, key(30, true));
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].window(), top, "the key went to the focused window");
+    }
+
+    /// A window whose first `Configure` is still held takes neither the keyboard nor a click.
+    ///
+    /// It is on top of the stack and occupies its rectangle there, but the compositor has
+    /// decided it is not on screen (M6 B4). Routing to it would send keystrokes into a window
+    /// nobody can see and make a click land on it rather than on the visible window underneath
+    /// — for as long as the hold lasts, which on the deadline path is a bounded 200 ms during
+    /// every window launch (PR #218 review, finding 3).
+    #[test]
+    fn a_window_whose_configure_is_held_takes_neither_focus_nor_a_click() {
+        let mut s = WindowStack::new();
+        let visible = win(&mut s, Role::Normal, 0, 0, 200, 200);
+        // Created *over* the visible one and never configured — a launch in progress. Built
+        // with `create` rather than `win`, precisely because `win` configures.
+        let held = s
+            .create(&CreateWindowRequest { role: Role::Normal, width: 200, height: 200 })
+            .expect("create");
+        // No commit needed: `bounds()` falls back to the requested size, which is exactly the
+        // rectangle a held window occupies in the stack and the reason it could be clicked.
+
+        let mut r = InputRouter::new(SCREEN);
+        warp(&mut r, &mut s, 50, 50);
+        assert_eq!(r.inside(), Some(visible), "the click lands on what is on screen");
+
+        let out = go(&mut r, &mut s, key(30, true));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].window(), visible, "and so does the keystroke");
+
+        // Configured, and it takes both — it was topmost all along.
+        s.mark_configured(held);
+        warp(&mut r, &mut s, 51, 51);
+        assert_eq!(r.inside(), Some(held));
+        let out = go(&mut r, &mut s, key(30, true));
+        assert_eq!(out[out.len() - 1].window(), held);
     }
 
     #[test]

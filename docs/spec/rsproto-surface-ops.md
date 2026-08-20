@@ -182,7 +182,7 @@ sections, so it is stated once, normatively:
 
 | Op | On success | On failure |
 |---|---|---|
-| `CreateWindow` | reply carrying the window id, **then a `Configure`** | error reply |
+| `CreateWindow` | reply carrying the window id, **then a `Configure`** — not necessarily adjacent, see below | error reply |
 | `AttachBuffer` | **silent** | error reply |
 | `Commit` | **silent** | error reply |
 | `DestroyWindow` | **silent** | error reply |
@@ -267,11 +267,22 @@ treat a zeroed word as proof of anything.
 
 Reply, 4 bytes: the new `window` id.
 
-**And then a `Configure`, on the same channel, before anything else.** `CreateWindow` is the one
-request that produces two messages: the reply, then the window's first
-[`Configure`](#configure-0x0908). A client must read both — see the handshake below — and a
-compositor must send them in that order, because a client blocked on the reply for its id cannot
-read anything else until it has it.
+**And then a `Configure`, on the same channel.** `CreateWindow` is the one request that produces
+two messages: the reply, then the window's first [`Configure`](#configure-0x0908). A client must
+read both — see the handshake below — and a compositor must send them **in that order**, because a
+client blocked on the reply for its id cannot read anything else until it has it.
+
+**Nothing about the new window precedes its configure.** A window whose configure is held is not
+on screen, and the compositor treats that as one property: it is not composited, it is not a focus
+candidate, and it cannot be hit by a click. So there is no `FocusEvent` for a window that has not
+been configured — the configure is what makes it eligible for one.
+
+**But the configure is not necessarily the very next message on the channel.** A connection
+carries records for every window the client owns, so a `PointerEvent`, a `Release` or a focus
+change *for one of its other windows* may arrive between the reply and the configure — with a
+manager attached the gap is however long the manager takes. A client must read events in a loop
+until its configure arrives rather than assuming the message after the reply is it; `libsurface`'s
+`Window::new` does exactly that.
 
 ### `AttachBuffer` (`0x0901`)
 
@@ -486,7 +497,7 @@ against this rule needs no change when a manager appears.
 | Trigger | The client is told |
 | --- | --- |
 | The manager sends `Configure` (`0x0915`) for the window | exactly what the manager asked for — that op carries an origin *and* a size, so one message answers both halves |
-| The manager sends any other request naming the window (`Place`, `Raise`, `Lower`, `SetFocus`) | the window's geometry as it now stands — the placed origin, at the requested size |
+| The manager sends any other request naming the window (`Place`, `Raise`, `RaiseAbove`, `Lower`, `SetFocus`) | the window's geometry as it now stands — the placed origin, at the requested size |
 | Nothing, for **200 ms** | the requested size at the default origin |
 | The manager disconnects | the same, at once rather than after the remaining wait |
 

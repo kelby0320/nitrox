@@ -680,7 +680,7 @@ fn drain_stack_events(srv: &mut Server) {
 /// client waits forever in `Window::new`. The geometry is read from the stack at this moment
 /// rather than from what was stashed at creation, so a manager that placed the window first
 /// releases it *at the placed origin* — which is the entire point of holding it.
-fn release_configure(srv: &mut Server, window: u32) -> bool {
+fn release_configure(srv: &mut Server, fb: &mut RawFramebuffer, window: u32) -> bool {
     let Some(i) = srv.pending_configure.iter().position(|&(w, _)| w == window) else {
         return false;
     };
@@ -692,8 +692,20 @@ fn release_configure(srv: &mut Server, window: u32) -> bool {
     };
     let (width, height) = w.size;
     let origin = w.origin;
+    let bounds = w.bounds();
     srv.stack.mark_configured(window);
-    configure_window(srv, window, width, height, origin)
+    let sent = configure_window(srv, window, width, height, origin);
+    // **Both of these belong here rather than at the call sites**, because releasing is what
+    // changes the window's visibility and there are four paths that release. Two of them
+    // originally did neither, which is a window that becomes drawable and is not drawn until
+    // some unrelated damage arrives, and a keyboard that stays where it was (PR #218 review,
+    // findings 3 and 7).
+    //
+    // The window's own rectangle, not the whole screen: nothing else changed, and the ordinary
+    // release runs on every window creation while a manager is attached.
+    repaint_region(srv, fb, bounds);
+    announce_focus(srv);
+    sent
 }
 
 /// Show every window whose manager never answered in time.
@@ -701,9 +713,14 @@ fn release_configure(srv: &mut Server, window: u32) -> bool {
 /// **The window appears where the compositor put it rather than not at all.** A shell that is
 /// wedged, slow to start, or simply not interested must cost a launch some latency, never a
 /// window — a client blocked forever in `Window::new` is the failure this deadline exists to
-/// rule out. Repaints, because unlike the ordinary release this one can make a window that has
-/// already committed suddenly compositable.
-fn fire_configure_deadlines(srv: &mut Server, fb: &mut RawFramebuffer) {
+/// rule out.
+fn fire_configure_deadlines(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
+    // Free when nothing is held, which is the overwhelming majority of iterations — and it has
+    // to be free, because this runs every time round the serve loop rather than only on a
+    // timeout. Reading the clock unconditionally would put a syscall in the hot path.
+    if srv.pending_configure.is_empty() {
+        return false;
+    }
     let now = now_ns();
     let due: alloc::vec::Vec<u32> = srv
         .pending_configure
@@ -711,15 +728,14 @@ fn fire_configure_deadlines(srv: &mut Server, fb: &mut RawFramebuffer) {
         .filter(|&&(_, at)| at <= now)
         .map(|&(w, _)| w)
         .collect();
+    let fired = !due.is_empty();
     for window in due {
         let mut l = Line::new();
         l.s(b"compositor: no manager answer for window ").u(window as u64).s(b"; showing it");
         l.end();
-        if release_configure(srv, window) {
-            repaint(srv, fb);
-            announce_focus(srv);
-        }
+        release_configure(srv, fb, window);
     }
+    fired
 }
 
 /// Queue one event for the manager, if there is one. Logs a discard the way `enqueue` does.
@@ -1261,7 +1277,7 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             // A manager that only wants to position a window sends `Place` and nothing else;
             // making it wait out the deadline would mean every launch is slow by design. The
             // configure goes out carrying the origin the manager just set.
-            release_configure(srv, window);
+            release_configure(srv, fb, window);
             match dirty {
                 // Nothing on screen changed — placing a window that has not committed, which
                 // is the manager's ordinary case during the handshake.
@@ -1286,9 +1302,21 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
             // wants to set both should use this rather than `Place` followed by `Configure` —
             // the first of those pair releases the hold, and the second then arrives as an
             // ordinary later configure, after first paint.
+            // The manager's answer *is* this window's initial configure, so the hold is
+            // discharged here rather than by `release_configure` — the configure below carries
+            // the manager's geometry, which is more than the stack knows.
+            let was_held = srv.pending_configure.iter().any(|&(w, _)| w == window);
             srv.pending_configure.retain(|&(w, _)| w != window);
-            srv.stack.mark_configured(window);
+            let became_visible = srv.stack.mark_configured(window);
             if configure_window(srv, window, width, height, origin) {
+                if became_visible || was_held {
+                    // Newly drawable, and newly a focus candidate — see `release_configure`.
+                    let r = srv.stack.window(window).map(|w| w.bounds());
+                    if let Some(r) = r {
+                        repaint_region(srv, fb, r);
+                    }
+                    announce_focus(srv);
+                }
                 reply_on_session(ch, op, request_id, &[]);
             } else {
                 // No session owns that window, so nobody can be told: a refusal, not a
@@ -1341,14 +1369,14 @@ fn open_manager(serve_end: u64, request_id: u64) -> bool {
 /// while the departed manager was watching; handing that backlog to whoever attaches next
 /// would tell a fresh manager about creations it never saw and, after enough churn, about
 /// windows that no longer exist — with no resync op to repair the picture.
-fn close_manager(srv: &mut Server) {
+fn close_manager(srv: &mut Server, fb: &mut RawFramebuffer) {
     srv.mgr_outbox.clear();
     // **Every window it was going to place is shown now, not after the deadline.** The clients
     // holding those windows are blocked, and waiting out a timer for a manager that has
     // demonstrably gone is latency bought for nothing.
     let waiting: alloc::vec::Vec<u32> = srv.pending_configure.iter().map(|&(w, _)| w).collect();
     for window in waiting {
-        release_configure(srv, window);
+        release_configure(srv, fb, window);
     }
     // SAFETY: closing our own endpoint and clearing the slot.
     unsafe {
@@ -1748,6 +1776,20 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
     kprint(b"compositor: serving /dev/draw\n");
     let mut parked = false;
     loop {
+        // **Every iteration, not only on a timeout.** Checked in the `TimedOut` arm alone, the
+        // configure deadline would be a floor rather than a bound: any iteration where a handle
+        // was ready would skip it, so a busy compositor could hold a window well past 200 ms.
+        // It self-corrects at the first idle instant, which is why this is a bound rather than
+        // a bug fix — but a deadline that only holds when nothing is happening is not one worth
+        // documenting as 200 ms (PR #218 review, finding 8). Free when nothing is held.
+        //
+        // **Flushed here, not left to the next pass.** Releasing *queues* the configure, and
+        // the client is blocked on it; going straight back to `sys_wait` with it unsent means
+        // sleeping until something unrelated happens — and having just emptied the pending
+        // list, there is no longer a deadline to wake for.
+        if fire_configure_deadlines(srv, &mut fb) {
+            parked = flush_outboxes(srv);
+        }
         // SAFETY: WAIT_HANDLES holds MAX_WAIT_HANDLES slots; `n` is bounded by
         // `3 + MAX_SESSIONS` — `serve_end`, the input channel when connected, the manager
         // channel when one is attached, then the sessions — which the `const _` beside
@@ -1796,7 +1838,6 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             // `TimedOut` is a tick, not an error: whichever deadline expired, do its work
             // and go back to waiting rather than spinning.
             fire_repeat(srv);
-            fire_configure_deadlines(srv, &mut fb);
             parked = flush_outboxes(srv);
             continue;
         }
@@ -1834,7 +1875,7 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             // SAFETY: reading our own manager slot.
             if unsafe { MANAGER_CH } != 0 && h == unsafe { MANAGER_CH } {
                 if !serve_manager(srv, &mut fb) {
-                    close_manager(srv);
+                    close_manager(srv, &mut fb);
                 }
                 continue;
             }

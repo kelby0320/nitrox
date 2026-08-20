@@ -138,7 +138,13 @@ mod tests {
         let mut s = WindowStack::new();
         let ids = (0..n)
             .map(|_| {
-                s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap()
+                let id =
+                    s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal })
+                        .unwrap();
+                // Configured: a manager acts on windows that are on screen, and since B4
+                // `focus_candidate` does not consider one that is not.
+                s.mark_configured(id);
+                id
             })
             .collect();
         (s, ids)

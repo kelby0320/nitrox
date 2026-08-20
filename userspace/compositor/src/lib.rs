@@ -702,7 +702,13 @@ impl WindowStack {
     ///
     /// Panels are skipped: clicking the clock must not steal input from the terminal.
     pub fn focus_candidate(&self) -> Option<u32> {
-        self.windows.iter().rev().find(|w| w.role.takes_focus()).map(|w| w.id)
+        // **Unconfigured windows are not candidates**, for the same reason they are not
+        // composited: the compositor has decided they are not on screen yet, and giving the
+        // keyboard to a window nobody can see loses every keystroke typed into it. A new window
+        // goes on top of the stack, so without this it becomes the candidate the instant it is
+        // created — before anyone has placed it, and for as long as its configure is held
+        // (PR #218 review, finding 3).
+        self.windows.iter().rev().find(|w| w.configured && w.role.takes_focus()).map(|w| w.id)
     }
 
     /// Composite the stack into `fb`, repainting `damage` — **without the cursor**.
@@ -1325,7 +1331,11 @@ mod tests {
     fn a_window_with_no_committed_buffer_shows_background_not_garbage() {
         let mut s = WindowStack::new();
         let mut src = MapSource::default();
-        let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        // **Configured**, or B4's gate skips the window one line above the `committed` guard
+        // and this test passes without ever reaching what it is named for — the hazard the
+        // comment below already warned about, for the guard after this one (PR #218 review,
+        // finding 1).
+        let w = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         // **The pixels must exist**, or the source-resolution guard catches the window and
         // this test says nothing about the `committed` guard it is named for. In the server
@@ -1353,8 +1363,9 @@ mod tests {
         let dlg = s
             .create(&CreateWindowRequest { width: 2, height: 2, role: Role::Dialog { parent: sub } })
             .unwrap();
-        let other =
-            s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        // Configured, because the last assertion is about focus and since B4 a window that is
+        // not on screen is not a focus candidate.
+        let other = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
 
         s.destroy(w).unwrap();
         for gone in [menu, sub, dlg] {
@@ -1426,7 +1437,8 @@ mod tests {
         // from an unresolvable buffer would read whatever memory happened to be there.
         let mut s = WindowStack::new();
         let src = MapSource::default(); // deliberately empty
-        let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        // Configured, so B4's gate is not what skips this window — see finding 1.
+        let w = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         s.commit(&commit(w, 0)).unwrap();
 
@@ -1445,7 +1457,8 @@ mod tests {
             }
         }
         let mut s = WindowStack::new();
-        let w = s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal }).unwrap();
+        // Configured, so B4's gate is not what skips this window — see finding 1.
+        let w = shown(&mut s, &CreateWindowRequest { width: 8, height: 8, role: Role::Normal });
         s.attach(&attach(w, 0, 8, 8)).unwrap();
         s.commit(&commit(w, 0)).unwrap();
 

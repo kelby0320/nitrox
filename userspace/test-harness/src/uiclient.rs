@@ -68,7 +68,7 @@ use libkern::{
 };
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent,
-    MgrWindowCreated, OP_CONFIGURE,
+    MgrWindowCreated, OP_CONFIGURE, OP_FOCUS_EVENT,
     MgrWindowRef, OP_ATTACH_BUFFER, OP_COMMIT, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
     OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, ROLE_NORMAL, Role,
     SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
@@ -628,13 +628,30 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
     };
 
     // 2. **Nothing yet.** The reply came back, so the compositor has handled the request in
-    //    full; a configure sent unconditionally would already be here. Polled rather than
-    //    waited, because the assertion is an absence and waiting for one proves nothing.
+    //    full; a configure it did not hold would already be queued. Polled rather than waited,
+    //    because the assertion is an absence and waiting for one proves nothing.
+    //
+    //    **Every queued event, not the first.** A single poll only fails if a configure happens
+    //    to be at the head of the ring, and it will not be: creating a window puts it on top of
+    //    the stack, so a `FocusEvent` is queued for it first. A release that moved slightly
+    //    earlier — onto the created-event, say, rather than onto the manager acting — would
+    //    then sit second and the check would report success (PR #218 review, finding 4).
+    //
+    //    **A `FocusEvent` for this window is a failure here too**, and that assertion is not
+    //    decoration: a held window is not on screen, so it must not be the focus candidate, and
+    //    nothing about it can be announced before the configure that makes it one. Draining is
+    //    what makes the configure check thorough and is also what would hide this one — the
+    //    stray record would simply be discarded — so the drain has to judge what it discards.
     let mut buf = [0u8; 64];
-    if let Ok(Some((op, _))) = t.poll_event(&mut buf)
-        && op == OP_CONFIGURE
-    {
-        fail(b"ui-testclient: a configure arrived before the manager had answered\n");
+    while let Ok(Some((op, n))) = t.poll_event(&mut buf) {
+        if op == OP_CONFIGURE {
+            fail(b"ui-testclient: a configure arrived before the manager had answered\n");
+        }
+        if op == OP_FOCUS_EVENT
+            && FocusEvent::read(&buf[..n]).is_some_and(|f| f.window == id && f.focused != 0)
+        {
+            fail(b"ui-testclient: a held window was given the keyboard before it was on screen\n");
+        }
     }
 
     // 3. Now answer, as the manager, with an origin nothing else would produce.
@@ -651,12 +668,22 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
         fail(b"ui-testclient: B4 Place was refused\n");
     }
 
-    // 4. And the held configure arrives, carrying where the manager put it.
+    // 4. And the held configure arrives, carrying where the manager put it — **as the very
+    //    next record on this channel**, which is what the spec promises about `CreateWindow`
+    //    producing the reply and then a `Configure`. Asserted strictly rather than searched
+    //    for, because the ordering is the interesting part: a held window is not a focus
+    //    candidate (it is not on screen), so nothing about it can be announced before the
+    //    configure that makes it one. Searching past other records would pass on a compositor
+    //    that announced focus for an invisible window first.
     let mut waited = 0;
     let cfg = loop {
         match t.wait_event_timeout(&mut buf, MGR_EVENT_SLICE_NS) {
             Ok(Some((OP_CONFIGURE, n))) => break ConfigureEvent::read(&buf[..n]),
-            Ok(_) => {}
+            Ok(Some((op, _))) => {
+                Line::new().s(b"ui-testclient: expected a configure, got op ").u(op as u64).end();
+                fail(b"ui-testclient: a record preceded the window's first configure\n");
+            }
+            Ok(None) => {}
             Err(_) => fail(b"ui-testclient: B4 session channel error\n"),
         }
         waited += 1;

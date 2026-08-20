@@ -16489,6 +16489,28 @@ manager answered), the placement (released at the default origin — "configure 
 placed 137,89"), and the deadline (removed, the gate names the missing line rather than timing
 out bare).
 
+**Review turned "not on screen" into one property rather than three.** `configured` initially
+gated compositing alone, while `focus_candidate` and `InputRouter::hit` still treated a held
+window as present — so for the length of the hold it was topmost, took the keyboard, and won a
+click against the visible window underneath. Pre-existing in kind (an uncommitted window already
+did this) but newly deterministic at up to 200 ms on every launch. All three consult `configured`
+now. That change has a second effect worth recording: a held window is no longer a focus
+candidate, so **nothing about it can be announced before its configure** — which repaired a
+normative spec claim (`CreateWindow` produces "the reply, then a `Configure`, before anything
+else") that the hold had quietly falsified. The gate pins it: the probe's drain fails on a
+`FocusEvent` for a window that is not yet on screen.
+
+**Releasing repaints and announces focus from one place**, not four. Two of the four release paths
+did neither, which is a window that becomes drawable and is not drawn until unrelated damage
+arrives. It repaints the window's own rectangle rather than the screen, because the ordinary
+release runs on every window creation while a manager is attached.
+
+**The deadline is checked every iteration of the serve loop, not only on a timeout** — otherwise
+200 ms is a floor rather than a bound, since any iteration with a ready handle skips the check.
+Doing that surfaced a bug in the move itself: releasing *queues* the configure, and going back to
+`sys_wait` without flushing meant sleeping with it unsent — and having just emptied the pending
+list, there was no deadline left to wake for. The release now drives a flush.
+
 **Not exercised by any gate:** releasing held configures when the manager *disconnects*. The
 deadline covers those clients, so this is a latency optimisation rather than a correctness fix,
 and the only way to reach it in `ui-testclient` would be to leave a window held while dropping
