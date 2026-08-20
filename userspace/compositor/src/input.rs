@@ -315,7 +315,7 @@ mod tests {
     /// click or a keystroke to it would send input somewhere nobody can see.
     fn win(stack: &mut WindowStack, role: Role, x: i32, y: i32, w: u32, h: u32) -> u32 {
         let id = stack
-            .create(&CreateWindowRequest { role, width: w, height: h })
+            .create(&CreateWindowRequest::new(w, h, role))
             .expect("create");
         stack.mark_configured(id);
         // Damage ignored: this helper positions a window for a routing test, and nothing
@@ -410,7 +410,7 @@ mod tests {
         // Created *over* the visible one and never configured — a launch in progress. Built
         // with `create` rather than `win`, precisely because `win` configures.
         let held = s
-            .create(&CreateWindowRequest { role: Role::Normal, width: 200, height: 200 })
+            .create(&CreateWindowRequest::new(200, 200, Role::Normal))
             .expect("create");
         // No commit needed: `bounds()` falls back to the requested size, which is exactly the
         // rectangle a held window occupies in the stack and the reason it could be clicked.

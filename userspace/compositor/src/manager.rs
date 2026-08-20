@@ -139,7 +139,7 @@ mod tests {
         let ids = (0..n)
             .map(|_| {
                 let id =
-                    s.create(&CreateWindowRequest { width: 8, height: 8, role: Role::Normal })
+                    s.create(&CreateWindowRequest::new(8, 8, Role::Normal))
                         .unwrap();
                 // Configured: a manager acts on windows that are on screen, and since B4
                 // `focus_candidate` does not consider one that is not.

@@ -1322,19 +1322,90 @@ reflow.
 
 ### Part C — popups, and what an application may do
 
-- [ ] **C1 — a popup is positioned relative to its parent.** `Role::Popup { parent }` carries the
-      parent already; what is missing is an offset. Placed by its **creator**, checked against
-      `conn.owns(parent)` — the ownership test the connection already performs.
+**Detailed 2026-08-20.** Three decisions were taken before starting; the reasoning is below each
+item. Two facts found while detailing changed the shape of the work:
 
-- [ ] **C2 — a popup is clipped to the screen, not to its parent.** *"A menu clipped to its window
+- **C2 is almost entirely a proving job.** Nothing clips a popup to its parent — popups are
+  separate windows, so the property holds by construction — and `libdraw::compose` already clips
+  to the screen (`area.intersect(&screen)`, then `blit_clipped`). What is missing is any test
+  that says so.
+- **B4 would make every menu lag.** The initial-configure hold is role-blind, so with a manager
+  attached a popup waits out the 200 ms deadline for a manager that, by design, must not place
+  popups. That is a bug in waiting rather than a choice, and C1 fixes it.
+
+- [x] **C1 — a popup is positioned relative to its parent.** ✅ 2026-08-20. `Role::Popup { parent }` carries the
+      parent already; what is missing is an offset. Placed by its **creator**, checked against
+      `conn.owns(parent)` — the ownership test the connection already performs, and which
+      `server.rs` already does.
+
+      **The offset travels in `CreateWindowRequest`, which grows 16 → 24 bytes.** Two new
+      role-specific words: `x` and `y`, the offset from the parent's origin, zero for roles that
+      have no parent. A wire break, taken deliberately while the ABI is pre-stabilisation.
+
+      **"Popup" is shorthand for both parented roles.** A `dialog` is placed by its creator and
+      exempt from the hold on exactly the same terms; nothing in the tree creates one outside
+      tests, which is why the wording throughout says popup.
+
+      The alternative — a new `Surface::PlacePopup` op sent between `CreateWindow` and the first
+      `Commit` — was rejected: it puts a second message on the path of every menu open, and it
+      creates the popup at `(0, 0)` before moving it. Nothing would *see* it there, since a
+      window is not composited before its first commit, but the manager would see a spurious
+      `WindowGeometry`, and the position would be a thing that is briefly wrong rather than a
+      thing that is never wrong. Carrying it in the create request makes the popup's position
+      atomic with its existence.
+
+      **Popups and dialogs are exempt from B4's hold.** A window whose position is its creator's
+      business has nobody to wait for. Without this every menu open costs the full deadline the
+      moment a shell is attached — 200 ms, on the interaction most sensitive to latency.
+
+      **The offset is resolved once, at creation.** The compositor stores absolute origins; a
+      popup that tracked its parent would have to be re-placed whenever the parent moved, which
+      is placement policy and belongs with the shell. In M6 only a manager moves a window, and
+      a menu open outlives no such move. Recorded as a limitation rather than left implicit.
+
+- [x] **C2 — a popup is clipped to the screen, not to its parent.** ✅ 2026-08-20 — the tests, as detailed; no behaviour changed. *"A menu clipped to its window
       is not a menu"* (`display-substrate.md` §4a) is the whole reason popups are windows rather
       than `libui` nodes; `libui`'s `offset` clips at the parent's edge and that is correct one
       level down. The screen is the only clip left.
+
+      **Both halves already hold; this item is the tests that pin them.** A host test for a popup
+      whose bounds extend past its parent's on every side, and one for a popup crossing a screen
+      edge — including a negative origin, where the source-coordinate arithmetic in `blit_clipped`
+      would be the thing to get wrong. Each negative-controlled, because a test that passes for
+      the broken version too is decoration.
+
+      **The compositor clips and does nothing else.** It does not slide a popup back onto the
+      screen: that silently disagrees with where the client asked for it, with no way to tell the
+      client. Nor does M6 expose the screen size so a client can flip a menu upward — that is a
+      contract the shell (M7) may want to own, and nothing in M6 places a window near an edge.
 
 - [ ] **C3 — `nxterm`'s menu becomes a real popup**, which is the first honest consumer and the
       thing that proves C1/C2 rather than asserting them. This is also the moment `libui`'s
       in-window popup stops being the only option, so the toolkit's `offset` gets a doc note
       saying which to reach for.
+
+      **The bulk of Part C.** `nxterm` has exactly one `Window` and no window-id dispatch
+      anywhere: the conversion needs a second surface, its own buffers, its own render pass, and
+      an event loop that routes by window id. The menu is currently a `Stack` layer over the
+      whole window (`nxterm/src/lib.rs`), anchored under the bar item.
+
+      **It cannot prove the geometry, and should not be bent into trying.** `nxterm`'s menu fits
+      inside its own window, so converting it demonstrates that an application *can* use a popup —
+      not that a popup escapes its parent. Designing the menu to overflow in order to test the
+      compositor would be shaping the terminal around its gate. C2's host tests and a
+      `ui-testclient` case carry the geometry; `nxterm` carries the plumbing.
+
+      **Blocked on a `libsurface` change C1 discovered.** `Window` owns its `Transport`, so a
+      client can hold exactly one window per connection — while a popup may only name a parent
+      its *own* connection owns. `nxterm` therefore cannot have its terminal window and its menu
+      at the same time until `libsurface` grows a session type that owns the transport and mints
+      windows from it. The protocol has no such limit; the API does. `TODO(libsurface-multi-window)`,
+      and it is the first thing C3 has to build.
+
+      **Focus comes back for free, and gets a test anyway.** `Role::Popup` takes focus, so the
+      menu window takes the keyboard from the grid; on close `focus_candidate` is the topmost
+      configured focusable window, which is the terminal again. That it works by construction is
+      the reason to pin it — nothing would fail if it stopped.
 
 ### Part D — the contract
 

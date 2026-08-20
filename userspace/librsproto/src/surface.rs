@@ -261,9 +261,21 @@ impl WindowInfo {
 // --- CreateWindow -----------------------------------------------------------
 
 /// Body length of a `CreateWindowRequest`.
-pub const CREATE_WINDOW_REQUEST_LEN: usize = 16;
+///
+/// Grew from 16 to 24 in M6 C1, when popups gained an offset. Named rather than written out
+/// at each call site: every buffer in the tree is sized from this, so the record can grow
+/// without a search for stale literals.
+pub const CREATE_WINDOW_REQUEST_LEN: usize = 24;
 /// Body length of a `CreateWindowReply`.
 pub const CREATE_WINDOW_REPLY_LEN: usize = 4;
+
+// **The record's length is a contract**, published in `docs/spec/rsproto-surface-ops.md` and
+// read by a second implementation. Nothing pinned it before C1 — `ConfigureEvent` and
+// `FocusEvent` both carry asserts and this, the record every client sends first, did not — so
+// the spec and the encoder could drift apart silently. The offsets below are what the spec
+// table names.
+const _: () = assert!(CREATE_WINDOW_REQUEST_LEN == 24);
+const _: () = assert!(CREATE_WINDOW_REPLY_LEN == 4);
 
 /// A parsed `CreateWindowRequest`.
 #[derive(Copy, Clone, Debug)]
@@ -274,6 +286,45 @@ pub struct CreateWindowRequest {
     pub height: u32,
     /// The window's role, fixed for its lifetime.
     pub role: Role,
+    /// Offset from the parent's origin, for the roles that have a parent.
+    ///
+    /// **Role-specific, like the aux words**, and zero for `normal` and `panel` — a window with
+    /// no parent has nothing to be offset from, and a manager places it. For `popup` and
+    /// `dialog` this is the whole of their placement: they are positioned by their *creator*,
+    /// which is the only party that knows where the menu item it drops from was drawn.
+    ///
+    /// **Carried here rather than sent afterwards** so that a popup's position is atomic with
+    /// its existence. A separate op between `CreateWindow` and the first `Commit` would put a
+    /// second message on the path of every menu open, and would create the window at `(0, 0)`
+    /// before moving it — never *seen* there, since nothing is composited before its first
+    /// commit, but briefly wrong rather than never wrong, and a spurious `WindowGeometry` for
+    /// the manager.
+    ///
+    /// **Resolved once, at creation.** The compositor stores absolute origins; a popup that
+    /// tracked its parent would have to be re-placed whenever the parent moved, which is
+    /// placement policy and belongs with the shell — see `TODO(popup-follows-parent)`.
+    pub offset_x: i32,
+    /// Vertical half of [`offset_x`](Self::offset_x).
+    pub offset_y: i32,
+}
+
+impl CreateWindowRequest {
+    /// A window with no offset — the only meaningful shape for a role that has no parent.
+    ///
+    /// **Constructors rather than struct literals**, so the record can gain a role-specific
+    /// word without touching every caller in the tree. Adding the offset in C1 broke 66 literal
+    /// sites; the next field breaks none.
+    pub const fn new(width: u32, height: u32, role: Role) -> Self {
+        Self { width, height, role, offset_x: 0, offset_y: 0 }
+    }
+
+    /// A popup or dialog at `(x, y)` from its parent's origin.
+    ///
+    /// The offset is ignored — written and read as zero — for a role with no parent, so this
+    /// says what it means rather than being the general constructor.
+    pub const fn at(width: u32, height: u32, role: Role, x: i32, y: i32) -> Self {
+        Self { width, height, role, offset_x: x, offset_y: y }
+    }
 }
 
 /// Write a `CreateWindowRequest` body; returns its length.
@@ -293,6 +344,14 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     };
     put_u16(out, 10, aux16);
     put_u32(out, 12, aux32);
+    // Zero for a role with no parent, for the same reason the aux words are: two identical
+    // requests must produce identical bytes.
+    let (ox, oy) = match req.role {
+        Role::Popup { .. } | Role::Dialog { .. } => (req.offset_x, req.offset_y),
+        Role::Normal | Role::Panel { .. } => (0, 0),
+    };
+    put_u32(out, 16, ox as u32);
+    put_u32(out, 20, oy as u32);
     Some(CREATE_WINDOW_REQUEST_LEN)
 }
 
@@ -318,7 +377,15 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
         ROLE_DIALOG => Role::Dialog { parent: aux32 },
         _ => return None,
     };
-    Some(CreateWindowRequest { width, height, role })
+    // Only meaningful for the roles that have a parent; a `normal` or `panel` request carries
+    // zero here, and reading it anyway would invent an offset nobody sent.
+    let (offset_x, offset_y) = match role {
+        Role::Popup { .. } | Role::Dialog { .. } => {
+            (get_u32(body, 16) as i32, get_u32(body, 20) as i32)
+        }
+        Role::Normal | Role::Panel { .. } => (0, 0),
+    };
+    Some(CreateWindowRequest { width, height, role, offset_x, offset_y })
 }
 
 /// Write a `CreateWindowReply` body (the new window's id).
@@ -1073,11 +1140,7 @@ mod tests {
             Role::Dialog { parent: 9 },
         ] {
             let mut req = [0u8; CREATE_WINDOW_REQUEST_LEN];
-            build_create_window_request(&mut req, &CreateWindowRequest {
-                width: 640,
-                height: 480,
-                role,
-            })
+            build_create_window_request(&mut req, &CreateWindowRequest::new(640, 480, role))
             .expect("request encodes");
 
             let ev = MgrWindowCreated::for_role(3, role, 640, 480);
@@ -1152,7 +1215,7 @@ mod tests {
         ];
         let mut buf = [0u8; 64];
         for role in roles {
-            let req = CreateWindowRequest { width: 800, height: 600, role };
+            let req = CreateWindowRequest::new(800, 600, role);
             let n = build_create_window_request(&mut buf, &req).unwrap();
             assert_eq!(n, CREATE_WINDOW_REQUEST_LEN);
             let got = parse_create_window_request(&buf[..n]).unwrap();
@@ -1227,9 +1290,13 @@ mod tests {
         // A `Normal` window must not leak whatever the caller's buffer held, or two
         // otherwise-identical requests would differ on the wire.
         let mut buf = [0xAAu8; CREATE_WINDOW_REQUEST_LEN];
-        let req = CreateWindowRequest { width: 4, height: 4, role: Role::Normal };
+        let req = CreateWindowRequest::new(4, 4, Role::Normal);
         build_create_window_request(&mut buf, &req).unwrap();
-        assert_eq!(&buf[10..16], &[0, 0, 0, 0, 0, 0]);
+        // **10..24, not 10..16.** The record grew two words in C1 and the invariant covers them:
+        // the offset is meaningless without a parent, so a `normal` request that left those
+        // bytes alone would put the caller's stack contents on the wire and two identical
+        // requests would differ (PR #219 review, finding 4).
+        assert_eq!(&buf[10..24], &[0u8; 14]);
     }
 
     #[test]
@@ -1436,7 +1503,7 @@ mod tests {
     #[test]
     fn a_truncated_body_is_rejected_rather_than_read_short() {
         let mut buf = [0u8; 64];
-        let req = CreateWindowRequest { width: 1, height: 1, role: Role::Normal };
+        let req = CreateWindowRequest::new(1, 1, Role::Normal);
         let n = build_create_window_request(&mut buf, &req).unwrap();
         for short in 0..n {
             assert!(parse_create_window_request(&buf[..short]).is_none(), "len {short}");
@@ -1458,7 +1525,7 @@ mod tests {
     #[test]
     fn building_into_a_short_buffer_fails_rather_than_truncating() {
         let mut small = [0u8; 4];
-        let req = CreateWindowRequest { width: 1, height: 1, role: Role::Normal };
+        let req = CreateWindowRequest::new(1, 1, Role::Normal);
         assert!(build_create_window_request(&mut small, &req).is_none());
     }
 }

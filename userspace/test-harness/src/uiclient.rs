@@ -63,8 +63,8 @@ use libdraw::framebuffer::Framebuffer;
 use libdraw::scene;
 use libkern::debug::Line;
 use libkern::{
-    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint, syscall2,
-    syscall4,
+    SYS_MEMORY_CREATE, SYS_MEMORY_MAP, SYS_MEMORY_UNMAP, SYS_WAIT, exit, kprint,
+    syscall2, syscall4,
 };
 use librsproto::surface::{
     AttachBufferRequest, CommitRequest, ConfigureEvent, CreateWindowRequest, FocusEvent,
@@ -530,6 +530,17 @@ fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i3
 const MGR_EVENT_SLICE_NS: u64 = 100_000_000;
 const MGR_EVENT_TRIES: u32 = 20;
 
+/// How long a popup's first `Configure` may take before it is treated as having been held.
+///
+/// Bimodal, not a tolerance: a popup that is exempt from the initial-configure hold is answered
+/// in the same handler that created it, and one that is held waits out `CONFIGURE_DEADLINE_NS`
+/// — 200 ms. Anything in between does not happen, so 50 ms sits far from both.
+///
+/// **Slices that expired**, not iterations: a record that was already queued returns at once and
+/// must not spend the budget, or the bound is "five other events" rather than 50 ms.
+const POPUP_CONFIGURE_SLICE_NS: u64 = 10_000_000;
+const POPUP_CONFIGURE_SLICES: u32 = 5;
+
 /// Wait for an event with op `want` that names window `id`. Returns its body length.
 ///
 /// **Filtered by window, not just by op**, because several windows are alive here and one
@@ -612,7 +623,7 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
     let mut req = [0u8; librsproto::surface::CREATE_WINDOW_REQUEST_LEN];
     if librsproto::surface::build_create_window_request(
         &mut req,
-        &CreateWindowRequest { width: bw, height: bh, role: Role::Normal },
+        &CreateWindowRequest::new(bw, bh, Role::Normal),
     )
     .is_none()
     {
@@ -707,6 +718,128 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
     // Held open for the same reason the B3 probe's session is: closing it makes the compositor
     // tear the session down and repaint the whole screen.
     core::mem::forget(t);
+}
+
+/// **A popup is placed by its creator, relative to its parent** — M6 C1, on the wire.
+///
+/// Two things only a booted guest can show. That the offset is resolved against the parent's
+/// **current** origin, so a popup created after the manager moved its parent lands beside the
+/// parent rather than beside where it started. And that a popup is **not** held for the
+/// manager: its position is its creator's business, so there is nobody to wait for, and holding
+/// it would spend the initial-configure deadline on every menu open.
+///
+/// **Raw transport, because both windows must be on one connection.** A popup may only name a
+/// parent its own connection owns — `conn.owns(parent)`, which is what stops a client parenting
+/// onto a stranger's window — and `libsurface::Window` owns its transport, so it can hold only
+/// one window per connection. The protocol has no such limit (`conn.owned` is a list); the API
+/// does. `TODO(libsurface-multi-window)`.
+fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
+    drain_mgr(mgr);
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let mut t = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => alloc::boxed::Box::new(t),
+        Err(_) => fail(b"ui-testclient: C1 connect to /dev/draw FAILED\n"),
+    };
+
+    // 1. A parent, moved somewhere the default placement would never put it — so an offset
+    //    resolved against `(0, 0)` instead of against the parent is a different answer.
+    let parent = raw_create(&mut t, &CreateWindowRequest::new(120, 90, Role::Normal), b"C1 parent");
+    let (px, py) = (211i32, 143i32);
+    if !place_window(mgr, parent, px, py) {
+        fail(b"ui-testclient: C1 parent Place was refused\n");
+    }
+
+    // 2. The popup. Negative in x, so it hangs off the parent's left edge: a menu that could not
+    //    do that would not be a menu. That it is *drawn* there is C2's host test, which reads
+    //    pixels; this checks the geometry the compositor recorded.
+    let (ox, oy) = (-14i32, 90i32);
+    let popup = raw_create(
+        &mut t,
+        &CreateWindowRequest::at(40, 30, Role::Popup { parent }, ox, oy),
+        b"C1 popup",
+    );
+
+    // 3. **Not held.** Nothing here answered as the manager, so a popup that was held would
+    //    still be waiting. Bounded by *elapsed time*, not by iterations — see
+    //    `POPUP_CONFIGURE_SLICES`.
+    //
+    //    **Only an empty slice counts.** `wait_event_timeout` returns a queued record without
+    //    waiting, so counting every iteration would spend the budget on other people's events
+    //    rather than on time: two of the five were already gone before this ever ran, on the
+    //    parent's own configure and the focus change that followed it. One more record ahead of
+    //    the popup — a pointer crossing the parent, a third window in this probe — and the gate
+    //    would report "a popup waited for the manager" about a compositor that is perfectly
+    //    fine (PR #219 review, finding 1).
+    let mut buf = [0u8; 64];
+    let mut empty_slices = 0;
+    loop {
+        match t.wait_event_timeout(&mut buf, POPUP_CONFIGURE_SLICE_NS) {
+            Ok(Some((OP_CONFIGURE, n))) => {
+                match ConfigureEvent::read(&buf[..n]) {
+                    Some(c) if c.window == popup => break,
+                    _ => {}
+                }
+            }
+            // Somebody else's record. It cost no time, so it costs no budget.
+            Ok(Some(_)) => {}
+            Ok(None) => {
+                empty_slices += 1;
+                if empty_slices >= POPUP_CONFIGURE_SLICES {
+                    fail(
+                        b"ui-testclient: a popup waited for the manager, which never places popups\n",
+                    );
+                }
+            }
+            Err(_) => fail(b"ui-testclient: C1 session channel error\n"),
+        }
+    }
+
+    // 4. And it is where its creator asked, relative to where its parent *now* is.
+    let Some(info) = read_window_info(root_ns, popup) else {
+        fail(b"ui-testclient: C1 could not read the popup's info\n");
+    };
+    if (info.x, info.y) != (px + ox, py + oy) {
+        Line::new()
+            .s(b"ui-testclient: popup at ").i(info.x as i64).s(b",").i(info.y as i64)
+            .s(b", wanted ").i((px + ox) as i64).s(b",").i((py + oy) as i64).end();
+        fail(b"ui-testclient: the popup was not placed at its offset from the parent\n");
+    }
+
+    kprint(b"ui-testclient: a popup was placed by its creator, without the manager\n");
+
+    // Destroying the parent takes the popup with it — transitively, which is the stack's rule.
+    let mut body = [0u8; 8];
+    body[..4].copy_from_slice(&parent.to_le_bytes());
+    // **An empty reply buffer is how the transport is told an op is silent** — `DestroyWindow`
+    // answers only on failure. Passing a real buffer parks this thread waiting for a reply that
+    // is never coming, which is a hang rather than an error.
+    let _ = t.request(librsproto::surface::OP_DESTROY_WINDOW, &body[..4], None, &mut []);
+    // The session stays open for the run: closing it makes the compositor repaint everything.
+    core::mem::forget(t);
+}
+
+/// `CreateWindow` through the raw transport, returning the new id. `fail`s if it did not.
+fn raw_create(t: &mut ChannelTransport, req: &CreateWindowRequest, what: &[u8]) -> u32 {
+    let mut body = [0u8; librsproto::surface::CREATE_WINDOW_REQUEST_LEN];
+    if librsproto::surface::build_create_window_request(&mut body, req).is_none() {
+        kprint(what);
+        fail(b": could not build CreateWindow\n");
+    }
+    let mut reply = [0u8; 32];
+    let n = match t.request(librsproto::surface::OP_CREATE_WINDOW, &body, None, &mut reply) {
+        Ok(Some(n)) => n,
+        _ => {
+            kprint(what);
+            fail(b": CreateWindow got no reply\n");
+        }
+    };
+    match librsproto::surface::parse_create_window_reply(&reply[..n]) {
+        Some(id) => id,
+        None => {
+            kprint(what);
+            fail(b": CreateWindow reply did not decode\n");
+        }
+    }
 }
 
 /// **One window's whole life, watched from the manager channel** — M6 B3.
@@ -1046,6 +1179,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
         // clicking on, the screen.
         probe_session = Some(verify_manager_events(&mut mgr, root_ns));
         verify_initial_configure(&mut mgr, root_ns);
+        verify_popup_placement(&mut mgr, root_ns);
 
         // **Move one window somewhere that is not the default, and read it back**, before
         // putting everything at the origin. Placing only at `(0, 0)` proves nothing: that is

@@ -254,21 +254,54 @@ impl<T: Transport> Window<T> {
     /// into pixels the compositor is reading. `attach` is called for each, and the caller
     /// supplies the shared memory each buffer names.
     pub fn new(
-        mut transport: T,
+        transport: T,
         width: u32,
         height: u32,
         role: Role,
         count: usize,
     ) -> Result<Self, UiError> {
+        Self::create(transport, CreateWindowRequest::new(width, height, role), count)
+    }
+
+    /// A popup or dialog at `(x, y)` from its parent's origin.
+    ///
+    /// **The offset is the whole of a popup's placement**, and it travels with the create so
+    /// the window is never briefly somewhere else. A manager does not place these: only the
+    /// creator knows where the menu item it drops from was drawn (M6 C1).
+    ///
+    /// `role` must be [`Role::Popup`] or [`Role::Dialog`]; for anything else the offset is
+    /// written as zero and a manager places the window as usual.
+    ///
+    /// # This cannot yet create a popup — `TODO(libsurface-multi-window)`
+    ///
+    /// A popup may only name a parent **its own connection owns**, and a [`Window`] owns its
+    /// [`Transport`] — so a client already holding the parent has no transport left to create
+    /// the child with, and one that uses a second connection is refused with `NotFound`. The
+    /// protocol has no such limit; this API does, until it grows a session type that owns the
+    /// transport and mints windows from it.
+    ///
+    /// Usable today for a [`Role::Dialog`] or popup whose parent is on **another** window of
+    /// the same connection — which nothing can currently be — so in practice this is here for
+    /// the offset encoding and for the caller that arrives with the session type.
+    pub fn new_at(
+        transport: T,
+        width: u32,
+        height: u32,
+        role: Role,
+        x: i32,
+        y: i32,
+        count: usize,
+    ) -> Result<Self, UiError> {
+        Self::create(transport, CreateWindowRequest::at(width, height, role, x, y), count)
+    }
+
+    /// The body of both constructors.
+    fn create(mut transport: T, req: CreateWindowRequest, count: usize) -> Result<Self, UiError> {
         if count < 2 {
             return Err(UiError::TooFewBuffers);
         }
         let mut body = [0u8; 32];
-        let n = build_create_window_request(
-            &mut body,
-            &CreateWindowRequest { width, height, role },
-        )
-        .ok_or(UiError::Malformed)?;
+        let n = build_create_window_request(&mut body, &req).ok_or(UiError::Malformed)?;
         let mut reply = [0u8; 32];
         let len = transport
             .request(OP_CREATE_WINDOW, &body[..n], None, &mut reply)?

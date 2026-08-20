@@ -1474,6 +1474,13 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // origin and jump when placed, which no screen comparison taken afterwards can see.
     session.expect("ui-testclient: the first configure carried the manager's placement")?;
 
+    // **A popup is placed by its creator (M6 C1).** The client creates a parent, has the manager
+    // move it somewhere the default never puts a window, then creates a popup at a negative-x
+    // offset and reads the geometry back through `/dev/draw/<id>/info`. An offset resolved
+    // against the origin instead of against the parent is a different answer, and a popup held
+    // for a manager that by design never places popups would still be waiting.
+    session.expect("ui-testclient: a popup was placed by its creator, without the manager")?;
+
     // **The manager seam, asserted rather than attempted (M6 B1).** `ui-testclient` places its
     // reference windows through `/dev/draw/manage` and falls back to the compositor's default
     // placement if the resolve fails — deliberately, since it is a test fixture and not a real

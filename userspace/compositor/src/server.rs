@@ -358,7 +358,7 @@ mod tests {
         let mut body = [0u8; 32];
         let n = build_create_window_request(
             &mut body,
-            &CreateWindowRequest { width, height, role },
+            &CreateWindowRequest::new(width, height, role),
         )
         .unwrap();
         let mut reply = [0u8; 32];
@@ -632,7 +632,7 @@ mod tests {
         let mut body = [0u8; 32];
         let n = build_create_window_request(
             &mut body,
-            &CreateWindowRequest { width: 8, height: 8, role: Role::Normal },
+            &CreateWindowRequest::new(8, 8, Role::Normal),
         )
         .unwrap();
         let mut reply = [0u8; 32];
