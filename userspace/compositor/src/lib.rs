@@ -421,15 +421,19 @@ impl WindowStack {
         // tracked its parent would have to be re-placed whenever the parent moved, which is
         // placement policy — see `TODO(popup-follows-parent)`.
         //
-        // A role with no parent lands at the origin as before, and is placed by a manager.
+        // **A `dialog` is not placed this way, though it also names a parent.** Its parent
+        // carries desktop membership, lifetime and its exclusion from the composition canvas —
+        // not its position (`display-substrate.md` §4a, `ui-composition-model.md` §6). In
+        // placement terms it is an ordinary listed window, so it lands at the origin and a
+        // manager places it, exactly like a `normal`.
         let origin = match req.role {
-            Role::Popup { parent } | Role::Dialog { parent } => {
+            Role::Popup { parent } => {
                 // The parent is known to exist: checked directly above, and nothing between
                 // here and there can remove it.
                 let base = self.window(parent).expect("checked above").origin;
                 Point::new(base.x.saturating_add(req.offset_x), base.y.saturating_add(req.offset_y))
             }
-            Role::Normal | Role::Panel { .. } => Point::new(0, 0),
+            Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => Point::new(0, 0),
         };
         let id = self.next_id;
         self.next_id += 1;
@@ -1811,13 +1815,37 @@ mod tests {
         );
     }
 
-    /// A role with no parent ignores the offset entirely, rather than landing somewhere odd.
+    /// Only a `popup` is offset from its parent. A `dialog` lands where a `normal` does.
+    ///
+    /// The two parented roles share a wire shape and were treated as one placement rule, which
+    /// they are not: a `dialog`'s parent carries its desktop membership, its lifetime and its
+    /// exclusion from the composition canvas — not its position. In placement terms it is an
+    /// ordinary listed window and a manager places it.
     #[test]
-    fn only_a_parented_role_is_offset() {
+    fn only_a_popup_is_offset_from_its_parent() {
         let mut s = WindowStack::new();
+        let parent = shown(&mut s, &CreateWindowRequest::new(50, 50, Role::Normal));
+        let _ = s.place(parent, Point::new(60, 70)).unwrap();
+
         // `at` on a `normal` is a caller mistake; it must not move the window.
-        let w = s.create(&CreateWindowRequest::at(10, 10, Role::Normal, 77, 88)).unwrap();
-        assert_eq!(s.window(w).unwrap().origin, Point::new(0, 0), "a manager places this one");
+        let plain = s.create(&CreateWindowRequest::at(10, 10, Role::Normal, 77, 88)).unwrap();
+        assert_eq!(s.window(plain).unwrap().origin, Point::new(0, 0), "a manager places this one");
+
+        // A dialog names a parent and is still placed by a manager, from the origin.
+        let dlg = s
+            .create(&CreateWindowRequest::at(10, 10, Role::Dialog { parent }, 77, 88))
+            .unwrap();
+        assert_eq!(
+            s.window(dlg).unwrap().origin,
+            Point::new(0, 0),
+            "a dialog is not offset from its parent, however parented it is"
+        );
+
+        // A popup is.
+        let menu = s
+            .create(&CreateWindowRequest::at(10, 10, Role::Popup { parent }, 5, 6))
+            .unwrap();
+        assert_eq!(s.window(menu).unwrap().origin, Point::new(65, 76), "the popup is");
     }
 
     /// **A popup is not clipped to its parent** — the whole reason popups are windows (C2).

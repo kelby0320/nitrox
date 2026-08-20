@@ -16576,3 +16576,42 @@ transport. `TODO(libsurface-multi-window)`, and it is now the first thing C3 bui
 Also: the 66 `CreateWindowRequest` literals in the tree became `::new`/`::at` constructors. The
 same edit count as adding two zero fields everywhere, and the next role-specific word costs
 nothing.
+
+## 2026-08-20 — A `dialog` is placed by the manager, not by its creator
+
+C1 gave `Role::Dialog` the popup's treatment — creator-placed through the offset in
+`CreateWindow`, and exempt from B4's initial-configure hold — because the two roles share a wire
+shape: both name a parent, so both looked like the same placement rule. They are not the same
+rule, and the design already said so.
+
+`display-substrate.md` §4a defines `popup` as "a menu **or a modal**" — modality lives there, not
+in `dialog` — and `dialog` as "parented, on its parent's desktop, listed but **not offered as a
+wirable node** on the composition canvas". `ui-composition-model.md` §6 is explicit about what
+that role is for: dialogs are "genuinely *on* a desktop and should be listed, but which the canvas
+should not offer as wirable nodes — **a filter by `role`, not a different tree**".
+
+So a `dialog`'s parent carries three things — desktop membership, lifetime (destroy is
+transitive), and exclusion from the composition canvas — and **placement is not one of them**. In
+placement terms a dialog is an ordinary listed window that happens to name a parent.
+
+Two consequences, both now implemented:
+
+- **A dialog is held**, like a `normal`. It names a parent, but a manager places it, so there
+  *is* somebody to wait for. Only `popup` is exempt.
+- **A dialog carries no offset.** The words are written and read as zero, as they are for
+  `normal` and `panel`. A manager needs nothing from the client to place one: `WindowCreated`
+  already carries the parent id and the requested size, which is what centring on a parent takes.
+  A client-supplied offset would be redundant with that and would compete with the placement the
+  manager chose.
+
+**No wire format change** — the record stays 24 bytes; only which roles populate bytes 16..24
+changes. Nothing in the tree creates a `Role::Dialog` outside tests, so nothing regressed.
+
+**Nothing asserted this either way before.** Removing the dialog from the encoder's offset arm
+left all 66 `librsproto` tests passing, in both directions — the tests exercised popups and the
+parentless roles and never the third case. Both directions are pinned now.
+
+Found by a question about whether a popup should follow its parent through an interactive drag,
+which turned into: *do these two roles even want the same thing?* They do not, and the same
+conversation showed the `popup-follows-parent` deferral had been justified with an argument that
+does not hold — see that entry, rewritten the same day.

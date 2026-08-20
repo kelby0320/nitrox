@@ -297,12 +297,26 @@ resolved against its parent's origin once, when it is created (M6 C1); the compo
 absolute origins and nothing re-places a child when its parent moves. So a manager that moves a
 window leaves that window's open menus behind.
 
-Not fixed in M6 because tracking is placement *policy*, not geometry: it has to decide what
-happens when following would push the popup off the screen, whether a popup follows a resize as
-well as a move, and whether it follows during a drag or only at the end — questions that belong
-with the shell that does the moving. It is also unreachable today: only a manager moves a window,
-and no manager moves one while a menu is open. Trigger: interactive window movement (M7), which
-is the first thing that can move a parent under a live popup.
+**The first version of this entry justified that by calling tracking "placement policy", and
+that was mostly wrong.** Examined properly (2026-08-20): following off-screen just clips, because
+the compositor already clips and never slides; a resize does not move a popup at all, because the
+offset is from the parent's *origin*; and "during the drag or at the end" stops being a question
+if the rule is simply the invariant `popup.origin == parent.origin + offset`. That is geometry,
+not policy.
+
+What is actually true is that the case is **narrow**. A click-initiated drag lands on the parent
+and dismisses a menu, so the parent moves only when nothing was open. What is left is movement
+with no click on the parent — a keyboard move, tiling, a shell rearranging windows — and there a
+shell may well prefer to dismiss menus rather than slide them, which it can do by destroying them.
+Only `popup` is affected: a `dialog` is not offset from its parent and is not supposed to follow
+one.
+
+The **reachable** consequence of resolving once is a different one, and it is fixed differently:
+a popup created before its parent has been placed resolves against the default origin and is
+composited detached. Holding a popup whose parent is held — releasing both together, so the offset
+resolves against the parent's final origin — closes that without any tracking, and is what M6 C3
+will do. Trigger for tracking itself: a shell that moves windows without a click on them *and*
+wants open menus to survive it.
 
 **`libsurface` allows one window per connection — `TODO(libsurface-multi-window)`.** `Window`
 owns its `Transport`, so a client holds exactly one window per session and gets the transport

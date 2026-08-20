@@ -255,14 +255,20 @@ Request, 24 bytes:
 | 8 | 2 | `role` tag |
 | 10 | 2 | role aux16 — a panel's `dock` edge; otherwise **zero** |
 | 12 | 4 | role aux32 — a panel's `reserve`, or a popup/dialog's `parent`; otherwise **zero** |
-| 16 | 4 | `offset_x`, signed — a popup/dialog's offset from its parent's origin; otherwise **zero** |
+| 16 | 4 | `offset_x`, signed — a **popup's** offset from its parent's origin; otherwise **zero** |
 | 20 | 4 | `offset_y`, signed — likewise |
 
 **A popup is placed by its creator, and the offset is how.** Only the client knows where the
-menu item its popup drops from was drawn, so a manager does not place popups and dialogs — and
-they are exempt from the initial-configure hold below, because there is nobody to wait for.
-Roles with no parent ignore the offset: they land at the compositor's default origin and a
-manager places them.
+menu item its popup drops from was drawn, so a manager does not place popups — and they are
+exempt from the initial-configure hold below, because there is nobody to wait for.
+
+**A `dialog` is not.** It names a parent, but the parent carries its desktop membership, its
+lifetime and its exclusion from the composition canvas — not its position. In placement terms a
+dialog is an ordinary listed window: it lands at the compositor's default origin, a manager
+places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
+
+A manager needs nothing from the client to place one: `WindowCreated` carries the parent id and
+the requested size, which is what centring a dialog on its parent takes.
 
 The offset is **resolved once, against the parent's origin at the moment of creation**. A popup
 does not follow its parent afterwards; moving a parent leaves its popups where they were. That
@@ -519,10 +525,13 @@ instead. It is released by whichever comes first:
 | Nothing, for **200 ms** | the requested size at the default origin |
 | The manager disconnects | the same, at once rather than after the remaining wait |
 
-**A `popup` or a `dialog` is never held.** It is placed by its creator, through the offset in its
+**A `popup` is never held.** It is placed by its creator, through the offset in its
 `CreateWindow`, so there is nobody to wait for: the compositor sends `WindowCreated` to the
 manager *and* the first `Configure` to the client, immediately, exactly as it would with no
 manager attached. None of the four triggers above applies to one.
+
+A `dialog` **is** held, like a `normal` — it names a parent but a manager places it, so there is
+somebody to wait for.
 
 This is not a refinement — it is the difference between a menu that opens and a menu that takes
 200 ms to open, on every use, as soon as a shell is running.
@@ -543,9 +552,9 @@ for.
 the deadline. It must issue `CreateWindow` and service the manager channel separately rather than
 using a helper that does both. `libsurface`'s `Window::new` is such a helper.
 
-**This does not apply to a popup or a dialog**, which is never held — so a shell opening its own
-menu, the obvious case, may block on that window's configure like any other client. It applies to
-the `normal` and `panel` windows such a process creates.
+**This does not apply to a popup**, which is never held — so a shell opening its own menu, the
+obvious case, may block on that window's configure like any other client. It applies to every
+other role such a process creates, `dialog` included.
 
 **Create a popup only after its parent's first `Configure`.** The offset resolves against the
 parent's origin *as it stands at that moment*, so a popup created while its parent is still held
