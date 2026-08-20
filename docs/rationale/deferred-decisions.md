@@ -292,6 +292,30 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**A popup does not follow its parent — `TODO(popup-follows-parent)`.** A popup's offset is
+resolved against its parent's origin once, when it is created (M6 C1); the compositor stores
+absolute origins and nothing re-places a child when its parent moves. So a manager that moves a
+window leaves that window's open menus behind.
+
+Not fixed in M6 because tracking is placement *policy*, not geometry: it has to decide what
+happens when following would push the popup off the screen, whether a popup follows a resize as
+well as a move, and whether it follows during a drag or only at the end — questions that belong
+with the shell that does the moving. It is also unreachable today: only a manager moves a window,
+and no manager moves one while a menu is open. Trigger: interactive window movement (M7), which
+is the first thing that can move a parent under a live popup.
+
+**`libsurface` allows one window per connection — `TODO(libsurface-multi-window)`.** `Window`
+owns its `Transport`, so a client holds exactly one window per session and gets the transport
+back only by destroying it. The *protocol* has no such limit — `Connection::owned` is a list, and
+`AttachBuffer`/`Commit`/`DestroyWindow` all name a window explicitly.
+
+This blocks a client from having a parent and its popup at the same time, because a popup may
+only name a parent its **own connection** owns (`conn.owns(parent)`, which is what stops a client
+parenting onto a stranger's window). Found by writing C1's gate probe, which works around it by
+driving both windows through the raw transport. Trigger: **M6 C3** — `nxterm`'s menu becoming a
+real popup needs a parent and a child on one connection, so the API has to grow a session type
+that owns the transport and mints windows before that item can be built.
+
 **Window titles: `Surface::SetTitle` and `WindowTitle` — `TODO(m6-b3b-titles)`.** M6 B3 shipped four
 of the five manager events — `WindowCreated`, `WindowDestroyed`, `WindowGeometry`,
 `WindowFocus`. The fifth, `WindowTitle` (`0x091C`), is not implemented, and neither is the

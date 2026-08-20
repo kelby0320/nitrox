@@ -16516,3 +16516,53 @@ deadline covers those clients, so this is a latency optimisation rather than a c
 and the only way to reach it in `ui-testclient` would be to leave a window held while dropping
 the manager channel — distinguishable from the deadline path only by timing. Recorded here
 rather than left for a reviewer to find.
+
+## 2026-08-20 — M6 C1/C2: a popup is placed by its creator, and the wire grew to carry it
+
+**`CreateWindowRequest` grew from 16 to 24 bytes**, gaining a signed `offset_x`/`offset_y` pair
+that is role-specific in exactly the way the aux words already are: meaningful for `popup` and
+`dialog`, written and read as zero for `normal` and `panel`. A wire break taken deliberately
+while the ABI is pre-stabilisation.
+
+The alternative — a `Surface::PlacePopup` op sent between `CreateWindow` and the first `Commit` —
+was rejected. It puts a second message on the path of every menu open, and it creates the popup
+at `(0, 0)` before moving it. Nothing would *see* it there, since nothing is composited before
+its first commit, but the manager would see a spurious `WindowGeometry` and the position would be
+a thing that is briefly wrong rather than a thing that is never wrong.
+
+**Popups and dialogs are exempt from B4's initial-configure hold.** A window whose position is
+its creator's business has nobody to wait for. The hold was role-blind, so with a shell attached
+every menu open would have cost the full 200 ms deadline — on the interaction most sensitive to
+latency. Found while detailing Part C rather than by a gate, which is the argument for detailing.
+
+**Two limits recorded rather than left implicit.** The offset is resolved once, against the
+parent's origin at creation: a popup does not follow its parent, because tracking is placement
+policy (what happens when following pushes it off screen? does it follow a resize? a drag?) and
+belongs with the shell — `TODO(popup-follows-parent)`. And the compositor clips a popup to the
+screen and does nothing else: it does not slide one back into view, which would silently disagree
+with where the client asked for it, and M6 does not tell clients the screen size so they can flip
+a menu upward, which is a contract M7 may want to own.
+
+**C2 turned out to be a proving job, not a building one.** Nothing clips a popup to its parent —
+popups are separate windows — and `libdraw::compose` already clips to the screen. The tests are
+the deliverable: a popup drawn on all four sides of a parent far too small to contain it, and one
+at a negative origin, which is where `blit_clipped`'s source-coordinate arithmetic would go wrong
+by reading the wrong pixels rather than by crashing.
+
+**Two things the work found that the plan had not.**
+
+*The record's length was pinned by nothing.* `CREATE_WINDOW_REQUEST_LEN` had no `const _` assert
+and no gate, while `ConfigureEvent` and `FocusEvent` both carry one — so the spec's "Request, 16
+bytes" and the encoder could drift apart silently, on the record every client sends first. Both
+lengths are asserted now.
+
+*`libsurface` allows one window per connection, and that blocks C3.* `Window` owns its
+`Transport`, so a client gets the transport back only by destroying the window — while a popup may
+only name a parent its own connection owns. `nxterm` cannot hold its terminal and its menu at
+once until `libsurface` grows a session type. The protocol never had this limit; the API does.
+Discovered by writing C1's gate probe, which works around it with the raw transport.
+`TODO(libsurface-multi-window)`, and it is now the first thing C3 builds.
+
+Also: the 66 `CreateWindowRequest` literals in the tree became `::new`/`::at` constructors. The
+same edit count as adding two zero fields everywhere, and the next role-specific word costs
+nothing.

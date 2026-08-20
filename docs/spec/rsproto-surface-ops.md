@@ -246,7 +246,7 @@ All bodies are little-endian. Offsets are byte offsets from the start of the bod
 
 ### `CreateWindow` (`0x0900`)
 
-Request, 16 bytes:
+Request, 24 bytes:
 
 | Offset | Size | Field |
 |---|---|---|
@@ -255,6 +255,23 @@ Request, 16 bytes:
 | 8 | 2 | `role` tag |
 | 10 | 2 | role aux16 — a panel's `dock` edge; otherwise **zero** |
 | 12 | 4 | role aux32 — a panel's `reserve`, or a popup/dialog's `parent`; otherwise **zero** |
+| 16 | 4 | `offset_x`, signed — a popup/dialog's offset from its parent's origin; otherwise **zero** |
+| 20 | 4 | `offset_y`, signed — likewise |
+
+**A popup is placed by its creator, and the offset is how.** Only the client knows where the
+menu item its popup drops from was drawn, so a manager does not place popups and dialogs — and
+they are exempt from the initial-configure hold below, because there is nobody to wait for.
+Roles with no parent ignore the offset: they land at the compositor's default origin and a
+manager places them.
+
+The offset is **resolved once, against the parent's origin at the moment of creation**. A popup
+does not follow its parent afterwards; moving a parent leaves its popups where they were. That
+is a deliberate limit of M6 — tracking would mean re-placing children on every parent move,
+which is placement policy — recorded as `TODO(popup-follows-parent)`.
+
+The offset is **not clamped**. A popup may be placed partly or wholly off the screen; it is
+clipped and nothing more. The compositor does not slide it back into view, because that would
+silently disagree with where the client asked for it with no way to say so.
 
 An unknown role tag, a panel docked to an edge that does not exist, and a `reserve` above
 the bound are all **rejected** rather than defaulted.

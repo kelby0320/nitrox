@@ -1333,7 +1333,7 @@ item. Two facts found while detailing changed the shape of the work:
   attached a popup waits out the 200 ms deadline for a manager that, by design, must not place
   popups. That is a bug in waiting rather than a choice, and C1 fixes it.
 
-- [ ] **C1 — a popup is positioned relative to its parent.** `Role::Popup { parent }` carries the
+- [x] **C1 — a popup is positioned relative to its parent.** ✅ 2026-08-20. `Role::Popup { parent }` carries the
       parent already; what is missing is an offset. Placed by its **creator**, checked against
       `conn.owns(parent)` — the ownership test the connection already performs, and which
       `server.rs` already does.
@@ -1359,7 +1359,7 @@ item. Two facts found while detailing changed the shape of the work:
       is placement policy and belongs with the shell. In M6 only a manager moves a window, and
       a menu open outlives no such move. Recorded as a limitation rather than left implicit.
 
-- [ ] **C2 — a popup is clipped to the screen, not to its parent.** *"A menu clipped to its window
+- [x] **C2 — a popup is clipped to the screen, not to its parent.** ✅ 2026-08-20 — the tests, as detailed; no behaviour changed. *"A menu clipped to its window
       is not a menu"* (`display-substrate.md` §4a) is the whole reason popups are windows rather
       than `libui` nodes; `libui`'s `offset` clips at the parent's edge and that is correct one
       level down. The screen is the only clip left.
@@ -1390,6 +1390,13 @@ item. Two facts found while detailing changed the shape of the work:
       not that a popup escapes its parent. Designing the menu to overflow in order to test the
       compositor would be shaping the terminal around its gate. C2's host tests and a
       `ui-testclient` case carry the geometry; `nxterm` carries the plumbing.
+
+      **Blocked on a `libsurface` change C1 discovered.** `Window` owns its `Transport`, so a
+      client can hold exactly one window per connection — while a popup may only name a parent
+      its *own* connection owns. `nxterm` therefore cannot have its terminal window and its menu
+      at the same time until `libsurface` grows a session type that owns the transport and mints
+      windows from it. The protocol has no such limit; the API does. `TODO(libsurface-multi-window)`,
+      and it is the first thing C3 has to build.
 
       **Focus comes back for free, and gets a test anyway.** `Role::Popup` takes focus, so the
       menu window takes the keyboard from the grid; on close `focus_candidate` is the topmost

@@ -1682,8 +1682,21 @@ fn serve_session(slot: usize, srv: &mut Server, fb: &mut RawFramebuffer) -> bool
             // With no manager there is nobody to ask, so it goes out at once and nothing about
             // the client's behaviour changes.
             //
+            // **A popup or dialog is never held**, however many managers are attached. Its
+            // position is its creator's business — a menu drops from an item only the client
+            // knows the position of — so there is nobody to wait for, and holding it would
+            // spend the full deadline on the interaction most sensitive to latency: every menu
+            // open would cost 200 ms the moment a shell attached (M6 C1).
+            let placed_by_creator = srv
+                .stack
+                .window(configure.window)
+                .is_some_and(|w| matches!(
+                        w.role,
+                        librsproto::surface::Role::Popup { .. }
+                            | librsproto::surface::Role::Dialog { .. }
+                    ));
             // SAFETY: reading our own manager slot.
-            if sent && unsafe { MANAGER_CH } != 0 {
+            if sent && !placed_by_creator && unsafe { MANAGER_CH } != 0 {
                 let mut now: u64 = 0;
                 // SAFETY: a valid out-pointer for one u64.
                 unsafe { syscall2(SYS_CLOCK_READ, CLOCK_MONOTONIC, (&raw mut now) as u64) };
