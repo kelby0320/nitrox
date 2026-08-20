@@ -292,6 +292,20 @@ Part C** (`display-substrate.md` §6). Userspace takes its first external depend
 `libm`, all permissive, all verified to build for `x86_64-unknown-nitrox`. The bar every
 future one has to clear is in `userspace/CLAUDE.md`.
 
+**Window titles: `Surface::SetTitle` and `WindowTitle` — `TODO(m6-b3b-titles)`.** M6 B3 shipped four
+of the five manager events — `WindowCreated`, `WindowDestroyed`, `WindowGeometry`,
+`WindowFocus`. The fifth, `WindowTitle` (`0x091C`), is not implemented, and neither is the
+client-facing `Surface::SetTitle` (`0x0909`) that would give a window a title to report. Both
+encodings are declared in `librsproto` so this does not renumber anything.
+
+Split off rather than carried because it is the only one of the five that needs machinery the
+others did not: a **new client-facing op**, and a **variable-length body** — every Surface
+record today is fixed-size, so a title needs a length convention, a cap, and a decision about
+what a client sending 64 KiB of title gets back. That is a wire-format question, not a window-
+management one, and answering it inside B3 would have held up the four events a window list
+actually needs to exist at all. Trigger: the desktop shell (M7) drawing a window list or
+titlebars, which is the first thing that can display a title.
+
 **`/dev/draw/manage` gates nothing yet — `TODO(manage-ungated)`.** The manager channel's
 capability is meant to be the *binding*: a supervisor puts it in the shell's namespace and nowhere
 else, which is how everything else in this system is gated. In Milestone 6 that gates nothing, and

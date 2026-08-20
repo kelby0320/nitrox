@@ -16377,3 +16377,62 @@ Also fixed in passing: two `unused_unsafe` warnings the compositor has carried o
 real target — the kernel and xtask were checked and reported as "zero warnings", and the one time
 `cargo build -p compositor` was run directly it failed to link (the bin targets
 `x86_64-unknown-nitrox`), where `grep -c "^warning"` returns 0 and reads exactly like clean.
+
+## 2026-08-20 — M6 B3: the manager's events, and a display gate that waits for the screen to stop moving
+
+**Four of the five manager events are live**: `WindowCreated` (`0x0918`), `WindowDestroyed`
+(`0x0919`), `WindowGeometry` (`0x091A`), `WindowFocus` (`0x091B`). `WindowTitle` (`0x091C`) and
+the `Surface::SetTitle` that would feed it are split out as **B3b** — `TODO(m6-b3b-titles)`.
+They are the only pair needing a client-facing op *and* the first variable-length body on this
+wire; that is a format question (length convention, cap, what an over-long title is answered
+with), and settling it inside B3 would have held up the four events a window list needs in
+order to exist at all.
+
+B1 proved a manager can *act* on the compositor. It did not prove the compositor ever *tells*
+the manager anything, which is the half a window list is built from.
+
+**Three decisions worth the record:**
+
+*Delivery is the queued outbox, not `SENDMODE_NOBLOCK`.* A manager event is generated while the
+compositor is serving some other client, so the manager's receive ring may be full at that
+instant. A dropped `WindowCreated` leaves a manager holding a wrong window list forever — there
+is no resync op — so the record is queued and retried. Bounded at 512, sized against
+`ui-testclient`'s 128-window churn; overflow discards oldest and logs the count.
+
+*The removed set is recorded by `WindowStack`, not diffed by callers.* Destroy is transitive: a
+popup goes with its parent and a submenu with that popup, so one `DestroyWindow` can remove
+several windows and the id passed in does not name them. Two different paths reach `destroy`
+(the op, and a client disconnecting), and threading an out-param through `dispatch` would put it
+in the signature of every op that cannot remove anything. `take_removed()` drains, and the bin
+drains it after *every* dispatch whether or not a manager is attached — so the log cannot grow
+while nobody is listening, and a destruction is never announced twice.
+
+*Geometry is announced even when the manager caused it.* A manager that treated its own `Place`
+as needing no confirmation would keep a second source of truth for where a window is.
+
+**The gate change is the more general result.** `check-display` captured the screen as soon as
+`ui-testclient` said the scene was up. That was always a race — a repaint is work the compositor
+does *after* answering the request that caused it, and recompositing 1280x800 is not instant —
+but nothing had ever made the window wide enough to lose. B3's probe creates and destroys a
+window near the end of the run, and the gate began failing about half the time with a torn frame:
+background filled, windows not yet composited, no cursor. Measured: 3 of 6 with the probe, 0 of 5
+without.
+
+It now takes screendumps until two consecutive ones are identical (12 tries, 250 ms apart) and
+compares that. Deliberately not a sleep: a fixed delay is a guess that is either wasteful or
+silently too short the next time the scene grows. Instrumented to confirm the mechanism rather
+than assume it — the loop settles on the **third** capture on every run, so captures 1 and 2
+genuinely differ and the wait is doing the work the comment claims.
+
+**Two client-side bugs this shook out, both of the same shape — an instrument that could not
+fire.** `wait_event_timeout` passed a *relative* timeout to `sys_wait`, which takes an
+**absolute** deadline; every wait was therefore a deadline a fraction of a second after boot,
+permanently in the past, returning `TimedOut` at once. It looked like it worked wherever the
+event happened to be queued already, and failed only under `test-qemu`'s timing. And the probe's
+session was bound inside the `if let` that owns the manager channel, so it closed at the end of
+that block — triggering the full-screen repaint the arrangement existed to avoid, right as
+`check-terminal` began injecting clicks (4 of 6 passing, against 4 of 4 without the probe; 5 of 5
+once the binding was hoisted).
+
+All four events were negative-controlled by breaking each emission in turn and confirming the
+*named* client assertion fires.

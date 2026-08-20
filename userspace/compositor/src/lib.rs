@@ -334,6 +334,33 @@ pub fn focus_transition(
 pub struct WindowStack {
     windows: Vec<Window>,
     next_id: u32,
+    /// Every id that has left the stack since the last [`take_removed`](Self::take_removed).
+    ///
+    /// **A log rather than a return value because one destroy can remove several windows and
+    /// two different callers trigger it.** `DestroyWindow` and a client disconnecting both end
+    /// up in [`destroy`](Self::destroy), and a manager owed a `WindowDestroyed` event needs
+    /// both. Threading an out-param through `dispatch` would put it in the signature of every
+    /// op that cannot remove anything; recording it where the removal happens does not.
+    ///
+    /// The bin drains this after every dispatch whether or not a manager is attached, so it
+    /// holds at most one call's worth and cannot grow while nobody is listening.
+    removed_log: Vec<u32>,
+    /// Every id whose [`bounds`](Window::bounds) changed since the last
+    /// [`take_geometry_changes`](Self::take_geometry_changes).
+    ///
+    /// **Recorded where bounds change, not where a request is dispatched.** A window's
+    /// on-screen rectangle moves for more than one reason — a manager `Place`, and a client
+    /// committing a buffer of a different size — and `WindowGeometry` promises to report it
+    /// *for any reason*. Emitting from the one op the feature was written for is how the
+    /// commit case silently goes unreported, leaving a manager to poll `/dev/draw/<id>/info`
+    /// for the thing this event exists to save it from (PR #217 review, finding 2).
+    ///
+    /// **Including the changes a manager caused itself.** A manager that had to remember which
+    /// moves were its own would be keeping a second copy of the stack, which is the duplicate
+    /// state this event exists to make unnecessary.
+    ///
+    /// Drained like [`removed_log`](Self::removed_log), and for the same reason.
+    geometry_log: Vec<u32>,
 }
 
 impl Default for WindowStack {
@@ -351,7 +378,12 @@ impl Default for WindowStack {
 impl WindowStack {
     /// An empty stack.
     pub fn new() -> Self {
-        Self { windows: Vec::new(), next_id: 1 }
+        Self {
+            windows: Vec::new(),
+            next_id: 1,
+            removed_log: Vec::new(),
+            geometry_log: Vec::new(),
+        }
     }
 
     /// Windows, bottom-first.
@@ -410,13 +442,19 @@ impl WindowStack {
     /// type for why `#[must_use]` on this function would not have been enough.
     pub fn place(&mut self, id: u32, origin: Point) -> Result<Damage, StackError> {
         let w = self.windows.iter_mut().find(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
-        if w.committed.is_none() {
-            w.origin = origin;
-            return Ok(Damage(Rect::new(origin.x, origin.y, 0, 0)));
-        }
+        let uncommitted = w.committed.is_none();
         let was = w.bounds();
         w.origin = origin;
         let now = w.bounds();
+        if was != now {
+            self.geometry_log.push(id);
+        }
+        if uncommitted {
+            // A window with nothing on screen has no pixels to repaint, but it has still
+            // *moved*: `bounds()` is taken from the requested size at this point, so the
+            // record above fires and a manager learns where it will appear.
+            return Ok(Damage(Rect::new(origin.x, origin.y, 0, 0)));
+        }
         Ok(Damage(union(was, now)))
     }
 
@@ -453,17 +491,55 @@ impl WindowStack {
             return Err(StackError::NoSuchBuffer);
         }
         let previous = w.committed;
+        let was = w.bounds();
         w.committed = Some(req.buffer);
+        // **A commit can resize the window.** The committed buffer's geometry is what
+        // `bounds()` reports, so a client that reflows and commits a taller buffer has
+        // changed its on-screen rectangle without any manager involvement at all.
+        if w.bounds() != was {
+            self.geometry_log.push(req.window);
+        }
         // Re-committing the same buffer releases nothing: the client already knows it owns
         // no other buffer, and reporting a release here would let it draw into the buffer
         // now on screen.
         Ok(previous.filter(|&p| p != req.buffer))
     }
 
-    /// Destroy a window and everything attached to it.
+    /// Take every id removed since the last call, parent before the popups it took with it.
+    ///
+    /// Draining is the point: see [`removed_log`](Self::removed_log).
+    pub fn take_removed(&mut self) -> Vec<u32> {
+        core::mem::take(&mut self.removed_log)
+    }
+
+    /// Take every id whose bounds changed since the last call, each reported once.
+    ///
+    /// Deduplicated because one dispatch can change a window's rectangle twice — a place and
+    /// a commit in the same batch — and a manager gains nothing from hearing the same
+    /// rectangle described a second time. Draining is the point: see
+    /// [`geometry_log`](Self::geometry_log).
+    pub fn take_geometry_changes(&mut self) -> Vec<u32> {
+        let mut out: Vec<u32> = Vec::new();
+        for id in core::mem::take(&mut self.geometry_log) {
+            if !out.contains(&id) {
+                out.push(id);
+            }
+        }
+        out
+    }
+
+    /// Destroy a window and everything attached to it, recording every id removed.
+    ///
+    /// **The removed set is recorded because one `DestroyWindow` can remove several windows.**
+    /// A menu chain goes with its parent, transitively, so a caller that has to tell someone
+    /// else which windows disappeared — the manager's `WindowDestroyed` event — cannot work it
+    /// out from the id it passed in. Diffing the stack around the call would be the alternative
+    /// and is worse: it makes every caller responsible for a snapshot, and gets the order wrong
+    /// (the parent should be reported before the popups it took with it).
     pub fn destroy(&mut self, id: u32) -> Result<(), StackError> {
         let i = self.windows.iter().position(|w| w.id == id).ok_or(StackError::NoSuchWindow)?;
         self.windows.remove(i);
+        self.removed_log.push(id);
         // Descendants cannot outlive an ancestor: a popup or dialog with no parent has no
         // defined desktop or stacking position, and `create` refuses to produce one.
         //
@@ -474,9 +550,16 @@ impl WindowStack {
         loop {
             let live: Vec<u32> = self.windows.iter().map(|w| w.id).collect();
             let before = self.windows.len();
-            self.windows.retain(|w| match w.role {
-                Role::Popup { parent } | Role::Dialog { parent } => live.contains(&parent),
-                _ => true,
+            let removed = &mut self.removed_log;
+            self.windows.retain(|w| {
+                let keep = match w.role {
+                    Role::Popup { parent } | Role::Dialog { parent } => live.contains(&parent),
+                    _ => true,
+                };
+                if !keep {
+                    removed.push(w.id);
+                }
+                keep
             });
             if self.windows.len() == before {
                 break;
@@ -1578,6 +1661,61 @@ mod tests {
         assert_eq!(info.id, w);
     }
 
+    /// A geometry change reports the rectangle that is **on screen**, and reports one for a
+    /// commit as well as for a place.
+    ///
+    /// Two defects in one test, because they share a cause — the event was built at the one
+    /// op it was written for, from the field that op happened to have. It reported the
+    /// *requested* size while `/dev/draw/<id>/info` reports the *committed* one, so a manager
+    /// and a namespace read disagreed about the same window at the same instant; and a client
+    /// that resized itself by committing a different buffer produced no event at all, leaving
+    /// polling as the only way to notice — which is what this event exists to remove
+    /// (PR #217 review, findings 1 and 2).
+    #[test]
+    fn a_geometry_change_reports_committed_bounds_and_fires_for_a_commit_too() {
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 100, height: 50, role: Role::Normal }).unwrap();
+        // Creating alone changes no bounds: there is no previous rectangle to differ from.
+        assert!(s.take_geometry_changes().is_empty(), "create is not a geometry change");
+
+        // A commit that resizes the window — no manager involved anywhere.
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::BLACK);
+        s.commit(&commit(w, 0)).unwrap();
+        assert_eq!(s.take_geometry_changes(), vec![w], "a commit that resizes is reported");
+
+        let _ = s.place(w, Point::new(-3, 12)).unwrap();
+        assert_eq!(s.take_geometry_changes(), vec![w], "and so is a place");
+
+        // The rectangle a manager would be handed must equal the one `info` answers with.
+        let b = s.window(w).unwrap().bounds();
+        let info = s.info(w).unwrap();
+        assert_eq!(
+            (b.origin.x, b.origin.y, b.size.w, b.size.h),
+            (info.x, info.y, info.width, info.height),
+            "the event and /dev/draw/<id>/info must describe one window the same way"
+        );
+        assert_eq!((b.size.w, b.size.h), (8, 8), "committed, not the 100x50 requested");
+
+        // Re-committing the same buffer changes nothing, so it announces nothing.
+        s.commit(&commit(w, 0)).unwrap();
+        assert!(s.take_geometry_changes().is_empty(), "a commit that does not resize is silent");
+    }
+
+    /// One dispatch that both moves and resizes a window reports it once, not twice.
+    #[test]
+    fn geometry_changes_are_deduplicated() {
+        let mut s = WindowStack::new();
+        let mut src = MapSource::default();
+        let w = s.create(&CreateWindowRequest { width: 100, height: 50, role: Role::Normal }).unwrap();
+        s.attach(&attach(w, 0, 8, 8)).unwrap();
+        src.put(w, 0, geom(8, 8), Rgb::BLACK);
+        s.commit(&commit(w, 0)).unwrap();
+        let _ = s.place(w, Point::new(5, 5)).unwrap();
+        assert_eq!(s.take_geometry_changes(), vec![w], "one id, however many times it moved");
+    }
+
     #[test]
     fn info_carries_the_role_and_its_extra_fields() {
         let mut s = WindowStack::new();
@@ -1606,5 +1744,47 @@ mod tests {
         let mut req = attach(w, 0, 8, 8);
         req.pitch = 8 * 4 - 1; // cannot hold a row
         assert_eq!(s.attach(&req), Err(StackError::BadGeometry));
+    }
+
+    /// `take_removed` reports **every** window that went, parent first, and then drains.
+    ///
+    /// The set is what the manager's `WindowDestroyed` event is built from, and a menu chain
+    /// means one `DestroyWindow` can remove several windows — so a stack that recorded only
+    /// the id it was passed would leave a manager holding windows that no longer exist and
+    /// will never be mentioned again. It drains because the bin calls it after every dispatch
+    /// whether or not a manager is attached; a log that did not clear would re-announce the
+    /// same destruction on every later call, and grow without bound when nobody is listening.
+    #[test]
+    fn take_removed_reports_the_whole_subtree_parent_first_then_drains() {
+        let mut s = WindowStack::new();
+        let root = s
+            .create(&CreateWindowRequest { width: 100, height: 80, role: Role::Normal })
+            .unwrap();
+        let menu = s
+            .create(&CreateWindowRequest { width: 40, height: 20, role: Role::Popup { parent: root } })
+            .unwrap();
+        let submenu = s
+            .create(&CreateWindowRequest { width: 30, height: 15, role: Role::Popup { parent: menu } })
+            .unwrap();
+        // An unrelated window must not appear in the removed set.
+        let other = s
+            .create(&CreateWindowRequest { width: 10, height: 10, role: Role::Normal })
+            .unwrap();
+
+        assert!(s.take_removed().is_empty(), "nothing has been destroyed yet");
+
+        s.destroy(root).unwrap();
+        let gone = s.take_removed();
+
+        assert_eq!(gone[0], root, "the window asked for is reported first");
+        assert!(gone.contains(&menu), "a popup goes with its parent");
+        assert!(gone.contains(&submenu), "and so does a popup of that popup");
+        assert!(!gone.contains(&other), "an unrelated window is not reported");
+        assert_eq!(gone.len(), 3, "exactly the subtree, no duplicates");
+        assert!(s.window(other).is_some(), "the unrelated window survives");
+        assert!(
+            s.take_removed().is_empty(),
+            "the log drained: a second read must not re-announce the same subtree"
+        );
     }
 }

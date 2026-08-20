@@ -67,11 +67,12 @@ use libkern::{
     syscall4,
 };
 use librsproto::surface::{
-    AttachBufferRequest, CommitRequest, OP_ATTACH_BUFFER, OP_COMMIT, Role,
+    AttachBufferRequest, CommitRequest, ConfigureEvent, FocusEvent, MgrWindowCreated,
+    MgrWindowRef, OP_ATTACH_BUFFER, OP_COMMIT, OP_MGR_WINDOW_CREATED, OP_MGR_WINDOW_DESTROYED,
+    OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, ROLE_NORMAL, Role,
     SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
 };
-use libsurface::Transport;
-use libsurface::{Window, ipc::ChannelTransport};
+use libsurface::{Transport, Window, ipc::ChannelTransport};
 
 /// `alloc` backing — rendering the reference scene allocates.
 #[global_allocator]
@@ -517,6 +518,227 @@ fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i3
     }
 }
 
+/// How long one `wait_event_timeout` slice waits for a manager event, and how many slices.
+///
+/// **Up to ~2s, not a 2s budget.** An event of the wrong kind consumes a slice without
+/// waiting, so the wall-clock floor is only reached when nothing arrives at all. That is the
+/// case this bound exists for; with the handful of strays this probe can see, the count is
+/// ample either way. Generous next to a compositor that flushes its manager outbox every loop
+/// iteration, and short enough that a missing event is reported *by name* here rather than by
+/// the gate's wall-clock timeout, which cannot say which event never came.
+const MGR_EVENT_SLICE_NS: u64 = 100_000_000;
+const MGR_EVENT_TRIES: u32 = 20;
+
+/// Wait for an event with op `want` that names window `id`. Returns its body length.
+///
+/// **Filtered by window, not just by op**, because several windows are alive here and one
+/// change produces records about more than one of them: focus moving to a new window emits
+/// the *loss* for the old one first, so a wait that took the first `WindowFocus` off the
+/// wire would read the wrong window's event and call the feature broken. `window_of` is
+/// per-op because each body puts the id in a different place.
+///
+/// Events of other kinds are discarded: the four are queued by different paths in the
+/// compositor and this checks that each *arrives*, not how they interleave.
+fn await_mgr(
+    mgr: &mut ChannelTransport,
+    want: u16,
+    id: u32,
+    window_of: fn(&[u8]) -> Option<u32>,
+    out: &mut [u8],
+    what: &[u8],
+) -> usize {
+    for _ in 0..MGR_EVENT_TRIES {
+        match mgr.wait_event_timeout(out, MGR_EVENT_SLICE_NS) {
+            Ok(Some((op, n))) => {
+                if op == want && window_of(&out[..n]) == Some(id) {
+                    return n;
+                }
+            }
+            Ok(None) => {}
+            Err(_) => fail(b"ui-testclient: manager channel error while awaiting an event\n"),
+        }
+    }
+    kprint(what);
+    fail(b"ui-testclient: a manager event never arrived\n");
+}
+
+fn created_window(b: &[u8]) -> Option<u32> {
+    MgrWindowCreated::read(b).map(|c| c.window)
+}
+fn focus_window(b: &[u8]) -> Option<u32> {
+    FocusEvent::read(b).map(|f| f.window)
+}
+fn geometry_window(b: &[u8]) -> Option<u32> {
+    ConfigureEvent::read(b).map(|g| g.window)
+}
+fn destroyed_window(b: &[u8]) -> Option<u32> {
+    MgrWindowRef::read(b).map(|d| d.window)
+}
+
+/// Throw away whatever the run queued before the probe below starts.
+///
+/// `poll_event`, not a zero timeout: this wants what is already here and nothing more.
+fn drain_mgr(mgr: &mut ChannelTransport) {
+    let mut buf = [0u8; 64];
+    while let Ok(Some(_)) = mgr.poll_event(&mut buf) {}
+}
+
+/// **One window's whole life, watched from the manager channel** — M6 B3.
+///
+/// The manager is told about windows it did not create, which is the half of the seam B1
+/// left unproven: B1 showed a manager can *act* (`Place`), not that it is *told* anything.
+/// Each of the four events is queued by a different path in the compositor, so each is
+/// checked separately and named separately when it does not come.
+///
+/// The *transitive* removed set — a popup going with its parent — is covered by the host
+/// test `take_removed_reports_the_whole_subtree_parent_first_then_drains`. What only a
+/// booted guest can show is that these records are framed, queued and delivered at all.
+fn verify_manager_events(
+    mgr: &mut ChannelTransport,
+    root_ns: u64,
+) -> alloc::boxed::Box<ChannelTransport> {
+    // Everything the reference placements above queued is not this probe's business.
+    drain_mgr(mgr);
+
+    // A window created *after* the manager attached, so it is announced. Small and never
+    // committed, so it paints nothing the display gate could capture.
+    // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
+    let t = match unsafe { ChannelTransport::connect(root_ns) } {
+        Ok(t) => alloc::boxed::Box::new(t),
+        Err(_) => fail(b"ui-testclient: probe connect to /dev/draw FAILED\n"),
+    };
+    let (pw, ph) = (48u32, 24u32);
+    let mut w = match Window::new(t, pw, ph, Role::Normal, BUFFERS) {
+        Ok(w) => w,
+        Err(_) => fail(b"ui-testclient: probe CreateWindow FAILED\n"),
+    };
+    let id = w.id();
+
+    let mut buf = [0u8; 64];
+
+    // 1. Created — with the geometry and role the client asked for, not a placeholder.
+    let n = await_mgr(
+        mgr,
+        OP_MGR_WINDOW_CREATED,
+        id,
+        created_window,
+        &mut buf,
+        b"ui-testclient: no WindowCreated for the probe window\n",
+    );
+    let Some(c) = MgrWindowCreated::read(&buf[..n]) else {
+        fail(b"ui-testclient: WindowCreated body did not decode\n");
+    };
+    if c.width != pw || c.height != ph {
+        Line::new().s(b"ui-testclient: WindowCreated size ").u(c.width as u64).s(b"x").u(c.height as u64).end();
+        fail(b"ui-testclient: WindowCreated carried the wrong size\n");
+    }
+    if c.role != ROLE_NORMAL {
+        fail(b"ui-testclient: WindowCreated carried the wrong role\n");
+    }
+
+    // 2. Focus — a new window takes the keyboard, and the manager is told.
+    let n = await_mgr(
+        mgr,
+        OP_MGR_WINDOW_FOCUS,
+        id,
+        focus_window,
+        &mut buf,
+        b"ui-testclient: no WindowFocus for the probe window\n",
+    );
+    let Some(f) = FocusEvent::read(&buf[..n]) else {
+        fail(b"ui-testclient: WindowFocus body did not decode\n");
+    };
+    if f.focused == 0 {
+        fail(b"ui-testclient: WindowFocus did not say the new window gained focus\n");
+    }
+
+    // 3. Geometry — **after a move to somewhere that is not the default, on a window whose
+    //    committed size is not the size it asked for.** `(0, 0)` is where the compositor
+    //    already puts windows, so a geometry event reporting the origin cannot be told from one
+    //    that echoed the request without the window having moved. And the two sizes must
+    //    differ, or an event reporting the *requested* size looks identical to one reporting
+    //    what is actually on screen — which is exactly how that defect survived this gate the
+    //    first time (PR #217 review, finding 1).
+    let (cw, ch) = (32u32, 16u32);
+    let cpitch = cw as usize * 4;
+    let Some((chandle, caddr)) = shared_buffer(cpitch * ch as usize) else {
+        fail(b"ui-testclient: probe buffer alloc FAILED\n");
+    };
+    if w.attach(0, cw, ch, cpitch as u32, chandle).is_err() {
+        fail(b"ui-testclient: probe attach FAILED\n");
+    }
+    if w.commit(0, (0, 0, cw, ch)).is_err() {
+        fail(b"ui-testclient: probe commit FAILED\n");
+    }
+    // A commit that resizes is itself a geometry change, and it is announced. Take that one
+    // off the wire before placing, so step 3 below reads the event for the *move*.
+    await_mgr(
+        mgr,
+        OP_MGR_WINDOW_GEOMETRY,
+        id,
+        geometry_window,
+        &mut buf,
+        b"ui-testclient: no WindowGeometry for a commit that resized the window\n",
+    );
+
+    let (px, py) = (29i32, 41i32);
+    if !place_window(mgr, id, px, py) {
+        fail(b"ui-testclient: probe Place was refused\n");
+    }
+    let n = await_mgr(
+        mgr,
+        OP_MGR_WINDOW_GEOMETRY,
+        id,
+        geometry_window,
+        &mut buf,
+        b"ui-testclient: no WindowGeometry for the probe window\n",
+    );
+    let Some(g) = ConfigureEvent::read(&buf[..n]) else {
+        fail(b"ui-testclient: WindowGeometry body did not decode\n");
+    };
+    if g.x != px || g.y != py {
+        Line::new()
+            .s(b"ui-testclient: WindowGeometry ").u(g.window as u64)
+            .s(b" at ").i(g.x as i64).s(b",").i(g.y as i64).end();
+        fail(b"ui-testclient: WindowGeometry did not report the position placed\n");
+    }
+    if (g.width, g.height) != (cw, ch) {
+        Line::new()
+            .s(b"ui-testclient: WindowGeometry size ").u(g.width as u64).s(b"x").u(g.height as u64)
+            .s(b", committed ").u(cw as u64).s(b"x").u(ch as u64)
+            .s(b", requested ").u(pw as u64).s(b"x").u(ph as u64).end();
+        fail(b"ui-testclient: WindowGeometry reported a size that is not what is on screen\n");
+    }
+
+    // 4. Destroyed.
+    if w.destroy().is_err() {
+        fail(b"ui-testclient: probe destroy FAILED\n");
+    }
+    await_mgr(
+        mgr,
+        OP_MGR_WINDOW_DESTROYED,
+        id,
+        destroyed_window,
+        &mut buf,
+        b"ui-testclient: no WindowDestroyed for the probe window\n",
+    );
+    // The client's own half of the buffer; `attach` transferred the handle away.
+    // SAFETY: unmapping a range this process mapped in `shared_buffer`.
+    unsafe { syscall2(SYS_MEMORY_UNMAP, caddr as u64, (cpitch * ch as usize) as u64) };
+
+    kprint(b"ui-testclient: manager saw created, focus, geometry and destroyed\n");
+
+    // **Handed back rather than dropped.** Closing this session would make the compositor
+    // tear it down and *full-screen repaint* — the path that redraws the cursor after a
+    // client dies under it (PR #185 review, finding 1). Recompositing 1280x800 takes long
+    // enough that the display gate, which captures as soon as this client says the scene is
+    // up, caught a torn frame about half the time: reference windows half-drawn, no cursor.
+    // The window is destroyed either way, which is what this probe is checking; keeping the
+    // channel open just means the probe's *cleanup* is not the last thing to touch the screen.
+    w.into_transport()
+}
+
+
 /// Report failure and end the run.
 ///
 /// Called instead of exiting with a code, because init cannot wait for this program: on
@@ -681,8 +903,23 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     //
     // Best-effort: a compositor with a manager already attached refuses, and this client is a
     // test fixture rather than the manager of a real session.
+    //
+    // Outlives the block below deliberately; see where it is assigned.
+    let mut probe_session: Option<alloc::boxed::Box<ChannelTransport>> = None;
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     if let Ok(mut mgr) = unsafe { ChannelTransport::manage(root_ns) } {
+        // **Before the placements below, not after.** This probe creates and destroys a
+        // window, so it is the noisiest thing this client does to the screen; running it
+        // first leaves the reference placements as the last screen-affecting work, which is
+        // the sequence the display gate was stable under before this probe existed.
+        //
+        // **Bound outside this block**, so it lives as long as the process rather than as
+        // long as the manager channel. Dropping it here would close the probe's session, and
+        // the compositor answers a closed session with a full-screen repaint — the thing this
+        // whole arrangement exists to keep away from the moment a gate starts looking at, or
+        // clicking on, the screen.
+        probe_session = Some(verify_manager_events(&mut mgr, root_ns));
+
         // **Move one window somewhere that is not the default, and read it back**, before
         // putting everything at the origin. Placing only at `(0, 0)` proves nothing: that is
         // where the compositor already puts windows, so a `Place` that did nothing is
@@ -719,6 +956,10 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     kprint(b"ui-testclient: scene presented via /dev/draw\n");
     kprint(b"ui-testclient: PASSED\n");
+
+    // Named so it is obvious this is deliberate rather than a forgotten binding: the probe's
+    // session stays open for the life of the process.
+    let _held_open = probe_session;
 
     // Park. Exiting would close the channel, and the compositor would destroy this window
     // and repaint — leaving the gate to capture an empty screen.

@@ -1238,10 +1238,27 @@ reflow.
       `Move` would only serve an interactive drag, which is out of scope here and needs a grab
       offset the compositor does not keep. It comes back with decorations, or not at all.
 
-- [ ] **B3 — the manager's events**: window created, destroyed, geometry changed, focus changed,
+- [x] **B3 — the manager's events**: window created, destroyed, geometry changed, focus changed,
       title changed. `desktop-shell.md` §8 lists *"Window list, focus and title notifications"* as
       **"Implied, never specified"** — this is where they get specified. Titles need
       `Surface::SetTitle`, which does not exist.
+
+      ✅ 2026-08-20 — **four of the five.** `WindowCreated`, `WindowDestroyed`, `WindowGeometry`
+      and `WindowFocus` are live and specified (`docs/spec/rsproto-surface-ops.md`, "Manager
+      events"). Titles are split out as **B3b** — `TODO(m6-b3b-titles)` — because they are the
+      only one needing a client-facing op *and* the wire's first variable-length body, which is
+      a format question rather than a window-management one.
+
+      Delivery is the queued outbox, not a `NOBLOCK` send: a manager that missed a
+      `WindowCreated` holds a wrong window list forever and there is no resync op.
+      `WindowDestroyed` is emitted per window *removed* — destroy is transitive, so
+      `WindowStack` records the removed set as it goes rather than making each caller diff the
+      stack around the call.
+
+      Proven on the wire, not only in host tests: `ui-testclient` attaches as manager and
+      watches one window's whole life (created → focus → geometry after a move → destroyed),
+      naming whichever record fails to arrive. Each of the four was negative-controlled by
+      breaking its emission and confirming the *named* assertion fires.
 
       **What `created` carries matters as much as when it fires**: the id alone is useless to a
       manager, which must know the **role** (a `panel` is not placed like a `normal`, and a
