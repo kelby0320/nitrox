@@ -705,32 +705,40 @@ pub const OP_MGR_SET_FOCUS: u16 = 0x0914;
 /// initial-configure handshake; sent later it is an ordinary request the client may decline.
 pub const OP_MGR_CONFIGURE: u16 = 0x0915;
 
-/// `Manage::WindowCreated` — server → manager.
+/// `Manage::WindowCreated` — server → manager. **Reserved: encoding defined, not implemented.**
+///
+/// The five `OP_MGR_WINDOW_*` ops below and [`OP_SET_TITLE`] are Milestone 6 **Part B3**, which
+/// is open: nothing in the tree sends or receives any of them. They are declared so B3 does not
+/// have to renumber, and said so here because `cargo doc` is this project's code-level reference
+/// and the present indicative reads as built (PR #216 review, finding 5). The same separation
+/// the docs make between `design/` and `architecture/`, one layer down.
 ///
 /// **Carries the role and the requested geometry, not just an id.** A manager cannot place from
 /// an id alone: a `panel` is not placed like a `normal`, a `popup` is placed by its own client,
 /// and centring needs a size. All of it is already in the create request, so an event that made
 /// the manager ask a follow-up question would be a seam with a round trip in it.
 pub const OP_MGR_WINDOW_CREATED: u16 = 0x0918;
-/// `Manage::WindowDestroyed` — server → manager.
+/// `Manage::WindowDestroyed` — server → manager. **Reserved**, as above.
 pub const OP_MGR_WINDOW_DESTROYED: u16 = 0x0919;
 /// `Manage::WindowGeometry` — server → manager: this window's position or size changed.
+/// **Reserved**, as above.
 ///
-/// Sent whenever a window's bounds change for any reason, including the manager's own `Place`.
+/// Will be sent whenever a window's bounds change for any reason, including the manager's own `Place`.
 /// A window list that learned about size changes by polling is the thing this exists to avoid.
 pub const OP_MGR_WINDOW_GEOMETRY: u16 = 0x091A;
-/// `Manage::WindowFocus` — server → manager: the keyboard moved.
+/// `Manage::WindowFocus` — server → manager: the keyboard moved. **Reserved**, as above.
 pub const OP_MGR_WINDOW_FOCUS: u16 = 0x091B;
-/// `Manage::WindowTitle` — server → manager: this window's title changed.
+/// `Manage::WindowTitle` — server → manager: this window's title changed. **Reserved**, as above.
 pub const OP_MGR_WINDOW_TITLE: u16 = 0x091C;
 
-/// `Surface::SetTitle` — a client naming its own window. Client → server, silent on success.
+/// `Surface::SetTitle` — a client naming its own window. **Reserved**, as above: no client
+/// sends it and the compositor does not answer it. Would be client → server, silent on success.
 ///
 /// Body: the window id, then UTF-8 bytes, up to [`MAX_TITLE`]. A title is the one piece of a
 /// window a *manager* needs and only the *client* knows.
 pub const OP_SET_TITLE: u16 = 0x0909;
 
-/// The longest window title accepted, in bytes.
+/// The longest window title accepted, in bytes. **Reserved** with [`OP_SET_TITLE`].
 ///
 /// Bounded at the protocol edge for the reason [`MAX_STRUT_RESERVE`] is: it arrives off the wire
 /// from a client, it is stored per window for the compositor's life, and a manager forwarding it
@@ -1004,6 +1012,48 @@ impl PointerEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `MgrWindowCreated`'s 20-byte layout, which ships with no sender and no receiver.
+    ///
+    /// B3 is open, so nothing exercises this encoding end to end — and an event that carries
+    /// role and geometry so a manager need not ask a follow-up question is exactly the kind of
+    /// struct a byte-offset slip goes unnoticed in. `MgrPlace` and `MgrWindowRef` are at least
+    /// driven through `manager::dispatch`; this had nothing (PR #216 review, finding 5).
+    #[test]
+    fn mgr_window_created_round_trips_including_the_role_aux_fields() {
+        let cases = [
+            MgrWindowCreated { window: 1, role: ROLE_NORMAL, aux16: 0, aux32: 0, width: 64, height: 32 },
+            // A panel carries its dock edge and strut reserve in the aux fields.
+            MgrWindowCreated { window: 4096, role: ROLE_PANEL, aux16: 3, aux32: 28, width: 1280, height: 28 },
+            // A popup carries its parent in `aux32`.
+            MgrWindowCreated { window: 7, role: ROLE_POPUP, aux16: 0, aux32: 12, width: 180, height: 96 },
+            // Extremes, to catch a field written at the wrong offset or the wrong width.
+            MgrWindowCreated {
+                window: u32::MAX,
+                role: u16::MAX,
+                aux16: u16::MAX,
+                aux32: u32::MAX,
+                width: u32::MAX,
+                height: u32::MAX,
+            },
+        ];
+        for want in cases {
+            let mut buf = [0u8; 20];
+            assert_eq!(want.write(&mut buf), Some(20), "must serialise into exactly 20 bytes");
+            let got = MgrWindowCreated::read(&buf).expect("20 bytes must parse");
+            assert_eq!(got.window, want.window);
+            assert_eq!(got.role, want.role);
+            assert_eq!(got.aux16, want.aux16);
+            assert_eq!(got.aux32, want.aux32);
+            assert_eq!(got.width, want.width);
+            assert_eq!(got.height, want.height);
+        }
+
+        // Short buffers are refused rather than truncated, both directions.
+        let mut short = [0u8; 19];
+        assert_eq!(cases[0].write(&mut short), None, "19 bytes must not serialise");
+        assert!(MgrWindowCreated::read(&short).is_none(), "19 bytes must not parse");
+    }
 
     #[test]
     fn every_role_round_trips_with_its_extra_fields() {

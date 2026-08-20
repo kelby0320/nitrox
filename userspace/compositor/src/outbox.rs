@@ -63,6 +63,25 @@ pub enum Outbound {
         /// Whether it now has the keyboard.
         focused: bool,
     },
+    /// A `Surface::Configure` a **manager** asked for, addressed to the window's client.
+    ///
+    /// Queued rather than sent directly, for the reason every other server-initiated record
+    /// is: sent straight it competes with input on the same ring, and input is continuous. A
+    /// manager's `Configure` used to go out with `SENDMODE_NOBLOCK` and its failure discarded,
+    /// so a client whose ring was briefly full never resized — and the manager was told the
+    /// request succeeded (PR #216 review, finding 4).
+    Configure {
+        /// Which window is being asked to adopt the geometry.
+        window: u32,
+        /// Requested width in pixels.
+        width: u32,
+        /// Requested height in pixels.
+        height: u32,
+        /// Requested origin, x.
+        x: i32,
+        /// Requested origin, y.
+        y: i32,
+    },
 }
 
 impl Outbound {
@@ -72,7 +91,8 @@ impl Outbound {
             Outbound::Key { window, .. }
             | Outbound::Pointer { window, .. }
             | Outbound::Release { window, .. }
-            | Outbound::Focus { window, .. } => *window,
+            | Outbound::Focus { window, .. }
+            | Outbound::Configure { window, .. } => *window,
         }
     }
 

@@ -1212,14 +1212,21 @@ reflow.
       `ui-testclient` places its reference windows through the channel and falls back silently to
       the compositor's default if the resolve fails — deliberately, it is a fixture — and the
       windows land at the origin either way, because the origin **is** the default. So the whole
-      path could break with every gate still green. `check-display` now asserts the placement,
-      and the client asks a second time so the refusal branch is executed at all: it was
-      implemented and unreachable, pinned by nothing. Both assertions negative-controlled — break
-      the one-manager rule and the refusal line fails; break the resolve and the placement line
-      fails. Gating is still open as `TODO(manage-ungated)`, closed by M7's per-client
+      path could break with every gate still green. `check-display` now asserts the placement
+      by **read-back**, not by the reply: the client places a window at a non-default origin,
+      reads it through `/dev/draw/<id>/info`, and restores it. The first version asserted only
+      that the resolve worked, because every placement was to `(0, 0)` and that is already the
+      default — so a refused `Place` looked identical, and the gate stayed green with every
+      `Place` failing (PR #216 review). The client also asks a second time so the refusal branch
+      is executed at all: it was implemented and unreachable, pinned by nothing. Controlled three
+      ways — break the one-manager rule and the refusal line fails; break the resolve, or make
+      `Place` reply `Ok` without moving anything, and the placement line fails. Gating is still open as `TODO(manage-ungated)`, closed by M7's per-client
       namespaces.*
 
-- [ ] **B2 — the manager's ops**: `Place`, `Raise`, `Lower`, `SetFocus`, `Configure`.
+- [x] **B2 — the manager's ops** ✅ 2026-08-19: `Place`, `Raise`, `Lower`, `SetFocus`, `Configure`
+      (and `RaiseAbove`), with dispatch and host tests in `compositor/src/manager.rs`. A manager
+      `Configure` is queued through the outbox like every other server-initiated record rather
+      than sent `NOBLOCK` and forgotten, so a client whose ring is briefly full still gets it.
       Every one names a window by id and none of them checks ownership — that *is* the
       capability: a manager manages windows it did not create, which is the whole point, and the
       binding is what bounds who may.

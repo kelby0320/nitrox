@@ -458,6 +458,11 @@ fn log_route(rec: &Outbound) {
             l.s(b"compositor: focus win=").u(*window as u64);
             l.s(b" has=").u(*focused as u64);
         }
+        Outbound::Configure { window, width, height, x, y } => {
+            l.s(b"compositor: mgr-configure win=").u(*window as u64);
+            l.s(b" ").u(*width as u64).s(b"x").u(*height as u64);
+            l.s(b" at ").i(*x as i64).s(b",").i(*y as i64);
+        }
     }
     l.end();
 }
@@ -635,6 +640,20 @@ fn send_outbound(ch: u64, rec: &Outbound) -> bool {
             let mut body = [0u8; librsproto::surface::RELEASE_EVENT_LEN];
             match librsproto::surface::build_release_event(&mut body, *window, *buffer) {
                 Some(n) => reply_on_session(ch, OP_RELEASE, 0, &body[..n]),
+                None => true,
+            }
+        }
+        Outbound::Configure { window, width, height, x, y } => {
+            let mut body = [0u8; 20];
+            let ev = ConfigureEvent {
+                window: *window,
+                width: *width,
+                height: *height,
+                x: *x,
+                y: *y,
+            };
+            match ev.write(&mut body) {
+                Some(_) => send_input(ch, OP_CONFIGURE, &body),
                 None => true,
             }
         }
@@ -964,18 +983,31 @@ fn open_session(serve_end: u64, request_id: u64, srv: &mut Server) -> bool {
 /// with the first. A window whose session has gone is silently skipped: the manager is allowed
 /// to be a moment behind, and a manager that had to be told about every teardown before it could
 /// speak would need a synchronous protocol.
-fn configure_window(srv: &Server, window: u32, width: u32, height: u32, origin: Point) {
-    let Some(slot) = srv.session_of(window) else { return };
+/// Queue a `Configure` for `window`'s client. `false` if there is no such session.
+///
+/// **Queued, not sent.** It used to go out directly with `SENDMODE_NOBLOCK` and the result
+/// discarded, so a client whose receive ring was briefly full — mid-motion-burst, say — simply
+/// never resized, with nothing logged and the manager told it had succeeded. Every other
+/// server-initiated record goes through the outbox precisely so it holds its place and is
+/// retried (PR #216 review, finding 4).
+fn configure_window(
+    srv: &mut Server,
+    window: u32,
+    width: u32,
+    height: u32,
+    origin: Point,
+) -> bool {
+    let Some(slot) = srv.session_of(window) else { return false };
     // SAFETY: reading our own slot table.
-    let ch = unsafe { SESSION_CH[slot] };
-    if ch == 0 {
-        return;
+    if unsafe { SESSION_CH[slot] } == 0 {
+        return false;
     }
-    let mut body = [0u8; 20];
-    let ev = ConfigureEvent { window, width, height, x: origin.x, y: origin.y };
-    if ev.write(&mut body).is_some() {
-        send_input(ch, OP_CONFIGURE, &body);
-    }
+    enqueue(
+        srv,
+        slot,
+        Outbound::Configure { window, width, height, x: origin.x, y: origin.y },
+    );
+    true
 }
 
 /// Handle one request on the manager channel. Returns `false` if the manager is gone.
@@ -997,6 +1029,19 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
     }
     // SAFETY: bounded read-only slice over the just-received message.
     let (op, request_id, body) = unsafe {
+        // **Close every transfer this message carried.** No manager op takes a handle, but
+        // `sys_channel_recv` takes no capacity argument and the kernel installs whatever the
+        // sender attached into this process's table whether or not anything here looks at it.
+        // Left alone they pin a slot in the *global* handle table for the compositor's life,
+        // and a `MemoryObject` would pin the sender's frames with it. `serve_session` closes
+        // its surplus for exactly this reason (PR #175 review, finding 2); the manager path
+        // was the sibling that got missed (PR #216 review, finding 3). In M6 any `/dev/draw`
+        // holder can be the manager — see `TODO(manage-ungated)` — so "the manager would not
+        // do that" is not a bound.
+        let hcount = ((&raw const RECV_COUNT).read() as usize).min(libkern::abi::IPC_HANDLE_MAX);
+        for i in 0..hcount {
+            syscall4(SYS_HANDLE_CLOSE, RECV_HANDLES[i], 0, 0, 0);
+        }
         let payload_len =
             u32::from_le_bytes([RECV_MSG[4], RECV_MSG[5], RECV_MSG[6], RECV_MSG[7]]) as usize;
         let req = core::slice::from_raw_parts(
@@ -1025,9 +1070,16 @@ fn serve_manager(srv: &mut Server, fb: &mut RawFramebuffer) -> bool {
         }
         MgrOutcome::Configure { window, width, height, origin } => {
             // Forwarded to the window's *client*, which is a third party: the manager asked,
-            // the client is told. Nothing changes on screen until that client commits.
-            configure_window(srv, window, width, height, origin);
-            reply_on_session(ch, op, request_id, &[]);
+            // the client is told. Nothing changes on screen until that client commits, so the
+            // reply says the compositor accepted and queued the request — never that the
+            // client adopted it, which is not knowable here.
+            if configure_window(srv, window, width, height, origin) {
+                reply_on_session(ch, op, request_id, &[]);
+            } else {
+                // No session owns that window, so nobody can be told: a refusal, not a
+                // success with nothing behind it.
+                reply_error_on_session(ch, op, request_id, surface_errno(SurfaceError::NotFound));
+            }
         }
         MgrOutcome::Failed(e) => {
             reply_error_on_session(ch, op, request_id, surface_errno(e));
@@ -1537,8 +1589,9 @@ fn serve_loop(serve_end: u64, mut fb: RawFramebuffer, srv: &mut Server) -> ! {
             continue;
         }
 
-        // A forwarded resolve: `new` mints a session, `<N>/info` answers with window
-        // metadata. A bare `<N>` and `<N>/ports/...` are later milestones.
+        // A forwarded resolve: `new` mints a session, `manage` mints the manager channel
+        // (one holder), `<N>/info` answers with window metadata. A bare `<N>` and
+        // `<N>/ports/...` are later milestones.
         // SAFETY: valid recv out-params (a Resolve carries no transferred handles).
         let rr = unsafe {
             syscall4(

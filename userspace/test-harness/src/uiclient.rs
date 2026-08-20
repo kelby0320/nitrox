@@ -128,8 +128,12 @@ fn shared_buffer(len: usize) -> Option<(u64, *mut u8)> {
     Some((h as u64, addr as *mut u8))
 }
 
-/// Resolve `/dev/draw/<id>/info`, map it, and check it describes the window we created.
-fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
+/// Resolve `/dev/draw/<id>/info`, map it, and hand back the snapshot.
+///
+/// Split out of [`check_info`] so a placement can be *read back* rather than assumed: the
+/// manager's `Place` reply says only that the compositor answered, and B1's gate line was
+/// satisfied by that alone until 2026-08-19 (PR #216 review, blocking 1).
+fn read_window_info(root_ns: u64, id: u32) -> Option<librsproto::surface::WindowInfo> {
     use libkern::handle::{RawHandle, Rights};
     use libos::{Handle, MapRead, Memory, Namespace, NsReadOnly, block_on};
 
@@ -155,23 +159,27 @@ fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
     }
     path[n..n + 5].copy_from_slice(b"/info");
     n += 5;
-    let Ok(path) = core::str::from_utf8(&path[..n]) else { return false };
+    let path = core::str::from_utf8(&path[..n]).ok()?;
 
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     let ns =
         unsafe { Handle::<Namespace, NsReadOnly>::borrow(RawHandle(root_ns), Rights::LOOKUP) };
     // SAFETY: the path resolves to a read-mappable object holding one `WindowInfo`.
-    let Ok(obj) = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }) else {
-        return false;
-    };
-    let Ok(addr) = obj.map(32) else { return false };
+    let obj = block_on(unsafe { ns.lookup::<Memory, MapRead>(path, Rights::MAP_READ) }).ok()?;
+    let addr = obj.map(32).ok()?;
     // SAFETY: the compositor serves exactly 32 bytes of `WindowInfo` here.
     let bytes = unsafe { core::slice::from_raw_parts(addr as *const u8, 32) };
-    let Some(info) = librsproto::surface::WindowInfo::read(bytes) else { return false };
+    let info = librsproto::surface::WindowInfo::read(bytes);
     // Unmap once the snapshot is read. `info` mints a fresh object per resolve, so a client
     // that polls it and never unmaps leaks a page each time — the same defect the compositor
     // had on its side of this exchange (PR #175 review, finding 1).
     let _ = obj.unmap(addr as *mut u8, 32);
+    info
+}
+
+/// Resolve `/dev/draw/<id>/info` and check it describes the window we created.
+fn check_info(root_ns: u64, id: u32, want_w: u32, want_h: u32) -> bool {
+    let Some(info) = read_window_info(root_ns, id) else { return false };
 
     Line::new()
         .s(b"ui-testclient: info id=")
@@ -458,20 +466,55 @@ fn present_reference_term(
     win
 }
 
-/// Ask the manager channel to put `window` at `(x, y)`.
+/// Ask the manager channel to put `window` at `(x, y)`. `false` if the request did not succeed.
 ///
-/// Errors are ignored: this is a test fixture asserting that the path *works*, and the display
-/// gate is what checks the result — a placement that silently failed shows up there as a window
-/// in the wrong place, which is a better assertion than a return code.
-fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) {
+/// **The reply is no longer discarded, and the old reason it could be was wrong.** This said the
+/// display gate checked the result, because "a placement that silently failed shows up there as
+/// a window in the wrong place" — which it cannot, since every placement here is to `(0, 0)` and
+/// that is already the compositor's default. A refused `Place` moved nothing and looked
+/// identical. Demonstrated in review: with every `OP_MGR_PLACE` made to fail, `check-display`
+/// stayed green (PR #216 review, blocking 1).
+///
+/// A successful reply still only says the compositor answered `Ok`, so the caller reads the
+/// origin back through `/dev/draw/<id>/info` — see `verify_placement`.
+fn place_window(mgr: &mut ChannelTransport, window: u32, x: i32, y: i32) -> bool {
     use librsproto::surface::{MgrPlace, OP_MGR_PLACE};
     let mut body = [0u8; 12];
     let req = MgrPlace { window, x, y };
     if req.write(&mut body).is_none() {
-        return;
+        return false;
     }
     let mut reply = [0u8; 8];
-    let _ = mgr.request(OP_MGR_PLACE, &body, None, &mut reply);
+    mgr.request(OP_MGR_PLACE, &body, None, &mut reply).is_ok()
+}
+
+/// Place `window` at `(x, y)` and read the origin back through `/dev/draw/<id>/info`.
+///
+/// This is what makes the gate's placement line mean something. The reply to `Place` says the
+/// compositor answered; only the read-back says the window moved.
+fn verify_placement(mgr: &mut ChannelTransport, root_ns: u64, window: u32, x: i32, y: i32) {
+    if !place_window(mgr, window, x, y) {
+        fail(b"ui-testclient: a manager Place was refused\n");
+    }
+    let Some(info) = read_window_info(root_ns, window) else {
+        fail(b"ui-testclient: could not read back a placed window's info\n");
+    };
+    if info.x != x || info.y != y {
+        Line::new()
+            .s(b"ui-testclient: Place did not move window ")
+            .u(window as u64)
+            .s(b": asked (")
+            .i(x as i64)
+            .s(b",")
+            .i(y as i64)
+            .s(b") got (")
+            .i(info.x as i64)
+            .s(b",")
+            .i(info.y as i64)
+            .s(b")")
+            .end();
+        fail(b"ui-testclient: manager Place had no effect\n");
+    }
 }
 
 /// Report failure and end the run.
@@ -640,11 +683,16 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
     // test fixture rather than the manager of a real session.
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
     if let Ok(mut mgr) = unsafe { ChannelTransport::manage(root_ns) } {
-        for (w, id) in [(&_ui_window, _ui_window.id()), (&_term_window, _term_window.id())] {
-            let _ = w;
-            place_window(&mut mgr, id, 0, 0);
+        // **Move one window somewhere that is not the default, and read it back**, before
+        // putting everything at the origin. Placing only at `(0, 0)` proves nothing: that is
+        // where the compositor already puts windows, so a `Place` that did nothing is
+        // indistinguishable from one that worked. The offset is restored below, so the scene
+        // the display gate compares is unchanged.
+        verify_placement(&mut mgr, root_ns, win.id(), 11, 7);
+
+        for id in [_ui_window.id(), _term_window.id(), win.id()] {
+            verify_placement(&mut mgr, root_ns, id, 0, 0);
         }
-        place_window(&mut mgr, win.id(), 0, 0);
         kprint(b"ui-testclient: reference windows placed via /dev/draw/manage\n");
 
         // **Exercise the one-manager rule, which is the whole of B1's contract.** The

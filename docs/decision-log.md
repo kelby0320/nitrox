@@ -16348,6 +16348,30 @@ A method note, since it nearly cost a wrong conclusion: the manage lines are pri
 of `ui-testclient`'s output, and a first pass grepping the boot log with `head -8` showed neither
 of them. The path looked dead. It was the pager, not the path.
 
+**Correction, appended rather than edited (PR #216 review, blocking 1).** The paragraph above
+says `check-display` asserts the placement. It did not. `place_window` discarded the reply and
+the success line printed unconditionally, so the assertion proved the *resolve* worked and the
+compositor answered *something* — not that any window moved. The reviewer ran the control this
+entry should have: with every `OP_MGR_PLACE` made to fail, the gate stayed green.
+
+It is the same defect as the one this entry describes, one layer in. The client places at
+`(0, 0)`, which is where the compositor already puts windows, so a `Place` that did nothing was
+indistinguishable from one that worked — and the only channel that could still tell them apart,
+the reply, was thrown away. `place_window`'s own doc comment argued the display gate would catch
+a bad placement "as a window in the wrong place", which cannot happen when every placement is to
+the default position.
+
+Fixed by reading the result back: `ui-testclient` now places a window at a **non-default**
+origin, reads it back through `/dev/draw/<id>/info` (which carries `x`/`y`), fails loudly with
+both positions if they disagree, and only then restores the origin — so the scene the display
+gate compares is unchanged. `place_window` also returns its reply status now. Two controls, both
+of which the original PR would have passed:
+
+```
+every Place refused          -> gate FAILS (was: PASSED)
+Place replies Ok, moves none -> gate FAILS, "Place did not move window 4: asked (11,7) got (0,0)"
+```
+
 Also fixed in passing: two `unused_unsafe` warnings the compositor has carried on main since
 #212. They survived because no verification sweep in this project ever built userspace for its
 real target — the kernel and xtask were checked and reported as "zero warnings", and the one time
