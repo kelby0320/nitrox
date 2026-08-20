@@ -267,8 +267,9 @@ lifetime and its exclusion from the composition canvas — not its position. In 
 dialog is an ordinary listed window: it lands at the compositor's default origin, a manager
 places it, and it is held like a `normal`. Its offset words are written and read as **zero**.
 
-A manager needs nothing from the client to place one: `WindowCreated` carries the parent id and
-the requested size, which is what centring a dialog on its parent takes.
+A manager needs nothing **from the client** to place one: `WindowCreated` carries the parent id
+and the requested size, and the manager already tracks where the parent is from the geometry
+stream — so centring a dialog on its parent is something it can work out for itself.
 
 The offset is **resolved once, against the parent's origin at the moment of creation**. A popup
 does not follow its parent afterwards; moving a parent leaves its popups where they were. That

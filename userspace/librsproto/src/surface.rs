@@ -350,8 +350,9 @@ pub fn build_create_window_request(out: &mut [u8], req: &CreateWindowRequest) ->
     };
     put_u16(out, 10, aux16);
     put_u32(out, 12, aux32);
-    // Zero for a role with no parent, for the same reason the aux words are: two identical
-    // requests must produce identical bytes.
+    // Zero for every role but `popup` — `dialog` included, which has a parent but is placed by
+    // a manager — for the same reason the aux words are zeroed: two identical requests must
+    // produce identical bytes.
     let (ox, oy) = match req.role {
         Role::Popup { .. } => (req.offset_x, req.offset_y),
         Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => (0, 0),
@@ -383,8 +384,9 @@ pub fn parse_create_window_request(body: &[u8]) -> Option<CreateWindowRequest> {
         ROLE_DIALOG => Role::Dialog { parent: aux32 },
         _ => return None,
     };
-    // Only meaningful for the roles that have a parent; a `normal` or `panel` request carries
-    // zero here, and reading it anyway would invent an offset nobody sent.
+    // **Only a `popup`.** Having a parent is not the test: a `dialog` has one and is still placed
+    // by a manager, so reading these words for it would invent an offset the client is not
+    // entitled to send — and the spec says they are read as zero, not merely written as zero.
     let (offset_x, offset_y) = match role {
         Role::Popup { .. } => (get_u32(body, 16) as i32, get_u32(body, 20) as i32),
         Role::Normal | Role::Panel { .. } | Role::Dialog { .. } => (0, 0),
@@ -1144,8 +1146,19 @@ mod tests {
             build_create_window_request(&mut buf, &CreateWindowRequest::at(8, 8, role, 77, 88))
                 .expect("encodes");
             assert_eq!(&buf[16..24], &[0u8; 8], "{role:?} must not put an offset on the wire");
+
+            // **Then put an offset there by hand.** Parsing the buffer the correct encoder just
+            // zeroed asserts nothing: it holds for a parser that reads those words too, because
+            // there is nothing in them to read. The reader is a separate arm and needs a body
+            // that would betray it (PR #220 review, finding 1).
+            put_u32(&mut buf, 16, 77);
+            put_u32(&mut buf, 20, 88);
             let back = parse_create_window_request(&buf).expect("parses");
-            assert_eq!((back.offset_x, back.offset_y), (0, 0), "{role:?} reads back no offset");
+            assert_eq!(
+                (back.offset_x, back.offset_y),
+                (0, 0),
+                "{role:?} must discard an offset even when one is on the wire"
+            );
         }
 
         // And the one role that does.

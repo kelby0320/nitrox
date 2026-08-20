@@ -1481,6 +1481,12 @@ fn cmd_check_display(accel: Accel) -> R<()> {
     // for a manager that by design never places popups would still be waiting.
     session.expect("ui-testclient: a popup was placed by its creator, without the manager")?;
 
+    // **And the other parented role goes the other way.** A `dialog` names a parent but a
+    // manager places it, so it is held like a `normal` and its creator's offset is ignored. The
+    // hold lives in the compositor *binary*, which no host test builds — merge the two roles
+    // back into one arm and every other gate here stays green.
+    session.expect("ui-testclient: a dialog was held for the manager and placed by it")?;
+
     // **The manager seam, asserted rather than attempted (M6 B1).** `ui-testclient` places its
     // reference windows through `/dev/draw/manage` and falls back to the compositor's default
     // placement if the resolve fails — deliberately, since it is a test fixture and not a real

@@ -16584,11 +16584,23 @@ C1 gave `Role::Dialog` the popup's treatment — creator-placed through the offs
 shape: both name a parent, so both looked like the same placement rule. They are not the same
 rule, and the design already said so.
 
-`display-substrate.md` §4a defines `popup` as "a menu **or a modal**" — modality lives there, not
-in `dialog` — and `dialog` as "parented, on its parent's desktop, listed but **not offered as a
-wirable node** on the composition canvas". `ui-composition-model.md` §6 is explicit about what
-that role is for: dialogs are "genuinely *on* a desktop and should be listed, but which the canvas
-should not offer as wirable nodes — **a filter by `role`, not a different tree**".
+**The argument rests on `ui-composition-model.md` §6**, which is explicit about what the role is
+for: dialogs are "genuinely *on* a desktop and should be listed, but which the canvas should not
+offer as wirable nodes — **a filter by `role`, not a different tree**". That is a listing and
+canvas concern with nothing geometric in it. `display-substrate.md` §4a agrees as far as it goes,
+calling a `dialog` "parented, on its parent's desktop, listed but **not offered as a wirable
+node**" — and neither doc says who *places* one, so the rest of the argument is from what the role
+is for plus the fact that a manager already holds everything it needs.
+
+**A weaker leg, stated here so it is not leaned on later.** §4a also calls a `popup` "a menu or a
+modal", which might read as "modality lives in `popup`, not in `dialog`". It does not support that
+much: `desktop-shell.md:162` glosses it as "menus and **the modal** are popups", where *the modal*
+is the shell's own applications modal (§4) — its launcher overlay, which the shell places itself —
+not an application's modal dialog. Nothing in the tree implements modality in any form. So the
+claim that survives is only "no role implements modality today", and **when an application modal
+does arrive, that it is a `popup` should be argued afresh** rather than inherited from this
+sentence: a modal a manager would obviously want to centre should not pick up creator-placement
+and hold-exemption by the back door (PR #220 review).
 
 So a `dialog`'s parent carries three things — desktop membership, lifetime (destroy is
 transitive), and exclusion from the composition canvas — and **placement is not one of them**. In

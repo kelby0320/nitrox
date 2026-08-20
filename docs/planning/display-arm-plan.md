@@ -1342,9 +1342,11 @@ item. Two facts found while detailing changed the shape of the work:
       role-specific words: `x` and `y`, the offset from the parent's origin, zero for roles that
       have no parent. A wire break, taken deliberately while the ABI is pre-stabilisation.
 
-      **"Popup" is shorthand for both parented roles.** A `dialog` is placed by its creator and
-      exempt from the hold on exactly the same terms; nothing in the tree creates one outside
-      tests, which is why the wording throughout says popup.
+      **"Popup" means popup.** C1 shipped treating `dialog` the same way — creator-placed and
+      exempt from the hold — because the two roles share a wire shape. That was corrected the
+      same day: a dialog names a parent but a manager places it, so it is held like a `normal`
+      and carries no offset. See the 2026-08-20 decision-log entry "A `dialog` is placed by the
+      manager, not by its creator".
 
       The alternative — a new `Surface::PlacePopup` op sent between `CreateWindow` and the first
       `Commit` — was rejected: it puts a second message on the path of every menu open, and it
@@ -1354,7 +1356,7 @@ item. Two facts found while detailing changed the shape of the work:
       thing that is never wrong. Carrying it in the create request makes the popup's position
       atomic with its existence.
 
-      **Popups and dialogs are exempt from B4's hold.** A window whose position is its creator's
+      **Popups are exempt from B4's hold** (dialogs were too, briefly — see the note above). A window whose position is its creator's
       business has nobody to wait for. Without this every menu open costs the full deadline the
       moment a shell is attached — 200 ms, on the interaction most sensitive to latency.
 
