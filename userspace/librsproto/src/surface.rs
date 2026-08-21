@@ -299,8 +299,8 @@ pub struct CreateWindowRequest {
     /// For a `popup` this is the whole of its placement: a menu is positioned by its *creator*,
     /// the only party that knows where the item it drops from was drawn. A `dialog` is an
     /// ordinary listed window that happens to name a parent — the parent carries its desktop
-    /// membership, its lifetime and its exclusion from the composition canvas, not its position
-    /// (`display-substrate.md` §4a, `ui-composition-model.md` §6) — so a manager places it, and
+    /// membership and its lifetime, not its position (`display-substrate.md` §4a,
+    /// `ui-composition-model.md` §6) — so a manager places it, and
     /// a manager needs nothing from the client to do so: `MgrWindowCreated` already carries the
     /// parent id and the requested size, which is what centring on a parent takes.
     ///
@@ -1179,7 +1179,7 @@ mod tests {
     /// **Only a `popup` carries an offset.** Every other role, `dialog` included, sends zero.
     ///
     /// A `dialog` names a parent, but the parent carries its desktop membership, its lifetime
-    /// and its exclusion from the composition canvas — not its position. It is an ordinary
+    /// and its lifetime — not its position. It is an ordinary
     /// listed window and a manager places it, so a client-supplied offset would be redundant
     /// with what `MgrWindowCreated` already tells the manager, and would compete with the
     /// placement the manager chose. Nothing asserted this either way before, so the encoder

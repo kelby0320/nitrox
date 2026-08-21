@@ -85,7 +85,8 @@ Throughout the phase documents, links to `docs/architecture/`, `docs/spec/`, and
     *graphical* user in or spawns the desktop shell. That column is specified now in
     [docs/design/graphical-session.md](../design/graphical-session.md), and the milestones above
     M5 changed shape — M6 is window management, **M7 is the graphical session** (new), M8 is
-    desktops/ports/templates, M9 the composed desktop.
+    desktops and the overview, M9 applications and drag-and-drop between them. (M8/M9 were
+    rescoped 2026-08-21 when durable window-to-window wiring was cut — see the decision log.)
     Design in
     [docs/design/display-substrate.md](../design/display-substrate.md) +
     [docs/design/ui-composition-model.md](../design/ui-composition-model.md);

@@ -54,9 +54,10 @@ The shell is **one process owning several windows**, not separate taskbar, launc
 clients.
 
 They share state intensely — the window list, the desktop list and focus all come from the
-compositor, and one subscriber is simpler than three with identical authority. The composability
-argument in the composition model is about *users wiring applications*; the shell's own chrome is
-not something anyone wires.
+compositor, and one subscriber is simpler than three with identical authority. composability
+argument in the composition model was about *users wiring applications* — and that wiring was cut
+in its revision 3; what remains is a drag that dispatches one message. Either way the shell's own
+chrome is not something anyone composes.
 
 Because each surface is a window with a **role** (§8), splitting later costs nothing at the
 compositor. That is the cheap option kept open rather than exercised.

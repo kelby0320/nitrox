@@ -39,7 +39,7 @@ the source of truth for *the order*.
 - **Mechanism:** [`docs/design/display-substrate.md`](../design/display-substrate.md)
   — framebuffer ownership, surfaces, input, text, determinism, the test gate.
 - **Semantics:** [`docs/design/ui-composition-model.md`](../design/ui-composition-model.md)
-  — windows, ports, desktops, templates.
+  — windows, ports, desktops.
 - **The shell itself:** [`docs/design/desktop-shell.md`](../design/desktop-shell.md)
   — bars, applications modal, overview, and the operations it demands of the compositor.
 - **Who logs you in:** [`docs/design/graphical-session.md`](../design/graphical-session.md)
@@ -56,8 +56,7 @@ items are unblocked by this one, and they are listed under "What this unblocks" 
    pixels are the one place where "we'll add tests once it works" would actually happen, and
    the design doc's §8 exists to prevent it.
 2. **The compositor stays small.** Pixels, surfaces, windows, input routing, focus. Anything
-   else — desktops, the wiring graph, templates, spawning applications — belongs to the desktop
-   shell. It is the process everything visible depends on.
+   else — desktops and spawning applications — belongs to the desktop shell. It is the process everything visible depends on.
 3. **Serial keeps working throughout.** `test-qemu`, `test-interactive`, `eshell`'s recovery
    path and headless CI all depend on the serial console. The GUI is a *second* backend behind
    the tty server's existing `backend_write` seam, never a replacement. The precedent is
