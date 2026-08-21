@@ -12,9 +12,11 @@ doc-graduation box, which M5 carries as a prerequisite: `libui` — the retained
 the keyed diff, per-buffer damage, event routing, painting, and the widget set — plus real
 TrueType glyphs, key repeat, an on-screen pointer, and the font on the root filesystem.
 **Milestone 5 is complete** (2026-08-13): the GUI terminal runs a real shell.
-**Milestone 6 is in progress**: planned in detail 2026-08-13, and **Part A — geometry in
-the stack, plus the initial-configure handshake — landed the same day.** Parts B, C and D are
-not started.
+**Milestone 6 is complete** (2026-08-20): geometry in the stack and the initial-configure
+handshake, the manager seam and its four events, popups positioned by their creator and clipped
+to the screen, and the contract written down. **Milestone 7 was planned in detail 2026-08-21**,
+and carries a prerequisite outside this arm — [`test-path-retrofit.md`](test-path-retrofit.md),
+which lands first.
 **Milestone 5 Parts A and B were complete** (2026-08-12): `libterm`'s parser, grid, render and
 encoder, the blend that unblocked antialiasing, and `nxterm` itself — window, chrome, scrollback,
 key repeat, and the display gate's third region. **Part C landed 2026-08-13 — `Tty::AttachBackend`,
@@ -28,7 +30,9 @@ top of that column was empty. It is specified now in
 shape: the old Milestone 6 ("windows, ports, desktops") bundled work at three different
 dependency depths, so it splits into **M6 — window management** (compositor only),
 **M7 — the graphical session** (new: login, `desktop-session-mgr`, `desktop-shell`), and
-**M8 — desktops, ports, templates**; the old M7 becomes **M9**.
+**M8 — desktops and the overview**; the old M7 becomes **M9**. (M8 said "desktops, ports,
+templates" until durable window-to-window wiring was cut on 2026-08-21; ports survive as paths
+and are unscheduled, and templates went with the wiring.)
 
 ## What this is
 
@@ -1064,9 +1068,10 @@ keystroke is the first thing anyone would notice. It stays deferred — the trig
 *observed* overflow and none has happened outside a deliberately wedged test client — but if
 Part B drops input under load, the wire record lands there rather than being worked around.
 
-## Milestone 6 — window management
+## Milestone 6 — window management ✅ complete (2026-08-20)
 
-**Planned in detail 2026-08-13. Part A landed 2026-08-13; B, C and D are not started.**
+**Planned in detail 2026-08-13. Part A landed 2026-08-13; B, C and D followed, and every
+checkbox below is ticked.**
 
 **Re-scoped 2026-08-12.** This milestone was "windows, ports, and desktops", which bundled three
 things at very different dependency depths: windows need only the compositor, while ports and
@@ -1525,48 +1530,269 @@ a third thing to maintain and its feedback is worth less than it costs.
 
 ## Milestone 7 — the graphical session
 
-Sketched. **New in the 2026-08-12 re-scope**, and the piece whose absence caused the M5 Part C
+**New in the 2026-08-12 re-scope**, and the piece whose absence caused the M5 Part C
 misassignment: nothing in `docs/` said who authenticates a graphical user or who spawns the
 desktop shell. [`graphical-session.md`](../design/graphical-session.md) now specifies it.
 
-- [ ] **Graduate `graphical-session.md` and `desktop-shell.md`** to `docs/architecture/` — this
-      milestone builds both.
+**Planned in detail 2026-08-21.** The details pass found that the 45-line sketch this replaces
+described roughly half the milestone: three of its parts are work the sketch did not name at all,
+and two of its claims about the existing system are false. Both are recorded below rather than
+smoothed over, because the sketch read as complete.
 
-- [ ] **The shared session core.** "Authenticate → construct the namespace → spawn the leader →
-      reap → tear down" is the same logic in both columns, against different arguments. It
-      factors into a crate both supervisors link — Linux's PAM precedent: a shared library, not a
-      merged process.
+### Where this starts from
 
-      **Constraint attached:** the core must honour `session-mgr`'s dependency rule (`libkern` +
-      `librsproto` + `libstream` + `libheap`, no `libos`), because `session-mgr` links it. The
-      greeter — the part that draws — stays in each supervisor, which is where they diverge
-      anyway.
+M6 left a compositor that manages windows for a manager that does not exist yet: roles with
+panel struts, placement, raise/lower/focus, the initial-configure handshake, four of the five
+manager events, and popups positioned by their creator. `nxterm` is a real application with a
+real menu. What has never existed is anything **above** the compositor — no login, no shell, no
+process that spawns an application because a person asked for one.
 
-- [ ] **`desktop-session-mgr`.** `session-mgr`'s graphical twin: spawned by `service-mgr` with
-      `BIND_NAMESPACE` re-delegated, plus the fs/profile/tty endpoints, an auth channel, and
-      — the new part — a `/dev/draw` connection, because its greeter is itself a compositor
-      client. Presents a login **window**, calls the *same* `auth-service` over the *same*
-      protocol, constructs a session namespace, spawns `desktop-shell` into it.
+**The display arm is also entirely `selftest`-gated today**, which the sketch did not say and
+which changes what this milestone is. `run_nxterm`, `run_ui_testclient`, `run_display_selftest`
+and `run_input_testclient` are all `#[cfg(feature = "selftest")]` in `init`. A release boot binds
+`/dev/draw`, draws a cursor, and spawns nothing — so **M7 is where the graphical arm first exists
+in an image a person would run.**
 
-      That `auth-service` needs no change is the evidence the existing split was drawn in the
-      right place. `/dev/console` is deliberately **not** bound into a graphical session —
-      governing decision 3's failure is on the record.
+### The three questions this milestone exists to answer
 
-- [ ] **`desktop-shell`, minimally**: the top bar, the applications modal, window placement
-      policy driving M6's ops, and — the load-bearing part — **constructing a namespace per
-      application it spawns**. `ui-composition-model.md` §5a requires this: its guarantee that
-      "an application cannot compose other applications" rests on the shell being the process
-      that built them.
+1. **Who logs a graphical user in, and how is that not `session-mgr`?** Answered by
+   `graphical-session.md` §1 and built here: a second supervisor, sharing a core, never the
+   parent of the serial column.
+2. **What does it mean for an application to be *launched*?** A constructed namespace, not an
+   inherited one — which is the first time `sys_ns_create` is called by something that is not a
+   supervisor tier, and the first time the compositor's manager channel can be withheld from
+   anyone.
+3. **Can the toolkit build the hard case?** `desktop-shell.md` §5 says the shell — not the
+   terminal — is what decides the toolkit's central question, and the answer it gives is "an
+   explicit toolkit plus one model-backed list widget". That widget does not exist. Building it
+   is how the question gets settled.
 
-- [ ] **`nxterm` becomes launchable**, which is what makes this milestone visible: the
-      applications modal spawns it into a namespace the shell constructed, and M5 Part C's
-      `TODO(gui-dev-tty)` is discharged with a real `/dev/tty` binding
-      ([`graphical-session.md`](../design/graphical-session.md) §6.1).
+### Prerequisite — the test-path retrofit
 
-- [ ] **Decide concurrency** (`graphical-session.md` §6.2). Two supervisors able to authenticate
-      independently fires `session-and-auth.md`'s deferred "one console, one session at a time".
-      Serial must stay available while a graphical session runs — it is the recovery path — but
-      whether that is two sessions or one session with two views is undecided.
+[`test-path-retrofit.md`](test-path-retrofit.md) lands **before** this milestone starts.
+It is not something M7 needs in order to function; it is what stops M7 from tripling the
+problem. `init` and `session-mgr` carry 1009 cfg-gated lines between them — 32 % and 28 % of
+their files — and 117 of `session-mgr`'s are the *shipping* login path, compiled out under
+`test-harness`: one `login()` in the release build and a different one in the tested build. This
+milestone adds three more processes, each of which would otherwise want an auto-login of its own.
+
+**The rule that follows, and it is the whole reason for the ordering:** nothing built in M7
+contains a substitution cfg. The greeter is driven by the PS/2 injection `check-terminal`
+already uses, against a release-shaped image, and there is no auto-login anywhere in it.
+
+### What the details pass found, before the parts
+
+Two claims in the design docs are false against the code, and both are load-bearing for the
+sketch's own plan:
+
+- **`auth-service` cannot serve a second client.** `graphical-session.md` §2 says it is
+  "untouched", and the *protocol* is — but `auth-service/src/main.rs` creates exactly one channel
+  pair at startup, transfers the one client end in `Meta::Ready`, and `serve_loop` blocks on the
+  single serve end. There is no second endpoint for `desktop-session-mgr` to hold. Part C.
+- **`/svc/auth` does not exist.** [`session-and-auth.md`](../architecture/session-and-auth.md) is
+  an `architecture/` doc — a claim about current behaviour — and says auth-service's "endpoint is
+  bound at `/svc/auth`". Nothing in the tree binds anything under `/svc`; `service-mgr` hands
+  `session-mgr` a direct channel over its control channel. Were the doc true, the finding above
+  would be free: a second supervisor would resolve its own. Corrected as part of Part C, and the
+  reason `check-docs` could not catch it is that it validates `userspace/…` paths, not namespace
+  paths.
+
+And one requirement the sketch inherited without checking: `TODO(manage-ungated)` says M7 closes
+the manager-channel hole "by binding". **Binding alone does not close it** — the compositor
+classifies forwarded resolves by *suffix* with no caller identity, and serves everything from one
+endpoint, so a namespace that can reach `/dev/draw/new` can reach `/dev/draw/manage`. Part E.
+
+### Part A — the two widgets, and window titles
+
+The three things every later part draws with, none of which exist. Gated on the host and through
+`check-display` before anything new spawns.
+
+- [ ] **A single-line text field**, with a masked mode. The greeter needs it for a password and
+      the applications modal needs it for a search; `widget-toolkit.md` §8 says the **text
+      area** is deliberately absent and that it "returns when something needs it — plausibly the
+      file browser or a *find* box". This is that trigger, arriving earlier and narrower: a
+      single line is not an editor, and building the editor's widget now would be the guess §8
+      refuses to make. The distinction goes in the doc.
+
+      The toolkit already anticipated this: `route.rs` has focus, a focus ring, tree-order Tab
+      traversal, and `on_key` returning `Option<Msg>` **specifically** so a focused field cannot
+      swallow a menu accelerator. The plumbing is there and unexercised.
+
+- [ ] **A model-backed list view.** The window list, the launcher results and (in M8) the desktop
+      previews are `desktop-shell.md` §2's churn, and §5's answer to the toolkit question is one
+      widget covering all three rather than a diffing engine. **Design it against two callers,
+      not one** — a list of windows and a filtered list of programs — because a model API drawn
+      for a single consumer is the failure mode §5 was avoiding.
+
+- [ ] **Window titles — `TODO(m6-b3b-titles)` closes here.** `Surface::SetTitle` (`0x0909`) and
+      `WindowTitle` (`0x091C`) are declared in `librsproto` and unimplemented; the deferral's own
+      trigger is "the desktop shell (M7) drawing a window list", and a window list without titles
+      is a row of blanks. This brings the wire-format question the deferral split off: the
+      **first variable-length Surface record**, so a length convention, a cap, and a stated answer
+      for a client that sends 64 KiB of title.
+
+- [ ] **`check-display`'s reference render covers both widgets.** They are the first widgets since
+      M4 and the gate is how a widget is known to draw what it claims.
+
+### Part B — the shared session core
+
+- [ ] **`libsession`**: "authenticate → construct the namespace → spawn the leader → reap →
+      tear down", the same logic in both columns against different arguments. Linux's PAM
+      precedent — a shared library, not a merged process
+      ([`graphical-session.md`](../design/graphical-session.md) §4).
+
+      **Constraint:** `libkern` + `librsproto` + `libstream` + `libheap`, no `libos`, because
+      `session-mgr` links it ([`session-mgr/CLAUDE.md`](../../userspace/session-mgr/CLAUDE.md)).
+      Verified satisfiable: `libstream` and `librsproto` depend only on `libkern`, and only under
+      their `io` feature. The greeter — the part that draws — stays in each supervisor, which is
+      where they diverge anyway.
+
+- [ ] **`session-mgr` moves onto it first**, and `test-interactive` stays green. The serial column
+      proves the core before the graphical one depends on it; the alternative is a crate whose
+      only caller is also new.
+
+      This is why the retrofit is a prerequisite rather than a follow-up: factoring a `login()`
+      that has two compilations would carry the fork into the shared crate.
+
+### Part C — one credential oracle, two clients
+
+- [ ] **`auth-service` serves more than one client.** Two shapes, and the choice is the part's
+      first job: mint *N* client endpoints at `Meta::Ready` and multiplex with a wait set (which
+      is what the compositor does with `MAX_SESSIONS`), or become a namespace forwarder that each
+      supervisor resolves its own session from. The second matches how `fs-server`,
+      `profile-server` and the compositor already work, and matches what
+      [`session-and-auth.md`](../architecture/session-and-auth.md) has claimed all along.
+
+- [ ] **Whichever is chosen, `/svc/auth` becomes true or the doc stops saying it.** An
+      `architecture/` doc that describes a binding nobody makes is the failure root
+      `CLAUDE.md` names — the source wins and the doc is a bug — and it is a doc two designs
+      have now leaned on.
+
+- [ ] **The protocol does not change.** `Authenticate { username, password } → { AUTHENTICATED,
+      principal, home } | DENIED` is untouched, and that remains the evidence the split was drawn
+      in the right place. What changes is plumbing, and saying so precisely is the correction.
+
+### Part D — `desktop-session-mgr`, the greeter, and the gate
+
+- [ ] **`desktop-session-mgr`**, `session-mgr`'s graphical twin: spawned by `service-mgr` with
+      `BIND_NAMESPACE` re-delegated, plus the fs/profile/tty endpoints, an auth channel and — the
+      new part — a `/dev/draw` connection, because its greeter is itself a compositor client.
+      Presents a login **window**, calls the same `auth-service` over the same protocol,
+      constructs a session namespace, spawns `desktop-shell` into it.
+
+      `/dev/console` is deliberately **not** bound into a graphical session — governing decision
+      3's failure is on the record.
+
+- [ ] **The greeter draws before anyone has authenticated**, and outlives each session
+      (`graphical-session.md` §4). It is closer to `gdm`'s `class=greeter` than to anything
+      `session-mgr` does, and it is the first compositor client that exists at boot in a release
+      image.
+
+      One M6 interaction that already works and should stay working: the initial-configure hold
+      is skipped when no manager is attached, so the greeter composites without waiting for a
+      shell that does not exist yet.
+
+- [ ] **The graphical login gate, built here rather than at the end of the milestone.** A wrong
+      password, then a right one, then a shell — the sequence `test-interactive` runs on serial,
+      driven by the PS/2 injection `check-input` and `check-terminal` already use, adjudicated on
+      the host. Parts E and F then land against a gate that exists.
+
+- [ ] **Concurrency is decided: two independent sessions** (`graphical-session.md` §6.2,
+      `session-and-auth.md`'s deferred "one console, one session at a time"). `session-mgr` and
+      `desktop-session-mgr` each authenticate and run a session, unaware of each other. Serial
+      stays the recovery path by construction, which is governing decision 3 holding trivially
+      rather than by care. The costs are real and accepted: the same user may be logged in twice
+      with two namespaces, and nothing arbitrates. It matches Linux — `getty` and `gdm` do not
+      coordinate — and needs no registry, which is what `graphical-session.md` §1 says Nitrox
+      does not need yet.
+
+### Part E — `desktop-shell`
+
+- [ ] **The shell, minimally**: the top bar, the applications modal, and window placement policy
+      driving M6's manager ops. It is the compositor's first real manager — everything M6 built
+      for one has been exercised by a test client until now.
+
+- [ ] **Constructing a namespace per application it spawns** — the load-bearing part.
+      `ui-composition-model.md` §5a requires it: the guarantee that "an application cannot compose
+      other applications" rests on the shell being the process that built them, and the shell
+      holds `BIND_NAMESPACE` for exactly this.
+
+- [ ] **The shell does not bind its own endpoint.** `desktop-session-mgr` binds `/dev/desktop`
+      into the session namespace, exactly as `init` binds the tty server's and `session-mgr` binds
+      `/dev/tty`. The shell holds `BIND_NAMESPACE` to construct *application* namespaces
+      continuously, not to register itself once — which is what reconciles a process that both
+      serves and constructs with [`syscaps.md`](../architecture/syscaps.md)'s rule
+      (`graphical-session.md` §3).
+
+- [ ] **`TODO(manage-ungated)` closes, and needs a mechanism the deferral did not name.** The
+      compositor mints a **second forwarding endpoint** for management, carried in its
+      `Meta::Ready` alongside the first; `init` binds only `/dev/draw` into the root namespace;
+      the manage endpoint travels the courier chain (`init` → `service-mgr` →
+      `desktop-session-mgr`) and is bound only into the session namespace. Applications get
+      constructed namespaces holding `/dev/draw` and not the manage endpoint, so withholding
+      finally means something.
+
+      **State what stays open**: anything spawned with `namespace: 0` inherits root, so the
+      selftest path remains ungated. That is a property of the test image, not a hole in the
+      design, and it should be written down rather than found later.
+
+### Part F — `nxterm` becomes launchable
+
+What makes the milestone visible: a person clicks an entry in the applications modal and a
+terminal opens.
+
+- [ ] **The shell spawns `nxterm` into a namespace it constructed**, and M5 Part C's
+      `TODO(gui-dev-tty)` is discharged. `graphical-session.md` §6.1 holds three candidate shapes;
+      the second is already what the code does — `nxsh` takes a handed-down terminal when its
+      parent gives one and resolves `/dev/tty` otherwise, and its comment points at §6.1. The part
+      confirms that as the answer or replaces it, and either way §6.1 stops being an open
+      question.
+
+- [ ] **`nxterm` gets an environment, and hands it down.** It currently spawns `nxsh` with
+      `Record::default()` and takes no setup channel of its own, so a terminal launched into a
+      constructed namespace would give its shell no `$env.HOME` — unlike every serial login. It
+      needs to receive a setup message and forward it.
+
+- [ ] **`init` stops spawning graphical clients.** The retrofit made them service declarations;
+      this part makes the real answer real, and closes the comment `init` has carried since
+      2026-08-12: *"Until Milestone 7 there is nothing to launch `nxterm` from."*
+
+- [ ] **Graduate [`graphical-session.md`](../design/graphical-session.md) and
+      [`desktop-shell.md`](../design/desktop-shell.md)** to `docs/architecture/` — this milestone
+      builds both. `desktop-shell.md`'s overview (§6) and tray (§9) are M8 and v2 respectively, so
+      the graduation says what is built rather than moving a document that outruns its code.
+
+### What "done" means
+
+- A release image boots to a **login window**, a typed password reaches a desktop, and the
+  applications modal launches a terminal into a namespace the shell constructed.
+- `session-mgr` still presents `login:` on serial at the same time, and `test-interactive` still
+  passes — the recovery path, demonstrated rather than asserted.
+- An application cannot resolve `/dev/draw/manage`, and there is a test that says so.
+- `grep -rn 'feature = "test-harness"' userspace/desktop-session-mgr userspace/desktop-shell`
+  returns nothing.
+
+### Out of scope, deliberately
+
+- **Desktops, the overview, the desktop indicator** — Milestone 8. The shell ships with one
+  implicit desktop.
+- **The system tray** — `desktop-shell.md` §9 marks it v2; it is an inter-process protocol, not a
+  widget.
+- **Thumbnail capture and global hotkey registration** — `desktop-shell.md` §8 lists both as
+  demands not yet in the substrate. Capture belongs with the overview (M8). The Super key is the
+  modal's *second* trigger; the applications button is the first, and it needs no new compositor
+  op. Building a capability-gated global-hotkey path for a shortcut is work the milestone can do
+  without.
+- **Per-user profile overlays, session tokens, switch-user, lock screen, seats** —
+  `graphical-session.md` §7, all deferred with their serial equivalents.
+
+### The risk worth naming
+
+**Part E is where three untried things meet**: the compositor's first real manager, the first
+namespace constructed by something that is not a supervisor tier, and the first process that both
+serves and holds `BIND_NAMESPACE`. Each is designed; none has run. The mitigation is that Part D's
+gate exists before Part E starts, so a shell that comes up wrong is distinguishable from a greeter
+that never logged in — which is exactly the confusion that would otherwise cost the most time.
 
 ## Milestone 8 — desktops and the overview
 

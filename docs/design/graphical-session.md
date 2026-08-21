@@ -86,11 +86,21 @@ Everything below `desktop-session-mgr` already exists. Only the two right-hand r
 | **desktop-session-mgr** | **Graphical** session supervisor | the same, **plus** a `/dev/draw` connection | **new** |
 | **desktop-shell** | The graphical session's leader: bar, applications modal, window placement policy, application namespaces | its session namespace; `BIND_NAMESPACE` for the namespaces it builds | **new** |
 
-**`auth-service` is untouched.** Both supervisors ask it the same question over the same
-protocol — `Authenticate { username, password } → { AUTHENTICATED, principal, home } | DENIED`
-([`rsproto-auth-ops.md`](../spec/rsproto-auth-ops.md)). That the graphical path needs no change
-here is the strongest evidence the existing split was drawn in the right place: credential
-validation was already separate from session lifecycle and namespace construction.
+**`auth-service`'s protocol is untouched.** Both supervisors ask it the same question over the
+same protocol — `Authenticate { username, password } → { AUTHENTICATED, principal, home } |
+DENIED` ([`rsproto-auth-ops.md`](../spec/rsproto-auth-ops.md)). That the graphical path needs no
+change *there* is the strongest evidence the existing split was drawn in the right place:
+credential validation was already separate from session lifecycle and namespace construction.
+
+**Its plumbing is not untouched, and an earlier draft said it was.** As built, `auth-service`
+creates exactly one channel pair at startup, transfers the one client end in `Meta::Ready`, and
+serves on the other — a single-client server, with `service-mgr` couriering the client end to
+`session-mgr`. There is no second endpoint for `desktop-session-mgr` to hold, and no `/svc/auth`
+to resolve one from: nothing in the tree binds anything under `/svc`, though
+[`session-and-auth.md`](../architecture/session-and-auth.md) claimed otherwise until 2026-08-21.
+Making the oracle serve two clients is Milestone 7 Part C. The correction matters because "no
+change here" was doing work in this document that it could not support (details pass,
+2026-08-21).
 
 **`profile-server` is also untouched, and is worth stating precisely because it is easy to
 misremember**: it projects the *system* profile, identical for every user. There is no per-user
@@ -102,7 +112,7 @@ profile lookup in session construction today — per-user overlays are deferred
 ```
 kernel ─spawns→ init (full SysCaps)
   init ─spawns, delegates BIND_NAMESPACE→ service-mgr
-    ├─spawns→ auth-service                    (no caps; endpoint at /svc/auth)
+    ├─spawns→ auth-service                    (no caps; a client channel, couriered down)
     ├─spawns, re-delegates BIND_NAMESPACE→ session-mgr
     │      + fs ep, profile ep, tty ep, auth channel
     │      └─on login→ session ns ─spawns→ nxsh
@@ -228,11 +238,21 @@ shapes, none chosen:
 This is the question Milestone 5 Part C defers rather than answers, and it belongs here because
 it is a property of how applications get their namespaces, not of the tty server's backend.
 
-**6.2 — Are serial and graphical sessions concurrent?** `session-and-auth.md` defers "concurrent
-logins (one console, one session at a time)"; two supervisors able to authenticate independently
-fires that deferral. The recovery argument says serial must stay available while a graphical
-session is up. Whether that is *two sessions* or *one session with two views* is undecided, and
-the answer determines whether anything logind-shaped is eventually needed.
+**6.2 — Are serial and graphical sessions concurrent? — ANSWERED 2026-08-21: two independent
+sessions.** `session-mgr` and `desktop-session-mgr` each authenticate and run a session, unaware
+of each other. Maintainer's decision during Milestone 7's details pass.
+
+Serial staying available while a graphical session runs is then governing decision 3 holding
+*by construction* rather than by care — there is nothing to arbitrate, so there is nothing that
+can decide wrongly. It matches Linux, where `getty` and `gdm` do not coordinate, and it needs no
+registry, which is what §1 says Nitrox does not need yet.
+
+**The costs are real and accepted**: the same principal may hold two sessions with two
+namespaces at once, and nothing arbitrates between them. The alternative — one session with two
+views — is closer to the letter of `session-and-auth.md`'s deferred "one console, one session at
+a time", but requires the session registry §1 explicitly defers, so it would have made the
+graphical session wait on a logind-shaped component to exist. If that component ever arrives,
+this is the decision to revisit; nothing built for two sessions forecloses one.
 
 **6.3 — Does the session's process supervision live in `desktop-shell`?** GNOME separates "logs
 you in" (`gdm`) from "supervises the session's processes" (`gnome-session` / `systemd --user`)
@@ -240,11 +260,17 @@ from "draws" (`gnome-shell`). This design folds the middle into `desktop-shell`.
 while the shell is the only thing spawning applications; it stops being right if session
 services appear that must outlive or precede the shell.
 
-**6.4 — Which process places windows before `desktop-shell` exists?** Milestone 6 builds window
-management in the compositor with no shell running. Placement is *policy*, which
-[`desktop-shell.md`](desktop-shell.md) §8 assigns to the shell — so the compositor needs a default and a seam the shell can take
-over through. Designing that seam is Milestone 6's job; naming it here is so it is not
-discovered in Milestone 7.
+**6.4 — Which process places windows before `desktop-shell` exists? — ANSWERED by Milestone 6.**
+Placement is *policy*, which [`desktop-shell.md`](desktop-shell.md) §8 assigns to the shell, so
+the compositor needed a default and a seam the shell could take over through. It has both: a
+window lands at the origin and is held uncomposited until configured, a manager attaches through
+`/dev/draw/manage` and drives `Place`/`Raise`/`Lower`/`RaiseAbove`/`SetFocus`, and with no
+manager attached the hold is skipped so the screen still works. Naming it here was so it would
+not be discovered in Milestone 7, and that worked: the greeter draws before any manager exists
+because of the last clause.
+
+What Milestone 6 did **not** settle is who may be the manager — `TODO(manage-ungated)`, closed in
+Milestone 7 Part E.
 
 ## 7. What this does not do
 

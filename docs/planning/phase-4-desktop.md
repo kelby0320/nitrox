@@ -558,8 +558,10 @@ desktops) and
 interrupt to a keystroke in a window: kernel drivers, the `input-server`, `libinput`) and
 [`docs/design/desktop-shell.md`](../design/desktop-shell.md) (bars, applications modal,
 overview), all settled 2026-08-04. **Build order:
-[`display-arm-plan.md`](display-arm-plan.md)** — seven milestones, three prerequisites, starting
-with the test gate and putting the widget toolkit before the first application.
+[`display-arm-plan.md`](display-arm-plan.md)** — nine milestones, three prerequisites, starting
+with the test gate and putting the widget toolkit before the first application. Milestone 7 adds a
+fourth prerequisite from outside this arm — [`test-path-retrofit.md`](test-path-retrofit.md), which
+takes the test paths out of `init` and `session-mgr` before three more processes are written.
 
 - [x] **Per-interrupt-context lock-order tracking** ✅ (2026-07-29). Was scheduled here,
   ahead of the handlers it protects; pulled forward instead, because it turned out to be a
