@@ -730,7 +730,11 @@ fn subtree_bind_test(root_ns: u64) -> bool {
             break;
         }
     }
-    // SAFETY: unmap our two mappings (init runs forever — don't leak).
+    // SAFETY: unmap our two mappings. `init` ran this and never exits, so this said
+    // "init runs forever — don't leak"; `boot-probe` exits a few lines below and the address
+    // space goes with it either way. Still right to tidy before the checks that follow — and
+    // a file mapping released inside `AddressSpace::drop` is exactly what exposed the
+    // lock-order violation this move found.
     unsafe {
         syscall2(SYS_MEMORY_UNMAP, direct, PAGE);
         syscall2(SYS_MEMORY_UNMAP, via_sub, PAGE);

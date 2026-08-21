@@ -888,17 +888,29 @@ mod tests {
         }
     }
 
-    /// **One registration, two names** — bind-mount semantics, and the property `init`'s
-    /// boot-time `subtree_bind_test` smoke-tested until 2026-08-21.
+    /// **One registration can be bound at two paths, and the two coexist** — one unscoped,
+    /// one subtree-scoped, each resolving with its own suffix and base.
     ///
-    /// Binding the same server twice must *share* its registration rather than mint a rival:
-    /// a second registration would own a second view of the same endpoint, and a reply meant
-    /// for one could be matched against the other. `session-mgr` depends on this every login —
-    /// it binds `/home` subtree-scoped to the fs endpoint `init` already bound at `/` — and
-    /// that path is exercised end to end by `cargo xtask test-interactive` steps 5a–5c.
-    /// This test is the deterministic half: same `ObjectRef`, two paths, one with a base.
+    /// That is the shape `init` and `session-mgr` rely on: the fs endpoint is bound at `/`,
+    /// and `session-mgr` binds *the same* endpoint again at `/home` with a base. Nothing else
+    /// here covers it — [`bind_rejects_invalid_and_duplicate`] rejects a repeated *path*, not
+    /// a repeated target.
+    ///
+    /// **What this test does NOT establish, despite an earlier name that said it did.** It was
+    /// called `one_registration_bound_twice_is_shared_not_duplicated`, and its headline
+    /// assertion — that both bindings resolve to the same registration pointer — **cannot
+    /// fail**: the test hands the same `ObjectRef` to both binds, `bind_userspace_server`
+    /// stores it verbatim, and `resolve` clones it back out. There is no code path in
+    /// `Namespace` that could substitute a different registration, so the assertion is a
+    /// property of the test's own setup (PR #228 review, finding 4). It is kept below because
+    /// it states the intent cheaply, not because it is a check.
+    ///
+    /// **Sharing is the caller's property**, enforced by `init` and `session-mgr` passing the
+    /// same endpoint rather than minting a second, and pinned end to end by `boot-probe`'s
+    /// `subtree_bind_test` — which compares a file read through both names — and by
+    /// `test-interactive` steps 5a–5c, where a session writes through the scoped binding.
     #[test]
-    fn one_registration_bound_twice_is_shared_not_duplicated() {
+    fn one_registration_can_be_bound_at_two_paths() {
         let n = ns();
         let reg = us_reg_target();
         let same = reg.clone();
@@ -920,10 +932,12 @@ mod tests {
                 ResolvedTarget::UserspaceServer(a, abase),
                 ResolvedTarget::UserspaceServer(b, bbase),
             ) => {
-                // The whole point: **one** registration behind both names.
+                // True by construction (see the doc comment) — stated, not checked.
                 assert_eq!(a.as_ptr() as usize, addr);
-                assert_eq!(b.as_ptr() as usize, addr, "the second bind minted a rival");
-                assert!(abase.is_empty());
+                assert_eq!(b.as_ptr() as usize, addr);
+                // These two *are* checks: each binding carries its own base, and the second
+                // bind did not overwrite or inherit the first's.
+                assert!(abase.is_empty(), "the unscoped binding must carry no base");
                 assert_eq!(bbase.as_path(), b"/system");
             }
             _ => panic!("expected userspace-server targets"),

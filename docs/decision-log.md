@@ -17194,9 +17194,13 @@ a bare `return` after a `FAIL` print — nineteen of them — so a broken filesy
 exactly the class this plan exists for. Each returns `bool` now, joined with `&` rather than `&&`
 so one failure does not hide the others.
 
-**One `selftest` cfg stays in `init`, and it stays for a reason worth stating.** The
-`/subtreetest` binding cannot move: `[handles].namespace` is unparsed, and a declared service is
-spawned with `namespace: 0` — an inherited LOOKUP-only root — so "the test image differs by data"
-has no way to express a namespace bind. Removing it anyway broke the demo harness's case 8, which
-needs a binding that is *also* an openable directory to prove `move` refuses to recurse through a
-mount. Closing this needs a mechanism, not an edit.
+**The `/subtreetest` binding is the one cfg C1 could not remove, and it stays for a reason worth
+stating.** It cannot move: `[handles].namespace` is unparsed, and a declared service is spawned
+with `namespace: 0` — an inherited LOOKUP-only root — so "the test image differs by data" has no
+way to express a namespace bind. Removing it anyway broke the demo harness's case 8, which needs a
+binding that is *also* an openable directory to prove `move` refuses to recurse through a mount.
+Closing this needs a mechanism, not an edit.
+
+`init` still carries **20** `selftest` cfgs otherwise — the demo chain, the four graphical spawns,
+and the `cfg(not(selftest))` supervision of `service-mgr`. Those are ordinary code that becomes
+service declarations in C2, and they are the larger half of Part C.

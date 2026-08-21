@@ -594,15 +594,19 @@ fn mount_one(root_ns: u64, m: &MountSpec) -> bool {
             endpoint,
         )
     };
-    // **The one `selftest` cfg left in this file, and it is here because "data, not code"
-    // cannot express it.** Retrofit Part C moved every filesystem test out of PID 1; this
-    // *binding* could not follow, because there is no way to put a namespace bind in a
-    // service declaration — `[handles].namespace` is unparsed, and a declared service is
-    // spawned with `namespace: 0` (an inherited LOOKUP-only root) rather than a constructed
-    // one. Two things in the test image resolve it: `boot-probe`'s `subtree_bind_test`, and
-    // the demo harness's case 8, which needs a binding that is *also* an openable directory
-    // to prove `move` refuses to recurse through a mount. Closing this needs a mechanism,
-    // not an edit — see `docs/planning/test-path-retrofit.md` Part C.
+    // **The one cfg retrofit Part C1 could not remove, and the only one here that "data, not
+    // code" cannot express.** (The file still has others — the demo chain, the four graphical
+    // spawns, the `cfg(not(selftest))` service-mgr supervision — and those are ordinary code
+    // that Part C2 turns into service declarations.) This *binding* is different: there is no
+    // way to put a namespace bind in a declaration, because `[handles].namespace` is unparsed
+    // and a declared service is spawned with `namespace: 0` — an inherited LOOKUP-only root —
+    // rather than a constructed namespace.
+    //
+    // Two things in the test image resolve it: `boot-probe`'s `subtree_bind_test`, and the
+    // demo harness's case 8, which needs a binding that is *also* an openable directory to
+    // prove `move` refuses to recurse through a mount. Removing it without checking broke the
+    // second. Closing this needs a mechanism, not an edit — see
+    // `docs/planning/test-path-retrofit.md` Part C.
     //
     // auth+session Part B smoke test (selftest): bind the *same* fs endpoint a second
     // time as a **subtree** scoped to `/system` at `/subtreetest`, so a later lookup of

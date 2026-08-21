@@ -5,7 +5,7 @@
 complete, 2026-07-21). Every stage below is exercised on each CI run by
 `cargo xtask test-qemu` (headless, adjudicated by `isa-debug-exit`) and
 `cargo xtask test-interactive` (expect-driven over the serial console).
-Verified against source 2026-08-11 (the display arm's position in § 5 changed that day).
+Verified against source 2026-08-21, when the filesystem checks moved out of `init` (the display arm's position in § 5 changed that day).
 
 ## Overview
 
@@ -185,9 +185,23 @@ than an implementation detail.
    first only because they were initramfs-resident.
 5. **Hand off** to `service-mgr` and stay resident as supervisor.
 
-Under the `selftest` / `test-harness` builds init additionally runs the filesystem demo
-chain (large-file read, overwrite, grow, create, subtree bind) between steps 2 and 3, and
-the harness verdict gates the handoff to the login chain.
+Under the `selftest` / `test-harness` builds init additionally runs the **demo chain**
+(`run_test_harness`) after step 5 and before handing off, and a non-zero exit fails the run
+there. It also spawns the display self-test and the graphical test clients. Those are the
+last things in this file that a release build does not do — retrofit Part C2 turns them into
+service declarations.
+
+**The filesystem checks are no longer init's** (retrofit Part C1, 2026-08-21): the large-file
+read, overwrite, grow, create and subtree-bind checks moved to `boot-probe`, a declared
+service `service-mgr` starts, so they run *after* the step-5 handoff rather than between
+steps 2 and 3. They also gate the boot verdict now, which they never did here — every failure
+path in init was a bare `return` after a `FAIL` print. `init` keeps one thing they need: the
+`/subtreetest` binding in `mount_one`, which cannot become declaration data because nothing
+in a declaration can express a namespace bind.
+
+**Who fires the verdict** is `boot-probe`, not init; init only ever fires FAIL, for a
+critical-path boot failure or a crashed demo chain. See
+[`qemu-integration-tests.md`](../conventions/qemu-integration-tests.md).
 
 ## 6. service-mgr → session-mgr → login
 

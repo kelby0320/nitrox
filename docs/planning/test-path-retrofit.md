@@ -1,10 +1,11 @@
 # Nitrox Test-Path Retrofit — Subproject Plan
 
-**Status:** 🚧 in progress. Planned 2026-08-21; **Parts A, B and the first half of C landed
-the same day** —
+**Status:** 🚧 in progress. Planned 2026-08-21. **Parts A and B are complete and C1 has
+landed**; C2 and Part D are not started. Landed the same day:
 `parse_all` and the schema change under it, `boot-probe` started from a declaration,
-`service-mgr` holding more than one service, and `session-mgr` down to **zero** test cfgs
-with the verdict and the substrate gates moved out of it. Parts C and D are not started. Sits between Milestone 6 and Milestone 7 of
+`service-mgr` holding more than one service, `session-mgr` down to **zero** test cfgs with the
+verdict and the substrate gates moved out of it, and the five filesystem tests out of PID 1 —
+which turned up a kernel lock-order violation in `AddressSpace::drop`. Sits between Milestone 6 and Milestone 7 of
 the [display arm](display-arm-plan.md), and is a **prerequisite for M7** — not because M7
 needs it to function, but because M7 adds three processes to the set that would otherwise
 grow test paths of their own.
@@ -268,13 +269,20 @@ ordering box below real rather than theoretical.
       **Found by `check-terminal`, not `test-qemu`**, for the reason Part B recorded: the probe
       writes the verdict, so under `test-qemu` the machine stops before it can exit.
 
-- [ ] **`init` still has one `selftest` cfg, and closing it needs a mechanism.** The
-      `/subtreetest` binding cannot move: `[handles].namespace` is unparsed and a declared
-      service is spawned with `namespace: 0`, an inherited LOOKUP-only root — so "data, not
-      code" has no way to express a namespace bind. Two things need it: `boot-probe`'s
+- [ ] **The `/subtreetest` binding is the one cfg C1 could not remove, and closing it needs a
+      mechanism rather than an edit.** `[handles].namespace` is unparsed and a declared service
+      is spawned with `namespace: 0`, an inherited LOOKUP-only root — so "data, not code" has
+      no way to express a namespace bind. Two things need it: `boot-probe`'s
       `subtree_bind_test`, and the demo harness's case 8, which needs a binding that is *also*
       an openable directory to prove `move` refuses to recurse through a mount. Removing it
       without checking broke the second one.
+
+      **`init` still has 20 `selftest` cfgs**, and they are C2's, not this one's: the demo
+      chain (`run_test_harness`), the four `run_*` graphical spawns, and the
+      `cfg(not(selftest))` supervision of `service-mgr` — ordinary code that becomes service
+      declarations. An earlier draft of this box said `init` had "one cfg left", which would
+      have scoped C2 to a namespace-bind mechanism and nothing else (PR #228 review,
+      finding 2).
 
 - [ ] **The graphical spawns leave too.** `run_nxterm`, `run_ui_testclient`,
       `run_input_testclient`, `run_display_selftest` are declarations after Part A. This is also
