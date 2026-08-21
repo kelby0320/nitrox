@@ -17109,3 +17109,48 @@ the verdict first, so the control-channel shutdown path had shipped untested sin
 And the probe exits microseconds after starting while the verdict lands ~0.1 s later, which is
 what makes Part B's deferred "the verdict must be last" box concrete rather than theoretical:
 twenty million spin iterations in the probe were enough for the boot to finish first.
+
+## 2026-08-21 — Removing a substitution means sweeping what claims it exists
+
+PR #227 review, finding 1, recorded because the failure is the retrofit's own: Part B deleted
+`session-mgr`'s test-harness substitution and left **four current-behaviour rule files** stating
+it was still there — including the root `CLAUDE.md` paragraph a fresh session reads before
+touching the subsystem, and `session-mgr/CLAUDE.md`'s § Forbidden.
+
+The scenario the reviewer named is the one that matters: the next session reads `CLAUDE.md`,
+believes the login path is compiled out under `test-harness`, and either adds a
+`#[cfg(feature = "test-harness")]` shortcut ("that is how this service already works") or skips
+`test-interactive` on the grounds that `test-qemu` covers login. Both reintroduce exactly what
+Part B removed — **and the counter that says so, "zero cfg sites", would still read zero at the
+moment the first one goes back in.**
+
+**So the counter was made a wall.** `session-mgr` no longer *declares* `selftest` or
+`test-harness`, and `xtask` no longer passes them — nothing in the crate had read either since
+the verdict left. A test-only branch now fails to compile there rather than compiling on the
+first try, which is the difference between a property and a habit. `session-mgr/CLAUDE.md`
+§ Forbidden says so and says why, since the file is what a session reads first.
+
+**Two further stale claims were found by sweeping rather than by the review**, which is the
+point of sweeping: a resolved-item row in `deferred-decisions.md` still explained
+`test-interactive`'s existence by the auto-login, and `test-path-retrofit.md` block-quoted a doc
+comment that Part B had just rewritten. The quote is kept and marked as the pre-Part-B wording;
+quoting a live source without saying *when* is a stale claim waiting to happen.
+
+**One row was wrong before this change and is corrected by it**, because this is the change that
+moves the thing: `qemu-integration-tests.md` said PASS was fired by `init` after `parent` reaps.
+`init` has no `test_exit(true)` call and only ever fires FAIL — PASS was `session-mgr`'s, and is
+now `boot-probe`'s.
+
+**A general point about `isa-debug-exit` came out of the same review** and is now in that
+convention doc: a gate that boots **without** the device sees the guest keep running past the
+verdict, and can therefore assert things the adjudicated run structurally cannot. That is why
+`check_service_attribution` lives on `check-terminal` — under `test-qemu` the probe's verdict
+terminates the machine before its exit can be attributed — and it is the reason
+`TODO(child-exit-attribution)`'s reproduction recipe now names `check-terminal` too.
+
+**Also recorded: `check_login_chain` asserts an ordering that is not causal.** `service-mgr`
+queues session-mgr's handoffs before starting any declared service, but session-mgr must still
+be *scheduled* to print its line before `boot-probe` fires PASS and stops the machine. The margin
+was measured rather than assumed — six lines and one ELF materialisation — and the function says
+what to check first if it ever goes red on a healthy boot, plus the weaker causal alternative
+(`service-mgr: login chain up`) and what that alternative gives up.

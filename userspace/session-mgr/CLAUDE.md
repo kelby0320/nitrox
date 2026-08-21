@@ -19,6 +19,9 @@ shell, **tear the session down, prompt again**. It was a single pass before, so 
 `exit` parked the supervisor forever and left a machine with no prompt and no way back
 short of a reboot.
 
+**One login path, in every build** (2026-08-21). `login()`, `tty_open` and the `tty_*`
+helpers are unconditional; the file has no build-mode `cfg` at all.
+
 Three things the loop has to get right, all of which only matter once it *is* a loop:
 
 - **Close the session namespace after the shell is reaped.** That drops the last reference
@@ -26,8 +29,9 @@ Three things the loop has to get right, all of which only matter once it *is* a 
   per logout is invisible while there is exactly one login per boot.
 - **The long-lived endpoints are not per-session.** The fs, profile and auth endpoints are
   received once at startup and must survive every session; only the namespace is per-login.
-- **One verdict per boot.** Under `test-harness` the loop must not reach a second
-  iteration — the verdict fires and the run ends there.
+- **The loop is supposed to iterate, and no build stops it.** It used to end at the first
+  iteration under `test-harness`, because the verdict fired there. `session-mgr` writes no
+  verdict now — see below.
 
 A denied login **re-prompts** rather than locking out: a serial console has no second way
 in, so a lockout bricks the machine. The pause before re-prompting is what keeps repeated
@@ -61,9 +65,11 @@ is the 2026-07-31 `logging-service` bug, found from a hung shell three subsystem
 - **Never trust or store a password.** It forwards the console-entered password to
   auth-service once (over the auth channel) and does not keep it; the DB + hashing are
   auth-service's, never session-mgr's.
-- **The demo credential is a throwaway test fixture** (Part D), gated by matching the
-  xtask-seeded `DEMO_USER`/`DEMO_PASSWORD`. Part E reads the credential from the
-  console; do not grow the hardcoded path.
+- **There is no hardcoded credential**, and re-adding one is the specific regression this
+  crate is watched for. `DEMO_USER`/`DEMO_PASSWORD` existed for a `test-harness` auto-login
+  and are gone (2026-08-21); the credential a session authenticates comes from the console.
+  The demo credential still exists as an xtask-seeded **fixture** in `/system/users`, which is
+  data — `cargo xtask test-interactive` types it at a real prompt.
 
 ## Boot handoff
 
@@ -97,5 +103,12 @@ programs reachable** — that hands a session the boot image instead of a profil
 
 - Storing or logging a password.
 - Holding more than `BIND_NAMESPACE`; granting a user shell any syscaps.
-- Investing in the throwaway demo/login path (the real shell + login are Phase 4 /
-  Part E).
+- **Any `#[cfg(feature = "test-harness")]` or `#[cfg(feature = "selftest")]` in this crate.**
+  It has zero, the crate no longer declares either feature, and `xtask` no longer passes one —
+  so a test-only branch does not compile here, by construction rather than by discipline.
+  That is deliberate: `session-mgr` is where this project's worst instance of test/ship
+  divergence lived. Under `test-harness` it auto-logged-in, ran a fixed `-c` script, and
+  compiled out the interactive `login()` and the entire `tty_*` layer — so the gate that
+  adjudicated the whole boot proved that a string comparison worked. See
+  `docs/planning/test-path-retrofit.md`, and if you need a deterministic login, add a step to
+  `test-interactive` instead.

@@ -63,15 +63,20 @@ from QEMU's exit code: the guest writes a verdict to the `isa-debug-exit` device
 (init on success, the kernel panic handler on failure), a hang is caught by a
 wall-clock timeout. See `docs/conventions/qemu-integration-tests.md`.
 
-`cargo xtask test-interactive` is the one gate that boots the **release image**, and the
-distinction matters more than it looks: under `test-harness`, `session-mgr` auto-logs-in and
-runs a fixed script, so the `login:` prompt, the typed password, the real shell prompt and the
-whole `tty_*` layer are `#[cfg(not(feature = "test-harness"))]` code that CI compiles and never
-runs. This gate types at the real prompt over the serial console and matches on what comes
-back — 71 expectations, expect-driven rather than sleep-driven. **Prefer this shape for
-anything user-facing**: a service should behave in a test image the way it behaves in a
-release one, and where it does not today, `docs/planning/test-path-retrofit.md` is the plan
-that removes the difference.
+`cargo xtask test-interactive` is the one gate that boots the **release image**. It types at
+the real prompt over the serial console and matches on what comes back — 78 expectations across
+25 steps, expect-driven rather than sleep-driven.
+
+**Why it exists, in the past tense since 2026-08-21.** `session-mgr` used to auto-log-in and run
+a fixed script under `test-harness`, so the `login:` prompt, the typed password, the real shell
+prompt and the whole `tty_*` layer were `#[cfg(not(feature = "test-harness"))]` code that CI
+compiled and never ran. Retrofit Part B deleted that: `session-mgr` has **one** `login()` in
+every build and zero test cfgs, and its login proof lives here as steps 5a–5c.
+
+**Prefer this shape for anything user-facing**: a service should behave in a test image the way
+it behaves in a release one. `init` is the one that still does not —
+`docs/planning/test-path-retrofit.md` Part C is the plan that finishes it, and until then the
+test image differs from the release image by more than a service declaration.
 
 `cargo xtask check-terminal` is the **compositor-to-shell round trip** — a click that raises
 `nxterm`, keys travelling to `nxsh` and echoing back into the grid, and the shell's answer

@@ -6,13 +6,18 @@
 //! which it composes each login's per-user namespace. See
 //! `docs/architecture/session-and-auth.md`.
 //!
-//! **Part D (this file):** the plumbing is proven end to end — receive the handed-over
-//! endpoints, authenticate the demo user against auth-service over the auth channel
-//! (the first real exercise of the credential stack under spawning), and construct a
-//! session namespace binding the user's `/home` as a subtree of the fs-server (proving
-//! `BIND_NAMESPACE` + subtree scoping + shared registration). **Part E** replaces the
-//! hardcoded round-trip with an interactive `login:` prompt and spawns the user shell
-//! into the constructed namespace.
+//! **What it does:** receive the handed-over endpoints, prompt for a credential on a
+//! terminal it opens, authenticate it against auth-service over the auth channel, construct
+//! a session namespace binding the user's `/home` as a subtree of the fs-server
+//! (`BIND_NAMESPACE` + subtree scoping + shared registration), spawn the user shell into it,
+//! reap it, tear the session down, and prompt again.
+//!
+//! **One login path, in every build.** This file has no build-mode `cfg` and the crate
+//! declares no features. It used to auto-log-in a hardcoded credential under `test-harness`
+//! and run a fixed `-c` script, with the interactive `login()` and the whole `tty_*` layer
+//! compiled out — so the gate that adjudicated the boot proved a string comparison worked.
+//! Removed 2026-08-21; `cargo xtask test-interactive` types at the real prompt instead. See
+//! `docs/planning/test-path-retrofit.md`, and `userspace/session-mgr/CLAUDE.md` § Forbidden.
 //!
 //! `#![no_std]` + `#![no_main]`, **with `alloc`**. The no-`alloc` rule was lifted on
 //! 2026-07-31 because session-mgr hands each session its environment, and every step of
@@ -751,7 +756,6 @@ fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Op
 /// One tty per session. It serves the login prompt first, is then bound into the session's
 /// namespace for the shell, and is closed when the session ends — the terminal belongs to
 /// the session, not to session-mgr.
-
 fn tty_open(root_ns: u64) -> u64 {
     let (st, ch) = ns_lookup(root_ns, b"/dev/tty", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER);
     if st != 0 { 0 } else { ch }
@@ -759,7 +763,6 @@ fn tty_open(root_ns: u64) -> u64 {
 
 /// Send one tty request and wait for its reply. Returns the reply body length written into
 /// `out` (`0` for the acknowledgement-only ops), or `None` on any failure.
-
 fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     // SAFETY: SEND_MSG is a valid buffer; the rsproto message goes at offset 24.
     let sent = unsafe {
@@ -811,7 +814,6 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// Write `text` to the terminal. Output through a handle the process *holds* — not the
 /// ambient debug syscall every program used to print with.
-
 fn tty_write(ch: u64, text: &[u8]) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
@@ -822,7 +824,6 @@ fn tty_write(ch: u64, text: &[u8]) {
 /// **This is why the tty server exists.** It was a `bool` every caller of `read_line` had
 /// to remember to pass, so reading a password safely depended on each of them getting it
 /// right. Now it is the server's state and a client cannot forget it.
-
 fn tty_set_echo(ch: u64, on: bool) {
     let flags = [if on { librsproto::TTY_MODE_ECHO } else { 0 }];
     let mut scratch = [0u8; 1];
@@ -831,7 +832,6 @@ fn tty_set_echo(ch: u64, on: bool) {
 
 /// Read one edited line. The line discipline — backspace, kill, echo — is the server's,
 /// so this is a request rather than a byte loop.
-
 fn tty_read_line(ch: u64, out: &mut [u8]) -> usize {
     tty_request(ch, librsproto::OP_TTY_READ_LINE, &[], out).unwrap_or(0)
 }
@@ -841,7 +841,6 @@ fn tty_read_line(ch: u64, out: &mut [u8]) -> usize {
 /// **Revocation, not release.** Handles are refcounted and this kernel has none, so closing
 /// cannot take a tty back from a process that outlived the session. The server declining to
 /// serve the channel is what makes teardown a guarantee.
-
 fn tty_close(ch: u64) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_CLOSE, &[], &mut scratch);

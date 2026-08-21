@@ -80,8 +80,9 @@ verdict happens to live.
 
 `cargo xtask test-interactive` boots `BuildMode::Normal` — the **release image** — and drives a
 real login over the serial console: wrong password refused, right password accepted, a shell
-prompt, a program from `/bin`, `Ctrl-C`, `exit N`. 71 expectations, expect-driven rather than
-sleep-driven, and it runs in CI. Its own doc comment already makes this plan's argument:
+prompt, a program from `/bin`, `Ctrl-C`, `exit N`. Expect-driven rather than sleep-driven, and
+it runs in CI. Its doc comment made this plan's argument, in the words it carried **before Part
+B** (it is past tense there now, and the counts have grown — 78 expectations across 25 steps):
 
 > `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a fixed
 > script; the `login:` prompt, a typed password, a real shell prompt and `exit` are all

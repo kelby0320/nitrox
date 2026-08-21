@@ -357,8 +357,16 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, control: u64, _arg0: u64) ->
     let _ = control;
     let ok = sched_gate(root_ns) && fp_gate();
     verdict(ok);
-    // Reached only where the verdict device is absent. The exit code is what `service-mgr`
-    // reports and what `test-qemu`'s transcript assertion pins, so it tracks the gates.
+    // **Reached only where the verdict device is absent** — every gate except `test-qemu`
+    // boots this image without `isa-debug-exit`, so `SYS_TEST_EXIT` returns `Unsupported` and
+    // execution continues here. Naming `test-qemu` on this line would name the one gate that
+    // is not running when it is reached.
+    //
+    // The exit code tracks the gates, and `service-mgr` reports it. `check-terminal`'s
+    // `check_service_attribution` requires `code=0`, so a `sched_gate` or `fp_gate` regression
+    // fails **that** gate — with a message about attribution, since that is what it asserts.
+    // The `boot-probe: … FAIL` line naming the real cause is directly above it in the same
+    // transcript.
     exit(if ok { 0 } else { 1 });
 }
 

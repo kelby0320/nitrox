@@ -49,12 +49,23 @@ a particular keystroke. See the decision log, 2026-08-13.
 
 | Situation | Verdict | Fired by |
 |---|---|---|
-| Demo chain reaps cleanly | PASS (`0x10` → exit **33**) | `init` (`test_exit`) after `parent` reaps with code 0 |
-| A demo child crashes | FAIL (`0x11` → exit **35**) | `init`, on the non-zero reap code |
+| The substrate gates pass | PASS (`0x10` → exit **33**) | **`boot-probe`**, after `sched_gate` + `fp_gate` |
+| A substrate gate fails | FAIL (`0x11` → exit **35**) | `boot-probe`, same call |
+| A demo child crashes | FAIL | `init`, on the non-zero reap code |
 | Spawn / critical-path boot failure | FAIL | `init` (`supervise` spawn-fail; `emergency`) |
 | Kernel `panic!` | FAIL | the kernel panic handler (`main.rs`) |
 | Kernel triple-fault | (nonzero) | QEMU itself, via `-no-reboot` |
-| Hang (no verdict) | timeout → FAIL | the `timeout(1)` wrapper (90 s) |
+| Hang (no verdict) | timeout → FAIL | the runner's wall-clock timeout |
+
+**PASS moved to `boot-probe` on 2026-08-21** (retrofit Part B); before that it was
+`session-mgr`, after its auto-login proved. The row above said `init` fired it, which had not
+been true for longer than that — `init` has no `test_exit(true)` call and only ever fires FAIL.
+
+**The ordering is `init::supervise`'s, and it is what makes the gates mean anything.** The demo
+chain runs synchronously and a non-zero exit fails the run there; only then is the login chain
+handed off, and only then does `service-mgr` start `boot-probe`. So the gates run last, which is
+the property `fp_gate` needs — it completed in 2 of 15 KVM runs when it lived in the demo
+`parent`, because whoever owns the verdict races the demo chain.
 
 The runner treats exit **33** as the only pass; everything else (35, 124 timeout,
 triple-fault, signal) is a failure. `isa-debug-exit` can never produce exit `0`
@@ -66,12 +77,26 @@ A verdict is one bit, and some defects do not reach it. `test-qemu` therefore al
 against the **captured serial transcript** after a PASS, and a transcript check failing fails
 the run.
 
-The first of these is `check_service_attribution`, and the reason it exists is the general
-one: `service-mgr` supervises two children in a test image, and a supervisor that mixes their
-exits up restarts a service that never stopped — while every child still exits 0 and the guest
-still reports PASS. It was run that way deliberately to confirm it. Requiring
-`service-mgr: 'boot-probe' exited` and forbidding `service-mgr: restarting 'heartbeat'`
-distinguishes them.
+`test-qemu` has one: **`check_login_chain`**, requiring
+`session-mgr: received fs + profile endpoints + auth channel`. It replaces a `verdict(false)`
+`session-mgr` used to fire when its endpoint handoff failed — a session supervisor adjudicating
+a test run — and without it a broken login chain reaches PASS, because nothing else in
+`test-qemu` reads it. It asserts the chain came *up*, not that anyone logged in: nothing types
+a password here.
+
+**`check-terminal` has the other: `check_service_attribution`**, and *why it is there* is the
+useful part. `service-mgr` supervises two children in a test image, and a supervisor that mixes
+their exits up restarts a service that never stopped — while every child still exits 0 and the
+guest still reports PASS. It was run that way deliberately to confirm it. But once `boot-probe`
+became the verdict-writer, its last act terminates the machine, so under `test-qemu` nothing
+ever sees it exit. `check-terminal` boots the **same image without the `isa-debug-exit`
+device**: the verdict write returns `Unsupported`, the probe reaches `exit(0)`, and the exit is
+attributed like any other service's. Requiring `service-mgr: 'boot-probe' exited code=0` and
+forbidding `service-mgr: restarting 'heartbeat'` distinguishes them.
+
+That relocation is a general point about this device: **a gate that boots without
+`isa-debug-exit` sees the guest keep running past the verdict**, and can therefore assert things
+the adjudicated run structurally cannot.
 
 **When to add one:** the behaviour is observable on the console, and a wrong version of it
 would still reach the same verdict. If a defect *would* change the exit code, the exit code is

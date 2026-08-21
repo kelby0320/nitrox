@@ -71,8 +71,11 @@ enum BuildMode {
 }
 
 impl BuildMode {
-    /// The cargo `--features` value for the **userspace** builds `init` and `session-mgr`
-    /// (`None` = no flag).
+    /// The cargo `--features` value for the **userspace** build of `init` (`None` = no flag).
+    ///
+    /// `init` is the only userspace crate that takes it. `session-mgr` did until the retrofit
+    /// moved the boot verdict out of it (Part B); `nxterm` takes `test-harness` alone, which
+    /// is a different value and is passed separately.
     fn features(self) -> Option<&'static str> {
         match self {
             BuildMode::Normal => None,
@@ -97,10 +100,10 @@ impl BuildMode {
     /// The same, for the **kernel**, which has one feature userspace does not.
     ///
     /// Split rather than appended to [`features`](Self::features) because that value also
-    /// reaches `init` and `session-mgr`, and `no-ps2-irq` is a statement about the i8042 that
-    /// has no meaning in a userspace crate. Declaring it there as a no-op — the way
-    /// `session-mgr` declares `selftest` — would make `--features` valid at the cost of
-    /// putting a hardware setting in two crates that cannot act on it.
+    /// reaches `init`, and `no-ps2-irq` is a statement about the i8042 that has no meaning in
+    /// a userspace crate. Declaring it there as a no-op would make `--features` valid at the
+    /// cost of putting a hardware setting in a crate that cannot act on it — the same trade
+    /// `session-mgr` used to make with `selftest`, and the reason its features are gone.
     fn kernel_features(self) -> Option<&'static str> {
         match self {
             BuildMode::TestHarnessNoPs2Irq => Some("test-harness,no-ps2-irq"),
@@ -344,14 +347,17 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     build_userspace_bin("input-server", None)?;
     build_userspace_bin("logging-service", None)?;
     build_userspace_bin("auth-service", None)?;
-    // session-mgr fires the self-test verdict, so it takes the build-mode feature
-    // (`selftest`/`test-harness`) like init.
-    build_userspace_bin("session-mgr", mode.features())?;
+    // **`None`, and that is the point.** `session-mgr` took `mode.features()` because it
+    // fired the self-test verdict; the retrofit moved the verdict to `boot-probe` and left
+    // the crate with no reader for either feature. Passing one anyway would make the next
+    // test-only branch compile on the first try, which is how the thing Part B removed comes
+    // back — the zero should be a wall, not a count.
+    build_userspace_bin("session-mgr", None)?;
     build_userspace_bin("compositor", None)?;
     // The GUI terminal (M5 Part B). A lib/bin split like `tty-server`: the state, the view and
     // the update are host-tested, the bin is the window and the event pump.
-    // **`test-harness` only**, not `mode.features()` — which is what `init` and `session-mgr`
-    // take, and would hand this `selftest` as well. The feature makes the terminal report each
+    // **`test-harness` only**, not `mode.features()` — which is what `init` takes, and would
+    // hand this `selftest` as well. The feature makes the terminal report each
     // completed grid line on the debug console for `check-terminal` to assert on; a real build
     // must not have it, because a terminal narrating itself to the kernel log undoes the point
     // of the tty server owning output. A first version passed it unconditionally, so every
@@ -657,12 +663,19 @@ fn cmd_qemu(debug: bool, mode: BuildMode, accel: Accel, extra_args: &[String]) -
 /// **Interactive-session tests: drive the real login and shell over the serial console.**
 ///
 /// This boots `BuildMode::Normal` — the **release image**, which nothing else ever boots.
-/// `test-qemu` runs the `test-harness` build, where session-mgr auto-logs-in and runs a
-/// fixed script; the `login:` prompt, a typed password, a real shell prompt and `exit` are
-/// all `#[cfg(not(feature = "test-harness"))]` code that CI compiled and never executed.
-/// Every interactive bug this project has had lived exactly there — the console read using
-/// the wrong rights, a `cd` guard refusing a builtin that existed, a login that could not
-/// be repeated, a password prompt landing on the username's line.
+///
+/// **Why it exists**, in the past tense since 2026-08-21: `session-mgr` used to auto-log-in
+/// and run a fixed script under `test-harness`, so the `login:` prompt, a typed password, a
+/// real shell prompt and `exit` were all `#[cfg(not(feature = "test-harness"))]` code that CI
+/// compiled and never executed. Every interactive bug this project has had lived exactly
+/// there — the console read using the wrong rights, a `cd` guard refusing a builtin that
+/// existed, a login that could not be repeated, a password prompt landing on the username's
+/// line. Retrofit Part B deleted that substitution: `session-mgr` now has one `login()` in
+/// every build, and this gate is what exercises it.
+///
+/// It still boots the only release image any gate boots, and that is still the point — the
+/// `test-harness` image differs by a service declaration and by `init`'s remaining cfgs
+/// (retrofit Part C), so "the same code" is a claim this gate is the only one able to test.
 ///
 /// **Expect-driven, not sleep-driven.** Each step waits for the text that says the guest is
 /// ready for it, so the run is paced by the guest rather than by guessed delays. That is
@@ -1514,10 +1527,15 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
 fn check_service_attribution(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
     if !text.contains("service-mgr: 'boot-probe' exited code=0") {
+        // Three different faults reach this line, so the message names all three rather
+        // than the one that prompted the assertion.
         return Err("service-mgr did not attribute boot-probe's exit with its status \
-             (expected \"service-mgr: 'boot-probe' exited code=0\" in the transcript; \
+             (expected \"service-mgr: 'boot-probe' exited code=0\"). Check the transcript for \
+             which it is: a \"boot-probe: … FAIL\" line means a gate failed and the probe \
+             exited 1 — that is the real fault and this assertion is only how it surfaced; \
              \"code=unknown\" means the death was detected without a matching notification, \
-             which is what an early control-handle close looks like)"
+             which is what an early control-handle close looks like; and no \"boot-probe\" \
+             line at all means it never ran."
             .into());
     }
     // And nothing else was blamed for it. `heartbeat` is `policy = always`, so a
@@ -2751,6 +2769,21 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
 /// It does **not** assert that anyone logged in: nothing types a password here, and after
 /// Part B nothing auto-logs-in either. Whether a real login works is
 /// `cargo xtask test-interactive`'s question, on the release image.
+///
+/// **It depends on an ordering that is not causal, which is worth naming rather than
+/// discovering.** `service-mgr` queues session-mgr's four handoffs before `supervise` starts
+/// any declared service, so the *send* is ordered — but session-mgr still has to be scheduled
+/// to print this line before `boot-probe`, spawned afterwards, fires PASS and terminates the
+/// machine. If that ever inverts, a healthy boot fails here, which is the expensive kind of
+/// red.
+///
+/// The margin is large and was measured rather than assumed: session-mgr's line lands **six
+/// lines and one ELF materialisation** before `service-mgr: starting service 'heartbeat'`, and
+/// `boot-probe` starts after that — session-mgr has four queued receives to do while
+/// `service-mgr` resolves and spawns two programs. If this ever goes red on a boot that looks
+/// healthy, check that ordering first, and consider asserting on
+/// `service-mgr: login chain up` instead: that line *is* causally before `boot-probe`, at the
+/// cost of proving only that the handoffs were sent, not that they arrived.
 fn check_login_chain(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
     if !text.contains("session-mgr: received fs + profile endpoints + auth channel") {
