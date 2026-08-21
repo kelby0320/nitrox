@@ -1,11 +1,11 @@
 # Service Manager (`service-mgr`)
 
 **Status:** Implemented (Phase 3) — `userspace/service-mgr`, spawned by `init`, supervising
-the service set and performing supervisor-side namespace binding. Verified 2026-08-05.
+the service set and performing supervisor-side namespace binding. Verified 2026-08-05; last
+checked 2026-08-21, when it learned to hold **more than one** service and a stale
+"pre-implementation" line below was removed.
 
-Design doc for `service-mgr`, the userspace process supervisor. Status:
-**pre-implementation** — this is the design; the crate does not exist yet. It is
-the first entry in the Phase 3 service backlog.
+Design doc for `service-mgr`, the userspace process supervisor.
 
 ## What it is
 
@@ -75,6 +75,25 @@ boundary is:
   or must exist before service-mgr does. Non-declarative, must-never-crash, backstop.
 - **service-mgr = the policy-driven service ecosystem** — everything expressible as a
   declaration and supervised.
+
+### Several services, and how their exits are told apart
+
+`service-mgr` supervises every declaration in `/initramfs/etc/services.toml`, up to
+`MAX_SERVICES`, and applies each one's own restart policy. It says which declarations it
+dropped rather than truncating silently.
+
+**Which child exited is decided by the child's control channel, not by the notification.**
+`KIND_CHILD_EXITED` names a child by **pid**, and nothing maps a process handle to a pid —
+so a supervisor with two children would learn *that* one exited and never *which*
+(`TODO(child-exit-attribution)` in [deferred-decisions](../rationale/deferred-decisions.md)).
+Each service instead gets its own control channel; when the child dies its end is destroyed,
+the kernel signals the survivor on the same path `sys_wait` uses, and a non-blocking
+`sys_channel_recv` on the handle that woke answers `PeerClosed` rather than `WouldBlock`. A
+handle cannot be recycled under its holder the way a pid can, so this is exact.
+
+The exit **code** is still taken from the notification queue in arrival order, since it
+arrives beside a pid that cannot be matched. One exit per wake — every case the system
+produces — pairs correctly; the residual is in the deferral entry.
 
 **Litmus test:** *could this be written as a `service.toml` and supervised?* → it is
 service-mgr's. *Does it require being the kernel's first process / the reparent target

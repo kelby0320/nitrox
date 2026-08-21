@@ -60,6 +60,23 @@ The runner treats exit **33** as the only pass; everything else (35, 124 timeout
 triple-fault, signal) is a failure. `isa-debug-exit` can never produce exit `0`
 (the low bit is always set), so "pass" is a chosen odd code, not zero.
 
+### The exit code is not the only assertion
+
+A verdict is one bit, and some defects do not reach it. `test-qemu` therefore also matches
+against the **captured serial transcript** after a PASS, and a transcript check failing fails
+the run.
+
+The first of these is `check_service_attribution`, and the reason it exists is the general
+one: `service-mgr` supervises two children in a test image, and a supervisor that mixes their
+exits up restarts a service that never stopped — while every child still exits 0 and the guest
+still reports PASS. It was run that way deliberately to confirm it. Requiring
+`service-mgr: 'boot-probe' exited` and forbidding `service-mgr: restarting 'heartbeat'`
+distinguishes them.
+
+**When to add one:** the behaviour is observable on the console, and a wrong version of it
+would still reach the same verdict. If a defect *would* change the exit code, the exit code is
+the better assertion — a transcript match is coupled to log wording, which is a cost.
+
 ## The `test-harness` feature
 
 `test-qemu` builds the kernel and `init` with the **`test-harness`** cargo feature

@@ -48,3 +48,7 @@ path = "src/uiclient.rs"
 [[bin]]
 name = "input-testclient"
 path = "src/inputclient.rs"
+
+[[bin]]
+name = "boot-probe"
+path = "src/bootprobe.rs"

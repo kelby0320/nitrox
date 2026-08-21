@@ -29,13 +29,20 @@ pub const KIND_ILLEGAL_INSN: u32 = 0x0101;
 pub const KIND_DIVIDE_BY_ZERO: u32 = 0x0102;
 /// Hardware exception: stack overflow.
 pub const KIND_STACK_OVERFLOW: u32 = 0x0103;
-/// Process lifecycle: a child process exited. **Discriminant reserved; no
-/// producer until process spawn + real exit land.**
+/// Process lifecycle: a child process exited. Carries the child's **pid** and its
+/// exit status; the pid is not matchable to a process handle, which is why a
+/// supervisor with several children discriminates on their control channels
+/// instead — see `TODO(child-exit-attribution)`.
 pub const KIND_CHILD_EXITED: u32 = 0x0200;
-/// Process lifecycle: an IPC peer closed. **Discriminant reserved; no producer
-/// until IPC lands.**
+/// Process lifecycle: an IPC peer closed.
+///
+/// **Declared, specified, and never emitted.** `notification-format.md` gives it a
+/// body (`PeerClosed { handle }`), and nothing in the kernel constructs one: a dead
+/// peer is observed instead by `sys_channel_recv` answering
+/// [`PeerClosed`](crate::syscall::error::KError::PeerClosed), and a waiter is woken
+/// for it by `sched::ipc_endpoint_closing`. Kept because that is the discriminant a
+/// producer would use, and removing it would renumber the ABI for nothing.
 pub const KIND_PEER_CLOSED: u32 = 0x0201;
-/// Resource: a handle was invalidated.
 /// `TerminateRequested {}` — a holder of this process's handle has **asked it to
 /// exit** (§11h).
 ///

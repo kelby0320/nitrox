@@ -305,8 +305,14 @@ const SYSTEM_SERVICES: &[&str] = &[
 /// this OS is made of" rather than "those, plus whatever the test build needed". It also
 /// keeps the system package's content hash identical between a release and a test image,
 /// which is the property a content-addressed path is supposed to have.
-const TEST_PROGRAMS: &[&str] =
-    &["test-harness", "test-stage", "display-selftest", "ui-testclient", "input-testclient"];
+const TEST_PROGRAMS: &[&str] = &[
+    "test-harness",
+    "test-stage",
+    "display-selftest",
+    "ui-testclient",
+    "input-testclient",
+    "boot-probe",
+];
 
 fn cmd_build(mode: BuildMode) -> R<()> {
     // Build the userspace programs BEFORE the kernel: the kernel embeds their
@@ -317,7 +323,7 @@ fn cmd_build(mode: BuildMode) -> R<()> {
     // `display-selftest`) is built
     // + embedded ONLY in selftest/test-harness builds — absent from release images.
     if mode.features().is_some() {
-        build_userspace_crate("test-harness", &["test-harness", "test-stage", "display-selftest", "ui-testclient", "input-testclient"], None)?;
+        build_userspace_crate("test-harness", TEST_PROGRAMS, None)?;
     }
     build_userspace_bin("init", mode.features())?;
     build_userspace_bin("fs-server-ext4", None)?;
@@ -2648,6 +2654,8 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
 
     match status.code() {
         Some(code) if code == PASS_EXIT => {
+            let transcript = captured.lock().map(|g| g.clone()).unwrap_or_default();
+            check_service_attribution(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -2656,6 +2664,38 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
         }
         None => Err("qemu terminated by a signal with no exit code".into()),
     }
+}
+
+/// Assert that `service-mgr` told its two children's exits apart.
+///
+/// **The verdict cannot see this.** `boot-probe` exits 0 and `heartbeat` keeps running
+/// either way, so a supervisor that misattributes the exit still reaches
+/// `SYS_TEST_EXIT(PASS)` — proven by running exactly that: replacing the control-channel
+/// attribution with the pid-blind "first running service" rule makes the guest print
+/// `'heartbeat' exited code=0` and `restarting 'heartbeat' (attempt 1 of 3)`, spuriously
+/// starting a second copy while the first is alive, and `test-qemu` still passes.
+///
+/// So the transcript is the assertion. `boot-probe` being a declared service is what gives
+/// `service-mgr` two children at all, and telling them apart needs the control channel
+/// rather than `KIND_CHILD_EXITED`'s pid, which nothing can match to a handle
+/// (`TODO(child-exit-attribution)`). See `docs/planning/test-path-retrofit.md`.
+fn check_service_attribution(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    // The probe ran, and its exit was attributed to **it**.
+    if !text.contains("service-mgr: 'boot-probe' exited") {
+        return Err("service-mgr never attributed boot-probe's exit \
+             (expected \"service-mgr: 'boot-probe' exited\" in the transcript)"
+            .into());
+    }
+    // And nothing else was blamed for it. `heartbeat` is `policy = always`, so a
+    // misattributed exit shows up as a restart of a service that never stopped.
+    if text.contains("service-mgr: restarting 'heartbeat'") {
+        return Err("service-mgr restarted 'heartbeat', which never exited — \
+             boot-probe's exit was misattributed to it"
+            .into());
+    }
+    println!("xtask: service-mgr attributed boot-probe's exit to boot-probe ✓");
+    Ok(())
 }
 
 fn cmd_fetch_limine() -> R<PathBuf> {
@@ -4417,13 +4457,18 @@ mount_point = \"/\"\n\
 mode = \"rw\"\n\
 required_for = \"boot\"\n";
 
-/// A service declaration for the `heartbeat` demo service, read by `service-mgr` from
-/// the initramfs (`/initramfs/etc/services/heartbeat.toml`) in slice A. `executable`
-/// is a path per `docs/spec/service-toml-schema.md`, resolved through service-mgr's
-/// namespace: `/bin/heartbeat` is projected from the content-addressed store by the
-/// profile server (the real userspace path), not the initramfs `/sbin` staging.
-const HEARTBEAT_TOML: &str = "\
-# Nitrox service declaration (service-mgr slice A demo).\n\
+/// The service declarations, read by `service-mgr` from `/initramfs/etc/services.toml`.
+///
+/// **One file, many `[service.<name>]` tables** — the 2026-08-21 change to
+/// `docs/spec/service-toml-schema.md`. It previously said each file declares one service
+/// and the manager scans the directory, and nothing in this system can enumerate a
+/// directory of `.toml` files.
+///
+/// `executable` is a path per the schema, resolved through service-mgr's namespace:
+/// `/bin/heartbeat` is projected from the content-addressed store by the profile server
+/// (the real userspace path), not the initramfs `/sbin` staging.
+const SERVICES_TOML: &str = "\
+# Nitrox service declarations.\n\
 [service.heartbeat]\n\
 executable = \"/bin/heartbeat\"\n\
 description = \"Demo supervised service (slice A)\"\n\
@@ -4434,6 +4479,27 @@ max_attempts = 3\n\
 backoff = \"exponential\"\n\
 backoff_initial = \"200ms\"\n\
 backoff_max = \"2s\"\n";
+
+/// The `boot-probe` declaration, **appended to [`SERVICES_TOML`] in selftest and
+/// test-harness images and absent from a release image**.
+///
+/// This is the retrofit's governing decision 3 made concrete: the test image differs from
+/// the release image *by data*. `init` and `service-mgr` are byte-identical in both; one
+/// of them reads a file with an extra table in it. See
+/// `docs/planning/test-path-retrofit.md`.
+///
+/// `policy = "never"` because the probe runs once and exits — a restart would re-run
+/// checks that have already reported. `/bin/boot-probe` comes from the `test-harness`
+/// store package, which is itself absent from a release image, so the declaration and the
+/// executable appear and disappear together.
+const BOOT_PROBE_TOML: &str = "\
+\n\
+[service.boot-probe]\n\
+executable = \"/bin/boot-probe\"\n\
+description = \"In-guest substrate checks and the boot verdict\"\n\
+\n\
+[service.boot-probe.restart]\n\
+policy = \"never\"\n";
 
 /// Build path for the packed initramfs CPIO archive.
 fn initramfs_path() -> PathBuf {
@@ -4557,7 +4623,13 @@ fn profile_programs() -> Vec<&'static str> {
 fn build_initramfs(out: &Path, mode: BuildMode) -> R<()> {
     let mut buf = Vec::new();
     cpio_entry(&mut buf, 1, "etc/init.toml", INIT_TOML.as_bytes());
-    cpio_entry(&mut buf, 2, "etc/services/heartbeat.toml", HEARTBEAT_TOML.as_bytes());
+    // The declarations file. Its **content** is what differs between a test image and a
+    // release image — see `BOOT_PROBE_TOML`. The programs below do not differ.
+    let mut services = String::from(SERVICES_TOML);
+    if mode.features().is_some() {
+        services.push_str(BOOT_PROBE_TOML);
+    }
+    cpio_entry(&mut buf, 2, "etc/services.toml", services.as_bytes());
     // Pack every program ELF at `sbin/<name>`: the kernel boot-loads `/sbin/init`, and
     // the spawners resolve their children by path (`/initramfs/sbin/<name>`), retiring
     // the kernel-embedded `ImageId` images. Built by `cmd_build` before this runs.

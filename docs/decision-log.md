@@ -16932,3 +16932,73 @@ ids is the trigger for the second endpoint. What stays open regardless: anything
 `desktop-shell` exists?") was answered by Milestone 6 and had not been marked so — the compositor
 has a default origin, a manager seam, and skips the initial-configure hold when no manager is
 attached, which is exactly what lets the greeter draw before a shell exists.
+
+## 2026-08-21 — service declarations: one file, many services; and a supervisor learns to tell its children apart
+
+Test-path retrofit Part A. Two changes, one of them a schema change and one of them a bug the
+plan did not know was there.
+
+**One declarations file with many `[service.<name>]` tables**, replacing
+`service-toml-schema.md`'s "declarations live at `/store/<hash>-system-services/services/*.toml`
+… the service manager scans this directory at startup". **Maintainer's decision**, taken when the
+scan turned out to be unimplementable rather than merely unimplemented: nothing in Nitrox can
+enumerate a directory of `.toml` files. The initramfs is a CPIO archive the kernel looks up **by
+name** (`kernel/src/initramfs.rs`), `sys_ns_enumerate` lists a namespace's *bindings* and says in
+its own doc that it is "not a filesystem `readdir`", and `profile-server` serves `File::ReadDir`
+but projects only each package's `bin/`. Building enumeration to serve the schema was weighed
+against changing the schema, which is pre-stabilization, and lost.
+
+What this buys is the retrofit's governing decision 3, concretely: **the test image differs from
+the release image by data**. `init` and `service-mgr` are byte-identical in both, and one of them
+reads a file carrying an extra `[service.boot-probe]` table.
+
+**The `syscaps`/`[handles]` parser work in Part A was dropped, and the reason it was planned was
+wrong.** The plan said "a probe that reads `/proc/sched/stats` and writes the verdict needs stated
+authority". It needs none: `SYS_TEST_EXIT` is gated by the kernel's own `test-harness` feature and
+no syscap, and `SPAWN_SERVICE` already passes `namespace: 0, syscaps: 0` — the inherited
+LOOKUP-only root namespace every existing test program gets.
+
+---
+
+**No supervisor in this system could tell its children's exits apart.** `KIND_CHILD_EXITED` names
+a child by **pid**; nothing maps a process handle to a pid. `sys_process_spawn` returns a handle,
+`sys_handle_stat`'s `HandleInfo` carries rights / object type / generation / size, there is no pid
+syscall, and `/proc` is exactly `self/status` (the caller's *own*) and `sched/stats` — no per-pid
+tree. `KIND_PEER_CLOSED` is declared in both ABIs and **never emitted**.
+
+Found on contact, not by reading: starting `boot-probe` beside `heartbeat` made the probe's exit
+read as `heartbeat`'s, and `service-mgr` restarted a service that had never stopped. Both
+supervisors already assumed past this — `init`'s `reap_loop` attributes the first `ChildExited` to
+its primary child without comparing the pid, with six or more children — and neither had been
+bitten because only one child was ever *expected* to exit.
+
+**The fix needs no kernel change, which the option chosen for it assumed it would.** The
+maintainer picked "emit `KIND_PEER_CLOSED` and watch the control channel" over two ABI-touching
+alternatives. Implementing it revealed the first half was unnecessary: when a child exits, its
+control-channel end is destroyed, and `sched::ipc_endpoint_closing` already nulls the survivor's
+peer pointer and calls `signal_ipc_endpoint` — the same wake path `sys_wait` uses. So the control
+handles go in the wait set, `sys_wait` returns `IoResult::ready(handle)` naming the one that
+signalled, and a non-blocking `sys_channel_recv` on it answers `PeerClosed` (`-13`) rather than
+`WouldBlock` (`-11`). `KIND_PEER_CLOSED` stays unemitted. **A handle cannot be recycled under its
+holder the way a pid can**, so this is exact where pid matching would not have been.
+
+**Still deferred: the exit *code*.** It arrives beside the unmatched pid, so codes are paired with
+dead services in arrival order — right for one exit per wake, which is every case the system
+produces today; two in the same wake can swap them, which only `on-failure` reads. A service found
+dead with no code queued is treated as a failure, because a crash that outruns its notification is
+the case worth restarting. `TODO(child-exit-attribution)` carries the residual and `init`'s
+untouched copy of the original bug.
+
+---
+
+**`test-qemu` gained its first transcript assertion, because the verdict could not see this.**
+Run with the pid-blind rule in place, the guest restarts a live service and **still exits PASS** —
+`boot-probe` exits 0 and `heartbeat` keeps running either way. So `check_service_attribution`
+matches the captured serial output: `'boot-probe' exited` required, `restarting 'heartbeat'`
+forbidden. Negative-controlled in both directions — the broken version fails the named assertion,
+the fixed version passes it.
+
+The general rule, now in `conventions/qemu-integration-tests.md`: add a transcript assertion when
+the behaviour is observable on the console **and** a wrong version of it would reach the same
+verdict. Where a defect would change the exit code, the exit code is the better assertion, since a
+transcript match is coupled to log wording.

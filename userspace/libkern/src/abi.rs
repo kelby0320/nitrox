@@ -117,12 +117,14 @@ pub const KIND_DIVIDE_BY_ZERO: u32 = 0x0102;
 pub const KIND_STACK_OVERFLOW: u32 = 0x0103;
 /// Process lifecycle: a child process exited.
 pub const KIND_CHILD_EXITED: u32 = 0x0200;
-/// Process lifecycle: an IPC peer closed.
+/// Process lifecycle: an IPC peer closed. **Declared and never emitted** — a dead peer
+/// is observed by `sys_channel_recv` answering `PeerClosed` instead, which is what lets
+/// a supervisor tell its children's exits apart (`TODO(child-exit-attribution)`).
 pub const KIND_PEER_CLOSED: u32 = 0x0201;
-/// Resource: a handle was invalidated.
 /// A holder of this process's handle has asked it to exit (§11h). A request: nothing
 /// stops a process that ignores it, because there is no forcible kill.
 pub const KIND_TERMINATE_REQUESTED: u32 = 0x0202;
+/// Resource: a handle this process holds was invalidated.
 pub const KIND_HANDLE_INVALIDATED: u32 = 0x0400;
 /// Resource: notifications were dropped due to queue overflow (synthetic).
 pub const KIND_NOTIFICATIONS_DROPPED: u32 = 0x0401;
