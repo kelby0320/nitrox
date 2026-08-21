@@ -24,32 +24,47 @@ at all. The compositor, `tty-server`, `input-server`, `fs-server-ext4`, `auth-se
 `profile-server`, `nxsh` and every library are clean, which is what makes this contained
 rather than systemic.
 
-Counting lines in cfg-gated **top-level items**, and splitting them by which build they are
-absent from — a distinction that turns out to matter:
+**Method**, stated because an earlier draft of this table mixed two and the comparison it
+supported inverted when they were reconciled (PR #225 review, finding 2). For every
+`#[cfg(… feature = "test-harness" | "selftest" …)]`, take the set of line numbers it governs —
+the attribute through the end of the item, block or statement it applies to, brace-matched past
+comments and literals. Line numbers go into a **set**, so a cfg nested inside an
+already-counted item cannot be counted twice. Top-level items and inline blocks are both
+counted, everywhere.
 
-| Crate | cfg sites | Test apparatus | Shipping path, omitted under test | Total | Of the file |
+| Crate | cfg sites | Test apparatus | Shipping path, omitted under test | Lines that differ | Of the file |
 |---|---|---|---|---|---|
-| `init` | 41 | 684 | 0 | 684 | **32 %** |
-| `session-mgr` | 31 | 208 | **117** | 325 | **28 %** |
-| `nxterm` | 9 | ~21 | 0 | ~21 | 2 % |
+| `init` | 41 | 657 | **15** | 672 | 32 % |
+| `session-mgr` | 31 | 241 | **147** | 388 | 33 % |
+| `nxterm` | 9 | 74 | 0 | 74 | 10 % |
 
-`init` is PID 1, which [`init/CLAUDE.md`](../../userspace/init/CLAUDE.md) says must never
-panic; a third of it is filesystem tests — `overwrite_test`, `grow_test`, `create_test`,
+**The percentages are close, and the comparison is not the point** — an earlier draft leaned on
+a "32 % vs 28 %" contrast that a consistent method removes. What matters is the third column.
+
+`init` is PID 1, which [`init/CLAUDE.md`](../../userspace/init/CLAUDE.md) says must never panic;
+about a third of it is filesystem tests — `overwrite_test`, `grow_test`, `create_test`,
 `subtree_bind_test`, `read_large_file` — plus the four `run_*` spawns of graphical clients.
 
-**`session-mgr`'s middle column is the one to read.** 117 lines of it are not test apparatus at
-all: they are the *shipping* login — the interactive `login()`, `tty_open`, `tty_request`,
-`tty_write`, `tty_set_echo`, `tty_read_line`, `tty_close` — compiled **out** under
-`test-harness`. That is code CI builds in one configuration and never executes in the other.
-`nxterm`'s figure counts top-level items only; its remaining sites are inline blocks that print.
+**`session-mgr`'s 147 are not test apparatus at all**: they are the *shipping* login — the
+interactive `login()`, `tty_open`, `tty_request`, `tty_write`, `tty_set_echo`, `tty_read_line`,
+`tty_close`, and the branches that call them — compiled **out** under `test-harness`. Code CI
+builds in one configuration and never executes in the other.
+
+**`init`'s 15 are worse than their size**, and were missed twice — by the draft that said the
+column was zero and by the review that agreed. They are `#[cfg(not(feature = "selftest"))]` on
+two blocks: the normal boot's `spawn_service_mgr` + `reap_loop(notif, root_ns, service_mgr_h)`,
+and the restart of `service-mgr` when it dies. Under `selftest`, init closes service-mgr's handle
+immediately and calls `reap_loop(…, 0)` — the demo `parent` is the primary child, service-mgr is
+**not supervised at all**, and the critical-fault recovery path is a different branch. So PID 1's
+supervision loop is one of the things `test-qemu` structurally cannot exercise.
 
 ## The diagnosis, which is not "cfgs accumulated"
 
 The probes are in `session-mgr` **because the verdict is in `session-mgr`**, and the verdict is
-there because it is the last thing to run. `sched_gate`'s own comment says so:
-
-> The clause-3 sched gate runs at the single PASS point … login proving alone must not PASS a
-> boot whose SMP substrate is dead.
+there because it is the last thing to run. `sched_gate`'s own doc comment says so — it calls
+itself "the Phase 3 **clause 3** verdict gate, checked synchronously at the single PASS point",
+and justifies the placement by "because this runs *before* the only `SYS_TEST_EXIT(PASS)` call, a
+failure cannot lose a race to the verdict".
 
 That is correct reasoning from a bad premise. It has already produced one visible duplicate:
 `session-mgr::sched_gate` and `test-harness::sched_stats_demo` read the same
@@ -123,7 +138,8 @@ selftest images. The probes move there; they do not need a new crate.
       place with one exit path. It takes the SMP and floating-point probes from `session-mgr`
       (`sched_gate`, `cpus_with_switches`, `parse_field`, `fp_gate`, `fp_cpuid`,
       `fp_avx2_usable`, `fp_sum_squares_avx2` — 178 lines) and the five filesystem tests from
-      `init` (330 lines), and it writes the boot verdict.
+      `init` (330 lines in the test functions; 346 with their two helpers and their call sites),
+      and it writes the boot verdict.
 
       **The duplicate resolves here**: `sched_stats_demo` and `sched_gate` become one check.
 

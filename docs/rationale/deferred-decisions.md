@@ -397,6 +397,14 @@ given to one client and withheld from another. Trigger: **Milestone 7**, which c
 `manage` only into the shell's session namespace — at which point the first-come rule stops being
 load-bearing and becomes a belt-and-braces check.
 
+**The mechanism, since M7's plan now rests on it** (`display-arm-plan.md` Milestone 7 Part E): an
+application's namespace binds `/dev/draw/new` as its own path with subtree base `/new`, not the
+`/dev/draw` subtree. The exact resolve matches and forwards `new`; `/dev/draw/manage` is not a
+component-boundary prefix match against that binding, so nothing answers it. The shell's session
+namespace binds the subtree and reaches both. It cannot express "the subtree minus `manage`",
+which is why an application that ever needs `/dev/draw/<id>/info` for ids it does not know in
+advance re-opens this.
+
 **A per-backend output queue in the tty server — `TODO(tty-output-queue)`.** `Tty::Output` is
 sent with `SENDMODE_BLOCK`, so a terminal emulator that stops draining stalls **the whole
 server** — one blocked send holds its single serve loop, so `session-mgr`'s login terminal and

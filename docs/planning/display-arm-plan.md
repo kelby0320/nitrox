@@ -1571,10 +1571,12 @@ in an image a person would run.**
 
 [`test-path-retrofit.md`](test-path-retrofit.md) lands **before** this milestone starts.
 It is not something M7 needs in order to function; it is what stops M7 from tripling the
-problem. `init` and `session-mgr` carry 1009 cfg-gated lines between them — 32 % and 28 % of
-their files — and 117 of `session-mgr`'s are the *shipping* login path, compiled out under
-`test-harness`: one `login()` in the release build and a different one in the tested build. This
-milestone adds three more processes, each of which would otherwise want an auto-login of its own.
+problem. `init` and `session-mgr` carry 1060 lines between them that differ between the release
+and test builds, and the direction is what matters: **147 of `session-mgr`'s are the *shipping*
+login path**, compiled out under `test-harness` — one `login()` in the release build and a
+different one in the tested build — and **15 of `init`'s are its supervision of `service-mgr`**,
+including the restart on death. This milestone adds three more processes, each of which would
+otherwise want an auto-login of its own.
 
 **The rule that follows, and it is the whole reason for the ordering:** nothing built in M7
 contains a substitution cfg. The greeter is driven by the PS/2 injection `check-terminal`
@@ -1597,10 +1599,14 @@ sketch's own plan:
   reason `check-docs` could not catch it is that it validates `userspace/…` paths, not namespace
   paths.
 
-And one requirement the sketch inherited without checking: `TODO(manage-ungated)` says M7 closes
-the manager-channel hole "by binding". **Binding alone does not close it** — the compositor
-classifies forwarded resolves by *suffix* with no caller identity, and serves everything from one
-endpoint, so a namespace that can reach `/dev/draw/new` can reach `/dev/draw/manage`. Part E.
+And one requirement the sketch inherited without checking — where the check found the *sketch*
+right and a first draft of this section wrong. `TODO(manage-ungated)` says M7 closes the
+manager-channel hole "by binding", and it does: a namespace binding is per-path with an optional
+subtree base, so `/dev/draw/new` can be bound **on its own**, with base `/new`, into an
+application's namespace. An exact resolve of `/dev/draw/new` matches, forwards the suffix `new`,
+and mints a session; `/dev/draw/manage` is not a component-boundary prefix match against that
+binding, so it resolves to nothing. Part E, and the caveat that decides how long it lasts is
+there too.
 
 ### Part A — the two widgets, and window titles
 
@@ -1724,17 +1730,37 @@ The three things every later part draws with, none of which exist. Gated on the 
       serves and constructs with [`syscaps.md`](../architecture/syscaps.md)'s rule
       (`graphical-session.md` §3).
 
-- [ ] **`TODO(manage-ungated)` closes, and needs a mechanism the deferral did not name.** The
-      compositor mints a **second forwarding endpoint** for management, carried in its
-      `Meta::Ready` alongside the first; `init` binds only `/dev/draw` into the root namespace;
-      the manage endpoint travels the courier chain (`init` → `service-mgr` →
-      `desktop-session-mgr`) and is bound only into the session namespace. Applications get
-      constructed namespaces holding `/dev/draw` and not the manage endpoint, so withholding
-      finally means something.
+- [ ] **`TODO(manage-ungated)` closes, by binding — which is what the deferral said.** An
+      application's namespace binds `/dev/draw/new` **as its own path**, with subtree base
+      `/new`, rather than binding the `/dev/draw` subtree. Resolving `/dev/draw/new` is an exact
+      match, so the forwarded suffix is empty, the base becomes the whole of it, and the
+      compositor classifies `new` and mints a session. Resolving `/dev/draw/manage` is not a
+      component-boundary prefix match against that binding
+      (`kernel/src/object/namespace.rs`, `match_suffix_offset`), so nothing answers it. The
+      shell's session namespace binds the `/dev/draw` subtree unscoped and gets both.
 
-      **State what stays open**: anything spawned with `namespace: 0` inherits root, so the
-      selftest path remains ungated. That is a property of the test image, not a hole in the
-      design, and it should be written down rather than found later.
+      No protocol change and no new endpoint: `session-mgr` already binds `/home` this way, with
+      a subtree base, through the six-argument `SYS_NS_BIND`.
+
+      **A first draft of this milestone specified a second forwarding endpoint** for management,
+      carried in `Meta::Ready` and couriered `init` → `service-mgr` → `desktop-session-mgr`, on
+      the reasoning that the compositor classifies by suffix with no caller identity so binding
+      could not distinguish. Both premises are true and the conclusion does not follow from them:
+      what a namespace can *reach* is decided by what it **binds**, not by how the server on the
+      far side dispatches (PR #225 review, finding 1).
+
+- [ ] **Record the caveat, because it is what decides how long the cheap answer lasts.** A narrow
+      bind expresses "`new` and not `manage`". It cannot express "the `/dev/draw` subtree minus
+      `manage`" — so the moment an application needs `/dev/draw/<id>/info` for ids it does not
+      know in advance, a subtree bind is required again and `manage` comes with it. Today no
+      application library resolves anything but `new` (`libsurface`, `libui`, `libdraw`, `nxterm`
+      — `<id>/info` appears only in the test client and in manager-facing code), so the narrow
+      bind is sufficient and is what M7 builds. **The second endpoint is the fallback, and this
+      is its trigger**: the first application that needs to read a window's metadata by id.
+
+      **Also open, and a property of the test image rather than the design**: anything spawned
+      with `namespace: 0` inherits root, where `/dev/draw` is bound unscoped — so the selftest
+      path stays ungated whatever the session namespaces do.
 
 ### Part F — `nxterm` becomes launchable
 

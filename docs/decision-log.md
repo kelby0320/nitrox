@@ -16859,14 +16859,19 @@ builds both against two callers each, and gates them, before anything new spawns
 having custom test paths in services like init or session-mgr. Ideally all software under test
 should work basically the way it does on release builds."*
 
-The measurement behind it, counting cfg-gated top-level items: `init` is 684 lines / **32 %**
-— filesystem tests inside PID 1, which `init/CLAUDE.md` says must never panic — and `session-mgr`
-is 325 / **28 %**. `session-mgr`'s number splits in a way worth stating: 208 lines are test
-apparatus (SMP and floating-point probes that have nothing to do with sessions), and **117 are
-the shipping login path compiled out under `test-harness`** — the interactive `login()` and the
-whole `tty_*` layer. So `test-qemu` adjudicates a build in which the login code it claims to
-prove does not exist. Only three crates are affected at all (`init`, `session-mgr`, `nxterm`, the
-last ~21 lines of print statements), which is what makes this contained rather than systemic.
+The measurement behind it — counting, for each cfg site, the **set** of line numbers it governs,
+so nesting cannot double-count: `init` 672 lines / 32 %, `session-mgr` 388 / 33 %, `nxterm`
+74 / 10 %. Only three crates are affected at all, which is what makes this contained rather than
+systemic.
+
+**The percentages are not the finding; the direction is.** 147 of `session-mgr`'s lines are the
+*shipping* login compiled out under `test-harness` — the interactive `login()` and the whole
+`tty_*` layer — so `test-qemu` adjudicates a build in which the login code it claims to prove does
+not exist. And 15 of `init`'s are `cfg(not(selftest))` on PID 1's supervision of `service-mgr`:
+under `selftest` init closes service-mgr's handle immediately and reaps the demo `parent` as its
+primary child instead, so **service-mgr is not supervised and the restart-on-death path is a
+different branch**. That one was missed by the first draft of this entry, which said `init`'s
+shipping-omitted count was zero, and by the review that agreed with it.
 
 **The diagnosis is not "cfgs accumulated".** The probes are in `session-mgr` *because the verdict
 is in `session-mgr`*, and the verdict is there because it is the last thing to run — `sched_gate`
@@ -16902,12 +16907,25 @@ the split was drawn in the right place. The *plumbing* is a single-client server
 pair, one serve end, no second endpoint for `desktop-session-mgr` to hold, and no `/svc/auth` to
 resolve one from. M7 Part C either makes `/svc/auth` real or mints a second endpoint.
 
-**A requirement inherited without checking.** `TODO(manage-ungated)` says M7 closes the
-manager-channel hole "by binding". Binding alone does not: the compositor classifies forwarded
-resolves by *suffix*, with no caller identity, and serves everything from one endpoint — so a
-namespace that can reach `/dev/draw/new` can reach `/dev/draw/manage`. The mechanism is a
-**second forwarding endpoint** for management, couriered to `desktop-session-mgr` and bound only
-into the session namespace. M7 Part E, which also records what stays open: anything spawned with
+**A requirement inherited without checking — where the check vindicated the deferral and caught
+this entry's own first draft.** `TODO(manage-ungated)` says M7 closes the manager-channel hole
+"by binding", and it does. A namespace binding is per-path with an optional subtree base, so an
+application's namespace binds `/dev/draw/new` **on its own** with base `/new`: the exact resolve
+matches and forwards the suffix `new`, and `/dev/draw/manage` is not a component-boundary prefix
+match against that binding, so nothing answers it. The shell binds the subtree and gets both. No
+protocol change; `session-mgr` already binds `/home` this way.
+
+This entry first specified a **second forwarding endpoint** for management, couriered to
+`desktop-session-mgr`, reasoning that the compositor classifies by suffix with no caller identity
+and therefore binding could not distinguish. Both premises are true and **the conclusion does not
+follow**: what a namespace can *reach* is decided by what it binds, not by how the server on the
+far side dispatches. Recorded because the error was a protocol change bought on a non-sequitur,
+and because the three current-behaviour docs that already said "by binding" were right while the
+new plan was the outlier (PR #225 review, finding 1).
+
+The caveat that decides how long the cheap answer lasts is in Part E: a narrow bind cannot express
+"the subtree minus `manage`", so the first application needing `/dev/draw/<id>/info` for unknown
+ids is the trigger for the second endpoint. What stays open regardless: anything spawned with
 `namespace: 0` inherits root, so the selftest path remains ungated.
 
 **Also closed by this pass:** `graphical-session.md` §6.4 ("which process places windows before
