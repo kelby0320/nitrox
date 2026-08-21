@@ -328,6 +328,22 @@ Found by writing C1's gate probe and having the compositor correctly refuse a po
 across connections. Closing it also made the *compositor's* limit real: nothing bounded windows
 per connection, because the API was the bound — see `MAX_WINDOWS_PER_CONNECTION`.
 
+**Buffers per window are unbounded — `TODO(window-buffer-cap)`.** `WindowStack::attach` refuses a
+duplicate buffer id and nothing else, so one window may attach any number of buffers and the
+compositor maps each. Pre-existing, and not reachable by a well-behaved client: `libsurface`
+attaches exactly the count a client asked for at creation, and `ui-testclient`'s churn proves the
+mappings are reclaimed on destroy.
+
+Filed now because M6 C3 changed the arithmetic. The argument for
+`MAX_WINDOWS_PER_CONNECTION` was that everything else on this server is bounded — and this is
+the exception, now multiplied: 29 sessions (`MAX_WAIT_HANDLES - 3`) × 64 windows = 1,856 windows,
+each with an unbounded buffer list, where the old API held it to one window per connection.
+
+The bound is not obviously a count: what matters is mapped *bytes*, and a cap on buffers alone
+would still admit a few enormous ones. Trigger: the first untrusted client, or a per-connection
+memory budget, whichever comes first — the second is the better answer and the reason not to
+guess a number now. Raised by the PR #222 review.
+
 **Window titles: `Surface::SetTitle` and `WindowTitle` — `TODO(m6-b3b-titles)`.** M6 B3 shipped four
 of the five manager events — `WindowCreated`, `WindowDestroyed`, `WindowGeometry`,
 `WindowFocus`. The fifth, `WindowTitle` (`0x091C`), is not implemented, and neither is the

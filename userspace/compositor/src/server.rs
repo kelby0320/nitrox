@@ -74,8 +74,8 @@ pub enum Outcome {
     /// compositor that sent them the other way round would deadlock every client at startup.
     ///
     /// **The configure is what makes the window compositable** — see
-    /// [`WindowStack::configure`]. Until it arrives the client has no size it is entitled to
-    /// commit at, which is the ordering that lets a manager place a window before it is seen.
+    /// [`WindowStack::mark_configured`]. Until it arrives the client has no size it is entitled
+    /// to commit at, which is the ordering that lets a manager place a window before it is seen.
     Created {
         /// Length of the `CreateWindow` reply body already written.
         reply_len: usize,

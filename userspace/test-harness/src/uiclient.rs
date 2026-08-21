@@ -293,7 +293,7 @@ fn churn(root_ns: u64) -> bool {
         let mut w = match Win::open(t, CHURN_W, CHURN_H, Role::Normal) {
             Ok(w) => w,
             Err(_) => {
-                Line::new().s(b"churn: Window::new failed at cycle ").u(cycle as u64).end();
+                Line::new().s(b"churn: Win::open failed at cycle ").u(cycle as u64).end();
                 return false;
             }
         };

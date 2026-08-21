@@ -523,6 +523,12 @@ impl WindowStack {
     }
 
     /// Attach a buffer to a window.
+    ///
+    /// **Unbounded in count — `TODO(window-buffer-cap)`.** A duplicate id is refused and nothing
+    /// else is; a client may attach as many buffers as it likes and the compositor maps each.
+    /// Not reachable from `libsurface`, which attaches exactly what a client asked for at
+    /// creation, and the mappings are reclaimed on destroy. Filed because the per-connection
+    /// window cap made this the one thing here that is not bounded.
     pub fn attach(&mut self, req: &AttachBufferRequest) -> Result<(), StackError> {
         let geometry =
             Geometry::with_pitch(req.width, req.height, req.pitch as usize, PixelFormat::XRGB8888)
@@ -571,7 +577,8 @@ impl WindowStack {
 
     /// Take every id removed since the last call, parent before the popups it took with it.
     ///
-    /// Draining is the point: see [`removed_log`](Self::removed_log).
+    /// Draining is the point: the bin drains after every dispatch, so the log holds at most one
+    /// call's worth and cannot grow while no manager is attached.
     pub fn take_removed(&mut self) -> Vec<u32> {
         core::mem::take(&mut self.removed_log)
     }
@@ -580,8 +587,8 @@ impl WindowStack {
     ///
     /// Deduplicated because one dispatch can change a window's rectangle twice — a place and
     /// a commit in the same batch — and a manager gains nothing from hearing the same
-    /// rectangle described a second time. Draining is the point: see
-    /// [`geometry_log`](Self::geometry_log).
+    /// rectangle described a second time. Draining is the point, for the same reason
+    /// [`take_removed`](Self::take_removed) drains.
     pub fn take_geometry_changes(&mut self) -> Vec<u32> {
         let mut out: Vec<u32> = Vec::new();
         for id in core::mem::take(&mut self.geometry_log) {

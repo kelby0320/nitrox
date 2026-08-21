@@ -13,16 +13,16 @@
 //! invisible in testing and obvious in use (`display-substrate.md` §4).
 //!
 //! So that logic sits behind [`Transport`] and host-tests against a mock, rather than
-//! needing a running compositor. See [`Window::next_free`].
+//! needing a running compositor. See [`WindowRef::next_free`].
 //!
 //! ## Single buffering cannot work, and the library says so
 //!
 //! A buffer is busy from the moment it is committed until the compositor releases it, and
 //! the compositor releases the buffer that *left* the screen — never the one on it. With
-//! one buffer there is never anything to release, so [`Window::next_free`] returns `None`
+//! one buffer there is never anything to release, so [`WindowRef::next_free`] returns `None`
 //! forever after the first commit. That is not a bug to work around: drawing into the
 //! buffer the compositor is reading is exactly the tearing the protocol exists to prevent.
-//! [`Window::new`] refuses fewer than two.
+//! [`Session::create`] refuses fewer than two.
 
 #![cfg_attr(not(test), no_std)]
 #![deny(missing_docs)]
@@ -201,7 +201,7 @@ pub enum WindowEvent {
     /// declines by committing whatever it likes. Declining is legal and stays legal: a
     /// fixed-size window is ordinary.
     ///
-    /// The **first** one is not delivered here at all: [`Window::new`] waits for it and returns
+    /// The **first** one is not delivered here at all: [`Session::create`] waits for it and returns
     /// once it has arrived, because a window is not composited until it has been configured.
     /// What reaches a client through this variant is therefore always a *later* opinion — a
     /// manager moving or resizing a window that is already on screen.
@@ -325,7 +325,17 @@ impl<T: Transport> Session<T> {
         });
         while self.idx(id).is_some_and(|i| self.windows[i].configured.is_none()) {
             let mut buf = [0u8; 64];
-            let (op, n) = self.transport.wait_event(&mut buf)?;
+            let (op, n) = match self.transport.wait_event(&mut buf) {
+                Ok(ev) => ev,
+                // **Take the half-made window back out.** Leaving it would break
+                // `WindowRef::configured`'s promise that it is never `None`, and hand the
+                // caller — who has an `Err` in hand and no id — a window it does not know it
+                // owns (PR #222 review, finding 6).
+                Err(e) => {
+                    self.windows.retain(|w| w.id != id);
+                    return Err(e);
+                }
+            };
             self.apply_event(op, &buf[..n]);
         }
         Ok(id)
@@ -666,7 +676,14 @@ impl<T: Transport> WindowRef<'_, T> {
     /// and a submenu with that popup. A client that kept local state for those would be holding
     /// buffers and queued events for windows that no longer exist, and would never hear about
     /// them again.
-    pub fn destroy(&mut self) -> Result<(), UiError> {
+    ///
+    /// **Consumes the ref**, because after this there is no window for it to refer to. It
+    /// caches an index into the session's list and `retain` below shifts everything after the
+    /// removed entry down — so a ref that outlived its window would silently re-aim at
+    /// whichever window took its place, and `attach` through it would land a buffer on someone
+    /// else's window. Taking `self` by value makes that unrepresentable rather than merely
+    /// unwise (PR #222 review, finding 2).
+    pub fn destroy(self) -> Result<(), UiError> {
         let id = self.id();
         let mut body = [0u8; 8];
         let n = build_destroy_window_request(&mut body, id).ok_or(UiError::Malformed)?;
@@ -716,6 +733,11 @@ mod tests {
         /// How many times the client had to block.
         waits: usize,
         fail: bool,
+        /// Answer `CreateWindow`, then fail the wait for its `Configure`.
+        ///
+        /// Models the one failure that can strand a half-made window: the compositor took the
+        /// request and the channel died before the handshake finished.
+        fail_after_create: bool,
         /// Set by a test to model the real transport discarding a parked event.
         lost: bool,
     }
@@ -774,9 +796,12 @@ mod tests {
             // materialises because we waited. `deferred` is what a test arranges to have
             // the compositor "send" during the block.
             // **An event already queued is not a wait**, which the real transport gets right by
-            // polling before it blocks. Counting one here made `Window::new`'s handshake — which
+            // polling before it blocks. Counting one here made the create handshake — which
             // reads a configure the mock queued during the create — look like a block, and the
             // two `acquire` tests that assert on the count are about *buffer* waits.
+            if self.fail_after_create {
+                return Err(UiError::Transport);
+            }
             if !self.events.is_empty() {
                 return match self.poll_event(buf)? {
                     Some(ev) => Ok(ev),
@@ -922,6 +947,91 @@ mod tests {
             "the parent's keystroke survived the sibling's handshake"
         );
         assert!(s.window(menu).unwrap().configured().is_some(), "and the menu was configured");
+    }
+
+    /// A `create` that fails mid-handshake leaves nothing behind.
+    ///
+    /// The window exists on the compositor by then — the reply arrived — but the caller has an
+    /// `Err` and no id, so a session that kept the entry would hold a window nobody can name,
+    /// and one whose `configured` is `None`, which [`WindowRef::configured`] promises never
+    /// happens (PR #222 review, finding 6).
+    #[test]
+    fn a_create_that_fails_during_the_handshake_leaves_no_window_behind() {
+        let mut t = MockTransport::default();
+        // The create request is answered; the wait for the configure is not.
+        t.fail_after_create = true;
+        let mut s = Session::new(t);
+        assert!(
+            s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).is_err(),
+            "the handshake failed"
+        );
+        assert!(s.window_ids().is_empty(), "and the session kept no half-made window");
+    }
+
+    /// Transport-level loss is announced to **every** window, not just one.
+    ///
+    /// A message the transport dropped before decoding is not attributable to any window — it
+    /// was never decoded, so nothing says which one it named. Telling only one window leaves
+    /// the others carrying accumulated state they should have discarded: a client with a menu
+    /// open keeps a phantom button-down on the menu for the rest of its life, which is exactly
+    /// what `Dropped` exists to prevent.
+    ///
+    /// The existing loss test runs through the single-window fixture and structurally cannot
+    /// see the difference — narrowing the fan-out to one window leaves it passing
+    /// (PR #222 review, finding 3).
+    #[test]
+    fn transport_loss_is_announced_to_every_window() {
+        let mut s = Session::new(MockTransport::default());
+        let a = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
+        let b = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
+
+        s.transport.lost = true;
+        s.pump().expect("pump");
+
+        assert_eq!(s.next_event(), Some((a, WindowEvent::Dropped)), "the first window is told");
+        assert_eq!(s.next_event(), Some((b, WindowEvent::Dropped)), "and so is the second");
+        assert_eq!(s.next_event(), None, "once each");
+    }
+
+    /// One window overflowing its queue does not evict another window's events.
+    ///
+    /// The bound is per window precisely so a noisy window cannot cost a quiet one anything.
+    /// A session-wide budget would let a drag over the terminal evict the menu's queued click
+    /// and mark the *menu* `Dropped` — a window losing events because of traffic it had no part
+    /// in (PR #222 review, finding 4).
+    #[test]
+    fn one_windows_overflow_does_not_evict_anothers_events() {
+        let mut s = Session::new(MockTransport::default());
+        let noisy = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
+        let quiet = s.create(&CreateWindowRequest::new(8, 8, Role::Normal), 2).unwrap();
+
+        // One event for the quiet window, then far more than the bound for the noisy one.
+        s.transport.queue_key_for(quiet, 99, true, 0);
+        for i in 0..(EVENT_QUEUE_MAX + 8) {
+            s.transport.queue_key_for(noisy, i as u16, true, 0);
+        }
+        s.pump().expect("pump");
+
+        // The noisy window overflowed and is told so; the quiet one is untouched.
+        assert_eq!(
+            s.next_event(),
+            Some((noisy, WindowEvent::Dropped)),
+            "the window that overflowed is the window that is told"
+        );
+        let mut from_noisy = 0;
+        let mut quiet_key = None;
+        while let Some((w, e)) = s.next_event() {
+            if w == quiet {
+                assert!(quiet_key.is_none(), "the quiet window had exactly one event");
+                assert_eq!(e, WindowEvent::Key(KeyEvent::new(quiet, 99, 1, 0)));
+                quiet_key = Some(e);
+            } else {
+                assert_ne!(e, WindowEvent::Dropped, "only the overflowing window is marked");
+                from_noisy += 1;
+            }
+        }
+        assert!(quiet_key.is_some(), "the quiet window's event survived the flood");
+        assert_eq!(from_noisy, EVENT_QUEUE_MAX, "the noisy window kept exactly its bound");
     }
 
     /// A record naming a window this session does not hold is dropped, not misattributed.

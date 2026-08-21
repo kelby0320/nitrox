@@ -213,7 +213,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             fail(b"nxterm: buffer alloc FAILED\n");
         };
         maps[i] = addr;
-        if win.window(window_id).expect("our window").attach(i as u32, size.w, size.h, pitch as u32, handle).is_err() {
+        let Some(mut w) = win.window(window_id) else {
+            fail(b"nxterm: our own window is gone\n");
+        };
+        if w.attach(i as u32, size.w, size.h, pitch as u32, handle).is_err() {
             fail(b"nxterm: AttachBuffer FAILED\n");
         }
     }
@@ -286,7 +289,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
         if let Some(d) = damage {
             draw(&mut scratch, &app, &ui, &l, &font, &theme, d);
-            let Ok(b) = win.window(window_id).expect("our window").acquire() else {
+            let Some(mut w) = win.window(window_id) else {
+                fail(b"nxterm: our own window is gone\n");
+            };
+            let Ok(b) = w.acquire() else {
                 fail(b"nxterm: no buffer released\n");
             };
             // SAFETY: `maps[b]` maps `len` writable bytes and `scratch` holds exactly `len`;
@@ -294,12 +300,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             unsafe {
                 core::ptr::copy_nonoverlapping(scratch.bytes().as_ptr(), maps[b as usize], len)
             };
-            if win
-                .window(window_id)
-                .expect("our window")
-                .commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h))
-                .is_err()
-            {
+            let Some(mut w) = win.window(window_id) else {
+                fail(b"nxterm: our own window is gone\n");
+            };
+            if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
                 fail(b"nxterm: Commit FAILED\n");
             }
         }
