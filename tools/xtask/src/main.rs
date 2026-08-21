@@ -751,6 +751,38 @@ fn run_interactive_scenarios(s: &mut Session) -> R<usize> {
     s.expect("/home>")?;
     steps += 1;
 
+    // 5a. **The session's environment is what `session-mgr` built** — the shell starts in
+    //     the principal's home, and `$env.HOME` names it.
+    //
+    //     Steps 5a–5c are the login proof, moved here from a script `session-mgr` ran under
+    //     `test-harness` after auto-logging-in. It asserted the same three things in a build
+    //     where the typed login above did **not exist** — `login()`, `tty_open` and the whole
+    //     `tty_*` layer were `#[cfg(not(feature = "test-harness"))]`. Proving them against the
+    //     release image is the point of `docs/planning/test-path-retrofit.md`; they land here
+    //     *before* the script is deleted, so no coverage is lost in between.
+    s.send("format(\"athome={}\", ($env.PWD == $env.HOME))")?;
+    s.expect("athome=true")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 5b. **Home is writable, and what was written reads back.** The fs endpoint is bound
+    //     subtree-scoped to the principal's home, so this is the sandbox working rather than
+    //     a filesystem working: the same shell cannot reach anything above it.
+    s.send("[1, 2] | save ./nx-login.txt")?;
+    s.expect("/home>")?;
+    s.send("format(\"rows={}\", (open ./nx-login.txt | count))")?;
+    s.expect("rows=2")?;
+    s.expect("/home>")?;
+    steps += 1;
+
+    // 5c. **A directory read of the same bind finds it.** The script asserted `list . | count`
+    //     was at least one, which a count cannot express here; naming the file is stronger
+    //     anyway — a count of one passes on a home holding some *other* file.
+    s.send("list .")?;
+    s.expect("nx-login.txt")?;
+    s.expect("/home>")?;
+    steps += 1;
+
     // 6. A *failing* stage reports and returns to the prompt rather than hanging. This is
     //    the shape that hung the shell for an afternoon: a stage that exits without
     //    writing, whose pipe only closes once its process is reclaimed.
@@ -1336,8 +1368,6 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     // terminal in one and on a screen-sized window in the other.
     session.expect("input-testclient: idle before the window phase")?;
 
-
-
     // Click inside `nxterm` and clear of the reference windows above its top-left corner
     // (the largest is 320×160).
     //
@@ -1452,10 +1482,54 @@ fn cmd_check_terminal(accel: Accel) -> R<()> {
     let _ = session.child.kill();
     let _ = fs::remove_file(&qmp_sock);
 
+    // Everything above is ordered, so it is an `expect` chain. This last check is not:
+    // `boot-probe` exits somewhere between `ui-testclient: PASSED` and
+    // `input-testclient: idle`, and which side it lands on is timing. An `expect` placed
+    // between two lines whose order is not guaranteed is a flake, so this reads the
+    // finished transcript instead.
+    check_service_attribution(&session.finish().into_bytes())?;
+
     println!(
         "\nxtask: terminal gate PASSED — a keystroke reached the shell and its answer \
          reached the grid ✓"
     );
+    Ok(())
+}
+
+/// Assert that `service-mgr` told its two children's exits apart.
+///
+/// `KIND_CHILD_EXITED` names a child by pid and nothing maps a process handle to a pid, so
+/// the discriminator is which control endpoint closed (`TODO(child-exit-attribution)`).
+///
+/// **This lives on `check-terminal` rather than `test-qemu`, and the reason is the verdict.**
+/// `test-qemu` asserted it until retrofit Part B moved `SYS_TEST_EXIT` into `boot-probe`:
+/// there, the probe's last act terminates the machine, so `service-mgr` never sees it exit
+/// and there is nothing to attribute. `check-terminal` boots the *same image* without the
+/// `isa-debug-exit` device, so the verdict write is ignored, the probe carries on to
+/// `exit(0)`, and its exit is attributed like any other service's.
+///
+/// `code=0` and not a bare "exited": a supervisor that reads a *closed control channel* as
+/// an exit reports the death before the child has run and prints `code=unknown`
+/// (PR #226 review, findings 1 and 3).
+fn check_service_attribution(transcript: &[u8]) -> R<()> {
+    let text = String::from_utf8_lossy(transcript);
+    if !text.contains("service-mgr: 'boot-probe' exited code=0") {
+        return Err("service-mgr did not attribute boot-probe's exit with its status \
+             (expected \"service-mgr: 'boot-probe' exited code=0\" in the transcript; \
+             \"code=unknown\" means the death was detected without a matching notification, \
+             which is what an early control-handle close looks like)"
+            .into());
+    }
+    // And nothing else was blamed for it. `heartbeat` is `policy = always`, so a
+    // misattributed exit shows up as a restart of a service that never stopped. Its
+    // *requested* shutdown is a different line and is expected — this boot runs long
+    // enough to reach it, which `test-qemu` never did.
+    if text.contains("service-mgr: restarting 'heartbeat'") {
+        return Err("service-mgr restarted 'heartbeat', which never exited — \
+             boot-probe's exit was misattributed to it"
+            .into());
+    }
+    println!("xtask: service-mgr attributed boot-probe's exit to boot-probe ✓");
     Ok(())
 }
 
@@ -2655,7 +2729,7 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
     match status.code() {
         Some(code) if code == PASS_EXIT => {
             let transcript = captured.lock().map(|g| g.clone()).unwrap_or_default();
-            check_service_attribution(&transcript)?;
+            check_login_chain(&transcript)?;
             println!("\nxtask: integration tests PASSED (qemu exit {code})");
             Ok(())
         }
@@ -2666,44 +2740,26 @@ fn cmd_test_qemu(accel: Accel) -> R<()> {
     }
 }
 
-/// Assert that `service-mgr` told its two children's exits apart.
+/// Assert that the login chain came up — `session-mgr` holding the endpoints it needs to
+/// build a session.
 ///
-/// **The verdict cannot see this.** `boot-probe` exits 0 and `heartbeat` keeps running
-/// either way, so a supervisor that misattributes the exit still reaches
-/// `SYS_TEST_EXIT(PASS)` — proven by running exactly that: replacing the control-channel
-/// attribution with the pid-blind "first running service" rule makes the guest print
-/// `'heartbeat' exited code=0` and `restarting 'heartbeat' (attempt 1 of 3)`, spuriously
-/// starting a second copy while the first is alive, and `test-qemu` still passes.
+/// **This replaces a verdict `session-mgr` used to fire itself.** It called `verdict(false)`
+/// when its endpoint handoff failed, which is a session supervisor adjudicating a test run;
+/// removing that (retrofit Part B) would otherwise have let a broken login chain reach PASS,
+/// because nothing else in `test-qemu` reads it. The transcript does.
 ///
-/// So the transcript is the assertion. `boot-probe` being a declared service is what gives
-/// `service-mgr` two children at all, and telling them apart needs the control channel
-/// rather than `KIND_CHILD_EXITED`'s pid, which nothing can match to a handle
-/// (`TODO(child-exit-attribution)`). See `docs/planning/test-path-retrofit.md`.
-fn check_service_attribution(transcript: &[u8]) -> R<()> {
+/// It does **not** assert that anyone logged in: nothing types a password here, and after
+/// Part B nothing auto-logs-in either. Whether a real login works is
+/// `cargo xtask test-interactive`'s question, on the release image.
+fn check_login_chain(transcript: &[u8]) -> R<()> {
     let text = String::from_utf8_lossy(transcript);
-    // The probe ran, and its exit was attributed to **it**, **with its code**.
-    //
-    // `code=0` rather than a bare `exited`, and the difference is not cosmetic: a
-    // `service-mgr` that reads a *closed control channel* as an exit reports the death
-    // before the child has run, takes the "no code queued => failure" branch, and prints
-    // `'boot-probe' exited code=unknown`. The looser pattern passed that run
-    // (PR #226 review, findings 1 and 3). Pinning the code is what distinguishes "the
-    // child exited and we paired its status" from "its handle went away".
-    if !text.contains("service-mgr: 'boot-probe' exited code=0") {
-        return Err("service-mgr did not attribute boot-probe's exit with its status \
-             (expected \"service-mgr: 'boot-probe' exited code=0\" in the transcript; \
-             \"code=unknown\" means the death was detected without a matching notification, \
-             which is what an early control-handle close looks like)"
+    if !text.contains("session-mgr: received fs + profile endpoints + auth channel") {
+        return Err("the login chain did not come up — session-mgr never reported its \
+             endpoints (look for \"session-mgr: endpoint handoff FAIL\", or for \
+             service-mgr failing to spawn it at all)"
             .into());
     }
-    // And nothing else was blamed for it. `heartbeat` is `policy = always`, so a
-    // misattributed exit shows up as a restart of a service that never stopped.
-    if text.contains("service-mgr: restarting 'heartbeat'") {
-        return Err("service-mgr restarted 'heartbeat', which never exited — \
-             boot-probe's exit was misattributed to it"
-            .into());
-    }
-    println!("xtask: service-mgr attributed boot-probe's exit to boot-probe ✓");
+    println!("xtask: the login chain came up (session-mgr holds its endpoints) ✓");
     Ok(())
 }
 

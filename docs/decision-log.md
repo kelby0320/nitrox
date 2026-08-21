@@ -17055,3 +17055,57 @@ the early close reintroduced the gate fails, without it the transcript reads `up
 `session-mgr` writes the verdict about 0.1 s later. Twenty million spin iterations in the probe
 were enough for the boot to finish first. Part B's "the verdict must be last" box is not
 theoretical — the probe will take that long once it carries real checks.
+
+## 2026-08-21 — `session-mgr` ships one login, and the boot verdict leaves the supervisors
+
+Test-path retrofit Part B. `session-mgr` carried 31 `#[cfg(feature = "test-harness")]` sites
+and 1171 lines; it now carries **zero** and 857. What left is the auto-login, the `-c` script it
+ran, the demo credential, the SMP and floating-point gates, and `SYS_TEST_EXIT` itself.
+
+**The order was the load-bearing part, and the plan said so: the proof moves before the thing
+that proved it is deleted.** The harness script asserted four things after auto-logging-in —
+`$env.PWD == $env.HOME`, a write to home read back, `list .` finding something, and a program
+from `/bin` running. `test-interactive` already covered the last; the other three are now its
+steps 5a–5c, against the **release image**, typed at a real prompt. Only then was the script
+removed. `list . | count >= 1` became "the listing names the file", because a count cannot
+express `>=` in an expect and naming it is stronger anyway — a count of one passes on a home
+holding some *other* file.
+
+**Why the gates followed the verdict rather than staying put.** `sched_gate` and `fp_gate` had
+nothing to do with sessions; they were in `session-mgr` because the single `SYS_TEST_EXIT(PASS)`
+call was, and `fp_gate`'s own doc comment explains why that adjacency is required: it lived in
+the demo `parent` first and a KVM boot-loop showed it completing in **2 of 15 runs**, because
+whoever owns the verdict races the demo chain. Moving the verdict to `boot-probe` preserved the
+property exactly — `init::supervise` runs the demo chain synchronously, fails the run on a
+non-zero exit, and only *then* hands off to the login chain that reaches `service-mgr` and the
+probe. The gates are still the last thing before the only PASS.
+
+**One verdict `session-mgr` fired had no replacement, so the gate grew one.** It called
+`verdict(false)` when its endpoint handoff failed — a session supervisor adjudicating a test
+run, which is the pattern this plan removes, but deleting it would have let a broken login chain
+reach PASS because nothing else in `test-qemu` reads it. `check_login_chain` requires
+`session-mgr: received fs + profile endpoints + auth channel` in the transcript instead. It
+deliberately does **not** assert that anyone logged in: nothing types a password under
+`test-qemu` and nothing auto-logs-in any more. Whether a login works is `test-interactive`'s
+question now, on the image that ships.
+
+**The attribution assertion had to move, and where it went is the interesting part.** Part A's
+check — that `service-mgr` tells its two children's exits apart — rode on `boot-probe` exiting.
+Once the probe writes the verdict, its last act terminates the machine, so under `test-qemu`
+`service-mgr` never sees it exit and there is nothing to attribute. `check-terminal` boots the
+**same image without the `isa-debug-exit` device**: `SYS_TEST_EXIT` returns `Unsupported`, the
+probe carries on to `exit(0)`, and the exit is attributed like any other service's. So the
+assertion lives there now, negative-controlled in place.
+
+It is a transcript check rather than an `expect`, and that was a correction mid-change: an
+ordered `expect` placed between `ui-testclient: PASSED` and `input-testclient: idle` passed
+once and is a flake, because which side `boot-probe` lands on is timing. Sequential `expect`
+asserts an order; only assert one that exists.
+
+**Two things this exposed, both worth having.** `check-terminal`'s boot runs long enough that
+`heartbeat`'s **graceful-shutdown demo fires for the first time** — `'heartbeat' exited code=0`,
+`stopped as requested (policy=always overridden -- not restarting)`. `test-qemu` always reached
+the verdict first, so the control-channel shutdown path had shipped untested since it was built.
+And the probe exits microseconds after starting while the verdict lands ~0.1 s later, which is
+what makes Part B's deferred "the verdict must be last" box concrete rather than theoretical:
+twenty million spin iterations in the probe were enough for the boot to finish first.

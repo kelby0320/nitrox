@@ -1,8 +1,9 @@
 # Nitrox Test-Path Retrofit — Subproject Plan
 
-**Status:** 🚧 in progress. Planned 2026-08-21; **Part A landed the same day** —
-`parse_all`, the schema change under it, `boot-probe` started from a declaration, and
-`service-mgr` holding more than one service. Parts B, C and D are not started. Sits between Milestone 6 and Milestone 7 of
+**Status:** 🚧 in progress. Planned 2026-08-21; **Parts A and B landed the same day** —
+`parse_all` and the schema change under it, `boot-probe` started from a declaration,
+`service-mgr` holding more than one service, and `session-mgr` down to **zero** test cfgs
+with the verdict and the substrate gates moved out of it. Parts C and D are not started. Sits between Milestone 6 and Milestone 7 of
 the [display arm](display-arm-plan.md), and is a **prerequisite for M7** — not because M7
 needs it to function, but because M7 adds three processes to the set that would otherwise
 grow test paths of their own.
@@ -37,7 +38,7 @@ counted, everywhere.
 | Crate | cfg sites | Test apparatus | Shipping path, omitted under test | Lines that differ | Of the file |
 |---|---|---|---|---|---|
 | `init` | 41 | 657 | **15** | 672 | 32 % |
-| `session-mgr` | 31 | 241 | **147** | 388 | 33 % |
+| ~~`session-mgr`~~ | ~~31~~ **0** | ~~241~~ | ~~**147**~~ | ~~388~~ | **0 %** ✅ Part B |
 | `nxterm` | 9 | 74 | 0 | 74 | 10 % |
 
 **The percentages are close, and the comparison is not the point** — an earlier draft leaned on
@@ -197,23 +198,47 @@ selftest images. The probes move there; they do not need a new crate.
       attribution. Once Part B moves real checks in, the probe *will* take that long. Whatever
       carries the verdict has to be ordered against the probe rather than racing it.
 
-## Part B — `session-mgr` ships one login
+## Part B — `session-mgr` ships one login ✅ complete (2026-08-21)
 
-- [ ] **Delete the substitutions.** One `login()`, not two. `tty_open` and the four `tty_*`
-      helpers compile in every build. No `DEMO_USER`/`DEMO_PASSWORD` constants in the service —
-      the credential belongs to the gate that types it.
+- [x] **Move the login proof into `test-interactive` first** ✅ — steps 5a–5c: `$env.PWD ==
+      $env.HOME`, a write to home read back, and a directory read finding the file. The
+      fourth thing the script proved — a program from `/bin` runs — was already step 5.
+      Closed **before** the box below it, so no coverage lapsed in between. `list . | count >= 1`
+      became "the listing names the file", which a count cannot express and which is stronger
+      anyway: a count of one passes on a home holding some *other* file.
 
-- [ ] **Move the login proof into `test-interactive` first.** The harness script asserts four
-      things (`$env.PWD == $env.HOME`, a write to home round-trips, `list .` finds something,
-      a program from `/bin` runs). `test-interactive` already covers the last;
-      the other three become three added expectations. **This box closes before the box above
-      it**, so the coverage exists before the script is removed.
+- [x] **Delete the substitutions** ✅ — one `login()`, `tty_open` and the four `tty_*` helpers
+      in every build, and no demo credential in the service. `session-mgr` has **zero**
+      `#[cfg(feature = "test-harness")]`, down from 31 sites and 1171 lines to 857.
 
-- [ ] **`test-qemu`'s verdict comes from `boot-probe`.** With the auto-login gone, nothing in
-      `session-mgr` writes one, which is the point.
+- [x] **The verdict comes from `boot-probe`** ✅ — with `sched_gate`, `fp_gate` and their four
+      helpers, which were in `session-mgr` only because the verdict was. `fp_gate`'s own
+      doc explains why it must sit immediately before the only `SYS_TEST_EXIT(PASS)` call:
+      it was in the demo `parent` first and completed in 2 of 15 KVM runs, because whoever
+      owns the verdict races the demo chain. That property moved intact — `init::supervise`
+      runs the demo chain **synchronously** and only then hands off to the login chain that
+      reaches `boot-probe`.
 
-- [ ] **What remains in `session-mgr` is a session supervisor.** ~1170 lines to ~910, and the
-      part that is left is all about sessions.
+- [x] **A transcript assertion replaces the one verdict `session-mgr` still fired** ✅ — it
+      called `verdict(false)` when its endpoint handoff failed, which is a session supervisor
+      adjudicating a test run. Removing it would have let a broken login chain reach PASS,
+      since nothing else in `test-qemu` reads it; `check_login_chain` requires the success
+      line instead.
+
+- [x] **The attribution assertion moved to `check-terminal`** ✅, and Part B is why. Once
+      `boot-probe` writes the verdict, its last act terminates the machine — so under
+      `test-qemu` `service-mgr` never sees it exit and there is nothing to attribute.
+      `check-terminal` boots the **same image** without the `isa-debug-exit` device, so the
+      verdict write is ignored, the probe reaches `exit(0)`, and the exit is attributed
+      normally. Negative-controlled there: the pid-blind rule fails the gate.
+
+**Two things this run exposed, both worth having.** `check-terminal`'s boot is long enough that
+`heartbeat`'s **graceful-shutdown demo actually fires** — `'heartbeat' exited code=0`,
+`stopped as requested (policy=always overridden)`. It never had before: `test-qemu` reached the
+verdict first, so the control-channel shutdown path shipped untested. And `boot-probe` exits
+microseconds after starting, while the verdict lands ~0.1 s later — twenty million spin
+iterations in the probe were enough for the boot to finish first, which is what makes the
+ordering box below real rather than theoretical.
 
 ## Part C — `init` ships PID 1
 

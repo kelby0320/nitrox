@@ -40,15 +40,6 @@ use librsproto::{OP_AUTHENTICATE, decode, encode};
 const PAYLOAD_OFF: usize = 24;
 const MSG_LEN: usize = 4096;
 
-/// The demo credential the test-harness auto-login uses. **Must match** the fixture
-/// seeded into `/system/users` by `tools/xtask` (`DEMO_USER`/`DEMO_PASSWORD`). Only the
-/// deterministic test-harness path uses it; the interactive login reads the credential
-/// from the console instead.
-#[cfg(feature = "test-harness")]
-const DEMO_USER: &[u8] = b"alice";
-#[cfg(feature = "test-harness")]
-const DEMO_PASSWORD: &[u8] = b"correct horse battery staple";
-
 static mut WAIT_HANDLES: [u64; 1] = [0];
 static mut WAIT_RESULTS: [u8; 24] = [0; 24];
 static mut RECV_MSG: [u8; MSG_LEN] = [0; MSG_LEN];
@@ -118,8 +109,8 @@ fn kprint(msg: &[u8]) {
     unsafe { syscall4(SYS_DEBUG_KPRINT, msg.as_ptr() as u64, msg.len() as u64, 0, 0) };
 }
 
-/// Park forever. Reached only when this supervisor cannot usefully continue — no
-/// endpoints, or a verdict already fired.
+/// Park forever. Reached only when this supervisor cannot usefully continue — today, when
+/// its endpoint handoff did not arrive, so no session can be built.
 ///
 /// **Parks, never spins.** This was a `pause` loop, which burns a CPU for as long as the
 /// machine is up. The cost is not the cycles: a run queue that is never empty means the
@@ -543,23 +534,13 @@ fn spawn_user_shell(root_ns: u64, session_ns: u64, notif: u64) -> i32 {
     // reads `/dev/console` from its own namespace, which is a capability it was *given*
     // rather than a stream it was handed.
     //
-    // Under `test-harness` the shell runs a script instead of a prompt, so the boot has a
-    // deterministic verdict. The script is the login proof: the environment arrived, a
-    // relative path resolves against it, home is writable — and, since Part F, that the
-    // session can **run a program**.
-    //
-    // `list .` is the whole of Part F in one line. `list` is not a builtin, so the shell
-    // must resolve it as a program; the session namespace holds no `/initramfs`, so the
-    // only path that can find it is `/bin/list` → the profile server → the store. If the
-    // `/bin` bind is missing the script dies with "list is not a program", which is
-    // exactly the failure a real user hit at the prompt.
-    #[cfg(feature = "test-harness")]
-    let argv: &[&str] = &[
-        "nxsh",
-        "-c",
-        "if $env.PWD != $env.HOME { bad }\n         [1, 2] | save ./nx-login.txt\n         if (open ./nx-login.txt | count) != 2 { bad }\n         if (list . | count) < 1 { bad }",
-    ];
-    #[cfg(not(feature = "test-harness"))]
+    // **One `argv`, in every build.** Under `test-harness` this used to be a `-c` script —
+    // `$env.PWD == $env.HOME`, a write to home read back, and `list .` finding something —
+    // run after an auto-login, so the boot had a deterministic verdict without anyone
+    // typing. It proved the right three things in a build where the *typed* login did not
+    // exist: `login()` was a different function and the whole `tty_*` layer was compiled
+    // out. Those three assertions are now steps 5a–5c of `cargo xtask test-interactive`,
+    // which drives the release image (`docs/planning/test-path-retrofit.md` Part B).
     let argv: &[&str] = &["nxsh"];
 
     let sent = send_setup_env(setup_mgr, &Streams::default(), argv, &session_env());
@@ -608,8 +589,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     let tty_endpoint = recv_handoff(control);
     let auth_ch = recv_handoff(control);
     if fs_endpoint == 0 || auth_ch == 0 {
+        // No verdict here any more. A supervisor that cannot build sessions is a boot
+        // failure, but adjudicating one is not a session supervisor's job — it says what
+        // happened and stops. `test-qemu` requires the success line below in the
+        // transcript, so this path fails the run without this process knowing a run exists
+        // (`docs/planning/test-path-retrofit.md` Part B).
         kprint(b"session-mgr: endpoint handoff FAIL\n");
-        verdict(false);
         idle(notif);
     }
     // A session without `/bin` is the pre-Part-F shell: the language works, nothing
@@ -620,8 +605,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     kprint(b"session-mgr: received fs + profile endpoints + auth channel\n");
 
     // The session loop: authenticate a user, construct their per-user namespace, spawn
-    // the shell into it, and reap it. (Part D auto-logs-in the demo user for a
-    // deterministic verdict; the interactive path reads the credential from console.)
+    // the shell into it, and reap it — the same way in every build.
     let mut home = [0u8; 256];
     let mut user = [0u8; 64];
     // **The session loop.** It was a single `match` — log in once, run a shell, then park
@@ -630,10 +614,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
     loop {
     // One terminal per session: it serves the login prompt, is bound into the session's
     // namespace for the shell, and is closed when the session ends.
-    #[cfg(not(feature = "test-harness"))]
     let tty = tty_open(root_ns);
-    #[cfg(feature = "test-harness")]
-    let tty = 0u64;
 
     match login(tty, auth_ch, &mut home, &mut user) {
         Some((hl, ul)) => {
@@ -648,15 +629,8 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             );
             if session_ns == 0 {
                 kprint(b"session-mgr: session namespace FAIL\n");
-                // Under the harness this is a failed run. Interactively it is one bad
-                // session: go back to the prompt rather than bricking the console, since
-                // a permanent park is a worse answer than letting someone try again.
-                #[cfg(feature = "test-harness")]
-                {
-                    verdict(false);
-                    idle(notif);
-                }
-                #[cfg(not(feature = "test-harness"))]
+                // One bad session: go back to the prompt rather than bricking the console,
+                // since a permanent park is a worse answer than letting someone try again.
                 continue;
             }
             kprint(b"session-mgr: session namespace built (/home subtree + /dev/console");
@@ -683,31 +657,13 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
             // And the terminal. `Close` is the revocation — a process that outlived the
             // session cannot have its handle taken back, so the server declining to serve
             // is what ends the terminal.
-            #[cfg(not(feature = "test-harness"))]
             if tty != 0 {
                 tty_close(tty);
             }
 
-            #[cfg(feature = "test-harness")]
-            {
-                let ok = code == 0;
-                if ok {
-                    kprint(b"session-mgr: shell verified its environment + wrote to home (login proven)\n");
-                } else {
-                    kprint(b"session-mgr: user shell failed\n");
-                }
-                // The clause-3 sched gate runs at the single PASS point (see
-                // `sched_gate`): login proving alone must not PASS a boot whose
-                // SMP substrate is dead. One verdict per boot — the loop must not
-                // reach a second.
-                verdict(ok && sched_gate(root_ns) && fp_gate());
-                idle(notif);
-            }
-            // Interactive: the shell exited because the user asked it to. Say what
-            // happened and nothing more — the message here used to be the harness's
-            // proof text ("verified its environment + wrote to home"), which claimed a
-            // check that an interactive session never ran.
-            #[cfg(not(feature = "test-harness"))]
+            // The shell exited because the user asked it to. Say what happened and nothing
+            // more — this used to sit beside a harness branch claiming "verified its
+            // environment + wrote to home", a check an interactive session never ran.
             {
                 // **One `kprint`, not four.** The console is shared, so a line assembled
                 // from several calls can be torn by any other process that logs between
@@ -730,19 +686,12 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
         }
         None => {
             kprint(b"session-mgr: login denied\n");
-            #[cfg(not(feature = "test-harness"))]
             if tty != 0 {
                 tty_close(tty);
-            }
-            #[cfg(feature = "test-harness")]
-            {
-                verdict(false);
-                idle(notif);
             }
             // Re-prompt rather than locking out. A serial console has no second way in,
             // so a lockout bricks the machine; the pause is what keeps repeated failure
             // from being a free brute-force oracle.
-            #[cfg(not(feature = "test-harness"))]
             sleep_ms(2000);
         }
     }
@@ -753,25 +702,17 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, control: u64, _arg0: u64) -> 
 /// `home_out` and the authenticated name into `user_out`, or `None` if denied.
 ///
 /// The name comes back because the session namespace publishes it at `/session/user`:
-/// we are the component that authenticated, so we are the one that knows who this is. **test-harness**: a wrong-password sanity check, then auto-login of
-/// the demo user (deterministic verdict). **interactive**: prompt username + password on
-/// the console (up to a few attempts).
-#[cfg(feature = "test-harness")]
-fn login(_tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
-    // Sanity: a wrong password must be denied (no enumeration/timing oracle upstream).
-    let mut scratch = [0u8; 256];
-    if authenticate(auth_ch, DEMO_USER, b"not-the-password", &mut scratch).is_some() {
-        kprint(b"session-mgr: wrong password WRONGLY accepted\n");
-        return None;
-    }
-    kprint(b"session-mgr: wrong password correctly denied\n");
-    let hl = authenticate(auth_ch, DEMO_USER, DEMO_PASSWORD, home_out)?;
-    let ul = DEMO_USER.len().min(user_out.len());
-    user_out[..ul].copy_from_slice(&DEMO_USER[..ul]);
-    Some((hl, ul))
-}
-
-#[cfg(not(feature = "test-harness"))]
+/// we are the component that authenticated, so we are the one that knows who this is.
+///
+/// Prompts for a username and a password on the terminal, up to a few attempts.
+///
+/// **There used to be two of these**, and the other one is why
+/// `docs/planning/test-path-retrofit.md` exists: under `test-harness` this function was
+/// replaced by an auto-login of a hardcoded demo credential, so the gate that adjudicated
+/// the whole boot ran a build in which the prompt below, the echo discipline, and the whole
+/// `tty_*` layer were compiled out. What it proved about logging in was that a string
+/// comparison worked. The real path is now driven from the host by
+/// `cargo xtask test-interactive`, against the release image.
 fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Option<(usize, usize)> {
     if tty == 0 {
         kprint(b"session-mgr: no terminal for login\n");
@@ -810,7 +751,7 @@ fn login(tty: u64, auth_ch: u64, home_out: &mut [u8], user_out: &mut [u8]) -> Op
 /// One tty per session. It serves the login prompt first, is then bound into the session's
 /// namespace for the shell, and is closed when the session ends — the terminal belongs to
 /// the session, not to session-mgr.
-#[cfg(not(feature = "test-harness"))]
+
 fn tty_open(root_ns: u64) -> u64 {
     let (st, ch) = ns_lookup(root_ns, b"/dev/tty", RIGHT_SEND | RIGHT_RECV | RIGHT_WAIT | RIGHT_TRANSFER);
     if st != 0 { 0 } else { ch }
@@ -818,7 +759,7 @@ fn tty_open(root_ns: u64) -> u64 {
 
 /// Send one tty request and wait for its reply. Returns the reply body length written into
 /// `out` (`0` for the acknowledgement-only ops), or `None` on any failure.
-#[cfg(not(feature = "test-harness"))]
+
 fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
     // SAFETY: SEND_MSG is a valid buffer; the rsproto message goes at offset 24.
     let sent = unsafe {
@@ -870,7 +811,7 @@ fn tty_request(ch: u64, op: u16, body: &[u8], out: &mut [u8]) -> Option<usize> {
 
 /// Write `text` to the terminal. Output through a handle the process *holds* — not the
 /// ambient debug syscall every program used to print with.
-#[cfg(not(feature = "test-harness"))]
+
 fn tty_write(ch: u64, text: &[u8]) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_WRITE, text, &mut scratch);
@@ -881,7 +822,7 @@ fn tty_write(ch: u64, text: &[u8]) {
 /// **This is why the tty server exists.** It was a `bool` every caller of `read_line` had
 /// to remember to pass, so reading a password safely depended on each of them getting it
 /// right. Now it is the server's state and a client cannot forget it.
-#[cfg(not(feature = "test-harness"))]
+
 fn tty_set_echo(ch: u64, on: bool) {
     let flags = [if on { librsproto::TTY_MODE_ECHO } else { 0 }];
     let mut scratch = [0u8; 1];
@@ -890,7 +831,7 @@ fn tty_set_echo(ch: u64, on: bool) {
 
 /// Read one edited line. The line discipline — backspace, kill, echo — is the server's,
 /// so this is a request rather than a byte loop.
-#[cfg(not(feature = "test-harness"))]
+
 fn tty_read_line(ch: u64, out: &mut [u8]) -> usize {
     tty_request(ch, librsproto::OP_TTY_READ_LINE, &[], out).unwrap_or(0)
 }
@@ -900,7 +841,7 @@ fn tty_read_line(ch: u64, out: &mut [u8]) -> usize {
 /// **Revocation, not release.** Handles are refcounted and this kernel has none, so closing
 /// cannot take a tty back from a process that outlived the session. The server declining to
 /// serve the channel is what makes teardown a guarantee.
-#[cfg(not(feature = "test-harness"))]
+
 fn tty_close(ch: u64) {
     let mut scratch = [0u8; 1];
     let _ = tty_request(ch, librsproto::OP_TTY_CLOSE, &[], &mut scratch);
@@ -908,260 +849,6 @@ fn tty_close(ch: u64) {
     unsafe { syscall1(SYS_HANDLE_CLOSE, ch) };
 }
 
-
-/// Find the first occurrence of `key` in `text` and parse the ASCII decimal
-/// run that follows it. `None` if the key is absent or not followed by a digit.
-#[cfg(feature = "test-harness")]
-fn parse_field(text: &[u8], key: &[u8]) -> Option<u64> {
-    let start = text.windows(key.len()).position(|w| w == key)? + key.len();
-    let mut n: u64 = 0;
-    let mut any = false;
-    for &b in &text[start..] {
-        if !b.is_ascii_digit() {
-            break;
-        }
-        any = true;
-        n = n.wrapping_mul(10).wrapping_add((b - b'0') as u64);
-    }
-    if any { Some(n) } else { None }
-}
-
-/// Count the `cpu=` rows in a `/proc/sched/stats` snapshot whose `switches`
-/// counter is nonzero — the clause-3 "CPUs visibly active" measure.
-#[cfg(feature = "test-harness")]
-fn cpus_with_switches(text: &[u8]) -> u64 {
-    let mut n = 0;
-    for line in text.split(|&b| b == b'\n') {
-        if line.starts_with(b"cpu=") && parse_field(line, b"switches=").is_some_and(|v| v > 0) {
-            n += 1;
-        }
-    }
-    n
-}
-
-/// The Phase 4 **hardware floating point** verdict gate, checked synchronously at the
-/// single PASS point — the same placement, and for the same reason, as [`sched_gate`].
-///
-/// Userspace now compiles for `x86_64-unknown-nitrox`, a hard-float target: `f64`
-/// arithmetic lowers to `mulsd`/`addsd` instead of the `__muldf3` libcalls the old
-/// soft-float target emitted, and the kernel swaps the FP register file on every context
-/// switch. This gate proves that actually works, from ring 3:
-///
-/// - **Against integer math.** Σ v[k]² is computed in `f64` and again in `u64` and must
-///   agree *exactly* — every value is a small exact integer, so the comparison is
-///   bit-exact rather than epsilon-fuzzy. A self-consistent-but-wrong FPU (a bad
-///   multiply, a stuck rounding mode, an `MXCSR` we failed to initialise) fails here
-///   where a float-only check would not.
-/// - **Round trip across a syscall.** `x → 2x+1 → (x-1)/2` is exactly invertible at
-///   these magnitudes. The forward half runs, the process crosses into the kernel (and
-///   may be preempted and migrated), and the inverse half must reproduce the original
-///   bit patterns.
-/// - **Scalar vs. AVX2, and `XCR0` from ring 3.** When the CPU has AVX2 *and* the OS
-///   enabled the SSE+AVX state components — read back with `XGETBV`, which is userspace
-///   independently confirming the `XCR0` write the kernel made in `fpu_init_cpu` — the
-///   same sum computed through `#[target_feature(enable = "avx2")]` intrinsics must
-///   match exactly. That is the per-function opt-in pattern the GUI toolkit's font and
-///   image crates will use.
-///
-/// **Why here and not in the demo `parent`.** It was in `parent` first, and a KVM
-/// boot-loop showed it completing in only 2 of 15 runs: the login chain owns the verdict
-/// and races the demo chain, so on a fast boot the run was adjudicated PASS while the FP
-/// workers were still running — the check silently did not execute. Gating it at the
-/// verdict makes it airtight. `parent` keeps a *concurrent* multi-process version as
-/// extra breadth; this one is the guarantee.
-#[cfg(feature = "test-harness")]
-fn fp_gate() -> bool {
-    const LANES: usize = 8;
-    let mut v = [0f64; LANES];
-    let mut expect_sq: u64 = 0;
-    for k in 0..LANES {
-        let n = 1024 + k as u64;
-        v[k] = n as f64;
-        expect_sq += n * n;
-    }
-    let original = v;
-
-    let sum_scalar = |a: &[f64; LANES]| {
-        let mut acc = 0.0f64;
-        for x in a.iter() {
-            acc += x * x;
-        }
-        acc
-    };
-
-    if sum_scalar(&v) != expect_sq as f64 {
-        kprint(b"session-mgr: fp gate FAIL (f64 disagrees with integer math)\n");
-        return false;
-    }
-
-    // Round trip across a syscall, with the transformed values live.
-    for x in v.iter_mut() {
-        *x = *x * 2.0 + 1.0;
-    }
-    kprint(b"");
-    for x in v.iter_mut() {
-        *x = (*x - 1.0) / 2.0;
-    }
-    if v != original || sum_scalar(&v) != expect_sq as f64 {
-        kprint(b"session-mgr: fp gate FAIL (state lost across a syscall)\n");
-        return false;
-    }
-
-    match fp_avx2_usable() {
-        Err(()) => {
-            kprint(b"session-mgr: fp gate FAIL (CPU has AVX2 but XCR0 lacks YMM state)\n");
-            false
-        }
-        Ok(false) => {
-            kprint(b"session-mgr: fp gate ok (f64 verified in ring 3; no AVX2)\n");
-            true
-        }
-        Ok(true) => {
-            // SAFETY: `fp_avx2_usable` confirmed the CPU feature and that the OS enabled
-            // the SSE+AVX state components in `XCR0`.
-            let simd = unsafe { fp_sum_squares_avx2(&v) };
-            if simd != expect_sq as f64 {
-                kprint(b"session-mgr: fp gate FAIL (avx2 disagrees with scalar)\n");
-                return false;
-            }
-            kprint(b"session-mgr: fp gate ok (f64 + avx2 verified in ring 3)\n");
-            true
-        }
-    }
-}
-
-/// `CPUID`, unprivileged at CPL 3. Returns `(eax, ebx, ecx, edx)`.
-#[cfg(feature = "test-harness")]
-fn fp_cpuid(leaf: u32, subleaf: u32) -> (u32, u32, u32, u32) {
-    let (a, b, c, d);
-    // SAFETY: `cpuid` has no memory effects and is valid in ring 3. `rbx` is reserved by
-    // LLVM, so it is routed through `rsi` by hand.
-    unsafe {
-        core::arch::asm!(
-            "mov rsi, rbx",
-            "cpuid",
-            "xchg rsi, rbx",
-            inlateout("eax") leaf => a,
-            lateout("esi") b,
-            inlateout("ecx") subleaf => c,
-            lateout("edx") d,
-            options(nostack, preserves_flags),
-        );
-    }
-    (a, b, c, d)
-}
-
-/// `Ok(true)` if AVX2 is usable from this process, `Ok(false)` if the CPU or OS simply
-/// does not offer it, `Err(())` if the CPU has AVX2 but the OS left the `YMM` state
-/// component disabled — a kernel bug worth failing on rather than silently degrading.
-#[cfg(feature = "test-harness")]
-fn fp_avx2_usable() -> Result<bool, ()> {
-    let (_, _, ecx1, _) = fp_cpuid(1, 0);
-    let osxsave = ecx1 & (1 << 27) != 0;
-    let (_, ebx7, _, _) = fp_cpuid(7, 0);
-    let cpu_has_avx2 = ebx7 & (1 << 5) != 0;
-    if !osxsave {
-        return Ok(false);
-    }
-    let (lo, hi): (u32, u32);
-    // SAFETY: `CR4.OSXSAVE` confirmed above, so `XGETBV` is not `#UD`; ECX=0 selects
-    // `XCR0`, the only extended control register that exists.
-    unsafe {
-        core::arch::asm!("xgetbv", in("ecx") 0u32, out("eax") lo, out("edx") hi,
-                         options(nomem, nostack, preserves_flags));
-    }
-    let xcr0 = ((hi as u64) << 32) | (lo as u64);
-    let ymm_enabled = xcr0 & 0b110 == 0b110; // SSE (bit 1) + AVX (bit 2)
-    if cpu_has_avx2 && !ymm_enabled {
-        return Err(());
-    }
-    Ok(cpu_has_avx2 && ymm_enabled)
-}
-
-/// Σ v[k]² through AVX2, four `f64` lanes at a time.
-///
-/// # Safety
-/// The caller must have confirmed AVX2 is usable via [`fp_avx2_usable`].
-#[cfg(feature = "test-harness")]
-#[target_feature(enable = "avx2")]
-unsafe fn fp_sum_squares_avx2(v: &[f64; 8]) -> f64 {
-    use core::arch::x86_64::*;
-    // SAFETY: `v` is 8 contiguous `f64`, so both 4-lane loads stay in bounds; the caller
-    // confirmed the AVX2 feature is present.
-    unsafe {
-        let a = _mm256_loadu_pd(v.as_ptr());
-        let b = _mm256_loadu_pd(v.as_ptr().add(4));
-        let acc = _mm256_add_pd(_mm256_mul_pd(a, a), _mm256_mul_pd(b, b));
-        // The lane values are exact integers well under 2^53, so addition is exact and
-        // this reassociation is bit-identical to the scalar left-to-right sum.
-        let hi = _mm256_extractf128_pd(acc, 1);
-        let lo = _mm256_castpd256_pd128(acc);
-        let s = _mm_add_pd(lo, hi);
-        let s = _mm_add_sd(s, _mm_unpackhi_pd(s, s));
-        _mm_cvtsd_f64(s)
-    }
-}
-
-/// The Phase 3 **clause 3** verdict gate, checked synchronously at the single
-/// PASS point: resolve `/proc/sched/stats` through the inherited namespace, map
-/// the snapshot, and require **≥ 2 CPUs with `switches` > 0** ("two CPUs
-/// visibly active via `/proc`"). Login proving alone must not PASS a boot whose
-/// SMP substrate has died — and because this runs *before* the only
-/// `SYS_TEST_EXIT(PASS)` call, a failure cannot lose a race to the verdict (the
-/// demo `parent`'s richer sched-stats check exits nonzero for init to fail the
-/// run, but that path races the login chain; this placement is airtight).
-#[cfg(feature = "test-harness")]
-fn sched_gate(root_ns: u64) -> bool {
-    let (st, mem) = ns_lookup(root_ns, b"/proc/sched/stats", RIGHT_MAP_READ);
-    if st != 0 || mem == 0 {
-        kprint(b"session-mgr: sched gate: lookup FAIL\n");
-        return false;
-    }
-    // SAFETY: register-only syscall; `mem` is a MemoryObject handle with MAP_READ.
-    let addr = unsafe { syscall4(SYS_MEMORY_MAP, mem, 0, 4096, RIGHT_MAP_READ) };
-    if addr < 0 {
-        // SAFETY: closing our own handle.
-        unsafe { syscall1(SYS_HANDLE_CLOSE, mem) };
-        kprint(b"session-mgr: sched gate: map FAIL\n");
-        return false;
-    }
-    // SAFETY: `addr` is a page the kernel mapped MAP_READ holding the snapshot
-    // text (zero-padded to the page).
-    let text = unsafe { core::slice::from_raw_parts(addr as u64 as *const u8, 4096) };
-    let active = cpus_with_switches(text);
-    // SAFETY: unmapping the page mapped above (`text` is not used past here);
-    // closing our own handle.
-    unsafe {
-        syscall2(SYS_MEMORY_UNMAP, addr as u64, 0);
-        syscall1(SYS_HANDLE_CLOSE, mem);
-    }
-    if active >= 2 {
-        kprint(b"session-mgr: sched gate ok (>=2 CPUs with switches>0)\n");
-        true
-    } else {
-        kprint(b"session-mgr: sched gate FAIL (<2 CPUs with switches>0)\n");
-        false
-    }
-}
-
-/// Fire the boot verdict under `test-harness` (terminates QEMU via `SYS_TEST_EXIT`);
-/// a no-op otherwise. session-mgr is the final gate of the self-test boot in Part D.
-#[cfg(feature = "test-harness")]
-fn verdict(ok: bool) {
-    let code = if ok { TEST_EXIT_SUCCESS } else { TEST_EXIT_FAILURE };
-    kprint(if ok {
-        b"session-mgr: test-harness verdict PASS\n"
-    } else {
-        b"session-mgr: test-harness verdict FAIL\n"
-    });
-    // SAFETY: SYS_TEST_EXIT takes the verdict in a0; under the kernel test-harness build
-    // it writes isa-debug-exit and QEMU terminates (so this does not return in practice).
-    unsafe { syscall1(SYS_TEST_EXIT, code as u64) };
-}
-
-/// No-op verdict outside the test harness (a normal / interactive boot).
-#[cfg(not(feature = "test-harness"))]
-fn verdict(_ok: bool) {}
 
 #[panic_handler]
 fn panic(_info: &core::panic::PanicInfo) -> ! {
