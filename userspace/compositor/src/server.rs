@@ -29,7 +29,7 @@ use librsproto::surface::{
 
 use libdraw::geom::Rect;
 
-use crate::{union, StackError, WindowStack};
+use crate::{MAX_WINDOWS_PER_CONNECTION, StackError, WindowStack, union};
 
 /// A client connection: the identity a request arrives on, and the windows it owns.
 #[derive(Clone, Debug, Default)]
@@ -74,8 +74,8 @@ pub enum Outcome {
     /// compositor that sent them the other way round would deadlock every client at startup.
     ///
     /// **The configure is what makes the window compositable** — see
-    /// [`WindowStack::configure`]. Until it arrives the client has no size it is entitled to
-    /// commit at, which is the ordering that lets a manager place a window before it is seen.
+    /// [`WindowStack::mark_configured`]. Until it arrives the client has no size it is entitled
+    /// to commit at, which is the ordering that lets a manager place a window before it is seen.
     Created {
         /// Length of the `CreateWindow` reply body already written.
         reply_len: usize,
@@ -140,6 +140,14 @@ pub fn dispatch(
             let Some(req) = parse_create_window_request(body) else {
                 return Outcome::Failed(SurfaceError::Malformed);
             };
+            // **Bounded per connection.** A client may legitimately hold several windows
+            // since M6 C3 — a menu is a second window on its parent's session — and nothing
+            // else bounded it: `conn.owned` and the stack are both plain `Vec`s. The old
+            // one-window-per-connection API was the only thing keeping this finite, and it
+            // was an accident of `libsurface` rather than a rule.
+            if conn.owned.len() >= MAX_WINDOWS_PER_CONNECTION {
+                return Outcome::Failed(SurfaceError::Rejected(StackError::TooManyWindows));
+            }
             // A parent must be one of *this* connection's windows. Otherwise a client
             // could parent a popup onto a stranger's window and have it destroyed when
             // that window closes — or learn that the id exists.
@@ -589,6 +597,37 @@ mod tests {
         let real = create(&mut a, &mut stack, Role::Normal).unwrap();
         let never_existed = 9999;
         assert_eq!(destroy(&mut b, &mut stack, real), destroy(&mut b, &mut stack, never_existed));
+    }
+
+    /// A connection cannot hold more than [`MAX_WINDOWS_PER_CONNECTION`] windows at once.
+    ///
+    /// Nothing bounded this before C3: `conn.owned` and the stack are plain `Vec`s, and the
+    /// only thing keeping a client to one window was `libsurface`'s API owning the transport.
+    /// A session type removes that accident, so the bound has to be real.
+    #[test]
+    fn a_connection_is_bounded_in_how_many_windows_it_may_hold() {
+        let mut stack = WindowStack::new();
+        let mut conn = Connection::new();
+        for i in 0..MAX_WINDOWS_PER_CONNECTION {
+            create(&mut conn, &mut stack, Role::Normal)
+                .unwrap_or_else(|e| panic!("window {i} refused: {e:?}"));
+        }
+        assert_eq!(
+            create(&mut conn, &mut stack, Role::Normal),
+            Err(SurfaceError::Rejected(StackError::TooManyWindows)),
+            "the one past the bound is refused, and says why"
+        );
+
+        // **Destroying one makes room again**, so the bound is on what is held rather than on
+        // how many have ever been created — a client that opens and closes menus forever must
+        // not eventually be unable to open another.
+        let first = conn.owned()[0];
+        assert!(matches!(destroy(&mut conn, &mut stack, first), Outcome::Applied { .. }));
+        create(&mut conn, &mut stack, Role::Normal).expect("room again");
+
+        // Another connection is unaffected: the bound is per connection, not global.
+        let mut other = Connection::new();
+        create(&mut other, &mut stack, Role::Normal).expect("a different client is not punished");
     }
 
     #[test]

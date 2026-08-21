@@ -318,17 +318,31 @@ resolves against the parent's final origin — closes that without any tracking,
 will do. Trigger for tracking itself: a shell that moves windows without a click on them *and*
 wants open menus to survive it.
 
-**`libsurface` allows one window per connection — `TODO(libsurface-multi-window)`.** `Window`
-owns its `Transport`, so a client holds exactly one window per session and gets the transport
-back only by destroying it. The *protocol* has no such limit — `Connection::owned` is a list, and
-`AttachBuffer`/`Commit`/`DestroyWindow` all name a window explicitly.
+~~**`libsurface` allows one window per connection.**~~ — **done 2026-08-20, M6 C3.** `Window`
+owned its `Transport`, so a client held one usable window per session while the *protocol* had
+no such limit: `Connection::owned` is a list, and a popup may only name a parent its own
+connection owns. `Session` owns the transport now and lends windows through `WindowRef`, so a
+client can hold a parent and its menu at once.
 
-This blocks a client from having a parent and its popup at the same time, because a popup may
-only name a parent its **own connection** owns (`conn.owns(parent)`, which is what stops a client
-parenting onto a stranger's window). Found by writing C1's gate probe, which works around it by
-driving both windows through the raw transport. Trigger: **M6 C3** — `nxterm`'s menu becoming a
-real popup needs a parent and a child on one connection, so the API has to grow a session type
-that owns the transport and mints windows before that item can be built.
+Found by writing C1's gate probe and having the compositor correctly refuse a popup parented
+across connections. Closing it also made the *compositor's* limit real: nothing bounded windows
+per connection, because the API was the bound — see `MAX_WINDOWS_PER_CONNECTION`.
+
+**Buffers per window are unbounded — `TODO(window-buffer-cap)`.** `WindowStack::attach` refuses a
+duplicate buffer id and nothing else, so one window may attach any number of buffers and the
+compositor maps each. Pre-existing, and not reachable by a well-behaved client: `libsurface`
+attaches exactly the count a client asked for at creation, and `ui-testclient`'s churn proves the
+mappings are reclaimed on destroy.
+
+Filed now because M6 C3 changed the arithmetic. The argument for
+`MAX_WINDOWS_PER_CONNECTION` was that everything else on this server is bounded — and this is
+the exception, now multiplied: 29 sessions (`MAX_WAIT_HANDLES - 3`) × 64 windows = 1,856 windows,
+each with an unbounded buffer list, where the old API held it to one window per connection.
+
+The bound is not obviously a count: what matters is mapped *bytes*, and a cap on buffers alone
+would still admit a few enormous ones. Trigger: the first untrusted client, or a per-connection
+memory budget, whichever comes first — the second is the better answer and the reason not to
+guess a number now. Raised by the PR #222 review.
 
 **Window titles: `Surface::SetTitle` and `WindowTitle` — `TODO(m6-b3b-titles)`.** M6 B3 shipped four
 of the five manager events — `WindowCreated`, `WindowDestroyed`, `WindowGeometry`,

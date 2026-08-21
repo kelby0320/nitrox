@@ -44,14 +44,15 @@
 //! `/system/fonts/DejaVuSansMono.ttf` through `fs-server-ext4` and rasterises with it, and
 //! `check-display` compares the result against the same render performed on the host.
 //!
-//! **Two connections, not two windows on one.** Not for the reason this comment used to give:
-//! `KeyEvent` and `PointerEvent` carry a window id as of M6 C3, so input *can* be attributed
-//! now. What remains is `libsurface` — a [`Window`] owns its [`ChannelTransport`], so a client
-//! holds one usable window per session — `TODO(libsurface-multi-window)`, which C3's second
-//! part removes. A session each keeps the question from arising, and costs one channel.
+//! **A connection per window, though neither thing that forced it is true any more.** Input
+//! records carry a window id (C3 part 1) and `Session` holds several windows on one connection
+//! (C3 part 2), so this client *could* be one session now. It is not, because nothing here
+//! needs it and rewriting a working gate to prove an API is how gates acquire bugs.
 //!
-//! `verify_popup_placement` is the exception and drives its two windows through the raw
-//! transport, because a popup may only name a parent its **own** connection owns.
+//! `verify_popup_placement` is the exception, and drives its two windows through the raw
+//! transport for a reason that **is** still live: it is the manager as well as the client, and
+//! `Session::create` blocks for a window's first `Configure` — which, for a `normal` window
+//! with a manager attached, only the manager can release. See `verify_initial_configure`.
 //!
 //! **The UI window is created first**, so the reference scene — created second — stacks above
 //! it. That ordering is load-bearing for the gate: it compares the scene's 64×32 at the
@@ -77,7 +78,7 @@ use librsproto::surface::{
     OP_MGR_WINDOW_FOCUS, OP_MGR_WINDOW_GEOMETRY, ROLE_NORMAL, Role,
     SURFACE_FORMAT_XRGB8888, build_attach_buffer_request, build_commit_request,
 };
-use libsurface::{Transport, Window, ipc::ChannelTransport};
+use libsurface::{Session, Transport, ipc::ChannelTransport};
 
 /// `alloc` backing — rendering the reference scene allocates.
 #[global_allocator]
@@ -103,6 +104,67 @@ const CHURN_CYCLES: usize = 128;
 const CHURN_W: u32 = 1024;
 /// Churn window height.
 const CHURN_H: u32 = 768;
+
+/// A session holding exactly one window — the shape most of this client uses.
+///
+/// `libsurface` became session-oriented in M6 C3, because a client may hold several windows on
+/// one connection and a menu needs exactly that. Most of this file predates it and wants one
+/// window per connection, so this keeps those call sites saying what they always said. The
+/// multi-window API is used directly where it matters — see `verify_popup_placement`.
+struct Win {
+    session: Session<alloc::boxed::Box<ChannelTransport>>,
+    id: u32,
+}
+
+impl Win {
+    /// Connect, create one window, and wait out its initial configure.
+    fn open(
+        t: alloc::boxed::Box<ChannelTransport>,
+        width: u32,
+        height: u32,
+        role: Role,
+    ) -> Result<Self, libsurface::UiError> {
+        let mut session = Session::new(t);
+        let id = session.create(&CreateWindowRequest::new(width, height, role), BUFFERS)?;
+        Ok(Self { session, id })
+    }
+
+    fn id(&self) -> u32 {
+        self.id
+    }
+
+    fn w(&mut self) -> libsurface::WindowRef<'_, alloc::boxed::Box<ChannelTransport>> {
+        self.session.window(self.id).expect("this session's only window")
+    }
+
+    fn attach(
+        &mut self,
+        b: u32,
+        width: u32,
+        height: u32,
+        pitch: u32,
+        handle: u64,
+    ) -> Result<(), libsurface::UiError> {
+        self.w().attach(b, width, height, pitch, handle)
+    }
+
+    fn commit(&mut self, b: u32, damage: (u32, u32, u32, u32)) -> Result<(), libsurface::UiError> {
+        self.w().commit(b, damage)
+    }
+
+    fn acquire(&mut self) -> Result<u32, libsurface::UiError> {
+        self.w().acquire()
+    }
+
+    fn destroy(&mut self) -> Result<(), libsurface::UiError> {
+        self.w().destroy()
+    }
+
+    fn into_transport(self) -> alloc::boxed::Box<ChannelTransport> {
+        self.session.into_transport()
+    }
+}
+
 
 /// Create a `MemoryObject` of `len` bytes and map it read-write.
 ///
@@ -228,10 +290,10 @@ fn churn(root_ns: u64) -> bool {
     let pitch = CHURN_W as usize * 4;
     let len = pitch * CHURN_H as usize;
     for cycle in 0..CHURN_CYCLES {
-        let mut w = match Window::new(t, CHURN_W, CHURN_H, Role::Normal, BUFFERS) {
+        let mut w = match Win::open(t, CHURN_W, CHURN_H, Role::Normal) {
             Ok(w) => w,
             Err(_) => {
-                Line::new().s(b"churn: Window::new failed at cycle ").u(cycle as u64).end();
+                Line::new().s(b"churn: Win::open failed at cycle ").u(cycle as u64).end();
                 return false;
             }
         };
@@ -332,7 +394,7 @@ fn churn(root_ns: u64) -> bool {
 /// green boot with no text on screen.
 fn present_reference_ui(
     root_ns: u64,
-) -> (Window<alloc::boxed::Box<ChannelTransport>>, libdraw::text::Font) {
+) -> (Win, libdraw::text::Font) {
     use libdraw::text::{LoadError, SYSTEM_FONT_PATH, load};
 
     // The font. Resolved through the namespace and demand-paged out of ext4 — the first time
@@ -369,7 +431,7 @@ fn present_reference_ui(
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: second connect to /dev/draw FAILED\n"),
     };
-    let mut win = match Window::new(t, w, h, Role::Normal, BUFFERS) {
+    let mut win = match Win::open(t, w, h, Role::Normal) {
         Ok(win) => win,
         Err(_) => fail(b"ui-testclient: reference UI CreateWindow FAILED\n"),
     };
@@ -419,7 +481,7 @@ fn present_reference_ui(
 fn present_reference_term(
     root_ns: u64,
     font: &libdraw::text::Font,
-) -> Window<alloc::boxed::Box<ChannelTransport>> {
+) -> Win {
     use libterm::render::reference;
 
     let size = reference::size(font);
@@ -436,7 +498,7 @@ fn present_reference_term(
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"ui-testclient: third connect to /dev/draw FAILED\n"),
     };
-    let mut win = match Window::new(t, w, h, Role::Normal, BUFFERS) {
+    let mut win = match Win::open(t, w, h, Role::Normal) {
         Ok(win) => win,
         Err(_) => fail(b"ui-testclient: reference terminal CreateWindow FAILED\n"),
     };
@@ -737,11 +799,12 @@ fn verify_initial_configure(mgr: &mut ChannelTransport, root_ns: u64) {
 /// manager: its position is its creator's business, so there is nobody to wait for, and holding
 /// it would spend the initial-configure deadline on every menu open.
 ///
-/// **Raw transport, because both windows must be on one connection.** A popup may only name a
-/// parent its own connection owns — `conn.owns(parent)`, which is what stops a client parenting
-/// onto a stranger's window — and `libsurface::Window` owns its transport, so it can hold only
-/// one window per connection. The protocol has no such limit (`conn.owned` is a list); the API
-/// does. `TODO(libsurface-multi-window)`.
+/// **Raw transport, and not because `libsurface` cannot do this any more.** `Session` holds
+/// both windows on one connection since C3 part 2, which is what a popup needs — a popup may
+/// only name a parent its own connection owns. The live reason is different: this client is
+/// *also* the manager, and `Session::create` blocks for a window's first `Configure`, which for
+/// a `normal` window with a manager attached only the manager can release. Splitting create
+/// from wait is the pattern such a process has to follow either way.
 fn verify_popup_placement(mgr: &mut ChannelTransport, root_ns: u64) {
     drain_mgr(mgr);
     // SAFETY: `root_ns` is this process's live root namespace, owned for its whole run.
@@ -939,7 +1002,7 @@ fn verify_manager_events(
         Err(_) => fail(b"ui-testclient: probe connect to /dev/draw FAILED\n"),
     };
     let (pw, ph) = (48u32, 24u32);
-    let mut w = match Window::new(t, pw, ph, Role::Normal, BUFFERS) {
+    let mut w = match Win::open(t, pw, ph, Role::Normal) {
         Ok(w) => w,
         Err(_) => fail(b"ui-testclient: probe CreateWindow FAILED\n"),
     };
@@ -1119,7 +1182,7 @@ pub extern "C" fn _start(notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
     // 2. A window. This blocks on the compositor's reply — the step that did not exist.
     let (w, h) = (scene::SCREEN_WIDTH, scene::SCREEN_HEIGHT);
-    let mut win = match Window::new(transport, w, h, Role::Normal, BUFFERS) {
+    let mut win = match Win::open(transport, w, h, Role::Normal) {
         Ok(win) => win,
         Err(_) => {
             fail(b"ui-testclient: CreateWindow FAILED (no reply?)\n");

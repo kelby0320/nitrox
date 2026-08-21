@@ -24,8 +24,8 @@ use libdraw::framebuffer::{Framebuffer, Geometry, MemFramebuffer};
 use libdraw::geom::Rect;
 use libdraw::text::{Font, SYSTEM_FONT_PATH, load};
 use libkern::{SYS_MEMORY_CREATE, SYS_MEMORY_MAP, exit, kprint, syscall4};
-use librsproto::surface::Role;
-use libsurface::{Window, WindowEvent, ipc::ChannelTransport};
+use librsproto::surface::{CreateWindowRequest, Role};
+use libsurface::{Session, WindowEvent, ipc::ChannelTransport};
 use libterm::render::Metrics;
 use libui::diff::Tree;
 use libui::damage::union_opt;
@@ -183,7 +183,11 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
         Ok(t) => alloc::boxed::Box::new(t),
         Err(_) => fail(b"nxterm: connect to /dev/draw FAILED\n"),
     };
-    let mut win = match Window::new(transport, size.w, size.h, Role::Normal, BUFFERS) {
+    // **A session, not a window.** `libsurface` hands out a session since M6 C3, because a
+    // client may hold several windows on one connection — which is what the menu becoming a
+    // real popup needs (C3 part 3). Today this holds exactly one.
+    let mut win = Session::new(transport);
+    let window_id = match win.create(&CreateWindowRequest::new(size.w, size.h, Role::Normal), BUFFERS) {
         Ok(w) => w,
         Err(_) => fail(b"nxterm: CreateWindow FAILED\n"),
     };
@@ -209,7 +213,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             fail(b"nxterm: buffer alloc FAILED\n");
         };
         maps[i] = addr;
-        if win.attach(i as u32, size.w, size.h, pitch as u32, handle).is_err() {
+        let Some(mut w) = win.window(window_id) else {
+            fail(b"nxterm: our own window is gone\n");
+        };
+        if w.attach(i as u32, size.w, size.h, pitch as u32, handle).is_err() {
             fail(b"nxterm: AttachBuffer FAILED\n");
         }
     }
@@ -282,7 +289,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
 
         if let Some(d) = damage {
             draw(&mut scratch, &app, &ui, &l, &font, &theme, d);
-            let Ok(b) = win.acquire() else {
+            let Some(mut w) = win.window(window_id) else {
+                fail(b"nxterm: our own window is gone\n");
+            };
+            let Ok(b) = w.acquire() else {
                 fail(b"nxterm: no buffer released\n");
             };
             // SAFETY: `maps[b]` maps `len` writable bytes and `scratch` holds exactly `len`;
@@ -290,7 +300,10 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             unsafe {
                 core::ptr::copy_nonoverlapping(scratch.bytes().as_ptr(), maps[b as usize], len)
             };
-            if win.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
+            let Some(mut w) = win.window(window_id) else {
+                fail(b"nxterm: our own window is gone\n");
+            };
+            if w.commit(b, (d.origin.x as u32, d.origin.y as u32, d.size.w, d.size.h)).is_err() {
                 fail(b"nxterm: Commit FAILED\n");
             }
         }
@@ -347,7 +360,9 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
             Some(bch) => {
                 loop {
                     match win.poll_event() {
-                        Ok(Some(e)) => events.push(e),
+                        // The id is discarded: one window today, and `Session`
+                        // has already filtered out anything that is not for it.
+                        Ok(Some((_, e))) => events.push(e),
                         Ok(None) => break,
                         Err(_) => {
                             kprint(b"nxterm: the compositor went away\n");
@@ -361,7 +376,7 @@ pub extern "C" fn _start(_notif: u64, root_ns: u64, _boot2: u64) -> ! {
                 }
             }
             None => match win.wait_event() {
-                Ok(e) => events.push(e),
+                Ok((_, e)) => events.push(e),
                 Err(_) => {
                     kprint(b"nxterm: the compositor went away\n");
                     exit(0);

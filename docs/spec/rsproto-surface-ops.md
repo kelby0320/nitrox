@@ -283,6 +283,16 @@ silently disagree with where the client asked for it with no way to say so.
 An unknown role tag, a panel docked to an edge that does not exist, and a `reserve` above
 the bound are all **rejected** rather than defaulted.
 
+**A connection may hold 64 windows at once**, and the 65th `CreateWindow` is refused with
+`InvalidArgument` until one is destroyed. The bound is on windows *held*, not on windows ever created, so a client that
+opens and closes menus forever is never eventually unable to open another. It is per
+connection: one client reaching it does not affect any other.
+
+Bounded because everything else on this server is, and because until M6 C3 the *client library*
+was the bound — a window owned its connection, so a well-behaved client held one and nothing
+needed a number. 64 is far above any honest use (a window, its menu, that menu's submenus, a
+dialog or two) and far below what would let one client exhaust the compositor.
+
 **Encoders write unused role words zero**, so two otherwise-identical requests are
 identical on the wire. Decoders do **not** currently require it: for `normal` both words
 are ignored, and for `popup`/`dialog` the aux16 word is, so several encodings map to one
@@ -306,7 +316,7 @@ carries records for every window the client owns, so a `PointerEvent`, a `Releas
 change *for one of its other windows* may arrive between the reply and the configure — with a
 manager attached the gap is however long the manager takes. A client must read events in a loop
 until its configure arrives rather than assuming the message after the reply is it; `libsurface`'s
-`Window::new` does exactly that.
+`Session::create` does exactly that.
 
 ### `AttachBuffer` (`0x0901`)
 
@@ -370,7 +380,7 @@ once per application.
 hold several windows — a popup is created on its parent's connection — so a client with a menu
 open must be able to tell a click on the menu from a click on the window beneath it. A client
 **must** discard a record whose `window` is not one it is handling; `libsurface` does this in
-`Window::apply_event`.
+`Session::apply_event`, which routes each record to the window it names.
 
 `KeyEvent`, 12 bytes:
 
@@ -558,7 +568,7 @@ ordinary later configure — after the window has been painted once. This is why
 an origin.
 
 **The deadline is the guarantee that a shell can delay a window but never lose one.** A manager
-that never answers costs a launch 200 ms; it cannot leave a client blocked in `Window::new`
+that never answers costs a launch 200 ms; it cannot leave a client blocked in `Session::create`
 forever. A compositor that omitted it would make every client's startup depend on a userspace
 process being alive and willing, which is what withholding the `CreateWindow` reply was rejected
 for.
@@ -566,7 +576,7 @@ for.
 **A process that is both the manager and a client must not block on its own window's first
 `Configure`** — it would be waiting for an answer only it can give, and would be released only by
 the deadline. It must issue `CreateWindow` and service the manager channel separately rather than
-using a helper that does both. `libsurface`'s `Window::new` is such a helper.
+using a helper that does both. `libsurface`'s `Session::create` is such a helper.
 
 **This does not apply to a popup**, which is never held — so a shell opening its own menu, the
 obvious case, may block on that window's configure like any other client. It applies to every
@@ -577,9 +587,9 @@ parent's origin *as it stands at that moment*, so a popup created while its pare
 resolves against the default origin — and, being exempt from the hold itself, is composited there
 while the parent is still invisible, and stays there when the manager finally places the parent.
 A client that waits for its parent's configure before opening a menu cannot reach this;
-`libsurface`'s `Window::new` waits, so nothing built on it can.
+`libsurface`'s `Session::create` waits, so nothing built on it can.
 
-`libsurface` performs the wait inside `Window::new`, which returns only once the first `Configure`
+`libsurface` performs the wait inside `Session::create`, which returns only once the first `Configure`
 has arrived; the first one is **not** delivered to the application as an event, because it is
 permission to draw rather than an opinion about a drawing. Later ones are.
 
